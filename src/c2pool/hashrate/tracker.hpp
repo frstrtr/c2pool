@@ -38,7 +38,7 @@ private:
     double target_time_per_mining_share_ = 3.0;  // target seconds per pseudoshare (p2pool: 3)
 
     // Difficulty bounds
-    double min_difficulty_ = 0.001;
+    double min_difficulty_ = 0.0005;
     double max_difficulty_ = 65536.0;
 
     // Vardiff state (high-resolution)

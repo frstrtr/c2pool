@@ -98,7 +98,7 @@ private:
 
 /// Stratum mining configuration — tuneable from CLI, YAML, or API.
 struct StratumConfig {
-    double min_difficulty       = 0.001;    // floor for per-connection vardiff
+    double min_difficulty       = 0.0005;   // floor for per-connection vardiff
     double max_difficulty       = 65536.0;  // ceiling for per-connection vardiff
     double target_time          = 3.0;      // seconds between pseudoshares (p2pool default: 3)
     bool   vardiff_enabled      = true;     // auto-adjust per-connection difficulty

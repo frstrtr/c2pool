@@ -36,7 +36,7 @@ private:
     uint64_t last_difficulty_adjustment_ = 0;
     
     // Difficulty bounds
-    double min_difficulty_ = 0.001;
+    double min_difficulty_ = 0.0005;
     double max_difficulty_ = 1000000.0;
     
     // Statistics

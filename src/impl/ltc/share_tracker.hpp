@@ -814,57 +814,38 @@ public:
 
     // -- Pool hashrate estimation --
     /// Pool hashrate estimation — matches p2pool get_pool_attempts_per_second exactly.
-    /// Uses skip list (O(log n)) + TrackerView delta cache (O(1)).
-    /// p2pool: tracker.get_delta(near.hash, far.hash).work / time
+    /// Uses skip list O(log n) for ancestor lookup + TrackerView delta cache O(1) for work sum.
+    ///
+    /// p2pool (data.py:2489-2499):
+    ///   near = tracker.items[previous_share_hash]
+    ///   far  = tracker.items[tracker.get_nth_parent_hash(previous_share_hash, dist - 1)]
+    ///   attempts = tracker.get_delta(near.hash, far.hash).min_work   (if min_work)
+    ///            = tracker.get_delta(near.hash, far.hash).work        (otherwise)
+    ///   time = near.timestamp - far.timestamp
+    ///   return attempts // time   (integer=True in generate_transaction)
     uint288 get_pool_attempts_per_second(const uint256& share_hash, int32_t dist, bool use_min_work = false)
     {
         if (dist < 2 || !chain.contains(share_hash))
             return uint288(0);
 
-        // Direct chain walk — bypasses TrackerView delta cache which can
-        // become stale after forest remove/trim operations.
-        // Matches p2pool exactly:
-        //   near = items[share_hash]
-        //   far  = items[get_nth_parent(share_hash, dist-1)]
-        //   attempts = get_delta(near, far).work   ← excludes far
-        //   time = near.timestamp - far.timestamp
-        //   APS = attempts / time
-
-        // Step 1: Find far hash by walking dist-1 parents
-        uint32_t near_ts = 0;
-        chain.get_share(share_hash).invoke([&](auto* obj) { near_ts = obj->m_timestamp; });
-
-        auto cur = share_hash;
-        for (int32_t i = 0; i < dist - 1 && !cur.IsNull() && chain.contains(cur); ++i) {
-            auto* idx = chain.get_index(cur);
-            cur = idx ? idx->tail : uint256();
-        }
-        if (cur.IsNull() || !chain.contains(cur))
+        // p2pool: far = tracker.items[tracker.get_nth_parent_hash(share_hash, dist - 1)]
+        auto far_hash = chain.get_nth_parent_via_skip(share_hash, dist - 1);
+        if (far_hash.IsNull() || !chain.contains(far_hash))
             return uint288(0);
-        auto far_hash = cur;
 
-        uint32_t far_ts = 0;
+        // p2pool: tracker.get_delta(near.hash, far.hash)  — O(1) via TrackerView
+        auto delta = chain.get_delta(share_hash, far_hash);
+        uint288 attempts = use_min_work ? delta.min_work : delta.work;
+
+        // p2pool: time = near.timestamp - far.timestamp; if time <= 0: time = 1
+        uint32_t near_ts = 0, far_ts = 0;
+        chain.get_share(share_hash).invoke([&](auto* obj) { near_ts = obj->m_timestamp; });
         chain.get_share(far_hash).invoke([&](auto* obj) { far_ts = obj->m_timestamp; });
-
-        // Step 2: Sum work from near down to (but NOT including) far
-        // p2pool: get_delta(near, far) = sum(near, near-1, ..., far+1)
-        uint288 total_work;
-        cur = share_hash;
-        while (cur != far_hash && !cur.IsNull() && chain.contains(cur)) {
-            chain.get_share(cur).invoke([&](auto* obj) {
-                if (use_min_work)
-                    total_work += chain::target_to_average_attempts(chain::bits_to_target(obj->m_max_bits));
-                else
-                    total_work += chain::target_to_average_attempts(chain::bits_to_target(obj->m_bits));
-            });
-            auto* idx = chain.get_index(cur);
-            cur = idx ? idx->tail : uint256();
-        }
 
         int32_t time_span = static_cast<int32_t>(near_ts) - static_cast<int32_t>(far_ts);
         if (time_span <= 0) time_span = 1;
 
-        return total_work / uint288(time_span);
+        return attempts / uint288(time_span);
     }
 
     // -- Share target computation --
@@ -958,49 +939,13 @@ public:
         auto aps = get_pool_attempts_per_second(prev_share_hash,
             PoolConfig::TARGET_LOOKBEHIND, /*min_work=*/true);
 
-        // Diagnostic: compare cached height vs walked height
+        // Periodic APS diagnostic (lean — delta cache is now the primary path)
         {
             static int cst_diag = 0;
             if (cst_diag++ % 50 == 0) {
-                auto cached_h = chain.get_acc_height(prev_share_hash);
-                auto walked_h = chain.get_height(prev_share_hash);
-                if (cached_h != walked_h) {
-                    LOG_WARNING << "[CST-DIAG] HEIGHT MISMATCH cached=" << cached_h
-                                << " walked=" << walked_h
-                                << " prev=" << prev_share_hash.GetHex().substr(0,16);
-                }
-                // Log APS components
-                auto far = chain.get_nth_parent_via_skip(prev_share_hash,
-                    PoolConfig::TARGET_LOOKBEHIND - 1);
-                if (!far.IsNull() && chain.contains(far)) {
-                    auto delta = chain.get_delta(prev_share_hash, far);
-                    uint32_t near_ts = 0, far_ts = 0;
-                    chain.get_share(prev_share_hash).invoke([&](auto* s){ near_ts = s->m_timestamp; });
-                    chain.get_share(far).invoke([&](auto* s){ far_ts = s->m_timestamp; });
-                    LOG_INFO << "[CST-APS] min_work=" << delta.min_work.GetHex()
-                             << " work=" << delta.work.GetHex()
-                             << " timespan=" << (int32_t(near_ts)-int32_t(far_ts))
-                             << " aps=" << aps.GetLow64()
-                             << " height_delta=" << delta.height
-                             << " near=" << prev_share_hash.GetHex().substr(0,16)
-                             << " far=" << far.GetHex().substr(0,16);
-                    // Count local vs remote in APS walk
-                    {
-                        auto cur = prev_share_hash;
-                        int local_count = 0, remote_count = 0;
-                        for (int i = 0; i < 200 && !cur.IsNull() && chain.contains(cur); ++i) {
-                            bool is_local = false;
-                            chain.get_share(cur).invoke([&](auto* s) {
-                                is_local = (s->peer_addr.port() == 0);
-                            });
-                            if (is_local) ++local_count; else ++remote_count;
-                            auto* idx = chain.get_index(cur);
-                            cur = idx ? idx->tail : uint256();
-                        }
-                        LOG_INFO << "[CST-WALK] local=" << local_count << " remote=" << remote_count
-                                 << " aps=" << aps.GetLow64();
-                    }
-                }
+                LOG_INFO << "[CST-APS] aps=" << aps.GetLow64()
+                         << " height=" << acc_height
+                         << " prev=" << prev_share_hash.GetHex().substr(0,16);
             }
         }
 
@@ -1030,22 +975,6 @@ public:
             else
             {
                 pre_target.SetHex(result.GetHex());
-            }
-        }
-
-        {
-            static int cst_log = 0;
-            if (cst_log++ % 20 == 0) {
-                // Check if the walk went through local shares
-                bool is_local = false;
-                chain.get_share(prev_share_hash).invoke([&](auto* obj) {
-                    is_local = (obj->peer_addr.port() == 0);
-                });
-                LOG_INFO << "[CST] aps=" << aps.GetLow64()
-                         << " period=" << PoolConfig::share_period()
-                         << " height=" << acc_height
-                         << " prev=" << prev_share_hash.GetHex().substr(0,16)
-                         << " prev_is_local=" << is_local;
             }
         }
 
