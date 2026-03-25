@@ -210,6 +210,23 @@ public:
     /// Callback to get local hashrate from stratum server (H/s)
     void set_local_hashrate_fn(std::function<double()> fn) { m_local_hashrate_fn = std::move(fn); }
 
+    /// Local mining stats from RateMonitor (for p2pool-style status lines)
+    struct LocalRateStats {
+        double hashrate = 0;       // H/s (total local)
+        double effective_dt = 0;   // seconds of data in window
+        int total_datums = 0;      // pseudoshares in window
+        int dead_datums = 0;       // dead (DOA) pseudoshares in window
+    };
+    void set_local_rate_stats_fn(std::function<LocalRateStats()> fn) { m_local_rate_stats_fn = std::move(fn); }
+
+    /// Current PPLNS outputs {script_hex, satoshis} for payout display
+    void set_current_pplns_fn(std::function<std::vector<std::pair<std::string, uint64_t>>()> fn) {
+        m_current_pplns_fn = std::move(fn);
+    }
+
+    /// Node operator's payout script hex (for matching in PPLNS outputs)
+    void set_node_payout_script_hex(const std::string& hex) { m_node_payout_script_hex = hex; }
+
     /// Check whether a peer address is currently banned.
     bool is_banned(const NetService& addr) const;
 
@@ -217,6 +234,9 @@ protected:
     std::function<void()> m_on_bestblock;
     std::function<void()> m_on_best_share_changed;
     std::function<double()> m_local_hashrate_fn;
+    std::function<LocalRateStats()> m_local_rate_stats_fn;
+    std::function<std::vector<std::pair<std::string, uint64_t>>()> m_current_pplns_fn;
+    std::string m_node_payout_script_hex;
     std::set<uint256> m_shared_share_hashes;  // de-dup set for broadcast_share
     std::set<uint256> m_downloading_shares;   // hashes currently being fetched
 

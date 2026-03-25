@@ -57,6 +57,49 @@ static std::string format_duration(double secs) {
     return os.str();
 }
 
+// p2pool-style Wilson score confidence interval (util/math.py:133-152)
+// Returns "~X.Y% (lo-hi%)" string for binomial proportion x/n at 95% confidence.
+static std::string format_binomial_conf(int x, int n, double conf = 0.95) {
+    if (n == 0) return "???";
+    // z for 95% ≈ 1.96 (inverse error function approximation)
+    double z = 1.96;
+    double p = static_cast<double>(x) / n;
+    double topa = p + z * z / (2.0 * n);
+    double topb = z * std::sqrt(p * (1.0 - p) / n + z * z / (4.0 * n * n));
+    double bottom = 1.0 + z * z / n;
+    double lo = std::max(0.0, (topa - topb) / bottom);
+    double hi = std::min(1.0, (topa + topb) / bottom);
+    std::ostringstream os;
+    os << "~" << std::fixed << std::setprecision(1) << (100.0 * p) << "% ("
+       << static_cast<int>(std::floor(100.0 * lo)) << "-"
+       << static_cast<int>(std::ceil(100.0 * hi)) << "%)";
+    return os.str();
+}
+
+// Wilson score confidence interval for efficiency: 1 - stale_rate, scaled
+static std::string format_binomial_conf_efficiency(int stale, int n, double stale_prop) {
+    if (n == 0) return "???";
+    double z = 1.96;
+    double p = static_cast<double>(stale) / n;
+    double topa = p + z * z / (2.0 * n);
+    double topb = z * std::sqrt(p * (1.0 - p) / n + z * z / (4.0 * n * n));
+    double bottom = 1.0 + z * z / n;
+    double lo_stale = std::max(0.0, (topa - topb) / bottom);
+    double hi_stale = std::min(1.0, (topa + topb) / bottom);
+    // Efficiency = (1 - stale_rate) / (1 - stale_prop)
+    double denom = (stale_prop < 0.999) ? (1.0 - stale_prop) : 1.0;
+    double eff = (1.0 - p) / denom;
+    double eff_lo = (1.0 - hi_stale) / denom;
+    double eff_hi = (1.0 - lo_stale) / denom;
+    eff_lo = std::max(0.0, eff_lo);
+    eff_hi = std::min(1.0, eff_hi);
+    std::ostringstream os;
+    os << "~" << std::fixed << std::setprecision(1) << (100.0 * eff) << "% ("
+       << static_cast<int>(std::floor(100.0 * eff_lo)) << "-"
+       << static_cast<int>(std::ceil(100.0 * eff_hi)) << "%)";
+    return os.str();
+}
+
 namespace ltc
 {
 
@@ -317,24 +360,19 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
 
         ++new_count;
 
-        // Log received share BEFORE add (add may move/invalidate the variant)
-        share.ACTION({
-            auto as = addr.to_string();
-            std::string source = (addr.port() == 0) ? as.substr(0, as.rfind(':')) : as;
-            LOG_INFO << "Received share: hash=" << obj->m_hash.GetHex().substr(0, 16)
-                     << " height=" << obj->m_absheight
-                     << " from " << source;
-            // One-time diagnostic: log first share's bits and chain work
-            static int bits_log = 0;
-            if (bits_log++ < 3) {
-                LOG_INFO << "[SHARE-BITS] bits=0x" << std::hex << obj->m_bits
-                         << " max_bits=0x" << obj->m_max_bits << std::dec
-                         << " absheight=" << obj->m_absheight;
-                auto target = chain::bits_to_target(obj->m_bits);
-                auto att = chain::target_to_average_attempts(target);
-                LOG_INFO << "[SHARE-BITS] target=" << target.GetHex().substr(0, 20)
-                         << " att=" << att.GetHex().substr(0, 20);
-            }
+        // Log received share — p2pool format: "Received share diff=X hash=Y miner=Z"
+        share.invoke([](auto* obj) {
+            auto target = chain::bits_to_target(obj->m_bits);
+            double diff = chain::target_to_difficulty(target);
+            // Extract miner identity (pubkey_hash for v17/v33/v36, address script for v34/v35)
+            std::string miner_hex;
+            if constexpr (requires { obj->m_pubkey_hash; })
+                miner_hex = obj->m_pubkey_hash.GetHex().substr(0, 16);
+            else if constexpr (requires { obj->m_address; })
+                miner_hex = "script";
+            LOG_INFO << "Received share: diff=" << std::scientific << std::setprecision(2) << diff
+                     << " hash=" << obj->m_hash.GetHex().substr(0, 16)
+                     << " miner=" << miner_hex;
         });
 
         m_tracker.add(share);
@@ -949,7 +987,7 @@ void NodeImpl::run_think()
     if (m_think_running.exchange(true))
         return;
 
-    // p2pool-style periodic heartbeat
+    // p2pool-style periodic heartbeat (matches main.py:603-648)
     {
         auto chain_sz  = m_tracker.chain.size();
         auto verified  = m_tracker.verified.size();
@@ -962,23 +1000,51 @@ void NodeImpl::run_think()
                 ++incoming_peers;
         }
 
-        // Chain height from best_share (fall back to verified size if best not set yet)
+        // p2pool-compatible chain height: verified.get_height(best_share)
+        // This walks from best_share to chain end, matching p2pool's tracker.get_height().
+        // chain.get_height() includes LevelDB history beyond pruning — too large.
         int height = 0;
-        if (!m_best_share_hash.IsNull() && m_tracker.chain.contains(m_best_share_hash))
-            height = m_tracker.chain.get_height(m_best_share_hash);
-        else if (verified > 0)
+        int verified_height = 0;
+        if (!m_best_share_hash.IsNull()) {
+            if (m_tracker.chain.contains(m_best_share_hash))
+                height = m_tracker.chain.get_height(m_best_share_hash);
+            if (m_tracker.verified.contains(m_best_share_hash))
+                verified_height = m_tracker.verified.get_height(m_best_share_hash);
+        }
+        if (height == 0 && verified > 0)
             height = static_cast<int>(verified);
 
-        // Line 1: chain status
-        auto fork_count = static_cast<int>(chain_sz) > height ? static_cast<int>(chain_sz) - height : 0;
-        LOG_INFO << "c2pool: best=" << height
-                 << " verified=" << verified
-                 << " total=" << chain_sz
-                 << (fork_count > 0 ? " forks=" + std::to_string(fork_count) : "")
+        // L1: p2pool format — "c2pool: N shares in chain (V verified/T total) Peers: P (I incoming)"
+        LOG_INFO << "c2pool: " << height << " shares in chain ("
+                 << verified << " verified/" << chain_sz << " total)"
                  << " Peers: " << peers << " (" << incoming_peers << " incoming)";
 
-        // Line 2: Local hashrate + DOA
-        if (m_local_hashrate_fn) {
+        // L2: Local hashrate + DOA% + time window + expected time to share
+        // p2pool: " Local: XH/s in last Y minutes Local dead on arrival: ~Z% (lo-hi%) Expected time to share: T"
+        uint32_t share_bits = 0;
+        if (!m_best_share_hash.IsNull() && m_tracker.chain.contains(m_best_share_hash)) {
+            m_tracker.chain.get(m_best_share_hash).share.invoke([&](auto* s) {
+                share_bits = s->m_bits;
+            });
+        }
+
+        if (m_local_rate_stats_fn) {
+            auto stats = m_local_rate_stats_fn();
+            std::ostringstream local_line;
+            local_line << " Local: " << format_hashrate(stats.hashrate);
+            if (stats.effective_dt > 0)
+                local_line << " in last " << format_duration(stats.effective_dt);
+            local_line << " Local dead on arrival: "
+                       << format_binomial_conf(stats.dead_datums, stats.total_datums);
+            // Expected time to share: target_to_average_attempts(share_bits) / hashrate
+            if (stats.hashrate > 0 && share_bits != 0) {
+                auto share_target = chain::bits_to_target(share_bits);
+                auto share_aps = chain::target_to_average_attempts(share_target);
+                double ets = static_cast<double>(share_aps.GetLow64()) / stats.hashrate;
+                local_line << " Expected time to share: " << format_duration(ets);
+            }
+            LOG_INFO << local_line.str();
+        } else if (m_local_hashrate_fn) {
             double local_hs = m_local_hashrate_fn();
             LOG_INFO << " Local: " << format_hashrate(local_hs);
         }
@@ -995,10 +1061,6 @@ void NodeImpl::run_think()
             int window = std::min(height, static_cast<int>(
                 std::min(size_t(3600) / PoolConfig::share_period(), size_t(height))));
             if (window > 0) {
-                // Clamp to actual walkable depth (get_height may differ
-                // from the height computed above if the chain was modified
-                // between the two calls, or if segment-walking gives a
-                // different result than the raw index height).
                 auto walkable = m_tracker.chain.get_height(walk_start);
                 auto walk_n = std::min(window, walkable);
                 if (walk_n > 0) {
@@ -1015,19 +1077,39 @@ void NodeImpl::run_think()
                 }
             }
         }
-        double stale_pct = total_recent > 0 ? 100.0 * (orphan_count + doa_count) / total_recent : 0.0;
+        double stale_prop = total_recent > 0 ? static_cast<double>(orphan_count + doa_count) / total_recent : 0.0;
 
-        // Line 3: Best chain stale breakdown + topology
-        LOG_INFO << " Best chain: " << total_recent << " shares ("
-                 << orphan_count << " orphan, " << doa_count << " dead"
-                 << ") stale=" << std::fixed << std::setprecision(1) << stale_pct << "%"
-                 << " heads=" << m_tracker.chain.get_heads().size()
-                 << " v_heads=" << m_tracker.verified.get_heads().size()
-                 << " rss=" << get_rss_mb() << "MB";
+        // L3: Shares line — "Shares: N (O orphan, D dead) Stale rate: ~X% Efficiency: ~Y% Current payout: Z tLTC"
+        {
+            std::ostringstream shares_line;
+            shares_line << " Shares: " << total_recent
+                        << " (" << orphan_count << " orphan, " << doa_count << " dead)"
+                        << " Stale rate: " << format_binomial_conf(orphan_count + doa_count, total_recent)
+                        << " Efficiency: " << format_binomial_conf_efficiency(orphan_count + doa_count, total_recent, stale_prop);
 
-        // Line 4: Pool hashrate + expected time to block
-        // p2pool: real_att_s = pool_aps / (1 - stale_prop)
-        //         etb = 2^256 / block_target / real_att_s
+            // Current payout from PPLNS cache (match node operator's script)
+            if (m_current_pplns_fn && !m_node_payout_script_hex.empty()) {
+                auto outputs = m_current_pplns_fn();
+                uint64_t my_payout = 0;
+                for (const auto& [script, amount] : outputs) {
+                    if (script == m_node_payout_script_hex)
+                        my_payout += amount;
+                }
+                if (my_payout > 0) {
+                    double coins = static_cast<double>(my_payout) / 1e8;
+                    shares_line << " Current payout: (" << std::fixed << std::setprecision(4) << coins
+                                << ")=" << coins << " tLTC";
+                }
+            }
+
+            shares_line << " [heads=" << m_tracker.chain.get_heads().size()
+                        << " v_heads=" << m_tracker.verified.get_heads().size()
+                        << " rss=" << get_rss_mb() << "MB]";
+            LOG_INFO << shares_line.str();
+        }
+
+        // L4: Pool hashrate + expected time to block
+        // p2pool: " Pool: XH/s Stale rate: Y.Y% Expected time to block: Z"
         if (height > 2) {
             try {
                 auto aps = m_tracker.get_pool_attempts_per_second(
@@ -1035,8 +1117,8 @@ void NodeImpl::run_think()
                     std::min(height - 1, static_cast<int>(PoolConfig::TARGET_LOOKBEHIND)),
                     /*min_work=*/false);
                 double pool_hs = static_cast<double>(aps.GetLow64());
-                double real_pool_hs = (stale_pct < 99.9 && pool_hs > 0)
-                    ? pool_hs / (1.0 - stale_pct / 100.0) : pool_hs;
+                double real_pool_hs = (stale_prop < 0.999 && pool_hs > 0)
+                    ? pool_hs / (1.0 - stale_prop) : pool_hs;
 
                 // ETB: use block target (network difficulty) from best share's header
                 double etb_secs = 0;
@@ -1048,17 +1130,15 @@ void NodeImpl::run_think()
                 }
                 if (real_pool_hs > 0 && block_bits != 0) {
                     auto block_target = chain::bits_to_target(block_bits);
-                    // target_to_average_attempts = 2^256 / (target + 1)
                     auto block_aps = chain::target_to_average_attempts(block_target);
                     etb_secs = static_cast<double>(block_aps.GetLow64()) / real_pool_hs;
-                    // For very high targets (testnet), use high bits too
                     if (block_aps.IsNull() && !block_target.IsNull())
-                        etb_secs = 1e18; // effectively infinite
+                        etb_secs = 1e18;
                 }
 
                 LOG_INFO << " Pool: " << format_hashrate(real_pool_hs)
                          << " Stale rate: " << std::fixed << std::setprecision(1)
-                         << stale_pct << "% Expected time to block: "
+                         << (100.0 * stale_prop) << "% Expected time to block: "
                          << format_duration(etb_secs);
             } catch (...) {}
         }

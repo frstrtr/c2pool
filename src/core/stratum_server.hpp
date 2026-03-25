@@ -255,6 +255,15 @@ public:
     std::pair<std::unordered_map<std::string, double>,
               std::unordered_map<std::string, double>> get_local_rates() const;
 
+    /// Rate monitor stats for p2pool-style status display.
+    struct RateStats {
+        double hashrate = 0;       // H/s
+        double effective_dt = 0;   // seconds of data in window
+        int total_datums = 0;      // pseudoshares in window
+        int dead_datums = 0;       // dead pseudoshares
+    };
+    RateStats get_rate_stats() const;
+
     /// Record a pseudoshare in rate monitors.
     /// Called from StratumSession::handle_submit for every accepted pseudoshare.
     /// work = difficulty × 2^32 (hashes), matching p2pool's target_to_average_attempts.

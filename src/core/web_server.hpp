@@ -503,6 +503,22 @@ public:
     // Local stratum hashrate (H/s) — set via callback from WebServer
     void set_stratum_hashrate_fn(std::function<double()> fn) { m_stratum_hashrate_fn = std::move(fn); }
     double get_stratum_total_hashrate() const { return m_stratum_hashrate_fn ? m_stratum_hashrate_fn() : 0.0; }
+
+    // Rate monitor stats for p2pool-style status (DOA%, time window)
+    struct RateStats {
+        double hashrate = 0;
+        double effective_dt = 0;
+        int total_datums = 0;
+        int dead_datums = 0;
+    };
+    void set_stratum_rate_stats_fn(std::function<RateStats()> fn) { m_stratum_rate_stats_fn = std::move(fn); }
+    RateStats get_stratum_rate_stats() const { return m_stratum_rate_stats_fn ? m_stratum_rate_stats_fn() : RateStats{}; }
+
+    // Current PPLNS outputs for payout display
+    std::vector<std::pair<std::string, uint64_t>> get_cached_pplns_outputs() const {
+        std::lock_guard<std::mutex> l(m_work_mutex);
+        return m_cached_pplns_outputs;
+    }
     // THE state root for sharechain anchoring (used by merged coinbase too)
     uint256 get_the_state_root() const { std::lock_guard<std::mutex> l(m_work_mutex); return m_cached_the_state_root; }
     // String-based overload for donation script
@@ -766,6 +782,7 @@ private:
     std::string m_node_fee_address;                 // node operator address (display/logging)
     std::vector<unsigned char> m_donation_script;   // protocol donation scriptPubKey
     std::function<double()> m_stratum_hashrate_fn;  // callback to get stratum total hashrate
+    std::function<RateStats()> m_stratum_rate_stats_fn;  // callback to get rate monitor stats
 
     // Cached network difficulty (computed from bits in refresh_work)
     std::atomic<double> m_network_difficulty{0.0};

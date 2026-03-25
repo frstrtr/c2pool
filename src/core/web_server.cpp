@@ -5290,6 +5290,10 @@ bool WebServer::start_stratum_server()
             mining_interface_->set_stratum_hashrate_fn([ss]() -> double {
                 return ss->get_total_hashrate();
             });
+            mining_interface_->set_stratum_rate_stats_fn([ss]() -> MiningInterface::RateStats {
+                auto s = ss->get_rate_stats();
+                return {s.hashrate, s.effective_dt, s.total_datums, s.dead_datums};
+            });
         }
         return started;
         

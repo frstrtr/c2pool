@@ -207,6 +207,23 @@ StratumServer::get_local_rates() const
     return {hash_rates, dead_hash_rates};
 }
 
+StratumServer::RateStats StratumServer::get_rate_stats() const
+{
+    auto [datums, dt] = local_rate_monitor_.get_datums_in_last();
+    RateStats stats;
+    stats.effective_dt = dt;
+    stats.total_datums = static_cast<int>(datums.size());
+    if (dt > 0) {
+        double total_work = 0;
+        for (const auto& d : datums) {
+            total_work += d.work;
+            if (d.dead) ++stats.dead_datums;
+        }
+        stats.hashrate = total_work / dt;
+    }
+    return stats;
+}
+
 void StratumServer::record_pseudoshare(double work, const std::array<uint8_t, 20>& pubkey_hash,
                                         const std::string& user, bool dead)
 {
@@ -252,7 +269,7 @@ void StratumServer::notify_all()
     for (auto& s : snapshot) {
         try {
             if (s->is_connected())
-                s->send_notify_work(false, &frozen_best);
+                s->send_notify_work(true, &frozen_best);  // clean_jobs=true: miner switches to new prev_share immediately (p2pool behavior)
         } catch (...) {}
     }
 }
