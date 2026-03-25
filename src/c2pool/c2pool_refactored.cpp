@@ -1172,8 +1172,10 @@ int main(int argc, char* argv[]) {
                     : ltc::coin::LTCChainParams::mainnet();
 
                 // LevelDB-backed header chain for persistence across restarts
-                std::string chain_db_path = (settings->m_testnet ? "ltc_testnet" : "ltc")
-                                            + std::string("/embedded_headers");
+                // Use absolute path under ~/.c2pool/ (matches sharechain + found_blocks)
+                std::string chain_db_path = (core::filesystem::config_path()
+                    / (settings->m_testnet ? "litecoin_testnet" : "litecoin")
+                    / "embedded_headers").string();
                 embedded_chain = std::make_unique<ltc::coin::HeaderChain>(ltc_params, chain_db_path);
                 if (!embedded_chain->init())
                     LOG_WARNING << "HeaderChain LevelDB init failed — running in-memory only";
@@ -1300,8 +1302,8 @@ int main(int argc, char* argv[]) {
             {
                 auto* mi = web_server.get_mining_interface();
                 std::string net_label = settings->m_testnet ? "testnet" : "mainnet";
-                std::string fblk_db_path = std::string(getenv("HOME") ? getenv("HOME") : ".") +
-                    "/.c2pool/" + net_label + "/found_blocks_db";
+                std::string fblk_db_path = (core::filesystem::config_path()
+                    / net_label / "found_blocks_db").string();
                 auto fblk_leveldb = std::make_shared<core::LevelDBStore>(
                     fblk_db_path, core::LevelDBOptions{});
                 if (fblk_leveldb->open()) {
@@ -2702,8 +2704,9 @@ int main(int argc, char* argv[]) {
                             : doge::coin::DOGEChainParams::mainnet();
                         doge_params_ptr = std::make_unique<doge::coin::DOGEChainParams>(dp);
 
-                        std::string doge_db = (settings->m_testnet ? "doge_testnet" : "doge")
-                                            + std::string("/embedded_headers");
+                        std::string doge_db = (core::filesystem::config_path()
+                            / (settings->m_testnet ? "dogecoin_testnet" : "dogecoin")
+                            / "embedded_headers").string();
                         doge_chain = std::make_unique<doge::coin::HeaderChain>(*doge_params_ptr, doge_db);
                         if (!doge_chain->init())
                             LOG_WARNING << "DOGE HeaderChain LevelDB init failed — in-memory only";
