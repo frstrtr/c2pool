@@ -255,12 +255,17 @@ public:
     {}
 
     /// Build a template from the current chain tip + mempool.
-    /// Throws std::runtime_error if the chain has no genesis yet.
+    /// Throws std::runtime_error if the chain has no genesis yet or not synced.
     rpc::WorkData getwork() override {
         LOG_DEBUG_COIND << "[EMB-LTC] EmbeddedCoinNode::getwork() called"
                   << " chain_height=" << m_chain.height()
                   << " mempool_size=" << m_pool.size()
                   << " synced=" << m_chain.is_synced();
+        if (!m_chain.is_synced()) {
+            LOG_INFO << "[EMB-LTC] getwork() blocked: chain not synced (height="
+                     << m_chain.height() << ")";
+            throw std::runtime_error("EmbeddedCoinNode::getwork: chain not synced — waiting for header sync");
+        }
         auto result = TemplateBuilder::build_template(m_chain, m_pool, m_testnet);
         if (!result) {
             LOG_WARNING << "[EMB-LTC] EmbeddedCoinNode::getwork() FAILED: no tip (chain empty)";
