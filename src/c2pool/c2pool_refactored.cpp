@@ -1591,6 +1591,7 @@ int main(int argc, char* argv[]) {
                 embedded_chain->set_on_tip_changed(
                     [tracker = mweb_tracker.get(),
                      bcaster = embedded_broadcaster.get(),
+                     pool = embedded_pool.get(),
                      &web_server](
                         const uint256& old_tip, uint32_t old_height,
                         const uint256& new_tip, uint32_t new_height) {
@@ -1600,6 +1601,15 @@ int main(int argc, char* argv[]) {
                         // Invalidate stale MWEB state — HogEx prev_txid is from the old fork
                         if (tracker) {
                             tracker->invalidate();
+                        }
+                        // Clear mempool — confirmed txs are now spent, stale txs cause
+                        // bad-txns-inputs-missingorspent if included in our blocks.
+                        // Fresh txs will arrive from P2P within seconds.
+                        if (pool) {
+                            auto old_size = pool->size();
+                            pool->clear();
+                            if (old_size > 0)
+                                LOG_INFO << "[EMB-LTC] Mempool cleared on tip change (" << old_size << " txs removed)";
                         }
                         // Request the new tip's full block for MWEB state extraction
                         if (bcaster) {
