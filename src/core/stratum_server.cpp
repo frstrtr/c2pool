@@ -862,7 +862,10 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     }
     
     // Calculate share difficulty using per-connection coinbase and job-specific template data
-    const auto& job = job_it->second;
+    // CRITICAL: copy the job snapshot — do NOT hold a reference.
+    // handle_submit() may trigger notify_all() → send_notify_work() → new job
+    // added to active_jobs_ → map rebalance → reference invalidated → SIGSEGV.
+    const auto job = job_it->second;
 
     // ASICBoost: apply version rolling bits to the job version
     uint32_t effective_version = job.version;
