@@ -43,7 +43,8 @@ using ltc::coin::TX_WITH_WITNESS;
 
 class TemplateBuilder {
 public:
-    static constexpr int      BLOCK_VERSION     = 6422786; // AuxPoW version (0x00620002)
+    // Block version derived from chain tip in build_template(), not hardcoded.
+    // DOGE uses (chain_id << 16) | base_version, e.g. 0x00620004 for BIP65.
     static constexpr uint32_t MAX_BLOCK_WEIGHT  = 4'000'000u;
     static constexpr uint32_t COINBASE_RESERVE  = 2'000u;
 
@@ -79,7 +80,8 @@ public:
         }
 
         // ── Subsidy ──────────────────────────────────────────────────────
-        uint64_t subsidy = get_doge_block_subsidy(next_h, params);
+        // Use prevHash-based random subsidy (exact match with Dogecoin Core)
+        uint64_t subsidy = get_doge_block_subsidy(next_h, params, tip.block_hash);
 
         // ── Transactions from mempool ────────────────────────────────────
         auto mtxs = pool.get_sorted_txs(MAX_BLOCK_WEIGHT - COINBASE_RESERVE);
@@ -104,7 +106,12 @@ public:
 
         // ── Build GBT-compatible JSON ────────────────────────────────────
         nlohmann::json data;
-        data["version"]           = BLOCK_VERSION;
+        // Derive version from chain tip (preserves chain_id + BIP signaling bits)
+        // Strip the AuxPoW bit (0x100) — it's added later during block construction.
+        int32_t tip_version = tip.header.m_version;
+        int block_version = tip_version & ~0x100;  // strip auxpow bit from tip
+        if (block_version == 0) block_version = (DOGEChainParams::AUXPOW_CHAIN_ID << 16) | 4;
+        data["version"]           = block_version;
         data["previousblockhash"] = tip.block_hash.GetHex();
         data["bits"]              = bits_to_hex(next_bits);
         data["height"]            = static_cast<int>(next_h);

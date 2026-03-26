@@ -439,24 +439,32 @@ private:
         const auto& prev = prev_it->second;
         uint32_t new_height = prev.height + 1;
 
-        // Validate PoW — skip expensive scrypt for old headers during initial sync.
-        // Headers below (peer_tip - SCRYPT_VALIDATION_DEPTH) are validated
-        // structurally only (prev_hash + difficulty retarget).  This makes bulk
-        // sync ~100x faster: 170k headers × 0.01ms vs 170k × 20ms.
-        // The depth threshold (2100) covers: 1 difficulty retarget interval (2016)
-        // + margin for block_rel_height scoring (~72 blocks).
-        static constexpr uint32_t SCRYPT_VALIDATION_DEPTH = 2100;
-        uint32_t peer_tip = m_peer_tip_height.load(std::memory_order_relaxed);
-        bool need_scrypt = (peer_tip == 0) // unknown tip → validate everything
-                        || (new_height + SCRYPT_VALIDATION_DEPTH >= peer_tip);
+        // AuxPoW blocks (DOGE after auxpow_height): PoW is on the PARENT block
+        // header (e.g. LTC), not on the 80-byte DOGE base header.  Since we only
+        // store the base header (AuxPoW proof stripped during parsing), we cannot
+        // validate PoW from the base header alone.  For AuxPoW blocks, rely on
+        // structural validation (prev_hash linkage + difficulty retarget) only.
+        //
+        // Non-AuxPoW blocks (pre-auxpow_height): validate scrypt PoW normally,
+        // with fast-sync skip for old headers during initial sync.
+        bool is_auxpow = m_params.is_auxpow(new_height);
         uint256 pow_hash;
-        if (need_scrypt) {
-            pow_hash = scrypt_hash(header);
-            if (!check_pow(pow_hash, header.m_bits, m_params.pow_limit))
-                return false;
+        if (is_auxpow) {
+            // AuxPoW: trust PoW (validated by parent chain), store SHA256d placeholder
+            pow_hash = block_hash(header);
         } else {
-            // Structural-only: trust PoW, store zero hash (not needed for old blocks)
-            pow_hash = block_hash(header); // SHA256d, not scrypt — cheap placeholder
+            // Non-AuxPoW: scrypt PoW validation (with fast-sync skip for old headers)
+            static constexpr uint32_t SCRYPT_VALIDATION_DEPTH = 2100;
+            uint32_t peer_tip = m_peer_tip_height.load(std::memory_order_relaxed);
+            bool need_scrypt = (peer_tip == 0)
+                            || (new_height + SCRYPT_VALIDATION_DEPTH >= peer_tip);
+            if (need_scrypt) {
+                pow_hash = scrypt_hash(header);
+                if (!check_pow(pow_hash, header.m_bits, m_params.pow_limit))
+                    return false;
+            } else {
+                pow_hash = block_hash(header);
+            }
         }
 
         // Validate difficulty
@@ -591,10 +599,10 @@ private:
     std::vector<uint256> get_locator_internal() const {
         std::vector<uint256> locator;
         if (m_tip.IsNull()) {
-            // Chain is empty — return genesis hash so peers know where to start.
-            // Without this, getheaders with empty locator gets ignored.
-            if (!m_params.genesis_hash.IsNull())
-                locator.push_back(m_params.genesis_hash);
+            // Chain is empty — send EMPTY locator so the peer responds with
+            // headers starting from genesis (height 0).  If we included the
+            // genesis hash, the peer would skip genesis and start from height 1,
+            // but height 1's prev_hash wouldn't connect to any stored header.
             return locator;
         }
 

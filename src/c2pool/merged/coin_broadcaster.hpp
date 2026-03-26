@@ -305,14 +305,17 @@ private:
             auto peer = std::make_unique<BroadcastPeer>(
                 &m_ioc, key, m_prefix, addr, m_symbol);
 
-            // Wire addr callback for peer discovery
+            // Wire addr callback for peer discovery (disabled on isolated networks)
             bool should_discover = m_peer_manager.discovery_enabled();
-            peer->node_p2p.set_addr_callback(
-                [this](const std::vector<NetService>& addrs) {
-                    for (auto& a : addrs) {
-                        m_peer_manager.add_discovered_peer(a);
-                    }
-                });
+            if (should_discover) {
+                peer->node_p2p.set_addr_callback(
+                    [this](const std::vector<NetService>& addrs) {
+                        if (!m_peer_manager.discovery_enabled()) return;
+                        for (auto& a : addrs) {
+                            m_peer_manager.add_discovered_peer(a);
+                        }
+                    });
+            }
 
             // Wire coin_node events so received P2P data feeds upward
             auto peer_key = key;
@@ -386,6 +389,9 @@ private:
 
     void do_maintenance()
     {
+        // Isolated networks: skip all discovery/connection logic
+        if (m_peer_manager.config().disable_discovery) return;
+
         // 1. Get set of currently connected keys
         std::set<std::string> connected;
         {

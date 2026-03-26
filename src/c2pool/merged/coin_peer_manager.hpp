@@ -180,6 +180,7 @@ struct PeerManagerConfig
     int         peer_db_save_interval_sec{300};
     int         maintenance_interval_sec{5};
     bool        is_merged{false};               // merged chain uses inv instead of full block
+    bool        disable_discovery{false};       // isolated network — only connect to specified peers
     std::set<uint16_t> valid_ports;             // only connect to peers on known ports
 
     // Hardening: network group limits (Sybil resistance)
@@ -404,12 +405,16 @@ public:
     /// Check if we're below min_peers — triggers emergency refresh.
     bool needs_emergency_refresh(int connected_count) const
     {
+        if (m_config.disable_discovery) return false;
         return connected_count < m_config.min_peers;
     }
+
+    const PeerManagerConfig& config() const { return m_config; }
 
     /// Whether discovery (getaddr) should be enabled.
     bool discovery_enabled() const
     {
+        if (m_config.disable_discovery) return false;
         std::lock_guard<std::mutex> lock(m_mutex);
         return static_cast<int>(m_peers.size()) < m_config.max_peers;
     }

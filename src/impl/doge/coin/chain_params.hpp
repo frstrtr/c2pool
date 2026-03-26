@@ -41,6 +41,9 @@ struct DOGEChainParams
     static constexpr uint32_t AUXPOW_CHAIN_ID = 0x0062; // 98 — "Josh Wise!"
     bool strict_chain_id{true};
 
+    // ─── Rewards ─────────────────────────────────────────────────────
+    bool simplified_rewards{true};   // false = random rewards (testnet4alpha)
+
     // ─── PoW limits ───────────────────────────────────────────────────
     uint256 pow_limit;
     uint256 genesis_hash;
@@ -86,6 +89,8 @@ struct DOGEChainParams
         p.auxpow_height = 0;
         p.strict_chain_id = true;
         p.allow_min_difficulty = true;
+        // testnet4alpha does NOT set fSimplifiedRewards → random rewards via MT
+        p.simplified_rewards = false;
         return p;
     }
 
@@ -171,27 +176,72 @@ inline uint32_t calculate_doge_next_work(
 // ─── DOGE subsidy schedule ────────────────────────────────────────────────
 // Port from dogecoin/src/dogecoin.cpp GetDogecoinBlockSubsidy()
 //
-// Height 0-144999:     random (simplified: use max = 500000 * COIN >> halvings)
-// Height 145000-599999: 500000 * COIN >> halvings (fixed schedule)
-// Height 600000+:       10000 * COIN (forever)
-inline uint64_t get_doge_block_subsidy(uint32_t height, const DOGEChainParams& params)
-{
-    static constexpr uint64_t COIN = 100000000ULL; // 1 DOGE = 10^8 koinu
+// Two modes:
+//   fSimplifiedRewards=true  (mainnet ≥145000, testnet3 ≥145000):
+//     Height <600000: 500000 * COIN >> halvings (fixed)
+//     Height ≥600000: 10000 * COIN (forever)
+//   fSimplifiedRewards=false (testnet4alpha, mainnet <145000):
+//     Random reward derived from prevHash via Mersenne Twister
+//     Range: [1, (1000000 >> halvings) - 1] * COIN
+//
+// The prevHash overload computes the exact random subsidy.
+// The no-prevHash overload returns the MAX for fee estimation.
 
+#include <random>
+
+// Exact port of boost::uniform_int<>::operator()(gen) for range [min, max].
+// boost::uniform_int uses rejection sampling: generate a raw value, scale,
+// and reject if it falls outside the range.  std::mt19937 and boost::mt19937
+// produce identical raw output for the same seed (both are MT19937).
+inline int doge_mt_uniform_int(unsigned int seed, int min_val, int max_val)
+{
+    std::mt19937 gen(seed);
+    // boost::uniform_int<int>(min, max)(gen) uses this algorithm:
+    // range = max - min, bucket_size = (gen.max() - gen.min() + 1) / (range + 1)
+    // loop: val = (gen() - gen.min()) / bucket_size; if val <= range, return min + val
+    uint32_t range = static_cast<uint32_t>(max_val - min_val);
+    uint64_t bucket_size = (uint64_t(0xFFFFFFFF) + 1) / (uint64_t(range) + 1);
+    for (;;) {
+        uint32_t raw = gen();
+        uint32_t val = static_cast<uint32_t>(raw / bucket_size);
+        if (val <= range)
+            return min_val + static_cast<int>(val);
+    }
+}
+
+inline uint64_t get_doge_block_subsidy(uint32_t height, const DOGEChainParams& params,
+                                        const uint256& prev_hash)
+{
+    static constexpr uint64_t COIN = 100000000ULL;
     int halvings = static_cast<int>(height) / DOGEChainParams::SUBSIDY_HALVING_INTERVAL;
 
-    if (height >= 600000) {
+    if (params.simplified_rewards) {
+        if (height >= 600000) return 10000ULL * COIN;
+        if (height < 6u * DOGEChainParams::SUBSIDY_HALVING_INTERVAL)
+            return (500000ULL * COIN) >> halvings;
         return 10000ULL * COIN;
     }
 
-    if (params.is_simplified_rewards(height)) {
-        // Fixed schedule: 500000 >> halvings
-        return (500000ULL * COIN) >> halvings;
-    }
+    // Random rewards: exact port of dogecoin/src/dogecoin.cpp
+    std::string hash_hex = prev_hash.GetHex();
+    std::string seed_str = hash_hex.substr(7, 7);
+    unsigned int seed = static_cast<unsigned int>(std::strtoul(seed_str.c_str(), nullptr, 16));
+    int64_t max_reward = (1000000LL >> halvings) - 1;
+    if (max_reward <= 0) return COIN;
 
-    // Pre-simplified: max possible reward (for template building)
-    // Real blocks use Mersenne Twister random, but for templates we use max
-    if (halvings >= 20) return 0; // overflow protection
+    int rand_val = doge_mt_uniform_int(seed, 1, static_cast<int>(max_reward));
+    return static_cast<uint64_t>(1 + rand_val) * COIN;
+}
+
+// Max-subsidy overload (for fee estimation, no prevHash needed)
+inline uint64_t get_doge_block_subsidy(uint32_t height, const DOGEChainParams& params)
+{
+    static constexpr uint64_t COIN = 100000000ULL;
+    int halvings = static_cast<int>(height) / DOGEChainParams::SUBSIDY_HALVING_INTERVAL;
+    if (height >= 600000) return 10000ULL * COIN;
+    if (params.simplified_rewards)
+        return (500000ULL * COIN) >> halvings;
+    if (halvings >= 20) return 0;
     return (1000000ULL * COIN) >> halvings;
 }
 

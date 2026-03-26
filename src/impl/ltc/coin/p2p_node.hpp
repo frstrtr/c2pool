@@ -125,16 +125,19 @@ public:
             timeout("handshake timeout");
         });
 
-        // Service flags: NODE_NETWORK(1) | NODE_WITNESS(8) | NODE_MWEB(1<<24)
-        // NODE_WITNESS: required for segwit block/tx relay
-        // NODE_MWEB: required for litecoind to send MWEB extension data in blocks
+        // Service flags depend on chain type:
+        // LTC: NODE_NETWORK | NODE_WITNESS | NODE_MWEB
+        // DOGE: NODE_NETWORK only (no segwit, no MWEB)
         static constexpr uint64_t NODE_NETWORK = 1;
         static constexpr uint64_t NODE_WITNESS = (1 << 3);
         static constexpr uint64_t NODE_MWEB    = (1ULL << 24);
-        uint64_t our_services = NODE_NETWORK | NODE_WITNESS | NODE_MWEB;
+        bool is_doge = (m_chain_label == "DOGE" || m_chain_label == "doge");
+        uint64_t our_services = NODE_NETWORK;
+        if (!is_doge) our_services |= NODE_WITNESS | NODE_MWEB;
+        uint32_t protocol_version = is_doge ? 70015 : 70017;
 
         auto msg_version = message_version::make_raw(
-            70017,
+            protocol_version,
             our_services,
             core::timestamp(),
             addr_t{our_services, m_peer->get_addr()},
@@ -445,12 +448,18 @@ private:
         auto msg_sendheaders = message_sendheaders::make_raw();
         m_peer->write(msg_sendheaders);
 
-        // BIP 152: announce compact block support (version 2 = with witness)
-        auto msg_cmpct = message_sendcmpct::make_raw(false, 2);
-        m_peer->write(msg_cmpct);
+        // BIP 152: compact blocks — DOGE doesn't support segwit compact blocks (v2)
+        bool is_doge = (m_chain_label == "DOGE" || m_chain_label == "doge");
+        if (!is_doge) {
+            auto msg_cmpct = message_sendcmpct::make_raw(false, 2);
+            m_peer->write(msg_cmpct);
+        }
 
         // BIP 133: advertise minimum feerate (0 = accept all transactions)
-        send_feefilter(0);
+        // DOGE Core may not support BIP 133 — skip to avoid disconnection
+        if (!is_doge) {
+            send_feefilter(0);
+        }
 
         // NOTE: send_mempool() (BIP 35) is NOT called automatically here.
         // It requires NODE_BLOOM service flags on both sides or the daemon
@@ -535,8 +544,24 @@ private:
     {
         std::vector<BlockHeaderType> vheaders;
 
-        if (!msg->m_headers.empty()) {
-            // Standard path: headers parsed successfully as 80-byte BlockType
+        // When a raw parser is set (DOGE AuxPoW), always prefer it over the
+        // standard parser.  The standard parser misinterprets AuxPoW data as
+        // block transactions, producing a small number of garbage entries
+        // instead of the full 2000-header batch.
+        if (m_raw_headers_parser && !msg->m_raw_payload.empty()) {
+            try {
+                vheaders = m_raw_headers_parser(
+                    msg->m_raw_payload.data(), msg->m_raw_payload.size());
+                LOG_INFO << "[" << m_chain_label << "] AuxPoW parser: "
+                         << vheaders.size() << " headers from "
+                         << msg->m_raw_payload.size() << " bytes";
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[" << m_chain_label << "] AuxPoW headers parser failed: " << e.what();
+            }
+        }
+
+        if (vheaders.empty() && !msg->m_headers.empty()) {
+            // Standard path: headers parsed as 80-byte BlockType (LTC, BTC)
             for (auto block : msg->m_headers)
             {
                 auto header = (BlockHeaderType)block;
@@ -549,34 +574,26 @@ private:
             }
         }
 
-        // If standard parsing yielded 0 headers but raw parser is available,
-        // the message contains AuxPoW extended headers (DOGE).
-        if (vheaders.empty() && m_raw_headers_parser && !msg->m_raw_payload.empty()) {
-            try {
-                vheaders = m_raw_headers_parser(
-                    msg->m_raw_payload.data(), msg->m_raw_payload.size());
-            } catch (const std::exception& e) {
-                LOG_WARNING << "AuxPoW headers parser failed: " << e.what();
-            }
-        }
-
         if (!vheaders.empty()) {
             m_coin->new_headers.happened(vheaders);
 
             // BIP 130: when receiving a small headers batch (new block announcement),
-            // request the full block via getdata for MWEB state extraction.
-            // MSG_MWEB_BLOCK (0x60000002) = MSG_WITNESS_BLOCK | MSG_MWEB_FLAG
-            // Requires NODE_MWEB in our version services (set above).
+            // request the full block via getdata.
+            // LTC: MSG_MWEB_BLOCK (0x60000002) for MWEB state extraction
+            // DOGE: MSG_BLOCK (0x02) — no segwit/MWEB
+            bool is_doge_chain = (m_chain_label == "DOGE" || m_chain_label == "doge");
             if (vheaders.size() <= 3 && m_peer) {
                 for (auto& hdr : vheaders) {
                     auto packed = pack(hdr);
                     auto bhash = Hash(packed.get_span());
-                    // 0x60000002 = MSG_BLOCK | MSG_WITNESS_FLAG | MSG_MWEB_FLAG
+                    auto inv_type = is_doge_chain
+                        ? inventory_type::block  // MSG_BLOCK for DOGE
+                        : static_cast<inventory_type::inv_type>(0x60000002);  // MSG_MWEB_BLOCK
                     auto getdata_msg = message_getdata::make_raw(
-                        {inventory_type(static_cast<inventory_type::inv_type>(0x60000002), bhash)});
+                        {inventory_type(inv_type, bhash)});
                     m_peer->write(getdata_msg);
                     LOG_INFO << "[" << m_chain_label << "] Requesting full block "
-                             << bhash.GetHex().substr(0, 16) << "... (MSG_MWEB_BLOCK)";
+                             << bhash.GetHex().substr(0, 16) << "...";
                 }
             }
         }

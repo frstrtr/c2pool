@@ -1065,6 +1065,21 @@ int main(int argc, char* argv[]) {
         LOG_INFO << "Assembled merged spec from p2pool-style flags: " << spec;
     }
 
+    // Auto-generate DOGE merged spec when --embedded-doge is set but no --merged DOGE:* provided
+    if (embedded_doge) {
+        bool has_doge_spec = false;
+        for (const auto& s : merged_chain_specs) {
+            if (s.substr(0, 4) == "DOGE" || s.substr(0, 4) == "doge") {
+                has_doge_spec = true;
+                break;
+            }
+        }
+        if (!has_doge_spec) {
+            merged_chain_specs.push_back("DOGE:98");
+            LOG_INFO << "Auto-generated merged spec DOGE:98 for --embedded-doge";
+        }
+    }
+
     // If --address was given without --node-owner-address, use it for node owner too
     if (!payout_address.empty() && node_owner_address.empty() && node_owner_fee > 0.0)
         node_owner_address = payout_address;
@@ -3009,10 +3024,18 @@ int main(int argc, char* argv[]) {
                             // Valid ports for this chain (main + testnet)
                             c2pool::merged::PeerManagerConfig pm_cfg;
                             pm_cfg.is_merged = true;
-                            pm_cfg.max_peers = 20;
-                            pm_cfg.min_peers = 4;
                             pm_cfg.max_connection_attempts = 5;
                             pm_cfg.refresh_interval_sec = 300; // 5 min for merged
+                            // Testnet4alpha is an isolated network — disable discovery,
+                            // only connect to the specified daemon.
+                            if (doge_testnet4alpha && (cfg.symbol == "DOGE" || cfg.symbol == "doge")) {
+                                pm_cfg.max_peers = 1;
+                                pm_cfg.min_peers = 1;
+                                pm_cfg.disable_discovery = true;
+                            } else {
+                                pm_cfg.max_peers = 20;
+                                pm_cfg.min_peers = 4;
+                            }
                             // Populate valid ports for this chain
                             if (cfg.symbol == "DOGE" || cfg.symbol == "doge") {
                                 pm_cfg.valid_ports = {22556, 44556, 44557};
@@ -3057,6 +3080,7 @@ int main(int argc, char* argv[]) {
                             // (not gated on --embedded-doge anymore).
                             if (cfg.symbol == "DOGE" && doge_chain) {
                                 auto doge_hdr_pool = std::make_shared<boost::asio::thread_pool>(1);
+                                auto* bcaster_ptr = broadcaster.get();
 
                                 // Wire peer tip height for fast-sync scrypt skip
                                 broadcaster->set_on_peer_height(
@@ -3082,7 +3106,7 @@ int main(int argc, char* argv[]) {
 
                                 // Wire headers: parse AuxPoW extended format → base headers → HeaderChain
                                 broadcaster->set_on_new_headers(
-                                    [dc = doge_chain.get(), doge_hdr_pool, &ioc](
+                                    [dc = doge_chain.get(), doge_hdr_pool, bcaster_ptr, &ioc](
                                         const std::string& /*key*/,
                                         const std::vector<ltc::coin::BlockHeaderType>& hdrs) {
                                         // The broadcaster's on_new_headers gives us raw BlockHeaderType
@@ -3099,20 +3123,32 @@ int main(int argc, char* argv[]) {
                                         // For testnet4alpha (all AuxPoW from genesis), we may need
                                         // the dedicated AuxPoW parser. For now, pass through directly
                                         // and handle parse errors gracefully.
+                                        LOG_INFO << "[EMB-DOGE] Received " << hdrs.size()
+                                                 << " headers from P2P";
                                         auto batch = std::make_shared<std::vector<ltc::coin::BlockHeaderType>>(hdrs);
                                         boost::asio::post(*doge_hdr_pool,
-                                            [batch, dc, &ioc]() {
+                                            [batch, dc, bcaster_ptr, &ioc]() {
                                                 int accepted = dc->add_headers(*batch);
-                                                if (accepted > 0 || batch->size() >= 2000) {
-                                                    // Use last header hash as locator for next request
-                                                    uint256 last_hash;
-                                                    if (!batch->empty()) {
-                                                        auto packed = pack(batch->back());
-                                                        last_hash = Hash(packed.get_span());
-                                                    }
-                                                    // Note: request_headers is called on the broadcaster
-                                                    // via the periodic 60s sync timer — no explicit
-                                                    // follow-up needed here.
+                                                LOG_INFO << "[EMB-DOGE] add_headers: "
+                                                         << accepted << "/" << batch->size()
+                                                         << " accepted, chain height="
+                                                         << dc->height();
+
+                                                // Pipeline: immediate follow-up getheaders for fast sync
+                                                uint256 last_hash;
+                                                if (!batch->empty()) {
+                                                    auto packed = pack(batch->back());
+                                                    last_hash = Hash(packed.get_span());
+                                                }
+                                                bool full_batch = (batch->size() >= 2000);
+                                                if (accepted > 0 || full_batch) {
+                                                    boost::asio::post(ioc, [accepted, last_hash, dc, bcaster_ptr]() {
+                                                        if (accepted > 0 && !last_hash.IsNull()) {
+                                                            bcaster_ptr->request_headers({last_hash}, uint256::ZERO);
+                                                        } else {
+                                                            bcaster_ptr->request_headers(dc->get_locator(), uint256::ZERO);
+                                                        }
+                                                    });
                                                 }
                                             });
                                     });
@@ -3120,7 +3156,6 @@ int main(int argc, char* argv[]) {
                                 // Periodic DOGE header sync (every 60s)
                                 auto doge_sync_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
                                 auto doge_sync_timer = std::make_shared<boost::asio::steady_timer>(ioc);
-                                auto* bcaster_ptr = broadcaster.get();
                                 *doge_sync_fn = [doge_sync_fn, doge_sync_timer, dc = doge_chain.get(),
                                                  bcaster_ptr](boost::system::error_code ec) {
                                     if (ec) return;

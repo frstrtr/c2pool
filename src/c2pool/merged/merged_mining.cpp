@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstring>
 #include <sstream>
+#include <fstream>
 #include <iomanip>
 #include <chrono>
 
@@ -619,7 +620,23 @@ void MergedMiningManager::refresh_aux_work()
             // the daemon expects back in submitauxblock.  In multiaddress mode we
             // also fetch the full template (for PPLNS coinbase building), but the
             // block_hash comes from createauxblock.
-            chain.current_work = chain.rpc->create_aux_block(chain.config.aux_payout_address);
+            auto new_work = chain.rpc->create_aux_block(chain.config.aux_payout_address);
+
+            // Skip empty work (embedded chain not synced yet)
+            if (new_work.block_hash.IsNull() && new_work.height == 0) {
+                // Rate-limited log: once per 30s while waiting for sync
+                static std::map<uint32_t, int64_t> s_last_sync_log;
+                auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+                auto& last = s_last_sync_log[chain.config.chain_id];
+                if (now_ns - last > 30'000'000'000LL) {
+                    last = now_ns;
+                    LOG_INFO << "[MM:" << chain.config.symbol
+                             << "] Waiting for embedded chain sync...";
+                }
+                continue;
+            }
+
+            chain.current_work = std::move(new_work);
             if (chain.config.multiaddress) {
                 auto tmpl_work = chain.rpc->get_work_template();
                 // Keep the template data but preserve the createauxblock hash
@@ -857,6 +874,13 @@ void MergedMiningManager::try_submit_merged_blocks(
                 LOG_INFO << "[MM:" << chain.config.symbol
                          << "] Frozen block submitted (" << block_hex.size()/2 << " bytes"
                          << ", frozen coinbase from ref_hash_fn)";
+                // Save block hex for manual submitblock debugging
+                {
+                    std::string path = "/tmp/c2pool_doge_block_" + std::to_string(chain.current_work.height) + ".hex";
+                    std::ofstream f(path);
+                    if (f.is_open()) { f << block_hex; f.close(); }
+                    LOG_INFO << "[MM:" << chain.config.symbol << "] Block hex saved to " << path;
+                }
                 chain.rpc->submit_block(block_hex);
                 if (m_block_relay_fn) {
                     try { m_block_relay_fn(chain.config.chain_id, block_hex); }
@@ -952,7 +976,10 @@ MergedMiningManager::build_merged_header_info() const
         // Build coinbase hex using the same logic as build_multiaddress_block
         // (simplified — just need the coinbase hash + tx hashes for merkle)
         uint32_t version = tmpl.value("version", 1u);
-        if (tmpl.contains("auxpow") && tmpl["auxpow"].value("is_auxpow", false))
+        // AuxPoW blocks must have bit 0x100 set in the version. The template
+        // stores the base version (without 0x100) — add it here so the committed
+        // block hash matches the version used at block submission time.
+        if ((version >> 16) > 0)  // has chain_id → AuxPoW chain
             version |= (1 << 8);
         std::string prev_hash_hex = tmpl.value("previousblockhash", std::string("0000000000000000000000000000000000000000000000000000000000000000"));
         uint32_t curtime = tmpl.value("curtime", 0u);
