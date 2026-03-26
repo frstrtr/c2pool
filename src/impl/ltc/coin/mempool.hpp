@@ -119,6 +119,11 @@ public:
         m_time_index.emplace(m_pool[txid].time_added, txid);
         m_total_bytes += m_pool[txid].base_size;
 
+        // Track spent outputs for conflict detection (Phase 2)
+        for (const auto& vin : m_pool[txid].tx.vin) {
+            m_spent_outputs[std::make_pair(vin.prevout.hash, vin.prevout.index)] = txid;
+        }
+
         // Periodic mempool stats (every 100 txs)
         if (m_pool.size() % 100 == 0 || m_pool.size() <= 5) {
             LOG_INFO << "[EMB-LTC] Mempool: size=" << m_pool.size()
@@ -136,18 +141,46 @@ public:
         remove_tx_locked(txid);
     }
 
-    /// Remove all transactions that appear in a confirmed block.
-    /// Called when HeaderChain tip advances.
+    /// Remove confirmed txs + double-spend conflicts from mempool.
+    /// Called from the full_block callback when a new block arrives via P2P.
+    ///
+    /// Phase 1: remove txs whose txid appears in the block.
+    /// Phase 2: remove mempool txs that spend the same outputs as block txs
+    ///          (double-spend / conflict detection via m_spent_outputs).
     void remove_for_block(const BlockType& block) {
         std::lock_guard<std::mutex> lock(m_mutex);
-        int removed = 0;
+        int removed = 0, conflicts = 0;
+
+        // Phase 1: remove confirmed txs by txid
         for (const auto& mtx : block.m_txs) {
             uint256 txid = compute_txid(mtx);
             if (m_pool.count(txid)) ++removed;
             remove_tx_locked(txid);
         }
-        if (removed > 0) {
-            LOG_INFO << "[EMB-LTC] Mempool: removed " << removed << " txs from confirmed block"
+
+        // Phase 2: remove mempool txs that conflict with block txs
+        // (spend the same input as a confirmed tx)
+        for (const auto& mtx : block.m_txs) {
+            for (const auto& vin : mtx.vin) {
+                auto key = std::make_pair(vin.prevout.hash, vin.prevout.index);
+                auto it = m_spent_outputs.find(key);
+                if (it != m_spent_outputs.end()) {
+                    // A mempool tx spends the same output — it's now invalid
+                    auto conflict_txid = it->second;
+                    if (m_pool.count(conflict_txid)) {
+                        LOG_INFO << "[EMB-LTC] Mempool: removing conflict tx "
+                                 << conflict_txid.GetHex().substr(0, 16)
+                                 << " (spends same input as confirmed tx)";
+                        ++conflicts;
+                    }
+                    remove_tx_locked(conflict_txid);
+                }
+            }
+        }
+
+        if (removed > 0 || conflicts > 0) {
+            LOG_INFO << "[EMB-LTC] Mempool: block cleanup removed=" << removed
+                     << " conflicts=" << conflicts
                      << " remaining=" << m_pool.size();
         }
     }
@@ -166,6 +199,7 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         m_pool.clear();
         m_time_index.clear();
+        m_spent_outputs.clear();
         m_total_bytes = 0;
     }
 
@@ -247,6 +281,14 @@ private:
 
         m_total_bytes -= it->second.base_size;
 
+        // Clean up spent outputs index
+        for (const auto& vin : it->second.tx.vin) {
+            auto key = std::make_pair(vin.prevout.hash, vin.prevout.index);
+            auto so = m_spent_outputs.find(key);
+            if (so != m_spent_outputs.end() && so->second == txid)
+                m_spent_outputs.erase(so);
+        }
+
         // Remove from time index
         auto range = m_time_index.equal_range(it->second.time_added);
         for (auto ti = range.first; ti != range.second; ++ti) {
@@ -268,6 +310,10 @@ private:
 
     std::map<uint256, MempoolEntry>  m_pool;        // txid → entry
     std::multimap<time_t, uint256>   m_time_index;  // arrival time → txid (FIFO)
+
+    /// Conflict detection: (prev_txid, prev_n) → spending mempool txid.
+    /// Mirrors Litecoin Core's mapNextTx for O(1) double-spend detection.
+    std::map<std::pair<uint256, uint32_t>, uint256> m_spent_outputs;
 
     size_t m_total_bytes{0};    // sum of base_size across all entries
     size_t m_max_bytes;

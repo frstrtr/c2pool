@@ -1555,12 +1555,16 @@ int main(int argc, char* argv[]) {
                     });
                 LOG_INFO << "[EMB-LTC] Embedded coin node wired to web server";
 
-                // MWEB state extraction: when a full block is received via P2P,
-                // extract HogEx state and MWEB header for template construction.
-                if (mweb_tracker) {
-                    LOG_INFO << "[EMB-LTC] Wiring MWEB state extraction from full blocks";
+                // Full block handler: MWEB state extraction + mempool cleanup.
+                // When a full block arrives via P2P, remove confirmed txs from
+                // mempool (preserving unconfirmed ones for fee revenue) and
+                // extract HogEx state for template construction.
+                {
+                    LOG_INFO << "[EMB-LTC] Wiring full block handler (MWEB + mempool cleanup)";
                     embedded_broadcaster->set_on_full_block(
-                        [tracker = mweb_tracker.get(), chain = embedded_chain.get()](
+                        [tracker = mweb_tracker.get(),
+                         chain = embedded_chain.get(),
+                         pool = embedded_pool.get()](
                             const std::string& peer,
                             const ltc::coin::BlockType& block) {
                             // Determine block height from header chain
@@ -1577,7 +1581,13 @@ int main(int argc, char* argv[]) {
                                     height = prev_entry->height + 1;
                             }
 
-                            if (tracker->update(block, height, block.m_mweb_raw)) {
+                            // Remove confirmed txs + conflicts from mempool
+                            if (pool) {
+                                pool->remove_for_block(block);
+                            }
+
+                            // Extract MWEB state for template building
+                            if (tracker && tracker->update(block, height, block.m_mweb_raw)) {
                                 LOG_INFO << "[EMB-LTC] MWEB state updated from peer " << peer
                                          << " at height " << height
                                          << " (mweb_raw=" << block.m_mweb_raw.size() << " bytes)";
@@ -1585,9 +1595,9 @@ int main(int argc, char* argv[]) {
                         });
                 }
 
-                // Chain reorg handler: when the HeaderChain switches tip (equal-work
-                // fork on testnet, or longer competing chain), invalidate MWEB state
-                // and request the new tip's full block for fresh HogEx extraction.
+                // Tip-change handler: invalidate MWEB, request new full block,
+                // and on reorgs clear the mempool (normal advances are handled
+                // by remove_for_block() in the full_block callback above).
                 embedded_chain->set_on_tip_changed(
                     [tracker = mweb_tracker.get(),
                      bcaster = embedded_broadcaster.get(),
@@ -1595,23 +1605,26 @@ int main(int argc, char* argv[]) {
                      &web_server](
                         const uint256& old_tip, uint32_t old_height,
                         const uint256& new_tip, uint32_t new_height) {
+                        bool is_reorg = (new_height <= old_height);
                         LOG_WARNING << "[EMB-LTC] Chain tip changed: "
                                     << old_tip.GetHex().substr(0, 16) << " (h=" << old_height << ") → "
-                                    << new_tip.GetHex().substr(0, 16) << " (h=" << new_height << ")";
+                                    << new_tip.GetHex().substr(0, 16) << " (h=" << new_height << ")"
+                                    << (is_reorg ? " [REORG]" : "");
                         // Invalidate stale MWEB state — HogEx prev_txid is from the old fork
                         if (tracker) {
                             tracker->invalidate();
                         }
-                        // Clear mempool — confirmed txs are now spent, stale txs cause
-                        // bad-txns-inputs-missingorspent if included in our blocks.
-                        // Fresh txs will arrive from P2P within seconds.
-                        if (pool) {
+                        // On reorg, clear the entire mempool — txs from the disconnected
+                        // fork may have conflicting inputs.  Normal advances don't need
+                        // clearing: the full_block callback's remove_for_block() handles
+                        // confirmed tx removal + conflict detection.
+                        if (is_reorg && pool) {
                             auto old_size = pool->size();
                             pool->clear();
                             if (old_size > 0)
-                                LOG_INFO << "[EMB-LTC] Mempool cleared on tip change (" << old_size << " txs removed)";
+                                LOG_WARNING << "[EMB-LTC] Mempool cleared on reorg (" << old_size << " txs removed)";
                         }
-                        // Request the new tip's full block for MWEB state extraction
+                        // Request the new tip's full block for MWEB state + mempool cleanup
                         if (bcaster) {
                             bcaster->request_full_block(new_tip);
                         }
@@ -1640,6 +1653,21 @@ int main(int argc, char* argv[]) {
                 sync_timer->expires_after(std::chrono::seconds(3));
                 sync_timer->async_wait(*sync_fn);
                 LOG_INFO << "Embedded header sync timer started (60s interval)";
+
+                // Periodic mempool cleanup: evict expired txs every 5 minutes.
+                auto mempool_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
+                auto mempool_timer = std::make_shared<boost::asio::steady_timer>(ioc);
+                *mempool_fn = [mempool_fn, mempool_timer,
+                               pool = embedded_pool.get()](boost::system::error_code ec) {
+                    if (ec) return;
+                    if (pool)
+                        pool->evict_expired();
+                    mempool_timer->expires_after(std::chrono::minutes(5));
+                    mempool_timer->async_wait(*mempool_fn);
+                };
+                mempool_timer->expires_after(std::chrono::minutes(5));
+                mempool_timer->async_wait(*mempool_fn);
+                LOG_INFO << "[EMB-LTC] Mempool expiration timer started (5m interval)";
             }
 
             // Feed real network difficulty from block templates to the adjustment engine
