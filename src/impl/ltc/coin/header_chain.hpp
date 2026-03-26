@@ -645,11 +645,17 @@ private:
             m_best_work = entry.chain_work;
             m_tip = bhash;
             m_tip_height = new_height;
-            rebuild_height_index(bhash);
-            // Log reorgs (tip changed to a different branch)
-            if (new_height <= old_height && old_height > 0) {
-                LOG_WARNING << "[EMB-LTC] REORG detected: old_height=" << old_height
-                            << " new_height=" << new_height << " hash=" << bhash.GetHex().substr(0, 16);
+            // Incremental height index update: if this header extends the
+            // previous tip (common case during sync), just add one entry.
+            // Only do a full rebuild on reorgs (tip changed branch).
+            if (new_height == old_height + 1 && entry.prev_hash == m_height_index[old_height]) {
+                m_height_index[new_height] = bhash;
+            } else {
+                rebuild_height_index(bhash);
+                if (new_height <= old_height && old_height > 0) {
+                    LOG_WARNING << "[EMB-LTC] REORG detected: old_height=" << old_height
+                                << " new_height=" << new_height << " hash=" << bhash.GetHex().substr(0, 16);
+                }
             }
         }
 
