@@ -125,12 +125,20 @@ public:
             timeout("handshake timeout");
         });
 
+        // Service flags: NODE_NETWORK(1) | NODE_WITNESS(8) | NODE_MWEB(1<<24)
+        // NODE_WITNESS: required for segwit block/tx relay
+        // NODE_MWEB: required for litecoind to send MWEB extension data in blocks
+        static constexpr uint64_t NODE_NETWORK = 1;
+        static constexpr uint64_t NODE_WITNESS = (1 << 3);
+        static constexpr uint64_t NODE_MWEB    = (1ULL << 24);
+        uint64_t our_services = NODE_NETWORK | NODE_WITNESS | NODE_MWEB;
+
         auto msg_version = message_version::make_raw(
             70017,
-            1,
+            our_services,
             core::timestamp(),
-            addr_t{1, m_peer->get_addr()}, 
-            addr_t{1, NetService{"192.168.0.1", 12024}},
+            addr_t{our_services, m_peer->get_addr()},
+            addr_t{our_services, NetService{"192.168.0.1", 12024}},
             core::random::random_nonce(),
             "c2pool",
             0
@@ -546,17 +554,18 @@ private:
 
             // BIP 130: when receiving a small headers batch (new block announcement),
             // request the full block via getdata for MWEB state extraction.
-            // Use MSG_WITNESS_BLOCK (0x40000002) — litecoind includes MWEB extension
-            // in witness blocks. MSG_MWEB_BLOCK (0x60000002) requires NODE_MWEB.
+            // MSG_MWEB_BLOCK (0x60000002) = MSG_WITNESS_BLOCK | MSG_MWEB_FLAG
+            // Requires NODE_MWEB in our version services (set above).
             if (vheaders.size() <= 3 && m_peer) {
                 for (auto& hdr : vheaders) {
                     auto packed = pack(hdr);
                     auto bhash = Hash(packed.get_span());
+                    // 0x60000002 = MSG_BLOCK | MSG_WITNESS_FLAG | MSG_MWEB_FLAG
                     auto getdata_msg = message_getdata::make_raw(
-                        {inventory_type(inventory_type::witness_block, bhash)});
+                        {inventory_type(static_cast<inventory_type::inv_type>(0x60000002), bhash)});
                     m_peer->write(getdata_msg);
                     LOG_INFO << "[" << m_chain_label << "] Requesting full block "
-                             << bhash.GetHex().substr(0, 16) << "... (witness_block)";
+                             << bhash.GetHex().substr(0, 16) << "... (MSG_MWEB_BLOCK)";
                 }
             }
         }
