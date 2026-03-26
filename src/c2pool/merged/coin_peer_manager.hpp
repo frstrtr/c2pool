@@ -14,6 +14,10 @@
 #include <functional>
 #include <fstream>
 #include <cmath>
+#include <random>
+#include <algorithm>
+#include <array>
+#include <sstream>
 
 #include <boost/asio.hpp>
 #include <nlohmann/json.hpp>
@@ -25,6 +29,37 @@
 namespace c2pool {
 namespace merged {
 
+// ─── Network group for Sybil resistance ─────────────────────────────────────
+// IPv4: /16 prefix (first two octets, e.g. "192.168")
+// IPv6: /32 prefix (first 4 bytes hex)
+// Unresolvable: the full IP string as its own group
+inline std::string get_network_group(const std::string& ip)
+{
+    // Try IPv4: "a.b.c.d" → "a.b"
+    boost::system::error_code ec;
+    auto addr = boost::asio::ip::make_address(ip, ec);
+    if (!ec) {
+        if (addr.is_v4()) {
+            auto bytes = addr.to_v4().to_bytes();
+            return std::to_string(bytes[0]) + "." + std::to_string(bytes[1]);
+        }
+        if (addr.is_v6()) {
+            auto v6 = addr.to_v6();
+            if (v6.is_v4_mapped()) {
+                auto v4 = v6.to_v4().to_bytes();
+                return std::to_string(v4[0]) + "." + std::to_string(v4[1]);
+            }
+            // /32 prefix: first 4 bytes
+            auto bytes = v6.to_bytes();
+            char buf[12];
+            std::snprintf(buf, sizeof(buf), "%02x%02x:%02x%02x",
+                          bytes[0], bytes[1], bytes[2], bytes[3]);
+            return std::string(buf);
+        }
+    }
+    return ip; // fallback: treat entire IP as unique group
+}
+
 // ─── Peer info tracked per endpoint ──────────────────────────────────────────
 struct PeerInfo
 {
@@ -34,6 +69,8 @@ struct PeerInfo
     int                 score{0};
     Source              source{Source::coind};
     bool                is_protected{false};    // local daemon node — never drop
+    bool                in_tried{false};        // successfully connected at least once
+    std::string         network_group;          // /16 IPv4 or /32 IPv6 group
 
     // Timing
     std::chrono::steady_clock::time_point first_seen;
@@ -72,6 +109,7 @@ struct PeerInfo
         backoff_sec = 30; // reset backoff
         attempt_count = 0;
         score += 10;
+        in_tried = true;
         last_seen = std::chrono::steady_clock::now();
     }
 
@@ -143,6 +181,11 @@ struct PeerManagerConfig
     int         maintenance_interval_sec{5};
     bool        is_merged{false};               // merged chain uses inv instead of full block
     std::set<uint16_t> valid_ports;             // only connect to peers on known ports
+
+    // Hardening: network group limits (Sybil resistance)
+    int         max_peers_per_group{4};         // max peers from same /16 (IPv4) or /32 (IPv6)
+    int         max_new_peers_per_group{3};     // stricter limit for unverified (new) peers
+    int         anchor_count{2};                // number of anchor connections to persist
 };
 
 // ─── CoinPeerManager ─────────────────────────────────────────────────────────
@@ -204,6 +247,7 @@ public:
     void start()
     {
         load_peers();
+        boost_anchor_scores();
         bootstrap_from_getpeerinfo();
         bootstrap_from_dns_seeds();
         schedule_refresh();
@@ -211,8 +255,13 @@ public:
         schedule_maintenance();
         schedule_fixed_seed_fallback();
         m_running = true;
-        LOG_INFO << "[" << m_symbol << "] PeerManager started, "
-                 << m_peers.size() << " known peers"
+
+        auto stats = peer_stats();
+        LOG_INFO << "[" << m_symbol << "] PeerManager started: "
+                 << stats.total << " peers (tried=" << stats.tried
+                 << " new=" << stats.new_peers
+                 << " groups=" << stats.unique_groups
+                 << " anchors=" << stats.anchor_count << ")"
                  << " dns_seeds=" << m_dns_seeds.size()
                  << " fixed_seeds=" << m_fixed_seeds.size();
     }
@@ -238,9 +287,15 @@ public:
         if (m_peers.count(key)) return; // already known
         if (m_coind_peers.count(key)) return; // daemon already has it
 
+        // Network group dedup: limit how many untried peers from the same /16
+        auto group = get_network_group(addr.address());
+        if (group_count(group, false) >= m_config.max_new_peers_per_group) return;
+        if (group_count(group, true) >= m_config.max_peers_per_group) return;
+
         auto& peer = m_peers[key];
         peer.address = addr;
         peer.source = PeerInfo::Source::addr_crawl;
+        peer.network_group = group;
         peer.first_seen = std::chrono::steady_clock::now();
         peer.last_seen = std::chrono::steady_clock::now();
         peer.max_attempts = m_config.max_connection_attempts;
@@ -249,6 +304,7 @@ public:
     /// Get list of peers that should be connected right now.
     /// Returns up to max_connections_per_cycle peers sorted by score,
     /// excluding already-connected and backed-off peers.
+    /// Enforces network group diversity: max 2 connections per /16 group.
     std::vector<NetService> get_peers_to_connect(
         const std::set<std::string>& connected_keys) const
     {
@@ -263,21 +319,41 @@ public:
                      m_config.max_peers - pending));
         if (budget <= 0) return {};
 
-        // Score-sorted candidates
-        struct Candidate { int score; NetService addr; };
+        // Build group count of already-connected peers
+        std::map<std::string, int> connected_groups;
+        for (auto& [key, peer] : m_peers) {
+            if (connected_keys.count(key)) {
+                auto grp = peer.network_group.empty()
+                    ? get_network_group(peer.address.address()) : peer.network_group;
+                connected_groups[grp]++;
+            }
+        }
+
+        // Score-sorted candidates, preferring tried peers (50% bonus)
+        struct Candidate { int score; NetService addr; std::string group; };
         std::vector<Candidate> candidates;
         for (auto& [key, peer] : m_peers) {
             if (connected_keys.count(key)) continue;
             if (!peer.can_retry()) continue;
-            candidates.push_back({peer.compute_score(), peer.address});
+            int s = peer.compute_score();
+            if (peer.in_tried) s += 50; // prefer verified peers
+            auto grp = peer.network_group.empty()
+                ? get_network_group(peer.address.address()) : peer.network_group;
+            candidates.push_back({s, peer.address, grp});
         }
 
         std::sort(candidates.begin(), candidates.end(),
                   [](const auto& a, const auto& b) { return a.score > b.score; });
 
+        // Select with group diversity: max 2 outbound connections per /16
+        static constexpr int MAX_OUTBOUND_PER_GROUP = 2;
         std::vector<NetService> result;
-        for (int i = 0; i < budget && i < static_cast<int>(candidates.size()); ++i) {
-            result.push_back(candidates[i].addr);
+        for (auto& c : candidates) {
+            if (static_cast<int>(result.size()) >= budget) break;
+            int grp_total = connected_groups[c.group];
+            if (grp_total >= MAX_OUTBOUND_PER_GROUP && !c.group.empty()) continue;
+            result.push_back(c.addr);
+            connected_groups[c.group]++;
         }
         return result;
     }
@@ -289,6 +365,8 @@ public:
         auto it = m_peers.find(key);
         if (it != m_peers.end()) {
             it->second.record_connected();
+            // Track as anchor candidate (most recent successful connections)
+            update_anchors(key);
         }
         if (!m_bootstrapped) m_bootstrapped = true;
     }
@@ -358,6 +436,32 @@ public:
         return m_peers.size();
     }
 
+    /// Counts of tried vs new peers, and unique network groups.
+    struct PeerStats {
+        int total{0};
+        int tried{0};
+        int new_peers{0};
+        int unique_groups{0};
+        int anchor_count{0};
+    };
+
+    PeerStats peer_stats() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        PeerStats s;
+        s.total = static_cast<int>(m_peers.size());
+        s.anchor_count = static_cast<int>(m_anchors.size());
+        std::set<std::string> groups;
+        for (auto& [k, p] : m_peers) {
+            if (p.in_tried) ++s.tried; else ++s.new_peers;
+            auto grp = p.network_group.empty()
+                ? get_network_group(p.address.address()) : p.network_group;
+            groups.insert(grp);
+        }
+        s.unique_groups = static_cast<int>(groups.size());
+        return s;
+    }
+
     const std::string& symbol() const { return m_symbol; }
 
 private:
@@ -365,6 +469,50 @@ private:
     {
         if (m_config.valid_ports.empty()) return true;
         return m_config.valid_ports.count(port) > 0;
+    }
+
+    /// Count peers in a given network group. If include_tried=true, count all;
+    /// if false, count only new (untried) peers.
+    int group_count(const std::string& group, bool include_tried) const
+    {
+        int count = 0;
+        for (auto& [k, p] : m_peers) {
+            auto grp = p.network_group.empty()
+                ? get_network_group(p.address.address()) : p.network_group;
+            if (grp == group) {
+                if (include_tried || !p.in_tried) ++count;
+            }
+        }
+        return count;
+    }
+
+    /// Update anchor list: keep the N most recent successfully connected peers.
+    void update_anchors(const std::string& key)
+    {
+        // Remove if already present (will re-add at front)
+        m_anchors.erase(
+            std::remove(m_anchors.begin(), m_anchors.end(), key),
+            m_anchors.end());
+        m_anchors.insert(m_anchors.begin(), key);
+        while (static_cast<int>(m_anchors.size()) > m_config.anchor_count) {
+            m_anchors.pop_back();
+        }
+    }
+
+    /// On startup, boost anchor peer scores so they're connected first.
+    /// This provides partition resistance — we reconnect to known-good peers
+    /// before trying any new ones.
+    void boost_anchor_scores()
+    {
+        for (auto& anchor_key : m_anchors) {
+            auto it = m_peers.find(anchor_key);
+            if (it != m_peers.end()) {
+                it->second.score += 200;  // strong preference
+                it->second.backoff_sec = 0; // immediate retry
+                it->second.attempt_count = 0;
+                LOG_INFO << "[" << m_symbol << "] Anchor peer boosted: " << anchor_key;
+            }
+        }
     }
 
     void bootstrap_from_getpeerinfo()
@@ -382,6 +530,7 @@ private:
                     auto& peer = m_peers[key];
                     peer.address = addr;
                     peer.source = PeerInfo::Source::coind;
+                    peer.network_group = get_network_group(addr.address());
                     peer.first_seen = std::chrono::steady_clock::now();
                     peer.last_seen = std::chrono::steady_clock::now();
                     peer.max_attempts = m_config.max_connection_attempts;
@@ -455,6 +604,8 @@ private:
                 pj["score"] = peer.score;
                 pj["source"] = static_cast<int>(peer.source);
                 pj["protected"] = peer.is_protected;
+                pj["in_tried"] = peer.in_tried;
+                pj["network_group"] = peer.network_group;
                 pj["attempt_count"] = peer.attempt_count;
                 pj["backoff_sec"] = peer.backoff_sec;
                 pj["broadcast_successes"] = peer.broadcast_successes;
@@ -463,6 +614,12 @@ private:
                 peers_j[key] = pj;
             }
             j["peers"] = peers_j;
+
+            // Persist anchor connections
+            j["anchors"] = nlohmann::json::array();
+            for (auto& a : m_anchors) {
+                j["anchors"].push_back(a);
+            }
 
             // Atomic write: .tmp → rename
             std::string tmp_path = db_path() + ".tmp";
@@ -502,6 +659,11 @@ private:
                     peer.source = static_cast<PeerInfo::Source>(
                         pj.value("source", 0));
                     peer.is_protected = pj.value("protected", false);
+                    peer.in_tried = pj.value("in_tried", false);
+                    peer.network_group = pj.value("network_group", "");
+                    if (peer.network_group.empty()) {
+                        peer.network_group = get_network_group(host);
+                    }
                     peer.attempt_count = pj.value("attempt_count", 0);
                     peer.backoff_sec = pj.value("backoff_sec", 30);
                     peer.broadcast_successes = pj.value("broadcast_successes", 0);
@@ -512,8 +674,20 @@ private:
                     peer.max_attempts = peer.is_protected ? 999999
                         : m_config.max_connection_attempts;
                 }
+
+                // Restore anchor connections
+                if (j.contains("anchors") && j["anchors"].is_array()) {
+                    for (auto& a : j["anchors"]) {
+                        auto anchor_key = a.get<std::string>();
+                        if (m_peers.count(anchor_key)) {
+                            m_anchors.push_back(anchor_key);
+                        }
+                    }
+                }
+
                 LOG_INFO << "[" << m_symbol << "] Loaded " << m_peers.size()
-                         << " peers from " << db_path();
+                         << " peers from " << db_path()
+                         << " (anchors=" << m_anchors.size() << ")";
             }
         } catch (const std::exception& e) {
             LOG_DEBUG_COIND << "[" << m_symbol << "] No saved peers: " << e.what();
@@ -543,9 +717,14 @@ private:
             auto key = addr.to_string();
             if (m_peers.count(key)) continue;
 
+            // Network group limit for DNS seeds
+            auto group = get_network_group(addr.address());
+            if (group_count(group, true) >= m_config.max_peers_per_group) continue;
+
             auto& peer = m_peers[key];
             peer.address = addr;
             peer.source = PeerInfo::Source::dns_seed;
+            peer.network_group = group;
             peer.first_seen = std::chrono::steady_clock::now();
             peer.last_seen = std::chrono::steady_clock::now();
             peer.max_attempts = m_config.max_connection_attempts;
@@ -578,9 +757,13 @@ private:
             auto key = addr.to_string();
             if (m_peers.count(key)) continue;
 
+            auto group = get_network_group(addr.address());
+            if (group_count(group, true) >= m_config.max_peers_per_group) continue;
+
             auto& peer = m_peers[key];
             peer.address = addr;
             peer.source = PeerInfo::Source::fixed_seed;
+            peer.network_group = group;
             peer.first_seen = std::chrono::steady_clock::now();
             peer.last_seen = std::chrono::steady_clock::now();
             peer.max_attempts = m_config.max_connection_attempts;
@@ -626,6 +809,7 @@ private:
     std::map<std::string, PeerInfo> m_peers;        // key = "host:port"
     std::set<std::string> m_coind_peers;            // daemon's own peers (overlap filter)
     std::string m_local_node_key;
+    std::vector<std::string> m_anchors;             // last N successfully connected (partition resistance)
     bool m_bootstrapped{false};
     bool m_running{false};
 };
