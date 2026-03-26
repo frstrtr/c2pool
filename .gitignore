@@ -142,3 +142,4 @@ conanrunenv-*.sh
 deactivate_conanbuild.sh
 deactivate_conanrun.sh
 CMakePresets.json
+src/c2pool/c2pool
