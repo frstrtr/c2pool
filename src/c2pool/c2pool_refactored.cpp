@@ -1883,6 +1883,63 @@ int main(int argc, char* argv[]) {
                 });
             }
 
+            // Embedded mode + RPC submit fallback: if the user also provides
+            // --rpc-host / --rpc-user / --rpc-pass, use litecoin-cli submitblock
+            // as a secondary path that gives us immediate accept/reject feedback.
+            if (embedded_ltc && !rpc_user.empty() && !rpc_pass.empty()) {
+                int submit_rpc_port = rpc_port > 0 ? rpc_port
+                    : (settings->m_testnet ? 19332 : 9332);
+                std::string submit_rpc_host = rpc_host;
+                std::string submit_rpc_user = rpc_user;
+                std::string submit_rpc_pass = rpc_pass;
+                bool submit_testnet = settings->m_testnet;
+
+                LOG_INFO << "[EMB-LTC] RPC submit fallback enabled: "
+                         << submit_rpc_host << ":" << submit_rpc_port;
+
+                auto* mi = web_server.get_mining_interface();
+                mi->set_rpc_submit_fallback(
+                    [submit_rpc_host, submit_rpc_port, submit_rpc_user,
+                     submit_rpc_pass, submit_testnet](const std::string& hex) -> std::string {
+                        try {
+                            // Use litecoin-cli for simplicity — avoids needing a full RPC client
+                            std::string cmd = "litecoin-cli";
+                            if (submit_testnet) cmd += " -testnet";
+                            cmd += " -rpcconnect=" + submit_rpc_host;
+                            cmd += " -rpcport=" + std::to_string(submit_rpc_port);
+                            cmd += " -rpcuser=" + submit_rpc_user;
+                            cmd += " -rpcpassword=" + submit_rpc_pass;
+                            cmd += " submitblock " + hex;
+
+                            namespace bp = boost::process;
+                            bp::ipstream pipe_out;
+                            bp::ipstream pipe_err;
+                            bp::child c(cmd,
+                                bp::std_out > pipe_out,
+                                bp::std_err > pipe_err);
+                            c.wait();
+
+                            std::string result, err_line;
+                            std::getline(pipe_out, result);
+                            std::getline(pipe_err, err_line);
+
+                            // litecoin-cli submitblock returns:
+                            //   null (empty) = accepted
+                            //   "error string" = rejected
+                            boost::trim(result);
+                            boost::trim(err_line);
+                            if (result == "null" || result.empty()) {
+                                if (err_line.empty())
+                                    return {};  // accepted
+                                return err_line; // CLI error
+                            }
+                            return result; // rejection reason
+                        } catch (const std::exception& e) {
+                            return std::string("RPC submit exception: ") + e.what();
+                        }
+                    });
+            }
+
             // Configure payout system for web server (legacy — kept for REST stats)
             web_server.set_payout_manager(payout_manager.get());
 

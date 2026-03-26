@@ -212,6 +212,8 @@ public:
             } catch (const std::exception& e) {
                 m_peer_manager.record_broadcast_failure(key);
                 ++failed;
+                LOG_WARNING << "[" << m_symbol << "] Raw block relay to " << key
+                            << " FAILED: " << e.what();
             }
         }
         LOG_INFO << "[" << m_symbol << "] Raw block broadcast to "

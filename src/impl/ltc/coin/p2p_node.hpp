@@ -302,9 +302,14 @@ public:
                 return;
             } catch (const std::exception& e) {
                 LOG_WARNING << "[" << m_chain_label
-                            << "] Compact block build failed, sending full block: "
-                            << e.what();
+                            << "] Compact block build failed (block_size=" << block_bytes.size()
+                            << "), sending full block: " << e.what();
             }
+        } else {
+            LOG_DEBUG_COIND << "[" << m_chain_label << "] Peer does not support compact blocks"
+                     << " (cmpct=" << m_peer_supports_cmpct
+                     << " ver=" << m_peer_cmpct_version
+                     << "), sending full block (" << block_bytes.size() << " bytes)";
         }
 
         // Fallback: send full block
@@ -318,6 +323,8 @@ public:
         PackStream ps(block_bytes);
         auto rmsg = std::make_unique<RawMessage>("block", std::move(ps));
         m_peer->write(rmsg);
+        LOG_INFO << "[" << m_chain_label << "] Sent full block message ("
+                 << block_bytes.size() << " bytes) to " << m_target_addr.to_string();
     }
 
     //[x][x][x] void handle_message_version(std::shared_ptr<coind::messages::message_version> msg, CoindProtocol* protocol); //

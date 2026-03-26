@@ -692,6 +692,11 @@ void MiningInterface::set_on_block_relay(std::function<void(const std::string&)>
     m_on_block_relay = std::move(fn);
 }
 
+void MiningInterface::set_rpc_submit_fallback(std::function<std::string(const std::string&)> fn)
+{
+    m_rpc_submit_fallback = std::move(fn);
+}
+
 bool MiningInterface::has_merged_chain(uint32_t chain_id) const
 {
     if (!m_mm_manager) return false;
@@ -2137,11 +2142,68 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
     } else if (m_embedded_node) {
         // Phase 4 embedded mode: no daemon — relay the block directly via P2P.
         // on_block_relay is wired to CoinBroadcaster::submit_block_raw().
-        LOG_TRACE << "[LTC] submitblock: embedded relay " << hex_data.size()/2 << " bytes";
-        if (m_on_block_relay)
-            m_on_block_relay(hex_data);
+        size_t block_size = hex_data.size() / 2;
+        LOG_INFO << "[EMB-LTC] submitblock: embedded relay " << block_size << " bytes";
+
+        // Parse and log header fields for debugging
+        if (hex_data.size() >= 160) {
+            auto hdr = ParseHex(hex_data.substr(0, 160));
+            uint32_t ver = hdr[0] | (hdr[1]<<8) | (hdr[2]<<16) | (hdr[3]<<24);
+            LOG_INFO << "[EMB-LTC] submitblock header:"
+                     << " version=0x" << std::hex << ver << std::dec
+                     << " prev=" << HexStr(std::span<const unsigned char>(hdr.data()+4, 32))
+                     << " merkle=" << HexStr(std::span<const unsigned char>(hdr.data()+36, 32))
+                     << " bits=" << HexStr(std::span<const unsigned char>(hdr.data()+72, 4))
+                     << " nonce=" << HexStr(std::span<const unsigned char>(hdr.data()+76, 4));
+            // Log tx count varint
+            if (hex_data.size() > 162) {
+                auto txcnt_byte = ParseHex(hex_data.substr(160, 2));
+                LOG_INFO << "[EMB-LTC] submitblock tx_count_byte=0x"
+                         << std::hex << (int)txcnt_byte[0] << std::dec
+                         << " total_hex_len=" << hex_data.size();
+            }
+        }
+
+        // Save block hex to file for manual submitblock testing
+        {
+            std::string path = "/tmp/c2pool_block_" + std::to_string(std::time(nullptr)) + ".hex";
+            std::ofstream f(path);
+            if (f) {
+                f << hex_data;
+                LOG_INFO << "[EMB-LTC] Block hex saved to " << path
+                         << " (" << block_size << " bytes)"
+                         << " — test with: litecoin-cli -testnet submitblock $(cat " << path << ")";
+            }
+        }
+
+        // Fire block-found callback immediately (synchronous — updates stats)
         if (m_on_block_submitted && hex_data.size() >= 160)
             m_on_block_submitted(hex_data.substr(0, 160), 0);
+
+        // Thread the slow parts (RPC + P2P relay) so stratum isn't blocked.
+        // Capture by value — hex_data, callbacks are all safe to copy.
+        auto rpc_fn   = m_rpc_submit_fallback;
+        auto relay_fn = m_on_block_relay;
+        std::string hex_copy = hex_data;
+        std::thread([rpc_fn, relay_fn, hex_copy]() {
+            // 1) RPC submitblock (if configured) — immediate accept/reject feedback
+            if (rpc_fn) {
+                std::string rpc_err = rpc_fn(hex_copy);
+                if (rpc_err.empty()) {
+                    LOG_INFO << "[EMB-LTC] submitblock via RPC: ACCEPTED";
+                } else {
+                    LOG_ERROR << "[EMB-LTC] submitblock via RPC: REJECTED — " << rpc_err;
+                }
+            }
+            // 2) P2P relay to all connected peers
+            if (relay_fn) {
+                try {
+                    relay_fn(hex_copy);
+                } catch (const std::exception& e) {
+                    LOG_ERROR << "[EMB-LTC] P2P relay thread exception: " << e.what();
+                }
+            }
+        }).detach();
     } else {
         LOG_WARNING << "[LTC] submitblock: no coin RPC or embedded node connected, block discarded";
     }

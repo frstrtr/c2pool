@@ -126,7 +126,7 @@ inline std::string bits_to_hex(uint32_t bits) {
 /// creation, Stratum) works without modification.
 ///
 /// JSON fields produced:
-///   version           — 4 (LTC post-SegWit block version)
+///   version           — derived from chain tip (BIP9 base 0x20000000 + signaling bits)
 ///   previousblockhash — SHA256d hex of tip header (big-endian display)
 ///   bits              — compact target for next block as 8-char hex
 ///   height            — next block height
@@ -142,9 +142,13 @@ inline std::string bits_to_hex(uint32_t bits) {
 ///   mintime           — tip.timestamp + 1
 class TemplateBuilder {
 public:
-    static constexpr int     BLOCK_VERSION     = 4;
-    static constexpr uint32_t MAX_BLOCK_WEIGHT = 4'000'000u;
-    static constexpr uint32_t COINBASE_RESERVE = 2'000u;   // weight reserved for coinbase tx
+    // BIP9 base version — all modern blocks use 0x20000000 as the base with
+    // optional version-bit signaling.  We derive the actual version from the
+    // chain tip so we automatically mirror whatever signaling bits the network
+    // is using (e.g. MWEB, Taproot, future soft-forks).
+    static constexpr uint32_t BIP9_BASE_VERSION = 0x20000000u;
+    static constexpr uint32_t MAX_BLOCK_WEIGHT  = 4'000'000u;
+    static constexpr uint32_t COINBASE_RESERVE  = 2'000u;   // weight reserved for coinbase tx
 
     /// Build a WorkData template from the current chain tip + mempool.
     /// Returns std::nullopt if the chain has no tip yet (not synced to genesis).
@@ -187,6 +191,15 @@ public:
                      << " (chain too short for retarget)";
         }
 
+        // ── Block version ──────────────────────────────────────────────────
+        // Derive version from the chain tip header.  This mirrors whatever BIP9
+        // signaling bits the network is currently using, so litecoind won't
+        // reject our blocks for missing mandatory version-bit signals.
+        // Fall back to BIP9_BASE_VERSION if the tip has an ancient version.
+        uint32_t block_version = static_cast<uint32_t>(tip.header.m_version);
+        if (block_version < BIP9_BASE_VERSION)
+            block_version = BIP9_BASE_VERSION;
+
         // ── Subsidy ────────────────────────────────────────────────────────
         uint64_t subsidy = get_block_subsidy(next_h);
 
@@ -214,7 +227,7 @@ public:
 
         // ── Build GBT-compatible JSON ──────────────────────────────────────
         nlohmann::json data;
-        data["version"]           = BLOCK_VERSION;
+        data["version"]           = static_cast<int>(block_version);
         data["previousblockhash"] = tip.block_hash.GetHex();
         data["bits"]              = bits_to_hex(next_bits);
         data["height"]            = static_cast<int>(next_h);
@@ -230,6 +243,7 @@ public:
         data["mintime"]           = static_cast<int64_t>(tip.header.m_timestamp + 1);
 
         LOG_INFO << "[EMB-LTC] TemplateBuilder: height=" << next_h
+                 << " version=0x" << std::hex << block_version << std::dec
                  << " prev=" << tip.block_hash.GetHex().substr(0, 16) << "..."
                  << " bits=" << bits_to_hex(next_bits)
                  << " subsidy=" << subsidy << " sat"

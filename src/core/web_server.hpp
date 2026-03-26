@@ -604,6 +604,8 @@ public:
 
     // Callback for P2P block relay — receives full block hex for direct daemon P2P broadcast.
     void set_on_block_relay(std::function<void(const std::string& full_block_hex)> fn);
+    // Optional RPC submitblock fallback for embedded mode (returns error string, empty = ok).
+    void set_rpc_submit_fallback(std::function<std::string(const std::string&)> fn);
     // Redistribute / address-fallback callback.
     // Called when a share's primary address cannot be resolved to a valid hash160.
     // Receives the bad address string; must return a 40-char hex hash160, or "" to keep share.
@@ -710,6 +712,10 @@ private:
     // P2P block relay callback — receives the full block hex for direct P2P broadcast.
     // Only called for accepted blocks (not stale/orphan/doa).
     std::function<void(const std::string&)> m_on_block_relay;
+
+    // Optional RPC submitblock fallback — called BEFORE P2P relay in embedded mode.
+    // Returns the error string from litecoind (empty = accepted).
+    std::function<std::string(const std::string&)> m_rpc_submit_fallback;
 
     // Share tracker hook
     std::function<uint256()> m_best_share_hash_fn;
