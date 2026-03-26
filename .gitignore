@@ -62,6 +62,10 @@ src/*/*/*/CMakeFiles/
 src/*/*/*/CTestTestfile.cmake
 src/*/*/*/Makefile
 src/*/*/*/cmake_install.cmake
+test/CMakeFiles/
+test/CTestTestfile.cmake
+test/Makefile
+test/cmake_install.cmake
 
 #other
 /.idea
