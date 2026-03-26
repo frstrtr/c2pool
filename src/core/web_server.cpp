@@ -980,8 +980,15 @@ MiningInterface::build_block_from_stratum(const std::string& extranonce1,
 
     // MWEB extension block (Litecoin): append HogEx flag + MWEB data
     const std::string& mweb_data = job ? job->mweb : m_cached_mweb;
-    if (!mweb_data.empty())
+    if (!mweb_data.empty()) {
         block << "01" << mweb_data;
+    } else if (segwit) {
+        // MWEB not yet bootstrapped — litecoind will reject with "mweb-missing".
+        // Return empty string to signal invalid block — caller should skip submission.
+        LOG_WARNING << "[EMB-LTC] Block built WITHOUT MWEB — skipping submission"
+                    << " (MWEB state not yet bootstrapped from P2P full block)";
+        return {};
+    }
 
     return block.str();
 }
