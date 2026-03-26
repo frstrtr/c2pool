@@ -329,6 +329,12 @@ private:
     boost::asio::steady_timer m_poll_timer;
     std::atomic<bool> m_running{false};
 
+    // Dedicated thread for RPC calls — prevents blocking the ioc event loop.
+    // refresh_aux_work() calls createauxblock/getblocktemplate which are ~1s
+    // round-trip RPC calls; running them on ioc blocks stratum notifications.
+    boost::asio::thread_pool m_rpc_pool{1};
+    std::atomic<bool> m_refresh_in_progress{false};
+
     // Registered aux chains
     struct ChainState {
         AuxChainConfig                       config;

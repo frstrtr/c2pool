@@ -256,10 +256,19 @@ public:
 
     /// Add a single header. Returns true if accepted (new + valid).
     bool add_header(const BlockHeaderType& header) {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        bool ok = add_header_internal(header);
-        if (ok) persist_tip();
-        return ok;
+        PendingTipChange ptc;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            bool ok = add_header_internal(header);
+            if (ok) persist_tip();
+            ptc = m_pending_tip_change;
+            m_pending_tip_change.fired = false;
+            if (!ok) return false;
+        }
+        // Fire tip-changed callback OUTSIDE the mutex to avoid deadlock
+        if (ptc.fired && m_on_tip_changed)
+            m_on_tip_changed(ptc.old_tip, ptc.old_height, ptc.new_tip, ptc.new_height);
+        return true;
     }
 
     /// Set the estimated network tip height (from peer's version message).
@@ -305,6 +314,7 @@ public:
         // Large batches during fast-sync (no scrypt), small near tip (scrypt active)
         size_t BATCH_SIZE = (peer_tip > 0 && m_tip_height + 2100 < peer_tip) ? 500 : 50;
         int accepted = 0;
+        PendingTipChange last_ptc;
         for (size_t offset = 0; offset < headers.size(); offset += BATCH_SIZE) {
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
@@ -313,6 +323,10 @@ public:
                     if (add_header_internal(headers[i]))
                         ++accepted;
                 }
+                // Capture any pending tip change from this batch
+                if (m_pending_tip_change.fired)
+                    last_ptc = m_pending_tip_change;
+                m_pending_tip_change.fired = false;
             }
             // Yield between batches so ioc-thread callers (get_height,
             // is_synced, get_tip) can acquire the mutex.
@@ -338,6 +352,9 @@ public:
                 }
             }
         }
+        // Fire tip-changed callback OUTSIDE the mutex to avoid deadlock
+        if (last_ptc.fired && m_on_tip_changed)
+            m_on_tip_changed(last_ptc.old_tip, last_ptc.old_height, last_ptc.new_tip, last_ptc.new_height);
         return accepted;
     }
 
@@ -361,11 +378,25 @@ public:
         auto it = m_headers.find(m_tip);
         if (it == m_headers.end()) return false;
         auto now = static_cast<uint32_t>(std::time(nullptr));
-        return (now - it->second.header.m_timestamp) < 7200; // 2 hours
+        uint32_t age = now - it->second.header.m_timestamp;
+        bool synced = age < 7200; // 2 hours
+        // Log state changes (throttled via static)
+        static bool s_last_synced = false;
+        if (synced != s_last_synced) {
+            LOG_INFO << "[EMB-DOGE] Sync state changed: synced=" << synced
+                     << " tip_age=" << age << "s height=" << m_tip_height;
+            s_last_synced = synced;
+        }
+        return synced;
     }
 
     /// Get params (for external difficulty validation tests).
     const DOGEChainParams& params() const { return m_params; }
+
+    /// Register a callback fired when the chain tip changes (reorg or equal-work switch).
+    /// Signature: void(old_tip_hash, old_height, new_tip_hash, new_height)
+    using TipChangedCallback = std::function<void(const uint256&, uint32_t, const uint256&, uint32_t)>;
+    void set_on_tip_changed(TipChangedCallback cb) { m_on_tip_changed = std::move(cb); }
 
 private:
     /// Add a single header (caller holds mutex).
@@ -452,14 +483,33 @@ private:
                          && new_height == m_tip_height
                          && bhash != m_tip;
         if (dominated || equal_at_tip) {
+            uint32_t old_height = m_tip_height;
+            uint256  old_tip    = m_tip;
             m_best_work = entry.chain_work;
             m_tip = bhash;
             m_tip_height = new_height;
-            rebuild_height_index(bhash);
-            if (equal_at_tip) {
-                LOG_WARNING << "[EMB-DOGE] EQUAL-WORK REORG at height " << new_height
-                            << " new_tip=" << bhash.GetHex().substr(0, 16);
+            // Incremental height index update: if this header extends the
+            // previous tip (common case during sync), just add one entry.
+            // Only do a full rebuild on reorgs (tip changed branch).
+            if (new_height == old_height + 1 && entry.prev_hash == m_height_index[old_height]) {
+                m_height_index[new_height] = bhash;
+            } else {
+                rebuild_height_index(bhash);
+                if (equal_at_tip) {
+                    LOG_WARNING << "[EMB-DOGE] EQUAL-WORK REORG at height " << new_height
+                                << ": old_tip=" << old_tip.GetHex().substr(0, 16)
+                                << " new_tip=" << bhash.GetHex().substr(0, 16);
+                } else if (new_height <= old_height && old_height > 0) {
+                    LOG_WARNING << "[EMB-DOGE] REORG detected: old_height=" << old_height
+                                << " new_height=" << new_height << " hash=" << bhash.GetHex().substr(0, 16);
+                }
             }
+            // Defer reorg callback — will fire AFTER mutex is released by caller.
+            m_pending_tip_change.fired = true;
+            m_pending_tip_change.old_tip = old_tip;
+            m_pending_tip_change.old_height = old_height;
+            m_pending_tip_change.new_tip = bhash;
+            m_pending_tip_change.new_height = new_height;
         }
 
         return true;
@@ -656,6 +706,17 @@ private:
     std::atomic<uint32_t> m_peer_tip_height{0};
 
     std::unique_ptr<core::LevelDBStore> m_db;
+
+    /// Callback fired on tip change (reorg / equal-work switch).
+    TipChangedCallback m_on_tip_changed;
+
+    /// Deferred tip change — fired OUTSIDE mutex to avoid deadlock.
+    struct PendingTipChange {
+        bool fired{false};
+        uint256 old_tip, new_tip;
+        uint32_t old_height{0}, new_height{0};
+    };
+    PendingTipChange m_pending_tip_change;
 };
 
 } // namespace coin

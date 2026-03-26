@@ -570,13 +570,26 @@ void MergedMiningManager::stop()
 {
     m_running = false;
     m_poll_timer.cancel();
+    m_rpc_pool.join();
 }
 
 void MergedMiningManager::poll_loop()
 {
     if (!m_running) return;
 
-    refresh_aux_work();
+    // Offload refresh_aux_work to dedicated RPC thread — prevents blocking
+    // the ioc event loop during ~1s RPC round-trips (createauxblock, etc.).
+    // Skip if previous refresh is still in progress (RPC latency spike).
+    if (!m_refresh_in_progress.exchange(true)) {
+        boost::asio::post(m_rpc_pool, [this]() {
+            try {
+                refresh_aux_work();
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[MM] refresh_aux_work exception: " << e.what();
+            }
+            m_refresh_in_progress.store(false);
+        });
+    }
 
     m_poll_timer.expires_after(std::chrono::seconds(1));
     m_poll_timer.async_wait([this](const boost::system::error_code& ec) {

@@ -3135,6 +3135,51 @@ int main(int argc, char* argv[]) {
                                 doge_sync_timer->expires_after(std::chrono::seconds(10));
                                 doge_sync_timer->async_wait(*doge_sync_fn);
                                 LOG_INFO << "DOGE embedded header sync wired via P2P";
+
+                                // Wire full-block handler: remove confirmed txs from DOGE mempool.
+                                // DOGE has no MWEB — only mempool cleanup needed.
+                                broadcaster->set_on_full_block(
+                                    [pool = doge_pool.get(),
+                                     chain = doge_chain.get()](
+                                        const std::string& peer,
+                                        const ltc::coin::BlockType& block) {
+                                        if (pool)
+                                            pool->remove_for_block(block);
+                                    });
+
+                                // Tip-changed handler: trigger work refresh so stratum miners
+                                // get updated merged mining targets immediately.
+                                doge_chain->set_on_tip_changed(
+                                    [bcaster_ptr, &web_server](
+                                        const uint256& old_tip, uint32_t old_height,
+                                        const uint256& new_tip, uint32_t new_height) {
+                                        bool is_reorg = (new_height <= old_height);
+                                        LOG_WARNING << "[EMB-DOGE] Chain tip changed: "
+                                                    << old_tip.GetHex().substr(0, 16) << " (h=" << old_height << ") → "
+                                                    << new_tip.GetHex().substr(0, 16) << " (h=" << new_height << ")"
+                                                    << (is_reorg ? " [REORG]" : "");
+                                        // Request the new tip's full block for mempool cleanup
+                                        if (bcaster_ptr)
+                                            bcaster_ptr->request_full_block(new_tip);
+                                        // Trigger work refresh so stratum miners get the new tip
+                                        web_server.trigger_work_refresh_debounced();
+                                    });
+                                LOG_INFO << "[EMB-DOGE] Chain reorg handler registered";
+
+                                // Periodic mempool cleanup: evict expired txs every 5 minutes.
+                                auto doge_mempool_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
+                                auto doge_mempool_timer = std::make_shared<boost::asio::steady_timer>(ioc);
+                                *doge_mempool_fn = [doge_mempool_fn, doge_mempool_timer,
+                                                    pool = doge_pool.get()](boost::system::error_code ec) {
+                                    if (ec) return;
+                                    if (pool)
+                                        pool->evict_expired();
+                                    doge_mempool_timer->expires_after(std::chrono::minutes(5));
+                                    doge_mempool_timer->async_wait(*doge_mempool_fn);
+                                };
+                                doge_mempool_timer->expires_after(std::chrono::minutes(5));
+                                doge_mempool_timer->async_wait(*doge_mempool_fn);
+                                LOG_INFO << "[EMB-DOGE] Mempool expiration timer started (5m interval)";
                             }
 
                             broadcaster->start();
