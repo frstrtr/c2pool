@@ -21,12 +21,21 @@ inline std::vector<c2pool::dns::DnsSeed> doge_mainnet_dns_seeds()
     };
 }
 
-/// DNS seeds for Dogecoin testnet.
+/// DNS seeds for Dogecoin testnet3 (legacy).
+/// Same port as testnet4alpha (44556) — P2P magic prefix distinguishes networks.
 inline std::vector<c2pool::dns::DnsSeed> doge_testnet_dns_seeds()
 {
     return {
         {"testseed.jrn.me.uk",  44556},
     };
+}
+
+/// DNS seeds for Dogecoin testnet4alpha.
+/// No public seeds — testnet4alpha is a custom network.
+/// Use --doge-p2p-address to connect to a known dogecoind.
+inline std::vector<c2pool::dns::DnsSeed> doge_testnet4alpha_dns_seeds()
+{
+    return {};
 }
 
 /// Hardcoded fallback peers for Dogecoin mainnet.
@@ -41,7 +50,7 @@ inline std::vector<NetService> doge_mainnet_fixed_seeds()
     };
 }
 
-/// Hardcoded fallback peers for Dogecoin testnet.
+/// Hardcoded fallback peers for Dogecoin testnet3 (legacy).
 inline std::vector<NetService> doge_testnet_fixed_seeds()
 {
     return {
@@ -49,15 +58,25 @@ inline std::vector<NetService> doge_testnet_fixed_seeds()
     };
 }
 
-/// Get DNS seeds for the appropriate DOGE network.
-inline std::vector<c2pool::dns::DnsSeed> doge_dns_seeds(bool testnet)
+/// Hardcoded fallback peers for Dogecoin testnet4alpha.
+/// No public peers — testnet4alpha is a custom network.
+/// Use --doge-p2p-address to connect to a known dogecoind.
+inline std::vector<NetService> doge_testnet4alpha_fixed_seeds()
 {
+    return {};
+}
+
+/// Get DNS seeds for the appropriate DOGE network.
+inline std::vector<c2pool::dns::DnsSeed> doge_dns_seeds(bool testnet, bool testnet4alpha = false)
+{
+    if (testnet4alpha) return doge_testnet4alpha_dns_seeds();
     return testnet ? doge_testnet_dns_seeds() : doge_mainnet_dns_seeds();
 }
 
 /// Get fixed fallback seeds for the appropriate DOGE network.
-inline std::vector<NetService> doge_fixed_seeds(bool testnet)
+inline std::vector<NetService> doge_fixed_seeds(bool testnet, bool testnet4alpha = false)
 {
+    if (testnet4alpha) return doge_testnet4alpha_fixed_seeds();
     return testnet ? doge_testnet_fixed_seeds() : doge_mainnet_fixed_seeds();
 }
 

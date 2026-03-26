@@ -281,6 +281,15 @@ void print_help() {
     std::cout << "  --no-vardiff              Disable automatic difficulty adjustment\n";
     std::cout << "  --max-coinbase-outputs N  Max coinbase outputs per block (default: 4000, matches p2pool)\n\n";
 
+    std::cout << "EMBEDDED NODE OPTIONS:\n";
+    std::cout << "  --embedded-ltc            Use embedded LTC SPV node (no daemon needed)\n";
+    std::cout << "  --embedded-doge           Use embedded DOGE SPV node for merged mining\n";
+    std::cout << "  --doge-testnet4alpha      Use DOGE testnet4alpha (default: testnet3)\n";
+    std::cout << "  --doge-p2p-address HOST   Direct DOGE P2P peer address (e.g. your dogecoind)\n";
+    std::cout << "  --doge-p2p-port PORT      Direct DOGE P2P peer port (overrides auto-detect)\n";
+    std::cout << "  --header-checkpoint H:HASH  LTC header chain starting point\n";
+    std::cout << "  --doge-header-checkpoint H:HASH  DOGE header chain starting point\n\n";
+
     std::cout << "COINBASE CUSTOMIZATION:\n";
     std::cout << "  --coinbase-text TEXT       Custom text in coinbase scriptSig (replaces /c2pool/ tag)\n";
     std::cout << "                            Max 20 chars with merged mining, 64 without\n";
@@ -425,6 +434,7 @@ int main(int argc, char* argv[]) {
     bool sharechain_mode = false;
     bool embedded_ltc    = false;    // Phase 4: use embedded coin node instead of daemon RPC
     bool embedded_doge   = false;    // Phase 5: use embedded DOGE node for merged mining
+    bool doge_testnet4alpha = false;  // Use DOGE testnet4alpha instead of standard testnet3
     std::string header_checkpoint_str;       // --header-checkpoint HEIGHT:HASH (LTC)
     std::string doge_header_checkpoint_str;  // --doge-header-checkpoint HEIGHT:HASH
     std::string doge_p2p_address;            // --doge-p2p-address HOST
@@ -533,9 +543,11 @@ int main(int argc, char* argv[]) {
         }
     };
     // Known P2P magic prefixes for common chains
-    auto get_chain_p2p_prefix = [](const std::string& symbol, bool testnet) -> std::vector<std::byte> {
+    auto get_chain_p2p_prefix = [&doge_testnet4alpha](const std::string& symbol, bool testnet) -> std::vector<std::byte> {
         if (symbol == "DOGE" || symbol == "doge") {
-            return testnet ? ParseHexBytes("d4a1f4a1") : ParseHexBytes("c0c0c0c0");
+            if (!testnet) return ParseHexBytes("c0c0c0c0");
+            // --testnet = testnet3 (fcc1b7dc), --doge-testnet4alpha = testnet4alpha (d4a1f4a1)
+            return doge_testnet4alpha ? ParseHexBytes("d4a1f4a1") : ParseHexBytes("fcc1b7dc");
         }
         if (symbol == "LTC" || symbol == "ltc") {
             return testnet ? ParseHexBytes("fdd2c8f1") : ParseHexBytes("fbc0b6db");
@@ -618,6 +630,10 @@ int main(int argc, char* argv[]) {
         else if (arg == "--embedded-doge") {
             embedded_doge = true;
             cli_explicit.insert("embedded_doge");
+        }
+        else if (arg == "--doge-testnet4alpha") {
+            doge_testnet4alpha = true;
+            cli_explicit.insert("doge_testnet4alpha");
         }
         else if (arg == "--header-checkpoint" && i + 1 < argc) {
             header_checkpoint_str = argv[++i];
@@ -1520,13 +1536,15 @@ int main(int argc, char* argv[]) {
                                         if (accepted > 0) {
                                             LOG_INFO << "[EMB-LTC] Triggering work refresh (new headers)";
                                             web_server.trigger_work_refresh_debounced();
-                                        }
-                                        // Use last received hash as locator to advance past
-                                        // LevelDB duplicates.  On fresh sync (no LevelDB),
-                                        // this naturally follows the chain tip.
-                                        if (!last_hash.IsNull()) {
-                                            bcaster->request_headers({last_hash}, uint256::ZERO);
+                                            // New headers accepted — use last_hash to continue
+                                            if (!last_hash.IsNull()) {
+                                                bcaster->request_headers({last_hash}, uint256::ZERO);
+                                            } else {
+                                                bcaster->request_headers(chain->get_locator(), uint256::ZERO);
+                                            }
                                         } else {
+                                            // Full batch but all duplicates — use chain tip locator
+                                            // to skip past known headers and find new ones
                                             bcaster->request_headers(chain->get_locator(), uint256::ZERO);
                                         }
                                     });
@@ -2845,10 +2863,19 @@ int main(int argc, char* argv[]) {
                             LOG_INFO << "Auto-detected P2P port for " << cfg.symbol << ": " << auto_port;
                         }
                     }
-                    // P2P address: prefer --merged-coind-p2p-address if set
-                    // (RPC may go through mm-adapter on a different host than the P2P daemon)
-                    cfg.p2p_address = !merged_coind_p2p_address.empty()
-                        ? merged_coind_p2p_address : cfg.rpc_host;
+                    // P2P address: prefer chain-specific flags, then --merged-coind-p2p-address
+                    if (cfg.symbol == "DOGE" && !doge_p2p_address.empty()) {
+                        cfg.p2p_address = doge_p2p_address;
+                    } else if (!merged_coind_p2p_address.empty()) {
+                        cfg.p2p_address = merged_coind_p2p_address;
+                    } else {
+                        cfg.p2p_address = cfg.rpc_host;
+                    }
+                    // --doge-p2p-port overrides auto-detected port
+                    if (cfg.symbol == "DOGE" && doge_p2p_port > 0) {
+                        cfg.p2p_port = static_cast<uint16_t>(doge_p2p_port);
+                        LOG_INFO << "DOGE P2P port overridden via --doge-p2p-port: " << doge_p2p_port;
+                    }
 
                     // Phase 5/Step 4: create DOGE HeaderChain when embedded OR P2P is available.
                     // Even in RPC-primary mode, the HeaderChain enables live header sync
@@ -2856,13 +2883,17 @@ int main(int argc, char* argv[]) {
                     bool doge_has_p2p = (cfg.p2p_port > 0);
                     if ((embedded_doge || doge_has_p2p) && cfg.symbol == "DOGE" && !doge_chain) {
                         auto dp = settings->m_testnet
-                            ? doge::coin::DOGEChainParams::testnet4alpha()
+                            ? (doge_testnet4alpha
+                                ? doge::coin::DOGEChainParams::testnet4alpha()
+                                : doge::coin::DOGEChainParams::testnet())
                             : doge::coin::DOGEChainParams::mainnet();
                         doge_params_ptr = std::make_unique<doge::coin::DOGEChainParams>(dp);
 
+                        std::string doge_net_dir = settings->m_testnet
+                            ? (doge_testnet4alpha ? "dogecoin_testnet4alpha" : "dogecoin_testnet")
+                            : "dogecoin";
                         std::string doge_db = (core::filesystem::config_path()
-                            / (settings->m_testnet ? "dogecoin_testnet" : "dogecoin")
-                            / "embedded_headers").string();
+                            / doge_net_dir / "embedded_headers").string();
                         doge_chain = std::make_unique<doge::coin::HeaderChain>(*doge_params_ptr, doge_db);
                         if (!doge_chain->init())
                             LOG_WARNING << "DOGE HeaderChain LevelDB init failed — in-memory only";
@@ -2892,7 +2923,10 @@ int main(int argc, char* argv[]) {
                         if (!doge_pool)
                             doge_pool = std::make_unique<ltc::coin::Mempool>();
 
-                        if (embedded_doge) {
+                        // Embedded is always primary for DOGE when HeaderChain is available.
+                        // --embedded-doge or having P2P both trigger this path.
+                        // RPC becomes the fallback (auto-switch if embedded fails).
+                        {
                             auto backend = std::make_unique<doge::coin::AuxChainEmbedded>(
                                 *doge_chain, *doge_pool, *doge_params_ptr, cfg);
                             mm_manager->add_chain(cfg, std::move(backend));
@@ -2904,20 +2938,6 @@ int main(int argc, char* argv[]) {
                                 mm_manager->set_fallback_backend(cfg.chain_id, std::move(rpc_fallback));
                                 LOG_INFO << "Merged mining: DOGE RPC fallback at "
                                          << cfg.rpc_host << ":" << cfg.rpc_port;
-                            }
-                        } else {
-                            // P2P-only mode: HeaderChain available for sync, RPC is primary
-                            mm_manager->add_chain(cfg);
-                            LOG_INFO << "Merged mining: added " << cfg.symbol
-                                     << " (chain_id=" << cfg.chain_id << ") at "
-                                     << cfg.rpc_host << ":" << cfg.rpc_port;
-
-                            // Set embedded node as fallback (auto-switch on RPC failure)
-                            if (doge_chain && doge_pool && doge_params_ptr) {
-                                auto fallback = std::make_unique<doge::coin::AuxChainEmbedded>(
-                                    *doge_chain, *doge_pool, *doge_params_ptr, cfg);
-                                mm_manager->set_fallback_backend(cfg.chain_id, std::move(fallback));
-                                LOG_INFO << "Merged mining: DOGE embedded fallback (auto-switch on RPC failure)";
                             }
                         }
                     } else {
@@ -2955,9 +2975,9 @@ int main(int argc, char* argv[]) {
                             // Wire DNS seeds + fixed seed fallback for merged chain
                             if (cfg.symbol == "DOGE" || cfg.symbol == "doge") {
                                 broadcaster->peer_manager().set_dns_seeds(
-                                    doge::coin::doge_dns_seeds(settings->m_testnet));
+                                    doge::coin::doge_dns_seeds(settings->m_testnet, doge_testnet4alpha));
                                 broadcaster->peer_manager().set_fixed_seeds(
-                                    doge::coin::doge_fixed_seeds(settings->m_testnet));
+                                    doge::coin::doge_fixed_seeds(settings->m_testnet, doge_testnet4alpha));
                             } else if (cfg.symbol == "LTC" || cfg.symbol == "ltc") {
                                 broadcaster->peer_manager().set_dns_seeds(
                                     ltc::coin::ltc_dns_seeds(settings->m_testnet));
@@ -2990,6 +3010,21 @@ int main(int argc, char* argv[]) {
                                         dc->set_peer_tip_height(h);
                                         LOG_INFO << "DOGE peer reports height " << h;
                                     });
+
+                                // Wire DOGE mempool: feed P2P transactions into the template builder's pool
+                                if (doge_pool) {
+                                    broadcaster->set_on_new_tx(
+                                        [pool = doge_pool.get()](const std::string& peer_key,
+                                                                   const ltc::coin::Transaction& tx) {
+                                            ltc::coin::MutableTransaction mtx(tx);
+                                            bool added = pool->add_tx(mtx);
+                                            if (added) {
+                                                LOG_DEBUG_COIND << "[DOGE] TX from " << peer_key
+                                                          << " added to mempool (size=" << pool->size() << ")";
+                                            }
+                                        });
+                                    LOG_INFO << "DOGE mempool wired via P2P broadcaster";
+                                }
 
                                 // Wire headers: parse AuxPoW extended format → base headers → HeaderChain
                                 broadcaster->set_on_new_headers(
@@ -3035,11 +3070,15 @@ int main(int argc, char* argv[]) {
                                 *doge_sync_fn = [doge_sync_fn, doge_sync_timer, dc = doge_chain.get(),
                                                  bcaster_ptr](boost::system::error_code ec) {
                                     if (ec) return;
-                                    bcaster_ptr->request_headers(dc->get_locator(), uint256::ZERO);
-                                    doge_sync_timer->expires_after(std::chrono::seconds(60));
+                                    auto locator = dc->get_locator();
+                                    bcaster_ptr->request_headers(locator, uint256::ZERO);
+                                    // Fast poll during sync (5s), slow when caught up (60s)
+                                    int interval = dc->is_synced() ? 60 : 5;
+                                    doge_sync_timer->expires_after(std::chrono::seconds(interval));
                                     doge_sync_timer->async_wait(*doge_sync_fn);
                                 };
-                                doge_sync_timer->expires_after(std::chrono::seconds(3));
+                                // Initial delay: wait for broadcaster maintenance (5s) to connect peers
+                                doge_sync_timer->expires_after(std::chrono::seconds(10));
                                 doge_sync_timer->async_wait(*doge_sync_fn);
                                 LOG_INFO << "DOGE embedded header sync wired via P2P";
                             }

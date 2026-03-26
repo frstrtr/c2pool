@@ -179,6 +179,23 @@ TEST_F(DOGEHeaderChainTest, PeerTipHeight) {
     // Should not crash — just stores the value for fast-sync threshold
 }
 
+TEST_F(DOGEHeaderChainTest, EmptyChainLocatorReturnsGenesis) {
+    HeaderChain chain(params);
+    EXPECT_TRUE(chain.init());
+    EXPECT_EQ(chain.size(), 0u);
+
+    // Empty chain should return genesis hash in locator so peers know where to start
+    auto locator = chain.get_locator();
+    ASSERT_EQ(locator.size(), 1u);
+    EXPECT_EQ(locator[0], params.genesis_hash);
+}
+
+TEST_F(DOGEHeaderChainTest, SyncGateNotSyncedWhenEmpty) {
+    HeaderChain chain(params);
+    EXPECT_TRUE(chain.init());
+    EXPECT_FALSE(chain.is_synced());
+}
+
 // ─── Template Builder Tests ─────────────────────────────────────────────────
 
 TEST(DOGETemplateTest, BlockVersionIsAuxPoW) {

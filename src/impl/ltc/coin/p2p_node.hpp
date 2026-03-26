@@ -468,6 +468,8 @@ private:
                 break;
             case inventory_type::block:
                 m_coin->new_block.happened(inv.m_hash);
+                // Request full block for MWEB state extraction
+                vinv.push_back(inv);
                 break;
             case inventory_type::filtered_block:
             case inventory_type::cmpct_block:
@@ -532,8 +534,25 @@ private:
             }
         }
 
-        if (!vheaders.empty())
+        if (!vheaders.empty()) {
             m_coin->new_headers.happened(vheaders);
+
+            // BIP 130: when receiving a small headers batch (new block announcement),
+            // request the full block via getdata for MWEB state extraction.
+            // Use MSG_MWEB_BLOCK (0x60000002) to get witness + MWEB extension data.
+            // Large batches (initial sync) don't trigger full block download.
+            if (vheaders.size() <= 3 && m_peer) {
+                for (auto& hdr : vheaders) {
+                    auto packed = pack(hdr);
+                    auto bhash = Hash(packed.get_span());
+                    auto getdata_msg = message_getdata::make_raw(
+                        {inventory_type(static_cast<inventory_type::inv_type>(0x60000002), bhash)});
+                    m_peer->write(getdata_msg);
+                    LOG_INFO << "[" << m_chain_label << "] Requesting full block "
+                             << bhash.GetHex().substr(0, 16) << "... (MWEB)";
+                }
+            }
+        }
     }
 
     ADD_P2P_HANDLER(getaddr)
@@ -644,11 +663,15 @@ private:
 
         if (result.complete) {
             LOG_INFO << "[" << m_chain_label << "] Compact block reconstructed: "
-                     << blockhash.GetHex();
+                     << blockhash.GetHex()
+                     << " txs=" << result.block.m_txs.size()
+                     << " mweb_raw=" << result.block.m_mweb_raw.size() << " bytes";
             // Deliver as a full block
             m_peer->get_block(blockhash, result.block);
             auto header = static_cast<BlockHeaderType>(result.block);
             m_peer->get_header(blockhash, header);
+            // Fire full block event (carries MWEB data for state extraction)
+            m_coin->full_block.happened(result.block);
         } else {
             LOG_INFO << "[" << m_chain_label << "] Compact block incomplete, "
                      << result.missing_indexes.size() << " txs missing — requesting via getblocktxn";

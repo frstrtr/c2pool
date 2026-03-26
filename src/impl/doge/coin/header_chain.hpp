@@ -531,7 +531,13 @@ private:
     /// Block locator: exponential backoff from tip (caller holds mutex).
     std::vector<uint256> get_locator_internal() const {
         std::vector<uint256> locator;
-        if (m_tip.IsNull()) return locator;
+        if (m_tip.IsNull()) {
+            // Chain is empty — return genesis hash so peers know where to start.
+            // Without this, getheaders with empty locator gets ignored.
+            if (!m_params.genesis_hash.IsNull())
+                locator.push_back(m_params.genesis_hash);
+            return locator;
+        }
 
         int64_t step = 1;
         int64_t h = static_cast<int64_t>(m_tip_height);
@@ -540,7 +546,7 @@ private:
             auto it = m_height_index.find(static_cast<uint32_t>(h));
             if (it != m_height_index.end())
                 locator.push_back(it->second);
-            
+
             if (h == 0) break;
             h -= step;
             if (h < 0) h = 0;

@@ -44,6 +44,14 @@ public:
     }
 
     c2pool::merged::AuxWork get_work_template() override {
+        // Sync gate: don't return work until header chain is caught up.
+        // Returning stale tips produces invalid targets and wastes merged mining work.
+        if (!m_chain.is_synced()) {
+            LOG_DEBUG_COIND << "[MM:" << m_config.symbol << "] Embedded: header chain not synced"
+                           << " (height=" << m_chain.height() << "), returning empty work";
+            return {};
+        }
+
         auto wd = m_embedded.getwork();
 
         c2pool::merged::AuxWork work;
@@ -52,7 +60,6 @@ public:
         work.chain_id = DOGEChainParams::AUXPOW_CHAIN_ID;
         work.block_template = wd.m_data;
 
-        // Block hash = SHA256d of the template's prev_block + height (deterministic)
         if (wd.m_data.contains("previousblockhash")) {
             work.prev_block_hash = wd.m_data["previousblockhash"].get<std::string>();
         }
@@ -64,8 +71,7 @@ public:
             work.target.SetCompact(bits);
         }
 
-        // Block hash for AuxPoW commitment
-        // Use SHA256d of (height || prev_hash) as the aux block hash
+        // Block hash for AuxPoW commitment — use the hash of the block we're building
         auto tip = m_chain.tip();
         if (tip.has_value())
             work.block_hash = tip->block_hash;
@@ -74,28 +80,35 @@ public:
     }
 
     c2pool::merged::AuxWork create_aux_block(const std::string& /*address*/) override {
-        // Same as get_work_template for embedded mode
         return get_work_template();
     }
 
     bool submit_block(const std::string& block_hex) override {
-        // In embedded mode, block relay is handled by CoinBroadcaster
-        // (wired via set_block_relay_fn in MergedMiningManager)
-        LOG_INFO << "[MM:" << m_config.symbol << "] Embedded: block accepted ("
-                 << block_hex.size() / 2 << " bytes)";
+        // Embedded mode: P2P relay handled by CoinBroadcaster via set_block_relay_fn.
+        // Log block hex prefix for diagnostics (first 160 hex chars = 80-byte header).
+        LOG_INFO << "[MM:" << m_config.symbol << "] Embedded: block submitted ("
+                 << block_hex.size() / 2 << " bytes)"
+                 << " header=" << block_hex.substr(0, std::min(size_t(160), block_hex.size()));
+        // Cache last block hex for get_block_hex() retrieval
+        m_last_block_hex = block_hex;
         return true;
     }
 
     bool submit_aux_block(const uint256& block_hash, const std::string& auxpow_hex) override {
-        // In embedded mode, we validate the AuxPoW proof locally
-        // and relay via P2P. For now, accept and rely on P2P relay.
-        LOG_INFO << "[MM:" << m_config.symbol << "] Embedded: aux block accepted "
-                 << block_hash.GetHex().substr(0, 16) << "...";
+        // Fallback path: submit_aux_block without a fully assembled block.
+        // Embedded mode can't do RPC submitauxblock — log for diagnostics.
+        // The frozen block path (submit_block) is the primary submission method.
+        LOG_WARNING << "[MM:" << m_config.symbol << "] Embedded: submit_aux_block called"
+                    << " (fallback path) hash=" << block_hash.GetHex().substr(0, 16) << "..."
+                    << " auxpow=" << auxpow_hex.size() / 2 << " bytes"
+                    << " — no daemon to submit to, relying on P2P relay";
         return true;
     }
 
     std::string get_block_hex(const std::string& /*block_hash*/) override {
-        // SPV mode doesn't store full blocks — return empty
+        // Return last submitted block hex if available (for P2P relay after submission)
+        if (!m_last_block_hex.empty())
+            return m_last_block_hex;
         return {};
     }
 
@@ -117,6 +130,7 @@ private:
     const DOGEChainParams&             m_params;
     c2pool::merged::AuxChainConfig     m_config;
     EmbeddedCoinNode                   m_embedded;
+    std::string                        m_last_block_hex;  // cached for get_block_hex() after submit
 };
 
 } // namespace coin

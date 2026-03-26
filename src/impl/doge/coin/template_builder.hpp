@@ -130,6 +130,9 @@ public:
         : m_chain(chain), m_pool(pool), m_params(params) {}
 
     ltc::coin::rpc::WorkData getwork() override {
+        if (!m_chain.is_synced())
+            throw std::runtime_error("DOGE EmbeddedCoinNode: header chain not synced (height="
+                + std::to_string(m_chain.height()) + ")");
         auto result = TemplateBuilder::build_template(m_chain, m_pool, m_params);
         if (!result)
             throw std::runtime_error("DOGE EmbeddedCoinNode: chain has no tip");
