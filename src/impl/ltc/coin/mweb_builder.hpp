@@ -281,7 +281,19 @@ public:
     static uint256 compute_mweb_hash(const MWEBState& state, uint32_t next_height) {
         MWEBHeader hdr = state.prev_header;
         hdr.height = static_cast<int64_t>(next_height);
-        return blake3_hash_serialized(hdr);
+        // Debug: dump serialized header for hash verification
+        PackStream dbg_ps;
+        dbg_ps << hdr;
+        auto dbg_sp = dbg_ps.get_span();
+        LOG_INFO << "[MWEB-HASH] height=" << hdr.height
+                 << " output_mmr=" << hdr.output_mmr_size
+                 << " kernel_mmr=" << hdr.kernel_mmr_size
+                 << " serialized=" << dbg_sp.size() << " bytes"
+                 << " hex=" << HexStr(std::span<const unsigned char>(
+                    reinterpret_cast<const unsigned char*>(dbg_sp.data()), dbg_sp.size()));
+        auto result = blake3_hash_serialized(hdr);
+        LOG_INFO << "[MWEB-HASH] blake3=" << result.GetHex();
+        return result;
     }
 
     /// Build the HogEx transaction for a block with no MWEB activity.
@@ -377,13 +389,15 @@ public:
     /// Called when a new block is received via P2P.
     bool update(const BlockType& block, uint32_t height,
                 const std::vector<unsigned char>& mweb_raw) {
+        if (mweb_raw.empty()) {
+            LOG_WARNING << "[MWEB] Block has no MWEB raw data — cannot extract header roots";
+            return false;
+        }
         MWEBState new_state;
         if (!MWEBBuilder::extract_state(block, height, new_state))
             return false;
-        if (!mweb_raw.empty()) {
-            if (!MWEBBuilder::extract_mweb_header_from_raw(mweb_raw, new_state))
-                return false;
-        }
+        if (!MWEBBuilder::extract_mweb_header_from_raw(mweb_raw, new_state))
+            return false;
         std::lock_guard<std::mutex> lock(m_mutex);
         m_state = std::move(new_state);
         return true;

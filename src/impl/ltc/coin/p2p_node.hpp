@@ -546,17 +546,17 @@ private:
 
             // BIP 130: when receiving a small headers batch (new block announcement),
             // request the full block via getdata for MWEB state extraction.
-            // Use MSG_MWEB_BLOCK (0x60000002) to get witness + MWEB extension data.
-            // Large batches (initial sync) don't trigger full block download.
+            // Use MSG_WITNESS_BLOCK (0x40000002) — litecoind includes MWEB extension
+            // in witness blocks. MSG_MWEB_BLOCK (0x60000002) requires NODE_MWEB.
             if (vheaders.size() <= 3 && m_peer) {
                 for (auto& hdr : vheaders) {
                     auto packed = pack(hdr);
                     auto bhash = Hash(packed.get_span());
                     auto getdata_msg = message_getdata::make_raw(
-                        {inventory_type(static_cast<inventory_type::inv_type>(0x60000002), bhash)});
+                        {inventory_type(inventory_type::witness_block, bhash)});
                     m_peer->write(getdata_msg);
                     LOG_INFO << "[" << m_chain_label << "] Requesting full block "
-                             << bhash.GetHex().substr(0, 16) << "... (MWEB)";
+                             << bhash.GetHex().substr(0, 16) << "... (witness_block)";
                 }
             }
         }
