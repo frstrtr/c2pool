@@ -320,7 +320,9 @@ void StratumSession::read_message()
                 self->process_message(bytes_read);
                 self->read_message();  // Continue reading
             } else {
-                // Session disconnected — unregister from worker tracking
+                // Session disconnected — cancel timers to break prevent zombie callbacks,
+                // then unregister from worker tracking.
+                self->cancel_timers();
                 if (self->authorized_ && self->mining_interface_) {
                     self->mining_interface_->unregister_stratum_worker(self->session_id_);
                 }
@@ -1129,8 +1131,11 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         }
         auto timer = std::make_shared<boost::asio::steady_timer>(socket_.get_executor());
         timer->expires_after(std::chrono::seconds(1));
-        timer->async_wait([this, self = shared_from_this(), timer](boost::system::error_code ec) {
-            if (!ec) send_notify_work();
+        timer->async_wait([weak_self = weak_from_this(), timer](boost::system::error_code ec) {
+            if (ec) return;
+            auto self = weak_self.lock();
+            if (!self || !self->is_connected()) return;
+            self->send_notify_work();
         });
         return;
     }
@@ -1325,20 +1330,35 @@ void StratumSession::start_periodic_work_push()
     // new best_share, VARDIFF). This 30-second fallback catches edge cases where
     // an event-driven notify_all() might miss a session.
     work_push_timer_ = std::make_shared<boost::asio::steady_timer>(socket_.get_executor());
-    auto self = shared_from_this();
-    auto fn = std::make_shared<std::function<void(boost::system::error_code)>>();
-    *fn = [this, self, fn](boost::system::error_code ec) {
-        if (ec) return;
-        auto current_gen = mining_interface_->get_work_generation();
-        if (current_gen != last_pushed_generation_) {
-            send_notify_work();
-            last_pushed_generation_ = current_gen;
-        }
-        work_push_timer_->expires_after(std::chrono::seconds(30));
-        work_push_timer_->async_wait(*fn);
-    };
     work_push_timer_->expires_after(std::chrono::seconds(5));
-    work_push_timer_->async_wait(*fn);
+    schedule_work_push_timer();
+}
+
+void StratumSession::schedule_work_push_timer()
+{
+    // weak_from_this(): session dies naturally when removed from sessions_ set
+    // on disconnect, instead of being kept alive by the timer's strong reference.
+    std::weak_ptr<StratumSession> weak_self = weak_from_this();
+    work_push_timer_->async_wait([weak_self](boost::system::error_code ec) {
+        if (ec) return;
+        auto self = weak_self.lock();
+        if (!self || !self->is_connected()) return;
+        auto current_gen = self->mining_interface_->get_work_generation();
+        if (current_gen != self->last_pushed_generation_) {
+            self->send_notify_work();
+            self->last_pushed_generation_ = current_gen;
+        }
+        self->work_push_timer_->expires_after(std::chrono::seconds(30));
+        self->schedule_work_push_timer();
+    });
+}
+
+void StratumSession::cancel_timers()
+{
+    if (work_push_timer_) {
+        work_push_timer_->cancel();
+        work_push_timer_.reset();
+    }
 }
 
 // Parse multi-chain addresses from username string.

@@ -199,6 +199,8 @@ public:
     void send_notify_work(bool force_clean = false, const uint256* frozen_best_share = nullptr);
 private:
     void start_periodic_work_push();
+    void schedule_work_push_timer();
+    void cancel_timers();
 
     std::string generate_extranonce1();
     void parse_address_separators(std::string& username, std::string& merged_addr_raw);
