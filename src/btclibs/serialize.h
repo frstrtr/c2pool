@@ -443,15 +443,19 @@ static inline Wrapper<Formatter, T&> Using(T&& t) { return Wrapper<Formatter, T&
 template<VarIntMode Mode>
 struct VarIntFormatter
 {
-    template<typename Stream, typename I> void Ser(Stream &s, I v)
+    template<typename Stream, typename I> static void Ser(Stream &s, I v)
     {
         WriteVarInt<Stream,Mode,typename std::remove_cv<I>::type>(s, v);
     }
 
-    template<typename Stream, typename I> void Unser(Stream& s, I& v)
+    template<typename Stream, typename I> static void Unser(Stream& s, I& v)
     {
         v = ReadVarInt<Stream,Mode,typename std::remove_cv<I>::type>(s);
     }
+
+    // Aliases for Wrapper compatibility (Wrapper calls Write/Read)
+    template<typename Stream, typename I> static void Write(Stream &s, I v) { Ser(s, v); }
+    template<typename Stream, typename I> static void Read(Stream& s, I& v) { Unser(s, v); }
 };
 
 /** Serialization wrapper class for custom integers and enums.
@@ -520,6 +524,10 @@ struct CompactSizeFormatter
 
         WriteCompactSize<Stream>(s, v);
     }
+
+    // Aliases for Wrapper compatibility
+    template<typename Stream, typename I> static void Write(Stream& s, I v) { CompactSizeFormatter{}.Ser(s, v); }
+    template<typename Stream, typename I> static void Read(Stream& s, I& v) { CompactSizeFormatter{}.Unser(s, v); }
 };
 
 class CompactSizeWriter

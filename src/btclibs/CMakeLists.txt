@@ -1,5 +1,14 @@
 file(GLOB crypto_sources "crypto/*.h" "crypto/*.cpp")
 
+# Blake3 (portable-only build for MWEB header hashing)
+set(blake3_sources
+    crypto/blake3/blake3.c
+    crypto/blake3/blake3.h
+    crypto/blake3/blake3_impl.h
+    crypto/blake3/blake3_dispatch.c
+    crypto/blake3/blake3_portable.c
+)
+
 
 set(sources
         uint256.h
@@ -30,6 +39,7 @@ set(sources
         core_io.h
         streams.h streams.cpp
         ${crypto_sources}
+        ${blake3_sources}
         )
 
 add_library(btclibs STATIC ${sources}) #${SOURCE} ${HEADER})

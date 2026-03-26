@@ -139,6 +139,7 @@ static void segfault_handler(int sig) {
 #include <impl/ltc/coin/node_interface.hpp>
 #include <impl/ltc/coin/header_chain.hpp>
 #include <impl/ltc/coin/mempool.hpp>
+#include <impl/ltc/coin/mweb_builder.hpp>
 #include <impl/ltc/coin/template_builder.hpp>
 
 #include <boost/asio.hpp>
@@ -1166,6 +1167,7 @@ int main(int argc, char* argv[]) {
             std::unique_ptr<ltc::coin::HeaderChain>     embedded_chain;
             std::unique_ptr<ltc::coin::Mempool>         embedded_pool;
             std::unique_ptr<c2pool::merged::CoinBroadcaster> embedded_broadcaster;
+            std::unique_ptr<ltc::coin::MWEBTracker>     mweb_tracker;
             std::unique_ptr<ltc::coin::EmbeddedCoinNode> embedded_node;
 
             if (embedded_ltc) {
@@ -1230,11 +1232,13 @@ int main(int argc, char* argv[]) {
                              << " headers from LevelDB (height=" << embedded_chain->height() << ")";
                 }
 
-                LOG_INFO << "[EMB-LTC] Creating Mempool + EmbeddedCoinNode";
-                embedded_pool  = std::make_unique<ltc::coin::Mempool>();
-                embedded_node  = std::make_unique<ltc::coin::EmbeddedCoinNode>(
-                    *embedded_chain, *embedded_pool, settings->m_testnet);
-                LOG_INFO << "[EMB-LTC] EmbeddedCoinNode ready (testnet=" << settings->m_testnet << ")";
+                LOG_INFO << "[EMB-LTC] Creating Mempool + MWEBTracker + EmbeddedCoinNode";
+                embedded_pool   = std::make_unique<ltc::coin::Mempool>();
+                mweb_tracker    = std::make_unique<ltc::coin::MWEBTracker>();
+                embedded_node   = std::make_unique<ltc::coin::EmbeddedCoinNode>(
+                    *embedded_chain, *embedded_pool, settings->m_testnet, mweb_tracker.get());
+                LOG_INFO << "[EMB-LTC] EmbeddedCoinNode ready (testnet=" << settings->m_testnet
+                         << ", MWEB=enabled)";
 
                 // Auto-detect P2P port for the embedded broadcaster
                 if (coind_p2p_port == -1)
@@ -1532,6 +1536,36 @@ int main(int argc, char* argv[]) {
                             });
                     });
                 LOG_INFO << "[EMB-LTC] Embedded coin node wired to web server";
+
+                // MWEB state extraction: when a full block is received via P2P,
+                // extract HogEx state and MWEB header for template construction.
+                if (mweb_tracker) {
+                    LOG_INFO << "[EMB-LTC] Wiring MWEB state extraction from full blocks";
+                    embedded_broadcaster->set_on_full_block(
+                        [tracker = mweb_tracker.get(), chain = embedded_chain.get()](
+                            const std::string& peer,
+                            const ltc::coin::BlockType& block) {
+                            // Determine block height from header chain
+                            auto packed_hdr = pack(static_cast<const ltc::coin::BlockHeaderType&>(block));
+                            auto block_hash = Hash(packed_hdr.get_span());
+                            uint32_t height = 0;
+                            auto entry = chain->get_header(block_hash);
+                            if (entry)
+                                height = entry->height;
+                            else {
+                                // Block not in our chain yet — use prev_block to estimate
+                                auto prev_entry = chain->get_header(block.m_previous_block);
+                                if (prev_entry)
+                                    height = prev_entry->height + 1;
+                            }
+
+                            if (tracker->update(block, height, block.m_mweb_raw)) {
+                                LOG_INFO << "[EMB-LTC] MWEB state updated from peer " << peer
+                                         << " at height " << height
+                                         << " (mweb_raw=" << block.m_mweb_raw.size() << " bytes)";
+                            }
+                        });
+                }
 
                 // Periodic fallback: re-request headers every 60s even if no batch arrived.
                 // Uses shared_ptr self-capture so the lambda stays alive for the run duration.

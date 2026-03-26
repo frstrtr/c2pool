@@ -46,6 +46,14 @@ public:
         m_vch.insert(m_vch.end(), value.begin(), value.end());
     }
 
+    // Overload for Bitcoin Core's Span<const std::byte> (used by ser_writedata8 etc.)
+    template <typename C>
+    void write(Span<C> value) {
+        static_assert(sizeof(C) == 1, "Span write requires byte-sized type");
+        auto ptr = reinterpret_cast<const std::byte*>(value.data());
+        m_vch.insert(m_vch.end(), ptr, ptr + value.size());
+    }
+
     void read(const std::span<std::byte>& data)
     {
         if (data.empty()) return;
@@ -55,7 +63,7 @@ public:
             throw std::ios_base::failure("PackStream::read(): end of data!");
 
         memcpy(data.data(), &m_vch[m_cursor], data.size());
-        if (new_cursor_pos == m_vch.size()) 
+        if (new_cursor_pos == m_vch.size())
         {
             m_cursor = 0;
             m_vch.clear();
@@ -63,6 +71,14 @@ public:
         }
 
         m_cursor = new_cursor_pos;
+    }
+
+    // Overload for Bitcoin Core's Span<std::byte> (used by ser_readdata8 etc.)
+    template <typename C>
+    void read(Span<C> data) {
+        static_assert(sizeof(C) == 1, "Span read requires byte-sized type");
+        auto sp = std::span<std::byte>(reinterpret_cast<std::byte*>(data.data()), data.size());
+        read(sp);
     }
 
     std::vector<std::byte>::pointer data()

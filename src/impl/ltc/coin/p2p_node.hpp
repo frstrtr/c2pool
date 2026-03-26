@@ -499,6 +499,8 @@ private:
         auto blockhash = Hash(packed_header.get_span());
         m_peer->get_block(blockhash, msg->m_block);
         m_peer->get_header(blockhash, header);
+        // Fire full block event (carries MWEB data for state extraction)
+        m_coin->full_block.happened(msg->m_block);
     }
 
     ADD_P2P_HANDLER(headers)

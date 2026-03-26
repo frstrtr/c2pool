@@ -25,6 +25,7 @@ struct Node
     Event<uint256> new_block;								//block_hash
 	Event<coin::Transaction> new_tx;						//bitcoin_data.tx_type
 	Event<std::vector<coin::BlockHeaderType>> new_headers;	//bitcoin_data.block_header_type
+	Event<coin::BlockType> full_block;						// full block with txs + MWEB data
 
 	coin::TXIDCache txidcache;
 	std::map<uint256, coin::Transaction> known_txs; // TODO: move to other?

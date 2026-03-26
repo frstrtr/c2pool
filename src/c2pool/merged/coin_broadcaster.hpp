@@ -126,9 +126,12 @@ public:
     using TxCallback      = std::function<void(const std::string& peer, const ltc::coin::Transaction&)>;
     using HeadersCallback = std::function<void(const std::string& peer, const std::vector<ltc::coin::BlockHeaderType>&)>;
 
+    using FullBlockCallback = std::function<void(const std::string& peer, const ltc::coin::BlockType&)>;
+
     void set_on_new_block(BlockCallback cb)     { m_on_new_block = std::move(cb); }
     void set_on_new_tx(TxCallback cb)           { m_on_new_tx = std::move(cb); }
     void set_on_new_headers(HeadersCallback cb)  { m_on_new_headers = std::move(cb); }
+    void set_on_full_block(FullBlockCallback cb) { m_on_full_block = std::move(cb); }
 
     using PeerHeightCallback = std::function<void(uint32_t)>;
     void set_on_peer_height(PeerHeightCallback cb) { m_on_peer_height = std::move(cb); }
@@ -314,6 +317,11 @@ private:
                     if (m_on_new_headers)
                         m_on_new_headers(peer_key, hdrs);
                 });
+            peer->coin_node.full_block.subscribe(
+                [this, peer_key](const ltc::coin::BlockType& block) {
+                    if (m_on_full_block)
+                        m_on_full_block(peer_key, block);
+                });
 
             // Wire peer height callback (for fast-sync scrypt skip)
             if (m_on_peer_height) {
@@ -408,6 +416,7 @@ private:
     BlockCallback        m_on_new_block;
     TxCallback           m_on_new_tx;
     HeadersCallback      m_on_new_headers;
+    FullBlockCallback    m_on_full_block;
     PeerHeightCallback   m_on_peer_height;
     RawHeadersParser     m_raw_headers_parser;
 };
