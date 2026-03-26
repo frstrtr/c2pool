@@ -1595,13 +1595,14 @@ int main(int argc, char* argv[]) {
                         });
                 }
 
-                // Tip-change handler: invalidate MWEB, request new full block,
-                // and on reorgs clear the mempool (normal advances are handled
-                // by remove_for_block() in the full_block callback above).
+                // Tip-change handler: invalidate MWEB, request new full block.
+                // Mempool cleanup is handled by remove_for_block() in the
+                // full_block callback above — same as Litecoin Core, which
+                // runs removeForBlock() identically for both normal advances
+                // and reorgs (no clear()).
                 embedded_chain->set_on_tip_changed(
                     [tracker = mweb_tracker.get(),
                      bcaster = embedded_broadcaster.get(),
-                     pool = embedded_pool.get(),
                      &web_server](
                         const uint256& old_tip, uint32_t old_height,
                         const uint256& new_tip, uint32_t new_height) {
@@ -1613,16 +1614,6 @@ int main(int argc, char* argv[]) {
                         // Invalidate stale MWEB state — HogEx prev_txid is from the old fork
                         if (tracker) {
                             tracker->invalidate();
-                        }
-                        // On reorg, clear the entire mempool — txs from the disconnected
-                        // fork may have conflicting inputs.  Normal advances don't need
-                        // clearing: the full_block callback's remove_for_block() handles
-                        // confirmed tx removal + conflict detection.
-                        if (is_reorg && pool) {
-                            auto old_size = pool->size();
-                            pool->clear();
-                            if (old_size > 0)
-                                LOG_WARNING << "[EMB-LTC] Mempool cleared on reorg (" << old_size << " txs removed)";
                         }
                         // Request the new tip's full block for MWEB state + mempool cleanup
                         if (bcaster) {
