@@ -497,10 +497,17 @@ private:
     ADD_P2P_HANDLER(block)
     {
         auto header = (BlockHeaderType) msg->m_block;
-        auto packed_header = pack(header); // block_type -> block_header_type
+        auto packed_header = pack(header);
         auto blockhash = Hash(packed_header.get_span());
-        m_peer->get_block(blockhash, msg->m_block);
-        m_peer->get_header(blockhash, header);
+        // ReplyMatcher may throw if nobody registered a pending request for
+        // this block (e.g., unsolicited block or getdata-triggered response).
+        // Catch to ensure full_block event always fires for MWEB extraction.
+        try { m_peer->get_block(blockhash, msg->m_block); } catch (...) {}
+        try { m_peer->get_header(blockhash, header); } catch (...) {}
+        LOG_INFO << "[" << m_chain_label << "] Full block received: "
+                 << blockhash.GetHex().substr(0, 16) << "..."
+                 << " txs=" << msg->m_block.m_txs.size()
+                 << " mweb_raw=" << msg->m_block.m_mweb_raw.size() << " bytes";
         // Fire full block event (carries MWEB data for state extraction)
         m_coin->full_block.happened(msg->m_block);
     }
