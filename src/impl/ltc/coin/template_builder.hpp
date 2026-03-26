@@ -214,10 +214,13 @@ public:
             uint256     txid     = compute_txid(mtx);
             auto        packed   = pack(TX_WITH_WITNESS(mtx));
             std::string hex_data = HexStr(packed.get_span());
+            // wtxid = SHA256d of witness serialization (for witness merkle tree)
+            uint256     wtxid    = Hash(packed.get_span());
 
             nlohmann::json entry;
             entry["data"] = hex_data;
             entry["txid"] = txid.GetHex();
+            entry["hash"] = wtxid.GetHex();  // wtxid for witness commitment
             tx_array.push_back(std::move(entry));
 
             tx_objects.push_back(Transaction(mtx));
@@ -239,6 +242,7 @@ public:
                 nlohmann::json hogex_entry;
                 hogex_entry["data"] = hogex_hex;
                 hogex_entry["txid"] = hogex_txid.GetHex();
+                hogex_entry["hash"] = hogex_txid.GetHex();  // HogEx: wtxid == txid (no witness)
                 tx_array.push_back(std::move(hogex_entry));
 
                 tx_objects.push_back(Transaction(hogex));
