@@ -174,6 +174,18 @@ public:
             tip.header.m_timestamp,
             now_ts,
             chain.params());
+        // After a checkpoint, the chain may lack enough headers for difficulty
+        // calculation (need 2016+ ancestors). Fall back to tip's bits or
+        // pow_limit if bits came back as 0.
+        if (next_bits == 0) {
+            if (tip.header.m_bits != 0)
+                next_bits = tip.header.m_bits;
+            else
+                next_bits = chain.params().pow_limit.GetCompact();
+            LOG_INFO << "[EMB-LTC] TemplateBuilder: bits fallback to 0x"
+                     << std::hex << next_bits << std::dec
+                     << " (chain too short for retarget)";
+        }
 
         // ── Subsidy ────────────────────────────────────────────────────────
         uint64_t subsidy = get_block_subsidy(next_h);
