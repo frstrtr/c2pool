@@ -1585,6 +1585,31 @@ int main(int argc, char* argv[]) {
                         });
                 }
 
+                // Chain reorg handler: when the HeaderChain switches tip (equal-work
+                // fork on testnet, or longer competing chain), invalidate MWEB state
+                // and request the new tip's full block for fresh HogEx extraction.
+                embedded_chain->set_on_tip_changed(
+                    [tracker = mweb_tracker.get(),
+                     bcaster = embedded_broadcaster.get(),
+                     &web_server](
+                        const uint256& old_tip, uint32_t old_height,
+                        const uint256& new_tip, uint32_t new_height) {
+                        LOG_WARNING << "[EMB-LTC] Chain tip changed: "
+                                    << old_tip.GetHex().substr(0, 16) << " (h=" << old_height << ") → "
+                                    << new_tip.GetHex().substr(0, 16) << " (h=" << new_height << ")";
+                        // Invalidate stale MWEB state — HogEx prev_txid is from the old fork
+                        if (tracker) {
+                            tracker->invalidate();
+                        }
+                        // Request the new tip's full block for MWEB state extraction
+                        if (bcaster) {
+                            bcaster->request_full_block(new_tip);
+                        }
+                        // Trigger work refresh so stratum miners get the new tip
+                        web_server.trigger_work_refresh_debounced();
+                    });
+                LOG_INFO << "[EMB-LTC] Chain reorg handler registered";
+
                 // Periodic fallback: re-request headers every 60s even if no batch arrived.
                 // Uses shared_ptr self-capture so the lambda stays alive for the run duration.
                 auto sync_fn = std::make_shared<std::function<void(boost::system::error_code)>>();

@@ -541,6 +541,11 @@ public:
     /// Get params (for external difficulty validation tests).
     const LTCChainParams& params() const { return m_params; }
 
+    /// Register a callback fired when the chain tip changes (reorg or equal-work switch).
+    /// Signature: void(old_tip_hash, old_height, new_tip_hash, new_height)
+    using TipChangedCallback = std::function<void(const uint256&, uint32_t, const uint256&, uint32_t)>;
+    void set_on_tip_changed(TipChangedCallback cb) { m_on_tip_changed = std::move(cb); }
+
 private:
     /// Add a single header (caller holds mutex).
     bool add_header_internal(const BlockHeaderType& header) {
@@ -639,9 +644,26 @@ private:
         m_headers[bhash] = entry;
         persist_header(entry);
 
-        // Update tip if this chain has more work
-        if (entry.chain_work > m_best_work) {
+        // Update tip if this chain has more work, OR if a competing block
+        // at the same height has equal work (equal-work reorg).
+        //
+        // On testnet (min-difficulty), ALL blocks have identical per-block work.
+        // When our miner and the network both find a block at the same height,
+        // the `>` check alone never fires — the chain permanently diverges.
+        // The peer sending us this header represents network consensus (litecoind
+        // accepted their block), so we switch to it.
+        //
+        // Flip-flop is impossible: once both headers are stored, re-receiving
+        // either is a no-op (line 551 skips known hashes).  After switching,
+        // our mining builds on the new tip, so no new blocks appear on the
+        // old fork.
+        bool dominated    = entry.chain_work > m_best_work;
+        bool equal_at_tip = entry.chain_work == m_best_work
+                         && new_height == m_tip_height
+                         && bhash != m_tip;
+        if (dominated || equal_at_tip) {
             uint32_t old_height = m_tip_height;
+            uint256  old_tip    = m_tip;
             m_best_work = entry.chain_work;
             m_tip = bhash;
             m_tip_height = new_height;
@@ -652,11 +674,18 @@ private:
                 m_height_index[new_height] = bhash;
             } else {
                 rebuild_height_index(bhash);
-                if (new_height <= old_height && old_height > 0) {
+                if (equal_at_tip) {
+                    LOG_WARNING << "[EMB-LTC] EQUAL-WORK REORG at height " << new_height
+                                << ": old_tip=" << old_tip.GetHex().substr(0, 16)
+                                << " new_tip=" << bhash.GetHex().substr(0, 16);
+                } else if (new_height <= old_height && old_height > 0) {
                     LOG_WARNING << "[EMB-LTC] REORG detected: old_height=" << old_height
                                 << " new_height=" << new_height << " hash=" << bhash.GetHex().substr(0, 16);
                 }
             }
+            // Fire reorg callback (MWEB state invalidation, work refresh, etc.)
+            if (m_on_tip_changed)
+                m_on_tip_changed(old_tip, old_height, bhash, new_height);
         }
 
         return true;
@@ -849,6 +878,9 @@ private:
     std::atomic<uint32_t> m_peer_tip_height{0};
 
     std::unique_ptr<core::LevelDBStore> m_db;
+
+    /// Callback fired on tip change (reorg / equal-work switch).
+    TipChangedCallback m_on_tip_changed;
 };
 
 } // namespace coin

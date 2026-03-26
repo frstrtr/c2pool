@@ -445,12 +445,21 @@ private:
         m_headers[bhash] = entry;
         persist_header(entry);
 
-        // Update tip if this chain has more work
-        if (entry.chain_work > m_best_work) {
+        // Update tip if this chain has more work, or equal-work competing block
+        // at the same height (peer represents network consensus).
+        bool dominated    = entry.chain_work > m_best_work;
+        bool equal_at_tip = entry.chain_work == m_best_work
+                         && new_height == m_tip_height
+                         && bhash != m_tip;
+        if (dominated || equal_at_tip) {
             m_best_work = entry.chain_work;
             m_tip = bhash;
             m_tip_height = new_height;
             rebuild_height_index(bhash);
+            if (equal_at_tip) {
+                LOG_WARNING << "[EMB-DOGE] EQUAL-WORK REORG at height " << new_height
+                            << " new_tip=" << bhash.GetHex().substr(0, 16);
+            }
         }
 
         return true;

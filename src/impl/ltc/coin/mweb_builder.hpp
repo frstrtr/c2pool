@@ -416,6 +416,17 @@ public:
         return m_state.valid;
     }
 
+    /// Invalidate current MWEB state (e.g., after a chain reorg).
+    /// Blocks will not include MWEB data until a fresh full block is received.
+    void invalidate() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_state.valid) {
+            LOG_WARNING << "[MWEB] State INVALIDATED (chain reorg) — was at height "
+                        << m_state.captured_at_height;
+        }
+        m_state = MWEBState{};  // reset to default (valid=false)
+    }
+
 private:
     mutable std::mutex m_mutex;
     MWEBState m_state;
