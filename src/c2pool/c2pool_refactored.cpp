@@ -3311,7 +3311,44 @@ int main(int argc, char* argv[]) {
             };
             monitor_timer->expires_after(std::chrono::seconds(30));
             monitor_timer->async_wait(monitor_tick);
-            
+
+            // ── Embedded LTC sync gate ──────────────────────────────────
+            // Match p2pool's implicit sync gate: block startup until the
+            // parent chain is ready.  p2pool blocks on getblocktemplate()
+            // which fails until the daemon is synced.  We block on
+            // HeaderChain::is_synced() (tip within 2 hours of wall clock).
+            //
+            // During this loop ioc runs — P2P header sync proceeds — but
+            // Stratum is NOT open yet, so miners see "connection refused".
+            // Merged chains (DOGE) do NOT block: they degrade gracefully
+            // once the parent chain is ready, matching p2pool behavior.
+            if (embedded_ltc && embedded_chain) {
+                LOG_INFO << "[EMB-LTC] Waiting for header chain sync before starting Stratum...";
+                auto sync_log_timer = std::chrono::steady_clock::now();
+                while (!embedded_chain->is_synced() && !g_shutdown_requested) {
+                    ioc.restart();
+                    try {
+                        ioc.run_for(std::chrono::milliseconds(100));
+                    } catch (const std::exception& e) {
+                        LOG_ERROR << "ioc handler exception during sync wait: " << e.what();
+                    }
+                    // Progress log every 5 seconds
+                    auto now = std::chrono::steady_clock::now();
+                    if (now - sync_log_timer >= std::chrono::seconds(5)) {
+                        LOG_INFO << "[EMB-LTC] Sync in progress: height="
+                                 << embedded_chain->height()
+                                 << " peers=" << embedded_broadcaster->connected_count();
+                        sync_log_timer = now;
+                    }
+                }
+                if (g_shutdown_requested) {
+                    LOG_INFO << "Shutdown requested during header sync — exiting";
+                    return 0;
+                }
+                LOG_INFO << "[EMB-LTC] Header chain synced (height="
+                         << embedded_chain->height() << ") — starting Stratum";
+            }
+
             if (!web_server.start()) {
                 LOG_ERROR << "Failed to start integrated mining pool";
                 return 1;
