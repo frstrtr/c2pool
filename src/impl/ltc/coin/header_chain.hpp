@@ -415,16 +415,25 @@ public:
 
     /// Add a single header. Returns true if accepted (new + valid).
     bool add_header(const BlockHeaderType& header) {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        bool ok = add_header_internal(header);
-        if (ok) {
-            persist_tip();
-            LOG_INFO << "[EMB-LTC] Single header accepted: height=" << m_tip_height
-                     << " hash=" << m_tip.GetHex().substr(0, 16) << "..."
-                     << " bits=0x" << std::hex << header.m_bits << std::dec
-                     << " ts=" << header.m_timestamp;
+        PendingTipChange ptc;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            bool ok = add_header_internal(header);
+            if (ok) {
+                persist_tip();
+                LOG_INFO << "[EMB-LTC] Single header accepted: height=" << m_tip_height
+                         << " hash=" << m_tip.GetHex().substr(0, 16) << "..."
+                         << " bits=0x" << std::hex << header.m_bits << std::dec
+                         << " ts=" << header.m_timestamp;
+            }
+            ptc = m_pending_tip_change;
+            m_pending_tip_change.fired = false;
+            if (!ok) return false;
         }
-        return ok;
+        // Fire tip-changed callback OUTSIDE the mutex to avoid deadlock
+        if (ptc.fired && m_on_tip_changed)
+            m_on_tip_changed(ptc.old_tip, ptc.old_height, ptc.new_tip, ptc.new_height);
+        return true;
     }
 
     /// Set the estimated network tip height (from peer's version message).
@@ -470,6 +479,7 @@ public:
         // Large batches during fast-sync (no scrypt), small near tip (scrypt active)
         size_t BATCH_SIZE = (peer_tip > 0 && m_tip_height + 2100 < peer_tip) ? 500 : 50;
         int accepted = 0;
+        PendingTipChange last_ptc;
         for (size_t offset = 0; offset < headers.size(); offset += BATCH_SIZE) {
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
@@ -478,6 +488,10 @@ public:
                     if (add_header_internal(headers[i]))
                         ++accepted;
                 }
+                // Capture any pending tip change from this batch
+                if (m_pending_tip_change.fired)
+                    last_ptc = m_pending_tip_change;
+                m_pending_tip_change.fired = false;
             }
             // Yield between batches so ioc-thread callers (get_height,
             // is_synced, get_tip) can acquire the mutex.
@@ -503,6 +517,9 @@ public:
                 }
             }
         }
+        // Fire tip-changed callback OUTSIDE the mutex to avoid deadlock
+        if (last_ptc.fired && m_on_tip_changed)
+            m_on_tip_changed(last_ptc.old_tip, last_ptc.old_height, last_ptc.new_tip, last_ptc.new_height);
         return accepted;
     }
 
@@ -683,9 +700,13 @@ private:
                                 << " new_height=" << new_height << " hash=" << bhash.GetHex().substr(0, 16);
                 }
             }
-            // Fire reorg callback (MWEB state invalidation, work refresh, etc.)
-            if (m_on_tip_changed)
-                m_on_tip_changed(old_tip, old_height, bhash, new_height);
+            // Defer reorg callback — will fire AFTER mutex is released by caller.
+            // Firing inside the lock causes deadlock (callback → getwork → get_header → lock).
+            m_pending_tip_change.fired = true;
+            m_pending_tip_change.old_tip = old_tip;
+            m_pending_tip_change.old_height = old_height;
+            m_pending_tip_change.new_tip = bhash;
+            m_pending_tip_change.new_height = new_height;
         }
 
         return true;
@@ -881,6 +902,14 @@ private:
 
     /// Callback fired on tip change (reorg / equal-work switch).
     TipChangedCallback m_on_tip_changed;
+
+    /// Deferred tip change — fired OUTSIDE mutex to avoid deadlock.
+    struct PendingTipChange {
+        bool fired{false};
+        uint256 old_tip, new_tip;
+        uint32_t old_height{0}, new_height{0};
+    };
+    PendingTipChange m_pending_tip_change;
 };
 
 } // namespace coin

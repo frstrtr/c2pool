@@ -1188,7 +1188,7 @@ int main(int argc, char* argv[]) {
 
             if (embedded_ltc) {
                 LOG_INFO << "╔══════════════════════════════════════════════════════════════╗";
-                LOG_INFO << "║  [EMB-LTC] Phase 4: EMBEDDED COIN NODE MODE                 ║";
+                LOG_INFO << "║  [EMB-LTC] Phase 4: EMBEDDED COIN NODE MODE                  ║";
                 LOG_INFO << "║  No litecoind RPC required — SPV header chain + P2P sync     ║";
                 LOG_INFO << "╚══════════════════════════════════════════════════════════════╝";
 
