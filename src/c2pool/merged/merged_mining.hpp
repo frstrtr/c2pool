@@ -350,6 +350,7 @@ private:
         // try_submit_merged_blocks uses these instead of rebuilding.
         std::string frozen_coinbase_hex;   // pre-built PPLNS coinbase from ref_hash_fn time
         nlohmann::json frozen_template;    // template snapshot from ref_hash_fn time
+        uint256 frozen_block_hash;         // block hash at commit time (for AuxPoW proof)
     };
     std::vector<ChainState> m_chains;
 

@@ -775,13 +775,18 @@ void MergedMiningManager::try_submit_merged_blocks(
 
         uint32_t slot = it->second;
 
-        // Build all slot hashes
+        // Build all slot hashes using FROZEN block hashes (from commit time).
+        // The LTC coinbase commitment was built from frozen hashes — the AuxPoW
+        // proof must reference the same hashes or dogecoind rejects with
+        // "Aux POW missing chain merkle root in parent coinbase".
         std::map<uint32_t, uint256> slot_hashes;
         for (const auto& c : m_chains) {
-            if (!c.current_work.block_hash.IsNull()) {
+            auto hash = !c.frozen_block_hash.IsNull() ? c.frozen_block_hash
+                                                       : c.current_work.block_hash;
+            if (!hash.IsNull()) {
                 auto sit = m_tree.slot_map.find(c.config.chain_id);
                 if (sit != m_tree.slot_map.end())
-                    slot_hashes[sit->second] = c.current_work.block_hash;
+                    slot_hashes[sit->second] = hash;
             }
         }
 
@@ -1065,8 +1070,10 @@ MergedMiningManager::build_merged_header_info_with_commitment()
         LOG_TRACE << "[MM-commit] freezing chain " << hi.chain_id;
         for (auto& chain : m_chains) {
             if (chain.config.chain_id != hi.chain_id) continue;
-            if (hi.block_header.size() == 80)
+            if (hi.block_header.size() == 80) {
                 chain.current_work.block_hash = Hash(hi.block_header);
+                chain.frozen_block_hash = chain.current_work.block_hash;
+            }
             chain.frozen_coinbase_hex = hi.coinbase_hex;
             chain.frozen_template = chain.current_work.block_template;
             LOG_TRACE << "[MM-commit] chain " << hi.chain_id << " frozen";
