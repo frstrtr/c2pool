@@ -168,7 +168,7 @@ void NodeImpl::close_connection(const NetService& service)
 void NodeImpl::send_version(peer_ptr peer)
 {
     auto rmsg = ltc::message_version::make_raw(
-        ltc::PoolConfig::MINIMUM_PROTOCOL_VERSION,
+        ltc::PoolConfig::ADVERTISED_PROTOCOL_VERSION,
         1,                                    // services
         addr_t{1, peer->addr()},              // addr_to (the remote)
         addr_t{1, NetService{"0.0.0.0", ltc::PoolConfig::P2P_PORT}}, // addr_from (us)

@@ -268,7 +268,7 @@ void StratumServer::notify_all()
     // sessions_mutex_ RELEASED — safe to call into m_work_mutex territory
     for (auto& s : snapshot) {
         try {
-            if (s->is_connected())
+            if (s->is_connected() && s->is_subscribed())
                 s->send_notify_work(true, &frozen_best);  // clean_jobs=true: miner switches to new prev_share immediately (p2pool behavior)
         } catch (...) {}
     }
@@ -955,6 +955,8 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     snapshot.frozen_ref.frozen_merkle_branches = job.frozen_merkle_branches;
     snapshot.frozen_ref.frozen_witness_root = job.frozen_witness_root;
     snapshot.frozen_ref.frozen_merged_coinbase_info = job.frozen_merged_coinbase_info;
+    snapshot.frozen_ref.share_version = job.share_version;
+    snapshot.frozen_ref.desired_version = job.desired_version;
     // NOTE: stale_info is NOT propagated here. It must match what ref_hash_fn
     // used at job creation time (always 0 for now). Changing it at submit
     // time would break ref_hash consistency. Future: compute stale_info
@@ -1299,6 +1301,8 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         je.frozen_merkle_branches = cbr.snapshot.frozen_ref.frozen_merkle_branches;
         je.frozen_witness_root = cbr.snapshot.frozen_ref.frozen_witness_root;
         je.frozen_merged_coinbase_info = cbr.snapshot.frozen_ref.frozen_merged_coinbase_info;
+        je.share_version = cbr.snapshot.frozen_ref.share_version;
+        je.desired_version = cbr.snapshot.frozen_ref.desired_version;
         je.has_frozen = true;
 
         if (!tmpl.empty() && !tmpl.is_null() && tmpl.contains("transactions")) {

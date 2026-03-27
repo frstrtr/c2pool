@@ -1405,6 +1405,72 @@ public:
         return result;
     }
 
+    // -- V35 PPLNS expected payouts --
+    // Flat (non-decayed) weights, GRANDPARENT start, height-1 window.
+    // Returns amounts WITHOUT finder fee — caller adds subsidy/200 to the
+    // share creator's script.  Donation absorbs the remainder.
+    // Reference: p2pool data.py lines 878-965
+    std::map<std::vector<unsigned char>, double>
+    get_v35_expected_payouts(const uint256& best_share_hash, const uint256& block_target, uint64_t subsidy,
+                             const std::vector<unsigned char>& donation_script)
+    {
+        // V35: PPLNS starts from the GRANDPARENT (prev_share.prev_hash)
+        // Reference: data.py line 884
+        uint256 pplns_start;
+        if (!best_share_hash.IsNull() && chain.contains(best_share_hash)) {
+            chain.get(best_share_hash).share.invoke([&](auto* s) {
+                pplns_start = s->m_prev_hash;  // grandparent
+            });
+        }
+
+        if (pplns_start.IsNull()) {
+            // No grandparent: all subsidy to donation
+            std::map<std::vector<unsigned char>, double> result;
+            result[donation_script] = static_cast<double>(subsidy);
+            return result;
+        }
+
+        // V35: max_shares = max(0, min(height, REAL_CHAIN_LENGTH) - 1)
+        // Reference: data.py line 885
+        auto height = chain.get_height(best_share_hash);
+        int32_t max_shares = std::max(0, std::min(height, static_cast<int32_t>(PoolConfig::real_chain_length())) - 1);
+
+        // V35: desired_weight = 65535 * SPREAD * target_to_average_attempts(block_target)
+        // Reference: data.py line 886
+        uint288 desired_weight = chain::target_to_average_attempts(block_target)
+                                 * uint288(PoolConfig::SPREAD) * uint288(65535);
+
+        // Flat weight accumulation with hard cap (existing get_cumulative_weights)
+        auto [weights, total_weight, donation_weight] = get_cumulative_weights(pplns_start, max_shares, desired_weight);
+
+        std::map<std::vector<unsigned char>, double> result;
+        uint64_t sum = 0;
+
+        if (!total_weight.IsNull())
+        {
+            for (const auto& [script, weight] : weights)
+            {
+                // V35: 99.5% to PPLNS — subsidy * 199 * weight / (200 * total_weight)
+                // Reference: data.py line 924
+                uint64_t amount = (uint288(subsidy) * uint288(199) * weight / (uint288(200) * total_weight)).GetLow64();
+                if (amount > 0)
+                {
+                    result[script] = static_cast<double>(amount);
+                    sum += amount;
+                }
+            }
+        }
+
+        // Remainder goes to donation (includes the ~0.5% finder fee portion;
+        // caller subtracts subsidy/200 for the finder and assigns it per-connection)
+        // V35: NO minimum donation enforcement (unlike v36)
+        uint64_t donation_amount = (subsidy > sum) ? (subsidy - sum) : 0;
+        result[donation_script] = (result.contains(donation_script) ? result[donation_script] : 0.0)
+                                  + static_cast<double>(donation_amount);
+
+        return result;
+    }
+
     // -- Stale share proportion --
     float get_average_stale_prop(const uint256& share_hash, uint64_t lookbehind)
     {

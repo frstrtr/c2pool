@@ -2,7 +2,7 @@
 
 // AutoRatchet: autonomous share version transition state machine.
 //
-// Manages V36 → V37 (and future) share format transitions without manual
+// Manages V35 → V36 (and future) share format transitions without manual
 // operator coordination. Persists state to JSON file so restarts don't
 // regress once the network has confirmed a new version.
 //
@@ -63,7 +63,7 @@ public:
     static constexpr int SWITCH_THRESHOLD = 60;        // % required for format switch in validation
 
     explicit AutoRatchet(const std::string& state_file_path = "",
-                         int64_t target_version = 37)
+                         int64_t target_version = 36)
         : state_file_(state_file_path)
         , target_version_(target_version)
     {
