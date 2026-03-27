@@ -2626,10 +2626,15 @@ int main(int argc, char* argv[]) {
                         LOG_TRACE << "[ref_hash_fn] getting far_share (99th parent)...";
                         {
                             auto [prev_height, last] = tracker.chain.get_height_and_last(params.prev_share);
-                            if (last.IsNull() && prev_height < 99) {
+                            if (prev_height < 99) {
+                                // Chain too short (cold-start, fragmented) — no 99th ancestor
                                 params.far_share_hash = uint256();
                             } else {
-                                params.far_share_hash = tracker.chain.get_nth_parent_key(params.prev_share, 99);
+                                try {
+                                    params.far_share_hash = tracker.chain.get_nth_parent_key(params.prev_share, 99);
+                                } catch (const std::exception&) {
+                                    params.far_share_hash = uint256();
+                                }
                             }
                         }
 

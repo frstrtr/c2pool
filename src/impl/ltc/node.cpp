@@ -719,8 +719,14 @@ void NodeImpl::download_shares(peer_ptr /*unused_peer*/, const uint256& target_h
     // p2pool: stops=list(set(tracker.heads) | set(
     //   tracker.get_nth_parent_hash(head, min(max(0, height-1), 10))
     //   for head in tracker.heads))[:100]
+    //
+    // IMPORTANT: On cold-start with fragmented chains (many heads, 0 verified),
+    // including ALL heads as stops causes the responding peer to stop walking
+    // after just 10-15 shares (every share in their chain hits one of our stops).
+    // Fix: only use stops when we have a verified chain (non-fragmented state).
     std::vector<uint256> stops;
-    {
+    bool has_verified_chain = !m_tracker.verified.get_heads().empty();
+    if (has_verified_chain) {
         std::set<uint256> stop_set;
         for (auto& [head_hash, tail_hash] : m_tracker.chain.get_heads()) {
             stop_set.insert(head_hash);
@@ -738,6 +744,7 @@ void NodeImpl::download_shares(peer_ptr /*unused_peer*/, const uint256& target_h
             stops.push_back(s);
         }
     }
+    // Cold-start: empty stops → peer sends full chain from target_hash
 
     auto req_id = core::random::random_uint256();
     std::vector<uint256> hashes = { target_hash };
