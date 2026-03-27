@@ -666,7 +666,23 @@ uint256 NodeImpl::best_share_hash()
         }
     }
 
-    // Fallback to raw chain during initial sync
+    // No verified chain yet — return null to prevent creating shares with
+    // MAX_TARGET max_bits.  p2pool does the same: best_share_var.value = None
+    // until the verified chain exists, and generate_transaction refuses to
+    // create work when best_share is None (with peers connected).
+    //
+    // On a genesis node (no peers, fresh chain), this returns ZERO which
+    // triggers genesis share creation with 100% donation payout.
+    if (!m_peers.empty()) {
+        static int wait_log = 0;
+        if (wait_log++ % 12 == 0)
+            LOG_INFO << "[best_share] waiting for verified chain (peers="
+                     << m_peers.size() << " raw="
+                     << (m_chain ? m_chain->size() : 0) << ")";
+        return uint256::ZERO;
+    }
+
+    // True genesis: no peers at all — use raw chain to bootstrap
     if (!m_chain || m_chain->size() == 0)
         return uint256::ZERO;
 
@@ -681,7 +697,7 @@ uint256 NodeImpl::best_share_hash()
     }
     static int raw_log = 0;
     if (raw_log++ % 60 == 0)
-        LOG_INFO << "[best_share] using RAW head (no verified yet) height=" << best_height;
+        LOG_INFO << "[best_share] using RAW head (genesis, no peers) height=" << best_height;
     return best;
 }
 

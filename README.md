@@ -205,6 +205,10 @@ CLI arguments always take priority over YAML values.
 | `--coinbase-text` | `coinbase_text` | — | Custom coinbase scriptSig text (see below) |
 | `--message-blob-hex` | — | — | V36 authority message blob |
 | `--embedded-ltc` | — | off | Use embedded SPV for LTC (no litecoind needed) |
+| `--embedded-doge` | — | off | Use embedded SPV for DOGE merged mining (no dogecoind needed) |
+| `--doge-header-checkpoint` | — | — | DOGE header chain starting point (`HEIGHT:HASH`) |
+| `--doge-testnet4alpha` | — | off | Use DOGE testnet4alpha (isolated custom testnet) |
+| `--startup-mode` | — | auto | Sharechain bootstrap: `auto`, `genesis`, or `wait` |
 | `--network-id` | `network_id` | 0 | Private chain identifier (hex, see below) |
 
 See [config/c2pool_testnet.yaml](config/c2pool_testnet.yaml) for a complete example.
@@ -278,6 +282,39 @@ a found block's PPLNS distribution matches the committed state root.
 
 Metadata is truncated from the end when space is limited (e.g., long
 operator text reduces metadata space).
+
+---
+
+## Sharechain bootstrap
+
+When a c2pool node starts for the first time, it needs to download and verify
+the existing share chain from peers before it can create valid shares.
+
+**Bootstrap behavior** (matches p2pool `PERSIST` logic):
+
+| Condition | Behavior |
+|-----------|----------|
+| Has peers, no verified chain | **Wait** — downloads shares, verifies, then starts mining. Prevents creating shares with invalid difficulty (`max_bits=MAX_TARGET`). |
+| Has peers, verified chain exists | **Mine** — creates shares extending the verified chain tip. |
+| No peers, empty chain | **Genesis** — creates the first share on a new chain (100% to donation). |
+
+The `--startup-mode` flag controls initial behavior:
+
+| Mode | Description |
+|------|-------------|
+| `auto` (default) | Wait 60s for peers, then create genesis if none found. |
+| `genesis` | Create new chain immediately, don't wait for peers. |
+| `wait` | Never create genesis — wait indefinitely for peers (p2pool `PERSIST=True`). |
+
+**Cold-start timeline** (typical, joining existing network):
+
+1. Connect to peers (~2s)
+2. Download share chain (~5s, 800+ shares in 1-2 batches)
+3. Verify shares (~3s, incremental from tail to tip)
+4. Start mining on verified chain tip
+
+Miners connected to stratum receive work immediately, but shares are only
+created and broadcast to the P2P network after step 4 completes.
 
 ---
 
