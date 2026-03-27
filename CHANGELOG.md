@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.9.3] - 2026-03-27
+
+### Milestone
+- **Embedded DOGE merged mining** — first DOGE block accepted on testnet4alpha via pure embedded SPV P2P. Zero daemon dependencies for LTC+DOGE mining.
+
+### Added
+- **Embedded LTC SPV node** (`--embedded-ltc`) — HeaderChain with LevelDB persistence, P2P header sync, MWEB HogEx carry-forward, mempool with conflict detection. Blocks accepted on LTC testnet.
+- **Embedded DOGE SPV node** (`--embedded-doge`) — AuxPoW header parser, DigiShield v3 difficulty, random subsidy via Mersenne Twister (boost-compatible), auto-generated `--merged DOGE:98` spec.
+- **DOGE-compatible P2P protocol** — protocol version 70015, no NODE_WITNESS/NODE_MWEB, no sendcmpct v2, no feefilter, MSG_BLOCK instead of MSG_MWEB_BLOCK for DOGE peers.
+- **AuxPoW header parser** — `parse_doge_headers_message()` extracts 80-byte base headers from DOGE extended P2P format (2000 headers/batch).
+- **Isolated network mode** — `disable_discovery` for testnet4alpha: single-peer operation, no addr crawl, no emergency refresh.
+- **DNS seed discovery** — async DNS resolution with fixed seed fallback for both LTC and DOGE networks.
+- **Addrman hardening** — network group dedup, tried/new table separation, anchor peer persistence.
+- **Block version from chain tip** — derives BIP9/AuxPoW version bits from tip header instead of hardcoded constants.
+- **Block hex logging** — saves merged block hex to `/tmp/c2pool_doge_block_*.hex` for manual verification.
+
+### Fixed
+- **Heap corruption in refresh_work()** — two threads (embedded header callback + stratum submit) racing through `build_coinbase_parts()`. Fixed with try_lock serialization.
+- **SIGSEGV #1: StratumSession timer use-after-free** — timer callbacks held raw `this` pointer. Fixed with `weak_from_this()`.
+- **SIGSEGV #2: JobSnapshot map reference invalidated** — copy by value instead of holding map reference.
+- **DOGE coinbase overpay** — testnet4alpha uses random rewards (Mersenne Twister seeded from prevHash), not fixed 500k DOGE. Implemented exact Dogecoin Core subsidy calculation.
+- **DOGE AuxPoW version mismatch** — committed block hash used version without AuxPoW bit (0x100), causing AuxPoW proof check failure. Both commit and submit now use identical version.
+- **DOGE header sync stall** — empty locator sent genesis hash causing peer to skip genesis block. Fixed: empty locator triggers genesis-inclusive response.
+- **DOGE AuxPoW PoW validation** — scrypt validation on AuxPoW blocks fails because PoW is on parent chain. Skip scrypt for AuxPoW heights.
+- **O(n^2) header sync** — `rebuild_height_index()` on every header. Incremental update for linear chain.
+- **bits=0 after checkpoint** — chain too short for retarget. Fallback to pow_limit.
+- **BIP9 version bits** — hardcoded BLOCK_VERSION=4. Derive from chain tip.
+- **NODE_MWEB not advertised** — peers ignored MSG_MWEB_BLOCK requests. Added to version services.
+- **Equal-work chain reorg** — testnet min-difficulty blocks have equal work. Switch tip on equal work at same height.
+- **Deadlock on reorg** — tip-changed callback inside HeaderChain mutex. Deferred PendingTipChange.
+- **Stale mempool transactions** — never removed confirmed txs. Added remove_for_block + conflict detection.
+
 ## [0.9.2] - 2026-03-20
 
 ### Security

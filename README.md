@@ -8,6 +8,8 @@ Bitcoin wiki: <https://en.bitcoin.it/wiki/P2Pool>
 Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 
 > **First merged-mined DOGE block:** [#6135703](https://blockchair.com/dogecoin/block/f84500c25a4cce2a08887f29763726bd5ecec7b66fed65a88b181fb0b0ab2383) (2026-03-23) — decentralized LTC+DOGE merged mining via P2Pool V36, cross-validated with c2pool on shared share chain
+>
+> **First daemonless DOGE block:** (2026-03-27) — DOGE block accepted on testnet4alpha via embedded SPV P2P, no dogecoind RPC needed
 
 ---
 
@@ -18,6 +20,8 @@ Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 | V36 share format (LTC parent chain) | Active development |
 | V36 share format (DGB Scrypt parent chain) | Planned |
 | Merged mining (DOGE, PEP, BELLS, LKY, JKC, SHIC) | Working |
+| Embedded LTC SPV node (`--embedded-ltc`) | Working — blocks accepted on testnet |
+| Embedded DOGE SPV node (`--embedded-doge`) | Working — blocks accepted on testnet4alpha |
 | Coin daemon RPC/P2P | Hardened (softfork gate, keepalive, timeouts) |
 | Stratum mining server | Working |
 | VARDIFF | Working |
