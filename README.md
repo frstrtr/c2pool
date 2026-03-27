@@ -13,27 +13,6 @@ Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 
 ---
 
-## Status
-
-| Area | Status |
-|---|---|
-| V36 share format (LTC parent chain) | Active development |
-| V36 share format (DGB Scrypt parent chain) | Planned |
-| Merged mining (DOGE, PEP, BELLS, LKY, JKC, SHIC) | Working |
-| Embedded LTC SPV node (`--embedded-ltc`) | Working — blocks accepted on testnet |
-| Embedded DOGE SPV node (`--embedded-doge`) | Working — blocks accepted on testnet4alpha |
-| Coin daemon RPC/P2P | Hardened (softfork gate, keepalive, timeouts) |
-| Stratum mining server | Working |
-| VARDIFF | Working |
-| Payout / PPLNS | Working |
-| Authority message blobs (V36) | Working |
-| Test suite | 390 tests, all passing |
-
-> **Need a pool running today?**  
-> [frstrtr/p2pool-merged-v36](https://github.com/frstrtr/p2pool-merged-v36) — production Python V36 pool (LTC + DGB + DOGE, Docker, dashboard).
-
----
-
 ## Quick start
 
 ```bash
@@ -48,318 +27,342 @@ cd c2pool && mkdir build && cd build
 conan install .. --build=missing --output-folder=. --settings=build_type=Debug
 cmake .. --preset conan-debug
 cmake --build . --target c2pool -j$(nproc)
+
+# 3 — run (zero config)
+./src/c2pool/c2pool
 ```
+
+That's it. No litecoind, no dogecoind, no config file. The node starts in
+**integrated P2P pool mode** with embedded LTC and DOGE SPV nodes, connects
+to p2pool sharechain peers via hardcoded bootstrap hosts, and waits for
+shares before opening stratum to miners.
+
+Miners connect to stratum and set their LTC payout address as the username
+(p2pool convention). No `--address` flag needed.
 
 Full step-by-step guide: [doc/build-unix.md](doc/build-unix.md)
 
 ---
 
-## Running
+## Operating modes
+
+c2pool has four operating modes. The default is a full P2P pool — no flags required.
+
+| Mode | CLI flag | P2P sharechain | Coinbase payouts | Use case |
+|------|----------|:-:|---|---|
+| **Integrated** | *(default)* | yes | PPLNS from sharechain | Decentralized pool node |
+| **Solo** | `--solo` | no | Proportional by miner hashrate | Private pool for own ASICs |
+| **Custodial** | `--custodial` | no | 100% to `--address` | Hosted pool, off-chain accounting |
+| **Sharechain** | `--sharechain` | yes | *(no mining)* | P2P relay node only |
+
+Legacy `--standalone` mode (minimal stratum + RPC daemon, no embedded SPV) is available for backwards compatibility.
+
+### Startup examples
 
 ```bash
-# Integrated mode with embedded SPV (no separate LTC/DOGE daemons needed)
-./src/c2pool/c2pool --integrated --net litecoin --embedded-ltc --embedded-doge \
-  --address YOUR_LTC_ADDRESS
+# Default: full P2P pool, embedded SPV, wait for peers
+./c2pool
 
-# Or with external daemons + additional merged chains
-./src/c2pool/c2pool --integrated --net litecoin \
+# Same, with explicit address for node-owner fee
+./c2pool --address YOUR_LTC_ADDRESS --fee 1
+
+# Solo pool for own miners (no sharechain, proportional payouts)
+./c2pool --solo
+
+# Custodial pool (all coinbase to operator, stratum for accounting)
+./c2pool --custodial --address YOUR_LTC_ADDRESS
+
+# With external LTC daemon instead of embedded SPV
+./c2pool --no-embedded-ltc \
   --coind-address 127.0.0.1 --coind-rpc-port 9332 \
-  --rpcuser litecoinrpc --rpcpassword RPCPASSWORD \
-  --address YOUR_LTC_ADDRESS \
-  --merged DOGE:98:127.0.0.1:22555:dogerpc:dogepass \
-  --merged PEP:63:127.0.0.1:29377:peprpc:peppass \
-  --merged LKY:8211:127.0.0.1:9916:lkyrpc:lkypass
+  --rpcuser user --rpcpassword pass
 
-# Testnet quick smoke-test
-./src/c2pool/c2pool --integrated --testnet
+# Testnet
+./c2pool --testnet
+
+# With config file
+./c2pool --config config/c2pool_mainnet.yaml
 
 # Full option reference
-./src/c2pool/c2pool --help
+./c2pool --help
 ```
 
-**Default ports**
+### Feature matrix
 
-| Port | Purpose |
-|------|--------|
-| 9326 | P2Pool sharechain (peer-to-peer) |
-| 9327 | Stratum mining + HTTP API |
+| Feature | Integrated | Solo | Custodial | Sharechain |
+|---------|:---:|:---:|:---:|:---:|
+| Embedded LTC SPV | on | on | on | -- |
+| Embedded DOGE SPV | on | on | on | -- |
+| Stratum server | yes | yes | yes | -- |
+| VARDIFF | yes | yes | yes | -- |
+| P2P share exchange | yes | -- | -- | yes |
+| PPLNS payouts | yes | -- | -- | -- |
+| Proportional payouts | -- | yes | -- | -- |
+| Single-address coinbase | -- | -- | yes | -- |
+| Merged mining (DOGE etc.) | yes | yes | yes | -- |
+| Web dashboard + REST API | yes | yes | yes | -- |
+| Per-worker accounting | yes | yes | yes | -- |
+| `--address` required | no | no | **yes** | no |
+| `--fee` supported | yes | yes | -- | -- |
+| Redistribute modes | yes | -- | -- | -- |
+| ShareTracker / LevelDB | yes | -- | -- | yes |
+| Think loop / monitoring | yes | -- | -- | -- |
 
-**Merged mining chains**
+### Payout model by mode
 
-LTC and DOGE have built-in embedded SPV nodes — no separate daemon required.
+| Mode | Who gets paid | How amounts are calculated |
+|------|---------------|---------------------------|
+| **Integrated** | All miners in PPLNS window | Share weight from sharechain (decentralized consensus) |
+| **Solo** | Connected stratum miners | Proportional to real-time hashrate from RateMonitor |
+| **Custodial** | Node operator only | 100% of block reward to `--address`; miners tracked in `/stratum_stats` |
+
+In **integrated** and **solo** modes, miners set their payout address as
+their stratum username (e.g., `LcAddress.worker1`). The address appears
+directly in coinbase outputs. `--address` is optional — it serves as the
+node operator's fee destination and fallback when no miners are connected.
+
+In **custodial** mode, miner stratum usernames are used for accounting only
+and never appear in coinbase outputs. The backoffice polls `/stratum_stats`
+for per-worker hashrate, accepted shares, and connection time.
+
+---
+
+## Defaults
+
+Running `c2pool` with no arguments is equivalent to:
+
+```
+--integrated --embedded-ltc --embedded-doge --wait-for-peers
+--header-checkpoint 3079000:862daf...
+--doge-header-checkpoint 6140000:743b7e...
+```
+
+| Setting | Default | Override |
+|---------|---------|----------|
+| Operating mode | Integrated P2P pool | `--solo`, `--custodial`, `--sharechain`, `--standalone` |
+| LTC backend | Embedded SPV (DNS seeds) | `--no-embedded-ltc` (requires RPC daemon) |
+| DOGE backend | Embedded SPV | `--no-embedded-doge` (disables merged mining) |
+| LTC bootstrap | Block 3,079,000 | `--header-checkpoint HEIGHT:HASH` |
+| DOGE bootstrap | Block 6,140,000 | `--doge-header-checkpoint HEIGHT:HASH` |
+| Startup mode | Wait for peers (persist=true) | `--genesis` or `--startup-mode auto` |
+| Coin daemon | Not required | `--coind-address` / `--coind-rpc-port` |
+| `--address` | Optional (miners use stratum username) | Required only for `--custodial` |
+| `--fee` | 0% | `-f 1` (1% to `--address`) |
+| Stratum port | 9327 | `-w PORT` |
+| P2P port | 9326 | `--p2pool-port PORT` |
+| Web port | 8080 | `--web-port PORT` |
+
+### Testnet overrides
+
+On `--testnet`, mainnet SPV checkpoints are automatically cleared (testnet
+uses a different chain). Ports shift to testnet defaults (P2P 19326,
+stratum 19327).
+
+---
+
+## Peer discovery and sharechain bootstrap
+
+The sharechain P2P layer discovers peers from multiple sources:
+
+| Source | Config | Priority |
+|--------|--------|----------|
+| CLI seed nodes | `-n HOST:PORT` (repeatable) | Highest |
+| YAML config | `seed_nodes:` list | Appended to CLI |
+| `~/.c2pool/ltc/pool.yaml` | `bootstrap_addrs:` (auto-generated, persists learned peers) | Medium |
+| Hardcoded bootstrap hosts | `ml.toom.im`, `usa.p2p-spb.xyz`, + 9 IPs | Fallback |
+
+With `startup_mode: wait` (default), the node waits until peers deliver
+shares before opening stratum. This matches p2pool's `PERSIST=True` behavior.
+
+| Startup mode | CLI flag | Behavior |
+|-------------|----------|----------|
+| **wait** (default) | `--wait-for-peers` | Wait for peers to deliver shares, then mine |
+| genesis | `--genesis` | Create first share immediately (new chain) |
+| auto | `--startup-mode auto` | Wait 60s for peers, then genesis |
+
+---
+
+## Merged mining
+
+LTC and DOGE have built-in embedded SPV nodes (enabled by default).
 Other chains need their daemon running externally.
 
-| Coin | chain_id | Daemon | `--merged` example |
-|------|----------|--------|--------------------|
-| DOGE | 98 | **Embedded SPV** (or external) | `DOGE:98:127.0.0.1:22555:user:pass` |
-| PEP | 63 | External (`pepecoind`) | `PEP:63:127.0.0.1:29377:user:pass` |
-| BELLS | 16 | External (`bellsd`) | `BELLS:16:127.0.0.1:19918:user:pass` |
-| LKY | 8211 | External (`luckycoind`) | `LKY:8211:127.0.0.1:9916:user:pass` |
-| JKC | 8224 | External (`junkcoind`) | `JKC:8224:127.0.0.1:9770:user:pass` |
-| SHIC | 74 | External (`shibacoind`) | `SHIC:74:127.0.0.1:33863:user:pass` |
-| DINGO | 98 | External (`dingocoind`) | Cannot run with DOGE (same chain_id) |
+| Coin | chain_id | Backend | `--merged` example |
+|------|----------|---------|---------------------|
+| DOGE | 98 | **Embedded SPV** | auto-configured |
+| PEP | 63 | External | `PEP:63:127.0.0.1:29377:user:pass` |
+| BELLS | 16 | External | `BELLS:16:127.0.0.1:19918:user:pass` |
+| LKY | 8211 | External | `LKY:8211:127.0.0.1:9916:user:pass` |
+| JKC | 8224 | External | `JKC:8224:127.0.0.1:9770:user:pass` |
+| SHIC | 74 | External | `SHIC:74:127.0.0.1:33863:user:pass` |
+| DINGO | 98 | External | Cannot run with DOGE (same chain_id) |
 
-LTC and DOGE use built-in embedded SPV nodes — zero external dependencies for the core LTC+DOGE setup. External daemons use `createauxblock`/`submitauxblock` RPC.
+DOGE merged mining activates automatically when `--embedded-doge` is on (default).
+External daemons use `createauxblock`/`submitauxblock` RPC.
 
-**DigiByte Scrypt** is planned as a second parent chain (`--net digibyte`), running its own P2Pool sharechain network. DGB Scrypt produces valid Scrypt PoW, so it can also merge-mine DOGE and the other AuxPoW coins.
+**DigiByte Scrypt** is planned as a second parent chain (`--net digibyte`),
+running its own P2Pool sharechain network.
 
-See [deploy/DEPLOY.md](deploy/DEPLOY.md) for HiveOS/MinerStat/RaveOS setup.
+---
 
-**API endpoints** (integrated mode)
+## Ports
 
-```
-GET  /local_rate          local pool hashrate
-GET  /global_rate         network hashrate
-GET  /current_payouts     PPLNS expected payouts
-GET  /recent_blocks       blocks found by pool
-GET  /global_stats        comprehensive pool stats
-GET  /sharechain/stats    sharechain tracker data
-GET  /local_stats         p2pool-compatible local stats
-POST {jsonrpc}            getinfo, getminerstats, getpayoutinfo, ...
-```
+| Port | Purpose |
+|------|---------|
+| 9326 | P2Pool sharechain (peer-to-peer) |
+| 9327 | Stratum mining |
+| 8080 | Web dashboard + REST API |
 
-**Web dashboard** — served by default from `web-static/`:
+---
+
+## Configuration
+
+CLI arguments always take priority over YAML values.
 
 ```bash
-# Built-in dashboard
-xdg-open http://localhost:8080/
-
-# Custom dashboard directory
-./src/c2pool/c2pool --dashboard-dir /path/to/my-dashboard ...
+# Use a YAML config file
+./c2pool --config config/c2pool_mainnet.yaml
 ```
 
+See [config/c2pool_mainnet.yaml](config/c2pool_mainnet.yaml) (mainnet) and
+[config/c2pool_testnet.yaml](config/c2pool_testnet.yaml) (testnet) for
+complete examples with all options documented.
+
+### Configuration reference
+
+| CLI flag | YAML key | Default | Description |
+|----------|----------|---------|-------------|
+| `--integrated` | `integrated` | **true** | Full P2P pool mode |
+| `--solo` | `solo` | false | Solo pool (no sharechain) |
+| `--custodial` | `custodial` | false | Custodial pool (single-address coinbase) |
+| `--sharechain` | `sharechain` | false | P2P node only (no mining) |
+| `--standalone` | -- | false | Legacy solo (RPC daemon, no embedded SPV) |
+| `--embedded-ltc` | `embedded_ltc` | **true** | Embedded LTC SPV node |
+| `--no-embedded-ltc` | | | Disable embedded LTC, use RPC daemon |
+| `--embedded-doge` | `embedded_doge` | **true** | Embedded DOGE SPV for merged mining |
+| `--no-embedded-doge` | | | Disable embedded DOGE |
+| `--net` | -- | litecoin | Blockchain: `litecoin`, `bitcoin`, `dogecoin` |
+| `--testnet` | `testnet` | false | Enable testnet mode |
+| `--config FILE` | -- | -- | YAML config file path |
+| `--address` | `solo_address` | -- | Node operator payout address (optional) |
+| `--give-author` | `donation_percentage` | 0.1 | Developer fee % (p2pool default: 0.5%) |
+| `-f` / `--fee` | `node_owner_fee` | 0 | Node owner fee % |
+| `--node-owner-address` | `node_owner_address` | -- | Node owner payout address |
+| `--redistribute` | `redistribute` | pplns | Mode: pplns/fee/boost/donate |
+| `-n HOST:PORT` | `seed_nodes` | -- | Sharechain seed peer (repeatable) |
+| `--startup-mode` | `startup_mode` | **wait** | Bootstrap: `wait`, `genesis`, `auto` |
+| `--genesis` | | | Shortcut for `--startup-mode genesis` |
+| `--wait-for-peers` | | | Shortcut for `--startup-mode wait` |
+| `--header-checkpoint` | `header_checkpoint` | mainnet default | LTC SPV starting point (`HEIGHT:HASH`) |
+| `--doge-header-checkpoint` | `doge_header_checkpoint` | mainnet default | DOGE SPV starting point |
+| `--p2pool-port` | `port` | 9326 | P2P sharechain port |
+| `-w` / `--worker-port` | `stratum_port` | 9327 | Stratum mining port |
+| `--web-port` | `web_port` | 8080 | HTTP API / dashboard port |
+| `--http-host` | `http_host` | 0.0.0.0 | HTTP bind address |
+| `--coind-address` | `ltc_rpc_host` | 127.0.0.1 | Coin daemon RPC host |
+| `--coind-rpc-port` | `ltc_rpc_port` | auto | Coin daemon RPC port |
+| `--rpcuser` | `ltc_rpc_user` | -- | RPC username |
+| `--rpcpassword` | `ltc_rpc_password` | -- | RPC password |
+| `--max-conns` | -- | 8 | Target outbound P2P peers |
+| `--stratum-min-diff` | `min_difficulty` | 0.001 | Vardiff floor |
+| `--stratum-max-diff` | `max_difficulty` | 65536 | Vardiff ceiling |
+| `--stratum-target-time` | `target_time` | 10 | Seconds between pseudoshares |
+| `--no-vardiff` | `vardiff_enabled` | true | Disable auto-difficulty |
+| `--max-coinbase-outputs` | `max_coinbase_outputs` | 4000 | Max coinbase outputs |
+| `--network-id` | `network_id` | 0 | Private chain identifier (hex) |
+| `--log-level` | `log_level` | INFO | trace/debug/info/warning/error |
+| `--log-file` | `log_file` | debug.log | Log filename |
+| `--log-rotation-mb` | `log_rotation_size_mb` | 100 | Log rotation threshold (MB) |
+| `--log-max-mb` | `log_max_total_mb` | 50 | Max rotated log space (MB) |
+| `--p2p-max-peers` | `p2p_max_peers` | 30 | Max total P2P peers |
+| `--ban-duration` | `ban_duration` | 300 | P2P ban duration (seconds) |
+| `--rss-limit-mb` | `rss_limit_mb` | 4000 | RSS memory abort limit (MB) |
+| `--cors-origin` | `cors_origin` | -- | CORS Allow-Origin header |
+| `--payout-window` | `payout_window_seconds` | 86400 | PPLNS window (seconds) |
+| `--storage-save-interval` | `storage_save_interval` | 300 | Sharechain save interval |
+| `--dashboard-dir` | `dashboard_dir` | web-static | Static dashboard directory |
+| `--coinbase-text` | `coinbase_text` | /c2pool/ | Custom coinbase scriptSig text |
+| `--message-blob-hex` | -- | -- | V36 authority message blob |
+| `--doge-testnet4alpha` | -- | false | Use DOGE testnet4alpha |
+
+---
+
+## API endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `/local_stats` | Local node statistics (peers, hashrates, shares) |
+| `/global_stats` | Pool-wide statistics |
+| `/current_payouts` | Current PPLNS payout distribution |
+| `/recent_blocks` | Recently found blocks |
+| `/connected_miners` | Connected stratum workers |
+| `/stratum_stats` | Per-worker stratum statistics (hashrate, difficulty, accepted/rejected) |
+| `/sharechain_stats` | Share chain state |
+| `/miner_thresholds` | Minimum viable hashrate, dust range |
+| `/merged_stats` | Merged mining block statistics |
+| `/current_merged_payouts` | Current merged mining payouts |
+| `/recent_merged_blocks` | Recent merged-mined blocks |
+| `/broadcaster_status` | Parent chain broadcaster status |
+
 See [docs/DASHBOARD_INTEGRATION.md](docs/DASHBOARD_INTEGRATION.md) for the
-complete API reference and custom dashboard development guide.
+complete API reference.
+
+**Web dashboard** — served from `web-static/` by default:
+
+```bash
+xdg-open http://localhost:8080/
+```
+
+---
+
+## Coinbase structure
+
+Every block found by c2pool embeds structured data in the coinbase scriptSig:
+
+```
+[4]  BIP34 block height (consensus)
+[44] AuxPoW merged mining commitment (when active)
+[N]  Operator text (--coinbase-text, default "/c2pool/")
+[32] THE state root (sharechain state commitment)
+[M]  THE metadata (pool analytics, fills remaining space)
+     Total: 100 bytes (Bitcoin consensus limit)
+```
+
+The THE state root commits the sharechain state at block-find time (PPLNS
+distribution, chain height, difficulty). Any node can verify a found block's
+payouts match the committed state root.
 
 ---
 
 ## Authority message blobs (V36)
 
-Node operators distributing upgrade signals or pool announcements use the
-standalone Python 3 CLI in [util/](util/):
-
 ```bash
-# authority key holder — create transition signal
+# Create transition signal (authority key holder)
 python3 util/create_transition_message.py create \
     --privkey <64-hex> \
     --from 36 --to 37 --msg "Upgrade to V37" --urgency recommended
 
-# node operator — pass blob at startup
-./src/c2pool/c2pool ... --message-blob-hex 01a2b3c4...
+# Pass blob at startup (node operator)
+./c2pool --message-blob-hex 01a2b3c4...
 ```
 
 See [util/README.md](util/README.md) for full documentation.
 
 ---
 
-## Configuration
-
-c2pool supports configuration via CLI arguments, YAML config file, or both.
-CLI arguments always take priority over YAML values.
-
-```bash
-# Use a YAML config file
-./src/c2pool/c2pool --config config/c2pool_testnet.yaml
-
-# Or pass everything via CLI
-./src/c2pool/c2pool --integrated --testnet --net litecoin \
-    --p2pool-port 19338 -w 19327 --web-port 8080 ...
-```
-
-### Configuration reference
-
-| CLI flag | YAML key | Default | Description |
-|----------|----------|---------|-------------|
-| `--net` | — | — | Blockchain: `litecoin`, `bitcoin`, `dogecoin` |
-| `--testnet` | — | off | Enable testnet mode |
-| `--p2pool-port` | `port` | 9326 | P2P sharechain port |
-| `-w` / `--worker-port` | `stratum_port` | 9327 | Stratum mining port |
-| `--web-port` | `http_port` | 8080 | HTTP API / dashboard port |
-| `--http-host` | `http_host` | 0.0.0.0 | HTTP bind address |
-| `--coind-address` | `ltc_rpc_host` | 127.0.0.1 | Coin daemon RPC host |
-| `--coind-rpc-port` | `ltc_rpc_port` | auto | Coin daemon RPC port |
-| `--rpcuser` | `ltc_rpc_user` | — | RPC username |
-| `--rpcpassword` | `ltc_rpc_password` | — | RPC password |
-| `--address` | — | — | Payout address |
-| `--give-author` | `donation_percentage` | 0 | Developer donation % |
-| `-f` / `--fee` | `node_owner_fee` | 0 | Node owner fee % |
-| `--node-owner-address` | `node_owner_address` | — | Node owner payout addr |
-| `--redistribute` | `redistribute` | pplns | Mode: pplns/fee/boost/donate |
-| `--max-conns` | — | 8 | Target outbound P2P peers |
-| `--stratum-min-diff` | `min_difficulty` | 0.0005 | Vardiff floor |
-| `--stratum-max-diff` | `max_difficulty` | 65536 | Vardiff ceiling |
-| `--stratum-target-time` | `target_time` | 10 | Seconds between pseudoshares |
-| `--no-vardiff` | `vardiff_enabled` | true | Disable auto-difficulty |
-| `--max-coinbase-outputs` | `max_coinbase_outputs` | 4000 | Max coinbase outputs |
-| `--log-file` | `log_file` | debug.log | Log filename |
-| `--log-level` | `log_level` | trace | trace/debug/info/warning/error |
-| `--log-rotation-mb` | `log_rotation_size_mb` | 10 | Log rotation threshold (MB) |
-| `--log-max-mb` | `log_max_total_mb` | 50 | Max rotated log space (MB) |
-| `--p2p-max-peers` | `p2p_max_peers` | 30 | Max total P2P peers |
-| `--ban-duration` | `ban_duration` | 300 | P2P ban duration (seconds) |
-| `--rss-limit-mb` | `rss_limit_mb` | 4000 | RSS memory abort limit (MB) |
-| `--cors-origin` | `cors_origin` | * | CORS Allow-Origin header |
-| `--payout-window` | `payout_window_seconds` | 86400 | PPLNS window (seconds) |
-| `--storage-save-interval` | `storage_save_interval` | 300 | Sharechain save interval |
-| `--dashboard-dir` | `dashboard_dir` | web-static | Static dashboard directory |
-| `--coinbase-text` | `coinbase_text` | — | Custom coinbase scriptSig text (see below) |
-| `--message-blob-hex` | — | — | V36 authority message blob |
-| `--embedded-ltc` | — | off | Use embedded SPV for LTC (no litecoind needed) |
-| `--embedded-doge` | — | off | Use embedded SPV for DOGE merged mining (no dogecoind needed) |
-| `--doge-header-checkpoint` | — | — | DOGE header chain starting point (`HEIGHT:HASH`) |
-| `--doge-testnet4alpha` | — | off | Use DOGE testnet4alpha (isolated custom testnet) |
-| `--startup-mode` | — | auto | Sharechain bootstrap: `auto`, `genesis`, or `wait` |
-| `--network-id` | `network_id` | 0 | Private chain identifier (hex, see below) |
-
-See [config/c2pool_testnet.yaml](config/c2pool_testnet.yaml) for a complete example.
-
----
-
-## Coinbase customization
-
-Every block found by c2pool embeds structured data in the coinbase
-scriptSig. The 100-byte scriptSig is partitioned as follows:
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│ [4]  BIP34 block height (consensus required)                    │
-│ [44] AuxPoW merged mining commitment (when merged mining active)│
-│ [N]  Tag or operator text (see below)                           │
-│ [32] THE state root (sharechain state commitment)               │
-│ [M]  THE metadata (pool analytics, fills remaining space)       │
-└─────────────────────────────────────────────────────────────────┘
-  Total: 100 bytes (Bitcoin consensus limit)
-```
-
-**Operator text (`--coinbase-text`)**
-
-By default, c2pool uses `/c2pool/` (8 bytes) as the tag. Node operators
-can replace this with custom text via `--coinbase-text`:
-
-```bash
-# Default: "/c2pool/" tag
-./src/c2pool/c2pool --integrated ...
-
-# Custom: your node name
-./src/c2pool/c2pool --integrated --coinbase-text "EU-Node1" ...
-
-# Custom: pool branding
-./src/c2pool/c2pool --integrated --coinbase-text "MyPool.io" ...
-```
-
-**Size limits** (enforced at startup):
-
-| Mode | Max text | Reason |
-|------|----------|--------|
-| With merged mining | **20 bytes** | AuxPoW commitment uses 44 bytes |
-| Without merged mining | **64 bytes** | No AuxPoW overhead |
-
-c2pool is always identified by the **combined donation address** in
-coinbase outputs (visible in any block explorer) — the scriptSig tag
-is optional branding, not the primary identifier.
-
-**THE state root** (32 bytes, always present)
-
-Commits the sharechain state at block-find time:
-- PPLNS weight distribution snapshot
-- Sharechain height and chain parameters
-- Epoch metadata (difficulty, pool hashrate)
-
-This enables trustless checkpoints: any c2pool node can verify that
-a found block's PPLNS distribution matches the committed state root.
-
-**THE metadata** (variable, fills remaining space after tag)
-
-| Byte | Field | Description |
-|------|-------|-------------|
-| 0 | version | Protocol version (0x01 = V36) |
-| 1-4 | sharechain_height | Share chain height at block-find |
-| 5-6 | miner_count | Unique miners in PPLNS window |
-| 7 | hashrate_class | log2(pool hashrate in H/s) |
-| 8-15 | chain_fingerprint | 0=public, SHA256d(PREFIX\|\|IDENTIFIER)[0:8]=private |
-| 16-17 | share_period | Current share period (seconds) |
-| 18-19 | verified_length | Verified chain length |
-
-Metadata is truncated from the end when space is limited (e.g., long
-operator text reduces metadata space).
-
----
-
-## Sharechain bootstrap
-
-When a c2pool node starts for the first time, it needs to download and verify
-the existing share chain from peers before it can create valid shares.
-
-**Bootstrap behavior** (matches p2pool `PERSIST` logic):
-
-| Condition | Behavior |
-|-----------|----------|
-| Has peers, no verified chain | **Wait** — downloads shares, verifies, then starts mining. Prevents creating shares with invalid difficulty (`max_bits=MAX_TARGET`). |
-| Has peers, verified chain exists | **Mine** — creates shares extending the verified chain tip. |
-| No peers, empty chain | **Genesis** — creates the first share on a new chain (100% to donation). |
-
-The `--startup-mode` flag controls initial behavior:
-
-| Mode | Description |
-|------|-------------|
-| `auto` (default) | Wait 60s for peers, then create genesis if none found. |
-| `genesis` | Create new chain immediately, don't wait for peers. |
-| `wait` | Never create genesis — wait indefinitely for peers (p2pool `PERSIST=True`). |
-
-**Cold-start timeline** (typical, joining existing network):
-
-1. Connect to peers (~2s)
-2. Download share chain (~5s, 800+ shares in 1-2 batches)
-3. Verify shares (~3s, incremental from tail to tip)
-4. Start mining on verified chain tip
-
-Miners connected to stratum receive work immediately, but shares are only
-created and broadcast to the P2P network after step 4 completes.
-
----
-
 ## Private sharechains
 
-c2pool supports private sharechains for isolated mining networks.
-
 ```bash
-# Start a private chain (operator)
-./src/c2pool/c2pool --integrated --network-id DEADBEEF12345678 \
-  --net litecoin --address YOUR_LTC_ADDRESS ...
+# Start a private chain
+./c2pool --network-id DEADBEEF12345678
 
-# Join the same private chain (miner)
-./src/c2pool/c2pool --integrated --network-id DEADBEEF12345678 \
-  -n OPERATOR_IP:9326 ...
+# Join the same chain
+./c2pool --network-id DEADBEEF12345678 -n OPERATOR_IP:9326
 ```
 
-**How it works:**
-
-The `--network-id` overrides the IDENTIFIER used in share consensus
-verification. p2pool uses two-layer network isolation:
-
-| Layer | Value | Security |
-|-------|-------|----------|
-| Transport | PREFIX (derived from network-id) | Filters connections — visible on wire |
-| Consensus | IDENTIFIER (= network-id) | Hashed into every share's `ref_hash` — **secret** |
-
-A node that doesn't know the network-id **cannot forge valid shares**
-because the IDENTIFIER is hashed into every share's verification hash.
-Sharing the network-id with a miner grants them sharechain access.
-
-**Genesis behavior:** When the chain is empty, c2pool automatically
-creates genesis shares — no special flag needed. The first miner
-solution becomes the genesis share, and the chain grows from there.
-Peers that connect later download shares from the genesis node.
-
-**Security:** The IDENTIFIER is never stored raw on the blockchain — it is
-the consensus secret. The `chain_fingerprint` in THE metadata is
-`SHA256d(PREFIX || IDENTIFIER)[0:4]` — a 4-byte cryptographic fingerprint
-using Bitcoin's standard double-SHA256. Even if the PREFIX is sniffed from
-network traffic, the IDENTIFIER half requires 2^64 brute force to recover.
-Blockchain scanners can group blocks by fingerprint without learning the
-secret needed to join the chain.
-
-Default `--network-id 0` = public p2pool network (standard IDENTIFIER).
+The `--network-id` overrides the IDENTIFIER hashed into every share's
+verification hash. Nodes without the correct ID cannot forge valid shares.
+See [above](#configuration-reference) for details.
 
 ---
 
@@ -372,10 +375,31 @@ Default `--network-id 0` = public p2pool network (standard IDENTIFIER).
 | `test_share_messages` | V36 authority message decrypt/verify tests |
 | `test_coin_broadcaster` | Coin peer-manager and broadcaster tests |
 
-Run all tests:
 ```bash
 cd build && ctest --output-on-failure -j$(nproc)
 ```
+
+---
+
+## Status
+
+| Area | Status |
+|---|---|
+| V36 share format (LTC parent chain) | Active development |
+| V36 share format (DGB Scrypt parent chain) | Planned |
+| Merged mining (DOGE, PEP, BELLS, LKY, JKC, SHIC) | Working |
+| Embedded LTC SPV node | Working |
+| Embedded DOGE SPV node | Working |
+| Coin daemon RPC/P2P | Hardened |
+| Stratum mining server | Working |
+| VARDIFF | Working |
+| Payout / PPLNS | Working |
+| Authority message blobs (V36) | Working |
+| Solo / Custodial modes | Working |
+| Test suite | 501 tests passing |
+
+> **Need a pool running today?**
+> [frstrtr/p2pool-merged-v36](https://github.com/frstrtr/p2pool-merged-v36) — production Python V36 pool (LTC + DGB + DOGE, Docker, dashboard).
 
 ---
 
@@ -386,43 +410,9 @@ cd build && ctest --output-on-failure -j$(nproc)
 
 ---
 
-<details>
-<summary>Donations</summary>
-
-### PayPal
-[![Donate](https://www.paypalobjects.com/en_US/i/btn/btn_donateCC_LG.gif)](https://www.paypal.com/cgi-bin/webscr?cmd=_s-xclick&hosted_button_id=9DF676HUWAHKY)
-
-</details>
-
----
-
 ### Install guides
 - [Ubuntu / Debian / Linux](doc/build-unix.md)
 - [FreeBSD](doc/build-freebsd.md)
 - [Windows](doc/build-windows.md)
 
----
-
-## API endpoints
-
-See [docs/DASHBOARD_INTEGRATION.md](docs/DASHBOARD_INTEGRATION.md) for the complete HTTP API reference, including:
-
-- Native c2pool endpoints (hashrate, payouts, stats, blocks, miners)
-- p2pool legacy endpoints (local_stats, web/version, etc.)
-- Merged mining endpoints (merged_stats, recent_merged_blocks, discovered_merged_blocks, current_merged_payouts, etc.)
-- JSON-RPC methods (getinfo, getminerstats, getpayoutinfo, submitblock, etc.)
-
-**Merged mining endpoints:**
-
-| Endpoint                   | Description                       |
-|---------------------------|-----------------------------------|
-| `/merged_stats`           | Merged mining block statistics     |
-| `/current_merged_payouts` | Current merged mining payouts      |
-| `/recent_merged_blocks`   | Recent merged-mined blocks         |
-| `/all_merged_blocks`      | All merged-mined blocks            |
-| `/discovered_merged_blocks` | Merged block proofs               |
-| `/broadcaster_status`     | Parent chain broadcaster status    |
-| `/merged_broadcaster_status` | Merged chain broadcaster status |
-| `/network_difficulty`     | Historical network difficulty      |
-
-For full field details and dashboard integration, see [docs/DASHBOARD_INTEGRATION.md](docs/DASHBOARD_INTEGRATION.md).
+See [deploy/DEPLOY.md](deploy/DEPLOY.md) for HiveOS/MinerStat/RaveOS setup.

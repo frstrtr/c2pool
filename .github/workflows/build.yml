@@ -91,13 +91,14 @@ jobs:
                     test_pplns_consensus \
                     test_v36_script_sorting test_v36_cross_impl_refhash \
                     test_phase4_embedded \
+                    test_mweb_builder \
             -j$(nproc)
 
       # ── 9. Run test suite ─────────────────────────────────────────────────
       # Live integration tests (test_phase*_live) excluded — require daemon
       - name: Run tests
         working-directory: build_ci
-        run: ctest --output-on-failure -j$(nproc)
+        run: ctest --output-on-failure -j$(nproc) --exclude-regex "LiveTest\."
 
       # ── 10. Upload test results on failure ───────────────────────────────
       - name: Upload test results

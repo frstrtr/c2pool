@@ -480,9 +480,7 @@ TEST(CoinNodeInterfaceTest, EmbeddedNodeIsPolymorphic) {
     std::unique_ptr<CoinNodeInterface> iface =
         std::make_unique<EmbeddedCoinNode>(*chain, pool, true);
 
-    EXPECT_NO_THROW({
-        auto wd = iface->getwork();
-        EXPECT_TRUE(wd.m_data.contains("height"));
-    });
+    // Chain with only genesis is not synced — getwork() throws the sync gate
+    EXPECT_THROW(iface->getwork(), std::runtime_error);
     EXPECT_FALSE(iface->is_synced());
 }

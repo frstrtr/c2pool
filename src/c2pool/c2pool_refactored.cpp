@@ -228,12 +228,19 @@ void print_help() {
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
     std::cout << "  --help, -h                Show this help message and exit\n";
     std::cout << "  --testnet                 Use testnet instead of mainnet\n";
-    std::cout << "  --integrated              Enable integrated mode (full mining pool)\n";
-    std::cout << "  --sharechain              Enable sharechain mode (P2P node)\n";
+    std::cout << "  --integrated              Full P2P pool with sharechain (DEFAULT)\n";
+    std::cout << "  --solo                    Solo pool mode (no P2P sharechain, local payouts)\n";
+    std::cout << "  --custodial               Custodial pool (coinbase to --address, stratum for accounting)\n";
+    std::cout << "  --sharechain              Sharechain-only mode (P2P node, no mining)\n";
+    std::cout << "  --standalone              Legacy solo: minimal stratum + RPC daemon, no embedded SPV\n";
     std::cout << "  --net CHAIN               Blockchain: litecoin, digibyte, bitcoin, dogecoin\n";
     std::cout << "                            (alias: --blockchain; default: litecoin)\n";
     std::cout << "  --config FILE             Load configuration from YAML file\n";
-    std::cout << "  --address ADDRESS         Payout address (alias: --solo-address)\n\n";
+    std::cout << "  --address ADDRESS         Node operator payout address (optional; miners use stratum username)\n";
+    std::cout << "  --no-embedded-ltc         Disable embedded LTC SPV (use RPC daemon instead)\n";
+    std::cout << "  --no-embedded-doge        Disable embedded DOGE SPV\n";
+    std::cout << "  --genesis                 Create genesis share if chain is empty (don't wait for peers)\n";
+    std::cout << "  --wait-for-peers          Wait for peers to download sharechain (DEFAULT)\n\n";
     
     std::cout << "PAYOUT & FEE CONFIGURATION:\n";
     std::cout << "  --give-author PERCENT     Developer donation (alias: --dev-donation; default: 0.1%)\n";
@@ -430,13 +437,18 @@ int main(int argc, char* argv[]) {
     double dev_donation = 0.1;          // Developer donation percentage (default 0.1%)
     double node_owner_fee = 0.0;        // Node owner fee percentage
     bool auto_detect_wallet = true;     // Auto-detect wallet address
-    bool integrated_mode = false;
+    bool integrated_mode = true;     // Default: full integrated pool (p2pool persist=true)
     bool sharechain_mode = false;
-    bool embedded_ltc    = false;    // Phase 4: use embedded coin node instead of daemon RPC
-    bool embedded_doge   = false;    // Phase 5: use embedded DOGE node for merged mining
+    bool solo_mode       = false;    // --solo: integrated pool without P2P sharechain
+    bool custodial_mode  = false;    // --custodial: all coinbase to --address, stratum for accounting
+    bool embedded_ltc    = true;     // Default: embedded LTC SPV (no daemon needed)
+    bool embedded_doge   = true;     // Default: embedded DOGE SPV for merged mining
     bool doge_testnet4alpha = false;  // Use DOGE testnet4alpha instead of standard testnet3
-    std::string header_checkpoint_str;       // --header-checkpoint HEIGHT:HASH (LTC)
-    std::string doge_header_checkpoint_str;  // --doge-header-checkpoint HEIGHT:HASH
+    // Embedded SPV bootstrap checkpoints (mainnet defaults, skip millions of old headers)
+    // Override with --header-checkpoint / --doge-header-checkpoint or config YAML.
+    // Testnet: set via CLI or config (no hardcoded default).
+    std::string header_checkpoint_str       = "3079000:862daffd70dd1d16bed4fce3773f04160749f39f59d2c37a7e28be4a6c5092f6";
+    std::string doge_header_checkpoint_str  = "6140000:743b7eb4ec40678b603d1fb9498175164dbaf43029ac42bc6eff4bc61cdc6ada";
     std::string doge_p2p_address;            // --doge-p2p-address HOST
     int doge_p2p_port = 0;                   // --doge-p2p-port PORT
     Blockchain blockchain = Blockchain::LITECOIN;  // Default to Litecoin
@@ -495,9 +507,9 @@ int main(int argc, char* argv[]) {
     // Private sharechain
     uint32_t network_id = 0;        // 0 = public p2pool network, nonzero = private
 
-    // Startup mode: auto (default), genesis, wait
+    // Startup mode: wait (default, p2pool persist=true), genesis, auto
     enum class StartupMode { AUTO, GENESIS, WAIT };
-    StartupMode startup_mode = StartupMode::AUTO;
+    StartupMode startup_mode = StartupMode::WAIT;  // Default: wait for peers (persist=true)
     int startup_timeout = 60;       // seconds to wait for peers in auto mode
 
     // Track which options were explicitly set via CLI so that --config file
@@ -619,16 +631,47 @@ int main(int argc, char* argv[]) {
             integrated_mode = true;
             cli_explicit.insert("integrated");
         }
+        else if (arg == "--solo") {
+            solo_mode = true;
+            integrated_mode = true;  // solo is a variant of integrated
+            cli_explicit.insert("solo");
+            cli_explicit.insert("integrated");
+        }
+        else if (arg == "--custodial") {
+            custodial_mode = true;
+            integrated_mode = true;  // custodial is a variant of integrated
+            cli_explicit.insert("custodial");
+            cli_explicit.insert("integrated");
+        }
         else if (arg == "--sharechain") {
             sharechain_mode = true;
+            integrated_mode = false;
             cli_explicit.insert("sharechain");
+            cli_explicit.insert("integrated");
+        }
+        else if (arg == "--standalone") {
+            // Legacy solo mode: minimal stratum + RPC daemon, no embedded SPV
+            integrated_mode = false;
+            embedded_ltc = false;
+            embedded_doge = false;
+            cli_explicit.insert("integrated");
+            cli_explicit.insert("embedded_ltc");
+            cli_explicit.insert("embedded_doge");
         }
         else if (arg == "--embedded-ltc") {
             embedded_ltc = true;
             cli_explicit.insert("embedded_ltc");
         }
+        else if (arg == "--no-embedded-ltc") {
+            embedded_ltc = false;
+            cli_explicit.insert("embedded_ltc");
+        }
         else if (arg == "--embedded-doge") {
             embedded_doge = true;
+            cli_explicit.insert("embedded_doge");
+        }
+        else if (arg == "--no-embedded-doge") {
+            embedded_doge = false;
             cli_explicit.insert("embedded_doge");
         }
         else if (arg == "--doge-testnet4alpha") {
@@ -906,6 +949,20 @@ int main(int argc, char* argv[]) {
                 integrated_mode = cfg["integrated"].as<bool>();
             if (!cli_explicit.count("sharechain") && cfg["sharechain"])
                 sharechain_mode = cfg["sharechain"].as<bool>();
+            if (!cli_explicit.count("solo") && cfg["solo"])
+                solo_mode = cfg["solo"].as<bool>();
+            if (!cli_explicit.count("custodial") && cfg["custodial"])
+                custodial_mode = cfg["custodial"].as<bool>();
+            if (!cli_explicit.count("embedded_ltc") && cfg["embedded_ltc"])
+                embedded_ltc = cfg["embedded_ltc"].as<bool>();
+            if (!cli_explicit.count("embedded_doge") && cfg["embedded_doge"])
+                embedded_doge = cfg["embedded_doge"].as<bool>();
+            if (!cli_explicit.count("startup_mode") && cfg["startup_mode"]) {
+                auto m = cfg["startup_mode"].as<std::string>();
+                if (m == "genesis") startup_mode = StartupMode::GENESIS;
+                else if (m == "wait") startup_mode = StartupMode::WAIT;
+                else startup_mode = StartupMode::AUTO;
+            }
             if (!cli_explicit.count("blockchain") && cfg["blockchain"])
                 blockchain = parse_blockchain(cfg["blockchain"].as<std::string>());
 
@@ -953,11 +1010,23 @@ int main(int argc, char* argv[]) {
                     merged_chain_specs.push_back(item.as<std::string>());
             }
 
+            // Embedded SPV checkpoints
+            if (!cli_explicit.count("header_checkpoint") && cfg["header_checkpoint"])
+                header_checkpoint_str = cfg["header_checkpoint"].as<std::string>();
+            if (!cli_explicit.count("doge_header_checkpoint") && cfg["doge_header_checkpoint"])
+                doge_header_checkpoint_str = cfg["doge_header_checkpoint"].as<std::string>();
+
             // Coin daemon P2P broadcaster
             if (!cli_explicit.count("coind_p2p_port") && cfg["coind_p2p_port"])
                 coind_p2p_port = cfg["coind_p2p_port"].as<int>();
             if (!cli_explicit.count("coind_p2p_address") && cfg["coind_p2p_address"])
                 coind_p2p_address = cfg["coind_p2p_address"].as<std::string>();
+
+            // Sharechain seed nodes (appends to -n CLI nodes)
+            if (cfg["seed_nodes"] && cfg["seed_nodes"].IsSequence()) {
+                for (const auto& item : cfg["seed_nodes"])
+                    seed_nodes.push_back(item.as<std::string>());
+            }
 
             // Redistribute mode
             if (!cli_explicit.count("redistribute") && cfg["redistribute"])
@@ -1049,6 +1118,11 @@ int main(int argc, char* argv[]) {
             p2p_port = 19326;    // p2pool testnet convention (mainnet + 10012)
         if (!cli_explicit.count("stratum_port"))
             stratum_port = 19327; // p2pool testnet convention (mainnet + 10000)
+        // Clear mainnet checkpoints for testnet (different chains!)
+        if (!cli_explicit.count("header_checkpoint"))
+            header_checkpoint_str.clear();
+        if (!cli_explicit.count("doge_header_checkpoint"))
+            doge_header_checkpoint_str.clear();
     }
 
     // Assemble p2pool-style --merged-coind-* flags into a merged spec
@@ -1711,27 +1785,35 @@ int main(int argc, char* argv[]) {
 
             // For testnet, discard hardcoded mainnet bootstrap peers before Node construction
             // (Node constructor copies bootstrap_addrs into its addr store)
-            if (settings->m_testnet)
-                ltc_p2p_config->pool()->m_bootstrap_addrs.clear();
-            for (const auto& seed : seed_nodes) {
-                ltc_p2p_config->pool()->m_bootstrap_addrs.emplace_back(seed);
-                LOG_INFO << "Added seed node: " << seed;
+            std::unique_ptr<ltc::Node> p2p_node;
+            if (solo_mode || custodial_mode) {
+                LOG_INFO << (solo_mode ? "Solo" : "Custodial")
+                         << " pool mode: no P2P sharechain, "
+                         << (custodial_mode ? "all coinbase to --address" : "local proportional payouts");
+            } else {
+                if (settings->m_testnet)
+                    ltc_p2p_config->pool()->m_bootstrap_addrs.clear();
+                for (const auto& seed : seed_nodes) {
+                    ltc_p2p_config->pool()->m_bootstrap_addrs.emplace_back(seed);
+                    LOG_INFO << "Added seed node: " << seed;
+                }
+                p2p_node = std::make_unique<ltc::Node>(&ioc, ltc_p2p_config.get());
+            } // P2P node creation
+            if (p2p_node) {
+                if (max_outgoing_conns_set) {
+                    p2p_node->set_target_outbound_peers(static_cast<size_t>(max_outgoing_conns));
+                    LOG_INFO << "Configured outbound peer target: " << max_outgoing_conns;
+                }
+                p2p_node->set_max_peers(static_cast<size_t>(p2p_max_peers));
+                p2p_node->set_ban_duration(p2p_ban_duration);
+                p2p_node->set_cache_limits(
+                    static_cast<size_t>(cache_max_shared_hashes),
+                    static_cast<size_t>(cache_max_known_txs),
+                    static_cast<size_t>(cache_max_raw_shares));
+                ltc::Node::set_rss_limit_mb(rss_limit_mb);
+                p2p_node->core::Server::listen(static_cast<uint16_t>(p2p_port));
+                LOG_INFO << "P2P sharechain node listening on port " << p2p_port;
             }
-
-            auto p2p_node = std::make_unique<ltc::Node>(&ioc, ltc_p2p_config.get());
-            if (max_outgoing_conns_set) {
-                p2p_node->set_target_outbound_peers(static_cast<size_t>(max_outgoing_conns));
-                LOG_INFO << "Configured outbound peer target: " << max_outgoing_conns;
-            }
-            p2p_node->set_max_peers(static_cast<size_t>(p2p_max_peers));
-            p2p_node->set_ban_duration(p2p_ban_duration);
-            p2p_node->set_cache_limits(
-                static_cast<size_t>(cache_max_shared_hashes),
-                static_cast<size_t>(cache_max_known_txs),
-                static_cast<size_t>(cache_max_raw_shares));
-            ltc::Node::set_rss_limit_mb(rss_limit_mb);
-            p2p_node->core::Server::listen(static_cast<uint16_t>(p2p_port));
-            LOG_INFO << "P2P sharechain node listening on port " << p2p_port;
 
             // --- Parent chain P2P broadcaster (fast block relay) ---
             // Auto-detect P2P port from chain type if not explicitly set.
@@ -1758,109 +1840,111 @@ int main(int argc, char* argv[]) {
             // Phase 1c: Whale departure detector (needs to be visible to ref_hash lambda)
             auto whale_detector = std::make_unique<ltc::WhaleDepartureDetector>();
 
-            // Wire block_rel_height for chain scoring.
-            // Embedded mode: use HeaderChain height diff. RPC mode: query daemon.
-            if (embedded_ltc) {
-                p2p_node->set_block_rel_height_fn(
-                    [chain = embedded_chain.get()](uint256 block_hash) -> int32_t {
-                        if (!chain || block_hash.IsNull()) return 0;
-                        auto entry = chain->get_header(block_hash);
-                        if (!entry) return 0;
-                        int32_t tip_h = static_cast<int32_t>(chain->height());
-                        int32_t blk_h = static_cast<int32_t>(entry->height);
-                        return tip_h - blk_h + 1; // confirmations-style depth
-                    });
-            } else {
-                p2p_node->set_block_rel_height_fn(
-                    [rpc = node_rpc.get()](uint256 block_hash) -> int32_t {
-                        if (!rpc || block_hash.IsNull()) return 0;
-                        try {
-                            auto reply = rpc->getblock(block_hash, 1);
-                            if (reply.contains("confirmations"))
-                                return reply["confirmations"].get<int32_t>();
-                        } catch (...) {}
-                        return 0; // RPC error or not found — safe default
-                    });
-            }
+            if (p2p_node) {
+                // Wire block_rel_height for chain scoring.
+                // Embedded mode: use HeaderChain height diff. RPC mode: query daemon.
+                if (embedded_ltc) {
+                    p2p_node->set_block_rel_height_fn(
+                        [chain = embedded_chain.get()](uint256 block_hash) -> int32_t {
+                            if (!chain || block_hash.IsNull()) return 0;
+                            auto entry = chain->get_header(block_hash);
+                            if (!entry) return 0;
+                            int32_t tip_h = static_cast<int32_t>(chain->height());
+                            int32_t blk_h = static_cast<int32_t>(entry->height);
+                            return tip_h - blk_h + 1; // confirmations-style depth
+                        });
+                } else {
+                    p2p_node->set_block_rel_height_fn(
+                        [rpc = node_rpc.get()](uint256 block_hash) -> int32_t {
+                            if (!rpc || block_hash.IsNull()) return 0;
+                            try {
+                                auto reply = rpc->getblock(block_hash, 1);
+                                if (reply.contains("confirmations"))
+                                    return reply["confirmations"].get<int32_t>();
+                            } catch (...) {}
+                            return 0; // RPC error or not found — safe default
+                        });
+                }
 
-            // Begin actively connecting to outbound peers from bootstrap list / addr store
-            p2p_node->start_outbound_connections();
-            LOG_INFO << "Outbound peer connection loop started";
+                // Begin actively connecting to outbound peers from bootstrap list / addr store
+                p2p_node->start_outbound_connections();
+                LOG_INFO << "Outbound peer connection loop started";
 
-            // When a peer announces a new best block, refresh our mining template
-            p2p_node->set_on_bestblock([&web_server, &p2p_node]() {
-                web_server.trigger_work_refresh();
-                // p2pool: bitcoind_work.changed → set_best_share() → think()
-                p2p_node->run_think();
-                LOG_INFO << "[LTC] bestblock received from P2P peer — work+think refreshed";
-            });
+                // When a peer announces a new best block, refresh our mining template
+                p2p_node->set_on_bestblock([&web_server, &p2p_node]() {
+                    web_server.trigger_work_refresh();
+                    // p2pool: bitcoind_work.changed → set_best_share() → think()
+                    p2p_node->run_think();
+                    LOG_INFO << "[LTC] bestblock received from P2P peer — work+think refreshed";
+                });
 
-            // When best_share changes (new share on chain), refresh work for all
-            // miners. Debounced (100ms) to coalesce P2P share bursts into one
-            // notification — matches p2pool's Twisted reactor tick coalescing.
-            // New blocks use trigger_work_refresh() (immediate, above).
-            p2p_node->set_on_best_share_changed([&web_server]() {
-                web_server.trigger_work_refresh_debounced();
-            });
+                // When best_share changes (new share on chain), refresh work for all
+                // miners. Debounced (100ms) to coalesce P2P share bursts into one
+                // notification — matches p2pool's Twisted reactor tick coalescing.
+                // New blocks use trigger_work_refresh() (immediate, above).
+                p2p_node->set_on_best_share_changed([&web_server]() {
+                    web_server.trigger_work_refresh_debounced();
+                });
 
-            // Wire local hashrate callback (from stratum server)
-            p2p_node->set_local_hashrate_fn([&web_server]() -> double {
-                auto* mi = web_server.get_mining_interface();
-                if (mi) return mi->get_stratum_total_hashrate();
-                return 0.0;
-            });
+                // Wire local hashrate callback (from stratum server)
+                p2p_node->set_local_hashrate_fn([&web_server]() -> double {
+                    auto* mi = web_server.get_mining_interface();
+                    if (mi) return mi->get_stratum_total_hashrate();
+                    return 0.0;
+                });
 
-            // Wire rate monitor stats for p2pool-style status lines (DOA%, time window)
-            p2p_node->set_local_rate_stats_fn([&web_server]() -> ltc::NodeImpl::LocalRateStats {
-                auto* mi = web_server.get_mining_interface();
-                if (!mi) return {};
-                auto s = mi->get_stratum_rate_stats();
-                return {s.hashrate, s.effective_dt, s.total_datums, s.dead_datums};
-            });
+                // Wire rate monitor stats for p2pool-style status lines (DOA%, time window)
+                p2p_node->set_local_rate_stats_fn([&web_server]() -> ltc::NodeImpl::LocalRateStats {
+                    auto* mi = web_server.get_mining_interface();
+                    if (!mi) return {};
+                    auto s = mi->get_stratum_rate_stats();
+                    return {s.hashrate, s.effective_dt, s.total_datums, s.dead_datums};
+                });
 
-            // Wire PPLNS outputs for current payout display
-            p2p_node->set_current_pplns_fn([&web_server]() -> std::vector<std::pair<std::string, uint64_t>> {
-                auto* mi = web_server.get_mining_interface();
-                if (!mi) return {};
-                return mi->get_cached_pplns_outputs();
-            });
+                // Wire PPLNS outputs for current payout display
+                p2p_node->set_current_pplns_fn([&web_server]() -> std::vector<std::pair<std::string, uint64_t>> {
+                    auto* mi = web_server.get_mining_interface();
+                    if (!mi) return {};
+                    return mi->get_cached_pplns_outputs();
+                });
 
-            // Wire payout script for PPLNS matching (p2pool: -a address lookup)
-            // Priority: node-owner script > --address converted to script
-            if (payout_manager && payout_manager->has_node_owner_fee()) {
-                const auto& nc = payout_manager->get_node_owner_config();
-                if (!nc.payout_script_hex.empty())
-                    p2p_node->set_node_payout_script_hex(nc.payout_script_hex);
-            }
-            if (!payout_address.empty() && p2p_node->get_node_payout_script_hex().empty()) {
-                auto script = core::address_to_script(payout_address);
-                if (!script.empty()) {
-                    std::string hex;
+                // Wire payout script for PPLNS matching (p2pool: -a address lookup)
+                // Priority: node-owner script > --address converted to script
+                if (payout_manager && payout_manager->has_node_owner_fee()) {
+                    const auto& nc = payout_manager->get_node_owner_config();
+                    if (!nc.payout_script_hex.empty())
+                        p2p_node->set_node_payout_script_hex(nc.payout_script_hex);
+                }
+                if (!payout_address.empty() && p2p_node->get_node_payout_script_hex().empty()) {
+                    auto script = core::address_to_script(payout_address);
+                    if (!script.empty()) {
+                        std::string hex;
+                        const char HX[] = "0123456789abcdef";
+                        for (unsigned char b : script) { hex += HX[b >> 4]; hex += HX[b & 0x0f]; }
+                        p2p_node->set_node_payout_script_hex(hex);
+                    }
+                }
+
+                // Wire local miner scripts callback for PPLNS payout display.
+                // Converts stratum sessions' pubkey_hashes to all script forms (P2PKH, P2WPKH, P2SH)
+                // so the status line can match them against PPLNS outputs.
+                p2p_node->set_local_miner_scripts_fn([&web_server]() -> std::vector<std::string> {
+                    std::vector<std::string> scripts;
+                    auto rates = web_server.get_local_addr_rates();
                     const char HX[] = "0123456789abcdef";
-                    for (unsigned char b : script) { hex += HX[b >> 4]; hex += HX[b & 0x0f]; }
-                    p2p_node->set_node_payout_script_hex(hex);
-                }
-            }
+                    for (const auto& [pubkey, rate] : rates) {
+                        std::string h160;
+                        for (auto b : pubkey) { h160 += HX[b >> 4]; h160 += HX[b & 0x0f]; }
+                        scripts.push_back("76a914" + h160 + "88ac"); // P2PKH
+                        scripts.push_back("0014" + h160);            // P2WPKH
+                        scripts.push_back("a914" + h160 + "87");     // P2SH
+                    }
+                    return scripts;
+                });
+            } // end if (p2p_node) — P2P callbacks
 
-            // Wire local miner scripts callback for PPLNS payout display.
-            // Converts stratum sessions' pubkey_hashes to all script forms (P2PKH, P2WPKH, P2SH)
-            // so the status line can match them against PPLNS outputs.
-            p2p_node->set_local_miner_scripts_fn([&web_server]() -> std::vector<std::string> {
-                std::vector<std::string> scripts;
-                auto rates = web_server.get_local_addr_rates();
-                const char HX[] = "0123456789abcdef";
-                for (const auto& [pubkey, rate] : rates) {
-                    std::string h160;
-                    for (auto b : pubkey) { h160 += HX[b >> 4]; h160 += HX[b & 0x0f]; }
-                    scripts.push_back("76a914" + h160 + "88ac"); // P2PKH
-                    scripts.push_back("0014" + h160);            // P2WPKH
-                    scripts.push_back("a914" + h160 + "87");     // P2SH
-                }
-                return scripts;
-            });
-
-            // When a block submission is attempted, broadcast bestblock to all P2P peers
-            // and record the found block for the /recent_blocks REST endpoint.
+            // When a block submission is attempted, record the found block
+            // and (if P2P mode) broadcast bestblock to sharechain peers.
             // stale_info: 0=accepted, 253=orphan (stale prev), 254=doa (daemon rejected)
             bool is_testnet = settings->m_testnet;
             auto* embedded_chain_ptr = embedded_chain.get();
@@ -1897,8 +1981,8 @@ int main(int argc, char* argv[]) {
                 hdr.m_bits      = le32(72);
                 hdr.m_nonce     = le32(76);
 
-                // Only broadcast bestblock for accepted blocks
-                if (stale_info == 0) {
+                // Only broadcast bestblock for accepted blocks (P2P mode only)
+                if (stale_info == 0 && p2p_node) {
                     p2p_node->broadcast_bestblock(hdr);
                 }
 
@@ -1942,7 +2026,7 @@ int main(int argc, char* argv[]) {
                          << "  Height:     " << height << "\n"
                          << "  Block hash: " << block_hash.GetHex() << "\n"
                          << "  Status:     " << (stale_info == 0 ? "ACCEPTED" : stale_str) << "\n"
-                         << "  Broadcast:  bestblock sent to P2P peers";
+                         << "  Broadcast:  " << (p2p_node ? "bestblock sent to P2P peers" : "relayed to coin network");
 
                 // Schedule post-submission orphan check at +30s and +120s (RPC mode only)
                 if (stale_info == 0 && !embedded_ltc)
@@ -2064,6 +2148,13 @@ int main(int argc, char* argv[]) {
             // Configure payout system for web server (legacy — kept for REST stats)
             web_server.set_payout_manager(payout_manager.get());
 
+            // Flag solo/custodial mode so REST APIs suppress P2P warnings
+            if (solo_mode || custodial_mode) {
+                web_server.get_mining_interface()->set_solo_mode(true);
+                if (!payout_address.empty())
+                    web_server.get_mining_interface()->set_solo_address(payout_address);
+            }
+
             // V36-compatible node fee: probabilistic address replacement at share
             // creation time.  The node operator's address accumulates PPLNS weight
             // for ~fee% of shares, so all peers compute identical coinbase outputs.
@@ -2123,6 +2214,7 @@ int main(int argc, char* argv[]) {
                 LOG_INFO << "Coinbase tag: /c2pool/ (default, use --coinbase-text to customize)";
             }
 
+          if (!solo_mode && !custodial_mode) {
             // Wire the share tracker's best share hash into the mining interface
             // so that mining_submit can link new shares to the chain head.
             web_server.set_best_share_hash_fn([&p2p_node]() {
@@ -2875,6 +2967,118 @@ int main(int argc, char* argv[]) {
                 }
             });
 
+          } else if (custodial_mode) {
+            // ─── CUSTODIAL MODE: all coinbase to --address ─────────────────
+            // No P2P sharechain, no share creation. Entire block reward goes
+            // to the node operator's address. Stratum-provided miner addresses
+            // are used ONLY for accounting (/stratum_stats, /connected_miners)
+            // — they never appear in coinbase outputs.
+
+            if (payout_address.empty()) {
+                LOG_ERROR << "--custodial requires --address (node operator payout address)";
+                return 1;
+            }
+
+            auto owner_script = core::address_to_script(payout_address);
+            if (owner_script.empty()) {
+                LOG_ERROR << "--custodial: invalid --address: " << payout_address;
+                return 1;
+            }
+
+            // Custodial PPLNS: entire subsidy minus donation to node operator
+            web_server.set_pplns_fn([owner_script, dev_donation](
+                    const uint256& /*best_hash*/, const uint256& /*block_target*/,
+                    uint64_t subsidy, const std::vector<unsigned char>& donation_script)
+                    -> std::map<std::vector<unsigned char>, double> {
+
+                std::map<std::vector<unsigned char>, double> result;
+
+                // Donation (dev_donation% or 1 satoshi marker when 0%)
+                uint64_t donation_amount = (dev_donation > 0)
+                    ? static_cast<uint64_t>(subsidy * dev_donation / 100.0)
+                    : 1;  // 1 satoshi marker
+                result[donation_script] = static_cast<double>(donation_amount);
+
+                // Everything else to node operator
+                uint64_t operator_amount = subsidy - donation_amount;
+                result[owner_script] = static_cast<double>(operator_amount);
+
+                return result;
+            });
+
+            // No sharechain
+            web_server.set_best_share_hash_fn([]() { return uint256::ZERO; });
+
+            LOG_INFO << "Custodial mode ready — all coinbase to " << payout_address
+                     << ", stratum addresses for accounting only";
+
+          } else {
+            // ─── SOLO MODE: local proportional payouts ─────────────────────
+            // No P2P sharechain, no share creation. Coinbase pays connected
+            // miners proportional to their hashrate, plus node owner fee and
+            // donation marker (1 satoshi when give-author=0).
+
+            // Solo PPLNS: distribute subsidy by stratum per-miner hashrates
+            web_server.set_pplns_fn([&web_server, dev_donation, node_owner_fee, &payout_address](
+                    const uint256& /*best_hash*/, const uint256& /*block_target*/,
+                    uint64_t subsidy, const std::vector<unsigned char>& donation_script)
+                    -> std::map<std::vector<unsigned char>, double> {
+
+                std::map<std::vector<unsigned char>, double> result;
+
+                auto rates = web_server.get_local_addr_rates();
+                double total_rate = 0;
+                for (auto& [_, rate] : rates) total_rate += rate;
+
+                // Node owner fee
+                uint64_t owner_fee_amount = 0;
+                if (node_owner_fee > 0 && !payout_address.empty()) {
+                    owner_fee_amount = static_cast<uint64_t>(subsidy * node_owner_fee / 100.0);
+                    auto owner_script = core::address_to_script(payout_address);
+                    if (!owner_script.empty())
+                        result[owner_script] = static_cast<double>(owner_fee_amount);
+                }
+
+                // Donation (dev_donation% or 1 satoshi marker when 0%)
+                uint64_t donation_amount = (dev_donation > 0)
+                    ? static_cast<uint64_t>(subsidy * dev_donation / 100.0)
+                    : 1;  // 1 satoshi marker
+                result[donation_script] += static_cast<double>(donation_amount);
+
+                uint64_t miner_pool = subsidy - owner_fee_amount - donation_amount;
+
+                if (total_rate > 0 && !rates.empty()) {
+                    // Proportional split by hashrate
+                    for (auto& [pubkey_hash, rate] : rates) {
+                        double fraction = rate / total_rate;
+                        uint64_t amount = static_cast<uint64_t>(miner_pool * fraction);
+                        if (amount == 0) continue;
+                        // Convert pubkey_hash to P2PKH script: OP_DUP OP_HASH160 <20> <hash> OP_EQUALVERIFY OP_CHECKSIG
+                        std::vector<unsigned char> script = {0x76, 0xa9, 0x14};
+                        script.insert(script.end(), pubkey_hash.begin(), pubkey_hash.end());
+                        script.push_back(0x88);
+                        script.push_back(0xac);
+                        result[script] += static_cast<double>(amount);
+                    }
+                } else {
+                    // No miners connected — all to payout address or donation
+                    if (!payout_address.empty()) {
+                        auto pa_script = core::address_to_script(payout_address);
+                        if (!pa_script.empty())
+                            result[pa_script] = static_cast<double>(miner_pool);
+                    } else {
+                        result[donation_script] += static_cast<double>(miner_pool);
+                    }
+                }
+                return result;
+            });
+
+            // Solo mode: best_share is always null (no sharechain)
+            web_server.set_best_share_hash_fn([]() { return uint256::ZERO; });
+
+            LOG_INFO << "Solo mode ready — miners connect to stratum, payouts proportional to hashrate";
+          } // end if (!solo_mode && !custodial_mode) ... else
+
             // --- Integrated Merged Mining ---
             // Parse --merged specs and set up the manager (replaces standalone mm-adapter)
             std::unique_ptr<c2pool::merged::MergedMiningManager> mm_manager;
@@ -3235,8 +3439,78 @@ int main(int argc, char* argv[]) {
                 web_server.set_merged_mining_manager(mm_manager.get());
 
                 // Wire the merged payout provider so that aux chain block
-                // construction uses per-chain PPLNS weights from the share tracker.
+                // construction uses the correct payout distribution.
                 auto* mi = web_server.get_mining_interface();
+
+              if (solo_mode || custodial_mode) {
+                // Solo/custodial: reuse the same payout logic as LTC coinbase.
+                // Custodial: entire merged subsidy to --address.
+                // Solo: proportional split by stratum hashrates.
+                auto owner_script_mm = core::address_to_script(payout_address);
+                mm_manager->set_payout_provider(
+                    [&web_server, mi, custodial_mode, owner_script_mm,
+                     dev_donation, node_owner_fee, &payout_address](
+                        uint32_t chain_id, uint64_t coinbase_value)
+                    -> std::vector<std::pair<std::vector<unsigned char>, uint64_t>>
+                {
+                    auto& donation_script = mi->get_donation_script();
+
+                    // Donation (dev_donation% or 1 satoshi marker)
+                    uint64_t donation_amount = (dev_donation > 0)
+                        ? static_cast<uint64_t>(coinbase_value * dev_donation / 100.0)
+                        : 1;
+
+                    std::vector<std::pair<std::vector<unsigned char>, uint64_t>> result;
+
+                    if (custodial_mode) {
+                        // Custodial: everything to node operator
+                        uint64_t operator_amount = coinbase_value - donation_amount;
+                        if (!owner_script_mm.empty() && operator_amount > 0)
+                            result.emplace_back(owner_script_mm, operator_amount);
+                        if (donation_amount > 0)
+                            result.emplace_back(donation_script, donation_amount);
+                    } else {
+                        // Solo: proportional split by hashrate
+                        uint64_t owner_fee_amount = 0;
+                        if (node_owner_fee > 0 && !owner_script_mm.empty()) {
+                            owner_fee_amount = static_cast<uint64_t>(coinbase_value * node_owner_fee / 100.0);
+                            result.emplace_back(owner_script_mm, owner_fee_amount);
+                        }
+                        if (donation_amount > 0)
+                            result.emplace_back(donation_script, donation_amount);
+
+                        uint64_t miner_pool = coinbase_value - owner_fee_amount - donation_amount;
+                        auto rates = web_server.get_local_addr_rates();
+                        double total_rate = 0;
+                        for (auto& [_, rate] : rates) total_rate += rate;
+
+                        if (total_rate > 0) {
+                            for (auto& [pubkey_hash, rate] : rates) {
+                                uint64_t amount = static_cast<uint64_t>(miner_pool * rate / total_rate);
+                                if (amount == 0) continue;
+                                std::vector<unsigned char> script = {0x76, 0xa9, 0x14};
+                                script.insert(script.end(), pubkey_hash.begin(), pubkey_hash.end());
+                                script.push_back(0x88);
+                                script.push_back(0xac);
+                                result.emplace_back(std::move(script), amount);
+                            }
+                        } else if (!owner_script_mm.empty()) {
+                            result.emplace_back(owner_script_mm, miner_pool);
+                        } else {
+                            result.emplace_back(donation_script, miner_pool);
+                        }
+                    }
+
+                    LOG_INFO << "[MM-payout] chain_id=" << chain_id
+                             << " coinbase_value=" << coinbase_value
+                             << " payouts=" << result.size()
+                             << " mode=" << (custodial_mode ? "custodial" : "solo");
+
+                    std::sort(result.begin(), result.end());
+                    return result;
+                });
+              } else {
+                // P2P mode: PPLNS weights from the share tracker
                 mm_manager->set_payout_provider(
                     [&p2p_node, mi](
                         uint32_t chain_id, uint64_t coinbase_value)
@@ -3264,17 +3538,16 @@ int main(int argc, char* argv[]) {
                              << " block_target=" << block_target.GetHex().substr(0,16);
 
                     // Convert map → sorted vector for coinbase construction
-                    // Amounts are already integer (uint64_t) from integer-only arithmetic
                     std::vector<std::pair<std::vector<unsigned char>, uint64_t>> result;
                     result.reserve(payouts_map.size());
                     for (auto& [script, amount] : payouts_map) {
                         if (amount >= 1)
                             result.emplace_back(script, amount);
                     }
-                    // Sort by script for deterministic coinbase ordering
                     std::sort(result.begin(), result.end());
                     return result;
                 });
+              } // end MM payout provider
 
                 // Wire THE state root provider: anchors sharechain state in merged
                 // coinbase scriptSig. Critical when only a merged block is found (no
@@ -3388,16 +3661,15 @@ int main(int argc, char* argv[]) {
             // Wire Redistributor into MiningInterface as the address-fallback callback.
             // Called for Case 3: invalid/empty LTC address with no usable DOGE address.
             //
-            // redistributor_ptr is a raw pointer — the unique_ptr is kept alive for the
-            // duration of the pool (moved into redistributor_holder below).
-            {
+            // Solo/custodial: no tracker — fallback to payout_address hash160.
+            // P2P: redistributor picks from share tracker PPLNS weights.
+            if (p2p_node) {
                 auto* redistributor_ptr = redistributor.get();
                 auto* node_ptr = p2p_node.get();
                 web_server.get_mining_interface()->set_address_fallback_fn(
                     [redistributor_ptr, node_ptr](const std::string& /*bad_addr*/) -> std::string {
                         auto best = node_ptr->best_share_hash();
                         auto result = redistributor_ptr->pick(node_ptr->tracker(), best);
-                        // Convert uint160 to 40-char hex string
                         static const char* HEX = "0123456789abcdef";
                         std::string h160;
                         h160.reserve(40);
@@ -3408,6 +3680,13 @@ int main(int argc, char* argv[]) {
                         }
                         return h160;
                     });
+            } else if (!payout_address.empty()) {
+                // Solo/custodial: invalid miner address → use node operator address
+                web_server.get_mining_interface()->set_address_fallback_fn(
+                    [&payout_address](const std::string& /*bad_addr*/) -> std::string {
+                        std::string atype;
+                        return core::address_to_hash160(payout_address, atype);
+                    });
             }
             // Keep redistributor alive for the lifetime of the pool
             auto redistributor_holder = std::move(redistributor);
@@ -3416,40 +3695,46 @@ int main(int argc, char* argv[]) {
             // Primary think trigger: processing_shares_phase2 calls run_think()
             // for small batches (real-time share relay). This timer catches
             // anything that falls through.
+            // Solo/custodial: no sharechain → no think/clean needed.
             auto think_timer = std::make_shared<boost::asio::steady_timer>(ioc);
             std::function<void(boost::system::error_code)> think_tick;
-            think_tick = [&, think_timer](boost::system::error_code ec) {
-                if (ec || g_shutdown_requested) return;
-                try {
-                    p2p_node->clean_tracker();
-                } catch (const std::exception& e) {
-                    LOG_ERROR << "[CLEAN-TRACKER] error: " << e.what();
-                }
+            if (p2p_node) {
+                think_tick = [&, think_timer](boost::system::error_code ec) {
+                    if (ec || g_shutdown_requested) return;
+                    try {
+                        p2p_node->clean_tracker();
+                    } catch (const std::exception& e) {
+                        LOG_ERROR << "[CLEAN-TRACKER] error: " << e.what();
+                    }
+                    think_timer->expires_after(std::chrono::seconds(5));
+                    think_timer->async_wait(think_tick);
+                };
                 think_timer->expires_after(std::chrono::seconds(5));
                 think_timer->async_wait(think_tick);
-            };
-            think_timer->expires_after(std::chrono::seconds(5));
-            think_timer->async_wait(think_tick);
+            }
 
             // Periodic monitoring timer (every 30 seconds)
+            // Solo/custodial: no tracker to monitor.
             auto monitor_timer = std::make_shared<boost::asio::steady_timer>(ioc);
             std::function<void(boost::system::error_code)> monitor_tick;
-            monitor_tick = [&, monitor_timer](boost::system::error_code ec) {
-                if (ec || g_shutdown_requested) return;
-                try {
-                    auto best = p2p_node->best_share_hash();
-                    if (!best.IsNull()) {
-                        pool_monitor->run_cycle(p2p_node->tracker(), best);
-                        whale_detector->detect(p2p_node->tracker(), best, "timer");
+            if (p2p_node) {
+                monitor_tick = [&, monitor_timer](boost::system::error_code ec) {
+                    if (ec || g_shutdown_requested) return;
+                    try {
+                        auto best = p2p_node->best_share_hash();
+                        if (!best.IsNull()) {
+                            pool_monitor->run_cycle(p2p_node->tracker(), best);
+                            whale_detector->detect(p2p_node->tracker(), best, "timer");
+                        }
+                    } catch (const std::exception& e) {
+                        LOG_ERROR << "[MONITOR] cycle error: " << e.what();
                     }
-                } catch (const std::exception& e) {
-                    LOG_ERROR << "[MONITOR] cycle error: " << e.what();
-                }
+                    monitor_timer->expires_after(std::chrono::seconds(30));
+                    monitor_timer->async_wait(monitor_tick);
+                };
                 monitor_timer->expires_after(std::chrono::seconds(30));
                 monitor_timer->async_wait(monitor_tick);
-            };
-            monitor_timer->expires_after(std::chrono::seconds(30));
-            monitor_timer->async_wait(monitor_tick);
+            }
 
             // ── Embedded LTC sync gate ──────────────────────────────────
             // Match p2pool's implicit sync gate: block startup until the
@@ -3504,9 +3789,15 @@ int main(int argc, char* argv[]) {
             LOG_INFO << "  ✓ Persistent storage";
 
             // ── Startup mode: genesis / auto / wait ──────────────────────────
-            // Determines behavior when sharechain is empty (no shares from
-            // LevelDB or peers). Logged clearly so operator knows what's happening.
-            {
+            // Solo/custodial: no sharechain, skip entirely.
+            if (solo_mode || custodial_mode) {
+                LOG_INFO << "[" << (solo_mode ? "Solo" : "Custodial")
+                         << "] No sharechain — ready to mine immediately";
+                LOG_INFO << "[" << (solo_mode ? "Solo" : "Custodial")
+                         << "] Payout address: " << payout_address;
+            } else if (p2p_node) {
+                // Determines behavior when sharechain is empty (no shares from
+                // LevelDB or peers). Logged clearly so operator knows what's happening.
                 auto chain_count = p2p_node->tracker().chain.size();
                 auto best = p2p_node->best_share_hash();
                 bool chain_empty = (chain_count == 0);
@@ -3537,12 +3828,6 @@ int main(int argc, char* argv[]) {
                         }
                     }
                     else {
-                        // AUTO/GENESIS: proceed immediately (p2pool PERSIST=False behavior).
-                        // Genesis share is created on-demand when the miner asks for work
-                        // and best_share is still null.  If peers send shares first,
-                        // best_share gets set → no genesis needed.
-                        // This matches p2pool: get_work() checks best_share_var.value,
-                        // creates genesis only when it's None at the time of work generation.
                         LOG_INFO << "[Sharechain] Ready — genesis on first work request if no peers";
                         if (network_id != 0)
                             LOG_INFO << "[Sharechain] Private chain network_id="
