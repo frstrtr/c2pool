@@ -12,6 +12,8 @@
 #include <core/uint256.hpp>
 #include <optional>
 #include <cstdint>
+#include <random>
+#include <string>
 
 namespace doge {
 namespace coin {
@@ -186,8 +188,6 @@ inline uint32_t calculate_doge_next_work(
 //
 // The prevHash overload computes the exact random subsidy.
 // The no-prevHash overload returns the MAX for fee estimation.
-
-#include <random>
 
 // Exact port of boost::uniform_int<>::operator()(gen) for range [min, max].
 // boost::uniform_int uses rejection sampling: generate a raw value, scale,

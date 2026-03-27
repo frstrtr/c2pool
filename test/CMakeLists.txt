@@ -248,4 +248,13 @@ if (BUILD_TESTING AND GTest_FOUND)
         core
     )
     gtest_add_tests(test_v36_cross_impl_refhash "" AUTO)
+
+    add_executable(test_mweb_builder test_mweb_builder.cpp)
+    target_link_libraries(test_mweb_builder PRIVATE
+        GTest::gtest_main GTest::gtest
+        core ltc
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    gtest_add_tests(test_mweb_builder "" AUTO)
 endif()

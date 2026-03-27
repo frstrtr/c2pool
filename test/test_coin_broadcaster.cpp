@@ -808,6 +808,87 @@ TEST(CoinBroadcaster, EventCallbackSetters)
     EXPECT_FALSE(headers_fired);
 }
 
+// ─── PeerManagerConfig disable_discovery tests ──────────────────────────────
+
+TEST(PeerManagerConfig, DisableDiscoveryDefault)
+{
+    PeerManagerConfig cfg;
+    EXPECT_FALSE(cfg.disable_discovery);
+}
+
+TEST(PeerManagerConfig, DisableDiscoveryFlag)
+{
+    PeerManagerConfig cfg;
+    cfg.disable_discovery = true;
+    cfg.max_peers = 1;
+    cfg.min_peers = 1;
+
+    boost::asio::io_context ioc;
+    CoinPeerManager pm(ioc, "DOGE", "/tmp/test_pm_disco", cfg);
+
+    // discovery_enabled() must return false when disabled
+    EXPECT_FALSE(pm.discovery_enabled());
+
+    // needs_emergency_refresh() must return false when disabled
+    EXPECT_FALSE(pm.needs_emergency_refresh(0));
+    EXPECT_FALSE(pm.needs_emergency_refresh(1));
+}
+
+TEST(PeerManagerConfig, DiscoveryEnabledWhenNotDisabled)
+{
+    PeerManagerConfig cfg;
+    cfg.disable_discovery = false;
+    cfg.max_peers = 5;
+    cfg.min_peers = 2;
+
+    boost::asio::io_context ioc;
+    CoinPeerManager pm(ioc, "LTC", "/tmp/test_pm_disco2", cfg);
+
+    // Should be enabled when peer count < max_peers
+    EXPECT_TRUE(pm.discovery_enabled());
+
+    // Emergency refresh when connected < min_peers
+    EXPECT_TRUE(pm.needs_emergency_refresh(0));
+    EXPECT_TRUE(pm.needs_emergency_refresh(1));
+    EXPECT_FALSE(pm.needs_emergency_refresh(2));
+    EXPECT_FALSE(pm.needs_emergency_refresh(5));
+}
+
+TEST(PeerManagerConfig, ValidPortsFiltering)
+{
+    PeerManagerConfig cfg;
+    cfg.max_peers = 20;
+    cfg.valid_ports = {22556, 44556};
+
+    boost::asio::io_context ioc;
+    CoinPeerManager pm(ioc, "DOGE", "/tmp/test_pm_ports", cfg);
+
+    // Valid port should be accepted
+    pm.add_discovered_peer(NetService("1.2.3.4", 22556));
+    EXPECT_EQ(pm.peer_count(), 1u);
+
+    // Invalid port should be rejected
+    pm.add_discovered_peer(NetService("5.6.7.8", 8333));
+    EXPECT_EQ(pm.peer_count(), 1u) << "Peer on invalid port should be rejected";
+
+    // Another valid port
+    pm.add_discovered_peer(NetService("9.10.11.12", 44556));
+    EXPECT_EQ(pm.peer_count(), 2u);
+}
+
+TEST(PeerManagerConfig, ConfigAccessor)
+{
+    PeerManagerConfig cfg;
+    cfg.disable_discovery = true;
+    cfg.max_peers = 42;
+
+    boost::asio::io_context ioc;
+    CoinPeerManager pm(ioc, "TEST", "/tmp/test_pm_cfg", cfg);
+
+    EXPECT_TRUE(pm.config().disable_discovery);
+    EXPECT_EQ(pm.config().max_peers, 42);
+}
+
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);

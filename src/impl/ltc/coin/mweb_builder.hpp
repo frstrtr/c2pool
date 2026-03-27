@@ -16,6 +16,7 @@
 #include "block.hpp"
 
 #include <core/pack.hpp>
+#include <core/hash.hpp>
 #include <core/log.hpp>
 #include <btclibs/uint256.h>
 #include <btclibs/serialize.h>

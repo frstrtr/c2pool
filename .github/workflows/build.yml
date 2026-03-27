@@ -75,7 +75,7 @@ jobs:
       - name: Build c2pool
         run: cmake --build build_ci --target c2pool -j$(nproc)
 
-      # ── 8. Build test targets ─────────────────────────────────────────────
+      # ── 8. Build test targets (unit tests only — no live daemon tests) ───
       - name: Build tests
         run: |
           cmake --build build_ci \
@@ -90,11 +90,11 @@ jobs:
                     test_hash_link test_decay_pplns \
                     test_pplns_consensus \
                     test_v36_script_sorting test_v36_cross_impl_refhash \
-                    test_phase0_live test_phase1_live test_phase2_live \
-                    test_phase3_live test_phase4_embedded test_phase4_live \
+                    test_phase4_embedded \
             -j$(nproc)
 
       # ── 9. Run test suite ─────────────────────────────────────────────────
+      # Live integration tests (test_phase*_live) excluded — require daemon
       - name: Run tests
         working-directory: build_ci
         run: ctest --output-on-failure -j$(nproc)
