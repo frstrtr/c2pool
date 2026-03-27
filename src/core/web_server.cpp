@@ -1588,6 +1588,14 @@ MiningInterface::build_connection_coinbase(
 void MiningInterface::refresh_work()
 {
     if (!m_coin_rpc && !m_embedded_node) return;
+
+    // Serialize refresh_work calls — two concurrent threads (e.g. embedded LTC
+    // header callback + stratum submit) hitting build_coinbase_parts() in parallel
+    // causes heap corruption ("corrupted size vs. prev_size in fastbins").
+    static std::mutex s_refresh_mutex;
+    std::unique_lock<std::mutex> refresh_lock(s_refresh_mutex, std::try_to_lock);
+    if (!refresh_lock.owns_lock()) return;  // another refresh in progress, skip
+
     try {
         // Phase 4: prefer embedded node; fall back to RPC (HybridCoinNode pattern)
         auto wd = m_embedded_node ? m_embedded_node->getwork()
