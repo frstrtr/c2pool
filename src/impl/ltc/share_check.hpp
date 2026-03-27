@@ -873,9 +873,13 @@ inline std::vector<unsigned char> get_share_script(const auto* obj)
 // Reference: frstrtr/p2pool-merged-v36  p2pool/data.py  generate_transaction()
 // ============================================================================
 template <typename ShareT, typename TrackerT>
-uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool dump_diag = false)
+uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool dump_diag = false, bool v36_active = false)
 {
     constexpr int64_t ver = ShareT::version;
+    // p2pool selects PPLNS formula by runtime AutoRatchet state, not compile-time
+    // share version. When v36_active is true (AutoRatchet ACTIVATED/CONFIRMED),
+    // use v36 PPLNS even for v35 shares. Ref: p2pool data.py:879, work.py:759.
+    const bool use_v36_pplns = v36_active || (ver >= 36);
     const uint64_t subsidy = share.m_subsidy;
     const uint16_t donation = share.m_donation;
 
@@ -899,11 +903,10 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
         auto max_weight = chain::target_to_average_attempts(block_target)
                           * PoolConfig::SPREAD * 65535;
 
-        // V36: use exponential depth-decay (matching Python's get_decayed_cumulative_weights)
-        // Remove desired_weight cap — exponential decay naturally limits old shares'
-        // contribution. The cap is harmful on low-difficulty networks (testnet) where
-        // block_att < share_att, truncating the PPLNS window to ~2 shares.
-        if constexpr (ver >= 36) {
+        // PPLNS formula selected by runtime v36_active (AutoRatchet state),
+        // not compile-time share version. Ref: p2pool data.py:879, work.py:759.
+        if (use_v36_pplns) {
+            // V36 PPLNS: exponential depth-decay, walk from parent
             uint288 unlimited_weight;
             unlimited_weight.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
             auto result = tracker.get_v36_decayed_cumulative_weights(prev_hash, chain_len, unlimited_weight);
@@ -911,7 +914,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
             total_weight = result.total_weight;
             total_donation_weight = result.total_donation_weight;
         } else {
-            // Pre-V36: flat cumulative weights (no decay)
+            // Pre-V36 PPLNS: flat cumulative weights (no decay)
             // CRITICAL: Walk from GRANDPARENT for HEIGHT-1 shares.
             // p2pool data.py:884-885:
             //   _pplns_start = previous_share.share_data['previous_share_hash']
@@ -1015,7 +1018,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
         for (auto& [script, weight] : weights)
         {
             uint64_t amount;
-            if constexpr (ver >= 36)
+            if (use_v36_pplns)
             {
                 // V36: amounts[script] = subsidy * weight / total_weight
                 uint288 num = uint288(subsidy) * weight;
@@ -1034,7 +1037,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
     }
 
     // Pre-V36: add 0.5% finder fee to share creator
-    if constexpr (ver < 36)
+    if (!use_v36_pplns)
     {
         auto finder_script = get_share_script(&share);
         amounts[finder_script] += subsidy / 200;
@@ -1059,7 +1062,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
     }
 
     // V36 consensus: donation output must carry >= 1 satoshi (a60f7f7f)
-    if constexpr (ver >= 36) {
+    if (use_v36_pplns) {
         if (donation_amount < 1 && subsidy > 0 && !amounts.empty()) {
             // Deduct 1 sat from the largest miner payout
             // Deterministic tiebreak: (amount, script) — largest script wins when equal
@@ -1592,20 +1595,30 @@ bool share_check(const ShareT& share,
         throw std::invalid_argument("share timestamp is too far in the future");
 
     // 2. Version counting — AutoRatchet upgrade enforcement
-    // If 95% of recent shares desire a higher version, this share's version
-    // is considered obsolete and must be rejected.
-    // Use share.m_hash (the stored identity) for chain lookups, not the
-    // recomputed share_hash — they may differ during genesis or hash_link
-    // reconstruction edge cases. p2pool uses self.share_data['previous_share_hash']
-    // for chain depth, not the share's own recomputed hash.
+    // p2pool data.py:1400-1414: version switch validation only at BOUNDARIES
+    // (when share.VERSION != parent.VERSION). Shares that match their parent's
+    // version are always valid — they were correct when created.
+    // Previous code rejected ALL v35 shares retroactively after 95% activation.
     {
         auto lookbehind = static_cast<int32_t>(PoolConfig::chain_length());
-        if (tracker.chain.contains(share.m_hash)) {
-            auto height = tracker.chain.get_height(share.m_hash);
-            if (height >= lookbehind)
+        if (tracker.chain.contains(share.m_hash) &&
+            !share.m_prev_hash.IsNull() && tracker.chain.contains(share.m_prev_hash))
+        {
+            // Get parent's share version
+            int64_t parent_version = 0;
+            tracker.chain.get_share(share.m_prev_hash).invoke([&](auto* obj) {
+                parent_version = std::remove_pointer_t<decltype(obj)>::version;
+            });
+
+            // Only enforce version obsolescence at version BOUNDARIES
+            if (share.version != parent_version)
             {
-                if (tracker.should_punish_version(share.m_hash, share.version, lookbehind))
-                    throw std::invalid_argument("share version too old — newer version has 95%+ activation");
+                auto height = tracker.chain.get_height(share.m_hash);
+                if (height >= lookbehind)
+                {
+                    if (tracker.should_punish_version(share.m_hash, share.version, lookbehind))
+                        throw std::invalid_argument("share version too old — newer version has 95%+ activation");
+                }
             }
         }
     }
@@ -1613,9 +1626,11 @@ bool share_check(const ShareT& share,
     // 3. GenerateShareTransaction reconstruction & comparison
     // Rebuild the expected coinbase from PPLNS weights and share fields,
     // then verify its txid matches the gentx_hash from share_init_verify().
+    // Pass v36_active from tracker (set by AutoRatchet) for runtime PPLNS selection.
+    bool v36_active = tracker.is_v36_active();
     if (!share.m_prev_hash.IsNull() && tracker.chain.contains(share.m_prev_hash))
     {
-        uint256 expected_gentx = generate_share_transaction(share, tracker);
+        uint256 expected_gentx = generate_share_transaction(share, tracker, false, v36_active);
         if (expected_gentx != gentx_hash)
         {
             LOG_WARNING << "GENTX-MISMATCH detail:"
@@ -1696,8 +1711,8 @@ bool share_check(const ShareT& share,
             static int s_diag_count = 0;
             if (s_diag_count++ < 5)
             {
-                LOG_WARNING << "[GENTX-DIAG] Re-running generate_share_transaction with full dump:";
-                generate_share_transaction(share, tracker, true);
+                LOG_WARNING << "[GENTX-DIAG] Re-running generate_share_transaction with full dump (v36_active=" << v36_active << "):";
+                generate_share_transaction(share, tracker, true, v36_active);
             }
 
             throw std::invalid_argument("GenerateShareTransaction mismatch — coinbase does not match PPLNS payouts");
@@ -3073,7 +3088,7 @@ uint256 create_local_share(
     {
         static int xcheck_count = 0;
         if (xcheck_count < 5) {
-            uint256 verify_hash = generate_share_transaction<MergedMiningShare>(*heap_share, tracker, true);
+            uint256 verify_hash = generate_share_transaction<MergedMiningShare>(*heap_share, tracker, true, tracker.is_v36_active());
             bool xcheck_ok = (verify_hash == gentx_hash_for_header);
             if (xcheck_ok) {
                 LOG_INFO << "[Pool] Cross-check PASSED";

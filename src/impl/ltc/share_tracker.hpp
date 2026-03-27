@@ -12,6 +12,7 @@
 #include <btclibs/bech32.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <map>
@@ -116,7 +117,15 @@ public:
     ShareChain chain;
     ShareChain verified;
 
+    // Runtime v36_active flag — set by AutoRatchet when state is ACTIVATED or CONFIRMED.
+    // Used by generate_share_transaction to select PPLNS formula at runtime,
+    // matching p2pool's behavior (data.py:879, work.py:759).
+    bool is_v36_active() const { return v36_active_.load(std::memory_order_relaxed); }
+    void set_v36_active(bool active) { v36_active_.store(active, std::memory_order_relaxed); }
+
 private:
+    std::atomic<bool> v36_active_{false};
+
     static int64_t now_seconds()
     {
         return std::chrono::duration_cast<std::chrono::seconds>(
