@@ -911,10 +911,23 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
             total_weight = result.total_weight;
             total_donation_weight = result.total_donation_weight;
         } else {
-            // Pre-V36: standard cumulative weights without decay
+            // Pre-V36: flat cumulative weights (no decay)
+            // CRITICAL: Walk from GRANDPARENT for HEIGHT-1 shares.
+            // p2pool data.py:884-885:
+            //   _pplns_start = previous_share.share_data['previous_share_hash']
+            //   _pplns_max_shares = max(0, min(height, REAL_CHAIN_LENGTH) - 1)
+            uint256 pplns_start;
+            tracker.chain.get(prev_hash).share.invoke([&](auto* s) {
+                pplns_start = s->m_prev_hash;  // grandparent
+            });
             auto available = tracker.chain.get_height(prev_hash);
-            auto walk_count = static_cast<size_t>(std::min(chain_len, available));
-            auto walk_view = tracker.chain.get_chain(prev_hash, walk_count);
+            auto walk_count = static_cast<size_t>(
+                std::max(0, std::min(chain_len, available) - 1));
+
+            if (pplns_start.IsNull() || !tracker.chain.contains(pplns_start) || walk_count == 0) {
+                // No grandparent reachable — skip PPLNS walk (genesis case)
+            } else {
+            auto walk_view = tracker.chain.get_chain(pplns_start, walk_count);
 
             for (auto [hash, data] : walk_view)
             {
@@ -964,6 +977,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
                 total_weight += share_total;
                 total_donation_weight += share_don_w;
             }
+            } // end if (pplns_start valid)
         }
     }
 
@@ -1616,7 +1630,14 @@ bool share_check(const ShareT& share,
             auto chain_len = std::min(
                 tracker.chain.get_height(share.m_prev_hash),
                 static_cast<int32_t>(PoolConfig::real_chain_length()));
+            // V35: log grandparent + height-1 window info
+            uint256 gp_hash;
+            if (tracker.chain.contains(share.m_prev_hash))
+                tracker.chain.get(share.m_prev_hash).share.invoke([&](auto* s){ gp_hash = s->m_prev_hash; });
+            int32_t v35_walk = std::max(0, chain_len - 1);
             LOG_WARNING << "  PPLNS chain_len=" << chain_len
+                        << " v35_walk=" << v35_walk
+                        << " grandparent=" << (gp_hash.IsNull() ? "null" : gp_hash.GetHex().substr(0,16))
                         << " prev_height=" << tracker.chain.get_height(share.m_prev_hash)
                         << " real_chain_length=" << PoolConfig::real_chain_length();
 

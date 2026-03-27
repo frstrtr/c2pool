@@ -1116,16 +1116,10 @@ public:
                         chain::bits_to_target(obj->m_bits));
                     uint32_t don = obj->m_donation;
 
-                    std::vector<unsigned char> script;
-                    if constexpr (requires { obj->m_pubkey_hash; }) {
-                        script = {0x76, 0xa9, 0x14};
-                        auto* hash_bytes = obj->m_pubkey_hash.data();
-                        script.insert(script.end(), hash_bytes, hash_bytes + 20);
-                        script.push_back(0x88);
-                        script.push_back(0xac);
-                    } else if constexpr (requires { obj->m_address; }) {
-                        script = obj->m_address.m_data;
-                    }
+                    // Extract scriptPubKey via get_share_script — handles both
+                    // V36 (m_pubkey_hash) and V35 (m_address string → script conversion).
+                    // Must match generate_share_transaction's key type.
+                    auto script = get_share_script(obj);
 
                     auto share_total = att * 65535;
                     auto share_addr_w = att * static_cast<uint32_t>(65535 - don);
@@ -1467,6 +1461,19 @@ public:
         uint64_t donation_amount = (subsidy > sum) ? (subsidy - sum) : 0;
         result[donation_script] = (result.contains(donation_script) ? result[donation_script] : 0.0)
                                   + static_cast<double>(donation_amount);
+
+        // Periodic diagnostic dump for cross-impl comparison
+        {
+            static int v35_dump = 0;
+            if (v35_dump++ < 10 || v35_dump % 60 == 0) {
+                LOG_INFO << "[V35-PPLNS] subsidy=" << subsidy << " addrs=" << weights.size()
+                         << " total_w=" << total_weight.GetLow64()
+                         << " max_shares=" << max_shares << " sum=" << sum
+                         << " donation=" << donation_amount
+                         << " prev=" << best_share_hash.GetHex().substr(0, 16)
+                         << " grandparent=" << pplns_start.GetHex().substr(0, 16);
+            }
+        }
 
         return result;
     }
