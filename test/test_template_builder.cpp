@@ -419,15 +419,12 @@ TEST(EmbeddedCoinNodeTest, GetworkThrowsWithNoGenesis) {
     EXPECT_THROW(node.getwork(), std::runtime_error);
 }
 
-TEST(EmbeddedCoinNodeTest, GetworkSucceedsAfterGenesis) {
+TEST(EmbeddedCoinNodeTest, GetworkThrowsWhenNotSynced) {
+    // Genesis has timestamp from 2017 — sync gate blocks getwork
     auto chain = make_chain_with_genesis();
     Mempool pool;
-
     EmbeddedCoinNode node(*chain, pool, true);
-    EXPECT_NO_THROW({
-        auto wd = node.getwork();
-        EXPECT_TRUE(wd.m_data.contains("previousblockhash"));
-    });
+    EXPECT_THROW(node.getwork(), std::runtime_error);
 }
 
 TEST(EmbeddedCoinNodeTest, GetblockchainInfoFields) {
