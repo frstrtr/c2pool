@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.9.3] - 2026-03-27
+## [0.9.5] - 2026-03-27
 
 ### Milestone
 - **Embedded DOGE merged mining** — first DOGE block accepted on testnet4alpha via pure embedded SPV P2P. Zero daemon dependencies for LTC+DOGE mining.
