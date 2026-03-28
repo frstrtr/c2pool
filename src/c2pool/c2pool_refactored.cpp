@@ -2730,9 +2730,17 @@ int main(int argc, char* argv[]) {
                         params.pubkey_type = 0;
                     }
 
-                    // V35: convert pubkey_hash to address string
+                    // V35: convert pubkey_hash to address string (uses raw bytes)
                     if (share_version <= 35) {
                         params.address = ltc::pubkey_hash_to_address(params.pubkey_hash, params.pubkey_type);
+                    }
+
+                    // V36: reverse P2WPKH witness program to match p2pool v0.14.3
+                    // IntType(160) LE convention. Must happen AFTER V35 address
+                    // generation (which needs raw bytes) but BEFORE ref_hash
+                    // computation (which needs reversed bytes for wire format).
+                    if (share_version >= 36 && params.pubkey_type == 1) {
+                        std::reverse(params.pubkey_hash.data(), params.pubkey_hash.data() + 20);
                     }
 
                     // Segwit data — txid_merkle_link must match create_local_share

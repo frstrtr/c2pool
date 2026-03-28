@@ -2460,8 +2460,12 @@ uint256 create_local_share(
             share.m_pubkey_type = 2;
         } else if (payout_script.size() == 22 &&
                    payout_script[0] == 0x00 && payout_script[1] == 0x14) {
-            // P2WPKH: 00 14 <hash160>
+            // P2WPKH: 00 14 <witness_program>
+            // p2pool v0.14.3 stores bech32 witness programs byte-reversed in
+            // IntType(160) (LE integer convention with [::-1] at bech32 boundary).
+            // pubkey_hash_to_script() reverses back when building the script.
             std::memcpy(share.m_pubkey_hash.data(), payout_script.data() + 2, 20);
+            std::reverse(share.m_pubkey_hash.data(), share.m_pubkey_hash.data() + 20);
             share.m_pubkey_type = 1;
         } else {
             // Fallback: store first 20 bytes as P2PKH
