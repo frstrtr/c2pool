@@ -764,12 +764,9 @@ inline std::vector<unsigned char> pubkey_hash_to_script(const uint160& hash, uin
     switch (type)
     {
     case 1: // P2WPKH: OP_0 <20>
-        // V36 shares store bech32 witness programs byte-reversed in uint160
-        // (p2pool IntType(160) LE convention). Reverse back to get BIP173
-        // network-order bytes for the P2WPKH script.
-        // P2PKH/P2SH don't need reversal because base58 also uses IntType(160),
-        // so the two reversals cancel out.
-        std::reverse(h.begin(), h.end());
+        // Use GetChars() output directly — same as P2PKH and P2SH.
+        // The bytes in m_pubkey_hash are the raw witness program as
+        // deserialized from the wire. No reversal needed.
         script.reserve(22);
         script.push_back(0x00);
         script.push_back(0x14);
@@ -1215,7 +1212,9 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
     for (auto& [script, amount] : payout_outputs)
         write_txout(amount, script);
 
-    // Donation output
+    // Donation output — V35 shares always use P2PK DONATION_SCRIPT,
+    // V36 shares always use P2SH COMBINED_DONATION_SCRIPT.
+    // Each share was created with the donation script matching its version.
     auto donation_script = PoolConfig::get_donation_script(ver);
     write_txout(donation_amount, donation_script);
 
@@ -2468,11 +2467,11 @@ uint256 create_local_share(
         } else if (payout_script.size() == 22 &&
                    payout_script[0] == 0x00 && payout_script[1] == 0x14) {
             // P2WPKH: 00 14 <witness_program>
-            // p2pool v0.14.3 stores bech32 witness programs byte-reversed in
-            // IntType(160) (LE integer convention with [::-1] at bech32 boundary).
-            // pubkey_hash_to_script() reverses back when building the script.
+            // P2WPKH: store raw witness program bytes directly.
+            // No reversal — c2pool uses raw bytes throughout, unlike p2pool's
+            // IntType(160) LE integer convention. The wire serialization of
+            // uint160 preserves the byte order from memcpy.
             std::memcpy(share.m_pubkey_hash.data(), payout_script.data() + 2, 20);
-            std::reverse(share.m_pubkey_hash.data(), share.m_pubkey_hash.data() + 20);
             share.m_pubkey_type = 1;
         } else {
             // Fallback: store first 20 bytes as P2PKH
