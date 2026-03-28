@@ -140,6 +140,27 @@ void NodeImpl::connected(std::shared_ptr<core::Socket> socket)
 
 void NodeImpl::error(const message_error_type& err, const NetService& service, const std::source_location where)
 {
+    // If peer disconnected within 10s of us sending shares, those shares
+    // were likely rejected (e.g. PoW-invalid).  Mark them so we don't
+    // keep re-broadcasting the same bad share on every reconnection.
+    {
+        auto it = m_last_broadcast_to.find(service);
+        if (it != m_last_broadcast_to.end()) {
+            auto elapsed = std::chrono::steady_clock::now() - it->second.when;
+            if (elapsed < std::chrono::seconds(10)) {
+                for (const auto& h : it->second.hashes) {
+                    if (m_rejected_share_hashes.insert(h).second) {
+                        LOG_WARNING << "[Pool] Marking share " << h.GetHex().substr(0, 16)
+                                    << " as rejected (peer " << service.to_string()
+                                    << " disconnected " << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
+                                    << "ms after broadcast)";
+                    }
+                }
+            }
+            m_last_broadcast_to.erase(it);
+        }
+    }
+
     // Drop stale nonce->peer entries for this endpoint before base cleanup.
     // Without this, reconnects can be rejected as false duplicates because
     // m_peers still contains the old nonce mapping.
@@ -160,6 +181,20 @@ void NodeImpl::error(const message_error_type& err, const NetService& service, c
 
 void NodeImpl::close_connection(const NetService& service)
 {
+    // Same rejection tracking as error() — close_connection is another
+    // path for peer disconnection.
+    {
+        auto it = m_last_broadcast_to.find(service);
+        if (it != m_last_broadcast_to.end()) {
+            auto elapsed = std::chrono::steady_clock::now() - it->second.when;
+            if (elapsed < std::chrono::seconds(10)) {
+                for (const auto& h : it->second.hashes)
+                    m_rejected_share_hashes.insert(h);
+            }
+            m_last_broadcast_to.erase(it);
+        }
+    }
+
     m_pending_outbound.erase(service);
     m_outbound_addrs.erase(service);
     base_t::close_connection(service);
@@ -493,6 +528,8 @@ std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
         {
 			if (std::find(stops.begin(), stops.end(), hash) != stops.end())
 				break;
+			if (m_rejected_share_hashes.count(hash))
+				continue;
 			shares.push_back(data.share);
 		}
 	}
@@ -506,11 +543,13 @@ std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
 
 void NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hashes)
 {
-    // Collect shares that exist in our chain
+    // Collect shares that exist in our chain (skip rejected)
     std::vector<ShareType> shares;
     for (const auto& hash : share_hashes)
     {
         if (!m_chain->contains(hash))
+            continue;
+        if (m_rejected_share_hashes.count(hash))
             continue;
         // Retrieve the share via get_chain(hash, 1) — first element is the share itself
         for (auto [h, data] : m_chain->get_chain(hash, 1))
@@ -609,6 +648,8 @@ void NodeImpl::broadcast_share(const uint256& share_hash)
     {
         if (m_shared_share_hashes.count(hash))
             break;
+        if (m_rejected_share_hashes.count(hash))
+            continue; // skip shares previously rejected by peers
         m_shared_share_hashes.insert(hash);
         to_send.push_back(hash);
     }
@@ -616,8 +657,11 @@ void NodeImpl::broadcast_share(const uint256& share_hash)
     if (to_send.empty())
         return;
 
-    for (auto& [nonce, peer] : m_peers)
+    auto now = std::chrono::steady_clock::now();
+    for (auto& [nonce, peer] : m_peers) {
         send_shares(peer, to_send);
+        m_last_broadcast_to[peer->addr()] = {to_send, now};
+    }
 }
 
 void NodeImpl::notify_local_share(const uint256& share_hash)

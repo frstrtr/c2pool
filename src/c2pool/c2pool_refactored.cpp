@@ -2183,11 +2183,19 @@ int main(int argc, char* argv[]) {
             }
 
             // Donation script (protocol-level, goes to p2pool devs)
-            // Use the consensus donation script directly from PoolConfig (V36).
+            // Use the AutoRatchet's initial share version so the donation script
+            // matches what generate_share_transaction expects.  Previously this
+            // was hardcoded to V36, so the genesis share (created before the
+            // PPLNS hook fires) used COMBINED_DONATION_SCRIPT (23 bytes) while
+            // V35's gentx_before_refhash expects DONATION_SCRIPT (67 bytes),
+            // causing p2pool to reject the share as PoW-invalid.
             {
-                auto donation_script = ltc::PoolConfig::get_donation_script(36);
+                auto [initial_ver, initial_desired] = auto_ratchet->get_share_version(
+                    p2p_node->tracker(), uint256());
+                auto donation_script = ltc::PoolConfig::get_donation_script(initial_ver);
                 web_server.get_mining_interface()->set_donation_script(donation_script);
-                LOG_INFO << "Donation script set: V36 COMBINED_DONATION_SCRIPT ("
+                web_server.get_mining_interface()->set_cached_share_version(initial_ver);
+                LOG_INFO << "Donation script set: V" << initial_ver << " ("
                          << donation_script.size() << " bytes)";
             }
 
@@ -2735,13 +2743,9 @@ int main(int argc, char* argv[]) {
                         params.address = ltc::pubkey_hash_to_address(params.pubkey_hash, params.pubkey_type);
                     }
 
-                    // V36: reverse P2WPKH witness program to match p2pool v0.14.3
-                    // IntType(160) LE convention. Must happen AFTER V35 address
-                    // generation (which needs raw bytes) but BEFORE ref_hash
-                    // computation (which needs reversed bytes for wire format).
-                    if (share_version >= 36 && params.pubkey_type == 1) {
-                        std::reverse(params.pubkey_hash.data(), params.pubkey_hash.data() + 20);
-                    }
+                    // No P2WPKH reversal — c2pool stores raw witness program
+                    // bytes in uint160. The wire serialization preserves byte
+                    // order from memcpy (uint160::data() = raw memory).
 
                     // Segwit data — txid_merkle_link must match create_local_share
                     if (segwit_active && !witness_commitment_hex.empty()) {

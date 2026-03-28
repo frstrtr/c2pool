@@ -14,6 +14,7 @@
 #include <c2pool/storage/sharechain_storage.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <random>
 
@@ -251,7 +252,16 @@ protected:
     std::function<std::vector<std::string>()> m_local_miner_scripts_fn;
     std::string m_node_payout_script_hex;
     std::set<uint256> m_shared_share_hashes;  // de-dup set for broadcast_share
+    std::set<uint256> m_rejected_share_hashes; // shares rejected by peers — never re-broadcast
     std::set<uint256> m_downloading_shares;   // hashes currently being fetched
+
+    // Track recently-broadcast share hashes + timestamp so we can detect
+    // rapid disconnections (peer rejected our share → PoW invalid loop).
+    struct BroadcastRecord {
+        std::vector<uint256> hashes;
+        std::chrono::steady_clock::time_point when;
+    };
+    std::map<NetService, BroadcastRecord> m_last_broadcast_to; // per-peer
 
     // Connection maintenance
     static constexpr size_t DEFAULT_TARGET_OUTBOUND_PEERS = 8;
