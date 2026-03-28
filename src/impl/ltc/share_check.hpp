@@ -1645,8 +1645,12 @@ bool share_check(const ShareT& share,
     // 3. GenerateShareTransaction reconstruction & comparison
     // Rebuild the expected coinbase from PPLNS weights and share fields,
     // then verify its txid matches the gentx_hash from share_init_verify().
-    // Pass v36_active from tracker (set by AutoRatchet) for runtime PPLNS selection.
-    bool v36_active = tracker.is_v36_active();
+    // p2pool check(): v36_active = (self.VERSION >= 36)
+    // Use the SHARE's own version, not the tracker's runtime AutoRatchet state.
+    // This ensures V35 shares always verify with V35 PPLNS formula, even after
+    // the AutoRatchet transitions to ACTIVATED.
+    constexpr int64_t share_ver = ShareT::version;
+    bool v36_active = (share_ver >= 36);
     if (!share.m_prev_hash.IsNull() && tracker.chain.contains(share.m_prev_hash))
     {
         uint256 expected_gentx = generate_share_transaction(share, tracker, false, v36_active);
@@ -3123,7 +3127,7 @@ uint256 create_local_share(
     {
         static int xcheck_count = 0;
         if (xcheck_count < 5) {
-            uint256 verify_hash = generate_share_transaction<MergedMiningShare>(*heap_share, tracker, true, tracker.is_v36_active());
+            uint256 verify_hash = generate_share_transaction<MergedMiningShare>(*heap_share, tracker, true, (MergedMiningShare::version >= 36));
             bool xcheck_ok = (verify_hash == gentx_hash_for_header);
             if (xcheck_ok) {
                 LOG_INFO << "[Pool] Cross-check PASSED";
