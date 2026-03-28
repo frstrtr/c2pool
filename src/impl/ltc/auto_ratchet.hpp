@@ -144,6 +144,33 @@ public:
         {
             if (full_window && vote_pct >= ACTIVATION_THRESHOLD)
             {
+                // Tail guard: oldest 10% of window must have >= 60% signaling
+                // (jtoomim rule). Prevents activation before the entire PPLNS
+                // window has transitioned — p2pool check() rejects V36 shares
+                // when the oldest 10% has < 60% signaling.
+                uint32_t tail_start = (chain_length * 9) / 10;
+                uint32_t tail_size  = chain_length / 10;
+                auto tail_ancestor = tracker.chain.get_nth_parent_key(best_share_hash, tail_start);
+                auto tail_counts = tracker.get_desired_version_counts(tail_ancestor, tail_size);
+
+                int64_t tail_target = 0, tail_total = 0;
+                for (auto& [ver, cnt] : tail_counts) {
+                    tail_total += cnt;
+                    if (ver >= target_version_)
+                        tail_target += cnt;
+                }
+                int tail_pct = (tail_total > 0) ? static_cast<int>(tail_target * 100 / tail_total) : 0;
+
+                if (tail_pct < SWITCH_THRESHOLD) {
+                    static int tail_log = 0;
+                    if (tail_log++ % 20 == 0)
+                        LOG_INFO << "[AutoRatchet] VOTING: full window " << vote_pct
+                                 << "% >= " << ACTIVATION_THRESHOLD << "% but oldest 10% only "
+                                 << tail_pct << "% (need " << SWITCH_THRESHOLD << "%) — waiting";
+                    // Don't transition yet
+                }
+                else
+                {
                 state_ = RatchetState::ACTIVATED;
                 activated_at_ = now_seconds();
                 activated_height_ = abs_height;
@@ -167,6 +194,7 @@ public:
                              << retroactive << " >= " << confirmation_window << ")";
                 }
                 save();
+                } // else (tail guard passed)
             }
         }
         else if (state_ == RatchetState::ACTIVATED)
