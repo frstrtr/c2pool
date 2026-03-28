@@ -438,7 +438,7 @@ void HttpSession::process_request()
                 const auto& dashboard_dir = mining_interface_->get_dashboard_dir();
                 if (!dashboard_dir.empty()) {
                     std::string file_path = target;
-                    if (file_path == "/" || file_path.empty()) file_path = "/index.html";
+                    if (file_path == "/" || file_path.empty()) file_path = "/dashboard.html";
 
                     std::error_code fec;
                     std::filesystem::path base = std::filesystem::weakly_canonical(dashboard_dir);
@@ -2525,6 +2525,25 @@ nlohmann::json MiningInterface::rest_global_rate()
 nlohmann::json MiningInterface::rest_current_payouts()
 {
     nlohmann::json result = nlohmann::json::object();
+    bool is_ltc = (m_blockchain == Blockchain::LITECOIN);
+
+    // Primary source: cached PPLNS outputs from the coinbase builder.
+    // These are always up-to-date with the latest share template and subsidy.
+    auto cached = get_cached_pplns_outputs();
+    if (!cached.empty()) {
+        for (const auto& [script_hex, amount] : cached) {
+            // script_hex is a hex-encoded scriptPubKey — decode to bytes, then to address
+            auto script_bytes = ParseHex(script_hex);
+            std::string addr = core::script_to_address(script_bytes, is_ltc, m_testnet);
+            if (addr.empty())
+                addr = script_hex;  // fallback to hex if address conversion fails
+            // p2pool returns coins (not satoshis)
+            result[addr] = static_cast<double>(amount) / 1e8;
+        }
+        return result;
+    }
+
+    // Fallback: PayoutManager (for modes without coinbase builder)
     auto* pm = m_payout_manager_ptr ? m_payout_manager_ptr : m_payout_manager.get();
     if (pm && pm->has_pplns_data()) {
         uint64_t subsidy = 0;
@@ -2535,15 +2554,17 @@ nlohmann::json MiningInterface::rest_current_payouts()
         }
         if (subsidy > 0) {
             auto outputs = pm->calculate_pplns_outputs(subsidy);
-            static const char* HEX = "0123456789abcdef";
             for (const auto& [script, amount] : outputs) {
-                std::string key;
-                key.reserve(script.size() * 2);
-                for (unsigned char b : script) {
-                    key += HEX[b >> 4];
-                    key += HEX[b & 0x0f];
+                std::string addr = core::script_to_address(script, is_ltc, m_testnet);
+                if (addr.empty()) {
+                    static const char* HEX = "0123456789abcdef";
+                    addr.reserve(script.size() * 2);
+                    for (unsigned char b : script) {
+                        addr += HEX[b >> 4];
+                        addr += HEX[b & 0x0f];
+                    }
                 }
-                result[key] = amount;
+                result[addr] = static_cast<double>(amount) / 1e8;
             }
         }
     }
@@ -2568,13 +2589,25 @@ nlohmann::json MiningInterface::rest_recent_blocks()
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
     for (const auto& b : m_found_blocks) {
         arr.push_back({
-            {"height", b.height},
-            {"hash", b.hash},
             {"ts", b.ts},
+            {"hash", b.hash},
+            {"number", b.height},
+            {"height", b.height},
             {"status", status_str[static_cast<int>(b.status)]},
+            {"verified", b.status == BlockStatus::confirmed},
             {"checks", b.check_count},
             {"chain", b.chain},
-            {"confirmations", b.confirmations}
+            {"confirmations", b.confirmations},
+            {"miner", b.miner},
+            {"share", b.share_hash},
+            {"network_difficulty", b.network_difficulty},
+            {"share_difficulty", b.share_difficulty},
+            {"pool_hashrate_at_find", b.pool_hashrate},
+            {"subsidy", b.subsidy},
+            {"expected_time", b.expected_time},
+            {"time_to_find", b.time_to_find},
+            {"luck", b.luck},
+            {"luck_method", "expected_time"}
         });
     }
     return arr;
@@ -2605,17 +2638,20 @@ nlohmann::json MiningInterface::rest_uptime()
 
 nlohmann::json MiningInterface::rest_connected_miners()
 {
-    nlohmann::json result = nlohmann::json::object();
+    // p2pool returns a simple array of unique miner addresses
     auto workers = get_stratum_workers();
-
-    result["total_connected"] = static_cast<int>(workers.size());
-    result["active_workers"] = static_cast<int>(workers.size());
-    uint64_t total_stale = 0;
-    for (const auto& [sid, w] : workers)
-        total_stale += w.stale;
-    result["stale_count"] = total_stale;
-
-    return result;
+    std::set<std::string> unique_addrs;
+    for (const auto& [sid, w] : workers) {
+        // Strip worker suffix: "addr.worker" → "addr"
+        std::string base = w.username;
+        auto dot = base.find('.');
+        if (dot != std::string::npos) base = base.substr(0, dot);
+        unique_addrs.insert(base);
+    }
+    nlohmann::json arr = nlohmann::json::array();
+    for (const auto& addr : unique_addrs)
+        arr.push_back(addr);
+    return arr;
 }
 
 nlohmann::json MiningInterface::rest_stratum_stats()
@@ -2790,9 +2826,11 @@ nlohmann::json MiningInterface::rest_global_stats()
 
     // p2pool field names the dashboard expects
     result["pool_hash_rate"] = pool_rate;
+    result["pool_nonstale_hash_rate"] = pool_rate; // TODO: subtract stale when tracked
     result["pool_stale_prop"] = 0.0;
     result["min_difficulty"] = share_diff;
-    
+    result["network_block_difficulty"] = net_diff;
+
     // Additional fields
     result["network_hashrate"] = net_hashrate;
     result["shares_in_chain"] = total_shares;
@@ -2801,7 +2839,7 @@ nlohmann::json MiningInterface::rest_global_stats()
     result["uptime_seconds"] = rest_uptime();
     result["status"] = "operational";
     result["last_block"] = 0;
-    
+
     return result;
 }
 
@@ -2911,12 +2949,37 @@ nlohmann::json MiningInterface::rest_control_mining_unban(const std::string& tar
 }
 
 void MiningInterface::record_found_block(uint64_t height, const uint256& hash, uint64_t ts,
-                                          const std::string& chain)
+                                          const std::string& chain,
+                                          const std::string& miner,
+                                          const std::string& share_hash,
+                                          double network_difficulty,
+                                          double share_difficulty,
+                                          double pool_hashrate,
+                                          uint64_t subsidy)
 {
     if (ts == 0) ts = static_cast<uint64_t>(std::time(nullptr));
-    FoundBlock blk{height, hash.GetHex(), ts, BlockStatus::pending, 0, chain, 0};
+    FoundBlock blk{height, hash.GetHex(), ts, BlockStatus::pending, 0, chain, 0,
+                   miner, share_hash, network_difficulty, share_difficulty,
+                   pool_hashrate, subsidy, 0, 0, 0};
+
+    // Compute time_to_find from previous block, then derive expected_time and luck
     {
         std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        // Find previous block in the same chain for time_to_find
+        for (const auto& prev : m_found_blocks) {
+            if (prev.chain == chain) {
+                blk.time_to_find = static_cast<double>(ts) - static_cast<double>(prev.ts);
+                break;
+            }
+        }
+        // expected_time = network_difficulty * 2^32 / pool_hashrate
+        if (pool_hashrate > 0 && network_difficulty > 0) {
+            blk.expected_time = network_difficulty * 4294967296.0 / pool_hashrate;
+        }
+        // luck = expected / actual * 100 (>100 = lucky)
+        if (blk.time_to_find > 0 && blk.expected_time > 0) {
+            blk.luck = blk.expected_time / blk.time_to_find * 100.0;
+        }
         m_found_blocks.insert(m_found_blocks.begin(), blk);
     }
 
@@ -3295,6 +3358,60 @@ nlohmann::json MiningInterface::rest_local_stats()
     }
     result["attempts_to_merged_block"] = merged_attempts;
 
+    // p2pool-compat: my_hash_rates_in_last_hour — aggregate from all local workers
+    double total_hr = 0, total_dead = 0;
+    {
+        auto workers = get_stratum_workers();
+        for (const auto& [sid, w] : workers) {
+            total_hr += w.hashrate;
+            total_dead += w.dead_hashrate;
+        }
+    }
+    result["my_hash_rates_in_last_hour"] = {
+        {"nonstale", total_hr - total_dead},
+        {"rewarded", total_hr - total_dead},
+        {"actual", total_hr},
+        {"note", "from stratum worker hashrates"}
+    };
+
+    // p2pool-compat: my_share_counts_in_last_hour
+    result["my_share_counts_in_last_hour"] = {
+        {"shares", total_shares},
+        {"unstale_shares", total_shares - orphan_shares - dead_shares},
+        {"stale_shares", orphan_shares + dead_shares},
+        {"orphan_stale_shares", orphan_shares},
+        {"doa_stale_shares", dead_shares}
+    };
+
+    // p2pool-compat: my_stale_proportions_in_last_hour
+    double stale_prop = total_shares > 0 ? static_cast<double>(orphan_shares + dead_shares) / total_shares : 0.0;
+    double orphan_prop = total_shares > 0 ? static_cast<double>(orphan_shares) / total_shares : 0.0;
+    double dead_prop = total_shares > 0 ? static_cast<double>(dead_shares) / total_shares : 0.0;
+    result["my_stale_proportions_in_last_hour"] = {
+        {"stale", stale_prop}, {"orphan_stale", orphan_prop}, {"dead_stale", dead_prop}
+    };
+
+    // p2pool-compat: efficiency_if_miner_perfect
+    if (total_shares > 0)
+        result["efficiency_if_miner_perfect"] = 1.0 - stale_prop;
+    else
+        result["efficiency_if_miner_perfect"] = nullptr;
+
+    // p2pool-compat: miner_last_difficulties — from stratum workers
+    nlohmann::json miner_diffs = nlohmann::json::object();
+    {
+        auto workers = get_stratum_workers();
+        for (const auto& [sid, w] : workers) {
+            std::string key = w.username;
+            miner_diffs[key] = w.difficulty;
+        }
+    }
+    result["miner_last_difficulties"] = miner_diffs;
+
+    // p2pool-compat: version and protocol_version
+    result["version"] = "c2pool/0.8.0";
+    result["protocol_version"] = 3600;  // V36 share format
+
     return result;
 }
 
@@ -3591,12 +3708,16 @@ nlohmann::json MiningInterface::rest_luck_stats()
     nlohmann::json result = nlohmann::json::object();
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
     result["luck_available"] = !m_found_blocks.empty();
-    result["current_luck_trend"] = 0.0;
 
+    // Compute average luck trend from recent blocks
+    double luck_sum = 0;
+    int luck_count = 0;
     nlohmann::json blocks = nlohmann::json::array();
     for (const auto& b : m_found_blocks) {
-        blocks.push_back({{"ts", b.ts}, {"hash", b.hash}, {"luck", 0.0}});
+        blocks.push_back({{"ts", b.ts}, {"hash", b.hash}, {"luck", b.luck}});
+        if (b.luck > 0) { luck_sum += b.luck; ++luck_count; }
     }
+    result["current_luck_trend"] = luck_count > 0 ? luck_sum / luck_count : 0.0;
     result["blocks"] = blocks;
     return result;
 }
@@ -3627,16 +3748,51 @@ nlohmann::json MiningInterface::rest_miner_stats(const std::string& address)
 {
     nlohmann::json result = nlohmann::json::object();
     result["address"] = address;
-    result["active"] = false;
-    result["hashrate"] = 0.0;
+
+    // Aggregate from stratum workers matching this address
+    double total_hr = 0, dead_hr = 0, diff = 0;
+    uint64_t accepted = 0, rejected = 0, stale = 0;
+    bool found = false;
+    {
+        auto workers = get_stratum_workers();
+        for (const auto& [sid, w] : workers) {
+            // Match base address (strip worker suffix)
+            std::string base = w.username;
+            auto dot = base.find('.');
+            if (dot != std::string::npos) base = base.substr(0, dot);
+            if (base == address) {
+                total_hr += w.hashrate;
+                dead_hr += w.dead_hashrate;
+                diff = w.difficulty;  // last seen difficulty
+                accepted += w.accepted;
+                rejected += w.rejected;
+                stale += w.stale;
+                found = true;
+            }
+        }
+    }
+
+    result["active"] = found;
+    result["hashrate"] = total_hr;
     result["estimated_hashrate"] = false;
-    result["dead_hashrate"] = 0.0;
-    result["doa_rate"] = 0.0;
-    result["share_difficulty"] = 0.0;
-    result["time_to_share"] = 0.0;
+    result["dead_hashrate"] = dead_hr;
+    result["doa_rate"] = (accepted + stale > 0) ? static_cast<double>(stale) / (accepted + stale) : 0.0;
+    result["share_difficulty"] = diff;
+    result["time_to_share"] = (total_hr > 0 && diff > 0) ? (diff * 4294967296.0 / total_hr) : 0.0;
     result["current_payout"] = 0.0;
     result["merged_payouts"] = nlohmann::json::array();
-    result["global_stale_prop"] = 0.0;
+
+    // Global stale proportion
+    double global_stale_prop = 0.0;
+    if (m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        uint64_t total_shares = sc.value("total_shares", uint64_t(0));
+        uint64_t orphan_shares = sc.value("orphan_shares", uint64_t(0));
+        uint64_t dead_shares = sc.value("dead_shares", uint64_t(0));
+        if (total_shares > 0)
+            global_stale_prop = static_cast<double>(orphan_shares + dead_shares) / total_shares;
+    }
+    result["global_stale_prop"] = global_stale_prop;
 
     // Best difficulty data
     {
@@ -3647,9 +3803,9 @@ nlohmann::json MiningInterface::rest_miner_stats(const std::string& address)
     }
 
     result["hashrate_periods"] = {
-        {"1m", {{"hashrate", 0.0}, {"dead_hashrate", 0.0}}},
-        {"10m", {{"hashrate", 0.0}, {"dead_hashrate", 0.0}}},
-        {"1h", {{"hashrate", 0.0}, {"dead_hashrate", 0.0}}}
+        {"1m", {{"hashrate", total_hr}, {"dead_hashrate", dead_hr}}},
+        {"10m", {{"hashrate", total_hr}, {"dead_hashrate", dead_hr}}},
+        {"1h", {{"hashrate", total_hr}, {"dead_hashrate", dead_hr}}}
     };
 
     // Try to get current payout from PPLNS
@@ -3679,12 +3835,13 @@ nlohmann::json MiningInterface::rest_miner_stats(const std::string& address)
     // Network difficulty
     double net_diff = m_network_difficulty.load(std::memory_order_relaxed);
     result["network_difficulty"] = net_diff;
-    result["chance_to_find_block"] = 0.0;
-    result["total_shares"] = 0;
-    result["unstale_shares"] = 0;
-    result["dead_shares"] = 0;
+    result["chance_to_find_block"] = (net_diff > 0 && total_hr > 0)
+        ? (total_hr / (net_diff * 4294967296.0) * 100.0) : 0.0;
+    result["total_shares"] = accepted + stale;
+    result["unstale_shares"] = accepted;
+    result["dead_shares"] = stale;
     result["orphan_shares"] = 0;
-    result["doa_shares"] = 0;
+    result["doa_shares"] = stale;
 
     return result;
 }
@@ -3721,11 +3878,14 @@ nlohmann::json MiningInterface::rest_best_share()
             return e;
         };
 
-        result["all_time"] = make_entry(best_all, m_best_difficulty.miner, m_best_difficulty.timestamp);
-        auto session = make_entry(best_sess, m_best_difficulty.miner, m_best_difficulty.timestamp);
+        result["all_time"] = make_entry(best_all,
+            m_best_difficulty.all_time_miner, m_best_difficulty.all_time_ts);
+        auto session = make_entry(best_sess,
+            m_best_difficulty.session_miner, m_best_difficulty.session_ts);
         session["started"] = m_start_time.time_since_epoch().count() / 1000000000ULL;
         result["session"] = session;
-        auto round = make_entry(best_round, m_best_difficulty.miner, m_best_difficulty.timestamp);
+        auto round = make_entry(best_round,
+            m_best_difficulty.miner, m_best_difficulty.timestamp);
         round["started"] = m_best_difficulty.round_start;
         result["round"] = round;
     }
@@ -3766,6 +3926,50 @@ nlohmann::json MiningInterface::rest_miner_payouts(const std::string& address)
                 }
             }
         }
+    }
+
+    // Populate from found blocks history
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        static const char* status_str[] = {"pending", "confirmed", "orphaned", "stale"};
+        nlohmann::json blocks_arr = nlohmann::json::array();
+        int blocks_found = 0;
+        double confirmed_rewards = 0, maturing_rewards = 0;
+        // Block explorer URL prefix
+        bool is_ltc = (m_blockchain == Blockchain::LITECOIN);
+        std::string explorer_prefix = is_ltc
+            ? (m_testnet ? "https://litecoinspace.org/testnet/block/" : "https://litecoinspace.org/block/")
+            : "https://blockchair.com/bitcoin/block/";
+
+        for (const auto& b : m_found_blocks) {
+            if (b.miner == address || address.empty()) {
+                ++blocks_found;
+                double payout_estimate = b.subsidy > 0 ? static_cast<double>(b.subsidy) / 1e8 : 0;
+                if (b.status == BlockStatus::confirmed)
+                    confirmed_rewards += payout_estimate;
+                else if (b.status == BlockStatus::pending)
+                    maturing_rewards += payout_estimate;
+
+                if (blocks_arr.size() < 20) {
+                    blocks_arr.push_back({
+                        {"timestamp", b.ts},
+                        {"block_height", b.height},
+                        {"block_hash", b.hash},
+                        {"block_reward", payout_estimate},
+                        {"explorer_url", explorer_prefix + b.hash},
+                        {"status", status_str[static_cast<int>(b.status)]},
+                        {"estimated_payout", payout_estimate},
+                        {"confirmations", b.confirmations},
+                        {"confirmations_required", 100}
+                    });
+                }
+            }
+        }
+        result["blocks_found"] = blocks_found;
+        result["total_estimated_rewards"] = confirmed_rewards + maturing_rewards;
+        result["confirmed_rewards"] = confirmed_rewards;
+        result["maturing_rewards"] = maturing_rewards;
+        result["blocks"] = blocks_arr;
     }
     return result;
 }
@@ -4383,9 +4587,13 @@ void MiningInterface::record_share_difficulty(double difficulty, const std::stri
     auto now_ts = static_cast<uint64_t>(std::time(nullptr));
     if (difficulty > m_best_difficulty.all_time) {
         m_best_difficulty.all_time = difficulty;
+        m_best_difficulty.all_time_miner = miner;
+        m_best_difficulty.all_time_ts = now_ts;
     }
     if (difficulty > m_best_difficulty.session) {
         m_best_difficulty.session = difficulty;
+        m_best_difficulty.session_miner = miner;
+        m_best_difficulty.session_ts = now_ts;
     }
     if (difficulty > m_best_difficulty.round) {
         m_best_difficulty.round = difficulty;

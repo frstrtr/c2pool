@@ -31,4 +31,16 @@ bool is_address_for_chain(const std::string& address,
 /// Returns empty vector on failure.
 std::vector<unsigned char> address_to_script(const std::string& address);
 
+/// Convert a raw scriptPubKey to a human-readable address string.
+/// Supports P2PKH, P2SH, P2WPKH, P2WSH. Returns "" on unrecognised script.
+/// bech32_hrp: "tltc", "ltc", "bc", "tb" etc.
+/// p2pkh_ver / p2sh_ver: base58check version bytes for the chain.
+std::string script_to_address(const std::vector<unsigned char>& script,
+    const std::string& bech32_hrp, uint8_t p2pkh_ver, uint8_t p2sh_ver);
+
+/// Convenience overload: derive chain params from blockchain + testnet flags.
+/// blockchain: "litecoin" or "bitcoin" (case-insensitive prefix match).
+std::string script_to_address(const std::vector<unsigned char>& script,
+    bool is_litecoin, bool is_testnet);
+
 } // namespace core

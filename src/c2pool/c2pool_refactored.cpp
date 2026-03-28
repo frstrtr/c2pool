@@ -1433,6 +1433,8 @@ int main(int argc, char* argv[]) {
             // Apply stratum tuning from CLI/YAML to the MiningInterface
             web_server.get_mining_interface()->set_stratum_config(stratum_config);
             web_server.get_mining_interface()->set_cors_origin(http_cors_origin);
+            web_server.get_mining_interface()->set_worker_port(static_cast<uint16_t>(stratum_port));
+            web_server.get_mining_interface()->set_p2p_port(static_cast<uint16_t>(p2p_port));
 
             // Dashboard serving directory and payout address for legacy API
             web_server.set_dashboard_dir(dashboard_dir);
@@ -1958,6 +1960,11 @@ int main(int argc, char* argv[]) {
                     }
                     return scripts;
                 });
+                // Wire peer info for /peer_list endpoint
+                web_server.get_mining_interface()->set_peer_info_fn(
+                    [&p2p_node]() -> nlohmann::json {
+                        return p2p_node->get_peer_info_json();
+                    });
             } // end if (p2p_node) — P2P callbacks
 
             // When a block submission is attempted, record the found block
@@ -2028,8 +2035,23 @@ int main(int argc, char* argv[]) {
                             height = tmpl["height"].get<uint64_t>();
                     }
                 }
-                web_server.get_mining_interface()->record_found_block(
-                    height, block_hash, 0, is_testnet ? "tLTC" : "LTC");
+                // Capture enriched data for dashboard /recent_blocks
+                auto* mi = web_server.get_mining_interface();
+                double net_diff = mi->get_network_difficulty();
+                double pool_hr = mi->get_local_hashrate();
+                uint64_t block_subsidy = 0;
+                {
+                    auto tmpl = mi->get_current_work_template();
+                    if (!tmpl.is_null() && tmpl.contains("coinbasevalue"))
+                        block_subsidy = tmpl["coinbasevalue"].get<uint64_t>();
+                }
+                std::string miner_addr = mi->get_payout_address();
+                std::string share_h;
+                if (auto fn = mi->get_best_share_hash_fn())
+                    share_h = fn().GetHex();
+                mi->record_found_block(
+                    height, block_hash, 0, is_testnet ? "tLTC" : "LTC",
+                    miner_addr, share_h, net_diff, 0, pool_hr, block_subsidy);
                 // Schedule async verification at +10s, +30s, +120s
                 if (stale_info == 0)
                     web_server.get_mining_interface()->schedule_block_verification(block_hash.GetHex());
@@ -3670,8 +3692,12 @@ int main(int argc, char* argv[]) {
                                  const std::string& block_hash, bool accepted) {
                             uint256 h;
                             h.SetHex(block_hash);
+                            double net_diff = mi_ptr->get_network_difficulty();
+                            double pool_hr = mi_ptr->get_local_hashrate();
+                            std::string miner_addr = mi_ptr->get_payout_address();
                             mi_ptr->record_found_block(
-                                static_cast<uint64_t>(height), h, 0, symbol);
+                                static_cast<uint64_t>(height), h, 0, symbol,
+                                miner_addr, "", net_diff, 0, pool_hr, 0);
                             if (accepted)
                                 mi_ptr->schedule_block_verification(block_hash);
                         });

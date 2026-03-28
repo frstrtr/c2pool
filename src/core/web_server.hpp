@@ -236,9 +236,16 @@ public:
     std::string rest_web_log();
     std::string rest_logs_export(const std::string& scope, int64_t from_ts, int64_t to_ts, const std::string& format);
 
-    // Track a found block for the /recent_blocks endpoint
+    // Track a found block for the /recent_blocks endpoint.
+    // Extended overload captures dashboard-enriched fields at record time.
     void record_found_block(uint64_t height, const uint256& hash, uint64_t ts = 0,
-                            const std::string& chain = "LTC");
+                            const std::string& chain = "LTC",
+                            const std::string& miner = "",
+                            const std::string& share_hash = "",
+                            double network_difficulty = 0,
+                            double share_difficulty = 0,
+                            double pool_hashrate = 0,
+                            uint64_t subsidy = 0);
     
     // Frozen share fields returned by ref_hash_fn — must be defined before JobSnapshot.
     struct RefHashResult {
@@ -470,6 +477,7 @@ public:
     const std::vector<CachedMergedHeaderInfo>& get_last_merged_header_infos() const { return m_last_merged_header_infos; }
     double get_local_hashrate() const { return m_cached_pool_hashrate; }
     void set_local_hashrate(double hr) { m_cached_pool_hashrate = hr; }
+    double get_network_difficulty() const { return m_network_difficulty.load(); }
 
     // Sharechain stats callback — returns live tracker data for the /sharechain/stats endpoint
     using sharechain_stats_fn_t = std::function<nlohmann::json()>;
@@ -586,6 +594,16 @@ public:
         uint8_t     check_count{0};   // how many verification attempts
         std::string chain;            // "LTC"/"tLTC"/"DOGE" etc — for log display
         uint32_t    confirmations{0}; // last known confirmation count
+        // Dashboard-enriched fields (populated at record time)
+        std::string miner;                 // payout address of the share that found the block
+        std::string share_hash;            // share hash that produced the block
+        double      network_difficulty{0}; // network difficulty at time of find
+        double      share_difficulty{0};   // share difficulty at time of find
+        double      pool_hashrate{0};      // pool hashrate at time of find
+        uint64_t    subsidy{0};            // block reward in satoshis
+        double      expected_time{0};      // expected seconds to find at current rate
+        double      time_to_find{0};       // actual seconds since previous block
+        double      luck{0};              // expected_time / time_to_find * 100
     };
 
     // Block acceptance verification: schedule async checks at +10s, +30s, +120s.
@@ -882,10 +900,14 @@ private:
     // Best share difficulty tracking
     struct BestDifficulty {
         double all_time{0.0};
+        std::string all_time_miner;
+        uint64_t all_time_ts{0};
         double session{0.0};
+        std::string session_miner;
+        uint64_t session_ts{0};
         double round{0.0};
-        std::string miner;
-        uint64_t timestamp{0};
+        std::string miner;       // round-level miner (backward compat)
+        uint64_t timestamp{0};   // round-level timestamp (backward compat)
         uint64_t round_start{0};
     };
     BestDifficulty m_best_difficulty;

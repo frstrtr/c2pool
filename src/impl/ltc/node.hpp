@@ -137,6 +137,25 @@ public:
             peer->write(message_bestblock::make_raw(header));
     }
 
+    /// Return a JSON array of connected peer info for the /peer_list endpoint.
+    nlohmann::json get_peer_info_json() const {
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& [nonce, peer] : m_peers) {
+            auto addr = peer->addr();
+            bool incoming = (m_outbound_addrs.find(addr) == m_outbound_addrs.end());
+            arr.push_back({
+                {"address", addr.to_string()},
+                {"version", peer->m_other_subversion},
+                {"incoming", incoming},
+                {"uptime", 0},
+                {"downtime", 0},
+                {"txpool_size", static_cast<int>(peer->m_remote_txs.size())},
+                {"web_port", 0}
+            });
+        }
+        return arr;
+    }
+
     /// Register a callback invoked whenever a bestblock message is received
     /// from any peer (after relaying). Use this to trigger work refresh.
     void set_on_bestblock(std::function<void()> fn) { m_on_bestblock = std::move(fn); }

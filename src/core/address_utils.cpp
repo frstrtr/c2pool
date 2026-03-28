@@ -6,6 +6,7 @@
 
 #include <btclibs/crypto/sha256.h>
 #include <btclibs/bech32.h>
+#include <btclibs/base58.h>
 
 namespace core {
 
@@ -174,6 +175,69 @@ bool is_address_for_chain(const std::string& address,
         }
     }
     return false;
+}
+
+std::string script_to_address(const std::vector<unsigned char>& script,
+    const std::string& bech32_hrp, uint8_t p2pkh_ver, uint8_t p2sh_ver)
+{
+    const size_t n = script.size();
+
+    // P2PKH: OP_DUP OP_HASH160 <20> <hash160> OP_EQUALVERIFY OP_CHECKSIG
+    if (n == 25 && script[0] == 0x76 && script[1] == 0xa9 &&
+        script[2] == 0x14 && script[23] == 0x88 && script[24] == 0xac)
+    {
+        std::vector<unsigned char> payload(21);
+        payload[0] = p2pkh_ver;
+        std::copy(script.begin() + 3, script.begin() + 23, payload.begin() + 1);
+        return EncodeBase58Check({payload.data(), payload.size()});
+    }
+
+    // P2SH: OP_HASH160 <20> <hash160> OP_EQUAL
+    if (n == 23 && script[0] == 0xa9 && script[1] == 0x14 && script[22] == 0x87)
+    {
+        std::vector<unsigned char> payload(21);
+        payload[0] = p2sh_ver;
+        std::copy(script.begin() + 2, script.begin() + 22, payload.begin() + 1);
+        return EncodeBase58Check({payload.data(), payload.size()});
+    }
+
+    // P2WPKH: OP_0 <20> <witness-program-20-bytes>
+    if (n == 22 && script[0] == 0x00 && script[1] == 0x14)
+    {
+        std::vector<uint8_t> prog(script.begin() + 2, script.end());
+        return bech32::encode_segwit(bech32_hrp, 0, prog);
+    }
+
+    // P2WSH: OP_0 <32> <witness-program-32-bytes>
+    if (n == 34 && script[0] == 0x00 && script[1] == 0x20)
+    {
+        std::vector<uint8_t> prog(script.begin() + 2, script.end());
+        return bech32::encode_segwit(bech32_hrp, 0, prog);
+    }
+
+    // P2TR: OP_1 <32> <x-only-pubkey>
+    if (n == 34 && script[0] == 0x51 && script[1] == 0x20)
+    {
+        std::vector<uint8_t> prog(script.begin() + 2, script.end());
+        return bech32::encode_segwit(bech32_hrp, 1, prog);
+    }
+
+    return {};
+}
+
+std::string script_to_address(const std::vector<unsigned char>& script,
+    bool is_litecoin, bool is_testnet)
+{
+    uint8_t p2pkh_ver, p2sh_ver;
+    std::string bech32_hrp;
+    if (is_litecoin) {
+        if (is_testnet) { p2pkh_ver = 0x6f; p2sh_ver = 0xc4; bech32_hrp = "tltc"; }
+        else            { p2pkh_ver = 0x30; p2sh_ver = 0x32; bech32_hrp = "ltc";  }
+    } else {
+        if (is_testnet) { p2pkh_ver = 0x6f; p2sh_ver = 0xc4; bech32_hrp = "tb";  }
+        else            { p2pkh_ver = 0x00; p2sh_ver = 0x05; bech32_hrp = "bc";   }
+    }
+    return script_to_address(script, bech32_hrp, p2pkh_ver, p2sh_ver);
 }
 
 std::vector<unsigned char> address_to_script(const std::string& address)
