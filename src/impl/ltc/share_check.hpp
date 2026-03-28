@@ -424,12 +424,17 @@ inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParam
 
     {
         static int rfn_log = 0;
-        if (rfn_log++ < 3) {
+        static int rfn_v36_log = 0;
+        bool should_log = (rfn_log < 3) || (p.share_version >= 36 && rfn_v36_log < 5);
+        if (should_log) {
+            rfn_log++;
+            if (p.share_version >= 36) rfn_v36_log++;
             static const char* HX = "0123456789abcdef";
             std::string hex;
             auto* rd = reinterpret_cast<const unsigned char*>(ref_stream.data());
             for (size_t i = 0; i < ref_stream.size(); ++i) { hex += HX[rd[i]>>4]; hex += HX[rd[i]&0xf]; }
-            LOG_INFO << "[REF-FN] ref_packed_len=" << ref_stream.size()
+            LOG_INFO << "[REF-FN] v=" << p.share_version
+                     << " ref_packed_len=" << ref_stream.size()
                      << " ref_hash=" << ref_hash.GetHex()
                      << " absheight=" << p.absheight << " prev=" << p.prev_share.GetHex().substr(0,16);
             LOG_INFO << "[REF-FN-FULL] " << hex;
@@ -759,10 +764,9 @@ inline std::vector<unsigned char> pubkey_hash_to_script(const uint160& hash, uin
     switch (type)
     {
     case 1: // P2WPKH: OP_0 <20>
-        // p2pool uses '{:040x}'.format(hash) for P2WPKH → big-endian.
-        // But IntType(160).pack() for P2PKH/P2SH → little-endian.
-        // So ONLY P2WPKH needs reversal.
-        std::reverse(h.begin(), h.end());
+        // GetChars() returns big-endian (network order) for uint160.
+        // P2WPKH witness programs use network order directly — NO reversal needed.
+        // (P2PKH/P2SH also use GetChars() directly without reversal.)
         script.reserve(22);
         script.push_back(0x00);
         script.push_back(0x14);
