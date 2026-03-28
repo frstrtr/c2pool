@@ -764,9 +764,12 @@ inline std::vector<unsigned char> pubkey_hash_to_script(const uint160& hash, uin
     switch (type)
     {
     case 1: // P2WPKH: OP_0 <20>
-        // GetChars() returns big-endian (network order) for uint160.
-        // P2WPKH witness programs use network order directly — NO reversal needed.
-        // (P2PKH/P2SH also use GetChars() directly without reversal.)
+        // V36 shares store bech32 witness programs byte-reversed in uint160
+        // (p2pool IntType(160) LE convention). Reverse back to get BIP173
+        // network-order bytes for the P2WPKH script.
+        // P2PKH/P2SH don't need reversal because base58 also uses IntType(160),
+        // so the two reversals cancel out.
+        std::reverse(h.begin(), h.end());
         script.reserve(22);
         script.push_back(0x00);
         script.push_back(0x14);
