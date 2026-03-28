@@ -149,10 +149,12 @@ inline bool decode_segwit(const std::string& hrp,
         data.push_back(static_cast<uint8_t>(p - detail::CHARSET));
     }
 
-    // Verify checksum (bech32: polymod == 1)
+    // Verify checksum: bech32 (polymod == 1) or bech32m (polymod == 0x2bc830a3)
+    // BIP-350: witness v0 uses bech32, witness v1+ uses bech32m
     auto values = detail::hrp_expand(got_hrp);
     values.insert(values.end(), data.begin(), data.end());
-    if (detail::polymod(values) != 1) return false;
+    uint32_t pm = detail::polymod(values);
+    if (pm != 1 && pm != 0x2bc830a3) return false;
 
     // Strip 6-byte checksum
     if (data.size() < 7) return false;  // witness version + at least 1 data char + 6 checksum

@@ -825,6 +825,22 @@ public:
         if (far_hash.IsNull() || !chain.contains(far_hash))
             return uint288(0);
 
+        // Verify skip list vs naive walk (periodic — detect stale pointers)
+        {
+            static int skip_verify = 0;
+            if (skip_verify++ % 100 == 0) {
+                try {
+                    auto naive_far = chain.get_nth_parent_key(share_hash, dist - 1);
+                    if (naive_far != far_hash) {
+                        LOG_ERROR << "[SKIP-MISMATCH] dist=" << dist
+                                  << " skip=" << far_hash.GetHex().substr(0,16)
+                                  << " naive=" << naive_far.GetHex().substr(0,16)
+                                  << " near=" << share_hash.GetHex().substr(0,16);
+                    }
+                } catch (...) {}
+            }
+        }
+
         // p2pool: tracker.get_delta(near.hash, far.hash)  — O(1) via TrackerView
         auto delta = chain.get_delta(share_hash, far_hash);
         uint288 attempts = use_min_work ? delta.min_work : delta.work;
@@ -931,13 +947,29 @@ public:
         auto aps = get_pool_attempts_per_second(prev_share_hash,
             PoolConfig::TARGET_LOOKBEHIND, /*min_work=*/true);
 
-        // Periodic APS diagnostic (lean — delta cache is now the primary path)
+        // Full APS diagnostic for cross-implementation comparison.
+        // Dumps all inputs so p2pool's values can be compared.
         {
             static int cst_diag = 0;
             if (cst_diag++ % 50 == 0) {
+                auto far_hash = chain.get_nth_parent_via_skip(prev_share_hash,
+                    static_cast<int32_t>(PoolConfig::TARGET_LOOKBEHIND) - 1);
+                uint32_t near_ts = 0, far_ts = 0;
+                chain.get_share(prev_share_hash).invoke([&](auto* obj) { near_ts = obj->m_timestamp; });
+                if (!far_hash.IsNull() && chain.contains(far_hash))
+                    chain.get_share(far_hash).invoke([&](auto* obj) { far_ts = obj->m_timestamp; });
+                auto delta = (!far_hash.IsNull() && chain.contains(far_hash))
+                    ? chain.get_delta(prev_share_hash, far_hash)
+                    : decltype(chain.get_delta(prev_share_hash, prev_share_hash)){};
                 LOG_INFO << "[CST-APS] aps=" << aps.GetLow64()
                          << " height=" << acc_height
-                         << " prev=" << prev_share_hash.GetHex().substr(0,16);
+                         << " prev=" << prev_share_hash.GetHex().substr(0,16)
+                         << " far=" << (far_hash.IsNull() ? "null" : far_hash.GetHex().substr(0,16))
+                         << " near_ts=" << near_ts << " far_ts=" << far_ts
+                         << " timespan=" << (int32_t(near_ts) - int32_t(far_ts))
+                         << " delta_h=" << delta.height
+                         << " delta_min_work=" << delta.min_work.GetLow64()
+                         << " delta_work=" << delta.work.GetLow64();
             }
         }
 
@@ -1085,7 +1117,27 @@ public:
         if (bits_target > pre_target3) bits_target = pre_target3;
         auto bits = chain::target_to_bits_upper_bound(bits_target);
 
-        // Same MAX_TARGET guard for bits
+        // Periodic full-chain diagnostic for cross-implementation comparison.
+        // Dumps all intermediate values so p2pool's computation can be matched.
+        {
+            static int cst_full = 0;
+            if (cst_full++ % 200 == 0) {
+                LOG_INFO << "[CST-FULL] max_bits=0x" << std::hex << max_bits
+                         << " bits=0x" << bits << std::dec
+                         << " aps=" << aps.GetLow64()
+                         << " pre_target_bits=0x" << std::hex
+                         << chain::target_to_bits_upper_bound(pre_target)
+                         << " clamp_ref_bits=0x"
+                         << chain::target_to_bits_upper_bound(clamp_ref_target)
+                         << " lo_bits=0x" << chain::target_to_bits_upper_bound(lo)
+                         << " hi_bits=0x" << chain::target_to_bits_upper_bound(hi)
+                         << " pre2_bits=0x" << chain::target_to_bits_upper_bound(pre_target2)
+                         << " pre3_bits=0x" << chain::target_to_bits_upper_bound(pre_target3)
+                         << std::dec
+                         << " height=" << acc_height
+                         << " prev=" << prev_share_hash.GetHex().substr(0,16);
+            }
+        }
         return {max_bits, bits};
     }
 

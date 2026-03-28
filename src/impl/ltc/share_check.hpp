@@ -1711,13 +1711,31 @@ bool share_check(const ShareT& share,
                     if (!far_hash.IsNull() && tracker.chain.contains(far_hash))
                         tracker.chain.get_share(far_hash).invoke([&](auto* s){ far_ts = s->m_timestamp; });
 
+                    // Compare skip-list far vs naive-walk far
+                    auto skip_far = tracker.chain.get_nth_parent_via_skip(
+                        share.m_prev_hash, dist - 1);
+                    bool skip_match = (!far_hash.IsNull() && skip_far == far_hash);
+
+                    // Also get delta via TrackerView for comparison
+                    uint288 delta_min_work;
+                    int32_t delta_height = 0;
+                    if (!skip_far.IsNull() && tracker.chain.contains(skip_far)) {
+                        auto dv = tracker.chain.get_delta(share.m_prev_hash, skip_far);
+                        delta_min_work = dv.min_work;
+                        delta_height = dv.height;
+                    }
+
                     LOG_WARNING << "[GENTX-APS] near=" << near_hash.GetHex().substr(0,16)
-                                << " far=" << (far_hash.IsNull() ? "null" : far_hash.GetHex().substr(0,16))
+                                << " far_naive=" << (far_hash.IsNull() ? "null" : far_hash.GetHex().substr(0,16))
+                                << " far_skip=" << (skip_far.IsNull() ? "null" : skip_far.GetHex().substr(0,16))
+                                << " skip_match=" << (skip_match ? "YES" : "NO")
                                 << " actual_dist=" << actual_dist
                                 << " expected_dist=" << (dist - 1)
                                 << " timespan=" << (int32_t(near_ts) - int32_t(far_ts))
                                 << " near_ts=" << near_ts << " far_ts=" << far_ts
-                                << " chain_height=" << tracker.chain.get_height(share.m_prev_hash);
+                                << " chain_height=" << tracker.chain.get_height(share.m_prev_hash)
+                                << " delta_h=" << delta_height
+                                << " delta_min_work=" << delta_min_work.GetLow64();
 
                     // Previous share's max_target (clamp reference)
                     uint256 prev_max_target;

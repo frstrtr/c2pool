@@ -67,6 +67,16 @@ std::string address_to_hash160(const std::string& address, std::string& addr_typ
                     for (uint8_t b : prog) { hex += HEX[b >> 4]; hex += HEX[b & 0x0f]; }
                     return hex;
                 }
+                // P2WSH: witness v0, 32-byte script hash — non-convertible
+                if (witver == 0 && prog.size() == 32) {
+                    addr_type = "p2wsh";
+                    return "";
+                }
+                // P2TR (witness v1) or future witness versions — non-convertible
+                if (witver >= 1) {
+                    addr_type = "p2tr";
+                    return "";
+                }
             }
             return "";
         }
