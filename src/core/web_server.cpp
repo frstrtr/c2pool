@@ -4701,7 +4701,14 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
             if (comma_pos != std::string::npos)
                 primary_addr = primary_addr.substr(0, comma_pos);
         }
-        std::string share_address = base58check_to_hash160(primary_addr);
+        // Decode any address format: base58 (P2PKH/P2SH) or bech32 (P2WPKH)
+        std::string addr_type_str;
+        std::string share_address = address_to_hash160(primary_addr, addr_type_str);
+        uint8_t share_addr_type = 0; // 0=P2PKH, 1=P2WPKH, 2=P2SH
+        if (share_address.size() == 40) {
+            if (addr_type_str == "p2wpkh") share_addr_type = 1;
+            else if (addr_type_str == "p2sh") share_addr_type = 2;
+        }
         if (share_address.size() != 40) {
             // Case 4 (Python work.py): invalid/empty LTC address but miner provided an
             // explicit DOGE merged address → derive LTC hash160 from DOGE P2PKH script.
@@ -4798,14 +4805,33 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                 params.miner_address = display;
             }
 
-            // Build P2PKH script from share_address (40-char hex hash160)
+            // Build scriptPubKey from share_address (40-char hex hash160) + type
             if (share_address.size() == 40) {
-                params.payout_script = {0x76, 0xa9, 0x14};
+                std::vector<unsigned char> hash160_bytes;
+                hash160_bytes.reserve(20);
                 for (size_t i = 0; i < share_address.size(); i += 2)
-                    params.payout_script.push_back(static_cast<unsigned char>(
+                    hash160_bytes.push_back(static_cast<unsigned char>(
                         std::stoul(share_address.substr(i, 2), nullptr, 16)));
-                params.payout_script.push_back(0x88);
-                params.payout_script.push_back(0xac);
+
+                if (share_addr_type == 1) {
+                    // P2WPKH: 00 14 <20-byte witness program>
+                    params.payout_script = {0x00, 0x14};
+                    params.payout_script.insert(params.payout_script.end(),
+                        hash160_bytes.begin(), hash160_bytes.end());
+                } else if (share_addr_type == 2) {
+                    // P2SH: a9 14 <20-byte hash> 87
+                    params.payout_script = {0xa9, 0x14};
+                    params.payout_script.insert(params.payout_script.end(),
+                        hash160_bytes.begin(), hash160_bytes.end());
+                    params.payout_script.push_back(0x87);
+                } else {
+                    // P2PKH: 76 a9 14 <20-byte hash> 88 ac
+                    params.payout_script = {0x76, 0xa9, 0x14};
+                    params.payout_script.insert(params.payout_script.end(),
+                        hash160_bytes.begin(), hash160_bytes.end());
+                    params.payout_script.push_back(0x88);
+                    params.payout_script.push_back(0xac);
+                }
             }
 
             params.merged_addresses = merged_addresses;

@@ -1365,6 +1365,14 @@ public:
         // See generate_share_transaction() for detailed rationale.
         uint288 unlimited_weight;
         unlimited_weight.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        {
+            static int ep_log = 0;
+            if (ep_log++ % 20 == 0) {
+                LOG_INFO << "[EP-PPLNS] v36 start=" << best_share_hash.GetHex().substr(0, 16)
+                         << " chain_len=" << chain_len
+                         << " subsidy=" << subsidy;
+            }
+        }
         auto [weights, total_weight, donation_weight] = get_v36_decayed_cumulative_weights(best_share_hash, chain_len, unlimited_weight);
 
         std::map<std::vector<unsigned char>, double> result;
@@ -1443,6 +1451,16 @@ public:
         uint288 desired_weight = chain::target_to_average_attempts(block_target)
                                  * uint288(PoolConfig::SPREAD) * uint288(65535);
 
+        {
+            static int ep35_log = 0;
+            if (ep35_log++ % 20 == 0) {
+                LOG_INFO << "[EP-PPLNS] v35 start=" << pplns_start.GetHex().substr(0, 16)
+                         << " max_shares=" << max_shares
+                         << " desired_w=" << desired_weight.GetLow64()
+                         << " subsidy=" << subsidy
+                         << " best=" << best_share_hash.GetHex().substr(0, 16);
+            }
+        }
         // Flat weight accumulation with hard cap (existing get_cumulative_weights)
         auto [weights, total_weight, donation_weight] = get_cumulative_weights(pplns_start, max_shares, desired_weight);
 

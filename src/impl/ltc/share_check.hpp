@@ -883,6 +883,19 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
     const uint64_t subsidy = share.m_subsidy;
     const uint16_t donation = share.m_donation;
 
+    // Debug: log the PPLNS formula selection for cross-impl comparison
+    {
+        static int gst_pplns_log = 0;
+        if (gst_pplns_log++ % 50 == 0) {
+            LOG_INFO << "[GST-PPLNS] v36_active=" << v36_active
+                     << " use_v36_pplns=" << use_v36_pplns
+                     << " ver=" << ver
+                     << " start=" << share.m_prev_hash.GetHex().substr(0, 16)
+                     << " subsidy=" << subsidy
+                     << " donation=" << donation;
+        }
+    }
+
     // --- 1. Compute PPLNS weights with full scriptPubKey keys ---
     // Walk from share's prev_hash (parent) backward through the chain.
     // This matches the Python: weights are computed relative to the share's parent.
@@ -2010,6 +2023,18 @@ uint256 create_local_share_v35(
         }
         std::string addr_str = pubkey_hash_to_address(pubkey_hash, pubkey_type);
         share.m_address.m_data.assign(addr_str.begin(), addr_str.end());
+        {
+            auto roundtrip = core::address_to_script(addr_str);
+            static const char* H = "0123456789abcdef";
+            std::string ps_hex, rt_hex;
+            for (auto b : payout_script) { ps_hex += H[b>>4]; ps_hex += H[b&0xf]; }
+            for (auto b : roundtrip) { rt_hex += H[b>>4]; rt_hex += H[b&0xf]; }
+            LOG_INFO << "[V35-ADDR] type=" << (int)pubkey_type
+                     << " addr=" << addr_str
+                     << " payout_script=" << ps_hex
+                     << " roundtrip=" << rt_hex
+                     << " match=" << (payout_script == roundtrip ? "YES" : "NO");
+        }
     }
 
     // Chain position: absheight and abswork

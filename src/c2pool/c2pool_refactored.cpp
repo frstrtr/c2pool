@@ -2519,6 +2519,19 @@ int main(int argc, char* argv[]) {
                 mi->set_donation_script(correct_donation);
                 mi->set_cached_share_version(share_version);
 
+                {
+                    static int pplns_hook_log = 0;
+                    if (pplns_hook_log++ % 20 == 0) {
+                        bool v36_act = (auto_ratchet->state() == ltc::RatchetState::ACTIVATED ||
+                                        auto_ratchet->state() == ltc::RatchetState::CONFIRMED);
+                        LOG_INFO << "[PPLNS-HOOK] share_version=" << share_version
+                                 << " v36_active=" << v36_act
+                                 << " best_hash=" << best_hash.GetHex().substr(0, 16)
+                                 << " using=" << (share_version < 36 ? "v35" : "v36")
+                                 << " ratchet=" << ltc::ratchet_state_str(auto_ratchet->state());
+                    }
+                }
+
                 if (share_version < 36) {
                     return p2p_node->tracker().get_v35_expected_payouts(
                         best_hash, block_target, subsidy, correct_donation);
@@ -2991,6 +3004,15 @@ int main(int argc, char* argv[]) {
                     } catch (const std::exception& e) {
                         LOG_ERROR << "broadcast_share failed: " << e.what();
                     }
+
+                    // CRITICAL: Update best share immediately so refresh_work()
+                    // sends new mining.notify to miners. Without this, the miner
+                    // keeps working on the old chain tip and creates duplicate
+                    // shares at the same height (self-orphaning).
+                    // p2pool does this via set_best_share() → work_event.
+                    // notify_local_share() is a fast-path that bypasses
+                    // run_think() scoring — it directly sets the new tip.
+                    p2p_node->notify_local_share(share_hash);
 
                     {
                         // p2pool format: GOT SHARE! addr.worker hash prev age

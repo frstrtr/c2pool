@@ -620,6 +620,16 @@ void NodeImpl::broadcast_share(const uint256& share_hash)
         send_shares(peer, to_send);
 }
 
+void NodeImpl::notify_local_share(const uint256& share_hash)
+{
+    // After creating a local share, run_think() to update best share and
+    // trigger mining.notify. Without this, miners keep working on the old
+    // chain tip and create duplicate shares at the same height.
+    // p2pool equivalent: set_best_share() → think() → work_event.
+    (void)share_hash;
+    run_think();
+}
+
 uint256 NodeImpl::best_share_hash()
 {
     // p2pool's think() returns the best VERIFIED head — not the raw chain tip.

@@ -192,6 +192,12 @@ public:
     /// Should be called periodically (e.g. after processing_shares or on a timer).
     void run_think();
 
+    /// Fast-path: update best share after creating a local share.
+    /// Bypasses run_think() scoring — just sets the new tip and triggers
+    /// work refresh so miners immediately build on the new share.
+    /// p2pool equivalent: set_best_share() → work_event.happened().
+    void notify_local_share(const uint256& share_hash);
+
     /// Periodic maintenance: eat stale heads, drop tails, then run_think().
     /// Matches p2pool's clean_tracker() (node.py:355-402).
     void clean_tracker();
