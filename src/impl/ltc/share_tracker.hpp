@@ -47,33 +47,33 @@ struct TailScore
 
 struct HeadScore
 {
-    uint288 work;
-    int32_t reason{};
-    int32_t is_local{};  // 1=local, 0=peer — peer wins tiebreak
-    int64_t time_seen{};
+    // p2pool: (work - min(punish,1)*ata(target), -reason, -time_seen)
+    // Sorted ascending, .back() = best. Standard < comparison.
+    uint288 adjusted_work;  // work - punishment_deduction
+    int32_t neg_reason{};   // -reason (higher = less punished = better)
+    int64_t neg_time_seen{}; // -time_seen (higher = seen earlier = better)
 
     friend bool operator<(const HeadScore& a, const HeadScore& b)
     {
-        if (a.work < b.work) return true;
-        if (b.work < a.work) return false;
-        // p2pool: sort by (-reason, peer_addr is None, -time_seen)
-        // is_local=0 (peer) sorts BEFORE is_local=1 (local) → peer wins
-        return std::tie(a.reason, a.is_local, a.time_seen) > std::tie(b.reason, b.is_local, b.time_seen);
+        if (a.adjusted_work < b.adjusted_work) return true;
+        if (b.adjusted_work < a.adjusted_work) return false;
+        return std::tie(a.neg_reason, a.neg_time_seen) < std::tie(b.neg_reason, b.neg_time_seen);
     }
 };
 
 struct TraditionalScore
 {
+    // p2pool: (work, -time_seen, -reason)
+    // No is_local. Sorted ascending, .back() = best.
     uint288 work;
-    int64_t time_seen{};
-    int32_t is_local{};
-    int32_t reason{};
+    int64_t neg_time_seen{};
+    int32_t neg_reason{};
 
     friend bool operator<(const TraditionalScore& a, const TraditionalScore& b)
     {
         if (a.work < b.work) return true;
         if (b.work < a.work) return false;
-        return std::tie(a.time_seen, a.is_local, a.reason) > std::tie(b.time_seen, b.is_local, b.reason);
+        return std::tie(a.neg_time_seen, a.neg_reason) < std::tie(b.neg_time_seen, b.neg_reason);
     }
 };
 
@@ -656,17 +656,18 @@ public:
                             reason = std::max(reason, idx->naughty);
                     }
 
-                    // p2pool: sort key = (work - punish*att, -reason, -time_seen)
-                    // p2pool has commented-out: self.items[h].peer_addr is None
-                    // which deprioritizes local shares. c2pool enables this to break
-                    // the local fork feedback loop (local→best→local→best cycle).
-                    bool is_local = false;
-                    chain.get_share(hh).invoke([&](auto* obj) {
-                        is_local = (obj->peer_addr.port() == 0);
-                    });
-                    // is_local=true sorts AFTER is_local=false (peer wins tiebreak)
-                    decorated_heads.push_back({{work_score, reason, is_local ? 1 : 0, -ts}, hh});
-                    traditional_sort.push_back({{work_score, -ts, is_local ? 1 : 0, reason}, hh});
+                    // p2pool: sort key = (work - min(punish,1)*ata(target), -reason, -time_seen)
+                    // peer_addr is None is COMMENTED OUT in p2pool — no is_local dimension.
+                    // Punishment deducted from work: a punished share is mathematically behind.
+                    uint288 adjusted_work = work_score;
+                    if (reason > 0) {
+                        // Deduct one share's worth of attempts (min(reason,1) * ata(target))
+                        auto* share_idx = chain.get_index(hh);
+                        if (share_idx)
+                            adjusted_work = adjusted_work - share_idx->work;
+                    }
+                    decorated_heads.push_back({{adjusted_work, -reason, -ts}, hh});
+                    traditional_sort.push_back({{work_score, -ts, -reason}, hh});
                 } catch (const std::exception&) {
                     // Chain concurrently modified — skip this head, retry next cycle
                 }
@@ -676,7 +677,7 @@ public:
         }
 
         // p2pool: self.punish = punish value from Phase 5 (walk-back result)
-        bool punish_aggressively = !traditional_sort.empty() && traditional_sort.back().score.reason != 0;
+        bool punish_aggressively = !traditional_sort.empty() && traditional_sort.back().score.neg_reason != 0;
 
         // Phase 5: Determine best share — p2pool data.py:2142-2166
         // Walk back through punished shares, then find best non-naughty descendent.

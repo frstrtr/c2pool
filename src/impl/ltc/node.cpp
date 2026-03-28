@@ -622,12 +622,32 @@ void NodeImpl::broadcast_share(const uint256& share_hash)
 
 void NodeImpl::notify_local_share(const uint256& share_hash)
 {
-    // After creating a local share, run_think() to update best share and
-    // trigger mining.notify. Without this, miners keep working on the old
-    // chain tip and create duplicate shares at the same height.
-    // p2pool equivalent: set_best_share() → think() → work_event.
-    (void)share_hash;
-    run_think();
+    // p2pool: set_best_share() runs think() synchronously on the reactor thread.
+    // c2pool's run_think() has m_think_running atomic that blocks concurrent calls.
+    // If run_think() is already running (processing peer shares), our local share's
+    // best_share update gets SKIPPED → miner keeps working on stale tip → orphan.
+    //
+    // Fix: bypass run_think() entirely. Inline-verify the local share and directly
+    // update m_best_share_hash. Local shares extend the current best tip, so their
+    // parent is already verified → attempt_verify succeeds in one call.
+    if (share_hash.IsNull() || !m_tracker.chain.contains(share_hash))
+        return;
+
+    // Inline verify — local shares passed self-validation, should succeed
+    m_tracker.attempt_verify(share_hash);
+
+    // Direct best_share update — no m_think_running check
+    if (m_tracker.verified.contains(share_hash)) {
+        bool changed = (m_best_share_hash != share_hash);
+        m_best_share_hash = share_hash;
+        if (changed && m_on_best_share_changed)
+            m_on_best_share_changed();
+    } else {
+        // Unverified (chain too short) — still trigger work refresh so miner
+        // doesn't keep building on the pre-local-share tip
+        if (m_on_best_share_changed)
+            m_on_best_share_changed();
+    }
 }
 
 uint256 NodeImpl::best_share_hash()
