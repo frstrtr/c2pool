@@ -126,6 +126,19 @@ public:
 private:
     std::atomic<bool> v36_active_{false};
 
+    // Retry counter for shares that fail GENTX verification.
+    // After MAX_VERIFY_RETRIES failures, share is permanently skipped.
+    // Prevents infinite retry loops for shares whose PPLNS ancestry
+    // changed after restart (different fork resolution).
+    static constexpr int MAX_VERIFY_RETRIES = 3;
+    std::unordered_map<uint256, int, ShareHasher> m_verify_fail_count;
+
+    bool is_permanently_unverifiable(const uint256& h) const
+    {
+        auto it = m_verify_fail_count.find(h);
+        return it != m_verify_fail_count.end() && it->second >= MAX_VERIFY_RETRIES;
+    }
+
     static int64_t now_seconds()
     {
         return std::chrono::duration_cast<std::chrono::seconds>(
@@ -144,6 +157,7 @@ public:
         // Without this, pruned shares leave stale entries in weight caches.
         chain.on_removed([this](const uint256& hash) {
             invalidate_weight_caches(hash);
+            m_verify_fail_count.erase(hash);
         });
     }
     ~ShareTracker()
@@ -158,14 +172,21 @@ public:
     void add(ShareT* share)
     {
         if (!chain.contains(share->m_hash))
+        {
+            try_register_merged_addr(share);
             chain.add(share);
+        }
     }
 
     void add(ShareType share)
     {
         auto h = share.hash();
         if (!chain.contains(h))
+        {
+            // Register before chain.add() which may move the variant
+            share.invoke([this](auto* obj) { try_register_merged_addr(obj); });
             chain.add(share);
+        }
     }
 
     // -- Attempt to verify a share --
@@ -176,6 +197,10 @@ public:
     {
         if (verified.contains(share_hash))
             return true;
+
+        // Skip shares that have permanently failed verification.
+        if (is_permanently_unverifiable(share_hash))
+            return false;
 
         // NO parent-in-verified filter. p2pool doesn't have one.
         // p2pool's attempt_verify has only the guard (height < CL+1 && unrooted).
@@ -224,11 +249,22 @@ public:
         }
         catch (const std::exception& e)
         {
-            LOG_WARNING << "attempt_verify FAILED for " << share_hash.ToString().substr(0,16)
-                        << " acc_height=" << acc_height << " last=" << (last.IsNull() ? "null" : last.ToString().substr(0,16))
-                        << " error: " << e.what();
+            auto& cnt = m_verify_fail_count[share_hash];
+            ++cnt;
+            if (cnt >= MAX_VERIFY_RETRIES)
+                LOG_WARNING << "attempt_verify: share " << share_hash.ToString().substr(0,16)
+                            << " permanently unverifiable after " << cnt
+                            << " attempts (acc_height=" << acc_height << "): " << e.what();
+            else
+                LOG_WARNING << "attempt_verify FAILED (" << cnt << "/" << MAX_VERIFY_RETRIES
+                            << ") for " << share_hash.ToString().substr(0,16)
+                            << " acc_height=" << acc_height << " last=" << (last.IsNull() ? "null" : last.ToString().substr(0,16))
+                            << " error: " << e.what();
             return false;
         }
+
+        // Success — clear any previous fail count
+        m_verify_fail_count.erase(share_hash);
 
         // Add to verified chain
         auto& share_var = chain.get_share(share_hash);
@@ -401,7 +437,11 @@ public:
                             ++p1_verified;
                             break;
                         }
-                        bads.push_back(hash);
+                        // Don't add permanently unverifiable shares to bads —
+                        // they can't be removed (have children) and would just
+                        // trigger peer banning every cycle.
+                        if (!is_permanently_unverifiable(hash))
+                            bads.push_back(hash);
                     }
                 } catch (const std::exception& ex) {
                     ++p1_caught;
@@ -1889,6 +1929,42 @@ private:
     std::optional<chain::WeightsSkipList> m_v36_weights_skiplist;
     std::unordered_map<uint32_t, chain::WeightsSkipList> m_merged_skiplists;
 
+    // -- Retroactive merged address lookup table --
+    // Maps (chain_id) → (parent_script → explicit_merged_script).
+    // Populated incrementally as V36 shares with explicit merged_addresses
+    // are added.  Used as "Tier 1.5" in the merged skip list lambda:
+    // when a V36 share has empty merged_addresses (activation-boundary race),
+    // look up the same miner's explicit address from their other shares.
+    std::unordered_map<uint32_t,
+        std::map<std::vector<unsigned char>, std::vector<unsigned char>>> m_miner_merged_addr;
+
+    // Register explicit merged addresses from a share into the lookup table.
+    // If a NEW miner→address mapping is discovered, invalidates the merged
+    // skip list for that chain_id so affected shares get recomputed.
+    template <typename ShareT>
+    void try_register_merged_addr(ShareT* share)
+    {
+        if constexpr (requires { share->m_merged_addresses; })
+        {
+            if (share->m_desired_version < 36) return;
+            if (share->m_merged_addresses.empty()) return;
+            auto parent_script = get_share_script(share);
+            if (parent_script.empty()) return;
+            for (const auto& entry : share->m_merged_addresses)
+            {
+                if (entry.m_script.m_data.empty()) continue;
+                auto& lookup = m_miner_merged_addr[entry.m_chain_id];
+                auto [it, inserted] = lookup.emplace(parent_script, entry.m_script.m_data);
+                if (inserted)
+                {
+                    // New mapping — stale skip list entries used auto-convert
+                    // for this miner; recreate to use the explicit address.
+                    m_merged_skiplists.erase(entry.m_chain_id);
+                }
+            }
+        }
+    }
+
     // Previous-share lambda for RAW chain (work templates, general PPLNS)
     auto make_previous_fn()
     {
@@ -1995,11 +2071,22 @@ private:
                                 }
                             }
                         }
-                        // Tier 2: auto-convert parent script (P2WPKH→P2PKH etc.)
+                        // Tier 1.5 + Tier 2 share a single get_share_script call
                         if (weight_key.empty())
                         {
-                            auto raw = get_share_script(obj);
-                            weight_key = normalize_script_for_merged(raw);
+                            auto parent_script = get_share_script(obj);
+                            // Tier 1.5: retroactive lookup — same miner's
+                            // explicit merged address from their other shares
+                            auto table_it = m_miner_merged_addr.find(chain_id);
+                            if (table_it != m_miner_merged_addr.end())
+                            {
+                                auto miner_it = table_it->second.find(parent_script);
+                                if (miner_it != table_it->second.end())
+                                    weight_key = miner_it->second;
+                            }
+                            // Tier 2: auto-convert parent script (P2WPKH→P2PKH etc.)
+                            if (weight_key.empty())
+                                weight_key = normalize_script_for_merged(parent_script);
                         }
                         // Tier 3: unconvertible — skip, weight redistributed
                         if (weight_key.empty()) return;
