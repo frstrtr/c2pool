@@ -92,6 +92,7 @@ jobs:
                     test_v36_script_sorting test_v36_cross_impl_refhash \
                     test_phase4_embedded \
                     test_mweb_builder \
+                    test_address_resolution test_compute_share_target \
             -j$(nproc)
 
       # ── 9. Run test suite ─────────────────────────────────────────────────
