@@ -35,6 +35,7 @@
 // LTC implementation
 #include <impl/ltc/share.hpp>
 #include <impl/ltc/share_check.hpp>
+#include <impl/ltc/auto_ratchet.hpp>
 #include <impl/ltc/share_messages.hpp>
 #include <impl/ltc/coin/block.hpp>
 #include <impl/ltc/node.hpp>
@@ -1840,6 +1841,22 @@ int main(int argc, char* argv[]) {
             // Phase 1c: Whale departure detector (needs to be visible to ref_hash lambda)
             auto whale_detector = std::make_unique<ltc::WhaleDepartureDetector>();
 
+            // AutoRatchet: automated V35→V36 share version transition.
+            // Persists state to JSON file under the data directory.
+            std::string ratchet_path = (core::filesystem::config_path()
+                / (settings->m_testnet ? "testnet" : "litecoin")
+                / "v36_ratchet.json").string();
+            auto auto_ratchet = std::make_shared<ltc::AutoRatchet>(ratchet_path, /*target_version=*/36);
+            LOG_INFO << "[AutoRatchet] Initialized: state=" << ltc::ratchet_state_str(auto_ratchet->state())
+                     << " target=V36 file=" << ratchet_path;
+
+            // Set initial v36_active on tracker from persisted ratchet state
+            if (p2p_node) {
+                p2p_node->tracker().set_v36_active(
+                    auto_ratchet->state() == ltc::RatchetState::ACTIVATED ||
+                    auto_ratchet->state() == ltc::RatchetState::CONFIRMED);
+            }
+
             if (p2p_node) {
                 // Wire block_rel_height for chain scoring.
                 // Embedded mode: use HeaderChain height diff. RPC mode: query daemon.
@@ -2166,11 +2183,19 @@ int main(int argc, char* argv[]) {
             }
 
             // Donation script (protocol-level, goes to p2pool devs)
-            // Use the consensus donation script directly from PoolConfig (V36).
+            // Use the AutoRatchet's initial share version so the donation script
+            // matches what generate_share_transaction expects.  Previously this
+            // was hardcoded to V36, so the genesis share (created before the
+            // PPLNS hook fires) used COMBINED_DONATION_SCRIPT (23 bytes) while
+            // V35's gentx_before_refhash expects DONATION_SCRIPT (67 bytes),
+            // causing p2pool to reject the share as PoW-invalid.
             {
-                auto donation_script = ltc::PoolConfig::get_donation_script(36);
+                auto [initial_ver, initial_desired] = auto_ratchet->get_share_version(
+                    p2p_node->tracker(), uint256());
+                auto donation_script = ltc::PoolConfig::get_donation_script(initial_ver);
                 web_server.get_mining_interface()->set_donation_script(donation_script);
-                LOG_INFO << "Donation script set: V36 COMBINED_DONATION_SCRIPT ("
+                web_server.get_mining_interface()->set_cached_share_version(initial_ver);
+                LOG_INFO << "Donation script set: V" << initial_ver << " ("
                          << donation_script.size() << " bytes)";
             }
 
@@ -2484,11 +2509,43 @@ int main(int argc, char* argv[]) {
 
             // Wire the PPLNS computation hook so refresh_work() builds
             // proportional coinbase outputs from the share tracker.
-            web_server.set_pplns_fn([&p2p_node](
+            // Version-aware: uses v35 flat PPLNS when AutoRatchet says share_version<36,
+            // v36 decayed PPLNS otherwise.  Also updates donation script to match.
+            web_server.set_pplns_fn([&p2p_node, &auto_ratchet, &web_server](
                     const uint256& best_hash, const uint256& block_target,
-                    uint64_t subsidy, const std::vector<unsigned char>& donation_script) {
+                    uint64_t subsidy, const std::vector<unsigned char>& /*donation_script*/) {
+                auto [share_version, desired_ver] = auto_ratchet->get_share_version(
+                    p2p_node->tracker(), best_hash);
+                // Propagate v36_active to tracker for generate_share_transaction runtime PPLNS selection
+                p2p_node->tracker().set_v36_active(
+                    auto_ratchet->state() == ltc::RatchetState::ACTIVATED ||
+                    auto_ratchet->state() == ltc::RatchetState::CONFIRMED);
+                // Update donation script + cached version so refresh_work() and
+                // build_connection_coinbase() use the correct one.
+                auto correct_donation = ltc::PoolConfig::get_donation_script(share_version);
+                auto* mi = web_server.get_mining_interface();
+                mi->set_donation_script(correct_donation);
+                mi->set_cached_share_version(share_version);
+
+                {
+                    static int pplns_hook_log = 0;
+                    if (pplns_hook_log++ % 20 == 0) {
+                        bool v36_act = (auto_ratchet->state() == ltc::RatchetState::ACTIVATED ||
+                                        auto_ratchet->state() == ltc::RatchetState::CONFIRMED);
+                        LOG_INFO << "[PPLNS-HOOK] share_version=" << share_version
+                                 << " v36_active=" << v36_act
+                                 << " best_hash=" << best_hash.GetHex().substr(0, 16)
+                                 << " using=" << (share_version < 36 ? "v35" : "v36")
+                                 << " ratchet=" << ltc::ratchet_state_str(auto_ratchet->state());
+                    }
+                }
+
+                if (share_version < 36) {
+                    return p2p_node->tracker().get_v35_expected_payouts(
+                        best_hash, block_target, subsidy, correct_donation);
+                }
                 return p2p_node->tracker().get_expected_payouts(
-                    best_hash, block_target, subsidy, donation_script);
+                    best_hash, block_target, subsidy, correct_donation);
             });
 
             // Wire the ref_hash computation hook for per-connection coinbase generation.
@@ -2497,7 +2554,7 @@ int main(int argc, char* argv[]) {
             // creation use the share difficulty (not block difficulty).
             auto* mi_for_share_bits = web_server.get_mining_interface();
             web_server.get_mining_interface()->set_ref_hash_fn(
-                [&p2p_node, &whale_detector, mi_for_share_bits, dev_donation, &web_server](
+                [&p2p_node, &whale_detector, mi_for_share_bits, dev_donation, &web_server, &auto_ratchet](
                     const uint256& frozen_prev_share,
                     const std::vector<unsigned char>& coinbase_scriptSig,
                     const std::vector<unsigned char>& payout_script,
@@ -2509,7 +2566,24 @@ int main(int argc, char* argv[]) {
                     -> core::MiningInterface::RefHashResult
                 {
                     LOG_TRACE << "[ref_hash_fn] ENTER prev=" << frozen_prev_share.GetHex().substr(0,16);
+
+                    // AutoRatchet: determine share version from network state
+                    auto [share_version, desired_ver] = auto_ratchet->get_share_version(
+                        p2p_node->tracker(), frozen_prev_share);
+                    // Propagate v36_active to tracker for verification consistency
+                    p2p_node->tracker().set_v36_active(
+                        auto_ratchet->state() == ltc::RatchetState::ACTIVATED ||
+                        auto_ratchet->state() == ltc::RatchetState::CONFIRMED);
+                    {
+                        static int rv_log = 0;
+                        if (rv_log++ < 5 || rv_log % 100 == 0)
+                            LOG_INFO << "[AutoRatchet] share_version=" << share_version
+                                     << " desired=" << desired_ver
+                                     << " state=" << ltc::ratchet_state_str(auto_ratchet->state());
+                    }
+
                     ltc::RefHashParams params;
+                    params.share_version = share_version;
                     params.prev_share = frozen_prev_share;
                     params.coinbase_scriptSig = coinbase_scriptSig;
                     params.share_nonce = 0;
@@ -2517,7 +2591,7 @@ int main(int argc, char* argv[]) {
                     // donation = round(65535 * percentage / 100)
                     // Matches p2pool: math.perfect_round(65535*self.donation_percentage/100)
                     params.donation = static_cast<uint16_t>(std::round(65535.0 * dev_donation / 100.0));
-                    params.desired_version = 36;
+                    params.desired_version = desired_ver;
 
                     // Per-miner desired_target — matches p2pool work.py:2490-2505.
                     // 1) Start with 2^256-1 (easiest possible)
@@ -2664,6 +2738,15 @@ int main(int argc, char* argv[]) {
                         params.pubkey_type = 0;
                     }
 
+                    // V35: convert pubkey_hash to address string (uses raw bytes)
+                    if (share_version <= 35) {
+                        params.address = ltc::pubkey_hash_to_address(params.pubkey_hash, params.pubkey_type);
+                    }
+
+                    // No P2WPKH reversal — c2pool stores raw witness program
+                    // bytes in uint160. The wire serialization preserves byte
+                    // order from memcpy (uint160::data() = raw memory).
+
                     // Segwit data — txid_merkle_link must match create_local_share
                     if (segwit_active && !witness_commitment_hex.empty()) {
                         params.has_segwit = true;
@@ -2679,12 +2762,14 @@ int main(int argc, char* argv[]) {
                         params.segwit_data = sd;
                     }
 
-                    // Merged addresses
-                    for (const auto& [chain_id, script] : merged_addrs) {
-                        ltc::MergedAddressEntry entry;
-                        entry.m_chain_id = chain_id;
-                        entry.m_script.m_data = script;
-                        params.merged_addresses.push_back(std::move(entry));
+                    // Merged addresses (V36 only)
+                    if (share_version >= 36) {
+                        for (const auto& [chain_id, script] : merged_addrs) {
+                            ltc::MergedAddressEntry entry;
+                            entry.m_chain_id = chain_id;
+                            entry.m_script.m_data = script;
+                            params.merged_addresses.push_back(std::move(entry));
+                        }
                     }
 
                     // Chain position from tracker
@@ -2730,12 +2815,13 @@ int main(int argc, char* argv[]) {
                             }
                         }
 
-                        // Merged payout hash: deterministic V36 PPLNS commitment.
-                        // Must match what create_local_share computes at submit time.
-                        LOG_TRACE << "[ref_hash_fn] computing merged_payout_hash...";
-                        params.merged_payout_hash = tracker.compute_merged_payout_hash(
-                            params.prev_share, chain::bits_to_target(bits));
-                        LOG_TRACE << "[ref_hash_fn] merged_payout_hash done";
+                        // Merged payout hash: deterministic V36 PPLNS commitment (V36 only).
+                        if (share_version >= 36) {
+                            LOG_TRACE << "[ref_hash_fn] computing merged_payout_hash...";
+                            params.merged_payout_hash = tracker.compute_merged_payout_hash(
+                                params.prev_share, chain::bits_to_target(bits));
+                            LOG_TRACE << "[ref_hash_fn] merged_payout_hash done";
+                        }
                     } else {
                         // Genesis: p2pool always does (0 + 1) for absheight, (0 + aps) for abswork
                         params.absheight = 1;
@@ -2745,20 +2831,7 @@ int main(int argc, char* argv[]) {
 
                     LOG_TRACE << "[ref_hash_fn] chain position done, collecting MM coinbase info...";
                     // V36: Collect merged coinbase info from MM manager.
-                    // This contains DOGE block header + merkle proof for each merged chain.
-                    // Must be frozen at template time and match what p2pool stores in share_info.
-                    //
-                    // NOTE: Building the correct DOGE header requires the PPLNS coinbase
-                    // (which depends on share chain state → chicken-and-egg). p2pool solves
-                    // this by building everything in get_work() closure.
-                    // TODO: Implement full DOGE header construction at ref_hash_fn time.
-                    // For now, populate with available data from MM manager.
-                    // Use pre-computed merged header infos from build_connection_coinbase.
-                    // They were built atomically with the mm_commitment that's in the
-                    // scriptSig — this ensures the DOGE block hash in merged_coinbase_info
-                    // matches the aux_merkle_root in the mm_data commitment.
-                    // (p2pool: _build_user_specific_merged_work + mm_data computed together)
-                    {
+                    if (share_version >= 36) {
                         for (const auto& hi : mi_for_share_bits->get_last_merged_header_infos()) {
                             ltc::MergedCoinbaseEntry entry;
                             entry.m_chain_id = hi.chain_id;
@@ -2791,6 +2864,8 @@ int main(int argc, char* argv[]) {
                              << " max_bits=" << result.max_bits << std::dec
                              << " absheight=" << result.absheight;
                     result.merged_payout_hash = params.merged_payout_hash;
+                    result.share_version = share_version;
+                    result.desired_version = desired_ver;
                     // Freeze segwit merkle branches + witness root — these change
                     // between GBT updates but the ref_hash was computed with these values.
                     result.frozen_merkle_branches = merkle_branches;
@@ -2924,7 +2999,9 @@ int main(int argc, char* argv[]) {
                         p.has_frozen_fields,
                         p.frozen_merkle_branches,
                         p.frozen_witness_root,
-                        p.frozen_merged_coinbase_info);
+                        p.frozen_merged_coinbase_info,
+                        p.share_version,
+                        p.desired_version);
 
                     // Only broadcast if self-validation passed (non-null hash)
                     if (share_hash.IsNull()) {
@@ -2939,6 +3016,15 @@ int main(int argc, char* argv[]) {
                     } catch (const std::exception& e) {
                         LOG_ERROR << "broadcast_share failed: " << e.what();
                     }
+
+                    // CRITICAL: Update best share immediately so refresh_work()
+                    // sends new mining.notify to miners. Without this, the miner
+                    // keeps working on the old chain tip and creates duplicate
+                    // shares at the same height (self-orphaning).
+                    // p2pool does this via set_best_share() → work_event.
+                    // notify_local_share() is a fast-path that bypasses
+                    // run_think() scoring — it directly sets the new tip.
+                    p2p_node->notify_local_share(share_hash);
 
                     {
                         // p2pool format: GOT SHARE! addr.worker hash prev age

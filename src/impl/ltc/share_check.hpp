@@ -16,6 +16,9 @@
 #include <btclibs/crypto/common.h>
 #include <btclibs/crypto/sha256.h>
 #include <btclibs/crypto/scrypt.h>
+#include <btclibs/base58.h>
+#include <btclibs/bech32.h>
+#include <core/address_utils.hpp>
 
 #include <algorithm>
 #include <cstring>
@@ -159,6 +162,20 @@ inline V36HashLinkType prefix_to_hash_link(
     return result;
 }
 
+// prefix_to_hash_link for V35: returns HashLinkType (no extra_data field)
+inline HashLinkType prefix_to_hash_link_v35(
+    const std::vector<unsigned char>& prefix,
+    const std::vector<unsigned char>& const_ending)
+{
+    auto v36_link = prefix_to_hash_link(prefix, const_ending);
+    HashLinkType result;
+    result.m_state = v36_link.m_state;
+    result.m_length = v36_link.m_length;
+    // V35: extra_data is always empty (FixedStrType(0)) — the donation script
+    // is long enough to consume the entire SHA256 buffer tail.
+    return result;
+}
+
 // ============================================================================
 // check_merkle_link()
 //
@@ -256,6 +273,45 @@ inline std::vector<unsigned char> compute_gentx_before_refhash(int64_t share_ver
 }
 
 // ============================================================================
+// pubkey_hash_to_address()
+//
+// Convert (pubkey_hash, pubkey_type) to a Litecoin address string.
+// Used for V35 share_data.address field (VarStr).
+// pubkey_type: 0=P2PKH, 1=P2WPKH, 2=P2SH (same as V36 encoding)
+// ============================================================================
+inline std::string pubkey_hash_to_address(const uint160& pubkey_hash, uint8_t pubkey_type)
+{
+    bool testnet = PoolConfig::is_testnet;
+    if (pubkey_type == 0) {
+        // P2PKH: Base58Check with version byte
+        uint8_t ver = testnet ? 0x6f : 0x30;
+        std::vector<unsigned char> payload(21);
+        payload[0] = ver;
+        std::memcpy(payload.data() + 1, pubkey_hash.data(), 20);
+        return EncodeBase58Check({payload.data(), payload.size()});
+    } else if (pubkey_type == 1) {
+        // P2WPKH: Bech32 segwit v0
+        std::string hrp = testnet ? "tltc" : "ltc";
+        std::vector<uint8_t> prog(20);
+        std::memcpy(prog.data(), pubkey_hash.data(), 20);
+        return bech32::encode_segwit(hrp, 0, prog);
+    } else if (pubkey_type == 2) {
+        // P2SH: Base58Check with version byte
+        uint8_t ver = testnet ? 0xc4 : 0x32;
+        std::vector<unsigned char> payload(21);
+        payload[0] = ver;
+        std::memcpy(payload.data() + 1, pubkey_hash.data(), 20);
+        return EncodeBase58Check({payload.data(), payload.size()});
+    }
+    // Fallback: P2PKH
+    uint8_t ver = testnet ? 0x6f : 0x30;
+    std::vector<unsigned char> payload(21);
+    payload[0] = ver;
+    std::memcpy(payload.data() + 1, pubkey_hash.data(), 20);
+    return EncodeBase58Check({payload.data(), payload.size()});
+}
+
+// ============================================================================
 // compute_ref_hash_for_work()
 //
 // Computes the p2pool ref_hash for a set of share fields.  Used at Stratum
@@ -265,18 +321,21 @@ inline std::vector<unsigned char> compute_gentx_before_refhash(int64_t share_ver
 // Returns (ref_hash, last_txout_nonce).
 // ============================================================================
 struct RefHashParams {
+    int64_t  share_version{36};           // 35 or 36 — determines serialization format
     uint256 prev_share;
     std::vector<unsigned char> coinbase_scriptSig;
     uint32_t share_nonce{0};
+    // V36: pubkey_hash + pubkey_type; V35: address (string bytes)
     uint160  pubkey_hash;
     uint8_t  pubkey_type{0};
+    std::string address;                  // V35: base58/bech32 address string
     uint64_t subsidy{0};
     uint16_t donation{50};
     uint8_t  stale_info{0};
     uint64_t desired_version{36};
     bool     has_segwit{false};
     SegwitData segwit_data;
-    std::vector<MergedAddressEntry> merged_addresses;
+    std::vector<MergedAddressEntry> merged_addresses;  // V36 only
     uint256  far_share_hash;
     uint32_t max_bits{0};
     uint32_t bits{0};
@@ -284,7 +343,7 @@ struct RefHashParams {
     uint32_t absheight{0};
     uint128  abswork;
     std::vector<MergedCoinbaseEntry> merged_coinbase_info;  // V36: per-chain DOGE header + merkle proof
-    uint256  merged_payout_hash;
+    uint256  merged_payout_hash;                            // V36 only
     BaseScript message_data;              // V36 PossiblyNoneType(b'', VarStrType())
 };
 
@@ -313,9 +372,24 @@ inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParam
     }
 
     ref_stream << p.share_nonce;
-    ref_stream << p.pubkey_hash;
-    ref_stream << p.pubkey_type;
-    ::Serialize(ref_stream, VarInt(p.subsidy));
+
+    if (p.share_version >= 36) {
+        // V36: pubkey_hash (uint160) + pubkey_type (uint8)
+        ref_stream << p.pubkey_hash;
+        ref_stream << p.pubkey_type;
+        ::Serialize(ref_stream, VarInt(p.subsidy));
+    } else if (p.share_version >= 34) {
+        // V34-V35: address as VarStr
+        BaseScript addr_bs;
+        addr_bs.m_data.assign(p.address.begin(), p.address.end());
+        ref_stream << addr_bs;
+        ref_stream << p.subsidy;  // fixed uint64
+    } else {
+        // Pre-V34: pubkey_hash only
+        ref_stream << p.pubkey_hash;
+        ref_stream << p.subsidy;  // fixed uint64
+    }
+
     ref_stream << p.donation;
     ref_stream << p.stale_info;
     ::Serialize(ref_stream, VarInt(p.desired_version));
@@ -323,19 +397,26 @@ inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParam
     if (p.has_segwit)
         ref_stream << p.segwit_data;
 
-    ref_stream << p.merged_addresses;
+    // V36: merged_addresses (after segwit_data, before far_share_hash)
+    if (p.share_version >= 36)
+        ref_stream << p.merged_addresses;
+
     ref_stream << p.far_share_hash;
     ref_stream << p.max_bits;
     ref_stream << p.bits;
     ref_stream << p.timestamp;
     ref_stream << p.absheight;
-    ::Serialize(ref_stream, Using<AbsworkV36Format>(p.abswork));
-    ref_stream << p.merged_coinbase_info;
-    ref_stream << p.merged_payout_hash;
 
-    // V36 ref_type includes message_data as PossiblyNoneType(b'', VarStrType())
-    // When empty, BaseScript serialises as varint(0) = 0x00, matching Python's behavior.
-    ref_stream << p.message_data;
+    if (p.share_version >= 36) {
+        ::Serialize(ref_stream, Using<AbsworkV36Format>(p.abswork));
+        ref_stream << p.merged_coinbase_info;
+        ref_stream << p.merged_payout_hash;
+        // V36 ref_type includes message_data as PossiblyNoneType(b'', VarStrType())
+        ref_stream << p.message_data;
+    } else {
+        // Pre-V36: abswork as fixed uint128
+        ref_stream << p.abswork;
+    }
 
     auto ref_span = std::span<const unsigned char>(
         reinterpret_cast<const unsigned char*>(ref_stream.data()), ref_stream.size());
@@ -343,12 +424,17 @@ inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParam
 
     {
         static int rfn_log = 0;
-        if (rfn_log++ < 3) {
+        static int rfn_v36_log = 0;
+        bool should_log = (rfn_log < 3) || (p.share_version >= 36 && rfn_v36_log < 5);
+        if (should_log) {
+            rfn_log++;
+            if (p.share_version >= 36) rfn_v36_log++;
             static const char* HX = "0123456789abcdef";
             std::string hex;
             auto* rd = reinterpret_cast<const unsigned char*>(ref_stream.data());
             for (size_t i = 0; i < ref_stream.size(); ++i) { hex += HX[rd[i]>>4]; hex += HX[rd[i]&0xf]; }
-            LOG_INFO << "[REF-FN] ref_packed_len=" << ref_stream.size()
+            LOG_INFO << "[REF-FN] v=" << p.share_version
+                     << " ref_packed_len=" << ref_stream.size()
                      << " ref_hash=" << ref_hash.GetHex()
                      << " absheight=" << p.absheight << " prev=" << p.prev_share.GetHex().substr(0,16);
             LOG_INFO << "[REF-FN-FULL] " << hex;
@@ -678,10 +764,9 @@ inline std::vector<unsigned char> pubkey_hash_to_script(const uint160& hash, uin
     switch (type)
     {
     case 1: // P2WPKH: OP_0 <20>
-        // p2pool uses '{:040x}'.format(hash) for P2WPKH → big-endian.
-        // But IntType(160).pack() for P2PKH/P2SH → little-endian.
-        // So ONLY P2WPKH needs reversal.
-        std::reverse(h.begin(), h.end());
+        // Use GetChars() output directly — same as P2PKH and P2SH.
+        // The bytes in m_pubkey_hash are the raw witness program as
+        // deserialized from the wire. No reversal needed.
         script.reserve(22);
         script.push_back(0x00);
         script.push_back(0x14);
@@ -758,7 +843,16 @@ inline std::vector<unsigned char> get_share_script(const auto* obj)
     if constexpr (requires { obj->m_pubkey_type; })
         return pubkey_hash_to_script(obj->m_pubkey_hash, obj->m_pubkey_type);
     else if constexpr (requires { obj->m_address; })
+    {
+        // V34/V35: m_address contains a human-readable address string.
+        // Convert to scriptPubKey for PPLNS weight computation.
+        std::string addr_str(obj->m_address.m_data.begin(), obj->m_address.m_data.end());
+        auto script = core::address_to_script(addr_str);
+        if (!script.empty())
+            return script;
+        // Fallback: return raw bytes (shouldn't happen with valid addresses)
         return obj->m_address.m_data;
+    }
     else
         return pubkey_hash_to_script(obj->m_pubkey_hash, 0);
 }
@@ -783,11 +877,28 @@ inline std::vector<unsigned char> get_share_script(const auto* obj)
 // Reference: frstrtr/p2pool-merged-v36  p2pool/data.py  generate_transaction()
 // ============================================================================
 template <typename ShareT, typename TrackerT>
-uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool dump_diag = false)
+uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool dump_diag = false, bool v36_active = false)
 {
     constexpr int64_t ver = ShareT::version;
+    // p2pool selects PPLNS formula by runtime AutoRatchet state, not compile-time
+    // share version. When v36_active is true (AutoRatchet ACTIVATED/CONFIRMED),
+    // use v36 PPLNS even for v35 shares. Ref: p2pool data.py:879, work.py:759.
+    const bool use_v36_pplns = v36_active || (ver >= 36);
     const uint64_t subsidy = share.m_subsidy;
     const uint16_t donation = share.m_donation;
+
+    // Debug: log the PPLNS formula selection for cross-impl comparison
+    {
+        static int gst_pplns_log = 0;
+        if (gst_pplns_log++ % 50 == 0) {
+            LOG_INFO << "[GST-PPLNS] v36_active=" << v36_active
+                     << " use_v36_pplns=" << use_v36_pplns
+                     << " ver=" << ver
+                     << " start=" << share.m_prev_hash.GetHex().substr(0, 16)
+                     << " subsidy=" << subsidy
+                     << " donation=" << donation;
+        }
+    }
 
     // --- 1. Compute PPLNS weights with full scriptPubKey keys ---
     // Walk from share's prev_hash (parent) backward through the chain.
@@ -809,11 +920,10 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
         auto max_weight = chain::target_to_average_attempts(block_target)
                           * PoolConfig::SPREAD * 65535;
 
-        // V36: use exponential depth-decay (matching Python's get_decayed_cumulative_weights)
-        // Remove desired_weight cap — exponential decay naturally limits old shares'
-        // contribution. The cap is harmful on low-difficulty networks (testnet) where
-        // block_att < share_att, truncating the PPLNS window to ~2 shares.
-        if constexpr (ver >= 36) {
+        // PPLNS formula selected by runtime v36_active (AutoRatchet state),
+        // not compile-time share version. Ref: p2pool data.py:879, work.py:759.
+        if (use_v36_pplns) {
+            // V36 PPLNS: exponential depth-decay, walk from parent
             uint288 unlimited_weight;
             unlimited_weight.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
             auto result = tracker.get_v36_decayed_cumulative_weights(prev_hash, chain_len, unlimited_weight);
@@ -821,9 +931,23 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
             total_weight = result.total_weight;
             total_donation_weight = result.total_donation_weight;
         } else {
-            // Pre-V36: standard cumulative weights without decay
-            auto walk_count = static_cast<size_t>(chain_len);
-            auto walk_view = tracker.chain.get_chain(prev_hash, walk_count);
+            // Pre-V36 PPLNS: flat cumulative weights (no decay)
+            // CRITICAL: Walk from GRANDPARENT for HEIGHT-1 shares.
+            // p2pool data.py:884-885:
+            //   _pplns_start = previous_share.share_data['previous_share_hash']
+            //   _pplns_max_shares = max(0, min(height, REAL_CHAIN_LENGTH) - 1)
+            uint256 pplns_start;
+            tracker.chain.get(prev_hash).share.invoke([&](auto* s) {
+                pplns_start = s->m_prev_hash;  // grandparent
+            });
+            auto available = tracker.chain.get_height(prev_hash);
+            auto walk_count = static_cast<size_t>(
+                std::max(0, std::min(chain_len, available) - 1));
+
+            if (pplns_start.IsNull() || !tracker.chain.contains(pplns_start) || walk_count == 0) {
+                // No grandparent reachable — skip PPLNS walk (genesis case)
+            } else {
+            auto walk_view = tracker.chain.get_chain(pplns_start, walk_count);
 
             for (auto [hash, data] : walk_view)
             {
@@ -873,6 +997,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
                 total_weight += share_total;
                 total_donation_weight += share_don_w;
             }
+            } // end if (pplns_start valid)
         }
     }
 
@@ -910,7 +1035,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
         for (auto& [script, weight] : weights)
         {
             uint64_t amount;
-            if constexpr (ver >= 36)
+            if (use_v36_pplns)
             {
                 // V36: amounts[script] = subsidy * weight / total_weight
                 uint288 num = uint288(subsidy) * weight;
@@ -929,7 +1054,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
     }
 
     // Pre-V36: add 0.5% finder fee to share creator
-    if constexpr (ver < 36)
+    if (!use_v36_pplns)
     {
         auto finder_script = get_share_script(&share);
         amounts[finder_script] += subsidy / 200;
@@ -954,7 +1079,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
     }
 
     // V36 consensus: donation output must carry >= 1 satoshi (a60f7f7f)
-    if constexpr (ver >= 36) {
+    if (use_v36_pplns) {
         if (donation_amount < 1 && subsidy > 0 && !amounts.empty()) {
             // Deduct 1 sat from the largest miner payout
             // Deterministic tiebreak: (amount, script) — largest script wins when equal
@@ -1087,7 +1212,9 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
     for (auto& [script, amount] : payout_outputs)
         write_txout(amount, script);
 
-    // Donation output
+    // Donation output — V35 shares always use P2PK DONATION_SCRIPT,
+    // V36 shares always use P2SH COMBINED_DONATION_SCRIPT.
+    // Each share was created with the donation script matching its version.
     auto donation_script = PoolConfig::get_donation_script(ver);
     write_txout(donation_amount, donation_script);
 
@@ -1487,20 +1614,30 @@ bool share_check(const ShareT& share,
         throw std::invalid_argument("share timestamp is too far in the future");
 
     // 2. Version counting — AutoRatchet upgrade enforcement
-    // If 95% of recent shares desire a higher version, this share's version
-    // is considered obsolete and must be rejected.
-    // Use share.m_hash (the stored identity) for chain lookups, not the
-    // recomputed share_hash — they may differ during genesis or hash_link
-    // reconstruction edge cases. p2pool uses self.share_data['previous_share_hash']
-    // for chain depth, not the share's own recomputed hash.
+    // p2pool data.py:1400-1414: version switch validation only at BOUNDARIES
+    // (when share.VERSION != parent.VERSION). Shares that match their parent's
+    // version are always valid — they were correct when created.
+    // Previous code rejected ALL v35 shares retroactively after 95% activation.
     {
         auto lookbehind = static_cast<int32_t>(PoolConfig::chain_length());
-        if (tracker.chain.contains(share.m_hash)) {
-            auto height = tracker.chain.get_height(share.m_hash);
-            if (height >= lookbehind)
+        if (tracker.chain.contains(share.m_hash) &&
+            !share.m_prev_hash.IsNull() && tracker.chain.contains(share.m_prev_hash))
+        {
+            // Get parent's share version
+            int64_t parent_version = 0;
+            tracker.chain.get_share(share.m_prev_hash).invoke([&](auto* obj) {
+                parent_version = std::remove_pointer_t<decltype(obj)>::version;
+            });
+
+            // Only enforce version obsolescence at version BOUNDARIES
+            if (share.version != parent_version)
             {
-                if (tracker.should_punish_version(share.m_hash, share.version, lookbehind))
-                    throw std::invalid_argument("share version too old — newer version has 95%+ activation");
+                auto height = tracker.chain.get_height(share.m_hash);
+                if (height >= lookbehind)
+                {
+                    if (tracker.should_punish_version(share.m_hash, share.version, lookbehind))
+                        throw std::invalid_argument("share version too old — newer version has 95%+ activation");
+                }
             }
         }
     }
@@ -1508,9 +1645,15 @@ bool share_check(const ShareT& share,
     // 3. GenerateShareTransaction reconstruction & comparison
     // Rebuild the expected coinbase from PPLNS weights and share fields,
     // then verify its txid matches the gentx_hash from share_init_verify().
+    // p2pool check(): v36_active = (self.VERSION >= 36)
+    // Use the SHARE's own version, not the tracker's runtime AutoRatchet state.
+    // This ensures V35 shares always verify with V35 PPLNS formula, even after
+    // the AutoRatchet transitions to ACTIVATED.
+    constexpr int64_t share_ver = ShareT::version;
+    bool v36_active = (share_ver >= 36);
     if (!share.m_prev_hash.IsNull() && tracker.chain.contains(share.m_prev_hash))
     {
-        uint256 expected_gentx = generate_share_transaction(share, tracker);
+        uint256 expected_gentx = generate_share_transaction(share, tracker, false, v36_active);
         if (expected_gentx != gentx_hash)
         {
             LOG_WARNING << "GENTX-MISMATCH detail:"
@@ -1525,7 +1668,14 @@ bool share_check(const ShareT& share,
             auto chain_len = std::min(
                 tracker.chain.get_height(share.m_prev_hash),
                 static_cast<int32_t>(PoolConfig::real_chain_length()));
+            // V35: log grandparent + height-1 window info
+            uint256 gp_hash;
+            if (tracker.chain.contains(share.m_prev_hash))
+                tracker.chain.get(share.m_prev_hash).share.invoke([&](auto* s){ gp_hash = s->m_prev_hash; });
+            int32_t v35_walk = std::max(0, chain_len - 1);
             LOG_WARNING << "  PPLNS chain_len=" << chain_len
+                        << " v35_walk=" << v35_walk
+                        << " grandparent=" << (gp_hash.IsNull() ? "null" : gp_hash.GetHex().substr(0,16))
                         << " prev_height=" << tracker.chain.get_height(share.m_prev_hash)
                         << " real_chain_length=" << PoolConfig::real_chain_length();
 
@@ -1561,13 +1711,31 @@ bool share_check(const ShareT& share,
                     if (!far_hash.IsNull() && tracker.chain.contains(far_hash))
                         tracker.chain.get_share(far_hash).invoke([&](auto* s){ far_ts = s->m_timestamp; });
 
+                    // Compare skip-list far vs naive-walk far
+                    auto skip_far = tracker.chain.get_nth_parent_via_skip(
+                        share.m_prev_hash, dist - 1);
+                    bool skip_match = (!far_hash.IsNull() && skip_far == far_hash);
+
+                    // Also get delta via TrackerView for comparison
+                    uint288 delta_min_work;
+                    int32_t delta_height = 0;
+                    if (!skip_far.IsNull() && tracker.chain.contains(skip_far)) {
+                        auto dv = tracker.chain.get_delta(share.m_prev_hash, skip_far);
+                        delta_min_work = dv.min_work;
+                        delta_height = dv.height;
+                    }
+
                     LOG_WARNING << "[GENTX-APS] near=" << near_hash.GetHex().substr(0,16)
-                                << " far=" << (far_hash.IsNull() ? "null" : far_hash.GetHex().substr(0,16))
+                                << " far_naive=" << (far_hash.IsNull() ? "null" : far_hash.GetHex().substr(0,16))
+                                << " far_skip=" << (skip_far.IsNull() ? "null" : skip_far.GetHex().substr(0,16))
+                                << " skip_match=" << (skip_match ? "YES" : "NO")
                                 << " actual_dist=" << actual_dist
                                 << " expected_dist=" << (dist - 1)
                                 << " timespan=" << (int32_t(near_ts) - int32_t(far_ts))
                                 << " near_ts=" << near_ts << " far_ts=" << far_ts
-                                << " chain_height=" << tracker.chain.get_height(share.m_prev_hash);
+                                << " chain_height=" << tracker.chain.get_height(share.m_prev_hash)
+                                << " delta_h=" << delta_height
+                                << " delta_min_work=" << delta_min_work.GetLow64();
 
                     // Previous share's max_target (clamp reference)
                     uint256 prev_max_target;
@@ -1584,8 +1752,8 @@ bool share_check(const ShareT& share,
             static int s_diag_count = 0;
             if (s_diag_count++ < 5)
             {
-                LOG_WARNING << "[GENTX-DIAG] Re-running generate_share_transaction with full dump:";
-                generate_share_transaction(share, tracker, true);
+                LOG_WARNING << "[GENTX-DIAG] Re-running generate_share_transaction with full dump (v36_active=" << v36_active << "):";
+                generate_share_transaction(share, tracker, true, v36_active);
             }
 
             throw std::invalid_argument("GenerateShareTransaction mismatch — coinbase does not match PPLNS payouts");
@@ -1799,11 +1967,407 @@ uint256 verify_share(const ShareT& share, TrackerT& tracker)
 }
 
 // ============================================================================
+// create_local_share_v35()
+//
+// Constructs a PaddingBugfixShare (V35) from locally-generated block data.
+// This is the V35 counterpart of create_local_share (V36).
+// Key differences from V36:
+//   - Uses m_address (string) instead of m_pubkey_hash + m_pubkey_type
+//   - No merged_addresses, merged_coinbase_info, merged_payout_hash
+//   - Fixed uint64 subsidy (not VarInt)
+//   - Fixed uint128 abswork (not VarInt)
+//   - HashLinkType (no extra_data) instead of V36HashLinkType
+//   - DONATION_SCRIPT (P2PK 67b) instead of COMBINED_DONATION_SCRIPT (P2SH 23b)
+// ============================================================================
+template <typename TrackerT>
+uint256 create_local_share_v35(
+    TrackerT& tracker,
+    const coin::SmallBlockHeaderType& min_header,
+    const BaseScript& coinbase,
+    uint64_t subsidy,
+    const uint256& prev_share,
+    const std::vector<uint256>& merkle_branches,
+    const std::vector<unsigned char>& payout_script,
+    uint16_t donation = 50,
+    StaleInfo stale_info = StaleInfo::none,
+    bool segwit_active = false,
+    const std::string& witness_commitment_hex = {},
+    const std::vector<unsigned char>& actual_coinbase_bytes = {},
+    const uint256& witness_root = uint256(),
+    uint32_t override_max_bits = 0,
+    uint32_t override_bits = 0,
+    uint32_t frozen_absheight = 0,
+    uint128  frozen_abswork = uint128(),
+    uint256  frozen_far_share_hash = uint256(),
+    uint32_t frozen_timestamp = 0,
+    bool     has_frozen = false,
+    const std::vector<uint256>& frozen_merkle_branches = {},
+    const uint256& frozen_witness_root = uint256(),
+    uint64_t desired_version = 36)
+{
+    PaddingBugfixShare share;
+    share.m_min_header = min_header;
+    share.m_coinbase   = coinbase;
+    share.m_subsidy    = subsidy;
+    share.m_prev_hash  = prev_share;
+    share.m_donation   = donation;
+    share.m_stale_info = stale_info;
+    share.m_desired_version = desired_version;
+
+    // Timestamp: clip to at least previous_share.timestamp + 1
+    share.m_timestamp  = min_header.m_timestamp;
+    if (!prev_share.IsNull() && tracker.chain.contains(prev_share)) {
+        uint32_t prev_ts = 0;
+        tracker.chain.get(prev_share).share.invoke([&](auto* prev) {
+            prev_ts = prev->m_timestamp;
+        });
+        if (share.m_timestamp <= prev_ts)
+            share.m_timestamp = prev_ts + 1;
+    }
+
+    // Compute share target
+    auto desired_target = chain::bits_to_target(min_header.m_bits);
+    auto [share_max_bits, share_bits] = tracker.compute_share_target(
+        prev_share, share.m_timestamp, desired_target);
+    share.m_max_bits   = share_max_bits;
+    share.m_bits       = share_bits;
+    share.m_nonce      = 0;
+
+    // V35: address as string (VarStr), convert from payout_script
+    {
+        uint160 pubkey_hash;
+        uint8_t pubkey_type = 0;
+        if (payout_script.size() == 25 && payout_script[0] == 0x76) {
+            std::memcpy(pubkey_hash.data(), payout_script.data() + 3, 20);
+            pubkey_type = 0;
+        } else if (payout_script.size() == 23 && payout_script[0] == 0xa9) {
+            std::memcpy(pubkey_hash.data(), payout_script.data() + 2, 20);
+            pubkey_type = 2;
+        } else if (payout_script.size() == 22 && payout_script[0] == 0x00) {
+            std::memcpy(pubkey_hash.data(), payout_script.data() + 2, 20);
+            pubkey_type = 1;
+        } else if (payout_script.size() >= 20) {
+            std::memcpy(pubkey_hash.data(), payout_script.data(), 20);
+        }
+        std::string addr_str = pubkey_hash_to_address(pubkey_hash, pubkey_type);
+        share.m_address.m_data.assign(addr_str.begin(), addr_str.end());
+        {
+            auto roundtrip = core::address_to_script(addr_str);
+            static const char* H = "0123456789abcdef";
+            std::string ps_hex, rt_hex;
+            for (auto b : payout_script) { ps_hex += H[b>>4]; ps_hex += H[b&0xf]; }
+            for (auto b : roundtrip) { rt_hex += H[b>>4]; rt_hex += H[b&0xf]; }
+            LOG_INFO << "[V35-ADDR] type=" << (int)pubkey_type
+                     << " addr=" << addr_str
+                     << " payout_script=" << ps_hex
+                     << " roundtrip=" << rt_hex
+                     << " match=" << (payout_script == roundtrip ? "YES" : "NO");
+        }
+    }
+
+    // Chain position: absheight and abswork
+    if (!prev_share.IsNull() && tracker.chain.contains(prev_share)) {
+        tracker.chain.get(prev_share).share.invoke([&](auto* prev) {
+            share.m_absheight = prev->m_absheight + 1;
+        });
+        {
+            auto current_attempts = chain::target_to_average_attempts(
+                chain::bits_to_target(share.m_bits));
+            uint128 prev_abswork;
+            tracker.chain.get(prev_share).share.invoke([&](auto* prev) {
+                prev_abswork = prev->m_abswork;
+            });
+            share.m_abswork = prev_abswork + uint128(current_attempts.GetLow64());
+        }
+        // far_share_hash: 99th ancestor
+        {
+            auto [prev_height, last] = tracker.chain.get_height_and_last(prev_share);
+            if (last.IsNull() && prev_height < 99) {
+                share.m_far_share_hash = uint256();
+            } else {
+                try {
+                    share.m_far_share_hash = tracker.chain.get_nth_parent_key(prev_share, 99);
+                } catch (const std::exception&) {
+                    share.m_far_share_hash = uint256();
+                }
+            }
+        }
+    } else {
+        share.m_absheight = 1;
+        share.m_abswork = uint128(chain::target_to_average_attempts(
+            chain::bits_to_target(share.m_bits)).GetLow64());
+        share.m_far_share_hash = uint256();
+    }
+
+    // Apply frozen fields from template time
+    if (has_frozen) {
+        share.m_absheight = frozen_absheight;
+        share.m_abswork = frozen_abswork;
+        share.m_far_share_hash = frozen_far_share_hash;
+        share.m_timestamp = frozen_timestamp;
+        if (override_max_bits) share.m_max_bits = override_max_bits;
+        if (override_bits) share.m_bits = override_bits;
+    }
+
+    // Random last_txout_nonce
+    share.m_last_txout_nonce = static_cast<uint64_t>(std::time(nullptr)) ^
+                               (static_cast<uint64_t>(min_header.m_nonce) << 32);
+
+    // ref_merkle_link: empty
+    share.m_ref_merkle_link.m_branch.clear();
+    share.m_ref_merkle_link.m_index = 0;
+    // merkle_link: from Stratum
+    share.m_merkle_link.m_branch = merkle_branches;
+    share.m_merkle_link.m_index  = 0;
+
+    // Segwit data
+    if (segwit_active && !witness_commitment_hex.empty())
+    {
+        SegwitData sd;
+        sd.m_txid_merkle_link.m_branch = (has_frozen && !frozen_merkle_branches.empty())
+            ? frozen_merkle_branches : merkle_branches;
+        sd.m_txid_merkle_link.m_index  = 0;
+        if (has_frozen && !frozen_witness_root.IsNull()) {
+            sd.m_wtxid_merkle_root = frozen_witness_root;
+        } else if (!witness_root.IsNull()) {
+            sd.m_wtxid_merkle_root = witness_root;
+        } else if (witness_commitment_hex.size() >= 76) {
+            sd.m_wtxid_merkle_root = uint256S(witness_commitment_hex.substr(12, 64));
+        } else {
+            sd.m_wtxid_merkle_root = uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        }
+        share.m_segwit_data = sd;
+    }
+
+    // --- Compute ref_hash (V35 format) ---
+    PackStream ref_stream;
+    {
+        auto hex = PoolConfig::identifier_hex();
+        for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+            unsigned char byte = static_cast<unsigned char>(
+                std::stoul(hex.substr(i, 2), nullptr, 16));
+            ref_stream.write(std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(&byte), 1));
+        }
+    }
+    ref_stream << share.m_prev_hash;
+    ref_stream << share.m_coinbase;
+    ref_stream << share.m_nonce;
+    // V35: address as VarStr
+    ref_stream << share.m_address;
+    // V35: subsidy as fixed uint64
+    ref_stream << share.m_subsidy;
+    ref_stream << share.m_donation;
+    { uint8_t si = static_cast<uint8_t>(share.m_stale_info); ref_stream << si; }
+    ::Serialize(ref_stream, VarInt(share.m_desired_version));
+    // segwit_data
+    if (share.m_segwit_data.has_value()) {
+        ref_stream << share.m_segwit_data.value();
+    } else {
+        std::vector<uint256> empty_branch;
+        ref_stream << empty_branch;
+        uint256 zero_root;
+        ref_stream << zero_root;
+    }
+    // V35: NO merged_addresses
+    ref_stream << share.m_far_share_hash;
+    ref_stream << share.m_max_bits;
+    ref_stream << share.m_bits;
+    ref_stream << share.m_timestamp;
+    ref_stream << share.m_absheight;
+    // V35: abswork as fixed uint128
+    ref_stream << share.m_abswork;
+    // V35: NO merged_coinbase_info, NO merged_payout_hash, NO message_data
+
+    auto ref_span_v = std::span<const unsigned char>(
+        reinterpret_cast<const unsigned char*>(ref_stream.data()), ref_stream.size());
+    uint256 hash_ref = Hash(ref_span_v);
+    uint256 ref_hash = check_merkle_link(hash_ref, share.m_ref_merkle_link);
+
+    // Use ref_hash from actual coinbase if available
+    if (!actual_coinbase_bytes.empty() && actual_coinbase_bytes.size() > 44) {
+        uint256 coinbase_ref_hash;
+        std::memcpy(coinbase_ref_hash.data(),
+                     actual_coinbase_bytes.data() + actual_coinbase_bytes.size() - 44, 32);
+        ref_hash = coinbase_ref_hash;
+    }
+
+    // --- Derive hash_link (V35: HashLinkType, no extra_data) ---
+    auto gentx_before_refhash = compute_gentx_before_refhash(int64_t(35));
+
+    std::vector<unsigned char> coinbase_bytes_for_hashlink;
+    if (!actual_coinbase_bytes.empty()) {
+        coinbase_bytes_for_hashlink = actual_coinbase_bytes;
+    } else {
+        // Fallback: reconstruct coinbase from V35 PPLNS walk
+        // V35: flat weights, grandparent start, height-1 window, 199/200 formula, finder fee
+        // Reference: p2pool data.py lines 878-965
+        std::map<std::vector<unsigned char>, uint288> weights;
+        uint288 total_weight;
+
+        if (!prev_share.IsNull() && tracker.chain.contains(prev_share))
+        {
+            // V35: start from grandparent (prev_share.prev_hash)
+            uint256 pplns_start;
+            tracker.chain.get(prev_share).share.invoke([&](auto* s) {
+                pplns_start = s->m_prev_hash;
+            });
+
+            if (!pplns_start.IsNull()) {
+                auto height = tracker.chain.get_height(prev_share);
+                int32_t max_shares = std::max(0, std::min(height,
+                    static_cast<int32_t>(PoolConfig::real_chain_length())) - 1);
+                auto block_target = chain::bits_to_target(share.m_min_header.m_bits);
+                auto desired_weight = chain::target_to_average_attempts(block_target)
+                                      * uint288(PoolConfig::SPREAD) * uint288(65535);
+                // Flat weight accumulation (not decayed)
+                auto result = tracker.get_cumulative_weights(pplns_start, max_shares, desired_weight);
+                weights = std::move(result.weights);
+                total_weight = result.total_weight;
+            }
+        }
+
+        std::map<std::vector<unsigned char>, uint64_t> amounts;
+        if (!total_weight.IsNull()) {
+            for (auto& [script, weight] : weights) {
+                // V35: 99.5% to PPLNS — subsidy * 199 * weight / (200 * total_weight)
+                uint64_t amount = (uint288(subsidy) * uint288(199) * weight
+                                   / (uint288(200) * total_weight)).GetLow64();
+                if (amount > 0) amounts[script] = amount;
+            }
+        }
+        // V35: add 0.5% finder fee to the share creator's payout script
+        amounts[payout_script] = (amounts.count(payout_script) ? amounts[payout_script] : 0)
+                                 + subsidy / 200;
+        uint64_t sum_amounts = 0;
+        for (auto& [s, a] : amounts) sum_amounts += a;
+        // V35: no minimum donation enforcement (unlike v36)
+        uint64_t donation_amount = (subsidy > sum_amounts) ? (subsidy - sum_amounts) : 0;
+
+        std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs(
+            amounts.begin(), amounts.end());
+        std::sort(payout_outputs.begin(), payout_outputs.end(),
+            [](const auto& a, const auto& b) {
+                if (a.second != b.second) return a.second < b.second;
+                return a.first < b.first;
+            });
+        if (payout_outputs.size() > 4000)
+            payout_outputs.erase(payout_outputs.begin(), payout_outputs.end() - 4000);
+
+        PackStream gentx;
+        { uint32_t v = 1; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&v), 4)); }
+        { unsigned char one = 1; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&one), 1)); }
+        { uint256 z; gentx << z; }
+        { uint32_t idx = 0xffffffff; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&idx), 4)); }
+        gentx << share.m_coinbase;
+        { uint32_t seq = 0xffffffff; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&seq), 4)); }
+        size_t n_outs = payout_outputs.size() + 1 + 1;
+        bool has_segwit_fb = share.m_segwit_data.has_value();
+        if (has_segwit_fb) n_outs += 1;
+        if (n_outs < 253) { uint8_t cnt = (uint8_t)n_outs; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&cnt), 1)); }
+        else { uint8_t m = 0xfd; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&m), 1)); uint16_t cnt = (uint16_t)n_outs; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&cnt), 2)); }
+        auto write_txout = [&](uint64_t value, const std::vector<unsigned char>& script) {
+            gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&value), 8));
+            BaseScript bs; bs.m_data = script; gentx << bs;
+        };
+        if (has_segwit_fb) {
+            auto& sd = share.m_segwit_data.value();
+            std::vector<unsigned char> wscript = {0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed};
+            uint256 commitment = compute_p2pool_witness_commitment(sd.m_wtxid_merkle_root);
+            auto cb = commitment.GetChars();
+            wscript.insert(wscript.end(), cb.begin(), cb.end());
+            write_txout(0, wscript);
+        }
+        for (auto& [script, amount] : payout_outputs) write_txout(amount, script);
+        // V35: use pre-V36 DONATION_SCRIPT
+        write_txout(donation_amount, PoolConfig::get_donation_script(int64_t(35)));
+        { std::vector<unsigned char> op; op.push_back(0x6a); op.push_back(0x28);
+          op.insert(op.end(), ref_hash.data(), ref_hash.data() + 32);
+          uint64_t n = share.m_last_txout_nonce; auto* p = reinterpret_cast<const unsigned char*>(&n);
+          op.insert(op.end(), p, p + 8); write_txout(0, op); }
+        { uint32_t lt = 0; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&lt), 4)); }
+
+        coinbase_bytes_for_hashlink.assign(
+            reinterpret_cast<const unsigned char*>(gentx.data()),
+            reinterpret_cast<const unsigned char*>(gentx.data()) + gentx.size());
+    }
+
+    // Compute hash_link (V35: HashLinkType)
+    constexpr size_t suffix_len = 32 + 8 + 4;
+    if (coinbase_bytes_for_hashlink.size() > suffix_len) {
+        std::vector<unsigned char> prefix(
+            coinbase_bytes_for_hashlink.begin(), coinbase_bytes_for_hashlink.end() - suffix_len);
+        share.m_hash_link = prefix_to_hash_link_v35(prefix, gentx_before_refhash);
+
+        size_t nonce_offset = coinbase_bytes_for_hashlink.size() - 4 - 8;
+        uint64_t extracted_nonce = 0;
+        std::memcpy(&extracted_nonce, coinbase_bytes_for_hashlink.data() + nonce_offset, 8);
+        share.m_last_txout_nonce = extracted_nonce;
+    }
+
+    // --- Compute share hash (block header double-SHA256) ---
+    PackStream header_stream;
+    { uint32_t v = static_cast<uint32_t>(min_header.m_version);
+      header_stream << v; }
+    header_stream << min_header.m_previous_block;
+
+    uint256 gentx_hash_for_header;
+    if (!actual_coinbase_bytes.empty()) {
+        auto actual_span = std::span<const unsigned char>(
+            actual_coinbase_bytes.data(), actual_coinbase_bytes.size());
+        gentx_hash_for_header = Hash(actual_span);
+    } else {
+        auto cb_span = std::span<const unsigned char>(
+            coinbase_bytes_for_hashlink.data(), coinbase_bytes_for_hashlink.size());
+        gentx_hash_for_header = Hash(cb_span);
+    }
+    uint256 merkle_root = check_merkle_link(gentx_hash_for_header, share.m_merkle_link);
+
+    header_stream << merkle_root;
+    header_stream << min_header.m_timestamp;
+    header_stream << min_header.m_bits;
+    header_stream << min_header.m_nonce;
+
+    auto hdr_span = std::span<const unsigned char>(
+        reinterpret_cast<const unsigned char*>(header_stream.data()), header_stream.size());
+
+    uint256 share_hash = Hash(hdr_span);
+    share.m_hash = share_hash;
+
+    // PoW check against share target
+    {
+        uint256 target = chain::bits_to_target(share.m_bits);
+        if (!target.IsNull()) {
+            char pow_bytes[32];
+            scrypt_1024_1_1_256(reinterpret_cast<const char*>(hdr_span.data()), pow_bytes);
+            uint256 pow_hash;
+            memcpy(pow_hash.begin(), pow_bytes, 32);
+
+            if (pow_hash > target) {
+                return uint256();  // didn't meet share target
+            }
+            LOG_INFO << "[Pool] V35 SHARE CREATED! pow=" << pow_hash.GetHex().substr(0, 16)
+                     << " target=" << target.GetHex().substr(0, 16)
+                     << " diff=" << chain::target_to_difficulty(target);
+        }
+    }
+
+    // Add to tracker
+    auto* heap_share = new PaddingBugfixShare(share);
+    tracker.add(heap_share);
+    LOG_INFO << "create_local_share_v35: added share " << share_hash.GetHex()
+             << " height=" << share.m_absheight
+             << " prev=" << prev_share.GetHex().substr(0, 16) << "...";
+
+    return share_hash;
+}
+
+// ============================================================================
 // create_local_share()
 //
-// Constructs a MergedMiningShare (V36) from locally-generated block data and
-// adds it to the share tracker.  Returns the share hash (block header double-
-// SHA256).
+// Constructs a share (V35 PaddingBugfixShare or V36 MergedMiningShare) from
+// locally-generated block data and adds it to the share tracker.
+// Returns the share hash (block header double-SHA256).
 //
 // Parameters:
 //   tracker     — the ShareTracker to insert the new share into
@@ -1815,6 +2379,7 @@ uint256 verify_share(const ShareT& share, TrackerT& tracker)
 //   payout_script   — finder's scriptPubKey
 //   donation        — donation bps (e.g. 50 = 0.5%)
 //   merged_addrs    — optional merged mining addresses
+//   share_version   — 35 or 36 (default 36)
 //
 // This builds the p2pool coinbase in the same format as
 // generate_share_transaction() and computes the hash_link so remote peers
@@ -1849,8 +2414,19 @@ uint256 create_local_share(
     bool     has_frozen = false,
     const std::vector<uint256>& frozen_merkle_branches = {},
     const uint256& frozen_witness_root = uint256(),
-    const std::vector<unsigned char>& frozen_merged_coinbase_info = {})
+    const std::vector<unsigned char>& frozen_merged_coinbase_info = {},
+    int64_t share_version = 36,
+    uint64_t desired_version = 36)
 {
+    // V35 path: delegate to version-specific implementation
+    if (share_version <= 35)
+        return create_local_share_v35(
+            tracker, min_header, coinbase, subsidy, prev_share, merkle_branches,
+            payout_script, donation, stale_info, segwit_active, witness_commitment_hex,
+            actual_coinbase_bytes, witness_root, override_max_bits, override_bits,
+            frozen_absheight, frozen_abswork, frozen_far_share_hash, frozen_timestamp,
+            has_frozen, frozen_merkle_branches, frozen_witness_root, desired_version);
+
     MergedMiningShare share;
     share.m_min_header = min_header;
     share.m_coinbase   = coinbase;
@@ -1858,7 +2434,7 @@ uint256 create_local_share(
     share.m_prev_hash  = prev_share;
     share.m_donation   = donation;
     share.m_stale_info = stale_info;
-    share.m_desired_version = 36;
+    share.m_desired_version = desired_version;
 
     // Timestamp: clip to at least previous_share.timestamp + 1 (matches Python)
     share.m_timestamp  = min_header.m_timestamp;
@@ -1912,7 +2488,11 @@ uint256 create_local_share(
             share.m_pubkey_type = 2;
         } else if (payout_script.size() == 22 &&
                    payout_script[0] == 0x00 && payout_script[1] == 0x14) {
-            // P2WPKH: 00 14 <hash160>
+            // P2WPKH: 00 14 <witness_program>
+            // P2WPKH: store raw witness program bytes directly.
+            // No reversal — c2pool uses raw bytes throughout, unlike p2pool's
+            // IntType(160) LE integer convention. The wire serialization of
+            // uint160 preserves the byte order from memcpy.
             std::memcpy(share.m_pubkey_hash.data(), payout_script.data() + 2, 20);
             share.m_pubkey_type = 1;
         } else {
@@ -2565,7 +3145,7 @@ uint256 create_local_share(
     {
         static int xcheck_count = 0;
         if (xcheck_count < 5) {
-            uint256 verify_hash = generate_share_transaction<MergedMiningShare>(*heap_share, tracker, true);
+            uint256 verify_hash = generate_share_transaction<MergedMiningShare>(*heap_share, tracker, true, (MergedMiningShare::version >= 36));
             bool xcheck_ok = (verify_hash == gentx_hash_for_header);
             if (xcheck_ok) {
                 LOG_INFO << "[Pool] Cross-check PASSED";

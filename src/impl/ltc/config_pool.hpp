@@ -34,7 +34,8 @@ public:
     static constexpr uint16_t P2P_PORT                  = 9326;  // must match p2pool-merged-v36
     static constexpr uint32_t SPREAD                    = 3;       // blocks (PPLNS window)
     static constexpr uint32_t TARGET_LOOKBEHIND         = 200;
-    static constexpr uint32_t MINIMUM_PROTOCOL_VERSION  = 3600;
+    static constexpr uint32_t MINIMUM_PROTOCOL_VERSION  = 3301;  // accept v35 (3502) and v36 (3600) peers
+    static constexpr uint32_t ADVERTISED_PROTOCOL_VERSION = 3600; // our capability (V36 shares)
     static constexpr uint32_t SEGWIT_ACTIVATION_VERSION = 17;
     static constexpr uint32_t BLOCK_MAX_SIZE            = 1000000;
     static constexpr uint32_t BLOCK_MAX_WEIGHT          = 4000000;

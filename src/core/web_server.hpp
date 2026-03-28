@@ -251,6 +251,8 @@ public:
         uint32_t bits{0};
         uint32_t timestamp{0};
         uint256  merged_payout_hash;
+        int64_t  share_version{36};     // AutoRatchet: V35 or V36
+        uint64_t desired_version{36};   // Version vote (always target version)
         // Frozen mm_commitment — built atomically with merged_coinbase_info headers
         // by build_merged_header_info_with_commitment(). Empty if no merged mining.
         std::vector<uint8_t> frozen_mm_commitment;
@@ -429,6 +431,10 @@ public:
         uint256  frozen_witness_root;                  // wtxid_merkle_root at template time
         std::vector<unsigned char> frozen_merged_coinbase_info;  // pre-serialized MergedCoinbaseEntry vector
         bool     has_frozen_fields{false};  // true if the above are valid
+
+        // AutoRatchet share version (V35 or V36) — determined at template time
+        int64_t  share_version{36};
+        uint64_t desired_version{36};
     };
     using create_share_fn_t = std::function<void(const ShareCreationParams& params)>;
     void set_create_share_fn(create_share_fn_t fn) { m_create_share_fn = std::move(fn); }
@@ -500,6 +506,9 @@ public:
         m_donation_script = script;
     }
     const std::vector<unsigned char>& get_donation_script() const { return m_donation_script; }
+    // Cached share version (v35/v36) — updated by PPLNS hook from AutoRatchet
+    void set_cached_share_version(int64_t v) { m_cached_share_version = v; }
+    int64_t get_cached_share_version() const { return m_cached_share_version; }
     // Local stratum hashrate (H/s) — set via callback from WebServer
     void set_stratum_hashrate_fn(std::function<double()> fn) { m_stratum_hashrate_fn = std::move(fn); }
     double get_stratum_total_hashrate() const { return m_stratum_hashrate_fn ? m_stratum_hashrate_fn() : 0.0; }
@@ -737,6 +746,7 @@ private:
     std::vector<std::pair<std::string, uint64_t>> m_cached_pplns_outputs;
     uint256 m_cached_pplns_best_share;
     bool m_cached_raw_scripts{false};
+    int64_t m_cached_share_version{36};  // V35/V36 PPLNS selection
     std::string m_cached_witness_commitment;
     uint256 m_cached_witness_root;  // raw wtxid merkle root
     std::vector<uint8_t> m_cached_mm_commitment;

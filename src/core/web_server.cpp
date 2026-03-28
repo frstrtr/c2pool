@@ -1296,6 +1296,7 @@ MiningInterface::build_connection_coinbase(
         pplns_fn_t pplns_fn;
         ref_hash_fn_t ref_hash_fn;
         bool needs_pplns_recompute{false};
+        int64_t share_version{36};
     };
 
     WorkStateSnapshot ws;
@@ -1316,6 +1317,7 @@ MiningInterface::build_connection_coinbase(
         ws.mweb = m_cached_mweb;
         ws.coinbase_text = m_coinbase_text;
         ws.donation_script = m_donation_script;
+        ws.share_version = m_cached_share_version;
         ws.merkle_branches = m_cached_merkle_branches;
         ws.pplns_fn = m_pplns_fn;
         ws.ref_hash_fn = m_ref_hash_fn;
@@ -1384,6 +1386,53 @@ MiningInterface::build_connection_coinbase(
             LOG_INFO << "[build_connection_cb] PPLNS recomputed for frozen prev_share="
                      << prev_share_hash.ToString().substr(0, 16)
                      << " outputs=" << ws.pplns_outputs.size();
+        }
+    }
+
+    // ── Phase 2a: V35 finder fee (per-connection adjustment) ──
+    // V35 PPLNS returns 99.5% to miners + remainder to donation.
+    // The finder (this connection's miner) gets subsidy/200 (0.5%) moved
+    // from the donation output to their payout script.
+    // Reference: p2pool data.py lines 945-948
+    if (ws.share_version < 36 && !ws.pplns_outputs.empty() && !payout_script.empty())
+    {
+        uint64_t subsidy_for_fee = ws.tmpl.value("coinbasevalue", uint64_t(0));
+        uint64_t finder_fee = subsidy_for_fee / 200;
+
+        if (finder_fee > 0) {
+            // Build finder's script hex
+            std::string finder_hex;
+            finder_hex.reserve(payout_script.size() * 2);
+            for (unsigned char b : payout_script) {
+                finder_hex += HX[b >> 4]; finder_hex += HX[b & 0x0f];
+            }
+
+            // Subtract finder fee from donation (last entry)
+            auto& donation_out = ws.pplns_outputs.back();
+            uint64_t taken = std::min(donation_out.second, finder_fee);
+            donation_out.second -= taken;
+
+            // Add to finder's script (may already exist in PPLNS outputs)
+            bool found_finder = false;
+            for (auto& [hex, amt] : ws.pplns_outputs) {
+                if (hex == finder_hex) { amt += taken; found_finder = true; break; }
+            }
+            if (!found_finder) {
+                // Insert before donation (last entry) to maintain sort invariant
+                ws.pplns_outputs.insert(ws.pplns_outputs.end() - 1, {finder_hex, taken});
+            }
+
+            // Re-sort PPLNS entries (excluding donation at the end)
+            if (ws.pplns_outputs.size() > 1) {
+                auto donation_save = ws.pplns_outputs.back();
+                ws.pplns_outputs.pop_back();
+                std::sort(ws.pplns_outputs.begin(), ws.pplns_outputs.end(),
+                    [](const auto& a, const auto& b) {
+                        if (a.second != b.second) return a.second < b.second;
+                        return a.first < b.first;
+                    });
+                ws.pplns_outputs.push_back(donation_save);
+            }
         }
     }
 
@@ -1707,7 +1756,8 @@ void MiningInterface::refresh_work()
                             pplns_outputs.push_back(donation_entry);
 
                         pplns_raw_scripts = true;
-                        LOG_INFO << "[Pool] refresh_work: V36 PPLNS coinbase with "
+                        LOG_INFO << "[Pool] refresh_work: V" << m_cached_share_version
+                                 << " PPLNS coinbase with "
                                  << pplns_outputs.size() << " outputs (donation_last="
                                  << found_donation << ")";
                     }
@@ -4651,7 +4701,14 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
             if (comma_pos != std::string::npos)
                 primary_addr = primary_addr.substr(0, comma_pos);
         }
-        std::string share_address = base58check_to_hash160(primary_addr);
+        // Decode any address format: base58 (P2PKH/P2SH) or bech32 (P2WPKH)
+        std::string addr_type_str;
+        std::string share_address = address_to_hash160(primary_addr, addr_type_str);
+        uint8_t share_addr_type = 0; // 0=P2PKH, 1=P2WPKH, 2=P2SH
+        if (share_address.size() == 40) {
+            if (addr_type_str == "p2wpkh") share_addr_type = 1;
+            else if (addr_type_str == "p2sh") share_addr_type = 2;
+        }
         if (share_address.size() != 40) {
             // Case 4 (Python work.py): invalid/empty LTC address but miner provided an
             // explicit DOGE merged address → derive LTC hash160 from DOGE P2PKH script.
@@ -4748,14 +4805,33 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                 params.miner_address = display;
             }
 
-            // Build P2PKH script from share_address (40-char hex hash160)
+            // Build scriptPubKey from share_address (40-char hex hash160) + type
             if (share_address.size() == 40) {
-                params.payout_script = {0x76, 0xa9, 0x14};
+                std::vector<unsigned char> hash160_bytes;
+                hash160_bytes.reserve(20);
                 for (size_t i = 0; i < share_address.size(); i += 2)
-                    params.payout_script.push_back(static_cast<unsigned char>(
+                    hash160_bytes.push_back(static_cast<unsigned char>(
                         std::stoul(share_address.substr(i, 2), nullptr, 16)));
-                params.payout_script.push_back(0x88);
-                params.payout_script.push_back(0xac);
+
+                if (share_addr_type == 1) {
+                    // P2WPKH: 00 14 <20-byte witness program>
+                    params.payout_script = {0x00, 0x14};
+                    params.payout_script.insert(params.payout_script.end(),
+                        hash160_bytes.begin(), hash160_bytes.end());
+                } else if (share_addr_type == 2) {
+                    // P2SH: a9 14 <20-byte hash> 87
+                    params.payout_script = {0xa9, 0x14};
+                    params.payout_script.insert(params.payout_script.end(),
+                        hash160_bytes.begin(), hash160_bytes.end());
+                    params.payout_script.push_back(0x87);
+                } else {
+                    // P2PKH: 76 a9 14 <20-byte hash> 88 ac
+                    params.payout_script = {0x76, 0xa9, 0x14};
+                    params.payout_script.insert(params.payout_script.end(),
+                        hash160_bytes.begin(), hash160_bytes.end());
+                    params.payout_script.push_back(0x88);
+                    params.payout_script.push_back(0xac);
+                }
             }
 
             params.merged_addresses = merged_addresses;
@@ -4876,6 +4952,8 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                     params.frozen_witness_root = job->frozen_ref.frozen_witness_root;
                     params.frozen_merged_coinbase_info = job->frozen_ref.frozen_merged_coinbase_info;
                     params.has_frozen_fields = (job->frozen_ref.absheight > 0);
+                    params.share_version = job->frozen_ref.share_version;
+                    params.desired_version = job->frozen_ref.desired_version;
                     params.stale_info = job->stale_info;
                 }
             }

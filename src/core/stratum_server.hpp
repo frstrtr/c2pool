@@ -134,6 +134,8 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
         uint256  frozen_witness_root;                  // wtxid_merkle_root at template time
         std::vector<unsigned char> frozen_merged_coinbase_info;  // pre-serialized
         bool     has_frozen{false};
+        int64_t  share_version{36};    // AutoRatchet-determined share version at template time
+        uint64_t desired_version{36};  // Version vote
         int      stale_info{0};  // 0=none, 253=orphan (block template changed), 254=doa
     };
     std::unordered_map<std::string, JobEntry> active_jobs_;
@@ -171,6 +173,7 @@ public:
     void start();
 
     bool is_connected() const { return socket_.is_open(); }
+    bool is_subscribed() const { return subscribed_; }
     double get_hashrate() const { return hashrate_tracker_.get_current_hashrate(); }
     const std::array<uint8_t, 20>& get_pubkey_hash() const { return pubkey_hash_; }
     const std::map<uint32_t, std::string>& get_merged_addresses() const { return merged_addresses_; }

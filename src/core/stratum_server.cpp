@@ -268,7 +268,7 @@ void StratumServer::notify_all()
     // sessions_mutex_ RELEASED — safe to call into m_work_mutex territory
     for (auto& s : snapshot) {
         try {
-            if (s->is_connected())
+            if (s->is_connected() && s->is_subscribed())
                 s->send_notify_work(true, &frozen_best);  // clean_jobs=true: miner switches to new prev_share immediately (p2pool behavior)
         } catch (...) {}
     }
@@ -540,10 +540,29 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         if (!merged_addresses_.empty())
             LOG_INFO << "[Stratum] Merged addresses from login: " << merged_addresses_.size() << " chain(s)";
 
+        // Case 5: primary address belongs to a merged chain (e.g., DOGE), not LTC.
+        // Common when miners enter their DOGE address without a comma separator.
+        // The pubkey_hash is preserved — LTC payout uses P2PKH with same hash160.
+        if (merged_addr_raw.empty() && !username_.empty() && mining_interface_) {
+            bool is_ltc = is_address_for_chain(username_, LTC_HRPS, LTC_VERSIONS);
+            if (!is_ltc) {
+                for (const auto& chain : MERGED_CHAINS) {
+                    if (mining_interface_->has_merged_chain(chain.chain_id) &&
+                        is_address_for_chain(username_, chain.hrps, chain.versions)) {
+                        merged_addresses_[chain.chain_id] = username_;
+                        LOG_WARNING << "[Stratum] Case 5: Primary address is chain_id="
+                                    << chain.chain_id << " (not LTC) — LTC payout will use "
+                                    << "reverse-derived P2PKH from same pubkey_hash";
+                        break;
+                    }
+                }
+            }
+        }
+
         LOG_INFO << "[Stratum] Mining authorization successful for: " << username_;
 
         // Auto-derive: for each configured merged chain without an explicit address,
-        // reuse the LTC address (works when chains share hash160 format).
+        // reuse the primary address hash160 (works because chains share secp256k1 keys).
         if (mining_interface_) {
             std::string atype;
             auto h160 = address_to_hash160(username_, atype);
@@ -560,9 +579,16 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
                         merged_addresses_.find(chain.chain_id) == merged_addresses_.end()) {
                         merged_addresses_[chain.chain_id] = username_;
                         LOG_INFO << "[Stratum] Auto-derived merged address for chain_id="
-                                 << chain.chain_id << " from LTC address";
+                                 << chain.chain_id << " from primary " << atype << " address";
                     }
                 }
+            }
+            // Cases 7-9: P2WSH/P2TR addresses have 32-byte witness programs that
+            // cannot be converted to 20-byte hash160 for merged chain addresses.
+            else if (atype == "p2wsh" || atype == "p2tr") {
+                LOG_WARNING << "[Stratum] Primary address is " << atype
+                            << " — cannot auto-derive merged mining addresses "
+                            << "(non-convertible witness program)";
             }
         }
 
@@ -955,6 +981,8 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     snapshot.frozen_ref.frozen_merkle_branches = job.frozen_merkle_branches;
     snapshot.frozen_ref.frozen_witness_root = job.frozen_witness_root;
     snapshot.frozen_ref.frozen_merged_coinbase_info = job.frozen_merged_coinbase_info;
+    snapshot.frozen_ref.share_version = job.share_version;
+    snapshot.frozen_ref.desired_version = job.desired_version;
     // NOTE: stale_info is NOT propagated here. It must match what ref_hash_fn
     // used at job creation time (always 0 for now). Changing it at submit
     // time would break ref_hash consistency. Future: compute stale_info
@@ -1299,6 +1327,8 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         je.frozen_merkle_branches = cbr.snapshot.frozen_ref.frozen_merkle_branches;
         je.frozen_witness_root = cbr.snapshot.frozen_ref.frozen_witness_root;
         je.frozen_merged_coinbase_info = cbr.snapshot.frozen_ref.frozen_merged_coinbase_info;
+        je.share_version = cbr.snapshot.frozen_ref.share_version;
+        je.desired_version = cbr.snapshot.frozen_ref.desired_version;
         je.has_frozen = true;
 
         if (!tmpl.empty() && !tmpl.is_null() && tmpl.contains("transactions")) {

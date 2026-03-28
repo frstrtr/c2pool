@@ -12,6 +12,7 @@
 #include <btclibs/bech32.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <map>
@@ -46,33 +47,33 @@ struct TailScore
 
 struct HeadScore
 {
-    uint288 work;
-    int32_t reason{};
-    int32_t is_local{};  // 1=local, 0=peer — peer wins tiebreak
-    int64_t time_seen{};
+    // p2pool: (work - min(punish,1)*ata(target), -reason, -time_seen)
+    // Sorted ascending, .back() = best. Standard < comparison.
+    uint288 adjusted_work;  // work - punishment_deduction
+    int32_t neg_reason{};   // -reason (higher = less punished = better)
+    int64_t neg_time_seen{}; // -time_seen (higher = seen earlier = better)
 
     friend bool operator<(const HeadScore& a, const HeadScore& b)
     {
-        if (a.work < b.work) return true;
-        if (b.work < a.work) return false;
-        // p2pool: sort by (-reason, peer_addr is None, -time_seen)
-        // is_local=0 (peer) sorts BEFORE is_local=1 (local) → peer wins
-        return std::tie(a.reason, a.is_local, a.time_seen) > std::tie(b.reason, b.is_local, b.time_seen);
+        if (a.adjusted_work < b.adjusted_work) return true;
+        if (b.adjusted_work < a.adjusted_work) return false;
+        return std::tie(a.neg_reason, a.neg_time_seen) < std::tie(b.neg_reason, b.neg_time_seen);
     }
 };
 
 struct TraditionalScore
 {
+    // p2pool: (work, -time_seen, -reason)
+    // No is_local. Sorted ascending, .back() = best.
     uint288 work;
-    int64_t time_seen{};
-    int32_t is_local{};
-    int32_t reason{};
+    int64_t neg_time_seen{};
+    int32_t neg_reason{};
 
     friend bool operator<(const TraditionalScore& a, const TraditionalScore& b)
     {
         if (a.work < b.work) return true;
         if (b.work < a.work) return false;
-        return std::tie(a.time_seen, a.is_local, a.reason) > std::tie(b.time_seen, b.is_local, b.reason);
+        return std::tie(a.neg_time_seen, a.neg_reason) < std::tie(b.neg_time_seen, b.neg_reason);
     }
 };
 
@@ -116,7 +117,28 @@ public:
     ShareChain chain;
     ShareChain verified;
 
+    // Runtime v36_active flag — set by AutoRatchet when state is ACTIVATED or CONFIRMED.
+    // Used by generate_share_transaction to select PPLNS formula at runtime,
+    // matching p2pool's behavior (data.py:879, work.py:759).
+    bool is_v36_active() const { return v36_active_.load(std::memory_order_relaxed); }
+    void set_v36_active(bool active) { v36_active_.store(active, std::memory_order_relaxed); }
+
 private:
+    std::atomic<bool> v36_active_{false};
+
+    // Retry counter for shares that fail GENTX verification.
+    // After MAX_VERIFY_RETRIES failures, share is permanently skipped.
+    // Prevents infinite retry loops for shares whose PPLNS ancestry
+    // changed after restart (different fork resolution).
+    static constexpr int MAX_VERIFY_RETRIES = 3;
+    std::unordered_map<uint256, int, ShareHasher> m_verify_fail_count;
+
+    bool is_permanently_unverifiable(const uint256& h) const
+    {
+        auto it = m_verify_fail_count.find(h);
+        return it != m_verify_fail_count.end() && it->second >= MAX_VERIFY_RETRIES;
+    }
+
     static int64_t now_seconds()
     {
         return std::chrono::duration_cast<std::chrono::seconds>(
@@ -135,6 +157,7 @@ public:
         // Without this, pruned shares leave stale entries in weight caches.
         chain.on_removed([this](const uint256& hash) {
             invalidate_weight_caches(hash);
+            m_verify_fail_count.erase(hash);
         });
     }
     ~ShareTracker()
@@ -149,14 +172,21 @@ public:
     void add(ShareT* share)
     {
         if (!chain.contains(share->m_hash))
+        {
+            try_register_merged_addr(share);
             chain.add(share);
+        }
     }
 
     void add(ShareType share)
     {
         auto h = share.hash();
         if (!chain.contains(h))
+        {
+            // Register before chain.add() which may move the variant
+            share.invoke([this](auto* obj) { try_register_merged_addr(obj); });
             chain.add(share);
+        }
     }
 
     // -- Attempt to verify a share --
@@ -167,6 +197,10 @@ public:
     {
         if (verified.contains(share_hash))
             return true;
+
+        // Skip shares that have permanently failed verification.
+        if (is_permanently_unverifiable(share_hash))
+            return false;
 
         // NO parent-in-verified filter. p2pool doesn't have one.
         // p2pool's attempt_verify has only the guard (height < CL+1 && unrooted).
@@ -215,11 +249,22 @@ public:
         }
         catch (const std::exception& e)
         {
-            LOG_WARNING << "attempt_verify FAILED for " << share_hash.ToString().substr(0,16)
-                        << " acc_height=" << acc_height << " last=" << (last.IsNull() ? "null" : last.ToString().substr(0,16))
-                        << " error: " << e.what();
+            auto& cnt = m_verify_fail_count[share_hash];
+            ++cnt;
+            if (cnt >= MAX_VERIFY_RETRIES)
+                LOG_WARNING << "attempt_verify: share " << share_hash.ToString().substr(0,16)
+                            << " permanently unverifiable after " << cnt
+                            << " attempts (acc_height=" << acc_height << "): " << e.what();
+            else
+                LOG_WARNING << "attempt_verify FAILED (" << cnt << "/" << MAX_VERIFY_RETRIES
+                            << ") for " << share_hash.ToString().substr(0,16)
+                            << " acc_height=" << acc_height << " last=" << (last.IsNull() ? "null" : last.ToString().substr(0,16))
+                            << " error: " << e.what();
             return false;
         }
+
+        // Success — clear any previous fail count
+        m_verify_fail_count.erase(share_hash);
 
         // Add to verified chain
         auto& share_var = chain.get_share(share_hash);
@@ -392,7 +437,11 @@ public:
                             ++p1_verified;
                             break;
                         }
-                        bads.push_back(hash);
+                        // Don't add permanently unverifiable shares to bads —
+                        // they can't be removed (have children) and would just
+                        // trigger peer banning every cycle.
+                        if (!is_permanently_unverifiable(hash))
+                            bads.push_back(hash);
                     }
                 } catch (const std::exception& ex) {
                     ++p1_caught;
@@ -647,17 +696,18 @@ public:
                             reason = std::max(reason, idx->naughty);
                     }
 
-                    // p2pool: sort key = (work - punish*att, -reason, -time_seen)
-                    // p2pool has commented-out: self.items[h].peer_addr is None
-                    // which deprioritizes local shares. c2pool enables this to break
-                    // the local fork feedback loop (local→best→local→best cycle).
-                    bool is_local = false;
-                    chain.get_share(hh).invoke([&](auto* obj) {
-                        is_local = (obj->peer_addr.port() == 0);
-                    });
-                    // is_local=true sorts AFTER is_local=false (peer wins tiebreak)
-                    decorated_heads.push_back({{work_score, reason, is_local ? 1 : 0, -ts}, hh});
-                    traditional_sort.push_back({{work_score, -ts, is_local ? 1 : 0, reason}, hh});
+                    // p2pool: sort key = (work - min(punish,1)*ata(target), -reason, -time_seen)
+                    // peer_addr is None is COMMENTED OUT in p2pool — no is_local dimension.
+                    // Punishment deducted from work: a punished share is mathematically behind.
+                    uint288 adjusted_work = work_score;
+                    if (reason > 0) {
+                        // Deduct one share's worth of attempts (min(reason,1) * ata(target))
+                        auto* share_idx = chain.get_index(hh);
+                        if (share_idx)
+                            adjusted_work = adjusted_work - share_idx->work;
+                    }
+                    decorated_heads.push_back({{adjusted_work, -reason, -ts}, hh});
+                    traditional_sort.push_back({{work_score, -ts, -reason}, hh});
                 } catch (const std::exception&) {
                     // Chain concurrently modified — skip this head, retry next cycle
                 }
@@ -667,7 +717,7 @@ public:
         }
 
         // p2pool: self.punish = punish value from Phase 5 (walk-back result)
-        bool punish_aggressively = !traditional_sort.empty() && traditional_sort.back().score.reason != 0;
+        bool punish_aggressively = !traditional_sort.empty() && traditional_sort.back().score.neg_reason != 0;
 
         // Phase 5: Determine best share — p2pool data.py:2142-2166
         // Walk back through punished shares, then find best non-naughty descendent.
@@ -775,6 +825,22 @@ public:
         if (far_hash.IsNull() || !chain.contains(far_hash))
             return uint288(0);
 
+        // Verify skip list vs naive walk (periodic — detect stale pointers)
+        {
+            static int skip_verify = 0;
+            if (skip_verify++ % 100 == 0) {
+                try {
+                    auto naive_far = chain.get_nth_parent_key(share_hash, dist - 1);
+                    if (naive_far != far_hash) {
+                        LOG_ERROR << "[SKIP-MISMATCH] dist=" << dist
+                                  << " skip=" << far_hash.GetHex().substr(0,16)
+                                  << " naive=" << naive_far.GetHex().substr(0,16)
+                                  << " near=" << share_hash.GetHex().substr(0,16);
+                    }
+                } catch (...) {}
+            }
+        }
+
         // p2pool: tracker.get_delta(near.hash, far.hash)  — O(1) via TrackerView
         auto delta = chain.get_delta(share_hash, far_hash);
         uint288 attempts = use_min_work ? delta.min_work : delta.work;
@@ -881,13 +947,29 @@ public:
         auto aps = get_pool_attempts_per_second(prev_share_hash,
             PoolConfig::TARGET_LOOKBEHIND, /*min_work=*/true);
 
-        // Periodic APS diagnostic (lean — delta cache is now the primary path)
+        // Full APS diagnostic for cross-implementation comparison.
+        // Dumps all inputs so p2pool's values can be compared.
         {
             static int cst_diag = 0;
             if (cst_diag++ % 50 == 0) {
+                auto far_hash = chain.get_nth_parent_via_skip(prev_share_hash,
+                    static_cast<int32_t>(PoolConfig::TARGET_LOOKBEHIND) - 1);
+                uint32_t near_ts = 0, far_ts = 0;
+                chain.get_share(prev_share_hash).invoke([&](auto* obj) { near_ts = obj->m_timestamp; });
+                if (!far_hash.IsNull() && chain.contains(far_hash))
+                    chain.get_share(far_hash).invoke([&](auto* obj) { far_ts = obj->m_timestamp; });
+                auto delta = (!far_hash.IsNull() && chain.contains(far_hash))
+                    ? chain.get_delta(prev_share_hash, far_hash)
+                    : decltype(chain.get_delta(prev_share_hash, prev_share_hash)){};
                 LOG_INFO << "[CST-APS] aps=" << aps.GetLow64()
                          << " height=" << acc_height
-                         << " prev=" << prev_share_hash.GetHex().substr(0,16);
+                         << " prev=" << prev_share_hash.GetHex().substr(0,16)
+                         << " far=" << (far_hash.IsNull() ? "null" : far_hash.GetHex().substr(0,16))
+                         << " near_ts=" << near_ts << " far_ts=" << far_ts
+                         << " timespan=" << (int32_t(near_ts) - int32_t(far_ts))
+                         << " delta_h=" << delta.height
+                         << " delta_min_work=" << delta.min_work.GetLow64()
+                         << " delta_work=" << delta.work.GetLow64();
             }
         }
 
@@ -1035,7 +1117,27 @@ public:
         if (bits_target > pre_target3) bits_target = pre_target3;
         auto bits = chain::target_to_bits_upper_bound(bits_target);
 
-        // Same MAX_TARGET guard for bits
+        // Periodic full-chain diagnostic for cross-implementation comparison.
+        // Dumps all intermediate values so p2pool's computation can be matched.
+        {
+            static int cst_full = 0;
+            if (cst_full++ % 200 == 0) {
+                LOG_INFO << "[CST-FULL] max_bits=0x" << std::hex << max_bits
+                         << " bits=0x" << bits << std::dec
+                         << " aps=" << aps.GetLow64()
+                         << " pre_target_bits=0x" << std::hex
+                         << chain::target_to_bits_upper_bound(pre_target)
+                         << " clamp_ref_bits=0x"
+                         << chain::target_to_bits_upper_bound(clamp_ref_target)
+                         << " lo_bits=0x" << chain::target_to_bits_upper_bound(lo)
+                         << " hi_bits=0x" << chain::target_to_bits_upper_bound(hi)
+                         << " pre2_bits=0x" << chain::target_to_bits_upper_bound(pre_target2)
+                         << " pre3_bits=0x" << chain::target_to_bits_upper_bound(pre_target3)
+                         << std::dec
+                         << " height=" << acc_height
+                         << " prev=" << prev_share_hash.GetHex().substr(0,16);
+            }
+        }
         return {max_bits, bits};
     }
 
@@ -1116,16 +1218,10 @@ public:
                         chain::bits_to_target(obj->m_bits));
                     uint32_t don = obj->m_donation;
 
-                    std::vector<unsigned char> script;
-                    if constexpr (requires { obj->m_pubkey_hash; }) {
-                        script = {0x76, 0xa9, 0x14};
-                        auto* hash_bytes = obj->m_pubkey_hash.data();
-                        script.insert(script.end(), hash_bytes, hash_bytes + 20);
-                        script.push_back(0x88);
-                        script.push_back(0xac);
-                    } else if constexpr (requires { obj->m_address; }) {
-                        script = obj->m_address.m_data;
-                    }
+                    // Extract scriptPubKey via get_share_script — handles both
+                    // V36 (m_pubkey_hash) and V35 (m_address string → script conversion).
+                    // Must match generate_share_transaction's key type.
+                    auto script = get_share_script(obj);
 
                     auto share_total = att * 65535;
                     auto share_addr_w = att * static_cast<uint32_t>(65535 - don);
@@ -1362,6 +1458,14 @@ public:
         // See generate_share_transaction() for detailed rationale.
         uint288 unlimited_weight;
         unlimited_weight.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        {
+            static int ep_log = 0;
+            if (ep_log++ % 20 == 0) {
+                LOG_INFO << "[EP-PPLNS] v36 start=" << best_share_hash.GetHex().substr(0, 16)
+                         << " chain_len=" << chain_len
+                         << " subsidy=" << subsidy;
+            }
+        }
         auto [weights, total_weight, donation_weight] = get_v36_decayed_cumulative_weights(best_share_hash, chain_len, unlimited_weight);
 
         std::map<std::vector<unsigned char>, double> result;
@@ -1401,6 +1505,95 @@ public:
 
         result[donation_script] = (result.contains(donation_script) ? result[donation_script] : 0.0)
                                   + static_cast<double>(donation_amount);
+
+        return result;
+    }
+
+    // -- V35 PPLNS expected payouts --
+    // Flat (non-decayed) weights, GRANDPARENT start, height-1 window.
+    // Returns amounts WITHOUT finder fee — caller adds subsidy/200 to the
+    // share creator's script.  Donation absorbs the remainder.
+    // Reference: p2pool data.py lines 878-965
+    std::map<std::vector<unsigned char>, double>
+    get_v35_expected_payouts(const uint256& best_share_hash, const uint256& block_target, uint64_t subsidy,
+                             const std::vector<unsigned char>& donation_script)
+    {
+        // V35: PPLNS starts from the GRANDPARENT (prev_share.prev_hash)
+        // Reference: data.py line 884
+        uint256 pplns_start;
+        if (!best_share_hash.IsNull() && chain.contains(best_share_hash)) {
+            chain.get(best_share_hash).share.invoke([&](auto* s) {
+                pplns_start = s->m_prev_hash;  // grandparent
+            });
+        }
+
+        if (pplns_start.IsNull()) {
+            // No grandparent: all subsidy to donation
+            std::map<std::vector<unsigned char>, double> result;
+            result[donation_script] = static_cast<double>(subsidy);
+            return result;
+        }
+
+        // V35: max_shares = max(0, min(height, REAL_CHAIN_LENGTH) - 1)
+        // Reference: data.py line 885
+        auto height = chain.get_height(best_share_hash);
+        int32_t max_shares = std::max(0, std::min(height, static_cast<int32_t>(PoolConfig::real_chain_length())) - 1);
+
+        // V35: desired_weight = 65535 * SPREAD * target_to_average_attempts(block_target)
+        // Reference: data.py line 886
+        uint288 desired_weight = chain::target_to_average_attempts(block_target)
+                                 * uint288(PoolConfig::SPREAD) * uint288(65535);
+
+        {
+            static int ep35_log = 0;
+            if (ep35_log++ % 20 == 0) {
+                LOG_INFO << "[EP-PPLNS] v35 start=" << pplns_start.GetHex().substr(0, 16)
+                         << " max_shares=" << max_shares
+                         << " desired_w=" << desired_weight.GetLow64()
+                         << " subsidy=" << subsidy
+                         << " best=" << best_share_hash.GetHex().substr(0, 16);
+            }
+        }
+        // Flat weight accumulation with hard cap (existing get_cumulative_weights)
+        auto [weights, total_weight, donation_weight] = get_cumulative_weights(pplns_start, max_shares, desired_weight);
+
+        std::map<std::vector<unsigned char>, double> result;
+        uint64_t sum = 0;
+
+        if (!total_weight.IsNull())
+        {
+            for (const auto& [script, weight] : weights)
+            {
+                // V35: 99.5% to PPLNS — subsidy * 199 * weight / (200 * total_weight)
+                // Reference: data.py line 924
+                uint64_t amount = (uint288(subsidy) * uint288(199) * weight / (uint288(200) * total_weight)).GetLow64();
+                if (amount > 0)
+                {
+                    result[script] = static_cast<double>(amount);
+                    sum += amount;
+                }
+            }
+        }
+
+        // Remainder goes to donation (includes the ~0.5% finder fee portion;
+        // caller subtracts subsidy/200 for the finder and assigns it per-connection)
+        // V35: NO minimum donation enforcement (unlike v36)
+        uint64_t donation_amount = (subsidy > sum) ? (subsidy - sum) : 0;
+        result[donation_script] = (result.contains(donation_script) ? result[donation_script] : 0.0)
+                                  + static_cast<double>(donation_amount);
+
+        // Periodic diagnostic dump for cross-impl comparison
+        {
+            static int v35_dump = 0;
+            if (v35_dump++ < 10 || v35_dump % 60 == 0) {
+                LOG_INFO << "[V35-PPLNS] subsidy=" << subsidy << " addrs=" << weights.size()
+                         << " total_w=" << total_weight.GetLow64()
+                         << " max_shares=" << max_shares << " sum=" << sum
+                         << " donation=" << donation_amount
+                         << " prev=" << best_share_hash.GetHex().substr(0, 16)
+                         << " grandparent=" << pplns_start.GetHex().substr(0, 16);
+            }
+        }
 
         return result;
     }
@@ -1788,6 +1981,42 @@ private:
     std::optional<chain::WeightsSkipList> m_v36_weights_skiplist;
     std::unordered_map<uint32_t, chain::WeightsSkipList> m_merged_skiplists;
 
+    // -- Retroactive merged address lookup table --
+    // Maps (chain_id) → (parent_script → explicit_merged_script).
+    // Populated incrementally as V36 shares with explicit merged_addresses
+    // are added.  Used as "Tier 1.5" in the merged skip list lambda:
+    // when a V36 share has empty merged_addresses (activation-boundary race),
+    // look up the same miner's explicit address from their other shares.
+    std::unordered_map<uint32_t,
+        std::map<std::vector<unsigned char>, std::vector<unsigned char>>> m_miner_merged_addr;
+
+    // Register explicit merged addresses from a share into the lookup table.
+    // If a NEW miner→address mapping is discovered, invalidates the merged
+    // skip list for that chain_id so affected shares get recomputed.
+    template <typename ShareT>
+    void try_register_merged_addr(ShareT* share)
+    {
+        if constexpr (requires { share->m_merged_addresses; })
+        {
+            if (share->m_desired_version < 36) return;
+            if (share->m_merged_addresses.empty()) return;
+            auto parent_script = get_share_script(share);
+            if (parent_script.empty()) return;
+            for (const auto& entry : share->m_merged_addresses)
+            {
+                if (entry.m_script.m_data.empty()) continue;
+                auto& lookup = m_miner_merged_addr[entry.m_chain_id];
+                auto [it, inserted] = lookup.emplace(parent_script, entry.m_script.m_data);
+                if (inserted)
+                {
+                    // New mapping — stale skip list entries used auto-convert
+                    // for this miner; recreate to use the explicit address.
+                    m_merged_skiplists.erase(entry.m_chain_id);
+                }
+            }
+        }
+    }
+
     // Previous-share lambda for RAW chain (work templates, general PPLNS)
     auto make_previous_fn()
     {
@@ -1894,11 +2123,22 @@ private:
                                 }
                             }
                         }
-                        // Tier 2: auto-convert parent script (P2WPKH→P2PKH etc.)
+                        // Tier 1.5 + Tier 2 share a single get_share_script call
                         if (weight_key.empty())
                         {
-                            auto raw = get_share_script(obj);
-                            weight_key = normalize_script_for_merged(raw);
+                            auto parent_script = get_share_script(obj);
+                            // Tier 1.5: retroactive lookup — same miner's
+                            // explicit merged address from their other shares
+                            auto table_it = m_miner_merged_addr.find(chain_id);
+                            if (table_it != m_miner_merged_addr.end())
+                            {
+                                auto miner_it = table_it->second.find(parent_script);
+                                if (miner_it != table_it->second.end())
+                                    weight_key = miner_it->second;
+                            }
+                            // Tier 2: auto-convert parent script (P2WPKH→P2PKH etc.)
+                            if (weight_key.empty())
+                                weight_key = normalize_script_for_merged(parent_script);
                         }
                         // Tier 3: unconvertible — skip, weight redistributed
                         if (weight_key.empty()) return;

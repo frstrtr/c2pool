@@ -2,7 +2,7 @@
 
 // AutoRatchet: autonomous share version transition state machine.
 //
-// Manages V36 → V37 (and future) share format transitions without manual
+// Manages V35 → V36 (and future) share format transitions without manual
 // operator coordination. Persists state to JSON file so restarts don't
 // regress once the network has confirmed a new version.
 //
@@ -63,7 +63,7 @@ public:
     static constexpr int SWITCH_THRESHOLD = 60;        // % required for format switch in validation
 
     explicit AutoRatchet(const std::string& state_file_path = "",
-                         int64_t target_version = 37)
+                         int64_t target_version = 36)
         : state_file_(state_file_path)
         , target_version_(target_version)
     {
@@ -98,6 +98,16 @@ public:
 
         // Count votes and actual new-format shares in window
         int32_t height = tracker.chain.get_height(best_share_hash);
+
+        // Use absheight (monotonically increasing) for confirm_count tracking.
+        // chain.get_height() returns chain DEPTH which plateaus after pruning
+        // at ~CHAIN_LENGTH, preventing confirm_count from ever reaching 800.
+        int32_t abs_height = 0;
+        if (tracker.chain.contains(best_share_hash)) {
+            tracker.chain.get(best_share_hash).share.invoke([&](auto* obj) {
+                abs_height = static_cast<int32_t>(obj->m_absheight);
+            });
+        }
         int32_t sample = std::min(height, static_cast<int32_t>(chain_length));
 
         int32_t target_votes = 0;   // shares voting desired_version >= target
@@ -134,13 +144,40 @@ public:
         {
             if (full_window && vote_pct >= ACTIVATION_THRESHOLD)
             {
+                // Tail guard: oldest 10% of window must have >= 60% signaling
+                // (jtoomim rule). Prevents activation before the entire PPLNS
+                // window has transitioned — p2pool check() rejects V36 shares
+                // when the oldest 10% has < 60% signaling.
+                uint32_t tail_start = (chain_length * 9) / 10;
+                uint32_t tail_size  = chain_length / 10;
+                auto tail_ancestor = tracker.chain.get_nth_parent_key(best_share_hash, tail_start);
+                auto tail_counts = tracker.get_desired_version_counts(tail_ancestor, tail_size);
+
+                int64_t tail_target = 0, tail_total = 0;
+                for (auto& [ver, cnt] : tail_counts) {
+                    tail_total += cnt;
+                    if (ver >= target_version_)
+                        tail_target += cnt;
+                }
+                int tail_pct = (tail_total > 0) ? static_cast<int>(tail_target * 100 / tail_total) : 0;
+
+                if (tail_pct < SWITCH_THRESHOLD) {
+                    static int tail_log = 0;
+                    if (tail_log++ % 20 == 0)
+                        LOG_INFO << "[AutoRatchet] VOTING: full window " << vote_pct
+                                 << "% >= " << ACTIVATION_THRESHOLD << "% but oldest 10% only "
+                                 << tail_pct << "% (need " << SWITCH_THRESHOLD << "%) — waiting";
+                    // Don't transition yet
+                }
+                else
+                {
                 state_ = RatchetState::ACTIVATED;
                 activated_at_ = now_seconds();
-                activated_height_ = height;
+                activated_height_ = abs_height;
                 // Credit retroactive shares for late-joining nodes
-                int32_t retroactive = std::max(0, height - static_cast<int32_t>(chain_length));
+                int32_t retroactive = std::max(0, abs_height - static_cast<int32_t>(chain_length));
                 confirm_count_ = retroactive;
-                last_seen_height_ = height;
+                last_seen_height_ = abs_height;
 
                 LOG_INFO << "[AutoRatchet] VOTING -> ACTIVATED ("
                          << vote_pct << "% of " << total << " shares vote V"
@@ -157,6 +194,7 @@ public:
                              << retroactive << " >= " << confirmation_window << ")";
                 }
                 save();
+                } // else (tail guard passed)
             }
         }
         else if (state_ == RatchetState::ACTIVATED)
@@ -175,10 +213,22 @@ public:
             }
             else if (activated_height_ > 0)
             {
-                // Track cumulative height increases (survives tracker pruning)
-                if (last_seen_height_ > 0 && height > last_seen_height_)
-                    confirm_count_ += (height - last_seen_height_);
-                last_seen_height_ = height;
+                // Track cumulative height increases using absheight (monotonic).
+                // chain depth (get_height) plateaus at ~CHAIN_LENGTH after pruning,
+                // preventing confirm_count from reaching 800. absheight always grows.
+                if (last_seen_height_ > 0 && abs_height > last_seen_height_)
+                    confirm_count_ += (abs_height - last_seen_height_);
+                last_seen_height_ = abs_height;
+
+                {
+                    static int ac_log = 0;
+                    if (ac_log++ % 20 == 0)
+                        LOG_INFO << "[AutoRatchet] ACTIVATED: vote=" << vote_pct
+                                 << "% share=" << share_pct << "% full=" << (full_window ? "True" : "False")
+                                 << " height=" << abs_height
+                                 << " confirm=" << confirm_count_ << "/" << confirmation_window
+                                 << " chain_depth=" << height;
+                }
 
                 if (confirm_count_ >= static_cast<int32_t>(confirmation_window) &&
                     share_pct >= ACTIVATION_THRESHOLD)

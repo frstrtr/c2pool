@@ -257,4 +257,22 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     gtest_add_tests(test_mweb_builder "" AUTO)
+
+    add_executable(test_address_resolution test_address_resolution.cpp)
+    target_link_libraries(test_address_resolution PRIVATE
+        GTest::gtest_main GTest::gtest
+        core ltc
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    gtest_add_tests(test_address_resolution "" AUTO)
+
+    add_executable(test_compute_share_target test_compute_share_target.cpp)
+    target_link_libraries(test_compute_share_target PRIVATE
+        GTest::gtest_main GTest::gtest
+        core ltc
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    gtest_add_tests(test_compute_share_target "" AUTO)
 endif()
