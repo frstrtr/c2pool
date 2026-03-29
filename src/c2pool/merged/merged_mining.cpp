@@ -638,18 +638,38 @@ void MergedMiningManager::refresh_aux_work()
             // block_hash comes from createauxblock.
             auto new_work = chain.rpc->create_aux_block(chain.config.aux_payout_address);
 
-            // Skip empty work (embedded chain not synced yet)
+            // Primary returned empty work (embedded chain not synced yet).
+            // Try fallback (daemon RPC) so merged mining commitment is always
+            // present in the parent coinbase even when the embedded SPV node
+            // is still syncing headers (e.g. testnet4alpha incompatibility).
             if (new_work.block_hash.IsNull() && new_work.height == 0) {
-                // Rate-limited log: once per 30s while waiting for sync
-                static std::map<uint32_t, int64_t> s_last_sync_log;
-                auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
-                auto& last = s_last_sync_log[chain.config.chain_id];
-                if (now_ns - last > 30'000'000'000LL) {
-                    last = now_ns;
-                    LOG_INFO << "[MM:" << chain.config.symbol
-                             << "] Waiting for embedded chain sync...";
+                if (chain.fallback && !chain.using_fallback) {
+                    try {
+                        new_work = chain.fallback->create_aux_block(chain.config.aux_payout_address);
+                        if (!new_work.block_hash.IsNull()) {
+                            // Swap to fallback as primary for this cycle
+                            chain.rpc.swap(chain.fallback);
+                            chain.using_fallback = true;
+                            chain.last_tip = chain.rpc->get_best_block_hash();
+                            LOG_INFO << "[MM:" << chain.config.symbol
+                                     << "] Embedded not synced — using RPC (jumpstart)"
+                                     << " height=" << new_work.height;
+                        }
+                    } catch (const std::exception& e3) {
+                        // Fallback also unavailable
+                    }
                 }
-                continue;
+                if (new_work.block_hash.IsNull() && new_work.height == 0) {
+                    static std::map<uint32_t, int64_t> s_last_sync_log;
+                    auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+                    auto& last = s_last_sync_log[chain.config.chain_id];
+                    if (now_ns - last > 30'000'000'000LL) {
+                        last = now_ns;
+                        LOG_INFO << "[MM:" << chain.config.symbol
+                                 << "] Waiting for embedded chain sync (fallback also unavailable)...";
+                    }
+                    continue;
+                }
             }
 
             chain.current_work = std::move(new_work);
