@@ -144,6 +144,7 @@ static void segfault_handler(int sig) {
 #include <impl/ltc/coin/template_builder.hpp>
 
 #include <boost/asio.hpp>
+#include <boost/beast.hpp>
 #include <nlohmann/json.hpp>
 #include <yaml-cpp/yaml.h>
 #include <btclibs/util/strencodings.h>
@@ -2128,7 +2129,7 @@ int main(int argc, char* argv[]) {
             }
 
             // Embedded mode + RPC submit fallback: if the user also provides
-            // --rpc-host / --rpc-user / --rpc-pass, use litecoin-cli submitblock
+            // --rpc-host / --rpc-user / --rpc-pass, use direct HTTP JSON-RPC
             // as a secondary path that gives us immediate accept/reject feedback.
             if (embedded_ltc && !rpc_user.empty() && !rpc_pass.empty()) {
                 int submit_rpc_port = rpc_port > 0 ? rpc_port
@@ -2136,48 +2137,70 @@ int main(int argc, char* argv[]) {
                 std::string submit_rpc_host = rpc_host;
                 std::string submit_rpc_user = rpc_user;
                 std::string submit_rpc_pass = rpc_pass;
-                bool submit_testnet = settings->m_testnet;
 
-                LOG_INFO << "[EMB-LTC] RPC submit fallback enabled: "
+                LOG_INFO << "[EMB-LTC] RPC submit fallback enabled (HTTP JSON-RPC): "
                          << submit_rpc_host << ":" << submit_rpc_port;
 
                 auto* mi = web_server.get_mining_interface();
                 mi->set_rpc_submit_fallback(
                     [submit_rpc_host, submit_rpc_port, submit_rpc_user,
-                     submit_rpc_pass, submit_testnet](const std::string& hex) -> std::string {
+                     submit_rpc_pass](const std::string& hex) -> std::string {
                         try {
-                            // Use litecoin-cli for simplicity — avoids needing a full RPC client
-                            std::string cmd = "litecoin-cli";
-                            if (submit_testnet) cmd += " -testnet";
-                            cmd += " -rpcconnect=" + submit_rpc_host;
-                            cmd += " -rpcport=" + std::to_string(submit_rpc_port);
-                            cmd += " -rpcuser=" + submit_rpc_user;
-                            cmd += " -rpcpassword=" + submit_rpc_pass;
-                            cmd += " submitblock " + hex;
+                            namespace beast = boost::beast;
+                            namespace http = beast::http;
+                            namespace net = boost::asio;
+                            using tcp = net::ip::tcp;
 
-                            namespace bp = boost::process;
-                            bp::ipstream pipe_out;
-                            bp::ipstream pipe_err;
-                            bp::child c(cmd,
-                                bp::std_out > pipe_out,
-                                bp::std_err > pipe_err);
-                            c.wait();
+                            // Build JSON-RPC request body
+                            nlohmann::json rpc_req;
+                            rpc_req["jsonrpc"] = "1.0";
+                            rpc_req["id"] = "c2pool-submit";
+                            rpc_req["method"] = "submitblock";
+                            rpc_req["params"] = nlohmann::json::array({hex});
+                            std::string body = rpc_req.dump();
 
-                            std::string result, err_line;
-                            std::getline(pipe_out, result);
-                            std::getline(pipe_err, err_line);
+                            // Base64-encode auth
+                            std::string userpass = submit_rpc_user + ":" + submit_rpc_pass;
+                            std::string auth_enc;
+                            auth_enc.resize(beast::detail::base64::encoded_size(userpass.size()));
+                            auto n = beast::detail::base64::encode(&auth_enc[0], userpass.data(), userpass.size());
+                            auth_enc.resize(n);
 
-                            // litecoin-cli submitblock returns:
-                            //   null (empty) = accepted
-                            //   "error string" = rejected
-                            boost::trim(result);
-                            boost::trim(err_line);
-                            if (result == "null" || result.empty()) {
-                                if (err_line.empty())
-                                    return {};  // accepted
-                                return err_line; // CLI error
-                            }
-                            return result; // rejection reason
+                            // Synchronous HTTP POST (runs in detached thread)
+                            net::io_context submit_ioc;
+                            tcp::resolver resolver(submit_ioc);
+                            beast::tcp_stream stream(submit_ioc);
+                            stream.expires_after(std::chrono::seconds(10));
+
+                            auto results = resolver.resolve(submit_rpc_host, std::to_string(submit_rpc_port));
+                            stream.connect(results);
+
+                            http::request<http::string_body> req{http::verb::post, "/", 11};
+                            req.set(http::field::host, submit_rpc_host + ":" + std::to_string(submit_rpc_port));
+                            req.set(http::field::content_type, "application/json");
+                            req.set(http::field::authorization, "Basic " + auth_enc);
+                            req.body() = body;
+                            req.prepare_payload();
+
+                            http::write(stream, req);
+
+                            beast::flat_buffer buffer;
+                            http::response<http::string_body> resp;
+                            http::read(stream, buffer, resp);
+
+                            beast::error_code ec;
+                            stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+
+                            // Parse response: submitblock returns null on success
+                            auto json_resp = nlohmann::json::parse(resp.body(), nullptr, false);
+                            if (json_resp.is_discarded())
+                                return "Failed to parse RPC response";
+                            if (json_resp.contains("error") && !json_resp["error"].is_null())
+                                return json_resp["error"].value("message", "unknown RPC error");
+                            auto& result = json_resp["result"];
+                            if (result.is_null() || (result.is_string() && result.get<std::string>().empty()))
+                                return {};  // accepted
+                            return result.get<std::string>();  // rejection reason
                         } catch (const std::exception& e) {
                             return std::string("RPC submit exception: ") + e.what();
                         }

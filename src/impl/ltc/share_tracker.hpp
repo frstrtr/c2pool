@@ -339,7 +339,13 @@ public:
                 block_height = bh;
         }
 
-        if (!block_height.has_value() || block_height.value() >= 0)
+        // c2pool's block_rel_height returns confirmations: 1 at tip, N+1
+        // for N blocks behind, 0 for error/unknown.
+        // p2pool returns: 0 at tip, -N for N behind.
+        // Guard: skip hashrate scoring when block_height is 0 (error) or absent.
+        // p2pool has NO early-return guard — it always computes hashrate.
+        // Our guard only fires for the error case (0 confirmations).
+        if (!block_height.has_value() || block_height.value() <= 0)
             return {static_cast<int32_t>(PoolConfig::chain_length()), score_res};
 
         // Compute work using CHAIN (raw tracker), not verified.
@@ -358,7 +364,12 @@ public:
             } catch (...) {}
         }
 
-        auto time_span = (-block_height.value() + 1) * 150; // LTC BLOCK_PERIOD = 150s
+        // p2pool: time_span = (-block_height + 1) * BLOCK_PERIOD
+        // With p2pool convention (0 at tip): (-0 + 1) * 150 = 150
+        // c2pool uses confirmations (1 at tip): just use confirmations * BLOCK_PERIOD.
+        // confirmations=1 → 150s (same as p2pool's tip case)
+        // confirmations=4 → 600s (same as p2pool's -3 case)
+        auto time_span = block_height.value() * 150; // LTC BLOCK_PERIOD = 150s
         if (time_span <= 0)
             time_span = 1;
 

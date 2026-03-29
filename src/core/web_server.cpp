@@ -2245,27 +2245,31 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
         if (m_on_block_submitted && hex_data.size() >= 160)
             m_on_block_submitted(hex_data.substr(0, 160), 0);
 
-        // Thread the slow parts (RPC + P2P relay) so stratum isn't blocked.
-        // Capture by value — hex_data, callbacks are all safe to copy.
+        // Thread the slow parts (P2P relay + RPC) so stratum isn't blocked.
+        // P2P relay runs FIRST — fast propagation is critical for block acceptance.
+        // RPC runs SECOND — provides accept/reject feedback but is not time-critical.
         auto rpc_fn   = m_rpc_submit_fallback;
         auto relay_fn = m_on_block_relay;
         std::string hex_copy = hex_data;
         std::thread([rpc_fn, relay_fn, hex_copy]() {
-            // 1) RPC submitblock (if configured) — immediate accept/reject feedback
+            // 1) P2P relay to all connected peers — time-critical for acceptance
+            if (relay_fn) {
+                try {
+                    relay_fn(hex_copy);
+                    LOG_INFO << "[EMB-LTC] P2P block relay dispatched";
+                } catch (const std::exception& e) {
+                    LOG_ERROR << "[EMB-LTC] P2P relay exception: " << e.what();
+                }
+            } else {
+                LOG_WARNING << "[EMB-LTC] No P2P relay callback — block not broadcast!";
+            }
+            // 2) RPC submitblock (if configured) — accept/reject feedback
             if (rpc_fn) {
                 std::string rpc_err = rpc_fn(hex_copy);
                 if (rpc_err.empty()) {
                     LOG_INFO << "[EMB-LTC] submitblock via RPC: ACCEPTED";
                 } else {
-                    LOG_ERROR << "[EMB-LTC] submitblock via RPC: REJECTED — " << rpc_err;
-                }
-            }
-            // 2) P2P relay to all connected peers
-            if (relay_fn) {
-                try {
-                    relay_fn(hex_copy);
-                } catch (const std::exception& e) {
-                    LOG_ERROR << "[EMB-LTC] P2P relay thread exception: " << e.what();
+                    LOG_WARNING << "[EMB-LTC] submitblock via RPC: REJECTED — " << rpc_err;
                 }
             }
         }).detach();

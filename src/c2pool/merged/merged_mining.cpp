@@ -356,20 +356,23 @@ AuxWork AuxChainRPC::get_work_template()
     work.coinbase_value = tmpl.value("coinbasevalue", uint64_t(0));
     work.prev_block_hash = tmpl.value("previousblockhash", "");
 
-    // Target from bits
-    std::string bits_hex = tmpl.value("bits", "1d00ffff");
-    uint32_t nbits = std::stoul(bits_hex, nullptr, 16);
-    // Simple bits→target: mantissa * 2^(8*(exponent-3))
-    uint32_t exp = nbits >> 24;
-    uint32_t mantissa = nbits & 0x007fffff;
-    work.target.SetNull();
-    if (exp >= 3 && exp <= 32) {
-        uint8_t* p = reinterpret_cast<uint8_t*>(work.target.begin());
-        int shift = exp - 3;
-        if (shift + 2 < 32) {
-            p[shift]     = mantissa & 0xff;
-            p[shift + 1] = (mantissa >> 8) & 0xff;
-            p[shift + 2] = (mantissa >> 16) & 0xff;
+    // Target: prefer "target" field directly, fall back to SetCompact(bits)
+    bool target_set = false;
+    if (tmpl.contains("target") && tmpl["target"].is_string()) {
+        std::string target_hex = tmpl["target"].get<std::string>();
+        if (!target_hex.empty() && target_hex.size() <= 64) {
+            work.target.SetHex(target_hex);
+            target_set = !work.target.IsNull();
+        }
+    }
+    if (!target_set) {
+        std::string bits_hex = tmpl.value("bits", "");
+        if (!bits_hex.empty()) {
+            uint32_t nbits = std::stoul(bits_hex, nullptr, 16);
+            work.target.SetCompact(nbits);
+        } else {
+            LOG_WARNING << "[MM:" << m_config.symbol
+                        << "] getblocktemplate: no target/bits field — target will be null!";
         }
     }
 
@@ -401,18 +404,31 @@ AuxWork AuxChainRPC::create_aux_block(const std::string& address)
     work.height = result.value("height", 0);
     work.coinbase_value = result.value("coinbasevalue", uint64_t(0));
 
-    std::string bits_hex = result.value("bits", "1d00ffff");
-    uint32_t nbits = std::stoul(bits_hex, nullptr, 16);
-    uint32_t exp = nbits >> 24;
-    uint32_t mantissa = nbits & 0x007fffff;
-    work.target.SetNull();
-    if (exp >= 3 && exp <= 32) {
-        uint8_t* p = reinterpret_cast<uint8_t*>(work.target.begin());
-        int shift = exp - 3;
-        if (shift + 2 < 32) {
-            p[shift]     = mantissa & 0xff;
-            p[shift + 1] = (mantissa >> 8) & 0xff;
-            p[shift + 2] = (mantissa >> 16) & 0xff;
+    // Target: prefer the "target" field directly (like p2pool), fall back to "bits".
+    // createauxblock returns "target" as a 64-char big-endian hex string.
+    bool target_set = false;
+    if (result.contains("target") && result["target"].is_string()) {
+        std::string target_hex = result["target"].get<std::string>();
+        if (!target_hex.empty() && target_hex.size() <= 64) {
+            work.target.SetHex(target_hex);
+            target_set = !work.target.IsNull();
+        }
+    }
+    if (!target_set && result.contains("_target") && result["_target"].is_string()) {
+        std::string target_hex = result["_target"].get<std::string>();
+        if (!target_hex.empty() && target_hex.size() <= 64) {
+            work.target.SetHex(target_hex);
+            target_set = !work.target.IsNull();
+        }
+    }
+    if (!target_set) {
+        std::string bits_hex = result.value("bits", "");
+        if (!bits_hex.empty()) {
+            uint32_t nbits = std::stoul(bits_hex, nullptr, 16);
+            work.target.SetCompact(nbits);
+        } else {
+            LOG_WARNING << "[MM:" << m_config.symbol
+                        << "] createauxblock: no target/bits field — target will be null!";
         }
     }
 
@@ -645,13 +661,37 @@ void MergedMiningManager::refresh_aux_work()
                 chain.current_work.coinbase_value = tmpl_work.coinbase_value;
             }
 
+            // Like p2pool: get authoritative target from the daemon via
+            // createauxblock when RPC fallback is available.  The embedded
+            // backend computes target from its own difficulty calculation,
+            // which can diverge from the real chain.  The daemon is canonical.
+            if (chain.fallback && !chain.using_fallback) {
+                try {
+                    auto daemon_work = chain.fallback->create_aux_block(
+                        chain.config.aux_payout_address);
+                    if (!daemon_work.target.IsNull()) {
+                        if (chain.current_work.target != daemon_work.target) {
+                            LOG_INFO << "[MM:" << chain.config.symbol
+                                     << "] Target from daemon differs from embedded:"
+                                     << " embedded=" << chain.current_work.target.GetHex().substr(0, 16)
+                                     << " daemon=" << daemon_work.target.GetHex().substr(0, 16)
+                                     << " — using daemon (authoritative)";
+                        }
+                        chain.current_work.target = daemon_work.target;
+                    }
+                } catch (...) {
+                    // RPC unavailable — keep embedded target (best effort)
+                }
+            }
+
             chain.last_update_time = std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
             any_changed = true;
             LOG_INFO << "[MM:" << chain.config.symbol << "] New aux work at height "
                      << chain.current_work.height
                      << " hash=" << chain.current_work.block_hash.GetHex()
-                     << " target=" << chain.current_work.target.GetHex();
+                     << " target=" << chain.current_work.target.GetHex()
+                     << (chain.current_work.target.IsNull() ? " [NULL — NO BLOCKS POSSIBLE]" : "");
         } catch (const std::exception& e) {
             static std::map<uint32_t, int64_t> s_last_warn;
             auto now = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -792,18 +832,27 @@ void MergedMiningManager::try_submit_merged_blocks(
 
         // Check if parent hash meets aux target
         // Parent hash (scrypt for LTC) must be ≤ aux target
-        // Note: the actual check depends on whether the aux chain uses SHA256d or scrypt
-        // For Dogecoin (scrypt), the parent scrypt hash is what matters
         static int mm_check_count = 0;
         ++mm_check_count;
-        if (mm_check_count <= 3 || mm_check_count % 50 == 0) {
-            LOG_INFO << "[MM:" << chain.config.symbol << "] Check #" << mm_check_count
-                     << " parent_hash=" << parent_hash.GetHex()
-                     << " aux_target=" << chain.current_work.target.GetHex()
-                     << " meets=" << (parent_hash <= chain.current_work.target ? "YES" : "no");
+
+        if (chain.current_work.target.IsNull()) {
+            if (mm_check_count <= 5 || mm_check_count % 100 == 0) {
+                LOG_WARNING << "[MM:" << chain.config.symbol << "] Check #" << mm_check_count
+                            << " — target is NULL, no merged blocks can be found!"
+                            << " (chain synced? work height=" << chain.current_work.height << ")";
+            }
+            continue;
         }
-        if (!(parent_hash <= chain.current_work.target)) {
-            continue;  // doesn't meet this chain's target
+        bool meets = parent_hash <= chain.current_work.target;
+        if (mm_check_count <= 5 || mm_check_count % 20 == 0 || meets) {
+            LOG_INFO << "[MM:" << chain.config.symbol << "] Check #" << mm_check_count
+                     << " parent_hash=" << parent_hash.GetHex().substr(0, 16) << "..."
+                     << " aux_target=" << chain.current_work.target.GetHex().substr(0, 16) << "..."
+                     << " meets=" << (meets ? "YES" : "no")
+                     << " height=" << chain.current_work.height;
+        }
+        if (!meets) {
+            continue;
         }
 
         LOG_WARNING << "\n"
@@ -886,7 +935,8 @@ void MergedMiningManager::try_submit_merged_blocks(
                     if (f.is_open()) { f << block_hex; f.close(); }
                     LOG_INFO << "[MM:" << chain.config.symbol << "] Block hex saved to " << path;
                 }
-                chain.rpc->submit_block(block_hex);
+                bool ok = chain.rpc->submit_block(block_hex);
+                record_discovered_block(chain, ok, parent_hash.GetHex());
                 if (m_block_relay_fn) {
                     try { m_block_relay_fn(chain.config.chain_id, block_hex); }
                     catch (...) {}
