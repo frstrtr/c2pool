@@ -219,9 +219,14 @@ public:
                             << " FAILED: " << e.what();
             }
         }
-        LOG_INFO << "[" << m_symbol << "] Raw block broadcast to "
-                 << sent << "/" << (sent + failed) << " peers ("
-                 << block_bytes.size() << " bytes)";
+        if (sent + failed == 0) {
+            LOG_WARNING << "[" << m_symbol << "] Raw block broadcast: NO PEERS connected!"
+                        << " Block (" << block_bytes.size() << " bytes) NOT relayed.";
+        } else {
+            LOG_INFO << "[" << m_symbol << "] Raw block broadcast to "
+                     << sent << "/" << (sent + failed) << " peers ("
+                     << block_bytes.size() << " bytes)";
+        }
     }
 
     /// Send inv announcement to ALL connected peers (merged chain relay).

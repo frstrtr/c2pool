@@ -274,9 +274,16 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
             LOG_INFO << "Best share hash for " << msg->m_addr_from.m_endpoint.to_string()
                      << " = " << msg->m_best_share.ToString();
 
-            // Start downloading shares if we don't have the peer's best
-            if (!m_chain->contains(msg->m_best_share))
+            if (!m_chain->contains(msg->m_best_share)) {
+                // Start downloading shares we don't have
                 download_shares(peer, msg->m_best_share);
+            } else {
+                // p2pool: handle_share_hashes → handle_shares → set_best_share()
+                // Even when the share is known, re-run think() to re-evaluate
+                // best chain with the peer's perspective. Critical after restart:
+                // shares loaded from LevelDB may have stale best_share selection.
+                run_think();
+            }
         }
 
         // Advertise ourselves to the peer (matching Python p2pool sendAdvertisement)
@@ -500,9 +507,9 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
     }
 
     // Trigger think() after every share batch (p2pool: set_best_share after handle_shares).
-    // With inline verification, all shares are already verified by this point.
-    // think() just scores heads and updates best_share — safe for any batch size.
-    if (new_count > 0 && m_tracker.chain.size() > 10) {
+    // p2pool calls set_best_share() after EVERY batch with new_count > 0 — no size gate.
+    // think() scores heads and updates best_share + desired set for download_shares.
+    if (new_count > 0) {
         run_think();
     }
 }
@@ -667,31 +674,28 @@ void NodeImpl::broadcast_share(const uint256& share_hash)
 void NodeImpl::notify_local_share(const uint256& share_hash)
 {
     // p2pool: set_best_share() runs think() synchronously on the reactor thread.
-    // c2pool's run_think() has m_think_running atomic that blocks concurrent calls.
-    // If run_think() is already running (processing peer shares), our local share's
-    // best_share update gets SKIPPED → miner keeps working on stale tip → orphan.
+    // Both notify_local_share and run_think() execute on the same io_context thread
+    // (single-threaded ASIO), so m_think_running is never set when we get here.
     //
-    // Fix: bypass run_think() entirely. Inline-verify the local share and directly
-    // update m_best_share_hash. Local shares extend the current best tip, so their
-    // parent is already verified → attempt_verify succeeds in one call.
+    // CRITICAL: the old code bypassed think() and directly set m_best_share_hash.
+    // This created a self-reinforcing fork: if the local share extended the wrong
+    // fork (during bootstrap), think() could never override it — each new local
+    // share re-asserted the wrong best via the direct override.
+    //
+    // Fix: use think() for ALL best_share decisions, matching p2pool exactly.
+    // think() will verify the local share, score all heads, and pick the correct
+    // best — including our local share if it's on the winning chain.
     if (share_hash.IsNull() || !m_tracker.chain.contains(share_hash))
         return;
 
-    // Inline verify — local shares passed self-validation, should succeed
+    // Inline verify the local share first — it extends current best tip,
+    // so parent is already verified → attempt_verify succeeds immediately.
     m_tracker.attempt_verify(share_hash);
 
-    // Direct best_share update — no m_think_running check
-    if (m_tracker.verified.contains(share_hash)) {
-        bool changed = (m_best_share_hash != share_hash);
-        m_best_share_hash = share_hash;
-        if (changed && m_on_best_share_changed)
-            m_on_best_share_changed();
-    } else {
-        // Unverified (chain too short) — still trigger work refresh so miner
-        // doesn't keep building on the pre-local-share tip
-        if (m_on_best_share_changed)
-            m_on_best_share_changed();
-    }
+    // Let think() decide the best share through proper scoring.
+    // think() runs synchronously, so the stratum response (new work)
+    // is queued after think() completes — no stale work window.
+    run_think();
 }
 
 uint256 NodeImpl::best_share_hash()
@@ -1300,17 +1304,21 @@ void NodeImpl::run_think()
                             ++it;
                     }
 
-                    // p2pool node.py:111: peer_addr, share_hash = random.choice(desired)
-                    // Pick ONE random desired entry per cycle (not all).
-                    if (!result.desired.empty()) {
-                        auto idx = core::random::random_uint256().GetLow64() % result.desired.size();
-                        auto& [peer_addr, hash] = result.desired[idx];
-                        // download_shares picks its own random peer (p2pool pattern)
-                        // The peer_addr from desired is ignored — matching p2pool's
-                        // random.choice(self.peers.values()) in download_shares().
-                        if (!m_peers.empty()) {
-                            auto& [nonce, peer] = *m_peers.begin();
-                            download_shares(peer, hash);
+                    // p2pool node.py:108-141: download_shares is a continuous loop
+                    // that wakes on desired_var change and fetches ONE entry per
+                    // iteration — but iterates immediately after each download.
+                    // c2pool equivalent: kick off downloads for ALL desired entries.
+                    // download_shares' m_downloading_shares dedup prevents duplicates.
+                    // Each download completes → processing_shares → phase2 → run_think()
+                    // → new desired entries → more downloads. This matches p2pool's
+                    // continuous convergence loop without needing a while-loop coroutine.
+                    if (!result.desired.empty() && !m_peers.empty()) {
+                        for (auto& [peer_addr, hash] : result.desired) {
+                            // Pick random peer (p2pool: random.choice(self.peers.values()))
+                            auto peer_it = m_peers.begin();
+                            if (m_peers.size() > 1)
+                                std::advance(peer_it, core::random::random_uint256().GetLow64() % m_peers.size());
+                            download_shares(peer_it->second, hash);
                         }
                     }
 
