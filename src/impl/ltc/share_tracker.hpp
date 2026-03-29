@@ -2017,8 +2017,20 @@ private:
             {
                 if (entry.m_script.m_data.empty()) continue;
                 auto& lookup = m_miner_merged_addr[entry.m_chain_id];
+                bool any_new = false;
+                // Register under raw script (primary key)
+                // p2pool v0.14.5: lookup[item.new_script] = script
                 auto [it, inserted] = lookup.emplace(parent_script, entry.m_script.m_data);
-                if (inserted)
+                if (inserted) any_new = true;
+                // Also register under normalized P2PKH form so
+                // Tier 1.5 catches shares with different script encoding.
+                // p2pool v0.14.5: lookup[normalized] = script
+                auto normalized = normalize_script_for_merged(parent_script);
+                if (!normalized.empty() && normalized != parent_script) {
+                    auto [it2, ins2] = lookup.emplace(normalized, entry.m_script.m_data);
+                    if (ins2) any_new = true;
+                }
+                if (any_new)
                 {
                     // New mapping — stale skip list entries used auto-convert
                     // for this miner; recreate to use the explicit address.
@@ -2139,11 +2151,19 @@ private:
                         {
                             auto parent_script = get_share_script(obj);
                             // Tier 1.5: retroactive lookup — same miner's
-                            // explicit merged address from their other shares
+                            // explicit merged address from their other shares.
+                            // Tier 1.5: retroactive lookup — same miner's
+                            // explicit merged address from their other shares.
+                            // p2pool v0.14.5: try raw, then normalized P2PKH form.
                             auto table_it = m_miner_merged_addr.find(chain_id);
                             if (table_it != m_miner_merged_addr.end())
                             {
                                 auto miner_it = table_it->second.find(parent_script);
+                                if (miner_it == table_it->second.end()) {
+                                    auto norm = normalize_script_for_merged(parent_script);
+                                    if (!norm.empty() && norm != parent_script)
+                                        miner_it = table_it->second.find(norm);
+                                }
                                 if (miner_it != table_it->second.end())
                                     weight_key = miner_it->second;
                             }

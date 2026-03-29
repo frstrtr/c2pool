@@ -332,6 +332,12 @@ public:
         {
             ++h;
             cur = m_shares[cur].index->tail;
+            if (h > static_cast<int32_t>(m_shares.size())) {
+                // Cycle detected — walk exceeded total share count
+                std::fprintf(stderr, "[get_height] CYCLE at h=%d shares=%zu hash=%.16s\n",
+                             h, m_shares.size(), hash.GetHex().c_str());
+                break;
+            }
         }
         return h;
     }
@@ -768,8 +774,13 @@ public:
         else
         {
             // p2pool line 323: raise NotImplementedError()
-            // Should never happen if data structure is consistent.
-            branch = 99;
+            // Share doesn't match any safe removal pattern — it still has
+            // children that depend on it.  p2pool aborts the removal here;
+            // c2pool must do the same to keep the parent chain intact for
+            // the skip list and TrackerView.
+            std::fprintf(stderr, "[forest::remove] ABORT — share has dependents (p2pool NotImplementedError) hash=%.16s\n",
+                         hash.GetHex().c_str());
+            return false;
         }
 
         if (remove_log++ < 50 || branch == 99) {

@@ -143,3 +143,7 @@ deactivate_conanbuild.sh
 deactivate_conanrun.sh
 CMakePresets.json
 src/c2pool/c2pool
+test/test_address_resolution
+test/test_compute_share_target
+test/test_hardening
+test/test_stratum_extensions

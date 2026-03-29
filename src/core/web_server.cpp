@@ -4850,15 +4850,13 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                     uint256 pow_hash;
                     memcpy(pow_hash.begin(), pow_hash_bytes, 32);
 
-                    uint256 block_target;
-                    {
-                        std::lock_guard<std::mutex> lock(m_work_mutex);
-                        if (!m_cached_template.is_null() && m_cached_template.contains("bits")) {
-                            std::string bits_hex = m_cached_template["bits"].get<std::string>();
-                            uint32_t bits = static_cast<uint32_t>(std::stoul(bits_hex, nullptr, 16));
-                            block_target = chain::bits_to_target(bits);
-                        }
-                    }
+                    // Read nBits directly from the block header (offset 72, LE uint32).
+                    // Using the header's own bits guarantees the same target litecoind
+                    // will verify, avoiding races when GBT difficulty changes between
+                    // job creation and share submission.
+                    uint32_t header_bits = block_bytes[72] | (block_bytes[73] << 8) |
+                                           (block_bytes[74] << 16) | (block_bytes[75] << 24);
+                    uint256 block_target = chain::bits_to_target(header_bits);
 
                     if (!block_target.IsNull() && pow_hash <= block_target) {
                         // Validate merkle root before submitting
@@ -5198,15 +5196,11 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                     uint256 pow_hash;
                     memcpy(pow_hash.begin(), pow_hash_bytes, 32);
 
-                    uint256 block_target;
-                    {
-                        std::lock_guard<std::mutex> lock(m_work_mutex);
-                        if (!m_cached_template.is_null() && m_cached_template.contains("bits")) {
-                            std::string bits_hex = m_cached_template["bits"].get<std::string>();
-                            uint32_t bits = static_cast<uint32_t>(std::stoul(bits_hex, nullptr, 16));
-                            block_target = chain::bits_to_target(bits);
-                        }
-                    }
+                    // Read nBits from the block header itself (offset 72, LE uint32)
+                    // to match exactly what litecoind will verify.
+                    uint32_t header_bits = block_bytes[72] | (block_bytes[73] << 8) |
+                                           (block_bytes[74] << 16) | (block_bytes[75] << 24);
+                    uint256 block_target = chain::bits_to_target(header_bits);
 
                     if (!block_target.IsNull() && pow_hash <= block_target) {
                         uint256 header_merkle;

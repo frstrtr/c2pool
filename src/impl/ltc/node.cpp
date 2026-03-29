@@ -1435,25 +1435,11 @@ void NodeImpl::clean_tracker()
         }
     }
 
-    // Step 3: Drop tails — remove ALL children of qualifying tails (p2pool node.py:382-396)
-    // p2pool has NO best-chain protection here — it relies on the height threshold
-    // (2*CHAIN_LENGTH+10) being sufficient. The old 3*CL protection set was added
-    // to prevent a cascade bug from the hashrate feedback loop (now fixed with
-    // RateMonitor). With the feedback loop gone, we match p2pool exactly: protect
-    // only the most recent 2*CL+10 shares (same as the drop threshold).
+    // Step 3: Drop tails — remove ALL children of qualifying tails.
+    // Exact translation of p2pool node.py:382-398.
+    // p2pool has NO best-chain protection — the 2*CHAIN_LENGTH+10 threshold
+    // ensures only shares far beyond the PPLNS window are removed.
     {
-        std::set<uint256> best_chain_set;
-        {
-            auto cur = m_best_share_hash;
-            int walked = 0;
-            while (!cur.IsNull() && m_tracker.chain.contains(cur) && walked < 2 * CL + 10) {
-                best_chain_set.insert(cur);
-                auto* idx = m_tracker.chain.get_index(cur);
-                cur = idx ? idx->tail : uint256();
-                ++walked;
-            }
-        }
-
         int total_dropped = 0;
         for (int iter = 0; iter < 1000; ++iter)
         {
@@ -1461,57 +1447,53 @@ void NodeImpl::clean_tracker()
             auto tails_copy = m_tracker.chain.get_tails();
             for (auto& [tail_hash, head_hashes] : tails_copy)
             {
-                int32_t min_height = std::numeric_limits<int32_t>::max();
-                bool found_head = false;
+                int32_t min_height = 0;  // default 0 → skip if no valid heads
                 for (auto& hh : head_hashes) {
                     if (!m_tracker.chain.contains(hh)) continue;
-                    min_height = std::min(min_height, m_tracker.chain.get_height(hh));
-                    found_head = true;
+                    auto h = m_tracker.chain.get_height(hh);
+                    if (min_height == 0 || h < min_height)
+                        min_height = h;
                 }
-                if (!found_head || min_height < 2 * CL + 10) continue;
+                if (min_height < 2 * CL + 10) continue;
 
-                // Remove ALL children of this tail (p2pool node.py:386)
+                if (iter == 0) {
+                    LOG_WARNING << "[drop-tails-QUALIFY] tail=" << tail_hash.GetHex().substr(0,16)
+                                << " min_height=" << min_height << " threshold=" << (2*CL+10)
+                                << " n_heads=" << head_hashes.size()
+                                << " chain_size=" << m_tracker.chain.size();
+                }
+
+                // p2pool node.py:386: to_remove.update(tracker.reverse.get(tail, set()))
                 auto& rev = m_tracker.chain.get_reverse();
                 auto rev_it = rev.find(tail_hash);
-                if (rev_it != rev.end())
-                {
+                if (rev_it != rev.end()) {
                     for (const auto& child : rev_it->second)
                         to_remove.push_back(child);
                 }
-                LOG_INFO << "[clean-drop-tails] iter=" << iter
-                         << " tail=" << tail_hash.GetHex().substr(0,16)
-                         << " min_height=" << min_height << " threshold=" << (2*CL+10)
-                         << " children_in_rev=" << (rev_it != rev.end() ? rev_it->second.size() : 0)
-                         << " to_remove_total=" << to_remove.size();
             }
 
             if (to_remove.empty()) break;
 
-            for (const auto& h : to_remove)
+            // p2pool node.py:392-398
+            for (const auto& aftertail : to_remove)
             {
                 try {
-                    if (!m_tracker.chain.contains(h)) continue;
-                    // Safety 1: don't remove shares on the best chain
-                    if (best_chain_set.count(h)) {
-                        LOG_WARNING << "[clean-drop-tails] SKIPPING best-chain share "
-                                    << h.GetHex().substr(0,16);
-                        continue;
-                    }
-                    // Safety 2 (p2pool node.py:393): parent must still be a tail
-                    auto* idx = m_tracker.chain.get_index(h);
+                    if (!m_tracker.chain.contains(aftertail)) continue;
+                    // p2pool node.py:393: if items[aftertail].previous_hash not in tails: continue
+                    auto* idx = m_tracker.chain.get_index(aftertail);
                     if (!idx) continue;
                     if (!m_tracker.chain.get_tails().count(idx->tail)) {
                         continue;
                     }
-                    if (m_tracker.verified.contains(h))
-                        m_tracker.verified.remove(h, /*owns_data=*/false);
-                    m_tracker.chain.remove(h);
+                    if (m_tracker.verified.contains(aftertail))
+                        m_tracker.verified.remove(aftertail, /*owns_data=*/false);
+                    m_tracker.chain.remove(aftertail);
                     ++total_dropped;
                 } catch (...) {}
             }
         }
         if (total_dropped > 0)
-            LOG_INFO << "[clean-drop-tails] dropped " << total_dropped << " shares total"
+            LOG_INFO << "[clean-drop-tails] dropped " << total_dropped << " shares"
                      << " chain_size=" << m_tracker.chain.size()
                      << " heads=" << m_tracker.chain.get_heads().size();
     }
