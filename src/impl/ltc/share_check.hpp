@@ -911,9 +911,20 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
 
     if (!prev_hash.IsNull() && tracker.chain.contains(prev_hash))
     {
-        // Pass REAL_CHAIN_LENGTH — walk naturally stops at chain end.
-        // Avoids TrackerView cache staleness in multi-threaded context.
+        // p2pool data.py:762-764 — refuse to compute PPLNS with insufficient depth.
+        // Without this guard, attempt_verify() (which allows CHAIN_LENGTH+1) can
+        // trigger a PPLNS walk that terminates early, producing wrong coinbase
+        // amounts and causing persistent GENTX-MISMATCH during bootstrap.
         auto chain_len = static_cast<int32_t>(PoolConfig::real_chain_length());
+        {
+            auto pplns_height = tracker.chain.get_height(prev_hash);
+            auto pplns_last = tracker.chain.get_last(prev_hash);
+            if (!(pplns_height >= chain_len || pplns_last.IsNull()))
+                throw std::invalid_argument(
+                    "share chain not long enough for PPLNS verification (height="
+                    + std::to_string(pplns_height) + " need="
+                    + std::to_string(chain_len) + ")");
+        }
 
         // block_target from block header bits (matches Python: self.header['bits'].target)
         auto block_target = chain::bits_to_target(share.m_min_header.m_bits);

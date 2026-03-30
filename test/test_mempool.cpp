@@ -228,7 +228,7 @@ TEST(MempoolTest, RemoveForEmptyBlock) {
 
 TEST(MempoolTest, EvictExpiredRemovesOldEntries) {
     // Use a very short expiry (1 second) for the test
-    Mempool pool(Mempool::DEFAULT_MAX_BYTES, 1 /* 1 second expiry */);
+    Mempool pool(core::coin::LTC_LIMITS, Mempool::DEFAULT_MAX_BYTES, 1 /* 1 second expiry */);
 
     auto tx = make_tx(40);
     uint256 txid = compute_txid(tx);
@@ -258,7 +258,7 @@ TEST(MempoolTest, EvictExpiredLeavesRecentEntries) {
 
 TEST(MempoolTest, SizeCapEvictsOldestEntries) {
     // Each tx is ~100 bytes; cap at 300 bytes (fits ~3 txs)
-    Mempool pool(300, Mempool::DEFAULT_EXPIRY_SECS);
+    Mempool pool(core::coin::LTC_LIMITS, 300, Mempool::DEFAULT_EXPIRY_SECS);
 
     // Add transactions sequentially so arrival order is deterministic
     auto tx0 = make_tx(60);
