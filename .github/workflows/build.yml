@@ -93,6 +93,7 @@ jobs:
                     test_phase4_embedded \
                     test_mweb_builder \
                     test_address_resolution test_compute_share_target \
+                    test_utxo \
             -j$(nproc)
 
       # ── 9. Run test suite ─────────────────────────────────────────────────
