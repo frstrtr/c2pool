@@ -469,12 +469,15 @@ private:
 
         // BIP 35: Request mempool contents from peer.
         // Sends a "mempool" message → peer responds with inv for all mempool txids.
-        // Called after handshake when UTXO is initialized, enabling fee computation
-        // for the full mempool within seconds of connecting.
-        // Modern litecoind/dogecoind (0.21+) accepts this without NODE_BLOOM.
+        // NOTE: Many litecoind/dogecoind nodes require NODE_BLOOM service flag
+        // (-peerbloomfilters=1) to respond to BIP 35. If the peer doesn't support
+        // it, the request is silently ignored — no disconnect, no error.
+        // We send to all peers; only ONE needs to respond for success.
+        // Normal inv relay ensures mempool fills eventually even without BIP 35.
         if (m_request_mempool_on_connect) {
             send_mempool();
-            LOG_INFO << "[" << m_chain_label << "] Sent BIP 35 mempool request to peer";
+            LOG_INFO << "[" << m_chain_label << "] Sent BIP 35 mempool request to peer"
+                     << " (requires NODE_BLOOM on peer side)";
         }
     }
 

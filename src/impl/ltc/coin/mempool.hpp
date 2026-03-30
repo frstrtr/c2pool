@@ -377,17 +377,23 @@ public:
         if (!utxo) return 0;
         std::lock_guard<std::mutex> lock(m_mutex);
         int resolved = 0;
+        int still_unknown = 0;
+        uint64_t resolved_total_fee = 0;
         for (auto& [txid, entry] : m_pool) {
             if (entry.fee_known) continue;
             if (compute_fee_locked(entry, utxo)) {
-                // Add to feerate index now that fee is known
                 m_feerate_index.emplace(entry.feerate(), txid);
+                resolved_total_fee += entry.fee;
                 ++resolved;
+            } else {
+                ++still_unknown;
             }
         }
-        if (resolved > 0) {
-            LOG_INFO << "[EMB] Mempool: resolved " << resolved
-                     << " unknown fees after block connection";
+        if (resolved > 0 || still_unknown > 0) {
+            LOG_INFO << "[EMB] Mempool fee revalidation: resolved=" << resolved
+                     << " still_unknown=" << still_unknown
+                     << " resolved_fees=" << resolved_total_fee << " sat"
+                     << " pool_size=" << m_pool.size();
         }
         return resolved;
     }

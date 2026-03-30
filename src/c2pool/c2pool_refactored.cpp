@@ -1701,7 +1701,8 @@ int main(int argc, char* argv[]) {
                          pool = embedded_pool.get(),
                          utxo = ltc_utxo_cache.get(),
                          utxo_db = ltc_utxo_db.get(),
-                         bcaster = embedded_broadcaster.get()](
+                         bcaster = embedded_broadcaster.get(),
+                         &web_server](
                             const std::string& peer,
                             const ltc::coin::BlockType& block) {
                             // Determine block height from header chain
@@ -1766,9 +1767,16 @@ int main(int argc, char* argv[]) {
                             if (pool) {
                                 pool->set_tip_height(height);
                                 pool->remove_for_block(block);
-                                // Re-attempt fee computation for txs with unknown fees
+                                // Re-attempt fee computation for txs with unknown fees.
+                                // After UTXO connects a block, previously-unknown inputs
+                                // may now be in the UTXO set (especially bootstrap blocks).
                                 if (utxo) {
-                                    pool->recompute_unknown_fees(utxo);
+                                    int resolved = pool->recompute_unknown_fees(utxo);
+                                    if (resolved > 0) {
+                                        // Fees changed — trigger template rebuild so
+                                        // coinbasevalue includes the newly-resolved fees.
+                                        web_server.trigger_work_refresh_debounced();
+                                    }
                                 }
                             }
 
@@ -3688,7 +3696,8 @@ int main(int argc, char* argv[]) {
                                      chain = doge_chain.get(),
                                      utxo = doge_utxo_cache.get(),
                                      utxo_db = doge_utxo_db.get(),
-                                     bcaster_ptr = broadcaster.get()](
+                                     bcaster_ptr = broadcaster.get(),
+                                     &web_server](
                                         const std::string& peer,
                                         const ltc::coin::BlockType& block) {
                                         // Determine block height
@@ -3730,8 +3739,11 @@ int main(int argc, char* argv[]) {
                                         if (pool) {
                                             pool->set_tip_height(height);
                                             pool->remove_for_block(block);
-                                            if (utxo)
-                                                pool->recompute_unknown_fees(utxo);
+                                            if (utxo) {
+                                                int resolved = pool->recompute_unknown_fees(utxo);
+                                                if (resolved > 0)
+                                                    web_server.trigger_work_refresh_debounced();
+                                            }
                                         }
                                     });
 
