@@ -70,6 +70,8 @@ private:
     bool m_peer_wants_cmpct_announce{false};
     // BIP 339 wtxidrelay state
     bool m_peer_wtxidrelay{false};
+    // BIP 35: request full mempool inventory after handshake
+    bool m_request_mempool_on_connect{false};
     // Compact block reconstruction state: pending compact block awaiting blocktxn
     std::unique_ptr<CompactBlock> m_pending_cmpct;
     std::vector<uint32_t> m_pending_missing_indexes;
@@ -298,6 +300,10 @@ public:
     /// Set mempool reference for compact block reconstruction.
     void set_mempool(Mempool* mp) { m_mempool = mp; }
 
+    /// Enable BIP 35 mempool request after handshake.
+    /// Call after UTXO is initialized so incoming txs can have fees computed.
+    void enable_mempool_request() { m_request_mempool_on_connect = true; }
+
     /// Relay a pre-serialized block via P2P.
     /// Automatically uses compact block format for peers that support it.
     void submit_block_raw(const std::vector<unsigned char>& block_bytes)
@@ -461,10 +467,15 @@ private:
             send_feefilter(0);
         }
 
-        // NOTE: send_mempool() (BIP 35) is NOT called automatically here.
-        // It requires NODE_BLOOM service flags on both sides or the daemon
-        // may disconnect. Callers must invoke send_mempool() explicitly after
-        // confirming the peer supports it.
+        // BIP 35: Request mempool contents from peer.
+        // Sends a "mempool" message → peer responds with inv for all mempool txids.
+        // Called after handshake when UTXO is initialized, enabling fee computation
+        // for the full mempool within seconds of connecting.
+        // Modern litecoind/dogecoind (0.21+) accepts this without NODE_BLOOM.
+        if (m_request_mempool_on_connect) {
+            send_mempool();
+            LOG_INFO << "[" << m_chain_label << "] Sent BIP 35 mempool request to peer";
+        }
     }
 
     ADD_P2P_HANDLER(ping)
