@@ -1302,14 +1302,33 @@ int main(int argc, char* argv[]) {
 
                 // Apply CLI checkpoint (--header-checkpoint HEIGHT:HASH) if provided.
                 // This lets operators skip millions of old headers on any chain.
+                //
+                // score() needs block headers going back far enough to cover the
+                // share chain's tail window.  p2pool's HeightTracker uses a backlog
+                // of 5 * SHARE_PERIOD * CHAIN_LENGTH / BLOCK_PERIOD blocks.
+                // If the checkpoint is too recent, old shares will reference blocks
+                // before the checkpoint → unresolvable → degraded scoring accuracy.
+                // (Fix 1 in score() prevents oscillation, but accurate scoring
+                // requires actual header data.)
+                constexpr uint32_t LTC_BLOCK_PERIOD = 150; // seconds
+                uint32_t score_backlog = 5 * ltc::PoolConfig::share_period()
+                    * ltc::PoolConfig::chain_length() / LTC_BLOCK_PERIOD;
                 if (!header_checkpoint_str.empty()) {
                     auto colon = header_checkpoint_str.find(':');
                     if (colon != std::string::npos) {
                         uint32_t cp_height = static_cast<uint32_t>(std::stoul(header_checkpoint_str.substr(0, colon)));
                         uint256 cp_hash;
                         cp_hash.SetHex(header_checkpoint_str.substr(colon + 1));
-                        if (!cp_hash.IsNull())
+                        if (!cp_hash.IsNull()) {
                             embedded_chain->set_dynamic_checkpoint(cp_height, cp_hash);
+                            // Warn if checkpoint doesn't provide enough backlog
+                            // for accurate share chain scoring.  Operators should
+                            // set the checkpoint at least score_backlog blocks
+                            // before the current network tip.
+                            LOG_INFO << "[EMB-LTC] Score backlog needed: " << score_backlog
+                                     << " blocks before network tip"
+                                     << " (checkpoint at height " << cp_height << ")";
+                        }
                     }
                 }
 
@@ -1878,7 +1897,10 @@ int main(int argc, char* argv[]) {
                         [rpc = node_rpc.get()](uint256 block_hash) -> int32_t {
                             if (!rpc || block_hash.IsNull()) return 0;
                             try {
-                                auto reply = rpc->getblock(block_hash, 1);
+                                // Use getblockheader (not getblock) — matches p2pool,
+                                // and works for pruned daemons: block index (hash→height)
+                                // is never pruned, only full block data is.
+                                auto reply = rpc->getblockheader(block_hash);
                                 if (reply.contains("confirmations"))
                                     return reply["confirmations"].get<int32_t>();
                             } catch (...) {}

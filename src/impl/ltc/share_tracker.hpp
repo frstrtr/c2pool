@@ -126,18 +126,10 @@ public:
 private:
     std::atomic<bool> v36_active_{false};
 
-    // Retry counter for shares that fail GENTX verification.
-    // After MAX_VERIFY_RETRIES failures, share is permanently skipped.
-    // Prevents infinite retry loops for shares whose PPLNS ancestry
-    // changed after restart (different fork resolution).
-    static constexpr int MAX_VERIFY_RETRIES = 3;
+    // Retry counter for log throttling only — p2pool retries every think()
+    // with no limit.  Counter is cleared on successful verification or
+    // when the share is removed from the chain (on_removed signal).
     std::unordered_map<uint256, int, ShareHasher> m_verify_fail_count;
-
-    bool is_permanently_unverifiable(const uint256& h) const
-    {
-        auto it = m_verify_fail_count.find(h);
-        return it != m_verify_fail_count.end() && it->second >= MAX_VERIFY_RETRIES;
-    }
 
     static int64_t now_seconds()
     {
@@ -198,14 +190,16 @@ public:
         if (verified.contains(share_hash))
             return true;
 
-        // Skip shares that have permanently failed verification.
-        if (is_permanently_unverifiable(share_hash))
-            return false;
+        // p2pool has NO permanently-unverifiable concept — it retries
+        // share.check() every think() call.  Shares that failed during a
+        // temporary fork may succeed once the fork resolves and the PPLNS
+        // walk changes.  Skipping re-verification created permanent gaps
+        // in the verified chain → fragmentation (52 verified_tails).
 
         // NO parent-in-verified filter. p2pool doesn't have one.
         // p2pool's attempt_verify has only the guard (height < CL+1 && unrooted).
-        // Fragmentation doesn't affect scoring because scoring uses
-        // chain.get_work() (SubsetTracker pattern), not verified.get_work().
+        // score() uses verified for height/work/chain (matching p2pool),
+        // so fragmentation in the raw chain tracker doesn't affect scoring.
 
         // p2pool: height, last = self.get_height_and_last(share.hash)
         // p2pool's get_height uses get_delta_to_last() which walks through
@@ -249,14 +243,12 @@ public:
         }
         catch (const std::exception& e)
         {
+            // Counter for log throttling only — p2pool retries every think().
             auto& cnt = m_verify_fail_count[share_hash];
             ++cnt;
-            if (cnt >= MAX_VERIFY_RETRIES)
-                LOG_WARNING << "attempt_verify: share " << share_hash.ToString().substr(0,16)
-                            << " permanently unverifiable after " << cnt
-                            << " attempts (acc_height=" << acc_height << "): " << e.what();
-            else
-                LOG_WARNING << "attempt_verify FAILED (" << cnt << "/" << MAX_VERIFY_RETRIES
+            // Log first 3 failures verbosely, then every 10th to avoid spam.
+            if (cnt <= 3 || cnt % 10 == 0)
+                LOG_WARNING << "attempt_verify FAILED (" << cnt
                             << ") for " << share_hash.ToString().substr(0,16)
                             << " acc_height=" << acc_height << " last=" << (last.IsNull() ? "null" : last.ToString().substr(0,16))
                             << " error: " << e.what();
@@ -301,34 +293,38 @@ public:
 
     // -- Score a chain from share_hash to CHAIN_LENGTH*15/16 ancestor --
     // Returns (chain_len, hashrate_score) — higher is better.
-    // May throw if the chain is concurrently modified (think runs on a
-    // background thread).  Callers should catch or use the safe wrapper.
+    // p2pool data.py:2335-2347 — uses self.verified for ALL operations.
+    // May throw if the chain is concurrently modified.
     TailScore score(const uint256& share_hash,
                     const std::function<int32_t(uint256)>& block_rel_height_func)
     {
         uint288 score_res;
 
-        // Use CHAIN for navigation (p2pool SubsetTracker pattern).
-        // verified is only for membership checks, not navigation.
-        auto head_height = chain.get_height(share_hash);
+        // p2pool: head_height = self.verified.get_height(share_hash)
+        // Must use VERIFIED height — using chain inflates height with
+        // unverified shares, causing short verified chains to tie on
+        // chain_len with long chains and win on hashrate tiebreak.
+        auto head_height = verified.get_acc_height(share_hash);
         if (head_height < static_cast<int32_t>(PoolConfig::chain_length()))
             return {head_height, score_res};
 
-        auto end_point = chain.get_nth_parent_key(share_hash,
+        // p2pool: end_point = self.verified.get_nth_parent_hash(
+        //     share_hash, self.net.CHAIN_LENGTH*15//16)
+        // SubsetTracker delegates to parent's skip list (shared navigation).
+        auto end_point = verified.get_nth_parent_via_skip(share_hash,
             (PoolConfig::chain_length() * 15) / 16);
 
-        // Find max block_rel_height in the tail 1/16 of the chain
+        // p2pool: self.verified.get_chain(end_point, self.net.CHAIN_LENGTH//16)
         std::optional<int32_t> block_height;
         auto tail_count = std::min(
             static_cast<int32_t>(PoolConfig::chain_length() / 16),
-            chain.get_height(end_point));
+            verified.get_acc_height(end_point));
         if (tail_count <= 0)
             return {static_cast<int32_t>(PoolConfig::chain_length()), score_res};
 
-        auto tail_view = chain.get_chain(end_point, tail_count);
+        auto tail_view = verified.get_chain(end_point, tail_count);
         for (auto [hash, data] : tail_view)
         {
-            // Access the share's min_header.previous_block via the variant
             uint256 prev_block;
             data.share.invoke([&](auto* obj) {
                 prev_block = obj->m_min_header.m_previous_block;
@@ -339,36 +335,22 @@ public:
                 block_height = bh;
         }
 
-        // c2pool's block_rel_height returns confirmations: 1 at tip, N+1
-        // for N blocks behind, 0 for error/unknown.
-        // p2pool returns: 0 at tip, -N for N behind.
-        // Guard: skip hashrate scoring when block_height is 0 (error) or absent.
-        // p2pool has NO early-return guard — it always computes hashrate.
-        // Our guard only fires for the error case (0 confirmations).
+        // c2pool returns confirmations (1=tip, 0=unknown, -1=off-main-chain).
+        // p2pool returns relative height (0=tip, -N=behind, -1e9=unknown).
+        // When p2pool can't resolve a block, it computes score = work / (1e9 * 150)
+        // — tiny but non-zero, so both chains get similar scores and the one
+        // with more work wins (stable).  c2pool must match: use a very large
+        // confirmation count so the score is tiny but non-zero, preventing
+        // oscillation where short chains beat long chains simply because the
+        // long chain's old blocks are unresolvable.
         if (!block_height.has_value() || block_height.value() <= 0)
-            return {static_cast<int32_t>(PoolConfig::chain_length()), score_res};
+            block_height = 1000000;  // ~1M confirmations → time_span ≈ 150M seconds
 
-        // Compute work using CHAIN (raw tracker), not verified.
-        uint288 total_work;
-        auto c_dist = chain.get_height(share_hash) - chain.get_height(end_point);
-        if (c_dist > 0) {
-            try {
-                auto view = chain.get_chain(share_hash, c_dist);
-                for (auto [hash, data] : view) {
-                    if (hash == end_point) break;
-                    data.share.invoke([&](auto* obj) {
-                        total_work += chain::target_to_average_attempts(
-                            chain::bits_to_target(obj->m_bits));
-                    });
-                }
-            } catch (...) {}
-        }
+        // p2pool: self.verified.get_delta(share_hash, end_point).work
+        auto total_work = verified.get_delta_work(share_hash, end_point);
 
-        // p2pool: time_span = (-block_height + 1) * BLOCK_PERIOD
-        // With p2pool convention (0 at tip): (-0 + 1) * 150 = 150
-        // c2pool uses confirmations (1 at tip): just use confirmations * BLOCK_PERIOD.
-        // confirmations=1 → 150s (same as p2pool's tip case)
-        // confirmations=4 → 600s (same as p2pool's -3 case)
+        // p2pool: (0 - block_height + 1) * BLOCK_PERIOD
+        // c2pool confirmations: 1=tip → 150s, 4 → 600s (matches p2pool).
         auto time_span = block_height.value() * 150; // LTC BLOCK_PERIOD = 150s
         if (time_span <= 0)
             time_span = 1;
@@ -448,11 +430,12 @@ public:
                             ++p1_verified;
                             break;
                         }
-                        // Don't add permanently unverifiable shares to bads —
-                        // they can't be removed (have children) and would just
-                        // trigger peer banning every cycle.
-                        if (!is_permanently_unverifiable(hash))
-                            bads.push_back(hash);
+                        // p2pool data.py:2215: bads.append(share.hash)
+                        // ALL failing shares go into bads — p2pool has no
+                        // permanently-unverifiable filter.  remove() returns
+                        // false for mid-chain shares (NotImplementedError in
+                        // p2pool), which is caught below.
+                        bads.push_back(hash);
                     }
                 } catch (const std::exception& ex) {
                     ++p1_caught;
@@ -493,30 +476,17 @@ public:
         // got verified with truncated PPLNS → wrong coinbase.
         // p2pool's Phase 2 naturally handles forward extension via rooted chains.
 
-        // Remove bad shares (p2pool data.py:2133-2145).
-        // p2pool removes ONLY the bad shares themselves — NO cascade.
-        // clean_tracker() handles stale heads later (300s age check).
-        // The previous cascade removal was catastrophically wrong:
-        // it followed reverse map which includes MAIN CHAIN children,
-        // destroying the entire chain above the fork point.
+        // Remove bad shares (p2pool data.py:2224-2236).
+        // p2pool tries self.remove(bad) for ALL bads — catches
+        // NotImplementedError for mid-chain shares (have dependents).
+        // c2pool's chain.remove() returns false for that case.
+        // NO leaf-only filter — p2pool doesn't have one.
         {
-            std::vector<uint256> to_remove;
+            int removed_count = 0;
             for (const auto& bad : bads)
             {
                 if (verified.contains(bad))
-                    continue;
-                // Only remove LEAF shares (no children in the chain).
-                // Removing a share with children breaks their prev_hash
-                // chain → cascading GENTX failures. p2pool avoids this
-                // because GENTX rarely fails between p2pool nodes.
-                auto& rev = chain.get_reverse();
-                auto rit = rev.find(bad);
-                if (rit != rev.end() && !rit->second.empty())
-                    continue; // has children — don't remove
-                to_remove.push_back(bad);
-            }
-            for (const auto& bad : to_remove)
-            {
+                    continue; // p2pool: raise ValueError (should never happen)
                 if (!chain.contains(bad)) continue;
 
                 NetService bad_peer;
@@ -528,15 +498,21 @@ public:
                 if (bad_peer.port() != 0)
                     bad_peer_addresses.insert(bad_peer);
 
+                // p2pool data.py:2233-2236:
+                //   try: self.remove(bad)
+                //   except NotImplementedError: pass
+                // chain.remove() returns false for mid-chain shares
+                // (equivalent to NotImplementedError).
                 try {
                     invalidate_weight_caches(bad);
                     if (verified.contains(bad))
                         verified.remove(bad);
-                    chain.remove(bad);
+                    if (chain.remove(bad))
+                        ++removed_count;
                 } catch (...) {}
             }
-            if (!to_remove.empty()) {
-                LOG_INFO << "[think-P1] removed " << to_remove.size()
+            if (removed_count > 0) {
+                LOG_INFO << "[think-P1] removed " << removed_count
                          << " shares (bads=" << bads.size() << " + descendants)";
             }
         }

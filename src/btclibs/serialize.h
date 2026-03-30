@@ -139,6 +139,11 @@ enum
 template<typename X> X& ReadWriteAsHelper(X& x) { return x; }
 template<typename X> const X& ReadWriteAsHelper(const X& x) { return x; }
 
+// btclibs uses its own serialization macros — undef any prior definitions
+// from core/pack.hpp to avoid redefinition warnings.
+#ifdef READWRITE
+#undef READWRITE
+#endif
 #define READWRITE(...) (::legacy::SerReadWriteMany(s, ser_action, __VA_ARGS__))
 #define READWRITEAS(type, obj) (::legacy::SerReadWriteMany(s, ser_action, ReadWriteAsHelper<type>(obj)))
 #define SER_READ(obj, code) ::legacy::SerRead(s, ser_action, obj, [&](Stream& s, typename std::remove_const<Type>::type& obj) { code; })
@@ -175,6 +180,9 @@ template<typename X> const X& ReadWriteAsHelper(const X& x) { return x; }
  * thus allows a single implementation that sees the object as const for serializing
  * and non-const for deserializing, without casts.
  */
+#ifdef SERIALIZE_METHODS
+#undef SERIALIZE_METHODS
+#endif
 #define SERIALIZE_METHODS(cls, obj)                                                 \
     template<typename Stream>                                                       \
     void Serialize(Stream& s) const                                                 \
