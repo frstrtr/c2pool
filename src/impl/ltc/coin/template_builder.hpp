@@ -298,7 +298,7 @@ public:
                  << " bits=" << bits_to_hex(next_bits)
                  << " subsidy=" << subsidy << " fees=" << total_fees
                  << " coinbasevalue=" << coinbasevalue << " sat"
-                 << " txs=" << tx_array.size()
+                 << " txs=" << data["transactions"].size()
                  << " mweb=" << (has_mweb ? "yes" : "no")
                  << " tip_ts=" << tip.header.m_timestamp
                  << " now=" << now_ts
