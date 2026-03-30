@@ -1,11 +1,11 @@
 #pragma once
 
-/// LTC Mempool — Phase 2
+/// LTC Mempool — Phase 2 + UTXO fee computation
 ///
 /// In-memory transaction pool receiving transactions from P2P peers.
-/// Fee computation is not possible without a UTXO set; transactions
-/// are accepted unconditionally and ordered by arrival time (FIFO).
-/// Weight is tracked for block template building (Phase 3).
+/// When a UTXOViewCache is available, computes per-transaction fees
+/// (sum_inputs - sum_outputs) and maintains a feerate-sorted index
+/// for optimal block template building.
 ///
 /// Thread-safe via internal mutex.
 
@@ -16,9 +16,11 @@
 #include <core/pack.hpp>
 #include <core/hash.hpp>
 #include <core/log.hpp>
+#include <core/coin/utxo_view_cache.hpp>
 
 #include <map>
 #include <mutex>
+#include <set>
 #include <vector>
 #include <ctime>
 #include <cstdint>
@@ -35,12 +37,13 @@ struct MempoolEntry {
     uint32_t base_size{0};      // legacy serialized bytes (no witness)
     uint32_t witness_size{0};   // extra bytes for witness data
     uint32_t weight{0};         // base_size*4 + witness_size  (BIP 141)
-    uint64_t fee{0};            // satoshi — always 0 (no UTXO set)
+    uint64_t fee{0};            // satoshi (computed from UTXO when available)
+    bool     fee_known{false};  // true when fee was computed from UTXO lookups
     time_t   time_added{0};
 
     double feerate() const {
         uint32_t vsize = (weight + 3) / 4;  // ceil(weight/4)
-        return vsize > 0 ? static_cast<double>(fee) / vsize : 0.0;
+        return (fee_known && vsize > 0) ? static_cast<double>(fee) / vsize : 0.0;
     }
 };
 
@@ -89,9 +92,17 @@ public:
 
     // ─── Mutation ────────────────────────────────────────────────────────
 
-    /// Add a transaction to the pool.
+    /// Add a transaction to the pool (no fee computation).
     /// Returns false if already known or if the tx is malformed.
     bool add_tx(const MutableTransaction& tx) {
+        return add_tx(tx, nullptr);
+    }
+
+    /// Add a transaction to the pool with optional UTXO-based fee computation.
+    /// When utxo is non-null, computes fee = sum(input_values) - sum(output_values).
+    /// Falls back to fee_known=false if any input is missing from the UTXO set
+    /// or from a parent mempool transaction (chain-of-unconfirmed / CPFP).
+    bool add_tx(const MutableTransaction& tx, core::coin::UTXOViewCache* utxo) {
         uint256 txid = compute_txid(tx);
 
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -104,8 +115,10 @@ public:
         entry.tx    = tx;
         entry.txid  = txid;
         compute_tx_weight(tx, entry.base_size, entry.witness_size, entry.weight);
-        entry.fee         = 0;  // unknown — no UTXO set
         entry.time_added  = std::time(nullptr);
+
+        // Compute fee from UTXO + mempool parent lookups
+        compute_fee_locked(entry, utxo);
 
         // Enforce size cap: evict oldest entries until we have room
         int evicted = 0;
@@ -116,21 +129,28 @@ public:
         }
 
         m_pool[txid] = std::move(entry);
-        m_time_index.emplace(m_pool[txid].time_added, txid);
-        m_total_bytes += m_pool[txid].base_size;
+        auto& stored = m_pool[txid];
+        m_time_index.emplace(stored.time_added, txid);
+        m_total_bytes += stored.base_size;
 
-        // Track spent outputs for conflict detection (Phase 2)
-        for (const auto& vin : m_pool[txid].tx.vin) {
+        // Track spent outputs for conflict detection
+        for (const auto& vin : stored.tx.vin) {
             m_spent_outputs[std::make_pair(vin.prevout.hash, vin.prevout.index)] = txid;
+        }
+
+        // Add to feerate index if fee is known
+        if (stored.fee_known) {
+            m_feerate_index.emplace(stored.feerate(), txid);
         }
 
         // Periodic mempool stats (every 100 txs)
         if (m_pool.size() % 100 == 0 || m_pool.size() <= 5) {
-            LOG_INFO << "[EMB-LTC] Mempool: size=" << m_pool.size()
+            LOG_INFO << "[EMB] Mempool: size=" << m_pool.size()
                      << " bytes=" << m_total_bytes << "/" << m_max_bytes
-                     << " last_txid=" << txid.GetHex().substr(0, 16)
-                     << " weight=" << m_pool[txid].weight
-                     << (evicted > 0 ? " evicted=" + std::to_string(evicted) : "");
+                     << " txid=" << txid.GetHex().substr(0, 16)
+                     << " w=" << stored.weight
+                     << " fee=" << (stored.fee_known ? std::to_string(stored.fee) : "?")
+                     << (evicted > 0 ? " evict=" + std::to_string(evicted) : "");
         }
         return true;
     }
@@ -199,6 +219,7 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         m_pool.clear();
         m_time_index.clear();
+        m_feerate_index.clear();
         m_spent_outputs.clear();
         m_total_bytes = 0;
     }
@@ -220,8 +241,16 @@ public:
         return m_total_bytes;
     }
 
-    /// Sum of all known fees (always 0 without UTXO set).
-    uint64_t total_fees() const { return 0; }
+    /// Sum of all known fees across mempool transactions.
+    uint64_t total_fees() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        uint64_t sum = 0;
+        for (const auto& [txid, entry] : m_pool) {
+            if (entry.fee_known)
+                sum += entry.fee;
+        }
+        return sum;
+    }
 
     std::optional<MempoolEntry> get_entry(const uint256& txid) const {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -232,7 +261,7 @@ public:
 
     /// Return up to max_weight BIP141 weight units worth of transactions,
     /// in FIFO order (oldest first — fair ordering without feerate data).
-    /// Caller uses this for block template building (Phase 3).
+    /// Legacy method for backward compatibility.
     std::vector<MutableTransaction> get_sorted_txs(uint32_t max_weight) const {
         std::lock_guard<std::mutex> lock(m_mutex);
 
@@ -251,6 +280,78 @@ public:
             result.push_back(entry.tx);
         }
         return result;
+    }
+
+    /// Result struct for fee-aware transaction selection.
+    struct SelectedTx {
+        MutableTransaction tx;
+        uint64_t fee{0};
+        bool     fee_known{false};
+    };
+
+    /// Return transactions sorted by feerate (highest first), up to max_weight.
+    /// Transactions with known fees are prioritized; unknown-fee txs fill remaining space.
+    /// Returns total_fees across all selected transactions (known fees only).
+    std::pair<std::vector<SelectedTx>, uint64_t>
+    get_sorted_txs_with_fees(uint32_t max_weight) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+
+        std::vector<SelectedTx> result;
+        uint64_t total_fees = 0;
+        uint32_t total_weight = 0;
+        std::set<uint256> selected;
+
+        // Pass 1: highest feerate first (known-fee txs)
+        for (auto it = m_feerate_index.begin(); it != m_feerate_index.end(); ++it) {
+            auto pit = m_pool.find(it->second);
+            if (pit == m_pool.end()) continue;
+            const auto& entry = pit->second;
+            if (!entry.fee_known) continue;
+            if (total_weight + entry.weight > max_weight) continue;
+
+            total_weight += entry.weight;
+            total_fees += entry.fee;
+            result.push_back({entry.tx, entry.fee, true});
+            selected.insert(entry.txid);
+        }
+
+        // Pass 2: fill remaining space with unknown-fee txs (FIFO order)
+        for (auto& [ts, txid] : m_time_index) {
+            if (selected.count(txid)) continue;
+            auto pit = m_pool.find(txid);
+            if (pit == m_pool.end()) continue;
+            const auto& entry = pit->second;
+            if (total_weight + entry.weight > max_weight) continue;
+
+            total_weight += entry.weight;
+            // Unknown-fee txs contribute 0 to total_fees — conservative
+            result.push_back({entry.tx, 0, false});
+            selected.insert(txid);
+        }
+
+        return {std::move(result), total_fees};
+    }
+
+    /// Re-attempt fee computation for all transactions with fee_known=false.
+    /// Call after a new block is connected (new UTXOs may resolve missing inputs).
+    /// Returns the number of transactions whose fees were successfully computed.
+    int recompute_unknown_fees(core::coin::UTXOViewCache* utxo) {
+        if (!utxo) return 0;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        int resolved = 0;
+        for (auto& [txid, entry] : m_pool) {
+            if (entry.fee_known) continue;
+            if (compute_fee_locked(entry, utxo)) {
+                // Add to feerate index now that fee is known
+                m_feerate_index.emplace(entry.feerate(), txid);
+                ++resolved;
+            }
+        }
+        if (resolved > 0) {
+            LOG_INFO << "[EMB] Mempool: resolved " << resolved
+                     << " unknown fees after block connection";
+        }
+        return resolved;
     }
 
     /// Snapshot of all txids currently in the pool.
@@ -275,6 +376,62 @@ public:
 private:
     // ─── Internal (caller holds mutex) ───────────────────────────────────
 
+    /// Compute fee for a mempool entry using UTXO + parent mempool lookups.
+    /// Returns true if fee was successfully computed.
+    bool compute_fee_locked(MempoolEntry& entry, core::coin::UTXOViewCache* utxo) {
+        if (!utxo) {
+            entry.fee = 0;
+            entry.fee_known = false;
+            return false;
+        }
+
+        int64_t value_in = 0;
+        bool all_found = true;
+
+        for (const auto& vin : entry.tx.vin) {
+            core::coin::Outpoint op(vin.prevout.hash, vin.prevout.index);
+            core::coin::Coin coin;
+
+            if (utxo->get_coin(op, coin)) {
+                // Input found in UTXO set
+                value_in += coin.value;
+            } else {
+                // Not in UTXO — check if a parent mempool tx has this output
+                auto parent_it = m_pool.find(vin.prevout.hash);
+                if (parent_it != m_pool.end()
+                    && vin.prevout.index < parent_it->second.tx.vout.size()) {
+                    value_in += parent_it->second.tx.vout[vin.prevout.index].value;
+                } else {
+                    all_found = false;
+                    break;
+                }
+            }
+        }
+
+        if (!all_found) {
+            entry.fee = 0;
+            entry.fee_known = false;
+            return false;
+        }
+
+        // Sum outputs
+        int64_t value_out = 0;
+        for (const auto& vout : entry.tx.vout)
+            value_out += vout.value;
+
+        int64_t fee = value_in - value_out;
+        if (fee < 0) {
+            // Invalid transaction (outputs exceed inputs)
+            entry.fee = 0;
+            entry.fee_known = false;
+            return false;
+        }
+
+        entry.fee = static_cast<uint64_t>(fee);
+        entry.fee_known = true;
+        return true;
+    }
+
     void remove_tx_locked(const uint256& txid) {
         auto it = m_pool.find(txid);
         if (it == m_pool.end()) return;
@@ -297,6 +454,18 @@ private:
                 break;
             }
         }
+
+        // Remove from feerate index
+        if (it->second.fee_known) {
+            auto fr_range = m_feerate_index.equal_range(it->second.feerate());
+            for (auto fi = fr_range.first; fi != fr_range.second; ++fi) {
+                if (fi->second == txid) {
+                    m_feerate_index.erase(fi);
+                    break;
+                }
+            }
+        }
+
         m_pool.erase(it);
     }
 
@@ -310,6 +479,11 @@ private:
 
     std::map<uint256, MempoolEntry>  m_pool;        // txid → entry
     std::multimap<time_t, uint256>   m_time_index;  // arrival time → txid (FIFO)
+
+    /// Feerate index: feerate (sat/vbyte, descending) → txid.
+    /// Only contains entries with fee_known=true.
+    /// Used by get_sorted_txs_with_fees() for optimal block template building.
+    std::multimap<double, uint256, std::greater<double>> m_feerate_index;
 
     /// Conflict detection: (prev_txid, prev_n) → spending mempool txid.
     /// Mirrors Litecoin Core's mapNextTx for O(1) double-spend detection.
