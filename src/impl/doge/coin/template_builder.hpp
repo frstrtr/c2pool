@@ -83,24 +83,32 @@ public:
         // Use prevHash-based random subsidy (exact match with Dogecoin Core)
         uint64_t subsidy = get_doge_block_subsidy(next_h, params, tip.block_hash);
 
-        // ── Transactions from mempool ────────────────────────────────────
-        auto mtxs = pool.get_sorted_txs(MAX_BLOCK_WEIGHT - COINBASE_RESERVE);
+        // ── Transactions from mempool (fee-sorted when UTXO available) ──
+        auto [selected_txs, total_fees] =
+            pool.get_sorted_txs_with_fees(MAX_BLOCK_WEIGHT - COINBASE_RESERVE);
+
+        // coinbasevalue = block reward + included transaction fees
+        uint64_t coinbasevalue = subsidy + total_fees;
 
         nlohmann::json tx_array = nlohmann::json::array();
         std::vector<Transaction> tx_objects;
         std::vector<uint256>     tx_hashes;
 
-        for (const auto& mtx : mtxs) {
-            uint256     txid     = compute_txid(mtx);
-            auto        packed   = pack(TX_WITH_WITNESS(mtx));
+        for (const auto& stx : selected_txs) {
+            uint256     txid     = compute_txid(stx.tx);
+            auto        packed   = pack(TX_WITH_WITNESS(stx.tx));
             std::string hex_data = HexStr(packed.get_span());
 
             nlohmann::json entry;
             entry["data"] = hex_data;
             entry["txid"] = txid.GetHex();
+            if (stx.fee_known)
+                entry["fee"] = static_cast<int64_t>(stx.fee);
+            else
+                entry["fee"] = nullptr;
             tx_array.push_back(std::move(entry));
 
-            tx_objects.push_back(Transaction(mtx));
+            tx_objects.push_back(Transaction(stx.tx));
             tx_hashes.push_back(txid);
         }
 
@@ -116,7 +124,7 @@ public:
         data["bits"]              = bits_to_hex(next_bits);
         data["height"]            = static_cast<int>(next_h);
         data["curtime"]           = static_cast<int64_t>(now_ts);
-        data["coinbasevalue"]     = static_cast<int64_t>(subsidy);
+        data["coinbasevalue"]     = static_cast<int64_t>(coinbasevalue);
         data["transactions"]      = std::move(tx_array);
         data["rules"]             = nlohmann::json::array(); // DOGE: no segwit
         data["coinbaseflags"]     = "";

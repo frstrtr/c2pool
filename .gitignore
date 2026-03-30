@@ -147,3 +147,5 @@ test/test_address_resolution
 test/test_compute_share_target
 test/test_hardening
 test/test_stratum_extensions
+test/test_utxo
+test/test_utxo[1]_include.cmake

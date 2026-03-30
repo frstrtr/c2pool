@@ -1276,6 +1276,9 @@ int main(int argc, char* argv[]) {
             std::unique_ptr<c2pool::merged::CoinBroadcaster> embedded_broadcaster;
             std::unique_ptr<ltc::coin::MWEBTracker>     mweb_tracker;
             std::unique_ptr<ltc::coin::EmbeddedCoinNode> embedded_node;
+            // UTXO set for fee computation (block reward + mempool tx fees)
+            std::unique_ptr<core::coin::UTXOViewDB>     ltc_utxo_db;
+            std::unique_ptr<core::coin::UTXOViewCache>  ltc_utxo_cache;
 
             if (embedded_ltc) {
                 LOG_INFO << "╔══════════════════════════════════════════════════════════════╗";
@@ -1358,8 +1361,26 @@ int main(int argc, char* argv[]) {
                              << " headers from LevelDB (height=" << embedded_chain->height() << ")";
                 }
 
-                LOG_INFO << "[EMB-LTC] Creating Mempool + MWEBTracker + EmbeddedCoinNode";
-                embedded_pool   = std::make_unique<ltc::coin::Mempool>();
+                LOG_INFO << "[EMB-LTC] Creating Mempool + UTXO + MWEBTracker + EmbeddedCoinNode";
+                embedded_pool   = std::make_unique<ltc::coin::Mempool>(core::coin::LTC_LIMITS);
+
+                // UTXO set for transaction fee computation
+                {
+                    auto utxo_path = (core::filesystem::config_path()
+                        / (settings->m_testnet ? "litecoin_testnet" : "litecoin")
+                        / "utxo_leveldb").string();
+                    core::LevelDBOptions utxo_opts;
+                    utxo_opts.block_cache_size = 32 * 1024 * 1024;  // 32 MB cache
+                    utxo_opts.write_buffer_size = 8 * 1024 * 1024;  // 8 MB
+                    ltc_utxo_db = std::make_unique<core::coin::UTXOViewDB>(utxo_path, utxo_opts);
+                    if (ltc_utxo_db->open()) {
+                        ltc_utxo_cache = std::make_unique<core::coin::UTXOViewCache>(ltc_utxo_db.get());
+                        LOG_INFO << "[EMB-LTC] UTXO set opened: best_height=" << ltc_utxo_db->get_best_height()
+                                 << " best_block=" << ltc_utxo_db->get_best_block().GetHex().substr(0, 16);
+                    } else {
+                        LOG_WARNING << "[EMB-LTC] UTXO DB failed to open — fees will be unknown";
+                    }
+                }
                 mweb_tracker    = std::make_unique<ltc::coin::MWEBTracker>();
                 embedded_node   = std::make_unique<ltc::coin::EmbeddedCoinNode>(
                     *embedded_chain, *embedded_pool, settings->m_testnet, mweb_tracker.get());
@@ -1402,10 +1423,11 @@ int main(int argc, char* argv[]) {
                 // Feed mempool transactions into Mempool
                 LOG_INFO << "[EMB-LTC] Wiring P2P tx → Mempool callback";
                 embedded_broadcaster->set_on_new_tx(
-                    [pool = embedded_pool.get()](const std::string& peer_key,
-                                                  const ltc::coin::Transaction& tx) {
+                    [pool = embedded_pool.get(),
+                     utxo = ltc_utxo_cache.get()](const std::string& peer_key,
+                                                   const ltc::coin::Transaction& tx) {
                         ltc::coin::MutableTransaction mtx(tx);
-                        bool added = pool->add_tx(mtx);
+                        bool added = pool->add_tx(mtx, utxo);
                         if (added) {
                             LOG_DEBUG_COIND << "[EMB-LTC] TX from " << peer_key
                                       << " added to mempool (size=" << pool->size() << ")";
@@ -1676,7 +1698,11 @@ int main(int argc, char* argv[]) {
                     embedded_broadcaster->set_on_full_block(
                         [tracker = mweb_tracker.get(),
                          chain = embedded_chain.get(),
-                         pool = embedded_pool.get()](
+                         pool = embedded_pool.get(),
+                         utxo = ltc_utxo_cache.get(),
+                         utxo_db = ltc_utxo_db.get(),
+                         bcaster = embedded_broadcaster.get(),
+                         &web_server](
                             const std::string& peer,
                             const ltc::coin::BlockType& block) {
                             // Determine block height from header chain
@@ -1693,12 +1719,68 @@ int main(int argc, char* argv[]) {
                                     height = prev_entry->height + 1;
                             }
 
-                            // Remove confirmed txs + conflicts from mempool
-                            if (pool) {
-                                pool->remove_for_block(block);
+                            // Step 1: Update UTXO set (BEFORE mempool cleanup)
+                            // Connect block: spend inputs, add outputs, save undo data
+                            if (utxo && utxo_db) {
+                                auto txid_fn = [](const ltc::coin::MutableTransaction& tx) {
+                                    return ltc::coin::compute_txid(tx);
+                                };
+                                auto undo = utxo->connect_block(block, height, txid_fn);
+                                utxo_db->put_block_undo(height, undo);
+                                utxo->flush(block_hash, height);
+
+                                static int utxo_log = 0;
+                                if (utxo_log++ % 10 == 0) {
+                                    LOG_INFO << "[EMB-LTC] UTXO: connected block " << height
+                                             << " hash=" << block_hash.GetHex().substr(0, 16)
+                                             << " txs=" << block.m_txs.size()
+                                             << " cache=" << utxo->cache_size();
+                                }
+
+                                // Enable BIP 35 mempool sync after first block processed
+                                static bool mempool_requested = false;
+                                if (!mempool_requested && bcaster) {
+                                    bcaster->enable_mempool_request();
+                                    mempool_requested = true;
+                                    LOG_INFO << "[EMB-LTC] UTXO ready — enabled BIP 35 mempool sync";
+
+                                    // Bootstrap: request last 10 full blocks to seed UTXO.
+                                    // Ensures mempool fee computation has enough UTXOs from
+                                    // the start, instead of waiting for new blocks to arrive.
+                                    if (chain && utxo_db->get_best_height() <= height) {
+                                        int requested = 0;
+                                        for (int bi = 1; bi <= 10 && static_cast<int>(height) - bi >= 0; ++bi) {
+                                            auto entry = chain->get_header_by_height(height - bi);
+                                            if (entry) {
+                                                bcaster->request_full_block(entry->block_hash);
+                                                ++requested;
+                                            }
+                                        }
+                                        if (requested > 0)
+                                            LOG_INFO << "[EMB-LTC] Bootstrap: requested " << requested
+                                                     << " historical blocks to seed UTXO";
+                                    }
+                                }
                             }
 
-                            // Extract MWEB state for template building
+                            // Step 2: Remove confirmed txs + conflicts from mempool
+                            if (pool) {
+                                pool->set_tip_height(height);
+                                pool->remove_for_block(block);
+                                // Re-attempt fee computation for txs with unknown fees.
+                                // After UTXO connects a block, previously-unknown inputs
+                                // may now be in the UTXO set (especially bootstrap blocks).
+                                if (utxo) {
+                                    int resolved = pool->recompute_unknown_fees(utxo);
+                                    if (resolved > 0) {
+                                        // Fees changed — trigger template rebuild so
+                                        // coinbasevalue includes the newly-resolved fees.
+                                        web_server.trigger_work_refresh_debounced();
+                                    }
+                                }
+                            }
+
+                            // Step 3: Extract MWEB state for template building
                             if (tracker && tracker->update(block, height, block.m_mweb_raw)) {
                                 LOG_INFO << "[EMB-LTC] MWEB state updated from peer " << peer
                                          << " at height " << height
@@ -1715,6 +1797,9 @@ int main(int argc, char* argv[]) {
                 embedded_chain->set_on_tip_changed(
                     [tracker = mweb_tracker.get(),
                      bcaster = embedded_broadcaster.get(),
+                     chain = embedded_chain.get(),
+                     utxo = ltc_utxo_cache.get(),
+                     utxo_db = ltc_utxo_db.get(),
                      &web_server](
                         const uint256& old_tip, uint32_t old_height,
                         const uint256& new_tip, uint32_t new_height) {
@@ -1723,6 +1808,57 @@ int main(int argc, char* argv[]) {
                                     << old_tip.GetHex().substr(0, 16) << " (h=" << old_height << ") → "
                                     << new_tip.GetHex().substr(0, 16) << " (h=" << new_height << ")"
                                     << (is_reorg ? " [REORG]" : "");
+
+                        // Disconnect old fork blocks from UTXO during reorg.
+                        // Uses undo data (added_outpoints + spent_coins) so full blocks
+                        // are NOT needed for the old fork.
+                        if (is_reorg && utxo && utxo_db && chain) {
+                            // Find fork point: walk old_tip backward until we find
+                            // a hash that's an ancestor of new_tip
+                            std::set<uint256> new_ancestors;
+                            {
+                                uint256 cur = new_tip;
+                                while (!cur.IsNull()) {
+                                    new_ancestors.insert(cur);
+                                    auto e = chain->get_header(cur);
+                                    if (!e) break;
+                                    cur = e->prev_hash;
+                                }
+                            }
+                            uint256 fork_hash;
+                            uint32_t fork_height = 0;
+                            {
+                                uint256 cur = old_tip;
+                                while (!cur.IsNull()) {
+                                    if (new_ancestors.count(cur)) {
+                                        fork_hash = cur;
+                                        auto e = chain->get_header(cur);
+                                        if (e) fork_height = e->height;
+                                        break;
+                                    }
+                                    auto e = chain->get_header(cur);
+                                    if (!e) break;
+                                    cur = e->prev_hash;
+                                }
+                            }
+
+                            if (!fork_hash.IsNull() && fork_height < old_height) {
+                                int disconnected = 0;
+                                for (uint32_t h = old_height; h > fork_height; --h) {
+                                    core::coin::BlockUndo undo;
+                                    if (utxo_db->get_block_undo(h, undo)) {
+                                        utxo->disconnect_from_undo(undo);
+                                        utxo_db->remove_block_undo(h);
+                                        ++disconnected;
+                                    }
+                                }
+                                utxo->flush(fork_hash, fork_height);
+                                LOG_WARNING << "[EMB-LTC] UTXO reorg: disconnected " << disconnected
+                                            << " blocks (h=" << old_height << "→" << fork_height
+                                            << ") fork=" << fork_hash.GetHex().substr(0, 16);
+                            }
+                        }
+
                         // Invalidate stale MWEB state — HogEx prev_txid is from the old fork
                         if (tracker) {
                             tracker->invalidate();
@@ -3242,6 +3378,9 @@ int main(int argc, char* argv[]) {
             std::unique_ptr<doge::coin::HeaderChain>  doge_chain;
             std::unique_ptr<ltc::coin::Mempool>       doge_pool;
             std::unique_ptr<doge::coin::DOGEChainParams> doge_params_ptr;
+            // DOGE UTXO set for fee computation (no segwit/MWEB — simplified)
+            std::unique_ptr<core::coin::UTXOViewDB>    doge_utxo_db;
+            std::unique_ptr<core::coin::UTXOViewCache> doge_utxo_cache;
 
             if (!merged_chain_specs.empty()) {
                 mm_manager = std::make_unique<c2pool::merged::MergedMiningManager>(ioc);
@@ -3352,7 +3491,23 @@ int main(int argc, char* argv[]) {
                         }
 
                         if (!doge_pool)
-                            doge_pool = std::make_unique<ltc::coin::Mempool>();
+                            doge_pool = std::make_unique<ltc::coin::Mempool>(core::coin::DOGE_LIMITS);
+
+                        // DOGE UTXO set (simplified — no segwit/MWEB)
+                        if (!doge_utxo_db) {
+                            auto utxo_path = (core::filesystem::config_path()
+                                / (settings->m_testnet ? "dogecoin_testnet" : "dogecoin")
+                                / "utxo_leveldb").string();
+                            core::LevelDBOptions utxo_opts;
+                            utxo_opts.block_cache_size = 16 * 1024 * 1024;  // 16 MB
+                            doge_utxo_db = std::make_unique<core::coin::UTXOViewDB>(utxo_path, utxo_opts);
+                            if (doge_utxo_db->open()) {
+                                doge_utxo_cache = std::make_unique<core::coin::UTXOViewCache>(doge_utxo_db.get());
+                                LOG_INFO << "[EMB-DOGE] UTXO set opened: best_height=" << doge_utxo_db->get_best_height();
+                            } else {
+                                LOG_WARNING << "[EMB-DOGE] UTXO DB failed to open — fees will be unknown";
+                            }
+                        }
 
                         // Embedded is always primary for DOGE when HeaderChain is available.
                         // --embedded-doge or having P2P both trigger this path.
@@ -3454,10 +3609,11 @@ int main(int argc, char* argv[]) {
                                 // Wire DOGE mempool: feed P2P transactions into the template builder's pool
                                 if (doge_pool) {
                                     broadcaster->set_on_new_tx(
-                                        [pool = doge_pool.get()](const std::string& peer_key,
-                                                                   const ltc::coin::Transaction& tx) {
+                                        [pool = doge_pool.get(),
+                                         utxo = doge_utxo_cache.get()](const std::string& peer_key,
+                                                                        const ltc::coin::Transaction& tx) {
                                             ltc::coin::MutableTransaction mtx(tx);
-                                            bool added = pool->add_tx(mtx);
+                                            bool added = pool->add_tx(mtx, utxo);
                                             if (added) {
                                                 LOG_DEBUG_COIND << "[DOGE] TX from " << peer_key
                                                           << " added to mempool (size=" << pool->size() << ")";
@@ -3537,17 +3693,67 @@ int main(int argc, char* argv[]) {
                                 // DOGE has no MWEB — only mempool cleanup needed.
                                 broadcaster->set_on_full_block(
                                     [pool = doge_pool.get(),
-                                     chain = doge_chain.get()](
+                                     chain = doge_chain.get(),
+                                     utxo = doge_utxo_cache.get(),
+                                     utxo_db = doge_utxo_db.get(),
+                                     bcaster_ptr = broadcaster.get(),
+                                     &web_server](
                                         const std::string& peer,
                                         const ltc::coin::BlockType& block) {
-                                        if (pool)
+                                        // Determine block height
+                                        auto packed_hdr = pack(static_cast<const ltc::coin::BlockHeaderType&>(block));
+                                        auto block_hash = Hash(packed_hdr.get_span());
+                                        uint32_t height = 0;
+                                        if (chain) {
+                                            auto entry = chain->get_header(block_hash);
+                                            if (entry) height = entry->height;
+                                            else { auto prev = chain->get_header(block.m_previous_block); if (prev) height = prev->height + 1; }
+                                        }
+                                        // UTXO connect (before mempool cleanup)
+                                        if (utxo && utxo_db) {
+                                            // DOGE: txid = hash of full serialization (no witness stripping)
+                                            auto txid_fn = [](const ltc::coin::MutableTransaction& tx) {
+                                                return ltc::coin::compute_txid(tx);
+                                            };
+                                            auto undo = utxo->connect_block(block, height, txid_fn);
+                                            utxo_db->put_block_undo(height, undo);
+                                            utxo->flush(block_hash, height);
+
+                                            // Enable BIP 35 mempool sync after first block
+                                            static bool doge_mempool_requested = false;
+                                            if (!doge_mempool_requested && bcaster_ptr) {
+                                                bcaster_ptr->enable_mempool_request();
+                                                doge_mempool_requested = true;
+                                                LOG_INFO << "[EMB-DOGE] UTXO ready — enabled BIP 35 mempool sync";
+                                                // Bootstrap: seed UTXO from last 10 blocks
+                                                if (chain && utxo_db->get_best_height() <= height) {
+                                                    int req = 0;
+                                                    for (int bi = 1; bi <= 10 && static_cast<int>(height) - bi >= 0; ++bi) {
+                                                        auto e = chain->get_header_by_height(height - bi);
+                                                        if (e) { bcaster_ptr->request_full_block(e->block_hash); ++req; }
+                                                    }
+                                                    if (req > 0) LOG_INFO << "[EMB-DOGE] Bootstrap: requested " << req << " historical blocks";
+                                                }
+                                            }
+                                        }
+                                        if (pool) {
+                                            pool->set_tip_height(height);
                                             pool->remove_for_block(block);
+                                            if (utxo) {
+                                                int resolved = pool->recompute_unknown_fees(utxo);
+                                                if (resolved > 0)
+                                                    web_server.trigger_work_refresh_debounced();
+                                            }
+                                        }
                                     });
 
                                 // Tip-changed handler: trigger work refresh so stratum miners
                                 // get updated merged mining targets immediately.
                                 doge_chain->set_on_tip_changed(
-                                    [bcaster_ptr, &web_server](
+                                    [bcaster_ptr, &web_server,
+                                     chain = doge_chain.get(),
+                                     utxo = doge_utxo_cache.get(),
+                                     utxo_db = doge_utxo_db.get()](
                                         const uint256& old_tip, uint32_t old_height,
                                         const uint256& new_tip, uint32_t new_height) {
                                         bool is_reorg = (new_height <= old_height);
@@ -3555,10 +3761,27 @@ int main(int argc, char* argv[]) {
                                                     << old_tip.GetHex().substr(0, 16) << " (h=" << old_height << ") → "
                                                     << new_tip.GetHex().substr(0, 16) << " (h=" << new_height << ")"
                                                     << (is_reorg ? " [REORG]" : "");
+
+                                        // Disconnect old fork UTXO during reorg
+                                        if (is_reorg && utxo && utxo_db && chain) {
+                                            std::set<uint256> new_anc;
+                                            { uint256 c = new_tip; while (!c.IsNull()) { new_anc.insert(c); auto e = chain->get_header(c); if (!e) break; c = e->prev_hash; } }
+                                            uint256 fork_h; uint32_t fork_ht = 0;
+                                            { uint256 c = old_tip; while (!c.IsNull()) { if (new_anc.count(c)) { fork_h = c; auto e = chain->get_header(c); if (e) fork_ht = e->height; break; } auto e = chain->get_header(c); if (!e) break; c = e->prev_hash; } }
+                                            if (!fork_h.IsNull() && fork_ht < old_height) {
+                                                int disc = 0;
+                                                for (uint32_t h = old_height; h > fork_ht; --h) {
+                                                    core::coin::BlockUndo undo;
+                                                    if (utxo_db->get_block_undo(h, undo)) { utxo->disconnect_from_undo(undo); utxo_db->remove_block_undo(h); ++disc; }
+                                                }
+                                                utxo->flush(fork_h, fork_ht);
+                                                LOG_WARNING << "[EMB-DOGE] UTXO reorg: disconnected " << disc << " blocks";
+                                            }
+                                        }
+
                                         // Request the new tip's full block for mempool cleanup
                                         if (bcaster_ptr)
                                             bcaster_ptr->request_full_block(new_tip);
-                                        // Trigger work refresh so stratum miners get the new tip
                                         web_server.trigger_work_refresh_debounced();
                                     });
                                 LOG_INFO << "[EMB-DOGE] Chain reorg handler registered";

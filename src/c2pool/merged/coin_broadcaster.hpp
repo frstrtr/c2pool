@@ -141,6 +141,28 @@ public:
     using RawHeadersParser = std::function<std::vector<ltc::coin::BlockHeaderType>(const uint8_t*, size_t)>;
     void set_raw_headers_parser(RawHeadersParser p) { m_raw_headers_parser = std::move(p); }
 
+    /// Enable BIP 35 mempool request for all current and future peer connections.
+    /// Call after UTXO is initialized so incoming txs can have fees computed.
+    void enable_mempool_request() {
+        m_request_mempool = true;
+        // Enable on all existing connected peers — but ONLY send mempool
+        // to peers that advertise NODE_BLOOM. Peers without NODE_BLOOM
+        // DISCONNECT us on mempool request (litecoind net_processing.cpp:3918).
+        for (auto& [key, peer] : m_peers) {
+            if (peer && peer->node_p2p.is_handshake_complete()) {
+                peer->node_p2p.enable_mempool_request();
+                if (peer->node_p2p.peer_has_bloom()) {
+                    peer->node_p2p.send_mempool();
+                    LOG_INFO << "[" << m_symbol << "] Sent BIP 35 mempool request to " << key;
+                } else {
+                    LOG_INFO << "[" << m_symbol << "] Skipped BIP 35 for " << key
+                             << " — no NODE_BLOOM (svc=0x" << std::hex
+                             << peer->node_p2p.peer_services() << std::dec << ")";
+                }
+            }
+        }
+    }
+
     /// Start: register local node (if any), start peer manager, begin connection loop.
     void start()
     {
@@ -360,6 +382,11 @@ private:
                 peer->node_p2p.set_raw_headers_parser(m_raw_headers_parser);
             }
 
+            // BIP 35: enable mempool request if UTXO is ready
+            if (m_request_mempool) {
+                peer->node_p2p.enable_mempool_request();
+            }
+
             peer->node_p2p.connect(addr);
 
             // Send getaddr after connection for peer discovery
@@ -448,6 +475,7 @@ private:
     FullBlockCallback    m_on_full_block;
     PeerHeightCallback   m_on_peer_height;
     RawHeadersParser     m_raw_headers_parser;
+    bool                 m_request_mempool{false};  // BIP 35 mempool sync
 };
 
 } // namespace merged

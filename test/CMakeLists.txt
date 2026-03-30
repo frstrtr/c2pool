@@ -24,6 +24,15 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
 
+    add_executable(test_utxo test_utxo.cpp)
+    target_link_libraries(test_utxo PRIVATE
+        GTest::gtest_main GTest::gtest
+        core ltc
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    gtest_discover_tests(test_utxo)
+
     add_executable(test_redistribute_address test_redistribute_address.cpp)
     target_link_libraries(test_redistribute_address PRIVATE
         GTest::gtest_main GTest::gtest
