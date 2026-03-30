@@ -353,19 +353,10 @@ public:
             selected.insert(entry.txid);
         }
 
-        // Pass 2: fill remaining space with unknown-fee txs (FIFO order)
-        for (auto& [ts, txid] : m_time_index) {
-            if (selected.count(txid)) continue;
-            auto pit = m_pool.find(txid);
-            if (pit == m_pool.end()) continue;
-            const auto& entry = pit->second;
-            if (total_weight + entry.weight > max_weight) continue;
-
-            total_weight += entry.weight;
-            // Unknown-fee txs contribute 0 to total_fees — conservative
-            result.push_back({entry.tx, 0, false});
-            selected.insert(txid);
-        }
+        // Unknown-fee txs excluded from template — they'll be included
+        // after fee revalidation once UTXO processes their input blocks.
+        // Including them with fee=0 would cause coinbasevalue mismatch
+        // vs p2pool (which gets accurate fees from daemon GBT).
 
         return {std::move(result), total_fees};
     }
