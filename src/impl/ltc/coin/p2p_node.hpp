@@ -70,6 +70,8 @@ private:
     bool m_peer_wants_cmpct_announce{false};
     // BIP 339 wtxidrelay state
     bool m_peer_wtxidrelay{false};
+    // Peer's advertised service flags (from version message)
+    uint64_t m_peer_services{0};
     // BIP 35: request full mempool inventory after handshake
     bool m_request_mempool_on_connect{false};
     // Compact block reconstruction state: pending compact block awaiting blocktxn
@@ -417,8 +419,11 @@ private:
 
     ADD_P2P_HANDLER(version)
     {
-        LOG_INFO << "" << "[" << m_chain_label << "] version: " << msg->m_command
-                 << " start_height=" << msg->m_start_height;
+        m_peer_services = msg->m_services;
+        LOG_INFO << "[" << m_chain_label << "] version: " << msg->m_command
+                 << " start_height=" << msg->m_start_height
+                 << " services=0x" << std::hex << msg->m_services << std::dec
+                 << " subver=" << msg->m_subversion;
         // Notify header chain of peer's tip height for fast-sync scrypt skip.
         if (m_on_peer_height && msg->m_start_height > 0)
             m_on_peer_height(msg->m_start_height);
@@ -468,16 +473,21 @@ private:
         }
 
         // BIP 35: Request mempool contents from peer.
-        // Sends a "mempool" message → peer responds with inv for all mempool txids.
-        // NOTE: Many litecoind/dogecoind nodes require NODE_BLOOM service flag
-        // (-peerbloomfilters=1) to respond to BIP 35. If the peer doesn't support
-        // it, the request is silently ignored — no disconnect, no error.
-        // We send to all peers; only ONE needs to respond for success.
-        // Normal inv relay ensures mempool fills eventually even without BIP 35.
+        // CRITICAL: Peers without NODE_BLOOM (0x04) will DISCONNECT us if we
+        // send the mempool message (litecoind net_processing.cpp:3918-3926).
+        // Only send if peer advertises NODE_BLOOM in their version services.
+        // Normal inv relay delivers NEW txs without BIP 35.
+        static constexpr uint64_t SVC_NODE_BLOOM = 4;
         if (m_request_mempool_on_connect) {
-            send_mempool();
-            LOG_INFO << "[" << m_chain_label << "] Sent BIP 35 mempool request to peer"
-                     << " (requires NODE_BLOOM on peer side)";
+            if (m_peer_services & SVC_NODE_BLOOM) {
+                send_mempool();
+                LOG_INFO << "[" << m_chain_label << "] Sent BIP 35 mempool request"
+                         << " (peer has NODE_BLOOM)";
+            } else {
+                LOG_INFO << "[" << m_chain_label << "] Skipped BIP 35 mempool request"
+                         << " — peer lacks NODE_BLOOM (0x" << std::hex << m_peer_services
+                         << std::dec << "), would cause disconnect";
+            }
         }
     }
 
@@ -500,10 +510,19 @@ private:
     ADD_P2P_HANDLER(inv)
     {
         std::vector<inventory_type> vinv;
-        
+
         for (auto& inv : msg->m_invs)
         {
-            switch (inv.base_type())
+            auto btype = inv.base_type();
+            // BIP 339: MSG_WTX (type 5) uses wtxid instead of txid.
+            // Request via MSG_WITNESS_TX (0x40000001) since getdata doesn't accept MSG_WTX.
+            // Reference: Bitcoin Core protocol.h line 447, net_processing.cpp line 3036
+            if (inv.m_type == inventory_type::wtx) {
+                vinv.push_back(inventory_type(inventory_type::witness_tx, inv.m_hash));
+                continue;
+            }
+
+            switch (btype)
             {
             case inventory_type::tx:
                 vinv.push_back(inv);
@@ -518,7 +537,7 @@ private:
                 // Recognized but not requested — ignore
                 break;
             default:
-                LOG_WARNING << "Unknown inv type 0x" << std::hex
+                LOG_WARNING << "[" << m_chain_label << "] Unknown inv type 0x" << std::hex
                             << static_cast<uint32_t>(inv.m_type) << std::dec;
                 break;
             }

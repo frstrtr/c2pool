@@ -94,6 +94,7 @@ struct inventory_type
         block           = 2,
         filtered_block  = 3,
         cmpct_block     = 4,
+        wtx             = 5,            // MSG_WTX (BIP 339 — wtxid-based relay)
         witness_tx      = 0x40000001,   // MSG_WITNESS_TX  (BIP 144)
         witness_block   = 0x40000002,   // MSG_WITNESS_BLOCK (BIP 144)
     };
