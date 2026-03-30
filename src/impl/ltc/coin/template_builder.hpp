@@ -203,16 +203,21 @@ public:
         // ── Subsidy ────────────────────────────────────────────────────────
         uint64_t subsidy = get_block_subsidy(next_h);
 
-        // ── Transactions from mempool ──────────────────────────────────────
-        auto mtxs = pool.get_sorted_txs(MAX_BLOCK_WEIGHT - COINBASE_RESERVE);
+        // ── Transactions from mempool (fee-sorted when UTXO available) ────
+        auto [selected_txs, total_fees] =
+            pool.get_sorted_txs_with_fees(MAX_BLOCK_WEIGHT - COINBASE_RESERVE);
+
+        // coinbasevalue = block reward + included transaction fees
+        // Matches litecoind's getblocktemplate coinbasevalue field.
+        uint64_t coinbasevalue = subsidy + total_fees;
 
         nlohmann::json         tx_array = nlohmann::json::array();
         std::vector<Transaction> tx_objects;
         std::vector<uint256>     tx_hashes;
 
-        for (const auto& mtx : mtxs) {
-            uint256     txid     = compute_txid(mtx);
-            auto        packed   = pack(TX_WITH_WITNESS(mtx));
+        for (const auto& stx : selected_txs) {
+            uint256     txid     = compute_txid(stx.tx);
+            auto        packed   = pack(TX_WITH_WITNESS(stx.tx));
             std::string hex_data = HexStr(packed.get_span());
             // wtxid = SHA256d of witness serialization (for witness merkle tree)
             uint256     wtxid    = Hash(packed.get_span());
@@ -221,9 +226,16 @@ public:
             entry["data"] = hex_data;
             entry["txid"] = txid.GetHex();
             entry["hash"] = wtxid.GetHex();  // wtxid for witness commitment
+            // Per-tx fee field — p2pool reads this in helper.py:123
+            // and uses it in data.py:876-884 to adjust subsidy when
+            // transactions are excluded from shares.
+            if (stx.fee_known)
+                entry["fee"] = static_cast<int64_t>(stx.fee);
+            else
+                entry["fee"] = nullptr;  // JSON null → p2pool uses base_subsidy fallback
             tx_array.push_back(std::move(entry));
 
-            tx_objects.push_back(Transaction(mtx));
+            tx_objects.push_back(Transaction(stx.tx));
             tx_hashes.push_back(txid);
         }
 
@@ -267,7 +279,7 @@ public:
         data["bits"]              = bits_to_hex(next_bits);
         data["height"]            = static_cast<int>(next_h);
         data["curtime"]           = static_cast<int64_t>(now_ts);
-        data["coinbasevalue"]     = static_cast<int64_t>(subsidy);
+        data["coinbasevalue"]     = static_cast<int64_t>(coinbasevalue);
         data["transactions"]      = std::move(tx_array);
         // Match litecoind GBT rules exactly
         data["rules"]             = has_mweb
@@ -284,7 +296,8 @@ public:
                  << " version=0x" << std::hex << block_version << std::dec
                  << " prev=" << tip.block_hash.GetHex().substr(0, 16) << "..."
                  << " bits=" << bits_to_hex(next_bits)
-                 << " subsidy=" << subsidy << " sat"
+                 << " subsidy=" << subsidy << " fees=" << total_fees
+                 << " coinbasevalue=" << coinbasevalue << " sat"
                  << " txs=" << tx_array.size()
                  << " mweb=" << (has_mweb ? "yes" : "no")
                  << " tip_ts=" << tip.header.m_timestamp
