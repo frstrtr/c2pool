@@ -1702,6 +1702,7 @@ int main(int argc, char* argv[]) {
                          utxo = ltc_utxo_cache.get(),
                          utxo_db = ltc_utxo_db.get(),
                          bcaster = embedded_broadcaster.get(),
+                         coinbase_maturity = core::coin::LTC_LIMITS.coinbase_maturity,
                          &web_server](
                             const std::string& peer,
                             const ltc::coin::BlockType& block) {
@@ -1744,12 +1745,14 @@ int main(int argc, char* argv[]) {
                                     mempool_requested = true;
                                     LOG_INFO << "[EMB-LTC] UTXO ready — enabled BIP 35 mempool sync";
 
-                                    // Bootstrap: request last 10 full blocks to seed UTXO.
-                                    // Ensures mempool fee computation has enough UTXOs from
-                                    // the start, instead of waiting for new blocks to arrive.
+                                    // Bootstrap: request historical blocks to seed UTXO.
+                                    // Depth = coinbase_maturity (100 for LTC/DOGE): any
+                                    // mempool tx spending a coinbase output needs its input
+                                    // block in our UTXO set, and coinbase outputs mature
+                                    // after exactly this many confirmations.
                                     if (chain && utxo_db->get_best_height() <= height) {
                                         int requested = 0;
-                                        for (int bi = 1; bi <= 10 && static_cast<int>(height) - bi >= 0; ++bi) {
+                                        for (uint32_t bi = 1; bi <= coinbase_maturity && bi <= height; ++bi) {
                                             auto entry = chain->get_header_by_height(height - bi);
                                             if (entry) {
                                                 bcaster->request_full_block(entry->block_hash);
@@ -3697,6 +3700,7 @@ int main(int argc, char* argv[]) {
                                      utxo = doge_utxo_cache.get(),
                                      utxo_db = doge_utxo_db.get(),
                                      bcaster_ptr = broadcaster.get(),
+                                     coinbase_maturity = core::coin::DOGE_LIMITS.coinbase_maturity,
                                      &web_server](
                                         const std::string& peer,
                                         const ltc::coin::BlockType& block) {
@@ -3725,10 +3729,10 @@ int main(int argc, char* argv[]) {
                                                 bcaster_ptr->enable_mempool_request();
                                                 doge_mempool_requested = true;
                                                 LOG_INFO << "[EMB-DOGE] UTXO ready — enabled BIP 35 mempool sync";
-                                                // Bootstrap: seed UTXO from last 10 blocks
+                                                // Bootstrap: seed UTXO with coinbase_maturity blocks
                                                 if (chain && utxo_db->get_best_height() <= height) {
                                                     int req = 0;
-                                                    for (int bi = 1; bi <= 10 && static_cast<int>(height) - bi >= 0; ++bi) {
+                                                    for (uint32_t bi = 1; bi <= coinbase_maturity && bi <= height; ++bi) {
                                                         auto e = chain->get_header_by_height(height - bi);
                                                         if (e) { bcaster_ptr->request_full_block(e->block_hash); ++req; }
                                                     }
