@@ -29,10 +29,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@v4
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
@@ -50,7 +50,7 @@ jobs:
 
       - if: matrix.build-mode == 'manual'
         name: Set up Python for Conan
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
@@ -64,7 +64,7 @@ jobs:
 
       - if: matrix.build-mode == 'manual'
         name: Restore Conan package cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.conan2
           key: conan2-codeql-ubuntu24-gcc13-debug-${{ hashFiles('conanfile.txt') }}
@@ -89,6 +89,6 @@ jobs:
 
       # ── Analysis ──────────────────────────────────────────────────────────
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@v4
         with:
           category: "/language:${{ matrix.language }}"
