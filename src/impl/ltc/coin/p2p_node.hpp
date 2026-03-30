@@ -298,6 +298,10 @@ public:
     /// Whether this peer supports compact blocks (BIP 152).
     bool supports_compact_blocks() const { return m_peer_supports_cmpct; }
     bool peer_wtxidrelay() const { return m_peer_wtxidrelay; }
+    /// Peer's service flags from version message (for NODE_BLOOM check etc.)
+    uint64_t peer_services() const { return m_peer_services; }
+    /// Check if peer supports NODE_BLOOM (required for BIP 35 mempool).
+    bool peer_has_bloom() const { return (m_peer_services & 4) != 0; }
 
     /// Set mempool reference for compact block reconstruction.
     void set_mempool(Mempool* mp) { m_mempool = mp; }
