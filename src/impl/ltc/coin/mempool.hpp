@@ -167,6 +167,16 @@ public:
         remove_tx_locked(txid);
     }
 
+    /// Manually set a transaction's fee (for testing without a UTXO set).
+    void set_tx_fee(const uint256& txid, uint64_t fee) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_pool.find(txid);
+        if (it == m_pool.end()) return;
+        it->second.fee = fee;
+        it->second.fee_known = true;
+        m_feerate_index.emplace(it->second.feerate(), txid);
+    }
+
     /// Remove confirmed txs + double-spend conflicts from mempool.
     /// Called from the full_block callback when a new block arrives via P2P.
     ///

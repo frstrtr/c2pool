@@ -294,8 +294,12 @@ TEST(TemplateBuilderTest, EmptyMempoolYieldsNoTransactions) {
 TEST(TemplateBuilderTest, MempoolTxsAppearInTemplate) {
     auto chain = make_chain_with_genesis();
     Mempool pool;
-    for (int i = 0; i < 5; ++i)
-        pool.add_tx(make_tx(static_cast<uint32_t>(i)));
+    for (int i = 0; i < 5; ++i) {
+        auto tx = make_tx(static_cast<uint32_t>(i));
+        auto txid = compute_txid(tx);
+        pool.add_tx(tx);
+        pool.set_tx_fee(txid, 1000);
+    }
 
     auto wd = TemplateBuilder::build_template(*chain, pool, true);
     ASSERT_TRUE(wd.has_value());
@@ -308,7 +312,10 @@ TEST(TemplateBuilderTest, MempoolTxsAppearInTemplate) {
 TEST(TemplateBuilderTest, TxArrayHasDataAndTxidFields) {
     auto chain = make_chain_with_genesis();
     Mempool pool;
-    pool.add_tx(make_tx(99));
+    auto tx99 = make_tx(99);
+    auto txid99 = compute_txid(tx99);
+    pool.add_tx(tx99);
+    pool.set_tx_fee(txid99, 500);
     auto wd = TemplateBuilder::build_template(*chain, pool, true);
     ASSERT_TRUE(wd.has_value());
 
@@ -326,7 +333,9 @@ TEST(TemplateBuilderTest, TxHashConsistencyWithHashes) {
     auto chain = make_chain_with_genesis();
     Mempool pool;
     auto tx = make_tx(42);
+    auto txid42 = compute_txid(tx);
     pool.add_tx(tx);
+    pool.set_tx_fee(txid42, 500);
 
     auto wd = TemplateBuilder::build_template(*chain, pool, true);
     ASSERT_TRUE(wd.has_value());
