@@ -351,6 +351,20 @@ private:
         std::string frozen_coinbase_hex;   // pre-built PPLNS coinbase from ref_hash_fn time
         nlohmann::json frozen_template;    // template snapshot from ref_hash_fn time
         uint256 frozen_block_hash;         // block hash at commit time (for AuxPoW proof)
+
+        // History of frozen snapshots keyed by block hash.
+        // Solves the stale-commitment race: the LTC coinbase contains an MM root
+        // from freeze time T1, but by submission time T2 a newer freeze may have
+        // overwritten the single frozen_* fields.  The history lets us look up
+        // the exact template/coinbase that matches the committed root.
+        struct FrozenSnapshot {
+            nlohmann::json tmpl;
+            std::string    coinbase_hex;
+            int64_t        timestamp;   // monotonic seconds for expiration
+        };
+        std::map<uint256, FrozenSnapshot> frozen_history;  // block_hash → snapshot
+        static constexpr size_t MAX_FROZEN_HISTORY = 10;
+        static constexpr int64_t FROZEN_EXPIRY_SEC = 300;  // 5 minutes
     };
     std::vector<ChainState> m_chains;
 
