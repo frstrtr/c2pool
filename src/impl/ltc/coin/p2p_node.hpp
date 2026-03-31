@@ -284,13 +284,18 @@ public:
         }
     }
 
-    /// Request a full block via getdata (MSG_MWEB_BLOCK for MWEB state extraction).
+    /// Request a full block via getdata.
+    /// LTC: MSG_MWEB_BLOCK (0x60000002) for MWEB state extraction.
+    /// DOGE: MSG_BLOCK (0x02) — no segwit/MWEB support.
     void request_full_block(const uint256& block_hash)
     {
         if (m_peer) {
-            // 0x60000002 = MSG_BLOCK | MSG_WITNESS_FLAG | MSG_MWEB_FLAG
+            bool is_doge = (m_chain_label == "DOGE" || m_chain_label == "doge");
+            auto inv = is_doge
+                ? inventory_type::block  // MSG_BLOCK for DOGE
+                : static_cast<inventory_type::inv_type>(0x60000002);  // MSG_MWEB_BLOCK for LTC
             auto msg = message_getdata::make_raw(
-                {inventory_type(static_cast<inventory_type::inv_type>(0x60000002), block_hash)});
+                {inventory_type(inv, block_hash)});
             m_peer->write(msg);
         }
     }
@@ -459,12 +464,15 @@ private:
             send_ping();
         });
 
-        // BIP 130: request header-first block announcements
-        auto msg_sendheaders = message_sendheaders::make_raw();
-        m_peer->write(msg_sendheaders);
-
-        // BIP 152: compact blocks — DOGE doesn't support segwit compact blocks (v2)
         bool is_doge = (m_chain_label == "DOGE" || m_chain_label == "doge");
+
+        // BIP 130: request header-first block announcements
+        // DOGE Core may not fully support BIP 130 — skip to avoid misbehaving score
+        if (!is_doge) {
+            auto msg_sendheaders = message_sendheaders::make_raw();
+            m_peer->write(msg_sendheaders);
+        }
+        // BIP 152: compact blocks — DOGE doesn't support segwit compact blocks (v2)
         if (!is_doge) {
             auto msg_cmpct = message_sendcmpct::make_raw(false, 2);
             m_peer->write(msg_cmpct);
