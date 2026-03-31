@@ -3618,8 +3618,11 @@ int main(int argc, char* argv[]) {
                                             ltc::coin::MutableTransaction mtx(tx);
                                             bool added = pool->add_tx(mtx, utxo);
                                             if (added) {
-                                                LOG_DEBUG_COIND << "[DOGE] TX from " << peer_key
-                                                          << " added to mempool (size=" << pool->size() << ")";
+                                                auto txid = ltc::coin::compute_txid(mtx);
+                                                LOG_INFO << "[EMB-DOGE] Mempool: tx=" << txid.GetHex().substr(0, 16)
+                                                         << " from=" << peer_key
+                                                         << " size=" << pool->size()
+                                                         << " fee=" << (pool->contains(txid) ? "pending" : "?");
                                             }
                                         });
                                     LOG_INFO << "DOGE mempool wired via P2P broadcaster";
@@ -3713,6 +3716,11 @@ int main(int argc, char* argv[]) {
                                             if (entry) height = entry->height;
                                             else { auto prev = chain->get_header(block.m_previous_block); if (prev) height = prev->height + 1; }
                                         }
+                                        LOG_INFO << "[EMB-DOGE] Full block received: height=" << height
+                                                 << " hash=" << block_hash.GetHex().substr(0, 16) << "..."
+                                                 << " txs=" << block.m_txs.size()
+                                                 << " from=" << peer;
+
                                         // UTXO connect (before mempool cleanup)
                                         if (utxo && utxo_db) {
                                             // DOGE: txid = hash of full serialization (no witness stripping)
@@ -3722,13 +3730,21 @@ int main(int argc, char* argv[]) {
                                             auto undo = utxo->connect_block(block, height, txid_fn);
                                             utxo_db->put_block_undo(height, undo);
                                             utxo->flush(block_hash, height);
+                                            LOG_INFO << "[EMB-DOGE] UTXO: connected block " << height
+                                                     << " hash=" << block_hash.GetHex().substr(0, 16)
+                                                     << " txs=" << block.m_txs.size()
+                                                     << " cache=" << utxo->cache_size();
 
-                                            // Enable BIP 35 mempool sync after first block
+                                            // Enable mempool tx relay after first block.
+                                            // DOGE does NOT support BIP 35 (mempool msg) or
+                                            // wtxidrelay (BIP 339). Txs arrive via standard inv/tx.
+                                            // enable_mempool_request() enables inv processing;
+                                            // the BIP 35 mempool msg is only sent if peer has NODE_BLOOM.
                                             static bool doge_mempool_requested = false;
                                             if (!doge_mempool_requested && bcaster_ptr) {
                                                 bcaster_ptr->enable_mempool_request();
                                                 doge_mempool_requested = true;
-                                                LOG_INFO << "[EMB-DOGE] UTXO ready — enabled BIP 35 mempool sync";
+                                                LOG_INFO << "[EMB-DOGE] UTXO ready — mempool tx relay active (inv/tx, no BIP 35)";
                                                 // Bootstrap: seed UTXO with coinbase_maturity blocks
                                                 if (chain && utxo_db->get_best_height() <= height) {
                                                     int req = 0;
@@ -3741,12 +3757,22 @@ int main(int argc, char* argv[]) {
                                             }
                                         }
                                         if (pool) {
+                                            auto before = pool->size();
                                             pool->set_tip_height(height);
                                             pool->remove_for_block(block);
+                                            auto after = pool->size();
+                                            if (before != after) {
+                                                LOG_INFO << "[EMB-DOGE] Mempool: removed " << (before - after)
+                                                         << " txs for block " << height
+                                                         << " (remaining=" << after << ")";
+                                            }
                                             if (utxo) {
                                                 int resolved = pool->recompute_unknown_fees(utxo);
-                                                if (resolved > 0)
+                                                if (resolved > 0) {
+                                                    LOG_INFO << "[EMB-DOGE] Fee revalidation: resolved=" << resolved
+                                                             << " pool_size=" << after;
                                                     web_server.trigger_work_refresh_debounced();
+                                                }
                                             }
                                         }
                                     });

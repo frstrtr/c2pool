@@ -9,6 +9,8 @@
 #include "header_chain.hpp"    // DOGE HeaderChain (uses DOGEChainParams)
 #include "chain_params.hpp"    // get_doge_block_subsidy(), calculate_doge_next_work()
 
+#include <core/log.hpp>
+
 // Reuse LTC's generic components (Mempool, block format, RPC data, merkle)
 #include <impl/ltc/coin/mempool.hpp>
 #include <impl/ltc/coin/rpc_data.hpp>
@@ -132,6 +134,18 @@ public:
         data["sizelimit"]         = 1'000'000;
         data["weightlimit"]       = 4'000'000;
         data["mintime"]           = static_cast<int64_t>(tip.header.m_timestamp + 1);
+
+        LOG_INFO << "[EMB-DOGE] TemplateBuilder: height=" << next_h
+                 << " version=0x" << std::hex << block_version << std::dec
+                 << " prev=" << tip.block_hash.GetHex().substr(0, 16) << "..."
+                 << " bits=" << bits_to_hex(next_bits)
+                 << " subsidy=" << subsidy
+                 << " fees=" << total_fees
+                 << " coinbasevalue=" << coinbasevalue << " sat"
+                 << " txs=" << selected_txs.size()
+                 << " tip_ts=" << tip.header.m_timestamp
+                 << " now=" << now_ts
+                 << " synced=" << (chain.is_synced() ? "true" : "false");
 
         return ltc::coin::rpc::WorkData{std::move(data), std::move(tx_objects), std::move(tx_hashes), 0};
     }

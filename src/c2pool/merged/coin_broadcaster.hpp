@@ -302,7 +302,9 @@ public:
         int sent = 0;
         for (auto& [key, peer] : m_peers) {
             try {
-                peer->node_p2p.send_getheaders(70017, locator, stop_hash);
+                // DOGE uses protocol 70015, LTC uses 70017
+                uint32_t proto = (m_symbol == "DOGE" || m_symbol == "doge") ? 70015 : 70017;
+                peer->node_p2p.send_getheaders(proto, locator, stop_hash);
                 ++sent;
             } catch (const std::exception& e) {
                 LOG_WARNING << "[" << m_symbol << "] getheaders to "
