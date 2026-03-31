@@ -202,64 +202,61 @@ private:
 
     void calculate_head_tail(hash_t head, hash_t tail, index_t* /*index*/)
     {
-        // Matches p2pool forest.py add() logic.
-        // No prev pointers, no accumulated values.
-        // Just maintain heads/tails/reverse maps.
+        // Exact translation of p2pool forest.py add() lines 250-277.
+        // Two independent resolutions + uniform map update.
+        // The old 4-case if/elif pattern failed when tail (prev_hash) was a
+        // mid-chain share (not a head): it fell to NEW_FORK, creating a
+        // spurious disconnected tail.  p2pool resolves through mid-chain
+        // shares via get_last(), keeping all forks rooted at a common tail.
         //
         // head = new share's hash, tail = new share's prev_hash
-        //
-        // Cases:
-        //   tail in heads → only_heads: new share extends existing chain top
-        //   head in tails → only_tails: new share fills gap below existing chain
-        //   both          → merge: new share connects two chains
-        //   neither       → new_fork: new disconnected chain segment
 
-        bool tail_in_heads = m_heads.contains(tail);
-        bool head_in_tails = m_tails.contains(head);
-
-        if (tail_in_heads && head_in_tails)
+        // Step 1 (p2pool lines 257-260): If head was already a tail
+        // (children arrived before parent), gather all heads above it.
+        std::set<hash_t> heads_set;
+        if (m_tails.contains(head))
         {
-            // MERGE: connect two chains.
-            // tail was a head of chain A, head was a tail of chain B.
-            // After adding this share: A ← new_share ← B become one chain.
-            auto old_tail_of_A = m_heads[tail]; // A's deepest tail
-            auto heads_of_B = m_tails[head];    // all heads that reached B's tail
-
-            // Remove old entries
-            m_heads.erase(tail);
+            heads_set = m_tails[head];
             m_tails.erase(head);
-
-            // All B's heads now reach A's tail
-            for (auto& h : heads_of_B)
-                m_heads[h] = old_tail_of_A;
-            m_tails[old_tail_of_A].insert(heads_of_B.begin(), heads_of_B.end());
-            m_tails[old_tail_of_A].erase(tail);
-        }
-        else if (tail_in_heads)
-        {
-            // ONLY_HEADS: extend chain from the top.
-            // tail was a head → new share becomes the new head.
-            auto old_tail = m_heads[tail];
-            m_heads.erase(tail);
-            m_heads[head] = old_tail;
-            m_tails[old_tail].erase(tail);
-            m_tails[old_tail].insert(head);
-        }
-        else if (head_in_tails)
-        {
-            // ONLY_TAILS: extend chain from the bottom.
-            // head was a tail → shares above now reach deeper via new share.
-            auto heads_above = m_tails[head];
-            m_tails.erase(head);
-            for (auto& h : heads_above)
-                m_heads[h] = tail;
-            m_tails[tail].insert(heads_above.begin(), heads_above.end());
         }
         else
         {
-            // NEW_FORK: disconnected chain segment.
-            m_heads[head] = tail;
-            m_tails[tail].insert(head);
+            heads_set.insert(head);
+        }
+
+        // Step 2 (p2pool lines 262-265): Resolve the actual tail.
+        // If prev_hash is a current head → use its deep tail.
+        // Otherwise → walk the chain to find the real root.
+        hash_t resolved_tail;
+        if (m_heads.contains(tail))
+        {
+            resolved_tail = m_heads[tail];
+            m_heads.erase(tail);
+        }
+        else
+        {
+            // get_last() walks m_shares via prev_hash until a hash NOT in
+            // the tracker is reached.  If tail is mid-chain → finds real
+            // root.  If tail is not in tracker → returns tail itself.
+            resolved_tail = get_last(tail);
+        }
+
+        // Step 3 (p2pool lines 270-272): Update tails map.
+        m_tails[resolved_tail].insert(heads_set.begin(), heads_set.end());
+        if (m_tails[resolved_tail].contains(tail))
+            m_tails[resolved_tail].erase(tail);
+
+        // Step 4 (p2pool lines 274-275): Update heads map.
+        for (auto& h : heads_set)
+            m_heads[h] = resolved_tail;
+
+        // Diagnostic: log first 200 additions to verify case distribution.
+        static int add_log_count = 0;
+        if (add_log_count++ < 200) {
+            std::fprintf(stderr, "[forest-add] hash=%.16s prev=%.16s resolved_tail=%.16s heads=%zu tails=%zu\n",
+                         head.GetHex().c_str(), tail.GetHex().c_str(),
+                         resolved_tail.GetHex().c_str(),
+                         m_heads.size(), m_tails.size());
         }
     }
 
