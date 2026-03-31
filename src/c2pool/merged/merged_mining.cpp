@@ -929,6 +929,113 @@ void MergedMiningManager::try_submit_merged_blocks(
             uint32_t nonce = 0;
             std::memcpy(p, &nonce, 4);
 
+            // ── DIAGNOSTIC: verify AuxPoW will pass dogecoind validation ──
+            {
+                // 1. Hash the submitted DOGE header (what dogecoind will compute)
+                uint256 submitted_hash = Hash(header_bytes);
+                LOG_WARNING << "[MM-DIAG:" << chain.config.symbol << "] submitted_header_hash="
+                            << submitted_hash.GetHex();
+                LOG_WARNING << "[MM-DIAG:" << chain.config.symbol << "] frozen_block_hash="
+                            << chain.frozen_block_hash.GetHex();
+                LOG_WARNING << "[MM-DIAG:" << chain.config.symbol << "] current_work.block_hash="
+                            << chain.current_work.block_hash.GetHex();
+                if (submitted_hash != chain.frozen_block_hash) {
+                    LOG_ERROR << "[MM-DIAG:" << chain.config.symbol
+                              << "] HASH MISMATCH! submitted_header_hash != frozen_block_hash"
+                              << " — dogecoind WILL reject this block!";
+                }
+
+                // 2. Header field comparison
+                LOG_WARNING << "[MM-DIAG:" << chain.config.symbol << "] header fields:"
+                            << " version=0x" << std::hex << version << std::dec
+                            << " prev=" << prev_hash.GetHex().substr(0, 16) << "..."
+                            << " merkle=" << merkle_root.GetHex().substr(0, 16) << "..."
+                            << " time=" << curtime << " bits=0x" << std::hex << nbits << std::dec
+                            << " nonce=0";
+
+                // 3. Check MM commitment in parent coinbase
+                auto mm_root_for_check = proof.root;
+                LOG_WARNING << "[MM-DIAG:" << chain.config.symbol << "] proof.root="
+                            << mm_root_for_check.GetHex()
+                            << " proof.branch_size=" << proof.branch.size()
+                            << " proof.index=" << proof.index
+                            << " tree_size=" << m_tree.size;
+
+                // 4. Search for fabe6d6d in parent coinbase
+                auto parent_cb_bytes = from_hex(parent_coinbase_hex);
+                static const uint8_t MAGIC[] = {0xfa, 0xbe, 0x6d, 0x6d};
+                auto magic_pos = std::search(parent_cb_bytes.begin(), parent_cb_bytes.end(),
+                                              std::begin(MAGIC), std::end(MAGIC));
+                if (magic_pos == parent_cb_bytes.end()) {
+                    LOG_ERROR << "[MM-DIAG:" << chain.config.symbol
+                              << "] fabe6d6d NOT FOUND in parent coinbase! len="
+                              << parent_cb_bytes.size();
+                } else {
+                    size_t offset = std::distance(parent_cb_bytes.begin(), magic_pos);
+                    LOG_WARNING << "[MM-DIAG:" << chain.config.symbol
+                                << "] fabe6d6d found at offset " << offset
+                                << " in parent coinbase (len=" << parent_cb_bytes.size() << ")";
+                    // Extract 32 bytes after magic as the committed root
+                    if (offset + 4 + 32 <= parent_cb_bytes.size()) {
+                        // The committed root is in BE in the coinbase
+                        // Convert to uint256 for comparison
+                        uint256 committed_root;
+                        // Reverse BE→LE into uint256
+                        uint8_t* dst = reinterpret_cast<uint8_t*>(committed_root.data());
+                        for (int i = 0; i < 32; ++i)
+                            dst[i] = parent_cb_bytes[offset + 4 + 31 - i];
+                        LOG_WARNING << "[MM-DIAG:" << chain.config.symbol
+                                    << "] committed_root (from coinbase)="
+                                    << committed_root.GetHex();
+                        LOG_WARNING << "[MM-DIAG:" << chain.config.symbol
+                                    << "] submitted_hash (dogecoind expects)="
+                                    << submitted_hash.GetHex();
+                        if (committed_root != submitted_hash) {
+                            LOG_ERROR << "[MM-DIAG:" << chain.config.symbol
+                                      << "] ROOT MISMATCH! committed_root != submitted_hash"
+                                      << " — this is why dogecoind rejects!";
+                        } else {
+                            LOG_WARNING << "[MM-DIAG:" << chain.config.symbol
+                                        << "] Root matches — searching for raw bytes...";
+                        }
+                    }
+                    // 5. Raw byte search (exactly what dogecoind does)
+                    // dogecoind searches for submitted_hash reversed (BE) in scriptSig
+                    std::vector<uint8_t> hash_be(32);
+                    const uint8_t* hp = reinterpret_cast<const uint8_t*>(submitted_hash.data());
+                    for (int i = 0; i < 32; ++i) hash_be[i] = hp[31 - i];
+                    // Extract scriptSig from parent coinbase (skip version+vin_count+prevout)
+                    // version(4) + vin_count(1) + prev_hash(32) + prev_idx(4) = 41, then scriptSig_len
+                    if (parent_cb_bytes.size() > 42) {
+                        size_t ssoff = 41;
+                        uint8_t sslen_byte = parent_cb_bytes[ssoff];
+                        LOG_WARNING << "[MM-DIAG:" << chain.config.symbol
+                                    << "] scriptSig offset=" << ssoff
+                                    << " len_byte=0x" << std::hex << (int)sslen_byte << std::dec;
+                        auto ss_begin = parent_cb_bytes.begin() + ssoff + 1;
+                        auto ss_end = ss_begin + sslen_byte;
+                        if (ss_end > parent_cb_bytes.end()) ss_end = parent_cb_bytes.end();
+                        auto found = std::search(ss_begin, ss_end, hash_be.begin(), hash_be.end());
+                        if (found == ss_end) {
+                            LOG_ERROR << "[MM-DIAG:" << chain.config.symbol
+                                      << "] submitted_hash (BE) NOT FOUND in scriptSig!"
+                                      << " hash_be=" << to_hex(hash_be.data(), 32);
+                            // Dump scriptSig hex for manual inspection
+                            std::string ss_hex = to_hex(
+                                reinterpret_cast<const uint8_t*>(&*ss_begin),
+                                std::distance(ss_begin, ss_end));
+                            LOG_ERROR << "[MM-DIAG:" << chain.config.symbol
+                                      << "] scriptSig hex=" << ss_hex;
+                        } else {
+                            LOG_WARNING << "[MM-DIAG:" << chain.config.symbol
+                                        << "] submitted_hash found in scriptSig at offset "
+                                        << std::distance(ss_begin, found) << " — should pass!";
+                        }
+                    }
+                }
+            }
+            // ── END DIAGNOSTIC ──
+
             // Assemble: header + auxpow + coinbase + template txs
             std::ostringstream blk;
             blk << to_hex(header_bytes.data(), 80);
@@ -1108,6 +1215,19 @@ MergedMiningManager::build_merged_header_info() const
             std::memcpy(p, &nbits, 4); p += 4;
             uint32_t nonce = 0;
             std::memcpy(p, &nonce, 4);
+
+            // DIAGNOSTIC: log frozen header hash for comparison at submit time
+            {
+                uint256 frozen_hdr_hash = Hash(info.block_header);
+                LOG_WARNING << "[MM-FREEZE:" << snap.chain_id << "] frozen_header_hash="
+                            << frozen_hdr_hash.GetHex()
+                            << " version=0x" << std::hex << version << std::dec
+                            << " prev=" << prev_hash_hex.substr(0, 16) << "..."
+                            << " merkle=" << merkle_root.GetHex().substr(0, 16) << "..."
+                            << " time=" << curtime
+                            << " bits=" << bits_hex
+                            << " cb_len=" << info.coinbase_hex.size()/2;
+            }
 
             LOG_TRACE << "[MM-header] header built, pushing result";
             result.push_back(std::move(info));
