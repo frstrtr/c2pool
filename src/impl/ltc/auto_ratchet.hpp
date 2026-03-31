@@ -96,18 +96,10 @@ public:
             return {current_version, target_version_};
         }
 
-        // Count votes and actual new-format shares in window
+        // Count votes and actual new-format shares in window.
+        // p2pool uses tracker.get_height() (chain depth) for both sampling
+        // and confirmation counting. This matches data.py:2488,2576.
         int32_t height = tracker.chain.get_height(best_share_hash);
-
-        // Use absheight (monotonically increasing) for confirm_count tracking.
-        // chain.get_height() returns chain DEPTH which plateaus after pruning
-        // at ~CHAIN_LENGTH, preventing confirm_count from ever reaching 800.
-        int32_t abs_height = 0;
-        if (tracker.chain.contains(best_share_hash)) {
-            tracker.chain.get(best_share_hash).share.invoke([&](auto* obj) {
-                abs_height = static_cast<int32_t>(obj->m_absheight);
-            });
-        }
         int32_t sample = std::min(height, static_cast<int32_t>(chain_length));
 
         int32_t target_votes = 0;   // shares voting desired_version >= target
@@ -173,11 +165,12 @@ public:
                 {
                 state_ = RatchetState::ACTIVATED;
                 activated_at_ = now_seconds();
-                activated_height_ = abs_height;
+                activated_height_ = height;
                 // Credit retroactive shares for late-joining nodes
-                int32_t retroactive = std::max(0, abs_height - static_cast<int32_t>(chain_length));
+                // p2pool data.py:2535: retroactive = max(0, height - net.CHAIN_LENGTH)
+                int32_t retroactive = std::max(0, height - static_cast<int32_t>(chain_length));
                 confirm_count_ = retroactive;
-                last_seen_height_ = abs_height;
+                last_seen_height_ = height;
 
                 LOG_INFO << "[AutoRatchet] VOTING -> ACTIVATED ("
                          << vote_pct << "% of " << total << " shares vote V"
@@ -213,21 +206,19 @@ public:
             }
             else if (activated_height_ > 0)
             {
-                // Track cumulative height increases using absheight (monotonic).
-                // chain depth (get_height) plateaus at ~CHAIN_LENGTH after pruning,
-                // preventing confirm_count from reaching 800. absheight always grows.
-                if (last_seen_height_ > 0 && abs_height > last_seen_height_)
-                    confirm_count_ += (abs_height - last_seen_height_);
-                last_seen_height_ = abs_height;
+                // Track cumulative height increases using chain depth.
+                // p2pool data.py:2576: uses tracker.get_height() (chain depth).
+                if (last_seen_height_ > 0 && height > last_seen_height_)
+                    confirm_count_ += (height - last_seen_height_);
+                last_seen_height_ = height;
 
                 {
                     static int ac_log = 0;
                     if (ac_log++ % 20 == 0)
                         LOG_INFO << "[AutoRatchet] ACTIVATED: vote=" << vote_pct
                                  << "% share=" << share_pct << "% full=" << (full_window ? "True" : "False")
-                                 << " height=" << abs_height
-                                 << " confirm=" << confirm_count_ << "/" << confirmation_window
-                                 << " chain_depth=" << height;
+                                 << " height=" << height
+                                 << " confirm=" << confirm_count_ << "/" << confirmation_window;
                 }
 
                 if (confirm_count_ >= static_cast<int32_t>(confirmation_window) &&
