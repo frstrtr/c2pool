@@ -1381,6 +1381,7 @@ void NodeImpl::clean_tracker()
     //   1. Top-5 scored heads (decorated_heads[-5:])
     //   2. Heads seen < 300s ago
     //   3. Unverified heads whose tail has recent child activity (< 120s)
+    if (!m_last_top5_heads.empty())  // p2pool node.py:359: if decorated_heads:
     {
         // Build top-5 set for O(1) lookup
         std::set<uint256> top5_set(m_last_top5_heads.begin(), m_last_top5_heads.end());
