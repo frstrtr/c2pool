@@ -1384,21 +1384,20 @@ int main(int argc, char* argv[]) {
                 mweb_tracker    = std::make_unique<ltc::coin::MWEBTracker>();
                 embedded_node   = std::make_unique<ltc::coin::EmbeddedCoinNode>(
                     *embedded_chain, *embedded_pool, settings->m_testnet, mweb_tracker.get());
-                // Gate mining until UTXO has coinbase maturity depth (100 blocks).
+                // Gate mining until UTXO has coinbase maturity depth (100 blocks for LTC).
                 // Without this, block templates may include TXs spending immature coinbase outputs.
-                if (ltc_utxo_db) {
-                    auto* db_ptr = ltc_utxo_db.get();
-                    auto* chain_ptr = embedded_chain.get();
+                // Reference: litecoin/src/consensus/consensus.h COINBASE_MATURITY = 100
+                if (ltc_utxo_cache) {
+                    auto* cache_ptr = ltc_utxo_cache.get();
                     constexpr uint32_t LTC_MATURITY = core::coin::LTC_LIMITS.coinbase_maturity;
-                    embedded_node->set_utxo_ready_fn([db_ptr, chain_ptr, LTC_MATURITY]() {
-                        auto chain_h = chain_ptr->height();
-                        auto utxo_h = db_ptr->get_best_height();
-                        bool ready = utxo_h > 0 && chain_h > 0 && (chain_h - utxo_h) < LTC_MATURITY;
+                    embedded_node->set_utxo_ready_fn([cache_ptr, LTC_MATURITY]() {
+                        auto connected = cache_ptr->blocks_connected();
+                        bool ready = connected >= LTC_MATURITY;
                         if (!ready) {
                             static int s_log_ctr = 0;
                             if (s_log_ctr++ % 20 == 0)
-                                LOG_INFO << "[EMB-LTC] UTXO maturity gate: chain=" << chain_h
-                                         << " utxo=" << utxo_h << " need gap<" << LTC_MATURITY;
+                                LOG_INFO << "[EMB-LTC] UTXO maturity gate: blocks_connected="
+                                         << connected << " need>=" << LTC_MATURITY;
                         }
                         return ready;
                     });
@@ -1748,6 +1747,10 @@ int main(int argc, char* argv[]) {
                                 auto undo = utxo->connect_block(block, height, txid_fn);
                                 utxo_db->put_block_undo(height, undo);
                                 utxo->flush(block_hash, height);
+
+                                // Prune old undo data matching litecoind MIN_BLOCKS_TO_KEEP = 288
+                                // Reference: litecoin/src/validation.h MIN_BLOCKS_TO_KEEP
+                                utxo->prune_undo(height, core::coin::LTC_MIN_BLOCKS_TO_KEEP);
 
                                 static int utxo_log = 0;
                                 if (utxo_log++ % 10 == 0) {
@@ -3537,21 +3540,20 @@ int main(int argc, char* argv[]) {
                         {
                             auto backend = std::make_unique<doge::coin::AuxChainEmbedded>(
                                 *doge_chain, *doge_pool, *doge_params_ptr, cfg);
-                            // Gate mining until UTXO has coinbase maturity depth (240 blocks).
+                            // Gate mining until UTXO has coinbase maturity depth (240 blocks for DOGE).
                             // Without this, block templates may include TXs spending immature coinbase outputs.
-                            if (doge_utxo_db) {
-                                auto* db_ptr = doge_utxo_db.get();
-                                auto* chain_ptr = doge_chain.get();
+                            // Reference: dogecoin/src/chainparams.cpp digishieldConsensus.nCoinbaseMaturity = 240
+                            if (doge_utxo_cache) {
+                                auto* cache_ptr = doge_utxo_cache.get();
                                 constexpr uint32_t DOGE_MATURITY = core::coin::DOGE_LIMITS.coinbase_maturity;
-                                backend->embedded_node().set_utxo_ready_fn([db_ptr, chain_ptr, DOGE_MATURITY]() {
-                                    auto chain_h = chain_ptr->height();
-                                    auto utxo_h = db_ptr->get_best_height();
-                                    bool ready = utxo_h > 0 && chain_h > 0 && (chain_h - utxo_h) < DOGE_MATURITY;
+                                backend->embedded_node().set_utxo_ready_fn([cache_ptr, DOGE_MATURITY]() {
+                                    auto connected = cache_ptr->blocks_connected();
+                                    bool ready = connected >= DOGE_MATURITY;
                                     if (!ready) {
                                         static int s_log_ctr = 0;
                                         if (s_log_ctr++ % 20 == 0)
-                                            LOG_INFO << "[EMB-DOGE] UTXO maturity gate: chain=" << chain_h
-                                                     << " utxo=" << utxo_h << " need gap<" << DOGE_MATURITY;
+                                            LOG_INFO << "[EMB-DOGE] UTXO maturity gate: blocks_connected="
+                                                     << connected << " need>=" << DOGE_MATURITY;
                                     }
                                     return ready;
                                 });
@@ -3768,6 +3770,11 @@ int main(int argc, char* argv[]) {
                                             auto undo = utxo->connect_block(block, height, txid_fn);
                                             utxo_db->put_block_undo(height, undo);
                                             utxo->flush(block_hash, height);
+
+                                            // Prune old undo data matching dogecoind MIN_BLOCKS_TO_KEEP = 1440
+                                            // Reference: dogecoin/src/validation.h MIN_BLOCKS_TO_KEEP
+                                            utxo->prune_undo(height, core::coin::DOGE_MIN_BLOCKS_TO_KEEP);
+
                                             LOG_INFO << "[EMB-DOGE] UTXO: connected block " << height
                                                      << " hash=" << block_hash.GetHex().substr(0, 16)
                                                      << " txs=" << block.m_txs.size()

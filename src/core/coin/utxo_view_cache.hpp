@@ -28,7 +28,11 @@ namespace coin {
 
 class UTXOViewCache {
 public:
-    explicit UTXOViewCache(UTXOViewDB* base) : m_base(base) {}
+    explicit UTXOViewCache(UTXOViewDB* base) : m_base(base) {
+        // Initialize block counter from DB state (survives restarts)
+        if (m_base && m_base->get_best_height() > 0)
+            m_blocks_connected = m_base->get_best_height();
+    }
 
     // ── Read operations ─────────────────────────────────────────────────
 
@@ -178,6 +182,7 @@ public:
             }
         }
 
+        ++m_blocks_connected;
         return undo;
     }
 
@@ -272,8 +277,35 @@ public:
         return m_base ? m_base->get_best_height() : 0;
     }
 
+    /// Number of blocks connected since startup (or loaded from DB on restart).
+    /// Used for coinbase maturity gate — mining blocked until this reaches
+    /// the chain's COINBASE_MATURITY depth.
+    uint32_t blocks_connected() const { return m_blocks_connected; }
+
+    /// Prune undo data older than (tip_height - keep_depth).
+    /// Reference: litecoind validation.cpp PruneBlockFilesManual()
+    ///   LTC: keep_depth = MIN_BLOCKS_TO_KEEP = 288 (litecoin/src/validation.h)
+    ///   DOGE: keep_depth = MIN_BLOCKS_TO_KEEP = 1440 (dogecoin/src/validation.h)
+    uint32_t prune_undo(uint32_t tip_height, uint32_t keep_depth) {
+        if (!m_base || tip_height <= keep_depth) return 0;
+        uint32_t prune_below = tip_height - keep_depth;
+        uint32_t pruned = 0;
+        for (uint32_t h = m_oldest_undo_height; h < prune_below; ++h) {
+            if (m_base->remove_block_undo(h))
+                ++pruned;
+        }
+        if (pruned > 0) {
+            m_oldest_undo_height = prune_below;
+            LOG_INFO << "[UTXO] Pruned " << pruned << " undo records below height "
+                     << prune_below << " (keep_depth=" << keep_depth << ")";
+        }
+        return pruned;
+    }
+
 private:
     UTXOViewDB* m_base;
+    uint32_t m_blocks_connected{0};
+    uint32_t m_oldest_undo_height{0};
     // Cache: outpoint → optional<Coin>
     //   - has_value() && !is_spent(): coin exists
     //   - nullopt: coin was spent (erased)

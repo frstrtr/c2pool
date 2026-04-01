@@ -35,11 +35,20 @@ struct ChainLimits {
 };
 
 /// LTC: 84M * 1e8 sat, 100-block coinbase maturity, 6-block pegout maturity
+/// Reference: litecoin/src/consensus/consensus.h COINBASE_MATURITY, PEGOUT_MATURITY
 static constexpr ChainLimits LTC_LIMITS  = {8'400'000'000'000'000LL, 100, 6};
 
 /// DOGE: ~10B * 1e8 sat (infinite inflation, but max single value bounded),
-///       240-block coinbase maturity, no pegout (no MWEB)
+///       240-block coinbase maturity (post-DigiShield), no pegout (no MWEB)
+/// Reference: dogecoin/src/chainparams.cpp digishieldConsensus.nCoinbaseMaturity
 static constexpr ChainLimits DOGE_LIMITS = {1'000'000'000'000'000'000LL, 240, 0};
+
+/// Minimum blocks of undo data to keep for reorg safety + pruning.
+/// Matches the MIN_BLOCKS_TO_KEEP constant in each daemon's validation.h.
+/// Reference: litecoin/src/validation.h  MIN_BLOCKS_TO_KEEP = 288
+/// Reference: dogecoin/src/validation.h  MIN_BLOCKS_TO_KEEP = 1440
+static constexpr uint32_t LTC_MIN_BLOCKS_TO_KEEP  = 288;
+static constexpr uint32_t DOGE_MIN_BLOCKS_TO_KEEP = 1440;
 
 /// Check if a value is within the valid money range for a chain.
 /// Reference: LTC/DOGE amount.h MoneyRange()
