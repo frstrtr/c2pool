@@ -363,14 +363,12 @@ private:
             int64_t        timestamp;   // monotonic seconds for expiration
         };
         std::map<uint256, FrozenSnapshot> frozen_history;  // block_hash → snapshot
-        uint256 last_known_tip;  // previous DOGE block hash — used to clear cache on tip change
-
-        // Matches dogecoind CAuxBlockCache behavior (rpc/auxcache.cpp):
-        //   - No size limit — keep ALL snapshots between tip changes
-        //   - Clear entire cache when chain tip changes (new DOGE block)
-        //   - submitauxblock looks up by hash, finds any previously created block
-        // Fallback expiry (10 min) catches edge cases where tip doesn't change.
-        static constexpr int64_t FROZEN_EXPIRY_SEC = 600;
+        // Keep enough frozen snapshots to cover FROZEN_EXPIRY_SEC (300s).
+        // Each new share creates a snapshot (~3s on testnet, ~15s on mainnet).
+        // p2pool uses RPC submitauxblock which handles stale work natively —
+        // embedded mode needs this history because there's no daemon RPC.
+        static constexpr size_t MAX_FROZEN_HISTORY = 100;
+        static constexpr int64_t FROZEN_EXPIRY_SEC = 300;  // 5 minutes
     };
     std::vector<ChainState> m_chains;
 
