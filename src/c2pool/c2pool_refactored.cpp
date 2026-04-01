@@ -1452,7 +1452,9 @@ int main(int argc, char* argv[]) {
                         }
                     });
 
-                // Wire peer height callback for fast-sync: skip scrypt on old headers
+                // Wire peer height callback for fast-sync: skip scrypt PoW on old headers.
+                // No anchor checkpoint needed — header sync is fast (headers are 80 bytes,
+                // old ones skip scrypt PoW). Use --header-checkpoint as optional speedup.
                 embedded_broadcaster->set_on_peer_height(
                     [chain = embedded_chain.get()](uint32_t h) {
                         chain->set_peer_tip_height(h);
@@ -1768,15 +1770,17 @@ int main(int argc, char* argv[]) {
                                     LOG_INFO << "[EMB-LTC] UTXO ready — enabled BIP 35 mempool sync";
                                 }
 
-                                // Bootstrap: seed UTXO with coinbase_maturity (100) blocks.
-                                // Reference: litecoin/src/consensus/consensus.h COINBASE_MATURITY = 100
+                                // Bootstrap: seed UTXO with MIN_BLOCKS_TO_KEEP (288) blocks.
+                                // Matches litecoind pruned node safety depth.
+                                // Reference: litecoin/src/validation.h MIN_BLOCKS_TO_KEEP = 288
                                 // Only fire once, and only when header chain has synced
-                                // (height > maturity ensures we're at tip, not genesis).
+                                // (height > keep_depth ensures we're at tip, not genesis).
                                 static bool ltc_bootstrap_done = false;
-                                if (!ltc_bootstrap_done && chain && bcaster && height > coinbase_maturity) {
+                                constexpr uint32_t LTC_KEEP = core::coin::LTC_MIN_BLOCKS_TO_KEEP;
+                                if (!ltc_bootstrap_done && chain && bcaster && height > LTC_KEEP) {
                                     ltc_bootstrap_done = true;
                                     int requested = 0;
-                                    for (uint32_t bi = 1; bi <= coinbase_maturity && bi <= height; ++bi) {
+                                    for (uint32_t bi = 1; bi <= LTC_KEEP && bi <= height; ++bi) {
                                         auto entry = chain->get_header_by_height(height - bi);
                                         if (entry) {
                                             bcaster->request_full_block(entry->block_hash);
@@ -1785,8 +1789,8 @@ int main(int argc, char* argv[]) {
                                     }
                                     if (requested > 0)
                                         LOG_INFO << "[EMB-LTC] Bootstrap: requested " << requested
-                                                 << " historical blocks to seed UTXO (maturity="
-                                                 << coinbase_maturity << ")";
+                                                 << " historical blocks (MIN_BLOCKS_TO_KEEP="
+                                                 << LTC_KEEP << ")";
                                 }
                             }
 
@@ -3792,22 +3796,24 @@ int main(int argc, char* argv[]) {
                                                 LOG_INFO << "[EMB-DOGE] UTXO ready — mempool tx relay active (inv/tx, no BIP 35)";
                                             }
 
-                                            // Bootstrap: seed UTXO with coinbase_maturity (240) blocks.
-                                            // Reference: dogecoin/src/chainparams.cpp digishieldConsensus.nCoinbaseMaturity = 240
+                                            // Bootstrap: seed UTXO with MIN_BLOCKS_TO_KEEP (1440) blocks.
+                                            // Matches dogecoind pruned node safety depth.
+                                            // Reference: dogecoin/src/validation.h MIN_BLOCKS_TO_KEEP = 1440
                                             // Only fire once, and only when header chain has synced
-                                            // (height > 0 from header lookup, not genesis fallback).
+                                            // (height > keep_depth ensures we're at tip, not genesis).
                                             static bool doge_bootstrap_done = false;
-                                            if (!doge_bootstrap_done && chain && height > coinbase_maturity) {
+                                            constexpr uint32_t DOGE_KEEP = core::coin::DOGE_MIN_BLOCKS_TO_KEEP;
+                                            if (!doge_bootstrap_done && chain && height > DOGE_KEEP) {
                                                 doge_bootstrap_done = true;
                                                 int req = 0;
-                                                for (uint32_t bi = 1; bi <= coinbase_maturity && bi <= height; ++bi) {
+                                                for (uint32_t bi = 1; bi <= DOGE_KEEP && bi <= height; ++bi) {
                                                     auto e = chain->get_header_by_height(height - bi);
                                                     if (e) { bcaster_ptr->request_full_block(e->block_hash); ++req; }
                                                 }
                                                 if (req > 0)
                                                     LOG_INFO << "[EMB-DOGE] Bootstrap: requested " << req
-                                                             << " historical blocks to seed UTXO (maturity="
-                                                             << coinbase_maturity << ")";
+                                                             << " historical blocks (MIN_BLOCKS_TO_KEEP="
+                                                             << DOGE_KEEP << ")";
                                             }
                                         }
                                         if (pool) {
