@@ -3515,10 +3515,32 @@ int main(int argc, char* argv[]) {
                             }
                         }
 
-                        // Seed genesis if empty
+                        // Seed genesis if empty (same pattern as LTC genesis seeding).
+                        // Reference: dogecoin/src/chainparams.cpp CreateGenesisBlock()
+                        //   All networks: merkle_root=5b2a3f53..., version=1, bits=0x1e0ffff0
+                        //   Mainnet:       nTime=1386325540, nNonce=99943
+                        //   Testnet:       nTime=1391503289, nNonce=997879
+                        //   Testnet4alpha: nTime=1737907200, nNonce=1812121
                         if (doge_chain->size() == 0) {
-                            LOG_INFO << "DOGE HeaderChain: starting from "
-                                     << (doge_chain->height() > 0 ? "checkpoint" : "genesis");
+                            ltc::coin::BlockHeaderType genesis;
+                            genesis.m_previous_block.SetNull();
+                            genesis.m_version = 1;
+                            genesis.m_merkle_root.SetHex("5b2a3f53f605d62c53e62932dac6925e3d74afa5a4b459745c36d42d0ed26a69");
+                            genesis.m_bits = 0x1e0ffff0;
+                            if (doge_testnet4alpha) {
+                                genesis.m_timestamp = 1737907200;
+                                genesis.m_nonce     = 1812121;
+                            } else if (settings->m_testnet) {
+                                genesis.m_timestamp = 1391503289;
+                                genesis.m_nonce     = 997879;
+                            } else {
+                                genesis.m_timestamp = 1386325540;
+                                genesis.m_nonce     = 99943;
+                            }
+                            if (doge_chain->add_header(genesis))
+                                LOG_INFO << "[DOGE] HeaderChain: genesis block seeded (height 0)";
+                            else
+                                LOG_WARNING << "[DOGE] HeaderChain: genesis seed rejected — wrong genesis hash?";
                         } else {
                             LOG_INFO << "DOGE HeaderChain: loaded " << doge_chain->size()
                                      << " headers (height=" << doge_chain->height() << ")";
