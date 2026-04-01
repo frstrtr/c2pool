@@ -7,6 +7,7 @@
 /// Persistence via LevelDB for fast restarts.
 
 #include "block.hpp"
+#include <core/coin/utxo.hpp>  // DEFAULT_MAX_TIP_AGE
 
 #include <core/uint256.hpp>
 #include <core/leveldb_store.hpp>
@@ -536,10 +537,11 @@ public:
         return m_headers.count(prev_hash) > 0;
     }
 
-    /// Whether the chain is synced (tip timestamp within 2 hours of wall clock).
-    /// The 2-hour (7200s) threshold matches Bitcoin Core's IsInitialBlockDownload()
-    /// check (chainparams.h nMaxTipAge). p2pool uses the same gate implicitly:
-    /// getblocktemplate() fails until litecoind considers itself synced.
+    /// Whether the chain is synced (tip timestamp within DEFAULT_MAX_TIP_AGE of wall clock).
+    /// Both litecoind and dogecoind use 24 hours (86400s) as DEFAULT_MAX_TIP_AGE.
+    /// Reference: litecoin/src/validation.h  DEFAULT_MAX_TIP_AGE = 24 * 60 * 60
+    /// p2pool uses the same gate implicitly: getblocktemplate() fails until
+    /// litecoind considers itself synced (tip within nMaxTipAge).
     bool is_synced() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_tip.IsNull()) return false;
@@ -547,7 +549,7 @@ public:
         if (it == m_headers.end()) return false;
         auto now = static_cast<uint32_t>(std::time(nullptr));
         uint32_t age = now - it->second.header.m_timestamp;
-        bool synced = age < 7200; // 2 hours
+        bool synced = age < core::coin::DEFAULT_MAX_TIP_AGE; // 24 hours (86400s)
         // Log state changes (throttled via static)
         static bool s_last_synced = false;
         if (synced != s_last_synced) {

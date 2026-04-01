@@ -1389,15 +1389,18 @@ int main(int argc, char* argv[]) {
                 // Reference: litecoin/src/consensus/consensus.h COINBASE_MATURITY = 100
                 if (ltc_utxo_cache) {
                     auto* cache_ptr = ltc_utxo_cache.get();
-                    constexpr uint32_t LTC_MATURITY = core::coin::LTC_LIMITS.coinbase_maturity;
-                    embedded_node->set_utxo_ready_fn([cache_ptr, LTC_MATURITY]() {
+                    // Mining gate: coinbase_maturity + reorg_buffer
+                    // LTC: 100 + 6 (pegout maturity) = 106
+                    // Reference: litecoin/src/consensus/consensus.h
+                    constexpr uint32_t LTC_GATE = core::coin::LTC_MINING_GATE_DEPTH; // 106
+                    embedded_node->set_utxo_ready_fn([cache_ptr, LTC_GATE]() {
                         auto connected = cache_ptr->blocks_connected();
-                        bool ready = connected >= LTC_MATURITY;
+                        bool ready = connected >= LTC_GATE;
                         if (!ready) {
                             static int s_log_ctr = 0;
                             if (s_log_ctr++ % 20 == 0)
                                 LOG_INFO << "[EMB-LTC] UTXO maturity gate: blocks_connected="
-                                         << connected << " need>=" << LTC_MATURITY;
+                                         << connected << " need>=" << LTC_GATE;
                         }
                         return ready;
                     });
@@ -3551,15 +3554,18 @@ int main(int argc, char* argv[]) {
                             // Reference: dogecoin/src/chainparams.cpp digishieldConsensus.nCoinbaseMaturity = 240
                             if (doge_utxo_cache) {
                                 auto* cache_ptr = doge_utxo_cache.get();
-                                constexpr uint32_t DOGE_MATURITY = core::coin::DOGE_LIMITS.coinbase_maturity;
-                                backend->embedded_node().set_utxo_ready_fn([cache_ptr, DOGE_MATURITY]() {
+                                // Mining gate: coinbase_maturity + reorg_buffer
+                                // DOGE: 240 + 10 (reorg safety) = 250
+                                // Reference: dogecoin/src/chainparams.cpp digishieldConsensus
+                                constexpr uint32_t DOGE_GATE = core::coin::DOGE_MINING_GATE_DEPTH; // 250
+                                backend->embedded_node().set_utxo_ready_fn([cache_ptr, DOGE_GATE]() {
                                     auto connected = cache_ptr->blocks_connected();
-                                    bool ready = connected >= DOGE_MATURITY;
+                                    bool ready = connected >= DOGE_GATE;
                                     if (!ready) {
                                         static int s_log_ctr = 0;
                                         if (s_log_ctr++ % 20 == 0)
                                             LOG_INFO << "[EMB-DOGE] UTXO maturity gate: blocks_connected="
-                                                     << connected << " need>=" << DOGE_MATURITY;
+                                                     << connected << " need>=" << DOGE_GATE;
                                     }
                                     return ready;
                                 });

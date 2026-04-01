@@ -50,6 +50,19 @@ static constexpr ChainLimits DOGE_LIMITS = {1'000'000'000'000'000'000LL, 240, 0}
 static constexpr uint32_t LTC_MIN_BLOCKS_TO_KEEP  = 288;
 static constexpr uint32_t DOGE_MIN_BLOCKS_TO_KEEP = 1440;
 
+/// Minimum UTXO depth before mining can start: coinbase_maturity + reorg_buffer.
+/// LTC: 100 (COINBASE_MATURITY) + 6 (PEGOUT_MATURITY reorg depth) = 106
+/// DOGE: 240 (nCoinbaseMaturity post-DigiShield) + 10 (reorg safety) = 250
+/// Reference: litecoin/src/consensus/consensus.h, dogecoin/src/chainparams.cpp
+static constexpr uint32_t LTC_MINING_GATE_DEPTH  = LTC_LIMITS.coinbase_maturity + LTC_LIMITS.pegout_maturity; // 106
+static constexpr uint32_t DOGE_MINING_GATE_DEPTH = DOGE_LIMITS.coinbase_maturity + 10; // 250
+
+/// Tip age threshold for considering chain synced (seconds).
+/// Both LTC and DOGE use 24 hours (86400s) as DEFAULT_MAX_TIP_AGE.
+/// Reference: litecoin/src/validation.h  DEFAULT_MAX_TIP_AGE = 24 * 60 * 60
+/// Reference: dogecoin/src/validation.h  DEFAULT_MAX_TIP_AGE = 24 * 60 * 60
+static constexpr uint32_t DEFAULT_MAX_TIP_AGE = 24 * 60 * 60; // 86400s
+
 /// Check if a value is within the valid money range for a chain.
 /// Reference: LTC/DOGE amount.h MoneyRange()
 inline bool money_range(int64_t v, const ChainLimits& lim) {
