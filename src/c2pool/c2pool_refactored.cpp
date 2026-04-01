@@ -1766,25 +1766,27 @@ int main(int argc, char* argv[]) {
                                     bcaster->enable_mempool_request();
                                     mempool_requested = true;
                                     LOG_INFO << "[EMB-LTC] UTXO ready — enabled BIP 35 mempool sync";
+                                }
 
-                                    // Bootstrap: request historical blocks to seed UTXO.
-                                    // Depth = coinbase_maturity (100 for LTC/DOGE): any
-                                    // mempool tx spending a coinbase output needs its input
-                                    // block in our UTXO set, and coinbase outputs mature
-                                    // after exactly this many confirmations.
-                                    if (chain && utxo_db->get_best_height() <= height) {
-                                        int requested = 0;
-                                        for (uint32_t bi = 1; bi <= coinbase_maturity && bi <= height; ++bi) {
-                                            auto entry = chain->get_header_by_height(height - bi);
-                                            if (entry) {
-                                                bcaster->request_full_block(entry->block_hash);
-                                                ++requested;
-                                            }
+                                // Bootstrap: seed UTXO with coinbase_maturity (100) blocks.
+                                // Reference: litecoin/src/consensus/consensus.h COINBASE_MATURITY = 100
+                                // Only fire once, and only when header chain has synced
+                                // (height > maturity ensures we're at tip, not genesis).
+                                static bool ltc_bootstrap_done = false;
+                                if (!ltc_bootstrap_done && chain && bcaster && height > coinbase_maturity) {
+                                    ltc_bootstrap_done = true;
+                                    int requested = 0;
+                                    for (uint32_t bi = 1; bi <= coinbase_maturity && bi <= height; ++bi) {
+                                        auto entry = chain->get_header_by_height(height - bi);
+                                        if (entry) {
+                                            bcaster->request_full_block(entry->block_hash);
+                                            ++requested;
                                         }
-                                        if (requested > 0)
-                                            LOG_INFO << "[EMB-LTC] Bootstrap: requested " << requested
-                                                     << " historical blocks to seed UTXO";
                                     }
+                                    if (requested > 0)
+                                        LOG_INFO << "[EMB-LTC] Bootstrap: requested " << requested
+                                                 << " historical blocks to seed UTXO (maturity="
+                                                 << coinbase_maturity << ")";
                                 }
                             }
 
@@ -3783,22 +3785,29 @@ int main(int argc, char* argv[]) {
                                             // Enable mempool tx relay after first block.
                                             // DOGE does NOT support BIP 35 (mempool msg) or
                                             // wtxidrelay (BIP 339). Txs arrive via standard inv/tx.
-                                            // enable_mempool_request() enables inv processing;
-                                            // the BIP 35 mempool msg is only sent if peer has NODE_BLOOM.
                                             static bool doge_mempool_requested = false;
                                             if (!doge_mempool_requested && bcaster_ptr) {
                                                 bcaster_ptr->enable_mempool_request();
                                                 doge_mempool_requested = true;
                                                 LOG_INFO << "[EMB-DOGE] UTXO ready — mempool tx relay active (inv/tx, no BIP 35)";
-                                                // Bootstrap: seed UTXO with coinbase_maturity blocks
-                                                if (chain && utxo_db->get_best_height() <= height) {
-                                                    int req = 0;
-                                                    for (uint32_t bi = 1; bi <= coinbase_maturity && bi <= height; ++bi) {
-                                                        auto e = chain->get_header_by_height(height - bi);
-                                                        if (e) { bcaster_ptr->request_full_block(e->block_hash); ++req; }
-                                                    }
-                                                    if (req > 0) LOG_INFO << "[EMB-DOGE] Bootstrap: requested " << req << " historical blocks";
+                                            }
+
+                                            // Bootstrap: seed UTXO with coinbase_maturity (240) blocks.
+                                            // Reference: dogecoin/src/chainparams.cpp digishieldConsensus.nCoinbaseMaturity = 240
+                                            // Only fire once, and only when header chain has synced
+                                            // (height > 0 from header lookup, not genesis fallback).
+                                            static bool doge_bootstrap_done = false;
+                                            if (!doge_bootstrap_done && chain && height > coinbase_maturity) {
+                                                doge_bootstrap_done = true;
+                                                int req = 0;
+                                                for (uint32_t bi = 1; bi <= coinbase_maturity && bi <= height; ++bi) {
+                                                    auto e = chain->get_header_by_height(height - bi);
+                                                    if (e) { bcaster_ptr->request_full_block(e->block_hash); ++req; }
                                                 }
+                                                if (req > 0)
+                                                    LOG_INFO << "[EMB-DOGE] Bootstrap: requested " << req
+                                                             << " historical blocks to seed UTXO (maturity="
+                                                             << coinbase_maturity << ")";
                                             }
                                         }
                                         if (pool) {

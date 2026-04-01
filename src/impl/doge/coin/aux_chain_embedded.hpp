@@ -44,10 +44,11 @@ public:
     }
 
     c2pool::merged::AuxWork get_work_template() override {
-        // Sync gate: don't return work until header chain is caught up.
-        // Returning stale tips produces invalid targets and wastes merged mining work.
-        if (!m_chain.is_synced()) {
-            LOG_DEBUG_COIND << "[MM:" << m_config.symbol << "] Embedded: header chain not synced"
+        // Sync gate: don't return work until header chain is caught up AND
+        // UTXO has coinbase maturity depth (240 blocks for DOGE).
+        // Reference: dogecoin/src/chainparams.cpp digishieldConsensus.nCoinbaseMaturity = 240
+        if (!m_embedded.is_synced()) {
+            LOG_DEBUG_COIND << "[MM:" << m_config.symbol << "] Embedded: not synced"
                            << " (height=" << m_chain.height() << "), returning empty work";
             return {};
         }
