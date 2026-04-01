@@ -1240,16 +1240,35 @@ MergedMiningManager::build_merged_header_info_with_commitment()
 
             // Push into frozen history so stale stratum jobs can still submit
             // valid merged blocks using the snapshot that matches their commitment.
+            //
+            // Matches dogecoind CAuxBlockCache (rpc/auxcache.cpp):
+            //   - auxBlockCache.Reset() only when pindexPrev != chainActive.Tip()
+            //   - No size limit between tip changes — all templates kept alive
+            //   - submitauxblock looks up any previously created block by hash
             if (!chain.frozen_block_hash.IsNull()) {
+                // Detect DOGE chain tip change → clear cache (like dogecoind)
+                uint256 prev_hash;
+                if (chain.frozen_template.contains("previousblockhash")) {
+                    prev_hash.SetHex(chain.frozen_template["previousblockhash"].get<std::string>());
+                }
+                if (!prev_hash.IsNull() && !chain.last_known_tip.IsNull()
+                    && prev_hash != chain.last_known_tip) {
+                    auto old_size = chain.frozen_history.size();
+                    chain.frozen_history.clear();
+                    LOG_INFO << "[MM-commit] chain " << hi.chain_id
+                             << " tip changed → cleared " << old_size << " snapshots";
+                }
+                if (!prev_hash.IsNull())
+                    chain.last_known_tip = prev_hash;
+
                 chain.frozen_history[chain.frozen_block_hash] = {
                     chain.frozen_template,
                     chain.frozen_coinbase_hex,
                     now_sec
                 };
-                // Expire old snapshots
+                // Fallback expiry for edge cases (tip stuck, orphan chains)
                 for (auto it = chain.frozen_history.begin(); it != chain.frozen_history.end(); ) {
-                    if (now_sec - it->second.timestamp > ChainState::FROZEN_EXPIRY_SEC
-                        || chain.frozen_history.size() > ChainState::MAX_FROZEN_HISTORY) {
+                    if (now_sec - it->second.timestamp > ChainState::FROZEN_EXPIRY_SEC) {
                         it = chain.frozen_history.erase(it);
                     } else {
                         ++it;
