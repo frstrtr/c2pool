@@ -1419,6 +1419,51 @@ public:
             }
         }
 
+        // Per-address parent PPLNS breakdown — log once per new chain height
+        // for death valley comparison between p2pool and c2pool.
+        {
+            static int32_t s_last_pplns_height = -1;
+            auto cur_height = static_cast<int32_t>(walk_hashes.size());
+            if (cur_height != s_last_pplns_height) {
+                s_last_pplns_height = cur_height;
+                auto to_decimal = [](const uint288& val) -> std::string {
+                    if (val.IsNull()) return "0";
+                    uint288 tmp = val;
+                    std::string r;
+                    while (!tmp.IsNull()) {
+                        uint32_t rem = 0;
+                        for (int i = uint288::WIDTH - 1; i >= 0; --i) {
+                            uint64_t cur = (static_cast<uint64_t>(rem) << 32) | tmp.pn[i];
+                            tmp.pn[i] = static_cast<uint32_t>(cur / 10);
+                            rem = static_cast<uint32_t>(cur % 10);
+                        }
+                        r.push_back('0' + static_cast<char>(rem));
+                    }
+                    std::reverse(r.begin(), r.end());
+                    return r;
+                };
+                LOG_INFO << "[PARENT-PPLNS] height=" << cur_height
+                         << " shares=" << share_count
+                         << " addrs=" << result.weights.size()
+                         << " total_w=" << to_decimal(result.total_weight)
+                         << " don_w=" << to_decimal(result.total_donation_weight);
+                for (const auto& [script, w] : result.weights) {
+                    std::string script_hex;
+                    for (auto b : script) {
+                        static const char* H = "0123456789abcdef";
+                        script_hex += H[b >> 4]; script_hex += H[b & 0xf];
+                    }
+                    double pct = 0;
+                    if (!result.total_weight.IsNull()) {
+                        pct = (w * 10000 / result.total_weight).GetLow64() / 100.0;
+                    }
+                    LOG_INFO << "[PARENT-PPLNS]   " << script_hex.substr(0, 40)
+                             << " w=" << to_decimal(w)
+                             << " pct=" << std::fixed << std::setprecision(2) << pct << "%";
+                }
+            }
+        }
+
         // Cache result (single-entry, invalidated on chain change)
         m_decayed_cache_start = start;
         m_decayed_cache_shares = max_shares;
@@ -1679,6 +1724,65 @@ public:
 
         auto& sl = ensure_merged_skiplist(target_chain_id);
         auto result = sl.query(start, max_shares, desired_weight);
+
+        // [DOGE-PPLNS] Per-address breakdown — shows whether autoconverted
+        // addresses appear in merged PPLNS weights.  Log once per new height.
+        {
+            static int32_t s_last_doge_height = -1;
+            auto h = chain.get_height(start);
+            if (h != s_last_doge_height) {
+                s_last_doge_height = h;
+                auto to_dec = [](const uint288& val) -> std::string {
+                    if (val.IsNull()) return "0";
+                    uint288 tmp = val; std::string r;
+                    while (!tmp.IsNull()) {
+                        uint32_t rem = 0;
+                        for (int i = uint288::WIDTH - 1; i >= 0; --i) {
+                            uint64_t cur = (static_cast<uint64_t>(rem) << 32) | tmp.pn[i];
+                            tmp.pn[i] = static_cast<uint32_t>(cur / 10);
+                            rem = static_cast<uint32_t>(cur % 10);
+                        }
+                        r.push_back('0' + static_cast<char>(rem));
+                    }
+                    std::reverse(r.begin(), r.end());
+                    return r;
+                };
+                auto to_hex = [](const std::vector<unsigned char>& s) -> std::string {
+                    static const char* H = "0123456789abcdef";
+                    std::string r; r.reserve(s.size() * 2);
+                    for (auto b : s) { r += H[b >> 4]; r += H[b & 0xf]; }
+                    return r;
+                };
+                // Classify script type for diagnostics
+                auto classify = [](const std::vector<unsigned char>& s) -> const char* {
+                    if (is_merged_key(s)) return "MERGED";
+                    if (s.size() == 25 && s[0] == 0x76 && s[1] == 0xa9) return "P2PKH";
+                    if (s.size() == 23 && s[0] == 0xa9) return "P2SH";
+                    if (s.size() == 22 && s[0] == 0x00 && s[1] == 0x14) return "P2WPKH-RAW";
+                    if (s.size() == 34 && s[0] == 0x00 && s[1] == 0x20) return "P2WSH-RAW";
+                    if (s.size() == 34 && s[0] == 0x51 && s[1] == 0x20) return "P2TR-RAW";
+                    return "OTHER";
+                };
+                LOG_INFO << "[DOGE-PPLNS] chain_id=" << target_chain_id
+                         << " height=" << h
+                         << " max_shares=" << max_shares
+                         << " addrs=" << result.weights.size()
+                         << " total_w=" << to_dec(result.total_weight)
+                         << " don_w=" << to_dec(result.total_donation_weight)
+                         << " start=" << start.GetHex().substr(0, 16);
+                for (const auto& [key, w] : result.weights) {
+                    double pct = 0;
+                    if (!result.total_weight.IsNull())
+                        pct = (w * 10000 / result.total_weight).GetLow64() / 100.0;
+                    auto hex = to_hex(key);
+                    LOG_INFO << "[DOGE-PPLNS]   " << classify(key)
+                             << " " << hex.substr(0, 40)
+                             << " w=" << to_dec(w)
+                             << " pct=" << std::fixed << std::setprecision(2) << pct << "%";
+                }
+            }
+        }
+
         return {std::move(result.weights), result.total_weight, result.total_donation_weight};
     }
 
@@ -1754,7 +1858,11 @@ public:
                     delta.total_donation_weight = att * static_cast<uint32_t>(obj->m_donation);
                     auto raw_script = get_share_script(obj);
                     if (raw_script.empty()) return;
-                    delta.weights[raw_script] = att * static_cast<uint32_t>(65535 - obj->m_donation);
+                    // Normalize P2WPKH→P2PKH for merged chain compatibility.
+                    // P2TR/P2WSH → empty → skipped (unconvertible).
+                    auto script = normalize_script_for_merged(raw_script);
+                    if (script.empty()) return;
+                    delta.weights[script] = att * static_cast<uint32_t>(65535 - obj->m_donation);
                 });
                 return delta;
             },
@@ -1821,24 +1929,68 @@ public:
         payload += "|D:";
         payload += to_decimal(donation_weight);
 
-        // Log payload periodically (every 15s)
-        {
-            static auto last_log = std::chrono::steady_clock::now() - std::chrono::seconds(30);
-            auto now = std::chrono::steady_clock::now();
-            if (now - last_log > std::chrono::seconds(15)) {
-                last_log = now;
-                LOG_INFO << "[merged_payout_hash] chain_len=" << chain_len
-                         << " raw_height=" << height
-                         << " weights=" << sorted_by_script.size()
-                         << " total_weight=" << to_decimal(total_weight)
-                         << " payload(" << payload.size() << ")=" << payload.substr(0, 200);
-            }
-        }
-
         // SHA256d (hash256 in p2pool)
         auto span = std::span<const unsigned char>(
             reinterpret_cast<const unsigned char*>(payload.data()), payload.size());
-        return Hash(span);
+        auto hash_result = Hash(span);
+
+        // Per-address merged PPLNS breakdown — log once per new chain height
+        // for death valley comparison between p2pool and c2pool.
+        {
+            static int32_t s_last_log_height = -1;
+            if (height != s_last_log_height) {
+                s_last_log_height = height;
+                LOG_INFO << "[MERGED-PPLNS] height=" << height
+                         << " chain_len=" << chain_len
+                         << " addrs=" << sorted_by_script.size()
+                         << " total_w=" << to_decimal(total_weight)
+                         << " don_w=" << to_decimal(donation_weight);
+                for (const auto& [script_hex, w] : sorted_by_script) {
+                    double pct = 0;
+                    if (!total_weight.IsNull()) {
+                        pct = (w * 10000 / total_weight).GetLow64() / 100.0;
+                    }
+                    LOG_INFO << "[MERGED-PPLNS]   " << script_hex.substr(0, 40)
+                             << " w=" << to_decimal(w)
+                             << " pct=" << std::fixed << std::setprecision(2) << pct << "%";
+                }
+                LOG_INFO << "[MERGED-PPLNS]   hash=" << hash_result.GetHex();
+
+                // DOGE payout weights (chain_id=98, with Tier 1/1.5/2 resolution)
+                // This is what actually determines DOGE coinbase outputs.
+                // During death valley, compare address count and keys vs [MERGED-PPLNS].
+                constexpr uint32_t DOGE_CHAIN_ID = 98;
+                uint288 doge_unlimited;
+                doge_unlimited.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+                auto doge_result = get_merged_cumulative_weights(
+                    prev_share_hash, chain_len, doge_unlimited, DOGE_CHAIN_ID);
+                auto classify_doge = [](const std::vector<unsigned char>& s) -> const char* {
+                    if (is_merged_key(s)) return "MERGED";
+                    if (s.size() == 25 && s[0] == 0x76 && s[1] == 0xa9) return "P2PKH";
+                    if (s.size() == 23 && s[0] == 0xa9) return "P2SH";
+                    if (s.size() == 22 && s[0] == 0x00 && s[1] == 0x14) return "P2WPKH-RAW";
+                    if (s.size() == 34 && s[0] == 0x00 && s[1] == 0x20) return "P2WSH-RAW";
+                    if (s.size() == 34 && s[0] == 0x51 && s[1] == 0x20) return "P2TR-RAW";
+                    return "OTHER";
+                };
+                auto doge_miner_w = doge_result.total_weight - doge_result.total_donation_weight;
+                LOG_INFO << "[DOGE-PAYOUT] height=" << height
+                         << " addrs=" << doge_result.weights.size()
+                         << " total_w=" << to_decimal(doge_result.total_weight)
+                         << " don_w=" << to_decimal(doge_result.total_donation_weight);
+                for (const auto& [script, w] : doge_result.weights) {
+                    double pct = 0;
+                    if (!doge_miner_w.IsNull())
+                        pct = (w * 10000 / doge_miner_w).GetLow64() / 100.0;
+                    LOG_INFO << "[DOGE-PAYOUT]   " << classify_doge(script)
+                             << " " << script_to_hex(script).substr(0, 50)
+                             << " w=" << to_decimal(w)
+                             << " pct=" << std::fixed << std::setprecision(2) << pct << "%";
+                }
+            }
+        }
+
+        return hash_result;
     }
 
     // -- Merged mining: per-chain expected payouts --
@@ -1899,14 +2051,19 @@ public:
         uint64_t accepted_total = grand_total_lo - donation_w_lo;
 
         uint64_t total_distributed = 0;
-        for (const auto& [script, weight] : weights) {
+        for (const auto& [key, weight] : weights) {
+            // Resolve weight key to DOGE-compatible scriptPubKey:
+            // MERGED:-prefixed → strip prefix (already a DOGE script)
+            // Raw LTC script  → autoconvert (P2WPKH→P2PKH, etc.)
+            auto script = resolve_merged_payout_script(key);
+            if (script.empty()) continue;  // Unconvertible (P2WSH, P2TR)
             uint64_t w = weight.GetLow64();
             // amount = miners_reward * w // accepted_total
             __uint128_t num = static_cast<__uint128_t>(miners_reward) * w;
             uint64_t amount = (accepted_total > 0) ?
                 static_cast<uint64_t>(num / accepted_total) : 0;
             if (amount > 0) {
-                result[script] = amount;
+                result[script] += amount;
                 total_distributed += amount;
             }
         }
@@ -2011,6 +2168,15 @@ private:
                     // New mapping — stale skip list entries used auto-convert
                     // for this miner; recreate to use the explicit address.
                     m_merged_skiplists.erase(entry.m_chain_id);
+                    auto to_hex_short = [](const std::vector<unsigned char>& s, size_t n = 20) {
+                        static const char* H = "0123456789abcdef";
+                        std::string r; for (size_t i = 0; i < std::min(s.size(), n); ++i) { r += H[s[i]>>4]; r += H[s[i]&0xf]; }
+                        return r;
+                    };
+                    LOG_INFO << "[MERGED-REG] NEW chain_id=" << entry.m_chain_id
+                             << " parent=" << to_hex_short(parent_script)
+                             << " merged=" << to_hex_short(entry.m_script.m_data)
+                             << " — skiplist invalidated";
                 }
             }
         }
@@ -2075,13 +2241,13 @@ private:
                     auto att = chain::target_to_average_attempts(target);
                     delta.total_weight = att * 65535;
                     delta.total_donation_weight = att * static_cast<uint32_t>(obj->m_donation);
-                    // Use the ORIGINAL script (not normalized) so that
-                    // compute_merged_payout_hash produces the correct address
-                    // encoding (bech32 for P2WPKH, base58 for P2PKH/P2SH) —
-                    // matching Python p2pool's share.address key format.
                     auto raw_script = get_share_script(obj);
                     if (raw_script.empty()) return;
-                    delta.weights[raw_script] = att * static_cast<uint32_t>(65535 - obj->m_donation);
+                    // Normalize P2WPKH→P2PKH for merged chain compatibility.
+                    // P2TR/P2WSH → empty → skipped (unconvertible).
+                    auto script = normalize_script_for_merged(raw_script);
+                    if (script.empty()) return;
+                    delta.weights[script] = att * static_cast<uint32_t>(65535 - obj->m_donation);
                 });
                 return delta;
             },
@@ -2110,42 +2276,88 @@ private:
                         delta.total_donation_weight = att * static_cast<uint32_t>(obj->m_donation);
 
                         std::vector<unsigned char> weight_key;
-                        // Tier 1: explicit merged_addresses for this chain
+                        const char* tier_name = "raw:v35";
+                        // p2pool gates Tier 1 + 1.5 on share.VERSION >= 36.
+                        // V35-format shares always use raw parent script as key,
+                        // even if desired_version >= 36.  This keeps V35 and V36
+                        // weight entries separate per miner during the mixed window.
                         if constexpr (requires { obj->m_merged_addresses; })
                         {
+                            tier_name = "T3:skip";
+                            // Tier 1: explicit merged_addresses for this chain
                             for (const auto& entry : obj->m_merged_addresses)
                             {
                                 if (entry.m_chain_id == chain_id)
                                 {
-                                    weight_key = entry.m_script.m_data;
+                                    weight_key = make_merged_key(entry.m_script.m_data);
+                                    tier_name = "T1:explicit";
                                     break;
                                 }
                             }
-                        }
-                        // Tier 1.5 + Tier 2 share a single get_share_script call
-                        if (weight_key.empty())
-                        {
-                            auto parent_script = get_share_script(obj);
-                            // Tier 1.5: retroactive lookup — same miner's
-                            // explicit merged address from their other shares.
                             // Tier 1.5: retroactive lookup — same miner's
                             // explicit merged address from their other shares.
                             // p2pool v0.14.5: try raw, then normalized P2PKH form.
-                            auto table_it = m_miner_merged_addr.find(chain_id);
-                            if (table_it != m_miner_merged_addr.end())
-                            {
-                                auto miner_it = table_it->second.find(parent_script);
-                                if (miner_it == table_it->second.end()) {
-                                    auto norm = normalize_script_for_merged(parent_script);
-                                    if (!norm.empty() && norm != parent_script)
-                                        miner_it = table_it->second.find(norm);
-                                }
-                                if (miner_it != table_it->second.end())
-                                    weight_key = miner_it->second;
-                            }
-                            // Tier 2: auto-convert parent script (P2WPKH→P2PKH etc.)
                             if (weight_key.empty())
-                                weight_key = normalize_script_for_merged(parent_script);
+                            {
+                                auto parent_script = get_share_script(obj);
+                                auto table_it = m_miner_merged_addr.find(chain_id);
+                                if (table_it != m_miner_merged_addr.end())
+                                {
+                                    auto miner_it = table_it->second.find(parent_script);
+                                    if (miner_it == table_it->second.end()) {
+                                        auto norm = normalize_script_for_merged(parent_script);
+                                        if (!norm.empty() && norm != parent_script)
+                                            miner_it = table_it->second.find(norm);
+                                    }
+                                    if (miner_it != table_it->second.end()) {
+                                        weight_key = make_merged_key(miner_it->second);
+                                        tier_name = "T1.5:retro";
+                                    }
+                                }
+                                // Tier 2: normalize P2WPKH→P2PKH for merged
+                                // chain compatibility. P2TR/P2WSH → empty → skipped.
+                                if (weight_key.empty())
+                                    weight_key = normalize_script_for_merged(parent_script);
+                            }
+                        }
+                        else
+                        {
+                            // V35-format share: normalize P2WPKH→P2PKH for merged
+                            // chain compatibility. P2TR/P2WSH → empty → skipped.
+                            weight_key = normalize_script_for_merged(get_share_script(obj));
+                        }
+                        // Per-share tier diagnostic
+                        // Log every T1/T1.5/MERGED hit and every 200th otherwise
+                        {
+                            static int s_tier_log_ctr = 0;
+                            bool is_merged = is_merged_key(weight_key);
+                            bool is_p2wpkh = !is_merged && weight_key.size() == 22 &&
+                                             weight_key[0] == 0x00 && weight_key[1] == 0x14;
+                            if (is_merged || is_p2wpkh || s_tier_log_ctr++ % 200 == 0) {
+                                auto to_hex_short = [](const std::vector<unsigned char>& s, size_t n = 20) {
+                                    static const char* H = "0123456789abcdef";
+                                    std::string r; for (size_t i = 0; i < std::min(s.size(), n); ++i) { r += H[s[i]>>4]; r += H[s[i]&0xf]; }
+                                    return r;
+                                };
+                                auto parent_script = get_share_script(obj);
+                                LOG_INFO << "[DOGE-TIER] " << tier_name
+                                         << " chain_id=" << chain_id
+                                         << " ver=" << obj->version
+                                         << " dv=" << obj->m_desired_version
+                                         << " parent=" << to_hex_short(parent_script)
+                                         << " key=" << to_hex_short(weight_key)
+                                         << " bits=0x" << std::hex << obj->m_bits << std::dec;
+                                // For V36 shares, log merged_addresses status
+                                if constexpr (requires { obj->m_merged_addresses; }) {
+                                    LOG_INFO << "[DOGE-TIER]   merged_addrs=" << obj->m_merged_addresses.size()
+                                             << " ver=" << obj->version;
+                                    for (const auto& entry : obj->m_merged_addresses) {
+                                        LOG_INFO << "[DOGE-TIER]   chain_id=" << entry.m_chain_id
+                                                 << " script_len=" << entry.m_script.m_data.size()
+                                                 << " script=" << to_hex_short(entry.m_script.m_data);
+                                    }
+                                }
+                            }
                         }
                         // Tier 3: unconvertible — skip, weight redistributed
                         if (weight_key.empty()) return;

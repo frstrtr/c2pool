@@ -1533,7 +1533,13 @@ void NodeImpl::clean_tracker()
                      << " gap=" << (chain.size() - verified.size())
                      << " best_h=" << (m_best_share_hash.IsNull() ? 0
                          : (verified.contains(m_best_share_hash)
-                            ? verified.get_height(m_best_share_hash) : -1));
+                            ? verified.get_height(m_best_share_hash) : -1))
+                     << " chain_h=" << (m_best_share_hash.IsNull() ? 0
+                         : (chain.contains(m_best_share_hash)
+                            ? chain.get_height(m_best_share_hash) : -1))
+                     << " best=" << (m_best_share_hash.IsNull()
+                         ? std::string("null")
+                         : m_best_share_hash.GetHex().substr(0, 16));
         }
     }
 }
