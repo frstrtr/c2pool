@@ -47,6 +47,7 @@ public:
         {
             m_socket->cancel();
             m_socket->close();
+            m_socket.reset();  // prevent use-after-close
         }
     }
 
@@ -64,8 +65,13 @@ public:
 
     void write(std::unique_ptr<RawMessage>& rmsg)
     {
-        if (!m_socket) return;  // peer disconnected
-        m_socket->write(std::move(rmsg));
+        if (!m_socket) return;  // peer disconnected or destroyed
+        try {
+            m_socket->write(std::move(rmsg));
+        } catch (const std::exception& e) {
+            // Socket may be closed/broken — don't crash
+            m_socket.reset();
+        }
     }
 
     auto get_addr() const

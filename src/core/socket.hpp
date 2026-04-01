@@ -118,6 +118,7 @@ public:
 
     void write(std::unique_ptr<RawMessage> msg_data)
     {
+        if (!m_status || !m_socket || !m_socket->is_open()) return;  // closed/disconnected
         auto packet = std::make_shared<PackStream>(Packet::from_message(m_node->get_prefix(), msg_data));
         boost::asio::async_write(*m_socket, boost::asio::buffer(packet->data(), packet->size()),
             [self = shared_from_this(), this, packet](const boost::system::error_code& ec, std::size_t length)
