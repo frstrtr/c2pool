@@ -21,6 +21,7 @@
 #include <core/address_utils.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
@@ -835,6 +836,54 @@ inline std::vector<unsigned char> normalize_script_for_merged(
     return {};
 }
 
+// MERGED: prefix for weight map keys — matches p2pool's 'MERGED:' + hex string.
+// Keeps Tier 1/1.5 (explicit DOGE script) keys separate from raw LTC script keys
+// in the same weight map, preventing V35+V36 weight collapse for the same miner.
+// 7 bytes: 0x4d 0x45 0x52 0x47 0x45 0x44 0x3a = "MERGED:"
+inline constexpr std::array<unsigned char, 7> MERGED_KEY_PREFIX = {
+    0x4d, 0x45, 0x52, 0x47, 0x45, 0x44, 0x3a
+};
+
+// Prepend MERGED: prefix to a script for use as a weight map key.
+inline std::vector<unsigned char> make_merged_key(
+    const std::vector<unsigned char>& script)
+{
+    std::vector<unsigned char> key;
+    key.reserve(MERGED_KEY_PREFIX.size() + script.size());
+    key.insert(key.end(), MERGED_KEY_PREFIX.begin(), MERGED_KEY_PREFIX.end());
+    key.insert(key.end(), script.begin(), script.end());
+    return key;
+}
+
+// Check if a weight key has the MERGED: prefix.
+inline bool is_merged_key(const std::vector<unsigned char>& key)
+{
+    return key.size() > MERGED_KEY_PREFIX.size() &&
+           std::equal(MERGED_KEY_PREFIX.begin(), MERGED_KEY_PREFIX.end(),
+                      key.begin());
+}
+
+// Strip MERGED: prefix, returning the raw script bytes.
+// Caller must check is_merged_key() first.
+inline std::vector<unsigned char> strip_merged_key(
+    const std::vector<unsigned char>& key)
+{
+    return std::vector<unsigned char>(
+        key.begin() + MERGED_KEY_PREFIX.size(), key.end());
+}
+
+// Resolve a weight map key to a DOGE-compatible scriptPubKey.
+// MERGED:-prefixed keys: strip prefix, use directly (already a DOGE script).
+// Raw keys: autoconvert (P2WPKH→P2PKH, P2PKH/P2SH pass through).
+// Returns empty if unconvertible (P2WSH, P2TR, etc.).
+inline std::vector<unsigned char> resolve_merged_payout_script(
+    const std::vector<unsigned char>& key)
+{
+    if (is_merged_key(key))
+        return strip_merged_key(key);
+    return normalize_script_for_merged(key);
+}
+
 // ============================================================================
 // Helper: extract full scriptPubKey from a share variant
 // ============================================================================
@@ -1542,12 +1591,14 @@ std::string verify_merged_coinbase_commitment(
         uint64_t total_distributed = 0;
         double total_d = mw.total_weight.IsNull() ? 0.0
             : static_cast<double>(mw.total_weight.GetLow64());
-        for (auto& [script, weight] : mw.weights) {
+        for (auto& [key, weight] : mw.weights) {
+            auto script = resolve_merged_payout_script(key);
+            if (script.empty()) continue;
             double frac = weight.IsNull() ? 0.0
                 : static_cast<double>(weight.GetLow64()) / total_d;
             uint64_t amount = static_cast<uint64_t>(coinbase_value * frac);
             if (amount > 0) {
-                output_amounts[script] = amount;
+                output_amounts[script] += amount;
                 total_distributed += amount;
             }
         }
@@ -2467,6 +2518,19 @@ uint256 create_local_share(
 
     share.m_nonce      = 0; // share commitment nonce (not block nonce)
     share.m_merged_addresses = merged_addrs;
+
+    // Diagnostic: confirm merged_addresses are populated for DOGE skiplist Tier 1
+    {
+        LOG_INFO << "[create_local_share] merged_addresses=" << merged_addrs.size();
+        for (const auto& entry : merged_addrs) {
+            auto to_hex = [](const std::vector<unsigned char>& s) {
+                static const char* H = "0123456789abcdef";
+                std::string r; for (auto b : s) { r += H[b>>4]; r += H[b&0xf]; } return r;
+            };
+            LOG_INFO << "[create_local_share]   chain_id=" << entry.m_chain_id
+                     << " script=" << to_hex(entry.m_script.m_data);
+        }
+    }
 
     // Embed encrypted message_data (from create_message_data()) if provided
     if (!message_data.empty())
