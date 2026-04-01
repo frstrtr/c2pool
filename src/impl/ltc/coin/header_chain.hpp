@@ -844,6 +844,7 @@ private:
         // Load all headers
         auto keys = m_db->list_keys("h", 10000000);
         int loaded = 0, corrupt = 0;
+        int total_keys = static_cast<int>(keys.size());
         for (auto& key : keys) {
             if (key.size() != 33) continue; // 'h' + 32-byte hash
             std::vector<uint8_t> data;
@@ -855,6 +856,10 @@ private:
                 ps >> entry;
                 m_headers[entry.block_hash] = entry;
                 ++loaded;
+                // Progress every 500k headers
+                if (loaded % 500000 == 0)
+                    LOG_INFO << "[EMB-LTC] load_from_db: " << loaded << "/" << total_keys
+                             << " headers (" << (100 * loaded / total_keys) << "%)";
             } catch (const std::exception& e) {
                 ++corrupt;
                 LOG_WARNING << "[EMB-LTC] Corrupt header entry in DB: " << e.what();
