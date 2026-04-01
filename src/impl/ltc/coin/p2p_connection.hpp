@@ -64,6 +64,7 @@ public:
 
     void write(std::unique_ptr<RawMessage>& rmsg)
     {
+        if (!m_socket) return;  // peer disconnected
         m_socket->write(std::move(rmsg));
     }
 
