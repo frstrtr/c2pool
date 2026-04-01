@@ -537,6 +537,9 @@ public:
     }
 
     /// Whether the chain is synced (tip timestamp within 2 hours of wall clock).
+    /// The 2-hour (7200s) threshold matches Bitcoin Core's IsInitialBlockDownload()
+    /// check (chainparams.h nMaxTipAge). p2pool uses the same gate implicitly:
+    /// getblocktemplate() fails until litecoind considers itself synced.
     bool is_synced() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_tip.IsNull()) return false;

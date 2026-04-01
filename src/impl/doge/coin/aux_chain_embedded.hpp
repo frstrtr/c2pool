@@ -124,6 +124,9 @@ public:
 
     const c2pool::merged::AuxChainConfig& config() const override { return m_config; }
 
+    /// Expose embedded node for UTXO maturity gate wiring.
+    EmbeddedCoinNode& embedded_node() { return m_embedded; }
+
 private:
     HeaderChain&                       m_chain;
     ltc::coin::Mempool&                m_pool;

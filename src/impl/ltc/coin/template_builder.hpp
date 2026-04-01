@@ -12,6 +12,7 @@
 ///   CoinNodeInterface     — abstract interface (getwork / submit_block / getblockchaininfo)
 ///   EmbeddedCoinNode      — concrete implementation backed by HeaderChain + Mempool
 
+#include <functional>
 #include "header_chain.hpp"
 #include "mempool.hpp"
 #include "mweb_builder.hpp"
@@ -104,7 +105,7 @@ public:
     virtual nlohmann::json getblockchaininfo() = 0;
 
     /// True when the embedded chain is up to date with the network
-    /// (tip timestamp within 2 hours of wall clock).
+    /// AND has enough UTXO depth for coinbase maturity validation.
     virtual bool is_synced() const { return false; }
 };
 
@@ -370,13 +371,20 @@ public:
         return info;
     }
 
+    /// Set UTXO readiness callback — blocks getwork() until UTXO has
+    /// enough depth for coinbase maturity validation (100 blocks for LTC).
+    void set_utxo_ready_fn(std::function<bool()> fn) { m_utxo_ready = std::move(fn); }
+
     bool is_synced() const override {
-        return m_chain.is_synced();
+        if (!m_chain.is_synced()) return false;
+        if (m_utxo_ready && !m_utxo_ready()) return false;
+        return true;
     }
 
 private:
     HeaderChain& m_chain;
     Mempool&     m_pool;
+    std::function<bool()> m_utxo_ready;  // coinbase maturity gate
     bool         m_testnet;
     MWEBTracker* m_mweb_tracker{nullptr};
 };

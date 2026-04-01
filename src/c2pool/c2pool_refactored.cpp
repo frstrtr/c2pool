@@ -1384,6 +1384,25 @@ int main(int argc, char* argv[]) {
                 mweb_tracker    = std::make_unique<ltc::coin::MWEBTracker>();
                 embedded_node   = std::make_unique<ltc::coin::EmbeddedCoinNode>(
                     *embedded_chain, *embedded_pool, settings->m_testnet, mweb_tracker.get());
+                // Gate mining until UTXO has coinbase maturity depth (100 blocks).
+                // Without this, block templates may include TXs spending immature coinbase outputs.
+                if (ltc_utxo_db) {
+                    auto* db_ptr = ltc_utxo_db.get();
+                    auto* chain_ptr = embedded_chain.get();
+                    constexpr uint32_t LTC_MATURITY = core::coin::LTC_LIMITS.coinbase_maturity;
+                    embedded_node->set_utxo_ready_fn([db_ptr, chain_ptr, LTC_MATURITY]() {
+                        auto chain_h = chain_ptr->height();
+                        auto utxo_h = db_ptr->get_best_height();
+                        bool ready = utxo_h > 0 && chain_h > 0 && (chain_h - utxo_h) < LTC_MATURITY;
+                        if (!ready) {
+                            static int s_log_ctr = 0;
+                            if (s_log_ctr++ % 20 == 0)
+                                LOG_INFO << "[EMB-LTC] UTXO maturity gate: chain=" << chain_h
+                                         << " utxo=" << utxo_h << " need gap<" << LTC_MATURITY;
+                        }
+                        return ready;
+                    });
+                }
                 LOG_INFO << "[EMB-LTC] EmbeddedCoinNode ready (testnet=" << settings->m_testnet
                          << ", MWEB=enabled)";
 
@@ -3518,6 +3537,25 @@ int main(int argc, char* argv[]) {
                         {
                             auto backend = std::make_unique<doge::coin::AuxChainEmbedded>(
                                 *doge_chain, *doge_pool, *doge_params_ptr, cfg);
+                            // Gate mining until UTXO has coinbase maturity depth (240 blocks).
+                            // Without this, block templates may include TXs spending immature coinbase outputs.
+                            if (doge_utxo_db) {
+                                auto* db_ptr = doge_utxo_db.get();
+                                auto* chain_ptr = doge_chain.get();
+                                constexpr uint32_t DOGE_MATURITY = core::coin::DOGE_LIMITS.coinbase_maturity;
+                                backend->embedded_node().set_utxo_ready_fn([db_ptr, chain_ptr, DOGE_MATURITY]() {
+                                    auto chain_h = chain_ptr->height();
+                                    auto utxo_h = db_ptr->get_best_height();
+                                    bool ready = utxo_h > 0 && chain_h > 0 && (chain_h - utxo_h) < DOGE_MATURITY;
+                                    if (!ready) {
+                                        static int s_log_ctr = 0;
+                                        if (s_log_ctr++ % 20 == 0)
+                                            LOG_INFO << "[EMB-DOGE] UTXO maturity gate: chain=" << chain_h
+                                                     << " utxo=" << utxo_h << " need gap<" << DOGE_MATURITY;
+                                    }
+                                    return ready;
+                                });
+                            }
                             mm_manager->add_chain(cfg, std::move(backend));
                             LOG_INFO << "Merged mining: DOGE embedded (primary) chain_id=" << cfg.chain_id;
 

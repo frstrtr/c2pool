@@ -6,6 +6,7 @@
 /// Reuses LTC's CoinNodeInterface, Merkle tree, and TemplateBuilder logic.
 /// Only the subsidy schedule and difficulty calculation differ.
 
+#include <functional>
 #include "header_chain.hpp"    // DOGE HeaderChain (uses DOGEChainParams)
 #include "chain_params.hpp"    // get_doge_block_subsidy(), calculate_doge_next_work()
 
@@ -186,7 +187,15 @@ public:
         return info;
     }
 
-    bool is_synced() const override { return m_chain.is_synced(); }
+    /// Set UTXO readiness callback — blocks getwork() until UTXO has
+    /// enough depth for coinbase maturity validation (240 blocks for DOGE).
+    void set_utxo_ready_fn(std::function<bool()> fn) { m_utxo_ready = std::move(fn); }
+
+    bool is_synced() const override {
+        if (!m_chain.is_synced()) return false;
+        if (m_utxo_ready && !m_utxo_ready()) return false;
+        return true;
+    }
 
     // Expose header lookup for block verification
     std::optional<IndexEntry> get_header_by_hash(const std::string& hash_hex) const {
@@ -199,6 +208,7 @@ private:
     HeaderChain&         m_chain;
     Mempool&             m_pool;
     const DOGEChainParams& m_params;
+    std::function<bool()> m_utxo_ready;  // coinbase maturity gate
 };
 
 } // namespace coin
