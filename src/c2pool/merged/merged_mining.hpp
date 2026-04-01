@@ -363,7 +363,11 @@ private:
             int64_t        timestamp;   // monotonic seconds for expiration
         };
         std::map<uint256, FrozenSnapshot> frozen_history;  // block_hash → snapshot
-        static constexpr size_t MAX_FROZEN_HISTORY = 10;
+        // Keep enough frozen snapshots to cover FROZEN_EXPIRY_SEC (300s).
+        // Each new share creates a snapshot (~3s on testnet, ~15s on mainnet).
+        // p2pool uses RPC submitauxblock which handles stale work natively —
+        // embedded mode needs this history because there's no daemon RPC.
+        static constexpr size_t MAX_FROZEN_HISTORY = 100;
         static constexpr int64_t FROZEN_EXPIRY_SEC = 300;  // 5 minutes
     };
     std::vector<ChainState> m_chains;
