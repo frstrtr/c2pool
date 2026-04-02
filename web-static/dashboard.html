@@ -3510,10 +3510,12 @@
                             }
                         }
                     }
-                    d3.select('#payout_totamount').text(d3.format('.4f')(totamount));
-                    
+                    // Only overwrite computed estimates if PPLNS has real data
+                    if (totamount > 0)
+                        d3.select('#payout_totamount').text(d3.format('.4f')(totamount));
+
                     // Show merged payout (always show when merged mining is active)
-                    if (window.payoutsMergedSymbol) {
+                    if (window.payoutsMergedSymbol && totMergedAmount > 0) {
                         d3.select('#node_merged_amount').text(d3.format(',.2f')(totMergedAmount));
                         d3.select('#node_merged_symbol').text(window.payoutsMergedSymbol);
                     }
