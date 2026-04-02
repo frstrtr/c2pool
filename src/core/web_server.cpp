@@ -3291,15 +3291,21 @@ nlohmann::json MiningInterface::rest_local_stats()
     result["block_value_miner"] = block_value * (1.0 - fee_ratio);
     result["block_value_payments"] = block_value;  // total including fees
 
-    // Computed node fee amounts per block (for dashboard NODE FEE card)
-    result["node_fee_ltc"] = block_value * fee_ratio;
-    if (m_mm_manager) {
-        auto chain_infos = m_mm_manager->get_chain_infos();
-        for (const auto& ci : chain_infos) {
-            double merged_bv = ci.coinbase_value / 1e8;
-            std::string sym = ci.symbol;
-            for (auto& c : sym) c = std::tolower(c);
-            result["node_fee_" + sym] = merged_bv * fee_ratio;
+    // Node fee amounts per block: fee% × (local_hashrate / pool_hashrate) × block_value
+    // Matches p2pool: operator gets fee% of THIS node's contribution, not the whole block.
+    {
+        double local_hr = m_stratum_hashrate_fn ? m_stratum_hashrate_fn() : 0.0;
+        double pool_hr = m_pool_hashrate_fn ? m_pool_hashrate_fn() : 0.0;
+        double node_share = (pool_hr > 0 && local_hr > 0) ? local_hr / pool_hr : 0.0;
+        result["node_fee_ltc"] = block_value * fee_ratio * node_share;
+        if (m_mm_manager) {
+            auto chain_infos = m_mm_manager->get_chain_infos();
+            for (const auto& ci : chain_infos) {
+                double merged_bv = ci.coinbase_value / 1e8;
+                std::string sym = ci.symbol;
+                for (auto& c : sym) c = std::tolower(c);
+                result["node_fee_" + sym] = merged_bv * fee_ratio * node_share;
+            }
         }
     }
 
