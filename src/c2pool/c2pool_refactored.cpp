@@ -4056,9 +4056,14 @@ int main(int argc, char* argv[]) {
                         block_target = chain::bits_to_target(s->m_min_header.m_bits);
                     });
 
-                    auto& donation_script = mi->get_donation_script();
+                    // Merged chains always use COMBINED_DONATION_SCRIPT (P2SH)
+                    // regardless of share version — p2pool data.py line 303.
+                    // The parent chain uses version-dependent donation (P2PK for V35).
+                    auto combined_donation = std::vector<unsigned char>(
+                        ltc::PoolConfig::COMBINED_DONATION_SCRIPT.begin(),
+                        ltc::PoolConfig::COMBINED_DONATION_SCRIPT.end());
                     auto payouts_map = p2p_node->tracker().get_merged_expected_payouts(
-                        best, block_target, coinbase_value, chain_id, donation_script,
+                        best, block_target, coinbase_value, chain_id, combined_donation,
                         operator_ltc_script, operator_merged_script);
 
                     LOG_INFO << "[MM-payout] chain_id=" << chain_id
