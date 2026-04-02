@@ -93,44 +93,48 @@ void Legacy::HANDLER(getaddrs)
 
 void Legacy::HANDLER(shares)
 {
-    ltc::HandleSharesData result; //share, txs
+    try {
+        ltc::HandleSharesData result; //share, txs
 
-    for (auto wrappedshare : msg->m_shares)
-    {
-        ltc::ShareType share;
-        try
+        for (auto wrappedshare : msg->m_shares)
         {
-            share = ltc::load_share(wrappedshare, peer->addr());
-        }
-        catch(const std::exception& e)
-        {
-            LOG_WARNING << "Failed to load share (type=" << wrappedshare.type
-                        << ") from " << peer->addr().to_string() << ": " << e.what();
-            continue;
-        }
-
-        std::vector<coin::MutableTransaction> txs;
-        share.ACTION
-        ({
-            if constexpr (share_t::version >= 13 && share_t::version < 34) 
-            for (auto tx_hash : obj->m_tx_info.m_new_transaction_hashes)
+            ltc::ShareType share;
+            try
             {
-                auto it = m_known_txs.find(tx_hash);
-                if (it != m_known_txs.end())
-                {
-                    txs.emplace_back(it->second);
-                }
-                else
-                {
-                    LOG_WARNING << "Peer referenced unknown transaction " << tx_hash.ToString();
-                }
+                share = ltc::load_share(wrappedshare, peer->addr());
             }
-        });
-        
-        result.add(share, txs);
-    }
+            catch(const std::exception& e)
+            {
+                LOG_WARNING << "Failed to load share (type=" << wrappedshare.type
+                            << ") from " << peer->addr().to_string() << ": " << e.what();
+                continue;
+            }
 
-    processing_shares(result, peer->addr());
+            std::vector<coin::MutableTransaction> txs;
+            share.ACTION
+            ({
+                if constexpr (share_t::version >= 13 && share_t::version < 34)
+                for (auto tx_hash : obj->m_tx_info.m_new_transaction_hashes)
+                {
+                    auto it = m_known_txs.find(tx_hash);
+                    if (it != m_known_txs.end())
+                    {
+                        txs.emplace_back(it->second);
+                    }
+                    else
+                    {
+                        LOG_WARNING << "Peer referenced unknown transaction " << tx_hash.ToString();
+                    }
+                }
+            });
+
+            result.add(share, txs);
+        }
+
+        processing_shares(result, peer->addr());
+    } catch (const std::exception& e) {
+        LOG_ERROR << "[Pool] shares handler exception: " << e.what();
+    }
 }
 
 void Legacy::HANDLER(sharereq)
@@ -216,19 +220,22 @@ void Legacy::HANDLER(sharereply)
 
 void Legacy::HANDLER(bestblock)
 {
-    auto header_hash = Hash(pack(msg->m_header).get_span());
-    LOG_INFO << "[Pool] New best block from peer " << peer->addr().to_string()
-             << ": " << header_hash.ToString();
+    try {
+        auto header_hash = Hash(pack(msg->m_header).get_span());
+        LOG_INFO << "[Pool] New best block from peer " << peer->addr().to_string()
+                 << ": " << header_hash.ToString();
 
-    // Relay to all other connected peers so the block notification propagates
-    auto relay = message_bestblock::make_raw(msg->m_header);
-    for (auto& [nonce, wpeer] : m_peers)
-    {
-        if (wpeer != peer)
-            wpeer->write(message_bestblock::make_raw(msg->m_header));
+        // Relay to all other connected peers so the block notification propagates
+        for (auto& [nonce, wpeer] : m_peers)
+        {
+            if (wpeer && wpeer != peer)
+                wpeer->write(message_bestblock::make_raw(msg->m_header));
+        }
+        // Notify local work-refresh callback (e.g. to re-fetch getblocktemplate)
+        if (m_on_bestblock) m_on_bestblock();
+    } catch (const std::exception& e) {
+        LOG_WARNING << "[Pool] bestblock handler exception: " << e.what();
     }
-    // Notify local work-refresh callback (e.g. to re-fetch getblocktemplate)
-    if (m_on_bestblock) m_on_bestblock();
 }
 
 void Legacy::HANDLER(have_tx)
