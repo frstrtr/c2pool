@@ -629,22 +629,27 @@ std::vector<uint256> SharechainLevelDBStore::get_shares_by_height_range(uint64_t
         return hashes;
     }
 
-    // Cap to the actual stored height to avoid iterating billions of empty keys
-    if (end_height > m_metadata.max_height)
-        end_height = m_metadata.max_height;
-
+    // Use LevelDB iterator with prefix seek — O(stored shares) not O(max_height).
+    // Old code did point lookups for every height 0..max_height (26M+ lookups).
+    // Height keys are "height:XXXXXXXXXXXXXXXX" with zero-padded 16-digit height,
+    // so lexicographic iteration gives us sorted height order.
     try {
-        for (uint64_t height = start_height; height <= end_height; height++) {
-            std::string height_key = make_height_key(height);
+        std::string start_key = make_height_key(start_height);
+        std::string end_key = make_height_key(end_height);
+        std::string prefix = "height:";
+
+        auto keys = m_store->list_keys(start_key, std::numeric_limits<size_t>::max());
+        for (const auto& key : keys) {
+            // Stop if past height prefix or past end key
+            if (key.substr(0, prefix.size()) != prefix) break;
+            if (key > end_key) break;
             std::vector<uint8_t> hash_data;
-            
-            if (m_store->get(height_key, hash_data) && hash_data.size() == 32) {
+            if (m_store->get(key, hash_data) && hash_data.size() == 32) {
                 std::vector<unsigned char> hash_char_data(hash_data.begin(), hash_data.end());
                 uint256 hash(hash_char_data);
                 hashes.push_back(hash);
             }
         }
-        
     } catch (const std::exception& e) {
         LOG_ERROR << "Exception getting shares by height range: " << e.what();
         hashes.clear();

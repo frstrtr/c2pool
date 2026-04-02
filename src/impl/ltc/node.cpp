@@ -899,7 +899,12 @@ void NodeImpl::load_persisted_shares()
     // load_sharechain iterates the height index and loads each share.
     // Limit to keep_per_head shares to avoid loading unbounded history
     // into memory (LevelDB is never pruned, so it accumulates forever).
+    LOG_INFO << "[Pool] Scanning LevelDB height index for persisted shares...";
+    auto t0 = std::chrono::steady_clock::now();
     auto all_hashes = m_storage->get_shares_by_height_range(0, UINT64_MAX);
+    auto scan_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    LOG_INFO << "[Pool] Height index scan: " << all_hashes.size() << " entries in " << scan_ms << "ms";
     if (all_hashes.empty())
     {
         LOG_INFO << "No persisted shares found in LevelDB";
