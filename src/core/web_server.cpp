@@ -3291,6 +3291,18 @@ nlohmann::json MiningInterface::rest_local_stats()
     result["block_value_miner"] = block_value * (1.0 - fee_ratio);
     result["block_value_payments"] = block_value;  // total including fees
 
+    // Computed node fee amounts per block (for dashboard NODE FEE card)
+    result["node_fee_ltc"] = block_value * fee_ratio;
+    if (m_mm_manager) {
+        auto chain_infos = m_mm_manager->get_chain_infos();
+        for (const auto& ci : chain_infos) {
+            double merged_bv = ci.coinbase_value / 1e8;
+            std::string sym = ci.symbol;
+            for (auto& c : sym) c = std::tolower(c);
+            result["node_fee_" + sym] = merged_bv * fee_ratio;
+        }
+    }
+
     // Warnings: daemon health, version alerts, merged chain status
     {
         auto warnings = nlohmann::json::array();

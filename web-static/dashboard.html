@@ -2321,10 +2321,19 @@
                 d3.select('#block_value_payments').text(d3.format('.4f')(local_stats.block_value_payments || 0));
                 d3.select('#block_value_miner').text(d3.format('.4f')(local_stats.block_value_miner || local_stats.block_value));
                 
-                // Node fee percentage
+                // Node fee percentage and computed amounts
                 var nodeFee = local_stats.fee != null ? local_stats.fee : 0;
                 d3.select('#node_fee_percent').text(d3.format('.1f')(nodeFee));
-                
+                // Display computed node fee amounts per block
+                if (local_stats.node_fee_ltc != null) {
+                    d3.select('#payout_totamount').text(d3.format('.4f')(local_stats.node_fee_ltc));
+                    d3.select('#node_payout_symbol').text('LTC');
+                }
+                if (local_stats.node_fee_doge != null) {
+                    d3.select('#node_merged_amount').text(d3.format(',.2f')(local_stats.node_fee_doge));
+                    d3.select('#node_merged_symbol').text('DOGE');
+                }
+
                 // Warnings
                 var warnings = d3.select('#warnings').selectAll('.warning-item')
                     .data(local_stats.warnings || []);
