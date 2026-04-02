@@ -705,13 +705,23 @@ bool MiningInterface::has_merged_chain(uint32_t chain_id) const
 
 std::string MiningInterface::get_node_fee_hash160() const
 {
-    // Extract hash160 from a 25-byte P2PKH scriptPubKey (bytes 3–22)
-    if (m_node_fee_script.size() != 25) return {};
-    if (m_node_fee_script[0] != 0x76 || m_node_fee_script[1] != 0xa9) return {};
+    // Extract hash160 from scriptPubKey (P2PKH, P2SH, or P2WPKH)
+    int h160_off = -1;
+    auto sz = m_node_fee_script.size();
+    if (sz == 25 && m_node_fee_script[0] == 0x76 &&
+        m_node_fee_script[1] == 0xa9 && m_node_fee_script[2] == 0x14)
+        h160_off = 3;   // P2PKH
+    else if (sz == 23 && m_node_fee_script[0] == 0xa9 &&
+             m_node_fee_script[1] == 0x14)
+        h160_off = 2;   // P2SH
+    else if (sz == 22 && m_node_fee_script[0] == 0x00 &&
+             m_node_fee_script[1] == 0x14)
+        h160_off = 2;   // P2WPKH
+    if (h160_off < 0) return {};
     static const char* HEX = "0123456789abcdef";
     std::string h160;
     h160.reserve(40);
-    for (int i = 3; i < 23; ++i) {
+    for (int i = h160_off; i < h160_off + 20; ++i) {
         h160 += HEX[m_node_fee_script[i] >> 4];
         h160 += HEX[m_node_fee_script[i] & 0x0f];
     }
@@ -3495,19 +3505,14 @@ nlohmann::json MiningInterface::rest_payout_addr()
 
 nlohmann::json MiningInterface::rest_payout_addrs()
 {
+    // p2pool: returns the node operator's address(es) so the dashboard
+    // can look them up in /current_payouts and display operator earnings.
+    // The probabilistic fee replacement puts shares under this address.
     nlohmann::json arr = nlohmann::json::array();
     if (!m_payout_address.empty())
         arr.push_back(m_payout_address);
-    // Include donation script hex — this is the key used in /current_payouts
-    // for the combined donation output (node fee + dev donation).
-    // The dashboard matches payout_addrs against current_payouts keys.
-    if (!m_donation_script.empty()) {
-        std::string hex;
-        hex.reserve(m_donation_script.size() * 2);
-        static const char* H = "0123456789abcdef";
-        for (auto b : m_donation_script) { hex += H[b >> 4]; hex += H[b & 0x0f]; }
-        arr.push_back(hex);
-    }
+    if (!m_node_fee_address.empty() && m_node_fee_address != m_payout_address)
+        arr.push_back(m_node_fee_address);
     return arr;
 }
 
@@ -4974,20 +4979,32 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                             << primary_addr << "' — share will carry zero-hash payout";
         }
 
-        // V36 probabilistic node fee: with probability m_node_fee_percent%,
-        // replace the miner's address with the node operator's address.
-        // This means ~fee% of shares carry the operator's address in PPLNS.
+        // p2pool -f: probabilistic node fee (matches work.py:1592-1594).
+        // With probability fee%, replace the miner's pubkey_hash with the
+        // node operator's. ~fee% of shares carry the operator's address
+        // in PPLNS, so the operator earns ~fee% of block rewards.
+        // Supports P2PKH, P2SH, and P2WPKH node fee addresses.
         if (m_node_fee_percent > 0.0 && !m_node_fee_script.empty()) {
             float roll = core::random::random_float(0.0f, 100.0f);
             if (roll < static_cast<float>(m_node_fee_percent)) {
-                // Replace with node operator address for this share
-                // The script is stored as raw bytes; for share tracking we pass
-                // the hex representation of the hash160 (bytes 3..22 of P2PKH script)
-                if (m_node_fee_script.size() == 25) { // P2PKH: 76 a9 14 <20 bytes> 88 ac
-                    static const char* HEX = "0123456789abcdef";
+                // Extract hash160 from node fee scriptPubKey (any supported type)
+                static const char* HEX = "0123456789abcdef";
+                int h160_off = -1;
+                auto sz = m_node_fee_script.size();
+                if (sz == 25 && m_node_fee_script[0] == 0x76 &&
+                    m_node_fee_script[1] == 0xa9 && m_node_fee_script[2] == 0x14) {
+                    h160_off = 3;  // P2PKH: 76 a9 14 <20> 88 ac
+                } else if (sz == 23 && m_node_fee_script[0] == 0xa9 &&
+                           m_node_fee_script[1] == 0x14) {
+                    h160_off = 2;  // P2SH: a9 14 <20> 87
+                } else if (sz == 22 && m_node_fee_script[0] == 0x00 &&
+                           m_node_fee_script[1] == 0x14) {
+                    h160_off = 2;  // P2WPKH: 00 14 <20>
+                }
+                if (h160_off >= 0) {
                     std::string h160;
                     h160.reserve(40);
-                    for (int i = 3; i < 23; ++i) {
+                    for (int i = h160_off; i < h160_off + 20; ++i) {
                         h160 += HEX[m_node_fee_script[i] >> 4];
                         h160 += HEX[m_node_fee_script[i] & 0x0f];
                     }
