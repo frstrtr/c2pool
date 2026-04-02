@@ -1327,8 +1327,16 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
             {
                 if constexpr (ver >= ltc::SEGWIT_ACTIVATION_VERSION)
                 {
-                    if (share.m_segwit_data.has_value())
+                    // PossiblyNoneType: ALWAYS serialize (p2pool writes default when None).
+                    // Must match share_init_verify — both paths must produce identical ref_hash.
+                    if (share.m_segwit_data.has_value()) {
                         ref_stream << share.m_segwit_data.value();
+                    } else {
+                        std::vector<uint256> empty_branch;
+                        ref_stream << empty_branch;
+                        uint256 zero_root;
+                        ref_stream << zero_root;
+                    }
                 }
             }
 
@@ -3219,7 +3227,7 @@ uint256 create_local_share(
     // to verify p2pool would produce the same gentx_hash.
     {
         static int xcheck_count = 0;
-        if (xcheck_count < 5) {
+        if (true) { // Always cross-check (was: xcheck_count < 5)
             uint256 verify_hash = generate_share_transaction<MergedMiningShare>(*heap_share, tracker, true, (MergedMiningShare::version >= 36));
             bool xcheck_ok = (verify_hash == gentx_hash_for_header);
             if (xcheck_ok) {
