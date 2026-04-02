@@ -904,7 +904,11 @@ void NodeImpl::load_persisted_shares()
     auto all_hashes = m_storage->get_shares_by_height_range(0, UINT64_MAX);
     auto scan_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();
-    LOG_INFO << "[Pool] Height index scan: " << all_hashes.size() << " entries in " << scan_ms << "ms";
+    {
+        std::set<uint256> unique(all_hashes.begin(), all_hashes.end());
+        LOG_INFO << "[Pool] Height index scan: " << all_hashes.size() << " entries ("
+                 << unique.size() << " unique) in " << scan_ms << "ms";
+    }
     if (all_hashes.empty())
     {
         LOG_INFO << "No persisted shares found in LevelDB";
@@ -925,16 +929,20 @@ void NodeImpl::load_persisted_shares()
 
     const size_t to_load = total_in_db - skip;
     LOG_INFO << "[Pool] Loading shares from LevelDB: " << to_load << " shares to process...";
-    int loaded = 0;
+    int loaded = 0, skipped_contains = 0, skipped_load = 0, skipped_small = 0;
     for (size_t i = skip; i < total_in_db; ++i)
     {
         const auto& hash = all_hashes[i];
         std::vector<uint8_t> data;
         uint256 prev; uint64_t height, ts; uint256 work, target; bool orphan;
-        if (!m_storage->load_share(hash, data, prev, height, ts, work, target, orphan))
+        if (!m_storage->load_share(hash, data, prev, height, ts, work, target, orphan)) {
+            ++skipped_load;
             continue;
-        if (data.size() < 8)
+        }
+        if (data.size() < 8) {
+            ++skipped_small;
             continue;
+        }
 
         try
         {
@@ -955,6 +963,8 @@ void NodeImpl::load_persisted_shares()
                     LOG_INFO << "[Pool] Loading shares: " << progress << "/" << to_load
                              << " (" << (100 * progress / to_load) << "%)";
                 }
+            } else {
+                ++skipped_contains;
             }
         }
         catch (const std::exception& e)
@@ -965,7 +975,9 @@ void NodeImpl::load_persisted_shares()
     }
 
     LOG_INFO << "[Pool] Loaded " << loaded << " shares from LevelDB storage"
-             << " (DB total: " << total_in_db << ", limit: " << keep_per_head << ")";
+             << " (DB total: " << total_in_db << ", limit: " << keep_per_head
+             << ", skipped: load=" << skipped_load << " small=" << skipped_small
+             << " dup=" << skipped_contains << ")";
 
     // Prune old shares from LevelDB that we skipped
     if (skip > 0)
