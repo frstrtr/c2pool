@@ -2017,7 +2017,9 @@ public:
                                 const uint256& block_target,
                                 uint64_t subsidy,
                                 uint32_t chain_id,
-                                const std::vector<unsigned char>& donation_script)
+                                const std::vector<unsigned char>& donation_script,
+                                const std::vector<unsigned char>& operator_ltc_script = {},
+                                const std::vector<unsigned char>& operator_merged_script = {})
     {
         auto chain_len = std::min(chain.get_height(best_share_hash),
                                   static_cast<int32_t>(PoolConfig::real_chain_length()));
@@ -2060,7 +2062,15 @@ public:
             // Resolve weight key to DOGE-compatible scriptPubKey:
             // MERGED:-prefixed → strip prefix (already a DOGE script)
             // Raw LTC script  → autoconvert (P2WPKH→P2PKH, etc.)
-            auto script = resolve_merged_payout_script(key);
+            std::vector<unsigned char> script;
+            // p2pool --merged-operator-address: if this weight belongs to the
+            // node operator and an explicit merged address was provided, use it
+            // instead of auto-converting from the LTC script.
+            if (!operator_ltc_script.empty() && !operator_merged_script.empty() && key == operator_ltc_script) {
+                script = operator_merged_script;
+            } else {
+                script = resolve_merged_payout_script(key);
+            }
             if (script.empty()) continue;  // Unconvertible (P2WSH, P2TR)
             uint64_t w = weight.GetLow64();
             // amount = miners_reward * w // accepted_total

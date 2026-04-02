@@ -60,7 +60,9 @@ seed_nodes:
 # --address is only required for --custodial mode.
 donation_percentage: 0.1       # Developer donation % (default: 0.1%)
 # node_owner_fee: 0.0          # Node owner fee % (default: 0%)
-# node_owner_address: ""       # Node owner payout address
+# node_owner_address: ""       # Node owner payout address (LTC)
+# node_owner_merged_address: "" # Explicit merged chain (DOGE) payout address for node fee
+#                               # If not set, auto-converts from LTC address (same hash160)
 # redistribute: pplns           # Redistribution mode: pplns, fee, boost, donate
 
 # ─── Stratum per-connection vardiff tuning ───────────────────────────────────

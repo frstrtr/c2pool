@@ -435,6 +435,7 @@ int main(int argc, char* argv[]) {
     std::string config_file;
     std::string solo_address;
     std::string node_owner_address;
+    std::string node_owner_merged_address; // Explicit merged chain (DOGE) address for node fee
     std::string node_owner_script;         // Node owner script hex
     double dev_donation = 0.1;          // Developer donation percentage (default 0.1%)
     double node_owner_fee = 0.0;        // Node owner fee percentage
@@ -720,6 +721,10 @@ int main(int argc, char* argv[]) {
             node_owner_address = argv[++i];
             cli_explicit.insert("node_owner_address");
         }
+        else if ((arg == "--node-owner-merged-address" || arg == "--merged-operator-address") && i + 1 < argc) {
+            node_owner_merged_address = argv[++i];
+            cli_explicit.insert("node_owner_merged_address");
+        }
         else if (arg == "--node-owner-script" && i + 1 < argc) {
             node_owner_script = argv[++i];
             cli_explicit.insert("node_owner_script");
@@ -1001,6 +1006,8 @@ int main(int argc, char* argv[]) {
                 node_owner_fee = cfg["node_owner_fee"].as<double>();
             if (!cli_explicit.count("node_owner_address") && cfg["node_owner_address"])
                 node_owner_address = cfg["node_owner_address"].as<std::string>();
+            if (!cli_explicit.count("node_owner_merged_address") && cfg["node_owner_merged_address"])
+                node_owner_merged_address = cfg["node_owner_merged_address"].as<std::string>();
             if (!cli_explicit.count("node_owner_script") && cfg["node_owner_script"])
                 node_owner_script = cfg["node_owner_script"].as<std::string>();
             if (!cli_explicit.count("auto_detect_wallet") && cfg["auto_detect_wallet"])
@@ -4022,8 +4029,19 @@ int main(int argc, char* argv[]) {
                 });
               } else {
                 // P2P mode: PPLNS weights from the share tracker
+                // Build operator LTC script for merged address override (p2pool --merged-operator-address)
+                auto operator_ltc_script = node_owner_address.empty()
+                    ? std::vector<unsigned char>{}
+                    : core::address_to_script(node_owner_address);
+                auto operator_merged_script = node_owner_merged_address.empty()
+                    ? std::vector<unsigned char>{}
+                    : core::address_to_script(node_owner_merged_address);
+                if (!node_owner_merged_address.empty()) {
+                    LOG_INFO << "Merged operator address override: " << node_owner_merged_address
+                             << " (script " << operator_merged_script.size() << " bytes)";
+                }
                 mm_manager->set_payout_provider(
-                    [&p2p_node, mi](
+                    [&p2p_node, mi, operator_ltc_script, operator_merged_script](
                         uint32_t chain_id, uint64_t coinbase_value)
                     -> std::vector<std::pair<std::vector<unsigned char>, uint64_t>>
                 {
@@ -4040,7 +4058,8 @@ int main(int argc, char* argv[]) {
 
                     auto& donation_script = mi->get_donation_script();
                     auto payouts_map = p2p_node->tracker().get_merged_expected_payouts(
-                        best, block_target, coinbase_value, chain_id, donation_script);
+                        best, block_target, coinbase_value, chain_id, donation_script,
+                        operator_ltc_script, operator_merged_script);
 
                     LOG_INFO << "[MM-payout] chain_id=" << chain_id
                              << " coinbase_value=" << coinbase_value
