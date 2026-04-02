@@ -99,11 +99,14 @@ public:
 
     void error(const message_error_type& err, const NetService& service, const std::source_location where = std::source_location::current()) override
     {
-        LOG_WARNING << "[Pool] Peer " << service.to_string()
+        // Copy NetService — the reference may become dangling if the socket
+        // that owns it is destroyed before this handler completes.
+        NetService svc_copy = service;
+        LOG_WARNING << "[Pool] Peer " << svc_copy.to_string()
                     << " disconnected: " << err;
-        if (m_connections.contains(service))
+        if (m_connections.contains(svc_copy))
         {
-            auto node = m_connections.extract(service);
+            auto node = m_connections.extract(svc_copy);
             auto peer = std::move(node.mapped());
             peer->m_timeout->stop();
             peer->cancel();
@@ -117,10 +120,7 @@ public:
                 p.reset();
             });
         }
-        else
-        {
-            LOG_ERROR << "\tpeers not exist " << service.to_string();
-        }
+        // else: already removed (double-disconnect race) — safe to ignore
     }
 
     void error(const boost::system::error_code& ec, const NetService& service, const std::source_location where = std::source_location::current()) override

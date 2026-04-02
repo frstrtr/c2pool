@@ -196,17 +196,15 @@ public:
     // ICommmunicator
     void error(const message_error_type& err, const NetService& service, const std::source_location where = std::source_location::current()) override
     {
-        LOG_WARNING << "[" << m_chain_label << "] Peer " << service.to_string()
+        // Copy — the NetService reference may dangle if the socket is already freed
+        NetService svc_copy = service;
+        LOG_WARNING << "[" << m_chain_label << "] Peer " << svc_copy.to_string()
                     << " disconnected: " << err;
         if (m_peer)
         {
             m_peer.reset();
-            // peer.mapped()->m_timeout->stop(); // for case: peer stored somewhere (or leak)
         }
-        else
-        {
-            LOG_ERROR << "\tpeers not exist " << service.to_string();
-        }
+        // else: already disconnected (double-fire race) — safe to ignore
 
         stop_ping_timer();
         stop_timeout_timer();

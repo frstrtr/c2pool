@@ -4389,6 +4389,22 @@ int main(int argc, char* argv[]) {
             // where the event loop never exits until explicit shutdown.
             auto work_guard = boost::asio::make_work_guard(ioc);
 
+            // Watchdog: detect event loop stalls (handlers stopping)
+            auto watchdog_timer = std::make_shared<boost::asio::steady_timer>(ioc);
+            auto watchdog_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
+            *watchdog_fn = [watchdog_timer, watchdog_fn](boost::system::error_code ec) {
+                if (ec) return;
+                static int tick = 0;
+                ++tick;
+                if (tick % 2 == 0) { // every 60s
+                    LOG_INFO << "[WATCHDOG] alive tick=" << tick;
+                }
+                watchdog_timer->expires_after(std::chrono::seconds(30));
+                watchdog_timer->async_wait(*watchdog_fn);
+            };
+            watchdog_timer->expires_after(std::chrono::seconds(30));
+            watchdog_timer->async_wait(*watchdog_fn);
+
             // Run until shutdown
             while (!g_shutdown_requested) {
                 ioc.restart();
