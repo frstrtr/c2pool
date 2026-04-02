@@ -302,18 +302,84 @@ bool SharechainLevelDBStore::open()
 
     // Load metadata
     load_metadata();
-    
+
+    // Check dirty flag — if set, previous shutdown was ungraceful.
+    // Rebuild height index from share data to ensure consistency.
+    std::vector<uint8_t> dirty_data;
+    bool was_dirty = false;
+    if (m_store->get("dirty", dirty_data) && !dirty_data.empty() && dirty_data[0] == 1) {
+        was_dirty = true;
+        LOG_WARNING << "SharechainLevelDB: dirty flag set — previous shutdown was ungraceful";
+        LOG_INFO << "SharechainLevelDB: rebuilding height index...";
+        // Scan all index: keys, re-read metadata, rebuild height: keys
+        auto all_keys = m_store->list_keys("index:", std::numeric_limits<size_t>::max());
+        int rebuilt = 0, removed_stale = 0;
+        auto batch = m_store->create_batch();
+        // First: remove all existing height: keys
+        auto old_heights = m_store->list_keys("height:", std::numeric_limits<size_t>::max());
+        for (const auto& hk : old_heights)
+            batch.remove(hk);
+        // Then: rebuild from index metadata
+        for (const auto& idx_key : all_keys) {
+            // idx_key = "index:<hash_hex>"
+            std::string hash_hex = idx_key.substr(6);
+            uint256 hash;
+            hash.SetHex(hash_hex);
+            std::string share_key = make_share_key(hash);
+            if (!m_store->exists(share_key)) {
+                // Stale index entry — share data missing
+                batch.remove(idx_key);
+                ++removed_stale;
+                continue;
+            }
+            std::vector<uint8_t> meta_data;
+            if (!m_store->get(idx_key, meta_data)) continue;
+            try {
+                PackStream ps(std::span<const std::byte>(
+                    reinterpret_cast<const std::byte*>(meta_data.data()), meta_data.size()));
+                uint256 prev; uint64_t height, ts; uint256 work, target; uint8_t orphan;
+                ps >> prev >> height >> ts >> work >> target >> orphan;
+                if (height > 0) {
+                    std::string hk = make_height_key(height);
+                    std::vector<uint8_t> hash_data(hash.data(), hash.data() + 32);
+                    batch.put(hk, hash_data);
+                    ++rebuilt;
+                }
+            } catch (...) {
+                batch.remove(idx_key);
+                ++removed_stale;
+            }
+        }
+        batch.commit();
+        // Update metadata
+        m_metadata.total_shares = rebuilt;
+        save_metadata();
+        LOG_INFO << "SharechainLevelDB: rebuilt " << rebuilt << " height entries"
+                 << " (removed " << removed_stale << " stale)";
+    }
+
+    // Set dirty flag — cleared on graceful close()
+    {
+        std::vector<uint8_t> flag = {1};
+        m_store->put("dirty", flag);
+    }
+
     LOG_INFO << "SharechainLevelDBStore opened for network: " << m_network_name;
     LOG_INFO << "  Database path: " << m_db_path;
     LOG_INFO << "  Stored shares: " << m_metadata.total_shares;
     LOG_INFO << "  Database version: " << m_metadata.version;
-    
+    if (was_dirty)
+        LOG_INFO << "  Recovery: height index rebuilt from share metadata";
+
     return true;
 }
 
 void SharechainLevelDBStore::close()
 {
     if (m_store && m_store->is_open()) {
+        // Clear dirty flag — marks clean shutdown
+        std::vector<uint8_t> flag = {0};
+        m_store->put("dirty", flag);
         save_metadata();
         m_store->close();
     }
