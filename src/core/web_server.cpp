@@ -3275,8 +3275,11 @@ nlohmann::json MiningInterface::rest_local_stats()
             block_value = m_cached_template.value("coinbasevalue", uint64_t(0)) / 1e8;
     }
     result["block_value"] = block_value;
-    result["block_value_miner"] = block_value;    // miner portion (same for now)
-    result["block_value_payments"] = block_value;  // total with payments
+    // Deduct total fee (node fee + dev donation) from miner portion
+    // donation_proportion already represents the combined fee ratio
+    double fee_ratio = m_pool_fee_percent / 100.0;
+    result["block_value_miner"] = block_value * (1.0 - fee_ratio);
+    result["block_value_payments"] = block_value;  // total including fees
 
     // Warnings: daemon health, version alerts, merged chain status
     {
@@ -3495,6 +3498,9 @@ nlohmann::json MiningInterface::rest_payout_addrs()
     nlohmann::json arr = nlohmann::json::array();
     if (!m_payout_address.empty())
         arr.push_back(m_payout_address);
+    // Include node fee address so dashboard can show node operator payouts
+    if (!m_node_fee_address.empty() && m_node_fee_address != m_payout_address)
+        arr.push_back(m_node_fee_address);
     return arr;
 }
 
