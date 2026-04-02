@@ -14,6 +14,8 @@
 #include <core/target_utils.hpp> // chain::bits_to_target
 #include <btclibs/util/strencodings.h>  // ParseHex, HexStr
 #include <crypto/scrypt.h>  // scrypt_1024_1_1_256 for Litecoin PoW
+#include <crypto/sha256.h>      // CSHA256 for P2PK→P2PKH conversion
+#include <crypto/ripemd160.h>   // CRIPEMD160 for Hash160
 #include <c2pool/merged/merged_mining.hpp>  // Integrated merged mining
 
 #include <iomanip>
@@ -2549,13 +2551,23 @@ nlohmann::json MiningInterface::rest_current_payouts()
             // script_hex is a hex-encoded scriptPubKey — decode to bytes, then to address
             auto script_bytes = ParseHex(script_hex);
             std::string addr = core::script_to_address(script_bytes, is_ltc, m_testnet);
-            if (addr.empty()) {
-                // P2PK donation script — label as "donation" instead of raw hex
-                if (script_bytes.size() > 33 && script_bytes.back() == 0xac)
-                    addr = "donation";
-                else
-                    addr = script_hex;
+            if (addr.empty() && script_bytes.size() > 33 && script_bytes.back() == 0xac) {
+                // P2PK: PUSH<len> <pubkey> OP_CHECKSIG → hash pubkey → P2PKH address
+                size_t pk_len = script_bytes[0];
+                if (pk_len + 1 == script_bytes.size() - 1) {
+                    // SHA256 → RIPEMD160 (Hash160)
+                    unsigned char sha[32], rip[20];
+                    CSHA256().Write(&script_bytes[1], pk_len).Finalize(sha);
+                    CRIPEMD160().Write(sha, 32).Finalize(rip);
+                    std::vector<unsigned char> p2pkh = {0x76, 0xa9, 0x14};
+                    p2pkh.insert(p2pkh.end(), rip, rip + 20);
+                    p2pkh.push_back(0x88);
+                    p2pkh.push_back(0xac);
+                    addr = core::script_to_address(p2pkh, is_ltc, m_testnet);
+                }
             }
+            if (addr.empty())
+                addr = script_hex;
             // p2pool returns coins (not satoshis)
             result[addr] = static_cast<double>(amount) / 1e8;
         }
@@ -2575,16 +2587,25 @@ nlohmann::json MiningInterface::rest_current_payouts()
             auto outputs = pm->calculate_pplns_outputs(subsidy);
             for (const auto& [script, amount] : outputs) {
                 std::string addr = core::script_to_address(script, is_ltc, m_testnet);
+                if (addr.empty() && script.size() > 33 && script.back() == 0xac) {
+                    size_t pk_len = script[0];
+                    if (pk_len + 1 == script.size() - 1) {
+                        unsigned char sha[32], rip[20];
+                        CSHA256().Write(&script[1], pk_len).Finalize(sha);
+                        CRIPEMD160().Write(sha, 32).Finalize(rip);
+                        std::vector<unsigned char> p2pkh = {0x76, 0xa9, 0x14};
+                        p2pkh.insert(p2pkh.end(), rip, rip + 20);
+                        p2pkh.push_back(0x88);
+                        p2pkh.push_back(0xac);
+                        addr = core::script_to_address(p2pkh, is_ltc, m_testnet);
+                    }
+                }
                 if (addr.empty()) {
-                    if (script.size() > 33 && script.back() == 0xac)
-                        addr = "donation";
-                    else {
-                        static const char* HEX = "0123456789abcdef";
-                        addr.reserve(script.size() * 2);
-                        for (unsigned char b : script) {
-                            addr += HEX[b >> 4];
-                            addr += HEX[b & 0x0f];
-                        }
+                    static const char* HEX = "0123456789abcdef";
+                    addr.reserve(script.size() * 2);
+                    for (unsigned char b : script) {
+                        addr += HEX[b >> 4];
+                        addr += HEX[b & 0x0f];
                     }
                 }
                 result[addr] = static_cast<double>(amount) / 1e8;

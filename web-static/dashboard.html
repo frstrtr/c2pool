@@ -3399,7 +3399,8 @@
                     .attr('target', '_blank')
                     .attr('title', addr)
                     .text(addr);
-                if (addr === 'donation') {
+                // Label donation address (LeD2fnn... on mainnet)
+                if (addr.indexOf('LeD2f') === 0 || addr === 'donation') {
                     addrTd.append('span')
                         .style('color', '#888')
                         .style('font-size', '0.6rem')
