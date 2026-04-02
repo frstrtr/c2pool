@@ -2160,6 +2160,20 @@ int main(int argc, char* argv[]) {
                     [&p2p_node]() -> nlohmann::json {
                         return p2p_node->get_peer_info_json();
                     });
+                // Wire pool hashrate from p2pool's get_pool_attempts_per_second
+                web_server.get_mining_interface()->set_pool_hashrate_fn(
+                    [&p2p_node]() -> double {
+                        auto best = p2p_node->best_share_hash();
+                        if (best.IsNull()) return 0.0;
+                        auto& tracker = p2p_node->tracker();
+                        if (!tracker.chain.contains(best)) return 0.0;
+                        int height = tracker.chain.get_height(best);
+                        if (height < 3) return 0.0;
+                        auto lookbehind = std::min(height - 1,
+                            static_cast<int>(ltc::PoolConfig::TARGET_LOOKBEHIND));
+                        auto aps = tracker.get_pool_attempts_per_second(best, lookbehind, false);
+                        return static_cast<double>(aps.GetLow64());
+                    });
             } // end if (p2p_node) — P2P callbacks
 
             // When a block submission is attempted, record the found block

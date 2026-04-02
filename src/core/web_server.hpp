@@ -521,6 +521,10 @@ public:
     void set_stratum_hashrate_fn(std::function<double()> fn) { m_stratum_hashrate_fn = std::move(fn); }
     double get_stratum_total_hashrate() const { return m_stratum_hashrate_fn ? m_stratum_hashrate_fn() : 0.0; }
 
+    // Pool hashrate (H/s) — from P2P node's get_pool_attempts_per_second
+    void set_pool_hashrate_fn(std::function<double()> fn) { m_pool_hashrate_fn = std::move(fn); }
+    double get_pool_hashrate() const { return m_pool_hashrate_fn ? m_pool_hashrate_fn() : 0.0; }
+
     // Rate monitor stats for p2pool-style status (DOA%, time window)
     struct RateStats {
         double hashrate = 0;
@@ -789,6 +793,7 @@ private:
     uint32_t m_cached_sharechain_height{0};
     uint16_t m_cached_miner_count{0};
     double m_cached_pool_hashrate{0};
+    std::function<double()> m_pool_hashrate_fn;
 
     // THE checkpoint callbacks (set by node layer)
     checkpoint_store_fn_t m_checkpoint_latest_fn;

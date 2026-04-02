@@ -2798,25 +2798,12 @@ nlohmann::json MiningInterface::rest_global_stats()
         if (sc.contains("shares_by_miner") && sc["shares_by_miner"].is_object())
             unique_miners = static_cast<int>(sc["shares_by_miner"].size());
 
-        // Estimate pool hashrate from sharechain timeline
-        if (sc.contains("timeline") && sc["timeline"].is_array() && sc["timeline"].size() >= 2) {
-            auto& tl = sc["timeline"];
-            double first_ts = tl.front().value("timestamp", 0.0);
-            double last_ts  = tl.back().value("timestamp", 0.0);
-            double time_span = last_ts - first_ts;
-            if (time_span > 0 && total_shares > 0) {
-                // pool_hashrate = total_work / time_span
-                // total_work = total_shares * share_difficulty * 2^32
-                pool_rate = total_shares * share_diff * 4294967296.0 / time_span;
-            }
-        }
     }
 
-    // Also consider local miner hashrate from node
-    if (pool_rate == 0.0 && m_node) {
-        auto hs = m_node->get_hashrate_stats();
-        if (hs.contains("global_hashrate"))
-            pool_rate = hs["global_hashrate"].get<double>();
+    // Pool hashrate from P2P node's get_pool_attempts_per_second (p2pool-correct)
+    if (m_pool_hashrate_fn) {
+        double hr = m_pool_hashrate_fn();
+        if (hr > 0) pool_rate = hr;
     }
     
     // Network difficulty and hashrate
