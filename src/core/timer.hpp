@@ -23,6 +23,7 @@ private:
 
     void logic()
     {
+        if (*m_destroyed) return;
         m_timer.expires_from_now(boost::asio::chrono::seconds(m_t));
         m_timer.async_wait(
             [&, destroyed = m_destroyed](const boost::system::error_code& ec)
@@ -33,11 +34,11 @@ private:
                 if (!ec)
                 {
                     m_handler();
-                    if (m_repeat)
+                    if (m_repeat && !*destroyed)
                         restart();
                 } else
                 {
-                    if (m_cancel)
+                    if (m_cancel && !*destroyed)
                         m_cancel();
                 }
             }
@@ -67,12 +68,14 @@ public:
 
     void stop()
     {
+        if (*m_destroyed) return;
         m_timer.cancel();
     }
 
     void restart(std::optional<time_t> new_t = std::nullopt)
     {
-        if (new_t) 
+        if (*m_destroyed) return;
+        if (new_t)
             m_t = new_t.value();
         logic();
     }
