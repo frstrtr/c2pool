@@ -6,8 +6,11 @@ namespace core
 {
 
 #define ASYNC_READ(buffer, handler)\
-    if (!m_status) return;\
-    boost::asio::async_read(*m_socket, buffer, [self = shared_from_this(), this, packet](const auto& ec, std::size_t len) handler)
+    if (!m_status || !m_socket || !m_socket->is_open()) return;\
+    boost::asio::async_read(*m_socket, buffer, [self = shared_from_this(), this, packet](const auto& ec, std::size_t len) {\
+        if (!m_status) return; /* socket closed between dispatch and callback */\
+        handler\
+    })
 
 void Socket::read_prefix(std::shared_ptr<Packet> packet)
 {
