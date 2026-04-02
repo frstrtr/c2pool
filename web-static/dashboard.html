@@ -3392,12 +3392,20 @@
                 
                 // Main row for parent chain
                 var mainRow = tbody.append('tr');
-                mainRow.append('td').append('a')
+                var addrTd = mainRow.append('td');
+                addrTd.append('a')
                     .attr('class', 'hash-link')
                     .attr('href', currency_info.address_explorer_url_prefix + addr)
                     .attr('target', '_blank')
                     .attr('title', addr)
                     .text(addr);
+                if (addr === 'donation') {
+                    addrTd.append('span')
+                        .style('color', '#888')
+                        .style('font-size', '0.6rem')
+                        .style('margin-left', '4px')
+                        .text('pool dev fee');
+                }
                 mainRow.append('td')
                     .style('text-align', 'right')
                     .attr('class', 'amount')
@@ -3424,6 +3432,28 @@
                             .attr('target', '_blank')
                             .attr('title', merged.address)
                             .text(merged.address);
+                        // p2pool-style source labels
+                        if (merged.source === 'auto-convert') {
+                            addrCell.append('span')
+                                .style('color', '#b08800')
+                                .style('font-size', '0.6rem')
+                                .style('margin-left', '4px')
+                                .attr('title', 'Auto-converted from parent chain address (same pubkey hash). During V35\u2192V36 transition, all merged addresses are auto-converted since V35 shares cannot carry explicit merged addresses.')
+                                .text('\u26A0 auto');
+                        } else if (merged.source === 'donation') {
+                            addrCell.append('span')
+                                .style('color', '#888')
+                                .style('font-size', '0.6rem')
+                                .style('margin-left', '4px')
+                                .text('donation');
+                        } else if (merged.source === 'explicit') {
+                            addrCell.append('span')
+                                .style('color', '#28a745')
+                                .style('font-size', '0.6rem')
+                                .style('margin-left', '4px')
+                                .attr('title', 'Explicit merged chain address provided by miner via stratum username')
+                                .text('\u2713 explicit');
+                        }
                         
                         subRow.append('td')
                             .style('text-align', 'right')

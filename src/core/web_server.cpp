@@ -4218,11 +4218,25 @@ nlohmann::json MiningInterface::rest_current_merged_payouts()
             // TODO: testnet detection for DOGE address versions
 
             for (auto& [script, amount] : merged_payouts) {
+                // Determine source label (p2pool: auto-convert, donation, explicit)
+                std::string source = "auto-convert"; // default for V35 (no explicit merged addrs)
+                // Donation: P2PK (ends with OP_CHECKSIG), P2SH matching donation script,
+                // or script matching the known donation_script from MiningInterface
+                bool is_donation = (script.size() > 33 && script.back() == 0xac); // P2PK
+                if (!is_donation && !m_donation_script.empty() && script == m_donation_script)
+                    is_donation = true; // matches configured donation script
+                if (!is_donation && script.size() == 23 && script[0] == 0xa9) {
+                    // Check if P2SH matches combined donation hash (8c6272621d89e8fa...)
+                    if (script[2] == 0x8c && script[3] == 0x62 && script[4] == 0x72)
+                        is_donation = true;
+                }
+                if (is_donation) source = "donation";
+                // TODO: detect "explicit" when V36 shares carry merged_addresses
+
                 // Convert merged script to proper DOGE address
                 std::string merged_addr = script_to_address(script, "", merged_p2pkh_ver, merged_p2sh_ver);
                 if (merged_addr.empty()) {
-                    // P2PK (donation script) — hash the pubkey to get address
-                    if (script.size() > 33 && script.back() == 0xac) {
+                    if (source == "donation") {
                         merged_addr = "donation";
                     }
                 }
@@ -4257,7 +4271,8 @@ nlohmann::json MiningInterface::rest_current_merged_payouts()
                                 entry["merged"].push_back({
                                     {"symbol", ci.symbol},
                                     {"address", merged_addr.empty() ? hash160_hex : merged_addr},
-                                    {"amount", amount / 1e8}
+                                    {"amount", amount / 1e8},
+                                    {"source", source}
                                 });
                                 attached = true;
                                 break;
@@ -4272,7 +4287,8 @@ nlohmann::json MiningInterface::rest_current_merged_payouts()
                     result[key]["merged"].push_back({
                         {"symbol", ci.symbol},
                         {"address", key},
-                        {"amount", amount / 1e8}
+                        {"amount", amount / 1e8},
+                        {"source", source}
                     });
                 }
             }
