@@ -3498,9 +3498,16 @@ nlohmann::json MiningInterface::rest_payout_addrs()
     nlohmann::json arr = nlohmann::json::array();
     if (!m_payout_address.empty())
         arr.push_back(m_payout_address);
-    // Include node fee address so dashboard can show node operator payouts
-    if (!m_node_fee_address.empty() && m_node_fee_address != m_payout_address)
-        arr.push_back(m_node_fee_address);
+    // Include donation script hex — this is the key used in /current_payouts
+    // for the combined donation output (node fee + dev donation).
+    // The dashboard matches payout_addrs against current_payouts keys.
+    if (!m_donation_script.empty()) {
+        std::string hex;
+        hex.reserve(m_donation_script.size() * 2);
+        static const char* H = "0123456789abcdef";
+        for (auto b : m_donation_script) { hex += H[b >> 4]; hex += H[b & 0x0f]; }
+        arr.push_back(hex);
+    }
     return arr;
 }
 
