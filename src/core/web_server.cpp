@@ -3221,7 +3221,17 @@ nlohmann::json MiningInterface::rest_local_stats()
 
     // peers — legacy format: {incoming, outgoing}
     result["peers"] = {{"incoming", 0}, {"outgoing", 0}};
-    if (m_node) {
+    if (m_peer_info_fn) {
+        auto pi = m_peer_info_fn();
+        if (pi.is_array()) {
+            int incoming = 0, outgoing = 0;
+            for (const auto& p : pi) {
+                if (p.value("incoming", false)) ++incoming;
+                else ++outgoing;
+            }
+            result["peers"] = {{"incoming", incoming}, {"outgoing", outgoing}};
+        }
+    } else if (m_node) {
         auto hs = m_node->get_hashrate_stats();
         if (hs.contains("peer_count"))
             result["peers"]["outgoing"] = hs["peer_count"];
@@ -3301,19 +3311,27 @@ nlohmann::json MiningInterface::rest_local_stats()
         }
 
         // 3. Merged chain daemon contact check
+        // Threshold: 3x expected block time (LTC ~150s → 450s, DOGE ~60s → 180s).
+        // Aux work updates on each new block — brief gaps between blocks are normal.
         if (m_mm_manager) {
             auto chain_infos = m_mm_manager->get_chain_infos();
             for (const auto& ci : chain_infos) {
-                if (ci.last_update_age_s > 60)
+                int64_t threshold = 180; // 3 minutes default (covers DOGE 1min blocks)
+                if (ci.last_update_age_s > threshold)
                     warnings.push_back("LOST CONTACT WITH " + ci.symbol + " DAEMON for "
                         + std::to_string(ci.last_update_age_s) + "s!");
             }
         }
 
-        // 4. No peers connected
-        if (m_node) {
-            auto hs = m_node->get_hashrate_stats();
-            int peers = hs.value("peer_count", 0);
+        // 4. No peers connected — use P2P peer info callback if available
+        {
+            int peers = 0;
+            if (m_peer_info_fn) {
+                auto pi = m_peer_info_fn();
+                peers = pi.is_array() ? static_cast<int>(pi.size()) : 0;
+            } else if (m_node) {
+                peers = static_cast<int>(m_node->get_connected_peers_count());
+            }
             if (peers == 0)
                 warnings.push_back("No pool peers connected — share propagation disabled");
         }
