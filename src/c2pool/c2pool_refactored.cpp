@@ -1922,7 +1922,8 @@ int main(int argc, char* argv[]) {
                     sync_timer->async_wait(*sync_fn);
                 };
                 // Kick off first getheaders after 3s (allow handshake to complete)
-                LOG_INFO << "[EMB-LTC] First getheaders scheduled in 3s";
+                LOG_INFO << "[EMB-LTC] Header chain height: " << embedded_chain->height()
+                         << " — starting P2P sync in 3s";
                 sync_timer->expires_after(std::chrono::seconds(3));
                 sync_timer->async_wait(*sync_fn);
                 LOG_INFO << "Embedded header sync timer started (60s interval)";

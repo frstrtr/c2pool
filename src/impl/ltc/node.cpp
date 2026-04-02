@@ -918,6 +918,8 @@ void NodeImpl::load_persisted_shares()
                  << keep_per_head << " (skipping " << skip << " old shares)";
     }
 
+    const size_t to_load = total_in_db - skip;
+    LOG_INFO << "[Pool] Loading shares from LevelDB: " << to_load << " shares to process...";
     int loaded = 0;
     for (size_t i = skip; i < total_in_db; ++i)
     {
@@ -943,6 +945,11 @@ void NodeImpl::load_persisted_shares()
             {
                 m_tracker.add(share);
                 loaded++;
+                if (loaded % 1000 == 0) {
+                    size_t progress = i - skip + 1;
+                    LOG_INFO << "[Pool] Loading shares: " << progress << "/" << to_load
+                             << " (" << (100 * progress / to_load) << "%)";
+                }
             }
         }
         catch (const std::exception& e)
