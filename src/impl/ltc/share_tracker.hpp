@@ -568,10 +568,15 @@ public:
             if (to_get > 0)
             {
                 auto chain_view = chain.get_chain(last_hash, to_get);
+                int p2_verified_count = 0;
                 for (auto [hash, data] : chain_view)
                 {
                     if (!attempt_verify(hash))
                         break;
+                    ++p2_verified_count;
+                    if (p2_verified_count % 50 == 0)
+                        LOG_INFO << "[think-P2] verifying: " << p2_verified_count << "/" << to_get
+                                 << " verified_total=" << verified.size();
                 }
             }
 

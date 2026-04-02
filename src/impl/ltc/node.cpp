@@ -1282,7 +1282,14 @@ void NodeImpl::run_think()
             uint256 prev_block;
             uint32_t bits = 0;
 
+            LOG_INFO << "[Pool] think() starting: chain=" << m_tracker.chain.size()
+                     << " verified=" << m_tracker.verified.size();
+            auto think_t0 = std::chrono::steady_clock::now();
             auto result = m_tracker.think(block_rel_height, prev_block, bits);
+            auto think_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - think_t0).count();
+            if (think_ms > 1000)
+                LOG_INFO << "[Pool] think() completed in " << think_ms << "ms";
 
             // Process results inline (same ioc thread — no race with phase2)
             {
