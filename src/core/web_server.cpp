@@ -4295,7 +4295,27 @@ nlohmann::json MiningInterface::rest_current_merged_payouts()
         }
     }
 
-    return result;
+    // Filter out entries with 0 LTC and no merged payouts
+    nlohmann::json filtered = nlohmann::json::object();
+    for (auto& [key, entry] : result.items()) {
+        double ltc_amount = entry.value("amount", 0.0);
+        auto& merged = entry["merged"];
+        bool has_merged = merged.is_array() && !merged.empty();
+        if (ltc_amount < 0.000001 && !has_merged) continue;
+        // Filter out overflow merged entries (< 0.01 DOGE or > 1B — clearly wrong)
+        if (has_merged) {
+            nlohmann::json good = nlohmann::json::array();
+            for (auto& m : merged) {
+                double amt = m.value("amount", 0.0);
+                if (amt >= 0.01 && amt < 1e9)
+                    good.push_back(m);
+            }
+            entry["merged"] = good;
+            if (ltc_amount < 0.000001 && good.empty()) continue;
+        }
+        filtered[key] = entry;
+    }
+    return filtered;
 }
 
 nlohmann::json MiningInterface::rest_recent_merged_blocks()

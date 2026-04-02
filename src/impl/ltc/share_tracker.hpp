@@ -2054,41 +2054,46 @@ public:
         // finder_fee = 0 (CANONICAL_MERGED_FINDER_FEE_PER_MILLE = 0 in p2pool)
         uint64_t miners_reward = subsidy - donation_amount;
 
-        // accepted_total = total_weight - donation_weight (all miner weights)
-        uint64_t accepted_total = grand_total_lo - donation_w_lo;
-
-        uint64_t total_distributed = 0;
-        for (const auto& [key, weight] : weights) {
-            // Resolve weight key to DOGE-compatible scriptPubKey:
-            // MERGED:-prefixed → strip prefix (already a DOGE script)
-            // Raw LTC script  → autoconvert (P2WPKH→P2PKH, etc.)
+        // p2pool data.py:220-269: accepted_total_weight is the sum of ONLY
+        // convertible weights (after filtering unconvertible P2WSH/P2TR).
+        // NOT total_weight - donation_weight (which includes unconvertible).
+        // First pass: resolve scripts and compute accepted_total
+        struct ResolvedEntry {
             std::vector<unsigned char> script;
-            // p2pool --merged-operator-address: if this weight belongs to the
-            // node operator and an explicit merged address was provided, use it
-            // instead of auto-converting from the LTC script.
+            uint64_t weight;
+        };
+        std::vector<ResolvedEntry> resolved;
+        uint64_t accepted_total = 0;
+        for (const auto& [key, weight] : weights) {
+            std::vector<unsigned char> script;
             if (!operator_ltc_script.empty() && !operator_merged_script.empty() && key == operator_ltc_script) {
                 script = operator_merged_script;
             } else {
                 script = resolve_merged_payout_script(key);
             }
-            if (script.empty()) continue;  // Unconvertible (P2WSH, P2TR)
+            if (script.empty()) continue;  // Unconvertible (P2WSH, P2TR) — skip
             uint64_t w = weight.GetLow64();
-            // amount = miners_reward * w // accepted_total
-            __uint128_t num = static_cast<__uint128_t>(miners_reward) * w;
+            resolved.push_back({std::move(script), w});
+            accepted_total += w;
+        }
+
+        // Second pass: distribute miners_reward proportionally
+        uint64_t total_distributed = 0;
+        for (const auto& entry : resolved) {
+            __uint128_t num = static_cast<__uint128_t>(miners_reward) * entry.weight;
             uint64_t amount = (accepted_total > 0) ?
                 static_cast<uint64_t>(num / accepted_total) : 0;
             if (amount > 0) {
-                result[script] += amount;
+                result[entry.script] += amount;
                 total_distributed += amount;
             }
         }
 
         // Rounding remainder → donation (integer division truncates)
-        uint64_t rounding_remainder = miners_reward - total_distributed;
-        uint64_t final_donation = donation_amount + rounding_remainder;
+        uint64_t final_donation = donation_amount + (miners_reward - total_distributed);
 
         // V36 CONSENSUS RULE: Donation must be >= 1 satoshi
-        if (final_donation < 1 && subsidy > 0 && !result.empty()) {
+        if (final_donation < 1 && static_cast<int64_t>(subsidy) > 0 && !result.empty()) {
             // Deduct from largest miner (deterministic tiebreak by script)
             auto largest = std::max_element(result.begin(), result.end(),
                 [](const auto& a, const auto& b) {
@@ -2102,7 +2107,7 @@ public:
         }
 
         result[donation_script] = (result.contains(donation_script) ? result[donation_script] : 0ULL)
-                                  + final_donation;
+                                  + static_cast<uint64_t>(final_donation);
 
         return result;
     }
