@@ -1673,10 +1673,11 @@ int main(int argc, char* argv[]) {
                                 int accepted = chain->add_headers(*batch);
                                 auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                                     std::chrono::steady_clock::now() - t0).count();
-                                LOG_INFO << "[EMB-LTC] Processed batch: " << batch->size() << " headers"
-                                         << " accepted=" << accepted
-                                         << " chain_height=" << chain->height()
-                                         << " elapsed=" << elapsed << "ms";
+                                if (accepted > 0)
+                                    LOG_INFO << "[EMB-LTC] Processed batch: " << batch->size() << " headers"
+                                             << " accepted=" << accepted
+                                             << " chain_height=" << chain->height()
+                                             << " elapsed=" << elapsed << "ms";
                                 // Always use the LAST header in the batch as locator for the
                                 // next getheaders — this advances past known-but-duplicate
                                 // headers loaded from LevelDB.  The peer recognises the hash
@@ -3728,10 +3729,11 @@ int main(int argc, char* argv[]) {
                                         boost::asio::post(*doge_hdr_pool,
                                             [batch, dc, bcaster_ptr, &ioc]() {
                                                 int accepted = dc->add_headers(*batch);
-                                                LOG_INFO << "[EMB-DOGE] add_headers: "
-                                                         << accepted << "/" << batch->size()
-                                                         << " accepted, chain height="
-                                                         << dc->height();
+                                                if (accepted > 0)
+                                                    LOG_INFO << "[EMB-DOGE] add_headers: "
+                                                             << accepted << "/" << batch->size()
+                                                             << " accepted, chain height="
+                                                             << dc->height();
 
                                                 // Pipeline: immediate follow-up getheaders for fast sync
                                                 uint256 last_hash;
