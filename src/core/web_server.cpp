@@ -2549,8 +2549,13 @@ nlohmann::json MiningInterface::rest_current_payouts()
             // script_hex is a hex-encoded scriptPubKey — decode to bytes, then to address
             auto script_bytes = ParseHex(script_hex);
             std::string addr = core::script_to_address(script_bytes, is_ltc, m_testnet);
-            if (addr.empty())
-                addr = script_hex;  // fallback to hex if address conversion fails
+            if (addr.empty()) {
+                // P2PK donation script — label as "donation" instead of raw hex
+                if (script_bytes.size() > 33 && script_bytes.back() == 0xac)
+                    addr = "donation";
+                else
+                    addr = script_hex;
+            }
             // p2pool returns coins (not satoshis)
             result[addr] = static_cast<double>(amount) / 1e8;
         }
@@ -2571,11 +2576,15 @@ nlohmann::json MiningInterface::rest_current_payouts()
             for (const auto& [script, amount] : outputs) {
                 std::string addr = core::script_to_address(script, is_ltc, m_testnet);
                 if (addr.empty()) {
-                    static const char* HEX = "0123456789abcdef";
-                    addr.reserve(script.size() * 2);
-                    for (unsigned char b : script) {
-                        addr += HEX[b >> 4];
-                        addr += HEX[b & 0x0f];
+                    if (script.size() > 33 && script.back() == 0xac)
+                        addr = "donation";
+                    else {
+                        static const char* HEX = "0123456789abcdef";
+                        addr.reserve(script.size() * 2);
+                        for (unsigned char b : script) {
+                            addr += HEX[b >> 4];
+                            addr += HEX[b & 0x0f];
+                        }
                     }
                 }
                 result[addr] = static_cast<double>(amount) / 1e8;
@@ -4203,12 +4212,27 @@ nlohmann::json MiningInterface::rest_current_merged_payouts()
             auto merged_payouts = m_mm_manager->get_payouts(ci.chain_id, ci.coinbase_value);
             if (merged_payouts.empty()) continue;
 
+            // DOGE address version bytes (mainnet P2PKH=0x1e, P2SH=0x16)
+            uint8_t merged_p2pkh_ver = 0x1e;
+            uint8_t merged_p2sh_ver = 0x16;
+            // TODO: testnet detection for DOGE address versions
+
             for (auto& [script, amount] : merged_payouts) {
-                // Extract hash160 from merged script for matching to parent address
+                // Convert merged script to proper DOGE address
+                std::string merged_addr = script_to_address(script, "", merged_p2pkh_ver, merged_p2sh_ver);
+                if (merged_addr.empty()) {
+                    // P2PK (donation script) — hash the pubkey to get address
+                    if (script.size() > 33 && script.back() == 0xac) {
+                        merged_addr = "donation";
+                    }
+                }
+
+                // Extract hash160 from merged script for matching to parent LTC address
                 std::string hash160_hex;
                 int h160_offset = -1;
                 if (script.size() == 25 && script[0] == 0x76) h160_offset = 3; // P2PKH
                 else if (script.size() == 23 && script[0] == 0xa9) h160_offset = 2; // P2SH
+                else if (script.size() == 22 && script[0] == 0x00) h160_offset = 2; // P2WPKH
                 if (h160_offset >= 0) {
                     static const char* HEX = "0123456789abcdef";
                     hash160_hex.reserve(40);
@@ -4218,7 +4242,7 @@ nlohmann::json MiningInterface::rest_current_merged_payouts()
                     }
                 }
 
-                // Find parent address with same hash160
+                // Find parent LTC address with same hash160
                 bool attached = false;
                 if (!hash160_hex.empty()) {
                     for (auto& [parent_addr, entry] : result.items()) {
@@ -4231,7 +4255,9 @@ nlohmann::json MiningInterface::rest_current_merged_payouts()
                             for (int i = po; i < po + 20; ++i) { ph += HEX[ps[i] >> 4]; ph += HEX[ps[i] & 0x0f]; }
                             if (ph == hash160_hex) {
                                 entry["merged"].push_back({
-                                    {"symbol", ci.symbol}, {"address", hash160_hex}, {"amount", amount / 1e8}
+                                    {"symbol", ci.symbol},
+                                    {"address", merged_addr.empty() ? hash160_hex : merged_addr},
+                                    {"amount", amount / 1e8}
                                 });
                                 attached = true;
                                 break;
@@ -4240,11 +4266,13 @@ nlohmann::json MiningInterface::rest_current_merged_payouts()
                     }
                 }
                 if (!attached && amount > 0) {
-                    std::string key = hash160_hex.empty() ? "unknown" : hash160_hex;
+                    std::string key = merged_addr.empty() ? (hash160_hex.empty() ? "unknown" : hash160_hex) : merged_addr;
                     if (!result.contains(key))
                         result[key] = {{"amount", 0.0}, {"merged", nlohmann::json::array()}};
                     result[key]["merged"].push_back({
-                        {"symbol", ci.symbol}, {"address", key}, {"amount", amount / 1e8}
+                        {"symbol", ci.symbol},
+                        {"address", key},
+                        {"amount", amount / 1e8}
                     });
                 }
             }
