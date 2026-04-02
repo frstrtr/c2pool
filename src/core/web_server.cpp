@@ -4652,26 +4652,8 @@ void MiningInterface::update_stat_log()
     StatLogEntry entry;
     entry.time = static_cast<double>(std::time(nullptr));
 
-    // Pool hash rate — compute from sharechain
-    double share_diff = 1.0;
-    if (m_sharechain_stats_fn) {
-        auto sc = m_sharechain_stats_fn();
-        entry.pool_hash_rate = 0.0;
-        if (sc.contains("average_difficulty"))
-            share_diff = sc["average_difficulty"].get<double>();
-        int total_shares = sc.value("total_shares", 0);
-        // Estimate from sharechain timeline
-        if (sc.contains("timeline") && sc["timeline"].is_array() && sc["timeline"].size() >= 2) {
-            auto& tl = sc["timeline"];
-            double first_ts = tl.front().value("timestamp", 0.0);
-            double last_ts  = tl.back().value("timestamp", 0.0);
-            double time_span = last_ts - first_ts;
-            if (time_span > 0 && total_shares > 0)
-                entry.pool_hash_rate = total_shares * share_diff * 4294967296.0 / time_span;
-        }
-    } else if (m_node) {
-        entry.pool_hash_rate = 0.0;
-    }
+    // Pool hash rate — use p2pool-correct callback (safe, runs on ioc thread)
+    entry.pool_hash_rate = m_pool_hashrate_fn ? m_pool_hashrate_fn() : 0.0;
 
     entry.pool_stale_prop = 0.0;
 
@@ -4687,10 +4669,8 @@ void MiningInterface::update_stat_log()
 
     entry.shares = 0;
     entry.stale_shares = 0;
-    if (m_sharechain_stats_fn) {
-        auto sc = m_sharechain_stats_fn();
-        entry.shares = sc.value("total_shares", uint64_t(0));
-    }
+    // Note: sharechain_stats_fn is unsafe (concurrent tracker modification).
+    // Share count is non-critical for graphs — leave at 0 for now.
 
     // Current payout
     entry.current_payout = 0.0;
@@ -4716,13 +4696,22 @@ void MiningInterface::update_stat_log()
         }
     }
 
-    // Peers
+    // Peers — use P2P peer info callback for accurate counts
     int incoming = 0, outgoing = 0;
-    if (m_node) {
-        outgoing = m_node->get_connected_peers_count();
+    if (m_peer_info_fn) {
+        auto pi = m_peer_info_fn();
+        if (pi.is_array()) {
+            for (const auto& p : pi) {
+                if (p.value("incoming", false)) ++incoming;
+                else ++outgoing;
+            }
+        }
+    } else if (m_node) {
+        outgoing = static_cast<int>(m_node->get_connected_peers_count());
     }
     entry.peers = {{"incoming", incoming}, {"outgoing", outgoing}};
 
+    double share_diff = m_network_difficulty.load(std::memory_order_relaxed) / 65536.0; // approx
     entry.attempts_to_share = share_diff * 4294967296.0;
     double net_diff = m_network_difficulty.load(std::memory_order_relaxed);
     entry.attempts_to_block = net_diff * 4294967296.0;
@@ -5539,11 +5528,10 @@ bool WebServer::start()
             auto stat_fn = std::make_shared<std::function<void(beast::error_code)>>();
             *stat_fn = [this, stat_timer, stat_fn](beast::error_code ec) {
                 if (ec || !running_) return;
-                // Stat log temporarily disabled — accesses share chain that
-                // clean_tracker may have modified, causing SIGSEGV.
-                // TODO: make sharechain_stats_fn robust to concurrent removal.
-                // try { mining_interface_->update_stat_log(); }
-                // catch (...) {}
+                try { mining_interface_->update_stat_log(); }
+                catch (const std::exception& e) {
+                    LOG_WARNING << "Stat log update failed: " << e.what();
+                }
                 stat_timer->expires_after(std::chrono::seconds(60));
                 stat_timer->async_wait(*stat_fn);
             };
