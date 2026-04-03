@@ -1641,6 +1641,15 @@ MiningInterface::build_connection_coinbase(
     snap.witness_commitment_hex = ws.witness_commitment;
     snap.witness_root = ws.witness_root;
     snap.frozen_ref = rhr;
+    // Freeze block body data atomically — prevents merkle root mismatch
+    // when refresh_work() updates the template between separate reads.
+    snap.merkle_branches = ws.merkle_branches;
+    snap.template_json = ws.tmpl;
+    if (ws.tmpl.contains("transactions")) {
+        for (const auto& tx : ws.tmpl["transactions"])
+            if (tx.contains("data"))
+                snap.tx_data.push_back(tx["data"].get<std::string>());
+    }
     return {std::move(cb1), std::move(cb2), std::move(snap)};
 }
 

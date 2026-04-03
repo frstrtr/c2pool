@@ -1226,7 +1226,7 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
     ntime_ss << std::hex << std::setw(8) << std::setfill('0') << curtime;
     std::string ntime = ntime_ss.str();
 
-    // Merkle branches
+    // Merkle branches — will be overridden with snapshot data after coinbase build
     merkle_branches_vec = mining_interface_->get_stratum_merkle_branches();
     for (const auto& h : merkle_branches_vec)
         merkle_branches.push_back(h);
@@ -1276,6 +1276,45 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
                 coinb2 = std::move(gcb2);
             }
         }
+    }
+
+    // ── ATOMIC SNAPSHOT OVERRIDE ──
+    // Replace header fields, merkle branches, and tx_data with data from the
+    // atomic snapshot captured by build_connection_coinbase(). This prevents
+    // merkle root / witness commitment mismatch when refresh_work() updates
+    // the template between the separate get_current_work_template(),
+    // get_stratum_merkle_branches(), and build_connection_coinbase() calls.
+    if (!cbr.snapshot.template_json.is_null()) {
+        const auto& snap_tmpl = cbr.snapshot.template_json;
+
+        // Re-derive header fields from the snapshot template
+        gbt_prevhash = snap_tmpl.value("previousblockhash", "");
+        prevhash = gbt_to_stratum_prevhash(gbt_prevhash);
+
+        version_u32 = static_cast<uint32_t>(snap_tmpl.value("version", 0x20000000));
+        {
+            std::ostringstream ss;
+            ss << std::hex << std::setw(8) << std::setfill('0') << version_u32;
+            version = ss.str();
+        }
+
+        if (snap_tmpl.contains("bits"))
+            gbt_block_nbits = snap_tmpl["bits"].get<std::string>();
+        nbits = gbt_block_nbits;
+
+        if (snap_tmpl.contains("curtime"))
+            curtime = static_cast<uint32_t>(snap_tmpl["curtime"].get<uint64_t>());
+        {
+            std::ostringstream ss;
+            ss << std::hex << std::setw(8) << std::setfill('0') << curtime;
+            ntime = ss.str();
+        }
+
+        // Override merkle branches with snapshot
+        merkle_branches_vec = cbr.snapshot.merkle_branches;
+        merkle_branches = nlohmann::json::array();
+        for (const auto& h : merkle_branches_vec)
+            merkle_branches.push_back(h);
     }
 
     // clean_jobs = true when prevhash changed OR forced (e.g. after authorize)
@@ -1331,12 +1370,10 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         je.desired_version = cbr.snapshot.frozen_ref.desired_version;
         je.has_frozen = true;
 
-        if (!tmpl.empty() && !tmpl.is_null() && tmpl.contains("transactions")) {
-            for (const auto& tx : tmpl["transactions"]) {
-                if (tx.contains("data"))
-                    je.tx_data.push_back(tx["data"].get<std::string>());
-            }
-        }
+        // Use tx_data from the atomic snapshot — NOT from the potentially stale
+        // tmpl fetched at the top of send_notify_work(). This ensures the block
+        // body transactions match the witness commitment and merkle branches.
+        je.tx_data = cbr.snapshot.tx_data;
     }
 
     // VARDIFF: do NOT override per-connection difficulty with pool share_bits.

@@ -382,6 +382,11 @@ public:
         uint256 witness_root;
         // Frozen share fields from ref_hash_fn
         RefHashResult frozen_ref;
+        // Block body data — must be captured atomically with witness_commitment
+        // to prevent merkle root mismatch when refresh_work() updates the template.
+        std::vector<std::string> tx_data;              // raw tx hex from template
+        std::vector<std::string> merkle_branches;      // stratum merkle branches
+        nlohmann::json template_json;                  // full GBT template (for prevhash, version, bits)
     };
 
     // Build per-connection coinbase parts: computes ref_hash using the ref_hash callback,
