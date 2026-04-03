@@ -205,7 +205,7 @@ public:
     nlohmann::json rest_miner_stats(const std::string& address);  // /miner_stats/<addr> — detailed per-miner stats
     nlohmann::json rest_best_share();               // /best_share — node-wide best share (BitAxe style)
     nlohmann::json rest_miner_payouts(const std::string& address); // /miner_payouts/<addr> — payout history per miner
-    nlohmann::json rest_version_signaling();         // /version_signaling — V36 version tracking
+    nlohmann::json rest_version_signaling(const nlohmann::json* cached_sc = nullptr); // /version_signaling — V36 version tracking
     nlohmann::json rest_v36_status();                // /v36_status — V36 diagnostic
     nlohmann::json rest_patron_sendmany(const std::string& total); // /patron_sendmany/<total> — sendmany text
     nlohmann::json rest_tracker_debug();             // /tracker_debug — debug sharechain info

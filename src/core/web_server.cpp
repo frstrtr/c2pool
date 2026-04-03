@@ -3291,18 +3291,20 @@ nlohmann::json MiningInterface::rest_local_stats()
     result["miner_dead_hash_rates"] = miner_dead;
 
     // shares — {total, orphan, dead}
+    // Sharechain stats now use O(log n) StatsSkipList — no caching needed.
+    nlohmann::json cached_sc;
     int total_shares = 0, orphan_shares = 0, dead_shares = 0;
     double share_diff = 1.0;
     if (m_sharechain_stats_fn) {
-        auto sc = m_sharechain_stats_fn();
-        if (sc.contains("total_shares"))
-            total_shares = sc["total_shares"].get<int>();
-        if (sc.contains("orphan_shares"))
-            orphan_shares = sc["orphan_shares"].get<int>();
-        if (sc.contains("dead_shares"))
-            dead_shares = sc["dead_shares"].get<int>();
-        if (sc.contains("average_difficulty"))
-            share_diff = sc["average_difficulty"].get<double>();
+        cached_sc = m_sharechain_stats_fn();
+        if (cached_sc.contains("total_shares"))
+            total_shares = cached_sc["total_shares"].get<int>();
+        if (cached_sc.contains("orphan_shares"))
+            orphan_shares = cached_sc["orphan_shares"].get<int>();
+        if (cached_sc.contains("dead_shares"))
+            dead_shares = cached_sc["dead_shares"].get<int>();
+        if (cached_sc.contains("average_difficulty"))
+            share_diff = cached_sc["average_difficulty"].get<double>();
     }
     result["shares"] = {{"total", total_shares}, {"orphan", orphan_shares}, {"dead", dead_shares}};
 
@@ -3399,7 +3401,8 @@ nlohmann::json MiningInterface::rest_local_stats()
 
         // 6. Version signaling: majority voting for unsupported version
         if (m_node) {
-            auto vs = rest_version_signaling();
+            // Reuse cached sharechain stats to avoid a second expensive chain walk
+            auto vs = rest_version_signaling(&cached_sc);
             if (vs.contains("versions") && vs["versions"].is_object()) {
                 int64_t total_votes = 0;
                 int64_t max_version = 0;
@@ -4058,7 +4061,7 @@ nlohmann::json MiningInterface::rest_miner_payouts(const std::string& address)
     return result;
 }
 
-nlohmann::json MiningInterface::rest_version_signaling()
+nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cached_sc)
 {
     nlohmann::json result = nlohmann::json::object();
     result["chain_height"] = 0;
@@ -4075,8 +4078,15 @@ nlohmann::json MiningInterface::rest_version_signaling()
     result["status"] = "no_transition";
     result["message"] = "";
 
-    if (m_sharechain_stats_fn) {
-        auto sc = m_sharechain_stats_fn();
+    // Use pre-computed sharechain stats if provided (avoids second expensive chain walk)
+    nlohmann::json sc;
+    if (cached_sc && !cached_sc->is_null()) {
+        sc = *cached_sc;
+    } else if (m_sharechain_stats_fn) {
+        sc = m_sharechain_stats_fn();
+    }
+
+    if (!sc.is_null()) {
         if (sc.contains("chain_height"))
             result["chain_height"] = sc["chain_height"];
         if (sc.contains("shares_by_version")) {

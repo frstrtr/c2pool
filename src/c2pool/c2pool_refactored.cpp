@@ -31,6 +31,7 @@
 #include <pool/node.hpp>
 #include <pool/protocol.hpp>
 #include <sharechain/sharechain.hpp>
+#include <sharechain/stats_skiplist.hpp>
 
 // LTC implementation
 #include <impl/ltc/share.hpp>
@@ -2553,7 +2554,51 @@ int main(int argc, char* argv[]) {
                 });
 
             // Wire live sharechain statistics into the REST API.
-            web_server.get_mining_interface()->set_sharechain_stats_fn([&p2p_node]() {
+            // Uses StatsSkipList for O(log n) aggregate queries instead of O(n) linear walk.
+            // The skiplist is captured by shared_ptr so the lambda closure owns it.
+            auto stats_skiplist = std::make_shared<chain::StatsSkipList>(
+                // get_delta: extract stats for a single share
+                [&p2p_node](const uint256& hash) -> chain::StatsDelta {
+                    chain::StatsDelta d;
+                    auto& chain = p2p_node->tracker().chain;
+                    if (!chain.contains(hash))
+                        return d;
+                    try {
+                        auto& cd = chain.get(hash);
+                        cd.share.invoke([&](auto* s) {
+                            d.share_count = 1;
+                            d.version_counts[std::to_string(s->version)] = 1;
+
+                            std::string miner;
+                            if constexpr (requires { s->m_address; })
+                                miner = HexStr(s->m_address.m_data);
+                            else if constexpr (requires { s->m_pubkey_hash; })
+                                miner = s->m_pubkey_hash.GetHex();
+                            if (!miner.empty())
+                                d.miner_counts[miner] = 1;
+
+                            auto target = chain::bits_to_target(s->m_bits);
+                            d.difficulty_sum = chain::target_to_difficulty(target);
+                        });
+                    } catch (...) {}
+                    return d;
+                },
+                // previous: get parent share hash
+                [&p2p_node](const uint256& hash) -> uint256 {
+                    auto& chain = p2p_node->tracker().chain;
+                    if (!chain.contains(hash))
+                        return uint256();
+                    try {
+                        auto& cd = chain.get(hash);
+                        uint256 prev;
+                        cd.share.invoke([&](auto* s) { prev = s->m_prev_hash; });
+                        return prev;
+                    } catch (...) { return uint256(); }
+                }
+            );
+
+            web_server.get_mining_interface()->set_sharechain_stats_fn(
+                [&p2p_node, stats_skiplist]() {
                 nlohmann::json result;
                 auto& chain = p2p_node->tracker().chain;
 
@@ -2570,12 +2615,20 @@ int main(int argc, char* argv[]) {
                 result["chain_tip_hash"]  = best.IsNull() ? "" : best.GetHex();
                 result["chain_height"]    = best.IsNull() ? 0 : chain.get_height(best);
 
-                std::map<std::string, int> by_version;
-                std::map<std::string, int> by_miner;
-                double diff_sum = 0.0;
-                int diff_count  = 0;
+                // O(log n) aggregate stats via skiplist — replaces O(n) linear walk
+                int walk = best.IsNull() ? 0 : std::min(static_cast<int>(chain.get_height(best)), 2000);
+                auto sr = stats_skiplist->query(best, walk);
 
-                // Timeline: 6 slots of 10 minutes each, ending at now
+                result["shares_by_version"] = sr.version_counts;
+                result["shares_by_miner"]   = sr.miner_counts;
+                result["average_difficulty"] = sr.share_count > 0
+                    ? sr.difficulty_sum / sr.share_count : 1.0;
+                result["heaviest_fork_weight"] = chain.size() > 0
+                    ? static_cast<double>(best_height) / static_cast<double>(chain.size())
+                    : 0.0;
+                result["difficulty_trend"] = nlohmann::json::array();
+
+                // Timeline: short linear walk for last hour only (~360 shares at 10s/share)
                 auto now_ts = static_cast<uint32_t>(std::time(nullptr));
                 constexpr int SLOTS = 6;
                 constexpr uint32_t SLOT_SEC = 600;
@@ -2585,61 +2638,31 @@ int main(int argc, char* argv[]) {
                 for (int i = 0; i < SLOTS; ++i)
                     slots[i].ts = window_start + (i + 1) * SLOT_SEC;
 
-                // Walk up to 2000 shares from best head backwards.
-                // Chain may be concurrently modified by clean_tracker —
-                // use contains() guard and limit walk to actual height.
                 if (!best.IsNull() && chain.contains(best)) {
-                    int height = chain.get_height(best);
-                    int walk = std::min(height, 2000);
-                    if (walk > 0) {
-                        try {
-                            auto view = chain.get_chain(best, walk);
+                    try {
+                        // Walk only recent shares (within the 1-hour window)
+                        int tl_walk = std::min(static_cast<int>(chain.get_height(best)), 400);
+                        if (tl_walk > 0) {
+                            auto view = chain.get_chain(best, tl_walk);
                             for (auto [hash, data] : view) {
                                 data.share.invoke([&](auto* s) {
-                                    // Version
-                                    auto ver_key = std::to_string(s->version);
-                                    by_version[ver_key]++;
-
-                                    // Miner address (version-dependent)
+                                    if (s->m_timestamp < window_start)
+                                        return; // outside window, stop processing
+                                    int idx = static_cast<int>((s->m_timestamp - window_start) / SLOT_SEC);
+                                    if (idx >= SLOTS) idx = SLOTS - 1;
+                                    slots[idx].count++;
                                     std::string miner;
                                     if constexpr (requires { s->m_address; })
                                         miner = HexStr(s->m_address.m_data);
                                     else if constexpr (requires { s->m_pubkey_hash; })
                                         miner = s->m_pubkey_hash.GetHex();
                                     if (!miner.empty())
-                                        by_miner[miner]++;
-
-                                    // Difficulty
-                                    auto target = chain::bits_to_target(s->m_bits);
-                                    double diff = chain::target_to_difficulty(target);
-                                    diff_sum += diff;
-                                    diff_count++;
-
-                                    // Timeline bucketing
-                                    if (s->m_timestamp >= window_start) {
-                                        int idx = static_cast<int>((s->m_timestamp - window_start) / SLOT_SEC);
-                                        if (idx >= SLOTS) idx = SLOTS - 1;
-                                        slots[idx].count++;
-                                        if (!miner.empty())
-                                            slots[idx].miners[miner]++;
-                                    }
+                                        slots[idx].miners[miner]++;
                                 });
                             }
-                        } catch (...) {
-                            // chain walk may throw if data is inconsistent; return partial results
                         }
-                    }
+                    } catch (...) {}
                 }
-
-                result["shares_by_version"] = by_version;
-                result["shares_by_miner"]   = by_miner;
-                result["average_difficulty"] = diff_count > 0 ? diff_sum / diff_count : 1.0;
-                // Heaviest fork weight: height of the tallest head (best_height)
-                // relative to total chain size. Value 1.0 = single fork (healthy).
-                result["heaviest_fork_weight"] = chain.size() > 0
-                    ? static_cast<double>(best_height) / static_cast<double>(chain.size())
-                    : 0.0;
-                result["difficulty_trend"] = nlohmann::json::array();
 
                 nlohmann::json tl = nlohmann::json::array();
                 for (auto& sl : slots) {
