@@ -2197,12 +2197,13 @@ uint256 create_local_share_v35(
         sd.m_txid_merkle_link.m_branch = (has_frozen && !frozen_merkle_branches.empty())
             ? frozen_merkle_branches : merkle_branches;
         sd.m_txid_merkle_link.m_index  = 0;
-        if (has_frozen && !frozen_witness_root.IsNull()) {
+        // Same priority as V36: frozen > direct > fallback.
+        // NEVER extract from witness_commitment_hex (it's a p2pool commitment,
+        // not the raw root — using it causes double-hashing in verify path).
+        if (!frozen_witness_root.IsNull()) {
             sd.m_wtxid_merkle_root = frozen_witness_root;
         } else if (!witness_root.IsNull()) {
             sd.m_wtxid_merkle_root = witness_root;
-        } else if (witness_commitment_hex.size() >= 76) {
-            sd.m_wtxid_merkle_root = uint256S(witness_commitment_hex.substr(12, 64));
         } else {
             sd.m_wtxid_merkle_root = uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
         }
@@ -2690,36 +2691,27 @@ uint256 create_local_share(
                      << frozen_merkle_branches.size()
                      << " current=" << merkle_branches.size();
         }
-        // wtxid_merkle_root: use frozen witness root if available
+        // wtxid_merkle_root: use frozen witness root if available.
+        // Priority: frozen > direct witness_root > skip segwit data.
+        // NEVER extract from witness_commitment_hex — that contains the
+        // p2pool commitment (Hash(root, nonce)), not the raw root.
+        // Storing it in m_wtxid_merkle_root causes generate_share_transaction
+        // to double-hash: Hash(Hash(root, nonce), nonce) → GENTX mismatch.
         const char* wc_source = "unknown";
-        if (has_frozen && !frozen_witness_root.IsNull()) {
+        if (!frozen_witness_root.IsNull()) {
             sd.m_wtxid_merkle_root = frozen_witness_root;
-            wc_source = "frozen";
+            wc_source = has_frozen ? "frozen" : "frozen_unflagged";
         } else if (!witness_root.IsNull()) {
             sd.m_wtxid_merkle_root = witness_root;
             wc_source = "witness_root";
-        } else if (witness_commitment_hex.size() >= 76) {
-            // Legacy fallback: extract commitment hash from witness_commitment_hex
-            // WARNING: if witness_commitment_hex uses GBT nonce (zeros) but
-            // p2pool uses [P2Pool]*4 nonce, this will be WRONG
-            sd.m_wtxid_merkle_root = uint256S(witness_commitment_hex.substr(12, 64));
-            wc_source = "LEGACY_EXTRACT";
         } else {
+            // No raw witness root available — cannot safely populate segwit data.
+            // Log and skip: the share will be created without segwit commitment.
+            LOG_WARNING << "[WC-SOURCE] no raw witness root available!"
+                        << " has_frozen=" << has_frozen
+                        << " wc_hex_len=" << witness_commitment_hex.size();
             sd.m_wtxid_merkle_root = uint256S("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
             wc_source = "DEFAULT_FF";
-        }
-        {
-            static int wc_src_log = 0;
-            if (wc_src_log++ < 5) {
-                uint256 p2pool_commitment = compute_p2pool_witness_commitment(sd.m_wtxid_merkle_root);
-                LOG_INFO << "[WC-SOURCE] source=" << wc_source
-                         << " wtxid_root=" << sd.m_wtxid_merkle_root.GetHex()
-                         << " p2pool_wc=" << p2pool_commitment.GetHex();
-                // Also show what the GBT commitment would be (for comparison)
-                if (witness_commitment_hex.size() >= 76) {
-                    LOG_INFO << "[WC-SOURCE] gbt_wc_hex=" << witness_commitment_hex.substr(12, 64);
-                }
-            }
         }
         share.m_segwit_data = sd;
     }
@@ -3235,6 +3227,15 @@ uint256 create_local_share(
             } else {
                 LOG_WARNING << "[Pool] Cross-check FAILED! mined_gentx=" << gentx_hash_for_header.GetHex()
                             << " verify_gentx=" << verify_hash.GetHex();
+                // Dump actual mined coinbase hex for byte-level comparison
+                if (!actual_coinbase_bytes.empty()) {
+                    static const char* H = "0123456789abcdef";
+                    std::string mined_hex;
+                    mined_hex.reserve(actual_coinbase_bytes.size() * 2);
+                    for (unsigned char b : actual_coinbase_bytes) { mined_hex += H[b>>4]; mined_hex += H[b&0xf]; }
+                    LOG_WARNING << "[XCHECK-MINED] len=" << actual_coinbase_bytes.size()
+                                << " hex=" << mined_hex;
+                }
             }
             ++xcheck_count;
         }

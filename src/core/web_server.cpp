@@ -5306,7 +5306,11 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                     params.frozen_merkle_branches = job->frozen_ref.frozen_merkle_branches;
                     params.frozen_witness_root = job->frozen_ref.frozen_witness_root;
                     params.frozen_merged_coinbase_info = job->frozen_ref.frozen_merged_coinbase_info;
-                    params.has_frozen_fields = (job->frozen_ref.absheight > 0);
+                    // has_frozen = true when ref_hash_fn produced valid frozen data.
+                    // Cannot use absheight > 0: absheight IS 0 for the genesis share,
+                    // but frozen data is still valid. Use bits != 0 as the indicator:
+                    // bits is always non-zero when ref_hash_fn ran (share target > 0).
+                    params.has_frozen_fields = (job->frozen_ref.bits != 0);
                     params.share_version = job->frozen_ref.share_version;
                     params.desired_version = job->frozen_ref.desired_version;
                     params.stale_info = job->stale_info;

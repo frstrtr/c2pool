@@ -290,6 +290,11 @@ public:
                                                    const std::string& block_hash, bool accepted)>;
     void set_on_merged_block_found(MergedBlockFoundFn fn) { m_on_merged_block_found = std::move(fn); }
 
+    /// Callback when aux work changes (new block on any merged chain).
+    /// Used to trigger stratum work refresh so miners get fresh MM commitments.
+    using WorkChangedFn = std::function<void()>;
+    void set_on_work_changed(WorkChangedFn fn) { m_on_work_changed = std::move(fn); }
+
 private:
     void poll_loop();
     void refresh_aux_work();
@@ -391,6 +396,7 @@ private:
     // P2P block relay callback (set by integration layer)
     BlockRelayFn m_block_relay_fn;
     MergedBlockFoundFn m_on_merged_block_found;
+    WorkChangedFn m_on_work_changed;
 
     // Discovered merged blocks history
     std::vector<DiscoveredMergedBlock> m_discovered_blocks;

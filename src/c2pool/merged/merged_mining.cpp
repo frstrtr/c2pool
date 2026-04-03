@@ -781,6 +781,13 @@ void MergedMiningManager::refresh_aux_work()
             auto proof = m_tree.compute_root(slot_hashes, 0);  // root only
             m_cached_commitment = build_auxpow_commitment(proof.root, m_tree.size);
         }
+
+        // Notify stratum to push new work with the fresh MM commitment.
+        // Without this, miners keep working on old coinbases that commit to
+        // the previous DOGE block hash — any found DOGE blocks are stale.
+        if (m_on_work_changed) {
+            boost::asio::post(m_ioc, m_on_work_changed);
+        }
     }
 }
 

@@ -4162,6 +4162,12 @@ int main(int argc, char* argv[]) {
                                 mi_ptr->schedule_block_verification(block_hash);
                         });
 
+                    // When merged mining aux work changes (new DOGE block),
+                    // push fresh stratum work so miners get the new commitment.
+                    mm_manager->set_on_work_changed([&web_server]() {
+                        web_server.trigger_work_refresh_debounced();
+                    });
+
                     // Wire DOGE block verifier.
                     // Note: the aux block hash from createauxblock is NOT the chain
                     // block hash. After submitauxblock, the actual block gets a

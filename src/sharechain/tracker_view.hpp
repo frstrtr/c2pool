@@ -6,6 +6,11 @@
  * Stores deltas in two parts: (item→ref, ref→chain_end).
  * Selective invalidation on share removal — no full cache clear.
  *
+ * Thread safety: p2pool is single-threaded (Twisted reactor), but c2pool
+ * calls TrackerView from multiple stratum connections concurrently.
+ * A mutable mutex serializes all cache access, preserving p2pool's
+ * single-threaded semantics in a multi-threaded C++ environment.
+ *
  * p2pool source: forest.py lines 96-222
  * MIT License (c2pool project)
  */
@@ -16,6 +21,7 @@
 #include <cstdint>
 #include <vector>
 #include <atomic>
+#include <mutex>
 
 namespace chain {
 
@@ -106,6 +112,14 @@ class TrackerView
     // p2pool: self._ref_generator = itertools.count()
     mutable std::atomic<ref_t> m_ref_gen{0};
 
+    // Serializes all cache access. p2pool's forest.py TrackerView is only
+    // ever accessed from the single Twisted reactor thread. In c2pool,
+    // multiple stratum connections call into TrackerView concurrently via
+    // build_connection_cb → ref_hash_fn → compute_share_target →
+    // get_pool_attempts_per_second → get_delta. Without serialization,
+    // concurrent _set_delta calls corrupt the unordered_map/set internals.
+    mutable std::mutex m_cache_mutex;
+
     delta_t make_element_delta(const hash_t& hash) const {
         delta_t d;
         d.head = hash;
@@ -117,7 +131,8 @@ class TrackerView
     }
 
     // p2pool: _get_delta (forest.py:175-183)
-    delta_t _get_delta(const hash_t& item_hash) const {
+    // Caller MUST hold m_cache_mutex.
+    delta_t _get_delta_locked(const hash_t& item_hash) const {
         auto it = m_deltas.find(item_hash);
         if (it != m_deltas.end()) {
             auto& [delta1, ref] = it->second;
@@ -129,7 +144,8 @@ class TrackerView
     }
 
     // p2pool: _set_delta (forest.py:185-206)
-    void _set_delta(const hash_t& item_hash, const delta_t& delta) const {
+    // Caller MUST hold m_cache_mutex.
+    void _set_delta_locked(const hash_t& item_hash, const delta_t& delta) const {
         auto other_item_hash = delta.tail;
 
         if (m_reverse_delta_refs.find(other_item_hash) == m_reverse_delta_refs.end()) {
@@ -178,19 +194,21 @@ public:
     // p2pool: get_delta_to_last (forest.py:208-218)
     delta_t get_delta_to_last(const hash_t& item_hash) const
     {
+        std::lock_guard<std::mutex> lock(m_cache_mutex);
+
         delta_t delta = delta_t::get_none(item_hash);
         std::vector<std::pair<hash_t, delta_t>> updates;
 
         while (!delta.tail.IsNull() && m_contains_fn(delta.tail))
         {
             updates.push_back({delta.tail, delta});
-            delta_t this_delta = _get_delta(delta.tail);
+            delta_t this_delta = _get_delta_locked(delta.tail);
             delta += this_delta;
         }
 
         // Cache intermediate results
         for (auto& [update_hash, delta_then] : updates) {
-            _set_delta(update_hash, delta - delta_then);
+            _set_delta_locked(update_hash, delta - delta_then);
         }
 
         return delta;
@@ -218,11 +236,38 @@ public:
     }
 
     delta_t get_delta(const hash_t& item, const hash_t& ancestor) const {
-        return get_delta_to_last(item) - get_delta_to_last(ancestor);
+        // Lock once for the pair — avoids two separate lock acquisitions
+        // and ensures a consistent cache snapshot across both lookups.
+        std::lock_guard<std::mutex> lock(m_cache_mutex);
+
+        delta_t d1 = delta_t::get_none(item);
+        {
+            std::vector<std::pair<hash_t, delta_t>> updates;
+            while (!d1.tail.IsNull() && m_contains_fn(d1.tail)) {
+                updates.push_back({d1.tail, d1});
+                d1 += _get_delta_locked(d1.tail);
+            }
+            for (auto& [h, dt] : updates)
+                _set_delta_locked(h, d1 - dt);
+        }
+
+        delta_t d2 = delta_t::get_none(ancestor);
+        {
+            std::vector<std::pair<hash_t, delta_t>> updates;
+            while (!d2.tail.IsNull() && m_contains_fn(d2.tail)) {
+                updates.push_back({d2.tail, d2});
+                d2 += _get_delta_locked(d2.tail);
+            }
+            for (auto& [h, dt] : updates)
+                _set_delta_locked(h, d2 - dt);
+        }
+
+        return d1 - d2;
     }
 
     // p2pool: _handle_removed (forest.py:149-159)
     void handle_removed(const hash_t& hash) {
+        std::lock_guard<std::mutex> lock(m_cache_mutex);
         auto delta = make_element_delta(hash);
 
         auto it = m_deltas.find(delta.head);
@@ -243,32 +288,14 @@ public:
 
     // p2pool: _handle_remove_special (forest.py:112-135)
     void handle_remove_special(const hash_t& hash) {
-        auto delta = make_element_delta(hash);
-
-        if (m_reverse_delta_refs.find(delta.tail) == m_reverse_delta_refs.end())
-            return;
-
-        // Move delta refs referencing children down
-        auto head_ref_it = m_reverse_delta_refs.find(delta.head);
-        if (head_ref_it != m_reverse_delta_refs.end()) {
-            auto& items = m_reverse_deltas[head_ref_it->second];
-            for (auto x : std::vector<hash_t>(items.begin(), items.end()))
-                get_last(x);  // forces cache rebuild through new path
-        }
-
-        if (m_reverse_delta_refs.find(delta.tail) == m_reverse_delta_refs.end())
-            return;
-
-        // Move ref pointing to this up
-        ref_t ref = m_reverse_delta_refs[delta.tail];
-        auto& cur_delta = m_delta_refs[ref];
-        cur_delta = cur_delta - delta;
-        m_reverse_delta_refs.erase(delta.tail);
-        m_reverse_delta_refs[delta.head] = ref;
+        std::lock_guard<std::mutex> lock(m_cache_mutex);
+        _handle_remove_special_locked(hash);
     }
 
     // p2pool: _handle_remove_special2 (forest.py:137-147)
     void handle_remove_special2(const hash_t& hash) {
+        std::lock_guard<std::mutex> lock(m_cache_mutex);
+
         auto delta = make_element_delta(hash);
 
         auto tail_ref_it = m_reverse_delta_refs.find(delta.tail);
@@ -288,13 +315,54 @@ public:
     }
 
     void clear() {
+        std::lock_guard<std::mutex> lock(m_cache_mutex);
         m_deltas.clear();
         m_reverse_deltas.clear();
         m_delta_refs.clear();
         m_reverse_delta_refs.clear();
     }
 
-    size_t cache_size() const { return m_deltas.size(); }
+    size_t cache_size() const {
+        std::lock_guard<std::mutex> lock(m_cache_mutex);
+        return m_deltas.size();
+    }
+
+private:
+    // Locked version for internal use by handle_remove_special.
+    // Caller MUST hold m_cache_mutex.
+    void _handle_remove_special_locked(const hash_t& hash) {
+        auto delta = make_element_delta(hash);
+
+        if (m_reverse_delta_refs.find(delta.tail) == m_reverse_delta_refs.end())
+            return;
+
+        // Move delta refs referencing children down
+        auto head_ref_it = m_reverse_delta_refs.find(delta.head);
+        if (head_ref_it != m_reverse_delta_refs.end()) {
+            auto& items = m_reverse_deltas[head_ref_it->second];
+            for (auto x : std::vector<hash_t>(items.begin(), items.end())) {
+                // Inline get_last logic (already holds lock)
+                delta_t d = delta_t::get_none(x);
+                std::vector<std::pair<hash_t, delta_t>> updates;
+                while (!d.tail.IsNull() && m_contains_fn(d.tail)) {
+                    updates.push_back({d.tail, d});
+                    d += _get_delta_locked(d.tail);
+                }
+                for (auto& [h, dt] : updates)
+                    _set_delta_locked(h, d - dt);
+            }
+        }
+
+        if (m_reverse_delta_refs.find(delta.tail) == m_reverse_delta_refs.end())
+            return;
+
+        // Move ref pointing to this up
+        ref_t ref = m_reverse_delta_refs[delta.tail];
+        auto& cur_delta = m_delta_refs[ref];
+        cur_delta = cur_delta - delta;
+        m_reverse_delta_refs.erase(delta.tail);
+        m_reverse_delta_refs[delta.head] = ref;
+    }
 };
 
 } // namespace chain
