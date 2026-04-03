@@ -218,12 +218,14 @@ inline CompactBlock BuildCompactBlock(const BlockHeaderType& header,
     }
 
     // Remaining txs as short IDs (pre-compute SipHash keys once)
+    // BIP 152 v2: use wtxid (witness serialization hash) for short IDs.
     if (txs.size() > 1) {
         uint64_t k0, k1;
         cb.GetSipHashKeys(k0, k1);
         for (size_t i = 1; i < txs.size(); ++i) {
-            uint256 txid = compute_txid(txs[i]);
-            cb.short_ids.push_back(CompactBlock::GetShortID(k0, k1, txid));
+            auto packed = pack(TX_WITH_WITNESS(txs[i]));
+            uint256 wtxid = Hash(packed.get_span());
+            cb.short_ids.push_back(CompactBlock::GetShortID(k0, k1, wtxid));
         }
     }
 
@@ -241,7 +243,7 @@ struct CompactBlockReconstructionResult {
 
 /// Attempt to reconstruct a full block from a compact block + known transactions.
 /// @param cb        The received compact block.
-/// @param known_txs Map of txid → transaction (typically from mempool).
+/// @param known_txs Map of wtxid → transaction (BIP 152 v2 uses wtxid for short ID matching).
 /// @return          Result with reconstructed block (if complete) or missing indexes.
 inline CompactBlockReconstructionResult ReconstructBlock(
     const CompactBlock& cb,

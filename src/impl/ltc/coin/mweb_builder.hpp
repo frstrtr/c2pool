@@ -388,6 +388,8 @@ class MWEBTracker {
 public:
     /// Update state from a full block.
     /// Called when a new block is received via P2P.
+    /// Only accepts blocks that advance the state — bootstrap/historical blocks
+    /// are silently ignored to prevent stale HogEx references.
     bool update(const BlockType& block, uint32_t height,
                 const std::vector<unsigned char>& mweb_raw) {
         if (mweb_raw.empty()) {
@@ -400,6 +402,12 @@ public:
         if (!MWEBBuilder::extract_mweb_header_from_raw(mweb_raw, new_state))
             return false;
         std::lock_guard<std::mutex> lock(m_mutex);
+        // Only accept blocks that advance or match current height.
+        // Bootstrap delivers hundreds of old blocks whose HogEx references
+        // are long spent — accepting them would produce invalid templates.
+        if (m_state.valid && height < m_state.captured_at_height) {
+            return false;
+        }
         m_state = std::move(new_state);
         return true;
     }

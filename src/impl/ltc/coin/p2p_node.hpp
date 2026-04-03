@@ -77,6 +77,9 @@ private:
     // Compact block reconstruction state: pending compact block awaiting blocktxn
     std::unique_ptr<CompactBlock> m_pending_cmpct;
     std::vector<uint32_t> m_pending_missing_indexes;
+    // Last compact block we SENT — cached to serve getblocktxn requests
+    BlockType m_sent_cmpct_block;
+    uint256   m_sent_cmpct_hash;
     // External mempool for compact block tx matching
     Mempool* m_mempool{nullptr};
 
@@ -314,7 +317,8 @@ public:
     void enable_mempool_request() { m_request_mempool_on_connect = true; }
 
     /// Relay a pre-serialized block via P2P.
-    /// Automatically uses compact block format for peers that support it.
+    /// Uses compact block format (BIP 152 v2) for peers that support it,
+    /// falling back to full block otherwise.
     void submit_block_raw(const std::vector<unsigned char>& block_bytes)
     {
         if (!m_peer) return;
@@ -332,6 +336,11 @@ public:
 
                 auto packed_hdr = pack(static_cast<BlockHeaderType&>(block));
                 auto blockhash = Hash(packed_hdr.get_span());
+
+                // Cache the full block so we can serve getblocktxn requests.
+                m_sent_cmpct_block = std::move(block);
+                m_sent_cmpct_hash  = blockhash;
+
                 LOG_INFO << "[" << m_chain_label << "] Sent compact block "
                          << blockhash.GetHex()
                          << " (" << cb.short_ids.size() << " short IDs, "
@@ -535,7 +544,11 @@ private:
             switch (btype)
             {
             case inventory_type::tx:
-                vinv.push_back(inv);
+                // Always request with witness (MSG_WITNESS_TX) so segwit
+                // transactions arrive with their witness data intact.
+                // Without this, P2WPKH/P2WSH spends arrive stripped and
+                // fail CheckQueue when included in blocks.
+                vinv.push_back(inventory_type(inventory_type::witness_tx, inv.m_hash));
                 break;
             case inventory_type::block:
                 m_coin->new_block.happened(inv.m_hash);
@@ -733,16 +746,20 @@ private:
         m_coin->new_block.happened(blockhash);
 
         // Attempt reconstruction from mempool + known_txs
+        // BIP 152 v2: short IDs are keyed by wtxid (witness txid).
         std::map<uint256, MutableTransaction> known;
 
-        // Gather from node's known_txs
+        // Gather from node's known_txs (re-key by wtxid)
         for (const auto& [txid, tx] : m_coin->known_txs) {
-            known[txid] = MutableTransaction(tx);
+            MutableTransaction mtx(tx);
+            auto packed = pack(TX_WITH_WITNESS(mtx));
+            uint256 wtxid = Hash(packed.get_span());
+            known[wtxid] = std::move(mtx);
         }
 
-        // Gather from mempool
+        // Gather from mempool (wtxid-keyed)
         if (m_mempool) {
-            auto mp_txs = m_mempool->all_txs_map();
+            auto mp_txs = m_mempool->all_txs_map_wtxid();
             known.merge(mp_txs);
         }
 
@@ -776,10 +793,32 @@ private:
 
     ADD_P2P_HANDLER(getblocktxn)
     {
-        // BIP 152: Peer requests missing transactions — we don't serve blocks
-        LOG_DEBUG_COIND << "[" << m_chain_label << "] Peer requests "
-                        << msg->m_request.indexes.size() << " txs via getblocktxn for "
-                        << msg->m_request.blockhash.GetHex() << " (ignored, we don't serve blocks)";
+        auto& req = msg->m_request;
+
+        // Only serve our most recently sent compact block
+        if (req.blockhash != m_sent_cmpct_hash || m_sent_cmpct_block.m_txs.empty()) {
+            LOG_DEBUG_COIND << "[" << m_chain_label << "] getblocktxn for unknown block "
+                            << req.blockhash.GetHex() << " — ignoring";
+            return;
+        }
+
+        BlockTransactionsResponse resp;
+        resp.blockhash = req.blockhash;
+        resp.txs.reserve(req.indexes.size());
+
+        for (uint32_t idx : req.indexes) {
+            if (idx >= m_sent_cmpct_block.m_txs.size()) {
+                LOG_WARNING << "[" << m_chain_label << "] getblocktxn: index " << idx
+                            << " out of range (block has " << m_sent_cmpct_block.m_txs.size() << " txs)";
+                return;  // malformed request — drop
+            }
+            resp.txs.push_back(m_sent_cmpct_block.m_txs[idx]);
+        }
+
+        auto rmsg = message_blocktxn::make_raw(resp);
+        m_peer->write(rmsg);
+        LOG_INFO << "[" << m_chain_label << "] Served " << resp.txs.size()
+                 << " txs via blocktxn for " << req.blockhash.GetHex();
     }
 
     ADD_P2P_HANDLER(blocktxn)

@@ -18,6 +18,7 @@
 #include <core/log.hpp>
 #include <core/coin/utxo_view_cache.hpp>
 
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <set>
@@ -91,6 +92,7 @@ public:
     /// Update the current chain tip height (for coinbase maturity checks).
     /// Call after each block connection.
     void set_tip_height(uint32_t h) { m_tip_height = h; }
+    void set_utxo(core::coin::UTXOViewCache* u) { m_utxo.store(u); }
 
     // Disable copy
     Mempool(const Mempool&) = delete;
@@ -350,12 +352,32 @@ public:
         std::set<uint256> selected;
 
         // Pass 1: highest feerate first (known-fee txs)
+        auto* utxo = m_utxo.load();
         for (auto it = m_feerate_index.begin(); it != m_feerate_index.end(); ++it) {
             auto pit = m_pool.find(it->second);
             if (pit == m_pool.end()) continue;
             const auto& entry = pit->second;
             if (!entry.fee_known) continue;
             if (total_weight + entry.weight > max_weight) continue;
+
+            // Guard: verify inputs still exist in UTXO (or parent mempool tx).
+            // Catches stale txs in the window between tip-change and full_block arrival.
+            if (utxo) {
+                bool inputs_ok = true;
+                for (const auto& vin : entry.tx.vin) {
+                    core::coin::Outpoint op(vin.prevout.hash, vin.prevout.index);
+                    core::coin::Coin coin;
+                    if (!utxo->get_coin(op, coin)) {
+                        // Check if parent is in mempool (CPFP chain)
+                        if (!m_pool.count(vin.prevout.hash) ||
+                            vin.prevout.index >= m_pool.at(vin.prevout.hash).tx.vout.size()) {
+                            inputs_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if (!inputs_ok) continue;  // skip stale tx
+            }
 
             total_weight += entry.weight;
             total_fees += entry.fee;
@@ -399,6 +421,43 @@ public:
         return resolved;
     }
 
+    /// Re-validate all fee-known mempool transactions against the UTXO set.
+    /// Evicts any transaction whose inputs are no longer in the UTXO set
+    /// (i.e., were spent by a confirmed block but not caught by remove_for_block's
+    /// conflict detection — e.g., when the spending tx wasn't tracked in m_spent_outputs).
+    /// Call after remove_for_block() + UTXO connect to catch stale transactions.
+    /// Returns the number of evicted transactions.
+    int revalidate_inputs(core::coin::UTXOViewCache* utxo) {
+        if (!utxo) return 0;
+        std::lock_guard<std::mutex> lock(m_mutex);
+
+        std::vector<uint256> to_remove;
+        for (const auto& [txid, entry] : m_pool) {
+            if (!entry.fee_known) continue;  // already quarantined
+            for (const auto& vin : entry.tx.vin) {
+                core::coin::Outpoint op(vin.prevout.hash, vin.prevout.index);
+                core::coin::Coin coin;
+                if (!utxo->get_coin(op, coin)) {
+                    // Input not in UTXO — check if parent is in mempool (CPFP)
+                    if (m_pool.count(vin.prevout.hash) &&
+                        vin.prevout.index < m_pool.at(vin.prevout.hash).tx.vout.size())
+                        continue;  // parent still in mempool, tx is valid
+                    to_remove.push_back(txid);
+                    break;
+                }
+            }
+        }
+
+        for (const auto& txid : to_remove)
+            remove_tx_locked(txid);
+
+        if (!to_remove.empty()) {
+            LOG_INFO << "[EMB] Mempool revalidate: evicted " << to_remove.size()
+                     << " stale txs (inputs spent), remaining=" << m_pool.size();
+        }
+        return static_cast<int>(to_remove.size());
+    }
+
     /// Snapshot of all txids currently in the pool.
     std::vector<uint256> all_txids() const {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -415,6 +474,18 @@ public:
         std::map<uint256, MutableTransaction> out;
         for (const auto& [txid, entry] : m_pool)
             out[txid] = entry.tx;
+        return out;
+    }
+
+    /// Return all transactions keyed by wtxid (BIP 152 v2 compact block reconstruction).
+    std::map<uint256, MutableTransaction> all_txs_map_wtxid() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::map<uint256, MutableTransaction> out;
+        for (const auto& [txid, entry] : m_pool) {
+            auto packed = pack(TX_WITH_WITNESS(entry.tx));
+            uint256 wtxid = Hash(packed.get_span());
+            out[wtxid] = entry.tx;
+        }
         return out;
     }
 
@@ -568,6 +639,7 @@ private:
     time_t m_expiry_sec;
     core::coin::ChainLimits m_limits;   // MoneyRange + maturity constants
     uint32_t m_tip_height{0};           // current chain tip (for maturity checks)
+    std::atomic<core::coin::UTXOViewCache*> m_utxo{nullptr};  // for template-time input validation
 };
 
 } // namespace coin

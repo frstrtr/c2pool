@@ -1383,6 +1383,7 @@ int main(int argc, char* argv[]) {
                     ltc_utxo_db = std::make_unique<core::coin::UTXOViewDB>(utxo_path, utxo_opts);
                     if (ltc_utxo_db->open()) {
                         ltc_utxo_cache = std::make_unique<core::coin::UTXOViewCache>(ltc_utxo_db.get());
+                        embedded_pool->set_utxo(ltc_utxo_cache.get());
                         LOG_INFO << "[EMB-LTC] UTXO set opened: best_height=" << ltc_utxo_db->get_best_height()
                                  << " best_block=" << ltc_utxo_db->get_best_block().GetHex().substr(0, 16);
                     } else {
@@ -1815,9 +1816,15 @@ int main(int argc, char* argv[]) {
                                 // may now be in the UTXO set (especially bootstrap blocks).
                                 if (utxo) {
                                     int resolved = pool->recompute_unknown_fees(utxo);
-                                    if (resolved > 0) {
-                                        // Fees changed — trigger template rebuild so
-                                        // coinbasevalue includes the newly-resolved fees.
+                                    // Evict fee-known txs whose inputs are now spent.
+                                    // remove_for_block() only catches direct conflicts
+                                    // via m_spent_outputs; this catches any remaining
+                                    // stale txs (e.g., inputs spent by a tx the mempool
+                                    // never tracked).
+                                    int evicted = pool->revalidate_inputs(utxo);
+                                    if (resolved > 0 || evicted > 0) {
+                                        // Fees changed or stale txs evicted — trigger
+                                        // template rebuild so miners get clean work.
                                         web_server.trigger_work_refresh_debounced();
                                     }
                                 }
@@ -3605,6 +3612,7 @@ int main(int argc, char* argv[]) {
                             doge_utxo_db = std::make_unique<core::coin::UTXOViewDB>(utxo_path, utxo_opts);
                             if (doge_utxo_db->open()) {
                                 doge_utxo_cache = std::make_unique<core::coin::UTXOViewCache>(doge_utxo_db.get());
+                                if (doge_pool) doge_pool->set_utxo(doge_utxo_cache.get());
                                 LOG_INFO << "[EMB-DOGE] UTXO set opened: best_height=" << doge_utxo_db->get_best_height();
                             } else {
                                 LOG_WARNING << "[EMB-DOGE] UTXO DB failed to open — fees will be unknown";
@@ -3903,9 +3911,11 @@ int main(int argc, char* argv[]) {
                                             }
                                             if (utxo) {
                                                 int resolved = pool->recompute_unknown_fees(utxo);
-                                                if (resolved > 0) {
+                                                int evicted = pool->revalidate_inputs(utxo);
+                                                if (resolved > 0 || evicted > 0) {
                                                     LOG_INFO << "[EMB-DOGE] Fee revalidation: resolved=" << resolved
-                                                             << " pool_size=" << after;
+                                                             << " evicted=" << evicted
+                                                             << " pool_size=" << pool->size();
                                                     web_server.trigger_work_refresh_debounced();
                                                 }
                                             }
