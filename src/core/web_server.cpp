@@ -1644,7 +1644,6 @@ MiningInterface::build_connection_coinbase(
     // Freeze block body data atomically — prevents merkle root mismatch
     // when refresh_work() updates the template between separate reads.
     snap.merkle_branches = ws.merkle_branches;
-    snap.template_json = ws.tmpl;
     if (ws.tmpl.contains("transactions")) {
         for (const auto& tx : ws.tmpl["transactions"])
             if (tx.contains("data"))

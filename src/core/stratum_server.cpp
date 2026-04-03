@@ -1278,39 +1278,14 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         }
     }
 
-    // ── ATOMIC SNAPSHOT OVERRIDE ──
-    // Replace header fields, merkle branches, and tx_data with data from the
-    // atomic snapshot captured by build_connection_coinbase(). This prevents
-    // merkle root / witness commitment mismatch when refresh_work() updates
-    // the template between the separate get_current_work_template(),
-    // get_stratum_merkle_branches(), and build_connection_coinbase() calls.
-    if (!cbr.snapshot.template_json.is_null()) {
-        const auto& snap_tmpl = cbr.snapshot.template_json;
-
-        // Re-derive header fields from the snapshot template
-        gbt_prevhash = snap_tmpl.value("previousblockhash", "");
-        prevhash = gbt_to_stratum_prevhash(gbt_prevhash);
-
-        version_u32 = static_cast<uint32_t>(snap_tmpl.value("version", 0x20000000));
-        {
-            std::ostringstream ss;
-            ss << std::hex << std::setw(8) << std::setfill('0') << version_u32;
-            version = ss.str();
-        }
-
-        if (snap_tmpl.contains("bits"))
-            gbt_block_nbits = snap_tmpl["bits"].get<std::string>();
-        nbits = gbt_block_nbits;
-
-        if (snap_tmpl.contains("curtime"))
-            curtime = static_cast<uint32_t>(snap_tmpl["curtime"].get<uint64_t>());
-        {
-            std::ostringstream ss;
-            ss << std::hex << std::setw(8) << std::setfill('0') << curtime;
-            ntime = ss.str();
-        }
-
-        // Override merkle branches with snapshot
+    // ── ATOMIC SNAPSHOT: merkle branches ──
+    // Override merkle branches with snapshot captured atomically with coinbase.
+    // This ensures the merkle tree matches the witness commitment in coinb1.
+    // NOTE: Header fields (prevhash, version, bits, ntime) are NOT overridden —
+    // they come from the current daemon state and are independent of the
+    // coinbase/tx_data consistency. Overriding them caused GENTX validation
+    // failures on p2pool nodes (absheight, bits mismatch).
+    if (!cbr.snapshot.merkle_branches.empty()) {
         merkle_branches_vec = cbr.snapshot.merkle_branches;
         merkle_branches = nlohmann::json::array();
         for (const auto& h : merkle_branches_vec)
