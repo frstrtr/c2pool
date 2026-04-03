@@ -1336,13 +1336,12 @@ void NodeImpl::run_think()
                     }
 
                     // p2pool node.py:108-141: download_shares is a continuous loop
-                    // that wakes on desired_var change and fetches ONE entry per
-                    // iteration — but iterates immediately after each download.
-                    // c2pool equivalent: kick off downloads for ALL desired entries.
-                    // download_shares' m_downloading_shares dedup prevents duplicates.
-                    // Each download completes → processing_shares → phase2 → run_think()
-                    // → new desired entries → more downloads. This matches p2pool's
-                    // continuous convergence loop without needing a while-loop coroutine.
+                    // that re-requests every cycle with no dedup set.
+                    // c2pool's ReplyMatcher timeout (5s) silently drops the callback,
+                    // leaving stale entries in m_downloading_shares that permanently
+                    // block re-requesting. Clear each cycle to match p2pool behavior.
+                    m_downloading_shares.clear();
+
                     if (!result.desired.empty() && !m_peers.empty()) {
                         for (auto& [peer_addr, hash] : result.desired) {
                             // Pick random peer (p2pool: random.choice(self.peers.values()))
