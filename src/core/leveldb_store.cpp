@@ -52,7 +52,40 @@ bool LevelDBStore::open()
 
         leveldb::DB* db_ptr;
         leveldb::Status status = leveldb::DB::Open(db_options, m_db_path, &db_ptr);
-        
+
+        // Recovery after unclean shutdown (crash, kill -9, power loss).
+        // LevelDB uses fcntl locks on Linux which are released on process
+        // death, but a stale LOCK file can remain and block reopening if
+        // a zombie child still holds the fd or the OS didn't clean up.
+        // Standard approach (same as Bitcoin Core / litecoind):
+        //   1. Remove stale LOCK file → retry Open
+        //   2. If still fails (corruption) → RepairDB → retry Open
+        if (!status.ok()) {
+            auto lock_path = std::filesystem::path(m_db_path) / "LOCK";
+            if (std::filesystem::exists(lock_path)) {
+                LOG_WARNING << "LevelDB open failed at " << m_db_path
+                            << ": " << status.ToString()
+                            << " — removing stale LOCK file and retrying";
+                std::error_code ec;
+                std::filesystem::remove(lock_path, ec);
+                status = leveldb::DB::Open(db_options, m_db_path, &db_ptr);
+            }
+        }
+
+        if (!status.ok()) {
+            LOG_WARNING << "LevelDB open failed after LOCK removal at " << m_db_path
+                        << ": " << status.ToString()
+                        << " — attempting RepairDB (data will be preserved)";
+            leveldb::Status repair = leveldb::RepairDB(m_db_path, db_options);
+            if (repair.ok()) {
+                LOG_INFO << "LevelDB RepairDB succeeded at " << m_db_path;
+                status = leveldb::DB::Open(db_options, m_db_path, &db_ptr);
+            } else {
+                LOG_ERROR << "LevelDB RepairDB failed at " << m_db_path
+                          << ": " << repair.ToString();
+            }
+        }
+
         if (!status.ok()) {
             LOG_ERROR << "Failed to open LevelDB at " << m_db_path << ": " << status.ToString();
             return false;
