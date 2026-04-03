@@ -1374,9 +1374,9 @@ void NodeImpl::run_think()
 
                     // p2pool node.py:108-141: download_shares is a continuous loop
                     // that re-requests every cycle with no dedup set.
-                    // c2pool's ReplyMatcher timeout (5s) silently drops the callback,
-                    // leaving stale entries in m_downloading_shares that permanently
-                    // block re-requesting. Clear each cycle to match p2pool behavior.
+                    // Safety: clear stale entries each cycle. Normally cleaned up by
+                    // ReplyMatcher timeout callbacks and peer disconnect cancellation,
+                    // but this ensures no hash gets permanently stuck.
                     m_downloading_shares.clear();
 
                     if (!result.desired.empty() && !m_peers.empty()) {
