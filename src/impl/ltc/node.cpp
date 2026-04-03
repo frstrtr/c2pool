@@ -176,6 +176,22 @@ void NodeImpl::error(const message_error_type& err, const NetService& service, c
     m_pending_outbound.erase(service);
     m_outbound_addrs.erase(service);
 
+    // p2pool p2p.py:595: self.get_shares.respond_all(reason)
+    // Cancel pending share requests for this peer — invokes callbacks with
+    // empty response so m_downloading_shares entries are cleaned up immediately
+    // instead of waiting for the 5s ReplyMatcher timeout.
+    {
+        std::vector<uint256> to_cancel;
+        for (auto& [req_id, peer_addr] : m_pending_share_reqs) {
+            if (peer_addr == service)
+                to_cancel.push_back(req_id);
+        }
+        for (auto& req_id : to_cancel) {
+            m_pending_share_reqs.erase(req_id);
+            m_share_getter.cancel(req_id);
+        }
+    }
+
     base_t::error(err, service, where);
 }
 
@@ -197,6 +213,20 @@ void NodeImpl::close_connection(const NetService& service)
 
     m_pending_outbound.erase(service);
     m_outbound_addrs.erase(service);
+
+    // Cancel pending share requests for this peer (same as in error())
+    {
+        std::vector<uint256> to_cancel;
+        for (auto& [req_id, peer_addr] : m_pending_share_reqs) {
+            if (peer_addr == service)
+                to_cancel.push_back(req_id);
+        }
+        for (auto& req_id : to_cancel) {
+            m_pending_share_reqs.erase(req_id);
+            m_share_getter.cancel(req_id);
+        }
+    }
+
     base_t::close_connection(service);
 }
 
@@ -843,6 +873,9 @@ void NodeImpl::download_shares(peer_ptr /*unused_peer*/, const uint256& target_h
     auto req_id = core::random::random_uint256();
     std::vector<uint256> hashes = { target_hash };
 
+    // Track req_id → peer for selective cancellation on disconnect
+    m_pending_share_reqs[req_id] = peer->addr();
+
     // p2pool: print 'Requesting parent share %s from %s'
     LOG_INFO << "[Pool] Requesting parent share "
              << target_hash.ToString().substr(0,16)
@@ -854,13 +887,17 @@ void NodeImpl::download_shares(peer_ptr /*unused_peer*/, const uint256& target_h
     auto peer_addr_for_log = peer->addr();
 
     request_shares(req_id, peer, hashes, parents, stops,
-        [this, weak_peer, target_hash, peer_addr_for_log](ltc::ShareReplyData reply)
+        [this, weak_peer, target_hash, peer_addr_for_log, req_id](ltc::ShareReplyData reply)
         {
             m_downloading_shares.erase(target_hash);
+            m_pending_share_reqs.erase(req_id);
 
             if (reply.m_items.empty())
             {
-                LOG_DEBUG_POOL << "Empty sharereply for " << target_hash.ToString();
+                // Empty reply = timeout or peer had no matching shares (p2pool: sleep(1), continue)
+                LOG_INFO << "[Pool] Share request completed with no data for "
+                         << target_hash.ToString().substr(0,16)
+                         << " (timeout or empty reply from " << peer_addr_for_log.to_string() << ")";
                 return;
             }
 

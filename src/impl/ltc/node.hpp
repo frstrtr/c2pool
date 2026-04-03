@@ -78,7 +78,8 @@ public:
             {
                 auto rmsg = ltc::message_sharereq::make_raw(req_id, hashes, parents, stops);
                 to_peer->write(std::move(rmsg));
-            })
+            },
+            15)  // p2pool p2p.py:80: timeout=15 for share requests
     {
         // Seed addr store with hardcoded bootstrap peers
         m_addrs.load(config->pool()->m_bootstrap_addrs);
@@ -273,6 +274,12 @@ protected:
     std::set<uint256> m_shared_share_hashes;  // de-dup set for broadcast_share
     std::set<uint256> m_rejected_share_hashes; // shares rejected by peers — never re-broadcast
     std::set<uint256> m_downloading_shares;   // hashes currently being fetched
+
+    // Track req_id → peer addr for selective cancellation on disconnect.
+    // p2pool has per-peer get_shares (GenericDeferrer), so connectionLost calls
+    // respond_all() on just that peer's deferrer. c2pool has a shared m_share_getter,
+    // so we track which req_ids belong to which peer for cancel-on-disconnect.
+    std::map<uint256, NetService> m_pending_share_reqs;  // req_id → peer addr
 
     // Track recently-broadcast share hashes + timestamp so we can detect
     // rapid disconnections (peer rejected our share → PoW invalid loop).

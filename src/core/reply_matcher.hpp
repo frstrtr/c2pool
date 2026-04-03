@@ -80,9 +80,19 @@ struct Matcher
         if (!m_watchers.contains(id))
         {
             auto timer = std::make_unique<core::Timer>(m_context);
-            timer->start(m_timeout, [&, id = id](){ m_watchers.erase(id); });
+            // p2pool deferral.py:137-140: timeout fires df.errback(TimeoutError).
+            // The Deferred IS invoked — the caller handles the error and retries.
+            // c2pool equivalent: invoke the callback with a default-constructed
+            // (empty) response. This completes the async contract — every request
+            // produces exactly one callback invocation on all code paths.
+            timer->start(m_timeout, [&, id = id](){
+                auto it = m_watchers.find(id);
+                if (it != m_watchers.end()) {
+                    it->second(ResponseType{});
+                    m_watchers.erase(it);
+                }
+            });
 
-            // auto wrapper = wrapper_type(resp, std::move(timer));
             m_watchers[id] = wrapper_type(resp, std::move(timer));
 
             m_req(args...);
@@ -99,6 +109,29 @@ struct Matcher
         {
             throw std::invalid_argument("ReplyMatcher doesn't store this key!");
         }
+    }
+
+    // p2pool p2p.py:595 equivalent: cancel specific pending request by id.
+    // Invokes callback with empty response (completing the async contract),
+    // then removes the watcher. Returns true if id was found and cancelled.
+    bool cancel(id_type id)
+    {
+        auto it = m_watchers.find(id);
+        if (it == m_watchers.end())
+            return false;
+        it->second(ResponseType{});
+        m_watchers.erase(it);
+        return true;
+    }
+
+    // Cancel ALL pending requests (p2pool respond_all).
+    // Use only when all in-flight requests are invalid (e.g. shutdown).
+    void respond_all()
+    {
+        auto pending = std::move(m_watchers);
+        m_watchers.clear();
+        for (auto& [id, wrapper] : pending)
+            wrapper(ResponseType{});
     }
 };
 
