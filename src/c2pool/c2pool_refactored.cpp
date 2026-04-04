@@ -1850,9 +1850,15 @@ int main(int argc, char* argv[]) {
                      chain = embedded_chain.get(),
                      utxo = ltc_utxo_cache.get(),
                      utxo_db = ltc_utxo_db.get(),
-                     &web_server](
+                     &web_server, &ioc](
                         const uint256& old_tip, uint32_t old_height,
                         const uint256& new_tip, uint32_t new_height) {
+                        // This callback fires on the hdr_pool thread.
+                        // Post all work to ioc to avoid cross-thread access to
+                        // bcaster/web_server/UTXO which are ioc-thread objects.
+                        boost::asio::post(ioc,
+                            [tracker, bcaster, chain, utxo, utxo_db, &web_server,
+                             old_tip, old_height, new_tip, new_height]() {
                         bool is_reorg = (new_height <= old_height);
                         LOG_WARNING << "[EMB-LTC] Chain tip changed: "
                                     << old_tip.GetHex().substr(0, 16) << " (h=" << old_height << ") → "
@@ -1919,6 +1925,7 @@ int main(int argc, char* argv[]) {
                         }
                         // Trigger work refresh so stratum miners get the new tip
                         web_server.trigger_work_refresh_debounced();
+                            }); // end post(ioc)
                     });
                 LOG_INFO << "[EMB-LTC] Chain reorg handler registered";
 

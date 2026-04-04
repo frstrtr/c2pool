@@ -106,6 +106,10 @@ public:
     bool load_share(const uint256& hash, std::vector<uint8_t>& serialized_data,
                     uint256& prev_hash, uint64_t& height, uint64_t& timestamp,
                     uint256& work, uint256& target, bool& is_orphan);
+
+    /// Load a share with full metadata (includes is_verified)
+    bool load_share(const uint256& hash, std::vector<uint8_t>& serialized_data,
+                    core::ShareMetadata& metadata);
     
     /**
      * @brief Check if a share exists in storage
@@ -120,7 +124,10 @@ public:
      * @return True if successfully removed
      */
     bool remove_share(const uint256& hash);
-    
+
+    /// Batch-mark shares as verified in LevelDB metadata.
+    bool mark_shares_verified(const std::vector<uint256>& hashes);
+
     /**
      * @brief Log storage statistics
      */

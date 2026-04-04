@@ -967,12 +967,13 @@ void NodeImpl::load_persisted_shares()
     const size_t to_load = total_in_db - skip;
     LOG_INFO << "[Pool] Loading shares from LevelDB: " << to_load << " shares to process...";
     int loaded = 0, skipped_contains = 0, skipped_load = 0, skipped_small = 0;
+    std::vector<uint256> verified_hashes; // shares to pre-populate into verified
     for (size_t i = skip; i < total_in_db; ++i)
     {
         const auto& hash = all_hashes[i];
         std::vector<uint8_t> data;
-        uint256 prev; uint64_t height, ts; uint256 work, target; bool orphan;
-        if (!m_storage->load_share(hash, data, prev, height, ts, work, target, orphan)) {
+        core::ShareMetadata meta;
+        if (!m_storage->load_share(hash, data, meta)) {
             ++skipped_load;
             continue;
         }
@@ -995,6 +996,11 @@ void NodeImpl::load_persisted_shares()
             {
                 m_tracker.add(share);
                 loaded++;
+
+                // p2pool known_verified: pre-populate verified tracker without re-verification
+                if (meta.is_verified)
+                    verified_hashes.push_back(share.hash());
+
                 if (loaded % 1000 == 0) {
                     size_t progress = i - skip + 1;
                     LOG_INFO << "[Pool] Loading shares: " << progress << "/" << to_load
@@ -1010,6 +1016,21 @@ void NodeImpl::load_persisted_shares()
                         << " from LevelDB: " << e.what();
         }
     }
+
+    // Pre-populate verified chain from persisted known_verified set (p2pool node.py:190-192).
+    // Shares are loaded by ascending height, so parent-before-child order is guaranteed.
+    int pre_verified = 0;
+    for (const auto& vh : verified_hashes) {
+        if (m_tracker.chain.contains(vh) && !m_tracker.verified.contains(vh)) {
+            try {
+                auto& share_var = m_tracker.chain.get_share(vh);
+                m_tracker.verified.add(share_var);
+                ++pre_verified;
+            } catch (...) {}
+        }
+    }
+    if (pre_verified > 0)
+        LOG_INFO << "[Pool] Pre-populated " << pre_verified << " verified shares from LevelDB";
 
     LOG_INFO << "[Pool] Loaded " << loaded << " shares from LevelDB storage"
              << " (DB total: " << total_in_db << ", limit: " << keep_per_head
@@ -1027,6 +1048,14 @@ void NodeImpl::load_persisted_shares()
         }
         LOG_INFO << "[Pool] Pruned " << pruned << " old shares from LevelDB";
     }
+}
+
+void NodeImpl::flush_verified_to_leveldb()
+{
+    if (m_verified_flush_buf.empty() || !m_storage || !m_storage->is_available())
+        return;
+    m_storage->mark_shares_verified(m_verified_flush_buf);
+    m_verified_flush_buf.clear();
 }
 
 void NodeImpl::start_outbound_connections()
@@ -1411,6 +1440,15 @@ void NodeImpl::run_think()
                     }
 
                     m_think_running.store(false);
+
+                    // Flush any remaining verified hashes to LevelDB
+                    flush_verified_to_leveldb();
+
+                    // If think() Phase 2 hit its budget, schedule a continuation
+                    // so the io_context can process network I/O between batches.
+                    if (m_tracker.m_think_needs_continue) {
+                        boost::asio::post(*m_context, [this]() { run_think(); });
+                    }
             }
 
           } catch (const std::exception& e) {

@@ -49,6 +49,7 @@ public:
         void put(const std::string& key, const std::vector<uint8_t>& value);
         void remove(const std::string& key);
         bool commit();
+        bool commit_sync();  // force fsync regardless of store options
     };
 
     LevelDBStore(const std::string& db_path, const LevelDBOptions& options);
@@ -84,6 +85,7 @@ struct ShareMetadata {
     uint256 work = uint256::ZERO;
     uint256 target = uint256::ZERO;
     bool is_orphan = false;
+    bool is_verified = false;
 };
 
 /**
@@ -163,6 +165,9 @@ public:
     bool load_share(const uint256& hash, std::vector<uint8_t>& serialized_share, ShareMetadata& metadata);
     bool has_share(const uint256& hash);
     bool remove_share(const uint256& hash);
+
+    /// Batch-update the is_verified flag for multiple shares without rewriting share data.
+    bool mark_shares_verified(const std::vector<uint256>& hashes);
 
     // Chain traversal
     std::vector<uint256> get_chain_hashes(const uint256& start_hash, uint64_t max_count, bool forward = true);

@@ -182,6 +182,26 @@ bool SharechainStorage::remove_share(const uint256& hash)
     return m_leveldb_store->remove_share(hash);
 }
 
+bool SharechainStorage::load_share(const uint256& hash, std::vector<uint8_t>& serialized_data,
+                core::ShareMetadata& metadata)
+{
+    if (!m_leveldb_store)
+        return false;
+    try {
+        return m_leveldb_store->load_share(hash, serialized_data, metadata);
+    } catch (const std::exception& e) {
+        LOG_ERROR << "Error loading share from LevelDB: " << e.what();
+        return false;
+    }
+}
+
+bool SharechainStorage::mark_shares_verified(const std::vector<uint256>& hashes)
+{
+    if (!m_leveldb_store || hashes.empty())
+        return false;
+    return m_leveldb_store->mark_shares_verified(hashes);
+}
+
 void SharechainStorage::log_storage_stats()
 {
     if (!m_leveldb_store) {

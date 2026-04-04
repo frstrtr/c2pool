@@ -64,6 +64,9 @@ protected:
     // to protect the best chains from head pruning (p2pool node.py:363).
     std::vector<uint256> m_last_top5_heads;
 
+    // Buffer of newly verified share hashes, flushed to LevelDB periodically
+    std::vector<uint256> m_verified_flush_buf;
+
 public:
     NodeImpl()
         : m_share_getter(nullptr,
@@ -93,6 +96,13 @@ public:
         std::string net_name = config->m_testnet ? "litecoin_testnet" : "litecoin";
         m_storage = std::make_unique<c2pool::storage::SharechainStorage>(net_name);
         load_persisted_shares();
+
+        // Wire up verified-hash persistence callback (p2pool known_verified pattern)
+        m_tracker.m_on_share_verified = [this](const uint256& hash) {
+            m_verified_flush_buf.push_back(hash);
+            if (m_verified_flush_buf.size() >= 50)
+                flush_verified_to_leveldb();
+        };
     }
 
     // INetwork: Pool node does not initiate disconnect — peer connections
@@ -177,6 +187,7 @@ public:
 
     /// Load persisted shares from LevelDB storage into the tracker.
     void load_persisted_shares();
+    void flush_verified_to_leveldb();
 
     /// Start dialing outbound peers from AddrStore / bootstrap list.
     /// Maintains target outbound peer count active outbound connections.

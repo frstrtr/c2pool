@@ -22,6 +22,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <thread>
 #include <functional>
 #include <iomanip>
@@ -803,36 +804,60 @@ private:
     //   "height"                   → uint32_t
 
     void persist_header(const IndexEntry& entry) {
-        if (!m_db || !m_db->is_open()) {
-            LOG_DEBUG_COIND << "[EMB-LTC] persist_header: no DB (in-memory mode)";
-            return;
+        // Write-back model (matches Litecoin Core's setDirtyBlockIndex):
+        // Mark header as dirty — actual DB write happens in flush_dirty().
+        m_dirty_headers.insert(entry.block_hash);
+    }
+
+    /// Flush all dirty headers + tip to LevelDB in a single atomic WriteBatch
+    /// with sync=true (fsync).  Matches Litecoin Core's FlushStateToDisk() pattern.
+    /// Caller must hold m_mutex.
+    void flush_dirty() {
+        if (!m_db || !m_db->is_open() || m_dirty_headers.empty()) return;
+
+        auto batch = m_db->create_batch();
+        int count = 0;
+
+        for (const auto& hash : m_dirty_headers) {
+            auto it = m_headers.find(hash);
+            if (it == m_headers.end()) continue;
+
+            auto packed = pack(it->second);
+            std::vector<uint8_t> data(
+                reinterpret_cast<const uint8_t*>(packed.data()),
+                reinterpret_cast<const uint8_t*>(packed.data()) + packed.size());
+
+            std::string key = "h";
+            key.append(reinterpret_cast<const char*>(hash.data()), 32);
+            batch.put(key, data);
+            ++count;
         }
 
-        auto packed = pack(entry);
-        std::vector<uint8_t> data(
-            reinterpret_cast<const uint8_t*>(packed.data()),
-            reinterpret_cast<const uint8_t*>(packed.data()) + packed.size());
+        // Include tip in the same atomic batch
+        {
+            std::vector<uint8_t> tip_data(m_tip.data(), m_tip.data() + 32);
+            batch.put("tip", tip_data);
 
-        std::string key = "h";
-        key.append(reinterpret_cast<const char*>(entry.block_hash.data()), 32);
-        m_db->put(key, data);
+            uint32_t h = m_tip_height;
+            std::vector<uint8_t> height_data(4);
+            height_data[0] = (h >> 24) & 0xFF;
+            height_data[1] = (h >> 16) & 0xFF;
+            height_data[2] = (h >> 8) & 0xFF;
+            height_data[3] = h & 0xFF;
+            batch.put("height", height_data);
+        }
+
+        if (batch.commit_sync()) {
+            m_dirty_headers.clear();
+            LOG_DEBUG_COIND << "[EMB-LTC] flush_dirty: wrote " << count << " headers to LevelDB (synced)";
+        } else {
+            LOG_ERROR << "[EMB-LTC] flush_dirty: WriteBatch FAILED for " << count << " headers";
+        }
     }
 
     void persist_tip() {
-        if (!m_db || !m_db->is_open()) return;
-
-        // Store tip hash
-        std::vector<uint8_t> tip_data(m_tip.data(), m_tip.data() + 32);
-        m_db->put("tip", tip_data);
-
-        // Store height
-        uint32_t h = m_tip_height;
-        std::vector<uint8_t> height_data(4);
-        height_data[0] = (h >> 24) & 0xFF;
-        height_data[1] = (h >> 16) & 0xFF;
-        height_data[2] = (h >> 8) & 0xFF;
-        height_data[3] = h & 0xFF;
-        m_db->put("height", height_data);
+        // Write-back: flush all dirty headers + tip atomically.
+        flush_dirty();
     }
 
     void load_from_db() {
@@ -909,6 +934,9 @@ private:
     std::atomic<uint32_t> m_peer_tip_height{0};
 
     std::unique_ptr<core::LevelDBStore> m_db;
+
+    /// Dirty set: headers modified since last flush (write-back model).
+    std::set<uint256> m_dirty_headers;
 
     /// Callback fired on tip change (reorg / equal-work switch).
     TipChangedCallback m_on_tip_changed;

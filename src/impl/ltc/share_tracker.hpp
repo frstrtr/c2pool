@@ -123,6 +123,10 @@ public:
     bool is_v36_active() const { return v36_active_.load(std::memory_order_relaxed); }
     void set_v36_active(bool active) { v36_active_.store(active, std::memory_order_relaxed); }
 
+    // Set by think() Phase 2 when verification budget is exhausted.
+    // Checked by run_think() to schedule a deferred continuation.
+    bool m_think_needs_continue{false};
+
 private:
     std::atomic<bool> v36_active_{false};
 
@@ -138,6 +142,9 @@ private:
     }
 
 public:
+    // Callback fired when a share passes verification (for LevelDB persistence)
+    std::function<void(const uint256&)> m_on_share_verified;
+
     ShareTracker() {
         // p2pool SubsetTracker pattern: verified shares navigation
         // through the MAIN tracker's skip list.
@@ -262,6 +269,10 @@ public:
         auto& share_var = chain.get_share(share_hash);
         if (!verified.contains(share_hash))
             verified.add(share_var);
+
+        // Notify LevelDB persistence layer
+        if (m_on_share_verified)
+            m_on_share_verified(share_hash);
 
         // Naughty propagation: if parent is naughty, increment (up to 6 generations)
         // Python data.py:1432-1438 — ancestor punishment for invalid block shares
@@ -518,9 +529,14 @@ public:
         }
 
         // Phase 2: Extend verification from verified heads.
-        // Matches p2pool: verify ALL shares in one pass (no budget limit).
-        // p2pool does this in a single think() call — any artificial budget
-        // causes c2pool to fall behind the growing chain, creating forks.
+        // Budget-limited: verify up to THINK_VERIFY_BUDGET shares per call to
+        // prevent blocking the io_context for tens of seconds. Remaining shares
+        // are picked up by the next run_think() call (deferred via post()).
+        // p2pool avoids this problem by persisting verified status — we do too
+        // now, so budgeting is a safety net for cold starts only.
+        constexpr int THINK_VERIFY_BUDGET = 100;
+        int budget_remaining = THINK_VERIFY_BUDGET;
+        m_think_needs_continue = false;
         {
             static int p2_skip_log = 0;
             if (p2_skip_log++ % 20 == 0)
@@ -529,6 +545,11 @@ public:
         }
         for (auto& [head_hash, tail_hash] : verified.get_heads())
         {
+            if (budget_remaining <= 0) {
+                m_think_needs_continue = true;
+                break;
+            }
+
             if (!chain.contains(head_hash)) {
                 static int skip1 = 0;
                 if (skip1++ < 5) LOG_WARNING << "[think-P2] skip: head not in chain " << head_hash.GetHex().substr(0,16);
@@ -571,9 +592,16 @@ public:
                 int p2_verified_count = 0;
                 for (auto [hash, data] : chain_view)
                 {
+                    if (budget_remaining <= 0) {
+                        m_think_needs_continue = true;
+                        LOG_INFO << "[think-P2] budget exhausted after " << p2_verified_count
+                                 << " verifications, deferring remainder";
+                        break;
+                    }
                     if (!attempt_verify(hash))
                         break;
                     ++p2_verified_count;
+                    --budget_remaining;
                     if (p2_verified_count % 50 == 0)
                         LOG_INFO << "[think-P2] verifying: " << p2_verified_count << "/" << to_get
                                  << " verified_total=" << verified.size();

@@ -302,6 +302,25 @@ bool LevelDBStore::BatchWriter::commit()
     return true;
 }
 
+bool LevelDBStore::BatchWriter::commit_sync()
+{
+    if (!m_store || !m_store->m_db) {
+        LOG_ERROR << "LevelDB store not available for batch commit_sync";
+        return false;
+    }
+
+    leveldb::WriteOptions write_options;
+    write_options.sync = true;  // force fsync
+
+    leveldb::Status status = m_store->m_db->Write(write_options, m_batch.get());
+    if (!status.ok()) {
+        LOG_ERROR << "Failed to commit_sync batch: " << status.ToString();
+        return false;
+    }
+
+    return true;
+}
+
 // SharechainLevelDBStore implementation
 SharechainLevelDBStore::SharechainLevelDBStore(const std::string& base_path, const std::string& network_name)
     : m_base_path(base_path), m_network_name(network_name)
@@ -459,7 +478,8 @@ bool SharechainLevelDBStore::store_share(const uint256& hash, const std::vector<
         metadata_stream << metadata.work;
         metadata_stream << metadata.target;
         metadata_stream << static_cast<uint8_t>(metadata.is_orphan ? 1 : 0);
-        
+        metadata_stream << static_cast<uint8_t>(metadata.is_verified ? 1 : 0);
+
         // Convert from std::vector<std::byte> to std::vector<uint8_t>
         auto span = metadata_stream.get_span();
         std::vector<uint8_t> metadata_data(
@@ -467,7 +487,7 @@ bool SharechainLevelDBStore::store_share(const uint256& hash, const std::vector<
             reinterpret_cast<const uint8_t*>(span.data()) + span.size()
         );
         batch.put(index_key, metadata_data);
-        
+
         // Store height -> hash mapping for chain traversal
         if (metadata.height > 0) {
             std::string height_key = make_height_key(metadata.height);
@@ -515,6 +535,7 @@ bool SharechainLevelDBStore::store_shares_batch(const std::vector<BatchShareEntr
             metadata_stream << e.metadata.work;
             metadata_stream << e.metadata.target;
             metadata_stream << static_cast<uint8_t>(e.metadata.is_orphan ? 1 : 0);
+            metadata_stream << static_cast<uint8_t>(e.metadata.is_verified ? 1 : 0);
             auto span = metadata_stream.get_span();
             std::vector<uint8_t> metadata_data(
                 reinterpret_cast<const uint8_t*>(span.data()),
@@ -586,7 +607,17 @@ bool SharechainLevelDBStore::load_share(const uint256& hash, std::vector<uint8_t
         uint8_t orphan_flag;
         metadata_stream >> orphan_flag;
         metadata.is_orphan = (orphan_flag != 0);
-        
+
+        // is_verified: backward-compatible — old DBs won't have this byte
+        // PackStream clears m_vch when cursor reaches end, so non-empty means more data
+        try {
+            uint8_t verified_flag;
+            metadata_stream >> verified_flag;
+            metadata.is_verified = (verified_flag != 0);
+        } catch (...) {
+            metadata.is_verified = false;
+        }
+
         return true;
         
     } catch (const std::exception& e) {
@@ -643,6 +674,52 @@ bool SharechainLevelDBStore::remove_share(const uint256& hash)
         
     } catch (const std::exception& e) {
         LOG_ERROR << "Exception removing share " << hash.ToString() << ": " << e.what();
+        return false;
+    }
+}
+
+bool SharechainLevelDBStore::mark_shares_verified(const std::vector<uint256>& hashes)
+{
+    if (!m_store || hashes.empty())
+        return false;
+
+    try {
+        auto batch = m_store->create_batch();
+        int updated = 0;
+
+        for (const auto& hash : hashes) {
+            ShareMetadata metadata;
+            std::vector<uint8_t> dummy;
+            if (!load_share(hash, dummy, metadata))
+                continue;
+            if (metadata.is_verified)
+                continue; // already marked
+
+            metadata.is_verified = true;
+
+            PackStream ms;
+            ms << metadata.prev_hash;
+            ms << metadata.height;
+            ms << metadata.timestamp;
+            ms << metadata.work;
+            ms << metadata.target;
+            ms << static_cast<uint8_t>(metadata.is_orphan ? 1 : 0);
+            ms << static_cast<uint8_t>(1); // is_verified = true
+            auto span = ms.get_span();
+            std::vector<uint8_t> md(
+                reinterpret_cast<const uint8_t*>(span.data()),
+                reinterpret_cast<const uint8_t*>(span.data()) + span.size());
+            batch.put(make_index_key(hash), md);
+            ++updated;
+        }
+
+        if (updated > 0 && !batch.commit()) {
+            LOG_ERROR << "mark_shares_verified: batch commit failed";
+            return false;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        LOG_ERROR << "mark_shares_verified failed: " << e.what();
         return false;
     }
 }
