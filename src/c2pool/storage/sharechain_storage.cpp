@@ -182,6 +182,13 @@ bool SharechainStorage::remove_share(const uint256& hash)
     return m_leveldb_store->remove_share(hash);
 }
 
+bool SharechainStorage::remove_shares_batch(const std::vector<uint256>& hashes)
+{
+    if (!m_leveldb_store || hashes.empty())
+        return false;
+    return m_leveldb_store->remove_shares_batch(hashes);
+}
+
 bool SharechainStorage::load_share(const uint256& hash, std::vector<uint8_t>& serialized_data,
                 core::ShareMetadata& metadata)
 {

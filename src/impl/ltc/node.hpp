@@ -67,6 +67,9 @@ protected:
     // Buffer of newly verified share hashes, flushed to LevelDB periodically
     std::vector<uint256> m_verified_flush_buf;
 
+    // Buffer of pruned share hashes, batch-deleted from LevelDB after clean_tracker()
+    std::vector<uint256> m_removal_flush_buf;
+
 public:
     NodeImpl()
         : m_share_getter(nullptr,
@@ -103,6 +106,13 @@ public:
             if (m_verified_flush_buf.size() >= 50)
                 flush_verified_to_leveldb();
         };
+
+        // Wire up share removal → LevelDB cleanup (p2pool main.py:269-270)
+        // Buffer removals; clean_tracker() flushes after drop-tails.
+        // Safe on crash: unflushed shares get pruned at next startup by load_persisted_shares().
+        m_tracker.chain.on_removed([this](const uint256& hash) {
+            m_removal_flush_buf.push_back(hash);
+        });
     }
 
     // INetwork: Pool node does not initiate disconnect — peer connections

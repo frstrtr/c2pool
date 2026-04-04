@@ -1607,6 +1607,17 @@ void NodeImpl::clean_tracker()
     // Step 4: Update best share (p2pool node.py:402)
     run_think();
 
+    // Step 5: Flush pruned shares from LevelDB (p2pool main.py:269-270)
+    if (!m_removal_flush_buf.empty() && m_storage && m_storage->is_available())
+    {
+        auto count = m_removal_flush_buf.size();
+        if (m_storage->remove_shares_batch(m_removal_flush_buf))
+            LOG_INFO << "[clean-leveldb] removed " << count << " pruned shares from LevelDB";
+        else
+            LOG_WARNING << "[clean-leveldb] batch remove failed, count=" << count;
+        m_removal_flush_buf.clear();
+    }
+
     // Orphan/fork diagnostics — understand chain topology
     {
         auto& chain = m_tracker.chain;

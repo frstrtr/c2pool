@@ -125,6 +125,9 @@ public:
      */
     bool remove_share(const uint256& hash);
 
+    /// Batch-remove multiple shares from LevelDB in one WriteBatch.
+    bool remove_shares_batch(const std::vector<uint256>& hashes);
+
     /// Batch-mark shares as verified in LevelDB metadata.
     bool mark_shares_verified(const std::vector<uint256>& hashes);
 

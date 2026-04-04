@@ -678,6 +678,46 @@ bool SharechainLevelDBStore::remove_share(const uint256& hash)
     }
 }
 
+bool SharechainLevelDBStore::remove_shares_batch(const std::vector<uint256>& hashes)
+{
+    if (!m_store || hashes.empty())
+        return false;
+
+    try {
+        auto batch = m_store->create_batch();
+        size_t removed = 0;
+
+        for (const auto& hash : hashes)
+        {
+            // Load metadata for height key removal
+            ShareMetadata metadata;
+            std::vector<uint8_t> dummy;
+            bool had_meta = load_share(hash, dummy, metadata);
+
+            batch.remove(make_share_key(hash));
+            batch.remove(make_index_key(hash));
+            if (had_meta && metadata.height > 0)
+                batch.remove(make_height_key(metadata.height));
+            ++removed;
+        }
+
+        if (!batch.commit()) {
+            LOG_ERROR << "[LevelDB] batch remove failed, count=" << hashes.size();
+            return false;
+        }
+
+        if (m_metadata.total_shares >= removed)
+            m_metadata.total_shares -= removed;
+        else
+            m_metadata.total_shares = 0;
+
+        return true;
+    } catch (const std::exception& e) {
+        LOG_ERROR << "[LevelDB] batch remove exception: " << e.what();
+        return false;
+    }
+}
+
 bool SharechainLevelDBStore::mark_shares_verified(const std::vector<uint256>& hashes)
 {
     if (!m_store || hashes.empty())

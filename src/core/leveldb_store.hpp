@@ -166,6 +166,9 @@ public:
     bool has_share(const uint256& hash);
     bool remove_share(const uint256& hash);
 
+    /// Batch-remove multiple shares in a single WriteBatch (much faster than per-share remove).
+    bool remove_shares_batch(const std::vector<uint256>& hashes);
+
     /// Batch-update the is_verified flag for multiple shares without rewriting share data.
     bool mark_shares_verified(const std::vector<uint256>& hashes);
 
