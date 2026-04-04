@@ -965,6 +965,12 @@ int main(int argc, char* argv[]) {
                 embedded_ltc = cfg["embedded_ltc"].as<bool>();
             if (!cli_explicit.count("embedded_doge") && cfg["embedded_doge"])
                 embedded_doge = cfg["embedded_doge"].as<bool>();
+            if (!cli_explicit.count("doge_testnet4alpha") && cfg["doge_testnet4alpha"])
+                doge_testnet4alpha = cfg["doge_testnet4alpha"].as<bool>();
+            if (!cli_explicit.count("doge_p2p_address") && cfg["doge_p2p_address"])
+                doge_p2p_address = cfg["doge_p2p_address"].as<std::string>();
+            if (!cli_explicit.count("doge_p2p_port") && cfg["doge_p2p_port"])
+                doge_p2p_port = cfg["doge_p2p_port"].as<int>();
             if (!cli_explicit.count("startup_mode") && cfg["startup_mode"]) {
                 auto m = cfg["startup_mode"].as<std::string>();
                 if (m == "genesis") startup_mode = StartupMode::GENESIS;

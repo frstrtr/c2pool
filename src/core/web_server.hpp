@@ -974,7 +974,9 @@ private:
 /// Main Web Server class
 class WebServer
 {
-    net::io_context& ioc_;
+    net::io_context& ioc_;               // Main event loop (Stratum, timers, mining)
+    net::io_context http_ioc_;           // Dedicated HTTP event loop (dashboard/REST)
+    std::thread http_thread_;            // Thread driving http_ioc_
     tcp::acceptor acceptor_;
     std::shared_ptr<MiningInterface> mining_interface_;
     std::string bind_address_;

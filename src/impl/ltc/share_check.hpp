@@ -928,6 +928,7 @@ inline std::vector<unsigned char> get_share_script(const auto* obj)
 template <typename ShareT, typename TrackerT>
 uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool dump_diag = false, bool v36_active = false)
 {
+    auto gst_t0 = std::chrono::steady_clock::now();
     constexpr int64_t ver = ShareT::version;
     // p2pool selects PPLNS formula by runtime AutoRatchet state, not compile-time
     // share version. When v36_active is true (AutoRatchet ACTIVATED/CONFIRMED),
@@ -1001,63 +1002,15 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
                 pplns_start = s->m_prev_hash;  // grandparent
             });
             auto available = tracker.chain.get_height(prev_hash);
-            auto walk_count = static_cast<size_t>(
+            auto walk_count = static_cast<int32_t>(
                 std::max(0, std::min(chain_len, available) - 1));
 
-            if (pplns_start.IsNull() || !tracker.chain.contains(pplns_start) || walk_count == 0) {
-                // No grandparent reachable — skip PPLNS walk (genesis case)
-            } else {
-            auto walk_view = tracker.chain.get_chain(pplns_start, walk_count);
-
-            for (auto [hash, data] : walk_view)
-            {
-                uint288 share_att;
-                uint32_t share_don = 0;
-                std::vector<unsigned char> script;
-
-                data.share.invoke([&](auto* obj) {
-                    auto target = chain::bits_to_target(obj->m_bits);
-                    share_att = chain::target_to_average_attempts(target);
-                    share_don = obj->m_donation;
-                    script = get_share_script(obj);
-                });
-
-                uint288 share_total = share_att * 65535;
-                uint288 share_don_w = share_att * share_don;
-
-                if (total_weight + share_total > max_weight)
-                {
-                    auto remaining = max_weight - total_weight;
-                    auto share_addr_weight = share_att * static_cast<uint32_t>(65535 - share_don);
-
-                    uint288 partial_addr;
-                    if (!share_total.IsNull())
-                        partial_addr = remaining / 65535 * share_addr_weight / (share_total / 65535);
-
-                    if (weights.contains(script))
-                        weights[script] += partial_addr;
-                    else
-                        weights[script] = partial_addr;
-
-                    uint288 partial_donation;
-                    if (!share_total.IsNull())
-                        partial_donation = remaining / 65535 * share_don_w / (share_total / 65535);
-
-                    total_donation_weight += partial_donation;
-                    total_weight = max_weight;
-                    break;
-                }
-
-                auto share_addr_weight = share_att * static_cast<uint32_t>(65535 - share_don);
-                if (weights.contains(script))
-                    weights[script] += share_addr_weight;
-                else
-                    weights[script] = share_addr_weight;
-
-                total_weight += share_total;
-                total_donation_weight += share_don_w;
+            if (!pplns_start.IsNull() && tracker.chain.contains(pplns_start) && walk_count > 0) {
+                auto result = tracker.get_cumulative_weights(pplns_start, walk_count, max_weight);
+                weights = std::move(result.weights);
+                total_weight = result.total_weight;
+                total_donation_weight = result.total_donation_weight;
             }
-            } // end if (pplns_start valid)
         }
     }
 
@@ -1068,6 +1021,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
     //   V36:     amounts[script] = subsidy * weight / total_weight
     //   donation = subsidy - sum(amounts)
 
+    auto gst_t1 = std::chrono::steady_clock::now(); // after PPLNS walk
     std::map<std::vector<unsigned char>, uint64_t> amounts;
 
     // Periodic dump of PPLNS weights for cross-impl comparison
@@ -1157,6 +1111,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
     }
 
     // --- 3. Build sorted output list ---
+    auto gst_t2 = std::chrono::steady_clock::now(); // after amounts
     // Python: sorted(dests, key=lambda a: (amounts[a], a))[-4000:]
     // = ascending by (amount, script), keep last 4000 (highest amounts)
     std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs(
@@ -1502,6 +1457,17 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
         }
     }
 
+    {
+        auto gst_t3 = std::chrono::steady_clock::now();
+        static int64_t sp = 0, sa = 0, sc = 0, sn = 0;
+        sp += std::chrono::duration_cast<std::chrono::microseconds>(gst_t1 - gst_t0).count();
+        sa += std::chrono::duration_cast<std::chrono::microseconds>(gst_t2 - gst_t1).count();
+        sc += std::chrono::duration_cast<std::chrono::microseconds>(gst_t3 - gst_t2).count();
+        ++sn;
+        if (sn % 50 == 0)
+            LOG_INFO << "[GST-SPLIT] pplns=" << (sp/sn) << "us amounts=" << (sa/sn)
+                     << "us coinbase=" << (sc/sn) << "us count=" << sn;
+    }
     return txid;
 }
 
@@ -1882,11 +1848,13 @@ bool share_check(const ShareT& share,
 template <typename ShareT, typename TrackerT>
 uint256 verify_share(const ShareT& share, TrackerT& tracker)
 {
+    auto vt0 = std::chrono::steady_clock::now();
     // share_init_verify computes gentx_hash along the way — we need it
     // for the GenerateShareTransaction comparison in share_check.
     // Skip scrypt PoW re-check when hash was already computed in Phase 1
     // (processing_shares offloads scrypt to m_verify_pool; no need to repeat).
     uint256 hash = share_init_verify(share, share.m_hash.IsNull());
+    auto vt1 = std::chrono::steady_clock::now();
 
     // Verify recomputed hash matches stored hash (informational).
     // For locally created shares the hash was set during create_local_share;
@@ -2033,6 +2001,16 @@ uint256 verify_share(const ShareT& share, TrackerT& tracker)
     }
 
     share_check(share, hash, gentx_hash, tracker);
+    {
+        auto vt2 = std::chrono::steady_clock::now();
+        auto init_us = std::chrono::duration_cast<std::chrono::microseconds>(vt1 - vt0).count();
+        auto check_us = std::chrono::duration_cast<std::chrono::microseconds>(vt2 - vt1).count();
+        static int64_t s_init = 0, s_check = 0, s_cnt = 0;
+        s_init += init_us; s_check += check_us; ++s_cnt;
+        if (s_cnt % 50 == 0)
+            LOG_INFO << "[VERIFY-SPLIT] init_avg=" << (s_init/s_cnt)
+                     << "us check_avg=" << (s_check/s_cnt) << "us count=" << s_cnt;
+    }
     return hash;
 }
 

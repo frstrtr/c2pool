@@ -7,7 +7,7 @@
 # ─── Network ────────────────────────────────────────────────────────────────
 port: 19338                    # P2P p2pool sharechain port (testnet)
 stratum_port: 19327            # Stratum mining port (testnet)
-http_port: 8080                # HTTP/JSON-RPC API port
+http_port: 18080               # HTTP/JSON-RPC API port (testnet)
 http_host: "0.0.0.0"          # HTTP bind address
 
 # ─── Coin Daemon RPC ────────────────────────────────────────────────────────
@@ -58,3 +58,8 @@ cors_origin: "*"               # Access-Control-Allow-Origin header
 
 # ─── Web Dashboard ──────────────────────────────────────────────────────────
 dashboard_dir: "web-static"    # Static dashboard directory (relative or absolute)
+
+# ─── DOGE Merged Mining ─────────────────────────────────────────────────────
+doge_testnet4alpha: true       # Use testnet4alpha chain params (not testnet3)
+doge_p2p_address: "192.168.86.27"  # DOGE daemon P2P address
+doge_p2p_port: 44556           # DOGE daemon P2P port (testnet4alpha)

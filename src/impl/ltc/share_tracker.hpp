@@ -1209,65 +1209,19 @@ public:
         return t;
     }
 
-    // -- PPLNS cumulative weights computation --
+    // -- PPLNS cumulative weights computation (O(log n) via skip list) --
     CumulativeWeights get_cumulative_weights(const uint256& start, int32_t max_shares, const uint288& desired_weight)
     {
         if (start.IsNull())
             return {};
 
-        auto [start_height, last] = chain.get_height_and_last(start);
-
-        // Clamp chain to max_shares
-        uint256 end_hash = last;
-        if (start_height > max_shares)
-            end_hash = chain.get_nth_parent_key(start, max_shares);
-
-        // Walk shares individually via prev_hash (hash-dict navigation).
-        // This works across new_fork segment boundaries — unlike
-        // get_interval() which subtracts accumulated values that are
-        // wrong for fork shares.  O(max_shares) but max_shares ≤
-        // CHAIN_LENGTH (800), each step is O(1) hash lookup.
-        {
-            CumulativeWeights result;
-            uint256 cur = start;
-            for (int32_t i = 0; i < max_shares && !cur.IsNull() && chain.contains(cur); ++i) {
-                auto& share_data = chain.get_share(cur);
-                uint256 next_cur;
-                share_data.invoke([&](auto* obj) {
-                    auto att = chain::target_to_average_attempts(
-                        chain::bits_to_target(obj->m_bits));
-                    uint32_t don = obj->m_donation;
-
-                    // Extract scriptPubKey via get_share_script — handles both
-                    // V36 (m_pubkey_hash) and V35 (m_address string → script conversion).
-                    // Must match generate_share_transaction's key type.
-                    auto script = get_share_script(obj);
-
-                    auto share_total = att * 65535;
-                    auto share_addr_w = att * static_cast<uint32_t>(65535 - don);
-                    auto share_don_w = att * don;
-
-                    // Partial last share if we'd exceed desired_weight
-                    if (result.total_weight + share_total > desired_weight) {
-                        auto remaining = desired_weight - result.total_weight;
-                        if (!share_total.IsNull()) {
-                            share_addr_w = remaining / 65535 * share_addr_w / (share_total / 65535);
-                            share_don_w = remaining / 65535 * share_don_w / (share_total / 65535);
-                        }
-                        share_total = remaining;
-                    }
-
-                    result.weights[script] = result.weights[script] + share_addr_w;
-                    result.total_weight = result.total_weight + share_total;
-                    result.total_donation_weight = result.total_donation_weight + share_don_w;
-                    next_cur = obj->m_prev_hash;
-                });
-                cur = next_cur;
-                if (result.total_weight >= desired_weight)
-                    break;
-            }
-            return result;
-        }
+        ensure_weights_skiplist();
+        auto sl_result = m_weights_skiplist->query(start, max_shares, desired_weight);
+        return CumulativeWeights{
+            std::move(sl_result.weights),
+            sl_result.total_weight,
+            sl_result.total_donation_weight
+        };
     }
 
     // -- V36 PPLNS with exponential depth-decay --
@@ -1305,90 +1259,22 @@ public:
         int32_t share_count = 0;
         uint64_t decay_fp = DECAY_SCALE; // starts at 1.0
 
-        // Walk the chain directly (matches p2pool's while loop in
-        // get_decayed_cumulative_weights). Do NOT use TrackerView's cached
-        // get_height() — it can become stale in multi-threaded context when
-        // clean_tracker() removes shares concurrently.
-        // Collect share hashes for the walk, then iterate.
-        std::vector<uint256> walk_hashes;
-        walk_hashes.reserve(std::min(max_shares, int32_t(500)));
+        // Single-pass walk matching p2pool's while loop in
+        // get_decayed_cumulative_weights. No pre-collection needed.
+        auto cur = start;
+        while (!cur.IsNull() && chain.contains(cur) && share_count < max_shares)
         {
-            auto cur = start;
-            while (!cur.IsNull() && chain.contains(cur)
-                   && static_cast<int32_t>(walk_hashes.size()) < max_shares) {
-                walk_hashes.push_back(cur);
-                auto* idx = chain.get_index(cur);
-                cur = idx ? idx->tail : uint256();
-            }
-        }
-        auto walk_count = static_cast<int32_t>(walk_hashes.size());
-
-        LOG_INFO << "[PPLNS-WALK] start=" << start.GetHex().substr(0, 16)
-                 << " max_shares=" << max_shares
-                 << " walk_count=" << walk_count
-                 << " half_life=" << half_life
-                 << " decay_per=" << decay_per;
-
-        static int decay_dump = 0;
-        bool do_dump = (decay_dump++ % 100 == 0); // dump every 100th call
-        // Per-miner bits summary: every 20th call, log share count and bits per miner
-        static int bits_summary_counter = 0;
-        bool do_bits_summary = (bits_summary_counter++ % 20 == 0);
-        struct MinerBitsStat {
-            int count = 0;
-            uint32_t min_bits = 0xFFFFFFFF;
-            uint32_t max_bits = 0;
-            bool is_local = false;
-        };
-        std::map<std::string, MinerBitsStat> miner_bits;
-
-        for (const auto& hash : walk_hashes)
-        {
-            if (!chain.contains(hash)) break; // safety: share removed during walk
-            chain.get_share(hash).invoke([&](auto* obj) {
+            chain.get_share(cur).invoke([&](auto* obj) {
                 auto att = chain::target_to_average_attempts(
                     chain::bits_to_target(obj->m_bits));
                 uint32_t don = obj->m_donation;
 
-                // Apply exponential decay: decayed_att = att * decay_fp >> PRECISION
                 uint288 decayed_att = (att * uint288(decay_fp)) >> DECAY_PRECISION;
-
-                if (do_dump && share_count < 20) {
-                    auto script = get_share_script(obj);
-                    auto script_hex = std::string();
-                    for (auto b : script) {
-                        static const char* H = "0123456789abcdef";
-                        script_hex += H[b >> 4]; script_hex += H[b & 0xf];
-                    }
-                    LOG_INFO << "[DECAY-WALK] #" << share_count
-                             << " bits=0x" << std::hex << obj->m_bits << std::dec
-                             << " att=" << att.GetLow64()
-                             << " decay=" << decay_fp
-                             << " script=" << script_hex.substr(0, 20)
-                             << " hash=" << hash.GetHex().substr(0, 16);
-                }
-
-                // Track per-miner bits for diagnostic summary
-                if (do_bits_summary) {
-                    auto script = get_share_script(obj);
-                    auto script_hex = std::string();
-                    for (auto b : script) {
-                        static const char* H = "0123456789abcdef";
-                        script_hex += H[b >> 4]; script_hex += H[b & 0xf];
-                    }
-                    auto key = script_hex.substr(0, 20);
-                    auto& ms = miner_bits[key];
-                    ms.count++;
-                    if (obj->m_bits < ms.min_bits) ms.min_bits = obj->m_bits;
-                    if (obj->m_bits > ms.max_bits) ms.max_bits = obj->m_bits;
-                    ms.is_local = (obj->peer_addr.port() == 0);
-                }
 
                 auto addr_w = decayed_att * static_cast<uint32_t>(65535 - don);
                 auto don_w  = decayed_att * don;
                 auto this_total = addr_w + don_w; // = decayed_att * 65535
 
-                // Cap at desired_weight (partial last share)
                 if (result.total_weight + this_total > desired_weight) {
                     auto remaining = desired_weight - result.total_weight;
                     if (!this_total.IsNull()) {
@@ -1398,11 +1284,7 @@ public:
                     this_total = remaining;
                 }
 
-                // Use pointer to existing script data — avoid allocation.
-                // get_share_script returns by value, but for V36 shares with
-                // m_address, the data is already in the share object.
                 auto script = get_share_script(obj);
-
                 result.weights[script] += addr_w;
                 result.total_weight += this_total;
                 result.total_donation_weight += don_w;
@@ -1412,89 +1294,11 @@ public:
             if (result.total_weight >= desired_weight)
                 break;
 
-            // Decay for next (older) share.
-            // 128-bit multiply avoids overflow: decay_fp × decay_per ≈ 2^80.
             decay_fp = static_cast<uint64_t>(
                 (static_cast<__uint128_t>(decay_fp) * decay_per) >> DECAY_PRECISION);
-        }
 
-        if (do_dump) {
-            LOG_INFO << "[DECAY-WALK] TOTAL: shares=" << share_count
-                     << " addrs=" << result.weights.size()
-                     << " total_w=" << result.total_weight.GetLow64()
-                     << " don_w=" << result.total_donation_weight.GetLow64()
-                     << " start=" << start.GetHex().substr(0, 16)
-                     << " max_shares=" << max_shares;
-            for (auto& [script, w] : result.weights) {
-                auto script_hex = std::string();
-                for (auto b : script) {
-                    static const char* H = "0123456789abcdef";
-                    script_hex += H[b >> 4]; script_hex += H[b & 0xf];
-                }
-                LOG_INFO << "[DECAY-WALK]   " << script_hex.substr(0, 40)
-                         << " weight=" << w.GetLow64();
-            }
-        }
-
-        // Per-miner bits summary — shows whether c2pool and p2pool shares
-        // have different bits (share difficulty). Different bits means
-        // different per-share weight, which with exponential decay causes
-        // PPLNS imbalance even with equal hashrate.
-        if (do_bits_summary && !miner_bits.empty()) {
-            for (auto& [script, ms] : miner_bits) {
-                LOG_INFO << "[BITS-PARITY] " << script
-                         << (ms.is_local ? " (LOCAL)" : " (REMOTE)")
-                         << " shares=" << ms.count
-                         << " bits=[0x" << std::hex << ms.min_bits
-                         << ",0x" << ms.max_bits << std::dec << "]"
-                         << " of " << share_count << " total"
-                         << " (" << (share_count > 0 ? 100.0 * ms.count / share_count : 0.0) << "%)";
-            }
-        }
-
-        // Per-address parent PPLNS breakdown — log once per new chain height
-        // for death valley comparison between p2pool and c2pool.
-        {
-            static int32_t s_last_pplns_height = -1;
-            auto cur_height = static_cast<int32_t>(walk_hashes.size());
-            if (cur_height != s_last_pplns_height) {
-                s_last_pplns_height = cur_height;
-                auto to_decimal = [](const uint288& val) -> std::string {
-                    if (val.IsNull()) return "0";
-                    uint288 tmp = val;
-                    std::string r;
-                    while (!tmp.IsNull()) {
-                        uint32_t rem = 0;
-                        for (int i = uint288::WIDTH - 1; i >= 0; --i) {
-                            uint64_t cur = (static_cast<uint64_t>(rem) << 32) | tmp.pn[i];
-                            tmp.pn[i] = static_cast<uint32_t>(cur / 10);
-                            rem = static_cast<uint32_t>(cur % 10);
-                        }
-                        r.push_back('0' + static_cast<char>(rem));
-                    }
-                    std::reverse(r.begin(), r.end());
-                    return r;
-                };
-                LOG_INFO << "[PARENT-PPLNS] height=" << cur_height
-                         << " shares=" << share_count
-                         << " addrs=" << result.weights.size()
-                         << " total_w=" << to_decimal(result.total_weight)
-                         << " don_w=" << to_decimal(result.total_donation_weight);
-                for (const auto& [script, w] : result.weights) {
-                    std::string script_hex;
-                    for (auto b : script) {
-                        static const char* H = "0123456789abcdef";
-                        script_hex += H[b >> 4]; script_hex += H[b & 0xf];
-                    }
-                    double pct = 0;
-                    if (!result.total_weight.IsNull()) {
-                        pct = (w * 10000 / result.total_weight).GetLow64() / 100.0;
-                    }
-                    LOG_INFO << "[PARENT-PPLNS]   " << script_hex.substr(0, 40)
-                             << " w=" << to_decimal(w)
-                             << " pct=" << std::fixed << std::setprecision(2) << pct << "%";
-                }
-            }
+            auto* idx = chain.get_index(cur);
+            cur = idx ? idx->tail : uint256();
         }
 
         // Cache result (single-entry, invalidated on chain change)

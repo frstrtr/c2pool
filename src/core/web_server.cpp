@@ -5589,7 +5589,7 @@ nlohmann::json MiningInterface::getblockcandidate(const nlohmann::json& params)
 /// WebServer Implementation
 WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t port, bool testnet)
     : ioc_(ioc)
-    , acceptor_(ioc)
+    , acceptor_(http_ioc_)
     , bind_address_(address)
     , port_(port)
     , stratum_port_(port + 10)  // Default stratum port is +10 from main port
@@ -5603,7 +5603,7 @@ WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t 
 
 WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t port, bool testnet, std::shared_ptr<IMiningNode> node)
     : ioc_(ioc)
-    , acceptor_(ioc)
+    , acceptor_(http_ioc_)
     , bind_address_(address)
     , port_(port)
     , stratum_port_(port + 10)
@@ -5617,7 +5617,7 @@ WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t 
 
 WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t port, bool testnet, std::shared_ptr<IMiningNode> node, Blockchain blockchain)
     : ioc_(ioc)
-    , acceptor_(ioc)
+    , acceptor_(http_ioc_)
     , bind_address_(address)
     , port_(port)
     , stratum_port_(port + 10)
@@ -5637,21 +5637,37 @@ WebServer::~WebServer()
 bool WebServer::start()
 {
     try {
-        // Bind and listen on the HTTP port
+        // Bind and listen on the HTTP port (runs on dedicated http_ioc_)
         auto const address = net::ip::make_address(bind_address_);
         tcp::endpoint endpoint{address, port_};
-        
+
         acceptor_.open(endpoint.protocol());
         acceptor_.set_option(net::socket_base::reuse_address(true));
         acceptor_.bind(endpoint);
         acceptor_.listen(net::socket_base::max_listen_connections);
-        
-        LOG_INFO << "WebServer started on " << bind_address_ << ":" << port_;
-        
-        // Start accepting HTTP connections
+
+        LOG_INFO << "WebServer started on " << bind_address_ << ":" << port_ << " (dedicated HTTP thread)";
+
+        // Start accepting HTTP connections (on http_ioc_)
         accept_connections();
-        
-        // Start stratum server if configured
+
+        // Launch dedicated thread for HTTP event loop — decouples dashboard
+        // latency from think()/verification work on the main ioc_.
+        http_thread_ = std::thread([this]() {
+            LOG_INFO << "[HTTP-thread] started";
+            auto work_guard = net::make_work_guard(http_ioc_);
+            while (running_ || !http_ioc_.stopped()) {
+                try {
+                    http_ioc_.run();
+                    break;  // run() returned normally (ioc stopped)
+                } catch (const std::exception& e) {
+                    LOG_ERROR << "[HTTP-thread] exception: " << e.what();
+                }
+            }
+            LOG_INFO << "[HTTP-thread] exiting";
+        });
+
+        // Start stratum server if configured (stays on main ioc_)
         if (stratum_port_ > 0) {
             start_stratum_server();
         }
@@ -5688,10 +5704,10 @@ bool WebServer::start()
             stat_timer->async_wait(*stat_fn);
             LOG_INFO << "Stat-log timer scheduled (every 60 s)";
         }
-        
+
         running_ = true;
         return true;
-        
+
     } catch (const std::exception& e) {
         LOG_ERROR << "Failed to start WebServer: " << e.what();
         return false;
@@ -5806,9 +5822,13 @@ void WebServer::stop()
 {
     if (running_) {
         try {
-            acceptor_.close();
-            stop_stratum_server();
             running_ = false;
+            acceptor_.close();
+            // Stop the dedicated HTTP event loop and join its thread
+            http_ioc_.stop();
+            if (http_thread_.joinable())
+                http_thread_.join();
+            stop_stratum_server();
             LOG_INFO << "WebServer stopped";
         } catch (const std::exception& e) {
             LOG_ERROR << "Error stopping WebServer: " << e.what();
