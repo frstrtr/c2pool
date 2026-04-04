@@ -3050,11 +3050,15 @@ int main(int argc, char* argv[]) {
                         ltc::SegwitData sd;
                         sd.m_txid_merkle_link.m_branch = merkle_branches;
                         sd.m_txid_merkle_link.m_index  = 0;
-                        // Use raw wtxid merkle root (not the commitment hash)
+                        // Use raw wtxid merkle root (not the commitment hash).
+                        // NEVER fall back to witness_commitment_hex — that contains
+                        // SHA256d(root || nonce), not the raw root. Using it would
+                        // cause double-hashing in generate_share_transaction.
                         if (!witness_root.IsNull()) {
                             sd.m_wtxid_merkle_root = witness_root;
-                        } else if (witness_commitment_hex.size() >= 76) {
-                            sd.m_wtxid_merkle_root = uint256S(witness_commitment_hex.substr(12, 64));
+                        } else {
+                            LOG_WARNING << "[ref_hash_fn] witness_root is null despite segwit_active=true"
+                                        << " — ref_hash will include zero wtxid_merkle_root";
                         }
                         params.segwit_data = sd;
                     }

@@ -1565,10 +1565,30 @@ MiningInterface::build_connection_coinbase(
     }
 
     LOG_TRACE << "[build_cb] calling ref_hash_fn (lock-free)...";
+    // Safety: if witness_root lost in transit (race with refresh_work),
+    // recompute from the snapshotted template transactions — matches
+    // p2pool's approach of computing segwit_data from known_txs.
+    uint256 effective_witness_root = ws.witness_root;
+    if (effective_witness_root.IsNull() && ws.segwit_active && ws.tmpl.contains("transactions")) {
+        std::vector<uint256> wtxids;
+        wtxids.push_back(uint256());  // coinbase wtxid = 0
+        for (auto& tx : ws.tmpl["transactions"]) {
+            uint256 wtxid;
+            if (tx.is_object() && tx.contains("hash"))
+                wtxid.SetHex(tx["hash"].get<std::string>());
+            else if (tx.is_object() && tx.contains("txid"))
+                wtxid.SetHex(tx["txid"].get<std::string>());
+            wtxids.push_back(wtxid);
+        }
+        effective_witness_root = compute_witness_merkle_root(std::move(wtxids));
+        LOG_WARNING << "[build_cb] witness_root was null, recomputed from "
+                    << ws.tmpl["transactions"].size() << " txs: "
+                    << effective_witness_root.GetHex();
+    }
     auto rhr = ws.ref_hash_fn(
         prev_share_hash,
         scriptsig_bytes, payout_script, subsidy, bits, timestamp,
-        ws.segwit_active, ws.witness_commitment, ws.witness_root,
+        ws.segwit_active, ws.witness_commitment, effective_witness_root,
         merged_addrs, branches_u256);
     LOG_TRACE << "[build_cb] ref_hash_fn returned, bits=" << std::hex << rhr.bits << std::dec;
 
@@ -1639,7 +1659,7 @@ MiningInterface::build_connection_coinbase(
     snap.mweb = ws.mweb;
     snap.subsidy = subsidy;
     snap.witness_commitment_hex = ws.witness_commitment;
-    snap.witness_root = ws.witness_root;
+    snap.witness_root = effective_witness_root;
     snap.frozen_ref = rhr;
     // Freeze block body data atomically — prevents merkle root mismatch
     // when refresh_work() updates the template between separate reads.
@@ -5283,6 +5303,23 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                         params.witness_commitment_hex = m_cached_witness_commitment;
                         params.witness_root = m_cached_witness_root;
                     }
+                    // Safety net: if witness_root is still null, recompute from
+                    // the job's frozen tx_data (matches p2pool data.py:1024).
+                    // This handles race conditions where the root was lost in transit.
+                    const auto& txd = job ? job->tx_data : std::vector<std::string>{};
+                    if (params.witness_root.IsNull() && !txd.empty()) {
+                        std::vector<uint256> wtxids;
+                        wtxids.push_back(uint256());  // coinbase wtxid = 0
+                        for (const auto& tx_hex : txd) {
+                            auto tx_bytes = ParseHex(tx_hex);
+                            if (!tx_bytes.empty())
+                                wtxids.push_back(Hash(tx_bytes));
+                        }
+                        params.witness_root = compute_witness_merkle_root(std::move(wtxids));
+                        LOG_WARNING << "[WC-FIX] witness_root was null, recomputed from "
+                                    << txd.size() << " txs: "
+                                    << params.witness_root.GetHex();
+                    }
                 }
 
                 // Pass the actual mined coinbase TX bytes for hash_link computation.
@@ -5305,6 +5342,11 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                     params.frozen_merged_payout_hash = job->frozen_ref.merged_payout_hash;
                     params.frozen_merkle_branches = job->frozen_ref.frozen_merkle_branches;
                     params.frozen_witness_root = job->frozen_ref.frozen_witness_root;
+                    // Safety: if frozen_witness_root is null, use the recomputed witness_root.
+                    // The ref_hash_fn stored the same witness_root when it ran, so using
+                    // the recomputed value keeps consistency (both come from the same tx set).
+                    if (params.frozen_witness_root.IsNull() && !params.witness_root.IsNull())
+                        params.frozen_witness_root = params.witness_root;
                     params.frozen_merged_coinbase_info = job->frozen_ref.frozen_merged_coinbase_info;
                     // has_frozen = true when ref_hash_fn produced valid frozen data.
                     // Cannot use absheight > 0: absheight IS 0 for the genesis share,
