@@ -87,6 +87,8 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
 {
     tcp::socket socket_;
     boost::asio::streambuf buffer_;
+    std::deque<std::string> write_queue_;  // async write queue (non-blocking)
+    bool writing_ = false;                 // true while an async_write is in flight
     std::shared_ptr<MiningInterface> mining_interface_;
     StratumServer* server_ = nullptr;  // back-pointer for RateMonitor recording
     std::string subscription_id_;
@@ -192,6 +194,7 @@ private:
     nlohmann::json handle_suggest_difficulty(const nlohmann::json& params, const nlohmann::json& request_id);
 
     void send_response(const nlohmann::json& response);
+    void do_write();  // drain the async write queue
     void send_error(int code, const std::string& message, const nlohmann::json& request_id);
     void send_set_difficulty(double difficulty);
     void send_set_extranonce(const std::string& extranonce1, int extranonce2_size);

@@ -1085,10 +1085,34 @@ void StratumSession::send_response(const nlohmann::json& response)
 {
     try {
         std::string message = response.dump() + "\n";
-        boost::asio::write(socket_, boost::asio::buffer(message));
+        write_queue_.push_back(std::move(message));
+        if (!writing_)
+            do_write();
     } catch (const std::exception& e) {
-        LOG_ERROR << "[Stratum] Error sending response: " << e.what();
+        LOG_ERROR << "[Stratum] Error queueing response: " << e.what();
     }
+}
+
+void StratumSession::do_write()
+{
+    if (write_queue_.empty() || !socket_.is_open()) {
+        writing_ = false;
+        return;
+    }
+    writing_ = true;
+    auto self = shared_from_this();
+    boost::asio::async_write(socket_, boost::asio::buffer(write_queue_.front()),
+        [this, self](boost::system::error_code ec, std::size_t /*bytes*/) {
+            if (ec) {
+                LOG_ERROR << "[Stratum] Error sending response: " << ec.message();
+                write_queue_.clear();
+                writing_ = false;
+                try { socket_.close(); } catch (...) {}
+                return;
+            }
+            write_queue_.pop_front();
+            do_write();
+        });
 }
 
 void StratumSession::send_error(int code, const std::string& message, const nlohmann::json& request_id)
