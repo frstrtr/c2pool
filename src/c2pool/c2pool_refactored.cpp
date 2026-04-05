@@ -4530,6 +4530,12 @@ int main(int argc, char* argv[]) {
                             auto t = ltc_chain->tip();
                             r["bestblockhash"] = t ? t->block_hash.GetHex() : "";
                             r["explorer_depth"] = explorer_depth_ltc;
+                            if (t) {
+                                auto target = ltc::coin::target_from_bits(t->header.m_bits);
+                                double diff = target.IsNull() ? 0.0
+                                    : ltc_chain->params().pow_limit.getdouble() / target.getdouble();
+                                r["difficulty"] = diff;
+                            }
                         } else if (chain == "doge" && dg_chain) {
                             r["chain"] = testnet ? "test" : "main";
                             r["blocks"] = dg_chain->height();
@@ -4537,6 +4543,12 @@ int main(int argc, char* argv[]) {
                             auto t = dg_chain->tip();
                             r["bestblockhash"] = t ? t->block_hash.GetHex() : "";
                             r["explorer_depth"] = explorer_depth_doge;
+                            if (t) {
+                                auto target = doge::coin::target_from_bits(t->header.m_bits);
+                                double diff = target.IsNull() ? 0.0
+                                    : dg_chain->params().pow_limit.getdouble() / target.getdouble();
+                                r["difficulty"] = diff;
+                            }
                         } else {
                             r["error"] = "Unknown chain or chain not enabled";
                         }

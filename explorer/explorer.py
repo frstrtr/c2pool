@@ -728,12 +728,28 @@ class ExplorerEngine:
                 })
         return blocks
 
+    # First V36-era pool blocks — always shown so the "Pool Blocks" page is never empty.
+    SEED_POOL_BLOCKS = {
+        "ltc": [{
+            "chain": "ltc", "height": 3069917,
+            "hash": "806a9214cd63dae4b5091b69c1f8e14652ff95fff2bbcb06de6fcdafa76ec6ea",
+            "time": 1773145632, "pool_tag": "/c2pool/", "has_auxpow": True,
+            "the_state_root": "", "coinbase_value": 625_00000000,
+        }],
+        "doge": [{
+            "chain": "doge", "height": 6135703,
+            "hash": "f84500c25a4cce2a08887f29763726bd5ecec7b66fed65a88b181fb0b0ab2383",
+            "time": 1774276655, "pool_tag": "/c2pool/", "has_auxpow": False,
+            "the_state_root": "", "coinbase_value": 10000_00000000,
+        }],
+    }
+
     def scan_for_pool_blocks(self, chain="ltc", depth=100):
         """Scan recent blocks for p2pool/c2pool coinbase tags."""
         with self._scan_lock:
             info = self.get_chain_info(chain)
             if "error" in info:
-                return []
+                return self.SEED_POOL_BLOCKS.get(chain, [])
             tip = info["blocks"]
             found = []
             for h in range(tip, max(tip - depth, -1), -1):
@@ -758,6 +774,11 @@ class ExplorerEngine:
                         ),
                     }
                     found.append(entry)
+            # Append seed blocks not already in scan
+            found_heights = {b["height"] for b in found}
+            for seed in self.SEED_POOL_BLOCKS.get(chain, []):
+                if seed["height"] not in found_heights:
+                    found.append(seed)
             self.found_blocks = found
             return found
 
@@ -1081,8 +1102,8 @@ def render_dashboard(engine, chain):
     <tr><td>Height</td><td class="green">{info.get('blocks', '?')}</td></tr>
     <tr><td>Headers</td><td>{info.get('headers', '?')}</td></tr>
     <tr><td>Chain</td><td>{info.get('chain', '?')}</td></tr>
-    <tr><td>Difficulty</td><td>{float(info.get('difficulty', 0)):.6f}</td></tr>
-    <tr><td>Best block</td><td class="mono">{info.get('bestblockhash', '?')[:32]}...</td></tr>
+    <tr><td>Difficulty</td><td>{float(info.get('difficulty', 0)):,.4f}</td></tr>
+    <tr><td>Best block</td><td class="mono"><a href="/block?q={info.get('bestblockhash', '')}&chain={chain}">{info.get('bestblockhash', '?')[:32]}...</a></td></tr>
     </table></div>
     <div class="card"><h2>Legend</h2>
     <p style="margin:0;line-height:2">
