@@ -282,6 +282,10 @@ complete examples with all options documented.
 | `--storage-save-interval` | `storage_save_interval` | 300 | Sharechain save interval |
 | `--dashboard-dir` | `dashboard_dir` | web-static | Static dashboard directory |
 | `--analytics-id` | `analytics_id` | -- | Google Analytics measurement ID (e.g. `G-XXXXXXXXXX`); injected into dashboard HTML `</head>` |
+| -- | `explorer` | false | Enable lite block explorer (stores recent blocks + REST API) |
+| -- | `explorer_url` | -- | Explorer URL injected into dashboard nav (e.g. `http://localhost:9090`) |
+| -- | `explorer_depth_ltc` | 288 | LTC blocks to keep in explorer store |
+| -- | `explorer_depth_doge` | 1440 | DOGE blocks to keep in explorer store |
 | `--coinbase-text` | `coinbase_text` | /c2pool/ | Custom coinbase scriptSig text |
 | `--message-blob-hex` | -- | -- | V36 authority message blob |
 | `--doge-testnet4alpha` | -- | false | Use DOGE testnet4alpha |
@@ -304,6 +308,9 @@ complete examples with all options documented.
 | `/current_merged_payouts` | Current merged mining payouts |
 | `/recent_merged_blocks` | Recent merged-mined blocks |
 | `/broadcaster_status` | Parent chain broadcaster status |
+| `/api/explorer/getblockchaininfo` | Chain info (loopback-only, requires `explorer: true`) |
+| `/api/explorer/getblockhash` | Block hash by height (loopback-only) |
+| `/api/explorer/getblock` | Full block JSON by hash or height (loopback-only) |
 
 See [docs/DASHBOARD_INTEGRATION.md](docs/DASHBOARD_INTEGRATION.md) for the
 complete API reference.
@@ -313,6 +320,21 @@ complete API reference.
 ```bash
 xdg-open http://localhost:8080/
 ```
+
+**Lite block explorer** — bundled Python app in `explorer/` for browsing recent blocks:
+
+```yaml
+# Enable in config to store blocks + serve REST API
+explorer: true
+explorer_url: "http://localhost:9090"
+```
+
+```bash
+# Run the explorer UI against c2pool's API
+python3 explorer/explorer.py --ltc-c2pool http://127.0.0.1:8080/api/explorer --web-port 9090
+```
+
+The explorer shows block details, decoded coinbase scripts, THE commitment proofs for c2pool-found blocks, and links to Blockchair for transactions/addresses outside the stored range.
 
 ---
 

@@ -97,3 +97,9 @@ storage_save_interval: 300     # Periodic sharechain save interval (seconds)
 # ─── Web Dashboard ──────────────────────────────────────────────────────────
 dashboard_dir: "web-static"    # Static dashboard directory (relative or absolute)
 # analytics_id: "G-XXXXXXXXXX"  # Google Analytics measurement ID (optional)
+
+# ─── Lite Block Explorer ─────────────────────────────────────────────────────
+# explorer: false                          # Enable block storage + explorer REST API
+# explorer_url: "http://localhost:9090"    # Explorer URL for dashboard nav link
+# explorer_depth_ltc: 288                  # LTC blocks to keep
+# explorer_depth_doge: 1440               # DOGE blocks to keep

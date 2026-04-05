@@ -60,6 +60,12 @@ cors_origin: "*"               # Access-Control-Allow-Origin header
 dashboard_dir: "web-static"    # Static dashboard directory (relative or absolute)
 # analytics_id: "G-XXXXXXXXXX"  # Google Analytics measurement ID (optional)
 
+# ─── Lite Block Explorer ─────────────────────────────────────────────────────
+# explorer: false                          # Enable block storage + explorer REST API
+# explorer_url: "http://localhost:9090"    # Explorer URL for dashboard nav link
+# explorer_depth_ltc: 288                  # LTC blocks to keep
+# explorer_depth_doge: 1440               # DOGE blocks to keep
+
 # ─── DOGE Merged Mining ─────────────────────────────────────────────────────
 doge_testnet4alpha: true       # Use testnet4alpha chain params (not testnet3)
 doge_p2p_address: "192.168.86.27"  # DOGE daemon P2P address

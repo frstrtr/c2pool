@@ -47,6 +47,9 @@
 #include <impl/ltc/coin/chain_seeds.hpp>
 #include <impl/doge/coin/chain_seeds.hpp>
 
+// Block explorer JSON serializer
+#include <impl/ltc/coin/block_json.hpp>
+
 // Enhanced C2Pool components
 #include <c2pool/node/enhanced_node.hpp>
 #include <c2pool/hashrate/tracker.hpp>
@@ -504,6 +507,12 @@ int main(int argc, char* argv[]) {
 
     // Google Analytics measurement ID (e.g. G-XXXXXXXXXX)
     std::string analytics_id;
+
+    // Lite block explorer
+    bool explorer_enabled = false;
+    std::string explorer_url;
+    uint32_t explorer_depth_ltc = 288;
+    uint32_t explorer_depth_doge = 1440;
 
     // Optional encrypted authority message_data blob for local V36 shares.
     std::string operator_message_blob_hex;
@@ -1092,6 +1101,14 @@ int main(int argc, char* argv[]) {
                 dashboard_dir = cfg["dashboard_dir"].as<std::string>();
             if (cfg["analytics_id"])
                 analytics_id = cfg["analytics_id"].as<std::string>();
+            if (cfg["explorer"])
+                explorer_enabled = cfg["explorer"].as<bool>();
+            if (cfg["explorer_url"])
+                explorer_url = cfg["explorer_url"].as<std::string>();
+            if (cfg["explorer_depth_ltc"])
+                explorer_depth_ltc = cfg["explorer_depth_ltc"].as<uint32_t>();
+            if (cfg["explorer_depth_doge"])
+                explorer_depth_doge = cfg["explorer_depth_doge"].as<uint32_t>();
             if (cfg["cache_max_shared_hashes"])
                 cache_max_shared_hashes = cfg["cache_max_shared_hashes"].as<int>();
             if (cfg["cache_max_known_txs"])
@@ -1525,6 +1542,11 @@ int main(int argc, char* argv[]) {
             web_server.set_dashboard_dir(dashboard_dir);
             if (!analytics_id.empty())
                 web_server.set_analytics_id(analytics_id);
+            if (explorer_enabled) {
+                web_server.set_explorer_enabled(true);
+                if (!explorer_url.empty())
+                    web_server.set_explorer_url(explorer_url);
+            }
             web_server.get_mining_interface()->set_payout_address(payout_address);
             LOG_INFO << "Stratum config: min_diff=" << stratum_config.min_difficulty
                      << " max_diff=" << stratum_config.max_difficulty
@@ -1749,6 +1771,7 @@ int main(int argc, char* argv[]) {
                          utxo_db = ltc_utxo_db.get(),
                          bcaster = embedded_broadcaster.get(),
                          coinbase_maturity = core::coin::LTC_LIMITS.coinbase_maturity,
+                         explorer_enabled, explorer_depth_ltc,
                          &web_server](
                             const std::string& peer,
                             const ltc::coin::BlockType& block) {
@@ -1829,6 +1852,18 @@ int main(int argc, char* argv[]) {
                                         LOG_INFO << "[EMB-LTC] UTXO warm restart: best_height="
                                                  << utxo_best << " — no bootstrap needed";
                                 }
+                            }
+
+                            // Store raw block for explorer API
+                            if (explorer_enabled && utxo_db && height > 0) {
+                                PackStream ps;
+                                ps << block;
+                                auto span = ps.get_span();
+                                std::vector<uint8_t> raw(
+                                    reinterpret_cast<const uint8_t*>(span.data()),
+                                    reinterpret_cast<const uint8_t*>(span.data()) + span.size());
+                                utxo_db->put_raw_block(height, raw);
+                                utxo_db->prune_raw_blocks(height, explorer_depth_ltc);
                             }
 
                             // Step 2: Remove confirmed txs + conflicts from mempool
@@ -3874,6 +3909,7 @@ int main(int argc, char* argv[]) {
                                      utxo_db = doge_utxo_db.get(),
                                      bcaster_ptr = broadcaster.get(),
                                      coinbase_maturity = core::coin::DOGE_LIMITS.coinbase_maturity,
+                                     explorer_enabled, explorer_depth_doge,
                                      &web_server](
                                         const std::string& peer,
                                         const ltc::coin::BlockType& block) {
@@ -3946,6 +3982,17 @@ int main(int argc, char* argv[]) {
                                                     LOG_INFO << "[EMB-DOGE] UTXO warm restart: best_height="
                                                              << utxo_best << " — no bootstrap needed";
                                             }
+                                        }
+                                        // Store raw block for explorer API
+                                        if (explorer_enabled && utxo_db && height > 0) {
+                                            PackStream ps;
+                                            ps << block;
+                                            auto span = ps.get_span();
+                                            std::vector<uint8_t> raw(
+                                                reinterpret_cast<const uint8_t*>(span.data()),
+                                                reinterpret_cast<const uint8_t*>(span.data()) + span.size());
+                                            utxo_db->put_raw_block(height, raw);
+                                            utxo_db->prune_raw_blocks(height, explorer_depth_doge);
                                         }
                                         if (pool) {
                                             auto before = pool->size();
@@ -4402,6 +4449,147 @@ int main(int argc, char* argv[]) {
                 LOG_INFO << "[EMB-LTC] Synced: headers=" << embedded_chain->height()
                          << " utxo_blocks=" << (ltc_utxo_cache ? ltc_utxo_cache->blocks_connected() : 0)
                          << " — starting Stratum";
+            }
+
+            // ── Explorer API callbacks ────────────────────────────────────────
+            if (explorer_enabled) {
+                auto* mi = web_server.get_mining_interface();
+                auto* ltc_chain = embedded_chain.get();
+                auto* ltc_udb = ltc_utxo_db.get();
+                auto* dg_chain = doge_chain.get();
+                auto* dg_udb = doge_utxo_db.get();
+                bool testnet = settings->m_testnet;
+
+                // getblockchaininfo
+                mi->set_explorer_chaininfo_fn(
+                    [ltc_chain, dg_chain, explorer_depth_ltc, explorer_depth_doge, testnet]
+                    (const std::string& chain) -> nlohmann::json {
+                        nlohmann::json r;
+                        if (chain == "ltc" && ltc_chain) {
+                            r["chain"] = testnet ? "test" : "main";
+                            r["blocks"] = ltc_chain->height();
+                            r["headers"] = ltc_chain->size();
+                            auto t = ltc_chain->tip();
+                            r["bestblockhash"] = t ? t->block_hash.GetHex() : "";
+                            r["explorer_depth"] = explorer_depth_ltc;
+                        } else if (chain == "doge" && dg_chain) {
+                            r["chain"] = testnet ? "test" : "main";
+                            r["blocks"] = dg_chain->height();
+                            r["headers"] = dg_chain->size();
+                            auto t = dg_chain->tip();
+                            r["bestblockhash"] = t ? t->block_hash.GetHex() : "";
+                            r["explorer_depth"] = explorer_depth_doge;
+                        } else {
+                            r["error"] = "Unknown chain or chain not enabled";
+                        }
+                        return r;
+                    });
+
+                // getblockhash
+                mi->set_explorer_blockhash_fn(
+                    [ltc_chain, dg_chain]
+                    (uint32_t height, const std::string& chain) -> std::string {
+                        if (chain == "ltc" && ltc_chain) {
+                            auto e = ltc_chain->get_header_by_height(height);
+                            if (e) return e->block_hash.GetHex();
+                        } else if (chain == "doge" && dg_chain) {
+                            auto e = dg_chain->get_header_by_height(height);
+                            if (e) return e->block_hash.GetHex();
+                        }
+                        return {};
+                    });
+
+                // getblock — deserialize raw block from LevelDB, run block_to_explorer_json
+                mi->set_explorer_getblock_fn(
+                    [ltc_chain, ltc_udb, dg_chain, dg_udb, testnet,
+                     explorer_depth_ltc, explorer_depth_doge]
+                    (const std::string& hash_hex, const std::string& chain) -> nlohmann::json {
+                        // Resolve hash to height via HeaderChain
+                        uint256 blk_hash;
+                        blk_hash.SetHex(hash_hex);
+
+                        if (chain == "ltc" && ltc_chain && ltc_udb) {
+                            auto entry = ltc_chain->get_header(blk_hash);
+                            if (!entry)
+                                return nlohmann::json{{"error", "Block not in header chain"}};
+                            uint32_t height = entry->height;
+                            uint32_t tip = ltc_chain->height();
+                            if (tip > explorer_depth_ltc && height < tip - explorer_depth_ltc)
+                                return nlohmann::json{
+                                    {"error", "Block not in explorer range"},
+                                    {"explorer_depth", explorer_depth_ltc}};
+
+                            auto raw = ltc_udb->get_raw_block(height);
+                            if (!raw)
+                                return nlohmann::json{{"error", "Raw block not stored yet"}};
+
+                            // Deserialize
+                            ltc::coin::BlockType block;
+                            try {
+                                PackStream ps(*raw);
+                                ps >> block;
+                            } catch (...) {
+                                return nlohmann::json{{"error", "Failed to deserialize block"}};
+                            }
+
+                            ltc::coin::ExplorerChainParams params;
+                            if (testnet) {
+                                params.bech32_hrp = "tltc";
+                                params.p2pkh_ver = 0x6f;
+                                params.p2sh_ver = 0xc4;
+                                params.chain_name = "test";
+                            } else {
+                                params.bech32_hrp = "ltc";
+                                params.p2pkh_ver = 0x30;
+                                params.p2sh_ver = 0x32;
+                                params.chain_name = "main";
+                            }
+                            return ltc::coin::block_to_explorer_json(block, height, blk_hash, params);
+
+                        } else if (chain == "doge" && dg_chain && dg_udb) {
+                            auto entry = dg_chain->get_header(blk_hash);
+                            if (!entry)
+                                return nlohmann::json{{"error", "Block not in header chain"}};
+                            uint32_t height = entry->height;
+                            uint32_t tip = dg_chain->height();
+                            if (tip > explorer_depth_doge && height < tip - explorer_depth_doge)
+                                return nlohmann::json{
+                                    {"error", "Block not in explorer range"},
+                                    {"explorer_depth", explorer_depth_doge}};
+
+                            auto raw = dg_udb->get_raw_block(height);
+                            if (!raw)
+                                return nlohmann::json{{"error", "Raw block not stored yet"}};
+
+                            ltc::coin::BlockType block;
+                            try {
+                                PackStream ps(*raw);
+                                ps >> block;
+                            } catch (...) {
+                                return nlohmann::json{{"error", "Failed to deserialize block"}};
+                            }
+
+                            ltc::coin::ExplorerChainParams params;
+                            if (testnet) {
+                                params.bech32_hrp = "tdge";
+                                params.p2pkh_ver = 0x71;
+                                params.p2sh_ver = 0xc4;
+                                params.chain_name = "test";
+                            } else {
+                                params.bech32_hrp = "doge";
+                                params.p2pkh_ver = 0x1e;
+                                params.p2sh_ver = 0x16;
+                                params.chain_name = "main";
+                            }
+                            return ltc::coin::block_to_explorer_json(block, height, blk_hash, params);
+                        }
+                        return nlohmann::json{{"error", "Unknown chain or chain not enabled"}};
+                    });
+
+                LOG_INFO << "[Explorer] Callbacks wired — LTC:" << (ltc_chain ? "yes" : "no")
+                         << " DOGE:" << (dg_chain ? "yes" : "no")
+                         << " depth_ltc=" << explorer_depth_ltc
+                         << " depth_doge=" << explorer_depth_doge;
             }
 
             if (!web_server.start()) {

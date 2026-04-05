@@ -436,6 +436,64 @@ void HttpSession::process_request()
             }
 
             else {
+                // ── Explorer API endpoints (loopback-only) ────────────────
+                if (target.substr(0, 14) == "/api/explorer/") {
+                    // Loopback guard: only accept requests from 127.0.0.1 / ::1
+                    auto remote_addr = socket_.remote_endpoint().address();
+                    if (!remote_addr.is_loopback()) {
+                        response.result(http::status::forbidden);
+                        response.body() = R"({"error":"Explorer API is local-only"})";
+                        response.prepare_payload();
+                        send_response(std::move(response));
+                        return;
+                    }
+
+                    if (!mining_interface_->is_explorer_enabled()) {
+                        response.result(http::status::not_found);
+                        response.body() = R"({"error":"Explorer not enabled"})";
+                        response.prepare_payload();
+                        send_response(std::move(response));
+                        return;
+                    }
+
+                    std::string chain = getQueryParam("chain");
+                    if (chain.empty()) chain = "ltc";
+
+                    std::string ep = target.substr(14);
+
+                    if (ep == "getblockchaininfo" && mining_interface_->has_explorer_chaininfo_fn()) {
+                        rest_result = mining_interface_->call_explorer_chaininfo(chain);
+                    } else if (ep == "getblockhash" && mining_interface_->has_explorer_blockhash_fn()) {
+                        std::string height_str = getQueryParam("height");
+                        uint32_t h = 0;
+                        try { h = static_cast<uint32_t>(std::stoul(height_str)); } catch (...) {}
+                        auto hash = mining_interface_->call_explorer_blockhash(h, chain);
+                        if (hash.empty()) {
+                            rest_result = nlohmann::json{{"error", "Block not found"}};
+                        } else {
+                            rest_result = nlohmann::json{{"result", hash}};
+                        }
+                    } else if (ep == "getblock" && mining_interface_->has_explorer_getblock_fn()) {
+                        std::string hash = getQueryParam("hash");
+                        // Also support height lookup
+                        if (hash.empty()) {
+                            std::string h_str = getQueryParam("height");
+                            if (!h_str.empty() && mining_interface_->has_explorer_blockhash_fn()) {
+                                uint32_t h = 0;
+                                try { h = static_cast<uint32_t>(std::stoul(h_str)); } catch (...) {}
+                                hash = mining_interface_->call_explorer_blockhash(h, chain);
+                            }
+                        }
+                        if (hash.empty()) {
+                            rest_result = nlohmann::json{{"error", "Missing hash or height parameter"}};
+                        } else {
+                            rest_result = mining_interface_->call_explorer_getblock(hash, chain);
+                        }
+                    } else {
+                        rest_result = nlohmann::json{{"error", "Unknown explorer endpoint"}};
+                    }
+                }
+                else {
                 // ── Static file serving (dashboard gate) ───────────────────
                 const auto& dashboard_dir = mining_interface_->get_dashboard_dir();
                 if (!dashboard_dir.empty()) {
@@ -488,6 +546,20 @@ void HttpSession::process_request()
                             }
                         }
 
+                        // Inject explorer nav link if configured
+                        const auto& explorer_url = mining_interface_->get_explorer_url();
+                        if (!explorer_url.empty() && mining_interface_->is_explorer_enabled()
+                            && (ext == ".html" || ext == ".htm"))
+                        {
+                            // Find "Classic" nav link and insert Explorer after it
+                            auto pos = contents.find(R"(>Classic</a>)");
+                            if (pos != std::string::npos) {
+                                pos += 12;  // skip ">Classic</a>"
+                                std::string link = "\n        <a href=\"" + explorer_url + "\" target=\"_blank\">Explorer</a>";
+                                contents.insert(pos, link);
+                            }
+                        }
+
                         response.set(http::field::content_type, mime);
                         response.set(http::field::cache_control, "public, max-age=3600");
                         response.body() = std::move(contents);
@@ -498,7 +570,8 @@ void HttpSession::process_request()
                 }
                 // Fallback to getinfo JSON
                 rest_result = mining_interface_->getinfo();
-            }
+                }  // end static file serving else
+            }  // end explorer/static dispatch
 
             response_body = rest_result.dump();
         }
@@ -3565,33 +3638,54 @@ nlohmann::json MiningInterface::rest_web_currency_info()
         result["symbol"] = "LTC";
         result["name"] = "Litecoin";
         result["block_period"] = 150;  // 2.5 min average
-        if (m_testnet) {
-            result["address_explorer_url_prefix"] = "https://litecoinspace.org/testnet/address/";
-            result["block_explorer_url_prefix"]   = "https://litecoinspace.org/testnet/block/";
-            result["tx_explorer_url_prefix"]      = "https://litecoinspace.org/testnet/tx/";
+        if (!m_custom_address_explorer.empty()) {
+            result["address_explorer_url_prefix"] = m_custom_address_explorer;
+            result["block_explorer_url_prefix"]   = m_custom_block_explorer;
+            result["tx_explorer_url_prefix"]      = m_custom_tx_explorer;
+        } else if (m_testnet) {
+            result["address_explorer_url_prefix"] = "https://blockchair.com/litecoin/testnet/address/";
+            result["block_explorer_url_prefix"]   = "https://blockchair.com/litecoin/testnet/block/";
+            result["tx_explorer_url_prefix"]      = "https://blockchair.com/litecoin/testnet/transaction/";
         } else {
-            result["address_explorer_url_prefix"] = "https://litecoinspace.org/address/";
-            result["block_explorer_url_prefix"]   = "https://litecoinspace.org/block/";
-            result["tx_explorer_url_prefix"]      = "https://litecoinspace.org/tx/";
+            result["address_explorer_url_prefix"] = "https://blockchair.com/litecoin/address/";
+            result["block_explorer_url_prefix"]   = "https://blockchair.com/litecoin/block/";
+            result["tx_explorer_url_prefix"]      = "https://blockchair.com/litecoin/transaction/";
         }
         break;
     case Blockchain::BITCOIN:
         result["symbol"] = "BTC";
         result["name"] = "Bitcoin";
         result["block_period"] = 600;  // 10 min average
-        result["address_explorer_url_prefix"] = "https://mempool.space/address/";
-        result["block_explorer_url_prefix"]   = "https://mempool.space/block/";
-        result["tx_explorer_url_prefix"]      = "https://mempool.space/tx/";
+        if (!m_custom_address_explorer.empty()) {
+            result["address_explorer_url_prefix"] = m_custom_address_explorer;
+            result["block_explorer_url_prefix"]   = m_custom_block_explorer;
+            result["tx_explorer_url_prefix"]      = m_custom_tx_explorer;
+        } else {
+            result["address_explorer_url_prefix"] = "https://blockchair.com/bitcoin/address/";
+            result["block_explorer_url_prefix"]   = "https://blockchair.com/bitcoin/block/";
+            result["tx_explorer_url_prefix"]      = "https://blockchair.com/bitcoin/transaction/";
+        }
         break;
     case Blockchain::DOGECOIN:
         result["symbol"] = "DOGE";
         result["name"] = "Dogecoin";
         result["block_period"] = 60;   // 1 min average
-        result["address_explorer_url_prefix"] = "https://dogechain.info/address/";
-        result["block_explorer_url_prefix"]   = "https://dogechain.info/block/";
-        result["tx_explorer_url_prefix"]      = "https://dogechain.info/tx/";
+        if (!m_custom_address_explorer.empty()) {
+            result["address_explorer_url_prefix"] = m_custom_address_explorer;
+            result["block_explorer_url_prefix"]   = m_custom_block_explorer;
+            result["tx_explorer_url_prefix"]      = m_custom_tx_explorer;
+        } else {
+            result["address_explorer_url_prefix"] = "https://blockchair.com/dogecoin/address/";
+            result["block_explorer_url_prefix"]   = "https://blockchair.com/dogecoin/block/";
+            result["tx_explorer_url_prefix"]      = "https://blockchair.com/dogecoin/transaction/";
+        }
         break;
     }
+
+    // Expose explorer state so dashboard JS can link to internal explorer
+    result["explorer_enabled"] = m_explorer_enabled;
+    if (m_explorer_enabled && !m_explorer_url.empty())
+        result["explorer_url"] = m_explorer_url;
 
     return result;
 }
@@ -4060,11 +4154,16 @@ nlohmann::json MiningInterface::rest_miner_payouts(const std::string& address)
         nlohmann::json blocks_arr = nlohmann::json::array();
         int blocks_found = 0;
         double confirmed_rewards = 0, maturing_rewards = 0;
-        // Block explorer URL prefix
-        bool is_ltc = (m_blockchain == Blockchain::LITECOIN);
-        std::string explorer_prefix = is_ltc
-            ? (m_testnet ? "https://litecoinspace.org/testnet/block/" : "https://litecoinspace.org/block/")
-            : "https://blockchair.com/bitcoin/block/";
+        // Block explorer URL prefix — use custom if set, else Blockchair
+        std::string explorer_prefix;
+        if (!m_custom_block_explorer.empty()) {
+            explorer_prefix = m_custom_block_explorer;
+        } else {
+            bool is_ltc = (m_blockchain == Blockchain::LITECOIN);
+            explorer_prefix = is_ltc
+                ? (m_testnet ? "https://blockchair.com/litecoin/testnet/block/" : "https://blockchair.com/litecoin/block/")
+                : "https://blockchair.com/bitcoin/block/";
+        }
 
         for (const auto& b : m_found_blocks) {
             if (b.miner == address || address.empty()) {
@@ -5820,6 +5919,20 @@ void WebServer::set_analytics_id(const std::string& id)
     mining_interface_->set_analytics_id(id);
     if (!id.empty())
         LOG_INFO << "Analytics tag enabled: " << id;
+}
+
+void WebServer::set_explorer_enabled(bool enabled)
+{
+    mining_interface_->set_explorer_enabled(enabled);
+    if (enabled)
+        LOG_INFO << "[Explorer] API enabled (loopback-only)";
+}
+
+void WebServer::set_explorer_url(const std::string& url)
+{
+    mining_interface_->set_explorer_url(url);
+    if (!url.empty())
+        LOG_INFO << "[Explorer] Nav link URL: " << url;
 }
 
 bool WebServer::start_solo()

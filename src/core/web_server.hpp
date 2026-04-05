@@ -871,6 +871,31 @@ public:
     void set_analytics_id(const std::string& id) { m_analytics_id = id; }
     const std::string& get_analytics_id() const { return m_analytics_id; }
 
+    // Custom external block explorer link prefixes (overrides defaults)
+    void set_custom_explorer_links(const std::string& addr, const std::string& block, const std::string& tx) {
+        m_custom_address_explorer = addr;
+        m_custom_block_explorer = block;
+        m_custom_tx_explorer = tx;
+    }
+
+    // Explorer API
+    using explorer_chaininfo_fn_t = std::function<nlohmann::json(const std::string& chain)>;
+    using explorer_blockhash_fn_t = std::function<std::string(uint32_t height, const std::string& chain)>;
+    using explorer_getblock_fn_t  = std::function<nlohmann::json(const std::string& hash, const std::string& chain)>;
+    void set_explorer_enabled(bool enabled) { m_explorer_enabled = enabled; }
+    bool is_explorer_enabled() const { return m_explorer_enabled; }
+    void set_explorer_url(const std::string& url) { m_explorer_url = url; }
+    const std::string& get_explorer_url() const { return m_explorer_url; }
+    void set_explorer_chaininfo_fn(explorer_chaininfo_fn_t fn) { m_explorer_chaininfo_fn = std::move(fn); }
+    void set_explorer_blockhash_fn(explorer_blockhash_fn_t fn) { m_explorer_blockhash_fn = std::move(fn); }
+    void set_explorer_getblock_fn(explorer_getblock_fn_t fn) { m_explorer_getblock_fn = std::move(fn); }
+    bool has_explorer_chaininfo_fn() const { return !!m_explorer_chaininfo_fn; }
+    bool has_explorer_blockhash_fn() const { return !!m_explorer_blockhash_fn; }
+    bool has_explorer_getblock_fn() const { return !!m_explorer_getblock_fn; }
+    nlohmann::json call_explorer_chaininfo(const std::string& c) { return m_explorer_chaininfo_fn(c); }
+    std::string call_explorer_blockhash(uint32_t h, const std::string& c) { return m_explorer_blockhash_fn(h, c); }
+    nlohmann::json call_explorer_getblock(const std::string& h, const std::string& c) { return m_explorer_getblock_fn(h, c); }
+
     // Primary payout address (for legacy /payout_addr endpoint)
     void set_payout_address(const std::string& addr) { m_payout_address = addr; }
     const std::string& get_payout_address() const { return m_payout_address; }
@@ -902,6 +927,17 @@ private:
     std::string m_dashboard_dir;
     // Google Analytics measurement ID (e.g. "G-XXXXXXXXXX")
     std::string m_analytics_id;
+    // Custom external block explorer link prefixes (empty = use Blockchair defaults)
+    std::string m_custom_address_explorer;
+    std::string m_custom_block_explorer;
+    std::string m_custom_tx_explorer;
+    // Explorer configuration
+    bool m_explorer_enabled{false};
+    std::string m_explorer_url;  // URL for dashboard nav link injection
+    // Explorer data callbacks (set by c2pool_refactored.cpp)
+    explorer_chaininfo_fn_t m_explorer_chaininfo_fn;
+    explorer_blockhash_fn_t m_explorer_blockhash_fn;
+    explorer_getblock_fn_t  m_explorer_getblock_fn;
     // Primary payout address for legacy API
     std::string m_payout_address;
 
@@ -1045,6 +1081,10 @@ public:
     // Dashboard directory for static file serving
     void set_dashboard_dir(const std::string& dir);
     void set_analytics_id(const std::string& id);
+
+    // Explorer API — forward to MiningInterface
+    void set_explorer_enabled(bool enabled);
+    void set_explorer_url(const std::string& url);
 
     // Wire a live coin-daemon RPC connection for block template generation
     void set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Node* coin = nullptr);

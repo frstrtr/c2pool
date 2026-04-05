@@ -5,8 +5,10 @@
 #include <iomanip>
 
 #include <btclibs/crypto/sha256.h>
+#include <btclibs/crypto/ripemd160.h>
 #include <btclibs/bech32.h>
 #include <btclibs/base58.h>
+#include <btclibs/span.h>
 
 namespace core {
 
@@ -270,6 +272,144 @@ std::vector<unsigned char> address_to_script(const std::string& address)
     }
 
     return {};
+}
+
+// ── Helper: hex encoding ────────────────────────────────────────────────
+
+static std::string to_hex(const unsigned char* data, size_t len) {
+    static const char* H = "0123456789abcdef";
+    std::string out;
+    out.reserve(len * 2);
+    for (size_t i = 0; i < len; ++i) {
+        out += H[data[i] >> 4];
+        out += H[data[i] & 0x0f];
+    }
+    return out;
+}
+
+// ── Hash160: SHA256 + RIPEMD160 ─────────────────────────────────────────
+
+static void hash160(const unsigned char* data, size_t len, unsigned char out[20]) {
+    unsigned char sha[32];
+    CSHA256().Write(data, len).Finalize(sha);
+    CRIPEMD160().Write(sha, 32).Finalize(out);
+}
+
+std::string pubkey_to_p2pkh_address(const unsigned char* pubkey, size_t len, uint8_t p2pkh_ver) {
+    if (len != 33 && len != 65) return {};
+    unsigned char h160[20];
+    hash160(pubkey, len, h160);
+    std::vector<unsigned char> payload(21);
+    payload[0] = p2pkh_ver;
+    std::memcpy(payload.data() + 1, h160, 20);
+    return EncodeBase58Check({payload.data(), payload.size()});
+}
+
+ScriptClassification classify_script(const std::vector<unsigned char>& script,
+    const std::string& bech32_hrp, uint8_t p2pkh_ver, uint8_t p2sh_ver)
+{
+    ScriptClassification result;
+    result.hex = to_hex(script.data(), script.size());
+    const size_t n = script.size();
+
+    // Try standard address types first
+    auto addr = script_to_address(script, bech32_hrp, p2pkh_ver, p2sh_ver);
+    if (!addr.empty()) {
+        // Determine type from pattern
+        if (n == 25 && script[0] == 0x76 && script[24] == 0xac) {
+            result.type = "pubkeyhash";
+        } else if (n == 23 && script[0] == 0xa9 && script[22] == 0x87) {
+            result.type = "scripthash";
+        } else if (n == 22 && script[0] == 0x00 && script[1] == 0x14) {
+            result.type = "witness_v0_keyhash";
+        } else if (n == 34 && script[0] == 0x00 && script[1] == 0x20) {
+            result.type = "witness_v0_scripthash";
+        } else if (n == 34 && script[0] == 0x51 && script[1] == 0x20) {
+            result.type = "witness_v1_taproot";
+        }
+        result.addresses.push_back(std::move(addr));
+        return result;
+    }
+
+    // P2PK: <33|65 byte pubkey> OP_CHECKSIG (0xac)
+    if (n > 1 && script[n - 1] == 0xac) {
+        size_t push_len = script[0];
+        if ((push_len == 33 || push_len == 65) && n == push_len + 2) {
+            result.type = "pubkey";
+            result.pubkey = to_hex(script.data() + 1, push_len);
+            auto pk_addr = pubkey_to_p2pkh_address(script.data() + 1, push_len, p2pkh_ver);
+            if (!pk_addr.empty())
+                result.addresses.push_back(std::move(pk_addr));
+            return result;
+        }
+    }
+
+    // P2MS: OP_M <pubkey>... OP_N OP_CHECKMULTISIG (0xae)
+    if (n > 3 && script[n - 1] == 0xae) {
+        // OP_N is the byte before OP_CHECKMULTISIG
+        uint8_t op_n = script[n - 2];
+        if (op_n >= 0x51 && op_n <= 0x60) {  // OP_1 .. OP_16
+            int total = op_n - 0x50;
+            // OP_M is the first byte
+            uint8_t op_m = script[0];
+            if (op_m >= 0x51 && op_m <= 0x60) {
+                int required = op_m - 0x50;
+                if (required <= total) {
+                    // Walk pubkeys starting at offset 1
+                    size_t pos = 1;
+                    std::vector<std::string> pubkeys;
+                    std::vector<std::string> addrs;
+                    bool valid = true;
+                    for (int i = 0; i < total; ++i) {
+                        if (pos >= n - 2) { valid = false; break; }
+                        size_t pk_len = script[pos];
+                        if (pk_len != 33 && pk_len != 65) { valid = false; break; }
+                        if (pos + 1 + pk_len > n - 2) { valid = false; break; }
+                        pubkeys.push_back(to_hex(script.data() + pos + 1, pk_len));
+                        auto pk_addr = pubkey_to_p2pkh_address(
+                            script.data() + pos + 1, pk_len, p2pkh_ver);
+                        addrs.push_back(pk_addr.empty() ? "" : pk_addr);
+                        pos += 1 + pk_len;
+                    }
+                    if (valid && pos == n - 2) {
+                        result.type = "multisig";
+                        result.multisig_required = required;
+                        result.multisig_total = total;
+                        result.multisig_pubkeys = std::move(pubkeys);
+                        result.multisig_addresses = std::move(addrs);
+                        result.addresses = result.multisig_addresses;
+                        return result;
+                    }
+                }
+            }
+        }
+    }
+
+    // OP_RETURN: OP_RETURN (0x6a) ...
+    if (n >= 1 && script[0] == 0x6a) {
+        result.type = "nulldata";
+        if (n > 1)
+            result.op_return_hex = to_hex(script.data() + 1, n - 1);
+        return result;
+    }
+
+    result.type = "nonstandard";
+    return result;
+}
+
+ScriptClassification classify_script(const std::vector<unsigned char>& script,
+    bool is_litecoin, bool is_testnet)
+{
+    uint8_t p2pkh_ver, p2sh_ver;
+    std::string bech32_hrp;
+    if (is_litecoin) {
+        if (is_testnet) { p2pkh_ver = 0x6f; p2sh_ver = 0xc4; bech32_hrp = "tltc"; }
+        else            { p2pkh_ver = 0x30; p2sh_ver = 0x32; bech32_hrp = "ltc";  }
+    } else {
+        if (is_testnet) { p2pkh_ver = 0x6f; p2sh_ver = 0xc4; bech32_hrp = "tb";  }
+        else            { p2pkh_ver = 0x00; p2sh_ver = 0x05; bech32_hrp = "bc";   }
+    }
+    return classify_script(script, bech32_hrp, p2pkh_ver, p2sh_ver);
 }
 
 } // namespace core

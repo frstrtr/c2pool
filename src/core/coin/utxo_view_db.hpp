@@ -9,6 +9,7 @@
 ///   'C' + txid(32B) + index(4B LE)  →  serialized Coin
 ///   'B'                              →  best_block_hash(32B) + height(4B LE)
 ///   'U' + height(4B BE)             →  serialized BlockUndo
+///   'F' + height(4B BE)             →  raw serialized full block (explorer)
 ///
 /// Reference: Litecoin Core txdb.h CCoinsViewDB
 
@@ -142,10 +143,48 @@ public:
         return m_store.remove(key);
     }
 
+    // ── Raw block storage (explorer) ────────────────────────────────────
+
+    /// Store raw serialized block at given height (for lite explorer API).
+    bool put_raw_block(uint32_t height, const std::vector<uint8_t>& data) {
+        return m_store.put(make_block_key(height), data);
+    }
+
+    /// Retrieve raw serialized block at given height.
+    std::optional<std::vector<uint8_t>> get_raw_block(uint32_t height) {
+        std::vector<uint8_t> data;
+        if (!m_store.get(make_block_key(height), data))
+            return std::nullopt;
+        return data;
+    }
+
+    /// Remove raw block at given height.
+    bool remove_raw_block(uint32_t height) {
+        return m_store.remove(make_block_key(height));
+    }
+
+    /// Prune raw blocks below (tip_height - keep_depth).
+    uint32_t prune_raw_blocks(uint32_t tip_height, uint32_t keep_depth) {
+        if (tip_height <= keep_depth) return 0;
+        uint32_t prune_below = tip_height - keep_depth;
+        uint32_t pruned = 0;
+        for (uint32_t h = m_oldest_block_height; h < prune_below; ++h) {
+            if (remove_raw_block(h))
+                ++pruned;
+        }
+        if (pruned > 0) {
+            m_oldest_block_height = prune_below;
+            LOG_INFO << "[UTXO-DB] Pruned " << pruned << " raw blocks below height "
+                     << prune_below << " (keep_depth=" << keep_depth << ")";
+        }
+        return pruned;
+    }
+
 private:
     LevelDBStore m_store;
     uint256  m_best_block;
     uint32_t m_best_height{0};
+    uint32_t m_oldest_block_height{0};  // for raw block pruning
 
     // ── Key construction ────────────────────────────────────────────────
 
@@ -165,6 +204,17 @@ private:
         std::string key;
         key.reserve(5);  // 'U' + 4 bytes (big-endian for sorted iteration)
         key.push_back('U');
+        key.push_back(static_cast<char>((height >> 24) & 0xFF));
+        key.push_back(static_cast<char>((height >> 16) & 0xFF));
+        key.push_back(static_cast<char>((height >> 8) & 0xFF));
+        key.push_back(static_cast<char>(height & 0xFF));
+        return key;
+    }
+
+    static std::string make_block_key(uint32_t height) {
+        std::string key;
+        key.reserve(5);  // 'F' + 4 bytes (big-endian for sorted iteration)
+        key.push_back('F');
         key.push_back(static_cast<char>((height >> 24) & 0xFF));
         key.push_back(static_cast<char>((height >> 16) & 0xFF));
         key.push_back(static_cast<char>((height >> 8) & 0xFF));
