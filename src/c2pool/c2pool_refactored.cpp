@@ -2732,7 +2732,8 @@ int main(int argc, char* argv[]) {
                 result["chain_height"]    = best.IsNull() ? 0 : chain.get_height(best);
 
                 // O(log n) aggregate stats via skiplist — replaces O(n) linear walk
-                int walk = best.IsNull() ? 0 : std::min(static_cast<int>(chain.get_height(best)), 2000);
+                int walk = best.IsNull() ? 0 : std::min(static_cast<int>(chain.get_height(best)),
+                    static_cast<int>(ltc::PoolConfig::chain_length()));
                 auto sr = stats_skiplist->query(best, walk);
 
                 result["shares_by_version"] = sr.version_counts;
