@@ -3399,14 +3399,6 @@
                     .attr('target', '_blank')
                     .attr('title', addr)
                     .text(addr);
-                // Label donation address (LeD2fnn... on mainnet)
-                if (addr.indexOf('LeD2f') === 0 || addr === 'donation') {
-                    addrTd.append('span')
-                        .style('color', '#888')
-                        .style('font-size', '0.6rem')
-                        .style('margin-left', '4px')
-                        .text('pool dev fee');
-                }
                 mainRow.append('td')
                     .style('text-align', 'right')
                     .attr('class', 'amount')
@@ -3441,12 +3433,6 @@
                                 .style('margin-left', '4px')
                                 .attr('title', 'Auto-converted from parent chain address (same pubkey hash). During V35\u2192V36 transition, all merged addresses are auto-converted since V35 shares cannot carry explicit merged addresses.')
                                 .text('\u26A0 auto');
-                        } else if (merged.source === 'donation') {
-                            addrCell.append('span')
-                                .style('color', '#888')
-                                .style('font-size', '0.6rem')
-                                .style('margin-left', '4px')
-                                .text('donation');
                         } else if (merged.source === 'explicit') {
                             addrCell.append('span')
                                 .style('color', '#28a745')

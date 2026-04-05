@@ -592,6 +592,13 @@ class ExplorerEngine:
         if cached:
             return cached
 
+        # Fallback: hardcoded seed blocks (outside embedded chain depth)
+        seed_key = f"{chain}:{height_or_hash}"
+        seed = self.SEED_BLOCK_DETAILS.get(seed_key)
+        if seed:
+            self.cache.put(cache_key, seed)
+            return seed
+
         try:
             if isinstance(height_or_hash, int) or height_or_hash.isdigit():
                 height = int(height_or_hash)
@@ -743,6 +750,111 @@ class ExplorerEngine:
             "the_state_root": "", "coinbase_value": 10000_00000000,
         }],
     }
+
+    # ── Full block details for seed blocks so /block?q=... always works ──
+    # These are pre-decoded to match get_block() output format.  The
+    # _coinbase_decoded / _outputs_decoded dicts mirror decode_scriptsig()
+    # and decode_outputs() return values.
+    SEED_BLOCK_DETAILS = {
+        # ─────────────── LTC #3069917 ───────────────
+        "ltc:3069917": {
+            "height": 3069917,
+            "hash": "806a9214cd63dae4b5091b69c1f8e14652ff95fff2bbcb06de6fcdafa76ec6ea",
+            "previousblockhash": "90fc24dad8ccf4cb521af889a03d32a24db1590ef5ea2f66a2297dce8c4c1489",
+            "time": 1773145632,
+            "difficulty": 105778188,
+            "bits": "19283258",
+            "nonce": 59985092,
+            "merkleroot": "96f1d4f3a83499eab0bec48370a0b5e44ef054f2c7314609c876646bb0d4cd61",
+            "size": 58921,
+            "tx": [{"txid": "528f890b36514977fce03e38e9843bd2d41791d227e5fe841cdd426de3d6e694"}] + [{}] * 165,
+            "_coinbase_decoded": {
+                "raw_hex": "03ddd72e2cfabe6d6dfe4152f52456b9890a7bf9128648c0561d5dce7fd47e8e849df6c4315e8781c2010000000000000026202d2d204d696e6564206279204879706572446f6e6b65792e636f6d20285765737420555329",
+                "length": 82,
+                "bip34_height": 3069917,
+                "has_auxpow": True,
+                "pool_tag": "/c2pool/",
+                "the_state_root": "",
+                "ascii_strings": ["-- Mined by HyperDonkey.com (West US)"],
+                "components": [
+                    {"type": "BIP34 height", "value": 3069917},
+                    {"type": "AuxPoW commitment", "aux_hash": "fe4152f52456b9890a7bf9128648c0561d5dce7fd47e8e849df6c4315e878100", "merkle_size": 1, "merkle_nonce": 0},
+                    {"type": "pool_tag", "value": "/c2pool/", "offset": 48},
+                ],
+            },
+            "_outputs_decoded": [
+                {"index": 0,  "value_btc": 0.0,        "value_sat": 0,         "type": "op_return",  "asm": "OP_RETURN aa21a9ed1683273b0f24739675d6076c37c3f084998c2493e889e1399f913802912c22ea", "hex": "6a24aa21a9ed1683273b0f24739675d6076c37c3f084998c2493e889e1399f913802912c22ea", "addresses": [], "is_op_return": True},
+                {"index": 1,  "value_btc": 0.00074150, "value_sat": 74150,     "type": "p2sh",       "asm": "", "hex": "a9146cbbb83db91c3a72b761fc5ce1050f8dd87f3fca87", "addresses": ["MHp6697dpCacmGsDpaPGijZyYggAVRaVjD"]},
+                {"index": 2,  "value_btc": 0.00081093, "value_sat": 81093,     "type": "p2pkh",      "asm": "", "hex": "76a914218f1b2f0b5b9b6f7484573bb4d09d2e2c45238088ac", "addresses": ["LNHPzjcjb1HX6zMiAZWngBGr4u5UK7KdC4"]},
+                {"index": 3,  "value_btc": 0.00107655, "value_sat": 107655,    "type": "p2pkh",      "asm": "", "hex": "76a91481aab068a76fd27d4e778957dc68aa62e2dd2a2688ac", "addresses": ["LX3ZuePjBpjtst6dPepS2hXXfkmeZaBGmt"]},
+                {"index": 4,  "value_btc": 0.00123857, "value_sat": 123857,    "type": "p2pkh",      "asm": "", "hex": "76a914d4db09c28b7feade877c14856f2dc39dc3061b3488ac", "addresses": ["LedRuv8JCCHPu36Nn2HadHT9LXJmvH91so"]},
+                {"index": 5,  "value_btc": 0.00292087, "value_sat": 292087,    "type": "v0_p2wpkh",  "asm": "", "hex": "0014e98a1f371a1b36cf83def680c1605e92db25555a", "addresses": ["ltc1qax9p7dc6rvmvlq7776qvzcz7jtdj24266man39"]},
+                {"index": 6,  "value_btc": 0.00518639, "value_sat": 518639,    "type": "p2pkh",      "asm": "", "hex": "76a914670947f571cd38fff48b9fe35c94dd726bbf991788ac", "addresses": ["LUckyqGAZZ7RMRpH8bLYLgSw7g5Y6SwN7e"]},
+                {"index": 7,  "value_btc": 0.00894577, "value_sat": 894577,    "type": "p2sh",       "asm": "", "hex": "a914212c78273a43420588587a2c4160fe13bc0382dd87", "addresses": ["MAvZoYZxmdozi1BNsyHE8naNMNxqLkVTyd"]},
+                {"index": 8,  "value_btc": 0.01847205, "value_sat": 1847205,   "type": "p2sh",       "asm": "", "hex": "a91412fa01fbe0911efc7d350d7280bc238b0f3680f687", "addresses": ["M9dVtj4t94NRx3DPmHLkd8rhSE7HEWwFFA"]},
+                {"index": 9,  "value_btc": 0.02193889, "value_sat": 2193889,   "type": "v0_p2wpkh",  "asm": "", "hex": "001423279bb62e8807b064d92e1d5d6c2fc647b1e760", "addresses": ["ltc1qyvnehd3w3qrmqexe9cw46mp0cermremqd9fmqz"]},
+                {"index": 10, "value_btc": 0.02898877, "value_sat": 2898877,   "type": "p2sh",       "asm": "", "hex": "a914c15c9a506649e024d731ac78050556e92383c52387", "addresses": ["MRXZacDm3bAcqCMJJ4QReq5vbvP7QpLkFE"]},
+                {"index": 11, "value_btc": 0.02993388, "value_sat": 2993388,   "type": "p2pkh",      "asm": "", "hex": "76a91465295f7cdd536cdda899d9ea3ca9c7a07f6f7b0988ac", "addresses": ["LUSr5EYHTygRvGfBSt9vtvuN4X58mimfJq"]},
+                {"index": 12, "value_btc": 0.03024197, "value_sat": 3024197,   "type": "v0_p2wpkh",  "asm": "", "hex": "00145a34288f4f82236673b260fae84cc26447fe1213", "addresses": ["ltc1qtg6z3r60sg3kvuajvrawsnxzv3rluysn4dnuw3"]},
+                {"index": 13, "value_btc": 0.03493044, "value_sat": 3493044,   "type": "p2sh",       "asm": "", "hex": "a9149927d1b8ca9562869e874dd7974ad8b7401a189b87", "addresses": ["MMryKU8W7VP2pMdvRNRYbuzqiSdpcobans"]},
+                {"index": 14, "value_btc": 0.03903404, "value_sat": 3903404,   "type": "p2pkh",      "asm": "", "hex": "76a91416a8fa751d2bdc6f6dfe3ccb4ece16a5bc3200d888ac", "addresses": ["LMHmZFjXTzLtEKcxbBGBnc65LRqiWezM4f"]},
+                {"index": 15, "value_btc": 0.04114269, "value_sat": 4114269,   "type": "p2pkh",      "asm": "", "hex": "76a9140c42816983efe49e9748a5fad7ee64100d04807a88ac", "addresses": ["LLLn3Q7MwxwPZ34JHgePTfJdRL9rYEffhX"]},
+                {"index": 16, "value_btc": 0.04434624, "value_sat": 4434624,   "type": "p2pkh",      "asm": "", "hex": "76a9145498d7890aacbda5a8e20a12ad20016b48291c7088ac", "addresses": ["LSwG7yFGgHSEMdv8Xnqx9YSDo5fnPYkrUE"]},
+                {"index": 17, "value_btc": 0.04583976, "value_sat": 4583976,   "type": "v0_p2wpkh",  "asm": "", "hex": "0014be3b74236293ba942fad64038e67d7e9679e980a", "addresses": ["ltc1qhcahggmzjwafgtadvspcue7ha9neaxq24pe722"]},
+                {"index": 18, "value_btc": 0.04663059, "value_sat": 4663059,   "type": "v0_p2wpkh",  "asm": "", "hex": "00146e55db837d96371ddce6e5e58afbc382aa478503", "addresses": ["ltc1qde2ahqmajcm3mh8xuhjc477rs24y0pgrv2fucz"]},
+                {"index": 19, "value_btc": 0.08115990, "value_sat": 8115990,   "type": "p2pkh",      "asm": "", "hex": "76a914b1b0447a63a983dcd03b8507abf957db4b2e49ce88ac", "addresses": ["LbRV2StFb9Y6xqAsSPyeoUf2TaazuJHGYx"]},
+                {"index": 20, "value_btc": 0.13645416, "value_sat": 13645416,  "type": "p2pkh",      "asm": "", "hex": "76a91412f96bccf2e0a6bab2bb4574c7db76944f434aa888ac", "addresses": ["LLxHDkJwWpaT29imBHZj7EdNxpGwnfrktS"]},
+                {"index": 21, "value_btc": 0.16006377, "value_sat": 16006377,  "type": "v0_p2wpkh",  "asm": "", "hex": "0014e00dea88543bfdccdf556b12bdf452783c2695d4", "addresses": ["ltc1quqx74zz5807ueh64dvftmazj0q7zd9w5ef2adu"]},
+                {"index": 22, "value_btc": 0.23222312, "value_sat": 23222312,  "type": "v0_p2wpkh",  "asm": "", "hex": "001461f3800a7fdfb90f5c43f1f09004ff994bf3b1b9", "addresses": ["ltc1qv8ecqznlm7us7hzr78cfqp8ln99l8vdecdg06j"]},
+                {"index": 23, "value_btc": 0.27128166, "value_sat": 27128166,  "type": "p2pkh",      "asm": "", "hex": "76a914620f499fc74eba7ee7eb2e5821f95226bcbbfeeb88ac", "addresses": ["LUASoDK1SsV5DQ3dwGo5bGFxWJobPydupY"]},
+                {"index": 24, "value_btc": 0.39756879, "value_sat": 39756879,  "type": "v0_p2wpkh",  "asm": "", "hex": "0014db5cd391f60e263c137769dec54e88ead4989582", "addresses": ["ltc1qmdwd8y0kpcnrcymhd80v2n5gat2f39vzwv0dnv"]},
+                {"index": 25, "value_btc": 0.79428194, "value_sat": 79428194,  "type": "p2pkh",      "asm": "", "hex": "76a9140fa5296e6dcff4ce3bc9a300e959c3cfb224ab6588ac", "addresses": ["LLegFjfScJ3kZvz6rSBhZVg6A93JPrY3tf"]},
+                {"index": 26, "value_btc": 1.09527823, "value_sat": 109527823, "type": "p2pkh",      "asm": "", "hex": "76a914238e0e0d040b0d300fa03777e2a0ee9d9c9c221588ac", "addresses": ["LNTx65DqrACZWCSK8Jc4c7wriSWHS448Qj"]},
+                {"index": 27, "value_btc": 1.30603390, "value_sat": 130603390, "type": "p2pkh",      "asm": "", "hex": "76a914b8089e39a70cf3dd3bf057bf86bf03dc2ea1889a88ac", "addresses": ["Lc12vJZd5oMsZY4eGLdvMo9jrXNHKaouvk"]},
+                {"index": 28, "value_btc": 1.38024571, "value_sat": 138024571, "type": "p2pkh",      "asm": "", "hex": "76a91404f4e9aaf5021dcc4cff4b40498969025d0e832f88ac", "addresses": ["LKgAMpNXkKSq1ixoELmGS2UfvNn2TrpFBx"]},
+                {"index": 29, "value_btc": 0.00000014, "value_sat": 14,        "type": "p2pk",       "asm": "", "hex": "4104ffd03de44a6e11b9917f3a29f9443283d9871c9d743ef30d5eddcd37094b64d1b3d8090496b53256786bf5c82932ec23c3b74d9f05a6f95a8b5529352656664bac", "addresses": [], "is_donation": True, "donation_type": "p2pool_old"},
+                {"index": 30, "value_btc": 0.0,        "value_sat": 0,         "type": "op_return",  "asm": "OP_RETURN 8bd158eb8a5e928fea18613ac741a8a66c3b4058d7e059921c85a07250e02e6d000000002ecd1000", "hex": "6a288bd158eb8a5e928fea18613ac741a8a66c3b4058d7e059921c85a07250e02e6d000000002ecd1000", "addresses": [], "is_op_return": True, "ref_hash": "8bd158eb8a5e928fea18613ac741a8a66c3b4058d7e059921c85a07250e02e6d", "last_txout_nonce": "000000002ecd1000", "type": "p2pool_ref"},
+            ],
+        },
+        # ─────────────── DOGE #6135703 ───────────────
+        "doge:6135703": {
+            "height": 6135703,
+            "hash": "f84500c25a4cce2a08887f29763726bd5ecec7b66fed65a88b181fb0b0ab2383",
+            "previousblockhash": "8a8c522e08da9050bda3f161f5a5ae8d7f3dc38aee6de87c89d8b56deccba586",
+            "time": 1774276655,
+            "difficulty": 26085177.03517223,
+            "bits": "1a00a834",
+            "nonce": 0,
+            "merkleroot": "1fade1ce517047e3415bf6e2d02130718c33925c611a9b19481b7038771a0cde",
+            "size": 60350,
+            "tx": [{"txid": "42ca7cc895ae00b9f83e7b4fd1a2d2e59232d000d105e743a3e54df71e3a815c"}] + [{}] * 186,
+            "_coinbase_decoded": {
+                "raw_hex": "03979f5d2f5032506f6f6c207633362f",
+                "length": 16,
+                "bip34_height": 6135703,
+                "has_auxpow": True,
+                "pool_tag": "/c2pool/",
+                "the_state_root": "",
+                "ascii_strings": ["/P2Pool v36/"],
+                "components": [
+                    {"type": "BIP34 height", "value": 6135703},
+                    {"type": "pool_tag", "value": "/c2pool/", "offset": 4},
+                ],
+            },
+            "_outputs_decoded": [
+                {"index": 0, "value_btc": 8598.59979535, "value_sat": 859859979535, "type": "p2pkh", "asm": "", "hex": "76a914b8089e39a70cf3dd3bf057bf86bf03dc2ea1889a88ac", "addresses": ["DMvBCMCSJZ26qjZ5pneBdYFaXSjJUk5L4G"]},
+                {"index": 1, "value_btc": 1314.86645163, "value_sat": 131486645163, "type": "p2pkh", "asm": "", "hex": "76a914238e0e0d040b0d300fa03777e2a0ee9d9c9c221588ac", "addresses": ["D8P6N7rf4urnnPvkgkcKss3hPMsJfasFAs"]},
+                {"index": 2, "value_btc": 86.58781129,   "value_sat": 8658781129,   "type": "p2pkh", "asm": "", "hex": "76a91465295f7cdd536cdda899d9ea3ca9c7a07f6f7b0988ac", "addresses": ["DEMzMHB6gjLfCU9d1LACAg1CjSS9xPvLfG"]},
+                {"index": 3, "value_btc": 5.45895328,    "value_sat": 545895328,    "type": "p2pkh", "asm": "", "hex": "76a91404f4e9aaf5021dcc4cff4b40498969025d0e832f88ac", "addresses": ["D5bJds1Ly574HvTEnnmXhmaWbJ93fUhFUP"]},
+                {"index": 4, "value_btc": 0.0,           "value_sat": 0,            "type": "nulldata", "asm": "OP_RETURN 7032702d7370622e78797a", "hex": "6a0b7032702d7370622e78797a", "addresses": [], "is_op_return": True},
+                {"index": 5, "value_btc": 1.00000002,    "value_sat": 100000002,    "type": "p2sh",  "asm": "", "hex": "a9148c6272621d89e8fa526dd86acff60c7136be8e8587", "addresses": ["A5EZCT4tUrtoKuvJaWbtVQADzdUKdtsqpr"], "is_donation": True, "donation_type": "p2pool_combined"},
+            ],
+        },
+    }
+
+    # Also index by hash for hash-based lookups
+    SEED_BLOCK_DETAILS["ltc:806a9214cd63dae4b5091b69c1f8e14652ff95fff2bbcb06de6fcdafa76ec6ea"] = SEED_BLOCK_DETAILS["ltc:3069917"]
+    SEED_BLOCK_DETAILS["doge:f84500c25a4cce2a08887f29763726bd5ecec7b66fed65a88b181fb0b0ab2383"] = SEED_BLOCK_DETAILS["doge:6135703"]
 
     def scan_for_pool_blocks(self, chain="ltc", depth=100):
         """Scan recent blocks for p2pool/c2pool coinbase tags."""
