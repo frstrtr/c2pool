@@ -4262,18 +4262,13 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
             result["chain_height"] = sc["chain_height"];
         if (sc.contains("shares_by_version")) {
             result["versions"] = sc["shares_by_version"];
-            // Populate share_types and full_chain_versions from version data
-            // Both map version → {count: N}
+            // share_types: format version counts (share.VERSION)
             auto& sv = sc["shares_by_version"];
             if (sv.is_object()) {
                 nlohmann::json st = nlohmann::json::object();
-                nlohmann::json fcv = nlohmann::json::object();
-                for (auto& [ver, count] : sv.items()) {
+                for (auto& [ver, count] : sv.items())
                     st[ver] = {{"count", count}};
-                    fcv[ver] = {{"count", count}};  // desired = actual for now
-                }
                 result["share_types"] = st;
-                result["full_chain_versions"] = fcv;
                 // Set current share type to the highest version
                 if (!sv.empty()) {
                     auto last = sv.items().begin();
@@ -4282,6 +4277,17 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
                     result["current_share_type"] = std::stoi((*last).key());
                     result["current_share_name"] = "V" + (*last).key();
                 }
+            }
+        }
+        // full_chain_versions: desired version counts (share.desired_version)
+        // p2pool shows "want V35:N V36:M" from desired_version, not format version
+        if (sc.contains("shares_by_desired_version")) {
+            auto& dv = sc["shares_by_desired_version"];
+            if (dv.is_object()) {
+                nlohmann::json fcv = nlohmann::json::object();
+                for (auto& [ver, count] : dv.items())
+                    fcv[ver] = {{"count", count}};
+                result["full_chain_versions"] = fcv;
             }
         }
         if (sc.contains("total_shares"))

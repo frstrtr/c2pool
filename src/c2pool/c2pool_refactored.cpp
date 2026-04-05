@@ -1134,12 +1134,12 @@ int main(int argc, char* argv[]) {
     }
 
     // -----------------------------------------------------------------------
-    // Post-parse: re-initialize logger if custom log params were set
+    // Post-parse: add file sink (initial Logger::init() was console-only)
     // -----------------------------------------------------------------------
-    if (!log_file.empty() || log_rotation_size_mb != 10 || log_max_total_mb != 50 || !log_level_str.empty()) {
+    {
         boost::log::core::get()->remove_all_sinks();
         core::log::Logger::init(log_file, log_rotation_size_mb, log_max_total_mb, log_level_str);
-        LOG_INFO << "Logger re-initialized: file=" << (log_file.empty() ? "debug.log" : log_file)
+        LOG_INFO << "Logger initialized: file=" << (log_file.empty() ? "debug.log" : log_file)
                  << " rotation=" << log_rotation_size_mb << "MB"
                  << " max=" << log_max_total_mb << "MB"
                  << " level=" << (log_level_str.empty() ? "trace" : log_level_str);
@@ -2683,6 +2683,7 @@ int main(int argc, char* argv[]) {
                         cd.share.invoke([&](auto* s) {
                             d.share_count = 1;
                             d.version_counts[std::to_string(s->version)] = 1;
+                            d.desired_version_counts[std::to_string(s->m_desired_version)] = 1;
 
                             std::string miner;
                             if constexpr (requires { s->m_address; })
@@ -2735,6 +2736,7 @@ int main(int argc, char* argv[]) {
                 auto sr = stats_skiplist->query(best, walk);
 
                 result["shares_by_version"] = sr.version_counts;
+                result["shares_by_desired_version"] = sr.desired_version_counts;
                 result["shares_by_miner"]   = sr.miner_counts;
                 result["average_difficulty"] = sr.share_count > 0
                     ? sr.difficulty_sum / sr.share_count : 1.0;

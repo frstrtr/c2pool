@@ -47,7 +47,23 @@ const std::map<std::string, core::log::flags> categories =
 
 void Logger::init()
 {
-    init("", 10, 50, "");
+    // Console-only at startup — file sink is added after config is loaded
+    // (avoids hanging on a bloated debug.log with tight rotation limits)
+    boost::log::add_common_attributes();
+    boost::log::core::get()->add_global_attribute(
+        "Scope", boost::log::attributes::named_scope()
+    );
+
+    auto fmtTimeStamp = boost::log::expressions::
+        format_date_time<boost::posix_time::ptime>("TimeStamp", "%H:%M:%S.%f");
+    auto fmtSeverity = boost::log::expressions::
+        attr<boost::log::trivial::severity_level>("Severity");
+    boost::log::formatter logFmt =
+        boost::log::expressions::format("[%1%][%2%] %3%")
+        % fmtTimeStamp % fmtSeverity % boost::log::expressions::smessage;
+
+    auto consoleSink = boost::log::add_console_log(std::clog);
+    consoleSink->set_formatter(logFmt);
 }
 
 void Logger::init(const std::string& log_file_name, int rotation_size_mb, int max_total_mb, const std::string& level)

@@ -992,6 +992,9 @@ void NodeImpl::load_persisted_shares()
             PackStream ps(share_bytes);
 
             auto share = ltc::load_share(static_cast<int64_t>(ver), ps, NetService{"database", 0});
+            // m_hash is not part of the serialized format — it's computed
+            // during share_check validation.  Restore it from the LevelDB key.
+            share.ACTION({ obj->m_hash = hash; });
             if (!m_chain->contains(share.hash()))
             {
                 m_tracker.add(share);
