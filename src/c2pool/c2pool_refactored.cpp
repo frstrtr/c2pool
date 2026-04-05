@@ -4472,6 +4472,7 @@ int main(int argc, char* argv[]) {
             }
             work_guard.reset();
 
+            if (p2p_node) p2p_node->shutdown();
             enhanced_node->shutdown();
         }
         else if (sharechain_mode) {

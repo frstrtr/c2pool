@@ -1058,6 +1058,18 @@ void NodeImpl::flush_verified_to_leveldb()
     m_verified_flush_buf.clear();
 }
 
+void NodeImpl::shutdown()
+{
+    LOG_INFO << "[Pool] NodeImpl shutdown: flushing pending LevelDB buffers...";
+    flush_verified_to_leveldb();
+    if (!m_removal_flush_buf.empty() && m_storage && m_storage->is_available())
+    {
+        m_storage->remove_shares_batch(m_removal_flush_buf);
+        m_removal_flush_buf.clear();
+    }
+    LOG_INFO << "[Pool] NodeImpl shutdown complete";
+}
+
 void NodeImpl::start_outbound_connections()
 {
     if (m_target_outbound_peers == 0)

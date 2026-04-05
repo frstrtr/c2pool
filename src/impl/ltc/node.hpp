@@ -199,6 +199,9 @@ public:
     void load_persisted_shares();
     void flush_verified_to_leveldb();
 
+    /// Graceful shutdown: flush pending verified/removal buffers to LevelDB.
+    void shutdown();
+
     /// Start dialing outbound peers from AddrStore / bootstrap list.
     /// Maintains target outbound peer count active outbound connections.
     void start_outbound_connections();
