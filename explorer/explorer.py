@@ -88,16 +88,28 @@ def _convertbits(data, frombits, tobits, pad=True):
         ret.append((acc << (tobits - bits)) & maxv)
     return ret
 
+def _bech32m_create_checksum(hrp, data):
+    values = _bech32_hrp_expand(hrp) + data
+    polymod = _bech32_polymod(values + [0, 0, 0, 0, 0, 0]) ^ 0x2bc830a3
+    return [(polymod >> 5 * (5 - i)) & 31 for i in range(6)]
+
 def bech32_encode(hrp, witver, witprog):
-    """Encode a segwit address (BIP173 bech32)."""
+    """Encode a segwit address (BIP173 bech32 for v0, BIP350 bech32m for v1+)."""
     data = [witver] + _convertbits(witprog, 8, 5)
-    checksum = _bech32_create_checksum(hrp, data)
+    if witver == 0:
+        checksum = _bech32_create_checksum(hrp, data)
+    else:
+        checksum = _bech32m_create_checksum(hrp, data)
     return hrp + "1" + "".join(BECH32_CHARSET[d] for d in data + checksum)
+
+def _hash160(data):
+    """RIPEMD160(SHA256(data)) — standard Bitcoin hash160."""
+    return hashlib.new("ripemd160", hashlib.sha256(data).digest()).digest()
 
 def script_to_address(hex_script, chain="ltc_testnet"):
     """Decode a scriptPubKey hex to a human-readable address.
 
-    Supports P2PKH, P2SH, and P2WPKH for LTC and DOGE networks.
+    Supports P2PKH, P2SH, P2WPKH, P2WSH, P2TR, and P2PK.
     Returns None if the script format is not recognized.
     """
     # Chain-specific version bytes and bech32 HRP
@@ -116,12 +128,18 @@ def script_to_address(hex_script, chain="ltc_testnet"):
     if len(s) == 22 and s[0] == 0x00 and s[1] == 0x14:
         if cfg["hrp"]:
             return bech32_encode(cfg["hrp"], 0, list(s[2:]))
-        return None  # Chain doesn't support bech32
+        return None
 
     # P2WSH: OP_0 PUSH_32 <32 bytes>
     if len(s) == 34 and s[0] == 0x00 and s[1] == 0x20:
         if cfg["hrp"]:
             return bech32_encode(cfg["hrp"], 0, list(s[2:]))
+        return None
+
+    # P2TR: OP_1 PUSH_32 <32 bytes> (BIP341 Taproot)
+    if len(s) == 34 and s[0] == 0x51 and s[1] == 0x20:
+        if cfg["hrp"]:
+            return bech32_encode(cfg["hrp"], 1, list(s[2:]))
         return None
 
     # P2PKH: OP_DUP OP_HASH160 PUSH_20 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
@@ -131,6 +149,11 @@ def script_to_address(hex_script, chain="ltc_testnet"):
     # P2SH: OP_HASH160 PUSH_20 <20 bytes> OP_EQUAL
     if len(s) == 23 and s[0] == 0xa9 and s[1] == 0x14 and s[22] == 0x87:
         return _base58check_encode(cfg["p2sh"], s[2:22])
+
+    # P2PK: PUSH <pubkey> OP_CHECKSIG — uncompressed (65 bytes) or compressed (33 bytes)
+    if len(s) in (35, 67) and s[-1] == 0xac and s[0] == len(s) - 2:
+        pubkey = s[1:-1]
+        return _base58check_encode(cfg["p2pkh"], _hash160(pubkey))
 
     return None
 
@@ -399,6 +422,44 @@ def decode_scriptsig(raw_hex):
     return result
 
 
+def _decode_multisig(hex_script, chain="ltc_testnet"):
+    """Extract addresses from a P2MS (bare multisig) scriptPubKey.
+    Returns (m, n, [addresses]) or None."""
+    s = bytes.fromhex(hex_script)
+    if len(s) < 3 or s[-1] != 0xae:  # OP_CHECKMULTISIG
+        return None
+    m = s[0] - 0x50  # OP_1..OP_16 → 1..16
+    n = s[-2] - 0x50
+    if not (1 <= m <= 16 and 1 <= n <= 16 and m <= n):
+        return None
+    pos = 1
+    addrs = []
+    for _ in range(n):
+        if pos >= len(s) - 2:
+            break
+        key_len = s[pos]
+        pos += 1
+        if key_len not in (33, 65) or pos + key_len > len(s) - 2:
+            break
+        pubkey = s[pos:pos + key_len]
+        addr = _base58check_encode(
+            {"ltc_mainnet": 0x30, "ltc_testnet": 0x6f, "doge_mainnet": 0x1e,
+             "doge_testnet": 0x71, "btc_mainnet": 0x00, "btc_testnet": 0x6f
+            }.get(chain, 0x6f),
+            _hash160(pubkey),
+        )
+        addrs.append(addr)
+        pos += key_len
+    if len(addrs) == n:
+        return m, n, addrs
+    return None
+
+
+def _safe_ascii(raw_bytes):
+    """Decode bytes to ASCII, replacing non-printable chars with dots."""
+    return "".join(chr(b) if 0x20 <= b < 0x7f else "." for b in raw_bytes)
+
+
 def decode_outputs(vout_list, chain="ltc_testnet"):
     """Decode transaction outputs into structured components."""
     outputs = []
@@ -421,10 +482,17 @@ def decode_outputs(vout_list, chain="ltc_testnet"):
             decoded = script_to_address(out["hex"], chain)
             if decoded:
                 addresses = [decoded]
+        # P2MS (bare multisig): extract all pubkey addresses
+        if not addresses and out["hex"]:
+            ms = _decode_multisig(out["hex"], chain)
+            if ms:
+                m, n, ms_addrs = ms
+                addresses = ms_addrs
+                out["type"] = f"multisig ({m}-of-{n})"
         out["addresses"] = addresses
 
         # Detect OP_RETURN
-        if out["asm"].startswith("OP_RETURN"):
+        if out["asm"].startswith("OP_RETURN") or (out["hex"] and out["hex"][:2] == "6a"):
             out["is_op_return"] = True
             hex_data = out["hex"]
             if len(hex_data) >= 4 and hex_data[:4] == "6a28":
@@ -433,6 +501,23 @@ def decode_outputs(vout_list, chain="ltc_testnet"):
                     out["ref_hash"] = hex_data[4:68]
                     out["last_txout_nonce"] = hex_data[68:84]
                     out["type"] = "p2pool_ref"
+            # Decode OP_RETURN payload as ASCII (skip opcode + push bytes)
+            if not out.get("ref_hash"):
+                try:
+                    raw = bytes.fromhex(hex_data)
+                    # Skip OP_RETURN (0x6a) + optional push-length byte(s)
+                    payload = raw[1:]
+                    if payload and payload[0] < 0x4c:
+                        payload = payload[1:]  # single-byte push
+                    elif payload and payload[0] == 0x4c:
+                        payload = payload[2:]  # OP_PUSHDATA1
+                    ascii_str = _safe_ascii(payload)
+                    # Only store if it has meaningful printable content
+                    printable = sum(1 for c in ascii_str if c != '.')
+                    if printable >= 3:
+                        out["op_return_ascii"] = ascii_str
+                except Exception:
+                    pass
 
         # Detect donation script (P2SH: a914...87)
         if out["hex"].startswith("a914") and out["hex"].endswith("87") and len(out["hex"]) == 46:
@@ -813,7 +898,7 @@ class ExplorerEngine:
                 {"index": 26, "value_btc": 1.09527823, "value_sat": 109527823, "type": "p2pkh",      "asm": "", "hex": "76a914238e0e0d040b0d300fa03777e2a0ee9d9c9c221588ac", "addresses": ["LNTx65DqrACZWCSK8Jc4c7wriSWHS448Qj"]},
                 {"index": 27, "value_btc": 1.30603390, "value_sat": 130603390, "type": "p2pkh",      "asm": "", "hex": "76a914b8089e39a70cf3dd3bf057bf86bf03dc2ea1889a88ac", "addresses": ["Lc12vJZd5oMsZY4eGLdvMo9jrXNHKaouvk"]},
                 {"index": 28, "value_btc": 1.38024571, "value_sat": 138024571, "type": "p2pkh",      "asm": "", "hex": "76a91404f4e9aaf5021dcc4cff4b40498969025d0e832f88ac", "addresses": ["LKgAMpNXkKSq1ixoELmGS2UfvNn2TrpFBx"]},
-                {"index": 29, "value_btc": 0.00000014, "value_sat": 14,        "type": "p2pk",       "asm": "", "hex": "4104ffd03de44a6e11b9917f3a29f9443283d9871c9d743ef30d5eddcd37094b64d1b3d8090496b53256786bf5c82932ec23c3b74d9f05a6f95a8b5529352656664bac", "addresses": [], "is_donation": True, "donation_type": "p2pool_old"},
+                {"index": 29, "value_btc": 0.00000014, "value_sat": 14,        "type": "p2pk",       "asm": "", "hex": "4104ffd03de44a6e11b9917f3a29f9443283d9871c9d743ef30d5eddcd37094b64d1b3d8090496b53256786bf5c82932ec23c3b74d9f05a6f95a8b5529352656664bac", "addresses": ["LeD2fnnDJYZuyt8zgDsZ2oBGmuVcxGKCLd"], "is_donation": True, "donation_type": "p2pool_old"},
                 {"index": 30, "value_btc": 0.0,        "value_sat": 0,         "type": "op_return",  "asm": "OP_RETURN 8bd158eb8a5e928fea18613ac741a8a66c3b4058d7e059921c85a07250e02e6d000000002ecd1000", "hex": "6a288bd158eb8a5e928fea18613ac741a8a66c3b4058d7e059921c85a07250e02e6d000000002ecd1000", "addresses": [], "is_op_return": True, "ref_hash": "8bd158eb8a5e928fea18613ac741a8a66c3b4058d7e059921c85a07250e02e6d", "last_txout_nonce": "000000002ecd1000", "type": "p2pool_ref"},
             ],
         },
@@ -848,7 +933,7 @@ class ExplorerEngine:
                 {"index": 1, "value_btc": 1314.86645163, "value_sat": 131486645163, "type": "p2pkh", "asm": "", "hex": "76a914238e0e0d040b0d300fa03777e2a0ee9d9c9c221588ac", "addresses": ["D8P6N7rf4urnnPvkgkcKss3hPMsJfasFAs"]},
                 {"index": 2, "value_btc": 86.58781129,   "value_sat": 8658781129,   "type": "p2pkh", "asm": "", "hex": "76a91465295f7cdd536cdda899d9ea3ca9c7a07f6f7b0988ac", "addresses": ["DEMzMHB6gjLfCU9d1LACAg1CjSS9xPvLfG"]},
                 {"index": 3, "value_btc": 5.45895328,    "value_sat": 545895328,    "type": "p2pkh", "asm": "", "hex": "76a91404f4e9aaf5021dcc4cff4b40498969025d0e832f88ac", "addresses": ["D5bJds1Ly574HvTEnnmXhmaWbJ93fUhFUP"]},
-                {"index": 4, "value_btc": 0.0,           "value_sat": 0,            "type": "nulldata", "asm": "OP_RETURN 7032702d7370622e78797a", "hex": "6a0b7032702d7370622e78797a", "addresses": [], "is_op_return": True},
+                {"index": 4, "value_btc": 0.0,           "value_sat": 0,            "type": "nulldata", "asm": "OP_RETURN 7032702d7370622e78797a", "hex": "6a0b7032702d7370622e78797a", "addresses": [], "is_op_return": True, "op_return_ascii": "p2p-spb.xyz"},
                 {"index": 5, "value_btc": 1.00000002,    "value_sat": 100000002,    "type": "p2sh",  "asm": "", "hex": "a9148c6272621d89e8fa526dd86acff60c7136be8e8587", "addresses": ["A5EZCT4tUrtoKuvJaWbtVQADzdUKdtsqpr"], "is_donation": True, "donation_type": "p2pool_combined"},
             ],
         },
@@ -1329,6 +1414,8 @@ def render_block_detail(engine, query, chain):
             if o.get("ref_hash"):
                 tags += f'ref_hash=<span class="mono">{o["ref_hash"][:16]}...</span> '
                 tags += f'nonce=<span class="mono">{o.get("last_txout_nonce", "")}</span>'
+            elif o.get("op_return_ascii"):
+                tags += f'OP_RETURN <span class="dim">{escape(o["op_return_ascii"])}</span>'
             else:
                 tags += "OP_RETURN"
         if o.get("is_donation"):
