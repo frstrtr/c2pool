@@ -94,6 +94,7 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
     std::string subscription_id_;
     std::string extranonce1_;
     std::string username_;
+    std::string worker_name_;  // worker suffix from "ADDRESS.worker" (e.g. "alpha")
     bool subscribed_ = false;
     bool authorized_ = false;
     bool need_initial_setup_ = false;

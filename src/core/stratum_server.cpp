@@ -443,11 +443,16 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         // Separators: "." and "_" (Python compat)
         // Worker name is always AFTER the last address, so strip from the end.
         auto dot_pos = username_.rfind('.');
-        if (dot_pos != std::string::npos && dot_pos > 20)
+        if (dot_pos != std::string::npos && dot_pos > 20) {
+            worker_name_ = username_.substr(dot_pos + 1);
             username_ = username_.substr(0, dot_pos);
+        }
         auto underscore_pos = username_.rfind('_');
-        if (underscore_pos != std::string::npos && underscore_pos > 20)
+        if (underscore_pos != std::string::npos && underscore_pos > 20) {
+            if (worker_name_.empty())
+                worker_name_ = username_.substr(underscore_pos + 1);
             username_ = username_.substr(0, underscore_pos);
+        }
 
         // ─── Step 3: Parse multi-chain addresses ───
         // Supported separator formats for merged mining addresses:
@@ -606,6 +611,7 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         if (mining_interface_) {
             MiningInterface::WorkerInfo wi;
             wi.username = username_;
+            wi.worker_name = worker_name_;
             wi.difficulty = hashrate_tracker_.get_current_difficulty();
             wi.connected_at = connected_at_;
             try {

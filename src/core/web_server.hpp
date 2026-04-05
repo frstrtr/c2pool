@@ -1008,6 +1008,7 @@ private:
 public:
     struct WorkerInfo {
         std::string username;      // miner address (after parsing)
+        std::string worker_name;   // worker suffix from "ADDRESS.worker" (e.g. "alpha")
         double hashrate{0.0};      // measured H/s from HashrateTracker
         double dead_hashrate{0.0}; // DOA H/s
         double difficulty{1.0};    // current vardiff difficulty

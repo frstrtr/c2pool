@@ -2853,8 +2853,22 @@ nlohmann::json MiningInterface::rest_stratum_stats()
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - w.connected_at).count();
 
-        // Key by worker name (address or address.worker)
-        workers_json[w.username + "." + sid] = {
+        // Key by worker name: "ADDRESS.worker" (like p2pool) or just "ADDRESS" if no worker suffix
+        std::string worker_key = w.worker_name.empty()
+            ? w.username
+            : w.username + "." + w.worker_name;
+
+        // Aggregate multiple connections for the same worker (p2pool behavior)
+        if (workers_json.contains(worker_key)) {
+            workers_json[worker_key]["connections"] = workers_json[worker_key]["connections"].get<int>() + 1;
+            workers_json[worker_key]["connection_difficulties"].push_back(w.difficulty);
+            workers_json[worker_key]["hash_rate"] = workers_json[worker_key]["hash_rate"].get<double>() + w.hashrate;
+            workers_json[worker_key]["dead_hash_rate"] = workers_json[worker_key]["dead_hash_rate"].get<double>() + w.dead_hashrate;
+            workers_json[worker_key]["accepted"] = workers_json[worker_key]["accepted"].get<uint64_t>() + w.accepted;
+            workers_json[worker_key]["rejected"] = workers_json[worker_key]["rejected"].get<uint64_t>() + w.rejected;
+            workers_json[worker_key]["stale"] = workers_json[worker_key]["stale"].get<uint64_t>() + w.stale;
+        } else {
+            workers_json[worker_key] = {
             {"hash_rate", w.hashrate},
             {"dead_hash_rate", w.dead_hashrate},
             {"connections", 1},
@@ -2867,6 +2881,7 @@ nlohmann::json MiningInterface::rest_stratum_stats()
             {"connected_seconds", elapsed},
             {"remote_endpoint", w.remote_endpoint}
         };
+        }
     }
 
     result["difficulty"] = 1.0;
