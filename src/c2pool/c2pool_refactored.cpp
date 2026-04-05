@@ -2119,6 +2119,12 @@ int main(int argc, char* argv[]) {
                 p2p_node->start_outbound_connections();
                 LOG_INFO << "Outbound peer connection loop started";
 
+                // p2pool node.py:260: self.set_best_share() — run think() immediately
+                // after share loading + wiring so LevelDB-loaded shares get verified
+                // and m_best_share_hash is set before the first status line fires.
+                p2p_node->run_think();
+                LOG_INFO << "Initial think() completed for loaded shares";
+
                 // When a peer announces a new best block, refresh our mining template
                 p2p_node->set_on_bestblock([&web_server, &p2p_node]() {
                     web_server.trigger_work_refresh();
