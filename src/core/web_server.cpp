@@ -2855,7 +2855,11 @@ nlohmann::json MiningInterface::rest_stratum_stats()
 
         // Key by worker name (address or address.worker)
         workers_json[w.username + "." + sid] = {
-            {"hashrate", w.hashrate},
+            {"hash_rate", w.hashrate},
+            {"dead_hash_rate", w.dead_hashrate},
+            {"connections", 1},
+            {"connection_difficulties", nlohmann::json::array({w.difficulty})},
+            {"last_seen", static_cast<uint64_t>(std::time(nullptr))},
             {"difficulty", w.difficulty},
             {"accepted", w.accepted},
             {"rejected", w.rejected},
