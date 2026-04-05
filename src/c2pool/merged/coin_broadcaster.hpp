@@ -141,6 +141,11 @@ public:
     using RawHeadersParser = std::function<std::vector<ltc::coin::BlockHeaderType>(const uint8_t*, size_t)>;
     void set_raw_headers_parser(RawHeadersParser p) { m_raw_headers_parser = std::move(p); }
 
+    // Set custom raw block parser for AuxPoW chains (DOGE).
+    // Applied to every new peer connection.
+    using RawBlockParser = std::function<ltc::coin::BlockType(const uint8_t*, size_t)>;
+    void set_raw_block_parser(RawBlockParser p) { m_raw_block_parser = std::move(p); }
+
     /// Enable BIP 35 mempool request for all current and future peer connections.
     /// Call after UTXO is initialized so incoming txs can have fees computed.
     void enable_mempool_request() {
@@ -383,6 +388,10 @@ private:
             if (m_raw_headers_parser) {
                 peer->node_p2p.set_raw_headers_parser(m_raw_headers_parser);
             }
+            // Wire AuxPoW raw block parser (DOGE)
+            if (m_raw_block_parser) {
+                peer->node_p2p.set_raw_block_parser(m_raw_block_parser);
+            }
 
             // BIP 35: enable mempool request if UTXO is ready
             if (m_request_mempool) {
@@ -477,6 +486,7 @@ private:
     FullBlockCallback    m_on_full_block;
     PeerHeightCallback   m_on_peer_height;
     RawHeadersParser     m_raw_headers_parser;
+    RawBlockParser       m_raw_block_parser;
     bool                 m_request_mempool{false};  // BIP 35 mempool sync
 };
 

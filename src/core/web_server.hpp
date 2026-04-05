@@ -896,6 +896,20 @@ public:
     std::string call_explorer_blockhash(uint32_t h, const std::string& c) { return m_explorer_blockhash_fn(h, c); }
     nlohmann::json call_explorer_getblock(const std::string& h, const std::string& c) { return m_explorer_getblock_fn(h, c); }
 
+    // Mempool explorer callbacks
+    using explorer_mempoolinfo_fn_t  = std::function<nlohmann::json(const std::string& chain)>;
+    using explorer_rawmempool_fn_t   = std::function<nlohmann::json(const std::string& chain, bool verbose, uint32_t limit)>;
+    using explorer_mempoolentry_fn_t = std::function<nlohmann::json(const std::string& txid, const std::string& chain)>;
+    void set_explorer_mempoolinfo_fn(explorer_mempoolinfo_fn_t fn) { m_explorer_mempoolinfo_fn = std::move(fn); }
+    void set_explorer_rawmempool_fn(explorer_rawmempool_fn_t fn) { m_explorer_rawmempool_fn = std::move(fn); }
+    void set_explorer_mempoolentry_fn(explorer_mempoolentry_fn_t fn) { m_explorer_mempoolentry_fn = std::move(fn); }
+    bool has_explorer_mempoolinfo_fn() const { return !!m_explorer_mempoolinfo_fn; }
+    bool has_explorer_rawmempool_fn() const { return !!m_explorer_rawmempool_fn; }
+    bool has_explorer_mempoolentry_fn() const { return !!m_explorer_mempoolentry_fn; }
+    nlohmann::json call_explorer_mempoolinfo(const std::string& c) { return m_explorer_mempoolinfo_fn(c); }
+    nlohmann::json call_explorer_rawmempool(const std::string& c, bool v, uint32_t l) { return m_explorer_rawmempool_fn(c, v, l); }
+    nlohmann::json call_explorer_mempoolentry(const std::string& t, const std::string& c) { return m_explorer_mempoolentry_fn(t, c); }
+
     // Primary payout address (for legacy /payout_addr endpoint)
     void set_payout_address(const std::string& addr) { m_payout_address = addr; }
     const std::string& get_payout_address() const { return m_payout_address; }
@@ -938,6 +952,10 @@ private:
     explorer_chaininfo_fn_t m_explorer_chaininfo_fn;
     explorer_blockhash_fn_t m_explorer_blockhash_fn;
     explorer_getblock_fn_t  m_explorer_getblock_fn;
+    // Mempool explorer callbacks
+    explorer_mempoolinfo_fn_t  m_explorer_mempoolinfo_fn;
+    explorer_rawmempool_fn_t   m_explorer_rawmempool_fn;
+    explorer_mempoolentry_fn_t m_explorer_mempoolentry_fn;
     // Primary payout address for legacy API
     std::string m_payout_address;
 

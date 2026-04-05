@@ -3,6 +3,11 @@
 > Build custom dashboards for c2pool using the HTTP API.
 > Fully compatible with the p2pool dashboard lineage:
 > **p2pool/p2pool → jtoomim/p2pool → frstrtr/p2pool-merged-v36 → frstrtr/c2pool**
+>
+> **Both the dashboard (`web-static/`) and explorer (`explorer/explorer.py`) are
+> user-customizable.** Edit HTML/JS/CSS or Python code to change the design, add
+> features, or integrate with your infrastructure. Block explorer hyperlinks
+> default to Blockchair and can be overridden per-node via YAML config.
 
 ---
 
@@ -359,15 +364,21 @@ Version string.
 
 ### GET `/web/currency_info`
 
-Blockchain explorer URLs and currency symbol. Used by the original
-p2pool dashboard to construct hyperlinks.
+Blockchain explorer URLs and currency symbol. Used by the dashboard to
+construct hyperlinks. Defaults to Blockchair; overridable via YAML config
+(`address_explorer_prefix`, `block_explorer_prefix`, `tx_explorer_prefix`).
+
+Also includes `explorer_enabled` (bool) and `explorer_url` (string) when the
+lite block explorer is active.
 
 ```json
 {
   "symbol": "LTC",
-  "address_explorer_url_prefix": "https://litecoinspace.org/address/",
-  "block_explorer_url_prefix": "https://litecoinspace.org/block/",
-  "tx_explorer_url_prefix": "https://litecoinspace.org/tx/"
+  "address_explorer_url_prefix": "https://blockchair.com/litecoin/address/",
+  "block_explorer_url_prefix": "https://blockchair.com/litecoin/block/",
+  "tx_explorer_url_prefix": "https://blockchair.com/litecoin/transaction/",
+  "explorer_enabled": false,
+  "explorer_url": ""
 }
 ```
 

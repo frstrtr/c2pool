@@ -229,5 +229,140 @@ inline std::vector<BlockHeaderType> parse_doge_headers_message(
     return result;
 }
 
+/// Parse a DOGE full block from raw P2P bytes.
+/// Handles AuxPoW: reads 80-byte header, skips AuxPoW proof if present,
+/// then reads the standard transaction list.
+///
+/// Returns a BlockType with the correct header and transactions.
+/// Throws on parse failure.
+inline ltc::coin::BlockType parse_doge_block(const uint8_t* data, size_t len)
+{
+    using ltc::coin::BlockType;
+    using ltc::coin::BlockHeaderType;
+
+    const uint8_t* pos = data;
+    const uint8_t* end = data + len;
+
+    // Step 1: Parse 80-byte base header
+    if (end - pos < 80)
+        throw std::runtime_error("DOGE block: not enough data for header");
+
+    BlockHeaderType hdr;
+    {
+        PackStream ps(std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(pos), 80));
+        ps >> hdr;
+    }
+    pos += 80;
+
+    // Step 2: Skip AuxPoW if present
+    if (is_auxpow_version(hdr.m_version)) {
+        // Reuse the same AuxPoW skip logic from parse_doge_header.
+        // We need to skip: CTransaction + hashBlock(32) + vMerkleBranch + nIndex(4)
+        //                 + vChainMerkleBranch + nChainIndex(4) + parentBlock(80)
+        auto read_varint = [&]() -> uint64_t {
+            if (pos >= end) throw std::runtime_error("DOGE block auxpow: truncated varint");
+            uint8_t first = *pos++;
+            if (first < 0xfd) return first;
+            if (first == 0xfd) {
+                if (end - pos < 2) throw std::runtime_error("truncated varint16");
+                uint16_t v = pos[0] | (pos[1] << 8); pos += 2; return v;
+            }
+            if (first == 0xfe) {
+                if (end - pos < 4) throw std::runtime_error("truncated varint32");
+                uint32_t v = pos[0] | (pos[1]<<8) | (pos[2]<<16) | (pos[3]<<24);
+                pos += 4; return v;
+            }
+            if (end - pos < 8) throw std::runtime_error("truncated varint64");
+            uint64_t v = 0;
+            for (int i = 0; i < 8; i++) v |= (uint64_t(pos[i]) << (i*8));
+            pos += 8; return v;
+        };
+
+        // 1. Skip CTransaction (coinbase of parent block)
+        {
+            if (end - pos < 4) throw std::runtime_error("DOGE block auxpow: truncated tx version");
+            pos += 4; // tx version
+            bool is_segwit = false;
+            if (end - pos >= 2 && pos[0] == 0x00 && pos[1] != 0x00) {
+                is_segwit = true;
+                pos += 2;
+            }
+            uint64_t vin_count = read_varint();
+            for (uint64_t i = 0; i < vin_count; i++) {
+                if (end - pos < 36) throw std::runtime_error("truncated vin");
+                pos += 32 + 4; // prev_hash + prev_index
+                uint64_t script_len = read_varint();
+                if (end - pos < static_cast<ptrdiff_t>(script_len)) throw std::runtime_error("truncated vin script");
+                pos += script_len;
+                if (end - pos < 4) throw std::runtime_error("truncated vin sequence");
+                pos += 4;
+            }
+            uint64_t vout_count = read_varint();
+            for (uint64_t i = 0; i < vout_count; i++) {
+                if (end - pos < 8) throw std::runtime_error("truncated vout value");
+                pos += 8;
+                uint64_t script_len = read_varint();
+                if (end - pos < static_cast<ptrdiff_t>(script_len)) throw std::runtime_error("truncated vout script");
+                pos += script_len;
+            }
+            if (is_segwit) {
+                for (uint64_t i = 0; i < vin_count; i++) {
+                    uint64_t stack_items = read_varint();
+                    for (uint64_t j = 0; j < stack_items; j++) {
+                        uint64_t item_len = read_varint();
+                        if (end - pos < static_cast<ptrdiff_t>(item_len)) throw std::runtime_error("truncated witness");
+                        pos += item_len;
+                    }
+                }
+            }
+            if (end - pos < 4) throw std::runtime_error("truncated locktime");
+            pos += 4;
+        }
+
+        // 2. Skip hashBlock (32 bytes)
+        if (end - pos < 32) throw std::runtime_error("truncated hashBlock");
+        pos += 32;
+
+        // 3. Skip vMerkleBranch
+        {
+            uint64_t count = read_varint();
+            if (end - pos < static_cast<ptrdiff_t>(count * 32)) throw std::runtime_error("truncated merkle branch");
+            pos += count * 32;
+        }
+
+        // 4. Skip nIndex (4 bytes)
+        if (end - pos < 4) throw std::runtime_error("truncated nIndex");
+        pos += 4;
+
+        // 5. Skip vChainMerkleBranch
+        {
+            uint64_t count = read_varint();
+            if (end - pos < static_cast<ptrdiff_t>(count * 32)) throw std::runtime_error("truncated chain merkle branch");
+            pos += count * 32;
+        }
+
+        // 6. Skip nChainIndex (4 bytes)
+        if (end - pos < 4) throw std::runtime_error("truncated nChainIndex");
+        pos += 4;
+
+        // 7. Skip parentBlock (80 bytes)
+        if (end - pos < 80) throw std::runtime_error("truncated parentBlock");
+        pos += 80;
+    }
+
+    // Step 3: Parse transaction list from remaining bytes
+    BlockType block;
+    static_cast<BlockHeaderType&>(block) = hdr;
+    {
+        size_t remaining = end - pos;
+        PackStream ps(std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(pos), remaining));
+        ::Unserialize(ps, TX_WITH_WITNESS(block.m_txs));
+    }
+
+    return block;
+}
+
 } // namespace coin
 } // namespace doge

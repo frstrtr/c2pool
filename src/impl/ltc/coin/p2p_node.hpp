@@ -92,6 +92,9 @@ private:
     // the standard 80+1 byte parser.  Used for DOGE AuxPoW extended headers.
     using RawHeadersParser = std::function<std::vector<BlockHeaderType>(const uint8_t*, size_t)>;
     RawHeadersParser m_raw_headers_parser;
+    // Raw block parser: if set, re-parses DOGE AuxPoW full blocks from raw P2P bytes.
+    using RawBlockParser = std::function<BlockType(const uint8_t*, size_t)>;
+    RawBlockParser m_raw_block_parser;
 
 public:
     NodeP2P(io::io_context* context, ltc::interfaces::Node* coin, config_t* config,
@@ -251,7 +254,7 @@ public:
     {
         if (m_peer)
         {
-            auto rmsg = ltc::coin::p2p::message_block::make_raw(block);
+            auto rmsg = ltc::coin::p2p::message_block::make_raw(block, {});
             m_peer->write(rmsg);
         } else
         {
@@ -266,6 +269,9 @@ public:
     void set_on_peer_height(PeerHeightCallback cb) { m_on_peer_height = std::move(cb); }
     /// Set custom raw headers parser (for DOGE AuxPoW extended headers).
     void set_raw_headers_parser(RawHeadersParser p) { m_raw_headers_parser = std::move(p); }
+
+    /// Set custom raw block parser (for DOGE AuxPoW full blocks).
+    void set_raw_block_parser(RawBlockParser p) { m_raw_block_parser = std::move(p); }
 
     /// Send getaddr to request peer addresses.
     void send_getaddr()
@@ -580,20 +586,37 @@ private:
 
     ADD_P2P_HANDLER(block)
     {
-        auto header = (BlockHeaderType) msg->m_block;
+        // When a raw block parser is set (DOGE AuxPoW), re-parse the block from
+        // raw P2P bytes.  The standard BlockType deserialization misinterprets
+        // AuxPoW data as transactions, producing garbage.
+        BlockType block;
+        if (m_raw_block_parser && !msg->m_raw_payload.empty()) {
+            try {
+                block = m_raw_block_parser(msg->m_raw_payload.data(),
+                                           msg->m_raw_payload.size());
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[" << m_chain_label << "] AuxPoW block parser failed: " << e.what()
+                            << " — falling back to standard parse";
+                block = msg->m_block;
+            }
+        } else {
+            block = msg->m_block;
+        }
+
+        auto header = static_cast<BlockHeaderType>(block);
         auto packed_header = pack(header);
         auto blockhash = Hash(packed_header.get_span());
         // ReplyMatcher may throw if nobody registered a pending request for
         // this block (e.g., unsolicited block or getdata-triggered response).
         // Catch to ensure full_block event always fires for MWEB extraction.
-        try { m_peer->get_block(blockhash, msg->m_block); } catch (...) {}
+        try { m_peer->get_block(blockhash, block); } catch (...) {}
         try { m_peer->get_header(blockhash, header); } catch (...) {}
         LOG_INFO << "[" << m_chain_label << "] Full block received: "
                  << blockhash.GetHex().substr(0, 16) << "..."
-                 << " txs=" << msg->m_block.m_txs.size()
-                 << " mweb_raw=" << msg->m_block.m_mweb_raw.size() << " bytes";
+                 << " txs=" << block.m_txs.size()
+                 << " mweb_raw=" << block.m_mweb_raw.size() << " bytes";
         // Fire full block event (carries MWEB data for state extraction)
-        m_coin->full_block.happened(msg->m_block);
+        m_coin->full_block.happened(block);
     }
 
     ADD_P2P_HANDLER(headers)

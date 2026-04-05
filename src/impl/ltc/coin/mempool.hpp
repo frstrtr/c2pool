@@ -18,7 +18,9 @@
 #include <core/log.hpp>
 #include <core/coin/utxo_view_cache.hpp>
 
+#include <algorithm>
 #include <atomic>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <set>
@@ -487,6 +489,93 @@ public:
             out[wtxid] = entry.tx;
         }
         return out;
+    }
+
+    // ─── Lightweight snapshot for explorer API ───────────────────────────
+
+    /// Lightweight entry metadata (no MutableTransaction copy).
+    struct MempoolEntrySummary {
+        uint256  txid;
+        uint32_t base_size{0};
+        uint32_t weight{0};
+        uint64_t fee{0};
+        bool     fee_known{false};
+        time_t   time_added{0};
+        uint32_t n_vin{0};
+        uint32_t n_vout{0};
+        double feerate() const {
+            uint32_t vsize = (weight + 3) / 4;
+            return (fee_known && vsize > 0) ? static_cast<double>(fee) / vsize : 0.0;
+        }
+    };
+
+    /// Aggregate mempool statistics + sorted entry list.
+    struct MempoolSummary {
+        size_t   tx_count{0};
+        size_t   total_bytes{0};
+        uint64_t total_fees{0};
+        uint32_t total_weight{0};
+        size_t   fee_known_count{0};
+        double   min_feerate{0};
+        double   max_feerate{0};
+        double   median_feerate{0};
+        double   avg_feerate{0};
+        time_t   oldest_time{0};
+        std::vector<MempoolEntrySummary> entries;  // sorted by feerate descending
+    };
+
+    /// Build a lightweight snapshot: copies only metadata (no tx bodies),
+    /// computes aggregates, sorts by feerate descending.  Single lock hold.
+    MempoolSummary get_summary() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        MempoolSummary s;
+        s.tx_count = m_pool.size();
+        s.total_bytes = m_total_bytes;
+        s.entries.reserve(m_pool.size());
+
+        std::vector<double> feerates;  // for median computation
+        double feerate_sum = 0;
+        s.oldest_time = std::numeric_limits<time_t>::max();
+
+        for (const auto& [id, e] : m_pool) {
+            MempoolEntrySummary es;
+            es.txid       = e.txid;
+            es.base_size  = e.base_size;
+            es.weight     = e.weight;
+            es.fee        = e.fee;
+            es.fee_known  = e.fee_known;
+            es.time_added = e.time_added;
+            es.n_vin      = static_cast<uint32_t>(e.tx.vin.size());
+            es.n_vout     = static_cast<uint32_t>(e.tx.vout.size());
+            s.total_weight += e.weight;
+            if (e.fee_known) {
+                s.total_fees += e.fee;
+                ++s.fee_known_count;
+                double fr = es.feerate();
+                feerates.push_back(fr);
+                feerate_sum += fr;
+                if (fr < s.min_feerate || s.min_feerate == 0) s.min_feerate = fr;
+                if (fr > s.max_feerate) s.max_feerate = fr;
+            }
+            if (e.time_added < s.oldest_time) s.oldest_time = e.time_added;
+            s.entries.push_back(std::move(es));
+        }
+
+        // Sort by feerate descending
+        std::sort(s.entries.begin(), s.entries.end(),
+            [](const MempoolEntrySummary& a, const MempoolEntrySummary& b) {
+                return a.feerate() > b.feerate();
+            });
+
+        // Median + average feerate
+        if (!feerates.empty()) {
+            std::sort(feerates.begin(), feerates.end());
+            s.median_feerate = feerates[feerates.size() / 2];
+            s.avg_feerate = feerate_sum / feerates.size();
+        }
+        if (s.tx_count == 0) s.oldest_time = 0;
+
+        return s;
     }
 
 private:

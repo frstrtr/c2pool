@@ -178,7 +178,8 @@ END_MESSAGE()
 BEGIN_MESSAGE(block)
     MESSAGE_FIELDS
     (
-        (BlockType, m_block)
+        (BlockType, m_block),
+        (std::vector<uint8_t>, m_raw_payload)
     )
     {
         READWRITE(obj.m_block);

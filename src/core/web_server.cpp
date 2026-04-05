@@ -489,6 +489,20 @@ void HttpSession::process_request()
                         } else {
                             rest_result = mining_interface_->call_explorer_getblock(hash, chain);
                         }
+                    } else if (ep == "getmempoolinfo" && mining_interface_->has_explorer_mempoolinfo_fn()) {
+                        rest_result = mining_interface_->call_explorer_mempoolinfo(chain);
+                    } else if (ep == "getrawmempool" && mining_interface_->has_explorer_rawmempool_fn()) {
+                        bool verbose = getQueryParam("verbose") == "true";
+                        uint32_t limit = 500;
+                        try { auto ls = getQueryParam("limit"); if (!ls.empty()) limit = std::min(5000u, static_cast<uint32_t>(std::stoul(ls))); } catch (...) {}
+                        rest_result = mining_interface_->call_explorer_rawmempool(chain, verbose, limit);
+                    } else if (ep == "getmempoolentry" && mining_interface_->has_explorer_mempoolentry_fn()) {
+                        std::string txid_param = getQueryParam("txid");
+                        if (txid_param.empty()) {
+                            rest_result = nlohmann::json{{"error", "Missing txid parameter"}};
+                        } else {
+                            rest_result = mining_interface_->call_explorer_mempoolentry(txid_param, chain);
+                        }
                     } else {
                         rest_result = nlohmann::json{{"error", "Unknown explorer endpoint"}};
                     }

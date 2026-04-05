@@ -514,6 +514,11 @@ int main(int argc, char* argv[]) {
     uint32_t explorer_depth_ltc = 288;
     uint32_t explorer_depth_doge = 1440;
 
+    // Custom explorer link prefixes (override Blockchair defaults)
+    std::string address_explorer_prefix;
+    std::string block_explorer_prefix;
+    std::string tx_explorer_prefix;
+
     // Optional encrypted authority message_data blob for local V36 shares.
     std::string operator_message_blob_hex;
 
@@ -1109,6 +1114,12 @@ int main(int argc, char* argv[]) {
                 explorer_depth_ltc = cfg["explorer_depth_ltc"].as<uint32_t>();
             if (cfg["explorer_depth_doge"])
                 explorer_depth_doge = cfg["explorer_depth_doge"].as<uint32_t>();
+            if (cfg["address_explorer_prefix"])
+                address_explorer_prefix = cfg["address_explorer_prefix"].as<std::string>();
+            if (cfg["block_explorer_prefix"])
+                block_explorer_prefix = cfg["block_explorer_prefix"].as<std::string>();
+            if (cfg["tx_explorer_prefix"])
+                tx_explorer_prefix = cfg["tx_explorer_prefix"].as<std::string>();
             if (cfg["cache_max_shared_hashes"])
                 cache_max_shared_hashes = cfg["cache_max_shared_hashes"].as<int>();
             if (cfg["cache_max_known_txs"])
@@ -1333,8 +1344,20 @@ int main(int argc, char* argv[]) {
                     / "embedded_headers").string();
                 LOG_INFO << "[EMB-LTC] Creating HeaderChain with DB at " << chain_db_path;
                 embedded_chain = std::make_unique<ltc::coin::HeaderChain>(ltc_params, chain_db_path);
-                if (!embedded_chain->init())
-                    LOG_WARNING << "[EMB-LTC] HeaderChain LevelDB init failed — running in-memory only";
+                // Retry init up to 5 times (previous process may still hold LevelDB lock)
+                bool chain_ok = false;
+                for (int attempt = 1; attempt <= 5; ++attempt) {
+                    if (embedded_chain->init()) {
+                        chain_ok = true;
+                        break;
+                    }
+                    LOG_WARNING << "[EMB-LTC] HeaderChain LevelDB init failed (attempt "
+                                << attempt << "/5) — retrying in 2s...";
+                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                    embedded_chain = std::make_unique<ltc::coin::HeaderChain>(ltc_params, chain_db_path);
+                }
+                if (!chain_ok)
+                    LOG_WARNING << "[EMB-LTC] HeaderChain LevelDB init failed after 5 attempts — running in-memory only";
                 else
                     LOG_INFO << "[EMB-LTC] HeaderChain initialized: size=" << embedded_chain->size()
                              << " height=" << embedded_chain->height();
@@ -1409,13 +1432,23 @@ int main(int argc, char* argv[]) {
                     utxo_opts.block_cache_size = 32 * 1024 * 1024;  // 32 MB cache
                     utxo_opts.write_buffer_size = 8 * 1024 * 1024;  // 8 MB
                     ltc_utxo_db = std::make_unique<core::coin::UTXOViewDB>(utxo_path, utxo_opts);
-                    if (ltc_utxo_db->open()) {
-                        ltc_utxo_cache = std::make_unique<core::coin::UTXOViewCache>(ltc_utxo_db.get());
-                        embedded_pool->set_utxo(ltc_utxo_cache.get());
-                        LOG_INFO << "[EMB-LTC] UTXO set opened: best_height=" << ltc_utxo_db->get_best_height()
-                                 << " best_block=" << ltc_utxo_db->get_best_block().GetHex().substr(0, 16);
-                    } else {
-                        LOG_WARNING << "[EMB-LTC] UTXO DB failed to open — fees will be unknown";
+                    {
+                        bool utxo_ok = false;
+                        for (int attempt = 1; attempt <= 5; ++attempt) {
+                            if (ltc_utxo_db->open()) { utxo_ok = true; break; }
+                            LOG_WARNING << "[EMB-LTC] UTXO DB open failed (attempt "
+                                        << attempt << "/5) — retrying in 2s...";
+                            std::this_thread::sleep_for(std::chrono::seconds(2));
+                            ltc_utxo_db = std::make_unique<core::coin::UTXOViewDB>(utxo_path, utxo_opts);
+                        }
+                        if (utxo_ok) {
+                            ltc_utxo_cache = std::make_unique<core::coin::UTXOViewCache>(ltc_utxo_db.get());
+                            embedded_pool->set_utxo(ltc_utxo_cache.get());
+                            LOG_INFO << "[EMB-LTC] UTXO set opened: best_height=" << ltc_utxo_db->get_best_height()
+                                     << " best_block=" << ltc_utxo_db->get_best_block().GetHex().substr(0, 16);
+                        } else {
+                            LOG_WARNING << "[EMB-LTC] UTXO DB failed to open after 5 attempts — fees will be unknown";
+                        }
                     }
                 }
                 mweb_tracker    = std::make_unique<ltc::coin::MWEBTracker>();
@@ -1547,6 +1580,9 @@ int main(int argc, char* argv[]) {
                 if (!explorer_url.empty())
                     web_server.set_explorer_url(explorer_url);
             }
+            if (!address_explorer_prefix.empty())
+                web_server.get_mining_interface()->set_custom_explorer_links(
+                    address_explorer_prefix, block_explorer_prefix, tx_explorer_prefix);
             web_server.get_mining_interface()->set_payout_address(payout_address);
             LOG_INFO << "Stratum config: min_diff=" << stratum_config.min_difficulty
                      << " max_diff=" << stratum_config.max_difficulty
@@ -3628,8 +3664,18 @@ int main(int argc, char* argv[]) {
                         std::string doge_db = (core::filesystem::config_path()
                             / doge_net_dir / "embedded_headers").string();
                         doge_chain = std::make_unique<doge::coin::HeaderChain>(*doge_params_ptr, doge_db);
-                        if (!doge_chain->init())
-                            LOG_WARNING << "DOGE HeaderChain LevelDB init failed — in-memory only";
+                        {
+                            bool doge_ok = false;
+                            for (int attempt = 1; attempt <= 5; ++attempt) {
+                                if (doge_chain->init()) { doge_ok = true; break; }
+                                LOG_WARNING << "DOGE HeaderChain LevelDB init failed (attempt "
+                                            << attempt << "/5) — retrying in 2s...";
+                                std::this_thread::sleep_for(std::chrono::seconds(2));
+                                doge_chain = std::make_unique<doge::coin::HeaderChain>(*doge_params_ptr, doge_db);
+                            }
+                            if (!doge_ok)
+                                LOG_WARNING << "DOGE HeaderChain LevelDB init failed after 5 attempts — in-memory only";
+                        }
 
                         // Apply DOGE checkpoint if provided
                         if (!doge_header_checkpoint_str.empty()) {
@@ -3686,12 +3732,22 @@ int main(int argc, char* argv[]) {
                             core::LevelDBOptions utxo_opts;
                             utxo_opts.block_cache_size = 16 * 1024 * 1024;  // 16 MB
                             doge_utxo_db = std::make_unique<core::coin::UTXOViewDB>(utxo_path, utxo_opts);
-                            if (doge_utxo_db->open()) {
-                                doge_utxo_cache = std::make_unique<core::coin::UTXOViewCache>(doge_utxo_db.get());
-                                if (doge_pool) doge_pool->set_utxo(doge_utxo_cache.get());
-                                LOG_INFO << "[EMB-DOGE] UTXO set opened: best_height=" << doge_utxo_db->get_best_height();
-                            } else {
-                                LOG_WARNING << "[EMB-DOGE] UTXO DB failed to open — fees will be unknown";
+                            {
+                                bool utxo_ok = false;
+                                for (int attempt = 1; attempt <= 5; ++attempt) {
+                                    if (doge_utxo_db->open()) { utxo_ok = true; break; }
+                                    LOG_WARNING << "[EMB-DOGE] UTXO DB open failed (attempt "
+                                                << attempt << "/5) — retrying in 2s...";
+                                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                                    doge_utxo_db = std::make_unique<core::coin::UTXOViewDB>(utxo_path, utxo_opts);
+                                }
+                                if (utxo_ok) {
+                                    doge_utxo_cache = std::make_unique<core::coin::UTXOViewCache>(doge_utxo_db.get());
+                                    if (doge_pool) doge_pool->set_utxo(doge_utxo_cache.get());
+                                    LOG_INFO << "[EMB-DOGE] UTXO set opened: best_height=" << doge_utxo_db->get_best_height();
+                                } else {
+                                    LOG_WARNING << "[EMB-DOGE] UTXO DB failed to open after 5 attempts — fees will be unknown";
+                                }
                             }
                         }
 
@@ -3797,6 +3853,8 @@ int main(int argc, char* argv[]) {
                             if (cfg.symbol == "DOGE") {
                                 broadcaster->set_raw_headers_parser(
                                     doge::coin::parse_doge_headers_message);
+                                broadcaster->set_raw_block_parser(
+                                    doge::coin::parse_doge_block);
                             }
 
                             // Step 4: wire DOGE header sync via AuxPoW parser.
@@ -4544,7 +4602,13 @@ int main(int argc, char* argv[]) {
                                 params.p2sh_ver = 0x32;
                                 params.chain_name = "main";
                             }
-                            return ltc::coin::block_to_explorer_json(block, height, blk_hash, params);
+                            try {
+                                return ltc::coin::block_to_explorer_json(block, height, blk_hash, params);
+                            } catch (const std::exception& e) {
+                                return nlohmann::json{{"error", std::string("Block decode error: ") + e.what()}};
+                            } catch (...) {
+                                return nlohmann::json{{"error", "Block decode error (unknown)"}};
+                            }
 
                         } else if (chain == "doge" && dg_chain && dg_udb) {
                             auto entry = dg_chain->get_header(blk_hash);
@@ -4581,7 +4645,13 @@ int main(int argc, char* argv[]) {
                                 params.p2sh_ver = 0x16;
                                 params.chain_name = "main";
                             }
-                            return ltc::coin::block_to_explorer_json(block, height, blk_hash, params);
+                            try {
+                                return ltc::coin::block_to_explorer_json(block, height, blk_hash, params);
+                            } catch (const std::exception& e) {
+                                return nlohmann::json{{"error", std::string("Block decode error: ") + e.what()}};
+                            } catch (...) {
+                                return nlohmann::json{{"error", "Block decode error (unknown)"}};
+                            }
                         }
                         return nlohmann::json{{"error", "Unknown chain or chain not enabled"}};
                     });
@@ -4590,6 +4660,166 @@ int main(int argc, char* argv[]) {
                          << " DOGE:" << (dg_chain ? "yes" : "no")
                          << " depth_ltc=" << explorer_depth_ltc
                          << " depth_doge=" << explorer_depth_doge;
+
+                // ── Mempool explorer callbacks ───────────────────────────────
+                auto* ltc_pool = embedded_pool.get();
+                auto* dg_pool  = doge_pool.get();
+
+                // getmempoolinfo: summary stats + feerate histogram
+                mi->set_explorer_mempoolinfo_fn(
+                    [ltc_pool, dg_pool, testnet]
+                    (const std::string& chain) -> nlohmann::json {
+                        auto* pool = (chain == "doge") ? dg_pool : ltc_pool;
+                        if (!pool) return nlohmann::json{{"error", "Mempool not available for chain"}};
+
+                        auto snap = pool->get_summary();
+                        time_t now = std::time(nullptr);
+
+                        // Feerate histogram: [0-1), [1-5), [5-20), [20-100), [100+) sat/vB
+                        struct Bucket { double lo, hi; size_t count{0}; size_t bytes{0}; };
+                        std::vector<Bucket> buckets = {{0,1},{1,5},{5,20},{20,100},{100,1e9}};
+                        for (const auto& e : snap.entries) {
+                            double fr = e.feerate();
+                            for (auto& b : buckets) {
+                                if (fr >= b.lo && fr < b.hi) {
+                                    ++b.count;
+                                    b.bytes += e.base_size;
+                                    break;
+                                }
+                            }
+                        }
+                        nlohmann::json hist = nlohmann::json::array();
+                        for (const auto& b : buckets) {
+                            hist.push_back({
+                                {"min_feerate", b.lo}, {"max_feerate", b.hi >= 1e9 ? nlohmann::json("inf") : nlohmann::json(b.hi)},
+                                {"count", b.count}, {"bytes", b.bytes}
+                            });
+                        }
+
+                        return nlohmann::json{
+                            {"size", snap.tx_count},
+                            {"bytes", snap.total_bytes},
+                            {"total_weight", snap.total_weight},
+                            {"total_fees", snap.total_fees},
+                            {"fee_known_count", snap.fee_known_count},
+                            {"fee_unknown_count", snap.tx_count - snap.fee_known_count},
+                            {"min_feerate", snap.min_feerate},
+                            {"max_feerate", snap.max_feerate},
+                            {"median_feerate", snap.median_feerate},
+                            {"avg_feerate", snap.avg_feerate},
+                            {"oldest_age_sec", (snap.oldest_time > 0 && now > snap.oldest_time) ? (now - snap.oldest_time) : 0},
+                            {"fee_histogram", hist},
+                            {"chain", chain}
+                        };
+                    });
+
+                // getrawmempool: txid list or verbose entries
+                mi->set_explorer_rawmempool_fn(
+                    [ltc_pool, dg_pool]
+                    (const std::string& chain, bool verbose, uint32_t limit) -> nlohmann::json {
+                        auto* pool = (chain == "doge") ? dg_pool : ltc_pool;
+                        if (!pool) return nlohmann::json{{"error", "Mempool not available for chain"}};
+
+                        if (!verbose) {
+                            // Simple txid list
+                            auto txids = pool->all_txids();
+                            nlohmann::json arr = nlohmann::json::array();
+                            for (const auto& id : txids)
+                                arr.push_back(id.GetHex());
+                            return arr;
+                        }
+
+                        // Verbose: use summary for sorted metadata
+                        auto snap = pool->get_summary();
+                        time_t now = std::time(nullptr);
+                        nlohmann::json arr = nlohmann::json::array();
+                        uint32_t count = 0;
+                        for (const auto& e : snap.entries) {
+                            if (count >= limit) break;
+                            arr.push_back({
+                                {"txid", e.txid.GetHex()},
+                                {"size", e.base_size},
+                                {"weight", e.weight},
+                                {"fee", e.fee},
+                                {"fee_known", e.fee_known},
+                                {"feerate", e.feerate()},
+                                {"time_added", e.time_added},
+                                {"age_sec", (e.time_added > 0 && now > e.time_added) ? (now - e.time_added) : 0},
+                                {"n_vin", e.n_vin},
+                                {"n_vout", e.n_vout}
+                            });
+                            ++count;
+                        }
+                        return arr;
+                    });
+
+                // getmempoolentry: single tx full detail with vin/vout
+                mi->set_explorer_mempoolentry_fn(
+                    [ltc_pool, dg_pool, testnet]
+                    (const std::string& txid_hex, const std::string& chain) -> nlohmann::json {
+                        auto* pool = (chain == "doge") ? dg_pool : ltc_pool;
+                        if (!pool) return nlohmann::json{{"error", "Mempool not available for chain"}};
+
+                        uint256 txid;
+                        txid.SetHex(txid_hex);
+                        auto opt = pool->get_entry(txid);
+                        if (!opt) return nlohmann::json{{"error", "Transaction not in mempool"}};
+
+                        const auto& e = *opt;
+                        time_t now = std::time(nullptr);
+
+                        // Determine chain params for address decoding
+                        bool is_ltc = (chain != "doge");
+
+                        // vin
+                        nlohmann::json vin_arr = nlohmann::json::array();
+                        for (const auto& inp : e.tx.vin) {
+                            vin_arr.push_back({
+                                {"prevout_hash", inp.prevout.hash.GetHex()},
+                                {"prevout_n", inp.prevout.index},
+                                {"sequence", inp.prevout.index == 0xffffffff ? "ffffffff" : std::to_string(inp.sequence)}
+                            });
+                        }
+
+                        // vout
+                        nlohmann::json vout_arr = nlohmann::json::array();
+                        for (size_t i = 0; i < e.tx.vout.size(); ++i) {
+                            const auto& out = e.tx.vout[i];
+                            std::vector<unsigned char> script(out.scriptPubKey.m_data.begin(),
+                                                              out.scriptPubKey.m_data.end());
+                            auto cls = core::classify_script(script, is_ltc, testnet);
+                            nlohmann::json vout_obj = {
+                                {"n", i},
+                                {"value_sat", out.value},
+                                {"scriptPubKey_hex", cls.hex},
+                                {"type", cls.type}
+                            };
+                            if (!cls.addresses.empty())
+                                vout_obj["address"] = cls.addresses[0];
+                            if (cls.addresses.size() > 1)
+                                vout_obj["addresses"] = cls.addresses;
+                            vout_arr.push_back(std::move(vout_obj));
+                        }
+
+                        double feerate_val = e.feerate();
+                        return nlohmann::json{
+                            {"txid", e.txid.GetHex()},
+                            {"size", e.base_size},
+                            {"witness_size", e.witness_size},
+                            {"weight", e.weight},
+                            {"fee", e.fee},
+                            {"fee_known", e.fee_known},
+                            {"feerate", feerate_val},
+                            {"time_added", e.time_added},
+                            {"age_sec", (e.time_added > 0 && now > e.time_added) ? (now - e.time_added) : 0},
+                            {"vin", vin_arr},
+                            {"vout", vout_arr},
+                            {"chain", chain}
+                        };
+                    });
+
+                LOG_INFO << "[Explorer] Mempool callbacks wired — LTC:" << (ltc_pool ? "yes" : "no")
+                         << " DOGE:" << (dg_pool ? "yes" : "no");
             }
 
             if (!web_server.start()) {

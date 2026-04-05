@@ -244,7 +244,7 @@ inline nlohmann::json block_to_explorer_json(
     j["tx"] = std::move(txs);
 
     // THE commitment (c2pool-found blocks)
-    if (!block.m_txs.empty()) {
+    if (!block.m_txs.empty() && !block.m_txs[0].vin.empty()) {
         auto& scriptSig = block.m_txs[0].vin[0].scriptSig;
         std::vector<unsigned char> sig_vec(scriptSig.m_data.begin(), scriptSig.m_data.end());
         auto the = parse_the_commitment(sig_vec);

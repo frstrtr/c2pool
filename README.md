@@ -282,6 +282,9 @@ complete examples with all options documented.
 | `--storage-save-interval` | `storage_save_interval` | 300 | Sharechain save interval |
 | `--dashboard-dir` | `dashboard_dir` | web-static | Static dashboard directory |
 | `--analytics-id` | `analytics_id` | -- | Google Analytics measurement ID (e.g. `G-XXXXXXXXXX`); injected into dashboard HTML `</head>` |
+| -- | `address_explorer_prefix` | Blockchair | Custom address explorer URL prefix |
+| -- | `block_explorer_prefix` | Blockchair | Custom block explorer URL prefix |
+| -- | `tx_explorer_prefix` | Blockchair | Custom tx explorer URL prefix |
 | -- | `explorer` | false | Enable lite block explorer (stores recent blocks + REST API) |
 | -- | `explorer_url` | -- | Explorer URL injected into dashboard nav (e.g. `http://localhost:9090`) |
 | -- | `explorer_depth_ltc` | 288 | LTC blocks to keep in explorer store |
@@ -335,6 +338,18 @@ python3 explorer/explorer.py --ltc-c2pool http://127.0.0.1:8080/api/explorer --w
 ```
 
 The explorer shows block details, decoded coinbase scripts, THE commitment proofs for c2pool-found blocks, and links to Blockchair for transactions/addresses outside the stored range.
+
+**Customization** — both the dashboard (`web-static/`) and the explorer (`explorer/explorer.py`)
+are user-customizable components. Edit HTML/JS/CSS in `web-static/` or modify
+`explorer/explorer.py` to change the design, add features, or integrate with your
+own infrastructure. Block explorer links default to Blockchair but can be overridden
+per-node via YAML config:
+
+```yaml
+address_explorer_prefix: "https://your-explorer.example.com/address/"
+block_explorer_prefix: "https://your-explorer.example.com/block/"
+tx_explorer_prefix: "https://your-explorer.example.com/tx/"
+```
 
 ---
 

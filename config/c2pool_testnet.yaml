@@ -57,8 +57,15 @@ storage_save_interval: 300     # Periodic sharechain save interval (seconds)
 cors_origin: "*"               # Access-Control-Allow-Origin header
 
 # ─── Web Dashboard ──────────────────────────────────────────────────────────
+# Dashboard and explorer are user-customizable: edit web-static/ HTML/JS/CSS
+# and explorer/explorer.py freely — they are bundled as modifiable components.
 dashboard_dir: "web-static"    # Static dashboard directory (relative or absolute)
 # analytics_id: "G-XXXXXXXXXX"  # Google Analytics measurement ID (optional)
+
+# Custom block explorer link prefixes (override Blockchair defaults).
+# address_explorer_prefix: "https://blockchair.com/litecoin/testnet/address/"
+# block_explorer_prefix: "https://blockchair.com/litecoin/testnet/block/"
+# tx_explorer_prefix: "https://blockchair.com/litecoin/testnet/transaction/"
 
 # ─── Lite Block Explorer ─────────────────────────────────────────────────────
 # explorer: false                          # Enable block storage + explorer REST API
