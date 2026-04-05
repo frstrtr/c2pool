@@ -4861,14 +4861,11 @@ nlohmann::json MiningInterface::rest_web_graph_data(const std::string& source, c
             result.push_back({entry.time, 0.0});
         }
         else if (source == "worker_count" || source == "connected_miners") {
-            // Dashboard expects [ts, number], not [ts, {incoming, outgoing}]
-            int total = 0;
-            if (entry.peers.is_number()) {
-                total = entry.peers.get<int>();
-            } else if (entry.peers.is_object()) {
-                total = entry.peers.value("incoming", 0) + entry.peers.value("outgoing", 0);
-            }
-            result.push_back({entry.time, total});
+            // p2pool: len(miner_hash_rates) = number of stratum workers with recent work
+            int count = 0;
+            if (entry.local_hash_rates.is_object())
+                count = static_cast<int>(entry.local_hash_rates.size());
+            result.push_back({entry.time, count});
         }
         else if (source == "unique_miner_count") {
             int count = 0;
