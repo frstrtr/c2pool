@@ -767,7 +767,8 @@ class ExplorerEngine:
             "nonce": 59985092,
             "merkleroot": "96f1d4f3a83499eab0bec48370a0b5e44ef054f2c7314609c876646bb0d4cd61",
             "size": 58921,
-            "tx": [{"txid": "528f890b36514977fce03e38e9843bd2d41791d227e5fe841cdd426de3d6e694"}] + [{}] * 165,
+            "tx_count": 166,
+            "tx": [{"txid": "528f890b36514977fce03e38e9843bd2d41791d227e5fe841cdd426de3d6e694"}],
             "_coinbase_decoded": {
                 "raw_hex": "03ddd72e2cfabe6d6dfe4152f52456b9890a7bf9128648c0561d5dce7fd47e8e849df6c4315e8781c2010000000000000026202d2d204d696e6564206279204879706572446f6e6b65792e636f6d20285765737420555329",
                 "length": 82,
@@ -827,7 +828,8 @@ class ExplorerEngine:
             "nonce": 0,
             "merkleroot": "1fade1ce517047e3415bf6e2d02130718c33925c611a9b19481b7038771a0cde",
             "size": 60350,
-            "tx": [{"txid": "42ca7cc895ae00b9f83e7b4fd1a2d2e59232d000d105e743a3e54df71e3a815c"}] + [{}] * 186,
+            "tx_count": 187,
+            "tx": [{"txid": "42ca7cc895ae00b9f83e7b4fd1a2d2e59232d000d105e743a3e54df71e3a815c"}],
             "_coinbase_decoded": {
                 "raw_hex": "03979f5d2f5032506f6f6c207633362f",
                 "length": 16,
@@ -1282,7 +1284,7 @@ def render_block_detail(engine, query, chain):
     <tr><td>Nonce</td><td>{block.get('nonce', '?')}</td></tr>
     <tr><td>Merkle Root</td><td class="mono">{block.get('merkleroot', '?')}</td></tr>
     <tr><td>Size</td><td>{block.get('size', '?')} bytes</td></tr>
-    <tr><td>Transactions</td><td>{len(block.get('tx', []))}</td></tr>
+    <tr><td>Transactions</td><td>{block.get('tx_count', len(block.get('tx', [])))}</td></tr>
     </table>
     <p>{nav}</p></div>"""
 
@@ -1419,6 +1421,9 @@ def render_block_detail(engine, query, chain):
         tx_html += f'<td>{n_in}</td><td>{n_out}</td></tr>'
     if len(block.get("tx", [])) > 50:
         tx_html += f'<tr><td colspan="4" class="dim">... and {len(block["tx"]) - 50} more</td></tr>'
+    tx_count = block.get("tx_count", len(block.get("tx", [])))
+    if tx_count > len(block.get("tx", [])):
+        tx_html += f'<tr><td colspan="4" class="dim">Only coinbase shown. Block contains {tx_count} transactions total.</td></tr>'
     tx_html += '</table></div>'
 
     title = f"Block {height}"
