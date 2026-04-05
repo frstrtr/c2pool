@@ -867,6 +867,10 @@ public:
     void set_dashboard_dir(const std::string& dir) { m_dashboard_dir = dir; }
     const std::string& get_dashboard_dir() const { return m_dashboard_dir; }
 
+    // Google Analytics (or compatible) measurement ID injected into HTML pages
+    void set_analytics_id(const std::string& id) { m_analytics_id = id; }
+    const std::string& get_analytics_id() const { return m_analytics_id; }
+
     // Primary payout address (for legacy /payout_addr endpoint)
     void set_payout_address(const std::string& addr) { m_payout_address = addr; }
     const std::string& get_payout_address() const { return m_payout_address; }
@@ -896,6 +900,8 @@ private:
 
     // Dashboard static file serving directory (empty = disabled)
     std::string m_dashboard_dir;
+    // Google Analytics measurement ID (e.g. "G-XXXXXXXXXX")
+    std::string m_analytics_id;
     // Primary payout address for legacy API
     std::string m_payout_address;
 
@@ -1038,6 +1044,7 @@ public:
 
     // Dashboard directory for static file serving
     void set_dashboard_dir(const std::string& dir);
+    void set_analytics_id(const std::string& id);
 
     // Wire a live coin-daemon RPC connection for block template generation
     void set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Node* coin = nullptr);

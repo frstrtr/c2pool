@@ -502,6 +502,9 @@ int main(int argc, char* argv[]) {
     // Dashboard directory (web-static/ by default, relative to CWD)
     std::string dashboard_dir = "web-static";
 
+    // Google Analytics measurement ID (e.g. G-XXXXXXXXXX)
+    std::string analytics_id;
+
     // Optional encrypted authority message_data blob for local V36 shares.
     std::string operator_message_blob_hex;
 
@@ -1087,6 +1090,8 @@ int main(int argc, char* argv[]) {
                 storage_save_interval = cfg["storage_save_interval"].as<int>();
             if (!cli_explicit.count("dashboard_dir") && cfg["dashboard_dir"])
                 dashboard_dir = cfg["dashboard_dir"].as<std::string>();
+            if (cfg["analytics_id"])
+                analytics_id = cfg["analytics_id"].as<std::string>();
             if (cfg["cache_max_shared_hashes"])
                 cache_max_shared_hashes = cfg["cache_max_shared_hashes"].as<int>();
             if (cfg["cache_max_known_txs"])
@@ -1518,6 +1523,8 @@ int main(int argc, char* argv[]) {
 
             // Dashboard serving directory and payout address for legacy API
             web_server.set_dashboard_dir(dashboard_dir);
+            if (!analytics_id.empty())
+                web_server.set_analytics_id(analytics_id);
             web_server.get_mining_interface()->set_payout_address(payout_address);
             LOG_INFO << "Stratum config: min_diff=" << stratum_config.min_difficulty
                      << " max_diff=" << stratum_config.max_difficulty

@@ -58,6 +58,7 @@ cors_origin: "*"               # Access-Control-Allow-Origin header
 
 # ─── Web Dashboard ──────────────────────────────────────────────────────────
 dashboard_dir: "web-static"    # Static dashboard directory (relative or absolute)
+# analytics_id: "G-XXXXXXXXXX"  # Google Analytics measurement ID (optional)
 
 # ─── DOGE Merged Mining ─────────────────────────────────────────────────────
 doge_testnet4alpha: true       # Use testnet4alpha chain params (not testnet3)

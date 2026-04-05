@@ -469,6 +469,25 @@ void HttpSession::process_request()
                         std::string contents((std::istreambuf_iterator<char>(file)),
                                              std::istreambuf_iterator<char>());
 
+                        // Inject analytics tag into HTML pages if configured
+                        const auto& analytics_id = mining_interface_->get_analytics_id();
+                        if (!analytics_id.empty() && (ext == ".html" || ext == ".htm")) {
+                            auto pos = contents.find("</head>");
+                            if (pos == std::string::npos) pos = contents.find("</HEAD>");
+                            if (pos != std::string::npos) {
+                                std::string tag =
+                                    "<!-- analytics -->\n"
+                                    "<script async src=\"https://www.googletagmanager.com/gtag/js?id=" + analytics_id + "\"></script>\n"
+                                    "<script>\n"
+                                    "window.dataLayer=window.dataLayer||[];\n"
+                                    "function gtag(){dataLayer.push(arguments);}\n"
+                                    "gtag('js',new Date());\n"
+                                    "gtag('config','" + analytics_id + "');\n"
+                                    "</script>\n";
+                                contents.insert(pos, tag);
+                            }
+                        }
+
                         response.set(http::field::content_type, mime);
                         response.set(http::field::cache_control, "public, max-age=3600");
                         response.body() = std::move(contents);
@@ -5794,6 +5813,13 @@ void WebServer::set_dashboard_dir(const std::string& dir)
     mining_interface_->set_dashboard_dir(dir);
     if (!dir.empty())
         LOG_INFO << "Dashboard serving from: " << dir;
+}
+
+void WebServer::set_analytics_id(const std::string& id)
+{
+    mining_interface_->set_analytics_id(id);
+    if (!id.empty())
+        LOG_INFO << "Analytics tag enabled: " << id;
 }
 
 bool WebServer::start_solo()

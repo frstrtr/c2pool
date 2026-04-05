@@ -96,3 +96,4 @@ storage_save_interval: 300     # Periodic sharechain save interval (seconds)
 
 # ─── Web Dashboard ──────────────────────────────────────────────────────────
 dashboard_dir: "web-static"    # Static dashboard directory (relative or absolute)
+# analytics_id: "G-XXXXXXXXXX"  # Google Analytics measurement ID (optional)
