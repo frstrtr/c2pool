@@ -1768,7 +1768,8 @@ int main(int argc, char* argv[]) {
 
                             // Step 1: Update UTXO set (BEFORE mempool cleanup)
                             // Connect block: spend inputs, add outputs, save undo data
-                            if (utxo && utxo_db) {
+                            // Skip blocks already processed (warm restart: UTXO persists in LevelDB)
+                            if (utxo && utxo_db && height > utxo->get_best_height()) {
                                 auto txid_fn = [](const ltc::coin::MutableTransaction& tx) {
                                     return ltc::coin::compute_txid(tx);
                                 };
@@ -1801,13 +1802,19 @@ int main(int argc, char* argv[]) {
                                 // Reference: litecoin/src/validation.h MIN_BLOCKS_TO_KEEP = 288
                                 // Only fire once, and only when header chain has synced
                                 // (height > keep_depth ensures we're at tip, not genesis).
+                                // On warm restart, UTXO best_height is already within range
+                                // — skip bootstrap to avoid re-downloading blocks already processed.
                                 static bool ltc_bootstrap_done = false;
                                 constexpr uint32_t LTC_KEEP = core::coin::LTC_MIN_BLOCKS_TO_KEEP;
                                 if (!ltc_bootstrap_done && chain && bcaster && height > LTC_KEEP) {
                                     ltc_bootstrap_done = true;
+                                    // Only request blocks we haven't processed yet
+                                    uint32_t utxo_best = utxo->get_best_height();
+                                    uint32_t start_from = (utxo_best > 0 && utxo_best >= height - LTC_KEEP)
+                                        ? utxo_best + 1 : height - LTC_KEEP;
                                     int requested = 0;
-                                    for (uint32_t bi = 1; bi <= LTC_KEEP && bi <= height; ++bi) {
-                                        auto entry = chain->get_header_by_height(height - bi);
+                                    for (uint32_t h = start_from; h < height; ++h) {
+                                        auto entry = chain->get_header_by_height(h);
                                         if (entry) {
                                             bcaster->request_full_block(entry->block_hash);
                                             ++requested;
@@ -1815,8 +1822,12 @@ int main(int argc, char* argv[]) {
                                     }
                                     if (requested > 0)
                                         LOG_INFO << "[EMB-LTC] Bootstrap: requested " << requested
-                                                 << " historical blocks (MIN_BLOCKS_TO_KEEP="
-                                                 << LTC_KEEP << ")";
+                                                 << " blocks (utxo_best=" << utxo_best
+                                                 << " tip=" << height
+                                                 << " MIN_BLOCKS_TO_KEEP=" << LTC_KEEP << ")";
+                                    else
+                                        LOG_INFO << "[EMB-LTC] UTXO warm restart: best_height="
+                                                 << utxo_best << " — no bootstrap needed";
                                 }
                             }
 
@@ -3881,7 +3892,8 @@ int main(int argc, char* argv[]) {
                                                  << " from=" << peer;
 
                                         // UTXO connect (before mempool cleanup)
-                                        if (utxo && utxo_db) {
+                                        // Skip blocks already processed (warm restart)
+                                        if (utxo && utxo_db && height > utxo->get_best_height()) {
                                             // DOGE: txid = hash of full serialization (no witness stripping)
                                             auto txid_fn = [](const ltc::coin::MutableTransaction& tx) {
                                                 return ltc::coin::compute_txid(tx);
@@ -3912,21 +3924,27 @@ int main(int argc, char* argv[]) {
                                             // Bootstrap: seed UTXO with MIN_BLOCKS_TO_KEEP (1440) blocks.
                                             // Matches dogecoind pruned node safety depth.
                                             // Reference: dogecoin/src/validation.h MIN_BLOCKS_TO_KEEP = 1440
-                                            // Only fire once, and only when header chain has synced
-                                            // (height > keep_depth ensures we're at tip, not genesis).
+                                            // On warm restart, skip blocks already in UTXO LevelDB.
                                             static bool doge_bootstrap_done = false;
                                             constexpr uint32_t DOGE_KEEP = core::coin::DOGE_MIN_BLOCKS_TO_KEEP;
                                             if (!doge_bootstrap_done && chain && height > DOGE_KEEP) {
                                                 doge_bootstrap_done = true;
+                                                uint32_t utxo_best = utxo->get_best_height();
+                                                uint32_t start_from = (utxo_best > 0 && utxo_best >= height - DOGE_KEEP)
+                                                    ? utxo_best + 1 : height - DOGE_KEEP;
                                                 int req = 0;
-                                                for (uint32_t bi = 1; bi <= DOGE_KEEP && bi <= height; ++bi) {
-                                                    auto e = chain->get_header_by_height(height - bi);
+                                                for (uint32_t h = start_from; h < height; ++h) {
+                                                    auto e = chain->get_header_by_height(h);
                                                     if (e) { bcaster_ptr->request_full_block(e->block_hash); ++req; }
                                                 }
                                                 if (req > 0)
                                                     LOG_INFO << "[EMB-DOGE] Bootstrap: requested " << req
-                                                             << " historical blocks (MIN_BLOCKS_TO_KEEP="
-                                                             << DOGE_KEEP << ")";
+                                                             << " blocks (utxo_best=" << utxo_best
+                                                             << " tip=" << height
+                                                             << " MIN_BLOCKS_TO_KEEP=" << DOGE_KEEP << ")";
+                                                else
+                                                    LOG_INFO << "[EMB-DOGE] UTXO warm restart: best_height="
+                                                             << utxo_best << " — no bootstrap needed";
                                             }
                                         }
                                         if (pool) {
