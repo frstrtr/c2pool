@@ -1922,7 +1922,10 @@ public:
         }
 
         // Rounding remainder → donation (integer division truncates)
-        uint64_t final_donation = donation_amount + (miners_reward - total_distributed);
+        // Guard against uint64 underflow: total_distributed can exceed miners_reward
+        // when per-miner rounding accumulates beyond the pool (rare with many miners).
+        uint64_t remainder = (total_distributed <= miners_reward) ? (miners_reward - total_distributed) : 0;
+        uint64_t final_donation = donation_amount + remainder;
 
         // V36 CONSENSUS RULE: Donation must be >= 1 satoshi
         if (final_donation < 1 && static_cast<int64_t>(subsidy) > 0 && !result.empty()) {

@@ -17,6 +17,7 @@
 #include <crypto/sha256.h>      // CSHA256 for P2PK→P2PKH conversion
 #include <crypto/ripemd160.h>   // CRIPEMD160 for Hash160
 #include <c2pool/merged/merged_mining.hpp>  // Integrated merged mining
+#include <impl/ltc/config_pool.hpp>          // PoolConfig::is_testnet for donation addr
 
 #include <iomanip>
 #include <sstream>
@@ -4469,6 +4470,40 @@ nlohmann::json MiningInterface::rest_current_merged_payouts()
                                 break;
                             }
                         }
+                    }
+                }
+                // Donation not matched by hash160 — attach to LTC donation address
+                // by name (p2pool web.py:1164). DONATION_SCRIPT (P2PK → LeD2f on mainnet)
+                // and COMBINED_DONATION_SCRIPT (P2SH → MLhSm on mainnet) have different
+                // hash160 values, so hash160 matching won't find the parent.
+                if (!attached && is_donation) {
+                    // Use known DOGE donation address (precomputed, same as p2pool)
+                    std::string doge_donation_addr = merged_addr;
+                    if (doge_donation_addr.empty() || doge_donation_addr == "donation")
+                        doge_donation_addr = ltc::PoolConfig::is_testnet
+                            ? "2N63WXLw22FXFdLBNqWZLsDX7WQJTPXus7f"   // COMBINED_DONATION_DOGE_TESTNET
+                            : "A5EZCT4tUrtoKuvJaWbtVQADzdUKdtsqpr";  // COMBINED_DONATION_DOGE_MAINNET
+
+                    // Find LTC donation address: try known prefixes
+                    std::string ltc_donation_key;
+                    for (auto& [parent_addr, entry] : result.items()) {
+                        // Pre-V36: LeD2fnn... (hash160 of DONATION_SCRIPT pubkey)
+                        // V36+:    MLhSmVQ... (COMBINED_DONATION_SCRIPT P2SH)
+                        if (parent_addr.rfind("LeD2f", 0) == 0 ||
+                            parent_addr.rfind("MLhSm", 0) == 0)
+                        {
+                            ltc_donation_key = parent_addr;
+                            break;
+                        }
+                    }
+                    if (!ltc_donation_key.empty()) {
+                        result[ltc_donation_key]["merged"].push_back({
+                            {"symbol", ci.symbol},
+                            {"address", doge_donation_addr},
+                            {"amount", amount / 1e8},
+                            {"source", "donation"}
+                        });
+                        attached = true;
                     }
                 }
                 if (!attached && amount > 0) {
