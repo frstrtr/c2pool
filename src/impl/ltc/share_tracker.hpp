@@ -1867,20 +1867,13 @@ public:
         if (total_weight.IsNull() || subsidy == 0)
             return result;
 
-        // Integer division matching p2pool exactly:
-        // grand_total = total_weight (includes donation_weight)
-        // donation_amount = subsidy * donation_weight // grand_total
-        uint64_t grand_total_lo = total_weight.GetLow64();
-        uint64_t donation_w_lo = donation_weight.GetLow64();
-
-        // For large weights, use double only for the ratio, then truncate
-        // This matches Python's integer // on arbitrary-precision ints
+        // Integer division matching p2pool exactly (using uint288 throughout
+        // to avoid uint64 truncation — total_weight routinely exceeds 2^64):
+        // donation_amount = subsidy * donation_weight // total_weight
+        uint288 subsidy288(subsidy);
         uint64_t donation_amount = 0;
         if (!donation_weight.IsNull()) {
-            // donation_amount = subsidy * donation_weight // grand_total
-            // Use 128-bit arithmetic to avoid overflow
-            __uint128_t num = static_cast<__uint128_t>(subsidy) * donation_w_lo;
-            donation_amount = static_cast<uint64_t>(num / grand_total_lo);
+            donation_amount = (subsidy288 * donation_weight / total_weight).GetLow64();
         }
 
         // finder_fee = 0 (CANONICAL_MERGED_FINDER_FEE_PER_MILLE = 0 in p2pool)
@@ -1892,10 +1885,10 @@ public:
         // First pass: resolve scripts and compute accepted_total
         struct ResolvedEntry {
             std::vector<unsigned char> script;
-            uint64_t weight;
+            uint288 weight;
         };
         std::vector<ResolvedEntry> resolved;
-        uint64_t accepted_total = 0;
+        uint288 accepted_total;
         for (const auto& [key, weight] : weights) {
             std::vector<unsigned char> script;
             if (!operator_ltc_script.empty() && !operator_merged_script.empty() && key == operator_ltc_script) {
@@ -1904,17 +1897,17 @@ public:
                 script = resolve_merged_payout_script(key);
             }
             if (script.empty()) continue;  // Unconvertible (P2WSH, P2TR) — skip
-            uint64_t w = weight.GetLow64();
-            resolved.push_back({std::move(script), w});
-            accepted_total += w;
+            resolved.push_back({std::move(script), weight});
+            accepted_total = accepted_total + weight;
         }
 
-        // Second pass: distribute miners_reward proportionally
+        // Second pass: distribute miners_reward proportionally (uint288 arithmetic)
         uint64_t total_distributed = 0;
+        uint288 miners_reward288(miners_reward);
         for (const auto& entry : resolved) {
-            __uint128_t num = static_cast<__uint128_t>(miners_reward) * entry.weight;
-            uint64_t amount = (accepted_total > 0) ?
-                static_cast<uint64_t>(num / accepted_total) : 0;
+            uint64_t amount = !accepted_total.IsNull()
+                ? (miners_reward288 * entry.weight / accepted_total).GetLow64()
+                : 0;
             if (amount > 0) {
                 result[entry.script] += amount;
                 total_distributed += amount;
@@ -2094,14 +2087,16 @@ private:
                     if (obj->m_desired_version < 36) return;
                     auto target = chain::bits_to_target(obj->m_bits);
                     auto att = chain::target_to_average_attempts(target);
-                    delta.total_weight = att * 65535;
-                    delta.total_donation_weight = att * static_cast<uint32_t>(obj->m_donation);
                     auto raw_script = get_share_script(obj);
                     if (raw_script.empty()) return;
                     // Normalize P2WPKH→P2PKH for merged chain compatibility.
                     // P2TR/P2WSH → empty → skipped (unconvertible).
                     auto script = normalize_script_for_merged(raw_script);
                     if (script.empty()) return;
+                    // Only set total_weight/donation for convertible scripts
+                    // (matching p2pool: unconvertible → (1, {}, 0, 0))
+                    delta.total_weight = att * 65535;
+                    delta.total_donation_weight = att * static_cast<uint32_t>(obj->m_donation);
                     delta.weights[script] = att * static_cast<uint32_t>(65535 - obj->m_donation);
                 });
                 return delta;
@@ -2127,8 +2122,10 @@ private:
                         if (obj->m_desired_version < 36) return;
                         auto target = chain::bits_to_target(obj->m_bits);
                         auto att = chain::target_to_average_attempts(target);
-                        delta.total_weight = att * 65535;
-                        delta.total_donation_weight = att * static_cast<uint32_t>(obj->m_donation);
+                        // NOTE: total_weight and donation_weight are set AFTER
+                        // convertibility check below.  p2pool returns (1, {}, 0, 0)
+                        // for unconvertible scripts — zero total, zero donation.
+                        // Setting them here would inflate the denominator.
 
                         std::vector<unsigned char> weight_key;
                         const char* tier_name = "raw:v35";
@@ -2215,7 +2212,12 @@ private:
                             }
                         }
                         // Tier 3: unconvertible — skip, weight redistributed
+                        // p2pool: return (1, {}, 0, 0) — share counts but zero weight
                         if (weight_key.empty()) return;
+                        // Only set total_weight/donation for convertible scripts
+                        // (matching p2pool MergedWeightsSkipList.get_delta)
+                        delta.total_weight = att * 65535;
+                        delta.total_donation_weight = att * static_cast<uint32_t>(obj->m_donation);
                         delta.weights[weight_key] = att * static_cast<uint32_t>(65535 - obj->m_donation);
                     });
                     return delta;
