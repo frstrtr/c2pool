@@ -2253,10 +2253,15 @@ int main(int argc, char* argv[]) {
                         }
 
                         if (scan_depth > 0) {
-                            LOG_INFO << "[BLOCK-SCAN] Scanning " << scan_depth << " shares"
-                                     << " (latest block ts=" << latest_block_ts
+                            // Scan ALL heads (not just verified best) to catch blocks on forks
+                            auto& chain = p2p_node->tracker().chain;
+                            auto heads = chain.get_heads();
+                            LOG_INFO << "[BLOCK-SCAN] Scanning " << scan_depth << " shares from "
+                                     << heads.size() << " head(s) (latest block ts=" << latest_block_ts
                                      << ", existing=" << existing.size() << ")";
-                            p2p_node->tracker().scan_chain_for_blocks(best, scan_depth);
+                            for (const auto& [head_hash, _] : heads) {
+                                p2p_node->tracker().scan_chain_for_blocks(head_hash, scan_depth);
+                            }
                         } else {
                             LOG_INFO << "[BLOCK-SCAN] No new shares since last found block — skipping";
                         }
