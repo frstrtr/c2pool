@@ -4234,78 +4234,168 @@ nlohmann::json MiningInterface::rest_miner_payouts(const std::string& address)
 
 nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cached_sc)
 {
+    // Matches p2pool's get_version_signaling() — all fields the dashboard JS expects.
+    constexpr int TARGET_VERSION = 36;
+    const std::map<int, std::string> share_type_names = {
+        {17, "Share"}, {32, "PreSegwitShare"}, {33, "NewShare"},
+        {34, "SegwitMiningShare"}, {35, "PaddingBugfixShare"}, {36, "MergedMiningShare"}
+    };
+
     nlohmann::json result = nlohmann::json::object();
-    result["chain_height"] = 0;
-    result["chain_length_required"] = 0;
-    result["chain_ready"] = false;
-    result["chain_maturity"] = 0.0;
-    result["lookbehind"] = 0;
-    result["total_weight"] = 0;
-    result["share_types"] = nlohmann::json::object();
-    result["current_share_type"] = 0;
-    result["current_share_name"] = "";
-    result["versions"] = nlohmann::json::object();
-    result["full_chain_versions"] = nlohmann::json::object();
-    result["status"] = "no_transition";
-    result["message"] = "";
 
-    // Use pre-computed sharechain stats if provided (avoids second expensive chain walk)
+    // Use pre-computed sharechain stats if provided
     nlohmann::json sc;
-    if (cached_sc && !cached_sc->is_null()) {
+    if (cached_sc && !cached_sc->is_null())
         sc = *cached_sc;
-    } else if (m_sharechain_stats_fn) {
+    else if (m_sharechain_stats_fn)
         sc = m_sharechain_stats_fn();
+
+    if (sc.is_null()) return result;
+
+    int chain_height = sc.value("chain_height", 0);
+    int chain_length = sc.value("chain_length", 8640);
+    int overall_total = sc.value("total_shares", 0);
+
+    if (overall_total < 10) return result;
+
+    // ── Share type counts (format VERSION) ──
+    int overall_v36_shares = 0;
+    int current_share_type = 0;
+    nlohmann::json share_types_json = nlohmann::json::object();
+    if (sc.contains("shares_by_version") && sc["shares_by_version"].is_object()) {
+        auto& sv = sc["shares_by_version"];
+        for (auto& [ver, count] : sv.items()) {
+            int v = std::stoi(ver);
+            int c = count.get<int>();
+            auto it = share_type_names.find(v);
+            std::string name = (it != share_type_names.end()) ? it->second : "V" + ver;
+            double pct = overall_total > 0 ? (c * 100.0 / overall_total) : 0;
+            share_types_json[ver] = {{"name", name}, {"count", c}, {"percentage", pct}};
+            if (v >= TARGET_VERSION) overall_v36_shares += c;
+            if (v > current_share_type) current_share_type = v;
+        }
     }
 
-    if (!sc.is_null()) {
-        if (sc.contains("chain_height"))
-            result["chain_height"] = sc["chain_height"];
-        if (sc.contains("shares_by_version")) {
-            result["versions"] = sc["shares_by_version"];
-            // share_types: format version counts (share.VERSION)
-            auto& sv = sc["shares_by_version"];
-            if (sv.is_object()) {
-                nlohmann::json st = nlohmann::json::object();
-                for (auto& [ver, count] : sv.items())
-                    st[ver] = {{"count", count}};
-                result["share_types"] = st;
-                // Set current share type to the highest version
-                if (!sv.empty()) {
-                    auto last = sv.items().begin();
-                    for (auto it = sv.items().begin(); it != sv.items().end(); ++it)
-                        last = it;
-                    result["current_share_type"] = std::stoi((*last).key());
-                    result["current_share_name"] = "V" + (*last).key();
-                }
-            }
-        }
-        // full_chain_versions: desired version counts (share.desired_version)
-        // p2pool shows "want V35:N V36:M" from desired_version, not format version
-        if (sc.contains("shares_by_desired_version")) {
-            auto& dv = sc["shares_by_desired_version"];
-            if (dv.is_object()) {
-                nlohmann::json fcv = nlohmann::json::object();
-                for (auto& [ver, count] : dv.items())
-                    fcv[ver] = {{"count", count}};
-                result["full_chain_versions"] = fcv;
-            }
-        }
-        if (sc.contains("total_shares"))
-            result["total_weight"] = sc["total_shares"];
-
-        // show_transition: golden border when V35→V36 transition in progress.
-        // Matches p2pool: show when multiple format versions coexist, hide once 100% V36.
-        if (sc.contains("shares_by_version") && sc["shares_by_version"].is_object()) {
-            auto& sv = sc["shares_by_version"];
-            int total = 0, target_count = 0;
-            for (auto& [ver, count] : sv.items()) {
-                int c = count.get<int>();
-                total += c;
-                if (std::stoi(ver) >= 36) target_count += c;
-            }
-            result["show_transition"] = (total > 0 && target_count < total);
+    // ── Desired version counts (voting) ──
+    int overall_v36_votes = 0;
+    nlohmann::json full_chain_versions = nlohmann::json::object();
+    nlohmann::json versions_json = nlohmann::json::object();
+    if (sc.contains("shares_by_desired_version") && sc["shares_by_desired_version"].is_object()) {
+        auto& dv = sc["shares_by_desired_version"];
+        for (auto& [ver, count] : dv.items()) {
+            int v = std::stoi(ver);
+            int c = count.get<int>();
+            double pct = overall_total > 0 ? (c * 100.0 / overall_total) : 0;
+            full_chain_versions[ver] = {{"count", c}, {"percentage", pct}};
+            versions_json[ver] = {{"weight", c}, {"percentage", pct}};
+            if (v >= TARGET_VERSION) overall_v36_votes += c;
         }
     }
+
+    double overall_v36_vote_pct = overall_total > 0 ? (overall_v36_votes * 100.0 / overall_total) : 0;
+    double overall_v36_share_pct = overall_total > 0 ? (overall_v36_shares * 100.0 / overall_total) : 0;
+
+    // ── Chain maturity ──
+    double chain_maturity = chain_length > 0 ? std::min(chain_height / static_cast<double>(chain_length), 1.0) * 100.0 : 0;
+    bool chain_ready = chain_height >= chain_length;
+
+    // ── Current share name ──
+    auto cit = share_type_names.find(current_share_type);
+    std::string current_share_name = (cit != share_type_names.end()) ? cit->second : "V" + std::to_string(current_share_type);
+
+    // ── Target version: successor if V35 has one (V36), else dominant vote ──
+    int target_version = TARGET_VERSION;  // V35's successor is V36
+    auto tit = share_type_names.find(target_version);
+    std::string target_version_name = (tit != share_type_names.end()) ? tit->second : "V" + std::to_string(target_version);
+
+    // ── Transition detection ──
+    bool successor_transition = (current_share_type < TARGET_VERSION);  // V35 → V36
+    bool classic_transition = false;  // dominant vote differs from current
+    bool is_transitioning = classic_transition || successor_transition;
+
+    // ── show_transition: golden border ──
+    bool all_target = (overall_total > 0 && overall_v36_shares == overall_total);
+    bool confirmed = all_target && chain_height >= chain_length * 3;
+    bool show_transition = (is_transitioning || !confirmed) && !confirmed && !all_target;
+
+    // ── Sampling window signaling ──
+    // p2pool uses chain_length//10 sampling window at position 9/10 into chain.
+    // We approximate from desired_version counts in the full chain walk.
+    int sampling_window_size = chain_length / 10;
+    double sampling_signaling = overall_v36_vote_pct;  // approximate from full chain
+
+    // ── Status and message (matching p2pool phases) ──
+    std::string status, message;
+    double transition_progress = 0;
+
+    if (!is_transitioning && all_target) {
+        status = "no_transition";
+        message = "No version transition in progress";
+        transition_progress = 100;
+    } else if (!chain_ready) {
+        status = "building_chain";
+        int remaining = chain_length - chain_height;
+        message = "Building chain: " + std::to_string(chain_height) + "/" +
+                  std::to_string(chain_length) + " shares (need " +
+                  std::to_string(remaining) + " more before upgrade checks activate)";
+        transition_progress = chain_maturity;
+    } else if (sampling_signaling >= 95) {
+        status = "activating";
+        char buf[128];
+        snprintf(buf, sizeof(buf), "V%d activation threshold reached! %.1f%% in sampling window — switchover imminent",
+                 target_version, sampling_signaling);
+        message = buf;
+        transition_progress = 100;
+    } else if (sampling_signaling >= 60) {
+        status = "signaling_strong";
+        char buf[128];
+        snprintf(buf, sizeof(buf), "Strong V%d signaling — activation approaching (need 95%%)", target_version);
+        message = buf;
+        transition_progress = sampling_signaling;
+    } else if (overall_v36_votes > 0) {
+        status = "propagating";
+        char buf[256];
+        snprintf(buf, sizeof(buf), "V%d votes propagating: %d votes (%.1f%% of chain)",
+                 target_version, overall_v36_votes, overall_v36_vote_pct);
+        message = buf;
+        transition_progress = overall_v36_vote_pct;
+    } else {
+        status = "waiting";
+        char buf[256];
+        snprintf(buf, sizeof(buf), "Waiting for miners to upgrade. No V%d votes in chain yet (0/%d shares)",
+                 target_version, overall_total);
+        message = buf;
+        transition_progress = 0;
+    }
+
+    // ── Populate result ──
+    result["chain_height"] = chain_height;
+    result["chain_length_required"] = chain_length;
+    result["chain_ready"] = chain_ready;
+    result["chain_maturity"] = std::round(chain_maturity * 100) / 100.0;
+    result["lookbehind"] = std::min(chain_height, chain_length / 10);
+    result["total_weight"] = overall_total;
+    result["sampling_window_size"] = sampling_window_size;
+    result["sampling_signaling"] = std::round(sampling_signaling * 100) / 100.0;
+    result["share_types"] = share_types_json;
+    result["current_share_type"] = current_share_type;
+    result["current_share_name"] = current_share_name;
+    result["target_version"] = target_version;
+    result["target_version_name"] = target_version_name;
+    result["versions"] = versions_json;
+    result["full_chain_versions"] = full_chain_versions;
+    result["overall_v36_votes"] = overall_v36_votes;
+    result["overall_v36_vote_pct"] = std::round(overall_v36_vote_pct * 100) / 100.0;
+    result["overall_v36_shares"] = overall_v36_shares;
+    result["overall_v36_share_pct"] = std::round(overall_v36_share_pct * 100) / 100.0;
+    result["overall_total"] = overall_total;
+    result["show_transition"] = show_transition;
+    result["is_transitioning"] = is_transitioning;
+    result["transition_progress"] = std::round(transition_progress * 100) / 100.0;
+    result["thresholds"] = {{"accept", 60}, {"activate", 95}};
+    result["status"] = status;
+    result["message"] = message;
+
     return result;
 }
 

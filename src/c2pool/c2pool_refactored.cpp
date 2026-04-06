@@ -2731,6 +2731,7 @@ int main(int argc, char* argv[]) {
                 result["fork_count"]      = static_cast<int>(chain.get_heads().size());
                 result["chain_tip_hash"]  = best.IsNull() ? "" : best.GetHex();
                 result["chain_height"]    = best.IsNull() ? 0 : chain.get_height(best);
+                result["chain_length"]    = static_cast<int>(ltc::PoolConfig::chain_length());
 
                 // O(log n) aggregate stats via skiplist — replaces O(n) linear walk
                 int walk = best.IsNull() ? 0 : std::min(static_cast<int>(chain.get_height(best)),
