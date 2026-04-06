@@ -168,6 +168,16 @@ public:
                     share_init_verify(*s, true);  // computes scrypt + sets flags
                     ++scanned;
 
+                    // Diagnostic: log pow_hash vs block_target for first few shares
+                    if (scanned <= 3 || scanned % 2000 == 0) {
+                        uint256 bt = chain::bits_to_target(s->m_min_header.m_bits);
+                        LOG_INFO << "[BLOCK-SCAN] i=" << i
+                                 << " hash=" << pos.GetHex().substr(0,16)
+                                 << " pow=" << g_last_pow_hash.GetHex().substr(0,16)
+                                 << " blk_target=" << bt.GetHex().substr(0,16)
+                                 << " bits=0x" << std::hex << s->m_min_header.m_bits << std::dec
+                                 << " is_block=" << g_last_init_is_block;
+                    }
                     if (g_last_init_is_block && m_on_block_found) {
                         auto* idx = chain.get_index(pos);
                         if (idx) idx->is_block_solution = true;
