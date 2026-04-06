@@ -17,6 +17,7 @@
 #include "config_pool.hpp"
 #include "share_tracker.hpp"
 #include "share_check.hpp"
+#include "core/address_utils.hpp"
 
 #include <core/log.hpp>
 #include <core/target_utils.hpp>
@@ -211,23 +212,28 @@ private:
             for (auto& [addr, work] : addr_work)
             {
                 double pct = 100.0 * work / total_work;
-                // Show first 30 hex chars of the script for identification
-                std::string addr_hex;
-                for (size_t i = 0; i < std::min(addr.size(), size_t(15)); ++i) {
-                    char buf[3];
-                    snprintf(buf, sizeof(buf), "%02x", addr[i]);
-                    addr_hex += buf;
+                // Convert scriptPubKey to human-readable address
+                std::string addr_str = core::script_to_address(
+                    addr, true /*is_litecoin*/, PoolConfig::is_testnet);
+                if (addr_str.empty()) {
+                    // Fallback: show truncated script hex for non-standard scripts
+                    for (size_t i = 0; i < std::min(addr.size(), size_t(15)); ++i) {
+                        char buf[3];
+                        snprintf(buf, sizeof(buf), "%02x", addr[i]);
+                        addr_str += buf;
+                    }
+                    addr_str = "script:" + addr_str;
                 }
                 if (pct >= CONCENTRATION_ALERT_PCT)
                 {
-                    LOG_WARNING << "[MONITOR-CONC] ALERT addr=" << addr_hex
+                    LOG_WARNING << "[MONITOR-CONC] ALERT addr=" << addr_str
                                 << " pct=" << pct << "%"
                                 << " window=" << label << "(" << depth << ")";
                     ++alerts;
                 }
                 else if (pct >= CONCENTRATION_WARN_PCT)
                 {
-                    LOG_WARNING << "[MONITOR-CONC] WARN addr=" << addr_hex
+                    LOG_WARNING << "[MONITOR-CONC] WARN addr=" << addr_str
                                 << " pct=" << pct << "%"
                                 << " window=" << label << "(" << depth << ")";
                 }
@@ -247,13 +253,15 @@ private:
                 {
                     if (count >= 3) break;
                     if (count > 0) top3 << " ";
-                    std::string hex;
-                    for (size_t i = 0; i < std::min(a.size(), size_t(8)); ++i) {
-                        char buf[3];
-                        snprintf(buf, sizeof(buf), "%02x", a[i]);
-                        hex += buf;
+                    std::string display = core::script_to_address(
+                        a, true, PoolConfig::is_testnet);
+                    if (display.empty()) {
+                        for (size_t i = 0; i < std::min(a.size(), size_t(8)); ++i) {
+                            char buf[3]; snprintf(buf, sizeof(buf), "%02x", a[i]);
+                            display += buf;
+                        }
                     }
-                    top3 << hex << ":" << (100.0 * w / total_work) << "%";
+                    top3 << display << ":" << (100.0 * w / total_work) << "%";
                     ++count;
                 }
                 LOG_INFO << "[MONITOR-CONC] top3 window=" << label << "(" << depth << ") " << top3.str();
