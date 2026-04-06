@@ -33,6 +33,8 @@ namespace chain {
 struct StatsDelta
 {
     int32_t share_count{0};
+    int32_t orphan_count{0};                                 // stale_info == 253
+    int32_t dead_count{0};                                   // stale_info == 254
     double difficulty_sum{0.0};
     std::map<std::string, int32_t> version_counts;           // format version: "35" → N, "36" → M
     std::map<std::string, int32_t> desired_version_counts;   // desired version: "35" → N, "36" → M
@@ -43,6 +45,8 @@ inline StatsDelta combine_stats_deltas(const StatsDelta& a, const StatsDelta& b)
 {
     StatsDelta r;
     r.share_count = a.share_count + b.share_count;
+    r.orphan_count = a.orphan_count + b.orphan_count;
+    r.dead_count = a.dead_count + b.dead_count;
     r.difficulty_sum = a.difficulty_sum + b.difficulty_sum;
     r.version_counts = a.version_counts;
     for (const auto& [k, v] : b.version_counts) r.version_counts[k] += v;
@@ -60,6 +64,8 @@ inline StatsDelta combine_stats_deltas(const StatsDelta& a, const StatsDelta& b)
 struct StatsResult
 {
     int32_t share_count{0};
+    int32_t orphan_count{0};
+    int32_t dead_count{0};
     double difficulty_sum{0.0};
     std::map<std::string, int32_t> version_counts;
     std::map<std::string, int32_t> desired_version_counts;
@@ -119,6 +125,8 @@ public:
         // Phase 2: walk cached skip levels (largest jumps first)
         uint256 pos = start;
         int32_t sol_count = 0;
+        int32_t sol_orphan = 0;
+        int32_t sol_dead = 0;
         double sol_diff = 0.0;
         std::map<std::string, int32_t> sol_versions;
         std::map<std::string, int32_t> sol_desired;
@@ -147,6 +155,8 @@ public:
 
                 // Take this jump
                 sol_count = new_count;
+                sol_orphan += d.orphan_count;
+                sol_dead += d.dead_count;
                 sol_diff += d.difficulty_sum;
                 for (const auto& [k, v] : d.version_counts) sol_versions[k] += v;
                 for (const auto& [k, v] : d.desired_version_counts) sol_desired[k] += v;
@@ -160,7 +170,7 @@ public:
                 break;
         }
 
-        return {sol_count, sol_diff, std::move(sol_versions), std::move(sol_desired), std::move(sol_miners)};
+        return {sol_count, sol_orphan, sol_dead, sol_diff, std::move(sol_versions), std::move(sol_desired), std::move(sol_miners)};
     }
 
 private:

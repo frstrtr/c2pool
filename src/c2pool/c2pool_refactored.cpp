@@ -2682,6 +2682,8 @@ int main(int argc, char* argv[]) {
                         auto& cd = chain.get(hash);
                         cd.share.invoke([&](auto* s) {
                             d.share_count = 1;
+                            if (static_cast<int>(s->m_stale_info) == 253) d.orphan_count = 1;
+                            else if (static_cast<int>(s->m_stale_info) == 254) d.dead_count = 1;
                             d.version_counts[std::to_string(s->version)] = 1;
                             d.desired_version_counts[std::to_string(s->m_desired_version)] = 1;
 
@@ -2726,7 +2728,6 @@ int main(int argc, char* argv[]) {
                     if (h > best_height) { best = head_hash; best_height = h; }
                 }
 
-                result["total_shares"]    = static_cast<int>(chain.size());
                 result["fork_count"]      = static_cast<int>(chain.get_heads().size());
                 result["chain_tip_hash"]  = best.IsNull() ? "" : best.GetHex();
                 result["chain_height"]    = best.IsNull() ? 0 : chain.get_height(best);
@@ -2736,6 +2737,9 @@ int main(int argc, char* argv[]) {
                     static_cast<int>(ltc::PoolConfig::chain_length()));
                 auto sr = stats_skiplist->query(best, walk);
 
+                result["total_shares"]    = sr.share_count;
+                result["orphan_shares"]   = sr.orphan_count;
+                result["dead_shares"]     = sr.dead_count;
                 result["shares_by_version"] = sr.version_counts;
                 result["shares_by_desired_version"] = sr.desired_version_counts;
                 result["shares_by_miner"]   = sr.miner_counts;
