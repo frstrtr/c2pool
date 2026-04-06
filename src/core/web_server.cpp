@@ -4292,6 +4292,19 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
         }
         if (sc.contains("total_shares"))
             result["total_weight"] = sc["total_shares"];
+
+        // show_transition: golden border when V35→V36 transition in progress.
+        // Matches p2pool: show when multiple format versions coexist, hide once 100% V36.
+        if (sc.contains("shares_by_version") && sc["shares_by_version"].is_object()) {
+            auto& sv = sc["shares_by_version"];
+            int total = 0, target_count = 0;
+            for (auto& [ver, count] : sv.items()) {
+                int c = count.get<int>();
+                total += c;
+                if (std::stoi(ver) >= 36) target_count += c;
+            }
+            result["show_transition"] = (total > 0 && target_count < total);
+        }
     }
     return result;
 }
