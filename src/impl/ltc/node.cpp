@@ -1000,10 +1000,24 @@ void NodeImpl::load_persisted_shares()
                 m_tracker.add(share);
                 loaded++;
 
-                // Restore cached pow_hash from LevelDB onto the index
-                if (!meta.pow_hash.IsNull()) {
+                // Restore or compute pow_hash on the index.
+                // p2pool recomputes pow_hash on every load (data.py:1362).
+                // We cache it in LevelDB to avoid scrypt, but recompute if missing.
+                {
                     auto* idx = m_tracker.chain.get_index(share.hash());
-                    if (idx) idx->pow_hash = meta.pow_hash;
+                    if (idx) {
+                        if (!meta.pow_hash.IsNull()) {
+                            idx->pow_hash = meta.pow_hash;
+                        } else {
+                            // Recompute scrypt pow_hash (matching p2pool's __init__ behavior)
+                            try {
+                                g_last_pow_hash = uint256();
+                                share.ACTION({ share_init_verify(*obj, true); });
+                                if (!g_last_pow_hash.IsNull())
+                                    idx->pow_hash = g_last_pow_hash;
+                            } catch (...) {}
+                        }
+                    }
                 }
 
                 // p2pool known_verified: pre-populate verified tracker without re-verification
