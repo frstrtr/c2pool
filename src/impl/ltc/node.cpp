@@ -1012,9 +1012,20 @@ void NodeImpl::load_persisted_shares()
                             // Recompute scrypt pow_hash (matching p2pool's __init__ behavior)
                             try {
                                 g_last_pow_hash = uint256();
-                                share.ACTION({ share_init_verify(*obj, true); });
+                                g_last_init_is_block = false;
+                                uint256 computed_hash;
+                                share.ACTION({ computed_hash = share_init_verify(*obj, true); });
                                 if (!g_last_pow_hash.IsNull())
                                     idx->pow_hash = g_last_pow_hash;
+                                // Diagnostic: detect hash mismatch (header reconstruction bug)
+                                if (!computed_hash.IsNull() && computed_hash != hash) {
+                                    static int hash_mismatch = 0;
+                                    if (++hash_mismatch <= 5)
+                                        LOG_WARNING << "[LOAD-DIAG] hash mismatch! stored="
+                                                    << hash.GetHex().substr(0,16)
+                                                    << " computed=" << computed_hash.GetHex().substr(0,16)
+                                                    << " pow=" << g_last_pow_hash.GetHex().substr(0,16);
+                                }
                             } catch (...) {}
                         }
                     }
