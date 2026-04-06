@@ -4396,6 +4396,79 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
     result["status"] = status;
     result["message"] = message;
 
+    // ── Transition message + authority announcements from share message blob ──
+    // Matches p2pool's _get_transition_message() and _get_authority_announcements().
+    result["transition_message"] = nullptr;
+    result["authority_announcements"] = nlohmann::json::array();
+
+    if (m_protocol_messages_fn) {
+        try {
+            auto pm = m_protocol_messages_fn();
+            if (pm.value("decrypted", false) && pm.contains("messages") && pm["messages"].is_array()) {
+                auto now = static_cast<uint32_t>(std::time(nullptr));
+                nlohmann::json announcements = nlohmann::json::array();
+
+                for (auto& msg : pm["messages"]) {
+                    int msg_type = msg.value("type", 0);
+                    uint32_t ts = msg.value("timestamp", uint32_t(0));
+                    std::string payload_hex = msg.value("payload_hex", "");
+                    bool is_authority = msg.value("protocol_authority", false);
+
+                    // Try to decode payload as UTF-8 text, then parse as JSON
+                    std::vector<unsigned char> payload_bytes;
+                    if (!payload_hex.empty()) {
+                        auto parsed = ParseHex(payload_hex);
+                        payload_bytes.assign(parsed.begin(), parsed.end());
+                    }
+                    std::string payload_text(payload_bytes.begin(), payload_bytes.end());
+                    nlohmann::json payload_json;
+                    try { payload_json = nlohmann::json::parse(payload_text); } catch (...) {}
+
+                    if (msg_type == 0x20 && is_authority) {
+                        // MSG_TRANSITION_SIGNAL — use the first one found
+                        if (result["transition_message"].is_null()) {
+                            nlohmann::json tmsg = nlohmann::json::object();
+                            if (payload_json.is_object()) {
+                                tmsg["msg"] = payload_json.value("msg", "");
+                                tmsg["url"] = payload_json.value("url", "");
+                                tmsg["urgency"] = payload_json.value("urg", "info");
+                                tmsg["from_ver"] = payload_json.value("from", "");
+                                tmsg["to_ver"] = payload_json.value("to", "");
+                            } else {
+                                tmsg["msg"] = payload_text;
+                                tmsg["urgency"] = "info";
+                            }
+                            tmsg["timestamp"] = ts;
+                            tmsg["verified"] = true;
+                            tmsg["authority"] = true;
+                            result["transition_message"] = tmsg;
+                        }
+                    } else if (msg_type == 0x03 || msg_type == 0x10) {
+                        // MSG_POOL_ANNOUNCE or MSG_EMERGENCY
+                        nlohmann::json ann = nlohmann::json::object();
+                        std::string type_name = (msg_type == 0x10) ? "EMERGENCY" : "POOL_ANNOUNCE";
+                        ann["type"] = type_name;
+                        ann["type_id"] = msg_type;
+                        ann["timestamp"] = ts;
+                        ann["age"] = (now > ts) ? static_cast<int>(now - ts) : 0;
+                        ann["verified"] = true;
+                        ann["authority"] = is_authority;
+                        if (payload_json.is_object()) {
+                            ann["text"] = payload_json.value("msg", payload_json.value("text", ""));
+                            ann["urgency"] = payload_json.value("urg", payload_json.value("urgency", "info"));
+                            ann["url"] = payload_json.value("url", "");
+                        } else {
+                            ann["text"] = payload_text;
+                            ann["urgency"] = (msg_type == 0x10) ? "alert" : "info";
+                        }
+                        announcements.push_back(ann);
+                    }
+                }
+                result["authority_announcements"] = announcements;
+            }
+        } catch (...) {}
+    }
+
     return result;
 }
 
