@@ -2207,6 +2207,18 @@ int main(int argc, char* argv[]) {
                 p2p_node->run_think();
                 LOG_INFO << "Initial think() completed for loaded shares";
 
+                // Diagnostic: check if twin block share exists in tracker
+                {
+                    uint256 twin_hash;
+                    twin_hash.SetHex("e353fe7d65896bfeeab87efec46890ed8f67d5609fc1e365fb76162906075dee");
+                    bool in_chain = p2p_node->tracker().chain.contains(twin_hash);
+                    auto* idx = in_chain ? p2p_node->tracker().chain.get_index(twin_hash) : nullptr;
+                    LOG_INFO << "[TWIN-DIAG] share=" << twin_hash.GetHex().substr(0,16)
+                             << " in_chain=" << in_chain
+                             << " pow_hash=" << (idx && !idx->pow_hash.IsNull() ? idx->pow_hash.GetHex().substr(0,16) : "null")
+                             << " is_block=" << (idx ? idx->is_block_solution : false);
+                }
+
                 // Scan verified chain for block solutions newer than last known found block.
                 // On first run: scans full CHAIN_LENGTH. On subsequent restarts: only new shares.
                 {
