@@ -293,6 +293,7 @@ public:
     // Per-share metadata
     int64_t time_seen{0};
     int32_t naughty{0};
+    bool is_block_solution{false};  // pow_hash <= block_target (set during init_verify)
 
     ShareIndex() : base_index(), work(0), min_work(0) {}
 

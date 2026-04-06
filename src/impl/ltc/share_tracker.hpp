@@ -144,6 +144,8 @@ private:
 public:
     // Callback fired when a share passes verification (for LevelDB persistence)
     std::function<void(const uint256&)> m_on_share_verified;
+    // Callback fired when a verified share meets the block target (found block)
+    std::function<void(const uint256&)> m_on_block_found;
 
     ShareTracker() {
         // p2pool SubsetTracker pattern: verified shares navigation
@@ -273,6 +275,15 @@ public:
         // Notify LevelDB persistence layer
         if (m_on_share_verified)
             m_on_share_verified(share_hash);
+
+        // Block detection: if share_init_verify flagged this share as a block solution,
+        // fire the callback. Matches p2pool's tracker.verified.added watcher (node.py:289).
+        if (m_on_block_found && g_last_init_is_block) {
+            g_last_init_is_block = false;
+            auto* idx = chain.get_index(share_hash);
+            if (idx) idx->is_block_solution = true;
+            m_on_block_found(share_hash);
+        }
 
         // Naughty propagation: if parent is naughty, increment (up to 6 generations)
         // Python data.py:1432-1438 — ancestor punishment for invalid block shares

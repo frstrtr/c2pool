@@ -2876,6 +2876,38 @@ int main(int argc, char* argv[]) {
                 return result;
             });
 
+            // Wire block-found callback: when a verified share meets the block target,
+            // record it to the found_blocks store. Matches p2pool's tracker.verified.added
+            // watcher in node.py:289 — detects blocks from ANY pool participant.
+            p2p_node->tracker().m_on_block_found = [&p2p_node, &web_server, &is_testnet](const uint256& share_hash) {
+                auto mi = web_server.get_mining_interface();
+                auto& chain = p2p_node->tracker().chain;
+                if (!chain.contains(share_hash)) return;
+
+                chain.get(share_hash).share.invoke([&](auto* s) {
+                    uint64_t height = s->m_absheight;
+                    uint256 block_hash = s->m_hash;  // share hash = block header hash
+                    double net_diff = mi->get_network_difficulty();
+                    double share_diff = chain::target_to_difficulty(chain::bits_to_target(s->m_bits));
+                    double pool_hr = mi->get_local_hashrate();
+
+                    std::string miner_addr;
+                    if constexpr (requires { s->m_address; })
+                        miner_addr = HexStr(s->m_address.m_data);
+                    else if constexpr (requires { s->m_pubkey_hash; })
+                        miner_addr = s->m_pubkey_hash.GetHex();
+
+                    LOG_INFO << "GOT BLOCK FROM PEER! share=" << share_hash.GetHex().substr(0,16)
+                             << " miner=" << miner_addr.substr(0,16)
+                             << " height=" << height;
+
+                    mi->record_found_block(
+                        height, block_hash, 0, is_testnet ? "tLTC" : "LTC",
+                        miner_addr, share_hash.GetHex(), net_diff, share_diff, pool_hr, 0);
+                    mi->schedule_block_verification(block_hash.GetHex());
+                });
+            };
+
             // Expose decoded protocol messages from best share via API.
             web_server.get_mining_interface()->set_protocol_messages_fn([&p2p_node]() {
                 nlohmann::json result = {

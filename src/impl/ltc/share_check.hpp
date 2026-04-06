@@ -450,6 +450,10 @@ inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParam
     return {ref_hash, nonce};
 }
 
+// Thread-local flag: set by share_init_verify when a share beats the block target.
+// Read by attempt_verify() to fire the block-found callback without re-computing scrypt.
+inline thread_local bool g_last_init_is_block = false;
+
 // ============================================================================
 // share_init_verify()
 //
@@ -740,9 +744,10 @@ uint256 share_init_verify(const ShareT& share, bool check_pow = true)
         // Block detection: check if share's scrypt hash also meets the BLOCK target.
         // min_header.m_bits = block difficulty from GBT (much harder than share target).
         // When pow_hash <= block_target, this share IS a solved block!
-        // Use static dedup to avoid logging same block twice (phase1 + phase2 both call this).
         uint256 block_target = chain::bits_to_target(share.m_min_header.m_bits);
+        g_last_init_is_block = false;
         if (!block_target.IsNull() && pow_hash <= block_target) {
+            g_last_init_is_block = true;
             static uint256 s_last_block_share;
             if (share_hash != s_last_block_share) {
                 s_last_block_share = share_hash;
