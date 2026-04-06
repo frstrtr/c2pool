@@ -176,7 +176,13 @@ public:
                     }
                     if (m_on_merged_block_check && !g_last_pow_hash.IsNull())
                         m_on_merged_block_check(pos, g_last_pow_hash);
-                } catch (...) {}  // share_init_verify may throw on corrupt shares
+                } catch (const std::exception& e) {
+                    static int scan_err_count = 0;
+                    if (++scan_err_count <= 3)
+                        LOG_WARNING << "[BLOCK-SCAN] share_init_verify failed i=" << i
+                                    << " hash=" << pos.GetHex().substr(0,16)
+                                    << " error: " << e.what();
+                }
                 pos = s->m_prev_hash;
             });
         }
