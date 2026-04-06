@@ -4531,6 +4531,59 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
     if (result["authority_announcements"].empty() && !m_cached_authority_announcements.empty())
         result["authority_announcements"] = m_cached_authority_announcements;
 
+    // ── Address format warnings (node-generated, matches p2pool) ──
+    {
+        bool ratchet_confirmed = all_target && confirmed;
+        nlohmann::json warnings = nlohmann::json::array();
+
+        if (!ratchet_confirmed && TARGET_VERSION >= 36) {
+            warnings.push_back({
+                {"id", "v35_addr_limitation"},
+                {"urgency", "recommended"},
+                {"title", "V35 Address Limitation (Current Phase)"},
+                {"text", "During V35 (current share format), shares cannot carry "
+                         "explicit merged mining addresses. Even if you configure "
+                         "LTC,DOGE in stratum, PPLNS will use ONLY auto-converted "
+                         "DOGE addresses derived from your LTC public key hash. "
+                         "Explicit address support activates after V36 transition."}
+            });
+        }
+
+        warnings.push_back({
+            {"id", "multiaddr_format"},
+            {"urgency", "recommended"},
+            {"title", "Multi-Address Mining Format"},
+            {"text", "V36 introduces merged mining. To receive rewards on both "
+                     "chains, configure your miner's stratum username as: "
+                     "LTC_ADDRESS,DOGE_ADDRESS.worker_name  "
+                     "Example: ltc1q...abc,D9ab...def.rig1"}
+        });
+
+        warnings.push_back({
+            {"id", "auto_convert"},
+            {"urgency", "info"},
+            {"title", "Address Auto-Conversion"},
+            {"text", "If you only provide a LTC address, a DOGE address will be "
+                     "auto-derived from its public key hash. This derived address "
+                     "may NOT match your actual DOGE wallet \u2014 you could lose "
+                     "merged mining rewards. Always specify your own DOGE address "
+                     "explicitly."}
+        });
+
+        warnings.push_back({
+            {"id", "invalid_addr_redist"},
+            {"urgency", "info"},
+            {"title", "Invalid Address Redistribution"},
+            {"text", "Miners with invalid or unparseable addresses are handled "
+                     "per case: (1) Invalid LTC + no DOGE = both redistributed. "
+                     "(2) Invalid LTC + valid DOGE = DOGE preserved, LTC "
+                     "reverse-derived from DOGE key (Case 4). "
+                     "Redistributed shares go probabilistically to PPLNS miners."}
+        });
+
+        result["address_warnings"] = warnings;
+    }
+
     return result;
 }
 
