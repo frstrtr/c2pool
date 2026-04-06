@@ -1565,6 +1565,10 @@ int main(int argc, char* argv[]) {
             core::WebServer web_server(ioc, http_host, static_cast<uint16_t>(http_port), 
                                      settings->m_testnet, enhanced_node, blockchain);
 
+            // Shared function pointer for DOGE historic target lookup via embedded HeaderChain.
+            // Declared here so both --integrated callback wiring and merged mining init can access.
+            auto doge_target_fn = std::make_shared<std::function<uint256(uint32_t)>>();
+
             // Apply stratum tuning from CLI/YAML to the MiningInterface
             web_server.get_mining_interface()->set_stratum_config(stratum_config);
             web_server.get_mining_interface()->set_cors_origin(http_cors_origin);
@@ -2910,23 +2914,36 @@ int main(int argc, char* argv[]) {
                 });
             };
 
-            // Wire merged block detection for peer shares: check pow_hash against DOGE target.
-            // This detects twin blocks (LTC+DOGE found simultaneously) from any pool participant.
+            // Wire merged block detection for peer shares.
+            // doge_target_fn is set later when doge_chain is created — captured via shared_ptr.
             p2p_node->tracker().m_on_merged_block_check =
-                [&web_server](const uint256& share_hash, const uint256& pow_hash) {
+                [&web_server, &p2p_node, doge_target_fn](const uint256& share_hash, const uint256& pow_hash) {
                 auto mi = web_server.get_mining_interface();
                 auto* mm = mi->get_mm_manager();
                 if (!mm || !mm->has_chains()) return;
 
-                auto chain_infos = mm->get_chain_infos();
-                for (const auto& ci : chain_infos) {
-                    if (ci.target.IsNull()) continue;
-                    if (pow_hash <= ci.target) {
-                        // This share also solves the merged chain!
+                for (const auto& ci : mm->get_chain_infos()) {
+                    uint256 target = ci.target;
+
+                    // Fallback: if current target doesn't match, use historic lookup
+                    if ((target.IsNull() || !(pow_hash <= target)) && *doge_target_fn) {
+                        uint32_t share_ts = 0;
+                        auto& chain = p2p_node->tracker().chain;
+                        if (chain.contains(share_hash)) {
+                            chain.get(share_hash).share.invoke([&](auto* s) {
+                                share_ts = s->m_min_header.m_timestamp;
+                            });
+                        }
+                        if (share_ts > 0)
+                            target = (*doge_target_fn)(share_ts);
+                    }
+
+                    if (target.IsNull()) continue;
+                    if (pow_hash <= target) {
                         LOG_INFO << "*** MERGED BLOCK FROM PEER! " << ci.symbol
                                  << " share=" << share_hash.GetHex().substr(0,16)
                                  << " pow=" << pow_hash.GetHex().substr(0,16)
-                                 << " target=" << ci.target.GetHex().substr(0,16);
+                                 << " target=" << target.GetHex().substr(0,16);
 
                         uint256 block_hash;
                         block_hash.SetHex(ci.block_hash);
@@ -3691,7 +3708,6 @@ int main(int argc, char* argv[]) {
           } // end if (!solo_mode && !custodial_mode) ... else
 
             // --- Integrated Merged Mining ---
-            // Parse --merged specs and set up the manager (replaces standalone mm-adapter)
             std::unique_ptr<c2pool::merged::MergedMiningManager> mm_manager;
             // Merged chain P2P broadcasters (one per chain with P2P configured)
             std::map<uint32_t, std::unique_ptr<c2pool::merged::CoinBroadcaster>> merged_broadcasters;
@@ -3812,6 +3828,24 @@ int main(int argc, char* argv[]) {
                                     doge_chain->set_dynamic_checkpoint(cp_h, cp_hash);
                             }
                         }
+
+                        // Set the DOGE historic target lookup for merged block detection.
+                        // Used by m_on_merged_block_check during startup block scan.
+                        *doge_target_fn = [&doge_chain](uint32_t share_ts) -> uint256 {
+                            auto tip = doge_chain->tip();
+                            if (!tip.has_value()) return uint256();
+                            uint32_t tip_ts = tip->header.m_timestamp;
+                            int32_t dt = static_cast<int32_t>(tip_ts) - static_cast<int32_t>(share_ts);
+                            int32_t blocks_back = dt / 60;  // ~1 DOGE block/min
+                            int32_t est_h = static_cast<int32_t>(tip->height) - blocks_back;
+                            if (est_h < 1) return uint256();
+                            auto hdr = doge_chain->get_header_by_height(static_cast<uint32_t>(est_h));
+                            if (!hdr.has_value()) return uint256();
+                            uint256 t;
+                            t.SetCompact(hdr->header.m_bits);
+                            return t;
+                        };
+                        LOG_INFO << "[MM-DOGE] Historic target lookup wired via HeaderChain";
 
                         // Seed genesis if empty (same pattern as LTC genesis seeding).
                         // Reference: dogecoin/src/chainparams.cpp CreateGenesisBlock()
