@@ -4219,7 +4219,59 @@ nlohmann::json MiningInterface::rest_best_share()
         result["round"] = round;
     }
 
-    result["median_pct"] = 0.0;
+    // ── Merged chain (DOGE) best share stats ──
+    double merged_net_diff = 0.0;
+    std::string merged_symbol = "DOGE";
+    if (m_mm_manager && m_mm_manager->has_chains()) {
+        auto chain_infos = m_mm_manager->get_chain_infos();
+        if (!chain_infos.empty()) {
+            merged_net_diff = chain_infos.front().difficulty;
+            if (!chain_infos.front().symbol.empty())
+                merged_symbol = chain_infos.front().symbol;
+        }
+    }
+
+    if (merged_net_diff > 0 || m_best_difficulty.merged_all_time > 0) {
+        std::lock_guard<std::mutex> lock(m_best_diff_mutex);
+        auto pct = [](double d, double nd) { return nd > 0 ? d / nd * 100.0 : 0.0; };
+        result["merged"] = {
+            {"network_difficulty", merged_net_diff},
+            {"symbol", merged_symbol},
+            {"all_time", {
+                {"difficulty", m_best_difficulty.merged_all_time},
+                {"pct_of_block", pct(m_best_difficulty.merged_all_time, merged_net_diff)},
+                {"miner", m_best_difficulty.merged_all_time_miner},
+                {"timestamp", m_best_difficulty.merged_all_time_ts}
+            }},
+            {"round", {
+                {"difficulty", m_best_difficulty.merged_round},
+                {"pct_of_block", pct(m_best_difficulty.merged_round, merged_net_diff)},
+                {"miner", m_best_difficulty.merged_round_miner},
+                {"timestamp", m_best_difficulty.merged_round_ts},
+                {"started", m_best_difficulty.merged_round_start}
+            }}
+        };
+        // Merged median (same share difficulties, different network target)
+        if (m_sharechain_stats_fn) {
+            auto sc = m_sharechain_stats_fn();
+            double avg = sc.value("average_difficulty", 0.0);
+            if (avg > 0 && merged_net_diff > 0)
+                result["median_merged_pct"] = avg / merged_net_diff * 100.0;
+        }
+    }
+
+    // ── Median share % (approximate from average difficulty in skiplist) ──
+    if (m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        double avg = sc.value("average_difficulty", 0.0);
+        if (avg > 0 && net_diff > 0)
+            result["median_pct"] = avg / net_diff * 100.0;
+        else
+            result["median_pct"] = 0.0;
+    } else {
+        result["median_pct"] = 0.0;
+    }
+
     return result;
 }
 
@@ -5247,6 +5299,22 @@ void MiningInterface::record_share_difficulty(double difficulty, const std::stri
         m_best_difficulty.round = difficulty;
         m_best_difficulty.miner = miner;
         m_best_difficulty.timestamp = now_ts;
+    }
+}
+
+void MiningInterface::record_merged_share_difficulty(double difficulty, const std::string& miner)
+{
+    std::lock_guard<std::mutex> lock(m_best_diff_mutex);
+    auto now_ts = static_cast<uint64_t>(std::time(nullptr));
+    if (difficulty > m_best_difficulty.merged_all_time) {
+        m_best_difficulty.merged_all_time = difficulty;
+        m_best_difficulty.merged_all_time_miner = miner;
+        m_best_difficulty.merged_all_time_ts = now_ts;
+    }
+    if (difficulty > m_best_difficulty.merged_round) {
+        m_best_difficulty.merged_round = difficulty;
+        m_best_difficulty.merged_round_miner = miner;
+        m_best_difficulty.merged_round_ts = now_ts;
     }
 }
 

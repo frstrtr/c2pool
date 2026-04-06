@@ -932,6 +932,7 @@ public:
 
     // Best share difficulty tracking (for /best_share, /miner_stats)
     void record_share_difficulty(double difficulty, const std::string& miner);
+    void record_merged_share_difficulty(double difficulty, const std::string& miner);
 
     // Stat log entry (appended every 5 minutes, rolling 24h window for /web/log JSON)
     void update_stat_log();
@@ -986,6 +987,14 @@ private:
         std::string miner;       // round-level miner (backward compat)
         uint64_t timestamp{0};   // round-level timestamp (backward compat)
         uint64_t round_start{0};
+        // Merged chain (DOGE) best share tracking
+        double merged_all_time{0.0};
+        std::string merged_all_time_miner;
+        uint64_t merged_all_time_ts{0};
+        double merged_round{0.0};
+        std::string merged_round_miner;
+        uint64_t merged_round_ts{0};
+        uint64_t merged_round_start{0};
     };
     BestDifficulty m_best_difficulty;
     mutable std::mutex m_best_diff_mutex;
