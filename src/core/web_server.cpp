@@ -3054,6 +3054,7 @@ nlohmann::json MiningInterface::rest_global_stats()
     double share_diff = 1.0;
     int unique_miners = 0;
     int total_shares = 0;
+    int orphan_shares = 0, dead_shares = 0;
     int chain_height = 0;
 
     // Populate from sharechain
@@ -3061,13 +3062,16 @@ nlohmann::json MiningInterface::rest_global_stats()
         auto sc = m_sharechain_stats_fn();
         if (sc.contains("total_shares"))
             total_shares = sc["total_shares"].get<int>();
+        if (sc.contains("orphan_shares"))
+            orphan_shares = sc["orphan_shares"].get<int>();
+        if (sc.contains("dead_shares"))
+            dead_shares = sc["dead_shares"].get<int>();
         if (sc.contains("chain_height"))
             chain_height = sc["chain_height"].get<int>();
         if (sc.contains("average_difficulty"))
             share_diff = sc["average_difficulty"].get<double>();
         if (sc.contains("shares_by_miner") && sc["shares_by_miner"].is_object())
             unique_miners = static_cast<int>(sc["shares_by_miner"].size());
-
     }
 
     // Pool hashrate from P2P node's get_pool_attempts_per_second (p2pool-correct)
@@ -3086,9 +3090,13 @@ nlohmann::json MiningInterface::rest_global_stats()
     }
 
     // p2pool field names the dashboard expects
+    // pool_stale_prop = stales / (lookbehind + stales), matching p2pool's get_average_stale_prop()
+    int stales = orphan_shares + dead_shares;
+    int good = total_shares - stales;
+    double pool_stale_prop = (good + stales > 0) ? static_cast<double>(stales) / (good + stales) : 0.0;
     result["pool_hash_rate"] = pool_rate;
-    result["pool_nonstale_hash_rate"] = pool_rate; // TODO: subtract stale when tracked
-    result["pool_stale_prop"] = 0.0;
+    result["pool_nonstale_hash_rate"] = pool_rate * (1.0 - pool_stale_prop);
+    result["pool_stale_prop"] = pool_stale_prop;
     result["min_difficulty"] = share_diff;
     result["network_block_difficulty"] = net_diff;
 
@@ -5326,7 +5334,17 @@ void MiningInterface::update_stat_log()
     // Pool hash rate — use p2pool-correct callback (safe, runs on ioc thread)
     entry.pool_hash_rate = m_pool_hashrate_fn ? m_pool_hashrate_fn() : 0.0;
 
-    entry.pool_stale_prop = 0.0;
+    // Pool stale proportion from sharechain orphan+dead counts
+    if (m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        int ts = sc.value("total_shares", 0);
+        int os = sc.value("orphan_shares", 0);
+        int ds = sc.value("dead_shares", 0);
+        int st = os + ds;
+        entry.pool_stale_prop = (ts > 0) ? static_cast<double>(st) / ts : 0.0;
+    } else {
+        entry.pool_stale_prop = 0.0;
+    }
 
     // Local hash rates by address — from stratum worker registry
     entry.local_hash_rates = nlohmann::json::object();
