@@ -86,6 +86,7 @@ struct ShareMetadata {
     uint256 target = uint256::ZERO;
     bool is_orphan = false;
     bool is_verified = false;
+    uint256 pow_hash;  // scrypt hash, cached for restart block scan (backward-compatible)
 };
 
 /**
@@ -171,6 +172,9 @@ public:
 
     /// Batch-update the is_verified flag for multiple shares without rewriting share data.
     bool mark_shares_verified(const std::vector<uint256>& hashes);
+
+    /// Batch-update is_verified + pow_hash for multiple shares.
+    bool mark_shares_verified_with_pow(const std::vector<std::pair<uint256, uint256>>& hash_pow_pairs);
 
     // Chain traversal
     std::vector<uint256> get_chain_hashes(const uint256& start_hash, uint64_t max_count, bool forward = true);

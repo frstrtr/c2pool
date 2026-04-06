@@ -479,6 +479,7 @@ bool SharechainLevelDBStore::store_share(const uint256& hash, const std::vector<
         metadata_stream << metadata.target;
         metadata_stream << static_cast<uint8_t>(metadata.is_orphan ? 1 : 0);
         metadata_stream << static_cast<uint8_t>(metadata.is_verified ? 1 : 0);
+        metadata_stream << metadata.pow_hash;
 
         // Convert from std::vector<std::byte> to std::vector<uint8_t>
         auto span = metadata_stream.get_span();
@@ -536,6 +537,7 @@ bool SharechainLevelDBStore::store_shares_batch(const std::vector<BatchShareEntr
             metadata_stream << e.metadata.target;
             metadata_stream << static_cast<uint8_t>(e.metadata.is_orphan ? 1 : 0);
             metadata_stream << static_cast<uint8_t>(e.metadata.is_verified ? 1 : 0);
+            metadata_stream << e.metadata.pow_hash;
             auto span = metadata_stream.get_span();
             std::vector<uint8_t> metadata_data(
                 reinterpret_cast<const uint8_t*>(span.data()),
@@ -609,13 +611,19 @@ bool SharechainLevelDBStore::load_share(const uint256& hash, std::vector<uint8_t
         metadata.is_orphan = (orphan_flag != 0);
 
         // is_verified: backward-compatible — old DBs won't have this byte
-        // PackStream clears m_vch when cursor reaches end, so non-empty means more data
         try {
             uint8_t verified_flag;
             metadata_stream >> verified_flag;
             metadata.is_verified = (verified_flag != 0);
         } catch (...) {
             metadata.is_verified = false;
+        }
+
+        // pow_hash: backward-compatible — old DBs won't have this field
+        try {
+            metadata_stream >> metadata.pow_hash;
+        } catch (...) {
+            metadata.pow_hash = uint256::ZERO;
         }
 
         return true;
@@ -745,6 +753,7 @@ bool SharechainLevelDBStore::mark_shares_verified(const std::vector<uint256>& ha
             ms << metadata.target;
             ms << static_cast<uint8_t>(metadata.is_orphan ? 1 : 0);
             ms << static_cast<uint8_t>(1); // is_verified = true
+            ms << metadata.pow_hash;
             auto span = ms.get_span();
             std::vector<uint8_t> md(
                 reinterpret_cast<const uint8_t*>(span.data()),
@@ -760,6 +769,51 @@ bool SharechainLevelDBStore::mark_shares_verified(const std::vector<uint256>& ha
         return true;
     } catch (const std::exception& e) {
         LOG_ERROR << "mark_shares_verified failed: " << e.what();
+        return false;
+    }
+}
+
+bool SharechainLevelDBStore::mark_shares_verified_with_pow(
+    const std::vector<std::pair<uint256, uint256>>& hash_pow_pairs)
+{
+    if (!m_store || hash_pow_pairs.empty())
+        return false;
+    try {
+        auto batch = m_store->create_batch();
+        int updated = 0;
+        for (const auto& [hash, pow] : hash_pow_pairs) {
+            ShareMetadata metadata;
+            std::vector<uint8_t> dummy;
+            if (!load_share(hash, dummy, metadata))
+                continue;
+
+            metadata.is_verified = true;
+            if (!pow.IsNull())
+                metadata.pow_hash = pow;
+
+            PackStream ms;
+            ms << metadata.prev_hash;
+            ms << metadata.height;
+            ms << metadata.timestamp;
+            ms << metadata.work;
+            ms << metadata.target;
+            ms << static_cast<uint8_t>(metadata.is_orphan ? 1 : 0);
+            ms << static_cast<uint8_t>(1);
+            ms << metadata.pow_hash;
+            auto span = ms.get_span();
+            std::vector<uint8_t> md(
+                reinterpret_cast<const uint8_t*>(span.data()),
+                reinterpret_cast<const uint8_t*>(span.data()) + span.size());
+            batch.put(make_index_key(hash), md);
+            ++updated;
+        }
+        if (updated > 0 && !batch.commit()) {
+            LOG_ERROR << "mark_shares_verified_with_pow: batch commit failed";
+            return false;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        LOG_ERROR << "mark_shares_verified_with_pow failed: " << e.what();
         return false;
     }
 }

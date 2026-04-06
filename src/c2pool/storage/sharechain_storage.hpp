@@ -131,6 +131,9 @@ public:
     /// Batch-mark shares as verified in LevelDB metadata.
     bool mark_shares_verified(const std::vector<uint256>& hashes);
 
+    /// Batch-mark verified + persist pow_hash in one write.
+    bool mark_shares_verified_with_pow(const std::vector<std::pair<uint256, uint256>>& hash_pow_pairs);
+
     /**
      * @brief Log storage statistics
      */

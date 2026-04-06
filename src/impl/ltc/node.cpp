@@ -1000,6 +1000,12 @@ void NodeImpl::load_persisted_shares()
                 m_tracker.add(share);
                 loaded++;
 
+                // Restore cached pow_hash from LevelDB onto the index
+                if (!meta.pow_hash.IsNull()) {
+                    auto* idx = m_tracker.chain.get_index(share.hash());
+                    if (idx) idx->pow_hash = meta.pow_hash;
+                }
+
                 // p2pool known_verified: pre-populate verified tracker without re-verification
                 if (meta.is_verified)
                     verified_hashes.push_back(share.hash());
@@ -1057,7 +1063,15 @@ void NodeImpl::flush_verified_to_leveldb()
 {
     if (m_verified_flush_buf.empty() || !m_storage || !m_storage->is_available())
         return;
-    m_storage->mark_shares_verified(m_verified_flush_buf);
+    // Persist pow_hash from tracker index alongside verified status
+    std::vector<std::pair<uint256, uint256>> hash_pow_pairs;
+    for (const auto& hash : m_verified_flush_buf) {
+        uint256 pow;
+        auto* idx = m_tracker.chain.get_index(hash);
+        if (idx) pow = idx->pow_hash;
+        hash_pow_pairs.emplace_back(hash, pow);
+    }
+    m_storage->mark_shares_verified_with_pow(hash_pow_pairs);
     m_verified_flush_buf.clear();
 }
 
