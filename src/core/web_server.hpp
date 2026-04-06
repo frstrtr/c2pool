@@ -459,6 +459,10 @@ public:
     void set_coinbase_text(const std::string& text) { m_coinbase_text = text; }
     const std::string& get_coinbase_text() const { return m_coinbase_text; }
 
+    // Load transition message blobs from a directory (*.hex files).
+    // Decrypts and caches messages for display in the transition banner.
+    void load_transition_blobs(const std::string& dir_path);
+
     // Hook: expose decoded protocol messages (e.g. from current best share)
     // through API methods for dashboard/monitoring clients.
     using protocol_messages_fn_t = std::function<nlohmann::json()>;
@@ -789,6 +793,10 @@ private:
     // Operator blob injected into locally created shares (thread-safe).
     mutable std::mutex m_message_blob_mutex;
     std::vector<unsigned char> m_operator_message_blob;
+
+    // Cached transition messages loaded from blob files at startup.
+    nlohmann::json m_cached_transition_message;        // null or {msg,url,urgency,...}
+    nlohmann::json m_cached_authority_announcements;   // array of announcements
 
     // Coinbase scriptSig customization
     std::string m_coinbase_text;  // empty = "/c2pool/" default tag

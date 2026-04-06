@@ -764,6 +764,82 @@ void MiningInterface::setup_methods()
     }));
 }
 
+void MiningInterface::load_transition_blobs(const std::string& dir_path)
+{
+    namespace fs = std::filesystem;
+    if (!fs::is_directory(dir_path)) return;
+
+    int loaded = 0;
+    for (const auto& entry : fs::directory_iterator(dir_path)) {
+        if (!entry.is_regular_file()) continue;
+        auto ext = entry.path().extension().string();
+        if (ext != ".hex") continue;
+
+        // Read hex file
+        std::ifstream f(entry.path());
+        if (!f) continue;
+        std::string hex_str;
+        std::getline(f, hex_str);
+        // Trim whitespace
+        while (!hex_str.empty() && (hex_str.back() == '\n' || hex_str.back() == '\r' || hex_str.back() == ' '))
+            hex_str.pop_back();
+        if (hex_str.empty()) continue;
+
+        auto blob = ParseHex(hex_str);
+        if (blob.empty()) continue;
+
+        auto unpacked = ltc::unpack_share_messages(blob.data(), blob.size());
+        if (!unpacked.decrypted) continue;
+
+        auto now = static_cast<uint32_t>(std::time(nullptr));
+        for (const auto& msg : unpacked.messages) {
+            // Decode payload as UTF-8 text, try JSON
+            std::string payload_text(msg.payload.begin(), msg.payload.end());
+            nlohmann::json payload_json;
+            try { payload_json = nlohmann::json::parse(payload_text); } catch (...) {}
+
+            if (msg.msg_type == ltc::MSG_TRANSITION_SIGNAL && m_cached_transition_message.is_null()) {
+                nlohmann::json tmsg = nlohmann::json::object();
+                if (payload_json.is_object()) {
+                    tmsg["msg"] = payload_json.value("msg", "");
+                    tmsg["url"] = payload_json.value("url", "");
+                    tmsg["urgency"] = payload_json.value("urg", "info");
+                    tmsg["from_ver"] = payload_json.value("from", "");
+                    tmsg["to_ver"] = payload_json.value("to", "");
+                } else {
+                    tmsg["msg"] = payload_text;
+                    tmsg["urgency"] = "info";
+                }
+                tmsg["timestamp"] = msg.timestamp;
+                tmsg["verified"] = true;
+                tmsg["authority"] = (msg.wire_flags & ltc::FLAG_PROTOCOL_AUTHORITY) != 0;
+                m_cached_transition_message = tmsg;
+                ++loaded;
+            } else if (msg.msg_type == ltc::MSG_POOL_ANNOUNCE || msg.msg_type == ltc::MSG_EMERGENCY) {
+                nlohmann::json ann = nlohmann::json::object();
+                ann["type"] = (msg.msg_type == ltc::MSG_EMERGENCY) ? "EMERGENCY" : "POOL_ANNOUNCE";
+                ann["type_id"] = msg.msg_type;
+                ann["timestamp"] = msg.timestamp;
+                ann["age"] = (now > msg.timestamp) ? static_cast<int>(now - msg.timestamp) : 0;
+                ann["verified"] = true;
+                ann["authority"] = (msg.wire_flags & ltc::FLAG_PROTOCOL_AUTHORITY) != 0;
+                if (payload_json.is_object()) {
+                    ann["text"] = payload_json.value("msg", payload_json.value("text", ""));
+                    ann["urgency"] = payload_json.value("urg", payload_json.value("urgency", "info"));
+                    ann["url"] = payload_json.value("url", "");
+                } else {
+                    ann["text"] = payload_text;
+                    ann["urgency"] = (msg.msg_type == ltc::MSG_EMERGENCY) ? "alert" : "info";
+                }
+                m_cached_authority_announcements.push_back(ann);
+                ++loaded;
+            }
+        }
+    }
+    if (loaded > 0)
+        LOG_INFO << "Messaging: loaded " << loaded << " transition message(s) from " << dir_path;
+}
+
 void MiningInterface::set_operator_message_blob(const std::vector<unsigned char>& blob)
 {
     std::lock_guard<std::mutex> lock(m_message_blob_mutex);
@@ -4396,78 +4472,64 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
     result["status"] = status;
     result["message"] = message;
 
-    // ── Transition message + authority announcements from share message blob ──
-    // Matches p2pool's _get_transition_message() and _get_authority_announcements().
+    // ── Transition message + authority announcements ──
+    // First try live messages from best share, then fall back to cached blob files.
     result["transition_message"] = nullptr;
     result["authority_announcements"] = nlohmann::json::array();
 
+    // Try live messages from best share's message_data
     if (m_protocol_messages_fn) {
         try {
             auto pm = m_protocol_messages_fn();
             if (pm.value("decrypted", false) && pm.contains("messages") && pm["messages"].is_array()) {
                 auto now = static_cast<uint32_t>(std::time(nullptr));
                 nlohmann::json announcements = nlohmann::json::array();
-
                 for (auto& msg : pm["messages"]) {
                     int msg_type = msg.value("type", 0);
                     uint32_t ts = msg.value("timestamp", uint32_t(0));
                     std::string payload_hex = msg.value("payload_hex", "");
                     bool is_authority = msg.value("protocol_authority", false);
-
-                    // Try to decode payload as UTF-8 text, then parse as JSON
-                    std::vector<unsigned char> payload_bytes;
-                    if (!payload_hex.empty()) {
-                        auto parsed = ParseHex(payload_hex);
-                        payload_bytes.assign(parsed.begin(), parsed.end());
-                    }
+                    auto payload_bytes = ParseHex(payload_hex);
                     std::string payload_text(payload_bytes.begin(), payload_bytes.end());
                     nlohmann::json payload_json;
                     try { payload_json = nlohmann::json::parse(payload_text); } catch (...) {}
 
-                    if (msg_type == 0x20 && is_authority) {
-                        // MSG_TRANSITION_SIGNAL — use the first one found
-                        if (result["transition_message"].is_null()) {
-                            nlohmann::json tmsg = nlohmann::json::object();
-                            if (payload_json.is_object()) {
-                                tmsg["msg"] = payload_json.value("msg", "");
-                                tmsg["url"] = payload_json.value("url", "");
-                                tmsg["urgency"] = payload_json.value("urg", "info");
-                                tmsg["from_ver"] = payload_json.value("from", "");
-                                tmsg["to_ver"] = payload_json.value("to", "");
-                            } else {
-                                tmsg["msg"] = payload_text;
-                                tmsg["urgency"] = "info";
-                            }
-                            tmsg["timestamp"] = ts;
-                            tmsg["verified"] = true;
-                            tmsg["authority"] = true;
-                            result["transition_message"] = tmsg;
-                        }
+                    if (msg_type == 0x20 && is_authority && result["transition_message"].is_null()) {
+                        nlohmann::json tmsg = {{"timestamp", ts}, {"verified", true}, {"authority", true}};
+                        if (payload_json.is_object()) {
+                            tmsg["msg"] = payload_json.value("msg", "");
+                            tmsg["url"] = payload_json.value("url", "");
+                            tmsg["urgency"] = payload_json.value("urg", "info");
+                            tmsg["from_ver"] = payload_json.value("from", "");
+                            tmsg["to_ver"] = payload_json.value("to", "");
+                        } else { tmsg["msg"] = payload_text; tmsg["urgency"] = "info"; }
+                        result["transition_message"] = tmsg;
                     } else if (msg_type == 0x03 || msg_type == 0x10) {
-                        // MSG_POOL_ANNOUNCE or MSG_EMERGENCY
-                        nlohmann::json ann = nlohmann::json::object();
-                        std::string type_name = (msg_type == 0x10) ? "EMERGENCY" : "POOL_ANNOUNCE";
-                        ann["type"] = type_name;
-                        ann["type_id"] = msg_type;
-                        ann["timestamp"] = ts;
-                        ann["age"] = (now > ts) ? static_cast<int>(now - ts) : 0;
-                        ann["verified"] = true;
-                        ann["authority"] = is_authority;
+                        nlohmann::json ann = {
+                            {"type", (msg_type == 0x10) ? "EMERGENCY" : "POOL_ANNOUNCE"},
+                            {"type_id", msg_type}, {"timestamp", ts},
+                            {"age", (now > ts) ? int(now - ts) : 0},
+                            {"verified", true}, {"authority", is_authority}
+                        };
                         if (payload_json.is_object()) {
                             ann["text"] = payload_json.value("msg", payload_json.value("text", ""));
-                            ann["urgency"] = payload_json.value("urg", payload_json.value("urgency", "info"));
+                            ann["urgency"] = payload_json.value("urg", "info");
                             ann["url"] = payload_json.value("url", "");
-                        } else {
-                            ann["text"] = payload_text;
-                            ann["urgency"] = (msg_type == 0x10) ? "alert" : "info";
-                        }
+                        } else { ann["text"] = payload_text; ann["urgency"] = (msg_type == 0x10) ? "alert" : "info"; }
                         announcements.push_back(ann);
                     }
                 }
-                result["authority_announcements"] = announcements;
+                if (!announcements.empty())
+                    result["authority_announcements"] = announcements;
             }
         } catch (...) {}
     }
+
+    // Fall back to cached blob files (loaded at startup via load_transition_blobs)
+    if (result["transition_message"].is_null() && !m_cached_transition_message.is_null())
+        result["transition_message"] = m_cached_transition_message;
+    if (result["authority_announcements"].empty() && !m_cached_authority_announcements.empty())
+        result["authority_announcements"] = m_cached_authority_announcements;
 
     return result;
 }
