@@ -450,9 +450,9 @@ inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParam
     return {ref_hash, nonce};
 }
 
-// Thread-local flag: set by share_init_verify when a share beats the block target.
-// Read by attempt_verify() to fire the block-found callback without re-computing scrypt.
+// Thread-local state from share_init_verify — read by attempt_verify() without re-computing scrypt.
 inline thread_local bool g_last_init_is_block = false;
+inline thread_local uint256 g_last_pow_hash;  // scrypt hash of the share header
 
 // ============================================================================
 // share_init_verify()
@@ -729,6 +729,7 @@ uint256 share_init_verify(const ShareT& share, bool check_pow = true)
                             pow_hash_bytes);
         uint256 pow_hash;
         memcpy(pow_hash.begin(), pow_hash_bytes, 32);
+        g_last_pow_hash = pow_hash;  // cache for attempt_verify merged check
 
         if (pow_hash > target)
         {

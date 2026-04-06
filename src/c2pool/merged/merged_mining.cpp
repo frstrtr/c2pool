@@ -1724,6 +1724,8 @@ std::vector<MergedMiningManager::ChainInfo> MergedMiningManager::get_chain_infos
         info.current_height = c.current_work.height;
         info.current_tip    = c.last_tip;
         info.coinbase_value = c.current_work.coinbase_value;
+        info.target         = c.current_work.target;
+        info.block_hash     = c.current_work.block_hash.GetHex();
         // Compute difficulty from target: diff = 2^256 / (target+1)
         // Simplified: diff ≈ 0x00000000FFFF... / target  (Dogecoin uses scrypt diff1)
         if (!c.current_work.target.IsNull()) {

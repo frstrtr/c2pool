@@ -2908,6 +2908,34 @@ int main(int argc, char* argv[]) {
                 });
             };
 
+            // Wire merged block detection for peer shares: check pow_hash against DOGE target.
+            // This detects twin blocks (LTC+DOGE found simultaneously) from any pool participant.
+            p2p_node->tracker().m_on_merged_block_check =
+                [&web_server](const uint256& share_hash, const uint256& pow_hash) {
+                auto mi = web_server.get_mining_interface();
+                auto* mm = mi->get_mm_manager();
+                if (!mm || !mm->has_chains()) return;
+
+                auto chain_infos = mm->get_chain_infos();
+                for (const auto& ci : chain_infos) {
+                    if (ci.target.IsNull()) continue;
+                    if (pow_hash <= ci.target) {
+                        // This share also solves the merged chain!
+                        LOG_INFO << "*** MERGED BLOCK FROM PEER! " << ci.symbol
+                                 << " share=" << share_hash.GetHex().substr(0,16)
+                                 << " pow=" << pow_hash.GetHex().substr(0,16)
+                                 << " target=" << ci.target.GetHex().substr(0,16);
+
+                        uint256 block_hash;
+                        block_hash.SetHex(ci.block_hash);
+                        mi->record_found_block(
+                            static_cast<uint64_t>(ci.current_height), block_hash, 0, ci.symbol,
+                            "", share_hash.GetHex(),
+                            ci.difficulty, 0, 0, 0);
+                    }
+                }
+            };
+
             // Expose decoded protocol messages from best share via API.
             web_server.get_mining_interface()->set_protocol_messages_fn([&p2p_node]() {
                 nlohmann::json result = {

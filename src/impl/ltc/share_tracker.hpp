@@ -146,6 +146,9 @@ public:
     std::function<void(const uint256&)> m_on_share_verified;
     // Callback fired when a verified share meets the block target (found block)
     std::function<void(const uint256&)> m_on_block_found;
+    // Callback fired when a verified share meets a merged chain target (DOGE block)
+    // Args: share_hash, pow_hash (for target comparison by caller)
+    std::function<void(const uint256&, const uint256&)> m_on_merged_block_check;
 
     ShareTracker() {
         // p2pool SubsetTracker pattern: verified shares navigation
@@ -283,6 +286,13 @@ public:
             auto* idx = chain.get_index(share_hash);
             if (idx) idx->is_block_solution = true;
             m_on_block_found(share_hash);
+        }
+
+        // Merged block detection: check ALL verified shares against DOGE target.
+        // A share can meet the DOGE target without meeting the LTC target
+        // (DOGE difficulty is much lower). The pow_hash was cached by share_init_verify.
+        if (m_on_merged_block_check && !g_last_pow_hash.IsNull()) {
+            m_on_merged_block_check(share_hash, g_last_pow_hash);
         }
 
         // Naughty propagation: if parent is naughty, increment (up to 6 generations)

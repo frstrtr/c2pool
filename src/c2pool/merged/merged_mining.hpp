@@ -254,6 +254,8 @@ public:
         std::string current_tip;
         uint64_t    coinbase_value{0};  // satoshis
         double      difficulty{0.0};    // from target
+        uint256     target;             // current aux chain target (for peer block detection)
+        std::string block_hash;         // current aux block hash hex
         int64_t     last_update_age_s{0}; // seconds since last successful work refresh
     };
     std::vector<ChainInfo> get_chain_infos() const;
