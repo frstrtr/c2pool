@@ -1565,9 +1565,14 @@ int main(int argc, char* argv[]) {
             core::WebServer web_server(ioc, http_host, static_cast<uint16_t>(http_port), 
                                      settings->m_testnet, enhanced_node, blockchain);
 
-            // Shared function pointer for DOGE historic target lookup via embedded HeaderChain.
-            // Declared here so both --integrated callback wiring and merged mining init can access.
-            auto doge_target_fn = std::make_shared<std::function<uint256(uint32_t)>>();
+            // DOGE historic lookup result: target + height + block_hash at a given timestamp.
+            struct DogeHistoricResult {
+                uint256 target;
+                uint32_t height{0};
+                std::string block_hash;
+            };
+            // Shared function pointer for DOGE historic lookup via embedded HeaderChain.
+            auto doge_target_fn = std::make_shared<std::function<DogeHistoricResult(uint32_t)>>();
 
             // Apply stratum tuning from CLI/YAML to the MiningInterface
             web_server.get_mining_interface()->set_stratum_config(stratum_config);
@@ -2926,6 +2931,8 @@ int main(int argc, char* argv[]) {
                     uint256 target = ci.target;
 
                     // Fallback: if current target doesn't match, use historic lookup
+                    DogeHistoricResult hist;
+                    bool used_historic = false;
                     if ((target.IsNull() || !(pow_hash <= target)) && *doge_target_fn) {
                         uint32_t share_ts = 0;
                         auto& chain = p2p_node->tracker().chain;
@@ -2934,23 +2941,32 @@ int main(int argc, char* argv[]) {
                                 share_ts = s->m_min_header.m_timestamp;
                             });
                         }
-                        if (share_ts > 0)
-                            target = (*doge_target_fn)(share_ts);
+                        if (share_ts > 0) {
+                            hist = (*doge_target_fn)(share_ts);
+                            target = hist.target;
+                            used_historic = true;
+                        }
                     }
 
                     if (target.IsNull()) continue;
                     if (pow_hash <= target) {
+                        // Use historic height/hash if available, otherwise current
+                        uint32_t blk_height = used_historic && hist.height > 0
+                            ? hist.height : static_cast<uint32_t>(ci.current_height);
+                        std::string blk_hash = used_historic && !hist.block_hash.empty()
+                            ? hist.block_hash : ci.block_hash;
+
                         LOG_INFO << "*** MERGED BLOCK FROM PEER! " << ci.symbol
                                  << " share=" << share_hash.GetHex().substr(0,16)
+                                 << " height=" << blk_height
                                  << " pow=" << pow_hash.GetHex().substr(0,16)
                                  << " target=" << target.GetHex().substr(0,16);
 
-                        // Record to merged blocks table (not LTC found_blocks)
                         c2pool::merged::DiscoveredMergedBlock blk;
                         blk.chain_id = ci.chain_id;
                         blk.symbol = ci.symbol;
-                        blk.height = ci.current_height;
-                        blk.block_hash = ci.block_hash;
+                        blk.height = static_cast<int>(blk_height);
+                        blk.block_hash = blk_hash;
                         blk.parent_hash = share_hash.GetHex();
                         blk.timestamp = static_cast<int64_t>(std::time(nullptr));
                         blk.accepted = true;
@@ -3797,19 +3813,33 @@ int main(int argc, char* argv[]) {
 
                         // Set the DOGE historic target lookup for merged block detection.
                         // Used by m_on_merged_block_check during startup block scan.
-                        *doge_target_fn = [&doge_chain](uint32_t share_ts) -> uint256 {
+                        *doge_target_fn = [&doge_chain](uint32_t share_ts) -> DogeHistoricResult {
+                            DogeHistoricResult result;
                             auto tip = doge_chain->tip();
-                            if (!tip.has_value()) return uint256();
+                            if (!tip.has_value()) return result;
                             uint32_t tip_ts = tip->header.m_timestamp;
                             int32_t dt = static_cast<int32_t>(tip_ts) - static_cast<int32_t>(share_ts);
                             int32_t blocks_back = dt / 60;  // ~1 DOGE block/min
                             int32_t est_h = static_cast<int32_t>(tip->height) - blocks_back;
-                            if (est_h < 1) return uint256();
-                            auto hdr = doge_chain->get_header_by_height(static_cast<uint32_t>(est_h));
-                            if (!hdr.has_value()) return uint256();
-                            uint256 t;
-                            t.SetCompact(hdr->header.m_bits);
-                            return t;
+                            if (est_h < 1) return result;
+
+                            // Search ±10 blocks around estimate for closest timestamp match
+                            int32_t best_h = est_h;
+                            int32_t best_dt = INT32_MAX;
+                            for (int32_t h = std::max(1, est_h - 10); h <= est_h + 10; ++h) {
+                                auto hdr = doge_chain->get_header_by_height(static_cast<uint32_t>(h));
+                                if (!hdr.has_value()) continue;
+                                int32_t d = std::abs(static_cast<int32_t>(hdr->header.m_timestamp) -
+                                                     static_cast<int32_t>(share_ts));
+                                if (d < best_dt) { best_dt = d; best_h = h; }
+                            }
+
+                            auto hdr = doge_chain->get_header_by_height(static_cast<uint32_t>(best_h));
+                            if (!hdr.has_value()) return result;
+                            result.target.SetCompact(hdr->header.m_bits);
+                            result.height = static_cast<uint32_t>(best_h);
+                            result.block_hash = hdr->block_hash.GetHex();
+                            return result;
                         };
                         LOG_INFO << "[MM-DOGE] Historic target lookup wired via HeaderChain";
 
