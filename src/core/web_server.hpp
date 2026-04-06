@@ -1018,8 +1018,10 @@ private:
 
     // Network difficulty history for /network_difficulty
     struct NetDiffSample { double ts; double difficulty; std::string source; };
-    std::vector<NetDiffSample> m_netdiff_history;  // newest-first, capped at 10000
+    std::vector<NetDiffSample> m_netdiff_history;  // oldest-first, capped at 2000
     mutable std::mutex m_netdiff_mutex;
+    double m_last_netdiff_sampled{0.0};  // dedup: skip if unchanged
+    void add_netdiff_sample(double difficulty, const std::string& source);
 
     // ── Stratum worker session tracking ──────────────────────────────────
 public:

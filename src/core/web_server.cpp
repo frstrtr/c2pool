@@ -2077,6 +2077,7 @@ void MiningInterface::refresh_work()
                 if (net_diff > 0) {
                     m_on_network_difficulty_fn(net_diff);
                     m_network_difficulty.store(net_diff, std::memory_order_relaxed);
+                    add_netdiff_sample(net_diff, "block");
                 }
             } catch (...) {}
         } else {
@@ -2086,8 +2087,10 @@ void MiningInterface::refresh_work()
                     wd.m_data.value("bits", "1d00ffff"), nullptr, 16);
                 double net_diff = chain::target_to_difficulty(
                     chain::bits_to_target(nbits_val));
-                if (net_diff > 0)
+                if (net_diff > 0) {
                     m_network_difficulty.store(net_diff, std::memory_order_relaxed);
+                    add_netdiff_sample(net_diff, "block");
+                }
             } catch (...) {}
         }
     } catch (const std::exception& e) {
@@ -5026,6 +5029,21 @@ nlohmann::json MiningInterface::rest_merged_broadcaster_status()
     return result;
 }
 
+void MiningInterface::add_netdiff_sample(double difficulty, const std::string& source)
+{
+    if (difficulty <= 0) return;
+    // Skip if unchanged from last sample (dedup same-block updates)
+    if (difficulty == m_last_netdiff_sampled && source == "periodic") return;
+    m_last_netdiff_sampled = difficulty;
+
+    std::lock_guard<std::mutex> lock(m_netdiff_mutex);
+    double now = static_cast<double>(std::time(nullptr));
+    m_netdiff_history.push_back({now, difficulty, source});
+    // Cap at 2000 samples (oldest first)
+    while (m_netdiff_history.size() > 2000)
+        m_netdiff_history.erase(m_netdiff_history.begin());
+}
+
 nlohmann::json MiningInterface::rest_network_difficulty()
 {
     nlohmann::json arr = nlohmann::json::array();
@@ -5333,6 +5351,11 @@ void MiningInterface::update_stat_log()
 
     // Pool hash rate — use p2pool-correct callback (safe, runs on ioc thread)
     entry.pool_hash_rate = m_pool_hashrate_fn ? m_pool_hashrate_fn() : 0.0;
+
+    // Periodic network difficulty sample for graph
+    double cur_diff = m_network_difficulty.load(std::memory_order_relaxed);
+    if (cur_diff > 0)
+        add_netdiff_sample(cur_diff, "periodic");
 
     // Pool stale proportion from sharechain orphan+dead counts
     if (m_sharechain_stats_fn) {
