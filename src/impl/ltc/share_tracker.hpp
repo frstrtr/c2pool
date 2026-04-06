@@ -150,6 +150,40 @@ public:
     // Args: share_hash, pow_hash (for target comparison by caller)
     std::function<void(const uint256&, const uint256&)> m_on_merged_block_check;
 
+    // Scan the verified best chain for block solutions after startup.
+    // Calls share_init_verify (scrypt) on each share (~1ms each), then checks
+    // g_last_init_is_block and g_last_pow_hash to fire block callbacks.
+    void scan_chain_for_blocks(const uint256& tip, int max_shares)
+    {
+        if (tip.IsNull() || max_shares <= 0) return;
+        int scanned = 0, found_ltc = 0;
+        uint256 pos = tip;
+        for (int i = 0; i < max_shares && !pos.IsNull(); ++i) {
+            if (!chain.contains(pos)) break;
+            auto& cd = chain.get(pos);
+            cd.share.invoke([&](auto* s) {
+                try {
+                    g_last_init_is_block = false;
+                    g_last_pow_hash = uint256();
+                    share_init_verify(*s, true);  // computes scrypt + sets flags
+                    ++scanned;
+
+                    if (g_last_init_is_block && m_on_block_found) {
+                        auto* idx = chain.get_index(pos);
+                        if (idx) idx->is_block_solution = true;
+                        m_on_block_found(pos);
+                        ++found_ltc;
+                    }
+                    if (m_on_merged_block_check && !g_last_pow_hash.IsNull())
+                        m_on_merged_block_check(pos, g_last_pow_hash);
+                } catch (...) {}  // share_init_verify may throw on corrupt shares
+                pos = s->m_prev_hash;
+            });
+        }
+        LOG_INFO << "[BLOCK-SCAN] Scanned " << scanned << "/" << max_shares
+                 << " shares: " << found_ltc << " LTC block(s) detected";
+    }
+
     ShareTracker() {
         // p2pool SubsetTracker pattern: verified shares navigation
         // through the MAIN tracker's skip list.

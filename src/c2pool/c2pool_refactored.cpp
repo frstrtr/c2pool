@@ -2207,6 +2207,50 @@ int main(int argc, char* argv[]) {
                 p2p_node->run_think();
                 LOG_INFO << "Initial think() completed for loaded shares";
 
+                // Scan verified chain for block solutions newer than last known found block.
+                // On first run: scans full CHAIN_LENGTH. On subsequent restarts: only new shares.
+                {
+                    auto best = p2p_node->best_share_hash();
+                    int chain_len = static_cast<int>(ltc::PoolConfig::chain_length());
+                    if (!best.IsNull() && chain_len > 0) {
+                        // Find the most recent found block timestamp to limit scan depth
+                        uint64_t latest_block_ts = 0;
+                        auto existing = web_server.get_mining_interface()->rest_recent_blocks();
+                        for (const auto& b : existing) {
+                            uint64_t ts = b.value("ts", uint64_t(0));
+                            if (ts > latest_block_ts) latest_block_ts = ts;
+                        }
+
+                        // Count shares newer than latest found block to determine scan depth
+                        int scan_depth = chain_len;
+                        if (latest_block_ts > 0) {
+                            auto& chain = p2p_node->tracker().chain;
+                            int newer = 0;
+                            uint256 pos = best;
+                            for (int i = 0; i < chain_len && !pos.IsNull() && chain.contains(pos); ++i) {
+                                chain.get(pos).share.invoke([&](auto* s) {
+                                    if (s->m_min_header.m_timestamp > latest_block_ts)
+                                        ++newer;
+                                    else
+                                        newer = chain_len + 1;  // stop counting
+                                    pos = s->m_prev_hash;
+                                });
+                                if (newer > chain_len) break;
+                            }
+                            scan_depth = std::min(newer, chain_len);
+                        }
+
+                        if (scan_depth > 0) {
+                            LOG_INFO << "[BLOCK-SCAN] Scanning " << scan_depth << " shares"
+                                     << " (latest block ts=" << latest_block_ts
+                                     << ", existing=" << existing.size() << ")";
+                            p2p_node->tracker().scan_chain_for_blocks(best, scan_depth);
+                        } else {
+                            LOG_INFO << "[BLOCK-SCAN] No new shares since last found block — skipping";
+                        }
+                    }
+                }
+
                 // When a peer announces a new best block, refresh our mining template
                 p2p_node->set_on_bestblock([&web_server, &p2p_node]() {
                     web_server.trigger_work_refresh();
