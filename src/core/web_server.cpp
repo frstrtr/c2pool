@@ -3552,9 +3552,9 @@ nlohmann::json MiningInterface::rest_local_stats()
                 int64_t total_votes = 0;
                 int64_t max_version = 0;
                 int64_t max_count = 0;
-                for (auto& [ver_str, count] : vs["versions"].items()) {
+                for (auto& [ver_str, entry] : vs["versions"].items()) {
                     int64_t v = std::stoll(ver_str);
-                    int64_t c = count.get<int64_t>();
+                    int64_t c = entry.is_object() ? entry.value("weight", int64_t(0)) : entry.get<int64_t>();
                     total_votes += c;
                     if (c > max_count) { max_count = c; max_version = v; }
                 }
