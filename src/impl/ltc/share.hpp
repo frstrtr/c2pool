@@ -294,6 +294,7 @@ public:
     int64_t time_seen{0};
     int32_t naughty{0};
     bool is_block_solution{false};  // pow_hash <= block_target (set during init_verify)
+    uint256 pow_hash;               // scrypt hash, cached at reception (for block scan)
 
     ShareIndex() : base_index(), work(0), min_work(0) {}
 
