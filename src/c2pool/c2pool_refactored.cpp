@@ -2955,46 +2955,7 @@ int main(int argc, char* argv[]) {
                 }
             };
 
-            // Block scan: run AFTER callbacks are wired so found blocks get recorded.
-            // Scans all heads to catch blocks on any fork branch.
-            {
-                auto best = p2p_node->best_share_hash();
-                int chain_len = static_cast<int>(ltc::PoolConfig::chain_length());
-                if (!best.IsNull() && chain_len > 0) {
-                    uint64_t latest_block_ts = 0;
-                    auto existing = web_server.get_mining_interface()->rest_recent_blocks();
-                    for (const auto& b : existing) {
-                        uint64_t ts = b.value("ts", uint64_t(0));
-                        if (ts > latest_block_ts) latest_block_ts = ts;
-                    }
-                    int scan_depth = chain_len;
-                    if (latest_block_ts > 0) {
-                        auto& ch = p2p_node->tracker().chain;
-                        int newer = 0;
-                        uint256 pos = best;
-                        for (int i = 0; i < chain_len && !pos.IsNull() && ch.contains(pos); ++i) {
-                            ch.get(pos).share.invoke([&](auto* s) {
-                                if (s->m_min_header.m_timestamp > latest_block_ts)
-                                    ++newer;
-                                else
-                                    newer = chain_len + 1;
-                                pos = s->m_prev_hash;
-                            });
-                            if (newer > chain_len) break;
-                        }
-                        scan_depth = std::min(newer, chain_len);
-                    }
-                    if (scan_depth > 0) {
-                        auto& ch = p2p_node->tracker().chain;
-                        auto heads = ch.get_heads();
-                        LOG_INFO << "[BLOCK-SCAN] Scanning " << scan_depth << " shares from "
-                                 << heads.size() << " head(s) (latest block ts=" << latest_block_ts
-                                 << ", existing=" << existing.size() << ")";
-                        for (const auto& [head_hash, _] : heads)
-                            p2p_node->tracker().scan_chain_for_blocks(head_hash, scan_depth);
-                    }
-                }
-            }
+            // Block scan moved to after all callbacks + DOGE target fn are wired (see below "started successfully")
 
             // Expose decoded protocol messages from best share via API.
             web_server.get_mining_interface()->set_protocol_messages_fn([&p2p_node]() {
@@ -4996,6 +4957,46 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             
+            // Block scan: run here after ALL callbacks + DOGE target fn are wired.
+            if (p2p_node) {
+                auto best = p2p_node->best_share_hash();
+                int chain_len = static_cast<int>(ltc::PoolConfig::chain_length());
+                if (!best.IsNull() && chain_len > 0) {
+                    uint64_t latest_block_ts = 0;
+                    auto existing = web_server.get_mining_interface()->rest_recent_blocks();
+                    for (const auto& b : existing) {
+                        uint64_t ts = b.value("ts", uint64_t(0));
+                        if (ts > latest_block_ts) latest_block_ts = ts;
+                    }
+                    int scan_depth = chain_len;
+                    if (latest_block_ts > 0) {
+                        auto& ch = p2p_node->tracker().chain;
+                        int newer = 0;
+                        uint256 pos = best;
+                        for (int i = 0; i < chain_len && !pos.IsNull() && ch.contains(pos); ++i) {
+                            ch.get(pos).share.invoke([&](auto* s) {
+                                if (s->m_min_header.m_timestamp > latest_block_ts)
+                                    ++newer;
+                                else
+                                    newer = chain_len + 1;
+                                pos = s->m_prev_hash;
+                            });
+                            if (newer > chain_len) break;
+                        }
+                        scan_depth = std::min(newer, chain_len);
+                    }
+                    if (scan_depth > 0) {
+                        auto& ch = p2p_node->tracker().chain;
+                        auto heads = ch.get_heads();
+                        LOG_INFO << "[BLOCK-SCAN] Scanning " << scan_depth << " shares from "
+                                 << heads.size() << " head(s) (latest block ts=" << latest_block_ts
+                                 << ", existing=" << existing.size() << ")";
+                        for (const auto& [head_hash, _] : heads)
+                            p2p_node->tracker().scan_chain_for_blocks(head_hash, scan_depth);
+                    }
+                }
+            }
+
             LOG_INFO << "Integrated C2Pool Mining Pool started successfully!";
             LOG_INFO << "Blockchain: " << blockchain_name << " (" << (settings->m_testnet ? "testnet" : "mainnet") << ")";
             LOG_INFO << "Stratum interface: stratum+tcp://" << http_host << ":" << stratum_port;
