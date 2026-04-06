@@ -170,6 +170,14 @@ public:
 
                 // Check LTC block target
                 uint256 block_target = chain::bits_to_target(s->m_min_header.m_bits);
+                // Diagnostic: log comparison for shares with very low pow_hash
+                if (pow.GetHex().substr(0, 14) == "00000000000000") {
+                    LOG_INFO << "[SCAN-CHECK] hash=" << pos.GetHex().substr(0,16)
+                             << " pow=" << pow.GetHex()
+                             << " target=" << block_target.GetHex()
+                             << " bits=0x" << std::hex << s->m_min_header.m_bits << std::dec
+                             << " meets=" << (pow <= block_target);
+                }
                 if (!block_target.IsNull() && pow <= block_target) {
                     idx->is_block_solution = true;
                     if (m_on_block_found) { m_on_block_found(pos); ++found_ltc; }
