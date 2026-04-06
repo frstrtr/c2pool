@@ -241,6 +241,8 @@ public:
     std::vector<DiscoveredMergedBlock> get_recent_blocks(size_t limit = 20) const;
     uint64_t get_total_blocks() const;
     uint64_t get_chain_block_count(uint32_t chain_id) const;
+    // Add externally discovered block (e.g. from peer share scan)
+    void add_discovered_block(const DiscoveredMergedBlock& blk);
 
     // Per-chain config snapshots (for REST)
     struct ChainInfo {

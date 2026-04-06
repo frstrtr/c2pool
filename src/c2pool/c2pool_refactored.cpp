@@ -2945,12 +2945,17 @@ int main(int argc, char* argv[]) {
                                  << " pow=" << pow_hash.GetHex().substr(0,16)
                                  << " target=" << target.GetHex().substr(0,16);
 
-                        uint256 block_hash;
-                        block_hash.SetHex(ci.block_hash);
-                        mi->record_found_block(
-                            static_cast<uint64_t>(ci.current_height), block_hash, 0, ci.symbol,
-                            "", share_hash.GetHex(),
-                            ci.difficulty, 0, 0, 0);
+                        // Record to merged blocks table (not LTC found_blocks)
+                        c2pool::merged::DiscoveredMergedBlock blk;
+                        blk.chain_id = ci.chain_id;
+                        blk.symbol = ci.symbol;
+                        blk.height = ci.current_height;
+                        blk.block_hash = ci.block_hash;
+                        blk.parent_hash = share_hash.GetHex();
+                        blk.timestamp = static_cast<int64_t>(std::time(nullptr));
+                        blk.accepted = true;
+                        blk.coinbase_value = ci.coinbase_value;
+                        mm->add_discovered_block(blk);
                     }
                 }
             };

@@ -3230,7 +3230,18 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
                                           uint64_t subsidy)
 {
     if (ts == 0) ts = static_cast<uint64_t>(std::time(nullptr));
-    FoundBlock blk{height, hash.GetHex(), ts, BlockStatus::pending, 0, chain, 0,
+    std::string hash_hex = hash.GetHex();
+
+    // Runtime dedup: skip if this hash+chain combo already exists
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        for (const auto& existing : m_found_blocks) {
+            if (existing.hash == hash_hex && existing.chain == chain)
+                return;  // already recorded
+        }
+    }
+
+    FoundBlock blk{height, hash_hex, ts, BlockStatus::pending, 0, chain, 0,
                    miner, share_hash, network_difficulty, share_difficulty,
                    pool_hashrate, subsidy, 0, 0, 0};
 

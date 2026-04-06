@@ -1708,6 +1708,20 @@ uint64_t MergedMiningManager::get_chain_block_count(uint32_t chain_id) const
     return (it != m_blocks_per_chain.end()) ? it->second : 0;
 }
 
+void MergedMiningManager::add_discovered_block(const DiscoveredMergedBlock& blk)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    // Dedup by block_hash + chain_id
+    for (const auto& existing : m_discovered_blocks) {
+        if (existing.block_hash == blk.block_hash && existing.chain_id == blk.chain_id)
+            return;
+    }
+    m_discovered_blocks.push_back(blk);
+    m_blocks_per_chain[blk.chain_id]++;
+    LOG_INFO << "[MM:" << blk.symbol << "] External block added: height=" << blk.height
+             << " hash=" << blk.block_hash.substr(0, 16);
+}
+
 std::vector<MergedMiningManager::ChainInfo> MergedMiningManager::get_chain_infos() const
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
