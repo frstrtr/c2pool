@@ -3057,6 +3057,48 @@ int main(int argc, char* argv[]) {
                     local_j["peer_first_received_from"] = obj->peer_addr.to_string();
                     result["local"] = local_j;
 
+                    // Block solution detection
+                    bool is_ltc_block = idx && idx->is_block_solution;
+                    result["is_block_solution"] = is_ltc_block;
+
+                    // DOGE block detection — check discovered merged blocks
+                    auto mi = web_server.get_mining_interface();
+                    bool is_doge_block = false;
+                    nlohmann::json doge_block_info;
+                    if (mi) {
+                        auto* mm = mi->get_mm_manager();
+                        if (mm) {
+                            auto short_hash = hash.GetHex().substr(0, 16);
+                            for (const auto& db : mm->get_discovered_blocks()) {
+                                if (!db.parent_hash.empty() &&
+                                    db.parent_hash.substr(0, 16) == short_hash) {
+                                    is_doge_block = true;
+                                    doge_block_info["symbol"] = db.symbol;
+                                    doge_block_info["height"] = db.height;
+                                    doge_block_info["block_hash"] = db.block_hash;
+                                    doge_block_info["reward"] = static_cast<double>(db.coinbase_value) / 1e8;
+                                    doge_block_info["miner"] = db.miner;
+                                    break;
+                                }
+                            }
+                        }
+                        // Also check LTC found blocks for enriched data
+                        if (is_ltc_block) {
+                            for (const auto& fb : mi->get_found_blocks()) {
+                                if (fb.hash == hash.GetHex() ||
+                                    (!fb.share_hash.empty() && fb.share_hash == hash.GetHex())) {
+                                    result["ltc_block_height"] = fb.height;
+                                    result["ltc_block_confirmations"] = fb.confirmations;
+                                    result["ltc_block_status"] = static_cast<int>(fb.status);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    result["is_doge_block"] = is_doge_block;
+                    if (is_doge_block)
+                        result["doge_block"] = doge_block_info;
+
                     // Share data — convert miner to address
                     auto script = get_share_script(obj);
                     std::string addr = core::script_to_address(script, true, testnet);

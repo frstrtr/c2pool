@@ -235,6 +235,49 @@
             font-size: 0.82rem;
             margin-top: 30px;
         }
+        /* Block solution banners */
+        .block-banner {
+            border-radius: 10px;
+            padding: 16px 20px;
+            margin-bottom: 16px;
+            text-align: center;
+        }
+        .block-banner.legendary {
+            background: linear-gradient(135deg, rgba(255,128,0,0.2), rgba(204,102,0,0.15));
+            border: 2px solid #ff8000;
+            box-shadow: 0 0 20px rgba(255,128,0,0.3);
+            animation: legendary-pulse 2s ease-in-out infinite;
+        }
+        .block-banner.ltc-block {
+            background: linear-gradient(135deg, rgba(255,215,0,0.15), rgba(200,170,0,0.1));
+            border: 2px solid #ffd700;
+            box-shadow: 0 0 15px rgba(255,215,0,0.25);
+        }
+        .block-banner.doge-block {
+            background: linear-gradient(135deg, rgba(0,229,255,0.12), rgba(0,180,200,0.08));
+            border: 2px solid #00e5ff;
+            box-shadow: 0 0 15px rgba(0,229,255,0.2);
+        }
+        @keyframes legendary-pulse {
+            0%, 100% { box-shadow: 0 0 15px rgba(255,128,0,0.25); }
+            50% { box-shadow: 0 0 30px rgba(255,128,0,0.5); }
+        }
+        .block-banner .banner-title {
+            font-size: 1.3rem;
+            font-weight: 800;
+            margin-bottom: 8px;
+        }
+        .block-banner .banner-detail {
+            font-size: 0.9rem;
+            margin: 4px 0;
+        }
+        .block-banner a {
+            color: inherit;
+            text-decoration: underline;
+            text-decoration-style: dotted;
+        }
+        .block-banner a:hover { text-decoration-style: solid; }
+
         footer a { color: var(--primary); text-decoration: none; }
 
         /* PPLNS Treemap */
@@ -283,14 +326,15 @@
         .pplns-cell .pplns-pct {
             color: #fff;
             font-weight: 800;
-            text-shadow: 0 1px 4px rgba(0,0,0,0.8), 0 0 8px rgba(0,0,0,0.5);
-            line-height: 1.2;
+            text-shadow: 0 1px 2px rgba(0,0,0,1), 0 0 6px rgba(0,0,0,0.7), 0 0 12px rgba(0,0,0,0.4);
+            line-height: 1.15;
         }
         .pplns-cell .pplns-addr {
-            color: rgba(255,255,255,0.85);
+            color: rgba(255,255,255,0.9);
             font-family: 'Monaco','Consolas',monospace;
-            text-shadow: 0 1px 3px rgba(0,0,0,0.8);
-            line-height: 1.2;
+            font-weight: 600;
+            text-shadow: 0 1px 2px rgba(0,0,0,1), 0 0 6px rgba(0,0,0,0.7);
+            line-height: 1.15;
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
@@ -423,6 +467,47 @@
                 html += '</div>';
             }
             html += '</div>';
+
+            // Block solution banners
+            var isLtcBlock = share.is_block_solution;
+            var isDogeBlock = share.is_doge_block;
+            var blockExplorer = block_prefix || 'https://blockchair.com/litecoin/block/';
+            var dogeExplorer = 'https://blockchair.com/dogecoin/block/';
+
+            if (isLtcBlock && isDogeBlock) {
+                // LEGENDARY — twin block
+                var db = share.doge_block || {};
+                html += '<div class="block-banner legendary">';
+                html += '<div class="banner-title" style="color:#ff8000">TWIN BLOCK — LEGENDARY</div>';
+                html += '<div class="banner-detail" style="color:#ffd700">LTC Block: <a href="' + blockExplorer + share_hash + '" target="_blank">' + share_hash.substr(0, 20) + '…</a>';
+                if (share.ltc_block_height) html += ' (height ' + share.ltc_block_height + ')';
+                if (share.ltc_block_confirmations) html += ' — ' + share.ltc_block_confirmations + ' confirmations';
+                html += '</div>';
+                html += '<div class="banner-detail" style="color:#00e5ff">DOGE Block: <a href="' + dogeExplorer + (db.block_hash || '') + '" target="_blank">' + (db.block_hash || '').substr(0, 20) + '…</a>';
+                if (db.height) html += ' (height ' + db.height + ')';
+                if (db.reward) html += ' — ' + db.reward.toFixed(2) + ' DOGE reward';
+                html += '</div>';
+                html += '</div>';
+            } else if (isLtcBlock) {
+                html += '<div class="block-banner ltc-block">';
+                html += '<div class="banner-title" style="color:#ffd700">LTC BLOCK SOLUTION</div>';
+                html += '<div class="banner-detail" style="color:#ffd700">Block: <a href="' + blockExplorer + share_hash + '" target="_blank">' + share_hash.substr(0, 24) + '…</a>';
+                if (share.ltc_block_height) html += ' (height ' + share.ltc_block_height + ')';
+                if (share.ltc_block_confirmations) html += ' — ' + share.ltc_block_confirmations + ' confirmations';
+                html += '</div>';
+                var val = share.block && share.block.gentx ? share.block.gentx.value : null;
+                if (val) html += '<div class="banner-detail" style="color:var(--text)">Block reward: ' + val.toFixed(8) + ' ' + symbol + '</div>';
+                html += '</div>';
+            } else if (isDogeBlock) {
+                var db = share.doge_block || {};
+                html += '<div class="block-banner doge-block">';
+                html += '<div class="banner-title" style="color:#00e5ff">DOGE BLOCK SOLUTION</div>';
+                html += '<div class="banner-detail" style="color:#00e5ff">Block: <a href="' + dogeExplorer + (db.block_hash || '') + '" target="_blank">' + (db.block_hash || '').substr(0, 24) + '…</a>';
+                if (db.height) html += ' (height ' + db.height + ')';
+                html += '</div>';
+                if (db.reward) html += '<div class="banner-detail" style="color:var(--text)">Block reward: ' + db.reward.toFixed(2) + ' DOGE</div>';
+                html += '</div>';
+            }
 
             // Share Data section
             var sd = share.share_data || {};
@@ -636,72 +721,78 @@
                         var hasDoge = r.doge > 0;
                         var isV35Only = mv.ver && mv.ver < 36 && (!mv.dv || mv.dv < 36);
 
+                        // Clamp font sizes to actually fit in the cell
+                        var fitPct = Math.max(8, Math.min(r.w / 6, r.h / 5, 28));
+                        var fitAddr = Math.max(6, Math.min(fitPct * 0.5, r.w / 14, 12));
+                        var fitVer = Math.max(6, Math.min(fitPct * 0.4, 10));
+
                         // LTC percentage
-                        if (r.w > 30 && r.h > 16) {
+                        if (r.w > 28 && r.h > 14) {
                             var pctEl = document.createElement('div');
                             pctEl.className = 'pplns-pct';
-                            pctEl.style.fontSize = pctSize + 'px';
-                            pctEl.textContent = (r.pct * 100).toFixed(1) + '% LTC';
+                            pctEl.style.fontSize = fitPct + 'px';
+                            pctEl.textContent = (r.pct * 100).toFixed(1) + '%';
                             cell.appendChild(pctEl);
                         }
 
-                        // DOGE percentage — same size as LTC, right below
-                        if (r.w > 30 && r.h > 30) {
+                        // DOGE percentage — same size, right below
+                        if (r.w > 35 && r.h > 28) {
                             var dogeEl = document.createElement('div');
                             dogeEl.className = 'pplns-pct';
-                            dogeEl.style.fontSize = pctSize + 'px';
+                            dogeEl.style.fontSize = Math.max(8, fitPct * 0.85) + 'px';
                             if (hasDoge) {
                                 var dogePct = dogeTotal > 0 ? (r.doge / dogeTotal * 100).toFixed(1) : '0';
                                 dogeEl.style.color = '#ffd700';
-                                dogeEl.textContent = dogePct + '% DOGE';
+                                dogeEl.textContent = dogePct + '% D';
+                            } else if (isV35Only) {
+                                dogeEl.style.color = '#ff6b6b';
+                                dogeEl.textContent = r.w > 55 ? 'NO DOGE' : '0% D';
                             } else {
-                                // V35-only: NO DOGE — make it obvious
-                                dogeEl.style.color = '#dc3545';
-                                dogeEl.style.opacity = '0.9';
-                                dogeEl.textContent = isV35Only ? 'NO DOGE' : '\u2014';
+                                dogeEl.style.color = 'rgba(255,255,255,0.3)';
+                                dogeEl.textContent = '\u2014';
                             }
                             cell.appendChild(dogeEl);
                         }
 
                         // Address label
-                        if (r.w > 50 && r.h > 50) {
+                        if (r.w > 45 && r.h > 45) {
                             var addrEl = document.createElement('div');
                             addrEl.className = 'pplns-addr';
-                            addrEl.style.fontSize = addrSize + 'px';
-                            var maxChars = Math.max(6, Math.floor(r.w / (addrSize * 0.62)));
+                            addrEl.style.fontSize = fitAddr + 'px';
+                            var maxChars = Math.max(4, Math.floor(r.w / (fitAddr * 0.65)));
                             addrEl.textContent = r.addr.length > maxChars
                                 ? r.addr.substr(0, maxChars) + '…'
                                 : r.addr;
                             cell.appendChild(addrEl);
                         }
 
-                        // Version tag
-                        if (r.w > 35 && r.h > 60 && mv.ver) {
+                        // Version tag — only if enough vertical space
+                        if (r.w > 30 && r.h > 55 && mv.ver) {
                             var verEl = document.createElement('div');
-                            verEl.style.fontSize = verSize + 'px';
-                            verEl.style.lineHeight = '1.2';
-                            verEl.style.marginTop = '2px';
+                            verEl.style.fontSize = fitVer + 'px';
+                            verEl.style.lineHeight = '1.1';
+                            verEl.style.marginTop = '1px';
                             if (mv.dv && mv.dv !== mv.ver) {
-                                verEl.style.color = '#0097a7';
-                                verEl.style.textShadow = '0 1px 3px rgba(0,0,0,0.8)';
+                                verEl.style.color = '#4dd0e1';
+                                verEl.style.textShadow = '0 1px 3px rgba(0,0,0,0.9)';
                                 verEl.style.fontWeight = '700';
                                 verEl.textContent = 'V' + mv.ver + '\u2192V' + mv.dv;
                             } else if (isV35Only) {
-                                verEl.style.color = '#dc3545';
-                                verEl.style.textShadow = '0 1px 3px rgba(0,0,0,0.8)';
+                                verEl.style.color = '#ff6b6b';
+                                verEl.style.textShadow = '0 1px 3px rgba(0,0,0,0.9)';
                                 verEl.style.fontWeight = '700';
-                                verEl.textContent = 'V' + mv.ver + ' ONLY';
+                                verEl.textContent = 'V' + mv.ver;
                             } else {
-                                verEl.style.color = 'rgba(255,255,255,0.5)';
+                                verEl.style.color = 'rgba(255,255,255,0.4)';
                                 verEl.style.textShadow = '0 1px 2px rgba(0,0,0,0.6)';
                                 verEl.textContent = 'V' + mv.ver;
                             }
                             cell.appendChild(verEl);
                         }
 
-                        // V35-only cells get desaturated + red tint border to visually push upgrade
+                        // V35-only cells get desaturated + red border
                         if (isV35Only) {
-                            cell.style.filter = 'saturate(0.4)';
+                            cell.style.filter = 'saturate(0.4) brightness(0.85)';
                             cell.style.borderColor = 'rgba(220,53,69,0.6)';
                         }
 
