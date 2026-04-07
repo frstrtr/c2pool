@@ -3158,11 +3158,15 @@
                     tr.append('td')
                         .style('font-family', 'monospace')
                         .style('font-size', '11px')
-                        .text(function(b) {
-                            if (!b.miner) return '-';
-                            return b.miner.substr(0, 8) + '...';
-                        })
-                        .attr('title', function(b) { return b.miner || ''; });
+                        .each(function(b) {
+                            if (!b.miner) { d3.select(this).text('-'); return; }
+                            d3.select(this).append('a')
+                                .attr('class', 'hash-link')
+                                .attr('href', 'https://blockchair.com/litecoin/address/' + b.miner)
+                                .attr('target', '_blank')
+                                .attr('title', b.miner)
+                                .text(b.miner.substr(0, 8) + '...');
+                        });
                     tr.append('td')
                         .attr('class', function(b) {
                             if (b.verified === true) return 'status-confirmed';
@@ -3269,11 +3273,15 @@
                     tr.append('td')
                         .style('font-family', 'monospace')
                         .style('font-size', '11px')
-                        .text(function(b) {
-                            if (!b.miner) return '-';
-                            return b.miner.length > 16 ? b.miner.substr(0, 8) + '...' : b.miner;
-                        })
-                        .attr('title', function(b) { return b.miner || ''; });
+                        .each(function(b) {
+                            if (!b.miner) { d3.select(this).text('-'); return; }
+                            d3.select(this).append('a')
+                                .attr('class', 'hash-link')
+                                .attr('href', 'https://blockchair.com/litecoin/address/' + b.miner)
+                                .attr('target', '_blank')
+                                .attr('title', b.miner)
+                                .text(b.miner.substr(0, 8) + '...');
+                        });
                     tr.append('td')
                         .style('font-family', 'monospace')
                         .style('font-size', '11px')

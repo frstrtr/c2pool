@@ -5204,6 +5204,9 @@ int main(int argc, char* argv[]) {
                     blk.timestamp = static_cast<int64_t>(std::time(nullptr));
                     blk.accepted = true;
                     blk.miner = ctx.miner;
+                    // DOGE subsidy: 10,000 DOGE for blocks above 600,000
+                    // Reference: dogecoin/src/dogecoin.cpp GetDogecoinBlockSubsidy()
+                    blk.coinbase_value = 1000000000000ULL;  // 10000 * 1e8 koinu
                     // Get real LTC block height from header chain (not sharechain absheight)
                     if (ltc_hc) {
                         auto ltc_entry = ltc_hc->get_header(ltc_block_hash);
