@@ -1567,7 +1567,7 @@
                             <tr>
                                 <th>Time</th>
                                 <th>Network</th>
-                                <th>Chain ID</th>
+                                <th>Height</th>
                                 <th>Block Hash</th>
                                 <th>Miner</th>
                                 <th title="Block status">✓</th>
@@ -3137,19 +3137,29 @@
                         .style('font-weight', 'bold')
                         .style('color', '#6f42c1')
                         .text(function(b) { return b.symbol || b.network || 'AUX'; });
-                    tr.append('td').text(function(b) { return b.chainid || '-'; });
+                    tr.append('td')
+                        .style('font-weight', 'bold')
+                        .each(function(b) {
+                            if (!b.height) { d3.select(this).text('-'); return; }
+                            var chain = (b.symbol || '').toLowerCase() === 'doge' ? 'dogecoin' : 'litecoin';
+                            d3.select(this).append('a')
+                                .attr('class', 'hash-link')
+                                .style('color', '#6f42c1')
+                                .attr('href', 'https://blockchair.com/' + chain + '/block/' + b.height)
+                                .attr('target', '_blank')
+                                .attr('title', (b.symbol || 'AUX') + ' block #' + b.height)
+                                .text('#' + b.height);
+                        });
                     tr.append('td').append('a')
                         .attr('class', 'hash-link')
                         .attr('href', function(b) {
-                            var explorer_config = merged_explorers[b.chainid];
-                            if (explorer_config && b.pow_hash) {
-                                return explorer_config.testnet + b.pow_hash;
-                            }
+                            var chain = (b.symbol || '').toLowerCase() === 'doge' ? 'dogecoin' : 'litecoin';
+                            if (b.pow_hash) return 'https://blockchair.com/' + chain + '/block/' + b.pow_hash;
                             return '#';
                         })
                         .attr('target', '_blank')
                         .attr('title', function(b) {
-                            return 'POW Hash: ' + (b.pow_hash || 'N/A');
+                            return 'Block Hash: ' + (b.pow_hash || 'N/A');
                         })
                         .text(function(b) {
                             var hash = b.pow_hash || '-';

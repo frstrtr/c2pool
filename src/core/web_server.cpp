@@ -4968,7 +4968,7 @@ nlohmann::json MiningInterface::rest_recent_merged_blocks()
         j["pow_hash"]    = blk.block_hash;
         j["parent_hash"] = blk.parent_hash;
         j["height"]      = blk.height;
-        j["miner"]       = nullptr;  // not tracked per-block yet
+        j["miner"]       = blk.miner.empty() ? nlohmann::json(nullptr) : nlohmann::json(blk.miner);
         j["verified"]    = blk.accepted ? nlohmann::json(true) : nlohmann::json(nullptr);
         arr.push_back(std::move(j));
     }
