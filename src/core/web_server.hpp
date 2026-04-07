@@ -1008,7 +1008,10 @@ private:
         double time;
         double pool_hash_rate;
         double pool_stale_prop;
-        nlohmann::json local_hash_rates;
+        nlohmann::json local_hash_rates;  // per-address hashrate (aggregated)
+        int worker_count{0};              // unique address.worker combos
+        int miner_count{0};               // unique base addresses
+        int connected_count{0};           // raw stratum TCP connections
         uint64_t shares;
         uint64_t stale_shares;
         double current_payout;

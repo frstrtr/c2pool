@@ -21,6 +21,7 @@
 
 #include <iomanip>
 #include <sstream>
+#include <set>
 #include <ctime>
 #include <chrono>
 #include <cmath>
@@ -5265,18 +5266,17 @@ nlohmann::json MiningInterface::rest_web_graph_data(const std::string& source, c
         else if (source == "local_dead_hash_rate") {
             result.push_back({entry.time, 0.0});
         }
-        else if (source == "worker_count" || source == "connected_miners") {
-            // p2pool: len(miner_hash_rates) = number of stratum workers with recent work
-            int count = 0;
-            if (entry.local_hash_rates.is_object())
-                count = static_cast<int>(entry.local_hash_rates.size());
-            result.push_back({entry.time, count});
+        else if (source == "worker_count") {
+            // Unique address.worker combos — 1 miner with 3 named workers = 3
+            result.push_back({entry.time, entry.worker_count});
         }
         else if (source == "unique_miner_count") {
-            int count = 0;
-            if (entry.local_hash_rates.is_object())
-                count = static_cast<int>(entry.local_hash_rates.size());
-            result.push_back({entry.time, count});
+            // Unique base addresses — 3 rigs with same address = 1 miner
+            result.push_back({entry.time, entry.miner_count});
+        }
+        else if (source == "connected_miners") {
+            // Raw stratum TCP connections — 1 ASIC with 2 connections = 2
+            result.push_back({entry.time, entry.connected_count});
         }
         else if (source == "current_payout") {
             result.push_back({entry.time, entry.current_payout});
@@ -5381,13 +5381,24 @@ void MiningInterface::update_stat_log()
     }
 
     // Local hash rates by address — from stratum worker registry
+    // Matches p2pool: worker_count = unique address.worker combos,
+    // unique_miner_count = unique base addresses,
+    // connected_miners = raw stratum TCP connections.
     entry.local_hash_rates = nlohmann::json::object();
     {
         auto workers = get_stratum_workers();
+        entry.connected_count = static_cast<int>(workers.size());  // raw TCP connections
+        std::set<std::string> worker_combos;
         for (const auto& [sid, w] : workers) {
             double existing = entry.local_hash_rates.value(w.username, 0.0);
             entry.local_hash_rates[w.username] = existing + w.hashrate;
+            // address.worker combo — e.g. "LTC1abc.rig1" is distinct from "LTC1abc.rig2"
+            std::string combo = w.username;
+            if (!w.worker_name.empty()) combo += "." + w.worker_name;
+            worker_combos.insert(combo);
         }
+        entry.miner_count = static_cast<int>(entry.local_hash_rates.size());  // unique addresses
+        entry.worker_count = static_cast<int>(worker_combos.size());          // unique address.worker
     }
 
     entry.shares = 0;
