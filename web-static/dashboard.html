@@ -2142,6 +2142,10 @@
                             <span class="value" id="defrag-fee" style="color:#9c27b0">-</span>
                         </div>
                         <div class="defrag-stat-row">
+                            <span class="label">V36 Native</span>
+                            <span class="value" id="defrag-v36native" style="color:#00e676">-</span>
+                        </div>
+                        <div class="defrag-stat-row">
                             <span class="label">V36 Signaling</span>
                             <span class="value" id="defrag-v36sig" style="color:#0097a7">-</span>
                         </div>
@@ -2154,12 +2158,20 @@
                     <div class="defrag-legend">
                         <h4>Legend</h4>
                         <div class="legend-item">
-                            <div class="legend-swatch" style="background:#008de4"></div>
+                            <div class="legend-swatch" style="background:#00b0ff"></div>
                             <span>This Node</span>
                         </div>
                         <div class="legend-item">
+                            <div class="legend-swatch" style="background:#00e676"></div>
+                            <span>V36 (others)</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-swatch" style="background:#0097a7"></div>
+                            <span>V36 signaling</span>
+                        </div>
+                        <div class="legend-item">
                             <div class="legend-swatch" style="background:#28a745"></div>
-                            <span>Verified (others)</span>
+                            <span>V35 (others)</span>
                         </div>
                         <div class="legend-item">
                             <div class="legend-swatch" style="background:#555577"></div>
@@ -2176,10 +2188,6 @@
                         <div class="legend-item">
                             <div class="legend-swatch" style="background:#9c27b0"></div>
                             <span>Pool fee share</span>
-                        </div>
-                        <div class="legend-item">
-                            <div class="legend-swatch" style="background:#0097a7"></div>
-                            <span>V36 signaling</span>
                         </div>
                         <div class="legend-item">
                             <div class="legend-swatch" style="background:#28a745;border:2px solid #ffd700;box-shadow:0 0 3px rgba(255,215,0,0.5)"></div>
@@ -4730,15 +4738,20 @@
                 // Pool fee share - purple
                 if (share.fee) return '#9c27b0';
 
-                // V36-desired signaling shares - teal tint
-                var isV36Signal = share.dv && share.dv >= 36 && share.V < 36;
-
                 var isMine = this.myAddress && share.m === this.myAddress;
+                var isV36Native = share.V >= 36;
+                var isV36Signal = !isV36Native && share.dv && share.dv >= 36;
 
-                if (isMine) {
-                    return isV36Signal ? '#0097a7' : '#008de4';
+                if (isV36Native) {
+                    // V36 native shares — bright cyan-green / bright blue
+                    return isMine ? '#00b0ff' : '#00e676';
                 }
-                return isV36Signal ? '#2e7d32' : '#28a745';
+                if (isV36Signal) {
+                    // V35 signaling V36 — teal
+                    return isMine ? '#0097a7' : '#2e7d32';
+                }
+                // V35 only (not signaling) — standard green / blue
+                return isMine ? '#008de4' : '#28a745';
             },
 
             hitTest: function(e) {
@@ -5139,7 +5152,7 @@
 
             updateStats: function(data) {
                 var shares = data.shares || [];
-                var mine = 0, stale = 0, dead = 0, verified = 0, fee = 0, v36sig = 0;
+                var mine = 0, stale = 0, dead = 0, verified = 0, fee = 0, v36sig = 0, v36native = 0;
                 var ltcBlocks = 0, dogeBlocks = 0;
                 var self = this;
                 shares.forEach(function(s) {
@@ -5148,8 +5161,8 @@
                     if (s.s === 2) dead++;
                     if (s.v) verified++;
                     if (s.fee) fee++;
-                    if (s.dv && s.dv >= 36 && s.V < 36) v36sig++;
-                    // Count blocks from both blk flag and blockSet/dogeSet
+                    if (s.V >= 36) v36native++;
+                    else if (s.dv && s.dv >= 36) v36sig++;
                     if (s.blk || self.blockSet[s.h]) ltcBlocks++;
                     if (self.dogeSet[s.h]) dogeBlocks++;
                 });
@@ -5162,6 +5175,7 @@
                 document.getElementById('defrag-chain-len').textContent = data.chain_length || '-';
                 document.getElementById('defrag-blocks').textContent = ltcBlocks + ' LTC / ' + dogeBlocks + ' DOGE';
                 document.getElementById('defrag-fee').textContent = fee;
+                document.getElementById('defrag-v36native').textContent = v36native;
                 document.getElementById('defrag-v36sig').textContent = v36sig;
             }
         };
