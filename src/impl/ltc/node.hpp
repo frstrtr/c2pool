@@ -172,7 +172,7 @@ public:
                 {"incoming", incoming},
                 {"uptime", uptime_sec},
                 {"downtime", 0},
-                {"txpool_size", static_cast<int>(peer->m_remote_txs.size())},
+                {"txpool_size", static_cast<int>(peer->m_remembered_txs.size())},
                 {"web_port", 0}
             });
         }

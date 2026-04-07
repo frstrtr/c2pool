@@ -1667,7 +1667,7 @@
                                 <th>Version</th>
                                 <th>Direction</th>
                                 <th>Uptime</th>
-                                <th>TxPool</th>
+                                <th title="Remembered transactions (P2P tx cache)">TxPool</th>
                             </tr>
                         </thead>
                         <tbody id="peers_tbody">
@@ -3652,43 +3652,28 @@
                 if (!peers || peers.length === 0) {
                     var tr = d3.select('#peers_tbody').append('tr');
                     tr.append('td')
-                        .attr('colspan', '6')
+                        .attr('colspan', '5')
                         .style('text-align', 'center')
                         .style('color', 'var(--text-muted)')
                         .text('No peers connected');
                     return;
                 }
-                
+
                 var tr = d3.select('#peers_tbody').selectAll('tr').data(peers).enter().append('tr');
-                tr.append('td').append('a')
-                    .attr('href', function(p) { 
-                        // Use web_port from API response
-                        var parts = p.address.split(':');
-                        var host = parts[0];
-                        return 'http://' + host + ':' + p.web_port;
-                    })
-                    .attr('target', '_blank')
-                    .attr('class', 'hash-link')
-                    .text(function(p) { 
-                        // Display format: IP:WORKER_PORT (P2P:P2P_PORT)
-                        var parts = p.address.split(':');
-                        var host = parts[0];
-                        var p2p_port = parts[1];
-                        return host + ':' + p.web_port + ' (P2P:' + p2p_port + ')';
-                    });
+                tr.append('td')
+                    .style('font-family', 'monospace')
+                    .style('font-size', '12px')
+                    .text(function(p) { return p.address || '-'; });
                 tr.append('td').text(function(p) { return p.version || '-'; });
                 tr.append('td')
                     .style('white-space', 'nowrap')
-                    .html(function(p) { 
-                        return p.incoming ? 
-                            '<span style="color: var(--success)">⬇ Incoming</span>' : 
-                            '<span style="color: var(--info)">⬆ Outgoing</span>'; 
+                    .html(function(p) {
+                        return p.incoming ?
+                            '<span style="color: var(--success)">⬇ Incoming</span>' :
+                            '<span style="color: var(--info)">⬆ Outgoing</span>';
                     });
                 tr.append('td').text(function(p) { return format_duration(p.uptime || 0); });
-                tr.append('td')
-                    .text(function(p) { return format_duration(p.downtime || 0); })
-                    .style('color', function(p) { return p.downtime > 0 ? 'var(--text-muted)' : ''; });
-                tr.append('td').text(function(p) { return p.txpool_size || '0'; });
+                tr.append('td').text(function(p) { return p.txpool_size || 0; });
                 
                 // Update P2Pool peer count and stats
                 d3.select('#p2pool_peers_count').text(peers.length);
