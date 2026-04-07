@@ -2871,6 +2871,7 @@ int main(int argc, char* argv[]) {
                 nlohmann::json result;
                 auto& chain = p2p_node->tracker().chain;
                 auto& verified = p2p_node->tracker().verified;
+                bool testnet = ltc::PoolConfig::is_testnet;
 
                 // Use tallest chain head (not verified best) so the grid stays current during sync
                 uint256 best;
@@ -2882,32 +2883,48 @@ int main(int argc, char* argv[]) {
 
                 result["best_hash"] = best.IsNull() ? "" : best.GetHex();
                 result["chain_length"] = static_cast<int>(chain.size());
+                result["window_size"] = static_cast<int>(ltc::PoolConfig::chain_length());
 
                 // Include local payout address so frontend can mark "mine" shares
                 auto mi = web_server.get_mining_interface();
                 std::string local_addr;
-                if (mi) {
+                if (mi && !mi->get_payout_address().empty()) {
                     auto script = core::address_to_script(mi->get_payout_address());
                     if (!script.empty())
-                        local_addr = HexStr(script);
+                        local_addr = core::script_to_address(script, true, testnet);
                 }
                 result["my_address"] = local_addr;
 
+                // Node fee address for marking pool fee shares
+                std::string fee_addr;
+                if (mi) {
+                    std::string fee_h160 = mi->get_node_fee_hash160();
+                    if (!fee_h160.empty())
+                        fee_addr = fee_h160;
+                }
+                result["fee_hash160"] = fee_addr;
+
                 nlohmann::json shares_arr = nlohmann::json::array();
 
+                // Walk chain_length shares (8640 mainnet / 400 testnet)
                 if (!best.IsNull()) {
                     int height = chain.get_height(best);
-                    int walk = std::min(height, 2000);
+                    int walk = std::min(height, static_cast<int>(ltc::PoolConfig::chain_length()));
                     if (walk > 0) {
                         try {
                             int pos = 0;
                             auto view = chain.get_chain(best, walk);
                             for (auto [hash, data] : view) {
                                 nlohmann::json s;
-                                s["h"] = hash.GetHex().substr(0, 16);  // short hash for grid
-                                s["H"] = hash.GetHex();                // full hash for links
+                                s["h"] = hash.GetHex().substr(0, 16);
+                                s["H"] = hash.GetHex();
                                 s["p"] = pos++;
                                 s["v"] = verified.contains(hash) ? 1 : 0;
+
+                                // Check is_block_solution flag from tracker index
+                                auto* idx = chain.get_index(hash);
+                                if (idx && idx->is_block_solution)
+                                    s["blk"] = 1;
 
                                 data.share.invoke([&](auto* obj) {
                                     s["t"] = obj->m_timestamp;
@@ -2915,14 +2932,28 @@ int main(int argc, char* argv[]) {
                                     s["s"] = static_cast<int>(obj->m_stale_info);
                                     s["b"] = obj->m_bits;
                                     s["a"] = obj->m_absheight;
-                                    s["d"] = static_cast<int>(obj->m_donation);
+                                    s["dv"] = obj->m_desired_version;
 
-                                    std::string miner;
-                                    if constexpr (requires { obj->m_pubkey_hash; })
-                                        miner = obj->m_pubkey_hash.GetHex();
-                                    else if constexpr (requires { obj->m_address; })
-                                        miner = HexStr(obj->m_address.m_data);
-                                    s["m"] = miner;
+                                    // Convert miner script to human-readable address
+                                    auto script = get_share_script(obj);
+                                    std::string addr = core::script_to_address(
+                                        script, true /*litecoin*/, testnet);
+                                    s["m"] = addr.empty() ? HexStr(script) : addr;
+
+                                    // Detect pool fee share: compare hash160 with fee address
+                                    if (!fee_addr.empty() && script.size() >= 22) {
+                                        // Extract hash160 from script (P2PKH[3:23], P2WPKH[2:22], P2SH[2:22])
+                                        int off = -1;
+                                        if (script.size() == 25 && script[0] == 0x76) off = 3;
+                                        else if (script.size() == 22 && script[0] == 0x00) off = 2;
+                                        else if (script.size() == 23 && script[0] == 0xa9) off = 2;
+                                        if (off >= 0) {
+                                            std::string h160 = HexStr(std::vector<unsigned char>(
+                                                script.begin() + off, script.begin() + off + 20));
+                                            if (h160 == fee_addr)
+                                                s["fee"] = 1;
+                                        }
+                                    }
                                 });
 
                                 shares_arr.push_back(std::move(s));
@@ -2933,13 +2964,14 @@ int main(int argc, char* argv[]) {
                     }
                 }
 
-                // heads and tails for fork marking
+                // heads for fork marking
                 nlohmann::json heads_arr = nlohmann::json::array();
                 for (auto& [hh, _] : chain.get_heads()) {
                     heads_arr.push_back(hh.GetHex().substr(0, 16));
                 }
 
-                // Include found block share hashes so the grid can mark block solutions
+                // LTC found blocks — use is_block_solution flag (above), but also keep
+                // share hashes from persistence for blocks found before restart
                 nlohmann::json blocks_arr = nlohmann::json::array();
                 if (mi) {
                     for (const auto& fb : mi->get_found_blocks()) {
@@ -2948,9 +2980,22 @@ int main(int argc, char* argv[]) {
                     }
                 }
 
+                // DOGE discovered blocks — keyed by parent (LTC) block hash
+                nlohmann::json doge_arr = nlohmann::json::array();
+                if (mi) {
+                    auto* mm = mi->get_mm_manager();
+                    if (mm) {
+                        for (const auto& db : mm->get_discovered_blocks()) {
+                            if (!db.parent_hash.empty())
+                                doge_arr.push_back(db.parent_hash.substr(0, 16));
+                        }
+                    }
+                }
+
                 result["shares"] = std::move(shares_arr);
                 result["heads"] = std::move(heads_arr);
                 result["blocks"] = std::move(blocks_arr);
+                result["doge_blocks"] = std::move(doge_arr);
                 result["total"] = static_cast<int>(chain.size());
                 return result;
             });

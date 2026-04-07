@@ -358,7 +358,7 @@
             var payoutAddr = sd.payout_address || '';
             var payoutLink = addr_prefix ? '<a href="' + addr_prefix + payoutAddr + '" target="_blank">' + esc(payoutAddr) + '</a>' : esc(payoutAddr);
             html += kv('Payout Address', payoutLink);
-            html += kv('Donation', (sd.donation != null ? (sd.donation * 100).toFixed(3) : '-') + '%');
+            // Donation field omitted — always 0 in V36+
 
             var staleHtml = '-';
             if (sd.stale_info === 'orphan' || sd.stale_info === 1) {

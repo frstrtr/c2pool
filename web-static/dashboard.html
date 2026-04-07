@@ -1918,7 +1918,7 @@
                     <div class="defrag-stats">
                         <h4>Chain Window</h4>
                         <div class="defrag-stat-row">
-                            <span class="label">Visible</span>
+                            <span class="label">Shares</span>
                             <span class="value" id="defrag-total">-</span>
                         </div>
                         <div class="defrag-stat-row">
@@ -1940,6 +1940,14 @@
                         <div class="defrag-stat-row">
                             <span class="label">Dead</span>
                             <span class="value" id="defrag-dead" style="color:#dc3545">-</span>
+                        </div>
+                        <div class="defrag-stat-row">
+                            <span class="label">Pool Fee</span>
+                            <span class="value" id="defrag-fee" style="color:#9c27b0">-</span>
+                        </div>
+                        <div class="defrag-stat-row">
+                            <span class="label">V36 Signaling</span>
+                            <span class="value" id="defrag-v36sig" style="color:#0097a7">-</span>
                         </div>
                         <div class="defrag-stat-row">
                             <span class="label">Blocks Found</span>
@@ -1970,11 +1978,27 @@
                             <span>Dead</span>
                         </div>
                         <div class="legend-item">
-                            <div class="legend-swatch block-swatch" style="background:#28a745"></div>
-                            <span>Block solution</span>
+                            <div class="legend-swatch" style="background:#9c27b0"></div>
+                            <span>Pool fee share</span>
                         </div>
                         <div class="legend-item">
-                            <div class="legend-swatch head-swatch" style="background:#0d0d1a"></div>
+                            <div class="legend-swatch" style="background:#0097a7"></div>
+                            <span>V36 signaling</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-swatch" style="background:#28a745;border:2px solid #ffd700;box-shadow:0 0 3px rgba(255,215,0,0.5)"></div>
+                            <span>LTC block</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-swatch" style="background:#28a745;border:2px solid #00e5ff"></div>
+                            <span>DOGE block</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-swatch" style="background:#28a745;border:2px solid #ffd700"><div style="width:4px;height:4px;background:#00e5ff;margin:1px auto"></div></div>
+                            <span>Twin block (LTC+DOGE)</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-swatch" style="background:#0d0d1a;position:relative"><div style="position:absolute;top:0;left:0;width:0;height:0;border-left:5px solid #fff;border-bottom:5px solid transparent"></div></div>
                             <span>Chain head</span>
                         </div>
                     </div>
@@ -4209,9 +4233,11 @@
             ctx: null,
             tooltip: null,
             shares: [],
-            blockSet: {},      // short hashes of block solutions
+            blockSet: {},      // short hashes of LTC block solutions
+            dogeSet: {},       // short hashes of DOGE block solutions (parent hash)
             headSet: {},       // short hashes of chain heads
             myAddress: '',
+            windowSize: 8640,
             cellSize: 10,
             gap: 1,
             cols: 0,
@@ -4229,7 +4255,6 @@
                 this.canvas.addEventListener('mouseleave', function() { self.hideTooltip(); });
                 this.canvas.addEventListener('click', function(e) { self.onClick(e); });
 
-                // Resize handler for responsive grid
                 window.addEventListener('resize', function() {
                     if (self.shares.length > 0) self.render();
                 });
@@ -4241,13 +4266,22 @@
                     if (!data || !data.shares) return;
                     self.shares = data.shares;
                     self.myAddress = data.my_address || '';
+                    self.windowSize = data.window_size || 8640;
 
-                    // Build block solution lookup
                     self.blockSet = {};
                     if (data.blocks) {
                         data.blocks.forEach(function(h) { self.blockSet[h] = true; });
                     }
-                    // Build head lookup
+                    // Also mark shares that have blk=1 flag from tracker index
+                    self.shares.forEach(function(s) {
+                        if (s.blk) self.blockSet[s.h] = true;
+                    });
+
+                    self.dogeSet = {};
+                    if (data.doge_blocks) {
+                        data.doge_blocks.forEach(function(h) { self.dogeSet[h] = true; });
+                    }
+
                     self.headSet = {};
                     if (data.heads) {
                         data.heads.forEach(function(h) { self.headSet[h] = true; });
@@ -4257,7 +4291,6 @@
                     self.updateStats(data);
                 });
 
-                // Also load the link rows (best share, my shares, heads, tails)
                 loadShareLinks();
             },
 
@@ -4267,12 +4300,10 @@
                 var dpr = this.dpr;
                 var step = this.cellSize + this.gap;
 
-                // Calculate grid dimensions from container width
                 var containerWidth = canvas.parentElement.clientWidth - 16;
                 this.cols = Math.max(1, Math.floor(containerWidth / step));
                 this.rows = Math.ceil(this.shares.length / this.cols);
 
-                // Set canvas size (CSS pixels and backing pixels for retina)
                 var cssW = this.cols * step;
                 var cssH = Math.max(this.rows * step, 40);
                 canvas.style.width = cssW + 'px';
@@ -4281,7 +4312,6 @@
                 canvas.height = cssH * dpr;
                 ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-                // Clear
                 ctx.fillStyle = '#0d0d1a';
                 ctx.fillRect(0, 0, cssW, cssH);
 
@@ -4305,17 +4335,39 @@
                     ctx.fillStyle = this.getColor(share);
                     ctx.fillRect(x, y, cs, cs);
 
-                    // Block solution: gold border
-                    if (this.blockSet[share.h]) {
+                    var isLtcBlock = !!this.blockSet[share.h];
+                    var isDogeBlock = !!this.dogeSet[share.h];
+                    var isHead = !!this.headSet[share.h];
+
+                    // LTC block solution: gold border + inner fill
+                    if (isLtcBlock && isDogeBlock) {
+                        // Twin block (LTC + DOGE): gold border, cyan inner dot
                         ctx.strokeStyle = '#ffd700';
-                        ctx.lineWidth = 1.5;
-                        ctx.strokeRect(x + 0.75, y + 0.75, cs - 1.5, cs - 1.5);
-                    }
-                    // Chain head: magenta border
-                    else if (this.headSet[share.h]) {
-                        ctx.strokeStyle = '#e040fb';
-                        ctx.lineWidth = 1;
+                        ctx.lineWidth = 2;
                         ctx.strokeRect(x + 0.5, y + 0.5, cs - 1, cs - 1);
+                        ctx.fillStyle = '#00e5ff';
+                        ctx.fillRect(x + 3, y + 3, cs - 6, cs - 6);
+                    } else if (isLtcBlock) {
+                        // LTC block only: gold border
+                        ctx.strokeStyle = '#ffd700';
+                        ctx.lineWidth = 2;
+                        ctx.strokeRect(x + 0.5, y + 0.5, cs - 1, cs - 1);
+                    } else if (isDogeBlock) {
+                        // DOGE block only: cyan border
+                        ctx.strokeStyle = '#00e5ff';
+                        ctx.lineWidth = 2;
+                        ctx.strokeRect(x + 0.5, y + 0.5, cs - 1, cs - 1);
+                    }
+
+                    // Chain head: bright white triangle marker in corner
+                    if (isHead && !isLtcBlock && !isDogeBlock) {
+                        ctx.fillStyle = '#ffffff';
+                        ctx.beginPath();
+                        ctx.moveTo(x, y);
+                        ctx.lineTo(x + 4, y);
+                        ctx.lineTo(x, y + 4);
+                        ctx.closePath();
+                        ctx.fill();
                     }
 
                     // Hover highlight
@@ -4335,15 +4387,18 @@
                 // Unverified - gray
                 if (!share.v) return '#555577';
 
-                // Mine or others
+                // Pool fee share - purple
+                if (share.fee) return '#9c27b0';
+
+                // V36-desired signaling shares - teal tint
+                var isV36Signal = share.dv && share.dv >= 36 && share.V < 36;
+
                 var isMine = this.myAddress && share.m === this.myAddress;
 
-                // Block solutions get brighter shade
-                if (this.blockSet[share.h]) {
-                    return isMine ? '#00b4ff' : '#40d970';
+                if (isMine) {
+                    return isV36Signal ? '#0097a7' : '#008de4';
                 }
-
-                return isMine ? '#008de4' : '#28a745';
+                return isV36Signal ? '#2e7d32' : '#28a745';
             },
 
             hitTest: function(e) {
@@ -4363,7 +4418,7 @@
                 var idx = this.hitTest(e);
                 if (idx !== this.hoveredIdx) {
                     this.hoveredIdx = idx;
-                    this.render();  // redraw to update hover highlight
+                    this.render();
                 }
                 if (idx >= 0) {
                     this.showTooltip(this.shares[idx], e);
@@ -4382,7 +4437,8 @@
             showTooltip: function(share, e) {
                 var tip = this.tooltip;
                 var isMine = this.myAddress && share.m === this.myAddress;
-                var isBlock = !!this.blockSet[share.h];
+                var isLtcBlock = !!this.blockSet[share.h];
+                var isDogeBlock = !!this.dogeSet[share.h];
                 var age = Math.floor(Date.now() / 1000 - share.t);
                 var difficulty = this.bitsToDifficulty(share.b);
 
@@ -4390,9 +4446,16 @@
                 var staleText = share.s === 0 ? 'None' : share.s === 1 ? 'Orphan' : 'Dead';
                 var verText = share.v ? '<span style="color:#28a745">Verified</span>' : '<span style="color:#555577">Unverified</span>';
 
+                // Miner: show address (truncated), with "Mine" badge
+                var minerAddr = share.m || '?';
                 var minerDisplay = isMine
-                    ? '<span class="tt-mine">Mine</span>'
-                    : '<span style="font-family:Monaco,Consolas,monospace;font-size:0.78em">' + share.m.substr(0, 16) + '…</span>';
+                    ? '<span class="tt-mine">' + minerAddr.substr(0, 14) + '… (Mine)</span>'
+                    : '<span style="font-family:Monaco,Consolas,monospace;font-size:0.78em">' + minerAddr.substr(0, 20) + (minerAddr.length > 20 ? '…' : '') + '</span>';
+
+                // Tags
+                var tags = [];
+                if (share.fee) tags.push('<span style="color:#9c27b0;font-weight:700">Pool Fee</span>');
+                if (share.dv && share.dv >= 36 && share.V < 36) tags.push('<span style="color:#0097a7;font-weight:600">Signals V' + share.dv + '</span>');
 
                 var html =
                     '<div class="tt-hash">' + share.h + '</div>' +
@@ -4400,22 +4463,26 @@
                     '<div class="tt-row"><span class="tl">Miner</span><span class="tv">' + minerDisplay + '</span></div>' +
                     '<div class="tt-row"><span class="tl">Difficulty</span><span class="tv">' + format_difficulty(difficulty) + '</span></div>' +
                     '<div class="tt-row"><span class="tl">Age</span><span class="tv">' + format_dt(age) + '</span></div>' +
-                    '<div class="tt-row"><span class="tl">Version</span><span class="tv">V' + share.V + '</span></div>' +
-                    '<div class="tt-row"><span class="tl">Status</span><span class="tv">' + verText + '</span></div>' +
-                    '<div class="tt-row"><span class="tl">Donation</span><span class="tv">' + (share.d / 655.36).toFixed(2) + '%</span></div>';
+                    '<div class="tt-row"><span class="tl">Version</span><span class="tv">V' + share.V + (share.dv ? ' (desired V' + share.dv + ')' : '') + '</span></div>' +
+                    '<div class="tt-row"><span class="tl">Status</span><span class="tv">' + verText + '</span></div>';
 
+                if (tags.length > 0) {
+                    html += '<div class="tt-row"><span class="tl">Tags</span><span class="tv">' + tags.join(' ') + '</span></div>';
+                }
                 if (share.s > 0) {
                     html += '<div class="tt-row' + staleClass + '"><span class="tl">Stale</span><span class="tv">' + staleText + '</span></div>';
                 }
-                if (isBlock) {
-                    html += '<div class="tt-block">BLOCK SOLUTION</div>';
+                if (isLtcBlock || isDogeBlock) {
+                    var blockLabel = [];
+                    if (isLtcBlock) blockLabel.push('<span style="color:#ffd700">LTC BLOCK</span>');
+                    if (isDogeBlock) blockLabel.push('<span style="color:#00e5ff">DOGE BLOCK</span>');
+                    html += '<div class="tt-block">' + blockLabel.join(' + ') + '</div>';
                 }
                 html += '<div class="tt-click">Click to view share details</div>';
 
                 tip.innerHTML = html;
                 tip.style.display = 'block';
 
-                // Position tooltip, keeping it within viewport
                 var tx = e.clientX + 14;
                 var ty = e.clientY + 14;
                 var tw = tip.offsetWidth;
@@ -4447,24 +4514,29 @@
 
             updateStats: function(data) {
                 var shares = data.shares || [];
-                var mine = 0, stale = 0, dead = 0, verified = 0;
+                var mine = 0, stale = 0, dead = 0, verified = 0, fee = 0, v36sig = 0;
                 var self = this;
                 shares.forEach(function(s) {
                     if (self.myAddress && s.m === self.myAddress) mine++;
                     if (s.s === 1) stale++;
                     if (s.s === 2) dead++;
                     if (s.v) verified++;
+                    if (s.fee) fee++;
+                    if (s.dv && s.dv >= 36 && s.V < 36) v36sig++;
                 });
 
-                var blockCount = data.blocks ? data.blocks.length : 0;
+                var ltcBlocks = data.blocks ? data.blocks.length : 0;
+                var dogeBlocks = data.doge_blocks ? data.doge_blocks.length : 0;
 
-                document.getElementById('defrag-total').textContent = shares.length;
+                document.getElementById('defrag-total').textContent = shares.length + ' / ' + (data.window_size || '-');
                 document.getElementById('defrag-mine').textContent = mine;
                 document.getElementById('defrag-stale').textContent = stale;
                 document.getElementById('defrag-dead').textContent = dead;
                 document.getElementById('defrag-verified').textContent = verified;
                 document.getElementById('defrag-chain-len').textContent = data.chain_length || '-';
-                document.getElementById('defrag-blocks').textContent = blockCount;
+                document.getElementById('defrag-blocks').textContent = ltcBlocks + ' LTC' + (dogeBlocks > 0 ? ' / ' + dogeBlocks + ' DOGE' : '');
+                document.getElementById('defrag-fee').textContent = fee;
+                document.getElementById('defrag-v36sig').textContent = v36sig;
             }
         };
 
