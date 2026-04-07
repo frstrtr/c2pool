@@ -760,7 +760,167 @@
             color: var(--text-muted);
             margin-bottom: 8px;
         }
-        
+
+        /* ── Defragmenter Sharechain Viewer ──────────────────── */
+        .defrag-container {
+            display: grid;
+            grid-template-columns: 1fr 220px;
+            gap: 16px;
+            margin-top: 12px;
+        }
+        @media (max-width: 900px) {
+            .defrag-container { grid-template-columns: 1fr; }
+        }
+        .defrag-canvas-wrap {
+            background: #0d0d1a;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 8px;
+            position: relative;
+            overflow: hidden;
+            min-height: 120px;
+        }
+        #defrag-canvas {
+            display: block;
+            cursor: crosshair;
+            image-rendering: pixelated;
+        }
+        .defrag-sidebar {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        .defrag-stats {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 14px;
+        }
+        .defrag-stats h4 {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 10px;
+        }
+        .defrag-stat-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 4px 0;
+            font-size: 0.85rem;
+        }
+        .defrag-stat-row .label { color: var(--text-muted); }
+        .defrag-stat-row .value { font-weight: 600; font-family: 'Monaco','Consolas',monospace; }
+        .defrag-legend {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 14px;
+        }
+        .defrag-legend h4 {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 10px;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 3px 0;
+            font-size: 0.82rem;
+        }
+        .legend-swatch {
+            width: 12px;
+            height: 12px;
+            border-radius: 2px;
+            flex-shrink: 0;
+        }
+        .legend-swatch.block-swatch {
+            border: 2px solid #ffd700;
+            box-shadow: 0 0 4px rgba(255, 215, 0, 0.6);
+        }
+        .legend-swatch.head-swatch {
+            border: 2px solid #e040fb;
+        }
+
+        /* Tooltip */
+        #defrag-tooltip {
+            display: none;
+            position: fixed;
+            z-index: 9999;
+            background: #1e1e38;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 10px 14px;
+            pointer-events: none;
+            min-width: 200px;
+            max-width: 320px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+            font-size: 0.82rem;
+            line-height: 1.5;
+        }
+        .tt-hash {
+            font-family: 'Monaco','Consolas',monospace;
+            color: var(--primary);
+            font-weight: 700;
+            font-size: 0.85rem;
+            margin-bottom: 6px;
+            word-break: break-all;
+        }
+        .tt-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 1px 0;
+        }
+        .tt-row .tl { color: var(--text-muted); }
+        .tt-row .tv { color: var(--text); font-weight: 500; font-family: 'Monaco','Consolas',monospace; }
+        .tt-mine { color: #008de4; font-weight: 700; }
+        .tt-block {
+            color: #ffd700;
+            font-weight: 700;
+            text-align: center;
+            padding: 3px 0;
+            margin-top: 3px;
+            border-top: 1px solid rgba(255,215,0,0.3);
+        }
+        .tt-stale .tv { color: #ffc107; }
+        .tt-dead .tv { color: #dc3545; }
+        .tt-click {
+            color: var(--text-muted);
+            font-size: 0.75rem;
+            text-align: center;
+            margin-top: 6px;
+            opacity: 0.7;
+        }
+
+        /* Share links row below grid */
+        .defrag-links-bar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            align-items: center;
+            margin-top: 10px;
+            font-size: 0.82rem;
+        }
+        .defrag-links-bar .link-group {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .defrag-links-bar .link-label {
+            color: var(--text-muted);
+            font-weight: 600;
+            margin-right: 2px;
+        }
+        .defrag-links-bar .sep {
+            color: var(--border);
+            margin: 0 6px;
+        }
+
         /* Footer */
         footer {
             text-align: center;
@@ -1741,32 +1901,112 @@
             <div class="loading" id="merged_broadcaster_loading">Loading merged broadcaster stats...</div>
         </div>
         
-        <!-- Share Explorer -->
+        <!-- Sharechain Transparency Explorer -->
         <div class="shares-section">
             <div class="section-header">
-                <h2>🔍 Share Explorer</h2>
+                <h2>Sharechain Explorer</h2>
             </div>
-            
-            <div class="share-row">
-                <div class="share-row-label">Best Share</div>
-                <div class="share-links" id="best_share"></div>
+
+            <div class="defrag-container">
+                <!-- Canvas grid -->
+                <div class="defrag-canvas-wrap">
+                    <canvas id="defrag-canvas"></canvas>
+                </div>
+
+                <!-- Sidebar: stats + legend -->
+                <div class="defrag-sidebar">
+                    <div class="defrag-stats">
+                        <h4>Chain Window</h4>
+                        <div class="defrag-stat-row">
+                            <span class="label">Visible</span>
+                            <span class="value" id="defrag-total">-</span>
+                        </div>
+                        <div class="defrag-stat-row">
+                            <span class="label">Chain Length</span>
+                            <span class="value" id="defrag-chain-len">-</span>
+                        </div>
+                        <div class="defrag-stat-row">
+                            <span class="label">Verified</span>
+                            <span class="value" id="defrag-verified" style="color:#28a745">-</span>
+                        </div>
+                        <div class="defrag-stat-row">
+                            <span class="label">Mine</span>
+                            <span class="value" id="defrag-mine" style="color:#008de4">-</span>
+                        </div>
+                        <div class="defrag-stat-row">
+                            <span class="label">Orphan</span>
+                            <span class="value" id="defrag-stale" style="color:#ffc107">-</span>
+                        </div>
+                        <div class="defrag-stat-row">
+                            <span class="label">Dead</span>
+                            <span class="value" id="defrag-dead" style="color:#dc3545">-</span>
+                        </div>
+                        <div class="defrag-stat-row">
+                            <span class="label">Blocks Found</span>
+                            <span class="value" id="defrag-blocks" style="color:#ffd700">-</span>
+                        </div>
+                    </div>
+
+                    <div class="defrag-legend">
+                        <h4>Legend</h4>
+                        <div class="legend-item">
+                            <div class="legend-swatch" style="background:#008de4"></div>
+                            <span>My shares</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-swatch" style="background:#28a745"></div>
+                            <span>Verified (others)</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-swatch" style="background:#555577"></div>
+                            <span>Unverified</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-swatch" style="background:#ffc107"></div>
+                            <span>Orphan / Stale</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-swatch" style="background:#dc3545"></div>
+                            <span>Dead</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-swatch block-swatch" style="background:#28a745"></div>
+                            <span>Block solution</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-swatch head-swatch" style="background:#0d0d1a"></div>
+                            <span>Chain head</span>
+                        </div>
+                    </div>
+                </div>
             </div>
-            
-            <div class="share-row">
-                <div class="share-row-label">My Shares (last 50)</div>
-                <div class="share-links" id="my_share_hashes"></div>
-            </div>
-            
-            <div class="share-row">
-                <div class="share-row-label">Verified Heads</div>
-                <div class="share-links" id="verified_heads"></div>
-            </div>
-            
-            <div class="share-row">
-                <div class="share-row-label">Tails</div>
-                <div class="share-links" id="tails"></div>
+
+            <!-- Quick links row -->
+            <div class="defrag-links-bar">
+                <div class="link-group">
+                    <span class="link-label">Best:</span>
+                    <span id="best_share"></span>
+                </div>
+                <span class="sep">|</span>
+                <div class="link-group">
+                    <span class="link-label">My Shares:</span>
+                    <span class="share-links" id="my_share_hashes"></span>
+                </div>
+                <span class="sep">|</span>
+                <div class="link-group">
+                    <span class="link-label">Heads:</span>
+                    <span class="share-links" id="verified_heads"></span>
+                </div>
+                <span class="sep">|</span>
+                <div class="link-group">
+                    <span class="link-label">Tails:</span>
+                    <span class="share-links" id="tails"></span>
+                </div>
             </div>
         </div>
+
+        <!-- Floating tooltip for defrag grid -->
+        <div id="defrag-tooltip"></div>
     </main>
     
     <footer>
@@ -3961,9 +4201,279 @@
             });
         }
         
-        function loadShares() {
+        // =============================================
+        // Sharechain Defragmenter Viewer
+        // =============================================
+        var defrag = {
+            canvas: null,
+            ctx: null,
+            tooltip: null,
+            shares: [],
+            blockSet: {},      // short hashes of block solutions
+            headSet: {},       // short hashes of chain heads
+            myAddress: '',
+            cellSize: 10,
+            gap: 1,
+            cols: 0,
+            rows: 0,
+            hoveredIdx: -1,
+            dpr: window.devicePixelRatio || 1,
+
+            init: function() {
+                this.canvas = document.getElementById('defrag-canvas');
+                this.ctx = this.canvas.getContext('2d');
+                this.tooltip = document.getElementById('defrag-tooltip');
+
+                var self = this;
+                this.canvas.addEventListener('mousemove', function(e) { self.onMouseMove(e); });
+                this.canvas.addEventListener('mouseleave', function() { self.hideTooltip(); });
+                this.canvas.addEventListener('click', function(e) { self.onClick(e); });
+
+                // Resize handler for responsive grid
+                window.addEventListener('resize', function() {
+                    if (self.shares.length > 0) self.render();
+                });
+            },
+
+            load: function() {
+                var self = this;
+                d3.json('../sharechain/window', function(data) {
+                    if (!data || !data.shares) return;
+                    self.shares = data.shares;
+                    self.myAddress = data.my_address || '';
+
+                    // Build block solution lookup
+                    self.blockSet = {};
+                    if (data.blocks) {
+                        data.blocks.forEach(function(h) { self.blockSet[h] = true; });
+                    }
+                    // Build head lookup
+                    self.headSet = {};
+                    if (data.heads) {
+                        data.heads.forEach(function(h) { self.headSet[h] = true; });
+                    }
+
+                    self.render();
+                    self.updateStats(data);
+                });
+
+                // Also load the link rows (best share, my shares, heads, tails)
+                loadShareLinks();
+            },
+
+            render: function() {
+                var canvas = this.canvas;
+                var ctx = this.ctx;
+                var dpr = this.dpr;
+                var step = this.cellSize + this.gap;
+
+                // Calculate grid dimensions from container width
+                var containerWidth = canvas.parentElement.clientWidth - 16;
+                this.cols = Math.max(1, Math.floor(containerWidth / step));
+                this.rows = Math.ceil(this.shares.length / this.cols);
+
+                // Set canvas size (CSS pixels and backing pixels for retina)
+                var cssW = this.cols * step;
+                var cssH = Math.max(this.rows * step, 40);
+                canvas.style.width = cssW + 'px';
+                canvas.style.height = cssH + 'px';
+                canvas.width = cssW * dpr;
+                canvas.height = cssH * dpr;
+                ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+                // Clear
+                ctx.fillStyle = '#0d0d1a';
+                ctx.fillRect(0, 0, cssW, cssH);
+
+                if (this.shares.length === 0) {
+                    ctx.fillStyle = '#555577';
+                    ctx.font = '12px -apple-system, sans-serif';
+                    ctx.textAlign = 'center';
+                    ctx.fillText('Waiting for shares...', cssW / 2, cssH / 2);
+                    return;
+                }
+
+                var cs = this.cellSize;
+                for (var i = 0; i < this.shares.length; i++) {
+                    var share = this.shares[i];
+                    var col = i % this.cols;
+                    var row = Math.floor(i / this.cols);
+                    var x = col * step;
+                    var y = row * step;
+
+                    // Fill color
+                    ctx.fillStyle = this.getColor(share);
+                    ctx.fillRect(x, y, cs, cs);
+
+                    // Block solution: gold border
+                    if (this.blockSet[share.h]) {
+                        ctx.strokeStyle = '#ffd700';
+                        ctx.lineWidth = 1.5;
+                        ctx.strokeRect(x + 0.75, y + 0.75, cs - 1.5, cs - 1.5);
+                    }
+                    // Chain head: magenta border
+                    else if (this.headSet[share.h]) {
+                        ctx.strokeStyle = '#e040fb';
+                        ctx.lineWidth = 1;
+                        ctx.strokeRect(x + 0.5, y + 0.5, cs - 1, cs - 1);
+                    }
+
+                    // Hover highlight
+                    if (i === this.hoveredIdx) {
+                        ctx.strokeStyle = '#ffffff';
+                        ctx.lineWidth = 1.5;
+                        ctx.strokeRect(x + 0.5, y + 0.5, cs - 1, cs - 1);
+                    }
+                }
+            },
+
+            getColor: function(share) {
+                // Dead shares - red
+                if (share.s === 2) return '#dc3545';
+                // Orphan/stale - yellow
+                if (share.s === 1) return '#ffc107';
+                // Unverified - gray
+                if (!share.v) return '#555577';
+
+                // Mine or others
+                var isMine = this.myAddress && share.m === this.myAddress;
+
+                // Block solutions get brighter shade
+                if (this.blockSet[share.h]) {
+                    return isMine ? '#00b4ff' : '#40d970';
+                }
+
+                return isMine ? '#008de4' : '#28a745';
+            },
+
+            hitTest: function(e) {
+                var rect = this.canvas.getBoundingClientRect();
+                var x = e.clientX - rect.left;
+                var y = e.clientY - rect.top;
+                var step = this.cellSize + this.gap;
+                var col = Math.floor(x / step);
+                var row = Math.floor(y / step);
+                if (col < 0 || col >= this.cols) return -1;
+                var idx = row * this.cols + col;
+                if (idx >= 0 && idx < this.shares.length) return idx;
+                return -1;
+            },
+
+            onMouseMove: function(e) {
+                var idx = this.hitTest(e);
+                if (idx !== this.hoveredIdx) {
+                    this.hoveredIdx = idx;
+                    this.render();  // redraw to update hover highlight
+                }
+                if (idx >= 0) {
+                    this.showTooltip(this.shares[idx], e);
+                } else {
+                    this.hideTooltip();
+                }
+            },
+
+            onClick: function(e) {
+                var idx = this.hitTest(e);
+                if (idx >= 0 && this.shares[idx].H) {
+                    window.open('share.html#' + this.shares[idx].H, '_blank');
+                }
+            },
+
+            showTooltip: function(share, e) {
+                var tip = this.tooltip;
+                var isMine = this.myAddress && share.m === this.myAddress;
+                var isBlock = !!this.blockSet[share.h];
+                var age = Math.floor(Date.now() / 1000 - share.t);
+                var difficulty = this.bitsToDifficulty(share.b);
+
+                var staleClass = share.s === 2 ? ' tt-dead' : share.s === 1 ? ' tt-stale' : '';
+                var staleText = share.s === 0 ? 'None' : share.s === 1 ? 'Orphan' : 'Dead';
+                var verText = share.v ? '<span style="color:#28a745">Verified</span>' : '<span style="color:#555577">Unverified</span>';
+
+                var minerDisplay = isMine
+                    ? '<span class="tt-mine">Mine</span>'
+                    : '<span style="font-family:Monaco,Consolas,monospace;font-size:0.78em">' + share.m.substr(0, 16) + '…</span>';
+
+                var html =
+                    '<div class="tt-hash">' + share.h + '</div>' +
+                    '<div class="tt-row"><span class="tl">Height</span><span class="tv">' + (share.a || '-') + '</span></div>' +
+                    '<div class="tt-row"><span class="tl">Miner</span><span class="tv">' + minerDisplay + '</span></div>' +
+                    '<div class="tt-row"><span class="tl">Difficulty</span><span class="tv">' + format_difficulty(difficulty) + '</span></div>' +
+                    '<div class="tt-row"><span class="tl">Age</span><span class="tv">' + format_dt(age) + '</span></div>' +
+                    '<div class="tt-row"><span class="tl">Version</span><span class="tv">V' + share.V + '</span></div>' +
+                    '<div class="tt-row"><span class="tl">Status</span><span class="tv">' + verText + '</span></div>' +
+                    '<div class="tt-row"><span class="tl">Donation</span><span class="tv">' + (share.d / 655.36).toFixed(2) + '%</span></div>';
+
+                if (share.s > 0) {
+                    html += '<div class="tt-row' + staleClass + '"><span class="tl">Stale</span><span class="tv">' + staleText + '</span></div>';
+                }
+                if (isBlock) {
+                    html += '<div class="tt-block">BLOCK SOLUTION</div>';
+                }
+                html += '<div class="tt-click">Click to view share details</div>';
+
+                tip.innerHTML = html;
+                tip.style.display = 'block';
+
+                // Position tooltip, keeping it within viewport
+                var tx = e.clientX + 14;
+                var ty = e.clientY + 14;
+                var tw = tip.offsetWidth;
+                var th = tip.offsetHeight;
+                if (tx + tw > window.innerWidth - 8) tx = e.clientX - tw - 8;
+                if (ty + th > window.innerHeight - 8) ty = e.clientY - th - 8;
+                tip.style.left = tx + 'px';
+                tip.style.top = ty + 'px';
+            },
+
+            hideTooltip: function() {
+                this.tooltip.style.display = 'none';
+                if (this.hoveredIdx !== -1) {
+                    this.hoveredIdx = -1;
+                    this.render();
+                }
+            },
+
+            bitsToDifficulty: function(bits) {
+                if (!bits) return 0;
+                var exp = (bits >> 24) & 0xff;
+                var mant = bits & 0x7fffff;
+                if (bits & 0x800000) mant = 0;
+                if (mant === 0) return 0;
+                var target_top = mant * Math.pow(256, exp - 3);
+                if (target_top <= 0) return 0;
+                return (0xffff * Math.pow(256, 26)) / target_top;
+            },
+
+            updateStats: function(data) {
+                var shares = data.shares || [];
+                var mine = 0, stale = 0, dead = 0, verified = 0;
+                var self = this;
+                shares.forEach(function(s) {
+                    if (self.myAddress && s.m === self.myAddress) mine++;
+                    if (s.s === 1) stale++;
+                    if (s.s === 2) dead++;
+                    if (s.v) verified++;
+                });
+
+                var blockCount = data.blocks ? data.blocks.length : 0;
+
+                document.getElementById('defrag-total').textContent = shares.length;
+                document.getElementById('defrag-mine').textContent = mine;
+                document.getElementById('defrag-stale').textContent = stale;
+                document.getElementById('defrag-dead').textContent = dead;
+                document.getElementById('defrag-verified').textContent = verified;
+                document.getElementById('defrag-chain-len').textContent = data.chain_length || '-';
+                document.getElementById('defrag-blocks').textContent = blockCount;
+            }
+        };
+
+        // Initialize defrag viewer on page load
+        defrag.init();
+
+        // Legacy share link helpers (for the links bar below the grid)
+        function loadShareLinks() {
             d3.json('../web/best_share_hash', function(hash) {
-                // Clear existing content
                 d3.select('#best_share').selectAll('*').remove();
                 if (hash) {
                     d3.select('#best_share').append('a')
@@ -3972,17 +4482,18 @@
                         .text(hash.substr(-12));
                 }
             });
-            
             fillShares('../web/my_share_hashes50', '#my_share_hashes');
             fillShares('../web/verified_heads', '#verified_heads');
             fillShares('../web/tails', '#tails');
         }
-        
+
+        function loadShares() {
+            defrag.load();
+        }
+
         function fillShares(url, selector) {
             d3.json(url, function(data) {
-                // Clear existing content before adding
                 d3.select(selector).selectAll('*').remove();
-                
                 if (!data || data.length === 0) {
                     d3.select(selector).append('span')
                         .style('color', 'var(--text-muted)')

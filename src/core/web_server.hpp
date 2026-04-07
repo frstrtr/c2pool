@@ -631,6 +631,12 @@ public:
     // Per-chain verify function: register additional verifiers for merged chains
     void add_chain_verify_fn(const std::string& chain, block_verify_fn_t fn);
 
+    /// Read-only access to found blocks (for sharechain window grid).
+    std::vector<FoundBlock> get_found_blocks() const {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        return m_found_blocks;
+    }
+
     /// Set persistence callbacks for found blocks (Layer +2).
     void set_found_block_persistence(block_store_fn_t persist_fn, block_load_fn_t load_fn);
 

@@ -2867,7 +2867,7 @@ int main(int argc, char* argv[]) {
             });
 
             // Wire per-share window data for the defragmenter grid
-            web_server.get_mining_interface()->set_sharechain_window_fn([&p2p_node]() {
+            web_server.get_mining_interface()->set_sharechain_window_fn([&p2p_node, &web_server]() {
                 nlohmann::json result;
                 auto& chain = p2p_node->tracker().chain;
                 auto& verified = p2p_node->tracker().verified;
@@ -2883,6 +2883,16 @@ int main(int argc, char* argv[]) {
                 result["best_hash"] = best.IsNull() ? "" : best.GetHex();
                 result["chain_length"] = static_cast<int>(chain.size());
 
+                // Include local payout address so frontend can mark "mine" shares
+                auto mi = web_server.get_mining_interface();
+                std::string local_addr;
+                if (mi) {
+                    auto script = core::address_to_script(mi->get_payout_address());
+                    if (!script.empty())
+                        local_addr = HexStr(script);
+                }
+                result["my_address"] = local_addr;
+
                 nlohmann::json shares_arr = nlohmann::json::array();
 
                 if (!best.IsNull()) {
@@ -2894,21 +2904,25 @@ int main(int argc, char* argv[]) {
                             auto view = chain.get_chain(best, walk);
                             for (auto [hash, data] : view) {
                                 nlohmann::json s;
-                                s["hash"] = hash.GetHex().substr(0, 16);
-                                s["pos"] = pos++;
-                                s["verified"] = verified.contains(hash);
+                                s["h"] = hash.GetHex().substr(0, 16);  // short hash for grid
+                                s["H"] = hash.GetHex();                // full hash for links
+                                s["p"] = pos++;
+                                s["v"] = verified.contains(hash) ? 1 : 0;
 
                                 data.share.invoke([&](auto* obj) {
-                                    s["ts"] = obj->m_timestamp;
-                                    s["ver"] = obj->version;
-                                    s["stale"] = static_cast<int>(obj->m_stale_info);
+                                    s["t"] = obj->m_timestamp;
+                                    s["V"] = obj->version;
+                                    s["s"] = static_cast<int>(obj->m_stale_info);
+                                    s["b"] = obj->m_bits;
+                                    s["a"] = obj->m_absheight;
+                                    s["d"] = static_cast<int>(obj->m_donation);
 
                                     std::string miner;
                                     if constexpr (requires { obj->m_pubkey_hash; })
                                         miner = obj->m_pubkey_hash.GetHex();
                                     else if constexpr (requires { obj->m_address; })
                                         miner = HexStr(obj->m_address.m_data);
-                                    s["miner"] = miner;
+                                    s["m"] = miner;
                                 });
 
                                 shares_arr.push_back(std::move(s));
@@ -2925,8 +2939,18 @@ int main(int argc, char* argv[]) {
                     heads_arr.push_back(hh.GetHex().substr(0, 16));
                 }
 
+                // Include found block share hashes so the grid can mark block solutions
+                nlohmann::json blocks_arr = nlohmann::json::array();
+                if (mi) {
+                    for (const auto& fb : mi->get_found_blocks()) {
+                        if (!fb.share_hash.empty())
+                            blocks_arr.push_back(fb.share_hash.substr(0, 16));
+                    }
+                }
+
                 result["shares"] = std::move(shares_arr);
                 result["heads"] = std::move(heads_arr);
+                result["blocks"] = std::move(blocks_arr);
                 result["total"] = static_cast<int>(chain.size());
                 return result;
             });
