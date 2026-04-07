@@ -3957,14 +3957,7 @@
                     }
                 });
                 
-                // Update overall status badge
-                var hasActive = chainsArray.some(function(entry) { 
-                    return entry[1].health && entry[1].health.healthy; 
-                });
-                d3.select('#merged_broadcaster_status_badge')
-                    .style('background', hasActive ? 'var(--success)' : '#6366f1')
-                    .style('color', '#fff')
-                    .text(hasActive ? '✓ Active' : '⏳ Starting');
+                // Top-level badge already updated above (from data.peers)
             });
         }
         
