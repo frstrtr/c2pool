@@ -236,6 +236,42 @@
             margin-top: 30px;
         }
         footer a { color: var(--primary); text-decoration: none; }
+
+        /* PPLNS Treemap */
+        .pplns-section {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 16px 20px;
+            margin-bottom: 16px;
+        }
+        .pplns-section h2 {
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 12px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid var(--border);
+        }
+        #pplns-canvas {
+            display: block;
+            width: 100%;
+            cursor: pointer;
+            border-radius: 6px;
+        }
+        #pplns-tooltip {
+            display: none;
+            position: fixed;
+            z-index: 9999;
+            background: #1e1e38;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 8px 12px;
+            pointer-events: none;
+            font-size: 0.82rem;
+            box-shadow: 0 6px 20px rgba(0,0,0,0.5);
+        }
     </style>
 </head>
 <body>
@@ -469,7 +505,180 @@
                 html += '</div>';
             }
 
+            // PPLNS treemap section
+            html += '<div class="pplns-section"><h2>PPLNS Distribution</h2>' +
+                '<canvas id="pplns-canvas"></canvas>' +
+                '<div id="pplns-tooltip"></div></div>';
+
             root.innerHTML = html;
+
+            // Load and render PPLNS treemap
+            d3.json('../current_payouts', function(payouts) {
+                if (!payouts || typeof payouts !== 'object') return;
+                var canvas = document.getElementById('pplns-canvas');
+                if (!canvas) return;
+                var tooltip = document.getElementById('pplns-tooltip');
+                var total = 0;
+                var entries = [];
+                for (var addr in payouts) {
+                    total += payouts[addr];
+                    entries.push({ addr: addr, amt: payouts[addr] });
+                }
+                entries.sort(function(a, b) { return b.amt - a.amt; });
+                entries.forEach(function(e) { e.pct = total > 0 ? e.amt / total : 0; });
+
+                var w = canvas.parentElement.clientWidth - 40;
+                var h = Math.max(300, Math.min(w * 0.5, 500));
+                var dpr = window.devicePixelRatio || 1;
+                canvas.style.width = w + 'px';
+                canvas.style.height = h + 'px';
+                canvas.width = w * dpr;
+                canvas.height = h * dpr;
+                var ctx = canvas.getContext('2d');
+                ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+                ctx.fillStyle = '#0d0d1a';
+                ctx.fillRect(0, 0, w, h);
+
+                // Treemap layout
+                var rects = pplnsTreemap(entries, 3, 3, w - 6, h - 6);
+                var minerAddr = (share && share.share_data) ? share.share_data.payout_address : '';
+                var addrPrefix = ci.address_explorer_url_prefix || 'https://blockchair.com/litecoin/address/';
+
+                for (var i = 0; i < rects.length; i++) {
+                    var r = rects[i];
+                    var isThis = r.addr === minerAddr;
+                    var hue = addrHue(r.addr);
+                    ctx.fillStyle = isThis ? 'hsl('+hue+',85%,50%)' : 'hsl('+hue+',40%,30%)';
+                    ctx.fillRect(r.x, r.y, r.w, r.h);
+                    ctx.strokeStyle = '#0d0d1a';
+                    ctx.lineWidth = 2;
+                    ctx.strokeRect(r.x, r.y, r.w, r.h);
+                    if (isThis) {
+                        ctx.strokeStyle = '#fff';
+                        ctx.lineWidth = 2.5;
+                        ctx.strokeRect(r.x+1, r.y+1, r.w-2, r.h-2);
+                    }
+
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    var cx = r.x + r.w/2, cy = r.y + r.h/2;
+                    if (r.w > 40 && r.h > 20) {
+                        ctx.fillStyle = '#fff';
+                        ctx.font = (isThis ? 'bold 14px' : 'bold 12px') + ' -apple-system, sans-serif';
+                        ctx.fillText((r.pct*100).toFixed(1)+'%', cx, cy - (r.h > 36 ? 10 : 0));
+                        if (r.w > 60 && r.h > 36) {
+                            ctx.fillStyle = 'rgba(255,255,255,0.75)';
+                            ctx.font = '10px Monaco, Consolas, monospace';
+                            var maxC = Math.max(6, Math.floor(r.w / 7.5));
+                            var al = r.addr.substr(0, maxC) + (r.addr.length > maxC ? '…' : '');
+                            ctx.fillText(al, cx, cy + 8);
+                        }
+                    }
+                }
+
+                // Click → blockchair
+                canvas.addEventListener('click', function(ev) {
+                    var rect = canvas.getBoundingClientRect();
+                    var mx = ev.clientX - rect.left;
+                    var my = ev.clientY - rect.top;
+                    for (var i = 0; i < rects.length; i++) {
+                        var r = rects[i];
+                        if (mx >= r.x && mx <= r.x+r.w && my >= r.y && my <= r.y+r.h) {
+                            window.open(addrPrefix + r.addr, '_blank');
+                            return;
+                        }
+                    }
+                });
+
+                // Tooltip on hover
+                canvas.addEventListener('mousemove', function(ev) {
+                    var rect = canvas.getBoundingClientRect();
+                    var mx = ev.clientX - rect.left;
+                    var my = ev.clientY - rect.top;
+                    var found = false;
+                    for (var i = 0; i < rects.length; i++) {
+                        var r = rects[i];
+                        if (mx >= r.x && mx <= r.x+r.w && my >= r.y && my <= r.y+r.h) {
+                            tooltip.innerHTML = '<div style="color:var(--primary);font-weight:700;margin-bottom:4px">' + esc(r.addr) + '</div>' +
+                                '<div>' + (r.pct*100).toFixed(2) + '% — ' + r.amt.toFixed(8) + ' ' + symbol + '</div>' +
+                                '<div style="color:var(--text-muted);font-size:0.75em;margin-top:4px">Click to view on explorer</div>';
+                            tooltip.style.display = 'block';
+                            tooltip.style.left = (ev.clientX + 14) + 'px';
+                            tooltip.style.top = (ev.clientY + 14) + 'px';
+                            canvas.style.cursor = 'pointer';
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        tooltip.style.display = 'none';
+                        canvas.style.cursor = 'default';
+                    }
+                });
+                canvas.addEventListener('mouseleave', function() {
+                    tooltip.style.display = 'none';
+                });
+            });
+        }
+
+        // Treemap helpers for share.html
+        function addrHue(addr) {
+            var h = 0;
+            for (var i = 0; i < addr.length; i++) h = ((h << 5) - h + addr.charCodeAt(i)) | 0;
+            return ((h % 360) + 360) % 360;
+        }
+
+        function pplnsTreemap(data, x, y, w, h) {
+            var rects = [];
+            var items = data.map(function(d) { return { addr: d.addr, pct: d.pct, amt: d.amt, area: d.pct }; });
+            _tmLayout(items, x, y, w, h, rects);
+            return rects;
+        }
+
+        function _tmLayout(items, x, y, w, h, rects) {
+            if (items.length === 0 || w <= 0 || h <= 0) return;
+            var totalArea = 0;
+            items.forEach(function(it) { totalArea += it.area; });
+            if (totalArea <= 0) return;
+            var vertical = w >= h;
+            var mainSize = vertical ? h : w;
+            var crossSize = vertical ? w : h;
+            var row = [], rowArea = 0, remaining = items.slice();
+
+            while (remaining.length > 0) {
+                row.push(remaining[0]);
+                rowArea += remaining[0].area;
+                remaining.shift();
+                if (remaining.length === 0) break;
+                var stripNow = (rowArea / totalArea) * crossSize;
+                var stripNext = ((rowArea + remaining[0].area) / totalArea) * crossSize;
+                var worstNow = _tmWorst(row, rowArea, stripNow, mainSize);
+                var worstNext = _tmWorst(row.concat([remaining[0]]), rowArea + remaining[0].area, stripNext, mainSize);
+                if (worstNext > worstNow && row.length >= 1) break;
+            }
+            var stripSize = Math.max(1, (rowArea / totalArea) * crossSize);
+            var offset = 0;
+            for (var i = 0; i < row.length; i++) {
+                var sz = (row[i].area / rowArea) * mainSize;
+                if (vertical) rects.push({ x: x, y: y+offset, w: stripSize, h: sz, addr: row[i].addr, pct: row[i].pct, amt: row[i].amt });
+                else rects.push({ x: x+offset, y: y, w: sz, h: stripSize, addr: row[i].addr, pct: row[i].pct, amt: row[i].amt });
+                offset += sz;
+            }
+            if (remaining.length > 0) {
+                if (vertical) _tmLayout(remaining, x+stripSize, y, w-stripSize, h, rects);
+                else _tmLayout(remaining, x, y+stripSize, w, h-stripSize, rects);
+            }
+        }
+
+        function _tmWorst(row, rowArea, strip, main) {
+            var worst = 0;
+            for (var i = 0; i < row.length; i++) {
+                var sz = (row[i].area / rowArea) * main;
+                var a = Math.max(sz / strip, strip / sz);
+                if (a > worst) worst = a;
+            }
+            return worst;
         }
 
         function reload(currency_info) {

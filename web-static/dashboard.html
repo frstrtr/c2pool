@@ -2062,7 +2062,7 @@
                             <span class="value" id="defrag-verified" style="color:#28a745">-</span>
                         </div>
                         <div class="defrag-stat-row">
-                            <span class="label">Mine</span>
+                            <span class="label">This Node</span>
                             <span class="value" id="defrag-mine" style="color:#008de4">-</span>
                         </div>
                         <div class="defrag-stat-row">
@@ -2091,7 +2091,7 @@
                         <h4>Legend</h4>
                         <div class="legend-item">
                             <div class="legend-swatch" style="background:#008de4"></div>
-                            <span>My shares</span>
+                            <span>This Node</span>
                         </div>
                         <div class="legend-item">
                             <div class="legend-swatch" style="background:#28a745"></div>
@@ -2152,7 +2152,7 @@
                     <div class="defrag-chain-cells" id="tails_cells"></div>
                 </div>
                 <div class="defrag-chain-row">
-                    <span class="defrag-chain-label">My Shares</span>
+                    <span class="defrag-chain-label">This Node</span>
                     <div class="defrag-chain-cells" id="my_share_hashes"></div>
                 </div>
             </div>
@@ -4436,6 +4436,7 @@
                         data.heads.forEach(function(h) { self.headSet[h] = true; });
                     }
 
+                    self.computeMinerHashrates();
                     self.render();
                     self.updateStats(data);
                     loadShareLinks();
@@ -4648,6 +4649,28 @@
                 }
             },
 
+            // Compute per-miner hashrate from share window data (cached on load)
+            minerHashrates: {},
+            computeMinerHashrates: function() {
+                this.minerHashrates = {};
+                if (this.shares.length < 2) return;
+                var counts = {};
+                var diffSums = {};
+                this.shares.forEach(function(s) {
+                    if (!counts[s.m]) { counts[s.m] = 0; diffSums[s.m] = 0; }
+                    counts[s.m]++;
+                    diffSums[s.m] += this.bitsToDifficulty(s.b);
+                }.bind(this));
+                // Time span of window
+                var newest = this.shares[0].t;
+                var oldest = this.shares[this.shares.length - 1].t;
+                var span = Math.max(newest - oldest, 1);
+                for (var m in diffSums) {
+                    // hashrate = sum(difficulty) * 2^32 / time_span (scrypt)
+                    this.minerHashrates[m] = diffSums[m] * 4294967296 / span;
+                }
+            },
+
             showTooltip: function(share, e) {
                 var tip = this.tooltip;
                 var isMine = this.myAddress && share.m === this.myAddress;
@@ -4660,11 +4683,17 @@
                 var staleText = share.s === 0 ? 'None' : share.s === 1 ? 'Orphan' : 'Dead';
                 var verText = share.v ? '<span style="color:#28a745">Verified</span>' : '<span style="color:#555577">Unverified</span>';
 
-                // Miner: show address (truncated), with "Mine" badge
                 var minerAddr = share.m || '?';
                 var minerDisplay = isMine
-                    ? '<span class="tt-mine">' + minerAddr.substr(0, 14) + '… (Mine)</span>'
+                    ? '<span class="tt-mine">' + minerAddr.substr(0, 14) + '… (This Node)</span>'
                     : '<span style="font-family:Monaco,Consolas,monospace;font-size:0.78em">' + minerAddr.substr(0, 20) + (minerAddr.length > 20 ? '…' : '') + '</span>';
+
+                // Relative height: position in window (1 = oldest tail, windowSize = head)
+                var relHeight = this.shares.length - share.p;
+
+                // Miner hashrate
+                var hr = this.minerHashrates[share.m];
+                var hrText = hr ? format_hashrate(hr) : '-';
 
                 // Tags
                 var tags = [];
@@ -4673,13 +4702,17 @@
 
                 var html =
                     '<div class="tt-hash">' + share.h + '</div>' +
-                    '<div class="tt-row"><span class="tl">Height</span><span class="tv">' + (share.a || '-') + '</span></div>' +
+                    '<div class="tt-row"><span class="tl">Height</span><span class="tv">' + (share.a || '-') + ' <span style="opacity:0.5;font-size:0.85em">(' + relHeight + '/' + this.windowSize + ')</span></span></div>' +
                     '<div class="tt-row"><span class="tl">Miner</span><span class="tv">' + minerDisplay + '</span></div>' +
+                    '<div class="tt-row"><span class="tl">Hashrate</span><span class="tv">' + hrText + '</span></div>' +
                     '<div class="tt-row"><span class="tl">Difficulty</span><span class="tv">' + format_difficulty(difficulty) + '</span></div>' +
                     '<div class="tt-row"><span class="tl">Age</span><span class="tv">' + format_dt(age) + '</span></div>' +
                     '<div class="tt-row"><span class="tl">Version</span><span class="tv">V' + share.V + (share.dv ? ' (desired V' + share.dv + ')' : '') + '</span></div>' +
                     '<div class="tt-row"><span class="tl">Status</span><span class="tv">' + verText + '</span></div>';
 
+                if (share.cb) {
+                    html += '<div class="tt-row"><span class="tl">Coinbase</span><span class="tv" style="color:#ffc107;font-size:0.78em">' + share.cb + '</span></div>';
+                }
                 if (tags.length > 0) {
                     html += '<div class="tt-row"><span class="tl">Tags</span><span class="tv">' + tags.join(' ') + '</span></div>';
                 }
@@ -5017,7 +5050,7 @@
                 }
             }
 
-            // My shares: find shares matching my address (as cells)
+            // This Node: find shares matching my address (as cells)
             var myContainer = document.getElementById('my_share_hashes');
             if (myContainer) {
                 myContainer.innerHTML = '';
@@ -5030,10 +5063,10 @@
                             myContainer.appendChild(makeShareCell(s.H, s));
                         });
                     } else {
-                        myContainer.innerHTML = '<span style="color:var(--text-muted);font-size:0.82rem">None (not mining)</span>';
+                        myContainer.innerHTML = '<span style="color:var(--text-muted);font-size:0.82rem">None (node not mining)</span>';
                     }
                 } else {
-                    myContainer.innerHTML = '<span style="color:var(--text-muted);font-size:0.82rem">None (not mining)</span>';
+                    myContainer.innerHTML = '<span style="color:var(--text-muted);font-size:0.82rem">None (node not mining)</span>';
                 }
             }
 
@@ -5112,10 +5145,11 @@
                 window.open('share.html#' + fullHash, '_blank');
             });
 
-            // Tooltip — reuse defrag tooltip
+            // Tooltip + PPLNS treemap — reuse defrag tooltip and zoom
             cell.addEventListener('mouseenter', function(e) {
                 if (share) {
                     defrag.showTooltip(share, e);
+                    defrag.showZoom(share, e);
                 } else {
                     var tip = defrag.tooltip;
                     tip.innerHTML = '<div class="tt-hash">' + fullHash.substr(0, 16) + '</div>' +
@@ -5126,8 +5160,10 @@
                 }
             });
             cell.addEventListener('mousemove', function(e) {
-                if (share) defrag.showTooltip(share, e);
-                else {
+                if (share) {
+                    defrag.showTooltip(share, e);
+                    defrag.showZoom(share, e);
+                } else {
                     defrag.tooltip.style.left = (e.clientX + 14) + 'px';
                     defrag.tooltip.style.top = (e.clientY + 14) + 'px';
                 }

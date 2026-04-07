@@ -2940,6 +2940,21 @@ int main(int argc, char* argv[]) {
                                         script, true /*litecoin*/, testnet);
                                     s["m"] = addr.empty() ? HexStr(script) : addr;
 
+                                    // Short coinbase ASCII tag (printable chars only)
+                                    if (!obj->m_coinbase.m_data.empty()) {
+                                        std::string cb;
+                                        cb.reserve(32);
+                                        for (auto c : obj->m_coinbase.m_data) {
+                                            if (c >= 32 && c <= 126) cb += static_cast<char>(c);
+                                            else if (!cb.empty()) cb += '.';
+                                        }
+                                        // Trim dots from edges, cap at 48 chars
+                                        while (!cb.empty() && cb.front() == '.') cb.erase(cb.begin());
+                                        while (!cb.empty() && cb.back() == '.') cb.pop_back();
+                                        if (cb.size() > 48) cb.resize(48);
+                                        if (!cb.empty()) s["cb"] = cb;
+                                    }
+
                                     // Detect pool fee share: compare hash160 with fee address
                                     if (!fee_addr.empty() && script.size() >= 22) {
                                         // Extract hash160 from script (P2PKH[3:23], P2WPKH[2:22], P2SH[2:22])
