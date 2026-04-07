@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.12.0] - 2026-04-07
+
+### Milestone
+- **Sharechain Transparency Explorer** — Windows Defragmenter-style canvas visualization of the full sharechain window (8640 mainnet / 400 testnet shares) with interactive PPLNS treemaps, animated hover effects, and V36 upgrade pressure for miners.
+
+### Added
+- **Defrag sharechain viewer** — canvas grid where each share is a colored cell. Colors: blue (this node), green (verified), gray (unverified), yellow (orphan), red (dead), purple (pool fee), teal (V36 signaling). Gold/cyan/orange borders for LTC/DOGE/twin block solutions.
+- **PPLNS Distribution treemap** — interactive squarified treemap on dashboard and share detail pages. Shows per-miner LTC % and DOGE % with clickable addresses (Blockchair). V35-only miners shown desaturated with "NO DOGE" labels and red borders.
+- **Animated hover effects** — share cells enlarge 2.5x with white glow and spring animation. PPLNS treemap cells scale with brightness boost. Chain structure cells (Best Share, Verified Heads, Tails) as colored squares with tooltips.
+- **Rich share tooltips** — hash, absolute + relative height, miner address, hashrate, difficulty, age, version + desired version, coinbase tag, stale status, V36 signaling tags, LTC/DOGE block solution badges.
+- **Block solution banners** — share detail page shows prominent banners for block solutions: gold (LTC), cyan (DOGE), orange pulsing (LEGENDARY twin). Blockchair links, confirmations, block reward.
+- **Modern share.html** — complete redesign matching dashboard dark theme. Card layout with navigation, share data, local data, block header, generation TX, V36 metadata, full PPLNS treemap with DOGE payouts and version tags.
+- **`/sharechain/window` enhanced** — compact JSON keys, human-readable miner addresses, `is_block_solution` flag, `desired_version`, coinbase ASCII tag (longest 10+ char run with letters), DOGE discovered blocks.
+- **`/web/share/<hash>` endpoint** — full share lookup via `set_share_lookup_fn` callback. Returns p2pool-compatible JSON with block solution detection, DOGE block info, LTC confirmations.
+- **V36? column in Current Payouts** — green checkmark (V36), teal arrow (signaling), red X (V35 only, no DOGE).
+- **Time axis** — left-side hour labels on defrag grid showing share age per row.
+- **WoW quality colors** — Best Share: Epic purple glow. Twin blocks: Legendary orange pulse.
+
+### Changed
+- "My Shares" / "Mine" renamed to "This Node" throughout.
+- Share explorer section renamed to "Sharechain Transparency Explorer".
+- Donation field removed from tooltips (always 0 in V36+).
+
 ## [0.9.5] - 2026-03-27
 
 ### Milestone
