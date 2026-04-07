@@ -856,8 +856,7 @@
             border-radius: 8px;
             padding: 10px 14px;
             pointer-events: none;
-            min-width: 200px;
-            max-width: 320px;
+            width: 320px;
             box-shadow: 0 8px 24px rgba(0,0,0,0.5);
             font-size: 0.82rem;
             line-height: 1.5;
@@ -2036,7 +2035,7 @@
         <!-- Sharechain Transparency Explorer -->
         <div class="shares-section">
             <div class="section-header">
-                <h2>Sharechain Explorer</h2>
+                <h2>Sharechain Transparency Explorer</h2>
             </div>
 
             <div class="defrag-container">
@@ -4711,7 +4710,7 @@
                     '<div class="tt-row"><span class="tl">Status</span><span class="tv">' + verText + '</span></div>';
 
                 if (share.cb) {
-                    html += '<div class="tt-row"><span class="tl">Coinbase</span><span class="tv" style="color:#ffc107;font-size:0.78em">' + share.cb + '</span></div>';
+                    html += '<div class="tt-row"><span class="tl">Coinbase</span><span class="tv" style="color:#ffc107;font-size:0.78em;word-break:break-all;max-width:160px">' + share.cb + '</span></div>';
                 }
                 if (tags.length > 0) {
                     html += '<div class="tt-row"><span class="tl">Tags</span><span class="tv">' + tags.join(' ') + '</span></div>';
