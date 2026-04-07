@@ -105,6 +105,7 @@ libs/secp256k1/*
 *.log
 boost_1_78_0.tar.bz2
 /build
+/build-release
 /boost_1_78_0
 /boost_install
 
@@ -150,3 +151,5 @@ test/test_*_include.cmake
 !test/test_*.cpp
 !test/test_*.hpp
 !test/test_*.h
+CLAUDE.md
+CLAUDE.md
