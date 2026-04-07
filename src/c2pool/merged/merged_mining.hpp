@@ -153,6 +153,7 @@ struct DiscoveredMergedBlock
     int64_t     timestamp{0};     // unix epoch seconds
     bool        accepted{true};   // RPC returned success
     uint64_t    coinbase_value{0}; // aux block reward in satoshis
+    bool        is_local{false};  // true = our own submission, false = detected from peer share
 };
 
 // ─── Integrated Merged Mining Manager ────────────────────────────────────────

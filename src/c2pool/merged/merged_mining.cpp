@@ -1658,6 +1658,7 @@ void MergedMiningManager::record_discovered_block(
                             std::chrono::system_clock::now().time_since_epoch()).count();
     blk.accepted       = accepted;
     blk.coinbase_value = chain.current_work.coinbase_value;
+    blk.is_local       = true;  // our own submission
 
     m_discovered_blocks.push_back(std::move(blk));
     m_blocks_per_chain[chain.config.chain_id]++;

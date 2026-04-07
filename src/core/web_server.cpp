@@ -4993,7 +4993,7 @@ nlohmann::json MiningInterface::rest_discovered_merged_blocks()
         j["aux_symbol"]       = blk.symbol;
         j["aux_reward"]       = blk.coinbase_value / 1e8;
         j["miner"]            = nullptr;
-        j["peer_addr"]        = "local";
+        j["peer_addr"]        = blk.is_local ? "local" : "peer";
         j["status"]           = blk.accepted ? "confirmed" : "orphaned";
         arr.push_back(std::move(j));
     }
