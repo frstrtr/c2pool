@@ -307,6 +307,17 @@ public:
         }
     }
 
+    /// Request a block via plain MSG_BLOCK (0x02) getdata.
+    /// Works for any block regardless of MWEB support.
+    void request_block(const uint256& block_hash)
+    {
+        if (m_peer) {
+            auto msg = message_getdata::make_raw(
+                {inventory_type(inventory_type::block, block_hash)});
+            m_peer->write(msg);
+        }
+    }
+
     /// Whether this peer supports compact blocks (BIP 152).
     bool supports_compact_blocks() const { return m_peer_supports_cmpct; }
     bool peer_wtxidrelay() const { return m_peer_wtxidrelay; }

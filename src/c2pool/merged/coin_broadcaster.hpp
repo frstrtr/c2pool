@@ -299,6 +299,24 @@ public:
         }
     }
 
+    /// Request a block via plain MSG_BLOCK (0x02) from all peers.
+    /// Works for any block in the chain regardless of MWEB/witness support.
+    void request_block_plain(const uint256& block_hash)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        int sent = 0;
+        for (auto& [key, peer] : m_peers) {
+            try {
+                peer->node_p2p.request_block(block_hash);
+                ++sent;
+            } catch (...) {}
+        }
+        if (sent > 0) {
+            LOG_INFO << "[" << m_symbol << "] Block (MSG_BLOCK) requested from "
+                     << sent << " peer(s): " << block_hash.GetHex().substr(0, 16) << "...";
+        }
+    }
+
     /// Send getheaders to all connected peers using the supplied block locator.
     /// Used by the embedded node to request initial header sync after seeding genesis.
     void request_headers(const std::vector<uint256>& locator, const uint256& stop_hash)

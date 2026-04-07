@@ -1017,14 +1017,12 @@ void NodeImpl::load_persisted_shares()
                                 share.ACTION({ computed_hash = share_init_verify(*obj, true); });
                                 if (!g_last_pow_hash.IsNull())
                                     idx->pow_hash = g_last_pow_hash;
-                                // Diagnostic: detect hash mismatch (header reconstruction bug)
                                 if (!computed_hash.IsNull() && computed_hash != hash) {
                                     static int hash_mismatch = 0;
-                                    if (++hash_mismatch <= 5)
-                                        LOG_WARNING << "[LOAD-DIAG] hash mismatch! stored="
+                                    if (++hash_mismatch <= 3)
+                                        LOG_WARNING << "pow_hash recompute: hash mismatch stored="
                                                     << hash.GetHex().substr(0,16)
-                                                    << " computed=" << computed_hash.GetHex().substr(0,16)
-                                                    << " pow=" << g_last_pow_hash.GetHex().substr(0,16);
+                                                    << " computed=" << computed_hash.GetHex().substr(0,16);
                                 }
                             } catch (...) {}
                         }

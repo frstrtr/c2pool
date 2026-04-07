@@ -24,6 +24,7 @@
 #include <core/log.hpp>
 #include <core/uint256.hpp>
 #include <core/web_server.hpp>
+#include <core/hash.hpp>
 #include <core/address_utils.hpp>
 #include <core/config.hpp>
 
@@ -1565,14 +1566,25 @@ int main(int argc, char* argv[]) {
             core::WebServer web_server(ioc, http_host, static_cast<uint16_t>(http_port), 
                                      settings->m_testnet, enhanced_node, blockchain);
 
-            // DOGE historic lookup result: target + height + block_hash at a given timestamp.
-            struct DogeHistoricResult {
-                uint256 target;
-                uint32_t height{0};
-                std::string block_hash;
-            };
-            // Shared function pointer for DOGE historic lookup via embedded HeaderChain.
-            auto doge_target_fn = std::make_shared<std::function<DogeHistoricResult(uint32_t)>>();
+            // V35 merged block resolver: requests full LTC block from P2P,
+            // extracts fabe6d6d MM commitment from coinbase, looks up DOGE
+            // block hash in embedded HeaderChain for exact height.
+            // Set later when embedded_broadcaster + doge_chain are created.
+            using MergedResolverFn = std::function<void(const uint256& ltc_block_hash,
+                                                        const uint256& pow_hash)>;
+            auto merged_block_resolver = std::make_shared<MergedResolverFn>();
+
+            // Pending V35 merged block resolutions: LTC block hash → pow_hash.
+            // When a full LTC block arrives via P2P, check if it's in this set
+            // and resolve the DOGE block from its coinbase MM commitment.
+            auto pending_merged_resolve = std::make_shared<
+                std::map<uint256, uint256>>();  // ltc_block_hash → pow_hash
+
+            // Callback fired when a full LTC block arrives that matches a pending
+            // merged resolution. Set later when doge_chain is available.
+            using OnFullBlockMergedFn = std::function<void(const uint256& block_hash,
+                const uint256& pow_hash, const ltc::coin::BlockType& block)>;
+            auto on_full_block_merged = std::make_shared<OnFullBlockMergedFn>();
 
             // Apply stratum tuning from CLI/YAML to the MiningInterface
             web_server.get_mining_interface()->set_stratum_config(stratum_config);
@@ -1817,6 +1829,7 @@ int main(int argc, char* argv[]) {
                          bcaster = embedded_broadcaster.get(),
                          coinbase_maturity = core::coin::LTC_LIMITS.coinbase_maturity,
                          explorer_enabled, explorer_depth_ltc,
+                         pending_merged_resolve, on_full_block_merged,
                          &web_server](
                             const std::string& peer,
                             const ltc::coin::BlockType& block) {
@@ -1939,6 +1952,15 @@ int main(int argc, char* argv[]) {
                                 LOG_INFO << "[EMB-LTC] MWEB state updated from peer " << peer
                                          << " at height " << height
                                          << " (mweb_raw=" << block.m_mweb_raw.size() << " bytes)";
+                            }
+
+                            // Step 4: V35 merged block resolution
+                            // Check if this block was requested for merged block detection.
+                            auto pit = pending_merged_resolve->find(block_hash);
+                            if (pit != pending_merged_resolve->end() && *on_full_block_merged) {
+                                auto pow = pit->second;
+                                pending_merged_resolve->erase(pit);
+                                (*on_full_block_merged)(block_hash, pow, block);
                             }
                         });
                 }
@@ -2920,58 +2942,76 @@ int main(int argc, char* argv[]) {
             };
 
             // Wire merged block detection for peer shares.
-            // doge_target_fn is set later when doge_chain is created — captured via shared_ptr.
+            // V36: exact data from m_merged_coinbase_info (height, 80-byte header, coinbase_value).
+            // V35: no merged data in share — if the share is an LTC block solution,
+            //      request the full LTC block from P2P peers, parse coinbase for fabe6d6d
+            //      MM commitment, extract DOGE block hash, look up in embedded HeaderChain.
             p2p_node->tracker().m_on_merged_block_check =
-                [&web_server, &p2p_node, doge_target_fn](const uint256& share_hash, const uint256& pow_hash) {
+                [&web_server, &p2p_node, merged_block_resolver](const uint256& share_hash, const uint256& pow_hash) {
                 auto mi = web_server.get_mining_interface();
                 auto* mm = mi->get_mm_manager();
                 if (!mm || !mm->has_chains()) return;
 
-                for (const auto& ci : mm->get_chain_infos()) {
-                    uint256 target = ci.target;
+                auto& tracker_chain = p2p_node->tracker().chain;
+                if (!tracker_chain.contains(share_hash)) return;
 
-                    // Fallback: if current target doesn't match, use historic lookup
-                    DogeHistoricResult hist;
-                    bool used_historic = false;
-                    if ((target.IsNull() || !(pow_hash <= target)) && *doge_target_fn) {
-                        uint32_t share_ts = 0;
-                        auto& chain = p2p_node->tracker().chain;
-                        if (chain.contains(share_hash)) {
-                            chain.get(share_hash).share.invoke([&](auto* s) {
-                                share_ts = s->m_min_header.m_timestamp;
-                            });
-                        }
-                        if (share_ts > 0) {
-                            hist = (*doge_target_fn)(share_ts);
-                            target = hist.target;
-                            used_historic = true;
+                bool had_v36_data = false;
+                tracker_chain.get(share_hash).share.invoke([&](auto* s) {
+                    if constexpr (requires { s->m_merged_coinbase_info; }) {
+                        if (!s->m_merged_coinbase_info.empty())
+                            had_v36_data = true;
+                        for (const auto& entry : s->m_merged_coinbase_info) {
+                            if (entry.m_block_header.m_data.size() != 80) continue;
+
+                            // Extract nBits from aux block header (standard layout: offset 72, LE)
+                            const auto* d = entry.m_block_header.m_data.data();
+                            uint32_t bits = static_cast<uint32_t>(d[72]) |
+                                           (static_cast<uint32_t>(d[73]) << 8) |
+                                           (static_cast<uint32_t>(d[74]) << 16) |
+                                           (static_cast<uint32_t>(d[75]) << 24);
+                            uint256 target = chain::bits_to_target(bits);
+                            if (target.IsNull() || !(pow_hash <= target)) continue;
+
+                            // SHA256d of the 80-byte header = aux chain block hash
+                            uint256 block_hash = Hash(entry.m_block_header.m_data);
+
+                            // Resolve symbol from merged mining manager
+                            std::string symbol;
+                            for (const auto& ci : mm->get_chain_infos()) {
+                                if (ci.chain_id == entry.m_chain_id) { symbol = ci.symbol; break; }
+                            }
+                            if (symbol.empty()) symbol = "MERGED-" + std::to_string(entry.m_chain_id);
+
+                            LOG_INFO << "*** MERGED BLOCK FROM PEER! " << symbol
+                                     << " share=" << share_hash.GetHex().substr(0,16)
+                                     << " height=" << entry.m_block_height
+                                     << " pow=" << pow_hash.GetHex().substr(0,16)
+                                     << " target=" << target.GetHex().substr(0,16)
+                                     << " block=" << block_hash.GetHex().substr(0,16);
+
+                            c2pool::merged::DiscoveredMergedBlock blk;
+                            blk.chain_id = entry.m_chain_id;
+                            blk.symbol = symbol;
+                            blk.height = static_cast<int>(entry.m_block_height);
+                            blk.block_hash = block_hash.GetHex();
+                            blk.parent_hash = share_hash.GetHex();
+                            blk.timestamp = static_cast<int64_t>(std::time(nullptr));
+                            blk.accepted = true;
+                            blk.coinbase_value = entry.m_coinbase_value;
+                            mm->add_discovered_block(blk);
                         }
                     }
+                });
 
-                    if (target.IsNull()) continue;
-                    if (pow_hash <= target) {
-                        // Use historic height/hash if available, otherwise current
-                        uint32_t blk_height = used_historic && hist.height > 0
-                            ? hist.height : static_cast<uint32_t>(ci.current_height);
-                        std::string blk_hash = used_historic && !hist.block_hash.empty()
-                            ? hist.block_hash : ci.block_hash;
-
-                        LOG_INFO << "*** MERGED BLOCK FROM PEER! " << ci.symbol
-                                 << " share=" << share_hash.GetHex().substr(0,16)
-                                 << " height=" << blk_height
-                                 << " pow=" << pow_hash.GetHex().substr(0,16)
-                                 << " target=" << target.GetHex().substr(0,16);
-
-                        c2pool::merged::DiscoveredMergedBlock blk;
-                        blk.chain_id = ci.chain_id;
-                        blk.symbol = ci.symbol;
-                        blk.height = static_cast<int>(blk_height);
-                        blk.block_hash = blk_hash;
-                        blk.parent_hash = share_hash.GetHex();
-                        blk.timestamp = static_cast<int64_t>(std::time(nullptr));
-                        blk.accepted = true;
-                        blk.coinbase_value = ci.coinbase_value;
-                        mm->add_discovered_block(blk);
+                // V35 fallback: if this share is an LTC block solution but has no V36
+                // merged data, use the resolver to fetch the full LTC block from P2P
+                // and extract the DOGE block hash from the coinbase MM commitment.
+                // share_hash = SHA256d of the full 80-byte header (= LTC block hash),
+                // set by share_init_verify() → share.m_hash. Same hash used by P2P getdata.
+                if (!had_v36_data && *merged_block_resolver) {
+                    auto* idx = tracker_chain.get_index(share_hash);
+                    if (idx && idx->is_block_solution) {
+                        (*merged_block_resolver)(share_hash, pow_hash);
                     }
                 }
             };
@@ -3810,38 +3850,6 @@ int main(int argc, char* argv[]) {
                                     doge_chain->set_dynamic_checkpoint(cp_h, cp_hash);
                             }
                         }
-
-                        // Set the DOGE historic target lookup for merged block detection.
-                        // Used by m_on_merged_block_check during startup block scan.
-                        *doge_target_fn = [&doge_chain](uint32_t share_ts) -> DogeHistoricResult {
-                            DogeHistoricResult result;
-                            auto tip = doge_chain->tip();
-                            if (!tip.has_value()) return result;
-                            uint32_t tip_ts = tip->header.m_timestamp;
-                            int32_t dt = static_cast<int32_t>(tip_ts) - static_cast<int32_t>(share_ts);
-                            int32_t blocks_back = dt / 60;  // ~1 DOGE block/min
-                            int32_t est_h = static_cast<int32_t>(tip->height) - blocks_back;
-                            if (est_h < 1) return result;
-
-                            // Search ±10 blocks around estimate for closest timestamp match
-                            int32_t best_h = est_h;
-                            int32_t best_dt = INT32_MAX;
-                            for (int32_t h = std::max(1, est_h - 10); h <= est_h + 10; ++h) {
-                                auto hdr = doge_chain->get_header_by_height(static_cast<uint32_t>(h));
-                                if (!hdr.has_value()) continue;
-                                int32_t d = std::abs(static_cast<int32_t>(hdr->header.m_timestamp) -
-                                                     static_cast<int32_t>(share_ts));
-                                if (d < best_dt) { best_dt = d; best_h = h; }
-                            }
-
-                            auto hdr = doge_chain->get_header_by_height(static_cast<uint32_t>(best_h));
-                            if (!hdr.has_value()) return result;
-                            result.target.SetCompact(hdr->header.m_bits);
-                            result.height = static_cast<uint32_t>(best_h);
-                            result.block_hash = hdr->block_hash.GetHex();
-                            return result;
-                        };
-                        LOG_INFO << "[MM-DOGE] Historic target lookup wired via HeaderChain";
 
                         // Seed genesis if empty (same pattern as LTC genesis seeding).
                         // Reference: dogecoin/src/chainparams.cpp CreateGenesisBlock()
@@ -4992,6 +5000,167 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             
+            // Wire V35 merged block resolver: when an LTC block is found from a V35
+            // share (no m_merged_coinbase_info), fetch the full LTC block from P2P,
+            // extract the fabe6d6d MM commitment from coinbase, resolve DOGE block hash
+            // in the embedded HeaderChain.
+            // Retry structure: {hash → {pow_hash, attempts, timer}}.
+            struct PendingResolve {
+                uint256 pow_hash;
+                int attempts{0};
+                std::shared_ptr<boost::asio::steady_timer> timer;
+            };
+            auto pending_resolve_state = std::make_shared<
+                std::map<uint256, PendingResolve>>();
+
+            if (embedded_broadcaster && doge_chain) {
+                auto* bcaster = embedded_broadcaster.get();
+                constexpr int MAX_RETRY = 5;
+                constexpr int RETRY_SEC = 10;
+
+                *merged_block_resolver = [bcaster, pending_merged_resolve,
+                                          pending_resolve_state, &ioc](
+                    const uint256& ltc_block_hash, const uint256& pow_hash) {
+
+                    // Already pending? skip
+                    if (pending_resolve_state->count(ltc_block_hash)) return;
+
+                    (*pending_merged_resolve)[ltc_block_hash] = pow_hash;
+
+                    auto& state = (*pending_resolve_state)[ltc_block_hash];
+                    state.pow_hash = pow_hash;
+                    state.attempts = 0;
+                    state.timer = std::make_shared<boost::asio::steady_timer>(ioc);
+
+                    // Recursive retry lambda
+                    auto retry_fn = std::make_shared<std::function<void()>>();
+                    *retry_fn = [bcaster, pending_merged_resolve, pending_resolve_state,
+                                 retry_fn, ltc_block_hash, MAX_RETRY, RETRY_SEC]() {
+                        auto it = pending_resolve_state->find(ltc_block_hash);
+                        if (it == pending_resolve_state->end()) return;  // resolved
+
+                        auto& st = it->second;
+                        ++st.attempts;
+
+                        // Check if still pending (not yet resolved by full_block handler)
+                        if (!pending_merged_resolve->count(ltc_block_hash)) {
+                            pending_resolve_state->erase(it);
+                            return;  // already resolved
+                        }
+
+                        if (st.attempts > MAX_RETRY) {
+                            LOG_WARNING << "[V35-MERGED] Gave up on LTC block "
+                                        << ltc_block_hash.GetHex().substr(0, 16)
+                                        << " after " << MAX_RETRY << " attempts";
+                            pending_merged_resolve->erase(ltc_block_hash);
+                            pending_resolve_state->erase(it);
+                            return;
+                        }
+
+                        LOG_INFO << "[V35-MERGED] Requesting LTC block "
+                                 << ltc_block_hash.GetHex().substr(0, 16)
+                                 << " attempt " << st.attempts << "/" << MAX_RETRY
+                                 << " (peers=" << bcaster->connected_count() << ")";
+                        bcaster->request_block_plain(ltc_block_hash);
+
+                        // Schedule retry
+                        st.timer->expires_after(std::chrono::seconds(RETRY_SEC));
+                        st.timer->async_wait([retry_fn](const boost::system::error_code& ec) {
+                            if (!ec && retry_fn) (*retry_fn)();
+                        });
+                    };
+
+                    // First attempt immediately
+                    (*retry_fn)();
+                };
+
+                // Wire the actual resolution: parse coinbase for fabe6d6d,
+                // extract MM root = DOGE block hash, look up in HeaderChain.
+                auto* dc = doge_chain.get();
+                auto* mm = web_server.get_mining_interface()->get_mm_manager();
+                bool testnet = settings->m_testnet;
+                *on_full_block_merged = [dc, mm, testnet](
+                    const uint256& ltc_block_hash, const uint256& pow_hash,
+                    const ltc::coin::BlockType& block) {
+                    if (!mm || !dc || block.m_txs.empty()) return;
+
+                    // Extract coinbase scriptSig
+                    const auto& coinbase_tx = block.m_txs[0];
+                    if (coinbase_tx.vin.empty()) return;
+                    const auto& script_sig = coinbase_tx.vin[0].scriptSig.m_data;
+
+                    // Find fabe6d6d magic
+                    static const uint8_t MM_MAGIC[] = {0xfa, 0xbe, 0x6d, 0x6d};
+                    auto magic_pos = std::search(script_sig.begin(), script_sig.end(),
+                                                  std::begin(MM_MAGIC), std::end(MM_MAGIC));
+                    if (magic_pos == script_sig.end()) {
+                        LOG_INFO << "[V35-MERGED] No fabe6d6d in LTC block "
+                                 << ltc_block_hash.GetHex().substr(0, 16) << " — no merged mining";
+                        return;
+                    }
+                    size_t offset = std::distance(script_sig.begin(), magic_pos) + 4;
+                    if (offset + 32 + 4 + 4 > script_sig.size()) return;
+
+                    // MM commitment: 32-byte merkle root (big-endian) + 4-byte tree_size + 4-byte nonce
+                    // With single aux chain, tree_size=1, merkle_root = DOGE block hash
+                    uint32_t tree_size = 0;
+                    std::memcpy(&tree_size, &script_sig[offset + 32], 4);
+                    // tree_size is LE
+
+                    // Extract 32-byte MM root (stored big-endian in coinbase → reverse for uint256 LE)
+                    uint256 mm_root;
+                    for (int i = 0; i < 32; ++i)
+                        mm_root.data()[31 - i] = script_sig[offset + i];
+
+                    LOG_INFO << "[V35-MERGED] LTC block " << ltc_block_hash.GetHex().substr(0, 16)
+                             << " MM root=" << mm_root.GetHex().substr(0, 16)
+                             << " tree_size=" << tree_size;
+
+                    // With tree_size=1, mm_root IS the DOGE block hash.
+                    // With tree_size>1, we'd need the merkle branch to extract — but p2pool
+                    // uses tree_size=1 for single aux chain (DOGE only).
+                    if (tree_size > 1) {
+                        LOG_WARNING << "[V35-MERGED] tree_size=" << tree_size
+                                    << " — multi-chain aux tree, cannot resolve without merkle branch";
+                        return;
+                    }
+
+                    // Look up DOGE block hash in embedded HeaderChain
+                    auto doge_entry = dc->get_header(mm_root);
+                    if (!doge_entry) {
+                        LOG_INFO << "[V35-MERGED] DOGE block " << mm_root.GetHex().substr(0, 16)
+                                 << " not found in HeaderChain (may not be synced yet)";
+                        return;
+                    }
+
+                    // Verify pow_hash meets DOGE target
+                    uint256 doge_target;
+                    doge_target.SetCompact(doge_entry->header.m_bits);
+                    if (doge_target.IsNull() || !(pow_hash <= doge_target)) {
+                        LOG_INFO << "[V35-MERGED] pow_hash doesn't meet DOGE target at height "
+                                 << doge_entry->height;
+                        return;
+                    }
+
+                    LOG_INFO << "*** V35 MERGED BLOCK RESOLVED! DOGE"
+                             << " height=" << doge_entry->height
+                             << " block=" << mm_root.GetHex().substr(0, 16)
+                             << " ltc_block=" << ltc_block_hash.GetHex().substr(0, 16);
+
+                    c2pool::merged::DiscoveredMergedBlock blk;
+                    blk.chain_id = 98;  // DOGE
+                    blk.symbol = testnet ? "tDOGE" : "DOGE";
+                    blk.height = static_cast<int>(doge_entry->height);
+                    blk.block_hash = mm_root.GetHex();
+                    blk.parent_hash = ltc_block_hash.GetHex();
+                    blk.timestamp = static_cast<int64_t>(std::time(nullptr));
+                    blk.accepted = true;
+                    mm->add_discovered_block(blk);
+                };
+
+                LOG_INFO << "[V35-MERGED] Resolver wired via embedded LTC P2P + DOGE HeaderChain";
+            }
+
             // Block scan: run here after ALL callbacks + DOGE target fn are wired.
             if (p2p_node) {
                 auto best = p2p_node->best_share_hash();

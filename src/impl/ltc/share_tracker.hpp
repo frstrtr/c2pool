@@ -156,7 +156,7 @@ public:
     void scan_chain_for_blocks(const uint256& tip, int max_shares)
     {
         if (tip.IsNull() || max_shares <= 0) return;
-        int scanned = 0, found_ltc = 0, no_pow = 0;
+        int scanned = 0, found_ltc = 0, found_merged = 0, no_pow = 0;
         uint256 pos = tip;
         for (int i = 0; i < max_shares && !pos.IsNull(); ++i) {
             if (!chain.contains(pos)) break;
@@ -170,19 +170,11 @@ public:
 
                 // Check LTC block target
                 uint256 block_target = chain::bits_to_target(s->m_min_header.m_bits);
-                // Diagnostic: log comparison for shares with very low pow_hash
-                if (pow.GetHex().substr(0, 14) == "00000000000000") {
-                    LOG_INFO << "[SCAN-CHECK] hash=" << pos.GetHex().substr(0,16)
-                             << " pow=" << pow.GetHex()
-                             << " target=" << block_target.GetHex()
-                             << " bits=0x" << std::hex << s->m_min_header.m_bits << std::dec
-                             << " meets=" << (pow <= block_target);
-                }
                 if (!block_target.IsNull() && pow <= block_target) {
                     idx->is_block_solution = true;
                     if (m_on_block_found) { m_on_block_found(pos); ++found_ltc; }
                 }
-                // Check merged targets
+                // Check merged targets (V36 shares carry exact data in m_merged_coinbase_info)
                 if (m_on_merged_block_check)
                     m_on_merged_block_check(pos, pow);
 
