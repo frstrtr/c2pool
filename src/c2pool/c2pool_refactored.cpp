@@ -2955,8 +2955,8 @@ int main(int argc, char* argv[]) {
                                         }
                                         if (cur_run.size() > best_run.size())
                                             best_run = cur_run;
-                                        // Only show if meaningful (4+ chars)
-                                        if (best_run.size() >= 4) {
+                                        // Only show if meaningful (8+ chars)
+                                        if (best_run.size() >= 8) {
                                             if (best_run.size() > 48) best_run.resize(48);
                                             s["cb"] = best_run;
                                         }
