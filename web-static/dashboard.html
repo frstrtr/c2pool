@@ -972,6 +972,61 @@
             padding: 3px 0;
         }
 
+        /* Main PPLNS treemap cells */
+        .pplns-main-cell {
+            position: absolute;
+            overflow: hidden;
+            cursor: pointer;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            border: 2px solid rgba(0,0,0,0.4);
+            transition: transform 0.2s cubic-bezier(0.34, 1.4, 0.64, 1),
+                        box-shadow 0.2s ease;
+            transform-origin: center center;
+        }
+        .pplns-main-cell:hover {
+            transform: scale(1.08);
+            z-index: 100;
+            box-shadow: 0 0 16px 3px rgba(255,255,255,0.2);
+            border-color: rgba(255,255,255,0.5);
+            filter: brightness(1.25) saturate(1.15);
+        }
+        .pplns-main-cell .pm-pct {
+            color: #fff;
+            font-weight: 800;
+            text-shadow: 0 1px 2px rgba(0,0,0,1), 0 0 6px rgba(0,0,0,0.7);
+            line-height: 1.15;
+        }
+        .pplns-main-cell .pm-doge {
+            font-weight: 800;
+            text-shadow: 0 1px 2px rgba(0,0,0,1), 0 0 6px rgba(0,0,0,0.7);
+            line-height: 1.15;
+        }
+        .pplns-main-cell .pm-addr {
+            color: rgba(255,255,255,0.9);
+            font-family: 'Monaco','Consolas',monospace;
+            font-weight: 600;
+            text-shadow: 0 1px 2px rgba(0,0,0,1), 0 0 6px rgba(0,0,0,0.7);
+            line-height: 1.15;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            max-width: 95%;
+        }
+        .pplns-main-cell .pm-ver {
+            text-shadow: 0 1px 2px rgba(0,0,0,0.9);
+            line-height: 1.1;
+        }
+        .pplns-main-cell.v35-only {
+            filter: saturate(0.4) brightness(0.85);
+            border-color: rgba(220,53,69,0.6);
+        }
+        .pplns-main-cell.v35-only:hover {
+            filter: saturate(0.6) brightness(1.1);
+        }
+
         /* Verified Heads / Tails chain rows */
         .defrag-chain-rows {
             margin-top: 12px;
@@ -2033,6 +2088,15 @@
             <div class="loading" id="merged_broadcaster_loading">Loading merged broadcaster stats...</div>
         </div>
         
+        <!-- PPLNS Distribution Treemap -->
+        <div class="shares-section">
+            <div class="section-header">
+                <h2>PPLNS Distribution</h2>
+            </div>
+            <div class="pplns-main-grid" id="pplns-main-grid" style="position:relative;border-radius:8px;overflow:visible;min-height:60px"></div>
+            <div id="pplns-main-tooltip" style="display:none;position:fixed;z-index:9999;background:#1e1e38;border:1px solid var(--border);border-radius:8px;padding:8px 12px;pointer-events:none;font-size:0.82rem;box-shadow:0 6px 20px rgba(0,0,0,0.5);width:320px"></div>
+        </div>
+
         <!-- Sharechain Transparency Explorer -->
         <div class="shares-section">
             <div class="section-header">
@@ -3790,6 +3854,29 @@
             return { ver: topVer, dv: topDv || topVer };
         }
 
+        // Re-render V36 column in existing payouts table rows
+        function refreshPayoutsV36() {
+            d3.selectAll('#payouts tbody tr').each(function() {
+                var row = d3.select(this);
+                if (row.classed('merged-payout-row')) return; // skip sub-rows
+                var cells = row.selectAll('td');
+                if (cells[0].length < 3) return; // need addr, v36, amount
+                var addrCell = d3.select(cells[0][0]);
+                var v36Cell = d3.select(cells[0][1]);
+                var link = addrCell.select('a');
+                if (link.empty()) return;
+                var addr = link.attr('title') || link.text();
+                var mv = getMinerVersion(addr);
+                if (mv.ver >= 36) {
+                    v36Cell.html('<span style="color:#28a745;font-weight:700" title="V' + mv.ver + '">✓</span>');
+                } else if (mv.dv >= 36) {
+                    v36Cell.html('<span style="color:#0097a7;font-weight:700" title="V' + mv.ver + ' signaling V' + mv.dv + '">⇧</span>');
+                } else if (mv.ver > 0) {
+                    v36Cell.html('<span style="color:#dc3545;font-weight:700" title="V' + mv.ver + ' only — no DOGE!">✗</span>');
+                }
+            });
+        }
+
         // Payouts state for show more functionality
         window.payoutsData = null;
         window.payoutsDisplayCount = 5;
@@ -4483,6 +4570,10 @@
                     self.render();
                     self.updateStats(data);
                     loadShareLinks();
+                    // Re-render payouts V36 column now that share data is available
+                    refreshPayoutsV36();
+                    // Render main PPLNS treemap (needs miner version data)
+                    loadMainPPLNS();
                 });
 
                 // Fetch PPLNS distribution for treemap
@@ -5155,6 +5246,200 @@
 
         function loadShares() {
             defrag.load();
+        }
+
+        // Main PPLNS Distribution Treemap (dashboard-level)
+        function loadMainPPLNS() {
+            d3.json('../current_merged_payouts', function(payouts) {
+                if (!payouts || typeof payouts !== 'object') return;
+                var grid = document.getElementById('pplns-main-grid');
+                var tooltip = document.getElementById('pplns-main-tooltip');
+                if (!grid) return;
+                grid.innerHTML = '';
+
+                var total = 0, dogeTotal = 0;
+                var entries = [];
+                for (var addr in payouts) {
+                    var p = payouts[addr];
+                    var ltcAmt = typeof p === 'number' ? p : (p.amount || 0);
+                    total += ltcAmt;
+                    var dogeAmt = 0, dogeAddr = '';
+                    if (p.merged) {
+                        p.merged.forEach(function(m) {
+                            if (m.symbol === 'DOGE') { dogeAmt += m.amount || 0; dogeAddr = m.address || ''; }
+                        });
+                    }
+                    dogeTotal += dogeAmt;
+                    entries.push({ addr: addr, amt: ltcAmt, doge: dogeAmt, dogeAddr: dogeAddr });
+                }
+                entries.sort(function(a, b) { return b.amt - a.amt; });
+                entries.forEach(function(e) { e.pct = total > 0 ? e.amt / total : 0; });
+
+                var w = grid.clientWidth;
+                var h = Math.max(200, Math.min(w * 0.35, 400));
+                grid.style.height = h + 'px';
+
+                // Squarified treemap layout (standalone — carries all fields)
+                var rects = [];
+                var items = entries.map(function(d) { return { addr:d.addr, pct:d.pct, amt:d.amt, doge:d.doge, dogeAddr:d.dogeAddr, area:d.pct }; });
+                function tmLayout(items, x, y, w, h) {
+                    if (!items.length || w <= 0 || h <= 0) return;
+                    var tot = 0; items.forEach(function(it) { tot += it.area; });
+                    if (tot <= 0) return;
+                    var vert = w >= h, main = vert ? h : w, cross = vert ? w : h;
+                    var row = [], rowA = 0, rem = items.slice();
+                    while (rem.length) {
+                        row.push(rem[0]); rowA += rem[0].area; rem.shift();
+                        if (!rem.length) break;
+                        var sNow = (rowA/tot)*cross, sNext = ((rowA+rem[0].area)/tot)*cross;
+                        var wNow = 0, wNext = 0;
+                        row.forEach(function(r) { var s=(r.area/rowA)*main; var a=Math.max(s/sNow,sNow/s); if(a>wNow)wNow=a; });
+                        var testRow = row.concat([rem[0]]), testA = rowA+rem[0].area;
+                        testRow.forEach(function(r) { var s=(r.area/testA)*main; var a=Math.max(s/sNext,sNext/s); if(a>wNext)wNext=a; });
+                        if (wNext > wNow && row.length >= 1) break;
+                    }
+                    var strip = Math.max(1, (rowA/tot)*cross), off = 0;
+                    for (var i = 0; i < row.length; i++) {
+                        var sz = (row[i].area/rowA)*main;
+                        var r = vert
+                            ? { x:x, y:y+off, w:strip, h:sz }
+                            : { x:x+off, y:y, w:sz, h:strip };
+                        r.addr=row[i].addr; r.pct=row[i].pct; r.amt=row[i].amt; r.doge=row[i].doge; r.dogeAddr=row[i].dogeAddr;
+                        rects.push(r);
+                        off += sz;
+                    }
+                    if (rem.length) {
+                        if (vert) tmLayout(rem, x+strip, y, w-strip, h);
+                        else tmLayout(rem, x, y+strip, w, h-strip);
+                    }
+                }
+                tmLayout(items, 0, 0, w, h);
+
+                var addrPrefix = (typeof currency_info !== 'undefined' && currency_info.address_explorer_url_prefix)
+                    ? currency_info.address_explorer_url_prefix : 'https://blockchair.com/litecoin/address/';
+
+                rects.forEach(function(r) {
+                    var mv = getMinerVersion(r.addr);
+                    var isV35Only = mv.ver && mv.ver < 36 && (!mv.dv || mv.dv < 36);
+                    var hasDoge = r.doge > 0;
+                    var hue = defrag.addrHue(r.addr);
+
+                    var cell = document.createElement('div');
+                    cell.className = 'pplns-main-cell' + (isV35Only ? ' v35-only' : '');
+                    cell.style.left = r.x + 'px';
+                    cell.style.top = r.y + 'px';
+                    cell.style.width = r.w + 'px';
+                    cell.style.height = r.h + 'px';
+                    cell.style.background = 'hsl(' + hue + ',' + (isV35Only ? 30 : 45) + '%,' + (isV35Only ? 25 : 32) + '%)';
+
+                    var fitPct = Math.max(8, Math.min(r.w / 6, r.h / 5, 26));
+                    var fitAddr = Math.max(6, Math.min(fitPct * 0.5, r.w / 14, 11));
+                    var fitVer = Math.max(6, Math.min(fitPct * 0.4, 9));
+
+                    // LTC %
+                    if (r.w > 28 && r.h > 14) {
+                        var el = document.createElement('div');
+                        el.className = 'pm-pct';
+                        el.style.fontSize = fitPct + 'px';
+                        el.textContent = (r.pct * 100).toFixed(1) + '%';
+                        cell.appendChild(el);
+                    }
+                    // DOGE %
+                    if (r.w > 35 && r.h > 28) {
+                        var el = document.createElement('div');
+                        el.className = 'pm-doge';
+                        el.style.fontSize = Math.max(8, fitPct * 0.8) + 'px';
+                        if (hasDoge) {
+                            var dp = dogeTotal > 0 ? (r.doge / dogeTotal * 100).toFixed(1) : '0';
+                            el.style.color = '#ffd700';
+                            el.textContent = dp + '% D';
+                        } else if (isV35Only) {
+                            el.style.color = '#ff6b6b';
+                            el.textContent = r.w > 50 ? 'NO DOGE' : '0% D';
+                        } else {
+                            el.style.color = 'rgba(255,255,255,0.3)';
+                            el.textContent = '\u2014';
+                        }
+                        cell.appendChild(el);
+                    }
+                    // Address
+                    if (r.w > 45 && r.h > 42) {
+                        var el = document.createElement('div');
+                        el.className = 'pm-addr';
+                        el.style.fontSize = fitAddr + 'px';
+                        var mc = Math.max(4, Math.floor(r.w / (fitAddr * 0.65)));
+                        el.textContent = r.addr.length > mc ? r.addr.substr(0, mc) + '…' : r.addr;
+                        cell.appendChild(el);
+                    }
+                    // Version
+                    if (r.w > 30 && r.h > 52 && mv.ver) {
+                        var el = document.createElement('div');
+                        el.className = 'pm-ver';
+                        el.style.fontSize = fitVer + 'px';
+                        if (mv.dv && mv.dv !== mv.ver) {
+                            el.style.color = '#4dd0e1'; el.style.fontWeight = '700';
+                            el.textContent = 'V' + mv.ver + '\u2192V' + mv.dv;
+                        } else if (isV35Only) {
+                            el.style.color = '#ff6b6b'; el.style.fontWeight = '700';
+                            el.textContent = 'V' + mv.ver;
+                        } else {
+                            el.style.color = 'rgba(255,255,255,0.4)';
+                            el.textContent = 'V' + mv.ver;
+                        }
+                        cell.appendChild(el);
+                    }
+
+                    // Click → blockchair
+                    cell.addEventListener('click', function() {
+                        window.open(addrPrefix + r.addr, '_blank');
+                    });
+                    // Tooltip
+                    // Closure to capture hasDoge, isV35Only, mv, r for this cell
+                    (function(r, hasDoge, isV35Only, mv) {
+                        function positionTip(ev) {
+                            var tw = tooltip.offsetWidth || 320;
+                            var th = tooltip.offsetHeight || 120;
+                            var tx = ev.clientX + 14;
+                            var ty = ev.clientY + 14;
+                            if (tx + tw > window.innerWidth - 8) tx = ev.clientX - tw - 14;
+                            if (ty + th > window.innerHeight - 8) ty = ev.clientY - th - 14;
+                            if (tx < 8) tx = 8;
+                            if (ty < 8) ty = 8;
+                            tooltip.style.left = tx + 'px';
+                            tooltip.style.top = ty + 'px';
+                        }
+                        cell.addEventListener('mouseenter', function(ev) {
+                            var verLine = '';
+                            if (mv.ver) {
+                                if (mv.dv && mv.dv !== mv.ver) verLine = '<div style="color:#4dd0e1;font-weight:600">V'+mv.ver+' \u2192 V'+mv.dv+'</div>';
+                                else if (isV35Only) verLine = '<div style="color:#ff6b6b;font-weight:700">V'+mv.ver+' ONLY \u2014 missing DOGE!</div>';
+                                else verLine = '<div style="color:var(--success)">V'+mv.ver+'</div>';
+                            }
+                            var dogeLine = '';
+                            if (hasDoge) {
+                                var dp2 = dogeTotal > 0 ? (r.doge / dogeTotal * 100).toFixed(2) : '0';
+                                dogeLine = '<div style="color:#ffd700;font-weight:700">' + dp2 + '% \u2014 ' + r.doge.toFixed(2) + ' DOGE</div>';
+                                if (r.dogeAddr) {
+                                    dogeLine += '<div style="color:var(--text-muted);font-size:0.78em;font-family:Monaco,Consolas,monospace">\u2192 ' + r.dogeAddr + '</div>';
+                                }
+                            } else if (isV35Only) {
+                                dogeLine = '<div style="color:#ff6b6b;font-weight:600">0 DOGE \u2014 upgrade to V36!</div>';
+                            }
+                            tooltip.innerHTML =
+                                '<div style="color:var(--primary);font-weight:700;margin-bottom:4px">' + r.addr + '</div>' +
+                                '<div style="font-weight:600">' + (r.pct*100).toFixed(2) + '% \u2014 ' + r.amt.toFixed(8) + ' LTC</div>' +
+                                dogeLine + verLine +
+                                '<div style="color:var(--text-muted);font-size:0.75em;margin-top:4px">Click to view on Blockchair</div>';
+                            tooltip.style.display = 'block';
+                            positionTip(ev);
+                        });
+                        cell.addEventListener('mousemove', function(ev) { positionTip(ev); });
+                    })(r, hasDoge, isV35Only, mv);
+                    cell.addEventListener('mouseleave', function() { tooltip.style.display = 'none'; });
+
+                    grid.appendChild(cell);
+                });
+            });
         }
 
         // Create a single colored share cell (22x22 square) with tooltip + click
