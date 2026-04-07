@@ -2955,8 +2955,13 @@ int main(int argc, char* argv[]) {
                                         }
                                         if (cur_run.size() > best_run.size())
                                             best_run = cur_run;
-                                        // Only show if meaningful (8+ chars)
-                                        if (best_run.size() >= 8) {
+                                        // Only show if meaningful (10+ chars, must contain a letter)
+                                        bool has_letter = false;
+                                        for (auto c : best_run) {
+                                            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
+                                            { has_letter = true; break; }
+                                        }
+                                        if (best_run.size() >= 10 && has_letter) {
                                             if (best_run.size() > 48) best_run.resize(48);
                                             s["cb"] = best_run;
                                         }
