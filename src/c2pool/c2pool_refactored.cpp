@@ -24,6 +24,7 @@
 #include <core/log.hpp>
 #include <core/uint256.hpp>
 #include <core/web_server.hpp>
+#include <core/hash.hpp>
 #include <core/address_utils.hpp>
 #include <core/config.hpp>
 
@@ -258,7 +259,8 @@ void print_help() {
     std::cout << "  --p2pool-port PORT        P2P sharechain port (alias: --p2p-port; default: 9326)\n";
     std::cout << "  -w / --worker-port PORT   Stratum/worker port (alias: --stratum-port; default: 9327)\n";
     std::cout << "  --web-port PORT           Web dashboard / JSON-RPC API port (alias: --http-port; default: 8080)\n";
-    std::cout << "  --http-host HOST          HTTP server bind address (default: 0.0.0.0)\n\n";
+    std::cout << "  --http-host HOST          HTTP server bind address (default: 0.0.0.0)\n";
+    std::cout << "  --external-ip ADDR        Public IP or domain for stratum URL display (default: auto-detect)\n\n";
 
     std::cout << "PARENT COIN DAEMON:\n";
     std::cout << "  --coind-address HOST      RPC host (alias: --rpchost; default: 127.0.0.1)\n";
@@ -426,6 +428,7 @@ int main(int argc, char* argv[]) {
     int stratum_port = 9327;       // Stratum mining port (p2pool: -w / --worker-port)
     int http_port = 8080;          // Web dashboard / JSON-RPC API port
     std::string http_host = "0.0.0.0";  // HTTP server host
+    std::string external_ip;              // Public IP/domain for stratum URL (empty = auto-detect)
 
     // Coin daemon RPC connection (used by integrated/solo modes for live block templates)
     std::string rpc_host = "127.0.0.1";
@@ -647,6 +650,10 @@ int main(int argc, char* argv[]) {
         else if (arg == "--http-host" && i + 1 < argc) {
             http_host = argv[++i];
             cli_explicit.insert("http_host");
+        }
+        else if (arg == "--external-ip" && i + 1 < argc) {
+            external_ip = argv[++i];
+            cli_explicit.insert("external_ip");
         }
         else if (arg == "--integrated") {
             integrated_mode = true;
@@ -1010,6 +1017,8 @@ int main(int argc, char* argv[]) {
             }
             if (!cli_explicit.count("http_host") && cfg["http_host"])
                 http_host = cfg["http_host"].as<std::string>();
+            if (!cli_explicit.count("external_ip") && cfg["external_ip"])
+                external_ip = cfg["external_ip"].as<std::string>();
 
             // Coin daemon RPC
             if (!cli_explicit.count("rpc_host") && cfg["ltc_rpc_host"])
@@ -1565,20 +1574,39 @@ int main(int argc, char* argv[]) {
             core::WebServer web_server(ioc, http_host, static_cast<uint16_t>(http_port), 
                                      settings->m_testnet, enhanced_node, blockchain);
 
-            // DOGE historic lookup result: target + height + block_hash at a given timestamp.
-            struct DogeHistoricResult {
-                uint256 target;
-                uint32_t height{0};
-                std::string block_hash;
+            // V35 merged block resolver: requests full LTC block from P2P,
+            // extracts fabe6d6d MM commitment from coinbase, looks up DOGE
+            // block hash in embedded HeaderChain for exact height.
+            // Set later when embedded_broadcaster + doge_chain are created.
+            // V35 pending resolution context — carries share metadata for async lookup
+            struct MergedResolveCtx {
+                uint256 pow_hash;
+                std::string miner;  // human-readable address
+                uint32_t share_ts{0};  // share's block header timestamp
             };
-            // Shared function pointer for DOGE historic lookup via embedded HeaderChain.
-            auto doge_target_fn = std::make_shared<std::function<DogeHistoricResult(uint32_t)>>();
+            using MergedResolverFn = std::function<void(const uint256& ltc_block_hash,
+                                                        const MergedResolveCtx& ctx)>;
+            auto merged_block_resolver = std::make_shared<MergedResolverFn>();
+
+            // Pending V35 merged block resolutions: LTC block hash → context.
+            // When a full LTC block arrives via P2P, check if it's in this set
+            // and resolve the DOGE block from its coinbase MM commitment.
+            auto pending_merged_resolve = std::make_shared<
+                std::map<uint256, MergedResolveCtx>>();
+
+            // Callback fired when a full LTC block arrives that matches a pending
+            // merged resolution. Set later when doge_chain is available.
+            using OnFullBlockMergedFn = std::function<void(const uint256& block_hash,
+                const MergedResolveCtx& ctx, const ltc::coin::BlockType& block)>;
+            auto on_full_block_merged = std::make_shared<OnFullBlockMergedFn>();
 
             // Apply stratum tuning from CLI/YAML to the MiningInterface
             web_server.get_mining_interface()->set_stratum_config(stratum_config);
             web_server.get_mining_interface()->set_cors_origin(http_cors_origin);
             web_server.get_mining_interface()->set_worker_port(static_cast<uint16_t>(stratum_port));
             web_server.get_mining_interface()->set_p2p_port(static_cast<uint16_t>(p2p_port));
+            if (!external_ip.empty())
+                web_server.get_mining_interface()->set_external_ip(external_ip);
 
             // Dashboard serving directory and payout address for legacy API
             web_server.set_dashboard_dir(dashboard_dir);
@@ -1653,6 +1681,12 @@ int main(int argc, char* argv[]) {
                     );
                     mi->load_persisted_found_blocks();
                     LOG_INFO << "[Pool] Found block persistence enabled at " << fblk_db_path;
+
+                    // Merged block persistence (shares same LevelDB)
+                    auto mblk_store = std::make_shared<c2pool::storage::MergedBlockStore>(*fblk_leveldb);
+                    mi->set_merged_block_store(mblk_store);
+                    LOG_INFO << "[Pool] Merged block persistence enabled ("
+                             << mblk_store->count() << " stored)";
 
                     // THE checkpoint store (shares same LevelDB)
                     auto the_store = std::make_shared<c2pool::storage::TheCheckpointStore>(*fblk_leveldb);
@@ -1817,6 +1851,7 @@ int main(int argc, char* argv[]) {
                          bcaster = embedded_broadcaster.get(),
                          coinbase_maturity = core::coin::LTC_LIMITS.coinbase_maturity,
                          explorer_enabled, explorer_depth_ltc,
+                         pending_merged_resolve, on_full_block_merged,
                          &web_server](
                             const std::string& peer,
                             const ltc::coin::BlockType& block) {
@@ -1939,6 +1974,15 @@ int main(int argc, char* argv[]) {
                                 LOG_INFO << "[EMB-LTC] MWEB state updated from peer " << peer
                                          << " at height " << height
                                          << " (mweb_raw=" << block.m_mweb_raw.size() << " bytes)";
+                            }
+
+                            // Step 4: V35 merged block resolution
+                            // Check if this block was requested for merged block detection.
+                            auto pit = pending_merged_resolve->find(block_hash);
+                            if (pit != pending_merged_resolve->end() && *on_full_block_merged) {
+                                auto ctx = pit->second;
+                                pending_merged_resolve->erase(pit);
+                                (*on_full_block_merged)(block_hash, ctx, block);
                             }
                         });
                 }
@@ -2823,10 +2867,11 @@ int main(int argc, char* argv[]) {
             });
 
             // Wire per-share window data for the defragmenter grid
-            web_server.get_mining_interface()->set_sharechain_window_fn([&p2p_node]() {
+            web_server.get_mining_interface()->set_sharechain_window_fn([&p2p_node, &web_server]() {
                 nlohmann::json result;
                 auto& chain = p2p_node->tracker().chain;
                 auto& verified = p2p_node->tracker().verified;
+                bool testnet = ltc::PoolConfig::is_testnet;
 
                 // Use tallest chain head (not verified best) so the grid stays current during sync
                 uint256 best;
@@ -2838,33 +2883,104 @@ int main(int argc, char* argv[]) {
 
                 result["best_hash"] = best.IsNull() ? "" : best.GetHex();
                 result["chain_length"] = static_cast<int>(chain.size());
+                result["window_size"] = static_cast<int>(ltc::PoolConfig::chain_length());
+
+                // Include local payout address so frontend can mark "mine" shares
+                auto mi = web_server.get_mining_interface();
+                std::string local_addr;
+                if (mi && !mi->get_payout_address().empty()) {
+                    auto script = core::address_to_script(mi->get_payout_address());
+                    if (!script.empty())
+                        local_addr = core::script_to_address(script, true, testnet);
+                }
+                result["my_address"] = local_addr;
+
+                // Node fee address for marking pool fee shares
+                std::string fee_addr;
+                if (mi) {
+                    std::string fee_h160 = mi->get_node_fee_hash160();
+                    if (!fee_h160.empty())
+                        fee_addr = fee_h160;
+                }
+                result["fee_hash160"] = fee_addr;
 
                 nlohmann::json shares_arr = nlohmann::json::array();
 
+                // Walk chain_length shares (8640 mainnet / 400 testnet)
                 if (!best.IsNull()) {
                     int height = chain.get_height(best);
-                    int walk = std::min(height, 2000);
+                    int walk = std::min(height, static_cast<int>(ltc::PoolConfig::chain_length()));
                     if (walk > 0) {
                         try {
                             int pos = 0;
                             auto view = chain.get_chain(best, walk);
                             for (auto [hash, data] : view) {
                                 nlohmann::json s;
-                                s["hash"] = hash.GetHex().substr(0, 16);
-                                s["pos"] = pos++;
-                                s["verified"] = verified.contains(hash);
+                                s["h"] = hash.GetHex().substr(0, 16);
+                                s["H"] = hash.GetHex();
+                                s["p"] = pos++;
+                                s["v"] = verified.contains(hash) ? 1 : 0;
+
+                                // Check is_block_solution flag from tracker index
+                                auto* idx = chain.get_index(hash);
+                                if (idx && idx->is_block_solution)
+                                    s["blk"] = 1;
 
                                 data.share.invoke([&](auto* obj) {
-                                    s["ts"] = obj->m_timestamp;
-                                    s["ver"] = obj->version;
-                                    s["stale"] = static_cast<int>(obj->m_stale_info);
+                                    s["t"] = obj->m_timestamp;
+                                    s["V"] = obj->version;
+                                    s["s"] = static_cast<int>(obj->m_stale_info);
+                                    s["b"] = obj->m_bits;
+                                    s["a"] = obj->m_absheight;
+                                    s["dv"] = obj->m_desired_version;
 
-                                    std::string miner;
-                                    if constexpr (requires { obj->m_pubkey_hash; })
-                                        miner = obj->m_pubkey_hash.GetHex();
-                                    else if constexpr (requires { obj->m_address; })
-                                        miner = HexStr(obj->m_address.m_data);
-                                    s["miner"] = miner;
+                                    // Convert miner script to human-readable address
+                                    auto script = get_share_script(obj);
+                                    std::string addr = core::script_to_address(
+                                        script, true /*litecoin*/, testnet);
+                                    s["m"] = addr.empty() ? HexStr(script) : addr;
+
+                                    // Extract longest printable ASCII run from coinbase
+                                    if (!obj->m_coinbase.m_data.empty()) {
+                                        std::string best_run;
+                                        std::string cur_run;
+                                        for (auto c : obj->m_coinbase.m_data) {
+                                            if (c >= 32 && c <= 126) {
+                                                cur_run += static_cast<char>(c);
+                                            } else {
+                                                if (cur_run.size() > best_run.size())
+                                                    best_run = cur_run;
+                                                cur_run.clear();
+                                            }
+                                        }
+                                        if (cur_run.size() > best_run.size())
+                                            best_run = cur_run;
+                                        // Only show if meaningful (10+ chars, must contain a letter)
+                                        bool has_letter = false;
+                                        for (auto c : best_run) {
+                                            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
+                                            { has_letter = true; break; }
+                                        }
+                                        if (best_run.size() >= 10 && has_letter) {
+                                            if (best_run.size() > 48) best_run.resize(48);
+                                            s["cb"] = best_run;
+                                        }
+                                    }
+
+                                    // Detect pool fee share: compare hash160 with fee address
+                                    if (!fee_addr.empty() && script.size() >= 22) {
+                                        // Extract hash160 from script (P2PKH[3:23], P2WPKH[2:22], P2SH[2:22])
+                                        int off = -1;
+                                        if (script.size() == 25 && script[0] == 0x76) off = 3;
+                                        else if (script.size() == 22 && script[0] == 0x00) off = 2;
+                                        else if (script.size() == 23 && script[0] == 0xa9) off = 2;
+                                        if (off >= 0) {
+                                            std::string h160 = HexStr(std::vector<unsigned char>(
+                                                script.begin() + off, script.begin() + off + 20));
+                                            if (h160 == fee_addr)
+                                                s["fee"] = 1;
+                                        }
+                                    }
                                 });
 
                                 shares_arr.push_back(std::move(s));
@@ -2875,15 +2991,188 @@ int main(int argc, char* argv[]) {
                     }
                 }
 
-                // heads and tails for fork marking
+                // heads for fork marking
                 nlohmann::json heads_arr = nlohmann::json::array();
                 for (auto& [hh, _] : chain.get_heads()) {
                     heads_arr.push_back(hh.GetHex().substr(0, 16));
                 }
 
+                // LTC found blocks — use is_block_solution flag (above), but also keep
+                // share hashes from persistence for blocks found before restart
+                nlohmann::json blocks_arr = nlohmann::json::array();
+                if (mi) {
+                    for (const auto& fb : mi->get_found_blocks()) {
+                        if (!fb.share_hash.empty())
+                            blocks_arr.push_back(fb.share_hash.substr(0, 16));
+                    }
+                }
+
+                // DOGE discovered blocks — keyed by parent (LTC) block hash
+                nlohmann::json doge_arr = nlohmann::json::array();
+                if (mi) {
+                    auto* mm = mi->get_mm_manager();
+                    if (mm) {
+                        for (const auto& db : mm->get_discovered_blocks()) {
+                            if (!db.parent_hash.empty())
+                                doge_arr.push_back(db.parent_hash.substr(0, 16));
+                        }
+                    }
+                }
+
                 result["shares"] = std::move(shares_arr);
                 result["heads"] = std::move(heads_arr);
+                result["blocks"] = std::move(blocks_arr);
+                result["doge_blocks"] = std::move(doge_arr);
                 result["total"] = static_cast<int>(chain.size());
+                return result;
+            });
+
+            // Wire individual share lookup for /web/share/<hash> detail page
+            web_server.get_mining_interface()->set_share_lookup_fn(
+                [&p2p_node, &web_server](const std::string& hash_hex) -> nlohmann::json {
+                bool testnet = ltc::PoolConfig::is_testnet;
+                auto& chain = p2p_node->tracker().chain;
+                auto& verified = p2p_node->tracker().verified;
+
+                uint256 hash;
+                hash.SetHex(hash_hex);
+                if (hash.IsNull() || !chain.contains(hash))
+                    return nlohmann::json{{"error", "share not found"}};
+
+                nlohmann::json result;
+                auto& entry = chain.get(hash);
+
+                // Block solution detection (outside invoke — uses index directly)
+                auto* idx = chain.get_index(hash);
+                bool is_ltc_block = idx && idx->is_block_solution;
+                result["is_block_solution"] = is_ltc_block;
+
+                // DOGE block detection
+                auto mi = web_server.get_mining_interface();
+                bool is_doge_block = false;
+                nlohmann::json doge_block_info;
+                if (mi) {
+                    auto* mm = mi->get_mm_manager();
+                    if (mm) {
+                        auto short_hash = hash.GetHex().substr(0, 16);
+                        for (const auto& db : mm->get_discovered_blocks()) {
+                            if (!db.parent_hash.empty() &&
+                                db.parent_hash.substr(0, 16) == short_hash) {
+                                is_doge_block = true;
+                                doge_block_info["symbol"] = db.symbol;
+                                doge_block_info["height"] = db.height;
+                                doge_block_info["block_hash"] = db.block_hash;
+                                doge_block_info["reward"] = static_cast<double>(db.coinbase_value) / 1e8;
+                                doge_block_info["miner"] = db.miner;
+                                break;
+                            }
+                        }
+                    }
+                    if (is_ltc_block) {
+                        for (const auto& fb : mi->get_found_blocks()) {
+                            if (fb.hash == hash.GetHex() ||
+                                (!fb.share_hash.empty() && fb.share_hash == hash.GetHex())) {
+                                result["ltc_block_height"] = fb.height;
+                                result["ltc_block_confirmations"] = fb.confirmations;
+                                result["ltc_block_status"] = static_cast<int>(fb.status);
+                                break;
+                            }
+                        }
+                    }
+                }
+                result["is_doge_block"] = is_doge_block;
+                if (is_doge_block)
+                    result["doge_block"] = doge_block_info;
+
+                // Parent / far_parent / children
+                entry.share.invoke([&](auto* obj) {
+                    result["parent"] = obj->m_prev_hash.GetHex();
+                    result["far_parent"] = obj->m_far_share_hash.GetHex();
+                    result["type_name"] = "V" + std::to_string(obj->version);
+                    result["version"] = obj->version;
+
+                    // Local data
+                    nlohmann::json local_j;
+                    local_j["verified"] = verified.contains(hash);
+                    local_j["time_first_seen"] = idx ? idx->time_seen : 0;
+                    local_j["peer_first_received_from"] = obj->peer_addr.to_string();
+                    result["local"] = local_j;
+
+                    // Share data — convert miner to address
+                    auto script = get_share_script(obj);
+                    std::string addr = core::script_to_address(script, true, testnet);
+
+                    double target_diff = chain::target_to_difficulty(
+                        chain::bits_to_target(obj->m_bits));
+                    double max_target_diff = chain::target_to_difficulty(
+                        chain::bits_to_target(obj->m_max_bits));
+
+                    nlohmann::json sd;
+                    sd["timestamp"] = obj->m_timestamp;
+                    sd["target"] = obj->m_bits;
+                    sd["max_target"] = obj->m_max_bits;
+                    sd["payout_address"] = addr.empty() ? HexStr(script) : addr;
+                    sd["donation"] = static_cast<double>(obj->m_donation) / 65536.0;
+                    sd["stale_info"] = static_cast<int>(obj->m_stale_info);
+                    sd["nonce"] = obj->m_nonce;
+                    sd["desired_version"] = obj->m_desired_version;
+                    sd["absheight"] = obj->m_absheight;
+                    sd["abswork"] = obj->m_abswork.GetHex();
+                    sd["difficulty"] = target_diff;
+                    sd["min_difficulty"] = max_target_diff;
+                    result["share_data"] = sd;
+
+                    // Block header
+                    auto& hdr = obj->m_min_header;
+                    nlohmann::json hdr_j;
+                    hdr_j["version"] = hdr.m_version;
+                    hdr_j["previous_block"] = hdr.m_previous_block.GetHex();
+                    hdr_j["merkle_root"] = "";
+                    hdr_j["timestamp"] = hdr.m_timestamp;
+                    hdr_j["target"] = hdr.m_bits;
+                    hdr_j["nonce"] = hdr.m_nonce;
+                    nlohmann::json gentx_j;
+                    gentx_j["hash"] = "";
+                    gentx_j["coinbase"] = HexStr(obj->m_coinbase.m_data);
+                    gentx_j["value"] = static_cast<double>(obj->m_subsidy) / 1e8;
+                    gentx_j["last_txout_nonce"] = obj->m_last_txout_nonce;
+                    nlohmann::json block_j;
+                    block_j["hash"] = hash.GetHex();
+                    block_j["header"] = hdr_j;
+                    block_j["gentx"] = gentx_j;
+                    block_j["other_transaction_hashes"] = nlohmann::json::array();
+                    result["block"] = block_j;
+
+                    // Children (shares whose parent is this hash)
+                    nlohmann::json children_arr = nlohmann::json::array();
+                    // (would need reverse index — skip for now)
+                    result["children"] = children_arr;
+
+                    // V36 metadata
+                    if constexpr (requires { obj->m_merged_addresses; }) {
+                        nlohmann::json merged_addrs = nlohmann::json::array();
+                        for (auto& ma : obj->m_merged_addresses) {
+                            nlohmann::json a;
+                            a["chain_id"] = ma.m_chain_id;
+                            a["script_hex"] = HexStr(ma.m_script.m_data);
+                            // Try to decode DOGE address
+                            if (ma.m_chain_id == 98) {
+                                // Dogecoin: P2PKH version 0x1e, P2SH 0x16, hrp "doge"
+                                auto daddr = core::script_to_address(
+                                    ma.m_script.m_data, "doge", 0x1e, 0x16);
+                                if (!daddr.empty()) a["address"] = daddr;
+                            }
+                            merged_addrs.push_back(a);
+                        }
+                        nlohmann::json v36_j;
+                        v36_j["merged_addresses"] = merged_addrs;
+                        v36_j["merged_payout_hash"] = obj->m_merged_payout_hash.GetHex();
+                        v36_j["message_data_hex"] = HexStr(obj->m_message_data.m_data);
+                        v36_j["message_data_size"] = obj->m_message_data.m_data.size();
+                        result["v36_metadata"] = v36_j;
+                    }
+                });
+
                 return result;
             });
 
@@ -2913,65 +3202,132 @@ int main(int argc, char* argv[]) {
                              << " height=" << height;
 
                     mi->record_found_block(
-                        height, block_hash, 0, is_testnet ? "tLTC" : "LTC",
+                        height, block_hash, s->m_min_header.m_timestamp,
+                        is_testnet ? "tLTC" : "LTC",
                         miner_addr, share_hash.GetHex(), net_diff, share_diff, pool_hr, 0);
                     mi->schedule_block_verification(block_hash.GetHex());
                 });
             };
 
+            // Wire share difficulty tracking for best share dashboard display.
+            // Every verified share reports its difficulty — both LTC and DOGE use
+            // the same share difficulty (scrypt PoW), just compared against different
+            // network targets for the percentage display.
+            p2p_node->tracker().m_on_share_difficulty = [&web_server](double diff, const std::string& miner) {
+                auto mi = web_server.get_mining_interface();
+                mi->record_share_difficulty(diff, miner);
+                mi->record_merged_share_difficulty(diff, miner);
+            };
+
             // Wire merged block detection for peer shares.
-            // doge_target_fn is set later when doge_chain is created — captured via shared_ptr.
+            // V36: exact data from m_merged_coinbase_info (height, 80-byte header, coinbase_value).
+            // V35: no merged data in share — if the share is an LTC block solution,
+            //      request the full LTC block from P2P peers, parse coinbase for fabe6d6d
+            //      MM commitment, extract DOGE block hash, look up in embedded HeaderChain.
+            auto* ltc_header_chain = embedded_chain.get();
             p2p_node->tracker().m_on_merged_block_check =
-                [&web_server, &p2p_node, doge_target_fn](const uint256& share_hash, const uint256& pow_hash) {
+                [&web_server, &p2p_node, merged_block_resolver, ltc_header_chain](const uint256& share_hash, const uint256& pow_hash) {
                 auto mi = web_server.get_mining_interface();
                 auto* mm = mi->get_mm_manager();
                 if (!mm || !mm->has_chains()) return;
 
-                for (const auto& ci : mm->get_chain_infos()) {
-                    uint256 target = ci.target;
+                auto& tracker_chain = p2p_node->tracker().chain;
+                if (!tracker_chain.contains(share_hash)) return;
 
-                    // Fallback: if current target doesn't match, use historic lookup
-                    DogeHistoricResult hist;
-                    bool used_historic = false;
-                    if ((target.IsNull() || !(pow_hash <= target)) && *doge_target_fn) {
-                        uint32_t share_ts = 0;
-                        auto& chain = p2p_node->tracker().chain;
-                        if (chain.contains(share_hash)) {
-                            chain.get(share_hash).share.invoke([&](auto* s) {
-                                share_ts = s->m_min_header.m_timestamp;
-                            });
-                        }
-                        if (share_ts > 0) {
-                            hist = (*doge_target_fn)(share_ts);
-                            target = hist.target;
-                            used_historic = true;
-                        }
+                bool had_v36_data = false;
+                tracker_chain.get(share_hash).share.invoke([&](auto* s) {
+                    // Extract miner address and share timestamp
+                    uint32_t share_ts = s->m_min_header.m_timestamp;
+                    std::string miner_addr;
+                    {
+                        auto script = get_share_script(s);
+                        miner_addr = core::script_to_address(
+                            script, true /*is_litecoin*/, ltc::PoolConfig::is_testnet);
                     }
 
-                    if (target.IsNull()) continue;
-                    if (pow_hash <= target) {
-                        // Use historic height/hash if available, otherwise current
-                        uint32_t blk_height = used_historic && hist.height > 0
-                            ? hist.height : static_cast<uint32_t>(ci.current_height);
-                        std::string blk_hash = used_historic && !hist.block_hash.empty()
-                            ? hist.block_hash : ci.block_hash;
+                    if constexpr (requires { s->m_merged_coinbase_info; }) {
+                        if (!s->m_merged_coinbase_info.empty())
+                            had_v36_data = true;
+                        for (const auto& entry : s->m_merged_coinbase_info) {
+                            if (entry.m_block_header.m_data.size() != 80) continue;
 
-                        LOG_INFO << "*** MERGED BLOCK FROM PEER! " << ci.symbol
-                                 << " share=" << share_hash.GetHex().substr(0,16)
-                                 << " height=" << blk_height
-                                 << " pow=" << pow_hash.GetHex().substr(0,16)
-                                 << " target=" << target.GetHex().substr(0,16);
+                            // Extract nBits from aux block header (standard layout: offset 72, LE)
+                            const auto* d = entry.m_block_header.m_data.data();
+                            uint32_t bits = static_cast<uint32_t>(d[72]) |
+                                           (static_cast<uint32_t>(d[73]) << 8) |
+                                           (static_cast<uint32_t>(d[74]) << 16) |
+                                           (static_cast<uint32_t>(d[75]) << 24);
+                            uint256 target = chain::bits_to_target(bits);
+                            if (target.IsNull() || !(pow_hash <= target)) continue;
 
-                        c2pool::merged::DiscoveredMergedBlock blk;
-                        blk.chain_id = ci.chain_id;
-                        blk.symbol = ci.symbol;
-                        blk.height = static_cast<int>(blk_height);
-                        blk.block_hash = blk_hash;
-                        blk.parent_hash = share_hash.GetHex();
-                        blk.timestamp = static_cast<int64_t>(std::time(nullptr));
-                        blk.accepted = true;
-                        blk.coinbase_value = ci.coinbase_value;
-                        mm->add_discovered_block(blk);
+                            // SHA256d of the 80-byte header = aux chain block hash
+                            uint256 block_hash = Hash(entry.m_block_header.m_data);
+
+                            // Resolve symbol from merged mining manager
+                            std::string symbol;
+                            for (const auto& ci : mm->get_chain_infos()) {
+                                if (ci.chain_id == entry.m_chain_id) { symbol = ci.symbol; break; }
+                            }
+                            if (symbol.empty()) symbol = "MERGED-" + std::to_string(entry.m_chain_id);
+
+                            LOG_INFO << "*** MERGED BLOCK FROM PEER! " << symbol
+                                     << " share=" << share_hash.GetHex().substr(0,16)
+                                     << " height=" << entry.m_block_height
+                                     << " pow=" << pow_hash.GetHex().substr(0,16)
+                                     << " target=" << target.GetHex().substr(0,16)
+                                     << " block=" << block_hash.GetHex().substr(0,16);
+
+                            c2pool::merged::DiscoveredMergedBlock blk;
+                            blk.chain_id = entry.m_chain_id;
+                            blk.symbol = symbol;
+                            blk.height = static_cast<int>(entry.m_block_height);
+                            blk.block_hash = block_hash.GetHex();
+                            blk.parent_hash = share_hash.GetHex();
+                            blk.timestamp = static_cast<int64_t>(share_ts);
+                            blk.accepted = true;
+                            blk.coinbase_value = entry.m_coinbase_value;
+                            blk.miner = miner_addr;
+                            // Get real LTC block height from header chain
+                            if (ltc_header_chain) {
+                                auto ltc_entry = ltc_header_chain->get_header(share_hash);
+                                if (ltc_entry)
+                                    blk.parent_height = ltc_entry->height;
+                            }
+                            mm->add_discovered_block(blk);
+                            // Persist to LevelDB
+                            auto store_ptr = mi->get_merged_block_store();
+                            if (store_ptr) {
+                                auto* ms = static_cast<c2pool::storage::MergedBlockStore*>(store_ptr.get());
+                                c2pool::storage::MergedBlockRecord rec;
+                                rec.chain_id = blk.chain_id; rec.symbol = blk.symbol;
+                                rec.height = blk.height; rec.block_hash = blk.block_hash;
+                                rec.parent_hash = blk.parent_hash; rec.timestamp = blk.timestamp;
+                                rec.accepted = blk.accepted; rec.coinbase_value = blk.coinbase_value;
+                                rec.is_local = blk.is_local; rec.parent_height = blk.parent_height;
+                                rec.miner = blk.miner;
+                                ms->store(rec);
+                            }
+                        }
+                    }
+                });
+
+                // V35 fallback: if this share is an LTC block solution but has no V36
+                // merged data, use the resolver to fetch the full LTC block from P2P
+                // and extract the DOGE block hash from the coinbase MM commitment.
+                // share_hash = SHA256d of the full 80-byte header (= LTC block hash),
+                // set by share_init_verify() → share.m_hash. Same hash used by P2P getdata.
+                if (!had_v36_data && *merged_block_resolver) {
+                    auto* idx = tracker_chain.get_index(share_hash);
+                    if (idx && idx->is_block_solution) {
+                        MergedResolveCtx ctx;
+                        ctx.pow_hash = pow_hash;
+                        tracker_chain.get(share_hash).share.invoke([&](auto* s) {
+                            ctx.share_ts = s->m_min_header.m_timestamp;
+                            auto script = get_share_script(s);
+                            ctx.miner = core::script_to_address(
+                                script, true, ltc::PoolConfig::is_testnet);
+                        });
+                        (*merged_block_resolver)(share_hash, ctx);
                     }
                 }
             };
@@ -3811,38 +4167,6 @@ int main(int argc, char* argv[]) {
                             }
                         }
 
-                        // Set the DOGE historic target lookup for merged block detection.
-                        // Used by m_on_merged_block_check during startup block scan.
-                        *doge_target_fn = [&doge_chain](uint32_t share_ts) -> DogeHistoricResult {
-                            DogeHistoricResult result;
-                            auto tip = doge_chain->tip();
-                            if (!tip.has_value()) return result;
-                            uint32_t tip_ts = tip->header.m_timestamp;
-                            int32_t dt = static_cast<int32_t>(tip_ts) - static_cast<int32_t>(share_ts);
-                            int32_t blocks_back = dt / 60;  // ~1 DOGE block/min
-                            int32_t est_h = static_cast<int32_t>(tip->height) - blocks_back;
-                            if (est_h < 1) return result;
-
-                            // Search ±10 blocks around estimate for closest timestamp match
-                            int32_t best_h = est_h;
-                            int32_t best_dt = INT32_MAX;
-                            for (int32_t h = std::max(1, est_h - 10); h <= est_h + 10; ++h) {
-                                auto hdr = doge_chain->get_header_by_height(static_cast<uint32_t>(h));
-                                if (!hdr.has_value()) continue;
-                                int32_t d = std::abs(static_cast<int32_t>(hdr->header.m_timestamp) -
-                                                     static_cast<int32_t>(share_ts));
-                                if (d < best_dt) { best_dt = d; best_h = h; }
-                            }
-
-                            auto hdr = doge_chain->get_header_by_height(static_cast<uint32_t>(best_h));
-                            if (!hdr.has_value()) return result;
-                            result.target.SetCompact(hdr->header.m_bits);
-                            result.height = static_cast<uint32_t>(best_h);
-                            result.block_hash = hdr->block_hash.GetHex();
-                            return result;
-                        };
-                        LOG_INFO << "[MM-DOGE] Historic target lookup wired via HeaderChain";
-
                         // Seed genesis if empty (same pattern as LTC genesis seeding).
                         // Reference: dogecoin/src/chainparams.cpp CreateGenesisBlock()
                         //   All networks: merkle_root=5b2a3f53..., version=1, bits=0x1e0ffff0
@@ -4121,6 +4445,7 @@ int main(int argc, char* argv[]) {
                                      bcaster_ptr = broadcaster.get(),
                                      coinbase_maturity = core::coin::DOGE_LIMITS.coinbase_maturity,
                                      explorer_enabled, explorer_depth_doge,
+                                     mm_ptr = mm_manager.get(),
                                      &web_server](
                                         const std::string& peer,
                                         const ltc::coin::BlockType& block) {
@@ -4223,6 +4548,23 @@ int main(int argc, char* argv[]) {
                                                              << " evicted=" << evicted
                                                              << " pool_size=" << pool->size();
                                                     web_server.trigger_work_refresh_debounced();
+                                                }
+                                            }
+                                        }
+                                        // Update coinbase_value on discovered merged blocks that
+                                        // were added without exact reward (V35 peer detection).
+                                        // Sum all coinbase outputs for the exact block reward.
+                                        if (mm_ptr && !block.m_txs.empty()) {
+                                            uint64_t cb_total = 0;
+                                            for (const auto& out : block.m_txs[0].vout)
+                                                cb_total += out.value;
+                                            if (cb_total > 0) {
+                                                mm_ptr->update_block_coinbase(block_hash.GetHex(), cb_total);
+                                                // Also update LevelDB persistence
+                                                auto sp = web_server.get_mining_interface()->get_merged_block_store();
+                                                if (sp) {
+                                                    auto* ms = static_cast<c2pool::storage::MergedBlockStore*>(sp.get());
+                                                    ms->update_coinbase(block_hash.GetHex(), 98, cb_total);
                                                 }
                                             }
                                         }
@@ -4992,16 +5334,294 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             
+            // Wire V35 merged block resolver: when an LTC block is found from a V35
+            // share (no m_merged_coinbase_info), fetch the full LTC block from P2P,
+            // extract the fabe6d6d MM commitment from coinbase, resolve DOGE block hash
+            // in the embedded HeaderChain.
+            // Retry structure: {hash → {pow_hash, attempts, timer}}.
+            struct PendingResolve {
+                int attempts{0};
+                std::shared_ptr<boost::asio::steady_timer> timer;
+            };
+            auto pending_resolve_state = std::make_shared<
+                std::map<uint256, PendingResolve>>();
+
+            if (embedded_broadcaster && doge_chain) {
+                auto* bcaster = embedded_broadcaster.get();
+                constexpr int MAX_RETRY = 5;
+                constexpr int RETRY_SEC = 10;
+
+                *merged_block_resolver = [bcaster, pending_merged_resolve,
+                                          pending_resolve_state, &ioc](
+                    const uint256& ltc_block_hash, const MergedResolveCtx& ctx) {
+
+                    // Already pending? skip
+                    if (pending_resolve_state->count(ltc_block_hash)) return;
+
+                    (*pending_merged_resolve)[ltc_block_hash] = ctx;
+
+                    auto& state = (*pending_resolve_state)[ltc_block_hash];
+                    state.attempts = 0;
+                    state.timer = std::make_shared<boost::asio::steady_timer>(ioc);
+
+                    // Recursive retry lambda
+                    auto retry_fn = std::make_shared<std::function<void()>>();
+                    *retry_fn = [bcaster, pending_merged_resolve, pending_resolve_state,
+                                 retry_fn, ltc_block_hash, MAX_RETRY, RETRY_SEC]() {
+                        auto it = pending_resolve_state->find(ltc_block_hash);
+                        if (it == pending_resolve_state->end()) return;  // resolved
+
+                        auto& st = it->second;
+                        ++st.attempts;
+
+                        // Check if still pending (not yet resolved by full_block handler)
+                        if (!pending_merged_resolve->count(ltc_block_hash)) {
+                            pending_resolve_state->erase(it);
+                            return;  // already resolved
+                        }
+
+                        if (st.attempts > MAX_RETRY) {
+                            LOG_WARNING << "[V35-MERGED] Gave up on LTC block "
+                                        << ltc_block_hash.GetHex().substr(0, 16)
+                                        << " after " << MAX_RETRY << " attempts";
+                            pending_merged_resolve->erase(ltc_block_hash);
+                            pending_resolve_state->erase(it);
+                            return;
+                        }
+
+                        LOG_INFO << "[V35-MERGED] Requesting LTC block "
+                                 << ltc_block_hash.GetHex().substr(0, 16)
+                                 << " attempt " << st.attempts << "/" << MAX_RETRY
+                                 << " (peers=" << bcaster->connected_count() << ")";
+                        bcaster->request_block_plain(ltc_block_hash);
+
+                        // Schedule retry
+                        st.timer->expires_after(std::chrono::seconds(RETRY_SEC));
+                        st.timer->async_wait([retry_fn](const boost::system::error_code& ec) {
+                            if (!ec && retry_fn) (*retry_fn)();
+                        });
+                    };
+
+                    // First attempt immediately
+                    (*retry_fn)();
+                };
+
+                // Wire the actual resolution: parse coinbase for fabe6d6d,
+                // extract MM root = DOGE block hash, look up in HeaderChain.
+                auto* dc = doge_chain.get();
+                auto* ltc_hc = embedded_chain.get();
+                auto* mm = web_server.get_mining_interface()->get_mm_manager();
+                // Get DOGE broadcaster for fetching full DOGE blocks (coinbase_value)
+                c2pool::merged::CoinBroadcaster* doge_bcaster = nullptr;
+                {
+                    auto it = merged_broadcasters.find(98);
+                    if (it != merged_broadcasters.end())
+                        doge_bcaster = it->second.get();
+                }
+                bool testnet = settings->m_testnet;
+                auto mi_ptr_for_merge = web_server.get_mining_interface();
+                *on_full_block_merged = [dc, ltc_hc, mm, doge_bcaster, testnet, mi_ptr_for_merge](
+                    const uint256& ltc_block_hash, const MergedResolveCtx& ctx,
+                    const ltc::coin::BlockType& block) {
+                    if (!mm || !dc || block.m_txs.empty()) return;
+                    const auto& pow_hash = ctx.pow_hash;
+
+                    // Extract coinbase scriptSig
+                    const auto& coinbase_tx = block.m_txs[0];
+                    if (coinbase_tx.vin.empty()) return;
+                    const auto& script_sig = coinbase_tx.vin[0].scriptSig.m_data;
+
+                    // Find fabe6d6d magic
+                    static const uint8_t MM_MAGIC[] = {0xfa, 0xbe, 0x6d, 0x6d};
+                    auto magic_pos = std::search(script_sig.begin(), script_sig.end(),
+                                                  std::begin(MM_MAGIC), std::end(MM_MAGIC));
+                    if (magic_pos == script_sig.end()) {
+                        LOG_INFO << "[V35-MERGED] No fabe6d6d in LTC block "
+                                 << ltc_block_hash.GetHex().substr(0, 16) << " — no merged mining";
+                        return;
+                    }
+                    size_t offset = std::distance(script_sig.begin(), magic_pos) + 4;
+                    if (offset + 32 + 4 + 4 > script_sig.size()) return;
+
+                    // MM commitment: 32-byte merkle root (big-endian) + 4-byte tree_size + 4-byte nonce
+                    // With single aux chain, tree_size=1, merkle_root = DOGE block hash
+                    uint32_t tree_size = 0;
+                    std::memcpy(&tree_size, &script_sig[offset + 32], 4);
+                    // tree_size is LE
+
+                    // Extract 32-byte MM root (stored big-endian in coinbase → reverse for uint256 LE)
+                    uint256 mm_root;
+                    for (int i = 0; i < 32; ++i)
+                        mm_root.data()[31 - i] = script_sig[offset + i];
+
+                    LOG_INFO << "[V35-MERGED] LTC block " << ltc_block_hash.GetHex().substr(0, 16)
+                             << " MM root=" << mm_root.GetHex().substr(0, 16)
+                             << " tree_size=" << tree_size;
+
+                    // With tree_size=1, mm_root IS the DOGE block hash.
+                    // With tree_size>1, we'd need the merkle branch to extract — but p2pool
+                    // uses tree_size=1 for single aux chain (DOGE only).
+                    if (tree_size > 1) {
+                        LOG_WARNING << "[V35-MERGED] tree_size=" << tree_size
+                                    << " — multi-chain aux tree, cannot resolve without merkle branch";
+                        return;
+                    }
+
+                    // Look up DOGE block hash in embedded HeaderChain
+                    auto doge_entry = dc->get_header(mm_root);
+                    if (!doge_entry) {
+                        LOG_INFO << "[V35-MERGED] DOGE block " << mm_root.GetHex().substr(0, 16)
+                                 << " not found in HeaderChain (may not be synced yet)";
+                        return;
+                    }
+
+                    // Verify pow_hash meets DOGE target
+                    uint256 doge_target;
+                    doge_target.SetCompact(doge_entry->header.m_bits);
+                    if (doge_target.IsNull() || !(pow_hash <= doge_target)) {
+                        LOG_INFO << "[V35-MERGED] pow_hash doesn't meet DOGE target at height "
+                                 << doge_entry->height;
+                        return;
+                    }
+
+                    LOG_INFO << "*** V35 MERGED BLOCK RESOLVED! DOGE"
+                             << " height=" << doge_entry->height
+                             << " block=" << mm_root.GetHex().substr(0, 16)
+                             << " ltc_block=" << ltc_block_hash.GetHex().substr(0, 16);
+
+                    c2pool::merged::DiscoveredMergedBlock blk;
+                    blk.chain_id = 98;  // DOGE
+                    blk.symbol = testnet ? "tDOGE" : "DOGE";
+                    blk.height = static_cast<int>(doge_entry->height);
+                    blk.block_hash = mm_root.GetHex();
+                    blk.parent_hash = ltc_block_hash.GetHex();
+                    blk.timestamp = ctx.share_ts > 0
+                        ? static_cast<int64_t>(ctx.share_ts)
+                        : static_cast<int64_t>(std::time(nullptr));
+                    blk.accepted = true;
+                    blk.miner = ctx.miner;
+                    // Request full DOGE block from P2P to get exact coinbase_value.
+                    // The block arrives async — we set coinbase_value=0 now and update
+                    // when the DOGE block arrives via the full_block callback.
+                    // This ensures exact amounts (subsidy + TX fees), never approximations.
+                    blk.coinbase_value = 0;
+                    // Get real LTC block height from header chain (not sharechain absheight)
+                    if (ltc_hc) {
+                        auto ltc_entry = ltc_hc->get_header(ltc_block_hash);
+                        if (ltc_entry)
+                            blk.parent_height = ltc_entry->height;
+                    }
+                    mm->add_discovered_block(blk);
+
+                    // Persist to LevelDB
+                    auto store_ptr = mi_ptr_for_merge->get_merged_block_store();
+                    if (store_ptr) {
+                        auto* ms = static_cast<c2pool::storage::MergedBlockStore*>(store_ptr.get());
+                        c2pool::storage::MergedBlockRecord rec;
+                        rec.chain_id = blk.chain_id; rec.symbol = blk.symbol;
+                        rec.height = blk.height; rec.block_hash = blk.block_hash;
+                        rec.parent_hash = blk.parent_hash; rec.timestamp = blk.timestamp;
+                        rec.accepted = blk.accepted; rec.coinbase_value = blk.coinbase_value;
+                        rec.is_local = blk.is_local; rec.parent_height = blk.parent_height;
+                        rec.miner = blk.miner;
+                        ms->store(rec);
+                    }
+
+                    // Request full DOGE block from P2P to get exact coinbase_value.
+                    // When it arrives, the DOGE full_block handler will sum coinbase
+                    // outputs and call update_block_coinbase() with the exact amount.
+                    if (doge_bcaster) {
+                        LOG_INFO << "[V35-MERGED] Requesting DOGE block " << mm_root.GetHex().substr(0, 16)
+                                 << " for exact coinbase_value";
+                        doge_bcaster->request_block_plain(mm_root);
+                    }
+                };
+
+                LOG_INFO << "[V35-MERGED] Resolver wired via embedded LTC P2P + DOGE HeaderChain";
+            }
+
+            // Wire coin P2P peer info for dashboard tables
+            if (embedded_broadcaster) {
+                web_server.get_mining_interface()->set_ltc_peer_info_fn(
+                    [bcaster = embedded_broadcaster.get()]() { return bcaster->get_peer_info(); });
+            }
+            {
+                auto it = merged_broadcasters.find(98);  // DOGE
+                if (it != merged_broadcasters.end()) {
+                    web_server.get_mining_interface()->set_doge_peer_info_fn(
+                        [bcaster = it->second.get()]() { return bcaster->get_peer_info(); });
+                }
+            }
+
+            // Backfill network_difficulty + timestamp on persisted found blocks
+            // using LTC header chain. Exact values from the block header.
+            if (embedded_chain) {
+                auto* hc = embedded_chain.get();
+                web_server.get_mining_interface()->backfill_block_fields(
+                    [hc](const std::string& block_hash_hex) -> double {
+                        uint256 h;
+                        h.SetHex(block_hash_hex);
+                        auto entry = hc->get_header(h);
+                        if (!entry) return 0.0;
+                        auto target = chain::bits_to_target(entry->header.m_bits);
+                        return chain::target_to_difficulty(target);
+                    },
+                    [hc](const std::string& block_hash_hex) -> uint32_t {
+                        uint256 h;
+                        h.SetHex(block_hash_hex);
+                        auto entry = hc->get_header(h);
+                        return entry ? entry->header.m_timestamp : 0;
+                    });
+            }
+
+            // Load persisted merged blocks into mm_manager BEFORE block scan.
+            {
+                auto store_ptr = web_server.get_mining_interface()->get_merged_block_store();
+                auto* mm = web_server.get_mining_interface()->get_mm_manager();
+                if (store_ptr && mm) {
+                    auto* mblk_store = static_cast<c2pool::storage::MergedBlockStore*>(store_ptr.get());
+                    auto records = mblk_store->load_all();
+                    int loaded = 0;
+                    for (const auto& rec : records) {
+                        c2pool::merged::DiscoveredMergedBlock blk;
+                        blk.chain_id = rec.chain_id;
+                        blk.symbol = rec.symbol;
+                        blk.height = rec.height;
+                        blk.block_hash = rec.block_hash;
+                        blk.parent_hash = rec.parent_hash;
+                        blk.timestamp = rec.timestamp;
+                        blk.accepted = rec.accepted;
+                        blk.coinbase_value = rec.coinbase_value;
+                        blk.is_local = rec.is_local;
+                        blk.parent_height = rec.parent_height;
+                        blk.miner = rec.miner;
+                        mm->add_discovered_block(blk);  // dedup handles duplicates
+                        ++loaded;
+                    }
+                    if (loaded > 0)
+                        LOG_INFO << "[Pool] Loaded " << loaded << " persisted merged blocks";
+                }
+            }
+
             // Block scan: run here after ALL callbacks + DOGE target fn are wired.
             if (p2p_node) {
                 auto best = p2p_node->best_share_hash();
                 int chain_len = static_cast<int>(ltc::PoolConfig::chain_length());
                 if (!best.IsNull() && chain_len > 0) {
                     uint64_t latest_block_ts = 0;
+                    // Check LTC found blocks
                     auto existing = web_server.get_mining_interface()->rest_recent_blocks();
                     for (const auto& b : existing) {
                         uint64_t ts = b.value("ts", uint64_t(0));
                         if (ts > latest_block_ts) latest_block_ts = ts;
+                    }
+                    // Check merged blocks — use max(ltc, merged) for scan cutoff
+                    auto* mm = web_server.get_mining_interface()->get_mm_manager();
+                    if (mm) {
+                        for (const auto& mb : mm->get_discovered_blocks()) {
+                            if (mb.timestamp > 0 && static_cast<uint64_t>(mb.timestamp) > latest_block_ts)
+                                latest_block_ts = static_cast<uint64_t>(mb.timestamp);
+                        }
                     }
                     int scan_depth = chain_len;
                     if (latest_block_ts > 0) {

@@ -12,6 +12,7 @@ port: 9326                     # P2P p2pool sharechain port (LTC mainnet default
 stratum_port: 9327             # Stratum mining port
 web_port: 8080                 # Web dashboard / JSON-RPC API port
 http_host: "0.0.0.0"          # HTTP bind address
+external_ip: "voidbind.com"   # Public IP/domain for stratum URL display
 
 # ─── Operating Mode ────────────────────────────────────────────────────────
 # integrated: true             # Full P2P pool (DEFAULT)

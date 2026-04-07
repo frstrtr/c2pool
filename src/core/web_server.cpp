@@ -21,6 +21,7 @@
 
 #include <iomanip>
 #include <sstream>
+#include <set>
 #include <ctime>
 #include <chrono>
 #include <cmath>
@@ -3331,6 +3332,30 @@ void MiningInterface::load_persisted_found_blocks()
     }
 }
 
+void MiningInterface::backfill_block_fields(block_diff_lookup_fn diff_fn, block_ts_lookup_fn ts_fn)
+{
+    std::lock_guard<std::mutex> lock(m_blocks_mutex);
+    int diff_filled = 0, ts_filled = 0;
+    for (auto& blk : m_found_blocks) {
+        if (!blk.hash.empty()) {
+            if (diff_fn && blk.network_difficulty == 0.0) {
+                double diff = diff_fn(blk.hash);
+                if (diff > 0) { blk.network_difficulty = diff; ++diff_filled; }
+            }
+            if (ts_fn) {
+                uint32_t ts = ts_fn(blk.hash);
+                if (ts > 0 && blk.ts != ts) { blk.ts = ts; ++ts_filled; }
+            }
+        }
+    }
+    if (diff_filled > 0)
+        LOG_INFO << "[Pool] Backfilled network_difficulty on " << diff_filled << " found block(s)";
+    if (ts_filled > 0)
+        LOG_INFO << "[Pool] Backfilled timestamp on " << ts_filled << " found block(s)";
+}
+
+void MiningInterface::set_merged_block_store(std::shared_ptr<void> store) { m_merged_block_store = std::move(store); }
+
 void MiningInterface::set_block_verify_fn(block_verify_fn_t fn) { m_block_verify_fn = std::move(fn); }
 
 void MiningInterface::add_chain_verify_fn(const std::string& chain, block_verify_fn_t fn) {
@@ -3734,7 +3759,7 @@ nlohmann::json MiningInterface::rest_local_stats()
     result["miner_last_difficulties"] = miner_diffs;
 
     // p2pool-compat: version and protocol_version
-    result["version"] = "c2pool/0.8.0";
+    result["version"] = m_pool_version;
     result["protocol_version"] = 3600;  // V36 share format
 
     return result;
@@ -3758,7 +3783,7 @@ nlohmann::json MiningInterface::rest_p2pool_global_stats()
 
 nlohmann::json MiningInterface::rest_web_version()
 {
-    return "c2pool/0.8.0";
+    return m_pool_version;
 }
 
 nlohmann::json MiningInterface::rest_web_currency_info()
@@ -4033,7 +4058,7 @@ nlohmann::json MiningInterface::rest_stale_rates()
 nlohmann::json MiningInterface::rest_node_info()
 {
     nlohmann::json result = nlohmann::json::object();
-    result["external_ip"] = "0.0.0.0";
+    result["external_ip"] = m_external_ip.empty() ? "0.0.0.0" : m_external_ip;
     result["worker_port"] = m_worker_port;
     result["p2p_port"] = m_p2p_port;
 
@@ -4949,7 +4974,7 @@ nlohmann::json MiningInterface::rest_recent_merged_blocks()
         j["pow_hash"]    = blk.block_hash;
         j["parent_hash"] = blk.parent_hash;
         j["height"]      = blk.height;
-        j["miner"]       = nullptr;  // not tracked per-block yet
+        j["miner"]       = blk.miner.empty() ? nlohmann::json(nullptr) : nlohmann::json(blk.miner);
         j["verified"]    = blk.accepted ? nlohmann::json(true) : nlohmann::json(nullptr);
         arr.push_back(std::move(j));
     }
@@ -4985,14 +5010,14 @@ nlohmann::json MiningInterface::rest_discovered_merged_blocks()
     for (const auto& blk : m_mm_manager->get_discovered_blocks()) {
         nlohmann::json j;
         j["ts"]               = blk.timestamp;
-        j["number"]           = 0;  // parent height not tracked
+        j["number"]           = blk.parent_height > 0 ? nlohmann::json(blk.parent_height) : nlohmann::json(nullptr);
         j["hash"]             = blk.parent_hash;
         j["aux_block_height"] = blk.height;
         j["aux_hash"]         = blk.block_hash;
         j["aux_symbol"]       = blk.symbol;
-        j["aux_reward"]       = blk.coinbase_value / 1e8;
-        j["miner"]            = nullptr;
-        j["peer_addr"]        = "local";
+        j["aux_reward"]       = blk.coinbase_value > 0 ? nlohmann::json(blk.coinbase_value / 1e8) : nlohmann::json(nullptr);
+        j["miner"]            = blk.miner.empty() ? nlohmann::json(nullptr) : nlohmann::json(blk.miner);
+        j["peer_addr"]        = blk.is_local ? "local" : "peer";
         j["status"]           = blk.accepted ? "confirmed" : "orphaned";
         arr.push_back(std::move(j));
     }
@@ -5008,8 +5033,12 @@ nlohmann::json MiningInterface::rest_broadcaster_status()
         return result;
     }
     result["running"] = true;
+    result["enabled"] = true;
     result["chains"] = m_mm_manager->chain_count();
     result["total_blocks_found"] = m_mm_manager->get_total_blocks();
+    // LTC P2P peer info
+    if (m_ltc_peer_info_fn)
+        result["peers"] = m_ltc_peer_info_fn();
     return result;
 }
 
@@ -5036,6 +5065,10 @@ nlohmann::json MiningInterface::rest_merged_broadcaster_status()
         chains[ci.symbol]    = std::move(ch);
     }
     result["chains"] = std::move(chains);
+
+    // DOGE P2P peer info
+    if (m_doge_peer_info_fn)
+        result["peers"] = m_doge_peer_info_fn();
 
     return result;
 }
@@ -5177,10 +5210,11 @@ nlohmann::json MiningInterface::rest_web_my_share_hashes50()
 
 nlohmann::json MiningInterface::rest_web_share(const std::string& hash)
 {
-    if (m_sharechain_stats_fn) {
-        auto sc = m_sharechain_stats_fn();
-        if (sc.contains("shares") && sc["shares"].contains(hash))
-            return sc["shares"][hash];
+    // Use dedicated share lookup if wired
+    if (m_share_lookup_fn) {
+        auto result = m_share_lookup_fn(hash);
+        if (!result.is_null() && !result.contains("error"))
+            return result;
     }
     nlohmann::json result = nlohmann::json::object();
     result["error"] = "share not found";
@@ -5265,18 +5299,17 @@ nlohmann::json MiningInterface::rest_web_graph_data(const std::string& source, c
         else if (source == "local_dead_hash_rate") {
             result.push_back({entry.time, 0.0});
         }
-        else if (source == "worker_count" || source == "connected_miners") {
-            // p2pool: len(miner_hash_rates) = number of stratum workers with recent work
-            int count = 0;
-            if (entry.local_hash_rates.is_object())
-                count = static_cast<int>(entry.local_hash_rates.size());
-            result.push_back({entry.time, count});
+        else if (source == "worker_count") {
+            // Unique address.worker combos — 1 miner with 3 named workers = 3
+            result.push_back({entry.time, entry.worker_count});
         }
         else if (source == "unique_miner_count") {
-            int count = 0;
-            if (entry.local_hash_rates.is_object())
-                count = static_cast<int>(entry.local_hash_rates.size());
-            result.push_back({entry.time, count});
+            // Unique base addresses — 3 rigs with same address = 1 miner
+            result.push_back({entry.time, entry.miner_count});
+        }
+        else if (source == "connected_miners") {
+            // Raw stratum TCP connections — 1 ASIC with 2 connections = 2
+            result.push_back({entry.time, entry.connected_count});
         }
         else if (source == "current_payout") {
             result.push_back({entry.time, entry.current_payout});
@@ -5381,13 +5414,24 @@ void MiningInterface::update_stat_log()
     }
 
     // Local hash rates by address — from stratum worker registry
+    // Matches p2pool: worker_count = unique address.worker combos,
+    // unique_miner_count = unique base addresses,
+    // connected_miners = raw stratum TCP connections.
     entry.local_hash_rates = nlohmann::json::object();
     {
         auto workers = get_stratum_workers();
+        entry.connected_count = static_cast<int>(workers.size());  // raw TCP connections
+        std::set<std::string> worker_combos;
         for (const auto& [sid, w] : workers) {
             double existing = entry.local_hash_rates.value(w.username, 0.0);
             entry.local_hash_rates[w.username] = existing + w.hashrate;
+            // address.worker combo — e.g. "LTC1abc.rig1" is distinct from "LTC1abc.rig2"
+            std::string combo = w.username;
+            if (!w.worker_name.empty()) combo += "." + w.worker_name;
+            worker_combos.insert(combo);
         }
+        entry.miner_count = static_cast<int>(entry.local_hash_rates.size());  // unique addresses
+        entry.worker_count = static_cast<int>(worker_combos.size());          // unique address.worker
     }
 
     entry.shares = 0;

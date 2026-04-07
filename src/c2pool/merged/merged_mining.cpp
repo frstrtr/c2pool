@@ -1658,6 +1658,7 @@ void MergedMiningManager::record_discovered_block(
                             std::chrono::system_clock::now().time_since_epoch()).count();
     blk.accepted       = accepted;
     blk.coinbase_value = chain.current_work.coinbase_value;
+    blk.is_local       = true;  // our own submission
 
     m_discovered_blocks.push_back(std::move(blk));
     m_blocks_per_chain[chain.config.chain_id]++;
@@ -1720,6 +1721,20 @@ void MergedMiningManager::add_discovered_block(const DiscoveredMergedBlock& blk)
     m_blocks_per_chain[blk.chain_id]++;
     LOG_INFO << "[MM:" << blk.symbol << "] External block added: height=" << blk.height
              << " hash=" << blk.block_hash.substr(0, 16);
+}
+
+void MergedMiningManager::update_block_coinbase(const std::string& block_hash, uint64_t coinbase_value)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    for (auto& blk : m_discovered_blocks) {
+        if (blk.block_hash == block_hash) {
+            blk.coinbase_value = coinbase_value;
+            LOG_INFO << "[MM:" << blk.symbol << "] Coinbase updated: height=" << blk.height
+                     << " value=" << coinbase_value << " (" << (coinbase_value / 1e8) << " "
+                     << blk.symbol << ")";
+            return;
+        }
+    }
 }
 
 std::vector<MergedMiningManager::ChainInfo> MergedMiningManager::get_chain_infos() const

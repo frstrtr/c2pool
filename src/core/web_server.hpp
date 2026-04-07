@@ -495,6 +495,10 @@ public:
     using sharechain_window_fn_t = std::function<nlohmann::json()>;
     void set_sharechain_window_fn(sharechain_window_fn_t fn) { m_sharechain_window_fn = std::move(fn); }
 
+    // Individual share lookup — returns full p2pool-compatible share JSON by hash
+    using share_lookup_fn_t = std::function<nlohmann::json(const std::string&)>;
+    void set_share_lookup_fn(share_lookup_fn_t fn) { m_share_lookup_fn = std::move(fn); }
+
     // Network difficulty callback — invoked from refresh_work() with real value
     using network_difficulty_fn_t = std::function<void(double)>;
     void set_on_network_difficulty(network_difficulty_fn_t fn) { m_on_network_difficulty_fn = std::move(fn); }
@@ -631,11 +635,32 @@ public:
     // Per-chain verify function: register additional verifiers for merged chains
     void add_chain_verify_fn(const std::string& chain, block_verify_fn_t fn);
 
+    /// Read-only access to found blocks (for sharechain window grid).
+    std::vector<FoundBlock> get_found_blocks() const {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        return m_found_blocks;
+    }
+
     /// Set persistence callbacks for found blocks (Layer +2).
     void set_found_block_persistence(block_store_fn_t persist_fn, block_load_fn_t load_fn);
 
     /// Load persisted found blocks from storage (call once after persistence is set)
     void load_persisted_found_blocks();
+
+    /// Backfill network_difficulty on loaded blocks using a block hash → difficulty lookup.
+    /// Called after embedded header chain is available.
+    using block_diff_lookup_fn = std::function<double(const std::string& block_hash)>;
+    using block_ts_lookup_fn = std::function<uint32_t(const std::string& block_hash)>;
+    void backfill_block_fields(block_diff_lookup_fn diff_fn, block_ts_lookup_fn ts_fn);
+
+    /// Merged block persistence — opaque store pointer, cast in .cpp.
+    void set_merged_block_store(std::shared_ptr<void> store);
+    std::shared_ptr<void> get_merged_block_store() const { return m_merged_block_store; }
+
+    /// Coin P2P peer info callbacks (daemon-style getpeerinfo).
+    using coin_peer_info_fn = std::function<nlohmann::json()>;
+    void set_ltc_peer_info_fn(coin_peer_info_fn fn) { m_ltc_peer_info_fn = std::move(fn); }
+    void set_doge_peer_info_fn(coin_peer_info_fn fn) { m_doge_peer_info_fn = std::move(fn); }
 
     // Callback fired whenever a block submission is attempted.
     // Arguments: header hex (first 80 bytes), stale_info (none=accepted, orphan=stale prev, doa=daemon rejected).
@@ -762,6 +787,7 @@ private:
     // Sharechain stats callback
     sharechain_stats_fn_t m_sharechain_stats_fn;
     sharechain_window_fn_t m_sharechain_window_fn;
+    share_lookup_fn_t m_share_lookup_fn;
 
     // PPLNS computation hook
     pplns_fn_t m_pplns_fn;
@@ -846,6 +872,9 @@ private:
     block_store_fn_t m_persist_block_fn;   // called on record + status change
     block_load_fn_t  m_load_blocks_fn;     // called on startup
 
+    std::shared_ptr<void> m_merged_block_store;  // MergedBlockStore (opaque)
+    coin_peer_info_fn m_ltc_peer_info_fn;
+    coin_peer_info_fn m_doge_peer_info_fn;
     block_verify_fn_t m_block_verify_fn;  // default (parent chain)
     std::map<std::string, block_verify_fn_t> m_chain_verify_fns; // per-chain
     void verify_found_block(size_t index);
@@ -929,6 +958,8 @@ public:
     // Port configuration for /node_info
     void set_p2p_port(uint16_t port) { m_p2p_port = port; }
     void set_worker_port(uint16_t port) { m_worker_port = port; }
+    void set_external_ip(const std::string& ip) { m_external_ip = ip; }
+    void set_pool_version(const std::string& ver) { m_pool_version = ver; }
 
     // Best share difficulty tracking (for /best_share, /miner_stats)
     void record_share_difficulty(double difficulty, const std::string& miner);
@@ -974,6 +1005,8 @@ private:
     // Port configuration
     uint16_t m_p2p_port{9338};
     uint16_t m_worker_port{9327};
+    std::string m_external_ip;
+    std::string m_pool_version{"c2pool/0.12.0"};
 
     // Best share difficulty tracking
     struct BestDifficulty {
@@ -1004,7 +1037,10 @@ private:
         double time;
         double pool_hash_rate;
         double pool_stale_prop;
-        nlohmann::json local_hash_rates;
+        nlohmann::json local_hash_rates;  // per-address hashrate (aggregated)
+        int worker_count{0};              // unique address.worker combos
+        int miner_count{0};               // unique base addresses
+        int connected_count{0};           // raw stratum TCP connections
         uint64_t shares;
         uint64_t stale_shares;
         double current_payout;

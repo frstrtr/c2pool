@@ -760,7 +760,353 @@
             color: var(--text-muted);
             margin-bottom: 8px;
         }
-        
+
+        /* ── Defragmenter Sharechain Viewer ──────────────────── */
+        .defrag-container {
+            display: grid;
+            grid-template-columns: 1fr 220px;
+            gap: 16px;
+            margin-top: 12px;
+        }
+        @media (max-width: 900px) {
+            .defrag-container { grid-template-columns: 1fr; }
+        }
+        .defrag-canvas-wrap {
+            background: #0d0d1a;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 8px;
+            position: relative;
+            overflow: hidden;
+            min-height: 120px;
+        }
+        #defrag-canvas {
+            display: block;
+            cursor: crosshair;
+            image-rendering: pixelated;
+        }
+        .defrag-sidebar {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        .defrag-stats {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 14px;
+        }
+        .defrag-stats h4 {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 10px;
+        }
+        .defrag-stat-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 4px 0;
+            font-size: 0.85rem;
+        }
+        .defrag-stat-row .label { color: var(--text-muted); }
+        .defrag-stat-row .value { font-weight: 600; font-family: 'Monaco','Consolas',monospace; }
+        .defrag-legend {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 14px;
+        }
+        .defrag-legend h4 {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 10px;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 3px 0;
+            font-size: 0.82rem;
+        }
+        .legend-swatch {
+            width: 12px;
+            height: 12px;
+            border-radius: 2px;
+            flex-shrink: 0;
+        }
+        .legend-swatch.block-swatch {
+            border: 2px solid #ffd700;
+            box-shadow: 0 0 4px rgba(255, 215, 0, 0.6);
+        }
+        .legend-swatch.head-swatch {
+            border: 2px solid #e040fb;
+        }
+
+        /* Tooltip */
+        #defrag-tooltip {
+            display: none;
+            position: fixed;
+            z-index: 9999;
+            background: #1e1e38;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 10px 14px;
+            pointer-events: none;
+            width: 320px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+            font-size: 0.82rem;
+            line-height: 1.5;
+        }
+        .tt-hash {
+            font-family: 'Monaco','Consolas',monospace;
+            color: var(--primary);
+            font-weight: 700;
+            font-size: 0.85rem;
+            margin-bottom: 6px;
+            word-break: break-all;
+        }
+        .tt-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 1px 0;
+        }
+        .tt-row .tl { color: var(--text-muted); }
+        .tt-row .tv { color: var(--text); font-weight: 500; font-family: 'Monaco','Consolas',monospace; }
+        .tt-mine { color: #008de4; font-weight: 700; }
+        .tt-block {
+            color: #ffd700;
+            font-weight: 700;
+            text-align: center;
+            padding: 3px 0;
+            margin-top: 3px;
+            border-top: 1px solid rgba(255,215,0,0.3);
+        }
+        .tt-stale .tv { color: #ffc107; }
+        .tt-dead .tv { color: #dc3545; }
+        .tt-click {
+            color: var(--text-muted);
+            font-size: 0.75rem;
+            text-align: center;
+            margin-top: 6px;
+            opacity: 0.7;
+        }
+
+        /* Share links row below grid */
+        .defrag-links-bar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            align-items: center;
+            margin-top: 10px;
+            font-size: 0.82rem;
+        }
+        .defrag-links-bar .link-group {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .defrag-links-bar .link-label {
+            color: var(--text-muted);
+            font-weight: 600;
+            margin-right: 2px;
+        }
+        .defrag-links-bar .sep {
+            color: var(--border);
+            margin: 0 6px;
+        }
+
+        /* Hover cell — animated enlarging square */
+        .defrag-hover-cell {
+            position: fixed;
+            pointer-events: none;
+            z-index: 100;
+            border-radius: 2px;
+            transform: scale(1);
+            transform-origin: center center;
+            transition: transform 0.22s cubic-bezier(0.34, 1.4, 0.64, 1),
+                        box-shadow 0.22s ease;
+        }
+        .defrag-hover-cell.active {
+            transform: scale(2.5);
+            outline: 2px solid #fff;
+            outline-offset: 0px;
+            box-shadow: 0 0 16px 4px rgba(255,255,255,0.5),
+                        inset 0 0 4px rgba(255,255,255,0.3) !important;
+            filter: brightness(1.4) saturate(1.3);
+        }
+        .defrag-hover-cell.shrinking {
+            transform: scale(1);
+            outline: none;
+            box-shadow: none !important;
+            filter: none;
+            transition: transform 0.18s ease-in,
+                        box-shadow 0.18s ease-in,
+                        filter 0.18s ease-in;
+        }
+
+        /* Zoom panel — enlarged share with PPLNS treemap */
+        #defrag-zoom {
+            display: none;
+            position: fixed;
+            z-index: 9998;
+            border-radius: 10px;
+            border: 2px solid var(--border);
+            background: #1a1a2e;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+            pointer-events: none;
+            overflow: hidden;
+        }
+        #defrag-zoom canvas {
+            display: block;
+        }
+        #defrag-zoom-label {
+            background: rgba(13,13,26,0.9);
+            color: #b0b0cc;
+            font: bold 9px -apple-system, sans-serif;
+            text-align: center;
+            padding: 3px 0;
+        }
+
+        /* Main PPLNS treemap cells */
+        .pplns-main-cell {
+            position: absolute;
+            overflow: hidden;
+            cursor: pointer;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            border: 2px solid rgba(0,0,0,0.4);
+            transition: transform 0.2s cubic-bezier(0.34, 1.4, 0.64, 1),
+                        box-shadow 0.2s ease;
+            transform-origin: center center;
+        }
+        .pplns-main-cell:hover {
+            transform: scale(1.08);
+            z-index: 100;
+            box-shadow: 0 0 16px 3px rgba(255,255,255,0.2);
+            border-color: rgba(255,255,255,0.5);
+            filter: brightness(1.25) saturate(1.15);
+        }
+        .pplns-main-cell .pm-pct {
+            color: #fff;
+            font-weight: 800;
+            text-shadow: 0 1px 2px rgba(0,0,0,1), 0 0 6px rgba(0,0,0,0.7);
+            line-height: 1.15;
+        }
+        .pplns-main-cell .pm-doge {
+            font-weight: 800;
+            text-shadow: 0 1px 2px rgba(0,0,0,1), 0 0 6px rgba(0,0,0,0.7);
+            line-height: 1.15;
+        }
+        .pplns-main-cell .pm-addr {
+            color: rgba(255,255,255,0.9);
+            font-family: 'Monaco','Consolas',monospace;
+            font-weight: 600;
+            text-shadow: 0 1px 2px rgba(0,0,0,1), 0 0 6px rgba(0,0,0,0.7);
+            line-height: 1.15;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            max-width: 95%;
+        }
+        .pplns-main-cell .pm-ver {
+            text-shadow: 0 1px 2px rgba(0,0,0,0.9);
+            line-height: 1.1;
+        }
+        .pplns-main-cell.v35-only {
+            filter: saturate(0.4) brightness(0.85);
+            border-color: rgba(220,53,69,0.6);
+        }
+        .pplns-main-cell.v35-only:hover {
+            filter: saturate(0.6) brightness(1.1);
+        }
+
+        /* Verified Heads / Tails chain rows */
+        .defrag-chain-rows {
+            margin-top: 12px;
+        }
+        .defrag-chain-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 6px 0;
+        }
+        .defrag-chain-label {
+            color: var(--text-muted);
+            font-size: 0.82rem;
+            font-weight: 600;
+            min-width: 110px;
+            flex-shrink: 0;
+        }
+        .defrag-chain-cells {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            align-items: center;
+        }
+        .defrag-chain-cell {
+            width: 22px;
+            height: 22px;
+            border-radius: 3px;
+            cursor: pointer;
+            position: relative;
+            transition: transform 0.15s, box-shadow 0.15s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .defrag-chain-cell:hover {
+            transform: scale(1.3);
+            z-index: 10;
+            box-shadow: 0 0 8px rgba(255,255,255,0.3);
+        }
+        .defrag-chain-cell .cell-hash {
+            font-family: 'Monaco','Consolas',monospace;
+            font-size: 6.5px;
+            color: #fff;
+            text-shadow: 0 0 2px rgba(0,0,0,0.9);
+            font-weight: 700;
+            line-height: 1;
+            text-align: center;
+            pointer-events: none;
+            overflow: hidden;
+        }
+        .defrag-chain-cell.cell-epic {
+            background: linear-gradient(135deg, #a335ee, #7b2fbe) !important;
+            border: 2px solid #a335ee !important;
+            box-shadow: 0 0 10px rgba(163,53,238,0.6), inset 0 0 6px rgba(255,255,255,0.15);
+            animation: epic-glow 2s ease-in-out infinite;
+        }
+        @keyframes epic-glow {
+            0%, 100% { box-shadow: 0 0 8px rgba(163,53,238,0.5); }
+            50% { box-shadow: 0 0 16px rgba(163,53,238,0.8), 0 0 4px rgba(255,255,255,0.2); }
+        }
+        .defrag-chain-cell.cell-epic .cell-hash {
+            color: #e8d0ff;
+            text-shadow: 0 0 3px rgba(163,53,238,0.8);
+        }
+        /* WoW Legendary — twin block (LTC + DOGE) */
+        .cell-legendary {
+            background: linear-gradient(135deg, #ff8000, #cc6600) !important;
+            border: 2px solid #ff8000 !important;
+            box-shadow: 0 0 12px rgba(255,128,0,0.7), inset 0 0 6px rgba(255,255,255,0.2);
+            animation: legendary-glow 1.8s ease-in-out infinite;
+        }
+        @keyframes legendary-glow {
+            0%, 100% { box-shadow: 0 0 8px rgba(255,128,0,0.5); }
+            50% { box-shadow: 0 0 20px rgba(255,128,0,0.9), 0 0 6px rgba(255,200,0,0.4); }
+        }
+        .cell-legendary .cell-hash {
+            color: #fff3e0;
+            text-shadow: 0 0 3px rgba(255,128,0,0.8);
+        }
+
         /* Footer */
         footer {
             text-align: center;
@@ -1567,7 +1913,7 @@
                             <tr>
                                 <th>Time</th>
                                 <th>Network</th>
-                                <th>Chain ID</th>
+                                <th>Height</th>
                                 <th>Block Hash</th>
                                 <th>Miner</th>
                                 <th title="Block status">✓</th>
@@ -1594,6 +1940,7 @@
                         <thead>
                             <tr>
                                 <th>Address</th>
+                                <th style="text-align: center" title="Share version / desired version from sharechain">V36?</th>
                                 <th style="text-align: right">Amount</th>
                             </tr>
                         </thead>
@@ -1667,7 +2014,6 @@
                                 <th>Version</th>
                                 <th>Direction</th>
                                 <th>Uptime</th>
-                                <th>TxPool</th>
                             </tr>
                         </thead>
                         <tbody id="peers_tbody">
@@ -1714,11 +2060,9 @@
                         <thead>
                             <tr>
                                 <th>Address</th>
-                                <th>Score</th>
-                                <th>Source</th>
-                                <th>Success</th>
-                                <th>Sent</th>
-                                <th>Last Seen</th>
+                                <th>Version</th>
+                                <th>Height</th>
+                                <th>Uptime</th>
                             </tr>
                         </thead>
                         <tbody id="broadcaster_peers_tbody">
@@ -1744,32 +2088,142 @@
             <div class="loading" id="merged_broadcaster_loading">Loading merged broadcaster stats...</div>
         </div>
         
-        <!-- Share Explorer -->
+        <!-- PPLNS Distribution Treemap -->
         <div class="shares-section">
             <div class="section-header">
-                <h2>🔍 Share Explorer</h2>
+                <h2>PPLNS Distribution</h2>
             </div>
-            
-            <div class="share-row">
-                <div class="share-row-label">Best Share</div>
-                <div class="share-links" id="best_share"></div>
+            <div class="pplns-main-grid" id="pplns-main-grid" style="position:relative;border-radius:8px;overflow:visible;min-height:60px"></div>
+            <div id="pplns-main-tooltip" style="display:none;position:fixed;z-index:9999;background:#1e1e38;border:1px solid var(--border);border-radius:8px;padding:8px 12px;pointer-events:none;font-size:0.82rem;box-shadow:0 6px 20px rgba(0,0,0,0.5);width:320px"></div>
+        </div>
+
+        <!-- Sharechain Transparency Explorer -->
+        <div class="shares-section">
+            <div class="section-header">
+                <h2>Sharechain Transparency Explorer</h2>
             </div>
-            
-            <div class="share-row">
-                <div class="share-row-label">My Shares (last 50)</div>
-                <div class="share-links" id="my_share_hashes"></div>
+
+            <div class="defrag-container">
+                <!-- Canvas grid -->
+                <div class="defrag-canvas-wrap">
+                    <canvas id="defrag-canvas"></canvas>
+                </div>
+
+                <!-- Sidebar: stats + legend -->
+                <div class="defrag-sidebar">
+                    <div class="defrag-stats">
+                        <h4>Chain Window</h4>
+                        <div class="defrag-stat-row">
+                            <span class="label">Shares</span>
+                            <span class="value" id="defrag-total">-</span>
+                        </div>
+                        <div class="defrag-stat-row">
+                            <span class="label">Chain Length</span>
+                            <span class="value" id="defrag-chain-len">-</span>
+                        </div>
+                        <div class="defrag-stat-row">
+                            <span class="label">Verified</span>
+                            <span class="value" id="defrag-verified" style="color:#28a745">-</span>
+                        </div>
+                        <div class="defrag-stat-row">
+                            <span class="label">This Node</span>
+                            <span class="value" id="defrag-mine" style="color:#008de4">-</span>
+                        </div>
+                        <div class="defrag-stat-row">
+                            <span class="label">Orphan</span>
+                            <span class="value" id="defrag-stale" style="color:#ffc107">-</span>
+                        </div>
+                        <div class="defrag-stat-row">
+                            <span class="label">Dead</span>
+                            <span class="value" id="defrag-dead" style="color:#dc3545">-</span>
+                        </div>
+                        <div class="defrag-stat-row">
+                            <span class="label">Pool Fee</span>
+                            <span class="value" id="defrag-fee" style="color:#9c27b0">-</span>
+                        </div>
+                        <div class="defrag-stat-row">
+                            <span class="label">V36 Signaling</span>
+                            <span class="value" id="defrag-v36sig" style="color:#0097a7">-</span>
+                        </div>
+                        <div class="defrag-stat-row">
+                            <span class="label">Blocks Found</span>
+                            <span class="value" id="defrag-blocks" style="color:#ffd700">-</span>
+                        </div>
+                    </div>
+
+                    <div class="defrag-legend">
+                        <h4>Legend</h4>
+                        <div class="legend-item">
+                            <div class="legend-swatch" style="background:#008de4"></div>
+                            <span>This Node</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-swatch" style="background:#28a745"></div>
+                            <span>Verified (others)</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-swatch" style="background:#555577"></div>
+                            <span>Unverified</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-swatch" style="background:#ffc107"></div>
+                            <span>Orphan / Stale</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-swatch" style="background:#dc3545"></div>
+                            <span>Dead</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-swatch" style="background:#9c27b0"></div>
+                            <span>Pool fee share</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-swatch" style="background:#0097a7"></div>
+                            <span>V36 signaling</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-swatch" style="background:#28a745;border:2px solid #ffd700;box-shadow:0 0 3px rgba(255,215,0,0.5)"></div>
+                            <span>LTC block</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-swatch" style="background:#28a745;border:2px solid #00e5ff"></div>
+                            <span>DOGE block</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-swatch" style="background:linear-gradient(135deg,#ff8000,#cc6600);border:2px solid #ffaa00;box-shadow:0 0 6px rgba(255,128,0,0.5)"></div>
+                            <span style="color:#ff8000;font-weight:600">Twin block (Legendary)</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-swatch" style="background:#0d0d1a;position:relative"><div style="position:absolute;top:0;left:0;width:0;height:0;border-left:5px solid #fff;border-bottom:5px solid transparent"></div></div>
+                            <span>Chain head</span>
+                        </div>
+                    </div>
+                </div>
             </div>
-            
-            <div class="share-row">
-                <div class="share-row-label">Verified Heads</div>
-                <div class="share-links" id="verified_heads"></div>
-            </div>
-            
-            <div class="share-row">
-                <div class="share-row-label">Tails</div>
-                <div class="share-links" id="tails"></div>
+
+            <!-- Chain structure rows with share square cells -->
+            <div class="defrag-chain-rows">
+                <div class="defrag-chain-row">
+                    <span class="defrag-chain-label">Best Share</span>
+                    <div class="defrag-chain-cells" id="best_share"></div>
+                </div>
+                <div class="defrag-chain-row">
+                    <span class="defrag-chain-label">Verified Heads</span>
+                    <div class="defrag-chain-cells" id="verified_heads_cells"></div>
+                </div>
+                <div class="defrag-chain-row">
+                    <span class="defrag-chain-label">Tails</span>
+                    <div class="defrag-chain-cells" id="tails_cells"></div>
+                </div>
+                <div class="defrag-chain-row">
+                    <span class="defrag-chain-label">This Node</span>
+                    <div class="defrag-chain-cells" id="my_share_hashes"></div>
+                </div>
             </div>
         </div>
+
+        <!-- Floating tooltip for defrag grid -->
+        <div id="defrag-tooltip"></div>
     </main>
     
     <footer>
@@ -1779,19 +2233,15 @@
     <script>
         // Utility functions
         function format_dt(dt) {
-            var pairs = [
-                [365.2425*60*60*24, 'years'],
-                [60*60*24, 'days'],
-                [60*60, 'hours'],
-                [60, 'minutes'],
-                [1, 'seconds'],
-            ];
-            for(var i in pairs) {
-                var value = pairs[i][0];
-                var name = pairs[i][1];
-                if(dt > value) break;
-            }
-            return d3.format('.1f')(dt/value) + ' ' + name;
+            if (dt < 0) dt = 0;
+            var d = Math.floor(dt / 86400);
+            var h = Math.floor((dt % 86400) / 3600);
+            var m = Math.floor((dt % 3600) / 60);
+            var s = Math.floor(dt % 60);
+            if (d > 0) return d + 'd ' + h + 'h ' + m + 'm ' + s + 's';
+            if (h > 0) return h + 'h ' + m + 'm ' + s + 's';
+            if (m > 0) return m + 'm ' + s + 's';
+            return s + 's';
         }
         
         function format_hashrate(h) {
@@ -3137,19 +3587,29 @@
                         .style('font-weight', 'bold')
                         .style('color', '#6f42c1')
                         .text(function(b) { return b.symbol || b.network || 'AUX'; });
-                    tr.append('td').text(function(b) { return b.chainid || '-'; });
+                    tr.append('td')
+                        .style('font-weight', 'bold')
+                        .each(function(b) {
+                            if (!b.height) { d3.select(this).text('-'); return; }
+                            var chain = (b.symbol || '').toLowerCase() === 'doge' ? 'dogecoin' : 'litecoin';
+                            d3.select(this).append('a')
+                                .attr('class', 'hash-link')
+                                .style('color', '#6f42c1')
+                                .attr('href', 'https://blockchair.com/' + chain + '/block/' + b.height)
+                                .attr('target', '_blank')
+                                .attr('title', (b.symbol || 'AUX') + ' block #' + b.height)
+                                .text('#' + b.height);
+                        });
                     tr.append('td').append('a')
                         .attr('class', 'hash-link')
                         .attr('href', function(b) {
-                            var explorer_config = merged_explorers[b.chainid];
-                            if (explorer_config && b.pow_hash) {
-                                return explorer_config.testnet + b.pow_hash;
-                            }
+                            var chain = (b.symbol || '').toLowerCase() === 'doge' ? 'dogecoin' : 'litecoin';
+                            if (b.pow_hash) return 'https://blockchair.com/' + chain + '/block/' + b.pow_hash;
                             return '#';
                         })
                         .attr('target', '_blank')
                         .attr('title', function(b) {
-                            return 'POW Hash: ' + (b.pow_hash || 'N/A');
+                            return 'Block Hash: ' + (b.pow_hash || 'N/A');
                         })
                         .text(function(b) {
                             var hash = b.pow_hash || '-';
@@ -3158,11 +3618,15 @@
                     tr.append('td')
                         .style('font-family', 'monospace')
                         .style('font-size', '11px')
-                        .text(function(b) {
-                            if (!b.miner) return '-';
-                            return b.miner.substr(0, 8) + '...';
-                        })
-                        .attr('title', function(b) { return b.miner || ''; });
+                        .each(function(b) {
+                            if (!b.miner) { d3.select(this).text('-'); return; }
+                            d3.select(this).append('a')
+                                .attr('class', 'hash-link')
+                                .attr('href', 'https://blockchair.com/litecoin/address/' + b.miner)
+                                .attr('target', '_blank')
+                                .attr('title', b.miner)
+                                .text(b.miner.substr(0, 8) + '...');
+                        });
                     tr.append('td')
                         .attr('class', function(b) {
                             if (b.verified === true) return 'status-confirmed';
@@ -3269,11 +3733,15 @@
                     tr.append('td')
                         .style('font-family', 'monospace')
                         .style('font-size', '11px')
-                        .text(function(b) {
-                            if (!b.miner) return '-';
-                            return b.miner.length > 16 ? b.miner.substr(0, 8) + '...' : b.miner;
-                        })
-                        .attr('title', function(b) { return b.miner || ''; });
+                        .each(function(b) {
+                            if (!b.miner) { d3.select(this).text('-'); return; }
+                            d3.select(this).append('a')
+                                .attr('class', 'hash-link')
+                                .attr('href', 'https://blockchair.com/litecoin/address/' + b.miner)
+                                .attr('target', '_blank')
+                                .attr('title', b.miner)
+                                .text(b.miner.substr(0, 8) + '...');
+                        });
                     tr.append('td')
                         .style('font-family', 'monospace')
                         .style('font-size', '11px')
@@ -3370,6 +3838,45 @@
             });
         }
 
+        // Look up miner's share version from defrag data (cached per load)
+        function getMinerVersion(addr) {
+            if (!defrag.shares || defrag.shares.length === 0) return { ver: 0, dv: 0 };
+            var verCounts = {}, dvCounts = {};
+            defrag.shares.forEach(function(s) {
+                if (s.m !== addr) return;
+                verCounts[s.V] = (verCounts[s.V] || 0) + 1;
+                if (s.dv) dvCounts[s.dv] = (dvCounts[s.dv] || 0) + 1;
+            });
+            var topVer = 0, topN = 0;
+            for (var v in verCounts) { if (verCounts[v] > topN) { topVer = parseInt(v); topN = verCounts[v]; } }
+            var topDv = 0, topDvN = 0;
+            for (var d in dvCounts) { if (dvCounts[d] > topDvN) { topDv = parseInt(d); topDvN = dvCounts[d]; } }
+            return { ver: topVer, dv: topDv || topVer };
+        }
+
+        // Re-render V36 column in existing payouts table rows
+        function refreshPayoutsV36() {
+            d3.selectAll('#payouts tbody tr').each(function() {
+                var row = d3.select(this);
+                if (row.classed('merged-payout-row')) return; // skip sub-rows
+                var cells = row.selectAll('td');
+                if (cells[0].length < 3) return; // need addr, v36, amount
+                var addrCell = d3.select(cells[0][0]);
+                var v36Cell = d3.select(cells[0][1]);
+                var link = addrCell.select('a');
+                if (link.empty()) return;
+                var addr = link.attr('title') || link.text();
+                var mv = getMinerVersion(addr);
+                if (mv.ver >= 36) {
+                    v36Cell.html('<span style="color:#28a745;font-weight:700" title="V' + mv.ver + '">✓</span>');
+                } else if (mv.dv >= 36) {
+                    v36Cell.html('<span style="color:#0097a7;font-weight:700" title="V' + mv.ver + ' signaling V' + mv.dv + '">⇧</span>');
+                } else if (mv.ver > 0) {
+                    v36Cell.html('<span style="color:#dc3545;font-weight:700" title="V' + mv.ver + ' only — no DOGE!">✗</span>');
+                }
+            });
+        }
+
         // Payouts state for show more functionality
         window.payoutsData = null;
         window.payoutsDisplayCount = 5;
@@ -3399,6 +3906,20 @@
                     .attr('target', '_blank')
                     .attr('title', addr)
                     .text(addr);
+
+                // V36 column — look up miner version from defrag share data
+                var v36Td = mainRow.append('td').style('text-align', 'center');
+                var minerVer = getMinerVersion(addr);
+                if (minerVer.ver >= 36) {
+                    v36Td.html('<span style="color:#28a745;font-weight:700" title="V' + minerVer.ver + '">✓</span>');
+                } else if (minerVer.dv >= 36) {
+                    v36Td.html('<span style="color:#0097a7;font-weight:700" title="V' + minerVer.ver + ' signaling V' + minerVer.dv + '">⇧</span>');
+                } else if (minerVer.ver > 0) {
+                    v36Td.html('<span style="color:#dc3545;font-weight:700" title="V' + minerVer.ver + ' only — no DOGE!">✗</span>');
+                } else {
+                    v36Td.text('-');
+                }
+
                 mainRow.append('td')
                     .style('text-align', 'right')
                     .attr('class', 'amount')
@@ -3410,7 +3931,7 @@
                         var subRow = tbody.append('tr')
                             .attr('class', 'merged-payout-row')
                             .style('background', 'rgba(111, 66, 193, 0.1)');
-                        
+
                         var addrCell = subRow.append('td')
                             .style('padding-left', '20px');
                         addrCell.append('span')
@@ -3442,6 +3963,7 @@
                                 .text('\u2713 explicit');
                         }
                         
+                        subRow.append('td'); // V36 column spacer
                         subRow.append('td')
                             .style('text-align', 'right')
                             .style('color', '#6f42c1')
@@ -3609,6 +4131,18 @@
                     .attr('target', '_blank')
                     .attr('title', addr)
                     .text(addr);
+                // V36 column
+                var v36Td = tr.append('td').style('text-align', 'center');
+                var mv = getMinerVersion(addr);
+                if (mv.ver >= 36) {
+                    v36Td.html('<span style="color:#28a745;font-weight:700" title="V' + mv.ver + '">✓</span>');
+                } else if (mv.dv >= 36) {
+                    v36Td.html('<span style="color:#0097a7;font-weight:700" title="V' + mv.ver + ' signaling V' + mv.dv + '">⇧</span>');
+                } else if (mv.ver > 0) {
+                    v36Td.html('<span style="color:#dc3545;font-weight:700" title="V' + mv.ver + ' only — no DOGE!">✗</span>');
+                } else {
+                    v36Td.text('-');
+                }
                 tr.append('td')
                     .style('text-align', 'right')
                     .attr('class', 'amount')
@@ -3634,43 +4168,27 @@
                 if (!peers || peers.length === 0) {
                     var tr = d3.select('#peers_tbody').append('tr');
                     tr.append('td')
-                        .attr('colspan', '6')
+                        .attr('colspan', '4')
                         .style('text-align', 'center')
                         .style('color', 'var(--text-muted)')
                         .text('No peers connected');
                     return;
                 }
-                
+
                 var tr = d3.select('#peers_tbody').selectAll('tr').data(peers).enter().append('tr');
-                tr.append('td').append('a')
-                    .attr('href', function(p) { 
-                        // Use web_port from API response
-                        var parts = p.address.split(':');
-                        var host = parts[0];
-                        return 'http://' + host + ':' + p.web_port;
-                    })
-                    .attr('target', '_blank')
-                    .attr('class', 'hash-link')
-                    .text(function(p) { 
-                        // Display format: IP:WORKER_PORT (P2P:P2P_PORT)
-                        var parts = p.address.split(':');
-                        var host = parts[0];
-                        var p2p_port = parts[1];
-                        return host + ':' + p.web_port + ' (P2P:' + p2p_port + ')';
-                    });
+                tr.append('td')
+                    .style('font-family', 'monospace')
+                    .style('font-size', '12px')
+                    .text(function(p) { return p.address || '-'; });
                 tr.append('td').text(function(p) { return p.version || '-'; });
                 tr.append('td')
                     .style('white-space', 'nowrap')
-                    .html(function(p) { 
-                        return p.incoming ? 
-                            '<span style="color: var(--success)">⬇ Incoming</span>' : 
-                            '<span style="color: var(--info)">⬆ Outgoing</span>'; 
+                    .html(function(p) {
+                        return p.incoming ?
+                            '<span style="color: var(--success)">⬇ Incoming</span>' :
+                            '<span style="color: var(--info)">⬆ Outgoing</span>';
                     });
                 tr.append('td').text(function(p) { return format_duration(p.uptime || 0); });
-                tr.append('td')
-                    .text(function(p) { return format_duration(p.downtime || 0); })
-                    .style('color', function(p) { return p.downtime > 0 ? 'var(--text-muted)' : ''; });
-                tr.append('td').text(function(p) { return p.txpool_size || '0'; });
                 
                 // Update P2Pool peer count and stats
                 d3.select('#p2pool_peers_count').text(peers.length);
@@ -3684,8 +4202,8 @@
         function loadBroadcasterStats() {
             d3.json('../broadcaster_status', function(data) {
                 d3.select('#broadcaster_loading').style('display', 'none');
-                
-                if (!data || !data.enabled) {
+
+                if (!data || !data.running) {
                     d3.select('#broadcaster_status_badge')
                         .style('background', 'var(--danger)')
                         .text('Not Available');
@@ -3696,144 +4214,53 @@
                     d3.select('#broadcaster_peers_tbody').selectAll('tr').remove();
                     var tr = d3.select('#broadcaster_peers_tbody').append('tr');
                     tr.append('td')
-                        .attr('colspan', '6')
+                        .attr('colspan', '4')
                         .style('text-align', 'center')
                         .style('color', 'var(--text-muted)')
-                        .text('Broadcaster not enabled');
+                        .text('Embedded node not enabled');
                     return;
                 }
-                
+
+                var peers = data.peers || [];
+                var connectedPeers = peers.filter(function(p) { return p.connected; });
+
                 // Status badge
-                var badge = d3.select('#broadcaster_status_badge');
-                if (data.health && data.health.healthy) {
-                    badge.style('background', 'var(--success)').text('✓ Healthy');
-                } else {
-                    badge.style('background', 'var(--warning)').text('⚠ Issues');
-                }
-                
-                // Summary stats - connections
-                if (data.connections) {
-                    d3.select('#broadcaster_connections').text(
-                        data.connections.total + ' / ' + (data.configuration ? data.configuration.max_peers : 20)
-                    );
-                }
-                
-                // Peer database size
-                if (data.peer_database) {
-                    d3.select('#broadcaster_database_size').text(data.peer_database.total_peers.toLocaleString());
-                }
-                
-                // Connection success rate
-                if (data.connection_stats) {
-                    var totalAttempts = data.connection_stats.total_attempts || 0;
-                    var successRate = totalAttempts > 0 ? 
-                        ((data.connection_stats.successful_connections / totalAttempts) * 100).toFixed(1) : 0;
-                    d3.select('#broadcaster_success_rate').text(successRate + '%');
-                }
-                
-                // Broadcast stats
-                if (data.broadcast_stats) {
-                    var totalBroadcasts = data.broadcast_stats.successful_broadcasts + data.broadcast_stats.failed_broadcasts;
-                    d3.select('#broadcaster_broadcasts').text(
-                        data.broadcast_stats.successful_broadcasts + ' / ' + data.broadcast_stats.failed_broadcasts + 
-                        (totalBroadcasts > 0 ? ' (' + data.broadcast_stats.success_rate_percent.toFixed(1) + '%)' : '')
-                    );
-                }
-                
+                d3.select('#broadcaster_status_badge')
+                    .style('background', connectedPeers.length > 0 ? 'var(--success)' : 'var(--warning)')
+                    .text(connectedPeers.length > 0 ? '✓ Connected' : '⏳ Connecting');
+                d3.select('#broadcaster_peers_count').text(connectedPeers.length);
+                d3.select('#broadcaster_connections').text(connectedPeers.length);
+                d3.select('#broadcaster_database_size').text(peers.length);
+                d3.select('#broadcaster_success_rate').text('100%');
+                d3.select('#broadcaster_broadcasts').text(data.total_blocks_found || 0);
+
                 // Peers table
                 d3.select('#broadcaster_peers_tbody').selectAll('tr').remove();
-                
-                var peers = data.peers || [];
-                
-                // Update peer count badge
-                var connectedPeers = peers.filter(function(p) { return p.connected; });
-                d3.select('#broadcaster_peers_count').text(connectedPeers.length);
-                
-                if (peers.length === 0) {
+
+                if (connectedPeers.length === 0) {
                     var tr = d3.select('#broadcaster_peers_tbody').append('tr');
                     tr.append('td')
-                        .attr('colspan', '6')
+                        .attr('colspan', '4')
                         .style('text-align', 'center')
                         .style('color', 'var(--text-muted)')
-                        .text('No peers in database');
+                        .text('No peers connected');
                     d3.select('#broadcaster_peers_show_more').style('display', 'none');
                     return;
                 }
-                
-                // Store peers globally for pagination
-                window.allBroadcasterPeers = peers;
-                if (!window.broadcastPeersDisplayCount) {
-                    window.broadcastPeersDisplayCount = Math.min(10, peers.length);
-                }
-                
-                function renderBroadcasterPeers() {
-                    d3.select('#broadcaster_peers_tbody').selectAll('tr').remove();
-                    
-                    var displayPeers = window.allBroadcasterPeers.slice(0, window.broadcastPeersDisplayCount);
-                    
-                    var tr = d3.select('#broadcaster_peers_tbody').selectAll('tr')
-                        .data(displayPeers)
-                        .enter().append('tr');
-                    
-                    tr.append('td').html(function(p) { 
-                        var addr = p.address;
-                        // Truncate long addresses (IPv6)
-                        if (addr.length > 24) {
-                            addr = addr.substring(0, 20) + '...';
-                        }
-                        if (p.protected) {
-                            return addr + ' <span style="color: var(--success); font-size: 0.7rem;">[PROTECTED]</span>';
-                        }
-                        if (p.connected) {
-                            return '<span style="color: var(--success);">●</span> ' + addr;
-                        }
-                        return '<span style="color: var(--text-muted);">○</span> ' + addr;
-                    });
-                    tr.append('td').text(function(p) { return p.score.toFixed(1); });
-                    tr.append('td').text(function(p) { return p.source || 'unknown'; });
-                    
-                    tr.append('td').text(function(p) {
-                        var total = p.successful_broadcasts + p.failed_broadcasts;
-                        if (total === 0) return '-';
-                        return ((p.successful_broadcasts / total) * 100).toFixed(0) + '%';
-                    });
-                    
-                    tr.append('td').text(function(p) {
-                        return p.successful_broadcasts + ' / ' + p.failed_broadcasts;
-                    });
-                    
-                    tr.append('td').text(function(p) {
-                        if (!p.last_seen || p.last_seen === 0) return '-';
-                        var age = (Date.now() / 1000) - p.last_seen;
-                        if (age < 60) return 'Now';
-                        if (age < 3600) return Math.floor(age / 60) + 'm ago';
-                        if (age < 86400) return Math.floor(age / 3600) + 'h ago';
-                        return Math.floor(age / 86400) + 'd ago';
-                    });
-                    
-                    // Show "Show more" button if there are more peers
-                    var bcRemaining = window.allBroadcasterPeers.length - window.broadcastPeersDisplayCount;
-                    if (bcRemaining > 0) {
-                        d3.select('#broadcaster_peers_show_more')
-                            .style('display', 'block')
-                            .text('Show ' + Math.min(10, bcRemaining) + ' more... (' + bcRemaining + ' remaining)');
-                    } else {
-                        d3.select('#broadcaster_peers_show_more').style('display', 'none');
-                    }
-                }
-                
-                renderBroadcasterPeers();
-                
-                // Set up show more button
-                d3.select('#broadcaster_peers_show_more').on('click', function() {
-                    var bcRem = window.allBroadcasterPeers.length - window.broadcastPeersDisplayCount;
-                    var bcStep = (bcRem <= 10) ? bcRem : 10;
-                    window.broadcastPeersDisplayCount = Math.min(
-                        window.broadcastPeersDisplayCount + bcStep,
-                        window.allBroadcasterPeers.length
-                    );
-                    renderBroadcasterPeers();
-                });
+
+                var tr = d3.select('#broadcaster_peers_tbody').selectAll('tr')
+                    .data(connectedPeers)
+                    .enter().append('tr');
+
+                tr.append('td')
+                    .style('font-family', 'monospace')
+                    .style('font-size', '12px')
+                    .text(function(p) { return p.addr || '-'; });
+                tr.append('td').text(function(p) { return p.subver || '-'; });
+                tr.append('td').text(function(p) { return p.startingheight || '-'; });
+                tr.append('td').text(function(p) { return format_duration(p.conntime || 0); });
+
+                d3.select('#broadcaster_peers_show_more').style('display', 'none');
             });
         }
         
@@ -3854,6 +4281,13 @@
                 
                 var chainsArray = Object.entries(data.chains);
                 
+                // Update top-level badge
+                var topPeers = data.peers || [];
+                var topConn = topPeers.filter(function(p) { return p.connected; });
+                d3.select('#merged_broadcaster_status_badge')
+                    .style('background', topConn.length > 0 ? 'var(--success)' : '#6366f1')
+                    .text(topConn.length > 0 ? '✓ ' + topConn.length + ' peers' : '⏳ Starting');
+
                 chainsArray.forEach(function(entry) {
                     var chainId = entry[0];
                     var chainData = entry[1];
@@ -3882,13 +4316,16 @@
                         .style('color', 'var(--text-primary)')
                         .text('🐕 ' + displayName);
                     
+                    var mergedPeers = data.peers || [];
+                    var mergedConnected = mergedPeers.filter(function(p) { return p.connected; });
+                    var chainActive = mergedConnected.length > 0 && chainData.current_height > 0;
                     var statusBadge = headerDiv.append('span')
                         .attr('class', 'badge')
-                        .style('background', chainData.health && chainData.health.healthy ? 'var(--success)' : '#6366f1')
+                        .style('background', chainActive ? 'var(--success)' : '#6366f1')
                         .style('color', '#fff')
                         .style('border-radius', '20px')
                         .style('padding', '4px 10px')
-                        .text(chainData.health && chainData.health.healthy ? '✓ Active' : '⏳ Starting');
+                        .text(chainActive ? '✓ Active' : '⏳ Starting');
                     
                     // Stats grid - updated to show P2P connections
                     var statsGrid = chainDiv.append('div')
@@ -3897,45 +4334,46 @@
                         .style('gap', '10px')
                         .style('margin-bottom', '15px');
                     
-                    // P2P Connections
+                    // Use top-level peers array from merged_broadcaster_status
+                    var allPeers = data.peers || [];
+                    var connPeers = allPeers.filter(function(p) { return p.connected; });
+
+                    // Connections
                     var statCard = statsGrid.append('div')
                         .attr('class', 'stat-card')
                         .style('padding', '10px');
                     statCard.append('div').attr('class', 'stat-label').text('CONNECTIONS');
-                    var connTotal = chainData.connections ? chainData.connections.total : (chainData.active_connections || 0);
-                    var connMax = chainData.configuration ? chainData.configuration.max_peers : 10;
                     statCard.append('div')
                         .attr('class', 'stat-value')
                         .style('font-size', '1.2rem')
-                        .text(connTotal + ' / ' + connMax);
-                    statCard.append('div').attr('class', 'stat-sublabel').text('Active / Target');
-                    
-                    // Peer database
+                        .text(connPeers.length);
+                    statCard.append('div').attr('class', 'stat-sublabel').text('Active Peers');
+
+                    // Chain height
                     statCard = statsGrid.append('div')
                         .attr('class', 'stat-card')
                         .style('padding', '10px');
-                    statCard.append('div').attr('class', 'stat-label').text('DATABASE');
-                    var dbSize = chainData.peer_database ? chainData.peer_database.total_peers : (chainData.total_peers || 0);
+                    statCard.append('div').attr('class', 'stat-label').text('HEIGHT');
                     statCard.append('div')
                         .attr('class', 'stat-value')
                         .style('font-size', '1.2rem')
-                        .text(dbSize.toLocaleString());
-                    statCard.append('div').attr('class', 'stat-sublabel').text('Total Peers');
-                    
-                    // Connect Rate (P2P success)
+                        .text((chainData.current_height || 0).toLocaleString());
+                    statCard.append('div').attr('class', 'stat-sublabel').text('Chain Tip');
+
+                    // Header sync
                     statCard = statsGrid.append('div')
                         .attr('class', 'stat-card')
                         .style('padding', '10px');
-                    statCard.append('div').attr('class', 'stat-label').text('P2P');
-                    var p2pSuccess = chainData.broadcast_stats ? chainData.broadcast_stats.p2p_successes : 0;
-                    var p2pFail = chainData.broadcast_stats ? chainData.broadcast_stats.p2p_failures : 0;
-                    var p2pRate = (p2pSuccess + p2pFail) > 0 ? (p2pSuccess / (p2pSuccess + p2pFail) * 100) : 100;
+                    statCard.append('div').attr('class', 'stat-label').text('SYNC');
+                    var maxH = 0;
+                    connPeers.forEach(function(p) { if (p.startingheight > maxH) maxH = p.startingheight; });
+                    var syncPct = maxH > 0 ? Math.min(100, (chainData.current_height || 0) / maxH * 100) : 100;
                     statCard.append('div')
                         .attr('class', 'stat-value')
                         .style('font-size', '1.2rem')
-                        .style('color', p2pRate >= 80 ? 'var(--success)' : (p2pRate >= 50 ? 'var(--warning)' : 'var(--danger)'))
-                        .text(p2pRate.toFixed(1) + '%');
-                    statCard.append('div').attr('class', 'stat-sublabel').text('Connect Rate');
+                        .style('color', syncPct >= 99.9 ? 'var(--success)' : 'var(--warning)')
+                        .text(syncPct.toFixed(1) + '%');
+                    statCard.append('div').attr('class', 'stat-sublabel').text('Header Sync');
                     
                     // Broadcasts
                     statCard = statsGrid.append('div')
@@ -3950,8 +4388,8 @@
                         .text(bcastSuccess + ' / ' + bcastFail);
                     statCard.append('div').attr('class', 'stat-sublabel').text('Success / Failed');
                     
-                    // Peers table
-                    var peers = chainData.peers || [];
+                    // Peers table — use top-level data.peers (connected coin P2P nodes)
+                    var peers = mergedConnected;
                     if (peers.length > 0) {
                         var tableDiv = chainDiv.append('div')
                             .style('overflow-x', 'auto');
@@ -3964,7 +4402,7 @@
                         
                         var thead = table.append('thead');
                         var headerRow = thead.append('tr');
-                        ['ADDRESS', 'SCORE', 'SOURCE', 'SUCCESS', 'SENT', 'LAST SEEN'].forEach(function(h) {
+                        ['ADDRESS', 'VERSION', 'HEIGHT', 'UPTIME'].forEach(function(h) {
                             headerRow.append('th')
                                 .style('text-align', 'left')
                                 .style('padding', '8px')
@@ -3986,47 +4424,18 @@
                             tbody.selectAll('tr').remove();
                             var displayPeers = window[peersKey].slice(0, window[peersKey + '_display']);
                             
-                            displayPeers.forEach(function(p) {
+                            var connPeers = window[peersKey].filter(function(p) { return p.connected; });
+                            var dispPeers = connPeers.slice(0, window[peersKey + '_display']);
+
+                            dispPeers.forEach(function(p) {
                                 var tr = tbody.append('tr')
                                     .style('border-bottom', '1px solid var(--border)');
-                                
-                                // Address with connection status
-                                var addr = p.address;
-                                if (addr.length > 24) addr = addr.substring(0, 20) + '...';
-                                var addrHtml = p.connected ? 
-                                    '<span style="color: var(--success);">●</span> ' + addr :
-                                    '<span style="color: var(--text-muted);">○</span> ' + addr;
-                                if (p.protected) {
-                                    addrHtml += ' <span style="color: var(--success); font-size: 0.7rem;">[PROTECTED]</span>';
-                                }
-                                tr.append('td').style('padding', '8px').html(addrHtml);
-                                
-                                // Score
-                                tr.append('td').style('padding', '8px').text(p.score.toFixed(1));
-                                
-                                // Source
-                                tr.append('td').style('padding', '8px').style('color', 'var(--text-muted)').text(p.source || 'unknown');
-                                
-                                // Success rate
-                                var total = (p.successful_broadcasts || 0) + (p.failed_broadcasts || 0);
-                                var rate = total > 0 ? ((p.successful_broadcasts / total) * 100).toFixed(0) + '%' : '-';
-                                tr.append('td').style('padding', '8px').text(rate);
-                                
-                                // Sent count
-                                tr.append('td').style('padding', '8px').text(
-                                    (p.successful_broadcasts || 0) + ' / ' + (p.failed_broadcasts || 0)
-                                );
-                                
-                                // Last seen
-                                var lastSeen = '-';
-                                if (p.last_seen && p.last_seen > 0) {
-                                    var age = (Date.now() / 1000) - p.last_seen;
-                                    if (age < 60) lastSeen = 'Now';
-                                    else if (age < 3600) lastSeen = Math.floor(age / 60) + 'm ago';
-                                    else if (age < 86400) lastSeen = Math.floor(age / 3600) + 'h ago';
-                                    else lastSeen = Math.floor(age / 86400) + 'd ago';
-                                }
-                                tr.append('td').style('padding', '8px').style('color', 'var(--text-muted)').text(lastSeen);
+                                tr.append('td').style('padding', '8px')
+                                    .style('font-family', 'monospace').style('font-size', '12px')
+                                    .text(p.addr || '-');
+                                tr.append('td').style('padding', '8px').text(p.subver || '-');
+                                tr.append('td').style('padding', '8px').text(p.startingheight || '-');
+                                tr.append('td').style('padding', '8px').text(format_duration(p.conntime || 0));
                             });
                             
                             // Update show more button
@@ -4067,54 +4476,1031 @@
                     }
                 });
                 
-                // Update overall status badge
-                var hasActive = chainsArray.some(function(entry) { 
-                    return entry[1].health && entry[1].health.healthy; 
+                // Top-level badge already updated above (from data.peers)
+            });
+        }
+        
+        // =============================================
+        // Sharechain Defragmenter Viewer
+        // =============================================
+        var defrag = {
+            canvas: null,
+            ctx: null,
+            tooltip: null,
+            shares: [],
+            blockSet: {},      // short hashes of LTC block solutions
+            dogeSet: {},       // short hashes of DOGE block solutions (parent hash)
+            headSet: {},       // short hashes of chain heads
+            myAddress: '',
+            windowSize: 8640,
+            pplnsData: [],     // cached [{addr, pct, amt}] sorted by pct desc
+            zoomPanel: null,   // floating zoom panel element
+            cellSize: 10,
+            gap: 1,
+            cols: 0,
+            rows: 0,
+            hoveredIdx: -1,
+            dpr: window.devicePixelRatio || 1,
+
+            init: function() {
+                this.canvas = document.getElementById('defrag-canvas');
+                this.ctx = this.canvas.getContext('2d');
+                this.tooltip = document.getElementById('defrag-tooltip');
+
+                // Create hover cell overlay for enlarge animation
+                var hc = document.createElement('div');
+                hc.className = 'defrag-hover-cell';
+                document.body.appendChild(hc);
+                this.hoverCell = hc;
+                hc.addEventListener('transitionend', function() {
+                    if (hc.classList.contains('shrinking')) {
+                        hc.style.display = 'none';
+                        hc.classList.remove('shrinking');
+                    }
                 });
-                d3.select('#merged_broadcaster_status_badge')
-                    .style('background', hasActive ? 'var(--success)' : '#6366f1')
-                    .style('color', '#fff')
-                    .text(hasActive ? '✓ Active' : '⏳ Starting');
-            });
-        }
-        
-        function loadShares() {
-            d3.json('../web/best_share_hash', function(hash) {
-                // Clear existing content
-                d3.select('#best_share').selectAll('*').remove();
-                if (hash) {
-                    d3.select('#best_share').append('a')
-                        .attr('class', 'share-link')
-                        .attr('href', 'share.html#' + hash)
-                        .text(hash.substr(-12));
-                }
-            });
-            
-            fillShares('../web/my_share_hashes50', '#my_share_hashes');
-            fillShares('../web/verified_heads', '#verified_heads');
-            fillShares('../web/tails', '#tails');
-        }
-        
-        function fillShares(url, selector) {
-            d3.json(url, function(data) {
-                // Clear existing content before adding
-                d3.select(selector).selectAll('*').remove();
-                
-                if (!data || data.length === 0) {
-                    d3.select(selector).append('span')
-                        .style('color', 'var(--text-muted)')
-                        .style('font-size', '0.85rem')
-                        .text('None');
+
+                // Create zoom panel for enlarged share + PPLNS treemap
+                var zp = document.createElement('div');
+                zp.id = 'defrag-zoom';
+                zp.innerHTML = '<canvas id="defrag-zoom-canvas"></canvas><div id="defrag-zoom-label"></div>';
+                document.body.appendChild(zp);
+                this.zoomPanel = zp;
+                this.zoomCanvas = zp.querySelector('canvas');
+                this.zoomCtx = this.zoomCanvas.getContext('2d');
+                this.zoomLabel = zp.querySelector('#defrag-zoom-label');
+
+                var self = this;
+                this.canvas.addEventListener('mousemove', function(e) { self.onMouseMove(e); });
+                this.canvas.addEventListener('mouseleave', function() { self.hideTooltip(); });
+                this.canvas.addEventListener('click', function(e) { self.onClick(e); });
+
+                window.addEventListener('resize', function() {
+                    if (self.shares.length > 0) self.render();
+                });
+            },
+
+            load: function() {
+                var self = this;
+                d3.json('../sharechain/window', function(data) {
+                    if (!data || !data.shares) return;
+                    self.shares = data.shares;
+                    self.myAddress = data.my_address || '';
+                    self.windowSize = data.window_size || 8640;
+
+                    self.blockSet = {};
+                    if (data.blocks) {
+                        data.blocks.forEach(function(h) { self.blockSet[h] = true; });
+                    }
+                    // Also mark shares that have blk=1 flag from tracker index
+                    self.shares.forEach(function(s) {
+                        if (s.blk) self.blockSet[s.h] = true;
+                    });
+
+                    self.dogeSet = {};
+                    if (data.doge_blocks) {
+                        data.doge_blocks.forEach(function(h) { self.dogeSet[h] = true; });
+                    }
+
+                    self.headSet = {};
+                    if (data.heads) {
+                        data.heads.forEach(function(h) { self.headSet[h] = true; });
+                    }
+
+                    self.computeMinerHashrates();
+                    self.render();
+                    self.updateStats(data);
+                    loadShareLinks();
+                    // Re-render payouts V36 column now that share data is available
+                    refreshPayoutsV36();
+                    // Render main PPLNS treemap (needs miner version data)
+                    loadMainPPLNS();
+                });
+
+                // Fetch PPLNS distribution for treemap
+                d3.json('../current_payouts', function(payouts) {
+                    if (!payouts || typeof payouts !== 'object') return;
+                    var total = 0;
+                    var entries = [];
+                    for (var addr in payouts) {
+                        total += payouts[addr];
+                        entries.push({ addr: addr, amt: payouts[addr] });
+                    }
+                    entries.sort(function(a, b) { return b.amt - a.amt; });
+                    entries.forEach(function(e) { e.pct = total > 0 ? e.amt / total : 0; });
+                    self.pplnsData = entries;
+                });
+            },
+
+            marginLeft: 38,  // px reserved for time axis labels
+
+            render: function() {
+                var canvas = this.canvas;
+                var ctx = this.ctx;
+                var dpr = this.dpr;
+                var step = this.cellSize + this.gap;
+                var ml = this.marginLeft;
+
+                // Reset canvas width so parent can shrink freely on resize
+                canvas.style.width = '0px';
+                var containerWidth = canvas.parentElement.clientWidth - 16;
+                var gridWidth = containerWidth - ml;
+                this.cols = Math.max(1, Math.floor(gridWidth / step));
+                this.rows = Math.ceil(this.shares.length / this.cols);
+
+                var cssW = ml + this.cols * step;
+                var cssH = Math.max(this.rows * step, 40);
+                canvas.style.width = cssW + 'px';
+                canvas.style.height = cssH + 'px';
+                canvas.width = cssW * dpr;
+                canvas.height = cssH * dpr;
+                ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+                ctx.fillStyle = '#0d0d1a';
+                ctx.fillRect(0, 0, cssW, cssH);
+
+                if (this.shares.length === 0) {
+                    ctx.fillStyle = '#555577';
+                    ctx.font = '12px -apple-system, sans-serif';
+                    ctx.textAlign = 'center';
+                    ctx.fillText('Waiting for shares...', cssW / 2, cssH / 2);
                     return;
                 }
-                data.sort();
-                data.forEach(function(hash) {
-                    d3.select(selector).append('a')
-                        .attr('class', 'share-link')
-                        .attr('href', 'share.html#' + hash)
-                        .text(hash.substr(-8));
+
+                // Pre-compute average age per row for axis labels
+                var now = Date.now() / 1000;
+                var rowAges = [];
+                for (var r = 0; r < this.rows; r++) {
+                    var start = r * this.cols;
+                    var end = Math.min(start + this.cols, this.shares.length);
+                    var sum = 0;
+                    for (var j = start; j < end; j++) sum += (now - this.shares[j].t);
+                    rowAges.push(sum / (end - start));
+                }
+
+                // Draw time axis labels on the left margin — hours only
+                ctx.font = 'bold 11px -apple-system, sans-serif';
+                ctx.textAlign = 'right';
+                ctx.textBaseline = 'middle';
+
+                // Find which rows cross whole-hour boundaries and label those
+                var lastLabeledHour = -1;
+                for (var r = 0; r < this.rows; r++) {
+                    var hour = Math.floor(rowAges[r] / 3600);
+                    if (hour !== lastLabeledHour && hour >= 0) {
+                        lastLabeledHour = hour;
+                        var label = hour + 'h';
+                        var yLabel = r * step + step / 2;
+                        ctx.fillStyle = '#b0b0cc';
+                        ctx.fillText(label, ml - 4, yLabel);
+
+                        // Tick line
+                        ctx.strokeStyle = 'rgba(140,140,180,0.2)';
+                        ctx.lineWidth = 0.5;
+                        ctx.beginPath();
+                        ctx.moveTo(ml, r * step);
+                        ctx.lineTo(cssW, r * step);
+                        ctx.stroke();
+                    }
+                }
+
+                var cs = this.cellSize;
+                for (var i = 0; i < this.shares.length; i++) {
+                    var share = this.shares[i];
+                    var col = i % this.cols;
+                    var row = Math.floor(i / this.cols);
+                    var x = ml + col * step;
+                    var y = row * step;
+
+                    // Fill color
+                    ctx.fillStyle = this.getColor(share);
+                    ctx.fillRect(x, y, cs, cs);
+
+                    var isLtcBlock = !!this.blockSet[share.h];
+                    var isDogeBlock = !!this.dogeSet[share.h];
+                    var isHead = !!this.headSet[share.h];
+
+                    // LTC block solution: gold border + inner fill
+                    if (isLtcBlock && isDogeBlock) {
+                        // Twin block — Legendary: orange glow
+                        ctx.fillStyle = '#ff8000';
+                        ctx.fillRect(x, y, cs, cs);
+                        ctx.strokeStyle = '#ffaa00';
+                        ctx.lineWidth = 2;
+                        ctx.strokeRect(x + 0.5, y + 0.5, cs - 1, cs - 1);
+                    } else if (isLtcBlock) {
+                        // LTC block only: gold border
+                        ctx.strokeStyle = '#ffd700';
+                        ctx.lineWidth = 2;
+                        ctx.strokeRect(x + 0.5, y + 0.5, cs - 1, cs - 1);
+                    } else if (isDogeBlock) {
+                        // DOGE block only: cyan border
+                        ctx.strokeStyle = '#00e5ff';
+                        ctx.lineWidth = 2;
+                        ctx.strokeRect(x + 0.5, y + 0.5, cs - 1, cs - 1);
+                    }
+
+                    // Chain head: bright white triangle marker in corner
+                    if (isHead && !isLtcBlock && !isDogeBlock) {
+                        ctx.fillStyle = '#ffffff';
+                        ctx.beginPath();
+                        ctx.moveTo(x, y);
+                        ctx.lineTo(x + 4, y);
+                        ctx.lineTo(x, y + 4);
+                        ctx.closePath();
+                        ctx.fill();
+                    }
+
+                    // Hover highlight
+                    if (i === this.hoveredIdx) {
+                        ctx.strokeStyle = '#ffffff';
+                        ctx.lineWidth = 1.5;
+                        ctx.strokeRect(x + 0.5, y + 0.5, cs - 1, cs - 1);
+                    }
+                }
+            },
+
+            getColor: function(share) {
+                // Dead shares - red
+                if (share.s === 2) return '#dc3545';
+                // Orphan/stale - yellow
+                if (share.s === 1) return '#ffc107';
+                // Unverified - gray
+                if (!share.v) return '#555577';
+
+                // Pool fee share - purple
+                if (share.fee) return '#9c27b0';
+
+                // V36-desired signaling shares - teal tint
+                var isV36Signal = share.dv && share.dv >= 36 && share.V < 36;
+
+                var isMine = this.myAddress && share.m === this.myAddress;
+
+                if (isMine) {
+                    return isV36Signal ? '#0097a7' : '#008de4';
+                }
+                return isV36Signal ? '#2e7d32' : '#28a745';
+            },
+
+            hitTest: function(e) {
+                var rect = this.canvas.getBoundingClientRect();
+                var x = e.clientX - rect.left - this.marginLeft;
+                var y = e.clientY - rect.top;
+                var step = this.cellSize + this.gap;
+                if (x < 0) return -1;
+                var col = Math.floor(x / step);
+                var row = Math.floor(y / step);
+                if (col < 0 || col >= this.cols) return -1;
+                var idx = row * this.cols + col;
+                if (idx >= 0 && idx < this.shares.length) return idx;
+                return -1;
+            },
+
+            onMouseMove: function(e) {
+                var idx = this.hitTest(e);
+                if (idx !== this.hoveredIdx) {
+                    var prevIdx = this.hoveredIdx;
+                    this.hoveredIdx = idx;
+                    this.render();
+
+                    if (idx >= 0) {
+                        this.showHoverCell(idx);
+                    } else if (prevIdx >= 0) {
+                        this.hideHoverCell();
+                    }
+                }
+                if (idx >= 0) {
+                    this.showTooltip(this.shares[idx], e);
+                    this.showZoom(this.shares[idx], e);
+                } else {
+                    this.hideTooltip();
+                }
+            },
+
+            onClick: function(e) {
+                var idx = this.hitTest(e);
+                if (idx >= 0 && this.shares[idx].H) {
+                    window.open('share.html#' + this.shares[idx].H, '_blank');
+                }
+            },
+
+            // Compute per-miner hashrate from share window data (cached on load)
+            minerHashrates: {},
+            computeMinerHashrates: function() {
+                this.minerHashrates = {};
+                if (this.shares.length < 2) return;
+                var counts = {};
+                var diffSums = {};
+                this.shares.forEach(function(s) {
+                    if (!counts[s.m]) { counts[s.m] = 0; diffSums[s.m] = 0; }
+                    counts[s.m]++;
+                    diffSums[s.m] += this.bitsToDifficulty(s.b);
+                }.bind(this));
+                // Time span of window
+                var newest = this.shares[0].t;
+                var oldest = this.shares[this.shares.length - 1].t;
+                var span = Math.max(newest - oldest, 1);
+                for (var m in diffSums) {
+                    // hashrate = sum(difficulty) * 2^32 / time_span (scrypt)
+                    this.minerHashrates[m] = diffSums[m] * 4294967296 / span;
+                }
+            },
+
+            showTooltip: function(share, e) {
+                var tip = this.tooltip;
+                var isMine = this.myAddress && share.m === this.myAddress;
+                var isLtcBlock = !!this.blockSet[share.h];
+                var isDogeBlock = !!this.dogeSet[share.h];
+                var age = Math.floor(Date.now() / 1000 - share.t);
+                var difficulty = this.bitsToDifficulty(share.b);
+
+                var staleClass = share.s === 2 ? ' tt-dead' : share.s === 1 ? ' tt-stale' : '';
+                var staleText = share.s === 0 ? 'None' : share.s === 1 ? 'Orphan' : 'Dead';
+                var verText = share.v ? '<span style="color:#28a745">Verified</span>' : '<span style="color:#555577">Unverified</span>';
+
+                var minerAddr = share.m || '?';
+                var minerDisplay = isMine
+                    ? '<span class="tt-mine">' + minerAddr.substr(0, 14) + '… (This Node)</span>'
+                    : '<span style="font-family:Monaco,Consolas,monospace;font-size:0.78em">' + minerAddr.substr(0, 20) + (minerAddr.length > 20 ? '…' : '') + '</span>';
+
+                // Relative height: position in window (1 = oldest tail, windowSize = head)
+                var relHeight = this.shares.length - share.p;
+
+                // Miner hashrate
+                var hr = this.minerHashrates[share.m];
+                var hrText = hr ? format_hashrate(hr) : '-';
+
+                // Tags
+                var tags = [];
+                if (share.fee) tags.push('<span style="color:#9c27b0;font-weight:700">Pool Fee</span>');
+                if (share.dv && share.dv >= 36 && share.V < 36) tags.push('<span style="color:#0097a7;font-weight:600">Signals V' + share.dv + '</span>');
+
+                var html =
+                    '<div class="tt-hash">' + share.h + '</div>' +
+                    '<div class="tt-row"><span class="tl">Height</span><span class="tv">' + (share.a || '-') + ' <span style="opacity:0.5;font-size:0.85em">(' + relHeight + '/' + this.windowSize + ')</span></span></div>' +
+                    '<div class="tt-row"><span class="tl">Miner</span><span class="tv">' + minerDisplay + '</span></div>' +
+                    '<div class="tt-row"><span class="tl">Hashrate</span><span class="tv">' + hrText + '</span></div>' +
+                    '<div class="tt-row"><span class="tl">Difficulty</span><span class="tv">' + format_difficulty(difficulty) + '</span></div>' +
+                    '<div class="tt-row"><span class="tl">Age</span><span class="tv">' + format_dt(age) + '</span></div>' +
+                    '<div class="tt-row"><span class="tl">Version</span><span class="tv">V' + share.V + (share.dv ? ' (desired V' + share.dv + ')' : '') + '</span></div>' +
+                    '<div class="tt-row"><span class="tl">Status</span><span class="tv">' + verText + '</span></div>';
+
+                if (share.cb) {
+                    html += '<div class="tt-row"><span class="tl">Coinbase</span><span class="tv" style="color:#ffc107;font-size:0.78em;word-break:break-all;max-width:160px">' + share.cb + '</span></div>';
+                }
+                if (tags.length > 0) {
+                    html += '<div class="tt-row"><span class="tl">Tags</span><span class="tv">' + tags.join(' ') + '</span></div>';
+                }
+                if (share.s > 0) {
+                    html += '<div class="tt-row' + staleClass + '"><span class="tl">Stale</span><span class="tv">' + staleText + '</span></div>';
+                }
+                if (isLtcBlock || isDogeBlock) {
+                    if (isLtcBlock && isDogeBlock) {
+                        html += '<div class="tt-block" style="color:#ff8000;border-color:rgba(255,128,0,0.4)">TWIN BLOCK — LEGENDARY</div>';
+                    } else {
+                        var blockLabel = [];
+                        if (isLtcBlock) blockLabel.push('<span style="color:#ffd700">LTC BLOCK</span>');
+                        if (isDogeBlock) blockLabel.push('<span style="color:#00e5ff">DOGE BLOCK</span>');
+                        html += '<div class="tt-block">' + blockLabel.join(' ') + '</div>';
+                    }
+                }
+                html += '<div class="tt-click">Click to view share details</div>';
+
+                tip.innerHTML = html;
+                tip.style.display = 'block';
+
+                // Tooltip always below-left of cursor (treemap goes above-right)
+                var tw = tip.offsetWidth;
+                var th = tip.offsetHeight;
+                var tx = e.clientX - tw - 12;
+                var ty = e.clientY + 18;
+                if (tx < 8) tx = 8;
+                if (ty + th > window.innerHeight - 8) ty = e.clientY - th - 8;
+                tip.style.left = tx + 'px';
+                tip.style.top = ty + 'px';
+            },
+
+            showHoverCell: function(idx) {
+                var hc = this.hoverCell;
+                var share = this.shares[idx];
+                var step = this.cellSize + this.gap;
+                var col = idx % this.cols;
+                var row = Math.floor(idx / this.cols);
+                var ml = this.marginLeft;
+
+                // Get cell position in viewport coords
+                var rect = this.canvas.getBoundingClientRect();
+                var cellX = rect.left + ml + col * step;
+                var cellY = rect.top + row * step;
+
+                hc.style.width = this.cellSize + 'px';
+                hc.style.height = this.cellSize + 'px';
+                hc.style.left = cellX + 'px';
+                hc.style.top = cellY + 'px';
+                hc.style.background = this.getColor(share);
+                hc.style.display = 'block';
+                hc.style.border = 'none';
+                hc.style.boxShadow = 'none';
+
+                // Block solution / head borders on the overlay
+                var isLtc = this.blockSet[share.h];
+                var isDoge = this.dogeSet[share.h];
+                if (isLtc && isDoge) {
+                    hc.style.background = 'linear-gradient(135deg, #ff8000, #cc6600)';
+                    hc.style.border = '2px solid #ffaa00';
+                    hc.style.boxShadow = '0 0 12px rgba(255,128,0,0.7)';
+                } else if (isLtc) {
+                    hc.style.border = '2px solid #ffd700';
+                    hc.style.boxShadow = '0 0 8px rgba(255,215,0,0.5)';
+                } else if (isDoge) {
+                    hc.style.border = '2px solid #00e5ff';
+                    hc.style.boxShadow = '0 0 8px rgba(0,229,255,0.5)';
+                }
+
+                // Trigger enlarge: remove shrinking, force reflow, add active
+                hc.classList.remove('shrinking', 'active');
+                void hc.offsetWidth; // force reflow
+                hc.classList.add('active');
+            },
+
+            hideHoverCell: function() {
+                var hc = this.hoverCell;
+                if (hc.style.display === 'none') return;
+                hc.classList.remove('active');
+                hc.classList.add('shrinking');
+            },
+
+            hideTooltip: function() {
+                this.tooltip.style.display = 'none';
+                this.zoomPanel.style.display = 'none';
+                this.hideHoverCell();
+                if (this.hoveredIdx !== -1) {
+                    this.hoveredIdx = -1;
+                    this.render();
+                }
+            },
+
+            showZoom: function(share, e) {
+                var zp = this.zoomPanel;
+                var zc = this.zoomCanvas;
+                var ctx = this.zoomCtx;
+                var sz = 240;
+                var dpr = this.dpr;
+
+                // Don't show if no PPLNS data yet
+                if (!this.pplnsData || this.pplnsData.length === 0) {
+                    zp.style.display = 'none';
+                    return;
+                }
+
+                zc.width = sz * dpr;
+                zc.height = sz * dpr;
+                ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+                ctx.fillStyle = '#0d0d1a';
+                ctx.fillRect(0, 0, sz, sz);
+
+                // Squarified treemap of PPLNS distribution
+                var rects = this.treemap(this.pplnsData, 2, 2, sz - 4, sz - 4);
+                var minerAddr = share ? share.m : '';
+                var myAddr = this.myAddress;
+
+                for (var i = 0; i < rects.length; i++) {
+                    var r = rects[i];
+                    var addr = r.addr;
+                    var isThisMiner = addr === minerAddr;
+                    var isMe = addr === myAddr;
+
+                    var hue = this.addrHue(addr);
+                    if (isThisMiner) {
+                        ctx.fillStyle = 'hsl(' + hue + ',85%,55%)';
+                    } else if (isMe) {
+                        ctx.fillStyle = 'hsl(' + hue + ',60%,42%)';
+                    } else {
+                        ctx.fillStyle = 'hsl(' + hue + ',35%,30%)';
+                    }
+                    ctx.fillRect(r.x, r.y, r.w, r.h);
+
+                    // Cell border
+                    ctx.strokeStyle = '#0d0d1a';
+                    ctx.lineWidth = 1.5;
+                    ctx.strokeRect(r.x, r.y, r.w, r.h);
+
+                    // Highlight border for hovered share's miner
+                    if (isThisMiner) {
+                        ctx.strokeStyle = '#fff';
+                        ctx.lineWidth = 2.5;
+                        ctx.strokeRect(r.x + 1, r.y + 1, r.w - 2, r.h - 2);
+                    }
+
+                    // Labels — percentage + address
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    var cx = r.x + r.w / 2;
+                    var cy = r.y + r.h / 2;
+
+                    if (r.w > 30 && r.h > 16) {
+                        // Percentage
+                        ctx.fillStyle = '#fff';
+                        ctx.font = (isThisMiner ? 'bold 12px' : 'bold 10px') + ' -apple-system, sans-serif';
+                        var pctLabel = (r.pct * 100).toFixed(1) + '%';
+                        ctx.fillText(pctLabel, cx, cy - (r.h > 28 ? 6 : 0));
+
+                        // Address below percentage if there's room
+                        if (r.w > 44 && r.h > 28) {
+                            ctx.fillStyle = 'rgba(255,255,255,0.75)';
+                            ctx.font = (isThisMiner ? '9px' : '8px') + ' Monaco, Consolas, monospace';
+                            var maxChars = Math.max(4, Math.floor(r.w / 6));
+                            var addrLabel = addr.substr(0, maxChars);
+                            if (addr.length > maxChars) addrLabel += '…';
+                            ctx.fillText(addrLabel, cx, cy + 7);
+                        }
+                    }
+                }
+
+                // Label below canvas
+                this.zoomLabel.textContent = 'PPLNS Distribution \u2014 ' + this.pplnsData.length + ' miners';
+
+                // Set canvas CSS size
+                zc.style.width = sz + 'px';
+                zc.style.height = sz + 'px';
+
+                // Position: treemap above-right, tooltip below-left
+                zp.style.display = 'block';
+                var totalH = sz + 20;
+                var tx = e.clientX + 12;
+                var ty = e.clientY - totalH - 12;
+                if (tx + sz > window.innerWidth - 8) tx = e.clientX - sz - 12;
+                if (ty < 8) ty = 8;
+                zp.style.left = tx + 'px';
+                zp.style.top = ty + 'px';
+            },
+
+            // Simple hash to hue (0-360) for consistent miner colors
+            addrHue: function(addr) {
+                var hash = 0;
+                for (var i = 0; i < addr.length; i++) {
+                    hash = ((hash << 5) - hash + addr.charCodeAt(i)) | 0;
+                }
+                return ((hash % 360) + 360) % 360;
+            },
+
+            // Squarified treemap: place items into rows trying to keep aspect ratio ~1
+            treemap: function(data, x, y, w, h) {
+                var rects = [];
+                var items = data.map(function(d) { return { addr: d.addr, pct: d.pct, area: d.pct }; });
+                this._layoutRow(items, x, y, w, h, rects);
+                return rects;
+            },
+
+            _layoutRow: function(items, x, y, w, h, rects) {
+                if (items.length === 0) return;
+                var totalArea = 0;
+                items.forEach(function(it) { totalArea += it.area; });
+                if (totalArea <= 0) return;
+
+                // Lay out along the shorter axis
+                var vertical = w >= h;
+                var mainSize = vertical ? h : w;
+                var crossSize = vertical ? w : h;
+
+                var row = [];
+                var rowArea = 0;
+                var remaining = items.slice();
+
+                while (remaining.length > 0) {
+                    row.push(remaining[0]);
+                    rowArea += remaining[0].area;
+                    remaining.shift();
+
+                    if (remaining.length === 0) break;
+
+                    // Check if adding next item worsens aspect ratio
+                    var nextArea = rowArea + remaining[0].area;
+                    var rowFraction = rowArea / totalArea;
+                    var nextFraction = nextArea / totalArea;
+                    var stripSize = rowFraction * crossSize;
+                    var nextStripSize = nextFraction * crossSize;
+
+                    var worstCurrent = this._worstAspect(row, rowArea, stripSize, mainSize, totalArea);
+                    var testRow = row.concat([remaining[0]]);
+                    var worstNext = this._worstAspect(testRow, nextArea, nextStripSize, mainSize, totalArea);
+
+                    if (worstNext > worstCurrent && row.length >= 1) {
+                        // Current row is better, lay it out
+                        break;
+                    }
+                }
+
+                // Lay out the row
+                var rowFraction = rowArea / totalArea;
+                var stripSize = Math.max(1, rowFraction * crossSize);
+                var offset = 0;
+                for (var i = 0; i < row.length; i++) {
+                    var itemFraction = row[i].area / rowArea;
+                    var itemSize = itemFraction * mainSize;
+                    if (vertical) {
+                        rects.push({ x: x, y: y + offset, w: stripSize, h: itemSize, addr: row[i].addr, pct: row[i].pct });
+                    } else {
+                        rects.push({ x: x + offset, y: y, w: itemSize, h: stripSize, addr: row[i].addr, pct: row[i].pct });
+                    }
+                    offset += itemSize;
+                }
+
+                // Recurse on remaining
+                if (remaining.length > 0) {
+                    if (vertical) {
+                        this._layoutRow(remaining, x + stripSize, y, w - stripSize, h, rects);
+                    } else {
+                        this._layoutRow(remaining, x, y + stripSize, w, h - stripSize, rects);
+                    }
+                }
+            },
+
+            _worstAspect: function(row, rowArea, stripSize, mainSize, totalArea) {
+                var worst = 0;
+                for (var i = 0; i < row.length; i++) {
+                    var itemSize = (row[i].area / rowArea) * mainSize;
+                    var aspect = Math.max(itemSize / stripSize, stripSize / itemSize);
+                    if (aspect > worst) worst = aspect;
+                }
+                return worst;
+            },
+
+            bitsToDifficulty: function(bits) {
+                if (!bits) return 0;
+                var exp = (bits >> 24) & 0xff;
+                var mant = bits & 0x7fffff;
+                if (bits & 0x800000) mant = 0;
+                if (mant === 0) return 0;
+                var target_top = mant * Math.pow(256, exp - 3);
+                if (target_top <= 0) return 0;
+                return (0xffff * Math.pow(256, 26)) / target_top;
+            },
+
+            updateStats: function(data) {
+                var shares = data.shares || [];
+                var mine = 0, stale = 0, dead = 0, verified = 0, fee = 0, v36sig = 0;
+                var ltcBlocks = 0, dogeBlocks = 0;
+                var self = this;
+                shares.forEach(function(s) {
+                    if (self.myAddress && s.m === self.myAddress) mine++;
+                    if (s.s === 1) stale++;
+                    if (s.s === 2) dead++;
+                    if (s.v) verified++;
+                    if (s.fee) fee++;
+                    if (s.dv && s.dv >= 36 && s.V < 36) v36sig++;
+                    // Count blocks from both blk flag and blockSet/dogeSet
+                    if (s.blk || self.blockSet[s.h]) ltcBlocks++;
+                    if (self.dogeSet[s.h]) dogeBlocks++;
+                });
+
+                document.getElementById('defrag-total').textContent = shares.length + ' / ' + (data.window_size || '-');
+                document.getElementById('defrag-mine').textContent = mine;
+                document.getElementById('defrag-stale').textContent = stale;
+                document.getElementById('defrag-dead').textContent = dead;
+                document.getElementById('defrag-verified').textContent = verified;
+                document.getElementById('defrag-chain-len').textContent = data.chain_length || '-';
+                document.getElementById('defrag-blocks').textContent = ltcBlocks + ' LTC / ' + dogeBlocks + ' DOGE';
+                document.getElementById('defrag-fee').textContent = fee;
+                document.getElementById('defrag-v36sig').textContent = v36sig;
+            }
+        };
+
+        // Initialize defrag viewer on page load
+        defrag.init();
+
+        // Share link helpers — sourced from defrag data, not legacy endpoints
+        function loadShareLinks() {
+            // Best share: render as colored square cell
+            var bestContainer = document.getElementById('best_share');
+            if (bestContainer) {
+                bestContainer.innerHTML = '';
+                var bestHash = defrag.shares.length > 0 ? defrag.shares[0].H : null;
+                if (bestHash) {
+                    var share = defrag.shares[0];
+                    var cell = makeShareCell(bestHash, share);
+                    cell.classList.add('cell-epic');
+                    bestContainer.appendChild(cell);
+                }
+            }
+
+            // This Node: find shares matching my address (as cells)
+            var myContainer = document.getElementById('my_share_hashes');
+            if (myContainer) {
+                myContainer.innerHTML = '';
+                if (defrag.myAddress) {
+                    var myShares = defrag.shares.filter(function(s) {
+                        return s.m === defrag.myAddress;
+                    }).slice(0, 50);
+                    if (myShares.length > 0) {
+                        myShares.forEach(function(s) {
+                            myContainer.appendChild(makeShareCell(s.H, s));
+                        });
+                    } else {
+                        myContainer.innerHTML = '<span style="color:var(--text-muted);font-size:0.82rem">None (node not mining)</span>';
+                    }
+                } else {
+                    myContainer.innerHTML = '<span style="color:var(--text-muted);font-size:0.82rem">None (node not mining)</span>';
+                }
+            }
+
+            // Verified heads: from defrag heads (full hashes via best_hash prefix match)
+            renderChainCells('verified_heads_cells', defrag.headSet);
+
+            // Tails: find the last share in the chain (oldest)
+            var tailsContainer = document.getElementById('tails_cells');
+            if (tailsContainer) {
+                tailsContainer.innerHTML = '';
+                if (defrag.shares.length > 0) {
+                    var tail = defrag.shares[defrag.shares.length - 1];
+                    tailsContainer.appendChild(makeShareCell(tail.H, tail));
+                } else {
+                    tailsContainer.innerHTML = '<span style="color:var(--text-muted);font-size:0.82rem">None</span>';
+                }
+            }
+        }
+
+        // Render chain cells from a set of short hashes
+        function renderChainCells(containerId, shortHashSet) {
+            var container = document.getElementById(containerId);
+            if (!container) return;
+            container.innerHTML = '';
+            var keys = Object.keys(shortHashSet);
+            if (keys.length === 0) {
+                container.innerHTML = '<span style="color:var(--text-muted);font-size:0.82rem">None</span>';
+                return;
+            }
+            keys.forEach(function(shortHash) {
+                // Find full share data from defrag
+                var share = null;
+                for (var i = 0; i < defrag.shares.length; i++) {
+                    if (defrag.shares[i].h === shortHash) {
+                        share = defrag.shares[i];
+                        break;
+                    }
+                }
+                var fullHash = share ? share.H : shortHash;
+                container.appendChild(makeShareCell(fullHash, share));
+            });
+        }
+
+        function loadShares() {
+            defrag.load();
+        }
+
+        // Main PPLNS Distribution Treemap (dashboard-level)
+        function loadMainPPLNS() {
+            d3.json('../current_merged_payouts', function(payouts) {
+                if (!payouts || typeof payouts !== 'object') return;
+                var grid = document.getElementById('pplns-main-grid');
+                var tooltip = document.getElementById('pplns-main-tooltip');
+                if (!grid) return;
+                grid.innerHTML = '';
+
+                var total = 0, dogeTotal = 0;
+                var entries = [];
+                for (var addr in payouts) {
+                    var p = payouts[addr];
+                    var ltcAmt = typeof p === 'number' ? p : (p.amount || 0);
+                    total += ltcAmt;
+                    var dogeAmt = 0, dogeAddr = '';
+                    if (p.merged) {
+                        p.merged.forEach(function(m) {
+                            if (m.symbol === 'DOGE') { dogeAmt += m.amount || 0; dogeAddr = m.address || ''; }
+                        });
+                    }
+                    dogeTotal += dogeAmt;
+                    entries.push({ addr: addr, amt: ltcAmt, doge: dogeAmt, dogeAddr: dogeAddr });
+                }
+                entries.sort(function(a, b) { return b.amt - a.amt; });
+                entries.forEach(function(e) { e.pct = total > 0 ? e.amt / total : 0; });
+
+                var w = grid.clientWidth;
+                var h = Math.max(200, Math.min(w * 0.35, 400));
+                grid.style.height = h + 'px';
+
+                // Squarified treemap layout (standalone — carries all fields)
+                var rects = [];
+                var items = entries.map(function(d) { return { addr:d.addr, pct:d.pct, amt:d.amt, doge:d.doge, dogeAddr:d.dogeAddr, area:d.pct }; });
+                function tmLayout(items, x, y, w, h) {
+                    if (!items.length || w <= 0 || h <= 0) return;
+                    var tot = 0; items.forEach(function(it) { tot += it.area; });
+                    if (tot <= 0) return;
+                    var vert = w >= h, main = vert ? h : w, cross = vert ? w : h;
+                    var row = [], rowA = 0, rem = items.slice();
+                    while (rem.length) {
+                        row.push(rem[0]); rowA += rem[0].area; rem.shift();
+                        if (!rem.length) break;
+                        var sNow = (rowA/tot)*cross, sNext = ((rowA+rem[0].area)/tot)*cross;
+                        var wNow = 0, wNext = 0;
+                        row.forEach(function(r) { var s=(r.area/rowA)*main; var a=Math.max(s/sNow,sNow/s); if(a>wNow)wNow=a; });
+                        var testRow = row.concat([rem[0]]), testA = rowA+rem[0].area;
+                        testRow.forEach(function(r) { var s=(r.area/testA)*main; var a=Math.max(s/sNext,sNext/s); if(a>wNext)wNext=a; });
+                        if (wNext > wNow && row.length >= 1) break;
+                    }
+                    var strip = Math.max(1, (rowA/tot)*cross), off = 0;
+                    for (var i = 0; i < row.length; i++) {
+                        var sz = (row[i].area/rowA)*main;
+                        var r = vert
+                            ? { x:x, y:y+off, w:strip, h:sz }
+                            : { x:x+off, y:y, w:sz, h:strip };
+                        r.addr=row[i].addr; r.pct=row[i].pct; r.amt=row[i].amt; r.doge=row[i].doge; r.dogeAddr=row[i].dogeAddr;
+                        rects.push(r);
+                        off += sz;
+                    }
+                    if (rem.length) {
+                        if (vert) tmLayout(rem, x+strip, y, w-strip, h);
+                        else tmLayout(rem, x, y+strip, w, h-strip);
+                    }
+                }
+                tmLayout(items, 0, 0, w, h);
+
+                var addrPrefix = (typeof currency_info !== 'undefined' && currency_info.address_explorer_url_prefix)
+                    ? currency_info.address_explorer_url_prefix : 'https://blockchair.com/litecoin/address/';
+
+                rects.forEach(function(r) {
+                    var mv = getMinerVersion(r.addr);
+                    var isV35Only = mv.ver && mv.ver < 36 && (!mv.dv || mv.dv < 36);
+                    var hasDoge = r.doge > 0;
+                    var hue = defrag.addrHue(r.addr);
+
+                    var cell = document.createElement('div');
+                    cell.className = 'pplns-main-cell' + (isV35Only ? ' v35-only' : '');
+                    cell.style.left = r.x + 'px';
+                    cell.style.top = r.y + 'px';
+                    cell.style.width = r.w + 'px';
+                    cell.style.height = r.h + 'px';
+                    cell.style.background = 'hsl(' + hue + ',' + (isV35Only ? 30 : 45) + '%,' + (isV35Only ? 25 : 32) + '%)';
+
+                    var fitPct = Math.max(8, Math.min(r.w / 6, r.h / 5, 26));
+                    var fitAddr = Math.max(6, Math.min(fitPct * 0.5, r.w / 14, 11));
+                    var fitVer = Math.max(6, Math.min(fitPct * 0.4, 9));
+
+                    // LTC %
+                    if (r.w > 28 && r.h > 14) {
+                        var el = document.createElement('div');
+                        el.className = 'pm-pct';
+                        el.style.fontSize = fitPct + 'px';
+                        el.textContent = (r.pct * 100).toFixed(1) + '%';
+                        cell.appendChild(el);
+                    }
+                    // DOGE %
+                    if (r.w > 35 && r.h > 28) {
+                        var el = document.createElement('div');
+                        el.className = 'pm-doge';
+                        el.style.fontSize = Math.max(8, fitPct * 0.8) + 'px';
+                        if (hasDoge) {
+                            var dp = dogeTotal > 0 ? (r.doge / dogeTotal * 100).toFixed(1) : '0';
+                            el.style.color = '#ffd700';
+                            el.textContent = dp + '% D';
+                        } else if (isV35Only) {
+                            el.style.color = '#ff6b6b';
+                            el.textContent = r.w > 50 ? 'NO DOGE' : '0% D';
+                        } else {
+                            el.style.color = 'rgba(255,255,255,0.3)';
+                            el.textContent = '\u2014';
+                        }
+                        cell.appendChild(el);
+                    }
+                    // Address
+                    if (r.w > 45 && r.h > 42) {
+                        var el = document.createElement('div');
+                        el.className = 'pm-addr';
+                        el.style.fontSize = fitAddr + 'px';
+                        var mc = Math.max(4, Math.floor(r.w / (fitAddr * 0.65)));
+                        el.textContent = r.addr.length > mc ? r.addr.substr(0, mc) + '…' : r.addr;
+                        cell.appendChild(el);
+                    }
+                    // Version
+                    if (r.w > 30 && r.h > 52 && mv.ver) {
+                        var el = document.createElement('div');
+                        el.className = 'pm-ver';
+                        el.style.fontSize = fitVer + 'px';
+                        if (mv.dv && mv.dv !== mv.ver) {
+                            el.style.color = '#4dd0e1'; el.style.fontWeight = '700';
+                            el.textContent = 'V' + mv.ver + '\u2192V' + mv.dv;
+                        } else if (isV35Only) {
+                            el.style.color = '#ff6b6b'; el.style.fontWeight = '700';
+                            el.textContent = 'V' + mv.ver;
+                        } else {
+                            el.style.color = 'rgba(255,255,255,0.4)';
+                            el.textContent = 'V' + mv.ver;
+                        }
+                        cell.appendChild(el);
+                    }
+
+                    // Click → blockchair
+                    cell.addEventListener('click', function() {
+                        window.open(addrPrefix + r.addr, '_blank');
+                    });
+                    // Tooltip
+                    // Closure to capture hasDoge, isV35Only, mv, r for this cell
+                    (function(r, hasDoge, isV35Only, mv) {
+                        function positionTip(ev) {
+                            var tw = tooltip.offsetWidth || 320;
+                            var th = tooltip.offsetHeight || 120;
+                            var tx = ev.clientX + 14;
+                            var ty = ev.clientY + 14;
+                            if (tx + tw > window.innerWidth - 8) tx = ev.clientX - tw - 14;
+                            if (ty + th > window.innerHeight - 8) ty = ev.clientY - th - 14;
+                            if (tx < 8) tx = 8;
+                            if (ty < 8) ty = 8;
+                            tooltip.style.left = tx + 'px';
+                            tooltip.style.top = ty + 'px';
+                        }
+                        cell.addEventListener('mouseenter', function(ev) {
+                            var verLine = '';
+                            if (mv.ver) {
+                                if (mv.dv && mv.dv !== mv.ver) verLine = '<div style="color:#4dd0e1;font-weight:600">V'+mv.ver+' \u2192 V'+mv.dv+'</div>';
+                                else if (isV35Only) verLine = '<div style="color:#ff6b6b;font-weight:700">V'+mv.ver+' ONLY \u2014 missing DOGE!</div>';
+                                else verLine = '<div style="color:var(--success)">V'+mv.ver+'</div>';
+                            }
+                            var dogeLine = '';
+                            if (hasDoge) {
+                                var dp2 = dogeTotal > 0 ? (r.doge / dogeTotal * 100).toFixed(2) : '0';
+                                dogeLine = '<div style="color:#ffd700;font-weight:700">' + dp2 + '% \u2014 ' + r.doge.toFixed(2) + ' DOGE</div>';
+                                if (r.dogeAddr) {
+                                    dogeLine += '<div style="color:var(--text-muted);font-size:0.78em;font-family:Monaco,Consolas,monospace">\u2192 ' + r.dogeAddr + '</div>';
+                                }
+                            } else if (isV35Only) {
+                                dogeLine = '<div style="color:#ff6b6b;font-weight:600">0 DOGE \u2014 upgrade to V36!</div>';
+                            }
+                            tooltip.innerHTML =
+                                '<div style="color:var(--primary);font-weight:700;margin-bottom:4px">' + r.addr + '</div>' +
+                                '<div style="font-weight:600">' + (r.pct*100).toFixed(2) + '% \u2014 ' + r.amt.toFixed(8) + ' LTC</div>' +
+                                dogeLine + verLine +
+                                '<div style="color:var(--text-muted);font-size:0.75em;margin-top:4px">Click to view on Blockchair</div>';
+                            tooltip.style.display = 'block';
+                            positionTip(ev);
+                        });
+                        cell.addEventListener('mousemove', function(ev) { positionTip(ev); });
+                    })(r, hasDoge, isV35Only, mv);
+                    cell.addEventListener('mouseleave', function() { tooltip.style.display = 'none'; });
+
+                    grid.appendChild(cell);
                 });
             });
+        }
+
+        // Create a single colored share cell (22x22 square) with tooltip + click
+        function makeShareCell(fullHash, share) {
+            var cell = document.createElement('div');
+            cell.className = 'defrag-chain-cell';
+            cell.style.background = share ? defrag.getColor(share) : '#555577';
+
+            // Block borders / legendary treatment
+            if (share) {
+                var isLtc = defrag.blockSet[share.h];
+                var isDoge = defrag.dogeSet[share.h];
+                if (isLtc && isDoge) {
+                    cell.classList.add('cell-legendary');
+                } else if (isLtc) {
+                    cell.style.border = '2px solid #ffd700';
+                    cell.style.boxShadow = '0 0 4px rgba(255,215,0,0.4)';
+                } else if (isDoge) {
+                    cell.style.border = '2px solid #00e5ff';
+                }
+            }
+
+            // Short hash label inside the cell
+            var label = document.createElement('div');
+            label.className = 'cell-hash';
+            label.textContent = fullHash.substr(-8);
+            cell.appendChild(label);
+
+            // Click → share detail page
+            cell.addEventListener('click', function() {
+                window.open('share.html#' + fullHash, '_blank');
+            });
+
+            // Tooltip + PPLNS treemap — reuse defrag tooltip and zoom
+            cell.addEventListener('mouseenter', function(e) {
+                if (share) {
+                    defrag.showTooltip(share, e);
+                    defrag.showZoom(share, e);
+                } else {
+                    var tip = defrag.tooltip;
+                    tip.innerHTML = '<div class="tt-hash">' + fullHash.substr(0, 16) + '</div>' +
+                        '<div class="tt-click">Click to view share details</div>';
+                    tip.style.display = 'block';
+                    tip.style.left = (e.clientX + 14) + 'px';
+                    tip.style.top = (e.clientY + 14) + 'px';
+                }
+            });
+            cell.addEventListener('mousemove', function(e) {
+                if (share) {
+                    defrag.showTooltip(share, e);
+                    defrag.showZoom(share, e);
+                } else {
+                    defrag.tooltip.style.left = (e.clientX + 14) + 'px';
+                    defrag.tooltip.style.top = (e.clientY + 14) + 'px';
+                }
+            });
+            cell.addEventListener('mouseleave', function() {
+                defrag.hideTooltip();
+            });
+
+            return cell;
         }
         
         // =============================================
