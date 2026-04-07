@@ -2940,19 +2940,26 @@ int main(int argc, char* argv[]) {
                                         script, true /*litecoin*/, testnet);
                                     s["m"] = addr.empty() ? HexStr(script) : addr;
 
-                                    // Short coinbase ASCII tag (printable chars only)
+                                    // Extract longest printable ASCII run from coinbase
                                     if (!obj->m_coinbase.m_data.empty()) {
-                                        std::string cb;
-                                        cb.reserve(32);
+                                        std::string best_run;
+                                        std::string cur_run;
                                         for (auto c : obj->m_coinbase.m_data) {
-                                            if (c >= 32 && c <= 126) cb += static_cast<char>(c);
-                                            else if (!cb.empty()) cb += '.';
+                                            if (c >= 32 && c <= 126) {
+                                                cur_run += static_cast<char>(c);
+                                            } else {
+                                                if (cur_run.size() > best_run.size())
+                                                    best_run = cur_run;
+                                                cur_run.clear();
+                                            }
                                         }
-                                        // Trim dots from edges, cap at 48 chars
-                                        while (!cb.empty() && cb.front() == '.') cb.erase(cb.begin());
-                                        while (!cb.empty() && cb.back() == '.') cb.pop_back();
-                                        if (cb.size() > 48) cb.resize(48);
-                                        if (!cb.empty()) s["cb"] = cb;
+                                        if (cur_run.size() > best_run.size())
+                                            best_run = cur_run;
+                                        // Only show if meaningful (4+ chars)
+                                        if (best_run.size() >= 4) {
+                                            if (best_run.size() > 48) best_run.resize(48);
+                                            s["cb"] = best_run;
+                                        }
                                     }
 
                                     // Detect pool fee share: compare hash160 with fee address

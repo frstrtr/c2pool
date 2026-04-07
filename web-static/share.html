@@ -387,14 +387,14 @@
             // Share Data section
             var sd = share.share_data || {};
             html += '<div class="detail-section"><h2>Share Data</h2><div class="kv-grid">';
-            html += kv('Timestamp', format_time(sd.timestamp) + ' <span style="color:var(--text-muted);font-size:0.78rem">(' + format_age(sd.timestamp) + ')</span>');
-            html += kv('Difficulty', format_difficulty(target_to_difficulty(sd.target)));
-            html += kv('Min Difficulty', format_difficulty(target_to_difficulty(sd.max_target)));
+            html += kv('Timestamp', format_time(sd.timestamp) + ' <span style="color:var(--text-muted);font-size:0.78rem">(' + sd.timestamp + ' — ' + format_age(sd.timestamp) + ')</span>');
+            html += kv('Difficulty', sd.difficulty != null ? format_difficulty(sd.difficulty) : format_difficulty(target_to_difficulty(sd.target)));
+            html += kv('Min Difficulty', sd.min_difficulty != null ? format_difficulty(sd.min_difficulty) : format_difficulty(target_to_difficulty(sd.max_target)));
 
             var payoutAddr = sd.payout_address || '';
             var payoutLink = addr_prefix ? '<a href="' + addr_prefix + payoutAddr + '" target="_blank">' + esc(payoutAddr) + '</a>' : esc(payoutAddr);
             html += kv('Payout Address', payoutLink);
-            // Donation field omitted — always 0 in V36+
+            html += kv('Donation', sd.donation != null ? (sd.donation * 100).toFixed(2) + '%' : '0.00%');
 
             var staleHtml = '-';
             if (sd.stale_info === 'orphan' || sd.stale_info === 1) {
@@ -404,7 +404,7 @@
             } else {
                 staleHtml = '<span style="color:var(--success)">None</span>';
             }
-            html += kv('Stale Info', staleHtml);
+            html += kv('Last Stale', staleHtml);
             html += kv('Nonce', sd.nonce != null ? sd.nonce : '-');
             html += kv('Desired Version', sd.desired_version != null ? 'V' + sd.desired_version : '-');
             html += kv('Absolute Height', sd.absheight != null ? sd.absheight : '-');
@@ -453,8 +453,10 @@
                 ? '<a href="' + tx_prefix + (gentx.hash || '') + '" target="_blank">' + esc(gentx.hash || '') + '</a>'
                 : esc(gentx.hash || '');
             html += kv('TX Hash', txLink);
-            html += kv('Value', (gentx.value != null ? gentx.value : '-') + ' ' + symbol);
-            html += kv('Txout Nonce', gentx.last_txout_nonce || '-');
+            html += kv('Value', (gentx.value != null ? gentx.value.toFixed(8) : '-') + ' ' + symbol);
+            var txNonce = gentx.last_txout_nonce;
+            var txNonceHex = txNonce ? '0x' + ('0000000000000000' + txNonce.toString(16)).slice(-16) : '-';
+            html += kv('Last Txout Nonce', txNonceHex);
             html += '</div>';
 
             if (gentx.coinbase) {
