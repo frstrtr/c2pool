@@ -3762,6 +3762,13 @@
                 
                 var chainsArray = Object.entries(data.chains);
                 
+                // Update top-level badge
+                var topPeers = data.peers || [];
+                var topConn = topPeers.filter(function(p) { return p.connected; });
+                d3.select('#merged_broadcaster_status_badge')
+                    .style('background', topConn.length > 0 ? 'var(--success)' : '#6366f1')
+                    .text(topConn.length > 0 ? '✓ ' + topConn.length + ' peers' : '⏳ Starting');
+
                 chainsArray.forEach(function(entry) {
                     var chainId = entry[0];
                     var chainData = entry[1];
@@ -3790,13 +3797,16 @@
                         .style('color', 'var(--text-primary)')
                         .text('🐕 ' + displayName);
                     
+                    var mergedPeers = data.peers || [];
+                    var mergedConnected = mergedPeers.filter(function(p) { return p.connected; });
+                    var chainActive = mergedConnected.length > 0 && chainData.current_height > 0;
                     var statusBadge = headerDiv.append('span')
                         .attr('class', 'badge')
-                        .style('background', chainData.health && chainData.health.healthy ? 'var(--success)' : '#6366f1')
+                        .style('background', chainActive ? 'var(--success)' : '#6366f1')
                         .style('color', '#fff')
                         .style('border-radius', '20px')
                         .style('padding', '4px 10px')
-                        .text(chainData.health && chainData.health.healthy ? '✓ Active' : '⏳ Starting');
+                        .text(chainActive ? '✓ Active' : '⏳ Starting');
                     
                     // Stats grid - updated to show P2P connections
                     var statsGrid = chainDiv.append('div')
@@ -3859,8 +3869,8 @@
                         .text(bcastSuccess + ' / ' + bcastFail);
                     statCard.append('div').attr('class', 'stat-sublabel').text('Success / Failed');
                     
-                    // Peers table
-                    var peers = chainData.peers || [];
+                    // Peers table — use top-level data.peers (connected coin P2P nodes)
+                    var peers = mergedConnected;
                     if (peers.length > 0) {
                         var tableDiv = chainDiv.append('div')
                             .style('overflow-x', 'auto');
