@@ -4986,13 +4986,13 @@ nlohmann::json MiningInterface::rest_discovered_merged_blocks()
     for (const auto& blk : m_mm_manager->get_discovered_blocks()) {
         nlohmann::json j;
         j["ts"]               = blk.timestamp;
-        j["number"]           = 0;  // parent height not tracked
+        j["number"]           = blk.parent_height > 0 ? nlohmann::json(blk.parent_height) : nlohmann::json(nullptr);
         j["hash"]             = blk.parent_hash;
         j["aux_block_height"] = blk.height;
         j["aux_hash"]         = blk.block_hash;
         j["aux_symbol"]       = blk.symbol;
-        j["aux_reward"]       = blk.coinbase_value / 1e8;
-        j["miner"]            = nullptr;
+        j["aux_reward"]       = blk.coinbase_value > 0 ? nlohmann::json(blk.coinbase_value / 1e8) : nlohmann::json(nullptr);
+        j["miner"]            = blk.miner.empty() ? nlohmann::json(nullptr) : nlohmann::json(blk.miner);
         j["peer_addr"]        = blk.is_local ? "local" : "peer";
         j["status"]           = blk.accepted ? "confirmed" : "orphaned";
         arr.push_back(std::move(j));

@@ -154,6 +154,8 @@ struct DiscoveredMergedBlock
     bool        accepted{true};   // RPC returned success
     uint64_t    coinbase_value{0}; // aux block reward in satoshis
     bool        is_local{false};  // true = our own submission, false = detected from peer share
+    uint32_t    parent_height{0}; // parent (LTC) block height (absheight)
+    std::string miner;            // miner address who found the block
 };
 
 // ─── Integrated Merged Mining Manager ────────────────────────────────────────

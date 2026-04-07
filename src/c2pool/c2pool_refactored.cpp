@@ -1578,20 +1578,25 @@ int main(int argc, char* argv[]) {
             // extracts fabe6d6d MM commitment from coinbase, looks up DOGE
             // block hash in embedded HeaderChain for exact height.
             // Set later when embedded_broadcaster + doge_chain are created.
+            // V35 pending resolution context — carries share metadata for async lookup
+            struct MergedResolveCtx {
+                uint256 pow_hash;
+                std::string miner;  // human-readable address
+            };
             using MergedResolverFn = std::function<void(const uint256& ltc_block_hash,
-                                                        const uint256& pow_hash)>;
+                                                        const MergedResolveCtx& ctx)>;
             auto merged_block_resolver = std::make_shared<MergedResolverFn>();
 
-            // Pending V35 merged block resolutions: LTC block hash → pow_hash.
+            // Pending V35 merged block resolutions: LTC block hash → context.
             // When a full LTC block arrives via P2P, check if it's in this set
             // and resolve the DOGE block from its coinbase MM commitment.
             auto pending_merged_resolve = std::make_shared<
-                std::map<uint256, uint256>>();  // ltc_block_hash → pow_hash
+                std::map<uint256, MergedResolveCtx>>();
 
             // Callback fired when a full LTC block arrives that matches a pending
             // merged resolution. Set later when doge_chain is available.
             using OnFullBlockMergedFn = std::function<void(const uint256& block_hash,
-                const uint256& pow_hash, const ltc::coin::BlockType& block)>;
+                const MergedResolveCtx& ctx, const ltc::coin::BlockType& block)>;
             auto on_full_block_merged = std::make_shared<OnFullBlockMergedFn>();
 
             // Apply stratum tuning from CLI/YAML to the MiningInterface
@@ -1968,9 +1973,9 @@ int main(int argc, char* argv[]) {
                             // Check if this block was requested for merged block detection.
                             auto pit = pending_merged_resolve->find(block_hash);
                             if (pit != pending_merged_resolve->end() && *on_full_block_merged) {
-                                auto pow = pit->second;
+                                auto ctx = pit->second;
                                 pending_merged_resolve->erase(pit);
-                                (*on_full_block_merged)(block_hash, pow, block);
+                                (*on_full_block_merged)(block_hash, ctx, block);
                             }
                         });
                 }
@@ -2966,8 +2971,9 @@ int main(int argc, char* argv[]) {
             // V35: no merged data in share — if the share is an LTC block solution,
             //      request the full LTC block from P2P peers, parse coinbase for fabe6d6d
             //      MM commitment, extract DOGE block hash, look up in embedded HeaderChain.
+            auto* ltc_header_chain = embedded_chain.get();
             p2p_node->tracker().m_on_merged_block_check =
-                [&web_server, &p2p_node, merged_block_resolver](const uint256& share_hash, const uint256& pow_hash) {
+                [&web_server, &p2p_node, merged_block_resolver, ltc_header_chain](const uint256& share_hash, const uint256& pow_hash) {
                 auto mi = web_server.get_mining_interface();
                 auto* mm = mi->get_mm_manager();
                 if (!mm || !mm->has_chains()) return;
@@ -2977,6 +2983,14 @@ int main(int argc, char* argv[]) {
 
                 bool had_v36_data = false;
                 tracker_chain.get(share_hash).share.invoke([&](auto* s) {
+                    // Extract miner address as human-readable string
+                    std::string miner_addr;
+                    {
+                        auto script = get_share_script(s);
+                        miner_addr = core::script_to_address(
+                            script, true /*is_litecoin*/, ltc::PoolConfig::is_testnet);
+                    }
+
                     if constexpr (requires { s->m_merged_coinbase_info; }) {
                         if (!s->m_merged_coinbase_info.empty())
                             had_v36_data = true;
@@ -3018,6 +3032,13 @@ int main(int argc, char* argv[]) {
                             blk.timestamp = static_cast<int64_t>(std::time(nullptr));
                             blk.accepted = true;
                             blk.coinbase_value = entry.m_coinbase_value;
+                            blk.miner = miner_addr;
+                            // Get real LTC block height from header chain
+                            if (ltc_header_chain) {
+                                auto ltc_entry = ltc_header_chain->get_header(share_hash);
+                                if (ltc_entry)
+                                    blk.parent_height = ltc_entry->height;
+                            }
                             mm->add_discovered_block(blk);
                         }
                     }
@@ -3031,7 +3052,14 @@ int main(int argc, char* argv[]) {
                 if (!had_v36_data && *merged_block_resolver) {
                     auto* idx = tracker_chain.get_index(share_hash);
                     if (idx && idx->is_block_solution) {
-                        (*merged_block_resolver)(share_hash, pow_hash);
+                        MergedResolveCtx ctx;
+                        ctx.pow_hash = pow_hash;
+                        tracker_chain.get(share_hash).share.invoke([&](auto* s) {
+                            auto script = get_share_script(s);
+                            ctx.miner = core::script_to_address(
+                                script, true, ltc::PoolConfig::is_testnet);
+                        });
+                        (*merged_block_resolver)(share_hash, ctx);
                     }
                 }
             };
@@ -5026,7 +5054,6 @@ int main(int argc, char* argv[]) {
             // in the embedded HeaderChain.
             // Retry structure: {hash → {pow_hash, attempts, timer}}.
             struct PendingResolve {
-                uint256 pow_hash;
                 int attempts{0};
                 std::shared_ptr<boost::asio::steady_timer> timer;
             };
@@ -5040,15 +5067,14 @@ int main(int argc, char* argv[]) {
 
                 *merged_block_resolver = [bcaster, pending_merged_resolve,
                                           pending_resolve_state, &ioc](
-                    const uint256& ltc_block_hash, const uint256& pow_hash) {
+                    const uint256& ltc_block_hash, const MergedResolveCtx& ctx) {
 
                     // Already pending? skip
                     if (pending_resolve_state->count(ltc_block_hash)) return;
 
-                    (*pending_merged_resolve)[ltc_block_hash] = pow_hash;
+                    (*pending_merged_resolve)[ltc_block_hash] = ctx;
 
                     auto& state = (*pending_resolve_state)[ltc_block_hash];
-                    state.pow_hash = pow_hash;
                     state.attempts = 0;
                     state.timer = std::make_shared<boost::asio::steady_timer>(ioc);
 
@@ -5097,12 +5123,14 @@ int main(int argc, char* argv[]) {
                 // Wire the actual resolution: parse coinbase for fabe6d6d,
                 // extract MM root = DOGE block hash, look up in HeaderChain.
                 auto* dc = doge_chain.get();
+                auto* ltc_hc = embedded_chain.get();
                 auto* mm = web_server.get_mining_interface()->get_mm_manager();
                 bool testnet = settings->m_testnet;
-                *on_full_block_merged = [dc, mm, testnet](
-                    const uint256& ltc_block_hash, const uint256& pow_hash,
+                *on_full_block_merged = [dc, ltc_hc, mm, testnet](
+                    const uint256& ltc_block_hash, const MergedResolveCtx& ctx,
                     const ltc::coin::BlockType& block) {
                     if (!mm || !dc || block.m_txs.empty()) return;
+                    const auto& pow_hash = ctx.pow_hash;
 
                     // Extract coinbase scriptSig
                     const auto& coinbase_tx = block.m_txs[0];
@@ -5175,6 +5203,13 @@ int main(int argc, char* argv[]) {
                     blk.parent_hash = ltc_block_hash.GetHex();
                     blk.timestamp = static_cast<int64_t>(std::time(nullptr));
                     blk.accepted = true;
+                    blk.miner = ctx.miner;
+                    // Get real LTC block height from header chain (not sharechain absheight)
+                    if (ltc_hc) {
+                        auto ltc_entry = ltc_hc->get_header(ltc_block_hash);
+                        if (ltc_entry)
+                            blk.parent_height = ltc_entry->height;
+                    }
                     mm->add_discovered_block(blk);
                 };
 
