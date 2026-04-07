@@ -929,6 +929,8 @@ public:
     // Port configuration for /node_info
     void set_p2p_port(uint16_t port) { m_p2p_port = port; }
     void set_worker_port(uint16_t port) { m_worker_port = port; }
+    void set_external_ip(const std::string& ip) { m_external_ip = ip; }
+    void set_pool_version(const std::string& ver) { m_pool_version = ver; }
 
     // Best share difficulty tracking (for /best_share, /miner_stats)
     void record_share_difficulty(double difficulty, const std::string& miner);
@@ -974,6 +976,8 @@ private:
     // Port configuration
     uint16_t m_p2p_port{9338};
     uint16_t m_worker_port{9327};
+    std::string m_external_ip;
+    std::string m_pool_version{"c2pool/0.12.0"};
 
     // Best share difficulty tracking
     struct BestDifficulty {

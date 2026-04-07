@@ -259,7 +259,8 @@ void print_help() {
     std::cout << "  --p2pool-port PORT        P2P sharechain port (alias: --p2p-port; default: 9326)\n";
     std::cout << "  -w / --worker-port PORT   Stratum/worker port (alias: --stratum-port; default: 9327)\n";
     std::cout << "  --web-port PORT           Web dashboard / JSON-RPC API port (alias: --http-port; default: 8080)\n";
-    std::cout << "  --http-host HOST          HTTP server bind address (default: 0.0.0.0)\n\n";
+    std::cout << "  --http-host HOST          HTTP server bind address (default: 0.0.0.0)\n";
+    std::cout << "  --external-ip ADDR        Public IP or domain for stratum URL display (default: auto-detect)\n\n";
 
     std::cout << "PARENT COIN DAEMON:\n";
     std::cout << "  --coind-address HOST      RPC host (alias: --rpchost; default: 127.0.0.1)\n";
@@ -427,6 +428,7 @@ int main(int argc, char* argv[]) {
     int stratum_port = 9327;       // Stratum mining port (p2pool: -w / --worker-port)
     int http_port = 8080;          // Web dashboard / JSON-RPC API port
     std::string http_host = "0.0.0.0";  // HTTP server host
+    std::string external_ip;              // Public IP/domain for stratum URL (empty = auto-detect)
 
     // Coin daemon RPC connection (used by integrated/solo modes for live block templates)
     std::string rpc_host = "127.0.0.1";
@@ -648,6 +650,10 @@ int main(int argc, char* argv[]) {
         else if (arg == "--http-host" && i + 1 < argc) {
             http_host = argv[++i];
             cli_explicit.insert("http_host");
+        }
+        else if (arg == "--external-ip" && i + 1 < argc) {
+            external_ip = argv[++i];
+            cli_explicit.insert("external_ip");
         }
         else if (arg == "--integrated") {
             integrated_mode = true;
@@ -1011,6 +1017,8 @@ int main(int argc, char* argv[]) {
             }
             if (!cli_explicit.count("http_host") && cfg["http_host"])
                 http_host = cfg["http_host"].as<std::string>();
+            if (!cli_explicit.count("external_ip") && cfg["external_ip"])
+                external_ip = cfg["external_ip"].as<std::string>();
 
             // Coin daemon RPC
             if (!cli_explicit.count("rpc_host") && cfg["ltc_rpc_host"])
@@ -1591,6 +1599,8 @@ int main(int argc, char* argv[]) {
             web_server.get_mining_interface()->set_cors_origin(http_cors_origin);
             web_server.get_mining_interface()->set_worker_port(static_cast<uint16_t>(stratum_port));
             web_server.get_mining_interface()->set_p2p_port(static_cast<uint16_t>(p2p_port));
+            if (!external_ip.empty())
+                web_server.get_mining_interface()->set_external_ip(external_ip);
 
             // Dashboard serving directory and payout address for legacy API
             web_server.set_dashboard_dir(dashboard_dir);

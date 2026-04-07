@@ -3734,7 +3734,7 @@ nlohmann::json MiningInterface::rest_local_stats()
     result["miner_last_difficulties"] = miner_diffs;
 
     // p2pool-compat: version and protocol_version
-    result["version"] = "c2pool/0.8.0";
+    result["version"] = m_pool_version;
     result["protocol_version"] = 3600;  // V36 share format
 
     return result;
@@ -3758,7 +3758,7 @@ nlohmann::json MiningInterface::rest_p2pool_global_stats()
 
 nlohmann::json MiningInterface::rest_web_version()
 {
-    return "c2pool/0.8.0";
+    return m_pool_version;
 }
 
 nlohmann::json MiningInterface::rest_web_currency_info()
@@ -4033,7 +4033,7 @@ nlohmann::json MiningInterface::rest_stale_rates()
 nlohmann::json MiningInterface::rest_node_info()
 {
     nlohmann::json result = nlohmann::json::object();
-    result["external_ip"] = "0.0.0.0";
+    result["external_ip"] = m_external_ip.empty() ? "0.0.0.0" : m_external_ip;
     result["worker_port"] = m_worker_port;
     result["p2p_port"] = m_p2p_port;
 
