@@ -1885,6 +1885,7 @@
                         <thead>
                             <tr>
                                 <th>Address</th>
+                                <th style="text-align: center" title="Share version / desired version from sharechain">V36?</th>
                                 <th style="text-align: right">Amount</th>
                             </tr>
                         </thead>
@@ -3773,6 +3774,22 @@
             });
         }
 
+        // Look up miner's share version from defrag data (cached per load)
+        function getMinerVersion(addr) {
+            if (!defrag.shares || defrag.shares.length === 0) return { ver: 0, dv: 0 };
+            var verCounts = {}, dvCounts = {};
+            defrag.shares.forEach(function(s) {
+                if (s.m !== addr) return;
+                verCounts[s.V] = (verCounts[s.V] || 0) + 1;
+                if (s.dv) dvCounts[s.dv] = (dvCounts[s.dv] || 0) + 1;
+            });
+            var topVer = 0, topN = 0;
+            for (var v in verCounts) { if (verCounts[v] > topN) { topVer = parseInt(v); topN = verCounts[v]; } }
+            var topDv = 0, topDvN = 0;
+            for (var d in dvCounts) { if (dvCounts[d] > topDvN) { topDv = parseInt(d); topDvN = dvCounts[d]; } }
+            return { ver: topVer, dv: topDv || topVer };
+        }
+
         // Payouts state for show more functionality
         window.payoutsData = null;
         window.payoutsDisplayCount = 5;
@@ -3802,6 +3819,20 @@
                     .attr('target', '_blank')
                     .attr('title', addr)
                     .text(addr);
+
+                // V36 column — look up miner version from defrag share data
+                var v36Td = mainRow.append('td').style('text-align', 'center');
+                var minerVer = getMinerVersion(addr);
+                if (minerVer.ver >= 36) {
+                    v36Td.html('<span style="color:#28a745;font-weight:700" title="V' + minerVer.ver + '">✓</span>');
+                } else if (minerVer.dv >= 36) {
+                    v36Td.html('<span style="color:#0097a7;font-weight:700" title="V' + minerVer.ver + ' signaling V' + minerVer.dv + '">⇧</span>');
+                } else if (minerVer.ver > 0) {
+                    v36Td.html('<span style="color:#dc3545;font-weight:700" title="V' + minerVer.ver + ' only — no DOGE!">✗</span>');
+                } else {
+                    v36Td.text('-');
+                }
+
                 mainRow.append('td')
                     .style('text-align', 'right')
                     .attr('class', 'amount')
@@ -3813,7 +3844,7 @@
                         var subRow = tbody.append('tr')
                             .attr('class', 'merged-payout-row')
                             .style('background', 'rgba(111, 66, 193, 0.1)');
-                        
+
                         var addrCell = subRow.append('td')
                             .style('padding-left', '20px');
                         addrCell.append('span')
@@ -3845,6 +3876,7 @@
                                 .text('\u2713 explicit');
                         }
                         
+                        subRow.append('td'); // V36 column spacer
                         subRow.append('td')
                             .style('text-align', 'right')
                             .style('color', '#6f42c1')
@@ -4012,6 +4044,18 @@
                     .attr('target', '_blank')
                     .attr('title', addr)
                     .text(addr);
+                // V36 column
+                var v36Td = tr.append('td').style('text-align', 'center');
+                var mv = getMinerVersion(addr);
+                if (mv.ver >= 36) {
+                    v36Td.html('<span style="color:#28a745;font-weight:700" title="V' + mv.ver + '">✓</span>');
+                } else if (mv.dv >= 36) {
+                    v36Td.html('<span style="color:#0097a7;font-weight:700" title="V' + mv.ver + ' signaling V' + mv.dv + '">⇧</span>');
+                } else if (mv.ver > 0) {
+                    v36Td.html('<span style="color:#dc3545;font-weight:700" title="V' + mv.ver + ' only — no DOGE!">✗</span>');
+                } else {
+                    v36Td.text('-');
+                }
                 tr.append('td')
                     .style('text-align', 'right')
                     .attr('class', 'amount')
