@@ -637,6 +637,11 @@ public:
     /// Load persisted found blocks from storage (call once after persistence is set)
     void load_persisted_found_blocks();
 
+    /// Backfill network_difficulty on loaded blocks using a block hash → difficulty lookup.
+    /// Called after embedded header chain is available.
+    using block_diff_lookup_fn = std::function<double(const std::string& block_hash)>;
+    void backfill_block_difficulty(block_diff_lookup_fn fn);
+
     // Callback fired whenever a block submission is attempted.
     // Arguments: header hex (first 80 bytes), stale_info (none=accepted, orphan=stale prev, doa=daemon rejected).
     void set_on_block_submitted(std::function<void(const std::string& header_hex, int stale_info)> fn);

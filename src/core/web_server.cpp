@@ -3332,6 +3332,24 @@ void MiningInterface::load_persisted_found_blocks()
     }
 }
 
+void MiningInterface::backfill_block_difficulty(block_diff_lookup_fn fn)
+{
+    if (!fn) return;
+    std::lock_guard<std::mutex> lock(m_blocks_mutex);
+    int filled = 0;
+    for (auto& blk : m_found_blocks) {
+        if (blk.network_difficulty == 0.0 && !blk.hash.empty()) {
+            double diff = fn(blk.hash);
+            if (diff > 0) {
+                blk.network_difficulty = diff;
+                ++filled;
+            }
+        }
+    }
+    if (filled > 0)
+        LOG_INFO << "[Pool] Backfilled network_difficulty on " << filled << " found block(s)";
+}
+
 void MiningInterface::set_block_verify_fn(block_verify_fn_t fn) { m_block_verify_fn = std::move(fn); }
 
 void MiningInterface::add_chain_verify_fn(const std::string& chain, block_verify_fn_t fn) {

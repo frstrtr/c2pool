@@ -5248,6 +5248,21 @@ int main(int argc, char* argv[]) {
                 LOG_INFO << "[V35-MERGED] Resolver wired via embedded LTC P2P + DOGE HeaderChain";
             }
 
+            // Backfill network_difficulty on persisted found blocks using LTC header chain.
+            // Exact difficulty from the block's nBits field — no approximation.
+            if (embedded_chain) {
+                auto* hc = embedded_chain.get();
+                web_server.get_mining_interface()->backfill_block_difficulty(
+                    [hc](const std::string& block_hash_hex) -> double {
+                        uint256 h;
+                        h.SetHex(block_hash_hex);
+                        auto entry = hc->get_header(h);
+                        if (!entry) return 0.0;
+                        auto target = chain::bits_to_target(entry->header.m_bits);
+                        return chain::target_to_difficulty(target);
+                    });
+            }
+
             // Block scan: run here after ALL callbacks + DOGE target fn are wired.
             if (p2p_node) {
                 auto best = p2p_node->best_share_hash();
