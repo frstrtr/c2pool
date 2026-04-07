@@ -2166,12 +2166,12 @@
                             <span>V36 (others)</span>
                         </div>
                         <div class="legend-item">
-                            <div class="legend-swatch" style="background:#0097a7"></div>
+                            <div class="legend-swatch" style="background:#26c6da"></div>
                             <span>V36 signaling</span>
                         </div>
                         <div class="legend-item">
-                            <div class="legend-swatch" style="background:#28a745"></div>
-                            <span>V35 (others)</span>
+                            <div class="legend-swatch" style="background:#2e7d32"></div>
+                            <span>V35 only</span>
                         </div>
                         <div class="legend-item">
                             <div class="legend-swatch" style="background:#555577"></div>
@@ -4743,15 +4743,15 @@
                 var isV36Signal = !isV36Native && share.dv && share.dv >= 36;
 
                 if (isV36Native) {
-                    // V36 native shares — bright cyan-green / bright blue
+                    // V36 native — brightest: cyan-green / bright blue
                     return isMine ? '#00b0ff' : '#00e676';
                 }
                 if (isV36Signal) {
-                    // V35 signaling V36 — teal
-                    return isMine ? '#0097a7' : '#2e7d32';
+                    // V35 signaling V36 — bright teal (rewarded visually)
+                    return isMine ? '#0097a7' : '#26c6da';
                 }
-                // V35 only (not signaling) — standard green / blue
-                return isMine ? '#008de4' : '#28a745';
+                // V35 only (not signaling) — dim muted green / blue
+                return isMine ? '#1565c0' : '#2e7d32';
             },
 
             hitTest: function(e) {
