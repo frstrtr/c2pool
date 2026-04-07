@@ -164,11 +164,13 @@ public:
         for (const auto& [nonce, peer] : m_peers) {
             auto addr = peer->addr();
             bool incoming = (m_outbound_addrs.find(addr) == m_outbound_addrs.end());
+            auto uptime_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - peer->m_connected_at).count();
             arr.push_back({
                 {"address", addr.to_string()},
                 {"version", peer->m_other_subversion},
                 {"incoming", incoming},
-                {"uptime", 0},
+                {"uptime", uptime_sec},
                 {"downtime", 0},
                 {"txpool_size", static_cast<int>(peer->m_remote_txs.size())},
                 {"web_port", 0}
