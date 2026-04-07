@@ -2951,6 +2951,16 @@ int main(int argc, char* argv[]) {
                 });
             };
 
+            // Wire share difficulty tracking for best share dashboard display.
+            // Every verified share reports its difficulty — both LTC and DOGE use
+            // the same share difficulty (scrypt PoW), just compared against different
+            // network targets for the percentage display.
+            p2p_node->tracker().m_on_share_difficulty = [&web_server](double diff, const std::string& miner) {
+                auto mi = web_server.get_mining_interface();
+                mi->record_share_difficulty(diff, miner);
+                mi->record_merged_share_difficulty(diff, miner);
+            };
+
             // Wire merged block detection for peer shares.
             // V36: exact data from m_merged_coinbase_info (height, 80-byte header, coinbase_value).
             // V35: no merged data in share — if the share is an LTC block solution,

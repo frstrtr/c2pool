@@ -149,6 +149,9 @@ public:
     // Callback fired when a verified share meets a merged chain target (DOGE block)
     // Args: share_hash, pow_hash (for target comparison by caller)
     std::function<void(const uint256&, const uint256&)> m_on_merged_block_check;
+    // Callback fired for every verified share with its difficulty + miner script.
+    // Used to track best share difficulty for dashboard display.
+    std::function<void(double difficulty, const std::string& miner)> m_on_share_difficulty;
 
     // Scan the verified best chain for block solutions after startup.
     // Uses cached pow_hash from index (stored during original attempt_verify).
@@ -328,6 +331,19 @@ public:
             auto* idx = chain.get_index(share_hash);
             if (idx) idx->is_block_solution = true;
             m_on_block_found(share_hash);
+        }
+
+        // Report share difficulty for best-share dashboard tracking
+        if (m_on_share_difficulty) {
+            share_var.invoke([&](auto* s) {
+                double diff = chain::target_to_difficulty(chain::bits_to_target(s->m_bits));
+                std::string miner;
+                if constexpr (requires { s->m_pubkey_hash; })
+                    miner = s->m_pubkey_hash.GetHex();
+                else if constexpr (requires { s->m_address; })
+                    miner = HexStr(s->m_address.m_data);
+                m_on_share_difficulty(diff, miner);
+            });
         }
 
         // Merged block detection: check ALL verified shares against DOGE target.
