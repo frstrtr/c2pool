@@ -4177,6 +4177,7 @@ int main(int argc, char* argv[]) {
                                      bcaster_ptr = broadcaster.get(),
                                      coinbase_maturity = core::coin::DOGE_LIMITS.coinbase_maturity,
                                      explorer_enabled, explorer_depth_doge,
+                                     mm_ptr = mm_manager.get(),
                                      &web_server](
                                         const std::string& peer,
                                         const ltc::coin::BlockType& block) {
@@ -4281,6 +4282,16 @@ int main(int argc, char* argv[]) {
                                                     web_server.trigger_work_refresh_debounced();
                                                 }
                                             }
+                                        }
+                                        // Update coinbase_value on discovered merged blocks that
+                                        // were added without exact reward (V35 peer detection).
+                                        // Sum all coinbase outputs for the exact block reward.
+                                        if (mm_ptr && !block.m_txs.empty()) {
+                                            uint64_t cb_total = 0;
+                                            for (const auto& out : block.m_txs[0].vout)
+                                                cb_total += out.value;
+                                            if (cb_total > 0)
+                                                mm_ptr->update_block_coinbase(block_hash.GetHex(), cb_total);
                                         }
                                     });
 
@@ -5125,8 +5136,15 @@ int main(int argc, char* argv[]) {
                 auto* dc = doge_chain.get();
                 auto* ltc_hc = embedded_chain.get();
                 auto* mm = web_server.get_mining_interface()->get_mm_manager();
+                // Get DOGE broadcaster for fetching full DOGE blocks (coinbase_value)
+                c2pool::merged::CoinBroadcaster* doge_bcaster = nullptr;
+                {
+                    auto it = merged_broadcasters.find(98);
+                    if (it != merged_broadcasters.end())
+                        doge_bcaster = it->second.get();
+                }
                 bool testnet = settings->m_testnet;
-                *on_full_block_merged = [dc, ltc_hc, mm, testnet](
+                *on_full_block_merged = [dc, ltc_hc, mm, doge_bcaster, testnet](
                     const uint256& ltc_block_hash, const MergedResolveCtx& ctx,
                     const ltc::coin::BlockType& block) {
                     if (!mm || !dc || block.m_txs.empty()) return;
@@ -5204,9 +5222,11 @@ int main(int argc, char* argv[]) {
                     blk.timestamp = static_cast<int64_t>(std::time(nullptr));
                     blk.accepted = true;
                     blk.miner = ctx.miner;
-                    // DOGE subsidy: 10,000 DOGE for blocks above 600,000
-                    // Reference: dogecoin/src/dogecoin.cpp GetDogecoinBlockSubsidy()
-                    blk.coinbase_value = 1000000000000ULL;  // 10000 * 1e8 koinu
+                    // Request full DOGE block from P2P to get exact coinbase_value.
+                    // The block arrives async — we set coinbase_value=0 now and update
+                    // when the DOGE block arrives via the full_block callback.
+                    // This ensures exact amounts (subsidy + TX fees), never approximations.
+                    blk.coinbase_value = 0;
                     // Get real LTC block height from header chain (not sharechain absheight)
                     if (ltc_hc) {
                         auto ltc_entry = ltc_hc->get_header(ltc_block_hash);
@@ -5214,6 +5234,15 @@ int main(int argc, char* argv[]) {
                             blk.parent_height = ltc_entry->height;
                     }
                     mm->add_discovered_block(blk);
+
+                    // Request full DOGE block from P2P to get exact coinbase_value.
+                    // When it arrives, the DOGE full_block handler will sum coinbase
+                    // outputs and call update_block_coinbase() with the exact amount.
+                    if (doge_bcaster) {
+                        LOG_INFO << "[V35-MERGED] Requesting DOGE block " << mm_root.GetHex().substr(0, 16)
+                                 << " for exact coinbase_value";
+                        doge_bcaster->request_block_plain(mm_root);
+                    }
                 };
 
                 LOG_INFO << "[V35-MERGED] Resolver wired via embedded LTC P2P + DOGE HeaderChain";

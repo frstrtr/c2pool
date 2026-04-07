@@ -1723,6 +1723,20 @@ void MergedMiningManager::add_discovered_block(const DiscoveredMergedBlock& blk)
              << " hash=" << blk.block_hash.substr(0, 16);
 }
 
+void MergedMiningManager::update_block_coinbase(const std::string& block_hash, uint64_t coinbase_value)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    for (auto& blk : m_discovered_blocks) {
+        if (blk.block_hash == block_hash) {
+            blk.coinbase_value = coinbase_value;
+            LOG_INFO << "[MM:" << blk.symbol << "] Coinbase updated: height=" << blk.height
+                     << " value=" << coinbase_value << " (" << (coinbase_value / 1e8) << " "
+                     << blk.symbol << ")";
+            return;
+        }
+    }
+}
+
 std::vector<MergedMiningManager::ChainInfo> MergedMiningManager::get_chain_infos() const
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);

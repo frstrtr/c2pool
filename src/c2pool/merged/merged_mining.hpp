@@ -246,6 +246,8 @@ public:
     uint64_t get_chain_block_count(uint32_t chain_id) const;
     // Add externally discovered block (e.g. from peer share scan)
     void add_discovered_block(const DiscoveredMergedBlock& blk);
+    // Update coinbase_value on a discovered block (after fetching full block from P2P)
+    void update_block_coinbase(const std::string& block_hash, uint64_t coinbase_value);
 
     // Per-chain config snapshots (for REST)
     struct ChainInfo {
