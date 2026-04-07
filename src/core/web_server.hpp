@@ -495,6 +495,10 @@ public:
     using sharechain_window_fn_t = std::function<nlohmann::json()>;
     void set_sharechain_window_fn(sharechain_window_fn_t fn) { m_sharechain_window_fn = std::move(fn); }
 
+    // Individual share lookup — returns full p2pool-compatible share JSON by hash
+    using share_lookup_fn_t = std::function<nlohmann::json(const std::string&)>;
+    void set_share_lookup_fn(share_lookup_fn_t fn) { m_share_lookup_fn = std::move(fn); }
+
     // Network difficulty callback — invoked from refresh_work() with real value
     using network_difficulty_fn_t = std::function<void(double)>;
     void set_on_network_difficulty(network_difficulty_fn_t fn) { m_on_network_difficulty_fn = std::move(fn); }
@@ -783,6 +787,7 @@ private:
     // Sharechain stats callback
     sharechain_stats_fn_t m_sharechain_stats_fn;
     sharechain_window_fn_t m_sharechain_window_fn;
+    share_lookup_fn_t m_share_lookup_fn;
 
     // PPLNS computation hook
     pplns_fn_t m_pplns_fn;

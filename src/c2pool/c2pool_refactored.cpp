@@ -3000,6 +3000,114 @@ int main(int argc, char* argv[]) {
                 return result;
             });
 
+            // Wire individual share lookup for /web/share/<hash> detail page
+            web_server.get_mining_interface()->set_share_lookup_fn(
+                [&p2p_node, &web_server](const std::string& hash_hex) -> nlohmann::json {
+                bool testnet = ltc::PoolConfig::is_testnet;
+                auto& chain = p2p_node->tracker().chain;
+                auto& verified = p2p_node->tracker().verified;
+
+                uint256 hash;
+                hash.SetHex(hash_hex);
+                if (hash.IsNull() || !chain.contains(hash))
+                    return nlohmann::json{{"error", "share not found"}};
+
+                nlohmann::json result;
+                auto& entry = chain.get(hash);
+
+                // Parent / far_parent / children
+                entry.share.invoke([&](auto* obj) {
+                    result["parent"] = obj->m_prev_hash.GetHex();
+                    result["far_parent"] = obj->m_far_share_hash.GetHex();
+                    result["type_name"] = "V" + std::to_string(obj->version);
+                    result["version"] = obj->version;
+
+                    // Local data
+                    auto* idx = chain.get_index(hash);
+                    nlohmann::json local_j;
+                    local_j["verified"] = verified.contains(hash);
+                    local_j["time_first_seen"] = idx ? idx->time_seen : 0;
+                    local_j["peer_first_received_from"] = obj->peer_addr.to_string();
+                    result["local"] = local_j;
+
+                    // Share data — convert miner to address
+                    auto script = get_share_script(obj);
+                    std::string addr = core::script_to_address(script, true, testnet);
+
+                    double target_diff = chain::target_to_difficulty(
+                        chain::bits_to_target(obj->m_bits));
+                    double max_target_diff = chain::target_to_difficulty(
+                        chain::bits_to_target(obj->m_max_bits));
+
+                    nlohmann::json sd;
+                    sd["timestamp"] = obj->m_timestamp;
+                    sd["target"] = obj->m_bits;
+                    sd["max_target"] = obj->m_max_bits;
+                    sd["payout_address"] = addr.empty() ? HexStr(script) : addr;
+                    sd["donation"] = static_cast<double>(obj->m_donation) / 65536.0;
+                    sd["stale_info"] = static_cast<int>(obj->m_stale_info);
+                    sd["nonce"] = obj->m_nonce;
+                    sd["desired_version"] = obj->m_desired_version;
+                    sd["absheight"] = obj->m_absheight;
+                    sd["abswork"] = obj->m_abswork.GetHex();
+                    sd["difficulty"] = target_diff;
+                    sd["min_difficulty"] = max_target_diff;
+                    result["share_data"] = sd;
+
+                    // Block header
+                    auto& hdr = obj->m_min_header;
+                    nlohmann::json hdr_j;
+                    hdr_j["version"] = hdr.m_version;
+                    hdr_j["previous_block"] = hdr.m_previous_block.GetHex();
+                    hdr_j["merkle_root"] = "";
+                    hdr_j["timestamp"] = hdr.m_timestamp;
+                    hdr_j["target"] = hdr.m_bits;
+                    hdr_j["nonce"] = hdr.m_nonce;
+                    nlohmann::json gentx_j;
+                    gentx_j["hash"] = "";
+                    gentx_j["coinbase"] = HexStr(obj->m_coinbase.m_data);
+                    gentx_j["value"] = static_cast<double>(obj->m_subsidy) / 1e8;
+                    gentx_j["last_txout_nonce"] = obj->m_last_txout_nonce;
+                    nlohmann::json block_j;
+                    block_j["hash"] = hash.GetHex();
+                    block_j["header"] = hdr_j;
+                    block_j["gentx"] = gentx_j;
+                    block_j["other_transaction_hashes"] = nlohmann::json::array();
+                    result["block"] = block_j;
+
+                    // Children (shares whose parent is this hash)
+                    nlohmann::json children_arr = nlohmann::json::array();
+                    // (would need reverse index — skip for now)
+                    result["children"] = children_arr;
+
+                    // V36 metadata
+                    if constexpr (requires { obj->m_merged_addresses; }) {
+                        nlohmann::json merged_addrs = nlohmann::json::array();
+                        for (auto& ma : obj->m_merged_addresses) {
+                            nlohmann::json a;
+                            a["chain_id"] = ma.m_chain_id;
+                            a["script_hex"] = HexStr(ma.m_script.m_data);
+                            // Try to decode DOGE address
+                            if (ma.m_chain_id == 98) {
+                                // Dogecoin: P2PKH version 0x1e, P2SH 0x16, hrp "doge"
+                                auto daddr = core::script_to_address(
+                                    ma.m_script.m_data, "doge", 0x1e, 0x16);
+                                if (!daddr.empty()) a["address"] = daddr;
+                            }
+                            merged_addrs.push_back(a);
+                        }
+                        nlohmann::json v36_j;
+                        v36_j["merged_addresses"] = merged_addrs;
+                        v36_j["merged_payout_hash"] = obj->m_merged_payout_hash.GetHex();
+                        v36_j["message_data_hex"] = HexStr(obj->m_message_data.m_data);
+                        v36_j["message_data_size"] = obj->m_message_data.m_data.size();
+                        result["v36_metadata"] = v36_j;
+                    }
+                });
+
+                return result;
+            });
+
             // Wire block-found callback: when a verified share meets the block target,
             // record it to the found_blocks store. Matches p2pool's tracker.verified.added
             // watcher in node.py:289 — detects blocks from ANY pool participant.

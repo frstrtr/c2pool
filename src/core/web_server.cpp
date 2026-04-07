@@ -5210,10 +5210,11 @@ nlohmann::json MiningInterface::rest_web_my_share_hashes50()
 
 nlohmann::json MiningInterface::rest_web_share(const std::string& hash)
 {
-    if (m_sharechain_stats_fn) {
-        auto sc = m_sharechain_stats_fn();
-        if (sc.contains("shares") && sc["shares"].contains(hash))
-            return sc["shares"][hash];
+    // Use dedicated share lookup if wired
+    if (m_share_lookup_fn) {
+        auto result = m_share_lookup_fn(hash);
+        if (!result.is_null() && !result.contains("error"))
+            return result;
     }
     nlohmann::json result = nlohmann::json::object();
     result["error"] = "share not found";

@@ -921,6 +921,138 @@
             margin: 0 6px;
         }
 
+        /* Hover cell — animated enlarging square */
+        .defrag-hover-cell {
+            position: fixed;
+            pointer-events: none;
+            z-index: 100;
+            border-radius: 2px;
+            transform: scale(1);
+            transform-origin: center center;
+            transition: transform 0.22s cubic-bezier(0.34, 1.4, 0.64, 1),
+                        box-shadow 0.22s ease;
+        }
+        .defrag-hover-cell.active {
+            transform: scale(2.5);
+            outline: 2px solid #fff;
+            outline-offset: 0px;
+            box-shadow: 0 0 16px 4px rgba(255,255,255,0.5),
+                        inset 0 0 4px rgba(255,255,255,0.3) !important;
+            filter: brightness(1.4) saturate(1.3);
+        }
+        .defrag-hover-cell.shrinking {
+            transform: scale(1);
+            outline: none;
+            box-shadow: none !important;
+            filter: none;
+            transition: transform 0.18s ease-in,
+                        box-shadow 0.18s ease-in,
+                        filter 0.18s ease-in;
+        }
+
+        /* Zoom panel — enlarged share with PPLNS treemap */
+        #defrag-zoom {
+            display: none;
+            position: fixed;
+            z-index: 9998;
+            border-radius: 10px;
+            border: 2px solid var(--border);
+            background: #1a1a2e;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+            pointer-events: none;
+            overflow: hidden;
+        }
+        #defrag-zoom canvas {
+            display: block;
+        }
+        #defrag-zoom-label {
+            background: rgba(13,13,26,0.9);
+            color: #b0b0cc;
+            font: bold 9px -apple-system, sans-serif;
+            text-align: center;
+            padding: 3px 0;
+        }
+
+        /* Verified Heads / Tails chain rows */
+        .defrag-chain-rows {
+            margin-top: 12px;
+        }
+        .defrag-chain-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 6px 0;
+        }
+        .defrag-chain-label {
+            color: var(--text-muted);
+            font-size: 0.82rem;
+            font-weight: 600;
+            min-width: 110px;
+            flex-shrink: 0;
+        }
+        .defrag-chain-cells {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            align-items: center;
+        }
+        .defrag-chain-cell {
+            width: 22px;
+            height: 22px;
+            border-radius: 3px;
+            cursor: pointer;
+            position: relative;
+            transition: transform 0.15s, box-shadow 0.15s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .defrag-chain-cell:hover {
+            transform: scale(1.3);
+            z-index: 10;
+            box-shadow: 0 0 8px rgba(255,255,255,0.3);
+        }
+        .defrag-chain-cell .cell-hash {
+            font-family: 'Monaco','Consolas',monospace;
+            font-size: 6.5px;
+            color: #fff;
+            text-shadow: 0 0 2px rgba(0,0,0,0.9);
+            font-weight: 700;
+            line-height: 1;
+            text-align: center;
+            pointer-events: none;
+            overflow: hidden;
+        }
+        .defrag-chain-cell.cell-epic {
+            background: linear-gradient(135deg, #a335ee, #7b2fbe) !important;
+            border: 2px solid #a335ee !important;
+            box-shadow: 0 0 10px rgba(163,53,238,0.6), inset 0 0 6px rgba(255,255,255,0.15);
+            animation: epic-glow 2s ease-in-out infinite;
+        }
+        @keyframes epic-glow {
+            0%, 100% { box-shadow: 0 0 8px rgba(163,53,238,0.5); }
+            50% { box-shadow: 0 0 16px rgba(163,53,238,0.8), 0 0 4px rgba(255,255,255,0.2); }
+        }
+        .defrag-chain-cell.cell-epic .cell-hash {
+            color: #e8d0ff;
+            text-shadow: 0 0 3px rgba(163,53,238,0.8);
+        }
+        /* WoW Legendary — twin block (LTC + DOGE) */
+        .cell-legendary {
+            background: linear-gradient(135deg, #ff8000, #cc6600) !important;
+            border: 2px solid #ff8000 !important;
+            box-shadow: 0 0 12px rgba(255,128,0,0.7), inset 0 0 6px rgba(255,255,255,0.2);
+            animation: legendary-glow 1.8s ease-in-out infinite;
+        }
+        @keyframes legendary-glow {
+            0%, 100% { box-shadow: 0 0 8px rgba(255,128,0,0.5); }
+            50% { box-shadow: 0 0 20px rgba(255,128,0,0.9), 0 0 6px rgba(255,200,0,0.4); }
+        }
+        .cell-legendary .cell-hash {
+            color: #fff3e0;
+            text-shadow: 0 0 3px rgba(255,128,0,0.8);
+        }
+
         /* Footer */
         footer {
             text-align: center;
@@ -1994,8 +2126,8 @@
                             <span>DOGE block</span>
                         </div>
                         <div class="legend-item">
-                            <div class="legend-swatch" style="background:#28a745;border:2px solid #ffd700"><div style="width:4px;height:4px;background:#00e5ff;margin:1px auto"></div></div>
-                            <span>Twin block (LTC+DOGE)</span>
+                            <div class="legend-swatch" style="background:linear-gradient(135deg,#ff8000,#cc6600);border:2px solid #ffaa00;box-shadow:0 0 6px rgba(255,128,0,0.5)"></div>
+                            <span style="color:#ff8000;font-weight:600">Twin block (Legendary)</span>
                         </div>
                         <div class="legend-item">
                             <div class="legend-swatch" style="background:#0d0d1a;position:relative"><div style="position:absolute;top:0;left:0;width:0;height:0;border-left:5px solid #fff;border-bottom:5px solid transparent"></div></div>
@@ -2005,26 +2137,23 @@
                 </div>
             </div>
 
-            <!-- Quick links row -->
-            <div class="defrag-links-bar">
-                <div class="link-group">
-                    <span class="link-label">Best:</span>
-                    <span id="best_share"></span>
+            <!-- Chain structure rows with share square cells -->
+            <div class="defrag-chain-rows">
+                <div class="defrag-chain-row">
+                    <span class="defrag-chain-label">Best Share</span>
+                    <div class="defrag-chain-cells" id="best_share"></div>
                 </div>
-                <span class="sep">|</span>
-                <div class="link-group">
-                    <span class="link-label">My Shares:</span>
-                    <span class="share-links" id="my_share_hashes"></span>
+                <div class="defrag-chain-row">
+                    <span class="defrag-chain-label">Verified Heads</span>
+                    <div class="defrag-chain-cells" id="verified_heads_cells"></div>
                 </div>
-                <span class="sep">|</span>
-                <div class="link-group">
-                    <span class="link-label">Heads:</span>
-                    <span class="share-links" id="verified_heads"></span>
+                <div class="defrag-chain-row">
+                    <span class="defrag-chain-label">Tails</span>
+                    <div class="defrag-chain-cells" id="tails_cells"></div>
                 </div>
-                <span class="sep">|</span>
-                <div class="link-group">
-                    <span class="link-label">Tails:</span>
-                    <span class="share-links" id="tails"></span>
+                <div class="defrag-chain-row">
+                    <span class="defrag-chain-label">My Shares</span>
+                    <div class="defrag-chain-cells" id="my_share_hashes"></div>
                 </div>
             </div>
         </div>
@@ -2040,19 +2169,15 @@
     <script>
         // Utility functions
         function format_dt(dt) {
-            var pairs = [
-                [365.2425*60*60*24, 'years'],
-                [60*60*24, 'days'],
-                [60*60, 'hours'],
-                [60, 'minutes'],
-                [1, 'seconds'],
-            ];
-            for(var i in pairs) {
-                var value = pairs[i][0];
-                var name = pairs[i][1];
-                if(dt > value) break;
-            }
-            return d3.format('.1f')(dt/value) + ' ' + name;
+            if (dt < 0) dt = 0;
+            var d = Math.floor(dt / 86400);
+            var h = Math.floor((dt % 86400) / 3600);
+            var m = Math.floor((dt % 3600) / 60);
+            var s = Math.floor(dt % 60);
+            if (d > 0) return d + 'd ' + h + 'h ' + m + 'm ' + s + 's';
+            if (h > 0) return h + 'h ' + m + 'm ' + s + 's';
+            if (m > 0) return m + 'm ' + s + 's';
+            return s + 's';
         }
         
         function format_hashrate(h) {
@@ -4238,6 +4363,8 @@
             headSet: {},       // short hashes of chain heads
             myAddress: '',
             windowSize: 8640,
+            pplnsData: [],     // cached [{addr, pct, amt}] sorted by pct desc
+            zoomPanel: null,   // floating zoom panel element
             cellSize: 10,
             gap: 1,
             cols: 0,
@@ -4249,6 +4376,28 @@
                 this.canvas = document.getElementById('defrag-canvas');
                 this.ctx = this.canvas.getContext('2d');
                 this.tooltip = document.getElementById('defrag-tooltip');
+
+                // Create hover cell overlay for enlarge animation
+                var hc = document.createElement('div');
+                hc.className = 'defrag-hover-cell';
+                document.body.appendChild(hc);
+                this.hoverCell = hc;
+                hc.addEventListener('transitionend', function() {
+                    if (hc.classList.contains('shrinking')) {
+                        hc.style.display = 'none';
+                        hc.classList.remove('shrinking');
+                    }
+                });
+
+                // Create zoom panel for enlarged share + PPLNS treemap
+                var zp = document.createElement('div');
+                zp.id = 'defrag-zoom';
+                zp.innerHTML = '<canvas id="defrag-zoom-canvas"></canvas><div id="defrag-zoom-label"></div>';
+                document.body.appendChild(zp);
+                this.zoomPanel = zp;
+                this.zoomCanvas = zp.querySelector('canvas');
+                this.zoomCtx = this.zoomCanvas.getContext('2d');
+                this.zoomLabel = zp.querySelector('#defrag-zoom-label');
 
                 var self = this;
                 this.canvas.addEventListener('mousemove', function(e) { self.onMouseMove(e); });
@@ -4289,22 +4438,41 @@
 
                     self.render();
                     self.updateStats(data);
+                    loadShareLinks();
                 });
 
-                loadShareLinks();
+                // Fetch PPLNS distribution for treemap
+                d3.json('../current_payouts', function(payouts) {
+                    if (!payouts || typeof payouts !== 'object') return;
+                    var total = 0;
+                    var entries = [];
+                    for (var addr in payouts) {
+                        total += payouts[addr];
+                        entries.push({ addr: addr, amt: payouts[addr] });
+                    }
+                    entries.sort(function(a, b) { return b.amt - a.amt; });
+                    entries.forEach(function(e) { e.pct = total > 0 ? e.amt / total : 0; });
+                    self.pplnsData = entries;
+                });
             },
+
+            marginLeft: 38,  // px reserved for time axis labels
 
             render: function() {
                 var canvas = this.canvas;
                 var ctx = this.ctx;
                 var dpr = this.dpr;
                 var step = this.cellSize + this.gap;
+                var ml = this.marginLeft;
 
+                // Reset canvas width so parent can shrink freely on resize
+                canvas.style.width = '0px';
                 var containerWidth = canvas.parentElement.clientWidth - 16;
-                this.cols = Math.max(1, Math.floor(containerWidth / step));
+                var gridWidth = containerWidth - ml;
+                this.cols = Math.max(1, Math.floor(gridWidth / step));
                 this.rows = Math.ceil(this.shares.length / this.cols);
 
-                var cssW = this.cols * step;
+                var cssW = ml + this.cols * step;
                 var cssH = Math.max(this.rows * step, 40);
                 canvas.style.width = cssW + 'px';
                 canvas.style.height = cssH + 'px';
@@ -4323,12 +4491,49 @@
                     return;
                 }
 
+                // Pre-compute average age per row for axis labels
+                var now = Date.now() / 1000;
+                var rowAges = [];
+                for (var r = 0; r < this.rows; r++) {
+                    var start = r * this.cols;
+                    var end = Math.min(start + this.cols, this.shares.length);
+                    var sum = 0;
+                    for (var j = start; j < end; j++) sum += (now - this.shares[j].t);
+                    rowAges.push(sum / (end - start));
+                }
+
+                // Draw time axis labels on the left margin — hours only
+                ctx.font = 'bold 11px -apple-system, sans-serif';
+                ctx.textAlign = 'right';
+                ctx.textBaseline = 'middle';
+
+                // Find which rows cross whole-hour boundaries and label those
+                var lastLabeledHour = -1;
+                for (var r = 0; r < this.rows; r++) {
+                    var hour = Math.floor(rowAges[r] / 3600);
+                    if (hour !== lastLabeledHour && hour >= 0) {
+                        lastLabeledHour = hour;
+                        var label = hour + 'h';
+                        var yLabel = r * step + step / 2;
+                        ctx.fillStyle = '#b0b0cc';
+                        ctx.fillText(label, ml - 4, yLabel);
+
+                        // Tick line
+                        ctx.strokeStyle = 'rgba(140,140,180,0.2)';
+                        ctx.lineWidth = 0.5;
+                        ctx.beginPath();
+                        ctx.moveTo(ml, r * step);
+                        ctx.lineTo(cssW, r * step);
+                        ctx.stroke();
+                    }
+                }
+
                 var cs = this.cellSize;
                 for (var i = 0; i < this.shares.length; i++) {
                     var share = this.shares[i];
                     var col = i % this.cols;
                     var row = Math.floor(i / this.cols);
-                    var x = col * step;
+                    var x = ml + col * step;
                     var y = row * step;
 
                     // Fill color
@@ -4341,12 +4546,12 @@
 
                     // LTC block solution: gold border + inner fill
                     if (isLtcBlock && isDogeBlock) {
-                        // Twin block (LTC + DOGE): gold border, cyan inner dot
-                        ctx.strokeStyle = '#ffd700';
+                        // Twin block — Legendary: orange glow
+                        ctx.fillStyle = '#ff8000';
+                        ctx.fillRect(x, y, cs, cs);
+                        ctx.strokeStyle = '#ffaa00';
                         ctx.lineWidth = 2;
                         ctx.strokeRect(x + 0.5, y + 0.5, cs - 1, cs - 1);
-                        ctx.fillStyle = '#00e5ff';
-                        ctx.fillRect(x + 3, y + 3, cs - 6, cs - 6);
                     } else if (isLtcBlock) {
                         // LTC block only: gold border
                         ctx.strokeStyle = '#ffd700';
@@ -4403,9 +4608,10 @@
 
             hitTest: function(e) {
                 var rect = this.canvas.getBoundingClientRect();
-                var x = e.clientX - rect.left;
+                var x = e.clientX - rect.left - this.marginLeft;
                 var y = e.clientY - rect.top;
                 var step = this.cellSize + this.gap;
+                if (x < 0) return -1;
                 var col = Math.floor(x / step);
                 var row = Math.floor(y / step);
                 if (col < 0 || col >= this.cols) return -1;
@@ -4417,11 +4623,19 @@
             onMouseMove: function(e) {
                 var idx = this.hitTest(e);
                 if (idx !== this.hoveredIdx) {
+                    var prevIdx = this.hoveredIdx;
                     this.hoveredIdx = idx;
                     this.render();
+
+                    if (idx >= 0) {
+                        this.showHoverCell(idx);
+                    } else if (prevIdx >= 0) {
+                        this.hideHoverCell();
+                    }
                 }
                 if (idx >= 0) {
                     this.showTooltip(this.shares[idx], e);
+                    this.showZoom(this.shares[idx], e);
                 } else {
                     this.hideTooltip();
                 }
@@ -4473,32 +4687,276 @@
                     html += '<div class="tt-row' + staleClass + '"><span class="tl">Stale</span><span class="tv">' + staleText + '</span></div>';
                 }
                 if (isLtcBlock || isDogeBlock) {
-                    var blockLabel = [];
-                    if (isLtcBlock) blockLabel.push('<span style="color:#ffd700">LTC BLOCK</span>');
-                    if (isDogeBlock) blockLabel.push('<span style="color:#00e5ff">DOGE BLOCK</span>');
-                    html += '<div class="tt-block">' + blockLabel.join(' + ') + '</div>';
+                    if (isLtcBlock && isDogeBlock) {
+                        html += '<div class="tt-block" style="color:#ff8000;border-color:rgba(255,128,0,0.4)">TWIN BLOCK — LEGENDARY</div>';
+                    } else {
+                        var blockLabel = [];
+                        if (isLtcBlock) blockLabel.push('<span style="color:#ffd700">LTC BLOCK</span>');
+                        if (isDogeBlock) blockLabel.push('<span style="color:#00e5ff">DOGE BLOCK</span>');
+                        html += '<div class="tt-block">' + blockLabel.join(' ') + '</div>';
+                    }
                 }
                 html += '<div class="tt-click">Click to view share details</div>';
 
                 tip.innerHTML = html;
                 tip.style.display = 'block';
 
-                var tx = e.clientX + 14;
-                var ty = e.clientY + 14;
+                // Tooltip always below-left of cursor (treemap goes above-right)
                 var tw = tip.offsetWidth;
                 var th = tip.offsetHeight;
-                if (tx + tw > window.innerWidth - 8) tx = e.clientX - tw - 8;
+                var tx = e.clientX - tw - 12;
+                var ty = e.clientY + 18;
+                if (tx < 8) tx = 8;
                 if (ty + th > window.innerHeight - 8) ty = e.clientY - th - 8;
                 tip.style.left = tx + 'px';
                 tip.style.top = ty + 'px';
             },
 
+            showHoverCell: function(idx) {
+                var hc = this.hoverCell;
+                var share = this.shares[idx];
+                var step = this.cellSize + this.gap;
+                var col = idx % this.cols;
+                var row = Math.floor(idx / this.cols);
+                var ml = this.marginLeft;
+
+                // Get cell position in viewport coords
+                var rect = this.canvas.getBoundingClientRect();
+                var cellX = rect.left + ml + col * step;
+                var cellY = rect.top + row * step;
+
+                hc.style.width = this.cellSize + 'px';
+                hc.style.height = this.cellSize + 'px';
+                hc.style.left = cellX + 'px';
+                hc.style.top = cellY + 'px';
+                hc.style.background = this.getColor(share);
+                hc.style.display = 'block';
+                hc.style.border = 'none';
+                hc.style.boxShadow = 'none';
+
+                // Block solution / head borders on the overlay
+                var isLtc = this.blockSet[share.h];
+                var isDoge = this.dogeSet[share.h];
+                if (isLtc && isDoge) {
+                    hc.style.background = 'linear-gradient(135deg, #ff8000, #cc6600)';
+                    hc.style.border = '2px solid #ffaa00';
+                    hc.style.boxShadow = '0 0 12px rgba(255,128,0,0.7)';
+                } else if (isLtc) {
+                    hc.style.border = '2px solid #ffd700';
+                    hc.style.boxShadow = '0 0 8px rgba(255,215,0,0.5)';
+                } else if (isDoge) {
+                    hc.style.border = '2px solid #00e5ff';
+                    hc.style.boxShadow = '0 0 8px rgba(0,229,255,0.5)';
+                }
+
+                // Trigger enlarge: remove shrinking, force reflow, add active
+                hc.classList.remove('shrinking', 'active');
+                void hc.offsetWidth; // force reflow
+                hc.classList.add('active');
+            },
+
+            hideHoverCell: function() {
+                var hc = this.hoverCell;
+                if (hc.style.display === 'none') return;
+                hc.classList.remove('active');
+                hc.classList.add('shrinking');
+            },
+
             hideTooltip: function() {
                 this.tooltip.style.display = 'none';
+                this.zoomPanel.style.display = 'none';
+                this.hideHoverCell();
                 if (this.hoveredIdx !== -1) {
                     this.hoveredIdx = -1;
                     this.render();
                 }
+            },
+
+            showZoom: function(share, e) {
+                var zp = this.zoomPanel;
+                var zc = this.zoomCanvas;
+                var ctx = this.zoomCtx;
+                var sz = 240;
+                var dpr = this.dpr;
+
+                // Don't show if no PPLNS data yet
+                if (!this.pplnsData || this.pplnsData.length === 0) {
+                    zp.style.display = 'none';
+                    return;
+                }
+
+                zc.width = sz * dpr;
+                zc.height = sz * dpr;
+                ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+                ctx.fillStyle = '#0d0d1a';
+                ctx.fillRect(0, 0, sz, sz);
+
+                // Squarified treemap of PPLNS distribution
+                var rects = this.treemap(this.pplnsData, 2, 2, sz - 4, sz - 4);
+                var minerAddr = share ? share.m : '';
+                var myAddr = this.myAddress;
+
+                for (var i = 0; i < rects.length; i++) {
+                    var r = rects[i];
+                    var addr = r.addr;
+                    var isThisMiner = addr === minerAddr;
+                    var isMe = addr === myAddr;
+
+                    var hue = this.addrHue(addr);
+                    if (isThisMiner) {
+                        ctx.fillStyle = 'hsl(' + hue + ',85%,55%)';
+                    } else if (isMe) {
+                        ctx.fillStyle = 'hsl(' + hue + ',60%,42%)';
+                    } else {
+                        ctx.fillStyle = 'hsl(' + hue + ',35%,30%)';
+                    }
+                    ctx.fillRect(r.x, r.y, r.w, r.h);
+
+                    // Cell border
+                    ctx.strokeStyle = '#0d0d1a';
+                    ctx.lineWidth = 1.5;
+                    ctx.strokeRect(r.x, r.y, r.w, r.h);
+
+                    // Highlight border for hovered share's miner
+                    if (isThisMiner) {
+                        ctx.strokeStyle = '#fff';
+                        ctx.lineWidth = 2.5;
+                        ctx.strokeRect(r.x + 1, r.y + 1, r.w - 2, r.h - 2);
+                    }
+
+                    // Labels — percentage + address
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    var cx = r.x + r.w / 2;
+                    var cy = r.y + r.h / 2;
+
+                    if (r.w > 30 && r.h > 16) {
+                        // Percentage
+                        ctx.fillStyle = '#fff';
+                        ctx.font = (isThisMiner ? 'bold 12px' : 'bold 10px') + ' -apple-system, sans-serif';
+                        var pctLabel = (r.pct * 100).toFixed(1) + '%';
+                        ctx.fillText(pctLabel, cx, cy - (r.h > 28 ? 6 : 0));
+
+                        // Address below percentage if there's room
+                        if (r.w > 44 && r.h > 28) {
+                            ctx.fillStyle = 'rgba(255,255,255,0.75)';
+                            ctx.font = (isThisMiner ? '9px' : '8px') + ' Monaco, Consolas, monospace';
+                            var maxChars = Math.max(4, Math.floor(r.w / 6));
+                            var addrLabel = addr.substr(0, maxChars);
+                            if (addr.length > maxChars) addrLabel += '…';
+                            ctx.fillText(addrLabel, cx, cy + 7);
+                        }
+                    }
+                }
+
+                // Label below canvas
+                this.zoomLabel.textContent = 'PPLNS Distribution \u2014 ' + this.pplnsData.length + ' miners';
+
+                // Set canvas CSS size
+                zc.style.width = sz + 'px';
+                zc.style.height = sz + 'px';
+
+                // Position: treemap above-right, tooltip below-left
+                zp.style.display = 'block';
+                var totalH = sz + 20;
+                var tx = e.clientX + 12;
+                var ty = e.clientY - totalH - 12;
+                if (tx + sz > window.innerWidth - 8) tx = e.clientX - sz - 12;
+                if (ty < 8) ty = 8;
+                zp.style.left = tx + 'px';
+                zp.style.top = ty + 'px';
+            },
+
+            // Simple hash to hue (0-360) for consistent miner colors
+            addrHue: function(addr) {
+                var hash = 0;
+                for (var i = 0; i < addr.length; i++) {
+                    hash = ((hash << 5) - hash + addr.charCodeAt(i)) | 0;
+                }
+                return ((hash % 360) + 360) % 360;
+            },
+
+            // Squarified treemap: place items into rows trying to keep aspect ratio ~1
+            treemap: function(data, x, y, w, h) {
+                var rects = [];
+                var items = data.map(function(d) { return { addr: d.addr, pct: d.pct, area: d.pct }; });
+                this._layoutRow(items, x, y, w, h, rects);
+                return rects;
+            },
+
+            _layoutRow: function(items, x, y, w, h, rects) {
+                if (items.length === 0) return;
+                var totalArea = 0;
+                items.forEach(function(it) { totalArea += it.area; });
+                if (totalArea <= 0) return;
+
+                // Lay out along the shorter axis
+                var vertical = w >= h;
+                var mainSize = vertical ? h : w;
+                var crossSize = vertical ? w : h;
+
+                var row = [];
+                var rowArea = 0;
+                var remaining = items.slice();
+
+                while (remaining.length > 0) {
+                    row.push(remaining[0]);
+                    rowArea += remaining[0].area;
+                    remaining.shift();
+
+                    if (remaining.length === 0) break;
+
+                    // Check if adding next item worsens aspect ratio
+                    var nextArea = rowArea + remaining[0].area;
+                    var rowFraction = rowArea / totalArea;
+                    var nextFraction = nextArea / totalArea;
+                    var stripSize = rowFraction * crossSize;
+                    var nextStripSize = nextFraction * crossSize;
+
+                    var worstCurrent = this._worstAspect(row, rowArea, stripSize, mainSize, totalArea);
+                    var testRow = row.concat([remaining[0]]);
+                    var worstNext = this._worstAspect(testRow, nextArea, nextStripSize, mainSize, totalArea);
+
+                    if (worstNext > worstCurrent && row.length >= 1) {
+                        // Current row is better, lay it out
+                        break;
+                    }
+                }
+
+                // Lay out the row
+                var rowFraction = rowArea / totalArea;
+                var stripSize = Math.max(1, rowFraction * crossSize);
+                var offset = 0;
+                for (var i = 0; i < row.length; i++) {
+                    var itemFraction = row[i].area / rowArea;
+                    var itemSize = itemFraction * mainSize;
+                    if (vertical) {
+                        rects.push({ x: x, y: y + offset, w: stripSize, h: itemSize, addr: row[i].addr, pct: row[i].pct });
+                    } else {
+                        rects.push({ x: x + offset, y: y, w: itemSize, h: stripSize, addr: row[i].addr, pct: row[i].pct });
+                    }
+                    offset += itemSize;
+                }
+
+                // Recurse on remaining
+                if (remaining.length > 0) {
+                    if (vertical) {
+                        this._layoutRow(remaining, x + stripSize, y, w - stripSize, h, rects);
+                    } else {
+                        this._layoutRow(remaining, x, y + stripSize, w, h - stripSize, rects);
+                    }
+                }
+            },
+
+            _worstAspect: function(row, rowArea, stripSize, mainSize, totalArea) {
+                var worst = 0;
+                for (var i = 0; i < row.length; i++) {
+                    var itemSize = (row[i].area / rowArea) * mainSize;
+                    var aspect = Math.max(itemSize / stripSize, stripSize / itemSize);
+                    if (aspect > worst) worst = aspect;
+                }
+                return worst;
             },
 
             bitsToDifficulty: function(bits) {
@@ -4515,6 +4973,7 @@
             updateStats: function(data) {
                 var shares = data.shares || [];
                 var mine = 0, stale = 0, dead = 0, verified = 0, fee = 0, v36sig = 0;
+                var ltcBlocks = 0, dogeBlocks = 0;
                 var self = this;
                 shares.forEach(function(s) {
                     if (self.myAddress && s.m === self.myAddress) mine++;
@@ -4523,10 +4982,10 @@
                     if (s.v) verified++;
                     if (s.fee) fee++;
                     if (s.dv && s.dv >= 36 && s.V < 36) v36sig++;
+                    // Count blocks from both blk flag and blockSet/dogeSet
+                    if (s.blk || self.blockSet[s.h]) ltcBlocks++;
+                    if (self.dogeSet[s.h]) dogeBlocks++;
                 });
-
-                var ltcBlocks = data.blocks ? data.blocks.length : 0;
-                var dogeBlocks = data.doge_blocks ? data.doge_blocks.length : 0;
 
                 document.getElementById('defrag-total').textContent = shares.length + ' / ' + (data.window_size || '-');
                 document.getElementById('defrag-mine').textContent = mine;
@@ -4534,7 +4993,7 @@
                 document.getElementById('defrag-dead').textContent = dead;
                 document.getElementById('defrag-verified').textContent = verified;
                 document.getElementById('defrag-chain-len').textContent = data.chain_length || '-';
-                document.getElementById('defrag-blocks').textContent = ltcBlocks + ' LTC' + (dogeBlocks > 0 ? ' / ' + dogeBlocks + ' DOGE' : '');
+                document.getElementById('defrag-blocks').textContent = ltcBlocks + ' LTC / ' + dogeBlocks + ' DOGE';
                 document.getElementById('defrag-fee').textContent = fee;
                 document.getElementById('defrag-v36sig').textContent = v36sig;
             }
@@ -4543,44 +5002,141 @@
         // Initialize defrag viewer on page load
         defrag.init();
 
-        // Legacy share link helpers (for the links bar below the grid)
+        // Share link helpers — sourced from defrag data, not legacy endpoints
         function loadShareLinks() {
-            d3.json('../web/best_share_hash', function(hash) {
-                d3.select('#best_share').selectAll('*').remove();
-                if (hash) {
-                    d3.select('#best_share').append('a')
-                        .attr('class', 'share-link')
-                        .attr('href', 'share.html#' + hash)
-                        .text(hash.substr(-12));
+            // Best share: render as colored square cell
+            var bestContainer = document.getElementById('best_share');
+            if (bestContainer) {
+                bestContainer.innerHTML = '';
+                var bestHash = defrag.shares.length > 0 ? defrag.shares[0].H : null;
+                if (bestHash) {
+                    var share = defrag.shares[0];
+                    var cell = makeShareCell(bestHash, share);
+                    cell.classList.add('cell-epic');
+                    bestContainer.appendChild(cell);
                 }
+            }
+
+            // My shares: find shares matching my address (as cells)
+            var myContainer = document.getElementById('my_share_hashes');
+            if (myContainer) {
+                myContainer.innerHTML = '';
+                if (defrag.myAddress) {
+                    var myShares = defrag.shares.filter(function(s) {
+                        return s.m === defrag.myAddress;
+                    }).slice(0, 50);
+                    if (myShares.length > 0) {
+                        myShares.forEach(function(s) {
+                            myContainer.appendChild(makeShareCell(s.H, s));
+                        });
+                    } else {
+                        myContainer.innerHTML = '<span style="color:var(--text-muted);font-size:0.82rem">None (not mining)</span>';
+                    }
+                } else {
+                    myContainer.innerHTML = '<span style="color:var(--text-muted);font-size:0.82rem">None (not mining)</span>';
+                }
+            }
+
+            // Verified heads: from defrag heads (full hashes via best_hash prefix match)
+            renderChainCells('verified_heads_cells', defrag.headSet);
+
+            // Tails: find the last share in the chain (oldest)
+            var tailsContainer = document.getElementById('tails_cells');
+            if (tailsContainer) {
+                tailsContainer.innerHTML = '';
+                if (defrag.shares.length > 0) {
+                    var tail = defrag.shares[defrag.shares.length - 1];
+                    tailsContainer.appendChild(makeShareCell(tail.H, tail));
+                } else {
+                    tailsContainer.innerHTML = '<span style="color:var(--text-muted);font-size:0.82rem">None</span>';
+                }
+            }
+        }
+
+        // Render chain cells from a set of short hashes
+        function renderChainCells(containerId, shortHashSet) {
+            var container = document.getElementById(containerId);
+            if (!container) return;
+            container.innerHTML = '';
+            var keys = Object.keys(shortHashSet);
+            if (keys.length === 0) {
+                container.innerHTML = '<span style="color:var(--text-muted);font-size:0.82rem">None</span>';
+                return;
+            }
+            keys.forEach(function(shortHash) {
+                // Find full share data from defrag
+                var share = null;
+                for (var i = 0; i < defrag.shares.length; i++) {
+                    if (defrag.shares[i].h === shortHash) {
+                        share = defrag.shares[i];
+                        break;
+                    }
+                }
+                var fullHash = share ? share.H : shortHash;
+                container.appendChild(makeShareCell(fullHash, share));
             });
-            fillShares('../web/my_share_hashes50', '#my_share_hashes');
-            fillShares('../web/verified_heads', '#verified_heads');
-            fillShares('../web/tails', '#tails');
         }
 
         function loadShares() {
             defrag.load();
         }
 
-        function fillShares(url, selector) {
-            d3.json(url, function(data) {
-                d3.select(selector).selectAll('*').remove();
-                if (!data || data.length === 0) {
-                    d3.select(selector).append('span')
-                        .style('color', 'var(--text-muted)')
-                        .style('font-size', '0.85rem')
-                        .text('None');
-                    return;
+        // Create a single colored share cell (22x22 square) with tooltip + click
+        function makeShareCell(fullHash, share) {
+            var cell = document.createElement('div');
+            cell.className = 'defrag-chain-cell';
+            cell.style.background = share ? defrag.getColor(share) : '#555577';
+
+            // Block borders / legendary treatment
+            if (share) {
+                var isLtc = defrag.blockSet[share.h];
+                var isDoge = defrag.dogeSet[share.h];
+                if (isLtc && isDoge) {
+                    cell.classList.add('cell-legendary');
+                } else if (isLtc) {
+                    cell.style.border = '2px solid #ffd700';
+                    cell.style.boxShadow = '0 0 4px rgba(255,215,0,0.4)';
+                } else if (isDoge) {
+                    cell.style.border = '2px solid #00e5ff';
                 }
-                data.sort();
-                data.forEach(function(hash) {
-                    d3.select(selector).append('a')
-                        .attr('class', 'share-link')
-                        .attr('href', 'share.html#' + hash)
-                        .text(hash.substr(-8));
-                });
+            }
+
+            // Short hash label inside the cell
+            var label = document.createElement('div');
+            label.className = 'cell-hash';
+            label.textContent = fullHash.substr(-8);
+            cell.appendChild(label);
+
+            // Click → share detail page
+            cell.addEventListener('click', function() {
+                window.open('share.html#' + fullHash, '_blank');
             });
+
+            // Tooltip — reuse defrag tooltip
+            cell.addEventListener('mouseenter', function(e) {
+                if (share) {
+                    defrag.showTooltip(share, e);
+                } else {
+                    var tip = defrag.tooltip;
+                    tip.innerHTML = '<div class="tt-hash">' + fullHash.substr(0, 16) + '</div>' +
+                        '<div class="tt-click">Click to view share details</div>';
+                    tip.style.display = 'block';
+                    tip.style.left = (e.clientX + 14) + 'px';
+                    tip.style.top = (e.clientY + 14) + 'px';
+                }
+            });
+            cell.addEventListener('mousemove', function(e) {
+                if (share) defrag.showTooltip(share, e);
+                else {
+                    defrag.tooltip.style.left = (e.clientX + 14) + 'px';
+                    defrag.tooltip.style.top = (e.clientY + 14) + 'px';
+                }
+            });
+            cell.addEventListener('mouseleave', function() {
+                defrag.hideTooltip();
+            });
+
+            return cell;
         }
         
         // =============================================
