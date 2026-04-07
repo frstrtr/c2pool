@@ -5033,8 +5033,12 @@ nlohmann::json MiningInterface::rest_broadcaster_status()
         return result;
     }
     result["running"] = true;
+    result["enabled"] = true;
     result["chains"] = m_mm_manager->chain_count();
     result["total_blocks_found"] = m_mm_manager->get_total_blocks();
+    // LTC P2P peer info
+    if (m_ltc_peer_info_fn)
+        result["peers"] = m_ltc_peer_info_fn();
     return result;
 }
 
@@ -5061,6 +5065,10 @@ nlohmann::json MiningInterface::rest_merged_broadcaster_status()
         chains[ci.symbol]    = std::move(ch);
     }
     result["chains"] = std::move(chains);
+
+    // DOGE P2P peer info
+    if (m_doge_peer_info_fn)
+        result["peers"] = m_doge_peer_info_fn();
 
     return result;
 }

@@ -1713,11 +1713,9 @@
                         <thead>
                             <tr>
                                 <th>Address</th>
-                                <th>Score</th>
-                                <th>Source</th>
-                                <th>Success</th>
-                                <th>Sent</th>
-                                <th>Last Seen</th>
+                                <th>Version</th>
+                                <th>Height</th>
+                                <th>Uptime</th>
                             </tr>
                         </thead>
                         <tbody id="broadcaster_peers_tbody">
@@ -3685,8 +3683,8 @@
         function loadBroadcasterStats() {
             d3.json('../broadcaster_status', function(data) {
                 d3.select('#broadcaster_loading').style('display', 'none');
-                
-                if (!data || !data.enabled) {
+
+                if (!data || !data.running) {
                     d3.select('#broadcaster_status_badge')
                         .style('background', 'var(--danger)')
                         .text('Not Available');
@@ -3697,144 +3695,53 @@
                     d3.select('#broadcaster_peers_tbody').selectAll('tr').remove();
                     var tr = d3.select('#broadcaster_peers_tbody').append('tr');
                     tr.append('td')
-                        .attr('colspan', '6')
+                        .attr('colspan', '4')
                         .style('text-align', 'center')
                         .style('color', 'var(--text-muted)')
-                        .text('Broadcaster not enabled');
+                        .text('Embedded node not enabled');
                     return;
                 }
-                
+
+                var peers = data.peers || [];
+                var connectedPeers = peers.filter(function(p) { return p.connected; });
+
                 // Status badge
-                var badge = d3.select('#broadcaster_status_badge');
-                if (data.health && data.health.healthy) {
-                    badge.style('background', 'var(--success)').text('✓ Healthy');
-                } else {
-                    badge.style('background', 'var(--warning)').text('⚠ Issues');
-                }
-                
-                // Summary stats - connections
-                if (data.connections) {
-                    d3.select('#broadcaster_connections').text(
-                        data.connections.total + ' / ' + (data.configuration ? data.configuration.max_peers : 20)
-                    );
-                }
-                
-                // Peer database size
-                if (data.peer_database) {
-                    d3.select('#broadcaster_database_size').text(data.peer_database.total_peers.toLocaleString());
-                }
-                
-                // Connection success rate
-                if (data.connection_stats) {
-                    var totalAttempts = data.connection_stats.total_attempts || 0;
-                    var successRate = totalAttempts > 0 ? 
-                        ((data.connection_stats.successful_connections / totalAttempts) * 100).toFixed(1) : 0;
-                    d3.select('#broadcaster_success_rate').text(successRate + '%');
-                }
-                
-                // Broadcast stats
-                if (data.broadcast_stats) {
-                    var totalBroadcasts = data.broadcast_stats.successful_broadcasts + data.broadcast_stats.failed_broadcasts;
-                    d3.select('#broadcaster_broadcasts').text(
-                        data.broadcast_stats.successful_broadcasts + ' / ' + data.broadcast_stats.failed_broadcasts + 
-                        (totalBroadcasts > 0 ? ' (' + data.broadcast_stats.success_rate_percent.toFixed(1) + '%)' : '')
-                    );
-                }
-                
+                d3.select('#broadcaster_status_badge')
+                    .style('background', connectedPeers.length > 0 ? 'var(--success)' : 'var(--warning)')
+                    .text(connectedPeers.length > 0 ? '✓ Connected' : '⏳ Connecting');
+                d3.select('#broadcaster_peers_count').text(connectedPeers.length);
+                d3.select('#broadcaster_connections').text(connectedPeers.length);
+                d3.select('#broadcaster_database_size').text(peers.length);
+                d3.select('#broadcaster_success_rate').text('100%');
+                d3.select('#broadcaster_broadcasts').text(data.total_blocks_found || 0);
+
                 // Peers table
                 d3.select('#broadcaster_peers_tbody').selectAll('tr').remove();
-                
-                var peers = data.peers || [];
-                
-                // Update peer count badge
-                var connectedPeers = peers.filter(function(p) { return p.connected; });
-                d3.select('#broadcaster_peers_count').text(connectedPeers.length);
-                
-                if (peers.length === 0) {
+
+                if (connectedPeers.length === 0) {
                     var tr = d3.select('#broadcaster_peers_tbody').append('tr');
                     tr.append('td')
-                        .attr('colspan', '6')
+                        .attr('colspan', '4')
                         .style('text-align', 'center')
                         .style('color', 'var(--text-muted)')
-                        .text('No peers in database');
+                        .text('No peers connected');
                     d3.select('#broadcaster_peers_show_more').style('display', 'none');
                     return;
                 }
-                
-                // Store peers globally for pagination
-                window.allBroadcasterPeers = peers;
-                if (!window.broadcastPeersDisplayCount) {
-                    window.broadcastPeersDisplayCount = Math.min(10, peers.length);
-                }
-                
-                function renderBroadcasterPeers() {
-                    d3.select('#broadcaster_peers_tbody').selectAll('tr').remove();
-                    
-                    var displayPeers = window.allBroadcasterPeers.slice(0, window.broadcastPeersDisplayCount);
-                    
-                    var tr = d3.select('#broadcaster_peers_tbody').selectAll('tr')
-                        .data(displayPeers)
-                        .enter().append('tr');
-                    
-                    tr.append('td').html(function(p) { 
-                        var addr = p.address;
-                        // Truncate long addresses (IPv6)
-                        if (addr.length > 24) {
-                            addr = addr.substring(0, 20) + '...';
-                        }
-                        if (p.protected) {
-                            return addr + ' <span style="color: var(--success); font-size: 0.7rem;">[PROTECTED]</span>';
-                        }
-                        if (p.connected) {
-                            return '<span style="color: var(--success);">●</span> ' + addr;
-                        }
-                        return '<span style="color: var(--text-muted);">○</span> ' + addr;
-                    });
-                    tr.append('td').text(function(p) { return p.score.toFixed(1); });
-                    tr.append('td').text(function(p) { return p.source || 'unknown'; });
-                    
-                    tr.append('td').text(function(p) {
-                        var total = p.successful_broadcasts + p.failed_broadcasts;
-                        if (total === 0) return '-';
-                        return ((p.successful_broadcasts / total) * 100).toFixed(0) + '%';
-                    });
-                    
-                    tr.append('td').text(function(p) {
-                        return p.successful_broadcasts + ' / ' + p.failed_broadcasts;
-                    });
-                    
-                    tr.append('td').text(function(p) {
-                        if (!p.last_seen || p.last_seen === 0) return '-';
-                        var age = (Date.now() / 1000) - p.last_seen;
-                        if (age < 60) return 'Now';
-                        if (age < 3600) return Math.floor(age / 60) + 'm ago';
-                        if (age < 86400) return Math.floor(age / 3600) + 'h ago';
-                        return Math.floor(age / 86400) + 'd ago';
-                    });
-                    
-                    // Show "Show more" button if there are more peers
-                    var bcRemaining = window.allBroadcasterPeers.length - window.broadcastPeersDisplayCount;
-                    if (bcRemaining > 0) {
-                        d3.select('#broadcaster_peers_show_more')
-                            .style('display', 'block')
-                            .text('Show ' + Math.min(10, bcRemaining) + ' more... (' + bcRemaining + ' remaining)');
-                    } else {
-                        d3.select('#broadcaster_peers_show_more').style('display', 'none');
-                    }
-                }
-                
-                renderBroadcasterPeers();
-                
-                // Set up show more button
-                d3.select('#broadcaster_peers_show_more').on('click', function() {
-                    var bcRem = window.allBroadcasterPeers.length - window.broadcastPeersDisplayCount;
-                    var bcStep = (bcRem <= 10) ? bcRem : 10;
-                    window.broadcastPeersDisplayCount = Math.min(
-                        window.broadcastPeersDisplayCount + bcStep,
-                        window.allBroadcasterPeers.length
-                    );
-                    renderBroadcasterPeers();
-                });
+
+                var tr = d3.select('#broadcaster_peers_tbody').selectAll('tr')
+                    .data(connectedPeers)
+                    .enter().append('tr');
+
+                tr.append('td')
+                    .style('font-family', 'monospace')
+                    .style('font-size', '12px')
+                    .text(function(p) { return p.addr || '-'; });
+                tr.append('td').text(function(p) { return p.subver || '-'; });
+                tr.append('td').text(function(p) { return p.startingheight || '-'; });
+                tr.append('td').text(function(p) { return format_duration(p.conntime || 0); });
+
+                d3.select('#broadcaster_peers_show_more').style('display', 'none');
             });
         }
         
@@ -3898,45 +3805,46 @@
                         .style('gap', '10px')
                         .style('margin-bottom', '15px');
                     
-                    // P2P Connections
+                    // Use top-level peers array from merged_broadcaster_status
+                    var allPeers = data.peers || [];
+                    var connPeers = allPeers.filter(function(p) { return p.connected; });
+
+                    // Connections
                     var statCard = statsGrid.append('div')
                         .attr('class', 'stat-card')
                         .style('padding', '10px');
                     statCard.append('div').attr('class', 'stat-label').text('CONNECTIONS');
-                    var connTotal = chainData.connections ? chainData.connections.total : (chainData.active_connections || 0);
-                    var connMax = chainData.configuration ? chainData.configuration.max_peers : 10;
                     statCard.append('div')
                         .attr('class', 'stat-value')
                         .style('font-size', '1.2rem')
-                        .text(connTotal + ' / ' + connMax);
-                    statCard.append('div').attr('class', 'stat-sublabel').text('Active / Target');
-                    
-                    // Peer database
+                        .text(connPeers.length);
+                    statCard.append('div').attr('class', 'stat-sublabel').text('Active Peers');
+
+                    // Chain height
                     statCard = statsGrid.append('div')
                         .attr('class', 'stat-card')
                         .style('padding', '10px');
-                    statCard.append('div').attr('class', 'stat-label').text('DATABASE');
-                    var dbSize = chainData.peer_database ? chainData.peer_database.total_peers : (chainData.total_peers || 0);
+                    statCard.append('div').attr('class', 'stat-label').text('HEIGHT');
                     statCard.append('div')
                         .attr('class', 'stat-value')
                         .style('font-size', '1.2rem')
-                        .text(dbSize.toLocaleString());
-                    statCard.append('div').attr('class', 'stat-sublabel').text('Total Peers');
-                    
-                    // Connect Rate (P2P success)
+                        .text((chainData.current_height || 0).toLocaleString());
+                    statCard.append('div').attr('class', 'stat-sublabel').text('Chain Tip');
+
+                    // Header sync
                     statCard = statsGrid.append('div')
                         .attr('class', 'stat-card')
                         .style('padding', '10px');
-                    statCard.append('div').attr('class', 'stat-label').text('P2P');
-                    var p2pSuccess = chainData.broadcast_stats ? chainData.broadcast_stats.p2p_successes : 0;
-                    var p2pFail = chainData.broadcast_stats ? chainData.broadcast_stats.p2p_failures : 0;
-                    var p2pRate = (p2pSuccess + p2pFail) > 0 ? (p2pSuccess / (p2pSuccess + p2pFail) * 100) : 100;
+                    statCard.append('div').attr('class', 'stat-label').text('SYNC');
+                    var maxH = 0;
+                    connPeers.forEach(function(p) { if (p.startingheight > maxH) maxH = p.startingheight; });
+                    var syncPct = maxH > 0 ? Math.min(100, (chainData.current_height || 0) / maxH * 100) : 100;
                     statCard.append('div')
                         .attr('class', 'stat-value')
                         .style('font-size', '1.2rem')
-                        .style('color', p2pRate >= 80 ? 'var(--success)' : (p2pRate >= 50 ? 'var(--warning)' : 'var(--danger)'))
-                        .text(p2pRate.toFixed(1) + '%');
-                    statCard.append('div').attr('class', 'stat-sublabel').text('Connect Rate');
+                        .style('color', syncPct >= 99.9 ? 'var(--success)' : 'var(--warning)')
+                        .text(syncPct.toFixed(1) + '%');
+                    statCard.append('div').attr('class', 'stat-sublabel').text('Header Sync');
                     
                     // Broadcasts
                     statCard = statsGrid.append('div')
@@ -3965,7 +3873,7 @@
                         
                         var thead = table.append('thead');
                         var headerRow = thead.append('tr');
-                        ['ADDRESS', 'SCORE', 'SOURCE', 'SUCCESS', 'SENT', 'LAST SEEN'].forEach(function(h) {
+                        ['ADDRESS', 'VERSION', 'HEIGHT', 'UPTIME'].forEach(function(h) {
                             headerRow.append('th')
                                 .style('text-align', 'left')
                                 .style('padding', '8px')
@@ -3987,47 +3895,18 @@
                             tbody.selectAll('tr').remove();
                             var displayPeers = window[peersKey].slice(0, window[peersKey + '_display']);
                             
-                            displayPeers.forEach(function(p) {
+                            var connPeers = window[peersKey].filter(function(p) { return p.connected; });
+                            var dispPeers = connPeers.slice(0, window[peersKey + '_display']);
+
+                            dispPeers.forEach(function(p) {
                                 var tr = tbody.append('tr')
                                     .style('border-bottom', '1px solid var(--border)');
-                                
-                                // Address with connection status
-                                var addr = p.address;
-                                if (addr.length > 24) addr = addr.substring(0, 20) + '...';
-                                var addrHtml = p.connected ? 
-                                    '<span style="color: var(--success);">●</span> ' + addr :
-                                    '<span style="color: var(--text-muted);">○</span> ' + addr;
-                                if (p.protected) {
-                                    addrHtml += ' <span style="color: var(--success); font-size: 0.7rem;">[PROTECTED]</span>';
-                                }
-                                tr.append('td').style('padding', '8px').html(addrHtml);
-                                
-                                // Score
-                                tr.append('td').style('padding', '8px').text(p.score.toFixed(1));
-                                
-                                // Source
-                                tr.append('td').style('padding', '8px').style('color', 'var(--text-muted)').text(p.source || 'unknown');
-                                
-                                // Success rate
-                                var total = (p.successful_broadcasts || 0) + (p.failed_broadcasts || 0);
-                                var rate = total > 0 ? ((p.successful_broadcasts / total) * 100).toFixed(0) + '%' : '-';
-                                tr.append('td').style('padding', '8px').text(rate);
-                                
-                                // Sent count
-                                tr.append('td').style('padding', '8px').text(
-                                    (p.successful_broadcasts || 0) + ' / ' + (p.failed_broadcasts || 0)
-                                );
-                                
-                                // Last seen
-                                var lastSeen = '-';
-                                if (p.last_seen && p.last_seen > 0) {
-                                    var age = (Date.now() / 1000) - p.last_seen;
-                                    if (age < 60) lastSeen = 'Now';
-                                    else if (age < 3600) lastSeen = Math.floor(age / 60) + 'm ago';
-                                    else if (age < 86400) lastSeen = Math.floor(age / 3600) + 'h ago';
-                                    else lastSeen = Math.floor(age / 86400) + 'd ago';
-                                }
-                                tr.append('td').style('padding', '8px').style('color', 'var(--text-muted)').text(lastSeen);
+                                tr.append('td').style('padding', '8px')
+                                    .style('font-family', 'monospace').style('font-size', '12px')
+                                    .text(p.addr || '-');
+                                tr.append('td').style('padding', '8px').text(p.subver || '-');
+                                tr.append('td').style('padding', '8px').text(p.startingheight || '-');
+                                tr.append('td').style('padding', '8px').text(format_duration(p.conntime || 0));
                             });
                             
                             // Update show more button

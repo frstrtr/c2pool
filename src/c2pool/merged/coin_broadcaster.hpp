@@ -281,6 +281,28 @@ public:
         return static_cast<int>(m_peers.size());
     }
 
+    /// Return per-peer info JSON array (daemon-style getpeerinfo).
+    nlohmann::json get_peer_info() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& [key, peer] : m_peers) {
+            arr.push_back({
+                {"addr", key},
+                {"version", peer->node_p2p.peer_version()},
+                {"subver", peer->node_p2p.peer_subver()},
+                {"services", peer->node_p2p.peer_services()},
+                {"startingheight", peer->node_p2p.peer_start_height()},
+                {"conntime", peer->node_p2p.peer_uptime_sec()},
+                {"inbound", false},  // broadcaster only makes outbound connections
+                {"connected", peer->node_p2p.peer_version() > 0}
+            });
+        }
+        return arr;
+    }
+
+    const std::string& symbol() const { return m_symbol; }
+
     /// Request a full block (MSG_MWEB_BLOCK) from all peers via getdata.
     /// Used after a chain reorg to re-fetch MWEB state for the new tip.
     void request_full_block(const uint256& block_hash)
@@ -339,7 +361,6 @@ public:
                  << (locator.empty() ? "" : " tip=" + locator.front().GetHex().substr(0, 16) + "...");
     }
 
-    const std::string& symbol() const { return m_symbol; }
     CoinPeerManager& peer_manager() { return m_peer_manager; }
 
 private:

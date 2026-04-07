@@ -70,8 +70,12 @@ private:
     bool m_peer_wants_cmpct_announce{false};
     // BIP 339 wtxidrelay state
     bool m_peer_wtxidrelay{false};
-    // Peer's advertised service flags (from version message)
+    // Peer metadata from version message
     uint64_t m_peer_services{0};
+    uint32_t m_peer_version{0};          // protocol version (e.g. 70017)
+    std::string m_peer_subver;           // user agent (e.g. "/LitecoinCore:0.21.4/")
+    uint32_t m_peer_start_height{0};     // chain height at connect time
+    std::chrono::steady_clock::time_point m_connected_at{std::chrono::steady_clock::now()};
     // BIP 35: request full mempool inventory after handshake
     bool m_request_mempool_on_connect{false};
     // Compact block reconstruction state: pending compact block awaiting blocktxn
@@ -326,6 +330,16 @@ public:
     /// Check if peer supports NODE_BLOOM (required for BIP 35 mempool).
     bool peer_has_bloom() const { return (m_peer_services & 4) != 0; }
 
+    /// Peer metadata accessors
+    uint32_t peer_version() const { return m_peer_version; }
+    const std::string& peer_subver() const { return m_peer_subver; }
+    uint32_t peer_start_height() const { return m_peer_start_height; }
+    int64_t peer_uptime_sec() const {
+        return std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - m_connected_at).count();
+    }
+    const std::string& chain_label() const { return m_chain_label; }
+
     /// Set mempool reference for compact block reconstruction.
     void set_mempool(Mempool* mp) { m_mempool = mp; }
 
@@ -453,6 +467,9 @@ private:
     ADD_P2P_HANDLER(version)
     {
         m_peer_services = msg->m_services;
+        m_peer_version = msg->m_version;
+        m_peer_subver = msg->m_subversion;
+        m_peer_start_height = msg->m_start_height;
         LOG_INFO << "[" << m_chain_label << "] version: " << msg->m_command
                  << " start_height=" << msg->m_start_height
                  << " services=0x" << std::hex << msg->m_services << std::dec

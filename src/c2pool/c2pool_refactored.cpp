@@ -5295,6 +5295,19 @@ int main(int argc, char* argv[]) {
                 LOG_INFO << "[V35-MERGED] Resolver wired via embedded LTC P2P + DOGE HeaderChain";
             }
 
+            // Wire coin P2P peer info for dashboard tables
+            if (embedded_broadcaster) {
+                web_server.get_mining_interface()->set_ltc_peer_info_fn(
+                    [bcaster = embedded_broadcaster.get()]() { return bcaster->get_peer_info(); });
+            }
+            {
+                auto it = merged_broadcasters.find(98);  // DOGE
+                if (it != merged_broadcasters.end()) {
+                    web_server.get_mining_interface()->set_doge_peer_info_fn(
+                        [bcaster = it->second.get()]() { return bcaster->get_peer_info(); });
+                }
+            }
+
             // Backfill network_difficulty + timestamp on persisted found blocks
             // using LTC header chain. Exact values from the block header.
             if (embedded_chain) {
