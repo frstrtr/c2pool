@@ -1582,6 +1582,7 @@ int main(int argc, char* argv[]) {
             struct MergedResolveCtx {
                 uint256 pow_hash;
                 std::string miner;  // human-readable address
+                uint32_t share_ts{0};  // share's block header timestamp
             };
             using MergedResolverFn = std::function<void(const uint256& ltc_block_hash,
                                                         const MergedResolveCtx& ctx)>;
@@ -1680,6 +1681,12 @@ int main(int argc, char* argv[]) {
                     );
                     mi->load_persisted_found_blocks();
                     LOG_INFO << "[Pool] Found block persistence enabled at " << fblk_db_path;
+
+                    // Merged block persistence (shares same LevelDB)
+                    auto mblk_store = std::make_shared<c2pool::storage::MergedBlockStore>(*fblk_leveldb);
+                    mi->set_merged_block_store(mblk_store);
+                    LOG_INFO << "[Pool] Merged block persistence enabled ("
+                             << mblk_store->count() << " stored)";
 
                     // THE checkpoint store (shares same LevelDB)
                     auto the_store = std::make_shared<c2pool::storage::TheCheckpointStore>(*fblk_leveldb);
@@ -2983,7 +2990,8 @@ int main(int argc, char* argv[]) {
 
                 bool had_v36_data = false;
                 tracker_chain.get(share_hash).share.invoke([&](auto* s) {
-                    // Extract miner address as human-readable string
+                    // Extract miner address and share timestamp
+                    uint32_t share_ts = s->m_min_header.m_timestamp;
                     std::string miner_addr;
                     {
                         auto script = get_share_script(s);
@@ -3029,7 +3037,7 @@ int main(int argc, char* argv[]) {
                             blk.height = static_cast<int>(entry.m_block_height);
                             blk.block_hash = block_hash.GetHex();
                             blk.parent_hash = share_hash.GetHex();
-                            blk.timestamp = static_cast<int64_t>(std::time(nullptr));
+                            blk.timestamp = static_cast<int64_t>(share_ts);
                             blk.accepted = true;
                             blk.coinbase_value = entry.m_coinbase_value;
                             blk.miner = miner_addr;
@@ -3040,6 +3048,19 @@ int main(int argc, char* argv[]) {
                                     blk.parent_height = ltc_entry->height;
                             }
                             mm->add_discovered_block(blk);
+                            // Persist to LevelDB
+                            auto store_ptr = mi->get_merged_block_store();
+                            if (store_ptr) {
+                                auto* ms = static_cast<c2pool::storage::MergedBlockStore*>(store_ptr.get());
+                                c2pool::storage::MergedBlockRecord rec;
+                                rec.chain_id = blk.chain_id; rec.symbol = blk.symbol;
+                                rec.height = blk.height; rec.block_hash = blk.block_hash;
+                                rec.parent_hash = blk.parent_hash; rec.timestamp = blk.timestamp;
+                                rec.accepted = blk.accepted; rec.coinbase_value = blk.coinbase_value;
+                                rec.is_local = blk.is_local; rec.parent_height = blk.parent_height;
+                                rec.miner = blk.miner;
+                                ms->store(rec);
+                            }
                         }
                     }
                 });
@@ -3055,6 +3076,7 @@ int main(int argc, char* argv[]) {
                         MergedResolveCtx ctx;
                         ctx.pow_hash = pow_hash;
                         tracker_chain.get(share_hash).share.invoke([&](auto* s) {
+                            ctx.share_ts = s->m_min_header.m_timestamp;
                             auto script = get_share_script(s);
                             ctx.miner = core::script_to_address(
                                 script, true, ltc::PoolConfig::is_testnet);
@@ -4290,8 +4312,15 @@ int main(int argc, char* argv[]) {
                                             uint64_t cb_total = 0;
                                             for (const auto& out : block.m_txs[0].vout)
                                                 cb_total += out.value;
-                                            if (cb_total > 0)
+                                            if (cb_total > 0) {
                                                 mm_ptr->update_block_coinbase(block_hash.GetHex(), cb_total);
+                                                // Also update LevelDB persistence
+                                                auto sp = web_server.get_mining_interface()->get_merged_block_store();
+                                                if (sp) {
+                                                    auto* ms = static_cast<c2pool::storage::MergedBlockStore*>(sp.get());
+                                                    ms->update_coinbase(block_hash.GetHex(), 98, cb_total);
+                                                }
+                                            }
                                         }
                                     });
 
@@ -5144,7 +5173,8 @@ int main(int argc, char* argv[]) {
                         doge_bcaster = it->second.get();
                 }
                 bool testnet = settings->m_testnet;
-                *on_full_block_merged = [dc, ltc_hc, mm, doge_bcaster, testnet](
+                auto mi_ptr_for_merge = web_server.get_mining_interface();
+                *on_full_block_merged = [dc, ltc_hc, mm, doge_bcaster, testnet, mi_ptr_for_merge](
                     const uint256& ltc_block_hash, const MergedResolveCtx& ctx,
                     const ltc::coin::BlockType& block) {
                     if (!mm || !dc || block.m_txs.empty()) return;
@@ -5219,7 +5249,9 @@ int main(int argc, char* argv[]) {
                     blk.height = static_cast<int>(doge_entry->height);
                     blk.block_hash = mm_root.GetHex();
                     blk.parent_hash = ltc_block_hash.GetHex();
-                    blk.timestamp = static_cast<int64_t>(std::time(nullptr));
+                    blk.timestamp = ctx.share_ts > 0
+                        ? static_cast<int64_t>(ctx.share_ts)
+                        : static_cast<int64_t>(std::time(nullptr));
                     blk.accepted = true;
                     blk.miner = ctx.miner;
                     // Request full DOGE block from P2P to get exact coinbase_value.
@@ -5234,6 +5266,20 @@ int main(int argc, char* argv[]) {
                             blk.parent_height = ltc_entry->height;
                     }
                     mm->add_discovered_block(blk);
+
+                    // Persist to LevelDB
+                    auto store_ptr = mi_ptr_for_merge->get_merged_block_store();
+                    if (store_ptr) {
+                        auto* ms = static_cast<c2pool::storage::MergedBlockStore*>(store_ptr.get());
+                        c2pool::storage::MergedBlockRecord rec;
+                        rec.chain_id = blk.chain_id; rec.symbol = blk.symbol;
+                        rec.height = blk.height; rec.block_hash = blk.block_hash;
+                        rec.parent_hash = blk.parent_hash; rec.timestamp = blk.timestamp;
+                        rec.accepted = blk.accepted; rec.coinbase_value = blk.coinbase_value;
+                        rec.is_local = blk.is_local; rec.parent_height = blk.parent_height;
+                        rec.miner = blk.miner;
+                        ms->store(rec);
+                    }
 
                     // Request full DOGE block from P2P to get exact coinbase_value.
                     // When it arrives, the DOGE full_block handler will sum coinbase
@@ -5263,16 +5309,54 @@ int main(int argc, char* argv[]) {
                     });
             }
 
+            // Load persisted merged blocks into mm_manager BEFORE block scan.
+            {
+                auto store_ptr = web_server.get_mining_interface()->get_merged_block_store();
+                auto* mm = web_server.get_mining_interface()->get_mm_manager();
+                if (store_ptr && mm) {
+                    auto* mblk_store = static_cast<c2pool::storage::MergedBlockStore*>(store_ptr.get());
+                    auto records = mblk_store->load_all();
+                    int loaded = 0;
+                    for (const auto& rec : records) {
+                        c2pool::merged::DiscoveredMergedBlock blk;
+                        blk.chain_id = rec.chain_id;
+                        blk.symbol = rec.symbol;
+                        blk.height = rec.height;
+                        blk.block_hash = rec.block_hash;
+                        blk.parent_hash = rec.parent_hash;
+                        blk.timestamp = rec.timestamp;
+                        blk.accepted = rec.accepted;
+                        blk.coinbase_value = rec.coinbase_value;
+                        blk.is_local = rec.is_local;
+                        blk.parent_height = rec.parent_height;
+                        blk.miner = rec.miner;
+                        mm->add_discovered_block(blk);  // dedup handles duplicates
+                        ++loaded;
+                    }
+                    if (loaded > 0)
+                        LOG_INFO << "[Pool] Loaded " << loaded << " persisted merged blocks";
+                }
+            }
+
             // Block scan: run here after ALL callbacks + DOGE target fn are wired.
             if (p2p_node) {
                 auto best = p2p_node->best_share_hash();
                 int chain_len = static_cast<int>(ltc::PoolConfig::chain_length());
                 if (!best.IsNull() && chain_len > 0) {
                     uint64_t latest_block_ts = 0;
+                    // Check LTC found blocks
                     auto existing = web_server.get_mining_interface()->rest_recent_blocks();
                     for (const auto& b : existing) {
                         uint64_t ts = b.value("ts", uint64_t(0));
                         if (ts > latest_block_ts) latest_block_ts = ts;
+                    }
+                    // Check merged blocks — use max(ltc, merged) for scan cutoff
+                    auto* mm = web_server.get_mining_interface()->get_mm_manager();
+                    if (mm) {
+                        for (const auto& mb : mm->get_discovered_blocks()) {
+                            if (mb.timestamp > 0 && static_cast<uint64_t>(mb.timestamp) > latest_block_ts)
+                                latest_block_ts = static_cast<uint64_t>(mb.timestamp);
+                        }
                     }
                     int scan_depth = chain_len;
                     if (latest_block_ts > 0) {

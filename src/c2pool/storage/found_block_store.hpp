@@ -198,5 +198,154 @@ private:
     }
 };
 
+/// Persistent record for a discovered merged block (DOGE etc).
+/// Uses key prefix "mblk:" — never pruned.
+struct MergedBlockRecord {
+    uint32_t    chain_id{0};
+    std::string symbol;
+    int         height{0};
+    std::string block_hash;
+    std::string parent_hash;
+    int64_t     timestamp{0};
+    bool        accepted{true};
+    uint64_t    coinbase_value{0};
+    bool        is_local{false};
+    uint32_t    parent_height{0};
+    std::string miner;
+
+    std::vector<uint8_t> serialize() const
+    {
+        PackStream ps;
+        uint8_t version = 1;
+        ps << version;
+        ps << chain_id;
+        uint8_t sym_len = static_cast<uint8_t>(std::min(symbol.size(), size_t(31)));
+        ps << sym_len;
+        ps.write(std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(symbol.data()), sym_len));
+        ps << static_cast<uint32_t>(height);
+        uint8_t bh_len = static_cast<uint8_t>(std::min(block_hash.size(), size_t(255)));
+        ps << bh_len;
+        ps.write(std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(block_hash.data()), bh_len));
+        uint8_t ph_len = static_cast<uint8_t>(std::min(parent_hash.size(), size_t(255)));
+        ps << ph_len;
+        ps.write(std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(parent_hash.data()), ph_len));
+        ps << static_cast<uint64_t>(timestamp);
+        uint8_t flags = (accepted ? 1 : 0) | (is_local ? 2 : 0);
+        ps << flags;
+        ps << coinbase_value;
+        ps << parent_height;
+        uint8_t mn_len = static_cast<uint8_t>(std::min(miner.size(), size_t(255)));
+        ps << mn_len;
+        if (mn_len > 0)
+            ps.write(std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(miner.data()), mn_len));
+
+        auto span = ps.get_span();
+        return {reinterpret_cast<const uint8_t*>(span.data()),
+                reinterpret_cast<const uint8_t*>(span.data()) + span.size()};
+    }
+
+    static MergedBlockRecord deserialize(const std::vector<uint8_t>& data)
+    {
+        MergedBlockRecord rec;
+        if (data.size() < 4) return rec;
+        size_t pos = 0;
+        auto read_u8 = [&]() -> uint8_t { return pos < data.size() ? data[pos++] : 0; };
+        auto read_u32 = [&]() -> uint32_t {
+            if (pos + 4 > data.size()) return 0;
+            uint32_t v; std::memcpy(&v, &data[pos], 4); pos += 4; return v;
+        };
+        auto read_u64 = [&]() -> uint64_t {
+            if (pos + 8 > data.size()) return 0;
+            uint64_t v; std::memcpy(&v, &data[pos], 8); pos += 8; return v;
+        };
+        auto read_str = [&](uint8_t len) -> std::string {
+            if (pos + len > data.size()) { pos = data.size(); return ""; }
+            std::string s(reinterpret_cast<const char*>(&data[pos]), len);
+            pos += len; return s;
+        };
+
+        uint8_t version = read_u8();
+        if (version != 1) return rec;
+        rec.chain_id = read_u32();
+        rec.symbol = read_str(read_u8());
+        rec.height = static_cast<int>(read_u32());
+        rec.block_hash = read_str(read_u8());
+        rec.parent_hash = read_str(read_u8());
+        rec.timestamp = static_cast<int64_t>(read_u64());
+        uint8_t flags = read_u8();
+        rec.accepted = (flags & 1) != 0;
+        rec.is_local = (flags & 2) != 0;
+        rec.coinbase_value = read_u64();
+        rec.parent_height = read_u32();
+        rec.miner = read_str(read_u8());
+        return rec;
+    }
+};
+
+/// LevelDB-backed persistent store for discovered merged blocks.
+/// Uses key prefix "mblk:" — shares the same LevelDB as found blocks.
+class MergedBlockStore {
+public:
+    explicit MergedBlockStore(core::LevelDBStore& store) : m_store(store) {}
+
+    bool store(const MergedBlockRecord& rec)
+    {
+        auto key = make_key(rec.chain_id, rec.height, rec.block_hash);
+        return m_store.put(key, rec.serialize());
+    }
+
+    bool update_coinbase(const std::string& block_hash, uint32_t chain_id, uint64_t coinbase_value)
+    {
+        auto keys = m_store.list_keys("mblk:", 1000);
+        for (const auto& key : keys) {
+            std::vector<uint8_t> data;
+            if (!m_store.get(key, data)) continue;
+            auto rec = MergedBlockRecord::deserialize(data);
+            if (rec.block_hash == block_hash && rec.chain_id == chain_id) {
+                rec.coinbase_value = coinbase_value;
+                return m_store.put(key, rec.serialize());
+            }
+        }
+        return false;
+    }
+
+    std::vector<MergedBlockRecord> load_all()
+    {
+        std::vector<MergedBlockRecord> result;
+        auto keys = m_store.list_keys("mblk:", 10000);
+        for (const auto& key : keys) {
+            std::vector<uint8_t> data;
+            if (m_store.get(key, data)) {
+                auto rec = MergedBlockRecord::deserialize(data);
+                if (!rec.block_hash.empty())
+                    result.push_back(std::move(rec));
+            }
+        }
+        std::sort(result.begin(), result.end(),
+            [](const MergedBlockRecord& a, const MergedBlockRecord& b) {
+                return a.timestamp > b.timestamp;
+            });
+        return result;
+    }
+
+    size_t count() { return m_store.list_keys("mblk:", 10000).size(); }
+
+private:
+    core::LevelDBStore& m_store;
+
+    static std::string make_key(uint32_t chain_id, int height, const std::string& block_hash)
+    {
+        std::ostringstream oss;
+        oss << "mblk:" << chain_id << ":"
+            << std::setfill('0') << std::setw(12) << height << ":"
+            << block_hash.substr(0, 16);
+        return oss.str();
+    }
+};
+
 } // namespace storage
 } // namespace c2pool

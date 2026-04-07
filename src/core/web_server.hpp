@@ -642,6 +642,10 @@ public:
     using block_diff_lookup_fn = std::function<double(const std::string& block_hash)>;
     void backfill_block_difficulty(block_diff_lookup_fn fn);
 
+    /// Merged block persistence — opaque store pointer, cast in .cpp.
+    void set_merged_block_store(std::shared_ptr<void> store);
+    std::shared_ptr<void> get_merged_block_store() const { return m_merged_block_store; }
+
     // Callback fired whenever a block submission is attempted.
     // Arguments: header hex (first 80 bytes), stale_info (none=accepted, orphan=stale prev, doa=daemon rejected).
     void set_on_block_submitted(std::function<void(const std::string& header_hex, int stale_info)> fn);
@@ -851,6 +855,7 @@ private:
     block_store_fn_t m_persist_block_fn;   // called on record + status change
     block_load_fn_t  m_load_blocks_fn;     // called on startup
 
+    std::shared_ptr<void> m_merged_block_store;  // MergedBlockStore (opaque)
     block_verify_fn_t m_block_verify_fn;  // default (parent chain)
     std::map<std::string, block_verify_fn_t> m_chain_verify_fns; // per-chain
     void verify_found_block(size_t index);

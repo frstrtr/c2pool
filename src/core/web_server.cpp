@@ -3350,6 +3350,8 @@ void MiningInterface::backfill_block_difficulty(block_diff_lookup_fn fn)
         LOG_INFO << "[Pool] Backfilled network_difficulty on " << filled << " found block(s)";
 }
 
+void MiningInterface::set_merged_block_store(std::shared_ptr<void> store) { m_merged_block_store = std::move(store); }
+
 void MiningInterface::set_block_verify_fn(block_verify_fn_t fn) { m_block_verify_fn = std::move(fn); }
 
 void MiningInterface::add_chain_verify_fn(const std::string& chain, block_verify_fn_t fn) {
