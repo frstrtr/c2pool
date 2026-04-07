@@ -3332,22 +3332,26 @@ void MiningInterface::load_persisted_found_blocks()
     }
 }
 
-void MiningInterface::backfill_block_difficulty(block_diff_lookup_fn fn)
+void MiningInterface::backfill_block_fields(block_diff_lookup_fn diff_fn, block_ts_lookup_fn ts_fn)
 {
-    if (!fn) return;
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
-    int filled = 0;
+    int diff_filled = 0, ts_filled = 0;
     for (auto& blk : m_found_blocks) {
-        if (blk.network_difficulty == 0.0 && !blk.hash.empty()) {
-            double diff = fn(blk.hash);
-            if (diff > 0) {
-                blk.network_difficulty = diff;
-                ++filled;
+        if (!blk.hash.empty()) {
+            if (diff_fn && blk.network_difficulty == 0.0) {
+                double diff = diff_fn(blk.hash);
+                if (diff > 0) { blk.network_difficulty = diff; ++diff_filled; }
+            }
+            if (ts_fn) {
+                uint32_t ts = ts_fn(blk.hash);
+                if (ts > 0 && blk.ts != ts) { blk.ts = ts; ++ts_filled; }
             }
         }
     }
-    if (filled > 0)
-        LOG_INFO << "[Pool] Backfilled network_difficulty on " << filled << " found block(s)";
+    if (diff_filled > 0)
+        LOG_INFO << "[Pool] Backfilled network_difficulty on " << diff_filled << " found block(s)";
+    if (ts_filled > 0)
+        LOG_INFO << "[Pool] Backfilled timestamp on " << ts_filled << " found block(s)";
 }
 
 void MiningInterface::set_merged_block_store(std::shared_ptr<void> store) { m_merged_block_store = std::move(store); }

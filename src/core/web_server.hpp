@@ -640,7 +640,8 @@ public:
     /// Backfill network_difficulty on loaded blocks using a block hash → difficulty lookup.
     /// Called after embedded header chain is available.
     using block_diff_lookup_fn = std::function<double(const std::string& block_hash)>;
-    void backfill_block_difficulty(block_diff_lookup_fn fn);
+    using block_ts_lookup_fn = std::function<uint32_t(const std::string& block_hash)>;
+    void backfill_block_fields(block_diff_lookup_fn diff_fn, block_ts_lookup_fn ts_fn);
 
     /// Merged block persistence — opaque store pointer, cast in .cpp.
     void set_merged_block_store(std::shared_ptr<void> store);

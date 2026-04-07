@@ -2957,7 +2957,8 @@ int main(int argc, char* argv[]) {
                              << " height=" << height;
 
                     mi->record_found_block(
-                        height, block_hash, 0, is_testnet ? "tLTC" : "LTC",
+                        height, block_hash, s->m_min_header.m_timestamp,
+                        is_testnet ? "tLTC" : "LTC",
                         miner_addr, share_hash.GetHex(), net_diff, share_diff, pool_hr, 0);
                     mi->schedule_block_verification(block_hash.GetHex());
                 });
@@ -5294,11 +5295,11 @@ int main(int argc, char* argv[]) {
                 LOG_INFO << "[V35-MERGED] Resolver wired via embedded LTC P2P + DOGE HeaderChain";
             }
 
-            // Backfill network_difficulty on persisted found blocks using LTC header chain.
-            // Exact difficulty from the block's nBits field — no approximation.
+            // Backfill network_difficulty + timestamp on persisted found blocks
+            // using LTC header chain. Exact values from the block header.
             if (embedded_chain) {
                 auto* hc = embedded_chain.get();
-                web_server.get_mining_interface()->backfill_block_difficulty(
+                web_server.get_mining_interface()->backfill_block_fields(
                     [hc](const std::string& block_hash_hex) -> double {
                         uint256 h;
                         h.SetHex(block_hash_hex);
@@ -5306,6 +5307,12 @@ int main(int argc, char* argv[]) {
                         if (!entry) return 0.0;
                         auto target = chain::bits_to_target(entry->header.m_bits);
                         return chain::target_to_difficulty(target);
+                    },
+                    [hc](const std::string& block_hash_hex) -> uint32_t {
+                        uint256 h;
+                        h.SetHex(block_hash_hex);
+                        auto entry = hc->get_header(h);
+                        return entry ? entry->header.m_timestamp : 0;
                     });
             }
 
