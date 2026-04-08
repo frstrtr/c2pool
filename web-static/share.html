@@ -30,7 +30,7 @@
             line-height: 1.6;
         }
         .container {
-            max-width: 960px;
+            max-width: 95vw;
             margin: 0 auto;
             padding: 20px;
         }
@@ -381,6 +381,14 @@
             return (0xffff0000 * Math.pow(2, 256 - 64) + 1) / (target + 1);
         }
 
+        function format_hashrate(h) {
+            if (!h || h <= 0) return '0 H/s';
+            var units = ['H/s','KH/s','MH/s','GH/s','TH/s','PH/s','EH/s'];
+            var i = 0;
+            while (h >= 1000 && i < units.length - 1) { h /= 1000; i++; }
+            return h.toFixed(2) + ' ' + units[i];
+        }
+
         function format_difficulty(d) {
             if (d == null || !isFinite(d) || d <= 0) return '0';
             if (d < 1000) return d.toFixed(2);
@@ -672,24 +680,64 @@
                 if (winData.pplns && winData.pplns[shortHash]) {
                     sharePplns = winData.pplns[shortHash];
                 } else if (winData.pplns_current) {
-                    sharePplns = winData.pplns_current;  // fallback to current tip
+                    sharePplns = winData.pplns_current;
                 }
                 if (!sharePplns) return;
 
-                // Parse PPLNS: {addr: amount_ltc} → entries array
+                // Fetch merged payouts to get DOGE data
+                d3.json('../current_merged_payouts', function(mergedPayouts) {
+                // Build DOGE lookup from merged payouts
+                var dogeLookup = {};
+                if (mergedPayouts && typeof mergedPayouts === 'object') {
+                    for (var mAddr in mergedPayouts) {
+                        var mp = mergedPayouts[mAddr];
+                        if (mp.merged && mp.merged.length > 0) {
+                            mp.merged.forEach(function(m) {
+                                if (m.symbol === 'DOGE') {
+                                    dogeLookup[mAddr] = { amt: m.amount || 0, addr: m.address || '' };
+                                }
+                            });
+                        }
+                    }
+                }
+
+                // Parse per-share PPLNS + merge DOGE data
                 var total = 0;
                 var entries = [];
                 for (var addr in sharePplns) {
                     var ltcAmt = sharePplns[addr];
                     total += ltcAmt;
-                    entries.push({ addr: addr, amt: ltcAmt, doge: 0, dogeAddr: '' });
+                    var doge = dogeLookup[addr] || { amt: 0, addr: '' };
+                    entries.push({ addr: addr, amt: ltcAmt, doge: doge.amt, dogeAddr: doge.addr });
                 }
                 entries.sort(function(a, b) { return b.amt - a.amt; });
                 entries.forEach(function(e) { e.pct = total > 0 ? e.amt / total : 0; });
                 var dogeTotal = 0;
+                entries.forEach(function(e) { dogeTotal += e.doge; });
+
+                // Compute per-miner hashrate from sharechain window data
+                var minerHR = {};
+                if (winData.shares && winData.shares.length >= 2) {
+                    var diffSums = {};
+                    winData.shares.forEach(function(s) {
+                        if (!diffSums[s.m]) diffSums[s.m] = 0;
+                        if (s.b) {
+                            var nSize = s.b >>> 24, nWord = s.b & 0x00ffffff;
+                            var diff = (0xffff0000 * Math.pow(2, 256-64) + 1) / (nWord * Math.pow(2, 8*(nSize-3)) + 1);
+                            diffSums[s.m] += diff;
+                        }
+                    });
+                    var newest = winData.shares[0].t;
+                    var oldest = winData.shares[winData.shares.length-1].t;
+                    var span = Math.max(newest - oldest, 1);
+                    for (var m in diffSums) {
+                        minerHR[m] = diffSums[m] * 4294967296 / span;
+                    }
+                }
 
                     var w = grid.clientWidth;
-                    var h = Math.max(300, Math.min(w * 0.5, 500));
+                    var vh = window.innerHeight || document.documentElement.clientHeight;
+                    var h = Math.max(400, Math.min(w * 0.5, vh * 0.7));
                     grid.style.height = h + 'px';
 
                     var rects = pplnsTreemap(entries, 0, 0, w, h);
@@ -799,15 +847,15 @@
                             window.open(addrPrefix + r.addr, '_blank');
                         });
 
-                        // Tooltip with version + DOGE info
+                        // Tooltip — matches dashboard PPLNS treemap format
                         var _hasDoge = hasDoge, _isV35Only = isV35Only, _mv = mv;
                         cell.addEventListener('mouseenter', function(ev) {
                             var verLine = '';
                             if (_mv.ver) {
                                 if (_mv.dv && _mv.dv !== _mv.ver) {
-                                    verLine = '<div style="color:#0097a7;font-weight:600">V' + _mv.ver + ' \u2192 V' + _mv.dv + ' (upgrading)</div>';
+                                    verLine = '<div style="color:#4dd0e1;font-weight:600">V' + _mv.ver + ' \u2192 V' + _mv.dv + '</div>';
                                 } else if (_isV35Only) {
-                                    verLine = '<div style="color:#dc3545;font-weight:700">V' + _mv.ver + ' ONLY \u2014 missing DOGE rewards!</div>';
+                                    verLine = '<div style="color:#ff6b6b;font-weight:700">V' + _mv.ver + ' ONLY \u2014 missing DOGE!</div>';
                                 } else {
                                     verLine = '<div style="color:var(--success)">V' + _mv.ver + '</div>';
                                 }
@@ -815,16 +863,20 @@
                             var dogeLine = '';
                             if (_hasDoge) {
                                 var dogePct = dogeTotal > 0 ? (r.doge / dogeTotal * 100).toFixed(2) : '0';
-                                dogeLine = '<div style="color:#ffd700;font-weight:700;margin-top:2px">' + dogePct + '% \u2014 ' + r.doge.toFixed(4) + ' DOGE</div>';
+                                dogeLine = '<div style="color:#ffd700;font-weight:700">' + dogePct + '% \u2014 ' + r.doge.toFixed(2) + ' DOGE</div>';
                                 if (r.dogeAddr) {
                                     dogeLine += '<div style="color:var(--text-muted);font-size:0.78em;font-family:Monaco,Consolas,monospace">\u2192 ' + esc(r.dogeAddr) + '</div>';
                                 }
                             } else if (_isV35Only) {
-                                dogeLine = '<div style="color:#dc3545;font-weight:600;margin-top:2px">0 DOGE \u2014 upgrade to V36 to earn merged mining rewards!</div>';
+                                dogeLine = '<div style="color:#ff6b6b;font-weight:600">0 DOGE \u2014 upgrade to V36!</div>';
+                            }
+                            var hrLine = '';
+                            if (minerHR[r.addr]) {
+                                hrLine = '<div style="color:var(--text-secondary)">' + format_hashrate(minerHR[r.addr]) + '</div>';
                             }
                             tooltip.innerHTML = '<div style="color:var(--primary);font-weight:700;margin-bottom:4px">' + esc(r.addr) + '</div>' +
-                                '<div style="font-weight:600">' + (r.pct*100).toFixed(2) + '% \u2014 ' + r.amt.toFixed(8) + ' ' + symbol + '</div>' +
-                                dogeLine + verLine +
+                                '<div style="font-weight:600">' + (r.pct*100).toFixed(2) + '% \u2014 ' + r.amt.toFixed(8) + ' LTC</div>' +
+                                dogeLine + hrLine + verLine +
                                 '<div style="color:var(--text-muted);font-size:0.75em;margin-top:4px">Click to view on Blockchair</div>';
                             tooltip.style.display = 'block';
                         });
@@ -838,7 +890,8 @@
 
                         grid.appendChild(cell);
                     });
-                });
+                }); // end d3.json current_merged_payouts
+                }); // end d3.json sharechain/window
         }
 
         // Treemap helpers for share.html
