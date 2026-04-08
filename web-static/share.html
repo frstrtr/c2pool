@@ -686,8 +686,9 @@
 
                 // Fetch merged payouts to get DOGE data
                 d3.json('../current_merged_payouts', function(mergedPayouts) {
-                // Build DOGE lookup from merged payouts
+                // Build DOGE lookup + compute total DOGE subsidy from current payouts
                 var dogeLookup = {};
+                var currentDogeTotal = 0;
                 if (mergedPayouts && typeof mergedPayouts === 'object') {
                     for (var mAddr in mergedPayouts) {
                         var mp = mergedPayouts[mAddr];
@@ -695,20 +696,34 @@
                             mp.merged.forEach(function(m) {
                                 if (m.symbol === 'DOGE') {
                                     dogeLookup[mAddr] = { amt: m.amount || 0, addr: m.address || '' };
+                                    currentDogeTotal += m.amount || 0;
                                 }
                             });
                         }
                     }
                 }
 
-                // Parse per-share PPLNS + merge DOGE data
+                // Parse per-share PPLNS, compute LTC total first
                 var total = 0;
+                for (var addr in sharePplns) total += sharePplns[addr];
+
+                // Build entries: use exact DOGE from lookup, or estimate from LTC proportion
+                // V35 DOGE PPLNS mirrors LTC PPLNS (same weight walk), so estimation is exact
                 var entries = [];
                 for (var addr in sharePplns) {
                     var ltcAmt = sharePplns[addr];
-                    total += ltcAmt;
-                    var doge = dogeLookup[addr] || { amt: 0, addr: '' };
-                    entries.push({ addr: addr, amt: ltcAmt, doge: doge.amt, dogeAddr: doge.addr });
+                    var ltcPct = total > 0 ? ltcAmt / total : 0;
+                    var doge = dogeLookup[addr];
+                    var dogeAmt, dogeAddr;
+                    if (doge) {
+                        dogeAmt = doge.amt;
+                        dogeAddr = doge.addr;
+                    } else {
+                        // Estimate DOGE from LTC proportion × total DOGE subsidy
+                        dogeAmt = currentDogeTotal > 0 ? ltcPct * currentDogeTotal : 0;
+                        dogeAddr = '';
+                    }
+                    entries.push({ addr: addr, amt: ltcAmt, doge: dogeAmt, dogeAddr: dogeAddr });
                 }
                 entries.sort(function(a, b) { return b.amt - a.amt; });
                 entries.forEach(function(e) { e.pct = total > 0 ? e.amt / total : 0; });
@@ -765,9 +780,7 @@
                         var verSize = Math.max(7, Math.min(pctSize * 0.45, 11));
 
                         var hasDoge = r.doge > 0;
-                        // V35-only: known V35 without V36 signal, OR unknown version without DOGE
-                        var isV35Only = (mv.ver && mv.ver < 36 && (!mv.dv || mv.dv < 36))
-                            || (!mv.ver && !hasDoge);
+                        var isV35Only = mv.ver && mv.ver < 36 && (!mv.dv || mv.dv < 36);
 
                         // Clamp font sizes to actually fit in the cell
                         var fitPct = Math.max(8, Math.min(r.w / 6, r.h / 5, 28));
@@ -861,8 +874,8 @@
                                 } else {
                                     verLine = '<div style="color:#ff6b6b;font-weight:700">V' + _mv.ver + ' ONLY \u2014 missing DOGE!</div>';
                                 }
-                            } else if (_isV35Only) {
-                                verLine = '<div style="color:var(--text-muted)">V35 (historical)</div>';
+                            } else if (!_mv.ver && _hasDoge) {
+                                verLine = '<div style="color:var(--text-muted)">DOGE estimated from LTC share</div>';
                             }
                             var dogeLine = '';
                             if (_hasDoge) {
