@@ -3076,7 +3076,7 @@ int main(int argc, char* argv[]) {
                     result["pplns_current"] = mi->rest_current_payouts();
                     // Per-share PPLNS from cache (available for shares since server start)
                     nlohmann::json pplns_map = nlohmann::json::object();
-                    for (const auto& s : shares_arr) {
+                    for (const auto& s : result["shares"]) {
                         std::string sh = s["h"].get<std::string>();
                         auto p = mi->get_pplns_for_tip(sh);
                         if (!p.empty()) pplns_map[sh] = std::move(p);
