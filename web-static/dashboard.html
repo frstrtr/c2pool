@@ -40,7 +40,7 @@
         }
         
         .container {
-            max-width: 1800px;
+            max-width: 95vw;
             margin: 0 auto;
             padding: 20px;
             width: 100%;
@@ -1591,7 +1591,6 @@
                     <a href="stratum.html">Stratum</a>
                     <a href="miners.html">Miners</a>
                     <a href="index.html">Classic</a>
-                    <a href="explorer/" target="_blank">Explorer</a>
                     <a href="javascript:manualRefresh()" class="refresh-btn" title="Refresh data">🔄 Refresh</a>
                     <a href="javascript:toggleAutoRefresh()" id="auto-refresh-btn" class="refresh-btn" title="Toggle auto-refresh">⏸ Auto-Refresh: OFF</a>
                 </nav>
@@ -2099,6 +2098,7 @@
             </div>
             <div class="pplns-main-grid" id="pplns-main-grid" style="position:relative;border-radius:8px;overflow:visible;min-height:60px"></div>
             <div id="pplns-main-tooltip" style="display:none;position:fixed;z-index:9999;background:#1e1e38;border:1px solid var(--border);border-radius:8px;padding:8px 12px;pointer-events:none;font-size:0.82rem;box-shadow:0 6px 20px rgba(0,0,0,0.5);width:320px"></div>
+            <div style="text-align:right;margin-top:8px"><a href="#" style="color:var(--text-muted);font-size:0.8rem;text-decoration:none">Back to top</a></div>
         </div>
 
         <!-- Sharechain Transparency Explorer -->
@@ -2232,6 +2232,7 @@
                     <div class="defrag-chain-cells" id="my_share_hashes"></div>
                 </div>
             </div>
+            <div style="text-align:right;margin-top:8px"><a href="#" style="color:var(--text-muted);font-size:0.8rem;text-decoration:none">Back to top</a></div>
         </div>
 
         <!-- Floating tooltip for defrag grid -->
@@ -5299,7 +5300,7 @@
                 entries.forEach(function(e) { e.pct = total > 0 ? e.amt / total : 0; });
 
                 var w = grid.clientWidth;
-                var h = Math.max(300, Math.min(w * 0.45, 600));
+                var h = Math.max(400, Math.min(w * 0.5, 700));
                 grid.style.height = h + 'px';
 
                 // Squarified treemap layout (standalone — carries all fields)
