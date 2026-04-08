@@ -2847,6 +2847,7 @@ nlohmann::json MiningInterface::rest_recent_blocks()
     nlohmann::json arr = nlohmann::json::array();
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
     for (const auto& b : m_found_blocks) {
+        std::string method = (b.time_to_find > 0 && b.luck > 0) ? "simple_avg" : "first_block";
         arr.push_back({
             {"ts", b.ts},
             {"hash", b.hash},
@@ -2866,7 +2867,7 @@ nlohmann::json MiningInterface::rest_recent_blocks()
             {"expected_time", b.expected_time},
             {"time_to_find", b.time_to_find},
             {"luck", b.luck},
-            {"luck_method", "expected_time"}
+            {"luck_method", method}
         });
     }
     return arr;
@@ -3256,9 +3257,14 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
                 break;
             }
         }
+        // Fallback: if caller passed 0 pool hashrate, use live pool hashrate
+        double hr = pool_hashrate;
+        if (hr <= 0 && m_pool_hashrate_fn)
+            hr = m_pool_hashrate_fn();
+        blk.pool_hashrate = hr;
         // expected_time = network_difficulty * 2^32 / pool_hashrate
-        if (pool_hashrate > 0 && network_difficulty > 0) {
-            blk.expected_time = network_difficulty * 4294967296.0 / pool_hashrate;
+        if (hr > 0 && network_difficulty > 0) {
+            blk.expected_time = network_difficulty * 4294967296.0 / hr;
         }
         // luck = expected / actual * 100 (>100 = lucky)
         if (blk.time_to_find > 0 && blk.expected_time > 0) {
@@ -4085,16 +4091,31 @@ nlohmann::json MiningInterface::rest_luck_stats()
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
     result["luck_available"] = !m_found_blocks.empty();
 
-    // Compute average luck trend from recent blocks
-    double luck_sum = 0;
-    int luck_count = 0;
     nlohmann::json blocks = nlohmann::json::array();
     for (const auto& b : m_found_blocks) {
         blocks.push_back({{"ts", b.ts}, {"hash", b.hash}, {"luck", b.luck}});
-        if (b.luck > 0) { luck_sum += b.luck; ++luck_count; }
     }
-    result["current_luck_trend"] = luck_count > 0 ? luck_sum / luck_count : 0.0;
     result["blocks"] = blocks;
+
+    // Current round luck: expected_time / time_since_last_block * 100
+    // Matches p2pool: shows how the ongoing round compares to expectation
+    nlohmann::json current_luck_val = nullptr;
+    if (!m_found_blocks.empty()) {
+        auto now_ts = static_cast<double>(std::time(nullptr));
+        double time_since_last = now_ts - static_cast<double>(m_found_blocks.front().ts);
+
+        // Get LIVE pool hashrate and network difficulty
+        double pool_hr = m_pool_hashrate_fn ? m_pool_hashrate_fn() : 0;
+        double net_diff = m_network_difficulty.load(std::memory_order_relaxed);
+
+        double expected = 0;
+        if (net_diff > 0 && pool_hr > 0)
+            expected = net_diff * 4294967296.0 / pool_hr;
+
+        if (expected > 0 && time_since_last > 1)
+            current_luck_val = (expected / time_since_last) * 100.0;
+    }
+    result["current_luck_trend"] = current_luck_val;
     return result;
 }
 
@@ -4514,6 +4535,9 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
     double sampling_signaling = sampling_total_weight > 0
         ? (sampling_v36_weight * 100.0 / sampling_total_weight) : 0;
 
+    // ── Propagation depth (needed for status logic) ──
+    int deepest_v36_pos = sc.value("deepest_v36_position", 0);
+
     // ── Status and message (matching p2pool phases) ──
     std::string status, message;
     double transition_progress = 0;
@@ -4542,10 +4566,37 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
         snprintf(buf, sizeof(buf), "Strong V%d signaling — activation approaching (need 95%%)", target_version);
         message = buf;
         transition_progress = sampling_signaling;
-    } else if (overall_v36_votes > 0) {
-        status = "propagating";
+    } else if (sampling_signaling > 0) {
+        // Votes present in sampling window but below 60%
+        status = "signaling";
         char buf[256];
-        snprintf(buf, sizeof(buf), "V%d votes propagating: %d votes (%.1f%% of chain)",
+        snprintf(buf, sizeof(buf), "Network is signaling for V%d upgrade", target_version);
+        message = buf;
+        transition_progress = sampling_signaling;
+    } else if (overall_v36_votes > 0 && deepest_v36_pos < chain_length) {
+        // V36 votes exist but haven't reached the sampling window yet
+        status = "propagating";
+        int shares_to = std::max(0, chain_length - deepest_v36_pos);
+        int eta_sec = shares_to * 10;  // SHARE_PERIOD = 10s for LTC
+        int eta_min = eta_sec / 60;
+        int eta_h = eta_min / 60;
+        int eta_m = eta_min % 60;
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "V%d votes propagating: %d votes (%.1f%% of chain), deepest at position %d/%d. Reach sampling window in ~%s",
+                 target_version, overall_v36_votes, overall_v36_vote_pct,
+                 deepest_v36_pos, chain_length,
+                 eta_h > 0 ? (std::to_string(eta_h) + "h " + std::to_string(eta_m) + "m").c_str()
+                           : (std::to_string(eta_m) + "m").c_str());
+        message = buf;
+        double prop_pct = chain_length > 0
+            ? std::min(deepest_v36_pos * 100.0 / chain_length, 100.0) : 0;
+        transition_progress = prop_pct;
+    } else if (overall_v36_votes > 0) {
+        // V36 votes reached window position but 0% weighted (edge case)
+        status = "signaling";
+        char buf[256];
+        snprintf(buf, sizeof(buf), "V%d votes appearing in sampling window. %d votes (%.1f%%) in chain overall",
                  target_version, overall_v36_votes, overall_v36_vote_pct);
         message = buf;
         transition_progress = overall_v36_vote_pct;
@@ -4585,6 +4636,22 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
     result["thresholds"] = {{"accept", 60}, {"activate", 95}};
     result["status"] = status;
     result["message"] = message;
+
+    // ── Propagation tracking (V36 votes aging toward sampling window) ──
+    int v36_contiguous = sc.value("v36_contiguous_from_tip", 0);
+    int propagation_target = chain_length;  // 8640 for LTC
+    double propagation_pct = propagation_target > 0
+        ? std::min(deepest_v36_pos * 100.0 / propagation_target, 100.0) : 0;
+    int shares_to_window = std::max(0, propagation_target - deepest_v36_pos);
+    constexpr int SHARE_PERIOD = 10;  // LTC: 10 seconds per share
+    double time_to_window_seconds = shares_to_window * SHARE_PERIOD;
+    result["propagation_pct"] = std::round(propagation_pct * 100) / 100.0;
+    result["propagation_target"] = propagation_target;
+    result["deepest_v36_position"] = deepest_v36_pos;
+    result["v36_contiguous_from_tip"] = v36_contiguous;
+    result["shares_to_window"] = shares_to_window;
+    result["time_to_window_seconds"] = std::round(time_to_window_seconds);
+    result["chain_length"] = chain_length;
 
     // ── Transition message + authority announcements ──
     // First try live messages from best share, then fall back to cached blob files.

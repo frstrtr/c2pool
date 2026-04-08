@@ -2817,15 +2817,33 @@ int main(int argc, char* argv[]) {
                 int skip_count = std::min(chain_ht, chain_len * 9 / 10);
                 int sample_count = std::min(chain_ht - skip_count, chain_len / 10);
 
-                // Walk to the 9/10 position to find sampling start hash
-                uint256 sampling_start = best;
-                for (int i = 0; i < skip_count && !sampling_start.IsNull(); ++i) {
-                    if (!chain.contains(sampling_start)) break;
-                    try {
-                        auto& cd = chain.get(sampling_start);
-                        cd.share.invoke([&](auto* s) { sampling_start = s->m_prev_hash; });
-                    } catch (...) { break; }
+                // Walk active chain: find sampling start hash AND track V36 propagation
+                uint256 sampling_start;
+                int deepest_v36_pos = 0;
+                int v36_contiguous_from_tip = 0;
+                bool contiguous = true;
+                int full_walk = std::min(chain_ht, chain_len);
+                {
+                    uint256 pos = best;
+                    for (int i = 0; i < full_walk && !pos.IsNull(); ++i) {
+                        if (!chain.contains(pos)) break;
+                        if (i == skip_count) sampling_start = pos;
+                        try {
+                            auto& cd = chain.get(pos);
+                            cd.share.invoke([&](auto* s) {
+                                if (static_cast<int>(s->m_desired_version) >= 36) {
+                                    deepest_v36_pos = i + 1;
+                                    if (contiguous) v36_contiguous_from_tip = i + 1;
+                                } else if (contiguous) {
+                                    contiguous = false;
+                                }
+                                pos = s->m_prev_hash;
+                            });
+                        } catch (...) { break; }
+                    }
                 }
+                result["deepest_v36_position"] = deepest_v36_pos;
+                result["v36_contiguous_from_tip"] = v36_contiguous_from_tip;
 
                 // Query the oldest CHAIN_LENGTH/10 shares from that position
                 auto sampling_sr = (sample_count > 0 && !sampling_start.IsNull())

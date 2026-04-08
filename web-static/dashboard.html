@@ -573,10 +573,7 @@
             text-decoration: underline;
         }
         
-        /* Full address on hover tooltip */
-        .hash-link[title]:hover {
-            max-width: none;
-        }
+        /* Full address shown via native tooltip only — no expansion on hover */
         
         /* Scrollable table wrapper */
         .table-scroll {
@@ -644,6 +641,9 @@
         
         .merged-payout-row .hash-link {
             font-size: 0.68rem;
+            max-width: 160px;
+        }
+        .merged-payout-row .hash-link[title]:hover {
             max-width: 160px;
         }
         
@@ -2638,13 +2638,15 @@
                         mergedPayoutCell.style('color', '#666').text('-');
                     }
                     
-                    // Create worker rows (initially hidden)
+                    // Create worker rows (expanded for multi-worker, hidden for single)
+                    var startExpanded = miner.workers.length > 1;
                     miner.workers.forEach(function(worker, widx) {
                         var workerRow = tbody.append('tr')
-                            .attr('class', 'worker-row hidden')
+                            .attr('class', 'worker-row' + (startExpanded ? '' : ' hidden'))
                             .attr('data-parent', minerId);
                         
-                        workerRow.append('td').text('↳ ' + worker.name);
+                        var shortName = worker.name.indexOf('.') >= 0 ? worker.name.substring(worker.name.lastIndexOf('.') + 1) : worker.name;
+                        workerRow.append('td').attr('title', worker.name).text('↳ ' + shortName);
                         
                         // Worker hashrate with estimated indicator
                         var workerHashrateCell = workerRow.append('td');
@@ -3848,6 +3850,9 @@
 
         // Look up miner's share version from defrag data (cached per load)
         function getMinerVersion(addr) {
+            // Donation addresses always signal V36 during transition
+            if (addr && (addr.indexOf('LeD2f') === 0 || addr.indexOf('MLhSm') === 0))
+                return { ver: 35, dv: 36 };
             if (!defrag.shares || defrag.shares.length === 0) return { ver: 0, dv: 0 };
             var verCounts = {}, dvCounts = {};
             defrag.shares.forEach(function(s) {
@@ -3912,7 +3917,7 @@
                     .attr('class', 'hash-link')
                     .attr('href', currency_info.address_explorer_url_prefix + addr)
                     .attr('target', '_blank')
-                    .attr('title', addr)
+                    .attr('title', 'LTC: ' + addr)
                     .text(addr);
 
                 // V36 column — look up miner version from defrag share data
@@ -3947,12 +3952,12 @@
                             .style('font-weight', 'bold')
                             .style('margin-right', '6px')
                             .style('font-size', '0.7rem')
-                            .text('↳ ' + merged.symbol);
+                            .text('↳');
                         addrCell.append('a')
                             .attr('class', 'hash-link')
                             .attr('href', getMergedExplorerUrl(merged.symbol, merged.address))
                             .attr('target', '_blank')
-                            .attr('title', merged.address)
+                            .attr('title', merged.symbol + ': ' + merged.address)
                             .text(merged.address);
                         // p2pool-style source labels
                         if (merged.source === 'auto-convert') {
