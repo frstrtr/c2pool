@@ -4451,10 +4451,10 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
         }
     }
 
-    // ── Desired version counts (voting) ──
+    // ── Desired version counts (voting — full chain) ──
     int overall_v36_votes = 0;
     nlohmann::json full_chain_versions = nlohmann::json::object();
-    nlohmann::json versions_json = nlohmann::json::object();
+    nlohmann::json versions_json = nlohmann::json::object();  // populated below from sampling window
     if (sc.contains("shares_by_desired_version") && sc["shares_by_desired_version"].is_object()) {
         auto& dv = sc["shares_by_desired_version"];
         for (auto& [ver, count] : dv.items()) {
@@ -4462,7 +4462,6 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
             int c = count.get<int>();
             double pct = overall_total > 0 ? (c * 100.0 / overall_total) : 0;
             full_chain_versions[ver] = {{"count", c}, {"percentage", pct}};
-            versions_json[ver] = {{"weight", c}, {"percentage", pct}};
             if (v >= TARGET_VERSION) overall_v36_votes += c;
         }
     }
@@ -4493,11 +4492,27 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
     bool confirmed = all_target && chain_height >= chain_length * 3;
     bool show_transition = (is_transitioning || !confirmed) && !confirmed && !all_target;
 
-    // ── Sampling window signaling ──
-    // p2pool uses chain_length//10 sampling window at position 9/10 into chain.
-    // We approximate from desired_version counts in the full chain walk.
+    // ── Sampling window signaling (CHAIN_LENGTH/10 shares from tip, work-weighted like p2pool) ──
     int sampling_window_size = chain_length / 10;
-    double sampling_signaling = overall_v36_vote_pct;  // approximate from full chain
+    double sampling_v36_weight = 0;
+    double sampling_total_weight = 0;
+    if (sc.contains("sampling_desired_version") && sc["sampling_desired_version"].is_object()) {
+        versions_json = nlohmann::json::object();
+        for (auto& [ver, weight] : sc["sampling_desired_version"].items()) {
+            int v = std::stoi(ver);
+            double w = weight.get<double>();
+            sampling_total_weight += w;
+            if (v >= TARGET_VERSION) sampling_v36_weight += w;
+        }
+        // Build versions_json with percentages from work weights
+        for (auto& [ver, weight] : sc["sampling_desired_version"].items()) {
+            double w = weight.get<double>();
+            double pct = sampling_total_weight > 0 ? (w * 100.0 / sampling_total_weight) : 0;
+            versions_json[ver] = {{"weight", w}, {"percentage", pct}};
+        }
+    }
+    double sampling_signaling = sampling_total_weight > 0
+        ? (sampling_v36_weight * 100.0 / sampling_total_weight) : 0;
 
     // ── Status and message (matching p2pool phases) ──
     std::string status, message;

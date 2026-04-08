@@ -2754,6 +2754,14 @@ int main(int argc, char* argv[]) {
                             d.version_counts[std::to_string(s->version)] = 1;
                             d.desired_version_counts[std::to_string(s->m_desired_version)] = 1;
 
+                            auto target = chain::bits_to_target(s->m_bits);
+                            d.difficulty_sum = chain::target_to_difficulty(target);
+
+                            // Work-weighted desired version (matches p2pool's target_to_average_attempts weighting)
+                            auto att = chain::target_to_average_attempts(target);
+                            d.desired_version_weights[std::to_string(s->m_desired_version)] =
+                                static_cast<double>(att.GetLow64());
+
                             std::string miner;
                             if constexpr (requires { s->m_address; })
                                 miner = HexStr(s->m_address.m_data);
@@ -2761,9 +2769,6 @@ int main(int argc, char* argv[]) {
                                 miner = s->m_pubkey_hash.GetHex();
                             if (!miner.empty())
                                 d.miner_counts[miner] = 1;
-
-                            auto target = chain::bits_to_target(s->m_bits);
-                            d.difficulty_sum = chain::target_to_difficulty(target);
                         });
                     } catch (...) {}
                     return d;
@@ -2804,6 +2809,30 @@ int main(int argc, char* argv[]) {
                 int walk = best.IsNull() ? 0 : std::min(static_cast<int>(chain.get_height(best)),
                     static_cast<int>(ltc::PoolConfig::chain_length()));
                 auto sr = stats_skiplist->query(best, walk);
+
+                // Sampling window: oldest CHAIN_LENGTH/10 shares in the active chain
+                // Matches p2pool consensus: get_nth_parent(tip, CHAIN_LENGTH*9//10) then count CHAIN_LENGTH//10
+                int chain_len = static_cast<int>(ltc::PoolConfig::chain_length());
+                int chain_ht = best.IsNull() ? 0 : static_cast<int>(chain.get_height(best));
+                int skip_count = std::min(chain_ht, chain_len * 9 / 10);
+                int sample_count = std::min(chain_ht - skip_count, chain_len / 10);
+
+                // Walk to the 9/10 position to find sampling start hash
+                uint256 sampling_start = best;
+                for (int i = 0; i < skip_count && !sampling_start.IsNull(); ++i) {
+                    if (!chain.contains(sampling_start)) break;
+                    try {
+                        auto& cd = chain.get(sampling_start);
+                        cd.share.invoke([&](auto* s) { sampling_start = s->m_prev_hash; });
+                    } catch (...) { break; }
+                }
+
+                // Query the oldest CHAIN_LENGTH/10 shares from that position
+                auto sampling_sr = (sample_count > 0 && !sampling_start.IsNull())
+                    ? stats_skiplist->query(sampling_start, sample_count)
+                    : chain::StatsResult{};
+                result["sampling_desired_version"] = sampling_sr.desired_version_weights;
+                result["sampling_total"]           = sampling_sr.share_count;
 
                 result["total_shares"]    = sr.share_count;
                 result["orphan_shares"]   = sr.orphan_count;
