@@ -2107,7 +2107,10 @@
         <div class="shares-section" id="sharechain-section">
             <div class="section-header" style="display:flex;justify-content:space-between;align-items:center">
                 <h2>Sharechain Transparency Explorer</h2>
-                <a href="#" style="color:var(--text-muted);font-size:0.8rem;text-decoration:none">Back to top</a>
+                <div style="display:flex;gap:12px;align-items:center">
+                    <a href="javascript:toggleRealTime()" id="realtime-btn" style="padding:4px 12px;border-radius:4px;font-size:0.8rem;font-weight:600;cursor:pointer;text-decoration:none;background:var(--card-bg);color:var(--text-muted);border:1px solid var(--border)">RealTime: OFF</a>
+                    <a href="#" style="color:var(--text-muted);font-size:0.8rem;text-decoration:none">Back to top</a>
+                </div>
             </div>
 
             <div class="defrag-container">
@@ -7713,6 +7716,110 @@
         }
         // Expose for multipool.js
         window.manualRefresh = manualRefresh;
+
+        // ═══ RealTime Mode: poll tip every 3s, fetch delta on change, animate ═══
+        var _rtInterval = null;
+        var _rtTipHash = null;
+
+        function toggleRealTime() {
+            var btn = document.getElementById('realtime-btn');
+            if (_rtInterval) {
+                // Turn OFF
+                clearInterval(_rtInterval);
+                _rtInterval = null;
+                _rtTipHash = null;
+                btn.textContent = 'RealTime: OFF';
+                btn.style.background = 'var(--card-bg)';
+                btn.style.color = 'var(--text-muted)';
+                btn.style.borderColor = 'var(--border)';
+            } else {
+                // Turn ON — initialize tip from current cached shares
+                if (defrag.shares && defrag.shares.length > 0)
+                    _rtTipHash = defrag.shares[0].h;
+                btn.textContent = 'RealTime: ON';
+                btn.style.background = '#28a745';
+                btn.style.color = '#fff';
+                btn.style.borderColor = '#28a745';
+                _rtInterval = setInterval(_rtPollTip, 3000);
+            }
+        }
+
+        function _rtPollTip() {
+            d3.json('../sharechain/tip', function(tip) {
+                if (!tip || !tip.hash) return;
+                if (tip.hash === _rtTipHash) return;  // no change
+                // Tip changed — fetch delta
+                var since = _rtTipHash || '';
+                _rtTipHash = tip.hash;
+                _rtFetchDelta(since);
+            });
+        }
+
+        function _rtFetchDelta(sinceHash) {
+            d3.json('../sharechain/delta?since=' + encodeURIComponent(sinceHash), function(delta) {
+                if (!delta || !delta.shares || delta.shares.length === 0) return;
+
+                // Snapshot old positions before update
+                var step = defrag.cellSize + defrag.gap;
+                var ml = defrag.marginLeft;
+                defrag._oldPositions = {};
+                for (var i = 0; i < defrag.shares.length; i++) {
+                    var s = defrag.shares[i];
+                    var col = i % defrag.cols;
+                    var row = Math.floor(i / defrag.cols);
+                    defrag._oldPositions[s.h] = {
+                        x: ml + col * step, y: row * step,
+                        color: defrag.getColor(s),
+                        miner: s.m || '',
+                        diff: s.b ? defrag.bitsToDifficulty(s.b) : 0
+                    };
+                }
+
+                // Prepend new shares, trim to window size
+                var newShares = delta.shares;
+                var merged = newShares.concat(defrag.shares);
+                if (merged.length > defrag.windowSize)
+                    merged = merged.slice(0, defrag.windowSize);
+                defrag.shares = merged;
+
+                // Update blocks/heads/doge sets
+                if (delta.heads) {
+                    defrag.headSet = {};
+                    delta.heads.forEach(function(h) { defrag.headSet[h] = true; });
+                }
+                if (delta.blocks) {
+                    delta.blocks.forEach(function(h) { defrag.blockSet[h] = true; });
+                }
+                if (delta.doge_blocks) {
+                    delta.doge_blocks.forEach(function(h) { defrag.dogeSet[h] = true; });
+                }
+                defrag.shares.forEach(function(s) { if (s.blk) defrag.blockSet[s.h] = true; });
+
+                defrag.computeMinerHashrates();
+
+                // Animate!
+                var newCount = newShares.length;
+                if (newCount > 0 && newCount < 100) {
+                    defrag._animate3D(newCount);
+                } else {
+                    defrag._oldPositions = {};
+                    defrag.render();
+                }
+
+                // Update stats panel and links
+                defrag.updateStats({
+                    shares: defrag.shares,
+                    window_size: defrag.windowSize,
+                    my_address: defrag.myAddress,
+                    heads: delta.heads,
+                    blocks: delta.blocks,
+                    doge_blocks: delta.doge_blocks
+                });
+                loadShareLinks();
+                refreshPayoutsV36();
+                loadMainPPLNS();
+            });
+        }
     </script>
 </body>
 </html>

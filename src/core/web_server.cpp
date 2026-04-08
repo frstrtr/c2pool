@@ -234,6 +234,11 @@ void HttpSession::process_request()
                 rest_result = mining_interface_->rest_sharechain_stats();
             else if (target == "/sharechain/window")
                 rest_result = mining_interface_->rest_sharechain_window();
+            else if (target == "/sharechain/tip")
+                rest_result = mining_interface_->rest_sharechain_tip();
+            else if (target == "/sharechain/delta") {
+                rest_result = mining_interface_->rest_sharechain_delta(getQueryParam("since"));
+            }
             else if (target == "/control/mining/start")
                 rest_result = mining_interface_->rest_control_mining_start();
             else if (target == "/control/mining/stop")
@@ -3159,6 +3164,20 @@ nlohmann::json MiningInterface::rest_sharechain_window()
     result["best_hash"] = "";
     result["chain_length"] = 0;
     return result;
+}
+
+nlohmann::json MiningInterface::rest_sharechain_tip()
+{
+    if (m_sharechain_tip_fn)
+        return m_sharechain_tip_fn();
+    return nlohmann::json::object({{"hash", ""}, {"height", 0}});
+}
+
+nlohmann::json MiningInterface::rest_sharechain_delta(const std::string& since_hash)
+{
+    if (m_sharechain_delta_fn)
+        return m_sharechain_delta_fn(since_hash);
+    return nlohmann::json::object({{"shares", nlohmann::json::array()}, {"count", 0}});
 }
 
 nlohmann::json MiningInterface::rest_control_mining_start()

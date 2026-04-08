@@ -173,6 +173,8 @@ public:
     nlohmann::json rest_global_stats();
     nlohmann::json rest_sharechain_stats();
     nlohmann::json rest_sharechain_window();
+    nlohmann::json rest_sharechain_tip();
+    nlohmann::json rest_sharechain_delta(const std::string& since_hash);
     nlohmann::json rest_control_mining_start();
     nlohmann::json rest_control_mining_stop();
     nlohmann::json rest_control_mining_restart();
@@ -495,6 +497,14 @@ public:
     using sharechain_window_fn_t = std::function<nlohmann::json()>;
     void set_sharechain_window_fn(sharechain_window_fn_t fn) { m_sharechain_window_fn = std::move(fn); }
 
+    // Sharechain tip callback — returns {hash, height} for lightweight polling
+    using sharechain_tip_fn_t = std::function<nlohmann::json()>;
+    void set_sharechain_tip_fn(sharechain_tip_fn_t fn) { m_sharechain_tip_fn = std::move(fn); }
+
+    // Sharechain delta callback — returns shares newer than given hash
+    using sharechain_delta_fn_t = std::function<nlohmann::json(const std::string&)>;
+    void set_sharechain_delta_fn(sharechain_delta_fn_t fn) { m_sharechain_delta_fn = std::move(fn); }
+
     // Individual share lookup — returns full p2pool-compatible share JSON by hash
     using share_lookup_fn_t = std::function<nlohmann::json(const std::string&)>;
     void set_share_lookup_fn(share_lookup_fn_t fn) { m_share_lookup_fn = std::move(fn); }
@@ -787,6 +797,8 @@ private:
     // Sharechain stats callback
     sharechain_stats_fn_t m_sharechain_stats_fn;
     sharechain_window_fn_t m_sharechain_window_fn;
+    sharechain_tip_fn_t m_sharechain_tip_fn;
+    sharechain_delta_fn_t m_sharechain_delta_fn;
     share_lookup_fn_t m_share_lookup_fn;
 
     // PPLNS computation hook
