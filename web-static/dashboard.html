@@ -4739,29 +4739,38 @@
                 }
             },
 
-            // Animated live refresh: fetch new data, detect new shares, animate slide
-            _animOffset: 0,
-            _newCount: 0,
+            // Animated live refresh: per-share 3D lift→slide→land animation
             _animRunning: false,
+            _oldPositions: {},  // hash → {x, y}
 
             liveRefresh: function() {
                 var self = this;
+                // Snapshot old positions before fetch
+                var step = this.cellSize + this.gap;
+                var ml = this.marginLeft;
+                self._oldPositions = {};
+                for (var i = 0; i < self.shares.length; i++) {
+                    var col = i % self.cols;
+                    var row = Math.floor(i / self.cols);
+                    self._oldPositions[self.shares[i].h] = {
+                        x: ml + col * step, y: row * step
+                    };
+                }
+
                 d3.json('../sharechain/window', function(data) {
                     if (!data || !data.shares || !data.shares.length) return;
 
-                    // Detect how many new shares appeared at the tip
+                    // Detect new shares
                     var oldTip = self.shares.length > 0 ? self.shares[0].h : null;
-                    var newShares = data.shares;
                     var newCount = 0;
                     if (oldTip) {
-                        for (var i = 0; i < newShares.length; i++) {
-                            if (newShares[i].h === oldTip) { newCount = i; break; }
+                        for (var i = 0; i < data.shares.length; i++) {
+                            if (data.shares[i].h === oldTip) { newCount = i; break; }
                         }
-                        if (newCount === 0 && newShares[0].h !== oldTip) newCount = 0; // tip unchanged
                     }
 
                     // Update data
-                    self.shares = newShares;
+                    self.shares = data.shares;
                     self.myAddress = data.my_address || '';
                     self.windowSize = data.window_size || 8640;
                     self.blockSet = {};
@@ -4773,12 +4782,10 @@
                     if (data.heads) data.heads.forEach(function(h) { self.headSet[h] = true; });
                     self.computeMinerHashrates();
 
-                    if (newCount > 0 && newCount < 200) {
-                        self._newCount = newCount;
-                        self._animateSlide();
+                    if (newCount > 0 && newCount < 100) {
+                        self._animate3D(newCount);
                     } else {
-                        self._newCount = 0;
-                        self._animOffset = 0;
+                        self._oldPositions = {};
                         self.render();
                     }
                     self.updateStats(data);
@@ -4788,104 +4795,145 @@
                 });
             },
 
-            _animateSlide: function() {
+            _animate3D: function(newCount) {
                 if (this._animRunning) return;
                 this._animRunning = true;
                 var self = this;
                 var step = this.cellSize + this.gap;
-                // How many rows the new shares occupy
-                var totalPixels = Math.ceil(this._newCount / Math.max(1, this.cols)) * step;
+                var ml = this.marginLeft;
+                var cs = this.cellSize;
+                var cols = this.cols;
+                var duration = Math.min(900, 300 + newCount * 40);
                 var startTime = performance.now();
-                var duration = Math.min(600, 150 + this._newCount * 30); // 150-600ms
+
+                // Pre-compute new positions
+                var newPos = [];
+                for (var i = 0; i < self.shares.length; i++) {
+                    var col = i % cols;
+                    var row = Math.floor(i / cols);
+                    newPos.push({ x: ml + col * step, y: row * step });
+                }
 
                 function frame(now) {
                     var elapsed = now - startTime;
-                    var t = Math.min(elapsed / duration, 1);
-                    // Ease out cubic
-                    var ease = 1 - Math.pow(1 - t, 3);
-                    self._animOffset = totalPixels * (1 - ease);
-                    self._renderAnimated();
-                    if (t < 1) {
+                    var globalT = Math.min(elapsed / duration, 1);
+
+                    var canvas = self.canvas;
+                    var ctx = self.ctx;
+                    var dpr = self.dpr;
+                    var cssW = ml + cols * step;
+                    var cssH = Math.max(Math.ceil(self.shares.length / cols) * step, 40);
+                    canvas.style.width = cssW + 'px';
+                    canvas.style.height = cssH + 'px';
+                    canvas.width = cssW * dpr;
+                    canvas.height = cssH * dpr;
+                    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+                    ctx.fillStyle = '#0d0d1a';
+                    ctx.fillRect(0, 0, cssW, cssH);
+
+                    for (var i = 0; i < self.shares.length; i++) {
+                        var share = self.shares[i];
+                        var dst = newPos[i];
+                        var isNew = i < newCount;
+
+                        // Stagger: shares near tip animate first
+                        var stagger = Math.min(i, newCount * 2) / (newCount * 2 + 1) * 0.3;
+                        var t = Math.max(0, Math.min(1, (globalT - stagger) / (1 - stagger)));
+                        // Ease: cubic in-out
+                        var ease = t < 0.5 ? 4*t*t*t : 1 - Math.pow(-2*t+2, 3)/2;
+
+                        var x, y, scale, shadowAlpha;
+
+                        if (isNew) {
+                            // New share: pop in from above with scale
+                            var enterT = Math.max(0, Math.min(1, (globalT - 0.2) / 0.8));
+                            var enterEase = 1 - Math.pow(1 - enterT, 3);
+                            x = dst.x;
+                            y = dst.y - (1 - enterEase) * step * 3;
+                            scale = 0.3 + enterEase * 0.7;
+                            shadowAlpha = enterEase * 0.4;
+                            ctx.globalAlpha = enterEase;
+                        } else {
+                            // Existing share: lift → slide → land
+                            var old = self._oldPositions[share.h];
+                            if (old) {
+                                // Phase: 0-0.3 lift, 0.3-0.7 slide, 0.7-1.0 land
+                                var liftT, slideT, landT;
+                                if (ease < 0.3) {
+                                    liftT = ease / 0.3;
+                                    slideT = 0; landT = 0;
+                                } else if (ease < 0.7) {
+                                    liftT = 1;
+                                    slideT = (ease - 0.3) / 0.4;
+                                    landT = 0;
+                                } else {
+                                    liftT = 1;
+                                    slideT = 1;
+                                    landT = (ease - 0.7) / 0.3;
+                                }
+                                // Lift: scale up
+                                var liftScale = 1 + 0.25 * Math.sin(liftT * Math.PI);
+                                // Land: scale back
+                                var landScale = landT > 0 ? 1 + 0.25 * Math.sin((1-landT) * Math.PI) : liftScale;
+                                scale = landT > 0 ? landScale : liftScale;
+                                // Slide: interpolate position
+                                x = old.x + (dst.x - old.x) * slideT;
+                                y = old.y + (dst.y - old.y) * slideT;
+                                // Shadow during lift
+                                shadowAlpha = 0.3 * Math.sin(ease * Math.PI);
+                            } else {
+                                x = dst.x; y = dst.y; scale = 1; shadowAlpha = 0;
+                            }
+                            ctx.globalAlpha = 1;
+                        }
+
+                        // Draw shadow
+                        if (shadowAlpha > 0.02) {
+                            ctx.fillStyle = 'rgba(0,0,0,' + shadowAlpha + ')';
+                            ctx.fillRect(x + 2, y + 2, cs, cs);
+                        }
+
+                        // Draw scaled cell
+                        var sx = x + cs/2 - (cs*scale)/2;
+                        var sy = y + cs/2 - (cs*scale)/2;
+                        var sw = cs * scale;
+
+                        ctx.fillStyle = self.getColor(share);
+                        ctx.fillRect(sx, sy, sw, sw);
+
+                        // Block borders
+                        var isLtc = !!self.blockSet[share.h];
+                        var isDoge = !!self.dogeSet[share.h];
+                        if (isLtc && isDoge) {
+                            ctx.fillStyle = '#ff8000'; ctx.fillRect(sx, sy, sw, sw);
+                            ctx.strokeStyle = '#ffaa00'; ctx.lineWidth = 2;
+                            ctx.strokeRect(sx+0.5, sy+0.5, sw-1, sw-1);
+                        } else if (isLtc) {
+                            ctx.strokeStyle = '#ffd700'; ctx.lineWidth = 2;
+                            ctx.strokeRect(sx+0.5, sy+0.5, sw-1, sw-1);
+                        } else if (isDoge) {
+                            ctx.strokeStyle = '#00e5ff'; ctx.lineWidth = 2;
+                            ctx.strokeRect(sx+0.5, sy+0.5, sw-1, sw-1);
+                        }
+
+                        // Green glow on new shares
+                        if (isNew && ctx.globalAlpha > 0.3) {
+                            ctx.strokeStyle = 'rgba(0,255,136,' + (ctx.globalAlpha * 0.9) + ')';
+                            ctx.lineWidth = 2;
+                            ctx.strokeRect(sx-0.5, sy-0.5, sw+1, sw+1);
+                        }
+                    }
+                    ctx.globalAlpha = 1;
+
+                    if (globalT < 1) {
                         requestAnimationFrame(frame);
                     } else {
-                        self._animOffset = 0;
-                        self._newCount = 0;
                         self._animRunning = false;
+                        self._oldPositions = {};
                         self.render();
                     }
                 }
                 requestAnimationFrame(frame);
-            },
-
-            _renderAnimated: function() {
-                var canvas = this.canvas;
-                var ctx = this.ctx;
-                var dpr = this.dpr;
-                var step = this.cellSize + this.gap;
-                var ml = this.marginLeft;
-                var cs = this.cellSize;
-                var offset = this._animOffset;
-                var newCount = this._newCount;
-
-                var containerWidth = canvas.parentElement.clientWidth - 16;
-                var gridWidth = containerWidth - ml;
-                this.cols = Math.max(1, Math.floor(gridWidth / step));
-                this.rows = Math.ceil(this.shares.length / this.cols);
-
-                var cssW = ml + this.cols * step;
-                var cssH = Math.max(this.rows * step, 40);
-                canvas.style.width = cssW + 'px';
-                canvas.style.height = cssH + 'px';
-                canvas.width = cssW * dpr;
-                canvas.height = cssH * dpr;
-                ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-                ctx.fillStyle = '#0d0d1a';
-                ctx.fillRect(0, 0, cssW, cssH);
-
-                var now = Date.now() / 1000;
-                for (var i = 0; i < this.shares.length; i++) {
-                    var share = this.shares[i];
-                    var col = i % this.cols;
-                    var row = Math.floor(i / this.cols);
-                    var x = ml + col * step;
-                    var y = row * step;
-
-                    // New shares: slide in from above with fade
-                    if (i < newCount) {
-                        var alpha = 1 - (offset / (Math.ceil(newCount / this.cols) * step + 1));
-                        alpha = Math.max(0, Math.min(1, alpha));
-                        ctx.globalAlpha = alpha;
-                        y -= offset;
-                    } else {
-                        ctx.globalAlpha = 1;
-                    }
-
-                    ctx.fillStyle = this.getColor(share);
-                    ctx.fillRect(x, y, cs, cs);
-
-                    var isLtcBlock = !!this.blockSet[share.h];
-                    var isDogeBlock = !!this.dogeSet[share.h];
-                    if (isLtcBlock && isDogeBlock) {
-                        ctx.fillStyle = '#ff8000';
-                        ctx.fillRect(x, y, cs, cs);
-                        ctx.strokeStyle = '#ffaa00'; ctx.lineWidth = 2;
-                        ctx.strokeRect(x+0.5, y+0.5, cs-1, cs-1);
-                    } else if (isLtcBlock) {
-                        ctx.strokeStyle = '#ffd700'; ctx.lineWidth = 2;
-                        ctx.strokeRect(x+0.5, y+0.5, cs-1, cs-1);
-                    } else if (isDogeBlock) {
-                        ctx.strokeStyle = '#00e5ff'; ctx.lineWidth = 2;
-                        ctx.strokeRect(x+0.5, y+0.5, cs-1, cs-1);
-                    }
-
-                    // Glow effect on newest shares during animation
-                    if (i < newCount && ctx.globalAlpha > 0.5) {
-                        ctx.strokeStyle = 'rgba(0,255,136,' + (ctx.globalAlpha * 0.8) + ')';
-                        ctx.lineWidth = 1.5;
-                        ctx.strokeRect(x+0.5, y+0.5, cs-1, cs-1);
-                    }
-                }
-                ctx.globalAlpha = 1;
             },
 
             getColor: function(share) {
