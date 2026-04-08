@@ -173,6 +173,8 @@ public:
     nlohmann::json rest_global_stats();
     nlohmann::json rest_sharechain_stats();
     nlohmann::json rest_sharechain_window();
+    // Returns cached+serialized window JSON string (for ETag/cache layer)
+    std::pair<std::string, std::string> get_cached_window_response(); // {json_body, etag}
     nlohmann::json rest_sharechain_tip();
     nlohmann::json rest_sharechain_delta(const std::string& since_hash);
     nlohmann::json rest_control_mining_start();
@@ -800,6 +802,35 @@ private:
     sharechain_tip_fn_t m_sharechain_tip_fn;
     sharechain_delta_fn_t m_sharechain_delta_fn;
     share_lookup_fn_t m_share_lookup_fn;
+
+public:
+    // ── Sharechain window response cache (Layer 1 + 2) ──
+    void invalidate_window_cache() {
+        std::lock_guard<std::mutex> lock(m_window_cache_mutex);
+        m_window_cache_etag.clear();
+    }
+    // ── Per-IP rate limiting (Layer 3) ──
+    bool rate_check(const std::string& ip, int max_per_min);
+    // ── SSE subscribers (Layer 4) ──
+    void sse_push(const std::string& event_data);
+    void sse_register(std::shared_ptr<tcp::socket> socket);
+    size_t sse_subscriber_count() const;
+private:
+    std::mutex m_window_cache_mutex;
+    std::string m_window_cache_json;
+    std::string m_window_cache_etag;
+    struct RateBucket {
+        int tokens{0};
+        std::chrono::steady_clock::time_point last_refill;
+    };
+    std::mutex m_rate_mutex;
+    std::unordered_map<std::string, RateBucket> m_rate_buckets;
+    struct SSESubscriber {
+        std::shared_ptr<tcp::socket> socket;
+        std::string last_tip;
+    };
+    std::mutex m_sse_mutex;
+    std::vector<SSESubscriber> m_sse_subscribers;
 
     // PPLNS computation hook
     pplns_fn_t m_pplns_fn;

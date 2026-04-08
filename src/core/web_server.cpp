@@ -232,12 +232,63 @@ void HttpSession::process_request()
                 rest_result = mining_interface_->rest_global_stats();
             else if (target == "/sharechain/stats")
                 rest_result = mining_interface_->rest_sharechain_stats();
-            else if (target == "/sharechain/window")
-                rest_result = mining_interface_->rest_sharechain_window();
+            else if (target == "/sharechain/window") {
+                // Layer 1+2: cached response + ETag/304
+                auto client_ip = socket_.remote_endpoint().address().to_string();
+                if (!mining_interface_->rate_check(client_ip, 4)) {  // max 4/min
+                    response.result(http::status::too_many_requests);
+                    response_body = R"({"error":"Rate limited"})";
+                } else {
+                    auto [body, etag] = mining_interface_->get_cached_window_response();
+                    std::string client_etag;
+                    auto it = request_.find(http::field::if_none_match);
+                    if (it != request_.end()) client_etag = std::string(it->value());
+                    if (!etag.empty() && client_etag == "\"" + etag + "\"") {
+                        response.result(http::status::not_modified);
+                        response_body = "";
+                    } else {
+                        response.set(http::field::etag, "\"" + etag + "\"");
+                        response.set(http::field::cache_control, "no-cache");
+                        response_body = body;
+                    }
+                }
+            }
             else if (target == "/sharechain/tip")
                 rest_result = mining_interface_->rest_sharechain_tip();
             else if (target == "/sharechain/delta") {
-                rest_result = mining_interface_->rest_sharechain_delta(getQueryParam("since"));
+                auto client_ip = socket_.remote_endpoint().address().to_string();
+                if (!mining_interface_->rate_check(client_ip, 30)) {  // max 30/min
+                    response.result(http::status::too_many_requests);
+                    response_body = R"({"error":"Rate limited"})";
+                } else {
+                    rest_result = mining_interface_->rest_sharechain_delta(getQueryParam("since"));
+                }
+            }
+            else if (target == "/sharechain/stream") {
+                // Layer 4: SSE — send headers and keep connection open
+                auto client_ip = socket_.remote_endpoint().address().to_string();
+                if (!mining_interface_->rate_check(client_ip, 2)) {  // max 2 SSE connections/min per IP
+                    response.result(http::status::too_many_requests);
+                    response_body = R"({"error":"Rate limited"})";
+                } else {
+                    // Send SSE headers manually, then register for push
+                    std::string sse_headers =
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: text/event-stream\r\n"
+                        "Cache-Control: no-cache\r\n"
+                        "Connection: keep-alive\r\n"
+                        "X-Accel-Buffering: no\r\n"
+                        "\r\n"
+                        "data: {\"connected\":true}\n\n";
+                    auto buf = std::make_shared<std::string>(sse_headers);
+                    auto self = shared_from_this();
+                    auto sock_ptr = std::make_shared<tcp::socket>(std::move(socket_));
+                    boost::asio::async_write(*sock_ptr, boost::asio::buffer(*buf),
+                        [buf, sock_ptr, mi = mining_interface_](beast::error_code ec, std::size_t) {
+                            if (!ec) mi->sse_register(sock_ptr);
+                        });
+                    return;  // Don't close connection
+                }
             }
             else if (target == "/control/mining/start")
                 rest_result = mining_interface_->rest_control_mining_start();
@@ -594,7 +645,8 @@ void HttpSession::process_request()
                 }  // end static file serving else
             }  // end explorer/static dispatch
 
-            response_body = rest_result.dump();
+            if (!rest_result.is_null())
+                response_body = rest_result.dump();
         }
         else if (request_.method() == http::verb::post) {
             // Handle JSON-RPC POST request
@@ -3164,6 +3216,89 @@ nlohmann::json MiningInterface::rest_sharechain_window()
     result["best_hash"] = "";
     result["chain_length"] = 0;
     return result;
+}
+
+std::pair<std::string, std::string> MiningInterface::get_cached_window_response()
+{
+    std::lock_guard<std::mutex> lock(m_window_cache_mutex);
+    // Check if cache is valid (has etag = current tip)
+    if (!m_window_cache_etag.empty())
+        return {m_window_cache_json, m_window_cache_etag};
+
+    // Regenerate
+    auto data = rest_sharechain_window();
+    std::string tip;
+    if (data.contains("best_hash")) {
+        tip = data["best_hash"].get<std::string>();
+        if (tip.size() > 16) tip = tip.substr(0, 16);
+    }
+    m_window_cache_json = data.dump();
+    m_window_cache_etag = tip.empty() ? "none" : tip;
+    return {m_window_cache_json, m_window_cache_etag};
+}
+
+bool MiningInterface::rate_check(const std::string& ip, int max_per_min)
+{
+    std::lock_guard<std::mutex> lock(m_rate_mutex);
+    auto now = std::chrono::steady_clock::now();
+    auto& bucket = m_rate_buckets[ip];
+
+    // Refill tokens (1 per second, up to max_per_min)
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - bucket.last_refill).count();
+    if (elapsed > 0) {
+        bucket.tokens = std::min(max_per_min, bucket.tokens + static_cast<int>(elapsed));
+        bucket.last_refill = now;
+    }
+    // First access
+    if (bucket.tokens == 0 && elapsed == 0 && bucket.last_refill.time_since_epoch().count() == 0) {
+        bucket.tokens = max_per_min;
+        bucket.last_refill = now;
+    }
+
+    if (bucket.tokens > 0) {
+        bucket.tokens--;
+        return true;  // allowed
+    }
+    return false;  // rate limited
+}
+
+void MiningInterface::sse_register(std::shared_ptr<tcp::socket> socket)
+{
+    std::lock_guard<std::mutex> lock(m_sse_mutex);
+    // Cap at 200 subscribers
+    if (m_sse_subscribers.size() >= 200) return;
+    m_sse_subscribers.push_back({socket, ""});
+}
+
+void MiningInterface::sse_push(const std::string& event_data)
+{
+    std::lock_guard<std::mutex> lock(m_sse_mutex);
+    std::string msg = "data: " + event_data + "\n\n";
+    auto buf = std::make_shared<std::string>(msg);
+
+    std::vector<SSESubscriber> alive;
+    for (auto& sub : m_sse_subscribers) {
+        if (!sub.socket || !sub.socket->is_open()) continue;
+        try {
+            boost::asio::async_write(*sub.socket, boost::asio::buffer(*buf),
+                [buf, sock = sub.socket](beast::error_code ec, std::size_t) {
+                    if (ec) {
+                        beast::error_code close_ec;
+                        sock->shutdown(tcp::socket::shutdown_send, close_ec);
+                    }
+                });
+            alive.push_back(sub);
+        } catch (...) {
+            // dead socket, skip
+        }
+    }
+    m_sse_subscribers = std::move(alive);
+}
+
+size_t MiningInterface::sse_subscriber_count() const
+{
+    // No lock needed for approximate count
+    return m_sse_subscribers.size();
 }
 
 nlohmann::json MiningInterface::rest_sharechain_tip()
@@ -6498,11 +6633,16 @@ void WebServer::trigger_work_refresh()
 void WebServer::trigger_work_refresh_debounced()
 {
     // No debounce — call refresh immediately.
-    // C++ refresh_work() is 0ms latency. Shares arrive every ~3.5s on average,
-    // so there's nothing to coalesce. The 100ms debounce was adding a 100ms race
-    // window that caused ~14% orphan rate (miner works on stale prev_share while
-    // waiting for debounce timer). With 0ms, orphan rate drops to ~1%.
     trigger_work_refresh();
+
+    // Invalidate sharechain window cache (new share changed the tip)
+    mining_interface_->invalidate_window_cache();
+
+    // Push SSE event to RealTime subscribers
+    if (mining_interface_->sse_subscriber_count() > 0) {
+        auto tip = mining_interface_->rest_sharechain_tip();
+        mining_interface_->sse_push(tip.dump());
+    }
 }
 
 void WebServer::set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Node* coin)

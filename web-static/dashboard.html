@@ -5815,8 +5815,10 @@
         }
 
         function loadShares() {
-            // Use animated refresh if shares already loaded (auto-refresh / manual)
-            if (defrag.shares && defrag.shares.length > 0) {
+            // Use delta if shares already cached (auto-refresh / manual)
+            if (defrag.shares && defrag.shares.length > 0 && _rtTipHash) {
+                _rtFetchDelta(_rtTipHash);
+            } else if (defrag.shares && defrag.shares.length > 0) {
                 defrag.liveRefresh();
             } else {
                 defrag.load();
@@ -7717,38 +7719,74 @@
         // Expose for multipool.js
         window.manualRefresh = manualRefresh;
 
-        // ═══ RealTime Mode: poll tip every 3s, fetch delta on change, animate ═══
-        var _rtInterval = null;
+        // ═══ RealTime Mode: SSE push (primary) + polling fallback ═══
+        var _rtEventSource = null;
+        var _rtFallbackInterval = null;
         var _rtTipHash = null;
+        var _rtActive = false;
 
         function toggleRealTime() {
             var btn = document.getElementById('realtime-btn');
-            if (_rtInterval) {
+            if (_rtActive) {
                 // Turn OFF
-                clearInterval(_rtInterval);
-                _rtInterval = null;
+                _rtActive = false;
+                if (_rtEventSource) { _rtEventSource.close(); _rtEventSource = null; }
+                if (_rtFallbackInterval) { clearInterval(_rtFallbackInterval); _rtFallbackInterval = null; }
                 _rtTipHash = null;
                 btn.textContent = 'RealTime: OFF';
                 btn.style.background = 'var(--card-bg)';
                 btn.style.color = 'var(--text-muted)';
                 btn.style.borderColor = 'var(--border)';
             } else {
-                // Turn ON — initialize tip from current cached shares
+                // Turn ON
+                _rtActive = true;
                 if (defrag.shares && defrag.shares.length > 0)
                     _rtTipHash = defrag.shares[0].h;
-                btn.textContent = 'RealTime: ON';
+                btn.textContent = 'RealTime: SSE';
                 btn.style.background = '#28a745';
                 btn.style.color = '#fff';
                 btn.style.borderColor = '#28a745';
-                _rtInterval = setInterval(_rtPollTip, 3000);
+                _rtStartSSE();
+            }
+        }
+
+        function _rtStartSSE() {
+            if (!_rtActive) return;
+            try {
+                _rtEventSource = new EventSource('../sharechain/stream');
+                _rtEventSource.onmessage = function(event) {
+                    try {
+                        var tip = JSON.parse(event.data);
+                        if (tip.hash && tip.hash !== _rtTipHash) {
+                            var since = _rtTipHash || '';
+                            _rtTipHash = tip.hash;
+                            _rtFetchDelta(since);
+                        }
+                    } catch(e) {}
+                };
+                _rtEventSource.onerror = function() {
+                    // SSE failed — fall back to polling
+                    if (_rtEventSource) { _rtEventSource.close(); _rtEventSource = null; }
+                    if (_rtActive && !_rtFallbackInterval) {
+                        var btn = document.getElementById('realtime-btn');
+                        btn.textContent = 'RealTime: POLL';
+                        btn.style.background = '#e69500';
+                        _rtFallbackInterval = setInterval(_rtPollTip, 3000);
+                    }
+                };
+            } catch(e) {
+                // EventSource not supported — use polling
+                _rtFallbackInterval = setInterval(_rtPollTip, 3000);
+                var btn = document.getElementById('realtime-btn');
+                btn.textContent = 'RealTime: POLL';
+                btn.style.background = '#e69500';
             }
         }
 
         function _rtPollTip() {
             d3.json('../sharechain/tip', function(tip) {
                 if (!tip || !tip.hash) return;
-                if (tip.hash === _rtTipHash) return;  // no change
-                // Tip changed — fetch delta
+                if (tip.hash === _rtTipHash) return;
                 var since = _rtTipHash || '';
                 _rtTipHash = tip.hash;
                 _rtFetchDelta(since);
@@ -7759,7 +7797,7 @@
             d3.json('../sharechain/delta?since=' + encodeURIComponent(sinceHash), function(delta) {
                 if (!delta || !delta.shares || delta.shares.length === 0) return;
 
-                // Snapshot old positions before update
+                // Snapshot old positions
                 var step = defrag.cellSize + defrag.gap;
                 var ml = defrag.marginLeft;
                 defrag._oldPositions = {};
@@ -7782,22 +7820,17 @@
                     merged = merged.slice(0, defrag.windowSize);
                 defrag.shares = merged;
 
-                // Update blocks/heads/doge sets
+                // Update sets
                 if (delta.heads) {
                     defrag.headSet = {};
                     delta.heads.forEach(function(h) { defrag.headSet[h] = true; });
                 }
-                if (delta.blocks) {
-                    delta.blocks.forEach(function(h) { defrag.blockSet[h] = true; });
-                }
-                if (delta.doge_blocks) {
-                    delta.doge_blocks.forEach(function(h) { defrag.dogeSet[h] = true; });
-                }
+                if (delta.blocks) delta.blocks.forEach(function(h) { defrag.blockSet[h] = true; });
+                if (delta.doge_blocks) delta.doge_blocks.forEach(function(h) { defrag.dogeSet[h] = true; });
                 defrag.shares.forEach(function(s) { if (s.blk) defrag.blockSet[s.h] = true; });
-
                 defrag.computeMinerHashrates();
 
-                // Animate!
+                // Animate
                 var newCount = newShares.length;
                 if (newCount > 0 && newCount < 100) {
                     defrag._animate3D(newCount);
@@ -7806,14 +7839,10 @@
                     defrag.render();
                 }
 
-                // Update stats panel and links
                 defrag.updateStats({
-                    shares: defrag.shares,
-                    window_size: defrag.windowSize,
-                    my_address: defrag.myAddress,
-                    heads: delta.heads,
-                    blocks: delta.blocks,
-                    doge_blocks: delta.doge_blocks
+                    shares: defrag.shares, window_size: defrag.windowSize,
+                    my_address: defrag.myAddress, heads: delta.heads,
+                    blocks: delta.blocks, doge_blocks: delta.doge_blocks
                 });
                 loadShareLinks();
                 refreshPayoutsV36();
