@@ -5525,7 +5525,9 @@
                 var total = 0;
                 var entries = [];
                 for (var addr in payouts) {
-                    var amt = typeof payouts[addr] === 'number' ? payouts[addr] : 0;
+                    var v = payouts[addr];
+                    // Handle both flat {addr: amount} and merged {addr: {amount, merged:[]}}
+                    var amt = (typeof v === 'number') ? v : (v && v.amount ? v.amount : 0);
                     total += amt;
                     entries.push({ addr: addr, amt: amt });
                 }
