@@ -5985,7 +5985,7 @@
                         var el = document.createElement('div');
                         el.className = 'pm-pct';
                         el.style.fontSize = fitPct + 'px';
-                        el.textContent = (r.pct * 100).toFixed(1) + '%';
+                        el.textContent = (r.pct * 100).toFixed(1) + (r.w > 60 ? '% LTC' : '%');
                         cell.appendChild(el);
                     }
                     // DOGE %
@@ -5996,7 +5996,7 @@
                         if (hasDoge) {
                             var dp = dogeTotal > 0 ? (r.doge / dogeTotal * 100).toFixed(1) : '0';
                             el.style.color = '#ffd700';
-                            el.textContent = dp + '% D';
+                            el.textContent = dp + (r.w > 60 ? '% DOGE' : '% D');
                         } else if (isV35Only) {
                             el.style.color = '#ff6b6b';
                             el.textContent = r.w > 50 ? 'NO DOGE' : '0% D';

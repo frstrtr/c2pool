@@ -765,7 +765,9 @@
                         var verSize = Math.max(7, Math.min(pctSize * 0.45, 11));
 
                         var hasDoge = r.doge > 0;
-                        var isV35Only = mv.ver && mv.ver < 36 && (!mv.dv || mv.dv < 36);
+                        // V35-only: known V35 without V36 signal, OR unknown version without DOGE
+                        var isV35Only = (mv.ver && mv.ver < 36 && (!mv.dv || mv.dv < 36))
+                            || (!mv.ver && !hasDoge);
 
                         // Clamp font sizes to actually fit in the cell
                         var fitPct = Math.max(8, Math.min(r.w / 6, r.h / 5, 28));
@@ -777,7 +779,7 @@
                             var pctEl = document.createElement('div');
                             pctEl.className = 'pplns-pct';
                             pctEl.style.fontSize = fitPct + 'px';
-                            pctEl.textContent = (r.pct * 100).toFixed(1) + '%';
+                            pctEl.textContent = (r.pct * 100).toFixed(1) + (r.w > 60 ? '% LTC' : '%');
                             cell.appendChild(pctEl);
                         }
 
@@ -789,7 +791,7 @@
                             if (hasDoge) {
                                 var dogePct = dogeTotal > 0 ? (r.doge / dogeTotal * 100).toFixed(1) : '0';
                                 dogeEl.style.color = '#ffd700';
-                                dogeEl.textContent = dogePct + '% D';
+                                dogeEl.textContent = dogePct + (r.w > 60 ? '% DOGE' : '% D');
                             } else if (isV35Only) {
                                 dogeEl.style.color = '#ff6b6b';
                                 dogeEl.textContent = r.w > 55 ? 'NO DOGE' : '0% D';
@@ -854,11 +856,13 @@
                             if (_mv.ver) {
                                 if (_mv.dv && _mv.dv !== _mv.ver) {
                                     verLine = '<div style="color:#4dd0e1;font-weight:600">V' + _mv.ver + ' \u2192 V' + _mv.dv + '</div>';
-                                } else if (_isV35Only) {
-                                    verLine = '<div style="color:#ff6b6b;font-weight:700">V' + _mv.ver + ' ONLY \u2014 missing DOGE!</div>';
-                                } else {
+                                } else if (_mv.ver >= 36) {
                                     verLine = '<div style="color:var(--success)">V' + _mv.ver + '</div>';
+                                } else {
+                                    verLine = '<div style="color:#ff6b6b;font-weight:700">V' + _mv.ver + ' ONLY \u2014 missing DOGE!</div>';
                                 }
+                            } else if (_isV35Only) {
+                                verLine = '<div style="color:var(--text-muted)">V35 (historical)</div>';
                             }
                             var dogeLine = '';
                             if (_hasDoge) {
@@ -868,7 +872,7 @@
                                     dogeLine += '<div style="color:var(--text-muted);font-size:0.78em;font-family:Monaco,Consolas,monospace">\u2192 ' + esc(r.dogeAddr) + '</div>';
                                 }
                             } else if (_isV35Only) {
-                                dogeLine = '<div style="color:#ff6b6b;font-weight:600">0 DOGE \u2014 upgrade to V36!</div>';
+                                dogeLine = '<div style="color:#ff6b6b;font-weight:600">0 DOGE \u2014 no merged mining</div>';
                             }
                             var hrLine = '';
                             if (minerHR[r.addr]) {
