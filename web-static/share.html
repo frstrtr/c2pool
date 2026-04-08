@@ -640,55 +640,53 @@
 
             root.innerHTML = html;
 
-            // Load merged payouts + sharechain window for version info, then render treemap
-            d3.json('../current_merged_payouts', function(payouts) {
-                if (!payouts || typeof payouts !== 'object') return;
-                d3.json('../sharechain/window', function(winData) {
-                    var grid = document.getElementById('pplns-grid');
-                    if (!grid) return;
-                    var tooltip = document.getElementById('pplns-tooltip');
+            // Load sharechain window (includes per-share PPLNS cache) for treemap
+            d3.json('../sharechain/window', function(winData) {
+                if (!winData) return;
+                var grid = document.getElementById('pplns-grid');
+                if (!grid) return;
+                var tooltip = document.getElementById('pplns-tooltip');
 
-                    // Build per-miner version stats from window data
-                    var minerVersions = {};
-                    if (winData && winData.shares) {
-                        var verCounts = {};
-                        winData.shares.forEach(function(s) {
-                            if (!verCounts[s.m]) verCounts[s.m] = { v: {}, d: {} };
-                            verCounts[s.m].v[s.V] = (verCounts[s.m].v[s.V] || 0) + 1;
-                            if (s.dv) verCounts[s.m].d[s.dv] = (verCounts[s.m].d[s.dv] || 0) + 1;
-                        });
-                        for (var addr in verCounts) {
-                            var vc = verCounts[addr];
-                            var topVer = 0, topVerN = 0;
-                            for (var v in vc.v) { if (vc.v[v] > topVerN) { topVer = parseInt(v); topVerN = vc.v[v]; } }
-                            var topDv = 0, topDvN = 0;
-                            for (var d in vc.d) { if (vc.d[d] > topDvN) { topDv = parseInt(d); topDvN = vc.d[d]; } }
-                            minerVersions[addr] = { ver: topVer, dv: topDv || topVer };
-                        }
+                // Build per-miner version stats from window data
+                var minerVersions = {};
+                if (winData.shares) {
+                    var verCounts = {};
+                    winData.shares.forEach(function(s) {
+                        if (!verCounts[s.m]) verCounts[s.m] = { v: {}, d: {} };
+                        verCounts[s.m].v[s.V] = (verCounts[s.m].v[s.V] || 0) + 1;
+                        if (s.dv) verCounts[s.m].d[s.dv] = (verCounts[s.m].d[s.dv] || 0) + 1;
+                    });
+                    for (var addr in verCounts) {
+                        var vc = verCounts[addr];
+                        var topVer = 0, topVerN = 0;
+                        for (var v in vc.v) { if (vc.v[v] > topVerN) { topVer = parseInt(v); topVerN = vc.v[v]; } }
+                        var topDv = 0, topDvN = 0;
+                        for (var d in vc.d) { if (vc.d[d] > topDvN) { topDv = parseInt(d); topDvN = vc.d[d]; } }
+                        minerVersions[addr] = { ver: topVer, dv: topDv || topVer };
                     }
+                }
 
-                    // Parse merged payouts: {addr: {amount: X, merged: [{symbol, amount, address}]}}
-                    var total = 0;
-                    var entries = [];
-                    for (var addr in payouts) {
-                        var p = payouts[addr];
-                        var ltcAmt = typeof p === 'number' ? p : (p.amount || 0);
-                        total += ltcAmt;
-                        var dogeAmt = 0, dogeAddr = '';
-                        if (p.merged && p.merged.length > 0) {
-                            p.merged.forEach(function(m) {
-                                if (m.symbol === 'DOGE') {
-                                    dogeAmt += m.amount || 0;
-                                    dogeAddr = m.address || '';
-                                }
-                            });
-                        }
-                        entries.push({ addr: addr, amt: ltcAmt, doge: dogeAmt, dogeAddr: dogeAddr });
-                    }
-                    entries.sort(function(a, b) { return b.amt - a.amt; });
-                    entries.forEach(function(e) { e.pct = total > 0 ? e.amt / total : 0; });
-                    var dogeTotal = 0;
-                    entries.forEach(function(e) { dogeTotal += e.doge; });
+                // Use per-share PPLNS from server cache (exact for this share's position)
+                var shortHash = share_hash.substr(0, 16);
+                var sharePplns = null;
+                if (winData.pplns && winData.pplns[shortHash]) {
+                    sharePplns = winData.pplns[shortHash];
+                } else if (winData.pplns_current) {
+                    sharePplns = winData.pplns_current;  // fallback to current tip
+                }
+                if (!sharePplns) return;
+
+                // Parse PPLNS: {addr: amount_ltc} → entries array
+                var total = 0;
+                var entries = [];
+                for (var addr in sharePplns) {
+                    var ltcAmt = sharePplns[addr];
+                    total += ltcAmt;
+                    entries.push({ addr: addr, amt: ltcAmt, doge: 0, dogeAddr: '' });
+                }
+                entries.sort(function(a, b) { return b.amt - a.amt; });
+                entries.forEach(function(e) { e.pct = total > 0 ? e.amt / total : 0; });
+                var dogeTotal = 0;
 
                     var w = grid.clientWidth;
                     var h = Math.max(300, Math.min(w * 0.5, 500));
@@ -841,7 +839,6 @@
                         grid.appendChild(cell);
                     });
                 });
-            });
         }
 
         // Treemap helpers for share.html
