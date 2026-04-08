@@ -4745,6 +4745,7 @@
             // Animated live refresh: per-share 3D lift→slide→land animation
             _animRunning: false,
             _oldPositions: {},  // hash → {x, y}
+            _deltaQueue: [],   // queued deltas received during animation
 
             liveRefresh: function() {
                 var self = this;
@@ -4803,7 +4804,11 @@
             },
 
             _animate3D: function(newCount) {
-                if (this._animRunning) return;
+                if (this._animRunning) {
+                    // Queue this update — will replay after current animation ends
+                    this._deltaQueue.push(newCount);
+                    return;
+                }
                 this._animRunning = true;
                 var self = this;
                 var step = this.cellSize + this.gap;
@@ -5278,6 +5283,17 @@
                         self._animRunning = false;
                         self._oldPositions = {};
                         self.render();
+                        // Drain queued deltas — replay next update
+                        if (self._deltaQueue.length > 0) {
+                            self._deltaQueue = [];
+                            // Trigger a fresh delta fetch to get all accumulated changes
+                            if (typeof _rtTipHash !== 'undefined' && _rtTipHash) {
+                                var curTip = self.shares.length > 0 ? self.shares[0].h : '';
+                                if (curTip !== _rtTipHash) {
+                                    _rtFetchDelta(curTip);
+                                }
+                            }
+                        }
                     }
                 }
                 requestAnimationFrame(frame);
