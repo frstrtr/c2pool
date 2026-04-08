@@ -2198,15 +2198,15 @@
                         </div>
                         <div class="legend-item">
                             <div class="legend-swatch" style="background:#28a745;border:2px solid #ffd700;box-shadow:0 0 3px rgba(255,215,0,0.5)"></div>
-                            <span>LTC block</span>
+                            <span style="color:#0070dd;font-weight:600">LTC block</span>
                         </div>
                         <div class="legend-item">
                             <div class="legend-swatch" style="background:#28a745;border:2px solid #00e5ff"></div>
-                            <span>DOGE block</span>
+                            <span style="color:#a335ee;font-weight:600">DOGE block</span>
                         </div>
                         <div class="legend-item">
                             <div class="legend-swatch" style="background:linear-gradient(135deg,#ff8000,#cc6600);border:2px solid #ffaa00;box-shadow:0 0 6px rgba(255,128,0,0.5)"></div>
-                            <span style="color:#ff8000;font-weight:600">Twin block (Legendary)</span>
+                            <span style="color:#ff8000;font-weight:600">Twin block</span>
                         </div>
                         <div class="legend-item">
                             <div class="legend-swatch" style="background:#0d0d1a;position:relative"><div style="position:absolute;top:0;left:0;width:0;height:0;border-left:5px solid #fff;border-bottom:5px solid transparent"></div></div>
@@ -4752,8 +4752,12 @@
                 for (var i = 0; i < self.shares.length; i++) {
                     var col = i % self.cols;
                     var row = Math.floor(i / self.cols);
-                    self._oldPositions[self.shares[i].h] = {
-                        x: ml + col * step, y: row * step
+                    var s = self.shares[i];
+                    self._oldPositions[s.h] = {
+                        x: ml + col * step, y: row * step,
+                        color: self.getColor(s),
+                        miner: s.m || '',
+                        diff: s.b ? self.bitsToDifficulty(s.b) : 0
                     };
                 }
 
@@ -4803,7 +4807,6 @@
                 var ml = this.marginLeft;
                 var cs = this.cellSize;
                 var cols = this.cols;
-                var duration = Math.min(900, 300 + newCount * 40);
                 var startTime = performance.now();
 
                 // Pre-compute new positions
@@ -4813,6 +4816,102 @@
                     var row = Math.floor(i / cols);
                     newPos.push({ x: ml + col * step, y: row * step });
                 }
+
+                // Collect dying shares (old tail pushed off the chain)
+                var dying = [];
+                var newHashSet = {};
+                self.shares.forEach(function(s) { newHashSet[s.h] = true; });
+                for (var h in self._oldPositions) {
+                    if (!newHashSet[h]) {
+                        var op = self._oldPositions[h];
+                        dying.push({ pos: op, color: op.color || '#0097a7', miner: op.miner || '', diff: op.diff || 0 });
+                    }
+                }
+
+                // Pre-generate ash particles for each dying share
+                var ashParticles = [];
+                dying.forEach(function() {
+                    var particles = [];
+                    for (var p = 0; p < 20; p++) {
+                        particles.push({
+                            ox: (Math.random() - 0.5) * cs * 3,
+                            oy: (Math.random() - 0.5) * cs * 3,
+                            vx: (Math.random() - 0.5) * 8,
+                            vy: -Math.random() * 8 - 3,
+                            size: 2 + Math.random() * 4,
+                            delay: Math.random() * 0.3
+                        });
+                    }
+                    ashParticles.push(particles);
+                });
+
+                // Phase 1: dying shares (1.2s)
+                // Phase 2: all shares slide tail→head (4s smooth wave)
+                // Phase 3: new shares fly in
+                // Compute PPLNS weight for dying shares
+                var totalDiff = 0;
+                for (var h in self._oldPositions) totalDiff += self._oldPositions[h].diff || 0;
+                dying.forEach(function(d) {
+                    d.pplnsPct = totalDiff > 0 ? (d.diff / totalDiff * 100) : 0;
+                    d.shortAddr = d.miner.substr(0, 10);
+                });
+
+                // Compute uniform scale for all dying shares
+                var _dyingFontSize = 13;
+                var _tmpCanvas = document.createElement('canvas').getContext('2d');
+                _tmpCanvas.font = 'bold ' + _dyingFontSize + 'px Monaco,Consolas,monospace';
+                var _maxTextW = 0;
+                dying.forEach(function(d) {
+                    var w = Math.max(_tmpCanvas.measureText(d.shortAddr).width, _tmpCanvas.measureText(d.pplnsPct.toFixed(3)+'%').width);
+                    if (w > _maxTextW) _maxTextW = w;
+                });
+                var dyingScale = Math.max(5, (_maxTextW + 24) / cs);
+
+                // Collect info for new (born) shares — reverse pipeline
+                var born = [];
+                var newTotalDiff = 0;
+                self.shares.forEach(function(s) { newTotalDiff += self.bitsToDifficulty(s.b || 0); });
+                for (var bi = 0; bi < newCount; bi++) {
+                    var s = self.shares[bi];
+                    var diff = self.bitsToDifficulty(s.b || 0);
+                    born.push({
+                        color: self.getColor(s),
+                        miner: s.m || '',
+                        shortAddr: (s.m || '').substr(0, 10),
+                        pplnsPct: newTotalDiff > 0 ? (diff / newTotalDiff * 100) : 0
+                    });
+                }
+                // Uniform scale for born shares
+                var _bornFontSize = _dyingFontSize;
+                var _bornMaxW = 0;
+                born.forEach(function(b) {
+                    var w = Math.max(_tmpCanvas.measureText(b.shortAddr).width, _tmpCanvas.measureText(b.pplnsPct.toFixed(3)+'%').width);
+                    if (w > _bornMaxW) _bornMaxW = w;
+                });
+                var bornScale = Math.max(5, (_bornMaxW + 24) / cs);
+                // Birth particles
+                var birthParticles = [];
+                born.forEach(function() {
+                    var particles = [];
+                    for (var p = 0; p < 20; p++) {
+                        particles.push({
+                            ox: (Math.random() - 0.5) * cs * 3,
+                            oy: (Math.random() - 0.5) * cs * 3,
+                            vx: (Math.random() - 0.5) * 8,
+                            vy: -Math.random() * 8 - 3,
+                            size: 2 + Math.random() * 4,
+                            delay: Math.random() * 0.3
+                        });
+                    }
+                    birthParticles.push(particles);
+                });
+
+                var phase1Dur = 3000;
+                var phase2Dur = 4000;
+                var phase2Start = phase1Dur;
+                var phase3Start = phase2Start + phase2Dur * 0.7;
+                var phase3Dur = 3000;
+                var duration = phase3Start + phase3Dur;
 
                 function frame(now) {
                     var elapsed = now - startTime;
@@ -4831,69 +4930,163 @@
                     ctx.fillStyle = '#0d0d1a';
                     ctx.fillRect(0, 0, cssW, cssH);
 
-                    for (var i = 0; i < self.shares.length; i++) {
+                    // ═══ PHASE 2+3: Smooth wave tail→head + new shares ═══
+                    var p2elapsed = elapsed - phase2Start;
+                    var totalShares = self.shares.length;
+
+                    for (var i = totalShares - 1; i >= 0; i--) {
                         var share = self.shares[i];
                         var dst = newPos[i];
                         var isNew = i < newCount;
-
-                        // Stagger: shares near tip animate first
-                        var stagger = Math.min(i, newCount * 2) / (newCount * 2 + 1) * 0.3;
-                        var t = Math.max(0, Math.min(1, (globalT - stagger) / (1 - stagger)));
-                        // Ease: cubic in-out
-                        var ease = t < 0.5 ? 4*t*t*t : 1 - Math.pow(-2*t+2, 3)/2;
-
                         var x, y, scale, shadowAlpha;
 
                         if (isNew) {
-                            // New share: pop in from above with scale
-                            var enterT = Math.max(0, Math.min(1, (globalT - 0.2) / 0.8));
-                            var enterEase = 1 - Math.pow(1 - enterT, 3);
-                            x = dst.x;
-                            y = dst.y - (1 - enterEase) * step * 3;
-                            scale = 0.3 + enterEase * 0.7;
-                            shadowAlpha = enterEase * 0.4;
-                            ctx.globalAlpha = enterEase;
-                        } else {
-                            // Existing share: lift → slide → land
-                            var old = self._oldPositions[share.h];
-                            if (old) {
-                                // Phase: 0-0.3 lift, 0.3-0.7 slide, 0.7-1.0 land
-                                var liftT, slideT, landT;
-                                if (ease < 0.3) {
-                                    liftT = ease / 0.3;
-                                    slideT = 0; landT = 0;
-                                } else if (ease < 0.7) {
-                                    liftT = 1;
-                                    slideT = (ease - 0.3) / 0.4;
-                                    landT = 0;
-                                } else {
-                                    liftT = 1;
-                                    slideT = 1;
-                                    landT = (ease - 0.7) / 0.3;
+                            // Phase 3: reverse of Phase 1
+                            // Staggered per new share
+                            var bStagger = i * 150 / phase3Dur;
+                            var bt = Math.max(0, Math.min(1, ((elapsed - phase3Start) / phase3Dur - bStagger) / (1 - bStagger)));
+                            var bi = born[i];
+                            var bdsw = cs * bornScale;
+
+                            // Birth spread position (above destination)
+                            function bornPos(bIdx, bsc) {
+                                var bsw = cs * bsc;
+                                var gap = 4;
+                                var totalW = newCount * bsw + (newCount - 1) * gap;
+                                var avgX = 0;
+                                for (var bb = 0; bb < newCount; bb++) avgX += newPos[bb].x;
+                                avgX = avgX / newCount + cs/2;
+                                var groupLeft = avgX - totalW/2;
+                                if (groupLeft < ml) groupLeft = ml;
+                                if (groupLeft + totalW > cssW) groupLeft = cssW - totalW;
+                                return groupLeft + bIdx * (bsw + gap) + bsw/2;
+                            }
+                            var bFinalX = bornPos(i, bornScale);
+                            // Birth position: below destination, centered vertically in visible canvas
+                            var bFinalY = Math.min(dst.y + step * 6, cssH * 0.4);
+
+                            if (bt < 0.35) {
+                                // COALESCE: particles gather into square (reverse dissolve)
+                                var cT = bt / 0.35;
+                                var coreAlpha = cT;
+                                var coreShrink = 0.3 + cT * 0.7;
+                                var cw = bdsw * coreShrink;
+                                // Draw gathering particles
+                                var parts = birthParticles[i];
+                                var ashSpread = bdsw * 0.8;
+                                for (var p = 0; p < parts.length; p++) {
+                                    var pt = Math.max(0, 1 - (cT - parts[p].delay) / (1 - parts[p].delay));
+                                    if (pt <= 0 || pt > 1) continue;
+                                    ctx.globalAlpha = (1-pt*0.5);
+                                    var pSize = (parts[p].size + bdsw*0.04) * (0.5+pt*0.5);
+                                    var origRGB = parseColor(bi.color);
+                                    ctx.fillStyle = lerpColor([100,200,100], origRGB, cT);
+                                    ctx.fillRect(bFinalX+parts[p].ox*ashSpread/cs*(pt)+parts[p].vx*pt*40, bFinalY+parts[p].oy*ashSpread/cs*(pt)+parts[p].vy*pt*40, pSize, pSize);
                                 }
-                                // Lift: scale up
-                                var liftScale = 1 + 0.25 * Math.sin(liftT * Math.PI);
-                                // Land: scale back
-                                var landScale = landT > 0 ? 1 + 0.25 * Math.sin((1-landT) * Math.PI) : liftScale;
-                                scale = landT > 0 ? landScale : liftScale;
-                                // Slide: interpolate position
-                                x = old.x + (dst.x - old.x) * slideT;
-                                y = old.y + (dst.y - old.y) * slideT;
-                                // Shadow during lift
-                                shadowAlpha = 0.3 * Math.sin(ease * Math.PI);
+                                // Growing core
+                                if (coreAlpha > 0.1) {
+                                    ctx.globalAlpha = coreAlpha;
+                                    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+                                    ctx.fillRect(bFinalX-cw/2+5, bFinalY-cw/2+5, cw+2, cw+2);
+                                    ctx.fillStyle = lerpColor([80,200,80], parseColor(bi.color), cT);
+                                    ctx.fillRect(bFinalX-cw/2, bFinalY-cw/2, cw, cw);
+                                }
+                                x = dst.x; y = dst.y; scale = 0; shadowAlpha = 0;
+                                ctx.globalAlpha = 0;
+                            } else if (bt < 0.65) {
+                                // HOLD: show address + PPLNS % on scaled square
+                                var holdT = (bt - 0.35) / 0.3;
+                                ctx.globalAlpha = 1;
+                                // Shadow
+                                ctx.fillStyle = 'rgba(0,0,0,0.85)';
+                                ctx.fillRect(bFinalX-bdsw/2+6, bFinalY-bdsw/2+6, bdsw+4, bdsw+4);
+                                // Glow
+                                ctx.fillStyle = 'rgba(0,255,100,0.15)';
+                                ctx.fillRect(bFinalX-bdsw/2-4, bFinalY-bdsw/2-4, bdsw+8, bdsw+8);
+                                // Solid fill — original share color
+                                ctx.fillStyle = bi.color;
+                                ctx.fillRect(bFinalX-bdsw/2, bFinalY-bdsw/2, bdsw, bdsw);
+                                ctx.fillStyle = 'rgba(255,255,255,0.1)';
+                                ctx.fillRect(bFinalX-bdsw/2+3, bFinalY-bdsw/2+3, bdsw-6, bdsw-6);
+                                // Text
+                                var fontSize = _bornFontSize;
+                                ctx.fillStyle = '#ffffff';
+                                ctx.font = 'bold ' + fontSize + 'px Monaco,Consolas,monospace';
+                                ctx.textAlign = 'center';
+                                ctx.textBaseline = 'middle';
+                                ctx.fillText(bi.shortAddr, bFinalX, bFinalY - fontSize * 0.8);
+                                ctx.fillStyle = '#ffd700';
+                                ctx.font = 'bold ' + (fontSize+1) + 'px Monaco,Consolas,monospace';
+                                ctx.fillText(bi.pplnsPct.toFixed(3) + '%', bFinalX, bFinalY + fontSize * 0.8);
+                                x = dst.x; y = dst.y; scale = 0; shadowAlpha = 0;
+                                ctx.globalAlpha = 0;
+                            } else {
+                                // LAND: shrink from bornScale down to 1x, fly to final grid position
+                                var landT = (bt - 0.65) / 0.35;
+                                var landEase = 1 - Math.pow(1 - landT, 2);
+                                scale = bornScale - (bornScale - 1) * landEase;
+                                x = bFinalX + (dst.x + cs/2 - bFinalX) * landEase;
+                                y = bFinalY + (dst.y + cs/2 - bFinalY) * landEase;
+                                // Adjust x,y to top-left for the drawing code below
+                                var sw2 = cs * scale;
+                                x = x - sw2/2;
+                                y = y - sw2/2;
+                                shadowAlpha = 0.5 * (1 - landEase);
+                                ctx.globalAlpha = 1;
+                                // Draw directly here since scale is non-standard
+                                if (shadowAlpha > 0.02) {
+                                    ctx.fillStyle = 'rgba(0,0,0,' + shadowAlpha + ')';
+                                    ctx.fillRect(x+4, y+4, sw2, sw2);
+                                }
+                                ctx.fillStyle = bi.color;
+                                ctx.fillRect(x, y, sw2, sw2);
+                                // Green glow fading
+                                ctx.strokeStyle = 'rgba(0,255,136,' + (1-landEase)*0.8 + ')';
+                                ctx.lineWidth = 2;
+                                ctx.strokeRect(x-1, y-1, sw2+2, sw2+2);
+                                // Skip the generic draw below
+                                x = dst.x; y = dst.y; scale = 0; shadowAlpha = 0;
+                                ctx.globalAlpha = 0;
+                            }
+                        } else {
+                            // Phase 2: smooth wave from tail toward head
+                            // Each share gets a staggered start based on distance from tail
+                            var distFromTail = totalShares - 1 - i;
+                            var fraction = distFromTail / (totalShares - newCount);
+                            // Stagger: tail starts first, head last, spread over 70% of phase2
+                            var shareStart = fraction * phase2Dur * 0.7;
+                            var shareT = Math.max(0, Math.min(1, (p2elapsed - shareStart) / 600));
+                            var ease = 1 - Math.pow(1 - shareT, 3);
+
+                            var old = self._oldPositions[share.h];
+                            if (old && shareT > 0 && shareT < 1) {
+                                var liftA, slideA, landA;
+                                if (ease < 0.2) {
+                                    liftA = ease/0.2; slideA = 0; landA = 0;
+                                } else if (ease < 0.8) {
+                                    liftA = 1; slideA = (ease-0.2)/0.6; landA = 0;
+                                } else {
+                                    liftA = 1; slideA = 1; landA = (ease-0.8)/0.2;
+                                }
+                                var pop = liftA * (1 - landA);
+                                scale = 1 + 0.35 * pop;
+                                x = old.x + (dst.x - old.x) * slideA;
+                                y = old.y + (dst.y - old.y) * slideA;
+                                shadowAlpha = 0.35 * pop;
+                            } else if (old && shareT <= 0) {
+                                x = old.x; y = old.y; scale = 1; shadowAlpha = 0;
                             } else {
                                 x = dst.x; y = dst.y; scale = 1; shadowAlpha = 0;
                             }
                             ctx.globalAlpha = 1;
                         }
 
-                        // Draw shadow
+                        // Shadow
                         if (shadowAlpha > 0.02) {
                             ctx.fillStyle = 'rgba(0,0,0,' + shadowAlpha + ')';
-                            ctx.fillRect(x + 2, y + 2, cs, cs);
+                            ctx.fillRect(x + 2 + shadowAlpha*3, y + 2 + shadowAlpha*3, cs, cs);
                         }
 
-                        // Draw scaled cell
                         var sx = x + cs/2 - (cs*scale)/2;
                         var sy = y + cs/2 - (cs*scale)/2;
                         var sw = cs * scale;
@@ -4901,7 +5094,6 @@
                         ctx.fillStyle = self.getColor(share);
                         ctx.fillRect(sx, sy, sw, sw);
 
-                        // Block borders
                         var isLtc = !!self.blockSet[share.h];
                         var isDoge = !!self.dogeSet[share.h];
                         if (isLtc && isDoge) {
@@ -4916,11 +5108,163 @@
                             ctx.strokeRect(sx+0.5, sy+0.5, sw-1, sw-1);
                         }
 
-                        // Green glow on new shares
                         if (isNew && ctx.globalAlpha > 0.3) {
-                            ctx.strokeStyle = 'rgba(0,255,136,' + (ctx.globalAlpha * 0.9) + ')';
+                            ctx.strokeStyle = 'rgba(0,255,136,' + (ctx.globalAlpha*0.9) + ')';
                             ctx.lineWidth = 2;
                             ctx.strokeRect(sx-0.5, sy-0.5, sw+1, sw+1);
+                        }
+                    }
+                    ctx.globalAlpha = 1;
+
+                    // ═══ PHASE 1: Dying shares — staggered rise, turn red, dissolve ═══
+                    // Helper: parse CSS color to [r,g,b]
+                    function parseColor(c) {
+                        if (c.charAt(0)==='#') { var n=parseInt(c.substr(1),16); return [(n>>16)&255,(n>>8)&255,n&255]; }
+                        var m = c.match(/\d+/g); return m ? [+m[0],+m[1],+m[2]] : [100,100,100];
+                    }
+                    function lerpColor(c1,c2,t) {
+                        return 'rgb('+Math.floor(c1[0]+(c2[0]-c1[0])*t)+','+Math.floor(c1[1]+(c2[1]-c1[1])*t)+','+Math.floor(c1[2]+(c2[2]-c1[2])*t)+')';
+                    }
+                    var RED = [230,20,20];
+                    var p1t = Math.min(elapsed / phase1Dur, 1);
+                    var dyingCount = dying.length;
+                    for (var d = 0; d < dyingCount; d++) {
+                        var dp = dying[d].pos;
+                        var dcx = dp.x + cs/2;
+                        var dcy = dp.y + cs/2;
+                        // Stagger: each share starts 150ms after the previous
+                        var dDelay = (dyingCount - 1 - d) * 150 / phase1Dur;
+                        var dt = Math.max(0, (p1t - dDelay) / (1 - dDelay));
+                        // Helper: compute spread position for dying share at given scale
+                        function dyingPos(dIdx, dsc) {
+                            var dsw = cs * dsc;
+                            var gap = 4;
+                            var totalW = dyingCount * dsw + (dyingCount - 1) * gap;
+                            var avgX = 0;
+                            for (var dd = 0; dd < dyingCount; dd++) avgX += dying[dd].pos.x;
+                            avgX = avgX / dyingCount + cs/2;
+                            var groupLeft = avgX - totalW/2;
+                            if (groupLeft < ml) groupLeft = ml;
+                            if (groupLeft + totalW > cssW) groupLeft = cssW - totalW;
+                            return groupLeft + dIdx * (dsw + gap) + dsw/2;
+                        }
+
+                        // Fixed final target — no position shift between phases
+                        var finalX = dyingPos(d, dyingScale);
+                        var finalY = dcy - step * 8;
+
+                        if (dt < 0.3) {
+                            // RISE: 0→30%
+                            var riseT = dt / 0.3;
+                            var riseEase = 1 - Math.pow(1 - riseT, 2);
+                            var dsc = 1 + riseEase * (dyingScale - 1);
+                            var dsw = cs * dsc;
+                            var animX = dcx + (finalX - dcx) * riseEase;
+                            var animY = dcy + (finalY - dcy) * riseEase;
+                            var dsx = animX - dsw/2;
+                            var dsy = animY - dsw/2;
+                            ctx.globalAlpha = 1;
+
+                            // Shadow at original position
+                            var shScale = 1 + riseEase * 2;
+                            var shAlpha = 1.0 - riseEase * 0.4;
+                            ctx.fillStyle = 'rgba(0,0,0,' + shAlpha + ')';
+                            ctx.fillRect(dp.x+cs/2-cs*shScale/2+4, dp.y+cs/2-cs*shScale/2+4, cs*shScale, cs*shScale);
+
+                            // Glow + fill lerping to red
+                            var origRGB = parseColor(dying[d].color);
+                            ctx.fillStyle = lerpColor(origRGB, RED, riseEase * 0.4);
+                            ctx.globalAlpha = riseEase * 0.35;
+                            ctx.fillRect(dsx-8, dsy-8, dsw+16, dsw+16);
+                            ctx.globalAlpha = 1;
+                            ctx.fillStyle = lerpColor(origRGB, RED, riseEase);
+                            ctx.fillRect(dsx, dsy, dsw, dsw);
+                        } else if (dt < 0.55) {
+                            // HOLD: 30→55% — show miner address + PPLNS weight
+                            var fontSize = _dyingFontSize;
+                            var addrText = dying[d].shortAddr;
+                            var pctText = dying[d].pplnsPct.toFixed(3) + '%';
+                            var dsc = dyingScale;
+                            var dsw = cs * dsc;
+                            var holdX = finalX;
+                            var holdY = finalY;
+                            var dsx = holdX - dsw/2;
+                            var dsy = holdY - dsw/2;
+                            ctx.globalAlpha = 1;
+
+                            // Dark shadow under the flying share (bigger than share)
+                            ctx.fillStyle = 'rgba(0,0,0,0.85)';
+                            ctx.fillRect(dsx+6, dsy+6, dsw+4, dsw+4);
+
+                            // Subtle red glow (smaller than shadow)
+                            ctx.fillStyle = 'rgba(255,40,30,0.15)';
+                            ctx.fillRect(dsx-4, dsy-4, dsw+8, dsw+8);
+
+                            // Solid red fill
+                            ctx.fillStyle = 'rgb(200,15,15)';
+                            ctx.fillRect(dsx, dsy, dsw, dsw);
+                            ctx.fillStyle = 'rgba(255,60,50,0.2)';
+                            ctx.fillRect(dsx+3, dsy+3, dsw-6, dsw-6);
+
+                            // Miner address — white, bold
+                            ctx.fillStyle = '#ffffff';
+                            ctx.font = 'bold ' + fontSize + 'px Monaco,Consolas,monospace';
+                            ctx.textAlign = 'center';
+                            ctx.textBaseline = 'middle';
+                            ctx.fillText(addrText, holdX, holdY - fontSize * 0.8);
+                            // PPLNS weight — gold, bold
+                            ctx.fillStyle = '#ffd700';
+                            ctx.font = 'bold ' + (fontSize + 1) + 'px Monaco,Consolas,monospace';
+                            ctx.fillText(pctText, holdX, holdY + fontSize * 0.8);
+                        } else if (dt > 0 && dt < 1) {
+                            // Dissolve the actual scaled square at its hold position
+                            var ashT = (dt - 0.55) / 0.45;
+                            var dsc = dyingScale;
+                            var dsw = cs * dsc;
+                            var ashX = finalX;
+                            var ashY = finalY;
+                            var dsx = ashX - dsw/2;
+                            var dsy = ashY - dsw/2;
+
+                            // Shrinking core with text — starts at full hold size
+                            var coreAlpha = Math.max(0, 1 - ashT * 1.3);
+                            if (coreAlpha > 0) {
+                                var shrink = 1 - ashT * 0.5;
+                                var cw = dsw * shrink;
+                                var cx2 = ashX - cw/2;
+                                var cy2 = ashY - cw/2;
+                                // Shadow fading
+                                ctx.globalAlpha = coreAlpha * 0.7;
+                                ctx.fillStyle = 'rgba(0,0,0,0.8)';
+                                ctx.fillRect(cx2+5, cy2+5, cw+2, cw+2);
+                                // Core
+                                ctx.globalAlpha = coreAlpha;
+                                ctx.fillStyle = '#ff3040';
+                                ctx.fillRect(cx2, cy2, cw, cw);
+                                // Text dissolves with the core
+                                var fontSize = _dyingFontSize * shrink;
+                                if (fontSize > 5) {
+                                    ctx.fillStyle = '#ffffff';
+                                    ctx.font = 'bold ' + fontSize + 'px Monaco,Consolas,monospace';
+                                    ctx.textAlign = 'center';
+                                    ctx.textBaseline = 'middle';
+                                    ctx.fillText(dying[d].shortAddr, ashX, ashY - fontSize * 0.8);
+                                    ctx.fillStyle = '#ffd700';
+                                    ctx.font = 'bold ' + (fontSize + 1) + 'px Monaco,Consolas,monospace';
+                                    ctx.fillText(dying[d].pplnsPct.toFixed(3) + '%', ashX, ashY + fontSize * 0.8);
+                                }
+                            }
+                            // Ash particles — scaled to match the square size
+                            var parts = ashParticles[d];
+                            var ashSpread = dsw * 0.8;
+                            for (var p = 0; p < parts.length; p++) {
+                                var pt = Math.max(0, ashT-parts[p].delay)/(1-parts[p].delay);
+                                if (pt<=0||pt>1) continue;
+                                ctx.globalAlpha = (1-pt)*(1-pt);
+                                var pSize = (parts[p].size + dsw*0.04) * (1-pt*0.4);
+                                ctx.fillStyle = 'rgb('+Math.floor(255*(1-pt)+100*pt)+','+Math.floor(120*(1-pt)+80*pt)+','+Math.floor(30*(1-pt)+70*pt)+')';
+                                ctx.fillRect(ashX+parts[p].ox*ashSpread/cs+parts[p].vx*pt*60, ashY+parts[p].oy*ashSpread/cs+parts[p].vy*pt*60, pSize, pSize);
+                            }
                         }
                     }
                     ctx.globalAlpha = 1;
