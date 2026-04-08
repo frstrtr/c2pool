@@ -3352,6 +3352,8 @@ void MiningInterface::start_pplns_precompute()
             std::chrono::steady_clock::now() - start_time).count();
 
         m_pplns_precompute_done.store(true);
+        // Invalidate window cache so next request includes all per-share PPLNS
+        invalidate_window_cache();
         LOG_INFO << "[PPLNS-Cache] Pre-computation complete: " << computed
                  << " snapshots in " << elapsed << "s (cache size: "
                  << m_pplns_per_tip.size() << ")";
