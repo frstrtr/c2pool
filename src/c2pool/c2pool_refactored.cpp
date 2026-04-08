@@ -3071,6 +3071,8 @@ int main(int argc, char* argv[]) {
                 result["blocks"] = std::move(blocks_arr);
                 result["doge_blocks"] = std::move(doge_arr);
                 result["total"] = static_cast<int>(chain.size());
+                // Include current PPLNS snapshot for treemap
+                if (mi) result["pplns"] = mi->rest_current_payouts();
                 return result;
             });
 
@@ -3201,6 +3203,11 @@ int main(int argc, char* argv[]) {
                 result["heads"] = std::move(heads_arr);
                 result["blocks"] = std::move(blocks_arr);
                 result["doge_blocks"] = std::move(doge_arr);
+
+                // Include current PPLNS snapshot (pre-computed, cached from coinbase builder)
+                if (count > 0 && mi) {
+                    result["pplns"] = mi->rest_current_payouts();
+                }
                 return result;
             });
 

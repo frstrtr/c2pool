@@ -4517,6 +4517,8 @@
             myAddress: '',
             windowSize: 8640,
             pplnsData: [],     // cached [{addr, pct, amt}] sorted by pct desc
+            pplnsCache: {},    // share_hash → [{addr, pct, amt}] from server
+            pplnsFallback: [], // initial load PPLNS for shares without per-hash data
             zoomPanel: null,   // floating zoom panel element
             cellSize: 10,
             gap: 1,
@@ -4590,27 +4592,22 @@
                     }
 
                     self.computeMinerHashrates();
+
+                    // Cache PPLNS from server response
+                    if (data.pplns && typeof data.pplns === 'object') {
+                        var pplnsEntries = self._parsePPLNS(data.pplns);
+                        self.pplnsData = pplnsEntries;
+                        self.pplnsFallback = pplnsEntries;
+                        // Associate with tip share
+                        if (self.shares.length > 0)
+                            self.pplnsCache[self.shares[0].h] = pplnsEntries;
+                    }
+
                     self.render();
                     self.updateStats(data);
                     loadShareLinks();
-                    // Re-render payouts V36 column now that share data is available
                     refreshPayoutsV36();
-                    // Render main PPLNS treemap (needs miner version data)
                     loadMainPPLNS();
-                });
-
-                // Fetch PPLNS distribution for treemap
-                d3.json('../current_payouts', function(payouts) {
-                    if (!payouts || typeof payouts !== 'object') return;
-                    var total = 0;
-                    var entries = [];
-                    for (var addr in payouts) {
-                        total += payouts[addr];
-                        entries.push({ addr: addr, amt: payouts[addr] });
-                    }
-                    entries.sort(function(a, b) { return b.amt - a.amt; });
-                    entries.forEach(function(e) { e.pct = total > 0 ? e.amt / total : 0; });
-                    self.pplnsData = entries;
                 });
             },
 
@@ -4803,7 +4800,7 @@
                 });
             },
 
-            _animate3D: function(newCount) {
+            _animate3D: function(newCount, fast) {
                 if (this._animRunning) {
                     // Queue this update — will replay after current animation ends
                     this._deltaQueue.push(newCount);
@@ -4915,7 +4912,7 @@
                 });
 
                 var phase1Dur = 3000;
-                var phase2Dur = 4000;
+                var phase2Dur = fast ? 2000 : 4000;
                 var phase2Start = phase1Dur;
                 var phase3Start = phase2Start + phase2Dur * 0.7;
                 var phase3Dur = 3000;
@@ -5524,6 +5521,60 @@
                 }
             },
 
+            // Parse {addr: amount} to sorted [{addr, pct, amt}]
+            _parsePPLNS: function(payouts) {
+                var total = 0;
+                var entries = [];
+                for (var addr in payouts) {
+                    var amt = typeof payouts[addr] === 'number' ? payouts[addr] : 0;
+                    total += amt;
+                    entries.push({ addr: addr, amt: amt });
+                }
+                entries.sort(function(a, b) { return b.amt - a.amt; });
+                entries.forEach(function(e) { e.pct = total > 0 ? e.amt / total : 0; });
+                return entries;
+            },
+
+            // Get PPLNS for a share: check cache, fallback to nearest or default
+            getPPLNSForShare: function(share) {
+                if (!share) return this.pplnsFallback || this.pplnsData || [];
+                // Exact match
+                if (this.pplnsCache[share.h]) return this.pplnsCache[share.h];
+                // Find nearest cached share by position (walk forward from this share)
+                for (var i = 0; i < this.shares.length; i++) {
+                    if (this.shares[i].h === share.h) {
+                        // Look backward (newer) for nearest cached
+                        for (var j = i; j >= 0; j--) {
+                            if (this.pplnsCache[this.shares[j].h])
+                                return this.pplnsCache[this.shares[j].h];
+                        }
+                        break;
+                    }
+                }
+                return this.pplnsFallback || this.pplnsData || [];
+            },
+
+            // Compute PPLNS weights from share position to end of window
+            computePPLNSAtPosition: function(shareIdx) {
+                var weights = {};
+                var total = 0;
+                // Walk from shareIdx to the end (older shares) — matches PPLNS window from this point
+                var end = Math.min(shareIdx + this.windowSize, this.shares.length);
+                for (var i = shareIdx; i < end; i++) {
+                    var s = this.shares[i];
+                    var diff = s.b ? this.bitsToDifficulty(s.b) : 1;
+                    var addr = s.m || 'unknown';
+                    weights[addr] = (weights[addr] || 0) + diff;
+                    total += diff;
+                }
+                var entries = [];
+                for (var addr in weights) {
+                    entries.push({ addr: addr, pct: total > 0 ? weights[addr] / total : 0, amt: weights[addr] });
+                }
+                entries.sort(function(a, b) { return b.pct - a.pct; });
+                return entries;
+            },
+
             showZoom: function(share, e) {
                 var zp = this.zoomPanel;
                 var zc = this.zoomCanvas;
@@ -5531,8 +5582,9 @@
                 var sz = 240;
                 var dpr = this.dpr;
 
-                // Don't show if no PPLNS data yet
-                if (!this.pplnsData || this.pplnsData.length === 0) {
+                // Use server-cached PPLNS for this share
+                var pplnsAtPos = this.getPPLNSForShare(share);
+                if (!pplnsAtPos || pplnsAtPos.length === 0) {
                     zp.style.display = 'none';
                     return;
                 }
@@ -5544,8 +5596,8 @@
                 ctx.fillStyle = '#0d0d1a';
                 ctx.fillRect(0, 0, sz, sz);
 
-                // Squarified treemap of PPLNS distribution
-                var rects = this.treemap(this.pplnsData, 2, 2, sz - 4, sz - 4);
+                // Squarified treemap of PPLNS at this share's position
+                var rects = this.treemap(pplnsAtPos, 2, 2, sz - 4, sz - 4);
                 var minerAddr = share ? share.m : '';
                 var myAddr = this.myAddress;
 
@@ -5603,7 +5655,7 @@
                 }
 
                 // Label below canvas
-                this.zoomLabel.textContent = 'PPLNS Distribution \u2014 ' + this.pplnsData.length + ' miners';
+                this.zoomLabel.textContent = 'PPLNS Distribution \u2014 ' + pplnsAtPos.length + ' miners';
 
                 // Set canvas CSS size
                 zc.style.width = sz + 'px';
@@ -7763,6 +7815,8 @@
                 btn.style.color = '#fff';
                 btn.style.borderColor = '#28a745';
                 _rtStartSSE();
+                // Immediate first update — don't wait for SSE push
+                _rtFetchDelta(_rtTipHash || '');
             }
         }
 
@@ -7846,10 +7900,26 @@
                 defrag.shares.forEach(function(s) { if (s.blk) defrag.blockSet[s.h] = true; });
                 defrag.computeMinerHashrates();
 
+                // Cache PPLNS snapshot from delta (keyed to each new share)
+                if (delta.pplns && typeof delta.pplns === 'object') {
+                    var pplnsEntries = defrag._parsePPLNS(delta.pplns);
+                    defrag.pplnsData = pplnsEntries;  // update current
+                    newShares.forEach(function(s) {
+                        defrag.pplnsCache[s.h] = pplnsEntries;
+                    });
+                    // Cap cache size (keep last 500 entries)
+                    var cacheKeys = Object.keys(defrag.pplnsCache);
+                    if (cacheKeys.length > 500) {
+                        cacheKeys.slice(0, cacheKeys.length - 500).forEach(function(k) {
+                            delete defrag.pplnsCache[k];
+                        });
+                    }
+                }
+
                 // Animate
                 var newCount = newShares.length;
                 if (newCount > 0 && newCount < 100) {
-                    defrag._animate3D(newCount);
+                    defrag._animate3D(newCount, true);  // fast for RealTime
                 } else {
                     defrag._oldPositions = {};
                     defrag.render();
