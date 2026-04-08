@@ -2641,7 +2641,7 @@
                             .style('color', '#c3a634')
                             .text(d3.format(',.2f')(mp.amount) + ' ' + (mp.symbol || 'DOGE'));
                     } else {
-                        mergedPayoutCell.style('color', '#666').text('-');
+                        mergedPayoutCell.style('color', '#666').text('0.0000 DOGE');
                     }
                     
                     // Create worker rows (expanded for multi-worker, hidden for single)

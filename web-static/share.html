@@ -730,13 +730,17 @@
                     }
                 }
 
+                    var _shareEntries = entries;
+                    var _shareMinerAddr = (share && share.share_data) ? share.share_data.payout_address : '';
+                    function renderSharePPLNS() {
                     var w = grid.clientWidth;
                     var vh = window.innerHeight || document.documentElement.clientHeight;
-                    var h = Math.max(400, Math.min(w * 0.5, vh * 0.7));
+                    var h = Math.max(vh * 0.75, Math.min(w * 0.55, vh * 0.85));
                     grid.style.height = h + 'px';
+                    grid.innerHTML = '';
 
-                    var rects = pplnsTreemap(entries, 0, 0, w, h);
-                    var minerAddr = (share && share.share_data) ? share.share_data.payout_address : '';
+                    var rects = pplnsTreemap(_shareEntries, 0, 0, w, h);
+                    var minerAddr = _shareMinerAddr;
                     var addrPrefix = ci.address_explorer_url_prefix || 'https://blockchair.com/litecoin/address/';
 
                     rects.forEach(function(r) {
@@ -876,14 +880,30 @@
                             tooltip.style.display = 'block';
                         });
                         cell.addEventListener('mousemove', function(ev) {
-                            tooltip.style.left = (ev.clientX + 14) + 'px';
-                            tooltip.style.top = (ev.clientY + 14) + 'px';
+                            var tw = tooltip.offsetWidth || 320;
+                            var th = tooltip.offsetHeight || 120;
+                            var tx = ev.clientX + 14;
+                            var ty = ev.clientY + 14;
+                            if (tx + tw > window.innerWidth - 8) tx = ev.clientX - tw - 14;
+                            if (ty + th > window.innerHeight - 8) ty = ev.clientY - th - 14;
+                            if (tx < 8) tx = 8;
+                            if (ty < 8) ty = 8;
+                            tooltip.style.left = tx + 'px';
+                            tooltip.style.top = ty + 'px';
                         });
                         cell.addEventListener('mouseleave', function() {
                             tooltip.style.display = 'none';
                         });
 
                         grid.appendChild(cell);
+                    });
+                    } // end renderSharePPLNS
+                    renderSharePPLNS();
+                    // Resize handler
+                    var _resizeTimer;
+                    window.addEventListener('resize', function() {
+                        clearTimeout(_resizeTimer);
+                        _resizeTimer = setTimeout(renderSharePPLNS, 200);
                     });
                 }); // end d3.json sharechain/window
         }
