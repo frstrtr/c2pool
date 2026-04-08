@@ -3225,46 +3225,56 @@ void MiningInterface::start_pplns_precompute()
     m_pplns_precompute_thread = std::thread([this]() {
         LOG_INFO << "[PPLNS-Cache] Background pre-computation thread started";
 
-        // Wait for sharechain to have verified shares and PPLNS function to be wired
+        // Wait for: PPLNS function + sharechain sync + valid work template
+        uint256 block_target;
+        uint64_t subsidy = 0;
         for (int wait = 0; wait < 600; ++wait) {  // up to 10 minutes
             std::this_thread::sleep_for(std::chrono::seconds(1));
             if (!m_pplns_fn || !m_sharechain_window_fn) continue;
 
-            // Check if we have a meaningful chain
+            // Need meaningful chain
+            bool chain_ok = false;
             if (m_sharechain_tip_fn) {
                 auto tip = m_sharechain_tip_fn();
                 if (tip.contains("height") && tip["height"].get<int>() > 100)
-                    break;
+                    chain_ok = true;
             }
+            if (!chain_ok) continue;
+
+            // Need valid work template with real block target
+            {
+                std::lock_guard<std::mutex> lock(m_work_mutex);
+                if (!m_cached_template.is_null() && m_cached_template.contains("bits")) {
+                    // bits is stored as hex string in the template
+                    uint32_t bits = 0;
+                    try {
+                        if (m_cached_template["bits"].is_string())
+                            bits = static_cast<uint32_t>(std::stoul(
+                                m_cached_template["bits"].get<std::string>(), nullptr, 16));
+                        else
+                            bits = m_cached_template["bits"].get<uint32_t>();
+                    } catch (...) {}
+                    if (bits > 0 && (bits >> 24) < 0x21) {
+                        block_target = chain::bits_to_target(bits);
+                        if (m_cached_template.contains("coinbasevalue"))
+                            subsidy = m_cached_template["coinbasevalue"].get<uint64_t>();
+                    }
+                }
+            }
+            if (!block_target.IsNull() && subsidy > 0) break;
         }
 
         if (!m_pplns_fn || !m_sharechain_window_fn) {
             LOG_WARNING << "[PPLNS-Cache] No PPLNS function available, aborting pre-compute";
             return;
         }
-
-        LOG_INFO << "[PPLNS-Cache] Sharechain ready, starting full PPLNS walk...";
-
-        // Get current block target and subsidy from work template
-        uint256 block_target;
-        uint64_t subsidy = 0;
-        {
-            std::lock_guard<std::mutex> lock(m_work_mutex);
-            if (!m_cached_template.is_null()) {
-                if (m_cached_template.contains("bits")) {
-                    auto bits = m_cached_template["bits"].get<uint32_t>();
-                    block_target = chain::bits_to_target(bits);
-                }
-                if (m_cached_template.contains("coinbasevalue"))
-                    subsidy = m_cached_template["coinbasevalue"].get<uint64_t>();
-            }
-        }
         if (block_target.IsNull() || subsidy == 0) {
-            LOG_WARNING << "[PPLNS-Cache] No work template yet, using defaults";
-            // Use reasonable defaults
-            block_target.SetHex("00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-            subsidy = 1250000000;  // 12.5 LTC
+            LOG_WARNING << "[PPLNS-Cache] No valid work template after 10min, aborting pre-compute";
+            return;
         }
+
+        LOG_INFO << "[PPLNS-Cache] Sharechain + work template ready (subsidy=" << subsidy
+                 << "), starting full PPLNS walk...";
 
         // Get the share list from window
         auto window = m_sharechain_window_fn();
@@ -3329,6 +3339,9 @@ void MiningInterface::start_pplns_precompute()
                     LOG_INFO << "[PPLNS-Cache] Computed " << computed << "/" << total
                              << " (" << (computed * 100 / total) << "%)";
                 }
+
+                // Yield to mining thread — don't hog the tracker lock
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
             } catch (const std::exception& e) {
                 // Skip shares that fail (e.g., at chain boundary)
                 continue;
