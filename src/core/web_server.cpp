@@ -3365,8 +3365,73 @@ void MiningInterface::start_pplns_precompute()
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - start_time).count();
 
+        // Convert flat pre-computed entries to merged format with DOGE data
+        // Fetch current merged payouts once as a template for DOGE amounts
+        auto merged_template = rest_current_merged_payouts();
+        if (merged_template.is_object() && !merged_template.empty()) {
+            // Build DOGE lookup: addr → {symbol, address, amount_per_ltc_unit}
+            // For each address, compute DOGE/LTC ratio from the template
+            std::map<std::string, nlohmann::json> doge_info;  // addr → merged array
+            for (auto& [addr, entry] : merged_template.items()) {
+                if (entry.contains("merged") && entry["merged"].is_array()) {
+                    doge_info[addr] = entry["merged"];
+                }
+            }
+            // Compute total LTC in template for proportion scaling
+            double template_ltc_total = 0;
+            for (auto& [addr, entry] : merged_template.items()) {
+                if (entry.contains("amount"))
+                    template_ltc_total += entry["amount"].get<double>();
+            }
+
+            std::lock_guard<std::mutex> lock(m_pplns_cache_mutex);
+            int upgraded = 0;
+            for (auto& [hash, pplns] : m_pplns_per_tip) {
+                // Skip entries already in merged format
+                if (pplns.empty()) continue;
+                auto first_val = pplns.begin().value();
+                if (first_val.is_object()) continue;  // already merged format
+
+                // Convert flat {addr: ltc_amount} → merged {addr: {amount, merged:[]}}
+                double share_ltc_total = 0;
+                for (auto& [a, v] : pplns.items()) {
+                    if (v.is_number()) share_ltc_total += v.get<double>();
+                }
+
+                nlohmann::json merged_pplns = nlohmann::json::object();
+                for (auto& [addr, ltc_val] : pplns.items()) {
+                    double ltc_amt = ltc_val.is_number() ? ltc_val.get<double>() : 0;
+                    double ltc_pct = share_ltc_total > 0 ? ltc_amt / share_ltc_total : 0;
+
+                    nlohmann::json entry = {{"amount", ltc_amt}, {"merged", nlohmann::json::array()}};
+
+                    // Match DOGE data from template by address
+                    auto dit = doge_info.find(addr);
+                    if (dit != doge_info.end()) {
+                        // Use exact DOGE data for this address, scaled by LTC proportion
+                        for (auto& m : dit->second) {
+                            double template_doge = m.value("amount", 0.0);
+                            // Scale: this share's LTC pct vs template LTC pct for this addr
+                            double template_addr_ltc = 0;
+                            if (merged_template.contains(addr) && merged_template[addr].contains("amount"))
+                                template_addr_ltc = merged_template[addr]["amount"].get<double>();
+                            double scale = (template_addr_ltc > 0) ? (ltc_amt / template_addr_ltc) : 1.0;
+                            entry["merged"].push_back({
+                                {"symbol", m.value("symbol", "DOGE")},
+                                {"address", m.value("address", "")},
+                                {"amount", template_doge * scale}
+                            });
+                        }
+                    }
+                    merged_pplns[addr] = std::move(entry);
+                }
+                pplns = std::move(merged_pplns);
+                ++upgraded;
+            }
+            LOG_INFO << "[PPLNS-Cache] Upgraded " << upgraded << " entries to merged format with DOGE data";
+        }
+
         m_pplns_precompute_done.store(true);
-        // Invalidate window cache so next request includes all per-share PPLNS
         invalidate_window_cache();
         LOG_INFO << "[PPLNS-Cache] Pre-computation complete: " << computed
                  << " snapshots in " << elapsed << "s (cache size: "
