@@ -5448,13 +5448,14 @@
                 tip.innerHTML = html;
                 tip.style.display = 'block';
 
-                // Tooltip always below-left of cursor (treemap goes above-right)
+                // Tooltip: always LEFT of cursor, vertically centered
                 var tw = tip.offsetWidth;
                 var th = tip.offsetHeight;
-                var tx = e.clientX - tw - 12;
-                var ty = e.clientY + 18;
-                if (tx < 8) tx = 8;
-                if (ty + th > window.innerHeight - 8) ty = e.clientY - th - 8;
+                var tx = e.clientX - tw - 20;
+                var ty = e.clientY - th / 2;
+                if (tx < 8) { tx = e.clientX + 280; } // flip right past zoom panel
+                if (ty < 8) ty = 8;
+                if (ty + th > window.innerHeight - 8) ty = window.innerHeight - th - 8;
                 tip.style.left = tx + 'px';
                 tip.style.top = ty + 'px';
             },
@@ -5659,13 +5660,14 @@
                 zc.style.width = sz + 'px';
                 zc.style.height = sz + 'px';
 
-                // Position: treemap above-right, tooltip below-left
+                // Zoom panel: always RIGHT of cursor, vertically centered
                 zp.style.display = 'block';
                 var totalH = sz + 20;
-                var tx = e.clientX + 12;
-                var ty = e.clientY - totalH - 12;
-                if (tx + sz > window.innerWidth - 8) tx = e.clientX - sz - 12;
+                var tx = e.clientX + 20;
+                var ty = e.clientY - totalH / 2;
+                if (tx + sz > window.innerWidth - 8) { tx = e.clientX - sz - 280; } // flip left past tooltip
                 if (ty < 8) ty = 8;
+                if (ty + totalH > window.innerHeight - 8) ty = window.innerHeight - totalH - 8;
                 zp.style.left = tx + 'px';
                 zp.style.top = ty + 'px';
             },

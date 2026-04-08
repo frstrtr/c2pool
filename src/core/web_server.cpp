@@ -3316,10 +3316,24 @@ void MiningInterface::start_pplns_precompute()
                 nlohmann::json pplns_json = nlohmann::json::object();
                 for (const auto& [script, amount] : raw_pplns) {
                     std::string addr = core::script_to_address(script, is_ltc, m_testnet);
+                    // P2PK: PUSH<len> <pubkey> OP_CHECKSIG → hash to P2PKH address
+                    if (addr.empty() && script.size() > 33 && script.back() == 0xac) {
+                        size_t pk_len = script[0];
+                        if (pk_len + 1 == script.size() - 1) {
+                            unsigned char sha[32], rip[20];
+                            CSHA256().Write(&script[1], pk_len).Finalize(sha);
+                            CRIPEMD160().Write(sha, 32).Finalize(rip);
+                            std::vector<unsigned char> p2pkh = {0x76, 0xa9, 0x14};
+                            p2pkh.insert(p2pkh.end(), rip, rip + 20);
+                            p2pkh.push_back(0x88);
+                            p2pkh.push_back(0xac);
+                            addr = core::script_to_address(p2pkh, is_ltc, m_testnet);
+                        }
+                    }
                     if (addr.empty()) {
-                        // Fallback: hex
-                        addr.reserve(script.size() * 2);
+                        // Last resort: hex
                         static const char* HEX = "0123456789abcdef";
+                        addr.reserve(script.size() * 2);
                         for (unsigned char b : script) {
                             addr += HEX[b >> 4];
                             addr += HEX[b & 0x0f];
