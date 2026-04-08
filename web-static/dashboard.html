@@ -7909,10 +7909,10 @@
                         defrag.pplnsCache[sh] = parsed;
                         defrag.pplnsData = parsed;  // update current fallback
                     }
-                    // Cap cache size (keep last 1000 entries)
+                    // Cap cache size (keep last 10000 entries — full window)
                     var cacheKeys = Object.keys(defrag.pplnsCache);
-                    if (cacheKeys.length > 1000) {
-                        cacheKeys.slice(0, cacheKeys.length - 1000).forEach(function(k) {
+                    if (cacheKeys.length > 10000) {
+                        cacheKeys.slice(0, cacheKeys.length - 10000).forEach(function(k) {
                             delete defrag.pplnsCache[k];
                         });
                     }

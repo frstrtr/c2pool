@@ -3228,6 +3228,9 @@ int main(int argc, char* argv[]) {
                 return result;
             });
 
+            // Start background PPLNS pre-computation (separate thread, waits for sync)
+            web_server.get_mining_interface()->start_pplns_precompute();
+
             // Wire individual share lookup for /web/share/<hash> detail page
             web_server.get_mining_interface()->set_share_lookup_fn(
                 [&p2p_node, &web_server](const std::string& hash_hex) -> nlohmann::json {

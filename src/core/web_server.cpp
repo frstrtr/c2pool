@@ -3218,6 +3218,135 @@ nlohmann::json MiningInterface::rest_sharechain_window()
     return result;
 }
 
+void MiningInterface::start_pplns_precompute()
+{
+    if (m_pplns_precompute_thread.joinable()) return;  // already running
+
+    m_pplns_precompute_thread = std::thread([this]() {
+        LOG_INFO << "[PPLNS-Cache] Background pre-computation thread started";
+
+        // Wait for sharechain to have verified shares and PPLNS function to be wired
+        for (int wait = 0; wait < 600; ++wait) {  // up to 10 minutes
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (!m_pplns_fn || !m_sharechain_window_fn) continue;
+
+            // Check if we have a meaningful chain
+            if (m_sharechain_tip_fn) {
+                auto tip = m_sharechain_tip_fn();
+                if (tip.contains("height") && tip["height"].get<int>() > 100)
+                    break;
+            }
+        }
+
+        if (!m_pplns_fn || !m_sharechain_window_fn) {
+            LOG_WARNING << "[PPLNS-Cache] No PPLNS function available, aborting pre-compute";
+            return;
+        }
+
+        LOG_INFO << "[PPLNS-Cache] Sharechain ready, starting full PPLNS walk...";
+
+        // Get current block target and subsidy from work template
+        uint256 block_target;
+        uint64_t subsidy = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_work_mutex);
+            if (!m_cached_template.is_null()) {
+                if (m_cached_template.contains("bits")) {
+                    auto bits = m_cached_template["bits"].get<uint32_t>();
+                    block_target = chain::bits_to_target(bits);
+                }
+                if (m_cached_template.contains("coinbasevalue"))
+                    subsidy = m_cached_template["coinbasevalue"].get<uint64_t>();
+            }
+        }
+        if (block_target.IsNull() || subsidy == 0) {
+            LOG_WARNING << "[PPLNS-Cache] No work template yet, using defaults";
+            // Use reasonable defaults
+            block_target.SetHex("00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+            subsidy = 1250000000;  // 12.5 LTC
+        }
+
+        // Get the share list from window
+        auto window = m_sharechain_window_fn();
+        if (!window.contains("shares") || !window["shares"].is_array()) {
+            LOG_WARNING << "[PPLNS-Cache] No shares in window, aborting";
+            return;
+        }
+
+        auto& shares = window["shares"];
+        int total = static_cast<int>(shares.size());
+        int computed = 0;
+        bool is_ltc = (m_blockchain == Blockchain::LITECOIN);
+
+        LOG_INFO << "[PPLNS-Cache] Computing PPLNS for " << total << " shares...";
+        auto start_time = std::chrono::steady_clock::now();
+
+        for (int i = 0; i < total; ++i) {
+            auto& s = shares[i];
+            if (!s.contains("H") || !s.contains("h")) continue;
+
+            std::string full_hash = s["H"].get<std::string>();
+            std::string short_hash = s["h"].get<std::string>();
+
+            // Check if already cached (from live share arrivals)
+            {
+                std::lock_guard<std::mutex> lock(m_pplns_cache_mutex);
+                if (m_pplns_per_tip.count(short_hash)) continue;
+            }
+
+            // Compute PPLNS from this share's perspective
+            try {
+                uint256 share_hash;
+                share_hash.SetHex(full_hash);
+
+                auto raw_pplns = m_pplns_fn(share_hash, block_target, subsidy, m_donation_script);
+                if (raw_pplns.empty()) continue;
+
+                // Convert script→address map to JSON {addr: amount}
+                nlohmann::json pplns_json = nlohmann::json::object();
+                for (const auto& [script, amount] : raw_pplns) {
+                    std::string addr = core::script_to_address(script, is_ltc, m_testnet);
+                    if (addr.empty()) {
+                        // Fallback: hex
+                        addr.reserve(script.size() * 2);
+                        static const char* HEX = "0123456789abcdef";
+                        for (unsigned char b : script) {
+                            addr += HEX[b >> 4];
+                            addr += HEX[b & 0x0f];
+                        }
+                    }
+                    pplns_json[addr] = amount / 1e8;
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(m_pplns_cache_mutex);
+                    m_pplns_per_tip[short_hash] = std::move(pplns_json);
+                }
+                ++computed;
+
+                // Log progress every 500 shares
+                if (computed % 500 == 0) {
+                    LOG_INFO << "[PPLNS-Cache] Computed " << computed << "/" << total
+                             << " (" << (computed * 100 / total) << "%)";
+                }
+            } catch (const std::exception& e) {
+                // Skip shares that fail (e.g., at chain boundary)
+                continue;
+            }
+        }
+
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - start_time).count();
+
+        m_pplns_precompute_done.store(true);
+        LOG_INFO << "[PPLNS-Cache] Pre-computation complete: " << computed
+                 << " snapshots in " << elapsed << "s (cache size: "
+                 << m_pplns_per_tip.size() << ")";
+    });
+
+    m_pplns_precompute_thread.detach();
+}
+
 void MiningInterface::cache_pplns_at_tip()
 {
     // Get current tip hash
@@ -3234,11 +3363,6 @@ void MiningInterface::cache_pplns_at_tip()
 
     std::lock_guard<std::mutex> lock(m_pplns_cache_mutex);
     m_pplns_per_tip[tip] = std::move(pplns);
-
-    // Prune: keep last 1000 entries
-    while (m_pplns_per_tip.size() > 1000) {
-        m_pplns_per_tip.erase(m_pplns_per_tip.begin());
-    }
 }
 
 nlohmann::json MiningInterface::get_pplns_for_tip(const std::string& tip_hash)
@@ -3247,9 +3371,9 @@ nlohmann::json MiningInterface::get_pplns_for_tip(const std::string& tip_hash)
     auto it = m_pplns_per_tip.find(tip_hash);
     if (it != m_pplns_per_tip.end())
         return it->second;
-    // Fallback: return nearest (latest cached)
+    // Fallback: return any cached entry (unordered_map, no ordering)
     if (!m_pplns_per_tip.empty())
-        return m_pplns_per_tip.rbegin()->second;
+        return m_pplns_per_tip.begin()->second;
     return nlohmann::json::object();
 }
 
