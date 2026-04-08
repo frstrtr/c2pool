@@ -38,6 +38,7 @@ struct StatsDelta
     double difficulty_sum{0.0};
     std::map<std::string, int32_t> version_counts;           // format version: "35" → N, "36" → M
     std::map<std::string, int32_t> desired_version_counts;   // desired version: "35" → N, "36" → M
+    std::map<std::string, double>  desired_version_weights;  // desired version weighted by work (target_to_average_attempts)
     std::map<std::string, int32_t> miner_counts;             // miner_hex → count
 };
 
@@ -52,6 +53,8 @@ inline StatsDelta combine_stats_deltas(const StatsDelta& a, const StatsDelta& b)
     for (const auto& [k, v] : b.version_counts) r.version_counts[k] += v;
     r.desired_version_counts = a.desired_version_counts;
     for (const auto& [k, v] : b.desired_version_counts) r.desired_version_counts[k] += v;
+    r.desired_version_weights = a.desired_version_weights;
+    for (const auto& [k, v] : b.desired_version_weights) r.desired_version_weights[k] += v;
     r.miner_counts = a.miner_counts;
     for (const auto& [k, v] : b.miner_counts) r.miner_counts[k] += v;
     return r;
@@ -69,6 +72,7 @@ struct StatsResult
     double difficulty_sum{0.0};
     std::map<std::string, int32_t> version_counts;
     std::map<std::string, int32_t> desired_version_counts;
+    std::map<std::string, double>  desired_version_weights;
     std::map<std::string, int32_t> miner_counts;
 };
 
@@ -130,6 +134,7 @@ public:
         double sol_diff = 0.0;
         std::map<std::string, int32_t> sol_versions;
         std::map<std::string, int32_t> sol_desired;
+        std::map<std::string, double>  sol_desired_w;
         std::map<std::string, int32_t> sol_miners;
 
         for (int32_t safety = 0; safety < max_shares + 32; ++safety)
@@ -160,6 +165,7 @@ public:
                 sol_diff += d.difficulty_sum;
                 for (const auto& [k, v] : d.version_counts) sol_versions[k] += v;
                 for (const auto& [k, v] : d.desired_version_counts) sol_desired[k] += v;
+                for (const auto& [k, v] : d.desired_version_weights) sol_desired_w[k] += v;
                 for (const auto& [k, v] : d.miner_counts) sol_miners[k] += v;
                 pos = node.levels[i].target;
                 jumped = true;
@@ -170,7 +176,7 @@ public:
                 break;
         }
 
-        return {sol_count, sol_orphan, sol_dead, sol_diff, std::move(sol_versions), std::move(sol_desired), std::move(sol_miners)};
+        return {sol_count, sol_orphan, sol_dead, sol_diff, std::move(sol_versions), std::move(sol_desired), std::move(sol_desired_w), std::move(sol_miners)};
     }
 
 private:

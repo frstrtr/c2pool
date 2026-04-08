@@ -40,11 +40,12 @@
         }
         
         .container {
-            max-width: 1400px;
+            max-width: 95vw;
             margin: 0 auto;
             padding: 20px;
             width: 100%;
         }
+        html { scroll-behavior: smooth; }
         
         /* Header */
         header {
@@ -573,10 +574,7 @@
             text-decoration: underline;
         }
         
-        /* Full address on hover tooltip */
-        .hash-link[title]:hover {
-            max-width: none;
-        }
+        /* Full address shown via native tooltip only — no expansion on hover */
         
         /* Scrollable table wrapper */
         .table-scroll {
@@ -644,6 +642,9 @@
         
         .merged-payout-row .hash-link {
             font-size: 0.68rem;
+            max-width: 160px;
+        }
+        .merged-payout-row .hash-link[title]:hover {
             max-width: 160px;
         }
         
@@ -1062,9 +1063,11 @@
             justify-content: center;
         }
         .defrag-chain-cell:hover {
-            transform: scale(1.3);
+            transform: scale(1.8);
             z-index: 10;
-            box-shadow: 0 0 8px rgba(255,255,255,0.3);
+            box-shadow: 0 0 12px rgba(0,255,136,0.6), 0 0 24px rgba(0,255,136,0.3), inset 0 0 4px rgba(255,255,255,0.15);
+            border: 2px solid rgba(0,255,136,0.7);
+            border-radius: 5px;
         }
         .defrag-chain-cell .cell-hash {
             font-family: 'Monaco','Consolas',monospace;
@@ -1584,6 +1587,8 @@
                 </div>
                 <nav>
                     <a href="dashboard.html" class="active">Dashboard</a>
+                    <a href="#pplns-section">PPLNS</a>
+                    <a href="#sharechain-section">Sharechain</a>
                     <a href="graphs.html">Graphs</a>
                     <a href="stratum.html">Stratum</a>
                     <a href="miners.html">Miners</a>
@@ -2089,18 +2094,23 @@
         </div>
         
         <!-- PPLNS Distribution Treemap -->
-        <div class="shares-section">
-            <div class="section-header">
+        <div class="shares-section" id="pplns-section">
+            <div class="section-header" style="display:flex;justify-content:space-between;align-items:center">
                 <h2>PPLNS Distribution</h2>
+                <a href="#" style="color:var(--text-muted);font-size:0.8rem;text-decoration:none">Back to top</a>
             </div>
             <div class="pplns-main-grid" id="pplns-main-grid" style="position:relative;border-radius:8px;overflow:visible;min-height:60px"></div>
             <div id="pplns-main-tooltip" style="display:none;position:fixed;z-index:9999;background:#1e1e38;border:1px solid var(--border);border-radius:8px;padding:8px 12px;pointer-events:none;font-size:0.82rem;box-shadow:0 6px 20px rgba(0,0,0,0.5);width:320px"></div>
         </div>
 
         <!-- Sharechain Transparency Explorer -->
-        <div class="shares-section">
-            <div class="section-header">
+        <div class="shares-section" id="sharechain-section">
+            <div class="section-header" style="display:flex;justify-content:space-between;align-items:center">
                 <h2>Sharechain Transparency Explorer</h2>
+                <div style="display:flex;gap:12px;align-items:center">
+                    <a href="javascript:toggleRealTime()" id="realtime-btn" style="padding:4px 12px;border-radius:4px;font-size:0.8rem;font-weight:600;cursor:pointer;text-decoration:none;background:var(--card-bg);color:var(--text-muted);border:1px solid var(--border)">RealTime: OFF</a>
+                    <a href="#" style="color:var(--text-muted);font-size:0.8rem;text-decoration:none">Back to top</a>
+                </div>
             </div>
 
             <div class="defrag-container">
@@ -2138,7 +2148,7 @@
                             <span class="value" id="defrag-dead" style="color:#dc3545">-</span>
                         </div>
                         <div class="defrag-stat-row">
-                            <span class="label">Pool Fee</span>
+                            <span class="label">Node Fee</span>
                             <span class="value" id="defrag-fee" style="color:#9c27b0">-</span>
                         </div>
                         <div class="defrag-stat-row">
@@ -2187,19 +2197,19 @@
                         </div>
                         <div class="legend-item">
                             <div class="legend-swatch" style="background:#9c27b0"></div>
-                            <span>Pool fee share</span>
+                            <span>Node fee share</span>
                         </div>
                         <div class="legend-item">
                             <div class="legend-swatch" style="background:#28a745;border:2px solid #ffd700;box-shadow:0 0 3px rgba(255,215,0,0.5)"></div>
-                            <span>LTC block</span>
+                            <span style="color:#0070dd;font-weight:600">LTC block</span>
                         </div>
                         <div class="legend-item">
                             <div class="legend-swatch" style="background:#28a745;border:2px solid #00e5ff"></div>
-                            <span>DOGE block</span>
+                            <span style="color:#a335ee;font-weight:600">DOGE block</span>
                         </div>
                         <div class="legend-item">
                             <div class="legend-swatch" style="background:linear-gradient(135deg,#ff8000,#cc6600);border:2px solid #ffaa00;box-shadow:0 0 6px rgba(255,128,0,0.5)"></div>
-                            <span style="color:#ff8000;font-weight:600">Twin block (Legendary)</span>
+                            <span style="color:#ff8000;font-weight:600">Twin block</span>
                         </div>
                         <div class="legend-item">
                             <div class="legend-swatch" style="background:#0d0d1a;position:relative"><div style="position:absolute;top:0;left:0;width:0;height:0;border-left:5px solid #fff;border-bottom:5px solid transparent"></div></div>
@@ -2209,18 +2219,14 @@
                 </div>
             </div>
 
-            <!-- Chain structure rows with share square cells -->
+            <!-- Chain structure: Best Share + Verified Heads + Tails on one line -->
             <div class="defrag-chain-rows">
-                <div class="defrag-chain-row">
+                <div class="defrag-chain-row" style="flex-wrap:wrap">
                     <span class="defrag-chain-label">Best Share</span>
                     <div class="defrag-chain-cells" id="best_share"></div>
-                </div>
-                <div class="defrag-chain-row">
-                    <span class="defrag-chain-label">Verified Heads</span>
+                    <span class="defrag-chain-label" style="margin-left:12px">Verified Heads</span>
                     <div class="defrag-chain-cells" id="verified_heads_cells"></div>
-                </div>
-                <div class="defrag-chain-row">
-                    <span class="defrag-chain-label">Tails</span>
+                    <span class="defrag-chain-label" style="margin-left:12px">Tails</span>
                     <div class="defrag-chain-cells" id="tails_cells"></div>
                 </div>
                 <div class="defrag-chain-row">
@@ -2635,16 +2641,18 @@
                             .style('color', '#c3a634')
                             .text(d3.format(',.2f')(mp.amount) + ' ' + (mp.symbol || 'DOGE'));
                     } else {
-                        mergedPayoutCell.style('color', '#666').text('-');
+                        mergedPayoutCell.style('color', '#666').text('0.0000 DOGE');
                     }
                     
-                    // Create worker rows (initially hidden)
+                    // Create worker rows (expanded for multi-worker, hidden for single)
+                    var startExpanded = miner.workers.length > 1;
                     miner.workers.forEach(function(worker, widx) {
                         var workerRow = tbody.append('tr')
-                            .attr('class', 'worker-row hidden')
+                            .attr('class', 'worker-row' + (startExpanded ? '' : ' hidden'))
                             .attr('data-parent', minerId);
                         
-                        workerRow.append('td').text('↳ ' + worker.name);
+                        var shortName = worker.name.indexOf('.') >= 0 ? worker.name.substring(worker.name.lastIndexOf('.') + 1) : worker.name;
+                        workerRow.append('td').attr('title', worker.name).text('↳ ' + shortName);
                         
                         // Worker hashrate with estimated indicator
                         var workerHashrateCell = workerRow.append('td');
@@ -3848,6 +3856,9 @@
 
         // Look up miner's share version from defrag data (cached per load)
         function getMinerVersion(addr) {
+            // Donation addresses always signal V36 during transition
+            if (addr && (addr.indexOf('LeD2f') === 0 || addr.indexOf('MLhSm') === 0))
+                return { ver: 35, dv: 36 };
             if (!defrag.shares || defrag.shares.length === 0) return { ver: 0, dv: 0 };
             var verCounts = {}, dvCounts = {};
             defrag.shares.forEach(function(s) {
@@ -3912,7 +3923,7 @@
                     .attr('class', 'hash-link')
                     .attr('href', currency_info.address_explorer_url_prefix + addr)
                     .attr('target', '_blank')
-                    .attr('title', addr)
+                    .attr('title', 'LTC: ' + addr)
                     .text(addr);
 
                 // V36 column — look up miner version from defrag share data
@@ -3947,12 +3958,12 @@
                             .style('font-weight', 'bold')
                             .style('margin-right', '6px')
                             .style('font-size', '0.7rem')
-                            .text('↳ ' + merged.symbol);
+                            .text('↳');
                         addrCell.append('a')
                             .attr('class', 'hash-link')
                             .attr('href', getMergedExplorerUrl(merged.symbol, merged.address))
                             .attr('target', '_blank')
-                            .attr('title', merged.address)
+                            .attr('title', merged.symbol + ': ' + merged.address)
                             .text(merged.address);
                         // p2pool-style source labels
                         if (merged.source === 'auto-convert') {
@@ -4502,6 +4513,8 @@
             myAddress: '',
             windowSize: 8640,
             pplnsData: [],     // cached [{addr, pct, amt}] sorted by pct desc
+            pplnsCache: {},    // share_hash → [{addr, pct, amt}] from server
+            pplnsFallback: [], // initial load PPLNS for shares without per-hash data
             zoomPanel: null,   // floating zoom panel element
             cellSize: 10,
             gap: 1,
@@ -4575,27 +4588,24 @@
                     }
 
                     self.computeMinerHashrates();
+
+                    // Cache per-share PPLNS from server
+                    if (data.pplns_current && typeof data.pplns_current === 'object') {
+                        var fallback = self._parsePPLNS(data.pplns_current);
+                        self.pplnsData = fallback;
+                        self.pplnsFallback = fallback;
+                    }
+                    if (data.pplns && typeof data.pplns === 'object') {
+                        for (var sh in data.pplns) {
+                            self.pplnsCache[sh] = self._parsePPLNS(data.pplns[sh]);
+                        }
+                    }
+
                     self.render();
                     self.updateStats(data);
                     loadShareLinks();
-                    // Re-render payouts V36 column now that share data is available
                     refreshPayoutsV36();
-                    // Render main PPLNS treemap (needs miner version data)
                     loadMainPPLNS();
-                });
-
-                // Fetch PPLNS distribution for treemap
-                d3.json('../current_payouts', function(payouts) {
-                    if (!payouts || typeof payouts !== 'object') return;
-                    var total = 0;
-                    var entries = [];
-                    for (var addr in payouts) {
-                        total += payouts[addr];
-                        entries.push({ addr: addr, amt: payouts[addr] });
-                    }
-                    entries.sort(function(a, b) { return b.amt - a.amt; });
-                    entries.forEach(function(e) { e.pct = total > 0 ? e.amt / total : 0; });
-                    self.pplnsData = entries;
                 });
             },
 
@@ -4727,6 +4737,563 @@
                 }
             },
 
+            // Animated live refresh: per-share 3D lift→slide→land animation
+            _animRunning: false,
+            _oldPositions: {},  // hash → {x, y}
+            _deltaQueue: [],   // queued deltas received during animation
+
+            liveRefresh: function() {
+                var self = this;
+                // Snapshot old positions before fetch
+                var step = this.cellSize + this.gap;
+                var ml = this.marginLeft;
+                self._oldPositions = {};
+                for (var i = 0; i < self.shares.length; i++) {
+                    var col = i % self.cols;
+                    var row = Math.floor(i / self.cols);
+                    var s = self.shares[i];
+                    self._oldPositions[s.h] = {
+                        x: ml + col * step, y: row * step,
+                        color: self.getColor(s),
+                        miner: s.m || '',
+                        diff: s.b ? self.bitsToDifficulty(s.b) : 0
+                    };
+                }
+
+                d3.json('../sharechain/window', function(data) {
+                    if (!data || !data.shares || !data.shares.length) return;
+
+                    // Detect new shares
+                    var oldTip = self.shares.length > 0 ? self.shares[0].h : null;
+                    var newCount = 0;
+                    if (oldTip) {
+                        for (var i = 0; i < data.shares.length; i++) {
+                            if (data.shares[i].h === oldTip) { newCount = i; break; }
+                        }
+                    }
+
+                    // Update data
+                    self.shares = data.shares;
+                    self.myAddress = data.my_address || '';
+                    self.windowSize = data.window_size || 8640;
+                    self.blockSet = {};
+                    if (data.blocks) data.blocks.forEach(function(h) { self.blockSet[h] = true; });
+                    self.shares.forEach(function(s) { if (s.blk) self.blockSet[s.h] = true; });
+                    self.dogeSet = {};
+                    if (data.doge_blocks) data.doge_blocks.forEach(function(h) { self.dogeSet[h] = true; });
+                    self.headSet = {};
+                    if (data.heads) data.heads.forEach(function(h) { self.headSet[h] = true; });
+                    self.computeMinerHashrates();
+
+                    if (newCount > 0 && newCount < 100) {
+                        self._animate3D(newCount);
+                    } else {
+                        self._oldPositions = {};
+                        self.render();
+                    }
+                    self.updateStats(data);
+                    loadShareLinks();
+                    refreshPayoutsV36();
+                    loadMainPPLNS();
+                });
+            },
+
+            _animate3D: function(newCount, fast) {
+                if (this._animRunning) {
+                    // Queue this update — will replay after current animation ends
+                    this._deltaQueue.push(newCount);
+                    return;
+                }
+                this._animRunning = true;
+                var self = this;
+                var step = this.cellSize + this.gap;
+                var ml = this.marginLeft;
+                var cs = this.cellSize;
+                var cols = this.cols;
+                var startTime = performance.now();
+
+                // Pre-compute new positions
+                var newPos = [];
+                for (var i = 0; i < self.shares.length; i++) {
+                    var col = i % cols;
+                    var row = Math.floor(i / cols);
+                    newPos.push({ x: ml + col * step, y: row * step });
+                }
+
+                // Collect dying shares (old tail pushed off the chain)
+                var dying = [];
+                var newHashSet = {};
+                self.shares.forEach(function(s) { newHashSet[s.h] = true; });
+                for (var h in self._oldPositions) {
+                    if (!newHashSet[h]) {
+                        var op = self._oldPositions[h];
+                        dying.push({ pos: op, color: op.color || '#0097a7', miner: op.miner || '', diff: op.diff || 0 });
+                    }
+                }
+
+                // Pre-generate ash particles for each dying share
+                var ashParticles = [];
+                dying.forEach(function() {
+                    var particles = [];
+                    for (var p = 0; p < 20; p++) {
+                        particles.push({
+                            ox: (Math.random() - 0.5) * cs * 3,
+                            oy: (Math.random() - 0.5) * cs * 3,
+                            vx: (Math.random() - 0.5) * 8,
+                            vy: -Math.random() * 8 - 3,
+                            size: 2 + Math.random() * 4,
+                            delay: Math.random() * 0.3
+                        });
+                    }
+                    ashParticles.push(particles);
+                });
+
+                // Phase 1: dying shares (1.2s)
+                // Phase 2: all shares slide tail→head (4s smooth wave)
+                // Phase 3: new shares fly in
+                // Compute PPLNS weight for dying shares
+                var totalDiff = 0;
+                for (var h in self._oldPositions) totalDiff += self._oldPositions[h].diff || 0;
+                dying.forEach(function(d) {
+                    d.pplnsPct = totalDiff > 0 ? (d.diff / totalDiff * 100) : 0;
+                    d.shortAddr = d.miner.substr(0, 10);
+                });
+
+                // Compute uniform scale for all dying shares
+                var _dyingFontSize = 13;
+                var _tmpCanvas = document.createElement('canvas').getContext('2d');
+                _tmpCanvas.font = 'bold ' + _dyingFontSize + 'px Monaco,Consolas,monospace';
+                var _maxTextW = 0;
+                dying.forEach(function(d) {
+                    var w = Math.max(_tmpCanvas.measureText(d.shortAddr).width, _tmpCanvas.measureText(d.pplnsPct.toFixed(3)+'%').width);
+                    if (w > _maxTextW) _maxTextW = w;
+                });
+                var dyingScale = Math.max(5, (_maxTextW + 24) / cs);
+
+                // Collect info for new (born) shares — reverse pipeline
+                var born = [];
+                var newTotalDiff = 0;
+                self.shares.forEach(function(s) { newTotalDiff += self.bitsToDifficulty(s.b || 0); });
+                for (var bi = 0; bi < newCount; bi++) {
+                    var s = self.shares[bi];
+                    var diff = self.bitsToDifficulty(s.b || 0);
+                    born.push({
+                        color: self.getColor(s),
+                        miner: s.m || '',
+                        shortAddr: (s.m || '').substr(0, 10),
+                        pplnsPct: newTotalDiff > 0 ? (diff / newTotalDiff * 100) : 0
+                    });
+                }
+                // Uniform scale for born shares
+                var _bornFontSize = _dyingFontSize;
+                var _bornMaxW = 0;
+                born.forEach(function(b) {
+                    var w = Math.max(_tmpCanvas.measureText(b.shortAddr).width, _tmpCanvas.measureText(b.pplnsPct.toFixed(3)+'%').width);
+                    if (w > _bornMaxW) _bornMaxW = w;
+                });
+                var bornScale = Math.max(5, (_bornMaxW + 24) / cs);
+                // Birth particles
+                var birthParticles = [];
+                born.forEach(function() {
+                    var particles = [];
+                    for (var p = 0; p < 20; p++) {
+                        particles.push({
+                            ox: (Math.random() - 0.5) * cs * 3,
+                            oy: (Math.random() - 0.5) * cs * 3,
+                            vx: (Math.random() - 0.5) * 8,
+                            vy: -Math.random() * 8 - 3,
+                            size: 2 + Math.random() * 4,
+                            delay: Math.random() * 0.3
+                        });
+                    }
+                    birthParticles.push(particles);
+                });
+
+                var phase1Dur = 3000;
+                var phase2Dur = fast ? 2000 : 4000;
+                var phase2Start = phase1Dur;
+                var phase3Start = phase2Start + phase2Dur * 0.7;
+                var phase3Dur = 3000;
+                var duration = phase3Start + phase3Dur;
+
+                function frame(now) {
+                    var elapsed = now - startTime;
+                    var globalT = Math.min(elapsed / duration, 1);
+
+                    var canvas = self.canvas;
+                    var ctx = self.ctx;
+                    var dpr = self.dpr;
+                    var cssW = ml + cols * step;
+                    var cssH = Math.max(Math.ceil(self.shares.length / cols) * step, 40);
+                    canvas.style.width = cssW + 'px';
+                    canvas.style.height = cssH + 'px';
+                    canvas.width = cssW * dpr;
+                    canvas.height = cssH * dpr;
+                    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+                    ctx.fillStyle = '#0d0d1a';
+                    ctx.fillRect(0, 0, cssW, cssH);
+
+                    // ═══ PHASE 2+3: Smooth wave tail→head + new shares ═══
+                    var p2elapsed = elapsed - phase2Start;
+                    var totalShares = self.shares.length;
+
+                    for (var i = totalShares - 1; i >= 0; i--) {
+                        var share = self.shares[i];
+                        var dst = newPos[i];
+                        var isNew = i < newCount;
+                        var x, y, scale, shadowAlpha;
+
+                        if (isNew) {
+                            // Phase 3: reverse of Phase 1
+                            // Staggered per new share
+                            var bStagger = i * 150 / phase3Dur;
+                            var bt = Math.max(0, Math.min(1, ((elapsed - phase3Start) / phase3Dur - bStagger) / (1 - bStagger)));
+                            var bi = born[i];
+                            var bdsw = cs * bornScale;
+
+                            // Birth spread position (above destination)
+                            function bornPos(bIdx, bsc) {
+                                var bsw = cs * bsc;
+                                var gap = 4;
+                                var totalW = newCount * bsw + (newCount - 1) * gap;
+                                var avgX = 0;
+                                for (var bb = 0; bb < newCount; bb++) avgX += newPos[bb].x;
+                                avgX = avgX / newCount + cs/2;
+                                var groupLeft = avgX - totalW/2;
+                                if (groupLeft < ml) groupLeft = ml;
+                                if (groupLeft + totalW > cssW) groupLeft = cssW - totalW;
+                                return groupLeft + bIdx * (bsw + gap) + bsw/2;
+                            }
+                            var bFinalX = bornPos(i, bornScale);
+                            // Birth position: below destination, centered vertically in visible canvas
+                            var bFinalY = Math.min(dst.y + step * 6, cssH * 0.4);
+
+                            if (bt < 0.35) {
+                                // COALESCE: particles gather into square (reverse dissolve)
+                                var cT = bt / 0.35;
+                                var coreAlpha = cT;
+                                var coreShrink = 0.3 + cT * 0.7;
+                                var cw = bdsw * coreShrink;
+                                // Draw gathering particles
+                                var parts = birthParticles[i];
+                                var ashSpread = bdsw * 0.8;
+                                for (var p = 0; p < parts.length; p++) {
+                                    var pt = Math.max(0, 1 - (cT - parts[p].delay) / (1 - parts[p].delay));
+                                    if (pt <= 0 || pt > 1) continue;
+                                    ctx.globalAlpha = (1-pt*0.5);
+                                    var pSize = (parts[p].size + bdsw*0.04) * (0.5+pt*0.5);
+                                    var origRGB = parseColor(bi.color);
+                                    ctx.fillStyle = lerpColor([100,200,100], origRGB, cT);
+                                    ctx.fillRect(bFinalX+parts[p].ox*ashSpread/cs*(pt)+parts[p].vx*pt*40, bFinalY+parts[p].oy*ashSpread/cs*(pt)+parts[p].vy*pt*40, pSize, pSize);
+                                }
+                                // Growing core
+                                if (coreAlpha > 0.1) {
+                                    ctx.globalAlpha = coreAlpha;
+                                    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+                                    ctx.fillRect(bFinalX-cw/2+5, bFinalY-cw/2+5, cw+2, cw+2);
+                                    ctx.fillStyle = lerpColor([80,200,80], parseColor(bi.color), cT);
+                                    ctx.fillRect(bFinalX-cw/2, bFinalY-cw/2, cw, cw);
+                                }
+                                x = dst.x; y = dst.y; scale = 0; shadowAlpha = 0;
+                                ctx.globalAlpha = 0;
+                            } else if (bt < 0.65) {
+                                // HOLD: show address + PPLNS % on scaled square
+                                var holdT = (bt - 0.35) / 0.3;
+                                ctx.globalAlpha = 1;
+                                // Shadow
+                                ctx.fillStyle = 'rgba(0,0,0,0.85)';
+                                ctx.fillRect(bFinalX-bdsw/2+6, bFinalY-bdsw/2+6, bdsw+4, bdsw+4);
+                                // Glow
+                                ctx.fillStyle = 'rgba(0,255,100,0.15)';
+                                ctx.fillRect(bFinalX-bdsw/2-4, bFinalY-bdsw/2-4, bdsw+8, bdsw+8);
+                                // Solid fill — original share color
+                                ctx.fillStyle = bi.color;
+                                ctx.fillRect(bFinalX-bdsw/2, bFinalY-bdsw/2, bdsw, bdsw);
+                                ctx.fillStyle = 'rgba(255,255,255,0.1)';
+                                ctx.fillRect(bFinalX-bdsw/2+3, bFinalY-bdsw/2+3, bdsw-6, bdsw-6);
+                                // Text
+                                var fontSize = _bornFontSize;
+                                ctx.fillStyle = '#ffffff';
+                                ctx.font = 'bold ' + fontSize + 'px Monaco,Consolas,monospace';
+                                ctx.textAlign = 'center';
+                                ctx.textBaseline = 'middle';
+                                ctx.fillText(bi.shortAddr, bFinalX, bFinalY - fontSize * 0.8);
+                                ctx.fillStyle = '#ffd700';
+                                ctx.font = 'bold ' + (fontSize+1) + 'px Monaco,Consolas,monospace';
+                                ctx.fillText(bi.pplnsPct.toFixed(3) + '%', bFinalX, bFinalY + fontSize * 0.8);
+                                x = dst.x; y = dst.y; scale = 0; shadowAlpha = 0;
+                                ctx.globalAlpha = 0;
+                            } else {
+                                // LAND: shrink from bornScale down to 1x, fly to final grid position
+                                var landT = (bt - 0.65) / 0.35;
+                                var landEase = 1 - Math.pow(1 - landT, 2);
+                                scale = bornScale - (bornScale - 1) * landEase;
+                                x = bFinalX + (dst.x + cs/2 - bFinalX) * landEase;
+                                y = bFinalY + (dst.y + cs/2 - bFinalY) * landEase;
+                                // Adjust x,y to top-left for the drawing code below
+                                var sw2 = cs * scale;
+                                x = x - sw2/2;
+                                y = y - sw2/2;
+                                shadowAlpha = 0.5 * (1 - landEase);
+                                ctx.globalAlpha = 1;
+                                // Draw directly here since scale is non-standard
+                                if (shadowAlpha > 0.02) {
+                                    ctx.fillStyle = 'rgba(0,0,0,' + shadowAlpha + ')';
+                                    ctx.fillRect(x+4, y+4, sw2, sw2);
+                                }
+                                ctx.fillStyle = bi.color;
+                                ctx.fillRect(x, y, sw2, sw2);
+                                // Green glow fading
+                                ctx.strokeStyle = 'rgba(0,255,136,' + (1-landEase)*0.8 + ')';
+                                ctx.lineWidth = 2;
+                                ctx.strokeRect(x-1, y-1, sw2+2, sw2+2);
+                                // Skip the generic draw below
+                                x = dst.x; y = dst.y; scale = 0; shadowAlpha = 0;
+                                ctx.globalAlpha = 0;
+                            }
+                        } else {
+                            // Phase 2: smooth wave from tail toward head
+                            // Each share gets a staggered start based on distance from tail
+                            var distFromTail = totalShares - 1 - i;
+                            var fraction = distFromTail / (totalShares - newCount);
+                            // Stagger: tail starts first, head last, spread over 70% of phase2
+                            var shareStart = fraction * phase2Dur * 0.7;
+                            var shareT = Math.max(0, Math.min(1, (p2elapsed - shareStart) / 600));
+                            var ease = 1 - Math.pow(1 - shareT, 3);
+
+                            var old = self._oldPositions[share.h];
+                            if (old && shareT > 0 && shareT < 1) {
+                                var liftA, slideA, landA;
+                                if (ease < 0.2) {
+                                    liftA = ease/0.2; slideA = 0; landA = 0;
+                                } else if (ease < 0.8) {
+                                    liftA = 1; slideA = (ease-0.2)/0.6; landA = 0;
+                                } else {
+                                    liftA = 1; slideA = 1; landA = (ease-0.8)/0.2;
+                                }
+                                var pop = liftA * (1 - landA);
+                                scale = 1 + 0.35 * pop;
+                                x = old.x + (dst.x - old.x) * slideA;
+                                y = old.y + (dst.y - old.y) * slideA;
+                                shadowAlpha = 0.35 * pop;
+                            } else if (old && shareT <= 0) {
+                                x = old.x; y = old.y; scale = 1; shadowAlpha = 0;
+                            } else {
+                                x = dst.x; y = dst.y; scale = 1; shadowAlpha = 0;
+                            }
+                            ctx.globalAlpha = 1;
+                        }
+
+                        // Shadow
+                        if (shadowAlpha > 0.02) {
+                            ctx.fillStyle = 'rgba(0,0,0,' + shadowAlpha + ')';
+                            ctx.fillRect(x + 2 + shadowAlpha*3, y + 2 + shadowAlpha*3, cs, cs);
+                        }
+
+                        var sx = x + cs/2 - (cs*scale)/2;
+                        var sy = y + cs/2 - (cs*scale)/2;
+                        var sw = cs * scale;
+
+                        ctx.fillStyle = self.getColor(share);
+                        ctx.fillRect(sx, sy, sw, sw);
+
+                        var isLtc = !!self.blockSet[share.h];
+                        var isDoge = !!self.dogeSet[share.h];
+                        if (isLtc && isDoge) {
+                            ctx.fillStyle = '#ff8000'; ctx.fillRect(sx, sy, sw, sw);
+                            ctx.strokeStyle = '#ffaa00'; ctx.lineWidth = 2;
+                            ctx.strokeRect(sx+0.5, sy+0.5, sw-1, sw-1);
+                        } else if (isLtc) {
+                            ctx.strokeStyle = '#ffd700'; ctx.lineWidth = 2;
+                            ctx.strokeRect(sx+0.5, sy+0.5, sw-1, sw-1);
+                        } else if (isDoge) {
+                            ctx.strokeStyle = '#00e5ff'; ctx.lineWidth = 2;
+                            ctx.strokeRect(sx+0.5, sy+0.5, sw-1, sw-1);
+                        }
+
+                        if (isNew && ctx.globalAlpha > 0.3) {
+                            ctx.strokeStyle = 'rgba(0,255,136,' + (ctx.globalAlpha*0.9) + ')';
+                            ctx.lineWidth = 2;
+                            ctx.strokeRect(sx-0.5, sy-0.5, sw+1, sw+1);
+                        }
+                    }
+                    ctx.globalAlpha = 1;
+
+                    // ═══ PHASE 1: Dying shares — staggered rise, turn red, dissolve ═══
+                    // Helper: parse CSS color to [r,g,b]
+                    function parseColor(c) {
+                        if (c.charAt(0)==='#') { var n=parseInt(c.substr(1),16); return [(n>>16)&255,(n>>8)&255,n&255]; }
+                        var m = c.match(/\d+/g); return m ? [+m[0],+m[1],+m[2]] : [100,100,100];
+                    }
+                    function lerpColor(c1,c2,t) {
+                        return 'rgb('+Math.floor(c1[0]+(c2[0]-c1[0])*t)+','+Math.floor(c1[1]+(c2[1]-c1[1])*t)+','+Math.floor(c1[2]+(c2[2]-c1[2])*t)+')';
+                    }
+                    var RED = [230,20,20];
+                    var p1t = Math.min(elapsed / phase1Dur, 1);
+                    var dyingCount = dying.length;
+                    for (var d = 0; d < dyingCount; d++) {
+                        var dp = dying[d].pos;
+                        var dcx = dp.x + cs/2;
+                        var dcy = dp.y + cs/2;
+                        // Stagger: each share starts 150ms after the previous
+                        var dDelay = (dyingCount - 1 - d) * 150 / phase1Dur;
+                        var dt = Math.max(0, (p1t - dDelay) / (1 - dDelay));
+                        // Helper: compute spread position for dying share at given scale
+                        function dyingPos(dIdx, dsc) {
+                            var dsw = cs * dsc;
+                            var gap = 4;
+                            var totalW = dyingCount * dsw + (dyingCount - 1) * gap;
+                            var avgX = 0;
+                            for (var dd = 0; dd < dyingCount; dd++) avgX += dying[dd].pos.x;
+                            avgX = avgX / dyingCount + cs/2;
+                            var groupLeft = avgX - totalW/2;
+                            if (groupLeft < ml) groupLeft = ml;
+                            if (groupLeft + totalW > cssW) groupLeft = cssW - totalW;
+                            return groupLeft + dIdx * (dsw + gap) + dsw/2;
+                        }
+
+                        // Fixed final target — no position shift between phases
+                        var finalX = dyingPos(d, dyingScale);
+                        var finalY = dcy - step * 8;
+
+                        if (dt < 0.3) {
+                            // RISE: 0→30%
+                            var riseT = dt / 0.3;
+                            var riseEase = 1 - Math.pow(1 - riseT, 2);
+                            var dsc = 1 + riseEase * (dyingScale - 1);
+                            var dsw = cs * dsc;
+                            var animX = dcx + (finalX - dcx) * riseEase;
+                            var animY = dcy + (finalY - dcy) * riseEase;
+                            var dsx = animX - dsw/2;
+                            var dsy = animY - dsw/2;
+                            ctx.globalAlpha = 1;
+
+                            // Shadow at original position
+                            var shScale = 1 + riseEase * 2;
+                            var shAlpha = 1.0 - riseEase * 0.4;
+                            ctx.fillStyle = 'rgba(0,0,0,' + shAlpha + ')';
+                            ctx.fillRect(dp.x+cs/2-cs*shScale/2+4, dp.y+cs/2-cs*shScale/2+4, cs*shScale, cs*shScale);
+
+                            // Glow + fill lerping to red
+                            var origRGB = parseColor(dying[d].color);
+                            ctx.fillStyle = lerpColor(origRGB, RED, riseEase * 0.4);
+                            ctx.globalAlpha = riseEase * 0.35;
+                            ctx.fillRect(dsx-8, dsy-8, dsw+16, dsw+16);
+                            ctx.globalAlpha = 1;
+                            ctx.fillStyle = lerpColor(origRGB, RED, riseEase);
+                            ctx.fillRect(dsx, dsy, dsw, dsw);
+                        } else if (dt < 0.55) {
+                            // HOLD: 30→55% — show miner address + PPLNS weight
+                            var fontSize = _dyingFontSize;
+                            var addrText = dying[d].shortAddr;
+                            var pctText = dying[d].pplnsPct.toFixed(3) + '%';
+                            var dsc = dyingScale;
+                            var dsw = cs * dsc;
+                            var holdX = finalX;
+                            var holdY = finalY;
+                            var dsx = holdX - dsw/2;
+                            var dsy = holdY - dsw/2;
+                            ctx.globalAlpha = 1;
+
+                            // Dark shadow under the flying share (bigger than share)
+                            ctx.fillStyle = 'rgba(0,0,0,0.85)';
+                            ctx.fillRect(dsx+6, dsy+6, dsw+4, dsw+4);
+
+                            // Subtle red glow (smaller than shadow)
+                            ctx.fillStyle = 'rgba(255,40,30,0.15)';
+                            ctx.fillRect(dsx-4, dsy-4, dsw+8, dsw+8);
+
+                            // Solid red fill
+                            ctx.fillStyle = 'rgb(200,15,15)';
+                            ctx.fillRect(dsx, dsy, dsw, dsw);
+                            ctx.fillStyle = 'rgba(255,60,50,0.2)';
+                            ctx.fillRect(dsx+3, dsy+3, dsw-6, dsw-6);
+
+                            // Miner address — white, bold
+                            ctx.fillStyle = '#ffffff';
+                            ctx.font = 'bold ' + fontSize + 'px Monaco,Consolas,monospace';
+                            ctx.textAlign = 'center';
+                            ctx.textBaseline = 'middle';
+                            ctx.fillText(addrText, holdX, holdY - fontSize * 0.8);
+                            // PPLNS weight — gold, bold
+                            ctx.fillStyle = '#ffd700';
+                            ctx.font = 'bold ' + (fontSize + 1) + 'px Monaco,Consolas,monospace';
+                            ctx.fillText(pctText, holdX, holdY + fontSize * 0.8);
+                        } else if (dt > 0 && dt < 1) {
+                            // Dissolve the actual scaled square at its hold position
+                            var ashT = (dt - 0.55) / 0.45;
+                            var dsc = dyingScale;
+                            var dsw = cs * dsc;
+                            var ashX = finalX;
+                            var ashY = finalY;
+                            var dsx = ashX - dsw/2;
+                            var dsy = ashY - dsw/2;
+
+                            // Shrinking core with text — starts at full hold size
+                            var coreAlpha = Math.max(0, 1 - ashT * 1.3);
+                            if (coreAlpha > 0) {
+                                var shrink = 1 - ashT * 0.5;
+                                var cw = dsw * shrink;
+                                var cx2 = ashX - cw/2;
+                                var cy2 = ashY - cw/2;
+                                // Shadow fading
+                                ctx.globalAlpha = coreAlpha * 0.7;
+                                ctx.fillStyle = 'rgba(0,0,0,0.8)';
+                                ctx.fillRect(cx2+5, cy2+5, cw+2, cw+2);
+                                // Core
+                                ctx.globalAlpha = coreAlpha;
+                                ctx.fillStyle = '#ff3040';
+                                ctx.fillRect(cx2, cy2, cw, cw);
+                                // Text dissolves with the core
+                                var fontSize = _dyingFontSize * shrink;
+                                if (fontSize > 5) {
+                                    ctx.fillStyle = '#ffffff';
+                                    ctx.font = 'bold ' + fontSize + 'px Monaco,Consolas,monospace';
+                                    ctx.textAlign = 'center';
+                                    ctx.textBaseline = 'middle';
+                                    ctx.fillText(dying[d].shortAddr, ashX, ashY - fontSize * 0.8);
+                                    ctx.fillStyle = '#ffd700';
+                                    ctx.font = 'bold ' + (fontSize + 1) + 'px Monaco,Consolas,monospace';
+                                    ctx.fillText(dying[d].pplnsPct.toFixed(3) + '%', ashX, ashY + fontSize * 0.8);
+                                }
+                            }
+                            // Ash particles — scaled to match the square size
+                            var parts = ashParticles[d];
+                            var ashSpread = dsw * 0.8;
+                            for (var p = 0; p < parts.length; p++) {
+                                var pt = Math.max(0, ashT-parts[p].delay)/(1-parts[p].delay);
+                                if (pt<=0||pt>1) continue;
+                                ctx.globalAlpha = (1-pt)*(1-pt);
+                                var pSize = (parts[p].size + dsw*0.04) * (1-pt*0.4);
+                                ctx.fillStyle = 'rgb('+Math.floor(255*(1-pt)+100*pt)+','+Math.floor(120*(1-pt)+80*pt)+','+Math.floor(30*(1-pt)+70*pt)+')';
+                                ctx.fillRect(ashX+parts[p].ox*ashSpread/cs+parts[p].vx*pt*60, ashY+parts[p].oy*ashSpread/cs+parts[p].vy*pt*60, pSize, pSize);
+                            }
+                        }
+                    }
+                    ctx.globalAlpha = 1;
+
+                    if (globalT < 1) {
+                        requestAnimationFrame(frame);
+                    } else {
+                        self._animRunning = false;
+                        self._oldPositions = {};
+                        self.render();
+                        // Drain queued deltas — replay next update
+                        if (self._deltaQueue.length > 0) {
+                            self._deltaQueue = [];
+                            // Trigger a fresh delta fetch to get all accumulated changes
+                            if (typeof _rtTipHash !== 'undefined' && _rtTipHash) {
+                                var curTip = self.shares.length > 0 ? self.shares[0].h : '';
+                                if (curTip !== _rtTipHash) {
+                                    _rtFetchDelta(curTip);
+                                }
+                            }
+                        }
+                    }
+                }
+                requestAnimationFrame(frame);
+            },
+
             getColor: function(share) {
                 // Dead shares - red
                 if (share.s === 2) return '#dc3545';
@@ -4735,7 +5302,7 @@
                 // Unverified - gray
                 if (!share.v) return '#555577';
 
-                // Pool fee share - purple
+                // Node fee share - purple
                 if (share.fee) return '#9c27b0';
 
                 var isMine = this.myAddress && share.m === this.myAddress;
@@ -4844,7 +5411,7 @@
 
                 // Tags
                 var tags = [];
-                if (share.fee) tags.push('<span style="color:#9c27b0;font-weight:700">Pool Fee</span>');
+                if (share.fee) tags.push('<span style="color:#9c27b0;font-weight:700">Node Fee</span>');
                 if (share.dv && share.dv >= 36 && share.V < 36) tags.push('<span style="color:#0097a7;font-weight:600">Signals V' + share.dv + '</span>');
 
                 var html =
@@ -4881,13 +5448,14 @@
                 tip.innerHTML = html;
                 tip.style.display = 'block';
 
-                // Tooltip always below-left of cursor (treemap goes above-right)
+                // Tooltip: always LEFT of cursor, vertically centered
                 var tw = tip.offsetWidth;
                 var th = tip.offsetHeight;
-                var tx = e.clientX - tw - 12;
-                var ty = e.clientY + 18;
-                if (tx < 8) tx = 8;
-                if (ty + th > window.innerHeight - 8) ty = e.clientY - th - 8;
+                var tx = e.clientX - tw - 20;
+                var ty = e.clientY - th / 2;
+                if (tx < 8) { tx = e.clientX + 280; } // flip right past zoom panel
+                if (ty < 8) ty = 8;
+                if (ty + th > window.innerHeight - 8) ty = window.innerHeight - th - 8;
                 tip.style.left = tx + 'px';
                 tip.style.top = ty + 'px';
             },
@@ -4952,6 +5520,62 @@
                 }
             },
 
+            // Parse {addr: amount} to sorted [{addr, pct, amt}]
+            _parsePPLNS: function(payouts) {
+                var total = 0;
+                var entries = [];
+                for (var addr in payouts) {
+                    var v = payouts[addr];
+                    // Handle both flat {addr: amount} and merged {addr: {amount, merged:[]}}
+                    var amt = (typeof v === 'number') ? v : (v && v.amount ? v.amount : 0);
+                    total += amt;
+                    entries.push({ addr: addr, amt: amt });
+                }
+                entries.sort(function(a, b) { return b.amt - a.amt; });
+                entries.forEach(function(e) { e.pct = total > 0 ? e.amt / total : 0; });
+                return entries;
+            },
+
+            // Get PPLNS for a share: check cache, fallback to nearest or default
+            getPPLNSForShare: function(share) {
+                if (!share) return this.pplnsFallback || this.pplnsData || [];
+                // Exact match
+                if (this.pplnsCache[share.h]) return this.pplnsCache[share.h];
+                // Find nearest cached share by position (walk forward from this share)
+                for (var i = 0; i < this.shares.length; i++) {
+                    if (this.shares[i].h === share.h) {
+                        // Look backward (newer) for nearest cached
+                        for (var j = i; j >= 0; j--) {
+                            if (this.pplnsCache[this.shares[j].h])
+                                return this.pplnsCache[this.shares[j].h];
+                        }
+                        break;
+                    }
+                }
+                return this.pplnsFallback || this.pplnsData || [];
+            },
+
+            // Compute PPLNS weights from share position to end of window
+            computePPLNSAtPosition: function(shareIdx) {
+                var weights = {};
+                var total = 0;
+                // Walk from shareIdx to the end (older shares) — matches PPLNS window from this point
+                var end = Math.min(shareIdx + this.windowSize, this.shares.length);
+                for (var i = shareIdx; i < end; i++) {
+                    var s = this.shares[i];
+                    var diff = s.b ? this.bitsToDifficulty(s.b) : 1;
+                    var addr = s.m || 'unknown';
+                    weights[addr] = (weights[addr] || 0) + diff;
+                    total += diff;
+                }
+                var entries = [];
+                for (var addr in weights) {
+                    entries.push({ addr: addr, pct: total > 0 ? weights[addr] / total : 0, amt: weights[addr] });
+                }
+                entries.sort(function(a, b) { return b.pct - a.pct; });
+                return entries;
+            },
+
             showZoom: function(share, e) {
                 var zp = this.zoomPanel;
                 var zc = this.zoomCanvas;
@@ -4959,8 +5583,9 @@
                 var sz = 240;
                 var dpr = this.dpr;
 
-                // Don't show if no PPLNS data yet
-                if (!this.pplnsData || this.pplnsData.length === 0) {
+                // Use server-cached PPLNS for this share
+                var pplnsAtPos = this.getPPLNSForShare(share);
+                if (!pplnsAtPos || pplnsAtPos.length === 0) {
                     zp.style.display = 'none';
                     return;
                 }
@@ -4972,8 +5597,8 @@
                 ctx.fillStyle = '#0d0d1a';
                 ctx.fillRect(0, 0, sz, sz);
 
-                // Squarified treemap of PPLNS distribution
-                var rects = this.treemap(this.pplnsData, 2, 2, sz - 4, sz - 4);
+                // Squarified treemap of PPLNS at this share's position
+                var rects = this.treemap(pplnsAtPos, 2, 2, sz - 4, sz - 4);
                 var minerAddr = share ? share.m : '';
                 var myAddr = this.myAddress;
 
@@ -5031,19 +5656,20 @@
                 }
 
                 // Label below canvas
-                this.zoomLabel.textContent = 'PPLNS Distribution \u2014 ' + this.pplnsData.length + ' miners';
+                this.zoomLabel.textContent = 'PPLNS Distribution \u2014 ' + pplnsAtPos.length + ' miners';
 
                 // Set canvas CSS size
                 zc.style.width = sz + 'px';
                 zc.style.height = sz + 'px';
 
-                // Position: treemap above-right, tooltip below-left
+                // Zoom panel: always RIGHT of cursor, vertically centered
                 zp.style.display = 'block';
                 var totalH = sz + 20;
-                var tx = e.clientX + 12;
-                var ty = e.clientY - totalH - 12;
-                if (tx + sz > window.innerWidth - 8) tx = e.clientX - sz - 12;
+                var tx = e.clientX + 20;
+                var ty = e.clientY - totalH / 2;
+                if (tx + sz > window.innerWidth - 8) { tx = e.clientX - sz - 280; } // flip left past tooltip
                 if (ty < 8) ty = 8;
+                if (ty + totalH > window.innerHeight - 8) ty = window.innerHeight - totalH - 8;
                 zp.style.left = tx + 'px';
                 zp.style.top = ty + 'px';
             },
@@ -5259,12 +5885,19 @@
         }
 
         function loadShares() {
-            defrag.load();
+            // Use delta if shares already cached (auto-refresh / manual)
+            if (defrag.shares && defrag.shares.length > 0 && _rtTipHash) {
+                _rtFetchDelta(_rtTipHash);
+            } else if (defrag.shares && defrag.shares.length > 0) {
+                defrag.liveRefresh();
+            } else {
+                defrag.load();
+            }
         }
 
         // Main PPLNS Distribution Treemap (dashboard-level)
-        function loadMainPPLNS() {
-            d3.json('../current_merged_payouts', function(payouts) {
+        var _cachedPPLNSPayouts = null;
+        function renderMainPPLNS(payouts) {
                 if (!payouts || typeof payouts !== 'object') return;
                 var grid = document.getElementById('pplns-main-grid');
                 var tooltip = document.getElementById('pplns-main-tooltip');
@@ -5290,7 +5923,8 @@
                 entries.forEach(function(e) { e.pct = total > 0 ? e.amt / total : 0; });
 
                 var w = grid.clientWidth;
-                var h = Math.max(200, Math.min(w * 0.35, 400));
+                var vh = window.innerHeight || document.documentElement.clientHeight;
+                var h = Math.max(vh * 0.75, Math.min(w * 0.55, vh * 0.85));
                 grid.style.height = h + 'px';
 
                 // Squarified treemap layout (standalone — carries all fields)
@@ -5355,7 +5989,7 @@
                         var el = document.createElement('div');
                         el.className = 'pm-pct';
                         el.style.fontSize = fitPct + 'px';
-                        el.textContent = (r.pct * 100).toFixed(1) + '%';
+                        el.textContent = (r.pct * 100).toFixed(1) + (r.w > 60 ? '% LTC' : '%');
                         cell.appendChild(el);
                     }
                     // DOGE %
@@ -5366,7 +6000,7 @@
                         if (hasDoge) {
                             var dp = dogeTotal > 0 ? (r.doge / dogeTotal * 100).toFixed(1) : '0';
                             el.style.color = '#ffd700';
-                            el.textContent = dp + '% D';
+                            el.textContent = dp + (r.w > 60 ? '% DOGE' : '% D');
                         } else if (isV35Only) {
                             el.style.color = '#ff6b6b';
                             el.textContent = r.w > 50 ? 'NO DOGE' : '0% D';
@@ -5383,6 +6017,17 @@
                         el.style.fontSize = fitAddr + 'px';
                         var mc = Math.max(4, Math.floor(r.w / (fitAddr * 0.65)));
                         el.textContent = r.addr.length > mc ? r.addr.substr(0, mc) + '…' : r.addr;
+                        cell.appendChild(el);
+                    }
+                    // Hashrate (from sharechain defrag data)
+                    var minerHr = defrag.minerHashrates ? defrag.minerHashrates[r.addr] : 0;
+                    if (minerHr > 0 && r.w > 55 && r.h > 55) {
+                        var el = document.createElement('div');
+                        el.style.fontSize = Math.max(9, fitAddr * 0.9) + 'px';
+                        el.style.color = 'rgba(255,255,255,0.75)';
+                        el.style.textAlign = 'center';
+                        el.style.fontWeight = '600';
+                        el.textContent = format_hashrate(minerHr);
                         cell.appendChild(el);
                     }
                     // Version
@@ -5439,10 +6084,13 @@
                             } else if (isV35Only) {
                                 dogeLine = '<div style="color:#ff6b6b;font-weight:600">0 DOGE \u2014 upgrade to V36!</div>';
                             }
+                            var hrLine = '';
+                            var mHr = defrag.minerHashrates ? defrag.minerHashrates[r.addr] : 0;
+                            if (mHr > 0) hrLine = '<div style="color:var(--text-secondary)">' + format_hashrate(mHr) + '</div>';
                             tooltip.innerHTML =
                                 '<div style="color:var(--primary);font-weight:700;margin-bottom:4px">' + r.addr + '</div>' +
                                 '<div style="font-weight:600">' + (r.pct*100).toFixed(2) + '% \u2014 ' + r.amt.toFixed(8) + ' LTC</div>' +
-                                dogeLine + verLine +
+                                dogeLine + hrLine + verLine +
                                 '<div style="color:var(--text-muted);font-size:0.75em;margin-top:4px">Click to view on Blockchair</div>';
                             tooltip.style.display = 'block';
                             positionTip(ev);
@@ -5453,8 +6101,23 @@
 
                     grid.appendChild(cell);
                 });
+        }
+        function loadMainPPLNS() {
+            d3.json('../current_merged_payouts', function(payouts) {
+                if (!payouts || typeof payouts !== 'object') return;
+                _cachedPPLNSPayouts = payouts;
+                renderMainPPLNS(payouts);
             });
         }
+
+        // Re-render PPLNS treemap on window resize
+        var _pplnsResizeTimer;
+        window.addEventListener('resize', function() {
+            clearTimeout(_pplnsResizeTimer);
+            _pplnsResizeTimer = setTimeout(function() {
+                if (_cachedPPLNSPayouts) renderMainPPLNS(_cachedPPLNSPayouts);
+            }, 200);
+        });
 
         // Create a single colored share cell (22x22 square) with tooltip + click
         function makeShareCell(fullHash, share) {
@@ -5479,7 +6142,7 @@
             // Short hash label inside the cell
             var label = document.createElement('div');
             label.className = 'cell-hash';
-            label.textContent = fullHash.substr(-8);
+            label.textContent = fullHash.substr(-4);
             cell.appendChild(label);
 
             // Click → share detail page
@@ -7125,6 +7788,155 @@
         }
         // Expose for multipool.js
         window.manualRefresh = manualRefresh;
+
+        // ═══ RealTime Mode: SSE push (primary) + polling fallback ═══
+        var _rtEventSource = null;
+        var _rtFallbackInterval = null;
+        var _rtTipHash = null;
+        var _rtActive = false;
+
+        function toggleRealTime() {
+            var btn = document.getElementById('realtime-btn');
+            if (_rtActive) {
+                // Turn OFF
+                _rtActive = false;
+                if (_rtEventSource) { _rtEventSource.close(); _rtEventSource = null; }
+                if (_rtFallbackInterval) { clearInterval(_rtFallbackInterval); _rtFallbackInterval = null; }
+                _rtTipHash = null;
+                btn.textContent = 'RealTime: OFF';
+                btn.style.background = 'var(--card-bg)';
+                btn.style.color = 'var(--text-muted)';
+                btn.style.borderColor = 'var(--border)';
+            } else {
+                // Turn ON
+                _rtActive = true;
+                if (defrag.shares && defrag.shares.length > 0)
+                    _rtTipHash = defrag.shares[0].h;
+                btn.textContent = 'RealTime: SSE';
+                btn.style.background = '#28a745';
+                btn.style.color = '#fff';
+                btn.style.borderColor = '#28a745';
+                _rtStartSSE();
+                // Immediate first update — don't wait for SSE push
+                _rtFetchDelta(_rtTipHash || '');
+            }
+        }
+
+        function _rtStartSSE() {
+            if (!_rtActive) return;
+            try {
+                _rtEventSource = new EventSource('../sharechain/stream');
+                _rtEventSource.onmessage = function(event) {
+                    try {
+                        var tip = JSON.parse(event.data);
+                        if (tip.hash && tip.hash !== _rtTipHash) {
+                            var since = _rtTipHash || '';
+                            _rtTipHash = tip.hash;
+                            _rtFetchDelta(since);
+                        }
+                    } catch(e) {}
+                };
+                _rtEventSource.onerror = function() {
+                    // SSE failed — fall back to polling
+                    if (_rtEventSource) { _rtEventSource.close(); _rtEventSource = null; }
+                    if (_rtActive && !_rtFallbackInterval) {
+                        var btn = document.getElementById('realtime-btn');
+                        btn.textContent = 'RealTime: POLL';
+                        btn.style.background = '#e69500';
+                        _rtFallbackInterval = setInterval(_rtPollTip, 3000);
+                    }
+                };
+            } catch(e) {
+                // EventSource not supported — use polling
+                _rtFallbackInterval = setInterval(_rtPollTip, 3000);
+                var btn = document.getElementById('realtime-btn');
+                btn.textContent = 'RealTime: POLL';
+                btn.style.background = '#e69500';
+            }
+        }
+
+        function _rtPollTip() {
+            d3.json('../sharechain/tip', function(tip) {
+                if (!tip || !tip.hash) return;
+                if (tip.hash === _rtTipHash) return;
+                var since = _rtTipHash || '';
+                _rtTipHash = tip.hash;
+                _rtFetchDelta(since);
+            });
+        }
+
+        function _rtFetchDelta(sinceHash) {
+            d3.json('../sharechain/delta?since=' + encodeURIComponent(sinceHash), function(delta) {
+                if (!delta || !delta.shares || delta.shares.length === 0) return;
+
+                // Snapshot old positions
+                var step = defrag.cellSize + defrag.gap;
+                var ml = defrag.marginLeft;
+                defrag._oldPositions = {};
+                for (var i = 0; i < defrag.shares.length; i++) {
+                    var s = defrag.shares[i];
+                    var col = i % defrag.cols;
+                    var row = Math.floor(i / defrag.cols);
+                    defrag._oldPositions[s.h] = {
+                        x: ml + col * step, y: row * step,
+                        color: defrag.getColor(s),
+                        miner: s.m || '',
+                        diff: s.b ? defrag.bitsToDifficulty(s.b) : 0
+                    };
+                }
+
+                // Prepend new shares, trim to window size
+                var newShares = delta.shares;
+                var merged = newShares.concat(defrag.shares);
+                if (merged.length > defrag.windowSize)
+                    merged = merged.slice(0, defrag.windowSize);
+                defrag.shares = merged;
+
+                // Update sets
+                if (delta.heads) {
+                    defrag.headSet = {};
+                    delta.heads.forEach(function(h) { defrag.headSet[h] = true; });
+                }
+                if (delta.blocks) delta.blocks.forEach(function(h) { defrag.blockSet[h] = true; });
+                if (delta.doge_blocks) delta.doge_blocks.forEach(function(h) { defrag.dogeSet[h] = true; });
+                defrag.shares.forEach(function(s) { if (s.blk) defrag.blockSet[s.h] = true; });
+                defrag.computeMinerHashrates();
+
+                // Cache per-share PPLNS from delta
+                if (delta.pplns && typeof delta.pplns === 'object') {
+                    for (var sh in delta.pplns) {
+                        var parsed = defrag._parsePPLNS(delta.pplns[sh]);
+                        defrag.pplnsCache[sh] = parsed;
+                        defrag.pplnsData = parsed;  // update current fallback
+                    }
+                    // Cap cache size (keep last 10000 entries — full window)
+                    var cacheKeys = Object.keys(defrag.pplnsCache);
+                    if (cacheKeys.length > 10000) {
+                        cacheKeys.slice(0, cacheKeys.length - 10000).forEach(function(k) {
+                            delete defrag.pplnsCache[k];
+                        });
+                    }
+                }
+
+                // Animate
+                var newCount = newShares.length;
+                if (newCount > 0 && newCount < 100) {
+                    defrag._animate3D(newCount, true);  // fast for RealTime
+                } else {
+                    defrag._oldPositions = {};
+                    defrag.render();
+                }
+
+                defrag.updateStats({
+                    shares: defrag.shares, window_size: defrag.windowSize,
+                    my_address: defrag.myAddress, heads: delta.heads,
+                    blocks: delta.blocks, doge_blocks: delta.doge_blocks
+                });
+                loadShareLinks();
+                refreshPayoutsV36();
+                loadMainPPLNS();
+            });
+        }
     </script>
 </body>
 </html>

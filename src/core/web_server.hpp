@@ -173,6 +173,10 @@ public:
     nlohmann::json rest_global_stats();
     nlohmann::json rest_sharechain_stats();
     nlohmann::json rest_sharechain_window();
+    // Returns cached+serialized window JSON string (for ETag/cache layer)
+    std::pair<std::string, std::string> get_cached_window_response(); // {json_body, etag}
+    nlohmann::json rest_sharechain_tip();
+    nlohmann::json rest_sharechain_delta(const std::string& since_hash);
     nlohmann::json rest_control_mining_start();
     nlohmann::json rest_control_mining_stop();
     nlohmann::json rest_control_mining_restart();
@@ -495,6 +499,14 @@ public:
     using sharechain_window_fn_t = std::function<nlohmann::json()>;
     void set_sharechain_window_fn(sharechain_window_fn_t fn) { m_sharechain_window_fn = std::move(fn); }
 
+    // Sharechain tip callback — returns {hash, height} for lightweight polling
+    using sharechain_tip_fn_t = std::function<nlohmann::json()>;
+    void set_sharechain_tip_fn(sharechain_tip_fn_t fn) { m_sharechain_tip_fn = std::move(fn); }
+
+    // Sharechain delta callback — returns shares newer than given hash
+    using sharechain_delta_fn_t = std::function<nlohmann::json(const std::string&)>;
+    void set_sharechain_delta_fn(sharechain_delta_fn_t fn) { m_sharechain_delta_fn = std::move(fn); }
+
     // Individual share lookup — returns full p2pool-compatible share JSON by hash
     using share_lookup_fn_t = std::function<nlohmann::json(const std::string&)>;
     void set_share_lookup_fn(share_lookup_fn_t fn) { m_share_lookup_fn = std::move(fn); }
@@ -787,7 +799,49 @@ private:
     // Sharechain stats callback
     sharechain_stats_fn_t m_sharechain_stats_fn;
     sharechain_window_fn_t m_sharechain_window_fn;
+    sharechain_tip_fn_t m_sharechain_tip_fn;
+    sharechain_delta_fn_t m_sharechain_delta_fn;
     share_lookup_fn_t m_share_lookup_fn;
+
+public:
+    // ── Sharechain window response cache (Layer 1 + 2) ──
+    void invalidate_window_cache() {
+        std::lock_guard<std::mutex> lock(m_window_cache_mutex);
+        m_window_cache_etag.clear();
+    }
+    // ── Per-share PPLNS cache ──
+    void cache_pplns_at_tip();
+    nlohmann::json get_pplns_for_tip(const std::string& tip_hash);
+    // Background pre-computation: walks all verified shares after sync
+    void start_pplns_precompute();
+    bool pplns_precompute_done() const { return m_pplns_precompute_done.load(); }
+    // ── Per-IP rate limiting (Layer 3) ──
+    bool rate_check(const std::string& ip, int max_per_min);
+    // ── SSE subscribers (Layer 4) ──
+    void sse_push(const std::string& event_data);
+    void sse_register(std::shared_ptr<tcp::socket> socket);
+    size_t sse_subscriber_count() const;
+private:
+    std::mutex m_window_cache_mutex;
+    std::string m_window_cache_json;
+    std::string m_window_cache_etag;
+    struct RateBucket {
+        int tokens{0};
+        std::chrono::steady_clock::time_point last_refill;
+    };
+    std::mutex m_rate_mutex;
+    std::unordered_map<std::string, RateBucket> m_rate_buckets;
+    // Per-share PPLNS snapshots: share_short_hash → {addr: amount}
+    std::mutex m_pplns_cache_mutex;
+    std::unordered_map<std::string, nlohmann::json> m_pplns_per_tip;
+    std::atomic<bool> m_pplns_precompute_done{false};
+    std::thread m_pplns_precompute_thread;
+    struct SSESubscriber {
+        std::shared_ptr<tcp::socket> socket;
+        std::string last_tip;
+    };
+    std::mutex m_sse_mutex;
+    std::vector<SSESubscriber> m_sse_subscribers;
 
     // PPLNS computation hook
     pplns_fn_t m_pplns_fn;

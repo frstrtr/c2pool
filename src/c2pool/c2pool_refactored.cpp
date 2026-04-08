@@ -2754,6 +2754,14 @@ int main(int argc, char* argv[]) {
                             d.version_counts[std::to_string(s->version)] = 1;
                             d.desired_version_counts[std::to_string(s->m_desired_version)] = 1;
 
+                            auto target = chain::bits_to_target(s->m_bits);
+                            d.difficulty_sum = chain::target_to_difficulty(target);
+
+                            // Work-weighted desired version (matches p2pool's target_to_average_attempts weighting)
+                            auto att = chain::target_to_average_attempts(target);
+                            d.desired_version_weights[std::to_string(s->m_desired_version)] =
+                                static_cast<double>(att.GetLow64());
+
                             std::string miner;
                             if constexpr (requires { s->m_address; })
                                 miner = HexStr(s->m_address.m_data);
@@ -2761,9 +2769,6 @@ int main(int argc, char* argv[]) {
                                 miner = s->m_pubkey_hash.GetHex();
                             if (!miner.empty())
                                 d.miner_counts[miner] = 1;
-
-                            auto target = chain::bits_to_target(s->m_bits);
-                            d.difficulty_sum = chain::target_to_difficulty(target);
                         });
                     } catch (...) {}
                     return d;
@@ -2804,6 +2809,48 @@ int main(int argc, char* argv[]) {
                 int walk = best.IsNull() ? 0 : std::min(static_cast<int>(chain.get_height(best)),
                     static_cast<int>(ltc::PoolConfig::chain_length()));
                 auto sr = stats_skiplist->query(best, walk);
+
+                // Sampling window: oldest CHAIN_LENGTH/10 shares in the active chain
+                // Matches p2pool consensus: get_nth_parent(tip, CHAIN_LENGTH*9//10) then count CHAIN_LENGTH//10
+                int chain_len = static_cast<int>(ltc::PoolConfig::chain_length());
+                int chain_ht = best.IsNull() ? 0 : static_cast<int>(chain.get_height(best));
+                int skip_count = std::min(chain_ht, chain_len * 9 / 10);
+                int sample_count = std::min(chain_ht - skip_count, chain_len / 10);
+
+                // Walk active chain: find sampling start hash AND track V36 propagation
+                uint256 sampling_start;
+                int deepest_v36_pos = 0;
+                int v36_contiguous_from_tip = 0;
+                bool contiguous = true;
+                int full_walk = std::min(chain_ht, chain_len);
+                {
+                    uint256 pos = best;
+                    for (int i = 0; i < full_walk && !pos.IsNull(); ++i) {
+                        if (!chain.contains(pos)) break;
+                        if (i == skip_count) sampling_start = pos;
+                        try {
+                            auto& cd = chain.get(pos);
+                            cd.share.invoke([&](auto* s) {
+                                if (static_cast<int>(s->m_desired_version) >= 36) {
+                                    deepest_v36_pos = i + 1;
+                                    if (contiguous) v36_contiguous_from_tip = i + 1;
+                                } else if (contiguous) {
+                                    contiguous = false;
+                                }
+                                pos = s->m_prev_hash;
+                            });
+                        } catch (...) { break; }
+                    }
+                }
+                result["deepest_v36_position"] = deepest_v36_pos;
+                result["v36_contiguous_from_tip"] = v36_contiguous_from_tip;
+
+                // Query the oldest CHAIN_LENGTH/10 shares from that position
+                auto sampling_sr = (sample_count > 0 && !sampling_start.IsNull())
+                    ? stats_skiplist->query(sampling_start, sample_count)
+                    : chain::StatsResult{};
+                result["sampling_desired_version"] = sampling_sr.desired_version_weights;
+                result["sampling_total"]           = sampling_sr.share_count;
 
                 result["total_shares"]    = sr.share_count;
                 result["orphan_shares"]   = sr.orphan_count;
@@ -3024,8 +3071,165 @@ int main(int argc, char* argv[]) {
                 result["blocks"] = std::move(blocks_arr);
                 result["doge_blocks"] = std::move(doge_arr);
                 result["total"] = static_cast<int>(chain.size());
+                // Include per-share PPLNS + current as fallback
+                if (mi) {
+                    result["pplns_current"] = mi->rest_current_payouts();
+                    // Per-share PPLNS from cache (available for shares since server start)
+                    nlohmann::json pplns_map = nlohmann::json::object();
+                    for (const auto& s : result["shares"]) {
+                        std::string sh = s["h"].get<std::string>();
+                        auto p = mi->get_pplns_for_tip(sh);
+                        if (!p.empty()) pplns_map[sh] = std::move(p);
+                    }
+                    if (!pplns_map.empty()) result["pplns"] = std::move(pplns_map);
+                }
                 return result;
             });
+
+            // Lightweight tip endpoint for RealTime polling
+            web_server.get_mining_interface()->set_sharechain_tip_fn([&p2p_node]() {
+                auto& chain = p2p_node->tracker().chain;
+                uint256 best;
+                int32_t best_height = -1;
+                for (const auto& [head_hash, tail_hash] : chain.get_heads()) {
+                    auto h = chain.get_height(head_hash);
+                    if (h > best_height) { best = head_hash; best_height = h; }
+                }
+                return nlohmann::json::object({
+                    {"hash", best.IsNull() ? "" : best.GetHex().substr(0, 16)},
+                    {"height", best_height},
+                    {"total", static_cast<int>(chain.size())}
+                });
+            });
+
+            // Delta endpoint: return only shares newer than `since` hash
+            web_server.get_mining_interface()->set_sharechain_delta_fn(
+                [&p2p_node, &web_server](const std::string& since_hash) {
+                nlohmann::json result;
+                auto& chain = p2p_node->tracker().chain;
+                auto& verified = p2p_node->tracker().verified;
+                bool testnet = ltc::PoolConfig::is_testnet;
+
+                uint256 best;
+                int32_t best_height = -1;
+                for (const auto& [head_hash, tail_hash] : chain.get_heads()) {
+                    auto h = chain.get_height(head_hash);
+                    if (h > best_height) { best = head_hash; best_height = h; }
+                }
+
+                auto mi = web_server.get_mining_interface();
+                std::string fee_addr;
+                if (mi) fee_addr = mi->get_node_fee_hash160();
+
+                nlohmann::json shares_arr = nlohmann::json::array();
+                int count = 0;
+
+                if (!best.IsNull()) {
+                    int walk = std::min(static_cast<int>(chain.get_height(best)),
+                                        static_cast<int>(ltc::PoolConfig::chain_length()));
+                    try {
+                        auto view = chain.get_chain(best, walk);
+                        for (auto [hash, data] : view) {
+                            std::string short_h = hash.GetHex().substr(0, 16);
+                            // Stop when we reach the share the client already has
+                            if (short_h == since_hash || hash.GetHex() == since_hash)
+                                break;
+
+                            nlohmann::json s;
+                            s["h"] = short_h;
+                            s["H"] = hash.GetHex();
+                            s["p"] = count;
+                            s["v"] = verified.contains(hash) ? 1 : 0;
+
+                            auto* idx = chain.get_index(hash);
+                            if (idx && idx->is_block_solution)
+                                s["blk"] = 1;
+
+                            data.share.invoke([&](auto* obj) {
+                                s["t"] = obj->m_timestamp;
+                                s["V"] = obj->version;
+                                s["s"] = static_cast<int>(obj->m_stale_info);
+                                s["b"] = obj->m_bits;
+                                s["a"] = obj->m_absheight;
+                                s["dv"] = obj->m_desired_version;
+
+                                auto script = get_share_script(obj);
+                                std::string addr = core::script_to_address(script, true, testnet);
+                                s["m"] = addr.empty() ? HexStr(script) : addr;
+
+                                if (!obj->m_coinbase.m_data.empty()) {
+                                    std::string best_run, cur_run;
+                                    for (auto c : obj->m_coinbase.m_data) {
+                                        if (c >= 32 && c <= 126) cur_run += static_cast<char>(c);
+                                        else { if (cur_run.size() > best_run.size()) best_run = cur_run; cur_run.clear(); }
+                                    }
+                                    if (cur_run.size() > best_run.size()) best_run = cur_run;
+                                    bool has_letter = false;
+                                    for (auto c : best_run) if ((c>='A'&&c<='Z')||(c>='a'&&c<='z')) { has_letter=true; break; }
+                                    if (best_run.size() >= 10 && has_letter) {
+                                        if (best_run.size() > 48) best_run.resize(48);
+                                        s["cb"] = best_run;
+                                    }
+                                }
+
+                                if (!fee_addr.empty() && script.size() >= 22) {
+                                    int off = -1;
+                                    if (script.size()==25 && script[0]==0x76) off=3;
+                                    else if (script.size()==22 && script[0]==0x00) off=2;
+                                    else if (script.size()==23 && script[0]==0xa9) off=2;
+                                    if (off >= 0) {
+                                        std::string h160 = HexStr(std::vector<unsigned char>(
+                                            script.begin()+off, script.begin()+off+20));
+                                        if (h160 == fee_addr) s["fee"] = 1;
+                                    }
+                                }
+                            });
+                            shares_arr.push_back(std::move(s));
+                            if (++count >= 200) break;  // safety cap
+                        }
+                    } catch (...) {}
+                }
+
+                // Updated heads/blocks for the client to merge
+                nlohmann::json heads_arr = nlohmann::json::array();
+                for (auto& [hh, _] : chain.get_heads())
+                    heads_arr.push_back(hh.GetHex().substr(0, 16));
+
+                nlohmann::json blocks_arr = nlohmann::json::array();
+                if (mi) {
+                    for (const auto& fb : mi->get_found_blocks())
+                        if (!fb.share_hash.empty()) blocks_arr.push_back(fb.share_hash.substr(0, 16));
+                }
+                nlohmann::json doge_arr = nlohmann::json::array();
+                if (mi) {
+                    auto* mm = mi->get_mm_manager();
+                    if (mm) for (const auto& db : mm->get_discovered_blocks())
+                        if (!db.parent_hash.empty()) doge_arr.push_back(db.parent_hash.substr(0, 16));
+                }
+
+                result["shares"] = std::move(shares_arr);
+                result["count"] = count;
+                result["tip"] = best.IsNull() ? "" : best.GetHex().substr(0, 16);
+                result["heads"] = std::move(heads_arr);
+                result["blocks"] = std::move(blocks_arr);
+                result["doge_blocks"] = std::move(doge_arr);
+
+                // Include per-share PPLNS snapshots from server cache
+                // Each share's tip had a unique PPLNS computed at arrival time
+                if (count > 0 && mi) {
+                    nlohmann::json pplns_map = nlohmann::json::object();
+                    for (const auto& s : result["shares"]) {
+                        std::string sh = s["h"].get<std::string>();
+                        auto p = mi->get_pplns_for_tip(sh);
+                        if (!p.empty()) pplns_map[sh] = std::move(p);
+                    }
+                    result["pplns"] = std::move(pplns_map);
+                }
+                return result;
+            });
+
+            // Start background PPLNS pre-computation (separate thread, waits for sync)
+            web_server.get_mining_interface()->start_pplns_precompute();
 
             // Wire individual share lookup for /web/share/<hash> detail page
             web_server.get_mining_interface()->set_share_lookup_fn(

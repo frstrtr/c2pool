@@ -232,8 +232,64 @@ void HttpSession::process_request()
                 rest_result = mining_interface_->rest_global_stats();
             else if (target == "/sharechain/stats")
                 rest_result = mining_interface_->rest_sharechain_stats();
-            else if (target == "/sharechain/window")
-                rest_result = mining_interface_->rest_sharechain_window();
+            else if (target == "/sharechain/window") {
+                // Layer 1+2: cached response + ETag/304
+                auto client_ip = socket_.remote_endpoint().address().to_string();
+                if (!mining_interface_->rate_check(client_ip, 4)) {  // max 4/min
+                    response.result(http::status::too_many_requests);
+                    response_body = R"({"error":"Rate limited"})";
+                } else {
+                    auto [body, etag] = mining_interface_->get_cached_window_response();
+                    std::string client_etag;
+                    auto it = request_.find(http::field::if_none_match);
+                    if (it != request_.end()) client_etag = std::string(it->value());
+                    if (!etag.empty() && client_etag == "\"" + etag + "\"") {
+                        response.result(http::status::not_modified);
+                        response_body = "";
+                    } else {
+                        response.set(http::field::etag, "\"" + etag + "\"");
+                        response.set(http::field::cache_control, "no-cache");
+                        response_body = body;
+                    }
+                }
+            }
+            else if (target == "/sharechain/tip")
+                rest_result = mining_interface_->rest_sharechain_tip();
+            else if (target == "/sharechain/delta") {
+                auto client_ip = socket_.remote_endpoint().address().to_string();
+                if (!mining_interface_->rate_check(client_ip, 30)) {  // max 30/min
+                    response.result(http::status::too_many_requests);
+                    response_body = R"({"error":"Rate limited"})";
+                } else {
+                    rest_result = mining_interface_->rest_sharechain_delta(getQueryParam("since"));
+                }
+            }
+            else if (target == "/sharechain/stream") {
+                // Layer 4: SSE — send headers and keep connection open
+                auto client_ip = socket_.remote_endpoint().address().to_string();
+                if (!mining_interface_->rate_check(client_ip, 2)) {  // max 2 SSE connections/min per IP
+                    response.result(http::status::too_many_requests);
+                    response_body = R"({"error":"Rate limited"})";
+                } else {
+                    // Send SSE headers manually, then register for push
+                    std::string sse_headers =
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: text/event-stream\r\n"
+                        "Cache-Control: no-cache\r\n"
+                        "Connection: keep-alive\r\n"
+                        "X-Accel-Buffering: no\r\n"
+                        "\r\n"
+                        "data: {\"connected\":true}\n\n";
+                    auto buf = std::make_shared<std::string>(sse_headers);
+                    auto self = shared_from_this();
+                    auto sock_ptr = std::make_shared<tcp::socket>(std::move(socket_));
+                    boost::asio::async_write(*sock_ptr, boost::asio::buffer(*buf),
+                        [buf, sock_ptr, mi = mining_interface_](beast::error_code ec, std::size_t) {
+                            if (!ec) mi->sse_register(sock_ptr);
+                        });
+                    return;  // Don't close connection
+                }
+            }
             else if (target == "/control/mining/start")
                 rest_result = mining_interface_->rest_control_mining_start();
             else if (target == "/control/mining/stop")
@@ -589,7 +645,8 @@ void HttpSession::process_request()
                 }  // end static file serving else
             }  // end explorer/static dispatch
 
-            response_body = rest_result.dump();
+            if (!rest_result.is_null())
+                response_body = rest_result.dump();
         }
         else if (request_.method() == http::verb::post) {
             // Handle JSON-RPC POST request
@@ -2847,6 +2904,7 @@ nlohmann::json MiningInterface::rest_recent_blocks()
     nlohmann::json arr = nlohmann::json::array();
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
     for (const auto& b : m_found_blocks) {
+        std::string method = (b.time_to_find > 0 && b.luck > 0) ? "simple_avg" : "first_block";
         arr.push_back({
             {"ts", b.ts},
             {"hash", b.hash},
@@ -2866,7 +2924,7 @@ nlohmann::json MiningInterface::rest_recent_blocks()
             {"expected_time", b.expected_time},
             {"time_to_find", b.time_to_find},
             {"luck", b.luck},
-            {"luck_method", "expected_time"}
+            {"luck_method", method}
         });
     }
     return arr;
@@ -3160,6 +3218,291 @@ nlohmann::json MiningInterface::rest_sharechain_window()
     return result;
 }
 
+void MiningInterface::start_pplns_precompute()
+{
+    if (m_pplns_precompute_thread.joinable()) return;  // already running
+
+    m_pplns_precompute_thread = std::thread([this]() {
+        LOG_INFO << "[PPLNS-Cache] Background pre-computation thread started";
+
+        // Wait for: PPLNS function + sharechain sync + valid work template
+        uint256 block_target;
+        uint64_t subsidy = 0;
+        for (int wait = 0; wait < 600; ++wait) {  // up to 10 minutes
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (!m_pplns_fn || !m_sharechain_window_fn) continue;
+
+            // Need meaningful chain
+            bool chain_ok = false;
+            if (m_sharechain_tip_fn) {
+                auto tip = m_sharechain_tip_fn();
+                if (tip.contains("height") && tip["height"].get<int>() > 100)
+                    chain_ok = true;
+            }
+            if (!chain_ok) continue;
+
+            // Need valid work template with real block target
+            {
+                std::lock_guard<std::mutex> lock(m_work_mutex);
+                if (!m_cached_template.is_null() && m_cached_template.contains("bits")) {
+                    // bits is stored as hex string in the template
+                    uint32_t bits = 0;
+                    try {
+                        if (m_cached_template["bits"].is_string())
+                            bits = static_cast<uint32_t>(std::stoul(
+                                m_cached_template["bits"].get<std::string>(), nullptr, 16));
+                        else
+                            bits = m_cached_template["bits"].get<uint32_t>();
+                    } catch (...) {}
+                    if (bits > 0 && (bits >> 24) < 0x21) {
+                        block_target = chain::bits_to_target(bits);
+                        if (m_cached_template.contains("coinbasevalue"))
+                            subsidy = m_cached_template["coinbasevalue"].get<uint64_t>();
+                    }
+                }
+            }
+            if (!block_target.IsNull() && subsidy > 0) break;
+        }
+
+        if (!m_pplns_fn || !m_sharechain_window_fn) {
+            LOG_WARNING << "[PPLNS-Cache] No PPLNS function available, aborting pre-compute";
+            return;
+        }
+        if (block_target.IsNull() || subsidy == 0) {
+            LOG_WARNING << "[PPLNS-Cache] No valid work template after 10min, aborting pre-compute";
+            return;
+        }
+
+        LOG_INFO << "[PPLNS-Cache] Sharechain + work template ready (subsidy=" << subsidy
+                 << "), starting full PPLNS walk...";
+
+        // Get the share list from window
+        auto window = m_sharechain_window_fn();
+        if (!window.contains("shares") || !window["shares"].is_array()) {
+            LOG_WARNING << "[PPLNS-Cache] No shares in window, aborting";
+            return;
+        }
+
+        auto& shares = window["shares"];
+        int total = static_cast<int>(shares.size());
+        int computed = 0;
+        bool is_ltc = (m_blockchain == Blockchain::LITECOIN);
+
+        LOG_INFO << "[PPLNS-Cache] Computing PPLNS for " << total << " shares...";
+        auto start_time = std::chrono::steady_clock::now();
+
+        for (int i = 0; i < total; ++i) {
+            auto& s = shares[i];
+            if (!s.contains("H") || !s.contains("h")) continue;
+
+            std::string full_hash = s["H"].get<std::string>();
+            std::string short_hash = s["h"].get<std::string>();
+
+            // Check if already cached (from live share arrivals)
+            {
+                std::lock_guard<std::mutex> lock(m_pplns_cache_mutex);
+                if (m_pplns_per_tip.count(short_hash)) continue;
+            }
+
+            // Compute PPLNS from this share's perspective
+            try {
+                uint256 share_hash;
+                share_hash.SetHex(full_hash);
+
+                auto raw_pplns = m_pplns_fn(share_hash, block_target, subsidy, m_donation_script);
+                if (raw_pplns.empty()) continue;
+
+                // Convert script→address map to JSON {addr: amount}
+                nlohmann::json pplns_json = nlohmann::json::object();
+                for (const auto& [script, amount] : raw_pplns) {
+                    std::string addr = core::script_to_address(script, is_ltc, m_testnet);
+                    // P2PK: PUSH<len> <pubkey> OP_CHECKSIG → hash to P2PKH address
+                    if (addr.empty() && script.size() > 33 && script.back() == 0xac) {
+                        size_t pk_len = script[0];
+                        if (pk_len + 1 == script.size() - 1) {
+                            unsigned char sha[32], rip[20];
+                            CSHA256().Write(&script[1], pk_len).Finalize(sha);
+                            CRIPEMD160().Write(sha, 32).Finalize(rip);
+                            std::vector<unsigned char> p2pkh = {0x76, 0xa9, 0x14};
+                            p2pkh.insert(p2pkh.end(), rip, rip + 20);
+                            p2pkh.push_back(0x88);
+                            p2pkh.push_back(0xac);
+                            addr = core::script_to_address(p2pkh, is_ltc, m_testnet);
+                        }
+                    }
+                    if (addr.empty()) {
+                        // Last resort: hex
+                        static const char* HEX = "0123456789abcdef";
+                        addr.reserve(script.size() * 2);
+                        for (unsigned char b : script) {
+                            addr += HEX[b >> 4];
+                            addr += HEX[b & 0x0f];
+                        }
+                    }
+                    pplns_json[addr] = amount / 1e8;
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(m_pplns_cache_mutex);
+                    m_pplns_per_tip[short_hash] = std::move(pplns_json);
+                }
+                ++computed;
+
+                // Log progress every 500 shares
+                if (computed % 500 == 0) {
+                    LOG_INFO << "[PPLNS-Cache] Computed " << computed << "/" << total
+                             << " (" << (computed * 100 / total) << "%)";
+                }
+
+                // Yield to mining thread — don't hog the tracker lock
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            } catch (const std::exception& e) {
+                // Skip shares that fail (e.g., at chain boundary)
+                continue;
+            }
+        }
+
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - start_time).count();
+
+        m_pplns_precompute_done.store(true);
+        // Invalidate window cache so next request includes all per-share PPLNS
+        invalidate_window_cache();
+        LOG_INFO << "[PPLNS-Cache] Pre-computation complete: " << computed
+                 << " snapshots in " << elapsed << "s (cache size: "
+                 << m_pplns_per_tip.size() << ")";
+    });
+
+    m_pplns_precompute_thread.detach();
+}
+
+void MiningInterface::cache_pplns_at_tip()
+{
+    // Get current tip hash
+    std::string tip;
+    if (m_sharechain_tip_fn) {
+        auto t = m_sharechain_tip_fn();
+        if (t.contains("hash")) tip = t["hash"].get<std::string>();
+    }
+    if (tip.empty()) return;
+
+    // Compute full merged PPLNS (LTC + DOGE with donation) and cache
+    auto pplns = rest_current_merged_payouts();
+    if (pplns.is_null() || pplns.empty()) return;
+
+    std::lock_guard<std::mutex> lock(m_pplns_cache_mutex);
+    m_pplns_per_tip[tip] = std::move(pplns);
+}
+
+nlohmann::json MiningInterface::get_pplns_for_tip(const std::string& tip_hash)
+{
+    std::lock_guard<std::mutex> lock(m_pplns_cache_mutex);
+    auto it = m_pplns_per_tip.find(tip_hash);
+    if (it != m_pplns_per_tip.end())
+        return it->second;
+    // Fallback: return any cached entry (unordered_map, no ordering)
+    if (!m_pplns_per_tip.empty())
+        return m_pplns_per_tip.begin()->second;
+    return nlohmann::json::object();
+}
+
+std::pair<std::string, std::string> MiningInterface::get_cached_window_response()
+{
+    std::lock_guard<std::mutex> lock(m_window_cache_mutex);
+    // Check if cache is valid (has etag = current tip)
+    if (!m_window_cache_etag.empty())
+        return {m_window_cache_json, m_window_cache_etag};
+
+    // Regenerate
+    auto data = rest_sharechain_window();
+    std::string tip;
+    if (data.contains("best_hash")) {
+        tip = data["best_hash"].get<std::string>();
+        if (tip.size() > 16) tip = tip.substr(0, 16);
+    }
+    m_window_cache_json = data.dump();
+    m_window_cache_etag = tip.empty() ? "none" : tip;
+    return {m_window_cache_json, m_window_cache_etag};
+}
+
+bool MiningInterface::rate_check(const std::string& ip, int max_per_min)
+{
+    std::lock_guard<std::mutex> lock(m_rate_mutex);
+    auto now = std::chrono::steady_clock::now();
+    auto& bucket = m_rate_buckets[ip];
+
+    // Refill tokens (1 per second, up to max_per_min)
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - bucket.last_refill).count();
+    if (elapsed > 0) {
+        bucket.tokens = std::min(max_per_min, bucket.tokens + static_cast<int>(elapsed));
+        bucket.last_refill = now;
+    }
+    // First access
+    if (bucket.tokens == 0 && elapsed == 0 && bucket.last_refill.time_since_epoch().count() == 0) {
+        bucket.tokens = max_per_min;
+        bucket.last_refill = now;
+    }
+
+    if (bucket.tokens > 0) {
+        bucket.tokens--;
+        return true;  // allowed
+    }
+    return false;  // rate limited
+}
+
+void MiningInterface::sse_register(std::shared_ptr<tcp::socket> socket)
+{
+    std::lock_guard<std::mutex> lock(m_sse_mutex);
+    // Cap at 200 subscribers
+    if (m_sse_subscribers.size() >= 200) return;
+    m_sse_subscribers.push_back({socket, ""});
+}
+
+void MiningInterface::sse_push(const std::string& event_data)
+{
+    std::lock_guard<std::mutex> lock(m_sse_mutex);
+    std::string msg = "data: " + event_data + "\n\n";
+    auto buf = std::make_shared<std::string>(msg);
+
+    std::vector<SSESubscriber> alive;
+    for (auto& sub : m_sse_subscribers) {
+        if (!sub.socket || !sub.socket->is_open()) continue;
+        try {
+            boost::asio::async_write(*sub.socket, boost::asio::buffer(*buf),
+                [buf, sock = sub.socket](beast::error_code ec, std::size_t) {
+                    if (ec) {
+                        beast::error_code close_ec;
+                        sock->shutdown(tcp::socket::shutdown_send, close_ec);
+                    }
+                });
+            alive.push_back(sub);
+        } catch (...) {
+            // dead socket, skip
+        }
+    }
+    m_sse_subscribers = std::move(alive);
+}
+
+size_t MiningInterface::sse_subscriber_count() const
+{
+    // No lock needed for approximate count
+    return m_sse_subscribers.size();
+}
+
+nlohmann::json MiningInterface::rest_sharechain_tip()
+{
+    if (m_sharechain_tip_fn)
+        return m_sharechain_tip_fn();
+    return nlohmann::json::object({{"hash", ""}, {"height", 0}});
+}
+
+nlohmann::json MiningInterface::rest_sharechain_delta(const std::string& since_hash)
+{
+    if (m_sharechain_delta_fn)
+        return m_sharechain_delta_fn(since_hash);
+    return nlohmann::json::object({{"shares", nlohmann::json::array()}, {"count", 0}});
+}
+
 nlohmann::json MiningInterface::rest_control_mining_start()
 {
     std::lock_guard<std::mutex> lock(m_control_mutex);
@@ -3256,9 +3599,14 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
                 break;
             }
         }
+        // Fallback: if caller passed 0 pool hashrate, use live pool hashrate
+        double hr = pool_hashrate;
+        if (hr <= 0 && m_pool_hashrate_fn)
+            hr = m_pool_hashrate_fn();
+        blk.pool_hashrate = hr;
         // expected_time = network_difficulty * 2^32 / pool_hashrate
-        if (pool_hashrate > 0 && network_difficulty > 0) {
-            blk.expected_time = network_difficulty * 4294967296.0 / pool_hashrate;
+        if (hr > 0 && network_difficulty > 0) {
+            blk.expected_time = network_difficulty * 4294967296.0 / hr;
         }
         // luck = expected / actual * 100 (>100 = lucky)
         if (blk.time_to_find > 0 && blk.expected_time > 0) {
@@ -4085,16 +4433,31 @@ nlohmann::json MiningInterface::rest_luck_stats()
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
     result["luck_available"] = !m_found_blocks.empty();
 
-    // Compute average luck trend from recent blocks
-    double luck_sum = 0;
-    int luck_count = 0;
     nlohmann::json blocks = nlohmann::json::array();
     for (const auto& b : m_found_blocks) {
         blocks.push_back({{"ts", b.ts}, {"hash", b.hash}, {"luck", b.luck}});
-        if (b.luck > 0) { luck_sum += b.luck; ++luck_count; }
     }
-    result["current_luck_trend"] = luck_count > 0 ? luck_sum / luck_count : 0.0;
     result["blocks"] = blocks;
+
+    // Current round luck: expected_time / time_since_last_block * 100
+    // Matches p2pool: shows how the ongoing round compares to expectation
+    nlohmann::json current_luck_val = nullptr;
+    if (!m_found_blocks.empty()) {
+        auto now_ts = static_cast<double>(std::time(nullptr));
+        double time_since_last = now_ts - static_cast<double>(m_found_blocks.front().ts);
+
+        // Get LIVE pool hashrate and network difficulty
+        double pool_hr = m_pool_hashrate_fn ? m_pool_hashrate_fn() : 0;
+        double net_diff = m_network_difficulty.load(std::memory_order_relaxed);
+
+        double expected = 0;
+        if (net_diff > 0 && pool_hr > 0)
+            expected = net_diff * 4294967296.0 / pool_hr;
+
+        if (expected > 0 && time_since_last > 1)
+            current_luck_val = (expected / time_since_last) * 100.0;
+    }
+    result["current_luck_trend"] = current_luck_val;
     return result;
 }
 
@@ -4451,10 +4814,10 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
         }
     }
 
-    // ── Desired version counts (voting) ──
+    // ── Desired version counts (voting — full chain) ──
     int overall_v36_votes = 0;
     nlohmann::json full_chain_versions = nlohmann::json::object();
-    nlohmann::json versions_json = nlohmann::json::object();
+    nlohmann::json versions_json = nlohmann::json::object();  // populated below from sampling window
     if (sc.contains("shares_by_desired_version") && sc["shares_by_desired_version"].is_object()) {
         auto& dv = sc["shares_by_desired_version"];
         for (auto& [ver, count] : dv.items()) {
@@ -4462,7 +4825,6 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
             int c = count.get<int>();
             double pct = overall_total > 0 ? (c * 100.0 / overall_total) : 0;
             full_chain_versions[ver] = {{"count", c}, {"percentage", pct}};
-            versions_json[ver] = {{"weight", c}, {"percentage", pct}};
             if (v >= TARGET_VERSION) overall_v36_votes += c;
         }
     }
@@ -4493,11 +4855,30 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
     bool confirmed = all_target && chain_height >= chain_length * 3;
     bool show_transition = (is_transitioning || !confirmed) && !confirmed && !all_target;
 
-    // ── Sampling window signaling ──
-    // p2pool uses chain_length//10 sampling window at position 9/10 into chain.
-    // We approximate from desired_version counts in the full chain walk.
+    // ── Sampling window signaling (CHAIN_LENGTH/10 shares from tip, work-weighted like p2pool) ──
     int sampling_window_size = chain_length / 10;
-    double sampling_signaling = overall_v36_vote_pct;  // approximate from full chain
+    double sampling_v36_weight = 0;
+    double sampling_total_weight = 0;
+    if (sc.contains("sampling_desired_version") && sc["sampling_desired_version"].is_object()) {
+        versions_json = nlohmann::json::object();
+        for (auto& [ver, weight] : sc["sampling_desired_version"].items()) {
+            int v = std::stoi(ver);
+            double w = weight.get<double>();
+            sampling_total_weight += w;
+            if (v >= TARGET_VERSION) sampling_v36_weight += w;
+        }
+        // Build versions_json with percentages from work weights
+        for (auto& [ver, weight] : sc["sampling_desired_version"].items()) {
+            double w = weight.get<double>();
+            double pct = sampling_total_weight > 0 ? (w * 100.0 / sampling_total_weight) : 0;
+            versions_json[ver] = {{"weight", w}, {"percentage", pct}};
+        }
+    }
+    double sampling_signaling = sampling_total_weight > 0
+        ? (sampling_v36_weight * 100.0 / sampling_total_weight) : 0;
+
+    // ── Propagation depth (needed for status logic) ──
+    int deepest_v36_pos = sc.value("deepest_v36_position", 0);
 
     // ── Status and message (matching p2pool phases) ──
     std::string status, message;
@@ -4527,10 +4908,37 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
         snprintf(buf, sizeof(buf), "Strong V%d signaling — activation approaching (need 95%%)", target_version);
         message = buf;
         transition_progress = sampling_signaling;
-    } else if (overall_v36_votes > 0) {
-        status = "propagating";
+    } else if (sampling_signaling > 0) {
+        // Votes present in sampling window but below 60%
+        status = "signaling";
         char buf[256];
-        snprintf(buf, sizeof(buf), "V%d votes propagating: %d votes (%.1f%% of chain)",
+        snprintf(buf, sizeof(buf), "Network is signaling for V%d upgrade", target_version);
+        message = buf;
+        transition_progress = sampling_signaling;
+    } else if (overall_v36_votes > 0 && deepest_v36_pos < chain_length) {
+        // V36 votes exist but haven't reached the sampling window yet
+        status = "propagating";
+        int shares_to = std::max(0, chain_length - deepest_v36_pos);
+        int eta_sec = shares_to * 10;  // SHARE_PERIOD = 10s for LTC
+        int eta_min = eta_sec / 60;
+        int eta_h = eta_min / 60;
+        int eta_m = eta_min % 60;
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "V%d votes propagating: %d votes (%.1f%% of chain), deepest at position %d/%d. Reach sampling window in ~%s",
+                 target_version, overall_v36_votes, overall_v36_vote_pct,
+                 deepest_v36_pos, chain_length,
+                 eta_h > 0 ? (std::to_string(eta_h) + "h " + std::to_string(eta_m) + "m").c_str()
+                           : (std::to_string(eta_m) + "m").c_str());
+        message = buf;
+        double prop_pct = chain_length > 0
+            ? std::min(deepest_v36_pos * 100.0 / chain_length, 100.0) : 0;
+        transition_progress = prop_pct;
+    } else if (overall_v36_votes > 0) {
+        // V36 votes reached window position but 0% weighted (edge case)
+        status = "signaling";
+        char buf[256];
+        snprintf(buf, sizeof(buf), "V%d votes appearing in sampling window. %d votes (%.1f%%) in chain overall",
                  target_version, overall_v36_votes, overall_v36_vote_pct);
         message = buf;
         transition_progress = overall_v36_vote_pct;
@@ -4570,6 +4978,22 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
     result["thresholds"] = {{"accept", 60}, {"activate", 95}};
     result["status"] = status;
     result["message"] = message;
+
+    // ── Propagation tracking (V36 votes aging toward sampling window) ──
+    int v36_contiguous = sc.value("v36_contiguous_from_tip", 0);
+    int propagation_target = chain_length;  // 8640 for LTC
+    double propagation_pct = propagation_target > 0
+        ? std::min(deepest_v36_pos * 100.0 / propagation_target, 100.0) : 0;
+    int shares_to_window = std::max(0, propagation_target - deepest_v36_pos);
+    constexpr int SHARE_PERIOD = 10;  // LTC: 10 seconds per share
+    double time_to_window_seconds = shares_to_window * SHARE_PERIOD;
+    result["propagation_pct"] = std::round(propagation_pct * 100) / 100.0;
+    result["propagation_target"] = propagation_target;
+    result["deepest_v36_position"] = deepest_v36_pos;
+    result["v36_contiguous_from_tip"] = v36_contiguous;
+    result["shares_to_window"] = shares_to_window;
+    result["time_to_window_seconds"] = std::round(time_to_window_seconds);
+    result["chain_length"] = chain_length;
 
     // ── Transition message + authority announcements ──
     // First try live messages from best share, then fall back to cached blob files.
@@ -6397,11 +6821,19 @@ void WebServer::trigger_work_refresh()
 void WebServer::trigger_work_refresh_debounced()
 {
     // No debounce — call refresh immediately.
-    // C++ refresh_work() is 0ms latency. Shares arrive every ~3.5s on average,
-    // so there's nothing to coalesce. The 100ms debounce was adding a 100ms race
-    // window that caused ~14% orphan rate (miner works on stale prev_share while
-    // waiting for debounce timer). With 0ms, orphan rate drops to ~1%.
     trigger_work_refresh();
+
+    // Invalidate sharechain window cache (new share changed the tip)
+    mining_interface_->invalidate_window_cache();
+
+    // Cache PPLNS snapshot for this tip (each share gets unique PPLNS)
+    mining_interface_->cache_pplns_at_tip();
+
+    // Push SSE event to RealTime subscribers
+    if (mining_interface_->sse_subscriber_count() > 0) {
+        auto tip = mining_interface_->rest_sharechain_tip();
+        mining_interface_->sse_push(tip.dump());
+    }
 }
 
 void WebServer::set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Node* coin)
