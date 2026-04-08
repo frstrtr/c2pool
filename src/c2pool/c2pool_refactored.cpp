@@ -3071,8 +3071,18 @@ int main(int argc, char* argv[]) {
                 result["blocks"] = std::move(blocks_arr);
                 result["doge_blocks"] = std::move(doge_arr);
                 result["total"] = static_cast<int>(chain.size());
-                // Include current PPLNS snapshot for treemap
-                if (mi) result["pplns"] = mi->rest_current_payouts();
+                // Include per-share PPLNS + current as fallback
+                if (mi) {
+                    result["pplns_current"] = mi->rest_current_payouts();
+                    // Per-share PPLNS from cache (available for shares since server start)
+                    nlohmann::json pplns_map = nlohmann::json::object();
+                    for (const auto& s : shares_arr) {
+                        std::string sh = s["h"].get<std::string>();
+                        auto p = mi->get_pplns_for_tip(sh);
+                        if (!p.empty()) pplns_map[sh] = std::move(p);
+                    }
+                    if (!pplns_map.empty()) result["pplns"] = std::move(pplns_map);
+                }
                 return result;
             });
 
@@ -3204,9 +3214,16 @@ int main(int argc, char* argv[]) {
                 result["blocks"] = std::move(blocks_arr);
                 result["doge_blocks"] = std::move(doge_arr);
 
-                // Include current PPLNS snapshot (pre-computed, cached from coinbase builder)
+                // Include per-share PPLNS snapshots from server cache
+                // Each share's tip had a unique PPLNS computed at arrival time
                 if (count > 0 && mi) {
-                    result["pplns"] = mi->rest_current_payouts();
+                    nlohmann::json pplns_map = nlohmann::json::object();
+                    for (const auto& s : result["shares"]) {
+                        std::string sh = s["h"].get<std::string>();
+                        auto p = mi->get_pplns_for_tip(sh);
+                        if (!p.empty()) pplns_map[sh] = std::move(p);
+                    }
+                    result["pplns"] = std::move(pplns_map);
                 }
                 return result;
             });

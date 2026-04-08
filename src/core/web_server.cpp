@@ -3218,6 +3218,41 @@ nlohmann::json MiningInterface::rest_sharechain_window()
     return result;
 }
 
+void MiningInterface::cache_pplns_at_tip()
+{
+    // Get current tip hash
+    std::string tip;
+    if (m_sharechain_tip_fn) {
+        auto t = m_sharechain_tip_fn();
+        if (t.contains("hash")) tip = t["hash"].get<std::string>();
+    }
+    if (tip.empty()) return;
+
+    // Compute current PPLNS and cache it keyed by this tip
+    auto pplns = rest_current_payouts();
+    if (pplns.is_null() || pplns.empty()) return;
+
+    std::lock_guard<std::mutex> lock(m_pplns_cache_mutex);
+    m_pplns_per_tip[tip] = std::move(pplns);
+
+    // Prune: keep last 1000 entries
+    while (m_pplns_per_tip.size() > 1000) {
+        m_pplns_per_tip.erase(m_pplns_per_tip.begin());
+    }
+}
+
+nlohmann::json MiningInterface::get_pplns_for_tip(const std::string& tip_hash)
+{
+    std::lock_guard<std::mutex> lock(m_pplns_cache_mutex);
+    auto it = m_pplns_per_tip.find(tip_hash);
+    if (it != m_pplns_per_tip.end())
+        return it->second;
+    // Fallback: return nearest (latest cached)
+    if (!m_pplns_per_tip.empty())
+        return m_pplns_per_tip.rbegin()->second;
+    return nlohmann::json::object();
+}
+
 std::pair<std::string, std::string> MiningInterface::get_cached_window_response()
 {
     std::lock_guard<std::mutex> lock(m_window_cache_mutex);
@@ -6637,6 +6672,9 @@ void WebServer::trigger_work_refresh_debounced()
 
     // Invalidate sharechain window cache (new share changed the tip)
     mining_interface_->invalidate_window_cache();
+
+    // Cache PPLNS snapshot for this tip (each share gets unique PPLNS)
+    mining_interface_->cache_pplns_at_tip();
 
     // Push SSE event to RealTime subscribers
     if (mining_interface_->sse_subscriber_count() > 0) {

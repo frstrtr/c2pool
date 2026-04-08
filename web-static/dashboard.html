@@ -4593,14 +4593,16 @@
 
                     self.computeMinerHashrates();
 
-                    // Cache PPLNS from server response
+                    // Cache per-share PPLNS from server
+                    if (data.pplns_current && typeof data.pplns_current === 'object') {
+                        var fallback = self._parsePPLNS(data.pplns_current);
+                        self.pplnsData = fallback;
+                        self.pplnsFallback = fallback;
+                    }
                     if (data.pplns && typeof data.pplns === 'object') {
-                        var pplnsEntries = self._parsePPLNS(data.pplns);
-                        self.pplnsData = pplnsEntries;
-                        self.pplnsFallback = pplnsEntries;
-                        // Associate with tip share
-                        if (self.shares.length > 0)
-                            self.pplnsCache[self.shares[0].h] = pplnsEntries;
+                        for (var sh in data.pplns) {
+                            self.pplnsCache[sh] = self._parsePPLNS(data.pplns[sh]);
+                        }
                     }
 
                     self.render();
@@ -7900,17 +7902,17 @@
                 defrag.shares.forEach(function(s) { if (s.blk) defrag.blockSet[s.h] = true; });
                 defrag.computeMinerHashrates();
 
-                // Cache PPLNS snapshot from delta (keyed to each new share)
+                // Cache per-share PPLNS from delta
                 if (delta.pplns && typeof delta.pplns === 'object') {
-                    var pplnsEntries = defrag._parsePPLNS(delta.pplns);
-                    defrag.pplnsData = pplnsEntries;  // update current
-                    newShares.forEach(function(s) {
-                        defrag.pplnsCache[s.h] = pplnsEntries;
-                    });
-                    // Cap cache size (keep last 500 entries)
+                    for (var sh in delta.pplns) {
+                        var parsed = defrag._parsePPLNS(delta.pplns[sh]);
+                        defrag.pplnsCache[sh] = parsed;
+                        defrag.pplnsData = parsed;  // update current fallback
+                    }
+                    // Cap cache size (keep last 1000 entries)
                     var cacheKeys = Object.keys(defrag.pplnsCache);
-                    if (cacheKeys.length > 500) {
-                        cacheKeys.slice(0, cacheKeys.length - 500).forEach(function(k) {
+                    if (cacheKeys.length > 1000) {
+                        cacheKeys.slice(0, cacheKeys.length - 1000).forEach(function(k) {
                             delete defrag.pplnsCache[k];
                         });
                     }

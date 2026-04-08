@@ -809,6 +809,9 @@ public:
         std::lock_guard<std::mutex> lock(m_window_cache_mutex);
         m_window_cache_etag.clear();
     }
+    // ── Per-tip PPLNS cache (snapshot per share arrival) ──
+    void cache_pplns_at_tip();
+    nlohmann::json get_pplns_for_tip(const std::string& tip_hash);
     // ── Per-IP rate limiting (Layer 3) ──
     bool rate_check(const std::string& ip, int max_per_min);
     // ── SSE subscribers (Layer 4) ──
@@ -825,6 +828,9 @@ private:
     };
     std::mutex m_rate_mutex;
     std::unordered_map<std::string, RateBucket> m_rate_buckets;
+    // Per-tip PPLNS snapshots: tip_short_hash → {addr: amount}
+    std::mutex m_pplns_cache_mutex;
+    std::map<std::string, nlohmann::json> m_pplns_per_tip;  // ordered map for easy pruning
     struct SSESubscriber {
         std::shared_ptr<tcp::socket> socket;
         std::string last_tip;
