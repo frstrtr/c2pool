@@ -1063,9 +1063,11 @@
             justify-content: center;
         }
         .defrag-chain-cell:hover {
-            transform: scale(1.3);
+            transform: scale(1.8);
             z-index: 10;
-            box-shadow: 0 0 8px rgba(255,255,255,0.3);
+            box-shadow: 0 0 12px rgba(0,255,136,0.6), 0 0 24px rgba(0,255,136,0.3), inset 0 0 4px rgba(255,255,255,0.15);
+            border: 2px solid rgba(0,255,136,0.7);
+            border-radius: 5px;
         }
         .defrag-chain-cell .cell-hash {
             font-family: 'Monaco','Consolas',monospace;
@@ -2093,18 +2095,19 @@
         
         <!-- PPLNS Distribution Treemap -->
         <div class="shares-section" id="pplns-section">
-            <div class="section-header">
+            <div class="section-header" style="display:flex;justify-content:space-between;align-items:center">
                 <h2>PPLNS Distribution</h2>
+                <a href="#" style="color:var(--text-muted);font-size:0.8rem;text-decoration:none">Back to top</a>
             </div>
             <div class="pplns-main-grid" id="pplns-main-grid" style="position:relative;border-radius:8px;overflow:visible;min-height:60px"></div>
             <div id="pplns-main-tooltip" style="display:none;position:fixed;z-index:9999;background:#1e1e38;border:1px solid var(--border);border-radius:8px;padding:8px 12px;pointer-events:none;font-size:0.82rem;box-shadow:0 6px 20px rgba(0,0,0,0.5);width:320px"></div>
-            <div style="text-align:right;margin-top:8px"><a href="#" style="color:var(--text-muted);font-size:0.8rem;text-decoration:none">Back to top</a></div>
         </div>
 
         <!-- Sharechain Transparency Explorer -->
         <div class="shares-section" id="sharechain-section">
-            <div class="section-header">
+            <div class="section-header" style="display:flex;justify-content:space-between;align-items:center">
                 <h2>Sharechain Transparency Explorer</h2>
+                <a href="#" style="color:var(--text-muted);font-size:0.8rem;text-decoration:none">Back to top</a>
             </div>
 
             <div class="defrag-container">
@@ -2142,7 +2145,7 @@
                             <span class="value" id="defrag-dead" style="color:#dc3545">-</span>
                         </div>
                         <div class="defrag-stat-row">
-                            <span class="label">Pool Fee</span>
+                            <span class="label">Node Fee</span>
                             <span class="value" id="defrag-fee" style="color:#9c27b0">-</span>
                         </div>
                         <div class="defrag-stat-row">
@@ -2191,7 +2194,7 @@
                         </div>
                         <div class="legend-item">
                             <div class="legend-swatch" style="background:#9c27b0"></div>
-                            <span>Pool fee share</span>
+                            <span>Node fee share</span>
                         </div>
                         <div class="legend-item">
                             <div class="legend-swatch" style="background:#28a745;border:2px solid #ffd700;box-shadow:0 0 3px rgba(255,215,0,0.5)"></div>
@@ -2232,7 +2235,6 @@
                     <div class="defrag-chain-cells" id="my_share_hashes"></div>
                 </div>
             </div>
-            <div style="text-align:right;margin-top:8px"><a href="#" style="color:var(--text-muted);font-size:0.8rem;text-decoration:none">Back to top</a></div>
         </div>
 
         <!-- Floating tooltip for defrag grid -->
@@ -4737,6 +4739,155 @@
                 }
             },
 
+            // Animated live refresh: fetch new data, detect new shares, animate slide
+            _animOffset: 0,
+            _newCount: 0,
+            _animRunning: false,
+
+            liveRefresh: function() {
+                var self = this;
+                d3.json('../sharechain/window', function(data) {
+                    if (!data || !data.shares || !data.shares.length) return;
+
+                    // Detect how many new shares appeared at the tip
+                    var oldTip = self.shares.length > 0 ? self.shares[0].h : null;
+                    var newShares = data.shares;
+                    var newCount = 0;
+                    if (oldTip) {
+                        for (var i = 0; i < newShares.length; i++) {
+                            if (newShares[i].h === oldTip) { newCount = i; break; }
+                        }
+                        if (newCount === 0 && newShares[0].h !== oldTip) newCount = 0; // tip unchanged
+                    }
+
+                    // Update data
+                    self.shares = newShares;
+                    self.myAddress = data.my_address || '';
+                    self.windowSize = data.window_size || 8640;
+                    self.blockSet = {};
+                    if (data.blocks) data.blocks.forEach(function(h) { self.blockSet[h] = true; });
+                    self.shares.forEach(function(s) { if (s.blk) self.blockSet[s.h] = true; });
+                    self.dogeSet = {};
+                    if (data.doge_blocks) data.doge_blocks.forEach(function(h) { self.dogeSet[h] = true; });
+                    self.headSet = {};
+                    if (data.heads) data.heads.forEach(function(h) { self.headSet[h] = true; });
+                    self.computeMinerHashrates();
+
+                    if (newCount > 0 && newCount < 200) {
+                        self._newCount = newCount;
+                        self._animateSlide();
+                    } else {
+                        self._newCount = 0;
+                        self._animOffset = 0;
+                        self.render();
+                    }
+                    self.updateStats(data);
+                    loadShareLinks();
+                    refreshPayoutsV36();
+                    loadMainPPLNS();
+                });
+            },
+
+            _animateSlide: function() {
+                if (this._animRunning) return;
+                this._animRunning = true;
+                var self = this;
+                var step = this.cellSize + this.gap;
+                // How many rows the new shares occupy
+                var totalPixels = Math.ceil(this._newCount / Math.max(1, this.cols)) * step;
+                var startTime = performance.now();
+                var duration = Math.min(600, 150 + this._newCount * 30); // 150-600ms
+
+                function frame(now) {
+                    var elapsed = now - startTime;
+                    var t = Math.min(elapsed / duration, 1);
+                    // Ease out cubic
+                    var ease = 1 - Math.pow(1 - t, 3);
+                    self._animOffset = totalPixels * (1 - ease);
+                    self._renderAnimated();
+                    if (t < 1) {
+                        requestAnimationFrame(frame);
+                    } else {
+                        self._animOffset = 0;
+                        self._newCount = 0;
+                        self._animRunning = false;
+                        self.render();
+                    }
+                }
+                requestAnimationFrame(frame);
+            },
+
+            _renderAnimated: function() {
+                var canvas = this.canvas;
+                var ctx = this.ctx;
+                var dpr = this.dpr;
+                var step = this.cellSize + this.gap;
+                var ml = this.marginLeft;
+                var cs = this.cellSize;
+                var offset = this._animOffset;
+                var newCount = this._newCount;
+
+                var containerWidth = canvas.parentElement.clientWidth - 16;
+                var gridWidth = containerWidth - ml;
+                this.cols = Math.max(1, Math.floor(gridWidth / step));
+                this.rows = Math.ceil(this.shares.length / this.cols);
+
+                var cssW = ml + this.cols * step;
+                var cssH = Math.max(this.rows * step, 40);
+                canvas.style.width = cssW + 'px';
+                canvas.style.height = cssH + 'px';
+                canvas.width = cssW * dpr;
+                canvas.height = cssH * dpr;
+                ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+                ctx.fillStyle = '#0d0d1a';
+                ctx.fillRect(0, 0, cssW, cssH);
+
+                var now = Date.now() / 1000;
+                for (var i = 0; i < this.shares.length; i++) {
+                    var share = this.shares[i];
+                    var col = i % this.cols;
+                    var row = Math.floor(i / this.cols);
+                    var x = ml + col * step;
+                    var y = row * step;
+
+                    // New shares: slide in from above with fade
+                    if (i < newCount) {
+                        var alpha = 1 - (offset / (Math.ceil(newCount / this.cols) * step + 1));
+                        alpha = Math.max(0, Math.min(1, alpha));
+                        ctx.globalAlpha = alpha;
+                        y -= offset;
+                    } else {
+                        ctx.globalAlpha = 1;
+                    }
+
+                    ctx.fillStyle = this.getColor(share);
+                    ctx.fillRect(x, y, cs, cs);
+
+                    var isLtcBlock = !!this.blockSet[share.h];
+                    var isDogeBlock = !!this.dogeSet[share.h];
+                    if (isLtcBlock && isDogeBlock) {
+                        ctx.fillStyle = '#ff8000';
+                        ctx.fillRect(x, y, cs, cs);
+                        ctx.strokeStyle = '#ffaa00'; ctx.lineWidth = 2;
+                        ctx.strokeRect(x+0.5, y+0.5, cs-1, cs-1);
+                    } else if (isLtcBlock) {
+                        ctx.strokeStyle = '#ffd700'; ctx.lineWidth = 2;
+                        ctx.strokeRect(x+0.5, y+0.5, cs-1, cs-1);
+                    } else if (isDogeBlock) {
+                        ctx.strokeStyle = '#00e5ff'; ctx.lineWidth = 2;
+                        ctx.strokeRect(x+0.5, y+0.5, cs-1, cs-1);
+                    }
+
+                    // Glow effect on newest shares during animation
+                    if (i < newCount && ctx.globalAlpha > 0.5) {
+                        ctx.strokeStyle = 'rgba(0,255,136,' + (ctx.globalAlpha * 0.8) + ')';
+                        ctx.lineWidth = 1.5;
+                        ctx.strokeRect(x+0.5, y+0.5, cs-1, cs-1);
+                    }
+                }
+                ctx.globalAlpha = 1;
+            },
+
             getColor: function(share) {
                 // Dead shares - red
                 if (share.s === 2) return '#dc3545';
@@ -4745,7 +4896,7 @@
                 // Unverified - gray
                 if (!share.v) return '#555577';
 
-                // Pool fee share - purple
+                // Node fee share - purple
                 if (share.fee) return '#9c27b0';
 
                 var isMine = this.myAddress && share.m === this.myAddress;
@@ -4854,7 +5005,7 @@
 
                 // Tags
                 var tags = [];
-                if (share.fee) tags.push('<span style="color:#9c27b0;font-weight:700">Pool Fee</span>');
+                if (share.fee) tags.push('<span style="color:#9c27b0;font-weight:700">Node Fee</span>');
                 if (share.dv && share.dv >= 36 && share.V < 36) tags.push('<span style="color:#0097a7;font-weight:600">Signals V' + share.dv + '</span>');
 
                 var html =
@@ -5269,12 +5420,17 @@
         }
 
         function loadShares() {
-            defrag.load();
+            // Use animated refresh if shares already loaded (auto-refresh / manual)
+            if (defrag.shares && defrag.shares.length > 0) {
+                defrag.liveRefresh();
+            } else {
+                defrag.load();
+            }
         }
 
         // Main PPLNS Distribution Treemap (dashboard-level)
-        function loadMainPPLNS() {
-            d3.json('../current_merged_payouts', function(payouts) {
+        var _cachedPPLNSPayouts = null;
+        function renderMainPPLNS(payouts) {
                 if (!payouts || typeof payouts !== 'object') return;
                 var grid = document.getElementById('pplns-main-grid');
                 var tooltip = document.getElementById('pplns-main-tooltip');
@@ -5300,7 +5456,8 @@
                 entries.forEach(function(e) { e.pct = total > 0 ? e.amt / total : 0; });
 
                 var w = grid.clientWidth;
-                var h = Math.max(400, Math.min(w * 0.5, 700));
+                var vh = window.innerHeight || document.documentElement.clientHeight;
+                var h = Math.max(vh * 0.75, Math.min(w * 0.55, vh * 0.85));
                 grid.style.height = h + 'px';
 
                 // Squarified treemap layout (standalone — carries all fields)
@@ -5395,6 +5552,17 @@
                         el.textContent = r.addr.length > mc ? r.addr.substr(0, mc) + '…' : r.addr;
                         cell.appendChild(el);
                     }
+                    // Hashrate (from sharechain defrag data)
+                    var minerHr = defrag.minerHashrates ? defrag.minerHashrates[r.addr] : 0;
+                    if (minerHr > 0 && r.w > 55 && r.h > 55) {
+                        var el = document.createElement('div');
+                        el.style.fontSize = Math.max(9, fitAddr * 0.9) + 'px';
+                        el.style.color = 'rgba(255,255,255,0.75)';
+                        el.style.textAlign = 'center';
+                        el.style.fontWeight = '600';
+                        el.textContent = format_hashrate(minerHr);
+                        cell.appendChild(el);
+                    }
                     // Version
                     if (r.w > 30 && r.h > 52 && mv.ver) {
                         var el = document.createElement('div');
@@ -5449,10 +5617,13 @@
                             } else if (isV35Only) {
                                 dogeLine = '<div style="color:#ff6b6b;font-weight:600">0 DOGE \u2014 upgrade to V36!</div>';
                             }
+                            var hrLine = '';
+                            var mHr = defrag.minerHashrates ? defrag.minerHashrates[r.addr] : 0;
+                            if (mHr > 0) hrLine = '<div style="color:var(--text-secondary)">' + format_hashrate(mHr) + '</div>';
                             tooltip.innerHTML =
                                 '<div style="color:var(--primary);font-weight:700;margin-bottom:4px">' + r.addr + '</div>' +
                                 '<div style="font-weight:600">' + (r.pct*100).toFixed(2) + '% \u2014 ' + r.amt.toFixed(8) + ' LTC</div>' +
-                                dogeLine + verLine +
+                                dogeLine + hrLine + verLine +
                                 '<div style="color:var(--text-muted);font-size:0.75em;margin-top:4px">Click to view on Blockchair</div>';
                             tooltip.style.display = 'block';
                             positionTip(ev);
@@ -5463,8 +5634,23 @@
 
                     grid.appendChild(cell);
                 });
+        }
+        function loadMainPPLNS() {
+            d3.json('../current_merged_payouts', function(payouts) {
+                if (!payouts || typeof payouts !== 'object') return;
+                _cachedPPLNSPayouts = payouts;
+                renderMainPPLNS(payouts);
             });
         }
+
+        // Re-render PPLNS treemap on window resize
+        var _pplnsResizeTimer;
+        window.addEventListener('resize', function() {
+            clearTimeout(_pplnsResizeTimer);
+            _pplnsResizeTimer = setTimeout(function() {
+                if (_cachedPPLNSPayouts) renderMainPPLNS(_cachedPPLNSPayouts);
+            }, 200);
+        });
 
         // Create a single colored share cell (22x22 square) with tooltip + click
         function makeShareCell(fullHash, share) {
@@ -5489,7 +5675,7 @@
             // Short hash label inside the cell
             var label = document.createElement('div');
             label.className = 'cell-hash';
-            label.textContent = fullHash.substr(-8);
+            label.textContent = fullHash.substr(-4);
             cell.appendChild(label);
 
             // Click → share detail page
