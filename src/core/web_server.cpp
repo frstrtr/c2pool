@@ -3386,8 +3386,8 @@ void MiningInterface::cache_pplns_at_tip()
     }
     if (tip.empty()) return;
 
-    // Compute current PPLNS and cache it keyed by this tip
-    auto pplns = rest_current_payouts();
+    // Compute full merged PPLNS (LTC + DOGE with donation) and cache
+    auto pplns = rest_current_merged_payouts();
     if (pplns.is_null() || pplns.empty()) return;
 
     std::lock_guard<std::mutex> lock(m_pplns_cache_mutex);
