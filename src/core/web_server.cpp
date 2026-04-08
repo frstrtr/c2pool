@@ -2889,6 +2889,15 @@ nlohmann::json MiningInterface::rest_current_payouts()
 
 nlohmann::json MiningInterface::rest_users()
 {
+    // Prefer sharechain unique miners count (matches /global_stats)
+    if (m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        if (sc.contains("shares_by_miner") && sc["shares_by_miner"].is_object()) {
+            int count = static_cast<int>(sc["shares_by_miner"].size());
+            if (count > 0) return nlohmann::json(count);
+        }
+    }
+    // Fallback to payout manager
     auto* pm = m_payout_manager_ptr ? m_payout_manager_ptr : m_payout_manager.get();
     return pm ? nlohmann::json(pm->get_active_miners_count()) : nlohmann::json(0);
 }
@@ -4180,17 +4189,15 @@ nlohmann::json MiningInterface::rest_local_stats()
 
 nlohmann::json MiningInterface::rest_p2pool_global_stats()
 {
-    // Original p2pool /global_stats shape
+    // Original p2pool /global_stats shape — delegate to full implementation
+    auto full = rest_global_stats();
     nlohmann::json result = nlohmann::json::object();
-    double pool_rate = 0.0;
-    if (m_node) {
-        auto hs = m_node->get_hashrate_stats();
-        if (hs.contains("global_hashrate"))
-            pool_rate = hs["global_hashrate"];
-    }
-    result["pool_hash_rate"] = pool_rate;
-    result["pool_stale_prop"] = 0.0;
-    result["min_difficulty"] = 1.0;
+    result["pool_hash_rate"] = full.value("pool_hash_rate", 0.0);
+    result["pool_stale_prop"] = full.value("pool_stale_prop", 0.0);
+    result["min_difficulty"] = full.value("min_difficulty", 1.0);
+    result["pool_nonstale_hash_rate"] = full.value("pool_nonstale_hash_rate", 0.0);
+    result["network_block_difficulty"] = full.value("network_block_difficulty", 0.0);
+    result["network_hashrate"] = full.value("network_hashrate", 0.0);
     return result;
 }
 
@@ -4367,6 +4374,12 @@ std::string MiningInterface::rest_logs_export(const std::string& scope,
 
 nlohmann::json MiningInterface::rest_rate()
 {
+    // Use sharechain-based pool hashrate (same source as /global_stats)
+    if (m_pool_hashrate_fn) {
+        double hr = m_pool_hashrate_fn();
+        if (hr > 0) return hr;
+    }
+    // Fallback to node hashrate tracker
     double rate = 0.0;
     if (m_node) {
         auto hs = m_node->get_hashrate_stats();
