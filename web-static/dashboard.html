@@ -4860,7 +4860,7 @@
                 });
 
                 // Compute uniform scale for all dying shares
-                var _dyingFontSize = 13;
+                var _dyingFontSize = 20;
                 var _tmpCanvas = document.createElement('canvas').getContext('2d');
                 _tmpCanvas.font = 'bold ' + _dyingFontSize + 'px Monaco,Consolas,monospace';
                 var _maxTextW = 0;
@@ -4916,6 +4916,18 @@
                 var phase3Dur = 3000;
                 var duration = phase3Start + phase3Dur;
 
+                // Immutable snapshots: animation reads ONLY these, never self.*
+                // Deltas can freely modify self.shares mid-animation without corruption.
+                var animShares = self.shares.slice();
+                var animColors = animShares.map(function(s) { return self.getColor(s); });
+                var animOldPos = {};
+                for (var _k in self._oldPositions) animOldPos[_k] = self._oldPositions[_k];
+                var animBlockSet = {};
+                for (var _k2 in self.blockSet) animBlockSet[_k2] = self.blockSet[_k2];
+                var animDogeSet = {};
+                for (var _k3 in self.dogeSet) animDogeSet[_k3] = self.dogeSet[_k3];
+                var animTotal = animShares.length;
+
                 function frame(now) {
                     var elapsed = now - startTime;
                     var globalT = Math.min(elapsed / duration, 1);
@@ -4924,7 +4936,7 @@
                     var ctx = self.ctx;
                     var dpr = self.dpr;
                     var cssW = ml + cols * step;
-                    var cssH = Math.max(Math.ceil(self.shares.length / cols) * step, 40);
+                    var cssH = Math.max(Math.ceil(animTotal / cols) * step, 40);
                     canvas.style.width = cssW + 'px';
                     canvas.style.height = cssH + 'px';
                     canvas.width = cssW * dpr;
@@ -4935,10 +4947,10 @@
 
                     // ═══ PHASE 2+3: Smooth wave tail→head + new shares ═══
                     var p2elapsed = elapsed - phase2Start;
-                    var totalShares = self.shares.length;
+                    var totalShares = animTotal;
 
                     for (var i = totalShares - 1; i >= 0; i--) {
-                        var share = self.shares[i];
+                        var share = animShares[i];
                         var dst = newPos[i];
                         var isNew = i < newCount;
                         var x, y, scale, shadowAlpha;
@@ -4951,27 +4963,28 @@
                             var bi = born[i];
                             var bdsw = cs * bornScale;
 
-                            // Birth spread position (above destination)
+                            // Birth spread position (below destination)
                             function bornPos(bIdx, bsc) {
                                 var bsw = cs * bsc;
-                                var gap = 4;
+                                var gap = bsw * 0.15;
                                 var totalW = newCount * bsw + (newCount - 1) * gap;
                                 var avgX = 0;
                                 for (var bb = 0; bb < newCount; bb++) avgX += newPos[bb].x;
                                 avgX = avgX / newCount + cs/2;
                                 var groupLeft = avgX - totalW/2;
-                                if (groupLeft < ml) groupLeft = ml;
+                                // Enforce minimum 2 share-columns from left border
+                                if (groupLeft < ml + step * 2) groupLeft = ml + step * 2;
                                 if (groupLeft + totalW > cssW) groupLeft = cssW - totalW;
                                 return groupLeft + bIdx * (bsw + gap) + bsw/2;
                             }
                             var bFinalX = bornPos(i, bornScale);
-                            // Birth position: below destination, centered vertically in visible canvas
-                            var bFinalY = Math.min(dst.y + step * 6, cssH * 0.4);
+                            // Birth position: below destination, shifted 1 row down for shadow clearance
+                            var bFinalY = Math.min(dst.y + step * 8, cssH * 0.5);
 
                             if (bt <= 0) {
                                 // Birth not started yet — draw at destination to prevent gaps
                                 ctx.globalAlpha = 1;
-                                ctx.fillStyle = self.getColor(share);
+                                ctx.fillStyle = animColors[i];
                                 ctx.fillRect(dst.x, dst.y, cs, cs);
                                 continue;
                             }
@@ -5018,15 +5031,19 @@
                                 ctx.fillRect(bFinalX-bdsw/2, bFinalY-bdsw/2, bdsw, bdsw);
                                 ctx.fillStyle = 'rgba(255,255,255,0.1)';
                                 ctx.fillRect(bFinalX-bdsw/2+3, bFinalY-bdsw/2+3, bdsw-6, bdsw-6);
-                                // Text
+                                // Text with shadow
                                 var fontSize = _bornFontSize;
-                                ctx.fillStyle = '#ffffff';
                                 ctx.font = 'bold ' + fontSize + 'px Monaco,Consolas,monospace';
                                 ctx.textAlign = 'center';
                                 ctx.textBaseline = 'middle';
+                                ctx.fillStyle = 'rgba(0,0,0,0.8)';
+                                ctx.fillText(bi.shortAddr, bFinalX+1, bFinalY - fontSize * 0.8 + 1);
+                                ctx.fillStyle = '#ffffff';
                                 ctx.fillText(bi.shortAddr, bFinalX, bFinalY - fontSize * 0.8);
+                                ctx.font = 'bold ' + (fontSize+2) + 'px Monaco,Consolas,monospace';
+                                ctx.fillStyle = 'rgba(0,0,0,0.8)';
+                                ctx.fillText(bi.pplnsPct.toFixed(3) + '%', bFinalX+1, bFinalY + fontSize * 0.8 + 1);
                                 ctx.fillStyle = '#ffd700';
-                                ctx.font = 'bold ' + (fontSize+1) + 'px Monaco,Consolas,monospace';
                                 ctx.fillText(bi.pplnsPct.toFixed(3) + '%', bFinalX, bFinalY + fontSize * 0.8);
                                 x = dst.x; y = dst.y; scale = 0; shadowAlpha = 0;
                                 ctx.globalAlpha = 0;
@@ -5068,7 +5085,7 @@
                             var shareT = Math.max(0, Math.min(1, (p2elapsed - shareStart) / 600));
                             var ease = 1 - Math.pow(1 - shareT, 3);
 
-                            var old = self._oldPositions[share.h];
+                            var old = animOldPos[share.h];
                             if (old && shareT > 0 && shareT < 1) {
                                 var liftA, slideA, landA;
                                 if (ease < 0.2) {
@@ -5101,11 +5118,11 @@
                         var sy = y + cs/2 - (cs*scale)/2;
                         var sw = cs * scale;
 
-                        ctx.fillStyle = self.getColor(share);
+                        ctx.fillStyle = animColors[i];
                         ctx.fillRect(sx, sy, sw, sw);
 
-                        var isLtc = !!self.blockSet[share.h];
-                        var isDoge = !!self.dogeSet[share.h];
+                        var isLtc = !!animBlockSet[share.h];
+                        var isDoge = !!animDogeSet[share.h];
                         if (isLtc && isDoge) {
                             ctx.fillStyle = '#ff8000'; ctx.fillRect(sx, sy, sw, sw);
                             ctx.strokeStyle = '#ffaa00'; ctx.lineWidth = 2;
@@ -5159,20 +5176,22 @@
                         // Helper: compute spread position for dying share at given scale
                         function dyingPos(dIdx, dsc) {
                             var dsw = cs * dsc;
-                            var gap = 4;
+                            var gap = dsw * 0.15;
                             var totalW = dyingCount * dsw + (dyingCount - 1) * gap;
                             var avgX = 0;
                             for (var dd = 0; dd < dyingCount; dd++) avgX += dying[dd].pos.x;
                             avgX = avgX / dyingCount + cs/2;
-                            var groupLeft = avgX - totalW/2;
+                            // Shift 2 columns left so shadow doesn't clip right edge
+                            var groupLeft = avgX - totalW/2 - step * 2;
                             if (groupLeft < ml) groupLeft = ml;
                             if (groupLeft + totalW > cssW) groupLeft = cssW - totalW;
                             return groupLeft + dIdx * (dsw + gap) + dsw/2;
                         }
 
                         // Fixed final target — no position shift between phases
+                        // Shift 1 row higher so shadow is fully visible
                         var finalX = dyingPos(d, dyingScale);
-                        var finalY = dcy - step * 8;
+                        var finalY = dcy - step * 9;
 
                         if (dt < 0.3) {
                             // RISE: 0→30%
@@ -5227,15 +5246,19 @@
                             ctx.fillStyle = 'rgba(255,60,50,0.2)';
                             ctx.fillRect(dsx+3, dsy+3, dsw-6, dsw-6);
 
-                            // Miner address — white, bold
-                            ctx.fillStyle = '#ffffff';
+                            // Miner address — white, bold, with shadow
                             ctx.font = 'bold ' + fontSize + 'px Monaco,Consolas,monospace';
                             ctx.textAlign = 'center';
                             ctx.textBaseline = 'middle';
+                            ctx.fillStyle = 'rgba(0,0,0,0.8)';
+                            ctx.fillText(addrText, holdX+1, holdY - fontSize * 0.8 + 1);
+                            ctx.fillStyle = '#ffffff';
                             ctx.fillText(addrText, holdX, holdY - fontSize * 0.8);
-                            // PPLNS weight — gold, bold
+                            // PPLNS weight — gold, bold, with shadow
+                            ctx.font = 'bold ' + (fontSize + 2) + 'px Monaco,Consolas,monospace';
+                            ctx.fillStyle = 'rgba(0,0,0,0.8)';
+                            ctx.fillText(pctText, holdX+1, holdY + fontSize * 0.8 + 1);
                             ctx.fillStyle = '#ffd700';
-                            ctx.font = 'bold ' + (fontSize + 1) + 'px Monaco,Consolas,monospace';
                             ctx.fillText(pctText, holdX, holdY + fontSize * 0.8);
                         } else if (dt > 0 && dt < 1) {
                             // Dissolve the actual scaled square at its hold position
@@ -7883,9 +7906,28 @@
             });
         }
 
+        var _rtFetching = false;   // serialize: only one delta fetch at a time
+        var _rtPendingSince = null; // queued since-hash while fetch is in-flight
+
         function _rtFetchDelta(sinceHash) {
+            if (_rtFetching) {
+                // Already fetching — save latest since for when it completes
+                _rtPendingSince = sinceHash;
+                return;
+            }
+            _rtFetching = true;
             d3.json('../sharechain/delta?since=' + encodeURIComponent(sinceHash), function(delta) {
-                if (!delta || !delta.shares || delta.shares.length === 0) return;
+                _rtFetching = false;
+
+                if (!delta || !delta.shares || delta.shares.length === 0) {
+                    // Drain pending
+                    if (_rtPendingSince !== null) {
+                        var next = _rtPendingSince;
+                        _rtPendingSince = null;
+                        _rtFetchDelta(next);
+                    }
+                    return;
+                }
 
                 // Snapshot old positions
                 var step = defrag.cellSize + defrag.gap;
@@ -7903,9 +7945,15 @@
                     };
                 }
 
-                // Prepend new shares, trim to window size
+                // Prepend new shares, dedup by hash, trim to window size
                 var newShares = delta.shares;
                 var merged = newShares.concat(defrag.shares);
+                var seen = {};
+                merged = merged.filter(function(s) {
+                    if (seen[s.h]) return false;
+                    seen[s.h] = true;
+                    return true;
+                });
                 if (merged.length > defrag.windowSize)
                     merged = merged.slice(0, defrag.windowSize);
                 defrag.shares = merged;
@@ -7953,6 +8001,17 @@
                 loadShareLinks();
                 refreshPayoutsV36();
                 loadMainPPLNS();
+
+                // Drain pending fetch (SSE arrived while we were fetching)
+                if (_rtPendingSince !== null) {
+                    var next = _rtPendingSince;
+                    _rtPendingSince = null;
+                    // Use current tip as since — we already have everything up to here
+                    var curTip = defrag.shares.length > 0 ? defrag.shares[0].h : next;
+                    if (curTip !== _rtTipHash) {
+                        _rtFetchDelta(curTip);
+                    }
+                }
             });
         }
     </script>
