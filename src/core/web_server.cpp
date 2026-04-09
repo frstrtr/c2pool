@@ -6839,12 +6839,12 @@ bool WebServer::start()
             auto stat_fn = std::make_shared<std::function<void(beast::error_code)>>();
             *stat_fn = [this, stat_timer, stat_fn](beast::error_code ec) {
                 if (ec || !running_) return;
+                stat_timer->expires_after(std::chrono::seconds(60));
+                stat_timer->async_wait(*stat_fn);
                 try { mining_interface_->update_stat_log(); }
                 catch (const std::exception& e) {
                     LOG_WARNING << "Stat log update failed: " << e.what();
                 }
-                stat_timer->expires_after(std::chrono::seconds(60));
-                stat_timer->async_wait(*stat_fn);
             };
             stat_timer->expires_after(std::chrono::seconds(10)); // first sample after 10s
             stat_timer->async_wait(*stat_fn);

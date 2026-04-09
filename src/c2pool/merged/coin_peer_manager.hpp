@@ -554,9 +554,13 @@ private:
             std::chrono::seconds(m_config.refresh_interval_sec));
         m_refresh_timer.async_wait([this](const boost::system::error_code& ec) {
             if (ec || !m_running) return;
-            bootstrap_from_getpeerinfo();
-            prune_dead_peers();
             schedule_refresh();
+            try {
+                bootstrap_from_getpeerinfo();
+                prune_dead_peers();
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[" << m_symbol << "] Peer refresh error: " << e.what();
+            }
         });
     }
 
@@ -566,8 +570,12 @@ private:
             std::chrono::seconds(m_config.peer_db_save_interval_sec));
         m_save_timer.async_wait([this](const boost::system::error_code& ec) {
             if (ec || !m_running) return;
-            save_peers();
             schedule_save();
+            try {
+                save_peers();
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[" << m_symbol << "] Peer save error: " << e.what();
+            }
         });
     }
 
@@ -788,7 +796,11 @@ private:
         m_fixed_seed_timer.expires_after(std::chrono::seconds(60));
         m_fixed_seed_timer.async_wait([this](const boost::system::error_code& ec) {
             if (ec || !m_running) return;
-            load_fixed_seeds();
+            try {
+                load_fixed_seeds();
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[" << m_symbol << "] Fixed seed load error: " << e.what();
+            }
         });
     }
 

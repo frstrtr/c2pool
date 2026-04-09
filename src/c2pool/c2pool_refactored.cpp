@@ -1336,6 +1336,20 @@ int main(int argc, char* argv[]) {
             std::unique_ptr<core::coin::UTXOViewDB>     ltc_utxo_db;
             std::unique_ptr<core::coin::UTXOViewCache>  ltc_utxo_cache;
 
+            // ── Timer heartbeat tracking ────────────────────────────────
+            // Each recurring timer stores its last-fired timestamp (ms).
+            // The watchdog periodically checks these to detect dead timers.
+            auto now_ms = []() -> int64_t {
+                return std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+            };
+            auto hb_ltc_sync     = std::make_shared<std::atomic<int64_t>>(0);
+            auto hb_ltc_mempool  = std::make_shared<std::atomic<int64_t>>(0);
+            auto hb_doge_sync    = std::make_shared<std::atomic<int64_t>>(0);
+            auto hb_doge_mempool = std::make_shared<std::atomic<int64_t>>(0);
+            auto hb_think        = std::make_shared<std::atomic<int64_t>>(0);
+            auto hb_monitor      = std::make_shared<std::atomic<int64_t>>(0);
+
             if (embedded_ltc) {
                 LOG_INFO << "╔══════════════════════════════════════════════════════════════╗";
                 LOG_INFO << "║  [EMB-LTC] Phase 4: EMBEDDED COIN NODE MODE                  ║";
@@ -1814,6 +1828,7 @@ int main(int argc, char* argv[]) {
                                 bool full_batch = (batch->size() >= 2000);
                                 if (accepted > 0 || full_batch) {
                                     boost::asio::post(ioc, [accepted, last_hash, chain, bcaster, &web_server]() {
+                                      try {
                                         if (accepted > 0) {
                                             LOG_INFO << "[EMB-LTC] Triggering work refresh (new headers)";
                                             web_server.trigger_work_refresh_debounced();
@@ -1828,6 +1843,9 @@ int main(int argc, char* argv[]) {
                                             // to skip past known headers and find new ones
                                             bcaster->request_headers(chain->get_locator(), uint256::ZERO);
                                         }
+                                      } catch (const std::exception& e) {
+                                        LOG_WARNING << "[EMB-LTC] Header post-process error: " << e.what();
+                                      }
                                     });
                                 } else {
                                     LOG_DEBUG_COIND << "[EMB-LTC] No new headers accepted (all known), batch=" << batch->size();
@@ -2007,6 +2025,7 @@ int main(int argc, char* argv[]) {
                         boost::asio::post(ioc,
                             [tracker, bcaster, chain, utxo, utxo_db, &web_server,
                              old_tip, old_height, new_tip, new_height]() {
+                      try {
                         bool is_reorg = (new_height <= old_height);
                         LOG_WARNING << "[EMB-LTC] Chain tip changed: "
                                     << old_tip.GetHex().substr(0, 16) << " (h=" << old_height << ") → "
@@ -2073,6 +2092,9 @@ int main(int argc, char* argv[]) {
                         }
                         // Trigger work refresh so stratum miners get the new tip
                         web_server.trigger_work_refresh_debounced();
+                      } catch (const std::exception& e) {
+                        LOG_ERROR << "[EMB-LTC] Reorg handler error: " << e.what();
+                      }
                             }); // end post(ioc)
                     });
                 LOG_INFO << "[EMB-LTC] Chain reorg handler registered";
@@ -2081,16 +2103,21 @@ int main(int argc, char* argv[]) {
                 // Uses shared_ptr self-capture so the lambda stays alive for the run duration.
                 auto sync_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
                 auto sync_timer = std::make_shared<boost::asio::steady_timer>(ioc);
-                *sync_fn = [sync_fn, sync_timer,
+                *sync_fn = [sync_fn, sync_timer, now_ms, hb_ltc_sync,
                             chain   = embedded_chain.get(),
                             bcaster = embedded_broadcaster.get()](boost::system::error_code ec) {
                     if (ec) return; // cancelled (ioc stopped)
-                    LOG_DEBUG_COIND << "[EMB-LTC] Periodic header sync: height=" << chain->height()
-                              << " synced=" << chain->is_synced()
-                              << " peers=" << bcaster->connected_count();
-                    bcaster->request_headers(chain->get_locator(), uint256::ZERO);
+                    hb_ltc_sync->store(now_ms());
                     sync_timer->expires_after(std::chrono::seconds(60));
                     sync_timer->async_wait(*sync_fn);
+                    try {
+                        LOG_DEBUG_COIND << "[EMB-LTC] Periodic header sync: height=" << chain->height()
+                                  << " synced=" << chain->is_synced()
+                                  << " peers=" << bcaster->connected_count();
+                        bcaster->request_headers(chain->get_locator(), uint256::ZERO);
+                    } catch (const std::exception& e) {
+                        LOG_WARNING << "[EMB-LTC] Header sync error: " << e.what();
+                    }
                 };
                 // Kick off first getheaders after 3s (allow handshake to complete)
                 LOG_INFO << "[EMB-LTC] Header chain height: " << embedded_chain->height()
@@ -2102,13 +2129,18 @@ int main(int argc, char* argv[]) {
                 // Periodic mempool cleanup: evict expired txs every 5 minutes.
                 auto mempool_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
                 auto mempool_timer = std::make_shared<boost::asio::steady_timer>(ioc);
-                *mempool_fn = [mempool_fn, mempool_timer,
+                *mempool_fn = [mempool_fn, mempool_timer, now_ms, hb_ltc_mempool,
                                pool = embedded_pool.get()](boost::system::error_code ec) {
                     if (ec) return;
-                    if (pool)
-                        pool->evict_expired();
+                    hb_ltc_mempool->store(now_ms());
                     mempool_timer->expires_after(std::chrono::minutes(5));
                     mempool_timer->async_wait(*mempool_fn);
+                    try {
+                        if (pool)
+                            pool->evict_expired();
+                    } catch (const std::exception& e) {
+                        LOG_WARNING << "[EMB-LTC] Mempool cleanup error: " << e.what();
+                    }
                 };
                 mempool_timer->expires_after(std::chrono::minutes(5));
                 mempool_timer->async_wait(*mempool_fn);
@@ -4611,11 +4643,15 @@ int main(int argc, char* argv[]) {
                                                 bool full_batch = (batch->size() >= 2000);
                                                 if (accepted > 0 || full_batch) {
                                                     boost::asio::post(ioc, [accepted, last_hash, dc, bcaster_ptr]() {
+                                                      try {
                                                         if (accepted > 0 && !last_hash.IsNull()) {
                                                             bcaster_ptr->request_headers({last_hash}, uint256::ZERO);
                                                         } else {
                                                             bcaster_ptr->request_headers(dc->get_locator(), uint256::ZERO);
                                                         }
+                                                      } catch (const std::exception& e) {
+                                                        LOG_WARNING << "[EMB-DOGE] Header post-process error: " << e.what();
+                                                      }
                                                     });
                                                 }
                                             });
@@ -4624,15 +4660,21 @@ int main(int argc, char* argv[]) {
                                 // Periodic DOGE header sync (every 60s)
                                 auto doge_sync_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
                                 auto doge_sync_timer = std::make_shared<boost::asio::steady_timer>(ioc);
-                                *doge_sync_fn = [doge_sync_fn, doge_sync_timer, dc = doge_chain.get(),
+                                *doge_sync_fn = [doge_sync_fn, doge_sync_timer, now_ms, hb_doge_sync,
+                                                 dc = doge_chain.get(),
                                                  bcaster_ptr](boost::system::error_code ec) {
                                     if (ec) return;
-                                    auto locator = dc->get_locator();
-                                    bcaster_ptr->request_headers(locator, uint256::ZERO);
+                                    hb_doge_sync->store(now_ms());
                                     // Fast poll during sync (5s), slow when caught up (60s)
                                     int interval = dc->is_synced() ? 60 : 5;
                                     doge_sync_timer->expires_after(std::chrono::seconds(interval));
                                     doge_sync_timer->async_wait(*doge_sync_fn);
+                                    try {
+                                        auto locator = dc->get_locator();
+                                        bcaster_ptr->request_headers(locator, uint256::ZERO);
+                                    } catch (const std::exception& e) {
+                                        LOG_WARNING << "[EMB-DOGE] Header sync error: " << e.what();
+                                    }
                                 };
                                 // Initial delay: wait for broadcaster maintenance (5s) to connect peers
                                 doge_sync_timer->expires_after(std::chrono::seconds(10));
@@ -4816,13 +4858,18 @@ int main(int argc, char* argv[]) {
                                 // Periodic mempool cleanup: evict expired txs every 5 minutes.
                                 auto doge_mempool_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
                                 auto doge_mempool_timer = std::make_shared<boost::asio::steady_timer>(ioc);
-                                *doge_mempool_fn = [doge_mempool_fn, doge_mempool_timer,
+                                *doge_mempool_fn = [doge_mempool_fn, doge_mempool_timer, now_ms, hb_doge_mempool,
                                                     pool = doge_pool.get()](boost::system::error_code ec) {
                                     if (ec) return;
-                                    if (pool)
-                                        pool->evict_expired();
+                                    hb_doge_mempool->store(now_ms());
                                     doge_mempool_timer->expires_after(std::chrono::minutes(5));
                                     doge_mempool_timer->async_wait(*doge_mempool_fn);
+                                    try {
+                                        if (pool)
+                                            pool->evict_expired();
+                                    } catch (const std::exception& e) {
+                                        LOG_WARNING << "[EMB-DOGE] Mempool cleanup error: " << e.what();
+                                    }
                                 };
                                 doge_mempool_timer->expires_after(std::chrono::minutes(5));
                                 doge_mempool_timer->async_wait(*doge_mempool_fn);
@@ -5129,15 +5176,18 @@ int main(int argc, char* argv[]) {
             auto think_timer = std::make_shared<boost::asio::steady_timer>(ioc);
             std::function<void(boost::system::error_code)> think_tick;
             if (p2p_node) {
-                think_tick = [&, think_timer](boost::system::error_code ec) {
+                think_tick = [&, think_timer, now_ms, hb_think](boost::system::error_code ec) {
                     if (ec || g_shutdown_requested) return;
+                    hb_think->store(now_ms());
+                    think_timer->expires_after(std::chrono::seconds(5));
+                    think_timer->async_wait(think_tick);
                     try {
                         p2p_node->clean_tracker();
                     } catch (const std::exception& e) {
                         LOG_ERROR << "[CLEAN-TRACKER] error: " << e.what();
+                    } catch (...) {
+                        LOG_ERROR << "[CLEAN-TRACKER] unknown error";
                     }
-                    think_timer->expires_after(std::chrono::seconds(5));
-                    think_timer->async_wait(think_tick);
                 };
                 think_timer->expires_after(std::chrono::seconds(5));
                 think_timer->async_wait(think_tick);
@@ -5148,8 +5198,11 @@ int main(int argc, char* argv[]) {
             auto monitor_timer = std::make_shared<boost::asio::steady_timer>(ioc);
             std::function<void(boost::system::error_code)> monitor_tick;
             if (p2p_node) {
-                monitor_tick = [&, monitor_timer](boost::system::error_code ec) {
+                monitor_tick = [&, monitor_timer, now_ms, hb_monitor](boost::system::error_code ec) {
                     if (ec || g_shutdown_requested) return;
+                    hb_monitor->store(now_ms());
+                    monitor_timer->expires_after(std::chrono::seconds(30));
+                    monitor_timer->async_wait(monitor_tick);
                     try {
                         auto best = p2p_node->best_share_hash();
                         if (!best.IsNull()) {
@@ -5158,9 +5211,9 @@ int main(int argc, char* argv[]) {
                         }
                     } catch (const std::exception& e) {
                         LOG_ERROR << "[MONITOR] cycle error: " << e.what();
+                    } catch (...) {
+                        LOG_ERROR << "[MONITOR] unknown error";
                     }
-                    monitor_timer->expires_after(std::chrono::seconds(30));
-                    monitor_timer->async_wait(monitor_tick);
                 };
                 monitor_timer->expires_after(std::chrono::seconds(30));
                 monitor_timer->async_wait(monitor_tick);
@@ -5593,17 +5646,20 @@ int main(int argc, char* argv[]) {
                             return;
                         }
 
-                        LOG_INFO << "[V35-MERGED] Requesting LTC block "
-                                 << ltc_block_hash.GetHex().substr(0, 16)
-                                 << " attempt " << st.attempts << "/" << MAX_RETRY
-                                 << " (peers=" << bcaster->connected_count() << ")";
-                        bcaster->request_block_plain(ltc_block_hash);
-
-                        // Schedule retry
+                        // Schedule retry before work — survives exceptions
                         st.timer->expires_after(std::chrono::seconds(RETRY_SEC));
                         st.timer->async_wait([retry_fn](const boost::system::error_code& ec) {
                             if (!ec && retry_fn) (*retry_fn)();
                         });
+                        try {
+                            LOG_INFO << "[V35-MERGED] Requesting LTC block "
+                                     << ltc_block_hash.GetHex().substr(0, 16)
+                                     << " attempt " << st.attempts << "/" << MAX_RETRY
+                                     << " (peers=" << bcaster->connected_count() << ")";
+                            bcaster->request_block_plain(ltc_block_hash);
+                        } catch (const std::exception& e) {
+                            LOG_WARNING << "[V35-MERGED] Request error: " << e.what();
+                        }
                     };
 
                     // First attempt immediately
@@ -5923,18 +5979,36 @@ int main(int argc, char* argv[]) {
             // where the event loop never exits until explicit shutdown.
             auto work_guard = boost::asio::make_work_guard(ioc);
 
-            // Watchdog: detect event loop stalls (handlers stopping)
+            // Watchdog: detect event loop stalls AND dead timers
             auto watchdog_timer = std::make_shared<boost::asio::steady_timer>(ioc);
             auto watchdog_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
-            *watchdog_fn = [watchdog_timer, watchdog_fn](boost::system::error_code ec) {
+            *watchdog_fn = [watchdog_timer, watchdog_fn, now_ms,
+                            hb_think, hb_monitor, hb_ltc_sync, hb_ltc_mempool,
+                            hb_doge_sync, hb_doge_mempool](boost::system::error_code ec) {
                 if (ec) return;
-                static int tick = 0;
-                ++tick;
-                if (tick % 2 == 0) { // every 60s
-                    LOG_INFO << "[WATCHDOG] alive tick=" << tick;
-                }
                 watchdog_timer->expires_after(std::chrono::seconds(30));
                 watchdog_timer->async_wait(*watchdog_fn);
+                static int tick = 0;
+                ++tick;
+                if (tick % 2 == 0) { // every 60s — heartbeat check
+                    int64_t now = now_ms();
+                    auto check = [&](const char* name, int64_t last, int expect_sec) {
+                        if (last == 0) return; // not yet started
+                        int64_t age_sec = (now - last) / 1000;
+                        if (age_sec > expect_sec * 3) {
+                            LOG_ERROR << "[WATCHDOG] TIMER DEAD: " << name
+                                      << " last fired " << age_sec << "s ago"
+                                      << " (expected every " << expect_sec << "s)";
+                        }
+                    };
+                    check("think",        hb_think->load(),        5);
+                    check("monitor",      hb_monitor->load(),      30);
+                    check("ltc_sync",     hb_ltc_sync->load(),     60);
+                    check("ltc_mempool",  hb_ltc_mempool->load(),  300);
+                    check("doge_sync",    hb_doge_sync->load(),    60);
+                    check("doge_mempool", hb_doge_mempool->load(), 300);
+                    LOG_INFO << "[WATCHDOG] alive tick=" << tick;
+                }
             };
             watchdog_timer->expires_after(std::chrono::seconds(30));
             watchdog_timer->async_wait(*watchdog_fn);

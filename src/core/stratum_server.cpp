@@ -1418,13 +1418,17 @@ void StratumSession::schedule_work_push_timer()
         if (ec) return;
         auto self = weak_self.lock();
         if (!self || !self->is_connected()) return;
-        auto current_gen = self->mining_interface_->get_work_generation();
-        if (current_gen != self->last_pushed_generation_) {
-            self->send_notify_work();
-            self->last_pushed_generation_ = current_gen;
-        }
         self->work_push_timer_->expires_after(std::chrono::seconds(30));
         self->schedule_work_push_timer();
+        try {
+            auto current_gen = self->mining_interface_->get_work_generation();
+            if (current_gen != self->last_pushed_generation_) {
+                self->send_notify_work();
+                self->last_pushed_generation_ = current_gen;
+            }
+        } catch (const std::exception& e) {
+            LOG_WARNING << "[STRATUM] Work push error: " << e.what();
+        }
     });
 }
 
