@@ -464,8 +464,12 @@ private:
         m_maintenance_timer.expires_after(std::chrono::seconds(5));
         m_maintenance_timer.async_wait([this](const boost::system::error_code& ec) {
             if (ec || !m_running) return;
-            do_maintenance();
             schedule_maintenance();
+            try {
+                do_maintenance();
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[" << m_symbol << "] Broadcaster maintenance error: " << e.what();
+            }
         });
     }
 
