@@ -4739,6 +4739,7 @@
 
             // Animated live refresh: per-share 3D lift→slide→land animation
             _animRunning: false,
+            _animDeferred: false, // data arrived during animation — fetch fresh on completion
             _oldPositions: {},  // hash → {x, y}
             _deltaQueue: [],   // queued deltas received during animation
 
@@ -4762,6 +4763,12 @@
 
                 d3.json('../sharechain/window', function(data) {
                     if (!data || !data.shares || !data.shares.length) return;
+
+                    // Don't mutate data during animation — defer to completion
+                    if (self._animRunning) {
+                        self._animDeferred = true;
+                        return;
+                    }
 
                     // Detect new shares
                     var oldTip = self.shares.length > 0 ? self.shares[0].h : null;
@@ -4974,7 +4981,7 @@
                                 var groupLeft = avgX - totalW/2;
                                 // Enforce minimum 2 share-columns from left border
                                 if (groupLeft < ml + step * 2) groupLeft = ml + step * 2;
-                                if (groupLeft + totalW > cssW) groupLeft = cssW - totalW;
+                                if (groupLeft + totalW > cssW - step * 2) groupLeft = cssW - step * 2 - totalW;
                                 return groupLeft + bIdx * (bsw + gap) + bsw/2;
                             }
                             var bFinalX = bornPos(i, bornScale);
@@ -5183,8 +5190,8 @@
                             avgX = avgX / dyingCount + cs/2;
                             // Shift 2 columns left so shadow doesn't clip right edge
                             var groupLeft = avgX - totalW/2 - step * 2;
-                            if (groupLeft < ml) groupLeft = ml;
-                            if (groupLeft + totalW > cssW) groupLeft = cssW - totalW;
+                            if (groupLeft < ml + step * 2) groupLeft = ml + step * 2;
+                            if (groupLeft + totalW > cssW - step * 2) groupLeft = cssW - step * 2 - totalW;
                             return groupLeft + dIdx * (dsw + gap) + dsw/2;
                         }
 
@@ -5319,15 +5326,16 @@
                         self._animRunning = false;
                         self._oldPositions = {};
                         self.render();
-                        // Drain queued deltas — replay next update
-                        if (self._deltaQueue.length > 0) {
+                        // Drain: data arrived during animation — one fresh fetch
+                        if (self._animDeferred || self._deltaQueue.length > 0) {
+                            self._animDeferred = false;
                             self._deltaQueue = [];
-                            // Trigger a fresh delta fetch to get all accumulated changes
+                            _rtPendingSince = null;
                             if (typeof _rtTipHash !== 'undefined' && _rtTipHash) {
                                 var curTip = self.shares.length > 0 ? self.shares[0].h : '';
-                                if (curTip !== _rtTipHash) {
-                                    _rtFetchDelta(curTip);
-                                }
+                                _rtFetchDelta(curTip);
+                            } else {
+                                self.liveRefresh();
                             }
                         }
                     }
@@ -7920,12 +7928,17 @@
                 _rtFetching = false;
 
                 if (!delta || !delta.shares || delta.shares.length === 0) {
-                    // Drain pending
                     if (_rtPendingSince !== null) {
                         var next = _rtPendingSince;
                         _rtPendingSince = null;
                         _rtFetchDelta(next);
                     }
+                    return;
+                }
+
+                // Don't mutate data during animation — defer to completion
+                if (defrag._animRunning) {
+                    defrag._animDeferred = true;
                     return;
                 }
 
