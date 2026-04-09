@@ -4717,8 +4717,8 @@
                         ctx.strokeRect(x + 0.5, y + 0.5, cs - 1, cs - 1);
                     }
 
-                    // Chain head: bright white triangle marker in corner
-                    if (isHead && !isLtcBlock && !isDogeBlock) {
+                    // Chain head: only mark position 0 (actual tip)
+                    if (i === 0 && !isLtcBlock && !isDogeBlock) {
                         ctx.fillStyle = '#ffffff';
                         ctx.beginPath();
                         ctx.moveTo(x, y);
@@ -5109,6 +5109,17 @@
                         } else if (isDoge) {
                             ctx.strokeStyle = '#00e5ff'; ctx.lineWidth = 2;
                             ctx.strokeRect(sx+0.5, sy+0.5, sw-1, sw-1);
+                        }
+
+                        // Head marker: only on tip share (position 0) after it has landed
+                        if (i === 0 && !isNew && !isLtc && !isDoge && ctx.globalAlpha >= 1) {
+                            ctx.fillStyle = '#ffffff';
+                            ctx.beginPath();
+                            ctx.moveTo(sx, sy);
+                            ctx.lineTo(sx + 4, sy);
+                            ctx.lineTo(sx, sy + 4);
+                            ctx.closePath();
+                            ctx.fill();
                         }
 
                         if (isNew && ctx.globalAlpha > 0.3) {
