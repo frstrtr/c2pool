@@ -5168,11 +5168,11 @@
                             var dsy = animY - dsw/2;
                             ctx.globalAlpha = 1;
 
-                            // Shadow at original position
-                            var shScale = 1 + riseEase * 2;
+                            // Shadow under flying share (follows it, offset down+right)
+                            var shOff = 4 + riseEase * 6;
                             var shAlpha = 1.0 - riseEase * 0.4;
                             ctx.fillStyle = 'rgba(0,0,0,' + shAlpha + ')';
-                            ctx.fillRect(dp.x+cs/2-cs*shScale/2+4, dp.y+cs/2-cs*shScale/2+4, cs*shScale, cs*shScale);
+                            ctx.fillRect(dsx + shOff, dsy + shOff, dsw, dsw);
 
                             // Glow + fill lerping to red
                             var origRGB = parseColor(dying[d].color);
