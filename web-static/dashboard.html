@@ -4968,6 +4968,13 @@
                             // Birth position: below destination, centered vertically in visible canvas
                             var bFinalY = Math.min(dst.y + step * 6, cssH * 0.4);
 
+                            if (bt <= 0) {
+                                // Birth not started yet — draw at destination to prevent gaps
+                                ctx.globalAlpha = 1;
+                                ctx.fillStyle = self.getColor(share);
+                                ctx.fillRect(dst.x, dst.y, cs, cs);
+                                continue;
+                            }
                             if (bt < 0.35) {
                                 // COALESCE: particles gather into square (reverse dissolve)
                                 var cT = bt / 0.35;
