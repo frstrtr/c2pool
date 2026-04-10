@@ -6108,6 +6108,87 @@ void MiningInterface::update_stat_log()
     }
 }
 
+void MiningInterface::save_stat_log()
+{
+    if (m_stat_log_path.empty()) return;
+    try {
+        nlohmann::json arr = nlohmann::json::array();
+        {
+            std::lock_guard<std::mutex> lock(m_stat_log_mutex);
+            for (const auto& e : m_stat_log) {
+                arr.push_back({
+                    {"t", e.time}, {"phr", e.pool_hash_rate}, {"psp", e.pool_stale_prop},
+                    {"lhr", e.local_hash_rates}, {"ldhr", e.local_dead_hash_rates},
+                    {"wc", e.worker_count}, {"mc", e.miner_count}, {"cc", e.connected_count},
+                    {"sh", e.shares}, {"st", e.stale_shares},
+                    {"cp", e.current_payout}, {"cps", e.current_payouts},
+                    {"pe", e.peers}, {"dv", e.desired_versions},
+                    {"as", e.attempts_to_share}, {"ab", e.attempts_to_block},
+                    {"bv", e.block_value}, {"mu", e.memory_usage},
+                    {"wl", e.work_latency}, {"tr", e.traffic}
+                });
+            }
+        }
+        // Atomic write: write to .new, fsync, rename
+        std::string tmp = m_stat_log_path + ".new";
+        {
+            std::ofstream f(tmp, std::ios::trunc);
+            f << arr.dump();
+            f.flush();
+        }
+        std::filesystem::rename(tmp, m_stat_log_path);
+        LOG_INFO << "[StatLog] Saved " << arr.size() << " entries to " << m_stat_log_path;
+    } catch (const std::exception& ex) {
+        LOG_WARNING << "[StatLog] Save failed: " << ex.what();
+    }
+}
+
+void MiningInterface::load_stat_log()
+{
+    if (m_stat_log_path.empty()) return;
+    try {
+        std::ifstream f(m_stat_log_path);
+        if (!f) return;
+        std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        if (content.empty()) return;
+        auto arr = nlohmann::json::parse(content);
+        if (!arr.is_array()) return;
+
+        auto now = std::time(nullptr);
+        double cutoff = static_cast<double>(now) - 86400.0;  // keep 24h
+
+        std::lock_guard<std::mutex> lock(m_stat_log_mutex);
+        for (const auto& j : arr) {
+            StatLogEntry e;
+            e.time = j.value("t", 0.0);
+            if (e.time < cutoff) continue;  // discard stale entries
+            e.pool_hash_rate = j.value("phr", 0.0);
+            e.pool_stale_prop = j.value("psp", 0.0);
+            e.local_hash_rates = j.value("lhr", nlohmann::json::object());
+            e.local_dead_hash_rates = j.value("ldhr", nlohmann::json::object());
+            e.worker_count = j.value("wc", 0);
+            e.miner_count = j.value("mc", 0);
+            e.connected_count = j.value("cc", 0);
+            e.shares = j.value("sh", uint64_t(0));
+            e.stale_shares = j.value("st", uint64_t(0));
+            e.current_payout = j.value("cp", 0.0);
+            e.current_payouts = j.value("cps", nlohmann::json::object());
+            e.peers = j.value("pe", nlohmann::json::object());
+            e.desired_versions = j.value("dv", nlohmann::json::object());
+            e.attempts_to_share = j.value("as", 0.0);
+            e.attempts_to_block = j.value("ab", 0.0);
+            e.block_value = j.value("bv", 0.0);
+            e.memory_usage = j.value("mu", 0.0);
+            e.work_latency = j.value("wl", 0.0);
+            e.traffic = j.value("tr", nlohmann::json::object());
+            m_stat_log.push_back(std::move(e));
+        }
+        LOG_INFO << "[StatLog] Loaded " << m_stat_log.size() << " entries from " << m_stat_log_path;
+    } catch (const std::exception& ex) {
+        LOG_WARNING << "[StatLog] Load failed: " << ex.what();
+    }
+}
+
 void MiningInterface::set_pool_fee_percent(double fee_percent)
 {
     m_pool_fee_percent = fee_percent;

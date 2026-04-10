@@ -1222,6 +1222,15 @@ private:
     };
     std::vector<StatLogEntry> m_stat_log;
     mutable std::mutex m_stat_log_mutex;
+    std::string m_stat_log_path;  // persistence file path (empty = no persistence)
+public:
+    /// Set persistence path for stat log (call before start)
+    void set_stat_log_path(const std::string& path) { m_stat_log_path = path; }
+    /// Save stat log to disk (atomic write). Called periodically + on shutdown.
+    void save_stat_log();
+    /// Load stat log from disk. Called once at startup.
+    void load_stat_log();
+private:
 
     // Network difficulty history for /network_difficulty
     struct NetDiffSample { double ts; double difficulty; std::string source; };

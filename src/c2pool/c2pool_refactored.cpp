@@ -1650,6 +1650,15 @@ int main(int argc, char* argv[]) {
             // io_context needed for block verification timers in all modes
             web_server.get_mining_interface()->set_io_context(&ioc);
 
+            // Stats persistence — survives restarts (p2pool: graph_db)
+            {
+                std::string net_label = settings->m_testnet ? "testnet" : "mainnet";
+                std::string graph_db_path = (core::filesystem::config_path()
+                    / net_label / "graph_db").string();
+                web_server.get_mining_interface()->set_stat_log_path(graph_db_path);
+                web_server.get_mining_interface()->load_stat_log();
+            }
+
             // --- Layer +2: Persistent found block + THE checkpoint storage ---
             // Runs in ALL modes (RPC and embedded). Uses dedicated LevelDB.
             {
@@ -6032,6 +6041,18 @@ int main(int argc, char* argv[]) {
             cache_timer->expires_after(std::chrono::seconds(2));
             cache_timer->async_wait(*cache_fn);
 
+            // Stats persistence timer — save every 100s (matches p2pool graph_db)
+            auto stats_timer = std::make_shared<boost::asio::steady_timer>(ioc);
+            auto stats_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
+            *stats_fn = [stats_timer, stats_fn, mi_ptr](boost::system::error_code ec) mutable {
+                if (ec) return;
+                mi_ptr->save_stat_log();
+                stats_timer->expires_after(std::chrono::seconds(100));
+                stats_timer->async_wait(*stats_fn);
+            };
+            stats_timer->expires_after(std::chrono::seconds(100));
+            stats_timer->async_wait(*stats_fn);
+
             // Run until shutdown
             while (!g_shutdown_requested) {
                 ioc.restart();
@@ -6042,6 +6063,9 @@ int main(int argc, char* argv[]) {
                 }
             }
             work_guard.reset();
+
+            // Save stats on shutdown
+            mi_ptr->save_stat_log();
 
             if (p2p_node) p2p_node->shutdown();
             enhanced_node->shutdown();
