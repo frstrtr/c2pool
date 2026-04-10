@@ -636,7 +636,14 @@ public:
                              const uint256& previous_block,
                              uint32_t bits)
     {
-        std::vector<std::pair<NetService, uint256>> desired;
+        // p2pool: desired is a set of (peer_addr, hash, max_timestamp, min_target)
+        // The timestamp is used to filter stale requests at return time.
+        struct DesiredEntry {
+            NetService peer;
+            uint256 hash;
+            uint32_t max_timestamp{0};  // max timestamp from chain head's recent shares
+        };
+        std::vector<DesiredEntry> desired;
         std::set<NetService> bad_peer_addresses;
 
         // Phase 1: Verify unverified heads, remove bad shares.
@@ -682,10 +689,12 @@ public:
                     // clean_tracker() eats truly stale heads after 300s.
                     if (!last.IsNull()) {
                         NetService peer;
+                        uint32_t head_ts = 0;
                         chain.get_share(head_hash).invoke([&](auto* obj) {
                             peer = obj->peer_addr;
+                            head_ts = obj->m_timestamp;
                         });
-                        desired.emplace_back(peer, last);
+                        desired.push_back({peer, last, head_ts});
                     }
                     continue;
                 }
@@ -721,10 +730,12 @@ public:
                 if (!verified_one && !last.IsNull())
                 {
                     NetService peer;
+                    uint32_t head_ts = 0;
                     chain.get_share(head_hash).invoke([&](auto* obj) {
                         peer = obj->peer_addr;
+                        head_ts = obj->m_timestamp;
                     });
-                    desired.emplace_back(peer, last);
+                    desired.push_back({peer, last, head_ts});
                 }
             }
 
@@ -940,10 +951,12 @@ public:
             if (head_height < static_cast<int32_t>(PoolConfig::chain_length()) && !last_last_hash.IsNull())
             {
                 NetService peer;
+                uint32_t head_ts = 0;
                 chain.get_share(head_hash).invoke([&](auto* obj) {
                     peer = obj->peer_addr;
+                    head_ts = obj->m_timestamp;
                 });
-                desired.emplace_back(peer, last_last_hash);
+                desired.push_back({peer, last_last_hash, head_ts});
             }
         }
 
@@ -1136,10 +1149,26 @@ public:
             timestamp_cutoff = static_cast<uint32_t>(now_seconds()) - 24 * 60 * 60;
         }
 
-        // Filter desired by cutoff
+        // Filter desired by timestamp cutoff — p2pool data.py:2374 EXACTLY:
+        //   return best, [(peer_addr, hash) for peer_addr, hash, ts, targ in desired
+        //                  if ts >= timestamp_cutoff]
+        // This prevents requesting shares from stale/pruned chain tails that
+        // peers no longer have. Without this, we hammer peers with unanswerable
+        // requests and they eventually drop us.
         std::vector<std::pair<NetService, uint256>> desired_result;
-        // For now, pass through all desired (timestamp filtering requires share timestamps at tail)
-        desired_result = std::move(desired);
+        for (auto& d : desired) {
+            if (d.max_timestamp >= timestamp_cutoff) {
+                desired_result.emplace_back(d.peer, d.hash);
+            } else {
+                static int filter_log = 0;
+                if (filter_log++ % 10 == 0)
+                    LOG_INFO << "[think-DESIRED] filtered stale request: hash="
+                             << d.hash.GetHex().substr(0,16)
+                             << " ts=" << d.max_timestamp
+                             << " cutoff=" << timestamp_cutoff
+                             << " age=" << (timestamp_cutoff - d.max_timestamp + 3600) << "s";
+            }
+        }
 
         // Extract top-5 scored heads for clean_tracker (p2pool node.py:363)
         std::vector<uint256> top5;
