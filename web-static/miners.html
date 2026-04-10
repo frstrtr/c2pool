@@ -644,6 +644,17 @@
         d3.json('../web/currency_info', function(info) {
             currency_info = info || {};
             d3.selectAll('.symbol-small').text((info && info.symbol) || 'DASH');
+            if (info && info.explorer_enabled && info.explorer_url) {
+                var nav = document.querySelector('nav');
+                if (nav && !document.getElementById('nav-explorer')) {
+                    var a = document.createElement('a');
+                    a.id = 'nav-explorer';
+                    a.href = info.explorer_url;
+                    a.target = '_blank';
+                    a.textContent = 'Explorer';
+                    nav.appendChild(a);
+                }
+            }
         });
         
         // Load version

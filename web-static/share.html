@@ -1002,6 +1002,18 @@
         }
 
         d3.json('../web/currency_info', function(currency_info) {
+            if (currency_info && currency_info.explorer_enabled && currency_info.explorer_url) {
+                var nav = document.querySelector('nav');
+                if (nav && !document.getElementById('nav-explorer')) {
+                    var a = document.createElement('a');
+                    a.id = 'nav-explorer';
+                    a.href = currency_info.explorer_url;
+                    a.target = '_blank';
+                    a.textContent = 'Explorer';
+                    a.style.cssText = 'color:#e0e0e0;text-decoration:none;padding:6px 14px;border-radius:6px;font-size:0.85rem;background:#16162a';
+                    nav.appendChild(a);
+                }
+            }
             reload(currency_info);
             // Watch for hash changes (navigation between shares)
             window.addEventListener('hashchange', function() {

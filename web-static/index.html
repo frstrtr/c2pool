@@ -267,6 +267,12 @@
             
             d3.json('../web/currency_info', function(currency_info) {
                 d3.selectAll('.symbol').text(currency_info.symbol);
+                if (currency_info.explorer_enabled && currency_info.explorer_url) {
+                    var navP = document.querySelector('body > p:first-of-type');
+                    if (navP && navP.innerHTML.indexOf('Explorer') === -1) {
+                        navP.innerHTML += ' | <a href="' + currency_info.explorer_url + '" target="_blank">Explorer</a>';
+                    }
+                }
                 
                 // Use current_merged_payouts which includes derived merged addresses
                 d3.json('../current_merged_payouts', function(mergedPays) {

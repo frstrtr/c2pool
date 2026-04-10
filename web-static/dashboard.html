@@ -2760,7 +2760,25 @@
             if (info && info.block_period) {
                 parentBlockPeriodMs = info.block_period * 1000;
             }
-            
+
+            // Inject Explorer nav link when explorer is enabled
+            if (info && info.explorer_enabled && info.explorer_url) {
+                var nav = document.querySelector('nav');
+                if (nav && !document.getElementById('nav-explorer')) {
+                    var classicLink = nav.querySelector('a[href="index.html"]');
+                    var a = document.createElement('a');
+                    a.id = 'nav-explorer';
+                    a.href = info.explorer_url;
+                    a.target = '_blank';
+                    a.textContent = 'Explorer';
+                    if (classicLink && classicLink.nextSibling) {
+                        nav.insertBefore(a, classicLink.nextSibling);
+                    } else {
+                        nav.appendChild(a);
+                    }
+                }
+            }
+
             // Now load everything else
             loadStats();
             loadBlocks();

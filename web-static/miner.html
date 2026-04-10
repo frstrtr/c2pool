@@ -1521,10 +1521,20 @@
         // Load currency info
         d3.json('../web/currency_info', function(info) {
             currency_info = info || {};
-            // Update currency symbol throughout the page
             var symbol = currency_info.symbol || 'COIN';
             document.getElementById('currency_symbol').textContent = symbol;
             document.getElementById('payout_label').textContent = symbol + ' on next block';
+            if (info && info.explorer_enabled && info.explorer_url) {
+                var nav = document.querySelector('nav');
+                if (nav && !document.getElementById('nav-explorer')) {
+                    var a = document.createElement('a');
+                    a.id = 'nav-explorer';
+                    a.href = info.explorer_url;
+                    a.target = '_blank';
+                    a.textContent = 'Explorer';
+                    nav.appendChild(a);
+                }
+            }
             loadMinerStats();
         });
         

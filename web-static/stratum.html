@@ -1221,6 +1221,21 @@
             });
         }
         
+        // Inject Explorer nav link if enabled
+        d3.json('../web/currency_info', function(info) {
+            if (info && info.explorer_enabled && info.explorer_url) {
+                var nav = document.querySelector('nav');
+                if (nav && !document.getElementById('nav-explorer')) {
+                    var a = document.createElement('a');
+                    a.id = 'nav-explorer';
+                    a.href = info.explorer_url;
+                    a.target = '_blank';
+                    a.textContent = 'Explorer';
+                    nav.appendChild(a);
+                }
+            }
+        });
+
         // Initial load
         update_stats();
         
