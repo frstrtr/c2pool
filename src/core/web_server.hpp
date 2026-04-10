@@ -1201,17 +1201,21 @@ private:
         double time;
         double pool_hash_rate;
         double pool_stale_prop;
-        nlohmann::json local_hash_rates;  // per-address hashrate (aggregated)
+        nlohmann::json local_hash_rates;       // {addr: hashrate}
+        nlohmann::json local_dead_hash_rates;  // {addr: dead_hashrate}
         int worker_count{0};              // unique address.worker combos
         int miner_count{0};               // unique base addresses
         int connected_count{0};           // raw stratum TCP connections
         uint64_t shares;
         uint64_t stale_shares;
         double current_payout;
-        nlohmann::json peers;         // {incoming, outgoing}
+        nlohmann::json current_payouts;   // {addr: payout_float}
+        nlohmann::json peers;             // {incoming: N, outgoing: N}
+        nlohmann::json desired_versions;  // {version_str: hashrate}
         double attempts_to_share;
         double attempts_to_block;
         double block_value;
+        double memory_usage{0};           // RSS in bytes
     };
     std::vector<StatLogEntry> m_stat_log;
     mutable std::mutex m_stat_log_mutex;

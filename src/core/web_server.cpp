@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cmath>
 #include <fstream>
+#include <unistd.h>
 #include <boost/process.hpp>
 #include <boost/algorithm/string.hpp>
 #include "btclibs/base58.h"
@@ -5788,96 +5789,100 @@ nlohmann::json MiningInterface::rest_web_log_json()
 
 nlohmann::json MiningInterface::rest_web_graph_data(const std::string& source, const std::string& view)
 {
-    // Graph data endpoint — returns p2pool-compatible time-series
-    // Format: array of [timestamp, value] tuples
-    // For pool_rates: [timestamp, {good: X, orphan: Y, null: Z}]
-    // For others:     [timestamp, scalar]
+    // p2pool-compatible graph data: array of [timestamp, value, width, default] 4-tuples.
+    // dict sources: [ts, {key: val} or null, width, 0]
+    // scalar sources: [ts, value, width, 0]
+    // data_to_lines() in graphs.html parses this format.
     nlohmann::json result = nlohmann::json::array();
 
     std::lock_guard<std::mutex> lock(m_stat_log_mutex);
     auto now = std::time(nullptr);
-    double window = 3600.0; // default: last hour
+    double window = 3600.0;
     if (view == "last_day") window = 86400.0;
     else if (view == "last_week") window = 604800.0;
     else if (view == "last_month") window = 2592000.0;
     else if (view == "last_year") window = 31536000.0;
+
+    // Compute bin width from stat_log interval (~300s) or use view-dependent default
+    double bin_width = 300.0;
 
     for (const auto& entry : m_stat_log) {
         if (entry.time < (now - static_cast<time_t>(window)))
             continue;
 
         if (source == "pool_rates") {
-            // p2pool format: [timestamp, {good, orphan, null}]
             nlohmann::json val = nlohmann::json::object();
-            val["good"] = entry.pool_hash_rate;
+            val["good"] = entry.pool_hash_rate * (1.0 - entry.pool_stale_prop);
             val["orphan"] = entry.pool_hash_rate * entry.pool_stale_prop;
-            val["null"] = 0.0;
-            result.push_back({entry.time, val});
+            val["dead"] = 0.0;
+            result.push_back({entry.time, val, bin_width, 0});
         }
         else if (source == "pool_hash_rate") {
-            result.push_back({entry.time, entry.pool_hash_rate});
+            result.push_back({entry.time, entry.pool_hash_rate, bin_width, 0});
         }
         else if (source == "pool_stale_prop") {
-            result.push_back({entry.time, entry.pool_stale_prop});
+            result.push_back({entry.time, entry.pool_stale_prop, bin_width, 0});
         }
         else if (source == "local_hash_rate") {
             double total = 0.0;
-            if (entry.local_hash_rates.is_object()) {
-                for (auto& [k, v] : entry.local_hash_rates.items()) {
-                    if (v.is_number())
-                        total += v.get<double>();
-                }
-            }
-            result.push_back({entry.time, total});
+            if (entry.local_hash_rates.is_object())
+                for (auto& [k, v] : entry.local_hash_rates.items())
+                    if (v.is_number()) total += v.get<double>();
+            result.push_back({entry.time, total, bin_width, 0});
         }
         else if (source == "local_dead_hash_rate") {
-            result.push_back({entry.time, 0.0});
-        }
-        else if (source == "worker_count") {
-            // Unique address.worker combos — 1 miner with 3 named workers = 3
-            result.push_back({entry.time, entry.worker_count});
-        }
-        else if (source == "unique_miner_count") {
-            // Unique base addresses — 3 rigs with same address = 1 miner
-            result.push_back({entry.time, entry.miner_count});
-        }
-        else if (source == "connected_miners") {
-            // Raw stratum TCP connections — 1 ASIC with 2 connections = 2
-            result.push_back({entry.time, entry.connected_count});
-        }
-        else if (source == "current_payout") {
-            result.push_back({entry.time, entry.current_payout});
-        }
-        else if (source == "peers") {
-            result.push_back({entry.time, entry.peers});
+            double total = 0.0;
+            if (entry.local_dead_hash_rates.is_object())
+                for (auto& [k, v] : entry.local_dead_hash_rates.items())
+                    if (v.is_number()) total += v.get<double>();
+            result.push_back({entry.time, total, bin_width, 0});
         }
         else if (source == "local_share_hash_rates") {
-            // Return per-miner data as object
-            result.push_back({entry.time, entry.local_hash_rates});
+            result.push_back({entry.time, entry.local_hash_rates, bin_width, 0});
         }
         else if (source == "miner_hash_rates") {
-            result.push_back({entry.time, entry.local_hash_rates});
+            result.push_back({entry.time, entry.local_hash_rates, bin_width, 0});
         }
         else if (source == "miner_dead_hash_rates") {
-            result.push_back({entry.time, nlohmann::json::object()});
+            result.push_back({entry.time, entry.local_dead_hash_rates, bin_width, 0});
+        }
+        else if (source == "current_payout") {
+            result.push_back({entry.time, entry.current_payout, bin_width, 0});
         }
         else if (source == "current_payouts") {
-            result.push_back({entry.time, nlohmann::json::object()});
+            result.push_back({entry.time, entry.current_payouts, bin_width, 0});
+        }
+        else if (source == "peers") {
+            result.push_back({entry.time, entry.peers, bin_width, 0});
         }
         else if (source == "desired_version_rates") {
-            result.push_back({entry.time, nlohmann::json::object()});
+            result.push_back({entry.time, entry.desired_versions, bin_width, 0});
+        }
+        else if (source == "worker_count") {
+            result.push_back({entry.time, entry.worker_count, bin_width, 0});
+        }
+        else if (source == "unique_miner_count") {
+            result.push_back({entry.time, entry.miner_count, bin_width, 0});
+        }
+        else if (source == "connected_miners") {
+            result.push_back({entry.time, entry.connected_count, bin_width, 0});
         }
         else if (source == "traffic_rate") {
-            result.push_back({entry.time, 0.0});
+            result.push_back({entry.time, nullptr, bin_width, 0});
         }
         else if (source == "getwork_latency") {
-            result.push_back({entry.time, 0.0});
+            result.push_back({entry.time, 0.0, bin_width, 0});
         }
         else if (source == "memory_usage") {
-            result.push_back({entry.time, 0.0});
+            result.push_back({entry.time, entry.memory_usage, bin_width, 0});
+        }
+        else if (source == "network_difficulty") {
+            double nd = 0;
+            // Use network difficulty from snapshot if available
+            result.push_back({entry.time, entry.pool_hash_rate > 0 ? m_network_difficulty.load() : 0.0, bin_width, 0});
         }
         else {
-            result.push_back({entry.time, 0.0});
+            result.push_back({entry.time, 0.0, bin_width, 0});
         }
     }
     return result;
@@ -5952,6 +5957,7 @@ void MiningInterface::update_stat_log()
     // unique_miner_count = unique base addresses,
     // connected_miners = raw stratum TCP connections.
     entry.local_hash_rates = nlohmann::json::object();
+    entry.local_dead_hash_rates = nlohmann::json::object();
     {
         auto workers = get_stratum_workers();
         entry.connected_count = static_cast<int>(workers.size());  // raw TCP connections
@@ -5959,19 +5965,18 @@ void MiningInterface::update_stat_log()
         for (const auto& [sid, w] : workers) {
             double existing = entry.local_hash_rates.value(w.username, 0.0);
             entry.local_hash_rates[w.username] = existing + w.hashrate;
-            // address.worker combo — e.g. "LTC1abc.rig1" is distinct from "LTC1abc.rig2"
+            double existing_dead = entry.local_dead_hash_rates.value(w.username, 0.0);
+            entry.local_dead_hash_rates[w.username] = existing_dead + w.dead_hashrate;
             std::string combo = w.username;
             if (!w.worker_name.empty()) combo += "." + w.worker_name;
             worker_combos.insert(combo);
         }
-        entry.miner_count = static_cast<int>(entry.local_hash_rates.size());  // unique addresses
-        entry.worker_count = static_cast<int>(worker_combos.size());          // unique address.worker
+        entry.miner_count = static_cast<int>(entry.local_hash_rates.size());
+        entry.worker_count = static_cast<int>(worker_combos.size());
     }
 
     entry.shares = 0;
     entry.stale_shares = 0;
-    // Note: sharechain_stats_fn is unsafe (concurrent tracker modification).
-    // Share count is non-critical for graphs — leave at 0 for now.
 
     // Current payout
     entry.current_payout = 0.0;
@@ -6012,6 +6017,36 @@ void MiningInterface::update_stat_log()
     }
     entry.peers = {{"incoming", incoming}, {"outgoing", outgoing}};
 
+    // Current payouts per address
+    entry.current_payouts = nlohmann::json::object();
+    {
+        auto cached = get_cached_pplns_outputs();
+        bool is_ltc = (m_blockchain == Blockchain::LITECOIN);
+        for (const auto& [script_hex, amount] : cached) {
+            auto script_bytes = ParseHex(script_hex);
+            std::string addr = core::script_to_address(script_bytes, is_ltc, m_testnet);
+            if (addr.empty()) addr = script_hex;
+            double coin_amt = static_cast<double>(amount) / 1e8;
+            if (entry.current_payouts.contains(addr))
+                coin_amt += entry.current_payouts[addr].get<double>();
+            entry.current_payouts[addr] = coin_amt;
+        }
+    }
+
+    // Desired version rates — p2pool: {version_str: hashrate}
+    entry.desired_versions = nlohmann::json::object();
+    if (m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        if (sc.contains("shares_by_version") && sc["shares_by_version"].is_object()) {
+            // Approximate: weight share version counts by pool hashrate
+            int total = sc.value("total_shares", 1);
+            for (auto& [ver, count] : sc["shares_by_version"].items()) {
+                double pct = (total > 0) ? count.get<double>() / total : 0.0;
+                entry.desired_versions[ver] = entry.pool_hash_rate * pct;
+            }
+        }
+    }
+
     double share_diff = m_network_difficulty.load(std::memory_order_relaxed) / 65536.0; // approx
     entry.attempts_to_share = share_diff * 4294967296.0;
     double net_diff = m_network_difficulty.load(std::memory_order_relaxed);
@@ -6023,6 +6058,18 @@ void MiningInterface::update_stat_log()
         std::lock_guard<std::mutex> lock(m_work_mutex);
         if (!m_cached_template.is_null())
             entry.block_value = m_cached_template.value("coinbasevalue", uint64_t(0)) / 1e8;
+    }
+
+    // Memory usage (RSS)
+    entry.memory_usage = 0;
+    {
+        std::ifstream statm("/proc/self/statm");
+        if (statm) {
+            long pages = 0;
+            statm >> pages; // first field is total, second is RSS
+            statm >> pages;
+            entry.memory_usage = static_cast<double>(pages) * sysconf(_SC_PAGESIZE);
+        }
     }
 
     {
