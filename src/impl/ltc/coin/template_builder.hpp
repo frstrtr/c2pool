@@ -163,6 +163,7 @@ public:
         const MWEBTracker* mweb_tracker = nullptr)
     {
         (void)is_testnet;  // reserved for future per-network rules
+        auto t0 = std::chrono::steady_clock::now();
 
         auto tip_opt = chain.tip();
         if (!tip_opt)
@@ -304,7 +305,9 @@ public:
                  << " tip_ts=" << tip.header.m_timestamp
                  << " now=" << now_ts
                  << " synced=" << chain.is_synced();
-        return rpc::WorkData{std::move(data), std::move(tx_objects), std::move(tx_hashes), 0};
+        auto t1 = std::chrono::steady_clock::now();
+        auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        return rpc::WorkData{std::move(data), std::move(tx_objects), std::move(tx_hashes), latency_ms};
     }
 
 };

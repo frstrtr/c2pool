@@ -860,6 +860,7 @@ private:
     std::atomic<bool>       m_work_valid{false};
     std::atomic<uint64_t>   m_work_generation{0};       // incremented on each refresh_work()
     std::atomic<int64_t>    m_last_work_update_time{0}; // monotonic seconds since epoch
+    std::atomic<double>     m_last_work_latency{0};    // template build latency (ms)
     nlohmann::json          m_cached_template;
 
 public:
@@ -1216,6 +1217,7 @@ private:
         double attempts_to_block;
         double block_value;
         double memory_usage{0};           // RSS in bytes
+        double work_latency{0};           // template build latency (ms)
     };
     std::vector<StatLogEntry> m_stat_log;
     mutable std::mutex m_stat_log_mutex;

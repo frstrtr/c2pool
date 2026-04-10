@@ -2121,6 +2121,7 @@ void MiningInterface::refresh_work()
         m_last_work_update_time   = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
 
+        m_last_work_latency.store(static_cast<double>(wd.m_latency), std::memory_order_relaxed);
         LOG_INFO << "[LTC] refresh_work: height=" << wd.m_data.value("height", 0)
                  << " txs=" << wd.m_hashes.size()
                  << " latency=" << wd.m_latency << "ms"
@@ -4287,6 +4288,10 @@ nlohmann::json MiningInterface::rest_web_currency_info()
     if (m_explorer_enabled && !m_explorer_url.empty())
         result["explorer_url"] = m_explorer_url;
 
+    // Mode indicators for conditional UI
+    result["embedded"] = (m_embedded_node != nullptr);
+    result["has_rpc"]  = (m_coin_rpc != nullptr);
+
     return result;
 }
 
@@ -5871,7 +5876,7 @@ nlohmann::json MiningInterface::rest_web_graph_data(const std::string& source, c
             result.push_back({entry.time, nullptr, bin_width, 0});
         }
         else if (source == "getwork_latency") {
-            result.push_back({entry.time, 0.0, bin_width, 0});
+            result.push_back({entry.time, entry.work_latency, bin_width, 0});
         }
         else if (source == "memory_usage") {
             result.push_back({entry.time, entry.memory_usage, bin_width, 0});
@@ -6071,6 +6076,9 @@ void MiningInterface::update_stat_log()
             entry.memory_usage = static_cast<double>(pages) * sysconf(_SC_PAGESIZE);
         }
     }
+
+    // Work latency (template build time in seconds, matching p2pool getwork_latency)
+    entry.work_latency = m_last_work_latency.load(std::memory_order_relaxed) / 1000.0;
 
     {
         std::lock_guard<std::mutex> lock(m_stat_log_mutex);
