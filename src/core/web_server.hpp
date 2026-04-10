@@ -648,26 +648,24 @@ public:
         m_main_thread_id = std::this_thread::get_id();
         LOG_INFO << "MiningInterface::set_io_context this=" << this << " ctx=" << ctx; }
 
-    /// Thread-safe cached callback entry.  Main thread computes + caches;
-    /// HTTP thread reads from cache instantly (never blocks).
+    /// Thread-safe cached callback entry.  Main thread computes + publishes;
+    /// HTTP thread reads a shared_ptr snapshot (lock-free, zero contention).
     template<typename R>
     struct CacheEntry {
         std::function<R()> fn;
-        mutable std::mutex mtx;
-        R cached{};
+        std::atomic<std::shared_ptr<const R>> cached{std::make_shared<const R>()};
 
         explicit CacheEntry(std::function<R()> f) : fn(std::move(f)) {}
 
         R refresh() {
-            R result = fn();
-            std::lock_guard<std::mutex> lk(mtx);
-            cached = std::move(result);
-            return cached;
+            auto result = std::make_shared<const R>(fn());
+            cached.store(result, std::memory_order_release);
+            return *result;
         }
 
         R get() const {
-            std::lock_guard<std::mutex> lk(mtx);
-            return cached;
+            auto snap = cached.load(std::memory_order_acquire);
+            return *snap;
         }
     };
 
