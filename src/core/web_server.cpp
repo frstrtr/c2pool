@@ -2955,10 +2955,9 @@ nlohmann::json MiningInterface::rest_checkpoints()
 
 nlohmann::json MiningInterface::rest_uptime()
 {
-    // Return daemon uptime in seconds
-    static auto start_time = std::chrono::steady_clock::now();
+    // Return daemon uptime in seconds (m_start_time set at MiningInterface construction)
     auto now = std::chrono::steady_clock::now();
-    auto uptime_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+    auto uptime_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - m_start_time).count();
     return nlohmann::json(uptime_seconds);
 }
 
