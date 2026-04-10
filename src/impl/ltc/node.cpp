@@ -1321,6 +1321,20 @@ void NodeImpl::run_think()
         // Flush verified hashes to LevelDB while lock is held
         flush_verified_to_leveldb();
 
+        // ── Work refresh on compute thread (while lock held) ──────────
+        // The PPLNS + MM coinbase rebuild is the remaining IO bottleneck:
+        // 0.8-2.9s per work refresh. Running it here on the compute thread
+        // with the exclusive lock keeps it off the IO thread entirely.
+        // Stratum notify_all() will be posted to the IO thread after.
+        if (best_changed) {
+            LOG_INFO << "[ASYNC-THINK] compute: work refresh starting (best changed)";
+            auto wr_t0 = std::chrono::steady_clock::now();
+            if (m_on_best_share_changed) m_on_best_share_changed();
+            auto wr_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - wr_t0).count();
+            LOG_INFO << "[ASYNC-THINK] compute: work refresh done in " << wr_ms << "ms";
+        }
+
       } catch (const std::exception& e) {
         LOG_ERROR << "run_think() failed on compute thread: " << e.what();
       } catch (...) {
@@ -1369,12 +1383,9 @@ void NodeImpl::run_think()
                 }
             }
 
-            // Trigger work refresh if best share changed
-            if (best_changed) {
-                LOG_INFO << "[ASYNC-THINK] IO-phase: best=" << m_best_share_hash.GetHex()
-                         << " triggering work refresh";
-                if (m_on_best_share_changed) m_on_best_share_changed();
-            } else if (result.best.IsNull()) {
+            // Work refresh already ran on compute thread (with exclusive lock).
+            // Log diagnostic if best was NULL.
+            if (result.best.IsNull()) {
                 LOG_WARNING << "[ASYNC-THINK] IO-phase: result.best is NULL — verified_tails="
                             << m_tracker.verified.get_tails().size()
                             << " verified_heads=" << m_tracker.verified.get_heads().size();
