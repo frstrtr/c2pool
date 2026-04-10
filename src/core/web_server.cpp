@@ -5315,6 +5315,14 @@ nlohmann::json MiningInterface::rest_merged_stats()
 
 nlohmann::json MiningInterface::rest_current_merged_payouts()
 {
+    // Fast path: return pre-computed cache from cache_pplns_at_tip()
+    // (called on main thread every time the tip changes)
+    {
+        std::lock_guard<std::mutex> lock(m_pplns_cache_mutex);
+        if (!m_pplns_per_tip.empty())
+            return m_pplns_per_tip.begin()->second;
+    }
+
     // Format: { "LTC_ADDRESS": { "amount": 0.123, "merged": [{"symbol":"DOGE","address":"D...","amount":0.456}] } }
     nlohmann::json result = nlohmann::json::object();
 

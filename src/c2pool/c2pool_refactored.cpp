@@ -6022,11 +6022,13 @@ int main(int argc, char* argv[]) {
             *cache_fn = [cache_timer, cache_fn, mi_ptr](boost::system::error_code ec) mutable {
                 if (ec) return;
                 mi_ptr->refresh_http_caches();
+                mi_ptr->cache_pplns_at_tip();   // keep merged payouts cache warm
                 cache_timer->expires_after(std::chrono::seconds(2));
                 cache_timer->async_wait(*cache_fn);
             };
             // Initial populate so dashboard has data immediately
             mi_ptr->refresh_http_caches();
+            mi_ptr->cache_pplns_at_tip();
             cache_timer->expires_after(std::chrono::seconds(2));
             cache_timer->async_wait(*cache_fn);
 
