@@ -847,6 +847,19 @@ void NodeImpl::download_shares(peer_ptr /*unused_peer*/, const uint256& target_h
     // Already downloading this hash — avoid duplicate requests
     if (m_downloading_shares.count(target_hash))
         return;
+
+    // Stop requesting hashes that have returned empty too many times —
+    // the share is pruned from the network. p2pool uses reactive desired_var
+    // + sleep(1) backoff; we use explicit failure counting.
+    if (m_download_fail_count[target_hash] >= MAX_EMPTY_RETRIES) {
+        static int fail_log = 0;
+        if (fail_log++ % 20 == 0)
+            LOG_INFO << "[Pool] Skipping permanently failed hash "
+                     << target_hash.ToString().substr(0,16)
+                     << " (failed " << m_download_fail_count[target_hash] << " times)";
+        return;
+    }
+
     m_downloading_shares.insert(target_hash);
 
     // p2pool: if len(self.peers) == 0: sleep(1); continue
@@ -919,12 +932,19 @@ void NodeImpl::download_shares(peer_ptr /*unused_peer*/, const uint256& target_h
 
             if (reply.m_items.empty())
             {
-                // Empty reply = timeout or peer had no matching shares (p2pool: sleep(1), continue)
-                LOG_INFO << "[Pool] Share request completed with no data for "
+                // Empty reply = timeout or peer had no matching shares.
+                // Track failures — stop requesting after MAX_EMPTY_RETRIES.
+                auto& fail_cnt = m_download_fail_count[target_hash];
+                ++fail_cnt;
+                LOG_INFO << "[Pool] Share request empty for "
                          << target_hash.ToString().substr(0,16)
-                         << " (timeout or empty reply from " << peer_addr_for_log.to_string() << ")";
+                         << " from " << peer_addr_for_log.to_string()
+                         << " (fail " << fail_cnt << "/" << MAX_EMPTY_RETRIES << ")";
                 return;
             }
+
+            // Success — clear failure count for this hash
+            m_download_fail_count.erase(target_hash);
 
             LOG_INFO << "[Pool] Received " << reply.m_items.size() << " shares for download request";
 
@@ -1367,6 +1387,10 @@ void NodeImpl::run_think()
 
             // Clear stale download set (p2pool node.py:108-141)
             m_downloading_shares.clear();
+
+            // Cap fail-count map to prevent unbounded growth
+            if (m_download_fail_count.size() > 1000)
+                m_download_fail_count.clear();
 
             // Request desired shares from random peers
             if (!result.desired.empty() && !m_peers.empty()) {

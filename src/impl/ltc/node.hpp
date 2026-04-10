@@ -325,6 +325,13 @@ protected:
     std::set<uint256> m_rejected_share_hashes; // shares rejected by peers — never re-broadcast
     std::set<uint256> m_downloading_shares;   // hashes currently being fetched
 
+    // Track share hashes that peers couldn't provide (empty reply).
+    // After MAX_EMPTY_RETRIES failures, stop requesting — the share is
+    // pruned from the network. p2pool avoids this via reactive desired_var
+    // + sleep(1) backoff. We use explicit failure counting.
+    static constexpr int MAX_EMPTY_RETRIES = 3;
+    std::unordered_map<uint256, int, ShareHasher> m_download_fail_count;
+
     // Track req_id → peer addr for selective cancellation on disconnect.
     // p2pool has per-peer get_shares (GenericDeferrer), so connectionLost calls
     // respond_all() on just that peer's deferrer. c2pool has a shared m_share_getter,
