@@ -217,7 +217,8 @@ public:
 
     // Merged mining endpoints
     nlohmann::json rest_merged_stats();              // /merged_stats — merged mining statistics
-    nlohmann::json rest_current_merged_payouts();    // /current_merged_payouts — merged payouts
+    nlohmann::json rest_current_merged_payouts();    // /current_merged_payouts — cached wrapper
+    nlohmann::json compute_current_merged_payouts(); // full computation (main thread only)
     nlohmann::json rest_recent_merged_blocks();      // /recent_merged_blocks — recent merged blocks
     nlohmann::json rest_all_merged_blocks();         // /all_merged_blocks — all merged blocks
     nlohmann::json rest_discovered_merged_blocks();  // /discovered_merged_blocks — merged block proofs
@@ -941,6 +942,9 @@ private:
     std::mutex m_pplns_cache_mutex;
     std::unordered_map<std::string, nlohmann::json> m_pplns_per_tip;
     std::atomic<bool> m_pplns_precompute_done{false};
+    // Cached full merged payouts (LTC + DOGE) — updated by cache_pplns_at_tip()
+    mutable std::mutex m_merged_payouts_mutex;
+    nlohmann::json m_cached_merged_payouts;
     std::thread m_pplns_precompute_thread;
     struct SSESubscriber {
         std::shared_ptr<tcp::socket> socket;

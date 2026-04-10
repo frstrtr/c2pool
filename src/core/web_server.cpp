@@ -3461,9 +3461,16 @@ void MiningInterface::cache_pplns_at_tip()
     if (tip.empty()) return;
 
     // Compute full merged PPLNS (LTC + DOGE with donation) and cache
-    auto pplns = rest_current_merged_payouts();
+    auto pplns = compute_current_merged_payouts();
     if (pplns.is_null() || pplns.empty()) return;
 
+    // Update dedicated merged payouts cache (for /current_merged_payouts endpoint)
+    {
+        std::lock_guard<std::mutex> lock(m_merged_payouts_mutex);
+        m_cached_merged_payouts = pplns;
+    }
+
+    // Also store in per-tip cache (for window PPLNS overlay)
     std::lock_guard<std::mutex> lock(m_pplns_cache_mutex);
     m_pplns_per_tip[tip] = std::move(pplns);
 }
@@ -5313,16 +5320,9 @@ nlohmann::json MiningInterface::rest_merged_stats()
     return result;
 }
 
-nlohmann::json MiningInterface::rest_current_merged_payouts()
+nlohmann::json MiningInterface::compute_current_merged_payouts()
 {
-    // Fast path: return pre-computed cache from cache_pplns_at_tip()
-    // (called on main thread every time the tip changes)
-    {
-        std::lock_guard<std::mutex> lock(m_pplns_cache_mutex);
-        if (!m_pplns_per_tip.empty())
-            return m_pplns_per_tip.begin()->second;
-    }
-
+    // Full computation — called by cache_pplns_at_tip() on main thread.
     // Format: { "LTC_ADDRESS": { "amount": 0.123, "merged": [{"symbol":"DOGE","address":"D...","amount":0.456}] } }
     nlohmann::json result = nlohmann::json::object();
 
@@ -5483,6 +5483,15 @@ nlohmann::json MiningInterface::rest_current_merged_payouts()
         filtered[key] = entry;
     }
     return filtered;
+}
+
+nlohmann::json MiningInterface::rest_current_merged_payouts()
+{
+    // Return pre-computed cache from cache_pplns_at_tip() (main thread, every 2s)
+    std::lock_guard<std::mutex> lock(m_merged_payouts_mutex);
+    if (!m_cached_merged_payouts.is_null() && !m_cached_merged_payouts.empty())
+        return m_cached_merged_payouts;
+    return nlohmann::json::object();
 }
 
 nlohmann::json MiningInterface::rest_recent_merged_blocks()
