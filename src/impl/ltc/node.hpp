@@ -16,6 +16,7 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <shared_mutex>
 #include <random>
 
 namespace ltc
@@ -51,14 +52,30 @@ protected:
     // Keeps expensive crypto off the io_context thread.
     boost::asio::thread_pool m_verify_pool{4};
 
-    // Dedicated single thread for think() validation (Litecoin Core pattern:
-    // validation runs on its own thread, never blocking the net/ioc thread).
-    // m_cs_tracker serializes access to m_tracker between think_pool and ioc,
-    // matching Litecoin Core's cs_main mutex pattern.
+    // ── Async compute pipeline ──────────────────────────────────────────
+    // think() runs on m_think_pool (1 thread) holding m_tracker_mutex exclusively.
+    // The IO thread NEVER calls lock() — only try_to_lock(). If the mutex is
+    // held by the compute thread, the IO thread defers the operation and continues
+    // processing network I/O, keepalive timers, and stratum. This eliminates the
+    // event loop freeze that previously caused all peers to timeout simultaneously.
+    //
+    // Synchronization contract:
+    //   Compute thread: unique_lock(m_tracker_mutex)     — exclusive, blocking
+    //   IO thread reads: shared_lock(try_to_lock)        — non-blocking, skip if busy
+    //   IO thread writes: unique_lock(try_to_lock)       — non-blocking, queue if busy
     boost::asio::thread_pool m_think_pool{1};
     std::atomic<bool> m_think_running{false};
     std::atomic<bool> m_clean_running{false};
-    std::recursive_mutex m_cs_tracker;
+    mutable std::shared_mutex m_tracker_mutex;
+
+    // Pending share batches queued while think() holds the mutex.
+    // Drained on the IO thread after think() releases the lock.
+    // Uses unique_ptr because HandleSharesData is forward-declared here.
+    struct PendingShareBatch {
+        std::unique_ptr<HandleSharesData> data;
+        NetService addr;
+    };
+    std::vector<PendingShareBatch> m_pending_adds;
 
     // Top-5 scored heads from last think() — used by clean_tracker()
     // to protect the best chains from head pruning (p2pool node.py:363).
@@ -248,6 +265,14 @@ public:
     /// Matches p2pool's clean_tracker() (node.py:355-402).
     void clean_tracker();
 
+    /// Drain share batches queued while think() held the tracker mutex.
+    /// Called on the IO thread after think() releases the lock.
+    void drain_pending_adds();
+
+    /// p2pool-style heartbeat: chain height, local/pool hashrate, orphan/DOA stats.
+    /// Runs on a separate 30s timer — diagnostic only, not consensus-critical.
+    void heartbeat_log();
+
     /// Set the block_rel_height function used by run_think() for chain scoring.
     /// fn(block_hash) should return confirmations from the coin daemon:
     ///   >= 0 : block is in main chain (0 = tip, higher = deeper)
@@ -326,10 +351,9 @@ protected:
     std::map<NetService, std::chrono::steady_clock::time_point> m_ban_list;
     std::chrono::seconds m_ban_duration{300}; // 5 minutes (configurable)
 
-    // Rate-limit run_think(): minimum interval between calls
-    std::chrono::steady_clock::time_point m_last_think_time{};
-    // p2pool: 0ms (synchronous, no rate limit). Match exactly.
-    static constexpr std::chrono::milliseconds THINK_MIN_INTERVAL{0};
+    // Rate-limiting no longer needed: think() runs on a dedicated compute
+    // thread (m_think_pool), serialized by m_think_running atomic flag.
+    // The IO thread never blocks. p2pool's reactor.callLater equivalent.
 
     // Cache limits (configurable)
     size_t m_max_shared_hashes = 50000;

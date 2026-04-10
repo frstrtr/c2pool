@@ -5202,6 +5202,24 @@ int main(int argc, char* argv[]) {
                 think_timer->async_wait(think_tick);
             }
 
+            // Heartbeat timer (every 30s): p2pool-style status lines.
+            // Separated from think() to avoid blocking the compute thread
+            // with diagnostic chain walks. Runs on IO thread with shared_lock.
+            auto heartbeat_timer = std::make_shared<boost::asio::steady_timer>(ioc);
+            std::function<void(boost::system::error_code)> heartbeat_tick;
+            if (p2p_node) {
+                heartbeat_tick = [&, heartbeat_timer](boost::system::error_code ec) {
+                    if (ec || g_shutdown_requested) return;
+                    heartbeat_timer->expires_after(std::chrono::seconds(30));
+                    heartbeat_timer->async_wait(heartbeat_tick);
+                    try {
+                        p2p_node->heartbeat_log();
+                    } catch (...) {}
+                };
+                heartbeat_timer->expires_after(std::chrono::seconds(10));
+                heartbeat_timer->async_wait(heartbeat_tick);
+            }
+
             // Periodic monitoring timer (every 30 seconds)
             // Solo/custodial: no tracker to monitor.
             auto monitor_timer = std::make_shared<boost::asio::steady_timer>(ioc);

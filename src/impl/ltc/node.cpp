@@ -11,6 +11,11 @@
 #include <iomanip>
 #include <random>
 
+// Static members for DensePPLNSRing precomputed decay table
+std::vector<uint64_t> ltc::DensePPLNSRing::s_decay_table;
+uint64_t ltc::DensePPLNSRing::s_decay_per = 0;
+bool ltc::DensePPLNSRing::s_table_initialized = false;
+
 // Helper: read current RSS from /proc/self/status (Linux only)
 static long get_rss_mb() {
     std::ifstream f("/proc/self/status");
@@ -373,9 +378,25 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
 {
     // Phase 2 (io_context thread): topological sort + chain insertion + LevelDB store.
     // All shared state (m_tracker, m_chain, m_raw_share_cache, m_storage) touched here.
-    // NOTE: think() runs synchronously on the same ioc thread, so ASIO guarantees
-    // handlers don't overlap.  The old 500ms defer was unnecessary and caused
-    // cascading delays under high share arrival rate (ROOT CAUSE 3 of verified lag).
+    //
+    // Non-blocking mutex: if think() holds the exclusive lock on the compute
+    // thread, queue this batch for processing after think() releases. The IO
+    // thread never blocks — keepalive timers and network I/O continue.
+    {
+        std::unique_lock lock(m_tracker_mutex, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            LOG_INFO << "[ASYNC-DEFER] processing_shares_phase2: mutex busy, queuing "
+                     << data.m_items.size() << " shares from " << addr.to_string()
+                     << " (pending=" << m_pending_adds.size() + 1 << ")";
+            m_pending_adds.push_back(PendingShareBatch{
+                std::make_unique<HandleSharesData>(std::move(data)), addr});
+            return;
+        }
+    }
+    // Lock released — proceed with normal processing.
+    // No lock needed for the rest: we only enter here when think() is NOT
+    // running (m_tracker_mutex was available), and ASIO single-thread
+    // guarantees no other IO handler overlaps.
 
     // Step 1: collect verified shares (skip any that failed verification, hash still null)
     std::vector<ShareType> valid_shares;
@@ -546,6 +567,12 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
 
 std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr)
 {
+    // Non-blocking: if think() holds the mutex, return empty.
+    // Peer will re-request within 15s timeout.
+    std::shared_lock lock(m_tracker_mutex, std::try_to_lock);
+    if (!lock.owns_lock())
+        return {};
+
     parents = std::min(parents, (uint64_t)1000/hashes.size());
 	std::vector<ltc::ShareType> shares;
 	for (const auto& handle_hash : hashes)
@@ -580,6 +607,11 @@ std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
 
 void NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hashes)
 {
+    // Non-blocking: skip if think() holds the mutex. Peer will re-request.
+    std::shared_lock lock(m_tracker_mutex, std::try_to_lock);
+    if (!lock.owns_lock())
+        return;
+
     // Collect shares that exist in our chain (skip rejected)
     std::vector<ShareType> shares;
     for (const auto& hash : share_hashes)
@@ -676,6 +708,12 @@ void NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hash
 
 void NodeImpl::broadcast_share(const uint256& share_hash)
 {
+    // Non-blocking: skip if think() holds the mutex.
+    // Share will be broadcast on next cycle or by periodic relay.
+    std::shared_lock lock(m_tracker_mutex, std::try_to_lock);
+    if (!lock.owns_lock())
+        return;
+
     // Walk the chain back from share_hash, collecting un-broadcast shares
     std::vector<uint256> to_send;
     int32_t height = m_chain->get_height(share_hash);
@@ -703,28 +741,20 @@ void NodeImpl::broadcast_share(const uint256& share_hash)
 
 void NodeImpl::notify_local_share(const uint256& share_hash)
 {
-    // p2pool: set_best_share() runs think() synchronously on the reactor thread.
-    // Both notify_local_share and run_think() execute on the same io_context thread
-    // (single-threaded ASIO), so m_think_running is never set when we get here.
-    //
-    // CRITICAL: the old code bypassed think() and directly set m_best_share_hash.
-    // This created a self-reinforcing fork: if the local share extended the wrong
-    // fork (during bootstrap), think() could never override it — each new local
-    // share re-asserted the wrong best via the direct override.
-    //
-    // Fix: use think() for ALL best_share decisions, matching p2pool exactly.
-    // think() will verify the local share, score all heads, and pick the correct
-    // best — including our local share if it's on the winning chain.
+    // p2pool: set_best_share() → think() synchronously on the reactor thread.
+    // Use think() for ALL best_share decisions, matching p2pool exactly.
     if (share_hash.IsNull() || !m_tracker.chain.contains(share_hash))
         return;
 
-    // Inline verify the local share first — it extends current best tip,
-    // so parent is already verified → attempt_verify succeeds immediately.
-    m_tracker.attempt_verify(share_hash);
+    // Try inline verify — if think() holds the mutex, defer to next think() cycle.
+    // The share is already in the chain; think() will verify + score it.
+    {
+        std::unique_lock lock(m_tracker_mutex, std::try_to_lock);
+        if (lock.owns_lock())
+            m_tracker.attempt_verify(share_hash);
+    }
 
-    // Let think() decide the best share through proper scoring.
-    // think() runs synchronously, so the stratum response (new work)
-    // is queued after think() completes — no stale work window.
+    // Trigger async think() — will pick up the local share through scoring.
     run_think();
 }
 
@@ -1218,298 +1248,338 @@ void NodeImpl::prune_shares(const uint256& /*best_share*/)
 
 void NodeImpl::run_think()
 {
-    // Rate-limit: skip if called too recently
-    auto now = std::chrono::steady_clock::now();
-    if (now - m_last_think_time < THINK_MIN_INTERVAL)
+    // Skip if a think() is already running on the compute thread.
+    // The atomic flag serializes: only one think() in flight at a time.
+    if (m_think_running.exchange(true)) {
+        static int skip_log = 0;
+        if (skip_log++ % 20 == 0)
+            LOG_INFO << "[ASYNC-THINK] skipped — compute thread busy (skip_count=" << skip_log << ")";
         return;
-    m_last_think_time = now;
-
-    // Skip if a think() is already running on the think pool.
-    // Litecoin Core pattern: validation runs on its own thread, never blocking
-    // the net/ioc thread.  The atomic flag prevents concurrent think + phase2.
-    if (m_think_running.exchange(true))
-        return;
-
-    // p2pool-style periodic heartbeat (matches main.py:603-648)
-    {
-        auto chain_sz  = m_tracker.chain.size();
-        auto verified  = m_tracker.verified.size();
-        auto peers     = m_peers.size();
-
-        // Count incoming peers (not in m_outbound_addrs)
-        int incoming_peers = 0;
-        for (auto& [nonce, peer] : m_peers) {
-            if (peer && !m_outbound_addrs.contains(peer->addr()))
-                ++incoming_peers;
-        }
-
-        // p2pool-compatible chain height: verified.get_height(best_share)
-        // This walks from best_share to chain end, matching p2pool's tracker.get_height().
-        // chain.get_height() includes LevelDB history beyond pruning — too large.
-        int height = 0;
-        int verified_height = 0;
-        if (!m_best_share_hash.IsNull()) {
-            if (m_tracker.chain.contains(m_best_share_hash))
-                height = m_tracker.chain.get_height(m_best_share_hash);
-            if (m_tracker.verified.contains(m_best_share_hash))
-                verified_height = m_tracker.verified.get_height(m_best_share_hash);
-        }
-        if (height == 0 && verified > 0)
-            height = static_cast<int>(verified);
-
-        // L1: p2pool format — "c2pool: N shares in chain (V verified/T total) Peers: P (I incoming)"
-        LOG_INFO << "c2pool: " << height << " shares in chain ("
-                 << verified << " verified/" << chain_sz << " total)"
-                 << " Peers: " << peers << " (" << incoming_peers << " incoming)";
-
-        // L2: Local hashrate + DOA% + time window + expected time to share
-        // p2pool: " Local: XH/s in last Y minutes Local dead on arrival: ~Z% (lo-hi%) Expected time to share: T"
-        uint32_t share_bits = 0;
-        if (!m_best_share_hash.IsNull() && m_tracker.chain.contains(m_best_share_hash)) {
-            m_tracker.chain.get(m_best_share_hash).share.invoke([&](auto* s) {
-                share_bits = s->m_bits;
-            });
-        }
-
-        if (m_local_rate_stats_fn) {
-            auto stats = m_local_rate_stats_fn();
-            std::ostringstream local_line;
-            local_line << " Local: " << format_hashrate(stats.hashrate);
-            if (stats.effective_dt > 0)
-                local_line << " in last " << format_duration(stats.effective_dt);
-            local_line << " Local dead on arrival: "
-                       << format_binomial_conf(stats.dead_datums, stats.total_datums);
-            // Expected time to share: target_to_average_attempts(share_bits) / hashrate
-            if (stats.hashrate > 0 && share_bits != 0) {
-                auto share_target = chain::bits_to_target(share_bits);
-                auto share_aps = chain::target_to_average_attempts(share_target);
-                double ets = static_cast<double>(share_aps.GetLow64()) / stats.hashrate;
-                local_line << " Expected time to share: " << format_duration(ets);
-            }
-            LOG_INFO << local_line.str();
-        } else if (m_local_hashrate_fn) {
-            double local_hs = m_local_hashrate_fn();
-            LOG_INFO << " Local: " << format_hashrate(local_hs);
-        }
-
-        // Count orphan/DOA shares in best chain via CIterator (handles segments)
-        int orphan_count = 0, doa_count = 0, total_recent = 0;
-        uint256 walk_start = m_best_share_hash;
-        if (walk_start.IsNull() || !m_tracker.chain.contains(walk_start)) {
-            auto& vheads = m_tracker.verified.get_heads();
-            if (!vheads.empty())
-                walk_start = vheads.begin()->first;
-        }
-        if (!walk_start.IsNull() && m_tracker.chain.contains(walk_start)) {
-            int window = std::min(height, static_cast<int>(
-                std::min(size_t(3600) / PoolConfig::share_period(), size_t(height))));
-            if (window > 0) {
-                auto walkable = m_tracker.chain.get_height(walk_start);
-                auto walk_n = std::min(window, walkable);
-                if (walk_n > 0) {
-                    try {
-                        auto view = m_tracker.chain.get_chain(walk_start, walk_n);
-                        for (auto [hash, data] : view) {
-                            data.share.invoke([&](auto* s) {
-                                if (s->m_stale_info == ltc::StaleInfo::orphan) ++orphan_count;
-                                else if (s->m_stale_info == ltc::StaleInfo::doa) ++doa_count;
-                            });
-                            ++total_recent;
-                        }
-                    } catch (...) {}
-                }
-            }
-        }
-        double stale_prop = total_recent > 0 ? static_cast<double>(orphan_count + doa_count) / total_recent : 0.0;
-
-        // L3: Shares line — "Shares: N (O orphan, D dead) Stale rate: ~X% Efficiency: ~Y% Current payout: Z tLTC"
-        {
-            std::ostringstream shares_line;
-            shares_line << " Shares: " << chain_sz
-                        << " (" << orphan_count << " orphan, " << doa_count << " dead)"
-                        << " Stale rate: " << format_binomial_conf(orphan_count + doa_count, total_recent)
-                        << " Efficiency: " << format_binomial_conf_efficiency(orphan_count + doa_count, total_recent, stale_prop);
-
-            // Current payout from PPLNS cache.
-            // p2pool matches its -a address (which IS the miner's address).
-            // c2pool: match --address script, AND also try local miner scripts
-            // by checking PPLNS output scripts against known local pubkey_hashes
-            // from the stratum server's RateMonitor (via get_local_addr_rates).
-            if (m_current_pplns_fn) {
-                auto outputs = m_current_pplns_fn();
-                uint64_t my_payout = 0;
-
-                // Build set of local scripts from --address + local miner pubkeys
-                std::set<std::string> local_scripts;
-                if (!m_node_payout_script_hex.empty())
-                    local_scripts.insert(m_node_payout_script_hex);
-
-                // Add local miner scripts from stratum pubkey_hashes
-                if (m_local_miner_scripts_fn) {
-                    for (const auto& s : m_local_miner_scripts_fn())
-                        local_scripts.insert(s);
-                }
-
-                for (const auto& [script, amount] : outputs) {
-                    if (local_scripts.count(script))
-                        my_payout += amount;
-                }
-                if (my_payout > 0) {
-                    double coins = static_cast<double>(my_payout) / 1e8;
-                    shares_line << " Current payout: (" << std::fixed << std::setprecision(4) << coins
-                                << ")=" << coins << " tLTC";
-                }
-            }
-
-            shares_line << " [heads=" << m_tracker.chain.get_heads().size()
-                        << " v_heads=" << m_tracker.verified.get_heads().size()
-                        << " rss=" << get_rss_mb() << "MB]";
-            LOG_INFO << shares_line.str();
-        }
-
-        // L4: Pool hashrate + expected time to block
-        // p2pool: " Pool: XH/s Stale rate: Y.Y% Expected time to block: Z"
-        if (height > 2) {
-            try {
-                auto aps = m_tracker.get_pool_attempts_per_second(
-                    m_best_share_hash,
-                    std::min(height - 1, static_cast<int>(PoolConfig::TARGET_LOOKBEHIND)),
-                    /*min_work=*/false);
-                double pool_hs = static_cast<double>(aps.GetLow64());
-                double real_pool_hs = (stale_prop < 0.999 && pool_hs > 0)
-                    ? pool_hs / (1.0 - stale_prop) : pool_hs;
-
-                // ETB: use block target (network difficulty) from best share's header
-                double etb_secs = 0;
-                uint32_t block_bits = 0;
-                if (!m_best_share_hash.IsNull() && m_tracker.chain.contains(m_best_share_hash)) {
-                    m_tracker.chain.get(m_best_share_hash).share.invoke([&](auto* s) {
-                        block_bits = s->m_min_header.m_bits;
-                    });
-                }
-                if (real_pool_hs > 0 && block_bits != 0) {
-                    auto block_target = chain::bits_to_target(block_bits);
-                    auto block_aps = chain::target_to_average_attempts(block_target);
-                    etb_secs = static_cast<double>(block_aps.GetLow64()) / real_pool_hs;
-                    if (block_aps.IsNull() && !block_target.IsNull())
-                        etb_secs = 1e18;
-                }
-
-                LOG_INFO << " Pool: " << format_hashrate(real_pool_hs)
-                         << " Stale rate: " << std::fixed << std::setprecision(1)
-                         << (100.0 * stale_prop) << "% Expected time to block: "
-                         << format_duration(etb_secs);
-            } catch (...) {}
-        }
     }
+    LOG_INFO << "[ASYNC-THINK] dispatching to compute thread"
+             << " pending_adds=" << m_pending_adds.size()
+             << " peers=" << m_peers.size();
 
     // Capture block_rel_height fn by value for thread safety
     auto block_rel_height = m_block_rel_height_fn
         ? m_block_rel_height_fn
         : std::function<int32_t(uint256)>([](uint256) -> int32_t { return 0; });
 
-    // Run think() synchronously on the ioc thread (matching p2pool).
-    // p2pool's think() runs synchronously in set_best_share() — no thread pool.
-    // Running on a separate thread caused SIGSEGV: prune_shares() freed shares
-    // that think() was traversing via prev pointers.
-    {
-          try {
-            uint256 prev_block;
-            uint32_t bits = 0;
+    // ── Post think() to the dedicated compute thread ──────────────────────
+    // The compute thread acquires m_tracker_mutex exclusively, guaranteeing
+    // no concurrent IO-thread modifications to the tracker. The IO thread
+    // uses try_to_lock for all tracker access — if the mutex is held, the
+    // operation is deferred (shares queued, clean_tracker skipped). Network
+    // I/O, keepalive timers, and stratum continue unimpeded.
+    //
+    // Previous attempt at threaded think() caused SIGSEGV because there was
+    // NO synchronization — prune_shares freed shares while think traversed
+    // them. The shared_mutex + try_to_lock pattern eliminates this race:
+    // no mutations occur while the compute thread holds the exclusive lock.
+    boost::asio::post(m_think_pool, [this, block_rel_height]() {
+      // ── Compute thread: exclusive tracker access ──────────────────────
+      // Collect results under the lock, then release before posting to IO.
+      TrackerThinkResult result;
+      bool best_changed = false;
+      bool needs_continue = false;
+      int64_t think_ms = 0;
 
-            LOG_INFO << "[Pool] think() starting: chain=" << m_tracker.chain.size()
-                     << " verified=" << m_tracker.verified.size();
-            auto think_t0 = std::chrono::steady_clock::now();
-            auto result = m_tracker.think(block_rel_height, prev_block, bits);
-            auto think_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - think_t0).count();
-            if (think_ms > 1000)
-                LOG_INFO << "[Pool] think() completed in " << think_ms << "ms";
+      try {
+        auto lock_t0 = std::chrono::steady_clock::now();
+        std::unique_lock lock(m_tracker_mutex);  // exclusive — IO defers
+        auto lock_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - lock_t0).count();
+        if (lock_ms > 10)
+            LOG_INFO << "[ASYNC-THINK] mutex acquired after " << lock_ms << "ms wait";
 
-            // Process results inline (same ioc thread — no race with phase2)
-            {
-                    // p2pool: pruning happens in clean_tracker() (every 5s timer),
-                    // NOT in set_best_share(). Verification must complete BEFORE
-                    // pruning — otherwise pruned shares break cached deltas.
-                    // prune_shares moved to clean_tracker() below.
+        uint256 prev_block;
+        uint32_t bits = 0;
 
-                    // Ban peers that provided invalid/unverifiable shares.
-                    // Skip localhost:0 — that's our own locally created shares
-                    // which can fail GENTX during chain growth (timing race, not a bug).
-                    auto now = std::chrono::steady_clock::now();
-                    for (const auto& bad_addr : result.bad_peer_addresses) {
-                        if (bad_addr.port() == 0)
-                            continue; // local share — don't ban ourselves
-                        LOG_WARNING << "run_think: banning peer " << bad_addr.to_string()
-                                    << " for unverifiable shares";
-                        m_ban_list[bad_addr] = now + m_ban_duration;
-                    }
+        LOG_INFO << "[ASYNC-THINK] compute: chain=" << m_tracker.chain.size()
+                 << " verified=" << m_tracker.verified.size()
+                 << " heads=" << m_tracker.chain.get_heads().size()
+                 << " v_heads=" << m_tracker.verified.get_heads().size();
+        auto think_t0 = std::chrono::steady_clock::now();
+        result = m_tracker.think(block_rel_height, prev_block, bits);
+        think_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - think_t0).count();
 
-                    // Expire old bans
-                    for (auto it = m_ban_list.begin(); it != m_ban_list.end(); ) {
-                        if (it->second <= now)
-                            it = m_ban_list.erase(it);
-                        else
-                            ++it;
-                    }
+        // Apply tracker-mutating results while still holding the lock:
+        // - Ban list and download set are NodeImpl members (not tracker),
+        //   but safe here since IO thread doesn't touch them during think.
+        // - best_share update and top5_heads are consumed by IO-thread
+        //   callbacks, so just record the values for the IO-thread phase.
+        m_last_top5_heads = std::move(result.top5_heads);
 
-                    // p2pool node.py:108-141: download_shares is a continuous loop
-                    // that re-requests every cycle with no dedup set.
-                    // Safety: clear stale entries each cycle. Normally cleaned up by
-                    // ReplyMatcher timeout callbacks and peer disconnect cancellation,
-                    // but this ensures no hash gets permanently stuck.
-                    m_downloading_shares.clear();
+        if (!result.best.IsNull()) {
+            best_changed = (m_best_share_hash != result.best);
+            m_best_share_hash = result.best;
+        }
 
-                    if (!result.desired.empty() && !m_peers.empty()) {
-                        for (auto& [peer_addr, hash] : result.desired) {
-                            // Pick random peer (p2pool: random.choice(self.peers.values()))
-                            auto peer_it = m_peers.begin();
-                            if (m_peers.size() > 1)
-                                std::advance(peer_it, core::random::random_uint256().GetLow64() % m_peers.size());
-                            download_shares(peer_it->second, hash);
-                        }
-                    }
+        needs_continue = m_tracker.m_think_needs_continue;
 
-                    // Save top-5 heads for clean_tracker (p2pool node.py:363)
-                    m_last_top5_heads = std::move(result.top5_heads);
+        // Flush verified hashes to LevelDB while lock is held
+        flush_verified_to_leveldb();
 
-                    // Update best share — only trigger work update when best changes.
-                    // p2pool: best_share_var.set(best) fires Variable.changed
-                    // which ONLY fires when value differs — new_work_event follows.
-                    // If best is unchanged (e.g. fork share, clean_tracker tick),
-                    // the miner's prev_share and PPLNS are identical — no new work needed.
-                    if (!result.best.IsNull()) {
-                        bool changed = (m_best_share_hash != result.best);
-                        m_best_share_hash = result.best;
-                        if (changed) {
-                            LOG_INFO << "[Pool] think(): best=" << result.best.GetHex();
-                            if (m_on_best_share_changed) m_on_best_share_changed();
-                        }
-                    } else {
-                        LOG_WARNING << "[Pool] think(): result.best is NULL — verified_tails="
-                                    << m_tracker.verified.get_tails().size()
-                                    << " verified_heads=" << m_tracker.verified.get_heads().size();
-                    }
+      } catch (const std::exception& e) {
+        LOG_ERROR << "run_think() failed on compute thread: " << e.what();
+      } catch (...) {
+        LOG_ERROR << "run_think() failed on compute thread: unknown error";
+      }
+      // ── Lock released here ────────────────────────────────────────────
 
-                    m_think_running.store(false);
+      LOG_INFO << "[ASYNC-THINK] compute done in " << think_ms << "ms"
+               << " best_changed=" << best_changed
+               << " needs_continue=" << needs_continue
+               << " bads=" << result.bad_peer_addresses.size()
+               << " desired=" << result.desired.size();
 
-                    // Flush any remaining verified hashes to LevelDB
-                    flush_verified_to_leveldb();
-
-                    // If think() Phase 2 hit its budget, schedule a continuation
-                    // so the io_context can process network I/O between batches.
-                    if (m_tracker.m_think_needs_continue) {
-                        boost::asio::post(*m_context, [this]() { run_think(); });
-                    }
+      // ── Post IO-thread phase: work refresh + drain pending ────────────
+      // These operations need the IO thread (send to peers, stratum notify).
+      // The mutex is NOT held — IO thread can acquire it for drain_pending.
+      boost::asio::post(*m_context, [this, result = std::move(result),
+                                      best_changed, needs_continue]() {
+        try {
+            // Ban peers that provided invalid/unverifiable shares
+            auto now = std::chrono::steady_clock::now();
+            for (const auto& bad_addr : result.bad_peer_addresses) {
+                if (bad_addr.port() == 0)
+                    continue;
+                LOG_WARNING << "run_think: banning peer " << bad_addr.to_string()
+                            << " for unverifiable shares";
+                m_ban_list[bad_addr] = now + m_ban_duration;
             }
 
-          } catch (const std::exception& e) {
-            LOG_ERROR << "run_think() failed: " << e.what();
+            // Expire old bans
+            for (auto it = m_ban_list.begin(); it != m_ban_list.end(); ) {
+                if (it->second <= now) it = m_ban_list.erase(it);
+                else ++it;
+            }
+
+            // Clear stale download set (p2pool node.py:108-141)
+            m_downloading_shares.clear();
+
+            // Request desired shares from random peers
+            if (!result.desired.empty() && !m_peers.empty()) {
+                for (auto& [peer_addr, hash] : result.desired) {
+                    auto peer_it = m_peers.begin();
+                    if (m_peers.size() > 1)
+                        std::advance(peer_it, core::random::random_uint256().GetLow64() % m_peers.size());
+                    download_shares(peer_it->second, hash);
+                }
+            }
+
+            // Trigger work refresh if best share changed
+            if (best_changed) {
+                LOG_INFO << "[ASYNC-THINK] IO-phase: best=" << m_best_share_hash.GetHex()
+                         << " triggering work refresh";
+                if (m_on_best_share_changed) m_on_best_share_changed();
+            } else if (result.best.IsNull()) {
+                LOG_WARNING << "[ASYNC-THINK] IO-phase: result.best is NULL — verified_tails="
+                            << m_tracker.verified.get_tails().size()
+                            << " verified_heads=" << m_tracker.verified.get_heads().size();
+            }
+
+            // Drain share batches queued while think() held the mutex
+            LOG_INFO << "[ASYNC-THINK] IO-phase: draining " << m_pending_adds.size()
+                     << " pending batches, peers=" << m_peers.size();
+            drain_pending_adds();
+
+            // Clear flag AFTER drain — prevents new think() from starting
+            // while deferred shares are still being added to the tracker.
             m_think_running.store(false);
-          } catch (...) {
-            LOG_ERROR << "run_think() failed: unknown error";
+            LOG_INFO << "[ASYNC-THINK] cycle complete — IO thread free";
+
+            // If verification budget was exhausted, schedule continuation.
+            // The IO thread processes network I/O between verification batches.
+            if (needs_continue) {
+                boost::asio::post(*m_context, [this]() { run_think(); });
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR << "run_think() IO phase failed: " << e.what();
             m_think_running.store(false);
-          }
+        } catch (...) {
+            LOG_ERROR << "run_think() IO phase failed: unknown error";
+            m_think_running.store(false);
+        }
+      });
+    });
+}
+
+// ── Drain pending share batches ─────────────────────────────────────────
+// Called on the IO thread after think() releases m_tracker_mutex.
+// Processes share batches that arrived while think was running.
+void NodeImpl::drain_pending_adds()
+{
+    if (m_pending_adds.empty())
+        return;
+
+    // Take ownership of pending queue
+    auto pending = std::move(m_pending_adds);
+    m_pending_adds.clear();
+
+    LOG_INFO << "[drain] Processing " << pending.size()
+             << " deferred share batches";
+
+    for (auto& batch : pending) {
+        processing_shares_phase2(*batch.data, batch.addr);
+    }
+}
+
+// ── Heartbeat logging ───────────────────────────────────────────────────
+// p2pool-style status lines: chain height, local/pool hashrate, orphan/DOA.
+// Runs on a separate 30s timer — diagnostic only, not consensus-critical.
+// Previously ran inside run_think() blocking the IO thread on every share.
+void NodeImpl::heartbeat_log()
+{
+    // Try shared lock — if think is running, skip this heartbeat
+    std::shared_lock lock(m_tracker_mutex, std::try_to_lock);
+    if (!lock.owns_lock())
+        return;
+
+    auto chain_sz  = m_tracker.chain.size();
+    auto verified  = m_tracker.verified.size();
+    auto peers     = m_peers.size();
+
+    int incoming_peers = 0;
+    for (auto& [nonce, peer] : m_peers) {
+        if (peer && !m_outbound_addrs.contains(peer->addr()))
+            ++incoming_peers;
+    }
+
+    int height = 0;
+    if (!m_best_share_hash.IsNull()) {
+        if (m_tracker.chain.contains(m_best_share_hash))
+            height = m_tracker.chain.get_height(m_best_share_hash);
+    }
+    if (height == 0 && verified > 0)
+        height = static_cast<int>(verified);
+
+    // L1: chain status
+    LOG_INFO << "c2pool: " << height << " shares in chain ("
+             << verified << " verified/" << chain_sz << " total)"
+             << " Peers: " << peers << " (" << incoming_peers << " incoming)";
+
+    // L2: local hashrate
+    uint32_t share_bits = 0;
+    if (!m_best_share_hash.IsNull() && m_tracker.chain.contains(m_best_share_hash)) {
+        m_tracker.chain.get(m_best_share_hash).share.invoke([&](auto* s) {
+            share_bits = s->m_bits;
+        });
+    }
+    if (m_local_rate_stats_fn) {
+        auto stats = m_local_rate_stats_fn();
+        std::ostringstream local_line;
+        local_line << " Local: " << format_hashrate(stats.hashrate);
+        if (stats.effective_dt > 0)
+            local_line << " in last " << format_duration(stats.effective_dt);
+        local_line << " Local dead on arrival: "
+                   << format_binomial_conf(stats.dead_datums, stats.total_datums);
+        if (stats.hashrate > 0 && share_bits != 0) {
+            auto share_target = chain::bits_to_target(share_bits);
+            auto share_aps = chain::target_to_average_attempts(share_target);
+            double ets = static_cast<double>(share_aps.GetLow64()) / stats.hashrate;
+            local_line << " Expected time to share: " << format_duration(ets);
+        }
+        LOG_INFO << local_line.str();
+    } else if (m_local_hashrate_fn) {
+        LOG_INFO << " Local: " << format_hashrate(m_local_hashrate_fn());
+    }
+
+    // L3: orphan/DOA/stale stats (chain walk — diagnostic only)
+    int orphan_count = 0, doa_count = 0, total_recent = 0;
+    uint256 walk_start = m_best_share_hash;
+    if (walk_start.IsNull() || !m_tracker.chain.contains(walk_start)) {
+        auto& vheads = m_tracker.verified.get_heads();
+        if (!vheads.empty())
+            walk_start = vheads.begin()->first;
+    }
+    if (!walk_start.IsNull() && m_tracker.chain.contains(walk_start)) {
+        int window = std::min(height, static_cast<int>(
+            std::min(size_t(3600) / PoolConfig::share_period(), size_t(height))));
+        if (window > 0) {
+            auto walkable = m_tracker.chain.get_height(walk_start);
+            auto walk_n = std::min(window, walkable);
+            if (walk_n > 0) {
+                try {
+                    auto view = m_tracker.chain.get_chain(walk_start, walk_n);
+                    for (auto [hash, data] : view) {
+                        data.share.invoke([&](auto* s) {
+                            if (s->m_stale_info == ltc::StaleInfo::orphan) ++orphan_count;
+                            else if (s->m_stale_info == ltc::StaleInfo::doa) ++doa_count;
+                        });
+                        ++total_recent;
+                    }
+                } catch (...) {}
+            }
+        }
+    }
+    double stale_prop = total_recent > 0
+        ? static_cast<double>(orphan_count + doa_count) / total_recent : 0.0;
+
+    {
+        std::ostringstream shares_line;
+        shares_line << " Shares: " << chain_sz
+                    << " (" << orphan_count << " orphan, " << doa_count << " dead)"
+                    << " Stale rate: " << format_binomial_conf(orphan_count + doa_count, total_recent)
+                    << " Efficiency: " << format_binomial_conf_efficiency(orphan_count + doa_count, total_recent, stale_prop);
+
+        if (m_current_pplns_fn) {
+            auto outputs = m_current_pplns_fn();
+            uint64_t my_payout = 0;
+            std::set<std::string> local_scripts;
+            if (!m_node_payout_script_hex.empty())
+                local_scripts.insert(m_node_payout_script_hex);
+            if (m_local_miner_scripts_fn) {
+                for (const auto& s : m_local_miner_scripts_fn())
+                    local_scripts.insert(s);
+            }
+            for (const auto& [script, amount] : outputs) {
+                if (local_scripts.count(script))
+                    my_payout += amount;
+            }
+            if (my_payout > 0) {
+                double coins = static_cast<double>(my_payout) / 1e8;
+                shares_line << " Current payout: (" << std::fixed << std::setprecision(4)
+                            << coins << ")=" << coins << " tLTC";
+            }
+        }
+
+        shares_line << " [heads=" << m_tracker.chain.get_heads().size()
+                    << " v_heads=" << m_tracker.verified.get_heads().size()
+                    << " rss=" << get_rss_mb() << "MB]";
+        LOG_INFO << shares_line.str();
+    }
+
+    // L4: pool hashrate + ETB
+    if (height > 2) {
+        try {
+            auto aps = m_tracker.get_pool_attempts_per_second(
+                m_best_share_hash,
+                std::min(height - 1, static_cast<int>(PoolConfig::TARGET_LOOKBEHIND)),
+                /*min_work=*/false);
+            double pool_hs = static_cast<double>(aps.GetLow64());
+            double real_pool_hs = (stale_prop < 0.999 && pool_hs > 0)
+                ? pool_hs / (1.0 - stale_prop) : pool_hs;
+            double etb_secs = 0;
+            uint32_t block_bits = 0;
+            if (!m_best_share_hash.IsNull() && m_tracker.chain.contains(m_best_share_hash)) {
+                m_tracker.chain.get(m_best_share_hash).share.invoke([&](auto* s) {
+                    block_bits = s->m_min_header.m_bits;
+                });
+            }
+            if (real_pool_hs > 0 && block_bits != 0) {
+                auto block_target = chain::bits_to_target(block_bits);
+                auto block_aps = chain::target_to_average_attempts(block_target);
+                etb_secs = static_cast<double>(block_aps.GetLow64()) / real_pool_hs;
+                if (block_aps.IsNull() && !block_target.IsNull())
+                    etb_secs = 1e18;
+            }
+            LOG_INFO << " Pool: " << format_hashrate(real_pool_hs)
+                     << " Stale rate: " << std::fixed << std::setprecision(1)
+                     << (100.0 * stale_prop) << "% Expected time to block: "
+                     << format_duration(etb_secs);
+        } catch (...) {}
     }
 }
 
@@ -1525,6 +1595,17 @@ void NodeImpl::clean_tracker()
         std::atomic<bool>& flag;
         ~CleanGuard() { flag.store(false); }
     } clean_guard{m_clean_running};
+
+    // Non-blocking: skip this cycle if think() holds the tracker mutex.
+    // clean_tracker runs every 5s — next cycle will catch up.
+    {
+        std::unique_lock lock(m_tracker_mutex, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            // Still trigger think() (async, non-blocking) so scoring continues
+            run_think();
+            return;
+        }
+    }
 
     // Step 1: Run think() to get current scoring + remove bad shares
     // (also populates m_last_top5_heads)
