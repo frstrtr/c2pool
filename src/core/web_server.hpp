@@ -6,6 +6,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <future>
 #include <set>
 #include <map>
 #include <unordered_map>
@@ -345,7 +346,7 @@ public:
         const std::vector<std::string>& merkle_branches);
 
     // Hook: returns the best share hash from the share tracker (for prev_hash wiring)
-    void set_best_share_hash_fn(std::function<uint256()> fn) { m_best_share_hash_fn = std::move(fn); }
+    void set_best_share_hash_fn(std::function<uint256()> fn) { m_best_share_hash_fn = thread_safe_wrap(std::move(fn)); }
     std::function<uint256()> get_best_share_hash_fn() const { return m_best_share_hash_fn; }
 
     // Hook: walk back from best_share to find nearest peer share for work template.
@@ -358,7 +359,7 @@ public:
     using pplns_fn_t = std::function<std::map<std::vector<unsigned char>, double>(
         const uint256& best_hash, const uint256& block_target,
         uint64_t subsidy, const std::vector<unsigned char>& donation_script)>;
-    void set_pplns_fn(pplns_fn_t fn) { m_pplns_fn = std::move(fn); }
+    void set_pplns_fn(pplns_fn_t fn) { m_pplns_fn = thread_safe_wrap(std::move(fn)); }
 
     // Hook: computes the p2pool ref_hash for a given coinbase scriptSig.
     // Returns (ref_hash, last_txout_nonce) pair.  The ref_hash depends on
@@ -470,7 +471,7 @@ public:
     // Hook: expose decoded protocol messages (e.g. from current best share)
     // through API methods for dashboard/monitoring clients.
     using protocol_messages_fn_t = std::function<nlohmann::json()>;
-    void set_protocol_messages_fn(protocol_messages_fn_t fn) { m_protocol_messages_fn = std::move(fn); }
+    void set_protocol_messages_fn(protocol_messages_fn_t fn) { m_protocol_messages_fn = thread_safe_wrap(std::move(fn)); }
 
     // Integrated merged mining manager
     void set_merged_mining_manager(c2pool::merged::MergedMiningManager* mgr) { m_mm_manager = mgr; }
@@ -493,23 +494,23 @@ public:
 
     // Sharechain stats callback — returns live tracker data for the /sharechain/stats endpoint
     using sharechain_stats_fn_t = std::function<nlohmann::json()>;
-    void set_sharechain_stats_fn(sharechain_stats_fn_t fn) { m_sharechain_stats_fn = std::move(fn); }
+    void set_sharechain_stats_fn(sharechain_stats_fn_t fn) { m_sharechain_stats_fn = thread_safe_wrap(std::move(fn)); }
 
     // Sharechain window callback — returns per-share data for the defragmenter grid
     using sharechain_window_fn_t = std::function<nlohmann::json()>;
-    void set_sharechain_window_fn(sharechain_window_fn_t fn) { m_sharechain_window_fn = std::move(fn); }
+    void set_sharechain_window_fn(sharechain_window_fn_t fn) { m_sharechain_window_fn = thread_safe_wrap(std::move(fn)); }
 
     // Sharechain tip callback — returns {hash, height} for lightweight polling
     using sharechain_tip_fn_t = std::function<nlohmann::json()>;
-    void set_sharechain_tip_fn(sharechain_tip_fn_t fn) { m_sharechain_tip_fn = std::move(fn); }
+    void set_sharechain_tip_fn(sharechain_tip_fn_t fn) { m_sharechain_tip_fn = thread_safe_wrap(std::move(fn)); }
 
     // Sharechain delta callback — returns shares newer than given hash
     using sharechain_delta_fn_t = std::function<nlohmann::json(const std::string&)>;
-    void set_sharechain_delta_fn(sharechain_delta_fn_t fn) { m_sharechain_delta_fn = std::move(fn); }
+    void set_sharechain_delta_fn(sharechain_delta_fn_t fn) { m_sharechain_delta_fn = thread_safe_wrap(std::move(fn)); }
 
     // Individual share lookup — returns full p2pool-compatible share JSON by hash
     using share_lookup_fn_t = std::function<nlohmann::json(const std::string&)>;
-    void set_share_lookup_fn(share_lookup_fn_t fn) { m_share_lookup_fn = std::move(fn); }
+    void set_share_lookup_fn(share_lookup_fn_t fn) { m_share_lookup_fn = thread_safe_wrap(std::move(fn)); }
 
     // Network difficulty callback — invoked from refresh_work() with real value
     using network_difficulty_fn_t = std::function<void(double)>;
@@ -542,11 +543,11 @@ public:
     void set_cached_share_version(int64_t v) { m_cached_share_version = v; }
     int64_t get_cached_share_version() const { return m_cached_share_version; }
     // Local stratum hashrate (H/s) — set via callback from WebServer
-    void set_stratum_hashrate_fn(std::function<double()> fn) { m_stratum_hashrate_fn = std::move(fn); }
+    void set_stratum_hashrate_fn(std::function<double()> fn) { m_stratum_hashrate_fn = thread_safe_wrap(std::move(fn)); }
     double get_stratum_total_hashrate() const { return m_stratum_hashrate_fn ? m_stratum_hashrate_fn() : 0.0; }
 
     // Pool hashrate (H/s) — from P2P node's get_pool_attempts_per_second
-    void set_pool_hashrate_fn(std::function<double()> fn) { m_pool_hashrate_fn = std::move(fn); }
+    void set_pool_hashrate_fn(std::function<double()> fn) { m_pool_hashrate_fn = thread_safe_wrap(std::move(fn)); }
     double get_pool_hashrate() const { return m_pool_hashrate_fn ? m_pool_hashrate_fn() : 0.0; }
 
     // Rate monitor stats for p2pool-style status (DOA%, time window)
@@ -556,7 +557,7 @@ public:
         int total_datums = 0;
         int dead_datums = 0;
     };
-    void set_stratum_rate_stats_fn(std::function<RateStats()> fn) { m_stratum_rate_stats_fn = std::move(fn); }
+    void set_stratum_rate_stats_fn(std::function<RateStats()> fn) { m_stratum_rate_stats_fn = thread_safe_wrap(std::move(fn)); }
     RateStats get_stratum_rate_stats() const { return m_stratum_rate_stats_fn ? m_stratum_rate_stats_fn() : RateStats{}; }
 
     // Current PPLNS outputs for payout display
@@ -641,7 +642,58 @@ public:
     using block_load_fn_t  = std::function<std::vector<FoundBlock>()>;
     void set_block_verify_fn(block_verify_fn_t fn);
     void set_io_context(boost::asio::io_context* ctx) { m_context = ctx;
+        m_main_thread_id = std::this_thread::get_id();
         LOG_INFO << "MiningInterface::set_io_context this=" << this << " ctx=" << ctx; }
+
+    /// Thread-safe callback wrapper (RCU-dispatch pattern).
+    /// If called from the main io_context thread, invokes fn directly.
+    /// If called from any other thread (HTTP, PPLNS precompute, etc.),
+    /// posts fn to the main io_context and blocks until it completes.
+    /// This eliminates ALL cross-thread data races on main-thread objects.
+    template<typename R, typename... Args>
+    std::function<R(Args...)> thread_safe_wrap(std::function<R(Args...)> fn) {
+        if (!fn) return fn;
+        return [this, fn = std::move(fn)](Args... args) -> R {
+            // Fast path: already on main thread — call directly
+            if (!m_context || std::this_thread::get_id() == m_main_thread_id) {
+                return fn(args...);
+            }
+            // Slow path: dispatch to main io_context and wait
+            std::promise<R> prom;
+            auto fut = prom.get_future();
+            boost::asio::post(*m_context, [&]() {
+                try {
+                    prom.set_value(fn(args...));
+                } catch (...) {
+                    prom.set_exception(std::current_exception());
+                }
+            });
+            return fut.get();
+        };
+    }
+
+    /// Void-returning overload
+    template<typename... Args>
+    std::function<void(Args...)> thread_safe_wrap(std::function<void(Args...)> fn) {
+        if (!fn) return fn;
+        return [this, fn = std::move(fn)](Args... args) {
+            if (!m_context || std::this_thread::get_id() == m_main_thread_id) {
+                fn(args...);
+                return;
+            }
+            std::promise<void> prom;
+            auto fut = prom.get_future();
+            boost::asio::post(*m_context, [&]() {
+                try {
+                    fn(args...);
+                    prom.set_value();
+                } catch (...) {
+                    prom.set_exception(std::current_exception());
+                }
+            });
+            fut.get();
+        };
+    }
     void schedule_block_verification(const std::string& block_hash);
 
     // Per-chain verify function: register additional verifiers for merged chains
@@ -671,8 +723,8 @@ public:
 
     /// Coin P2P peer info callbacks (daemon-style getpeerinfo).
     using coin_peer_info_fn = std::function<nlohmann::json()>;
-    void set_ltc_peer_info_fn(coin_peer_info_fn fn) { m_ltc_peer_info_fn = std::move(fn); }
-    void set_doge_peer_info_fn(coin_peer_info_fn fn) { m_doge_peer_info_fn = std::move(fn); }
+    void set_ltc_peer_info_fn(coin_peer_info_fn fn) { m_ltc_peer_info_fn = thread_safe_wrap(std::move(fn)); }
+    void set_doge_peer_info_fn(coin_peer_info_fn fn) { m_doge_peer_info_fn = thread_safe_wrap(std::move(fn)); }
 
     // Callback fired whenever a block submission is attempted.
     // Arguments: header hex (first 80 bytes), stale_info (none=accepted, orphan=stale prev, doa=daemon rejected).
@@ -759,6 +811,7 @@ private:
     ltc::coin::CoinNodeInterface* m_embedded_node = nullptr;
     // io_context for scheduling async verification timers
     boost::asio::io_context*     m_context        = nullptr;
+    std::thread::id              m_main_thread_id;          // set by set_io_context()
     std::atomic<bool>       m_work_valid{false};
     std::atomic<uint64_t>   m_work_generation{0};       // incremented on each refresh_work()
     std::atomic<int64_t>    m_last_work_update_time{0}; // monotonic seconds since epoch
@@ -977,9 +1030,9 @@ public:
     bool is_explorer_enabled() const { return m_explorer_enabled; }
     void set_explorer_url(const std::string& url) { m_explorer_url = url; }
     const std::string& get_explorer_url() const { return m_explorer_url; }
-    void set_explorer_chaininfo_fn(explorer_chaininfo_fn_t fn) { m_explorer_chaininfo_fn = std::move(fn); }
-    void set_explorer_blockhash_fn(explorer_blockhash_fn_t fn) { m_explorer_blockhash_fn = std::move(fn); }
-    void set_explorer_getblock_fn(explorer_getblock_fn_t fn) { m_explorer_getblock_fn = std::move(fn); }
+    void set_explorer_chaininfo_fn(explorer_chaininfo_fn_t fn) { m_explorer_chaininfo_fn = thread_safe_wrap(std::move(fn)); }
+    void set_explorer_blockhash_fn(explorer_blockhash_fn_t fn) { m_explorer_blockhash_fn = thread_safe_wrap(std::move(fn)); }
+    void set_explorer_getblock_fn(explorer_getblock_fn_t fn) { m_explorer_getblock_fn = thread_safe_wrap(std::move(fn)); }
     bool has_explorer_chaininfo_fn() const { return !!m_explorer_chaininfo_fn; }
     bool has_explorer_blockhash_fn() const { return !!m_explorer_blockhash_fn; }
     bool has_explorer_getblock_fn() const { return !!m_explorer_getblock_fn; }
@@ -991,9 +1044,9 @@ public:
     using explorer_mempoolinfo_fn_t  = std::function<nlohmann::json(const std::string& chain)>;
     using explorer_rawmempool_fn_t   = std::function<nlohmann::json(const std::string& chain, bool verbose, uint32_t limit)>;
     using explorer_mempoolentry_fn_t = std::function<nlohmann::json(const std::string& txid, const std::string& chain)>;
-    void set_explorer_mempoolinfo_fn(explorer_mempoolinfo_fn_t fn) { m_explorer_mempoolinfo_fn = std::move(fn); }
-    void set_explorer_rawmempool_fn(explorer_rawmempool_fn_t fn) { m_explorer_rawmempool_fn = std::move(fn); }
-    void set_explorer_mempoolentry_fn(explorer_mempoolentry_fn_t fn) { m_explorer_mempoolentry_fn = std::move(fn); }
+    void set_explorer_mempoolinfo_fn(explorer_mempoolinfo_fn_t fn) { m_explorer_mempoolinfo_fn = thread_safe_wrap(std::move(fn)); }
+    void set_explorer_rawmempool_fn(explorer_rawmempool_fn_t fn) { m_explorer_rawmempool_fn = thread_safe_wrap(std::move(fn)); }
+    void set_explorer_mempoolentry_fn(explorer_mempoolentry_fn_t fn) { m_explorer_mempoolentry_fn = thread_safe_wrap(std::move(fn)); }
     bool has_explorer_mempoolinfo_fn() const { return !!m_explorer_mempoolinfo_fn; }
     bool has_explorer_rawmempool_fn() const { return !!m_explorer_rawmempool_fn; }
     bool has_explorer_mempoolentry_fn() const { return !!m_explorer_mempoolentry_fn; }
@@ -1007,7 +1060,7 @@ public:
 
     // P2P peer info callback — returns JSON array of peer objects [{address,version,incoming,uptime,txpool_size}]
     using peer_info_fn_t = std::function<nlohmann::json()>;
-    void set_peer_info_fn(peer_info_fn_t fn) { m_peer_info_fn = std::move(fn); }
+    void set_peer_info_fn(peer_info_fn_t fn) { m_peer_info_fn = thread_safe_wrap(std::move(fn)); }
 
     // Port configuration for /node_info
     void set_p2p_port(uint16_t port) { m_p2p_port = port; }
