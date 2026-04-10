@@ -567,11 +567,9 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
 
 std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr)
 {
-    // Non-blocking: if think() holds the mutex, return empty.
-    // Peer will re-request within 15s timeout.
-    std::shared_lock lock(m_tracker_mutex, std::try_to_lock);
-    if (!lock.owns_lock())
-        return {};
+    // Shared lock: waits for think() to release exclusive lock (200-400ms max).
+    // Must respond to share requests — returning empty causes peer disconnect.
+    std::shared_lock lock(m_tracker_mutex);
 
     parents = std::min(parents, (uint64_t)1000/hashes.size());
 	std::vector<ltc::ShareType> shares;
@@ -607,10 +605,9 @@ std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
 
 void NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hashes)
 {
-    // Non-blocking: skip if think() holds the mutex. Peer will re-request.
-    std::shared_lock lock(m_tracker_mutex, std::try_to_lock);
-    if (!lock.owns_lock())
-        return;
+    // Shared lock: waits for think() to release (200-400ms max).
+    // Must send shares — skipping causes peer to see us as empty.
+    std::shared_lock lock(m_tracker_mutex);
 
     // Collect shares that exist in our chain (skip rejected)
     std::vector<ShareType> shares;
@@ -708,11 +705,9 @@ void NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hash
 
 void NodeImpl::broadcast_share(const uint256& share_hash)
 {
-    // Non-blocking: skip if think() holds the mutex.
-    // Share will be broadcast on next cycle or by periodic relay.
-    std::shared_lock lock(m_tracker_mutex, std::try_to_lock);
-    if (!lock.owns_lock())
-        return;
+    // Shared lock: waits for think() to release (200-400ms max).
+    // Must broadcast — skipping causes share propagation stalls.
+    std::shared_lock lock(m_tracker_mutex);
 
     // Walk the chain back from share_hash, collecting un-broadcast shares
     std::vector<uint256> to_send;
