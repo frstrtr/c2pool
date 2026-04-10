@@ -506,7 +506,10 @@ public:
 
     // Sharechain delta callback — returns shares newer than given hash
     using sharechain_delta_fn_t = std::function<nlohmann::json(const std::string&)>;
-    void set_sharechain_delta_fn(sharechain_delta_fn_t fn) { m_sharechain_delta_fn = thread_safe_wrap(std::move(fn)); }
+    void set_sharechain_delta_fn(sharechain_delta_fn_t fn) {
+        m_sharechain_delta_fn_raw = fn;   // raw copy for main-thread precompute
+        m_sharechain_delta_fn = thread_safe_wrap(std::move(fn));
+    }
 
     // Individual share lookup — returns full p2pool-compatible share JSON by hash
     using share_lookup_fn_t = std::function<nlohmann::json(const std::string&)>;
@@ -897,6 +900,7 @@ private:
     sharechain_window_fn_t m_sharechain_window_fn;
     sharechain_tip_fn_t m_sharechain_tip_fn;
     sharechain_delta_fn_t m_sharechain_delta_fn;
+    sharechain_delta_fn_t m_sharechain_delta_fn_raw;  // unwrapped, for main-thread precompute
     share_lookup_fn_t m_share_lookup_fn;
 
 public:
@@ -905,6 +909,9 @@ public:
         std::lock_guard<std::mutex> lock(m_window_cache_mutex);
         m_window_cache_etag.clear();
     }
+    // ── Pre-computed delta cache (called from main thread on new share) ──
+    void precompute_delta(const std::string& prev_tip_hash);
+
     // ── Per-share PPLNS cache ──
     void cache_pplns_at_tip();
     nlohmann::json get_pplns_for_tip(const std::string& tip_hash);
@@ -921,6 +928,11 @@ private:
     std::mutex m_window_cache_mutex;
     std::string m_window_cache_json;
     std::string m_window_cache_etag;
+    // Single-entry delta cache: pre-computed on main thread when tip changes.
+    // SSE clients all request the same since_hash (previous tip) → ~100% hit rate.
+    mutable std::mutex m_delta_cache_mutex;
+    std::string m_delta_cache_since;         // since_hash this delta was computed for
+    nlohmann::json m_delta_cache_result;     // the cached delta JSON
     struct RateBucket {
         int tokens{0};
         std::chrono::steady_clock::time_point last_refill;

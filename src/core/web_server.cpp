@@ -3572,9 +3572,25 @@ nlohmann::json MiningInterface::rest_sharechain_tip()
 
 nlohmann::json MiningInterface::rest_sharechain_delta(const std::string& since_hash)
 {
+    // Check single-entry delta cache (pre-computed on main thread when tip changes).
+    // All SSE clients request the same since_hash → near-100% hit rate.
+    {
+        std::lock_guard<std::mutex> lk(m_delta_cache_mutex);
+        if (!m_delta_cache_since.empty() && m_delta_cache_since == since_hash)
+            return m_delta_cache_result;
+    }
     if (m_sharechain_delta_fn)
         return m_sharechain_delta_fn(since_hash);
     return nlohmann::json::object({{"shares", nlohmann::json::array()}, {"count", 0}});
+}
+
+void MiningInterface::precompute_delta(const std::string& prev_tip_hash)
+{
+    if (!m_sharechain_delta_fn_raw || prev_tip_hash.empty()) return;
+    auto result = m_sharechain_delta_fn_raw(prev_tip_hash);
+    std::lock_guard<std::mutex> lk(m_delta_cache_mutex);
+    m_delta_cache_since = prev_tip_hash;
+    m_delta_cache_result = std::move(result);
 }
 
 nlohmann::json MiningInterface::rest_control_mining_start()
@@ -6898,6 +6914,10 @@ void WebServer::trigger_work_refresh()
 
 void WebServer::trigger_work_refresh_debounced()
 {
+    // Capture previous tip hash BEFORE refresh updates it — needed for delta precompute.
+    auto prev_tip = mining_interface_->rest_sharechain_tip();
+    std::string prev_tip_hash = prev_tip.value("hash", "");
+
     // No debounce — call refresh immediately.
     trigger_work_refresh();
 
@@ -6906,6 +6926,11 @@ void WebServer::trigger_work_refresh_debounced()
 
     // Cache PPLNS snapshot for this tip (each share gets unique PPLNS)
     mining_interface_->cache_pplns_at_tip();
+
+    // Pre-compute delta from previous tip so SSE clients get instant response.
+    // All clients request delta(prev_tip) simultaneously after receiving the SSE
+    // tip notification — this single-entry cache gives ~100% hit rate.
+    mining_interface_->precompute_delta(prev_tip_hash);
 
     // Push SSE event to RealTime subscribers
     if (mining_interface_->sse_subscriber_count() > 0) {
