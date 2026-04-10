@@ -24,6 +24,10 @@
                 font-size: 12px;
             }
 
+            nav { display: flex; gap: 10px; flex-wrap: wrap; }
+            nav a { color: #e0e0e0; text-decoration: none; padding: 8px 16px; border-radius: 6px; font-size: 0.9rem; transition: all 0.2s; background: #16162a; }
+            nav a:hover { background: #008de4; color: white; }
+            nav a.active { background: #008de4; color: white; }
             .pool-tab { background: rgba(255,255,255,0.08); color: #8888a0; padding: 4px 12px; border-radius: 6px; font-size: 0.9rem; font-weight: 700; cursor: pointer; transition: all 0.2s; border: 1px solid transparent; user-select: none; }
             .pool-tab:hover { background: rgba(255,255,255,0.15); color: #e0e0e0; }
             .pool-tab.active { background: #008de4; color: white; border-color: rgba(255,255,255,0.15); box-shadow: 0 2px 8px rgba(0,141,228,0.3); }
@@ -40,12 +44,12 @@
                         <h1 style="font-size: 1.5rem; font-weight: 600; color: #008de4; margin: 0;">c2pool Graphs</h1>
                         <div id="pool-tabs" style="display:flex;gap:4px;align-items:center;"></div>
                     </div>
-                    <nav style="display: flex; gap: 10px; flex-wrap: wrap;">
-                        <a href="dashboard.html" style="color: #e0e0e0; text-decoration: none; padding: 8px 16px; border-radius: 6px; font-size: 0.9rem; background: #16162a; transition: all 0.2s;">Dashboard</a>
-                        <a href="graphs.html" style="color: white; text-decoration: none; padding: 8px 16px; border-radius: 6px; font-size: 0.9rem; background: #008de4; transition: all 0.2s;">Graphs</a>
-                        <a href="stratum.html" style="color: #e0e0e0; text-decoration: none; padding: 8px 16px; border-radius: 6px; font-size: 0.9rem; background: #16162a; transition: all 0.2s;">Stratum</a>
-                        <a href="miners.html" style="color: #e0e0e0; text-decoration: none; padding: 8px 16px; border-radius: 6px; font-size: 0.9rem; background: #16162a; transition: all 0.2s;">Miners</a>
-                        <a href="index.html" style="color: #e0e0e0; text-decoration: none; padding: 8px 16px; border-radius: 6px; font-size: 0.9rem; background: #16162a; transition: all 0.2s;">Classic</a>
+                    <nav>
+                        <a href="dashboard.html">Dashboard</a>
+                        <a href="graphs.html" class="active">Graphs</a>
+                        <a href="stratum.html">Stratum</a>
+                        <a href="miners.html">Miners</a>
+                        <a href="index.html">Classic</a>
                     </nav>
                 </div>
             </div>

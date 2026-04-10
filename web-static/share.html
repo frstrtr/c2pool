@@ -364,12 +364,24 @@
     </style>
 </head>
 <body>
+    <header style="background: #252540; border-bottom: 1px solid #3a3a5a; padding: 12px 0; margin-bottom: 20px;">
+        <div style="max-width: 960px; margin: 0 auto; padding: 0 20px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+            <h1 style="font-size: 1.3rem; font-weight: 600; color: #008de4; margin: 0;">c2pool Share</h1>
+            <nav style="display:flex;gap:8px;flex-wrap:wrap">
+                <a href="dashboard.html" style="color:#e0e0e0;text-decoration:none;padding:6px 14px;border-radius:6px;font-size:0.85rem;background:#16162a">Dashboard</a>
+                <a href="graphs.html" style="color:#e0e0e0;text-decoration:none;padding:6px 14px;border-radius:6px;font-size:0.85rem;background:#16162a">Graphs</a>
+                <a href="stratum.html" style="color:#e0e0e0;text-decoration:none;padding:6px 14px;border-radius:6px;font-size:0.85rem;background:#16162a">Stratum</a>
+                <a href="miners.html" style="color:#e0e0e0;text-decoration:none;padding:6px 14px;border-radius:6px;font-size:0.85rem;background:#16162a">Miners</a>
+                <a href="index.html" style="color:#e0e0e0;text-decoration:none;padding:6px 14px;border-radius:6px;font-size:0.85rem;background:#16162a">Classic</a>
+            </nav>
+        </div>
+    </header>
     <div class="container" id="share-root">
         <div class="loading-msg">Loading share data...</div>
     </div>
 
     <footer>
-        <p>c2pool | <a href=".">Dashboard</a> | <a href="https://github.com/frstrtr/c2pool" target="_blank">GitHub</a></p>
+        <p>c2pool | <a href="dashboard.html">Dashboard</a> | <a href="https://github.com/frstrtr/c2pool" target="_blank">GitHub</a></p>
     </footer>
 
     <script type="text/javascript">
