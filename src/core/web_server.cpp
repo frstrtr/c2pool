@@ -6040,13 +6040,13 @@ void MiningInterface::update_stat_log()
     }
 
     // Desired version rates — p2pool: {version_str: hashrate}
+    // Uses desired_version (what miners signal they want) not share version (what's in the chain)
     entry.desired_versions = nlohmann::json::object();
     if (m_sharechain_stats_fn) {
         auto sc = m_sharechain_stats_fn();
-        if (sc.contains("shares_by_version") && sc["shares_by_version"].is_object()) {
-            // Approximate: weight share version counts by pool hashrate
+        if (sc.contains("shares_by_desired_version") && sc["shares_by_desired_version"].is_object()) {
             int total = sc.value("total_shares", 1);
-            for (auto& [ver, count] : sc["shares_by_version"].items()) {
+            for (auto& [ver, count] : sc["shares_by_desired_version"].items()) {
                 double pct = (total > 0) ? count.get<double>() / total : 0.0;
                 entry.desired_versions[ver] = entry.pool_hash_rate * pct;
             }
