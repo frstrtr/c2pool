@@ -645,25 +645,60 @@ public:
         m_main_thread_id = std::this_thread::get_id();
         LOG_INFO << "MiningInterface::set_io_context this=" << this << " ctx=" << ctx; }
 
-    /// Thread-safe callback wrapper (RCU-dispatch pattern).
-    /// If called from the main io_context thread, invokes fn directly.
-    /// If called from any other thread (HTTP, PPLNS precompute, etc.),
-    /// posts fn to the main io_context and blocks until it completes.
-    /// This eliminates ALL cross-thread data races on main-thread objects.
-    template<typename R, typename... Args>
-    std::function<R(Args...)> thread_safe_wrap(std::function<R(Args...)> fn) {
+    /// Thread-safe cached callback entry.  Main thread computes + caches;
+    /// HTTP thread reads from cache instantly (never blocks).
+    template<typename R>
+    struct CacheEntry {
+        std::function<R()> fn;
+        mutable std::mutex mtx;
+        R cached{};
+
+        explicit CacheEntry(std::function<R()> f) : fn(std::move(f)) {}
+
+        R refresh() {
+            R result = fn();
+            std::lock_guard<std::mutex> lk(mtx);
+            cached = std::move(result);
+            return cached;
+        }
+
+        R get() const {
+            std::lock_guard<std::mutex> lk(mtx);
+            return cached;
+        }
+    };
+
+    /// Zero-arg overload: RCU cache pattern.
+    /// Main thread calls → computes result, updates cache, returns result.
+    /// HTTP thread calls → returns cached result instantly (zero blocking).
+    /// Cache is also refreshed periodically via refresh_http_caches().
+    template<typename R>
+    std::function<R()> thread_safe_wrap(std::function<R()> fn) {
         if (!fn) return fn;
-        return [this, fn = std::move(fn)](Args... args) -> R {
-            // Fast path: already on main thread — call directly
+        auto entry = std::make_shared<CacheEntry<R>>(fn);
+        m_cache_refresh_fns.push_back([entry]() { entry->refresh(); });
+        return [this, entry, fn = std::move(fn)]() -> R {
             if (!m_context || std::this_thread::get_id() == m_main_thread_id) {
-                return fn(args...);
+                return entry->refresh();   // main thread: compute + cache
             }
-            // Slow path: dispatch to main io_context and wait
+            return entry->get();           // HTTP thread: instant cached read
+        };
+    }
+
+    /// Parameterized overload: dispatch-and-wait (used for delta, lookup, etc.)
+    /// These are called less frequently so blocking is acceptable.
+    template<typename R, typename Arg0, typename... Args>
+    std::function<R(Arg0, Args...)> thread_safe_wrap(std::function<R(Arg0, Args...)> fn) {
+        if (!fn) return fn;
+        return [this, fn = std::move(fn)](Arg0 arg0, Args... args) -> R {
+            if (!m_context || std::this_thread::get_id() == m_main_thread_id) {
+                return fn(arg0, args...);
+            }
             std::promise<R> prom;
             auto fut = prom.get_future();
             boost::asio::post(*m_context, [&]() {
                 try {
-                    prom.set_value(fn(args...));
+                    prom.set_value(fn(arg0, args...));
                 } catch (...) {
                     prom.set_exception(std::current_exception());
                 }
@@ -672,7 +707,7 @@ public:
         };
     }
 
-    /// Void-returning overload
+    /// Void-returning overload (parameterized)
     template<typename... Args>
     std::function<void(Args...)> thread_safe_wrap(std::function<void(Args...)> fn) {
         if (!fn) return fn;
@@ -693,6 +728,13 @@ public:
             });
             fut.get();
         };
+    }
+
+    /// Refresh all zero-arg callback caches.  Call from main thread periodically.
+    void refresh_http_caches() {
+        for (auto& fn : m_cache_refresh_fns) {
+            try { fn(); } catch (...) {}
+        }
     }
     void schedule_block_verification(const std::string& block_hash);
 
@@ -812,6 +854,7 @@ private:
     // io_context for scheduling async verification timers
     boost::asio::io_context*     m_context        = nullptr;
     std::thread::id              m_main_thread_id;          // set by set_io_context()
+    std::vector<std::function<void()>> m_cache_refresh_fns; // populated by thread_safe_wrap
     std::atomic<bool>       m_work_valid{false};
     std::atomic<uint64_t>   m_work_generation{0};       // incremented on each refresh_work()
     std::atomic<int64_t>    m_last_work_update_time{0}; // monotonic seconds since epoch

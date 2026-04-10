@@ -6013,6 +6013,23 @@ int main(int argc, char* argv[]) {
             watchdog_timer->expires_after(std::chrono::seconds(30));
             watchdog_timer->async_wait(*watchdog_fn);
 
+            // HTTP cache refresh timer: update all zero-arg callback caches
+            // every 2 seconds so the dashboard reads pre-computed data
+            // instead of blocking on main-thread dispatch.
+            auto cache_timer = std::make_shared<boost::asio::steady_timer>(ioc);
+            auto cache_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
+            auto* mi_ptr = web_server.get_mining_interface();
+            *cache_fn = [cache_timer, cache_fn, mi_ptr](boost::system::error_code ec) mutable {
+                if (ec) return;
+                mi_ptr->refresh_http_caches();
+                cache_timer->expires_after(std::chrono::seconds(2));
+                cache_timer->async_wait(*cache_fn);
+            };
+            // Initial populate so dashboard has data immediately
+            mi_ptr->refresh_http_caches();
+            cache_timer->expires_after(std::chrono::seconds(2));
+            cache_timer->async_wait(*cache_fn);
+
             // Run until shutdown
             while (!g_shutdown_requested) {
                 ioc.restart();
