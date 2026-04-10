@@ -1004,7 +1004,8 @@
         d3.json('../web/currency_info', function(currency_info) {
             if (currency_info && currency_info.explorer_enabled && currency_info.explorer_url) {
                 var nav = document.querySelector('nav');
-                if (nav && !document.getElementById('nav-explorer')) {
+                var _old = document.getElementById('nav-explorer'); if (_old) _old.remove();
+                if (nav) {
                     var a = document.createElement('a');
                     a.id = 'nav-explorer';
                     a.href = currency_info.explorer_url;

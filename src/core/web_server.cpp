@@ -4069,13 +4069,16 @@ nlohmann::json MiningInterface::rest_local_stats()
     {
         auto warnings = nlohmann::json::array();
 
-        // 1. LTC daemon contact check (>60s since last work update)
+        // 1. LTC block source contact check (>60s since last work update)
         auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
-        if (m_last_work_update_time > 0 && now_s - m_last_work_update_time > 60)
-            warnings.push_back("LOST CONTACT WITH LTC DAEMON for "
+        if (m_last_work_update_time > 0 && now_s - m_last_work_update_time > 60) {
+            std::string src = m_embedded_node ? "EMBEDDED LTC NODE" : "LTC DAEMON";
+            warnings.push_back("LOST CONTACT WITH " + src + " for "
                 + std::to_string(now_s - m_last_work_update_time) + "s! "
-                "Check that it isn't frozen or dead!");
+                + (m_embedded_node ? "No new blocks received from P2P peers."
+                                   : "Check that it isn't frozen or dead!"));
+        }
 
         // 2. No work template yet
         {
@@ -4091,9 +4094,12 @@ nlohmann::json MiningInterface::rest_local_stats()
             auto chain_infos = m_mm_manager->get_chain_infos();
             for (const auto& ci : chain_infos) {
                 int64_t threshold = 180; // 3 minutes default (covers DOGE 1min blocks)
-                if (ci.last_update_age_s > threshold)
-                    warnings.push_back("LOST CONTACT WITH " + ci.symbol + " DAEMON for "
-                        + std::to_string(ci.last_update_age_s) + "s!");
+                if (ci.last_update_age_s > threshold) {
+                    std::string src = m_embedded_node ? " EMBEDDED NODE" : " DAEMON";
+                    warnings.push_back("LOST CONTACT WITH " + ci.symbol + src + " for "
+                        + std::to_string(ci.last_update_age_s) + "s!"
+                        + (m_embedded_node ? " No new blocks from P2P peers." : ""));
+                }
             }
         }
 
