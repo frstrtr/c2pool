@@ -280,6 +280,11 @@
 
         footer a { color: var(--primary); text-decoration: none; }
 
+        @keyframes pbar {
+            0% { transform: translateX(-100%); }
+            100% { transform: translateX(400%); }
+        }
+
         /* PPLNS Treemap */
         .pplns-section {
             background: var(--card-bg);
@@ -643,6 +648,9 @@
 
             // PPLNS treemap section — DOM-based for CSS transitions
             html += '<div class="pplns-section"><h2>PPLNS Distribution</h2>' +
+                '<div id="pplns-loading" style="text-align:center;padding:30px 0;color:#8888a0;font-size:0.9rem">Loading PPLNS distribution...' +
+                '<div style="width:200px;height:4px;background:#3a3a5a;border-radius:2px;margin:10px auto 0;overflow:hidden">' +
+                '<div style="height:100%;width:30%;background:#008de4;border-radius:2px;animation:pbar 1.2s ease-in-out infinite"></div></div></div>' +
                 '<div class="pplns-grid" id="pplns-grid"></div>' +
                 '<div id="pplns-tooltip"></div></div>';
 
@@ -650,6 +658,8 @@
 
             // Load sharechain window (includes per-share PPLNS cache) for treemap
             d3.json('../sharechain/window', function(winData) {
+                var pl = document.getElementById('pplns-loading');
+                if (pl) pl.style.display = 'none';
                 if (!winData) return;
                 var grid = document.getElementById('pplns-grid');
                 if (!grid) return;

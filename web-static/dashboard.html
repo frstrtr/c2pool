@@ -720,6 +720,33 @@
             font-weight: normal;
         }
         
+        /* Loading progress bar */
+        .section-loading {
+            text-align: center;
+            padding: 30px 0;
+            color: var(--text-muted);
+            font-size: 0.9rem;
+        }
+        .section-loading .progress-track {
+            width: 200px;
+            height: 4px;
+            background: var(--border);
+            border-radius: 2px;
+            margin: 10px auto 0;
+            overflow: hidden;
+        }
+        .section-loading .progress-bar {
+            height: 100%;
+            width: 30%;
+            background: var(--primary);
+            border-radius: 2px;
+            animation: progress-slide 1.2s ease-in-out infinite;
+        }
+        @keyframes progress-slide {
+            0% { transform: translateX(-100%); }
+            100% { transform: translateX(400%); }
+        }
+
         /* Shares Explorer */
         .shares-section {
             background: var(--card-bg);
@@ -2099,6 +2126,7 @@
                 <h2>PPLNS Distribution</h2>
                 <a href="#" style="color:var(--text-muted);font-size:0.8rem;text-decoration:none">Back to top</a>
             </div>
+            <div id="pplns-loading" class="section-loading">Loading PPLNS distribution...<div class="progress-track"><div class="progress-bar"></div></div></div>
             <div class="pplns-main-grid" id="pplns-main-grid" style="position:relative;border-radius:8px;overflow:visible;min-height:60px"></div>
             <div id="pplns-main-tooltip" style="display:none;position:fixed;z-index:9999;background:#1e1e38;border:1px solid var(--border);border-radius:8px;padding:8px 12px;pointer-events:none;font-size:0.82rem;box-shadow:0 6px 20px rgba(0,0,0,0.5);width:320px"></div>
         </div>
@@ -2113,6 +2141,7 @@
                 </div>
             </div>
 
+            <div id="defrag-loading" class="section-loading">Loading sharechain...<div class="progress-track"><div class="progress-bar"></div></div></div>
             <div class="defrag-container">
                 <!-- Canvas grid -->
                 <div class="defrag-canvas-wrap">
@@ -4603,6 +4632,8 @@
                         }
                     }
 
+                    var dl = document.getElementById('defrag-loading');
+                    if (dl) dl.style.display = 'none';
                     self.render();
                     self.updateStats(data);
                     loadShareLinks();
@@ -5950,6 +5981,8 @@
         var _cachedPPLNSPayouts = null;
         function renderMainPPLNS(payouts) {
                 if (!payouts || typeof payouts !== 'object') return;
+                var pl = document.getElementById('pplns-loading');
+                if (pl) pl.style.display = 'none';
                 var grid = document.getElementById('pplns-main-grid');
                 var tooltip = document.getElementById('pplns-main-tooltip');
                 if (!grid) return;
