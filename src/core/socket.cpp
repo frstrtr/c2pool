@@ -9,6 +9,7 @@ namespace core
     if (!m_status || !m_socket || !m_socket->is_open()) return;\
     boost::asio::async_read(*m_socket, buffer, [self = shared_from_this(), this, packet](const auto& ec, std::size_t len) {\
         if (!m_status) return; /* socket closed between dispatch and callback */\
+        if (!ec) g_bytes_recv.fetch_add(len, std::memory_order_relaxed);\
         handler\
     })
 

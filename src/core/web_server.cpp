@@ -1,6 +1,7 @@
 #include "web_server.hpp"
 #include "stratum_server.hpp"
 #include "address_utils.hpp"
+#include "socket.hpp"
 
 // Real coin daemon RPC (optional - only linked when set_coin_rpc() is called)
 #include <impl/ltc/coin/rpc.hpp>
@@ -5873,7 +5874,7 @@ nlohmann::json MiningInterface::rest_web_graph_data(const std::string& source, c
             result.push_back({entry.time, entry.connected_count, bin_width, 0});
         }
         else if (source == "traffic_rate") {
-            result.push_back({entry.time, nullptr, bin_width, 0});
+            result.push_back({entry.time, entry.traffic, bin_width, 0});
         }
         else if (source == "getwork_latency") {
             result.push_back({entry.time, entry.work_latency, bin_width, 0});
@@ -6079,6 +6080,23 @@ void MiningInterface::update_stat_log()
 
     // Work latency (template build time in seconds, matching p2pool getwork_latency)
     entry.work_latency = m_last_work_latency.load(std::memory_order_relaxed) / 1000.0;
+
+    // Traffic rate (B/s) — diff global byte counters since last sample
+    {
+        static uint64_t prev_recv = 0, prev_sent = 0;
+        static double prev_time = 0;
+        uint64_t cur_recv = core::Socket::g_bytes_recv.load(std::memory_order_relaxed);
+        uint64_t cur_sent = core::Socket::g_bytes_sent.load(std::memory_order_relaxed);
+        double dt = (prev_time > 0) ? (entry.time - prev_time) : 1.0;
+        if (dt < 1.0) dt = 1.0;
+        entry.traffic = {
+            {"incoming", static_cast<double>(cur_recv - prev_recv) / dt},
+            {"outgoing", static_cast<double>(cur_sent - prev_sent) / dt}
+        };
+        prev_recv = cur_recv;
+        prev_sent = cur_sent;
+        prev_time = entry.time;
+    }
 
     {
         std::lock_guard<std::mutex> lock(m_stat_log_mutex);

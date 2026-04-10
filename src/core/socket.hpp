@@ -46,6 +46,11 @@ class Socket : public std::enable_shared_from_this<Socket>
     NetService m_addr;
     NetService m_addr_local;
 
+public:
+    // Global P2P traffic counters (all sockets combined)
+    static inline std::atomic<uint64_t> g_bytes_recv{0};
+    static inline std::atomic<uint64_t> g_bytes_sent{0};
+
 private:
     void read()
     {
@@ -123,6 +128,7 @@ public:
         boost::asio::async_write(*m_socket, boost::asio::buffer(packet->data(), packet->size()),
             [self = shared_from_this(), this, packet](const boost::system::error_code& ec, std::size_t length)
             {
+                if (!ec) g_bytes_sent.fetch_add(length, std::memory_order_relaxed);
                 if (ec)
                 {
                     m_node->error("Socket::write error: " + ec.message(), get_addr());

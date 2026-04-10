@@ -1218,6 +1218,7 @@ private:
         double block_value;
         double memory_usage{0};           // RSS in bytes
         double work_latency{0};           // template build latency (ms)
+        nlohmann::json traffic;           // {incoming: B/s, outgoing: B/s}
     };
     std::vector<StatLogEntry> m_stat_log;
     mutable std::mutex m_stat_log_mutex;
