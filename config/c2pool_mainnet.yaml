@@ -44,6 +44,7 @@ doge_header_checkpoint: "6160000:51efd04daebddba43ae403662098524d99abf3edad3bddc
 # bootstrap hosts (ml.toom.im, usa.p2p-spb.xyz, etc.). CLI: -n HOST:PORT
 # These are p2pool sharechain protocol peers (port 9326), NOT coin daemons.
 seed_nodes:
+  - "voidbind.com:9326"
   - "ml.toom.im:9326"
   - "usa.p2p-spb.xyz:9326"
 # Add your own trusted nodes:

@@ -7001,6 +7001,9 @@ WebServer::~WebServer()
 
 bool WebServer::start()
 {
+    if (running_) return true;  // Already started (early start for loading page)
+    running_ = true;
+
     try {
         // Bind and listen on the HTTP port (runs on dedicated http_ioc_)
         auto const address = net::ip::make_address(bind_address_);

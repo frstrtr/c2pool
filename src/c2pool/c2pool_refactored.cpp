@@ -1371,6 +1371,9 @@ int main(int argc, char* argv[]) {
             if (!address_explorer_prefix.empty())
                 web_server.get_mining_interface()->set_custom_explorer_links(
                     address_explorer_prefix, block_explorer_prefix, tx_explorer_prefix);
+            // Start HTTP server immediately so loading page is served during sync.
+            // Stratum won't have valid work yet, but that's fine — miners retry.
+            web_server.start();
             LOG_INFO << "WebServer started early — loading page available at http://"
                      << http_host << ":" << http_port;
 
