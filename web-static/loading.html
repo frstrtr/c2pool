@@ -44,44 +44,47 @@ h1 { font-size: 2rem; margin-bottom: 8px; color: #58a6ff; }
 </div>
 <script>
 function poll() {
-    fetch('/web/sync_status')
-        .then(function(r) { return r.json(); })
-        .then(function(d) {
-            document.getElementById('d-shares').textContent = d.chain_size || 0;
-            document.getElementById('d-shares').className = 'val ' + (d.has_shares ? 'ok' : 'wait');
-            document.getElementById('d-verified').textContent = d.verified_size || 0;
-            document.getElementById('d-verified').className = 'val ' + (d.verified_size > 0 ? 'ok' : 'wait');
-            document.getElementById('d-best').textContent = d.has_best_share ? 'found' : 'syncing...';
-            document.getElementById('d-best').className = 'val ' + (d.has_best_share ? 'ok' : 'wait');
-            document.getElementById('d-work').textContent = d.has_work ? 'synced' : 'syncing...';
-            document.getElementById('d-work').className = 'val ' + (d.has_work ? 'ok' : 'wait');
-            var m = Math.floor((d.uptime_seconds || 0) / 60);
-            var s = (d.uptime_seconds || 0) % 60;
-            document.getElementById('d-uptime').textContent = m + 'm ' + s + 's';
-            if (d.ready && d.verified_size >= 100) {
-                if (!window._readyCount) window._readyCount = 0;
-                window._readyCount++;
-                // Wait 3 consecutive ready polls (9s) before redirecting
-                if (window._readyCount >= 3) {
-                    document.getElementById('status').textContent = 'Ready! Redirecting to dashboard...';
-                    document.getElementById('status').className = 'status ok';
-                    setTimeout(function() { window.location.href = 'dashboard.html'; }, 2000);
-                    return;
-                }
-                document.getElementById('status').textContent = 'Initializing dashboard data... (' + window._readyCount + '/3)';
+    // Fetch both sync_status and currency_info in parallel
+    Promise.all([
+        fetch('/web/sync_status').then(function(r){return r.json()}).catch(function(){return {}}),
+        fetch('/web/currency_info').then(function(r){return r.json()}).catch(function(){return {}})
+    ]).then(function(arr) {
+        var d = arr[0], ci = arr[1];
+        document.getElementById('d-shares').textContent = d.chain_size || 0;
+        document.getElementById('d-shares').className = 'val ' + (d.has_shares ? 'ok' : 'wait');
+        document.getElementById('d-verified').textContent = d.verified_size || 0;
+        document.getElementById('d-verified').className = 'val ' + (d.verified_size > 0 ? 'ok' : 'wait');
+        document.getElementById('d-best').textContent = d.has_best_share ? 'found' : 'syncing...';
+        document.getElementById('d-best').className = 'val ' + (d.has_best_share ? 'ok' : 'wait');
+        // Dashboard is truly ready when currency_info has real data
+        var dashReady = ci.block_value != null && ci.block_value > 0
+            && ci.pool_hash_rate != null && d.verified_size > 0;
+        document.getElementById('d-work').textContent = dashReady ? 'ready' : 'syncing...';
+        document.getElementById('d-work').className = 'val ' + (dashReady ? 'ok' : 'wait');
+        var m = Math.floor((d.uptime_seconds || 0) / 60);
+        var s = (d.uptime_seconds || 0) % 60;
+        document.getElementById('d-uptime').textContent = m + 'm ' + s + 's';
+        if (dashReady) {
+            if (!window._readyCount) window._readyCount = 0;
+            window._readyCount++;
+            if (window._readyCount >= 3) {
+                document.getElementById('status').textContent = 'Ready! Redirecting to dashboard...';
                 document.getElementById('status').className = 'status ok';
-            } else if (d.has_shares && d.verified_size > 0 && !d.has_work) {
-                document.getElementById('status').textContent = 'Syncing embedded SPV nodes... (' + d.verified_size + ' shares verified)';
-            } else if (d.has_shares && d.verified_size > 0) {
-                document.getElementById('status').textContent = 'Verifying shares... ' + d.verified_size + ' verified';
-            } else if (d.has_shares) {
-                document.getElementById('status').textContent = 'Syncing sharechain... ' + d.chain_size + ' shares';
-            } else if (d.has_best_share) {
-                document.getElementById('status').textContent = 'Connecting to p2pool network...';
-            } else {
-                document.getElementById('status').textContent = 'Syncing blockchain headers...';
+                setTimeout(function() { window.location.href = 'dashboard.html'; }, 2000);
+                return;
             }
-        })
+            document.getElementById('status').textContent = 'Initializing dashboard... (' + window._readyCount + '/3)';
+            document.getElementById('status').className = 'status ok';
+        } else if (d.has_shares && d.verified_size > 0) {
+            document.getElementById('status').textContent = 'Syncing embedded SPV nodes... (' + d.verified_size + ' shares verified)';
+        } else if (d.has_shares) {
+            document.getElementById('status').textContent = 'Syncing sharechain... ' + d.chain_size + ' shares';
+        } else if (d.has_best_share) {
+            document.getElementById('status').textContent = 'Connecting to p2pool network...';
+        } else {
+            document.getElementById('status').textContent = 'Syncing blockchain headers...';
+        }
+    })
         .catch(function() {
             document.getElementById('status').textContent = 'Waiting for c2pool to start...';
         });

@@ -5,12 +5,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>c2pool Dashboard</title>
     <link rel="shortcut icon" type="image/x-icon" href="favicon.ico" />
-    <script>
-    // Redirect to loading page if node isn't synced yet
-    fetch('/web/sync_status').then(function(r){return r.json()}).then(function(d){
-        if(!d.ready) window.location.replace('loading.html');
-    }).catch(function(){});
-    </script>
     <script src="d3.v2.min.js"></script>
     <script src="multipool.js"></script>
     <script src="highcharts.js"></script>
