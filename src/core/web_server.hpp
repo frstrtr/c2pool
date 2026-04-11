@@ -193,6 +193,7 @@ public:
     nlohmann::json rest_payout_addrs();
     nlohmann::json rest_web_best_share_hash();
     nlohmann::json rest_sync_status();
+    bool is_node_ready();  // true when dashboard data is fully available
 
     // Additional p2pool-compatible REST endpoints (peer network, stale rates, mining details)
     nlohmann::json rest_rate();                     // /rate — pool hashrate (single number)

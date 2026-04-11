@@ -576,6 +576,21 @@ void HttpSession::process_request()
                     std::string file_path = target;
                     if (file_path == "/" || file_path.empty()) file_path = "/loading.html";
 
+                    // During startup, redirect all HTML pages to loading.html
+                    // (except loading.html itself). Only loading.html + sync_status
+                    // + currency_info work during early startup.
+                    if (file_path != "/loading.html" && file_path.find(".html") != std::string::npos) {
+                        bool node_ready = mining_interface_->is_node_ready();
+                        if (!node_ready) {
+                            response.result(http::status::temporary_redirect);
+                            response.set(http::field::location, "/loading.html");
+                            response.body() = "";
+                            response.prepare_payload();
+                            send_response(std::move(response));
+                            return;
+                        }
+                    }
+
                     std::error_code fec;
                     std::filesystem::path base = std::filesystem::weakly_canonical(dashboard_dir);
                     std::filesystem::path requested = base / file_path.substr(1);
@@ -3486,7 +3501,7 @@ nlohmann::json MiningInterface::get_pplns_for_tip(const std::string& tip_hash)
 std::pair<std::string, std::string> MiningInterface::get_cached_window_response()
 {
     std::lock_guard<std::mutex> lock(m_window_cache_mutex);
-    // Check if cache is valid (has etag = current tip)
+    // Check if cache is valid (has real tip hash, not empty/stub)
     if (!m_window_cache_etag.empty())
         return {m_window_cache_json, m_window_cache_etag};
 
@@ -3497,8 +3512,14 @@ std::pair<std::string, std::string> MiningInterface::get_cached_window_response(
         tip = data["best_hash"].get<std::string>();
         if (tip.size() > 16) tip = tip.substr(0, 16);
     }
+    // Don't cache stub responses (empty best_hash) — during early startup
+    // the sharechain_window_fn may not be wired yet or return empty data.
+    // Return the stub without caching so next request retries.
+    if (tip.empty()) {
+        return {data.dump(), ""};
+    }
     m_window_cache_json = data.dump();
-    m_window_cache_etag = tip.empty() ? "none" : tip;
+    m_window_cache_etag = tip;
     return {m_window_cache_json, m_window_cache_etag};
 }
 
@@ -4367,6 +4388,36 @@ nlohmann::json MiningInterface::rest_sync_status()
             std::chrono::steady_clock::now() - m_start_time).count());
 
     return result;
+}
+
+bool MiningInterface::is_node_ready()
+{
+    // Check sharechain has verified shares
+    if (m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        if (sc.value("verified_count", 0) <= 0)
+            return false;
+    } else {
+        return false;
+    }
+
+    // Check work template exists
+    {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        if (m_cached_template.is_null() ||
+            m_cached_template.value("coinbasevalue", uint64_t(0)) == 0)
+            return false;
+    }
+
+    // Check sharechain window has data (not a stub)
+    if (m_sharechain_window_fn) {
+        // Don't call the fn here (expensive) — just check if it's wired
+        // The window cache will be populated on first real request
+    } else {
+        return false;
+    }
+
+    return true;
 }
 
 // ── Log endpoints (read directly from debug.log) ───────────────────────
