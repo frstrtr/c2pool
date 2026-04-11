@@ -1336,19 +1336,10 @@ void NodeImpl::run_think()
         // Flush verified hashes to LevelDB while lock is held
         flush_verified_to_leveldb();
 
-        // ── Work refresh on compute thread (while lock held) ──────────
-        // The PPLNS + MM coinbase rebuild is the remaining IO bottleneck:
-        // 0.8-2.9s per work refresh. Running it here on the compute thread
-        // with the exclusive lock keeps it off the IO thread entirely.
-        // Stratum notify_all() will be posted to the IO thread after.
-        if (best_changed) {
-            LOG_INFO << "[ASYNC-THINK] compute: work refresh starting (best changed)";
-            auto wr_t0 = std::chrono::steady_clock::now();
-            if (m_on_best_share_changed) m_on_best_share_changed();
-            auto wr_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - wr_t0).count();
-            LOG_INFO << "[ASYNC-THINK] compute: work refresh done in " << wr_ms << "ms";
-        }
+        // Work refresh runs on the IO thread AFTER the lock is released.
+        // It takes 1-5s (PPLNS + MM coinbase) — must NOT hold exclusive lock
+        // or it blocks all shared_lock readers (handle_get_share, send_shares)
+        // and kills peer connections.
 
       } catch (const std::exception& e) {
         LOG_ERROR << "run_think() failed on compute thread: " << e.what();
@@ -1402,9 +1393,19 @@ void NodeImpl::run_think()
                 }
             }
 
-            // Work refresh already ran on compute thread (with exclusive lock).
-            // Log diagnostic if best was NULL.
-            if (result.best.IsNull()) {
+            // Work refresh on IO thread — NO lock held. Takes 1-5s but doesn't
+            // block shared_lock readers (handle_get_share, send_shares).
+            // The tracker is not being modified during this window (think finished,
+            // pending adds not yet drained), so reading it is safe.
+            if (best_changed) {
+                LOG_INFO << "[ASYNC-THINK] IO-phase: best=" << m_best_share_hash.GetHex()
+                         << " work refresh starting";
+                auto wr_t0 = std::chrono::steady_clock::now();
+                if (m_on_best_share_changed) m_on_best_share_changed();
+                auto wr_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - wr_t0).count();
+                LOG_INFO << "[ASYNC-THINK] IO-phase: work refresh done in " << wr_ms << "ms";
+            } else if (result.best.IsNull()) {
                 LOG_WARNING << "[ASYNC-THINK] IO-phase: result.best is NULL — verified_tails="
                             << m_tracker.verified.get_tails().size()
                             << " verified_heads=" << m_tracker.verified.get_heads().size();
@@ -1637,6 +1638,7 @@ void NodeImpl::clean_tracker()
     m_think_running.store(true);  // block think() re-entry during clean
 
     boost::asio::post(m_think_pool, [this]() {
+      bool clean_best_changed = false;
       try {
         std::unique_lock lock(m_tracker_mutex);  // exclusive
 
@@ -1658,16 +1660,12 @@ void NodeImpl::clean_tracker()
 
             m_last_top5_heads = std::move(result.top5_heads);
 
-            bool best_changed = false;
             if (!result.best.IsNull()) {
-                best_changed = (m_best_share_hash != result.best);
                 m_best_share_hash = result.best;
             }
 
             flush_verified_to_leveldb();
-
-            if (best_changed && m_on_best_share_changed)
-                m_on_best_share_changed();
+            // Work refresh deferred to IO thread (after lock release)
         }
 
         // Steps 2-3: Prune (still holding exclusive lock)
@@ -1807,11 +1805,11 @@ void NodeImpl::clean_tracker()
         auto result = m_tracker.think(block_rel_height, prev_block, bits);
         m_last_top5_heads = std::move(result.top5_heads);
         if (!result.best.IsNull()) {
-            bool changed = (m_best_share_hash != result.best);
+            clean_best_changed = (m_best_share_hash != result.best);
             m_best_share_hash = result.best;
-            if (changed && m_on_best_share_changed) m_on_best_share_changed();
         }
         flush_verified_to_leveldb();
+        // Work refresh deferred to IO thread (after lock release)
     }
 
     // Step 5: Flush pruned shares from LevelDB (p2pool main.py:269-270)
@@ -1871,8 +1869,14 @@ void NodeImpl::clean_tracker()
       } catch (...) {
         LOG_ERROR << "[CLEAN] failed on compute thread: unknown error";
       }
-      // Lock released — post drain to IO thread
-      boost::asio::post(*m_context, [this]() {
+      // Lock released — post work refresh + drain to IO thread.
+      // Work refresh (1-5s) runs WITHOUT any lock so shared_lock readers
+      // (handle_get_share, send_shares) are never blocked.
+      boost::asio::post(*m_context, [this, clean_best_changed]() {
+        if (clean_best_changed && m_on_best_share_changed) {
+            LOG_INFO << "[CLEAN] IO-phase: work refresh (best changed)";
+            m_on_best_share_changed();
+        }
         drain_pending_adds();
         m_think_running.store(false);
         m_clean_running.store(false);
