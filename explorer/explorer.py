@@ -1899,21 +1899,37 @@ def main():
 
     engine = ExplorerEngine(ltc_rpc, doge_rpc)
 
-    # Test connectivity
-    print(f"LTC RPC ({args.ltc_host}:{args.ltc_port}): ", end="")
-    if ltc_rpc.is_alive():
-        info = ltc_rpc.call("getblockchaininfo")
-        print(f"OK — chain={info['chain']} height={info['blocks']}")
+    # Test connectivity (retry if c2pool API isn't fully ready yet)
+    for attempt in range(10):
+        try:
+            print(f"LTC RPC: ", end="")
+            if ltc_rpc.is_alive():
+                info = ltc_rpc.call("getblockchaininfo")
+                chain = info.get('chain', info.get('network', 'unknown'))
+                height = info.get('blocks', info.get('headers', 0))
+                print(f"OK — chain={chain} height={height}")
+                break
+            else:
+                print("OFFLINE")
+                break
+        except (KeyError, TypeError):
+            print(f"waiting for API (attempt {attempt+1}/10)...")
+            import time; time.sleep(5)
     else:
-        print("OFFLINE")
+        print("WARNING: LTC API not ready — explorer may show incomplete data")
 
     if doge_rpc:
-        print(f"DOGE RPC ({args.doge_host}:{args.doge_port}): ", end="")
-        if doge_rpc.is_alive():
-            info = doge_rpc.call("getblockchaininfo")
-            print(f"OK — chain={info['chain']} height={info['blocks']}")
-        else:
-            print("OFFLINE")
+        print(f"DOGE RPC: ", end="")
+        try:
+            if doge_rpc.is_alive():
+                info = doge_rpc.call("getblockchaininfo")
+                chain = info.get('chain', info.get('network', 'unknown'))
+                height = info.get('blocks', info.get('headers', 0))
+                print(f"OK — chain={chain} height={height}")
+            else:
+                print("OFFLINE")
+        except (KeyError, TypeError):
+            print("WARNING: DOGE API not ready")
 
     # Start web server
     # Use ThreadingHTTPServer so SSE streams don't block other requests
