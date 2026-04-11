@@ -2951,6 +2951,35 @@ int main(int argc, char* argv[]) {
                     });
                 }
                 result["timeline"] = tl;
+
+                // Share explorer fields for classic page (/web/heads etc.)
+                {
+                    auto& verified = p2p_node->tracker().verified;
+
+                    nlohmann::json heads_arr = nlohmann::json::array();
+                    for (auto& [h, t] : chain.get_heads())
+                        heads_arr.push_back(h.GetHex());
+                    result["heads"] = std::move(heads_arr);
+
+                    nlohmann::json vheads_arr = nlohmann::json::array();
+                    for (auto& [h, t] : verified.get_heads())
+                        vheads_arr.push_back(h.GetHex());
+                    result["verified_heads"] = std::move(vheads_arr);
+
+                    nlohmann::json tails_arr = nlohmann::json::array();
+                    for (auto& [t, hs] : chain.get_tails())
+                        tails_arr.push_back(t.GetHex());
+                    result["tails"] = std::move(tails_arr);
+
+                    nlohmann::json vtails_arr = nlohmann::json::array();
+                    for (auto& [t, hs] : verified.get_tails())
+                        vtails_arr.push_back(t.GetHex());
+                    result["verified_tails"] = std::move(vtails_arr);
+
+                    // my_share_hashes: empty for now (no local share tracking yet)
+                    result["my_share_hashes"] = nlohmann::json::array();
+                }
+
                 return result;
             });
 

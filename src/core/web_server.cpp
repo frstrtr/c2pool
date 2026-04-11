@@ -620,19 +620,11 @@ void HttpSession::process_request()
                             }
                         }
 
-                        // Inject explorer nav link if configured
-                        const auto& explorer_url = mining_interface_->get_explorer_url();
-                        if (!explorer_url.empty() && mining_interface_->is_explorer_enabled()
-                            && (ext == ".html" || ext == ".htm"))
-                        {
-                            // Find "Classic" nav link and insert Explorer after it
-                            auto pos = contents.find(R"(>Classic</a>)");
-                            if (pos != std::string::npos) {
-                                pos += 12;  // skip ">Classic</a>"
-                                std::string link = "\n        <a href=\"" + explorer_url + "\" target=\"_blank\">Explorer</a>";
-                                contents.insert(pos, link);
-                            }
-                        }
+                        // Explorer nav link injection removed — each HTML page has
+                        // client-side JS that checks currency_info.explorer_enabled
+                        // and injects the link dynamically. Server-side injection was
+                        // fragile (depended on exact ">Classic</a>" text) and caused
+                        // duplicate buttons on pages that had both mechanisms.
 
                         response.set(http::field::content_type, mime);
                         response.set(http::field::cache_control, "public, max-age=3600");
