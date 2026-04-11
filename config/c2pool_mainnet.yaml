@@ -13,6 +13,13 @@ stratum_port: 9327             # Stratum mining port
 web_port: 8080                 # Web dashboard / JSON-RPC API port
 http_host: "0.0.0.0"          # HTTP bind address
 # external_ip: ""              # Public IP/domain for stratum URL display
+#
+# Port forwarding recommendations (if behind NAT/firewall):
+#   9326  TCP — P2P sharechain (REQUIRED for full p2pool participation)
+#   9327  TCP — Stratum mining (REQUIRED for miners to connect)
+#   8080  TCP — Web dashboard (optional, for remote monitoring)
+#   9333  TCP — LTC P2P (recommended for faster embedded SPV sync)
+#   22556 TCP — DOGE P2P (recommended for faster embedded DOGE sync)
 
 # ─── Operating Mode ────────────────────────────────────────────────────────
 # integrated: true             # Full P2P pool (DEFAULT)

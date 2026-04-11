@@ -1350,6 +1350,30 @@ int main(int argc, char* argv[]) {
             auto hb_think        = std::make_shared<std::atomic<int64_t>>(0);
             auto hb_monitor      = std::make_shared<std::atomic<int64_t>>(0);
 
+            // Create web server EARLY so the loading page is served immediately
+            // during SPV header sync and share loading.
+            core::WebServer web_server(ioc, http_host, static_cast<uint16_t>(http_port),
+                                     settings->m_testnet, enhanced_node, blockchain);
+            web_server.get_mining_interface()->set_stratum_config(stratum_config);
+            web_server.get_mining_interface()->set_cors_origin(http_cors_origin);
+            web_server.get_mining_interface()->set_worker_port(static_cast<uint16_t>(stratum_port));
+            web_server.get_mining_interface()->set_p2p_port(static_cast<uint16_t>(p2p_port));
+            if (!external_ip.empty())
+                web_server.get_mining_interface()->set_external_ip(external_ip);
+            web_server.set_dashboard_dir(dashboard_dir);
+            if (!analytics_id.empty())
+                web_server.set_analytics_id(analytics_id);
+            if (explorer_enabled) {
+                web_server.set_explorer_enabled(true);
+                if (!explorer_url.empty())
+                    web_server.set_explorer_url(explorer_url);
+            }
+            if (!address_explorer_prefix.empty())
+                web_server.get_mining_interface()->set_custom_explorer_links(
+                    address_explorer_prefix, block_explorer_prefix, tx_explorer_prefix);
+            LOG_INFO << "WebServer started early — loading page available at http://"
+                     << http_host << ":" << http_port;
+
             if (embedded_ltc) {
                 LOG_INFO << "╔══════════════════════════════════════════════════════════════╗";
                 LOG_INFO << "║  [EMB-LTC] Phase 4: EMBEDDED COIN NODE MODE                  ║";
@@ -1584,9 +1608,8 @@ int main(int argc, char* argv[]) {
                                   rpc_user + ":" + rpc_pass);
             }
 
-            // Create web server with explicit port configuration
-            core::WebServer web_server(ioc, http_host, static_cast<uint16_t>(http_port), 
-                                     settings->m_testnet, enhanced_node, blockchain);
+            // web_server was created early (before SPV sync) so the loading
+            // page is available immediately. Continue with remaining setup.
 
             // V35 merged block resolver: requests full LTC block from P2P,
             // extracts fabe6d6d MM commitment from coinbase, looks up DOGE
@@ -1614,26 +1637,7 @@ int main(int argc, char* argv[]) {
                 const MergedResolveCtx& ctx, const ltc::coin::BlockType& block)>;
             auto on_full_block_merged = std::make_shared<OnFullBlockMergedFn>();
 
-            // Apply stratum tuning from CLI/YAML to the MiningInterface
-            web_server.get_mining_interface()->set_stratum_config(stratum_config);
-            web_server.get_mining_interface()->set_cors_origin(http_cors_origin);
-            web_server.get_mining_interface()->set_worker_port(static_cast<uint16_t>(stratum_port));
-            web_server.get_mining_interface()->set_p2p_port(static_cast<uint16_t>(p2p_port));
-            if (!external_ip.empty())
-                web_server.get_mining_interface()->set_external_ip(external_ip);
-
-            // Dashboard serving directory and payout address for legacy API
-            web_server.set_dashboard_dir(dashboard_dir);
-            if (!analytics_id.empty())
-                web_server.set_analytics_id(analytics_id);
-            if (explorer_enabled) {
-                web_server.set_explorer_enabled(true);
-                if (!explorer_url.empty())
-                    web_server.set_explorer_url(explorer_url);
-            }
-            if (!address_explorer_prefix.empty())
-                web_server.get_mining_interface()->set_custom_explorer_links(
-                    address_explorer_prefix, block_explorer_prefix, tx_explorer_prefix);
+            // Stratum/payout config (web_server basic config was set at early creation above)
             web_server.get_mining_interface()->set_payout_address(payout_address);
             LOG_INFO << "Stratum config: min_diff=" << stratum_config.min_difficulty
                      << " max_diff=" << stratum_config.max_difficulty
