@@ -4344,7 +4344,9 @@ nlohmann::json MiningInterface::rest_sync_status()
         has_best = !h.IsNull();
     }
 
-    result["ready"] = has_best && has_shares;
+    // Node is truly ready when it has verified shares for PPLNS computation.
+    // Without verified shares, the dashboard shows empty PPLNS/hashrate data.
+    result["ready"] = has_best && has_shares && verified_size > 0;
     result["has_best_share"] = has_best;
     result["has_shares"] = has_shares;
     result["chain_size"] = chain_size;

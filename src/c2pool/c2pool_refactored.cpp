@@ -2959,6 +2959,9 @@ int main(int argc, char* argv[]) {
                 }
                 result["timeline"] = tl;
 
+                // Verified count for sync_status readiness check
+                result["verified_count"] = static_cast<int>(p2p_node->tracker().verified.size());
+
                 // Share explorer fields for classic page (/web/heads etc.)
                 {
                     auto& verified = p2p_node->tracker().verified;
