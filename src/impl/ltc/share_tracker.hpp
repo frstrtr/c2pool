@@ -644,6 +644,7 @@ public:
             uint32_t max_timestamp{0};  // max timestamp from chain head's recent shares
         };
         std::vector<DesiredEntry> desired;
+        std::set<uint256> desired_hashes;  // p2pool: desired = set() — dedup by hash
         std::set<NetService> bad_peer_addresses;
 
         // Phase 1: Verify unverified heads, remove bad shares.
@@ -688,13 +689,28 @@ public:
                     // they're new peer shares whose parents haven't arrived yet.
                     // clean_tracker() eats truly stale heads after 300s.
                     if (!last.IsNull()) {
-                        NetService peer;
-                        uint32_t head_ts = 0;
-                        chain.get_share(head_hash).invoke([&](auto* obj) {
-                            peer = obj->peer_addr;
-                            head_ts = obj->m_timestamp;
-                        });
-                        desired.push_back({peer, last, head_ts});
+                        // Option A: skip parent requests for chains already in the
+                        // pruning zone (height >= 2*CHAIN_LENGTH+10). These parents
+                        // would be immediately re-pruned by clean_tracker.
+                        auto CL_prune = static_cast<int32_t>(PoolConfig::chain_length());
+                        if (head_height >= 2 * CL_prune + 10) {
+                            static int prune_skip_log = 0;
+                            if (prune_skip_log++ % 20 == 0)
+                                LOG_INFO << "[think-P1] pruning-zone skip: head="
+                                         << head_hash.GetHex().substr(0,16)
+                                         << " height=" << head_height
+                                         << " threshold=" << (2*CL_prune+10);
+                        } else if (!desired_hashes.count(last)) {
+                            // Option C: dedup by hash (p2pool: desired = set())
+                            NetService peer;
+                            uint32_t head_ts = 0;
+                            chain.get_share(head_hash).invoke([&](auto* obj) {
+                                peer = obj->peer_addr;
+                                head_ts = obj->m_timestamp;
+                            });
+                            desired_hashes.insert(last);
+                            desired.push_back({peer, last, head_ts});
+                        }
                     }
                     continue;
                 }
@@ -729,13 +745,25 @@ public:
                 // Python for/else: if loop completed without break AND unrooted
                 if (!verified_one && !last.IsNull())
                 {
-                    NetService peer;
-                    uint32_t head_ts = 0;
-                    chain.get_share(head_hash).invoke([&](auto* obj) {
-                        peer = obj->peer_addr;
-                        head_ts = obj->m_timestamp;
-                    });
-                    desired.push_back({peer, last, head_ts});
+                    // Option A: skip if chain already in pruning zone
+                    auto CL_prune = static_cast<int32_t>(PoolConfig::chain_length());
+                    if (head_height >= 2 * CL_prune + 10) {
+                        static int prune_skip2_log = 0;
+                        if (prune_skip2_log++ % 20 == 0)
+                            LOG_INFO << "[think-P1] pruning-zone skip (for/else): head="
+                                     << head_hash.GetHex().substr(0,16)
+                                     << " height=" << head_height;
+                    } else if (!desired_hashes.count(last)) {
+                        // Option C: dedup by hash
+                        NetService peer;
+                        uint32_t head_ts = 0;
+                        chain.get_share(head_hash).invoke([&](auto* obj) {
+                            peer = obj->peer_addr;
+                            head_ts = obj->m_timestamp;
+                        });
+                        desired_hashes.insert(last);
+                        desired.push_back({peer, last, head_ts});
+                    }
                 }
             }
 
@@ -950,13 +978,29 @@ public:
             // Request more shares if verified chain is short
             if (head_height < static_cast<int32_t>(PoolConfig::chain_length()) && !last_last_hash.IsNull())
             {
-                NetService peer;
-                uint32_t head_ts = 0;
-                chain.get_share(head_hash).invoke([&](auto* obj) {
-                    peer = obj->peer_addr;
-                    head_ts = obj->m_timestamp;
-                });
-                desired.push_back({peer, last_last_hash, head_ts});
+                // Option A: check MAIN chain height (not verified height).
+                // If main chain is already in pruning zone, the unverified
+                // shares exist — they just need verification, not more parents.
+                auto main_ht = chain.get_height(head_hash);
+                auto CL_prune = static_cast<int32_t>(PoolConfig::chain_length());
+                if (main_ht >= 2 * CL_prune + 10) {
+                    static int p2_prune_log = 0;
+                    if (p2_prune_log++ % 20 == 0)
+                        LOG_INFO << "[think-P2] pruning-zone skip: head="
+                                 << head_hash.GetHex().substr(0,16)
+                                 << " verified_ht=" << head_height
+                                 << " main_ht=" << main_ht;
+                } else if (!desired_hashes.count(last_last_hash)) {
+                    // Option C: dedup by hash
+                    NetService peer;
+                    uint32_t head_ts = 0;
+                    chain.get_share(head_hash).invoke([&](auto* obj) {
+                        peer = obj->peer_addr;
+                        head_ts = obj->m_timestamp;
+                    });
+                    desired_hashes.insert(last_last_hash);
+                    desired.push_back({peer, last_last_hash, head_ts});
+                }
             }
         }
 
