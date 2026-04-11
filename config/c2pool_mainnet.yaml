@@ -12,7 +12,7 @@ port: 9326                     # P2P p2pool sharechain port (LTC mainnet default
 stratum_port: 9327             # Stratum mining port
 web_port: 8080                 # Web dashboard / JSON-RPC API port
 http_host: "0.0.0.0"          # HTTP bind address
-external_ip: "voidbind.com"   # Public IP/domain for stratum URL display
+# external_ip: ""              # Public IP/domain for stratum URL display
 
 # ─── Operating Mode ────────────────────────────────────────────────────────
 # integrated: true             # Full P2P pool (DEFAULT)
@@ -109,6 +109,6 @@ dashboard_dir: "web-static"    # Static dashboard directory (relative or absolut
 
 # ─── Lite Block Explorer ─────────────────────────────────────────────────────
 explorer: true                             # Enable block storage + explorer REST API
-explorer_url: "http://voidbind.com:9090"    # Explorer URL for dashboard nav link
+# explorer_url: "http://localhost:9090"      # Explorer URL for dashboard nav link
 explorer_depth_ltc: 288                    # LTC blocks to keep
 explorer_depth_doge: 1440                  # DOGE blocks to keep
