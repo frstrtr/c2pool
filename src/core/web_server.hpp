@@ -495,6 +495,10 @@ public:
     void set_local_hashrate(double hr) { m_cached_pool_hashrate = hr; }
     double get_network_difficulty() const { return m_network_difficulty.load(); }
 
+    // SPV sync progress callback — returns {ltc_blocks, ltc_need, doge_blocks, doge_need}
+    using spv_progress_fn_t = std::function<nlohmann::json()>;
+    void set_spv_progress_fn(spv_progress_fn_t fn) { m_spv_progress_fn = std::move(fn); }
+
     // Sharechain stats callback — returns live tracker data for the /sharechain/stats endpoint
     using sharechain_stats_fn_t = std::function<nlohmann::json()>;
     void set_sharechain_stats_fn(sharechain_stats_fn_t fn) { m_sharechain_stats_fn = thread_safe_wrap(std::move(fn)); }
@@ -899,6 +903,7 @@ private:
 
     // Sharechain stats callback
     sharechain_stats_fn_t m_sharechain_stats_fn;
+    spv_progress_fn_t m_spv_progress_fn;
     sharechain_window_fn_t m_sharechain_window_fn;
     sharechain_tip_fn_t m_sharechain_tip_fn;
     sharechain_delta_fn_t m_sharechain_delta_fn;

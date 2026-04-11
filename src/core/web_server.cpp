@@ -4387,6 +4387,12 @@ nlohmann::json MiningInterface::rest_sync_status()
         std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - m_start_time).count());
 
+    // SPV sync progress
+    if (m_spv_progress_fn) {
+        auto spv = m_spv_progress_fn();
+        result["spv"] = spv;
+    }
+
     return result;
 }
 

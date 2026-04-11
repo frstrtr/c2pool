@@ -37,7 +37,8 @@ h1 { font-size: 2rem; margin-bottom: 8px; color: #58a6ff; }
         <div class="row"><span class="label">Sharechain</span><span class="val" id="d-shares">...</span></div>
         <div class="row"><span class="label">Verified</span><span class="val" id="d-verified">...</span></div>
         <div class="row"><span class="label">Best share</span><span class="val" id="d-best">...</span></div>
-        <div class="row"><span class="label">SPV nodes</span><span class="val" id="d-work">...</span></div>
+        <div class="row"><span class="label">LTC SPV</span><span class="val" id="d-ltc-spv">...</span></div>
+        <div class="row"><span class="label">DOGE SPV</span><span class="val" id="d-doge-spv">...</span></div>
         <div class="row"><span class="label">Uptime</span><span class="val" id="d-uptime">...</span></div>
     </div>
     <div class="note">This page auto-refreshes. You will be redirected to the dashboard when ready.</div>
@@ -60,8 +61,27 @@ function poll() {
         // Dashboard is truly ready when currency_info has real data
         var dashReady = ci.block_value != null && ci.block_value > 0
             && ci.pool_hash_rate != null && d.verified_size > 0;
-        document.getElementById('d-work').textContent = dashReady ? 'ready' : 'syncing...';
-        document.getElementById('d-work').className = 'val ' + (dashReady ? 'ok' : 'wait');
+        // SPV progress with ETA
+        if (d.spv) {
+            var ltcDone = d.spv.ltc_blocks >= d.spv.ltc_need;
+            var ltcTxt = ltcDone ? 'ready' : d.spv.ltc_blocks + '/' + d.spv.ltc_need;
+            if (!ltcDone && d.spv.ltc_blocks > 1 && d.uptime_seconds > 10) {
+                var rate = d.spv.ltc_blocks / d.uptime_seconds;
+                var remain = Math.ceil((d.spv.ltc_need - d.spv.ltc_blocks) / Math.max(rate, 0.01));
+                ltcTxt += ' (~' + (remain > 60 ? Math.ceil(remain/60) + 'min' : remain + 's') + ')';
+            }
+            document.getElementById('d-ltc-spv').textContent = ltcTxt;
+            document.getElementById('d-ltc-spv').className = 'val ' + (ltcDone ? 'ok' : 'wait');
+            var dogeDone = d.spv.doge_blocks >= d.spv.doge_need;
+            var dogeTxt = dogeDone ? 'ready' : d.spv.doge_blocks + '/' + d.spv.doge_need;
+            if (!dogeDone && d.spv.doge_blocks > 1 && d.uptime_seconds > 10) {
+                var dr = d.spv.doge_blocks / d.uptime_seconds;
+                var drem = Math.ceil((d.spv.doge_need - d.spv.doge_blocks) / Math.max(dr, 0.01));
+                dogeTxt += ' (~' + (drem > 60 ? Math.ceil(drem/60) + 'min' : drem + 's') + ')';
+            }
+            document.getElementById('d-doge-spv').textContent = dogeTxt;
+            document.getElementById('d-doge-spv').className = 'val ' + (dogeDone ? 'ok' : 'wait');
+        }
         var m = Math.floor((d.uptime_seconds || 0) / 60);
         var s = (d.uptime_seconds || 0) % 60;
         document.getElementById('d-uptime').textContent = m + 'm ' + s + 's';

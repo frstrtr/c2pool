@@ -2993,6 +2993,22 @@ int main(int argc, char* argv[]) {
                 return result;
             });
 
+            // SPV sync progress for loading page
+            web_server.get_mining_interface()->set_spv_progress_fn(
+                [&ltc_utxo_cache, &embedded_chain]() {
+                nlohmann::json r;
+                int ltc_connected = ltc_utxo_cache ? static_cast<int>(ltc_utxo_cache->blocks_connected()) : 0;
+                int ltc_need = static_cast<int>(core::coin::LTC_MINING_GATE_DEPTH);
+                int ltc_height = embedded_chain ? static_cast<int>(embedded_chain->height()) : 0;
+                r["ltc_blocks"] = ltc_connected;
+                r["ltc_need"] = ltc_need;
+                r["ltc_height"] = ltc_height;
+                // DOGE UTXO is initialized after LTC — show 0 until wired
+                r["doge_blocks"] = 0;
+                r["doge_need"] = static_cast<int>(core::coin::DOGE_MINING_GATE_DEPTH);
+                return r;
+            });
+
             // Wire per-share window data for the defragmenter grid
             web_server.get_mining_interface()->set_sharechain_window_fn([&p2p_node, &web_server]() {
                 nlohmann::json result;
