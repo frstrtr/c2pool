@@ -4097,6 +4097,12 @@ int main(int argc, char* argv[]) {
                     else if (p.stale_info == 254)  stale = ltc::StaleInfo::doa;
 
                     // Create the share and add it to the tracker.
+                    // Shared lock: prevent data race with think()/clean_tracker()
+                    // on the compute thread. Without this, the PPLNS walk inside
+                    // create_local_share's cross-check sees inconsistent tracker
+                    // state → GENTX mismatch → share rejected → peers ban us.
+                    auto tracker_lock = p2p_node->tracker_shared_lock();
+
                     // Pass frozen fields from template time so ref_hash matches coinbase.
                     uint256 share_hash = ltc::create_local_share(
                         p2p_node->tracker(),

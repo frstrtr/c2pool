@@ -151,6 +151,14 @@ public:
     void processing_shares_phase2(HandleSharesData& data, NetService addr);
     ShareTracker& tracker() { return m_tracker; }
 
+    /// Acquire shared (reader) lock on the tracker mutex.
+    /// Callers that read the tracker from the IO thread (stratum submit,
+    /// work template build) MUST hold this to prevent data races with
+    /// think()/clean_tracker() on the compute thread.
+    std::shared_lock<std::shared_mutex> tracker_shared_lock() {
+        return std::shared_lock<std::shared_mutex>(m_tracker_mutex);
+    }
+
     // Async share download — response delivered to callback when sharereply arrives
     void request_shares(uint256 id, peer_ptr peer,
                         std::vector<uint256> hashes, uint64_t parents,
