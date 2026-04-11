@@ -55,12 +55,16 @@ function poll() {
             var m = Math.floor((d.uptime_seconds || 0) / 60);
             var s = (d.uptime_seconds || 0) % 60;
             document.getElementById('d-uptime').textContent = m + 'm ' + s + 's';
-            if (d.ready) {
-                document.getElementById('status').textContent = 'Ready! Redirecting...';
+            if (d.ready && d.verified_size >= 100) {
+                document.getElementById('status').textContent = 'Ready! Redirecting to dashboard...';
                 document.getElementById('status').className = 'status ok';
-                setTimeout(function() { window.location.href = 'dashboard.html'; }, 1500);
+                setTimeout(function() { window.location.href = 'dashboard.html'; }, 5000);
+            } else if (d.ready) {
+                document.getElementById('status').textContent = 'Verifying shares... ' + d.verified_size + ' verified';
             } else if (d.has_shares) {
-                document.getElementById('status').textContent = 'Syncing sharechain...';
+                document.getElementById('status').textContent = 'Syncing sharechain... ' + d.chain_size + ' shares';
+            } else if (d.has_best_share) {
+                document.getElementById('status').textContent = 'Connecting to p2pool network...';
             } else {
                 document.getElementById('status').textContent = 'Syncing blockchain headers...';
             }
