@@ -29,8 +29,8 @@ http_host: "0.0.0.0"          # HTTP bind address
 # Bootstrap checkpoints — skip millions of old headers on first sync.
 # Format: HEIGHT:BLOCK_HASH
 # Update these periodically for faster initial sync.
-header_checkpoint: "3079000:862daffd70dd1d16bed4fce3773f04160749f39f59d2c37a7e28be4a6c5092f6"
-doge_header_checkpoint: "6140000:743b7eb4ec40678b603d1fb9498175164dbaf43029ac42bc6eff4bc61cdc6ada"
+header_checkpoint: "3088000:4a7fc8d4668c69db4f40fcdeb99ad3dbd85545b742b48e1529ebbec641e547d1"
+doge_header_checkpoint: "6160000:51efd04daebddba43ae403662098524d99abf3edad3bddc3ea7b2938c6799939"
 
 # ─── Sharechain Seed Nodes ─────────────────────────────────────────────────
 # P2P peers to bootstrap the sharechain from. Added alongside hardcoded
