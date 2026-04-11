@@ -843,7 +843,19 @@ public:
                 LOG_INFO << "[think-P2-iter] verified_heads=" << verified.get_heads().size()
                          << " chain=" << chain.size() << " verified=" << verified.size();
         }
-        for (auto& [head_hash, tail_hash] : verified.get_heads())
+        // Sort verified heads by work (descending) so the best chain gets
+        // budget priority.  p2pool iterates in arbitrary order but has no
+        // budget — with our budget, a low-scored side chain can starve the
+        // best chain if it goes first.
+        std::vector<std::pair<uint256, uint256>> sorted_vheads(
+            verified.get_heads().begin(), verified.get_heads().end());
+        std::sort(sorted_vheads.begin(), sorted_vheads.end(),
+            [this](const auto& a, const auto& b) {
+                auto wa = verified.contains(a.first) ? verified.get_work(a.first) : uint288{};
+                auto wb = verified.contains(b.first) ? verified.get_work(b.first) : uint288{};
+                return wa > wb;  // highest work first
+            });
+        for (auto& [head_hash, tail_hash] : sorted_vheads)
         {
             if (budget_remaining <= 0) {
                 m_think_needs_continue = true;
@@ -965,12 +977,20 @@ public:
                         }
                     }
 
+                    // p2pool has no budget — it verifies all shares synchronously.
+                    // With our budget, don't count already-verified shares against it.
+                    // Head B's walk through Head A's verified territory should be free.
+                    bool was_already_verified = verified.contains(hash);
                     if (!attempt_verify(hash))
                         break;
                     ++p2_verified_count;
-                    --budget_remaining;
+                    if (!was_already_verified) {
+                        --budget_remaining;
+                    }
                     if (p2_verified_count % 50 == 0)
                         LOG_INFO << "[think-P2] verifying: " << p2_verified_count << "/" << to_get
+                                 << " new=" << (was_already_verified ? "no" : "yes")
+                                 << " budget=" << budget_remaining
                                  << " verified_total=" << verified.size();
                 }
             }
