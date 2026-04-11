@@ -340,6 +340,8 @@ void HttpSession::process_request()
                 rest_result = mining_interface_->rest_payout_addrs();
             else if (target == "/web/best_share_hash")
                 rest_result = mining_interface_->rest_web_best_share_hash();
+            else if (target == "/web/sync_status")
+                rest_result = mining_interface_->rest_sync_status();
             else if (target == "/p2pool_global_stats")
                 rest_result = mining_interface_->rest_p2pool_global_stats();
 
@@ -572,7 +574,7 @@ void HttpSession::process_request()
                 const auto& dashboard_dir = mining_interface_->get_dashboard_dir();
                 if (!dashboard_dir.empty()) {
                     std::string file_path = target;
-                    if (file_path == "/" || file_path.empty()) file_path = "/dashboard.html";
+                    if (file_path == "/" || file_path.empty()) file_path = "/loading.html";
 
                     std::error_code fec;
                     std::filesystem::path base = std::filesystem::weakly_canonical(dashboard_dir);
@@ -4319,6 +4321,39 @@ nlohmann::json MiningInterface::rest_web_best_share_hash()
         return h.GetHex();
     }
     return "0000000000000000000000000000000000000000000000000000000000000000";
+}
+
+nlohmann::json MiningInterface::rest_sync_status()
+{
+    nlohmann::json result;
+
+    // Check if sharechain has data
+    bool has_shares = false;
+    int chain_size = 0, verified_size = 0;
+    if (m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        chain_size = sc.value("chain_height", 0);
+        verified_size = sc.value("verified_count", 0);
+        has_shares = chain_size > 0;
+    }
+
+    // Check if best share exists
+    bool has_best = false;
+    if (m_best_share_hash_fn) {
+        auto h = m_best_share_hash_fn();
+        has_best = !h.IsNull();
+    }
+
+    result["ready"] = has_best && has_shares;
+    result["has_best_share"] = has_best;
+    result["has_shares"] = has_shares;
+    result["chain_size"] = chain_size;
+    result["verified_size"] = verified_size;
+    result["uptime_seconds"] = static_cast<int>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - m_start_time).count());
+
+    return result;
 }
 
 // ── Log endpoints (read directly from debug.log) ───────────────────────

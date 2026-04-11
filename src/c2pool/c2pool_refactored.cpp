@@ -457,8 +457,8 @@ int main(int argc, char* argv[]) {
     // Embedded SPV bootstrap checkpoints (mainnet defaults, skip millions of old headers)
     // Override with --header-checkpoint / --doge-header-checkpoint or config YAML.
     // Testnet: set via CLI or config (no hardcoded default).
-    std::string header_checkpoint_str       = "3079000:862daffd70dd1d16bed4fce3773f04160749f39f59d2c37a7e28be4a6c5092f6";
-    std::string doge_header_checkpoint_str  = "6140000:743b7eb4ec40678b603d1fb9498175164dbaf43029ac42bc6eff4bc61cdc6ada";
+    std::string header_checkpoint_str       = "3088000:4a7fc8d4668c69db4f40fcdeb99ad3dbd85545b742b48e1529ebbec641e547d1";
+    std::string doge_header_checkpoint_str  = "6160000:51efd04daebddba43ae403662098524d99abf3edad3bddc3ea7b2938c6799939";
     std::string doge_p2p_address;            // --doge-p2p-address HOST
     int doge_p2p_port = 0;                   // --doge-p2p-port PORT
     Blockchain blockchain = Blockchain::LITECOIN;  // Default to Litecoin
