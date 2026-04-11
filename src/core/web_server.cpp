@@ -4344,11 +4344,22 @@ nlohmann::json MiningInterface::rest_sync_status()
         has_best = !h.IsNull();
     }
 
-    // Node is truly ready when it has verified shares for PPLNS computation.
-    // Without verified shares, the dashboard shows empty PPLNS/hashrate data.
-    result["ready"] = has_best && has_shares && verified_size > 0;
+    // Check if a valid work template exists (SPV synced + UTXO mature)
+    bool has_work = false;
+    {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        has_work = !m_cached_template.is_null()
+            && m_cached_template.value("coinbasevalue", uint64_t(0)) > 0;
+    }
+
+    // Node is truly ready when:
+    // 1. Has verified shares (for PPLNS)
+    // 2. Has a valid work template (SPV synced, UTXO matured)
+    // Without both, the dashboard shows empty sections.
+    result["ready"] = has_best && has_shares && verified_size > 0 && has_work;
     result["has_best_share"] = has_best;
     result["has_shares"] = has_shares;
+    result["has_work"] = has_work;
     result["chain_size"] = chain_size;
     result["verified_size"] = verified_size;
     result["uptime_seconds"] = static_cast<int>(

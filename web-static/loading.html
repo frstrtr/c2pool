@@ -37,6 +37,7 @@ h1 { font-size: 2rem; margin-bottom: 8px; color: #58a6ff; }
         <div class="row"><span class="label">Sharechain</span><span class="val" id="d-shares">...</span></div>
         <div class="row"><span class="label">Verified</span><span class="val" id="d-verified">...</span></div>
         <div class="row"><span class="label">Best share</span><span class="val" id="d-best">...</span></div>
+        <div class="row"><span class="label">SPV nodes</span><span class="val" id="d-work">...</span></div>
         <div class="row"><span class="label">Uptime</span><span class="val" id="d-uptime">...</span></div>
     </div>
     <div class="note">This page auto-refreshes. You will be redirected to the dashboard when ready.</div>
@@ -52,6 +53,8 @@ function poll() {
             document.getElementById('d-verified').className = 'val ' + (d.verified_size > 0 ? 'ok' : 'wait');
             document.getElementById('d-best').textContent = d.has_best_share ? 'found' : 'syncing...';
             document.getElementById('d-best').className = 'val ' + (d.has_best_share ? 'ok' : 'wait');
+            document.getElementById('d-work').textContent = d.has_work ? 'synced' : 'syncing...';
+            document.getElementById('d-work').className = 'val ' + (d.has_work ? 'ok' : 'wait');
             var m = Math.floor((d.uptime_seconds || 0) / 60);
             var s = (d.uptime_seconds || 0) % 60;
             document.getElementById('d-uptime').textContent = m + 'm ' + s + 's';
@@ -67,7 +70,9 @@ function poll() {
                 }
                 document.getElementById('status').textContent = 'Initializing dashboard data... (' + window._readyCount + '/3)';
                 document.getElementById('status').className = 'status ok';
-            } else if (d.ready) {
+            } else if (d.has_shares && d.verified_size > 0 && !d.has_work) {
+                document.getElementById('status').textContent = 'Syncing embedded SPV nodes... (' + d.verified_size + ' shares verified)';
+            } else if (d.has_shares && d.verified_size > 0) {
                 document.getElementById('status').textContent = 'Verifying shares... ' + d.verified_size + ' verified';
             } else if (d.has_shares) {
                 document.getElementById('status').textContent = 'Syncing sharechain... ' + d.chain_size + ' shares';
