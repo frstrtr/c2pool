@@ -56,9 +56,17 @@ function poll() {
             var s = (d.uptime_seconds || 0) % 60;
             document.getElementById('d-uptime').textContent = m + 'm ' + s + 's';
             if (d.ready && d.verified_size >= 100) {
-                document.getElementById('status').textContent = 'Ready! Redirecting to dashboard...';
+                if (!window._readyCount) window._readyCount = 0;
+                window._readyCount++;
+                // Wait 3 consecutive ready polls (9s) before redirecting
+                if (window._readyCount >= 3) {
+                    document.getElementById('status').textContent = 'Ready! Redirecting to dashboard...';
+                    document.getElementById('status').className = 'status ok';
+                    setTimeout(function() { window.location.href = 'dashboard.html'; }, 2000);
+                    return;
+                }
+                document.getElementById('status').textContent = 'Initializing dashboard data... (' + window._readyCount + '/3)';
                 document.getElementById('status').className = 'status ok';
-                setTimeout(function() { window.location.href = 'dashboard.html'; }, 5000);
             } else if (d.ready) {
                 document.getElementById('status').textContent = 'Verifying shares... ' + d.verified_size + ' verified';
             } else if (d.has_shares) {
