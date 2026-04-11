@@ -1615,34 +1615,64 @@ void NodeImpl::heartbeat_log()
 
 // Periodic maintenance: eat stale heads, drop tails.
 // Direct translation of p2pool node.py:355-402 clean_tracker().
+//
+// Runs on the compute thread under exclusive lock — matching p2pool where
+// clean_tracker + think() execute on the same reactor thread. Chain
+// modifications (remove shares) MUST NOT happen concurrently with think().
 void NodeImpl::clean_tracker()
 {
     // Prevent concurrent clean_tracker (timer re-entry safety).
     if (m_clean_running.exchange(true))
         return;
-    // RAII guard: always clear flag on exit (even on exception)
-    struct CleanGuard {
-        std::atomic<bool>& flag;
-        ~CleanGuard() { flag.store(false); }
-    } clean_guard{m_clean_running};
 
-    // Non-blocking: skip this cycle if think() holds the tracker mutex.
-    // clean_tracker runs every 5s — next cycle will catch up.
-    {
-        std::unique_lock lock(m_tracker_mutex, std::try_to_lock);
-        if (!lock.owns_lock()) {
-            // Still trigger think() (async, non-blocking) so scoring continues
-            run_think();
-            return;
-        }
+    // Skip if think() is already in flight — the 5s timer will retry.
+    if (m_think_running.load()) {
+        m_clean_running.store(false);
+        return;
     }
 
-    // Step 1: Run think() to get current scoring + remove bad shares
-    // (also populates m_last_top5_heads)
-    run_think();
+    // Post the entire clean_tracker body to the compute thread.
+    // This guarantees chain modifications happen under exclusive lock,
+    // never concurrent with think() or IO-thread reads.
+    m_think_running.store(true);  // block think() re-entry during clean
 
-    auto now_sec = static_cast<int64_t>(std::time(nullptr));
-    auto CL = static_cast<int32_t>(ltc::PoolConfig::chain_length());
+    boost::asio::post(m_think_pool, [this]() {
+      try {
+        std::unique_lock lock(m_tracker_mutex);  // exclusive
+
+        // Step 1: Run think() inline (already holds the lock)
+        {
+            auto block_rel_height = m_block_rel_height_fn
+                ? m_block_rel_height_fn
+                : std::function<int32_t(uint256)>([](uint256) -> int32_t { return 0; });
+
+            uint256 prev_block;
+            uint32_t bits = 0;
+
+            LOG_INFO << "[CLEAN] think+clean starting on compute thread: chain="
+                     << m_tracker.chain.size() << " verified=" << m_tracker.verified.size();
+            auto think_t0 = std::chrono::steady_clock::now();
+            auto result = m_tracker.think(block_rel_height, prev_block, bits);
+            auto think_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - think_t0).count();
+
+            m_last_top5_heads = std::move(result.top5_heads);
+
+            bool best_changed = false;
+            if (!result.best.IsNull()) {
+                best_changed = (m_best_share_hash != result.best);
+                m_best_share_hash = result.best;
+            }
+
+            flush_verified_to_leveldb();
+
+            if (best_changed && m_on_best_share_changed)
+                m_on_best_share_changed();
+        }
+
+        // Steps 2-3: Prune (still holding exclusive lock)
+        auto now_sec = static_cast<int64_t>(std::time(nullptr));
+        auto CL = static_cast<int32_t>(ltc::PoolConfig::chain_length());
 
     // Step 2: Eat stale heads (p2pool node.py:358-378)
     // Three guards protect useful heads:
@@ -1767,8 +1797,22 @@ void NodeImpl::clean_tracker()
                      << " heads=" << m_tracker.chain.get_heads().size();
     }
 
-    // Step 4: Update best share (p2pool node.py:402)
-    run_think();
+    // Step 4: re-score after pruning (inline, already holding lock)
+    {
+        auto block_rel_height = m_block_rel_height_fn
+            ? m_block_rel_height_fn
+            : std::function<int32_t(uint256)>([](uint256) -> int32_t { return 0; });
+        uint256 prev_block;
+        uint32_t bits = 0;
+        auto result = m_tracker.think(block_rel_height, prev_block, bits);
+        m_last_top5_heads = std::move(result.top5_heads);
+        if (!result.best.IsNull()) {
+            bool changed = (m_best_share_hash != result.best);
+            m_best_share_hash = result.best;
+            if (changed && m_on_best_share_changed) m_on_best_share_changed();
+        }
+        flush_verified_to_leveldb();
+    }
 
     // Step 5: Flush pruned shares from LevelDB (p2pool main.py:269-270)
     if (!m_removal_flush_buf.empty() && m_storage && m_storage->is_available())
@@ -1821,6 +1865,19 @@ void NodeImpl::clean_tracker()
                          : m_best_share_hash.GetHex().substr(0, 16));
         }
     }
+
+      } catch (const std::exception& e) {
+        LOG_ERROR << "[CLEAN] failed on compute thread: " << e.what();
+      } catch (...) {
+        LOG_ERROR << "[CLEAN] failed on compute thread: unknown error";
+      }
+      // Lock released — post drain to IO thread
+      boost::asio::post(*m_context, [this]() {
+        drain_pending_adds();
+        m_think_running.store(false);
+        m_clean_running.store(false);
+      });
+    }); // end of m_think_pool lambda
 }
 
 bool NodeImpl::is_banned(const NetService& addr) const
