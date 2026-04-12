@@ -25,8 +25,6 @@ Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 | macOS | 26.3.1 (Tahoe) | Apple Clang 21.0 | 1.90 (Homebrew) | x86_64 Intel | Working |
 | macOS | — | Apple Clang | 1.90 (Homebrew) | arm64 (M-series) | Supported, untested |
 | Windows | 11 (26100) | MSVC 2022 | 1.78 (Conan) | x86_64 | In progress |
-| FreeBSD | 13.x / 14.x | Clang 13+ | system | x86_64 | Untested |
-
 > Other OS versions or Boost releases may require minor fixes.
 > Boost API changes between major versions are the most common source of build failures.
 
@@ -479,7 +477,6 @@ cd build && ctest --output-on-failure -j$(nproc)
 ### Install guides
 - [Ubuntu / Debian / Linux](doc/build-unix.md)
 - [macOS (Intel & Apple Silicon)](doc/build-macos.md)
-- [FreeBSD](doc/build-freebsd.md)
 - [Windows](doc/build-windows.md)
 
 See [deploy/DEPLOY.md](deploy/DEPLOY.md) for HiveOS/MinerStat/RaveOS setup.

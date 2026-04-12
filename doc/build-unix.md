@@ -214,10 +214,6 @@ The project already handles `CMP0167` — no manual workaround needed.
 
 See [build-macos.md](build-macos.md).
 
-## FreeBSD
-
-See [build-freebsd.md](build-freebsd.md).
-
 ## Windows
 
 See [build-windows.md](build-windows.md).

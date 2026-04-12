@@ -200,5 +200,4 @@ cmake --build . --target c2pool -j1
 ## Other platforms
 
 - [Ubuntu / Debian / Linux](build-unix.md)
-- [FreeBSD](build-freebsd.md)
 - [Windows](build-windows.md)
