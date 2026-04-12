@@ -451,7 +451,7 @@ struct ListType
             // Instead, allocate in 5MiB batches, so that an attacker actually needs to provide
             // X MiB of data to make us allocate X+5 Mib.
             static_assert(sizeof(typename V::value_type) <= MAX_VECTOR_ALLOCATE, "Vector element size too large");
-            allocated = std::min(nSize, allocated + MAX_VECTOR_ALLOCATE / sizeof(typename V::value_type));
+            allocated = std::min<size_t>(nSize, allocated + MAX_VECTOR_ALLOCATE / sizeof(typename V::value_type));
             values.reserve(allocated);
             while (values.size() < allocated) 
             {
