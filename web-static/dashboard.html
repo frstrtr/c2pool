@@ -2762,14 +2762,17 @@
             }
 
             // Inject Explorer nav link when explorer is enabled
-            if (info && info.explorer_enabled && info.explorer_url) {
+            if (info && info.explorer_enabled) {
+                // Use configured URL, or auto-detect from current host + default port
+                var explorerHref = info.explorer_url
+                    || ('http://' + window.location.hostname + ':9090');
                 var nav = document.querySelector('nav');
                 var _old = document.getElementById('nav-explorer'); if (_old) _old.remove();
                 if (nav) {
                     var classicLink = nav.querySelector('a[href="index.html"]');
                     var a = document.createElement('a');
                     a.id = 'nav-explorer';
-                    a.href = info.explorer_url;
+                    a.href = explorerHref;
                     a.target = '_blank';
                     a.textContent = 'Explorer';
                     if (classicLink && classicLink.nextSibling) {
@@ -2804,8 +2807,11 @@
         
         // Load node info for miner configuration (non-blocking, server responds instantly)
         d3.json('../node_info', function(nodeInfo) {
-            if (nodeInfo && nodeInfo.external_ip) {
-                var minerUrl = 'stratum+tcp://' + nodeInfo.external_ip + ':' + nodeInfo.worker_port;
+            if (nodeInfo) {
+                // Use configured external_ip, or fall back to browser hostname
+                var host = (nodeInfo.external_ip && nodeInfo.external_ip !== '0.0.0.0')
+                    ? nodeInfo.external_ip : window.location.hostname;
+                var minerUrl = 'stratum+tcp://' + host + ':' + (nodeInfo.worker_port || 9327);
                 document.getElementById('miner-url').textContent = minerUrl;
             } else {
                 document.getElementById('miner-url').textContent = 'unavailable';

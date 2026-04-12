@@ -1187,7 +1187,7 @@ private:
     uint16_t m_p2p_port{9338};
     uint16_t m_worker_port{9327};
     std::string m_external_ip;
-    std::string m_pool_version{"c2pool/0.12.0"};
+    std::string m_pool_version{"c2pool/0.1.0-alpha"};
 
     // Best share difficulty tracking
     struct BestDifficulty {
