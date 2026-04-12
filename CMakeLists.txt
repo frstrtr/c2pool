@@ -69,6 +69,11 @@ endif()
 include_directories(include)
 include_directories(src)
 
+# Make secp256k1 headers available globally (needed by btclibs, impl/)
+if(SECP256K1_INCLUDE_DIRS)
+    include_directories(${SECP256K1_INCLUDE_DIRS})
+endif()
+
 add_subdirectory(src)
 add_subdirectory(test)
 # add_subdirectory(benchmark)
