@@ -107,65 +107,10 @@ jobs:
         with: { name: test-results-linux, path: build_ci/Testing/, retention-days: 7 }
 
   # ════════════════════════════════════════════════════════════════════════════
-  # macOS Intel (x86_64, Homebrew)
+  # macOS (Apple Silicon arm64 — GitHub only provides ARM runners now)
+  # Intel x86_64 macOS binary is built locally; see doc/build-macos.md
   # ════════════════════════════════════════════════════════════════════════════
-  macos-intel:
-    name: macOS x86_64
-    runs-on: macos-13
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install dependencies
-        run: brew install cmake boost leveldb secp256k1 nlohmann-json yaml-cpp
-
-      - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-
-      - name: Build
-        run: cmake --build build --target c2pool -j$(sysctl -n hw.ncpu)
-
-      - name: Verify binary
-        run: file build/src/c2pool/c2pool && build/src/c2pool/c2pool --help 2>&1 | head -3
-
-      - name: Package release
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          PKG="c2pool-${VERSION}-macos-x86_64"
-          mkdir -p "${PKG}/lib" "${PKG}/config" "${PKG}/web-static" "${PKG}/explorer"
-          cp build/src/c2pool/c2pool "${PKG}/"
-          strip "${PKG}/c2pool"
-          # Bundle dylibs and fix rpaths
-          for dylib in $(otool -L "${PKG}/c2pool" | grep "/usr/local" | awk '{print $1}'); do
-            base=$(basename "$dylib")
-            cp "$dylib" "${PKG}/lib/${base}"
-            install_name_tool -change "$dylib" "@executable_path/lib/${base}" "${PKG}/c2pool"
-          done
-          for lib in "${PKG}"/lib/*.dylib; do
-            for ref in $(otool -L "$lib" | grep "/usr/local" | awk '{print $1}'); do
-              base=$(basename "$ref")
-              [ -f "${PKG}/lib/${base}" ] && install_name_tool -change "$ref" "@executable_path/lib/${base}" "$lib"
-            done
-            install_name_tool -id "@executable_path/lib/$(basename $lib)" "$lib"
-          done
-          cp start.sh "${PKG}/" && chmod +x "${PKG}/start.sh"
-          cp config/c2pool_mainnet.yaml "${PKG}/config/c2pool_mainnet.yaml.example" || true
-          cp -r web-static/* "${PKG}/web-static/"
-          cp explorer/explorer.py "${PKG}/explorer/"
-          zip -r "${PKG}.zip" "${PKG}/"
-          shasum -a 256 "${PKG}.zip" > "${PKG}.zip.sha256"
-
-      - name: Upload release artifact
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@v7
-        with:
-          name: macos-x86_64
-          path: c2pool-*-macos-x86_64.zip*
-
-  # ════════════════════════════════════════════════════════════════════════════
-  # macOS ARM (Apple Silicon, Homebrew)
-  # ════════════════════════════════════════════════════════════════════════════
-  macos-arm:
+  macos:
     name: macOS arm64
     runs-on: macos-14
     steps:
@@ -302,7 +247,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   release:
     name: Publish Release
-    needs: [linux, macos-intel, macos-arm, windows]
+    needs: [linux, macos, windows]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
