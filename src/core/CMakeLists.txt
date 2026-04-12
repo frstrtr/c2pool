@@ -51,6 +51,6 @@ else()
 endif()
 
 # Add LevelDB include directories
-target_include_directories(core PRIVATE ${LEVELDB_INCLUDE_DIRS})
+target_include_directories(core PUBLIC ${LEVELDB_INCLUDE_DIRS})
 
 add_subdirectory(test)
