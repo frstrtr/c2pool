@@ -31,19 +31,28 @@ find_package(nlohmann_json REQUIRED)
 find_package(Threads REQUIRED)
 
 # Find LevelDB for persistent storage
-# Try system shared lib first (Linux — no transitive deps needed at link time).
-# Fall back to find_package for Conan/vcpkg static builds (links snappy etc.).
-find_library(LEVELDB_LIBRARIES NAMES leveldb PATHS /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib NO_CMAKE_PATH NO_CMAKE_ENVIRONMENT_PATH)
-find_path(LEVELDB_INCLUDE_DIRS leveldb/db.h PATHS /usr/include /usr/local/include NO_CMAKE_PATH NO_CMAKE_ENVIRONMENT_PATH)
-if(LEVELDB_LIBRARIES AND LEVELDB_INCLUDE_DIRS)
-    message(STATUS "LevelDB found (system): ${LEVELDB_LIBRARIES}")
-    message(STATUS "LevelDB includes: ${LEVELDB_INCLUDE_DIRS}")
+# Try system shared lib first. If only static .a is found (Conan cross-compile),
+# use find_package which properly links transitive deps (snappy, crc32c).
+find_library(LEVELDB_LIB_PATH NAMES leveldb)
+find_path(LEVELDB_INC_PATH leveldb/db.h)
+if(LEVELDB_LIB_PATH AND LEVELDB_INC_PATH AND LEVELDB_LIB_PATH MATCHES "\\.(so|dylib)")
+    set(LEVELDB_LIBRARIES ${LEVELDB_LIB_PATH})
+    set(LEVELDB_INCLUDE_DIRS ${LEVELDB_INC_PATH})
+    message(STATUS "LevelDB found (shared): ${LEVELDB_LIBRARIES}")
 else()
-    # Conan/vcpkg/Homebrew — find_package handles transitive deps (snappy, crc32c)
-    find_package(leveldb REQUIRED)
-    message(STATUS "LevelDB found via find_package (Conan/vcpkg)")
-    set(LEVELDB_LIBRARIES leveldb::leveldb)
-    set(LEVELDB_INCLUDE_DIRS "")
+    find_package(leveldb QUIET)
+    if(TARGET leveldb::leveldb)
+        message(STATUS "LevelDB found via find_package (Conan/vcpkg)")
+        set(LEVELDB_LIBRARIES leveldb::leveldb)
+        set(LEVELDB_INCLUDE_DIRS "")
+    elseif(LEVELDB_LIB_PATH AND LEVELDB_INC_PATH)
+        # Shared lib on non-standard path (Homebrew)
+        set(LEVELDB_LIBRARIES ${LEVELDB_LIB_PATH})
+        set(LEVELDB_INCLUDE_DIRS ${LEVELDB_INC_PATH})
+        message(STATUS "LevelDB found: ${LEVELDB_LIBRARIES}")
+    else()
+        message(FATAL_ERROR "LevelDB not found. Install leveldb-dev or add to Conan.")
+    endif()
 endif()
 
 # Find libsecp256k1 for ECDSA signature verification
