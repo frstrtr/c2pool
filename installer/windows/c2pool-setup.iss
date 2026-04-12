@@ -45,8 +45,8 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Files]
 ; Main binary
 Source: "{#PACKAGE_DIR}\c2pool.exe"; DestDir: "{app}"; Flags: ignoreversion
-; DLLs (secp256k1, etc.)
-Source: "{#PACKAGE_DIR}\lib\*"; DestDir: "{app}\lib"; Flags: ignoreversion recursesubdirs createallsubdirs
+; DLLs (secp256k1, etc.) — must be next to c2pool.exe for Windows DLL search
+Source: "{#PACKAGE_DIR}\lib\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; Web dashboard
 Source: "{#PACKAGE_DIR}\web-static\*"; DestDir: "{app}\web-static"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; Block explorer
