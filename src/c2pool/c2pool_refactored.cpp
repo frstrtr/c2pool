@@ -83,7 +83,7 @@ static void write_crash_log(const char* reason) {
     fclose(f);
 }
 
-static void terminate_handler() {
+static void c2pool_terminate_handler() {
     fprintf(stderr, "\n=== std::terminate() called ===\n");
     auto eptr = std::current_exception();
     if (eptr) {
@@ -144,7 +144,7 @@ static void write_crash_log(const char* reason) {
     }
 }
 
-static void terminate_handler() {
+static void c2pool_terminate_handler() {
     fprintf(stderr, "\n=== std::terminate() called ===\n");
     auto eptr = std::current_exception();
     if (eptr) {
@@ -443,7 +443,7 @@ void print_help() {
 
 int main(int argc, char* argv[]) {
     // Install crash handlers
-    std::set_terminate(terminate_handler);
+    std::set_terminate(c2pool_terminate_handler);
     std::signal(SIGINT, signal_handler);
 #ifndef _WIN32
     std::signal(SIGTERM, signal_handler);  // SIGTERM not reliably delivered on Windows
