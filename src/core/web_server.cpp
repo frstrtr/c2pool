@@ -6335,6 +6335,9 @@ void MiningInterface::update_stat_log()
 
     // Memory usage (RSS)
     entry.memory_usage = 0;
+#ifdef _WIN32
+    // Windows: use GetProcessMemoryInfo if needed (optional, skip for now)
+#else
     {
         std::ifstream statm("/proc/self/statm");
         if (statm) {
@@ -6344,6 +6347,7 @@ void MiningInterface::update_stat_log()
             entry.memory_usage = static_cast<double>(pages) * sysconf(_SC_PAGESIZE);
         }
     }
+#endif
 
     // Work latency (template build time in seconds, matching p2pool getwork_latency)
     entry.work_latency = m_last_work_latency.load(std::memory_order_relaxed) / 1000.0;

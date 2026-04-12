@@ -325,7 +325,7 @@ bool LevelDBStore::BatchWriter::commit_sync()
 SharechainLevelDBStore::SharechainLevelDBStore(const std::string& base_path, const std::string& network_name)
     : m_base_path(base_path), m_network_name(network_name)
 {
-    m_db_path = std::filesystem::path(base_path) / network_name / "sharechain_leveldb";
+    m_db_path = (std::filesystem::path(base_path) / network_name / "sharechain_leveldb").string();
     
     // Configure optimized options for sharechain data
     m_options.write_buffer_size = 64 * 1024 * 1024;  // 64MB write buffer
