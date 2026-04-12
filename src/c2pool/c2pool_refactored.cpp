@@ -6084,8 +6084,8 @@ int main(int argc, char* argv[]) {
 
             if (embedded_broadcaster && doge_chain) {
                 auto* bcaster = embedded_broadcaster.get();
-                constexpr int MAX_RETRY = 5;
-                constexpr int RETRY_SEC = 10;
+                static constexpr int MAX_RETRY = 5;
+                static constexpr int RETRY_SEC = 10;
 
                 *merged_block_resolver = [bcaster, pending_merged_resolve,
                                           pending_resolve_state, &ioc](

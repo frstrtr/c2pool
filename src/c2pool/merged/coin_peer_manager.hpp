@@ -49,7 +49,8 @@ inline std::string get_network_group(const std::string& ip)
         if (addr.is_v6()) {
             auto v6 = addr.to_v6();
             if (v6.is_v4_mapped()) {
-                auto v4 = v6.to_v4().to_bytes();
+                auto v4 = boost::asio::ip::make_address_v4(
+                    boost::asio::ip::v4_mapped, v6).to_bytes();
                 return std::to_string(v4[0]) + "." + std::to_string(v4[1]);
             }
             // /32 prefix: first 4 bytes
