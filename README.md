@@ -19,20 +19,29 @@ Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 
 ## Quick start
 
+**Linux (Ubuntu 24.04)**
 ```bash
-# 1 — prerequisites (Ubuntu 24.04)
 sudo apt-get install -y g++ cmake make libleveldb-dev libsecp256k1-dev python3-pip
 pip install "conan>=2.0,<3.0" --break-system-packages
 conan profile detect --force
 
-# 2 — clone and build
 git clone https://github.com/frstrtr/c2pool.git
 cd c2pool && mkdir build && cd build
 conan install .. --build=missing --output-folder=. --settings=build_type=Debug
 cmake .. --preset conan-debug
 cmake --build . --target c2pool -j$(nproc)
+./src/c2pool/c2pool
+```
 
-# 3 — run (zero config)
+**macOS (Intel & Apple Silicon)**
+```bash
+xcode-select --install
+brew install cmake boost leveldb secp256k1 nlohmann-json yaml-cpp
+
+git clone https://github.com/frstrtr/c2pool.git
+cd c2pool && mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake --build . --target c2pool -j$(sysctl -n hw.ncpu)
 ./src/c2pool/c2pool
 ```
 
@@ -44,7 +53,7 @@ shares before opening stratum to miners.
 Miners connect to stratum and set their LTC payout address as the username
 (p2pool convention). No `--address` flag needed.
 
-Full step-by-step guide: [doc/build-unix.md](doc/build-unix.md)
+Full step-by-step guides: [Linux](doc/build-unix.md) | [macOS](doc/build-macos.md) | [Windows](doc/build-windows.md)
 
 ---
 
@@ -454,6 +463,7 @@ cd build && ctest --output-on-failure -j$(nproc)
 
 ### Install guides
 - [Ubuntu / Debian / Linux](doc/build-unix.md)
+- [macOS (Intel & Apple Silicon)](doc/build-macos.md)
 - [FreeBSD](doc/build-freebsd.md)
 - [Windows](doc/build-windows.md)
 
