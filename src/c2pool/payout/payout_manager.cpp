@@ -1095,7 +1095,12 @@ bool PayoutManager::try_detect_wallet_address() {
             return false;
         }
 
+        // Boost 1.88+ moved process API to v2; use v1 compat namespace
+#if BOOST_VERSION >= 108800
+        namespace bp = boost::process::v1;
+#else
         namespace bp = boost::process;
+#endif
         bp::ipstream pipe_stream;
         bp::child proc(cli_cmd + " getnewaddress \"c2pool_node_owner\"",
                        bp::std_out > pipe_stream, bp::std_err > bp::null);

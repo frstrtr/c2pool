@@ -244,7 +244,12 @@ bool PayoutManager::detect_wallet_address_rpc() {
         // Try to get a receiving address
         std::string full_command = command + " getnewaddress \"c2pool_node_owner\"";
         
+        // Boost 1.88+ moved process API to v2; use v1 compat namespace
+#if BOOST_VERSION >= 108800
+        namespace bp = boost::process::v1;
+#else
         namespace bp = boost::process;
+#endif
         bp::ipstream pipe_stream;
         bp::child rpc_process(full_command, bp::std_out > pipe_stream, bp::std_err > bp::null);
         
