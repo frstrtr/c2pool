@@ -97,10 +97,14 @@ target_link_libraries(c2pool_enhanced
     ${Boost_LIBRARIES}
 )
 
-# Windows: Boost.Asio requires Winsock libraries
+# Windows: Boost.Asio requires Winsock libraries; /bigobj for large translation units
 if(WIN32)
     target_link_libraries(c2pool ws2_32 mswsock bcrypt)
     target_link_libraries(c2pool_enhanced ws2_32 mswsock bcrypt)
+endif()
+if(MSVC)
+    target_compile_options(c2pool PRIVATE /bigobj)
+    target_compile_options(c2pool_enhanced PRIVATE /bigobj)
 endif()
 
 # Test applications
