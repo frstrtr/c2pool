@@ -201,10 +201,12 @@ jobs:
           cmake --install secp256k1-src/build --config Release
 
       - name: Configure
-        run: cmake -S . -B build_ci -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake -DCMAKE_PREFIX_PATH="${env:GITHUB_WORKSPACE}/secp256k1"
+        shell: cmd
+        run: cmake -S . -B build_ci -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake -DCMAKE_PREFIX_PATH="%GITHUB_WORKSPACE%/secp256k1"
 
       - name: Build
-        run: cmake --build build_ci --target c2pool --config Release -j $env:NUMBER_OF_PROCESSORS
+        shell: cmd
+        run: cmake --build build_ci --target c2pool --config Release -j %NUMBER_OF_PROCESSORS%
 
       - name: Verify binary
         run: |
