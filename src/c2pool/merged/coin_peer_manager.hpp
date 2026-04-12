@@ -469,6 +469,33 @@ public:
 
     const std::string& symbol() const { return m_symbol; }
 
+    /// Return a random subset of verified (tried) peers for sharing via API.
+    /// Only includes peers we've successfully connected to — prevents serving
+    /// unverified addresses that could be used for eclipse attacks.
+    /// max_count: cap on returned peers (default 25).
+    std::vector<NetService> get_tried_peers(int max_count = 25) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<NetService> result;
+        for (auto& [k, p] : m_peers) {
+            if (!p.in_tried) continue;
+            // Don't share localhost, empty, or private addresses
+            auto addr = p.address.address();
+            if (addr.empty() || addr == "127.0.0.1" || addr == "::1"
+                || addr.substr(0, 4) == "192." || addr.substr(0, 3) == "10."
+                || addr.substr(0, 7) == "172.16.") continue;
+            result.push_back(p.address);
+        }
+        // Shuffle for privacy (don't reveal connection order/topology)
+        if (result.size() > 1) {
+            thread_local std::mt19937 rng(std::random_device{}());
+            std::shuffle(result.begin(), result.end(), rng);
+        }
+        if (static_cast<int>(result.size()) > max_count)
+            result.resize(max_count);
+        return result;
+    }
+
 private:
     bool is_valid_port(uint16_t port) const
     {

@@ -11,6 +11,8 @@ namespace doge {
 namespace coin {
 
 /// DNS seeds for Dogecoin mainnet.
+/// Note: multidoge.org and dogecoin.com seeds are dead as of 2026-04.
+/// Kept for future recovery; fixed seeds below provide actual connectivity.
 inline std::vector<c2pool::dns::DnsSeed> doge_mainnet_dns_seeds()
 {
     return {
@@ -18,6 +20,9 @@ inline std::vector<c2pool::dns::DnsSeed> doge_mainnet_dns_seeds()
         {"seed2.multidoge.org",       22556},
         {"seed.doger.dogecoin.com",   22556},
         {"seed.dogecoin.com",         22556},
+        {"seed.mophides.com",         22556},
+        {"seed.dglibrary.org",        22556},
+        {"seed.dogechain.info",       22556},
     };
 }
 
@@ -39,14 +44,20 @@ inline std::vector<c2pool::dns::DnsSeed> doge_testnet4alpha_dns_seeds()
 }
 
 /// Hardcoded fallback peers for Dogecoin mainnet.
+/// Updated 2026-04-12 from opreturn.net/dogecoin/node/ — all DNS seeds are dead.
 inline std::vector<NetService> doge_mainnet_fixed_seeds()
 {
     return {
-        {"54.77.237.193",    22556},
-        {"52.31.196.188",    22556},
-        {"54.207.26.89",     22556},
-        {"95.217.1.76",      22556},
-        {"178.128.221.177",  22556},
+        {"18.144.182.93",    22556},
+        {"52.43.212.188",    22556},
+        {"173.212.197.63",   22556},
+        {"23.148.24.52",     22556},
+        {"161.35.231.176",   22556},
+        {"66.151.242.154",   22556},
+        {"194.233.65.194",   22556},
+        {"78.141.223.235",   22556},
+        {"54.37.130.17",     22556},
+        {"64.225.65.218",    22556},
     };
 }
 

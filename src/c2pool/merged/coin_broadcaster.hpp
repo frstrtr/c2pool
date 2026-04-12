@@ -321,6 +321,30 @@ public:
         }
     }
 
+    /// Request a full block from ONE specific peer (for bootstrap pipeline).
+    /// Uses round-robin index: peer_idx % peer_count selects the target.
+    /// Returns true if the request was sent, false if no peers available.
+    bool request_full_block_targeted(const uint256& block_hash, size_t peer_idx)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_peers.empty()) return false;
+        auto it = m_peers.begin();
+        std::advance(it, peer_idx % m_peers.size());
+        try {
+            it->second->node_p2p.request_full_block(block_hash);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    /// Number of connected peers (for bootstrap round-robin).
+    size_t peer_count() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_peers.size();
+    }
+
     /// Request a block via plain MSG_BLOCK (0x02) from all peers.
     /// Works for any block in the chain regardless of MWEB/witness support.
     void request_block_plain(const uint256& block_hash)

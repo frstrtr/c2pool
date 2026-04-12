@@ -497,6 +497,20 @@ void HttpSession::process_request()
                 rest_result = mining_interface_->rest_web_graph_data(source, view);
             }
 
+            // ── Coin peer sharing (public, rate-limited) ──────────────
+            else if (target == "/api/coin_peers") {
+                auto remote_ip = socket_.remote_endpoint().address().to_string();
+                auto result = mining_interface_->rest_coin_peers(remote_ip);
+                if (result.contains("error")) {
+                    response.result(http::status::too_many_requests);
+                    response.set(http::field::retry_after, "10");
+                }
+                response.body() = result.dump();
+                response.prepare_payload();
+                send_response(std::move(response));
+                return;
+            }
+
             else {
                 // ── Explorer API endpoints (loopback-only) ────────────────
                 if (target.substr(0, 14) == "/api/explorer/") {
@@ -574,7 +588,9 @@ void HttpSession::process_request()
                 const auto& dashboard_dir = mining_interface_->get_dashboard_dir();
                 if (!dashboard_dir.empty()) {
                     std::string file_path = target;
-                    if (file_path == "/" || file_path.empty()) file_path = "/loading.html";
+                    if (file_path == "/" || file_path.empty())
+                        file_path = mining_interface_->is_node_ready()
+                            ? "/dashboard.html" : "/loading.html";
 
                     // During startup, redirect all HTML pages to loading.html
                     // (except loading.html itself). Only loading.html + sync_status
@@ -4258,6 +4274,39 @@ nlohmann::json MiningInterface::rest_p2pool_global_stats()
 nlohmann::json MiningInterface::rest_web_version()
 {
     return m_pool_version;
+}
+
+nlohmann::json MiningInterface::rest_coin_peers(const std::string& remote_ip)
+{
+    // Rate limit: max 6 requests per minute per IP
+    auto now = std::chrono::steady_clock::now();
+    auto it = m_coin_peers_rate_limit.find(remote_ip);
+    if (it != m_coin_peers_rate_limit.end()) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            now - it->second).count();
+        if (elapsed < 10) {
+            return {{"error", "rate_limited"}, {"retry_after", 10 - elapsed}};
+        }
+    }
+    m_coin_peers_rate_limit[remote_ip] = now;
+
+    // Prune old entries (prevent unbounded growth)
+    if (m_coin_peers_rate_limit.size() > 1000) {
+        for (auto rl = m_coin_peers_rate_limit.begin();
+             rl != m_coin_peers_rate_limit.end(); ) {
+            if (std::chrono::duration_cast<std::chrono::seconds>(
+                    now - rl->second).count() > 60)
+                rl = m_coin_peers_rate_limit.erase(rl);
+            else
+                ++rl;
+        }
+    }
+
+    if (!m_coin_peers_fn)
+        return {{"ltc", nlohmann::json::array()},
+                {"doge", nlohmann::json::array()}};
+
+    return m_coin_peers_fn();
 }
 
 nlohmann::json MiningInterface::rest_web_currency_info()

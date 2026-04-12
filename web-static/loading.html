@@ -58,9 +58,10 @@ function poll() {
         document.getElementById('d-verified').className = 'val ' + (d.verified_size > 0 ? 'ok' : 'wait');
         document.getElementById('d-best').textContent = d.has_best_share ? 'found' : 'syncing...';
         document.getElementById('d-best').className = 'val ' + (d.has_best_share ? 'ok' : 'wait');
-        // Dashboard is truly ready when currency_info has real data
-        var dashReady = ci.block_value != null && ci.block_value > 0
-            && ci.pool_hash_rate != null && d.verified_size > 0;
+        // Dashboard is ready when sync_status reports ready and we have verified shares.
+        // In embedded mode, currency_info doesn't have block_value/pool_hash_rate
+        // (those come from getwork which requires stratum), so use the ready flag.
+        var dashReady = d.ready && d.verified_size > 0 && d.has_work;
         // SPV progress with ETA
         if (d.spv) {
             var ltcDone = d.spv.ltc_blocks >= d.spv.ltc_need;
@@ -86,16 +87,10 @@ function poll() {
         var s = (d.uptime_seconds || 0) % 60;
         document.getElementById('d-uptime').textContent = m + 'm ' + s + 's';
         if (dashReady) {
-            if (!window._readyCount) window._readyCount = 0;
-            window._readyCount++;
-            if (window._readyCount >= 3) {
-                document.getElementById('status').textContent = 'Ready! Redirecting to dashboard...';
-                document.getElementById('status').className = 'status ok';
-                setTimeout(function() { window.location.href = 'dashboard.html'; }, 2000);
-                return;
-            }
-            document.getElementById('status').textContent = 'Initializing dashboard... (' + window._readyCount + '/3)';
+            document.getElementById('status').textContent = 'Ready! Redirecting to dashboard...';
             document.getElementById('status').className = 'status ok';
+            setTimeout(function() { window.location.href = 'dashboard.html'; }, 1000);
+            return;
         } else if (d.has_shares && d.verified_size > 0) {
             document.getElementById('status').textContent = 'Syncing embedded SPV nodes... (' + d.verified_size + ' shares verified)';
         } else if (d.has_shares) {

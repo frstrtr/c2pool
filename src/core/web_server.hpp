@@ -499,6 +499,12 @@ public:
     using spv_progress_fn_t = std::function<nlohmann::json()>;
     void set_spv_progress_fn(spv_progress_fn_t fn) { m_spv_progress_fn = std::move(fn); }
 
+    // Coin peer sharing — returns verified LTC/DOGE peers for new node bootstrap.
+    // Rate-limited per IP (6 req/min), returns random subset of tried peers.
+    using coin_peers_fn_t = std::function<nlohmann::json()>;
+    void set_coin_peers_fn(coin_peers_fn_t fn) { m_coin_peers_fn = std::move(fn); }
+    nlohmann::json rest_coin_peers(const std::string& remote_ip);
+
     // Sharechain stats callback — returns live tracker data for the /sharechain/stats endpoint
     using sharechain_stats_fn_t = std::function<nlohmann::json()>;
     void set_sharechain_stats_fn(sharechain_stats_fn_t fn) { m_sharechain_stats_fn = thread_safe_wrap(std::move(fn)); }
@@ -904,6 +910,9 @@ private:
     // Sharechain stats callback
     sharechain_stats_fn_t m_sharechain_stats_fn;
     spv_progress_fn_t m_spv_progress_fn;
+    coin_peers_fn_t m_coin_peers_fn;
+    // Rate limiter for /api/coin_peers: IP → last request time
+    std::map<std::string, std::chrono::steady_clock::time_point> m_coin_peers_rate_limit;
     sharechain_window_fn_t m_sharechain_window_fn;
     sharechain_tip_fn_t m_sharechain_tip_fn;
     sharechain_delta_fn_t m_sharechain_delta_fn;

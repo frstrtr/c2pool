@@ -51,6 +51,9 @@
 // Block explorer JSON serializer
 #include <impl/ltc/coin/block_json.hpp>
 
+// UTXO bootstrap pipeline (ordered block download for cold-start sync)
+#include <core/coin/block_bootstrapper.hpp>
+
 // Enhanced C2Pool components
 #include <c2pool/node/enhanced_node.hpp>
 #include <c2pool/hashrate/tracker.hpp>
@@ -1878,6 +1881,12 @@ int main(int argc, char* argv[]) {
                 // extract HogEx state for template construction.
                 {
                     LOG_INFO << "[EMB-LTC] Wiring full block handler (MWEB + mempool cleanup)";
+                    // Bootstrap state: ordered block download pipeline for cold-start sync.
+                    // On a fresh install, the tip block arrives first and sets best_height
+                    // high — all bootstrap blocks below it silently fail the height > best
+                    // guard. This pipeline buffers blocks and processes in height order.
+                    auto ltc_bs = std::make_shared<
+                        core::coin::BlockBootstrapState<ltc::coin::BlockType>>();
                     embedded_broadcaster->set_on_full_block(
                         [tracker = mweb_tracker.get(),
                          chain = embedded_chain.get(),
@@ -1888,7 +1897,7 @@ int main(int argc, char* argv[]) {
                          coinbase_maturity = core::coin::LTC_LIMITS.coinbase_maturity,
                          explorer_enabled, explorer_depth_ltc,
                          pending_merged_resolve, on_full_block_merged,
-                         &web_server](
+                         ltc_bs, &ioc, &web_server](
                             const std::string& peer,
                             const ltc::coin::BlockType& block) {
                             // Determine block height from header chain
@@ -1899,123 +1908,264 @@ int main(int argc, char* argv[]) {
                             if (entry)
                                 height = entry->height;
                             else {
-                                // Block not in our chain yet — use prev_block to estimate
                                 auto prev_entry = chain->get_header(block.m_previous_block);
                                 if (prev_entry)
                                     height = prev_entry->height + 1;
                             }
 
-                            // Step 1: Update UTXO set (BEFORE mempool cleanup)
-                            // Connect block: spend inputs, add outputs, save undo data
-                            // Skip blocks already processed (warm restart: UTXO persists in LevelDB)
-                            if (utxo && utxo_db && height > utxo->get_best_height()) {
-                                auto txid_fn = [](const ltc::coin::MutableTransaction& tx) {
-                                    return ltc::coin::compute_txid(tx);
-                                };
-                                auto undo = utxo->connect_block(block, height, txid_fn);
-                                utxo_db->put_block_undo(height, undo);
-                                utxo->flush(block_hash, height);
+                            auto txid_fn = [](const ltc::coin::MutableTransaction& tx) {
+                                return ltc::coin::compute_txid(tx);
+                            };
+                            static bool mempool_requested = false;
+                            static bool ltc_bootstrap_done = false;
+                            constexpr uint32_t LTC_KEEP = core::coin::LTC_MIN_BLOCKS_TO_KEEP;
 
-                                // Prune old undo data matching litecoind MIN_BLOCKS_TO_KEEP = 288
-                                // Reference: litecoin/src/validation.h MIN_BLOCKS_TO_KEEP
-                                utxo->prune_undo(height, core::coin::LTC_MIN_BLOCKS_TO_KEEP);
+                            // ═══ BOOTSTRAP PIPELINE ═══════════════════════════════════
+                            // Buffers blocks and processes in strict height order.
+                            // Single-peer targeting with round-robin eliminates 20x
+                            // duplicate bandwidth. Sliding window of 16 in-flight
+                            // requests hides latency. Stall detection re-requests from
+                            // all peers if a block doesn't arrive within 30s.
 
-                                static int utxo_log = 0;
-                                if (utxo_log++ % 10 == 0) {
-                                    LOG_INFO << "[EMB-LTC] UTXO: connected block " << height
-                                             << " hash=" << block_hash.GetHex().substr(0, 16)
-                                             << " txs=" << block.m_txs.size()
-                                             << " cache=" << utxo->cache_size();
-                                }
-
-                                // Enable BIP 35 mempool sync after first block processed
-                                static bool mempool_requested = false;
-                                if (!mempool_requested && bcaster) {
-                                    bcaster->enable_mempool_request();
-                                    mempool_requested = true;
-                                    LOG_INFO << "[EMB-LTC] UTXO ready — enabled BIP 35 mempool sync";
-                                }
-
-                                // Bootstrap: seed UTXO with MIN_BLOCKS_TO_KEEP (288) blocks.
-                                // Matches litecoind pruned node safety depth.
-                                // Reference: litecoin/src/validation.h MIN_BLOCKS_TO_KEEP = 288
-                                // Only fire once, and only when header chain has synced
-                                // (height > keep_depth ensures we're at tip, not genesis).
-                                // On warm restart, UTXO best_height is already within range
-                                // — skip bootstrap to avoid re-downloading blocks already processed.
-                                static bool ltc_bootstrap_done = false;
-                                constexpr uint32_t LTC_KEEP = core::coin::LTC_MIN_BLOCKS_TO_KEEP;
-                                if (!ltc_bootstrap_done && chain && bcaster && height > LTC_KEEP) {
+                            if (utxo && utxo_db) {
+                                // 1. Bootstrap trigger — fires BEFORE connecting first
+                                //    block so best_height isn't set prematurely.
+                                if (!ltc_bootstrap_done && !ltc_bs->active &&
+                                    chain && bcaster && height > LTC_KEEP) {
                                     ltc_bootstrap_done = true;
-                                    // Only request blocks we haven't processed yet
                                     uint32_t utxo_best = utxo->get_best_height();
-                                    uint32_t start_from = (utxo_best > 0 && utxo_best >= height - LTC_KEEP)
+                                    uint32_t start_from =
+                                        (utxo_best > 0 && utxo_best >= height - LTC_KEEP)
                                         ? utxo_best + 1 : height - LTC_KEEP;
-                                    int requested = 0;
-                                    for (uint32_t h = start_from; h < height; ++h) {
-                                        auto entry = chain->get_header_by_height(h);
-                                        if (entry) {
-                                            bcaster->request_full_block(entry->block_hash);
-                                            ++requested;
+
+                                    if (start_from < height) {
+                                        ltc_bs->active = true;
+                                        ltc_bs->next_height = start_from;
+                                        ltc_bs->end_height = height;
+                                        ltc_bs->next_request = start_from;
+                                        ltc_bs->total = height - start_from + 1;
+                                        ltc_bs->buffer[height] = {block, block_hash};
+                                        ltc_bs->last_drain_time =
+                                            std::chrono::steady_clock::now();
+
+                                        // Request initial window via broadcast (all peers)
+                                        // to guarantee responses. Targeted requests are
+                                        // used for window refill after drain starts.
+                                        int requested = 0;
+                                        while (ltc_bs->next_request <= ltc_bs->end_height &&
+                                               (ltc_bs->next_request - ltc_bs->next_height)
+                                                   < ltc_bs->WINDOW_SIZE) {
+                                            if (!ltc_bs->buffer.count(ltc_bs->next_request)) {
+                                                auto e = chain->get_header_by_height(
+                                                    ltc_bs->next_request);
+                                                if (e) {
+                                                    bcaster->request_full_block(
+                                                        e->block_hash);
+                                                    ++requested;
+                                                }
+                                            }
+                                            ++ltc_bs->next_request;
+                                        }
+                                        LOG_INFO << "[EMB-LTC] Bootstrap pipeline: "
+                                                 << ltc_bs->total << " blocks ["
+                                                 << start_from << ".." << height << "]"
+                                                 << " window=" << ltc_bs->WINDOW_SIZE
+                                                 << " requests=" << requested
+                                                 << " peers=" << bcaster->peer_count();
+                                        // Timer-based stall detection
+                                        ltc_bs->start_stall_timer(ioc,
+                                            [chain, bcaster](uint32_t h) {
+                                                auto e = chain->get_header_by_height(h);
+                                                if (e && bcaster)
+                                                    bcaster->request_full_block(e->block_hash);
+                                            }, "EMB-LTC");
+                                        return;
+                                    } else {
+                                        LOG_INFO << "[EMB-LTC] UTXO warm restart: best="
+                                                 << utxo_best << " — no bootstrap needed";
+                                    }
+                                }
+
+                                // 2. Bootstrap active: buffer → drain → refill window
+                                if (ltc_bs->active) {
+                                    if (height >= ltc_bs->next_height &&
+                                        height <= ltc_bs->end_height) {
+                                        ltc_bs->buffer.try_emplace(
+                                            height, std::make_pair(block, block_hash));
+                                    } else if (height > ltc_bs->end_height) {
+                                        // New block mined during bootstrap — extend range
+                                        ltc_bs->end_height = height;
+                                        ltc_bs->total = ltc_bs->processed
+                                            + (ltc_bs->end_height - ltc_bs->next_height + 1);
+                                        ltc_bs->buffer.try_emplace(
+                                            height, std::make_pair(block, block_hash));
+                                    }
+
+                                    // Stall detection: re-request from all peers if stuck
+                                    auto now = std::chrono::steady_clock::now();
+                                    auto stall = std::chrono::duration_cast<
+                                        std::chrono::seconds>(
+                                        now - ltc_bs->last_drain_time).count();
+                                    if (stall >= ltc_bs->STALL_TIMEOUT_SEC && chain && bcaster) {
+                                        auto e = chain->get_header_by_height(
+                                            ltc_bs->next_height);
+                                        if (e) {
+                                            LOG_WARNING << "[EMB-LTC] Bootstrap stall h="
+                                                << ltc_bs->next_height << " (" << stall
+                                                << "s) — broadcast fallback";
+                                            bcaster->request_full_block(e->block_hash);
+                                        }
+                                        ltc_bs->last_drain_time = now;
+                                    }
+
+                                    // Drain consecutive blocks in height order
+                                    while (ltc_bs->buffer.count(ltc_bs->next_height)) {
+                                        auto node =
+                                            ltc_bs->buffer.extract(ltc_bs->next_height);
+                                        auto& [b, bh] = node.mapped();
+                                        uint32_t h = ltc_bs->next_height;
+
+                                        auto undo = utxo->connect_block(b, h, txid_fn);
+                                        utxo_db->put_block_undo(h, undo);
+                                        utxo->flush(bh, h);
+                                        utxo->prune_undo(h, LTC_KEEP);
+
+                                        if (explorer_enabled) {
+                                            PackStream ps;
+                                            ps << b;
+                                            auto span = ps.get_span();
+                                            std::vector<uint8_t> raw(
+                                                reinterpret_cast<const uint8_t*>(
+                                                    span.data()),
+                                                reinterpret_cast<const uint8_t*>(
+                                                    span.data()) + span.size());
+                                            utxo_db->put_raw_block(h, raw);
+                                            utxo_db->prune_raw_blocks(
+                                                h, explorer_depth_ltc);
+                                        }
+
+                                        if (pool) {
+                                            pool->set_tip_height(h);
+                                            pool->remove_for_block(b);
+                                        }
+
+                                        if (tracker)
+                                            tracker->update(b, h, b.m_mweb_raw);
+
+                                        auto pit = pending_merged_resolve->find(bh);
+                                        if (pit != pending_merged_resolve->end()
+                                            && *on_full_block_merged) {
+                                            auto ctx = pit->second;
+                                            pending_merged_resolve->erase(pit);
+                                            (*on_full_block_merged)(bh, ctx, b);
+                                        }
+
+                                        if (!mempool_requested && bcaster) {
+                                            bcaster->enable_mempool_request();
+                                            mempool_requested = true;
+                                        }
+
+                                        ++ltc_bs->next_height;
+                                        ++ltc_bs->processed;
+                                        ltc_bs->last_drain_time =
+                                            std::chrono::steady_clock::now();
+                                    }
+
+                                    // Progress log
+                                    static int bs_log = 0;
+                                    if (++bs_log % 20 == 0 ||
+                                        ltc_bs->next_height > ltc_bs->end_height) {
+                                        LOG_INFO << "[EMB-LTC] Bootstrap: "
+                                                 << ltc_bs->processed << "/"
+                                                 << ltc_bs->total
+                                                 << " buf=" << ltc_bs->buffer.size();
+                                    }
+
+                                    // Refill sliding window (broadcast to all peers)
+                                    if (chain && bcaster) {
+                                        while (ltc_bs->next_request <= ltc_bs->end_height
+                                               && (ltc_bs->next_request - ltc_bs->next_height)
+                                                   < ltc_bs->WINDOW_SIZE) {
+                                            if (!ltc_bs->buffer.count(
+                                                    ltc_bs->next_request)) {
+                                                auto e = chain->get_header_by_height(
+                                                    ltc_bs->next_request);
+                                                if (e)
+                                                    bcaster->request_full_block(
+                                                        e->block_hash);
+                                            }
+                                            ++ltc_bs->next_request;
                                         }
                                     }
-                                    if (requested > 0)
-                                        LOG_INFO << "[EMB-LTC] Bootstrap: requested " << requested
-                                                 << " blocks (utxo_best=" << utxo_best
-                                                 << " tip=" << height
-                                                 << " MIN_BLOCKS_TO_KEEP=" << LTC_KEEP << ")";
-                                    else
-                                        LOG_INFO << "[EMB-LTC] UTXO warm restart: best_height="
-                                                 << utxo_best << " — no bootstrap needed";
+
+                                    if (ltc_bs->next_height > ltc_bs->end_height) {
+                                        ltc_bs->active = false;
+                                        ltc_bs->stop_stall_timer();
+                                        LOG_INFO << "[EMB-LTC] Bootstrap complete: "
+                                                 << ltc_bs->processed << " blocks";
+                                    }
+                                    return;
+                                }
+
+                                // 3. Normal processing (after bootstrap or warm restart)
+                                if (height > utxo->get_best_height()) {
+                                    auto undo = utxo->connect_block(
+                                        block, height, txid_fn);
+                                    utxo_db->put_block_undo(height, undo);
+                                    utxo->flush(block_hash, height);
+                                    utxo->prune_undo(height, LTC_KEEP);
+
+                                    static int utxo_log = 0;
+                                    if (utxo_log++ % 10 == 0) {
+                                        LOG_INFO << "[EMB-LTC] UTXO: block " << height
+                                                 << " hash="
+                                                 << block_hash.GetHex().substr(0, 16)
+                                                 << " txs=" << block.m_txs.size()
+                                                 << " cache=" << utxo->cache_size();
+                                    }
+
+                                    if (!mempool_requested && bcaster) {
+                                        bcaster->enable_mempool_request();
+                                        mempool_requested = true;
+                                        LOG_INFO << "[EMB-LTC] BIP 35 mempool enabled";
+                                    }
                                 }
                             }
 
-                            // Store raw block for explorer API
+                            // Normal mode: explorer, mempool, MWEB, merged resolve.
+                            // During bootstrap these run inside the drain loop above.
                             if (explorer_enabled && utxo_db && height > 0) {
                                 PackStream ps;
                                 ps << block;
                                 auto span = ps.get_span();
                                 std::vector<uint8_t> raw(
                                     reinterpret_cast<const uint8_t*>(span.data()),
-                                    reinterpret_cast<const uint8_t*>(span.data()) + span.size());
+                                    reinterpret_cast<const uint8_t*>(span.data())
+                                        + span.size());
                                 utxo_db->put_raw_block(height, raw);
                                 utxo_db->prune_raw_blocks(height, explorer_depth_ltc);
                             }
 
-                            // Step 2: Remove confirmed txs + conflicts from mempool
                             if (pool) {
                                 pool->set_tip_height(height);
                                 pool->remove_for_block(block);
-                                // Re-attempt fee computation for txs with unknown fees.
-                                // After UTXO connects a block, previously-unknown inputs
-                                // may now be in the UTXO set (especially bootstrap blocks).
                                 if (utxo) {
                                     int resolved = pool->recompute_unknown_fees(utxo);
-                                    // Evict fee-known txs whose inputs are now spent.
-                                    // remove_for_block() only catches direct conflicts
-                                    // via m_spent_outputs; this catches any remaining
-                                    // stale txs (e.g., inputs spent by a tx the mempool
-                                    // never tracked).
                                     int evicted = pool->revalidate_inputs(utxo);
-                                    if (resolved > 0 || evicted > 0) {
-                                        // Fees changed or stale txs evicted — trigger
-                                        // template rebuild so miners get clean work.
+                                    if (resolved > 0 || evicted > 0)
                                         web_server.trigger_work_refresh_debounced();
-                                    }
                                 }
                             }
 
-                            // Step 3: Extract MWEB state for template building
                             if (tracker && tracker->update(block, height, block.m_mweb_raw)) {
-                                LOG_INFO << "[EMB-LTC] MWEB state updated from peer " << peer
-                                         << " at height " << height
-                                         << " (mweb_raw=" << block.m_mweb_raw.size() << " bytes)";
+                                LOG_INFO << "[EMB-LTC] MWEB state updated from " << peer
+                                         << " h=" << height
+                                         << " mweb=" << block.m_mweb_raw.size() << "B";
                             }
 
-                            // Step 4: V35 merged block resolution
-                            // Check if this block was requested for merged block detection.
                             auto pit = pending_merged_resolve->find(block_hash);
-                            if (pit != pending_merged_resolve->end() && *on_full_block_merged) {
+                            if (pit != pending_merged_resolve->end()
+                                && *on_full_block_merged) {
                                 auto ctx = pit->second;
                                 pending_merged_resolve->erase(pit);
                                 (*on_full_block_merged)(block_hash, ctx, block);
@@ -2732,6 +2882,16 @@ int main(int argc, char* argv[]) {
                 LOG_INFO << "Coinbase tag: /c2pool/ (default, use --coinbase-text to customize)";
             }
 
+          // Coin peer sources for /api/coin_peers endpoint (populated as
+          // broadcasters are created — LTC in integrated block, DOGE in MM block).
+          auto coin_peer_sources = std::make_shared<
+              std::vector<c2pool::merged::CoinBroadcaster*>>();
+
+          // DOGE UTXO pointer for SPV progress display (set after DOGE init,
+          // read by loading page sync_status). Lives in outer scope so both
+          // the SPV progress lambda and the merged mining init can access it.
+          core::coin::UTXOViewCache* doge_utxo_ptr = nullptr;
+
           if (!solo_mode && !custodial_mode) {
             // Wire the share tracker's best share hash into the mining interface
             // so that mining_submit can link new shares to the chain head.
@@ -2995,9 +3155,10 @@ int main(int argc, char* argv[]) {
                 return result;
             });
 
-            // SPV sync progress for loading page
+            // SPV sync progress for loading page.
+            // doge_utxo_ptr is declared in outer scope — set after DOGE UTXO init.
             web_server.get_mining_interface()->set_spv_progress_fn(
-                [&ltc_utxo_cache, &embedded_chain]() {
+                [&ltc_utxo_cache, &embedded_chain, &doge_utxo_ptr]() {
                 nlohmann::json r;
                 int ltc_connected = ltc_utxo_cache ? static_cast<int>(ltc_utxo_cache->blocks_connected()) : 0;
                 int ltc_need = static_cast<int>(core::coin::LTC_MINING_GATE_DEPTH);
@@ -3005,9 +3166,33 @@ int main(int argc, char* argv[]) {
                 r["ltc_blocks"] = ltc_connected;
                 r["ltc_need"] = ltc_need;
                 r["ltc_height"] = ltc_height;
-                // DOGE UTXO is initialized after LTC — show 0 until wired
-                r["doge_blocks"] = 0;
+                int doge_connected = doge_utxo_ptr
+                    ? static_cast<int>(doge_utxo_ptr->blocks_connected()) : 0;
+                r["doge_blocks"] = doge_connected;
                 r["doge_need"] = static_cast<int>(core::coin::DOGE_MINING_GATE_DEPTH);
+                return r;
+            });
+
+            // Coin peer sharing — share verified LTC/DOGE peers with new nodes.
+            // coin_peer_sources is declared in outer scope. Add LTC broadcaster.
+            if (embedded_broadcaster)
+                coin_peer_sources->push_back(embedded_broadcaster.get());
+            web_server.get_mining_interface()->set_coin_peers_fn(
+                [coin_peer_sources]() {
+                nlohmann::json r;
+                nlohmann::json ltc_arr = nlohmann::json::array();
+                nlohmann::json doge_arr = nlohmann::json::array();
+                for (auto* bc : *coin_peer_sources) {
+                    if (!bc) continue;
+                    auto sym = bc->symbol();
+                    auto peers = bc->peer_manager().get_tried_peers(25);
+                    auto& arr = (sym == "DOGE" || sym == "doge")
+                        ? doge_arr : ltc_arr;
+                    for (auto& p : peers)
+                        arr.push_back(p.to_string());
+                }
+                r["ltc"] = ltc_arr;
+                r["doge"] = doge_arr;
                 return r;
             });
 
@@ -4528,6 +4713,7 @@ int main(int argc, char* argv[]) {
                                 }
                                 if (utxo_ok) {
                                     doge_utxo_cache = std::make_unique<core::coin::UTXOViewCache>(doge_utxo_db.get());
+                                    doge_utxo_ptr = doge_utxo_cache.get();  // wire SPV progress
                                     if (doge_pool) doge_pool->set_utxo(doge_utxo_cache.get());
                                     LOG_INFO << "[EMB-DOGE] UTXO set opened: best_height=" << doge_utxo_db->get_best_height();
                                 } else {
@@ -4753,8 +4939,11 @@ int main(int argc, char* argv[]) {
                                 doge_sync_timer->async_wait(*doge_sync_fn);
                                 LOG_INFO << "DOGE embedded header sync wired via P2P";
 
-                                // Wire full-block handler: remove confirmed txs from DOGE mempool.
-                                // DOGE has no MWEB — only mempool cleanup needed.
+                                // Wire full-block handler: UTXO bootstrap + mempool cleanup.
+                                // Same bootstrap pipeline as LTC — see EMB-LTC handler.
+                                {
+                                auto doge_bs = std::make_shared<
+                                    core::coin::BlockBootstrapState<ltc::coin::BlockType>>();
                                 broadcaster->set_on_full_block(
                                     [pool = doge_pool.get(),
                                      chain = doge_chain.get(),
@@ -4764,10 +4953,9 @@ int main(int argc, char* argv[]) {
                                      coinbase_maturity = core::coin::DOGE_LIMITS.coinbase_maturity,
                                      explorer_enabled, explorer_depth_doge,
                                      mm_ptr = mm_manager.get(),
-                                     &web_server](
+                                     doge_bs, &ioc, &web_server](
                                         const std::string& peer,
                                         const ltc::coin::BlockType& block) {
-                                        // Determine block height
                                         auto packed_hdr = pack(static_cast<const ltc::coin::BlockHeaderType&>(block));
                                         auto block_hash = Hash(packed_hdr.get_span());
                                         uint32_t height = 0;
@@ -4776,117 +4964,248 @@ int main(int argc, char* argv[]) {
                                             if (entry) height = entry->height;
                                             else { auto prev = chain->get_header(block.m_previous_block); if (prev) height = prev->height + 1; }
                                         }
-                                        LOG_INFO << "[EMB-DOGE] Full block received: height=" << height
-                                                 << " hash=" << block_hash.GetHex().substr(0, 16) << "..."
-                                                 << " txs=" << block.m_txs.size()
-                                                 << " from=" << peer;
 
-                                        // UTXO connect (before mempool cleanup)
-                                        // Skip blocks already processed (warm restart)
-                                        if (utxo && utxo_db && height > utxo->get_best_height()) {
-                                            // DOGE: txid = hash of full serialization (no witness stripping)
-                                            auto txid_fn = [](const ltc::coin::MutableTransaction& tx) {
-                                                return ltc::coin::compute_txid(tx);
-                                            };
-                                            auto undo = utxo->connect_block(block, height, txid_fn);
-                                            utxo_db->put_block_undo(height, undo);
-                                            utxo->flush(block_hash, height);
+                                        auto txid_fn = [](const ltc::coin::MutableTransaction& tx) {
+                                            return ltc::coin::compute_txid(tx);
+                                        };
+                                        static bool doge_mempool_requested = false;
+                                        static bool doge_bootstrap_done = false;
+                                        constexpr uint32_t DOGE_KEEP = core::coin::DOGE_MIN_BLOCKS_TO_KEEP;
 
-                                            // Prune old undo data matching dogecoind MIN_BLOCKS_TO_KEEP = 1440
-                                            // Reference: dogecoin/src/validation.h MIN_BLOCKS_TO_KEEP
-                                            utxo->prune_undo(height, core::coin::DOGE_MIN_BLOCKS_TO_KEEP);
-
-                                            LOG_INFO << "[EMB-DOGE] UTXO: connected block " << height
-                                                     << " hash=" << block_hash.GetHex().substr(0, 16)
-                                                     << " txs=" << block.m_txs.size()
-                                                     << " cache=" << utxo->cache_size();
-
-                                            // Enable mempool tx relay after first block.
-                                            // DOGE does NOT support BIP 35 (mempool msg) or
-                                            // wtxidrelay (BIP 339). Txs arrive via standard inv/tx.
-                                            static bool doge_mempool_requested = false;
-                                            if (!doge_mempool_requested && bcaster_ptr) {
-                                                bcaster_ptr->enable_mempool_request();
-                                                doge_mempool_requested = true;
-                                                LOG_INFO << "[EMB-DOGE] UTXO ready — mempool tx relay active (inv/tx, no BIP 35)";
-                                            }
-
-                                            // Bootstrap: seed UTXO with MIN_BLOCKS_TO_KEEP (1440) blocks.
-                                            // Matches dogecoind pruned node safety depth.
-                                            // Reference: dogecoin/src/validation.h MIN_BLOCKS_TO_KEEP = 1440
-                                            // On warm restart, skip blocks already in UTXO LevelDB.
-                                            static bool doge_bootstrap_done = false;
-                                            constexpr uint32_t DOGE_KEEP = core::coin::DOGE_MIN_BLOCKS_TO_KEEP;
-                                            if (!doge_bootstrap_done && chain && height > DOGE_KEEP) {
+                                        // ═══ BOOTSTRAP PIPELINE (same as LTC) ═════════
+                                        if (utxo && utxo_db) {
+                                            // 1. Bootstrap trigger
+                                            if (!doge_bootstrap_done && !doge_bs->active &&
+                                                chain && bcaster_ptr && height > DOGE_KEEP) {
                                                 doge_bootstrap_done = true;
                                                 uint32_t utxo_best = utxo->get_best_height();
-                                                uint32_t start_from = (utxo_best > 0 && utxo_best >= height - DOGE_KEEP)
+                                                uint32_t start_from =
+                                                    (utxo_best > 0 && utxo_best >= height - DOGE_KEEP)
                                                     ? utxo_best + 1 : height - DOGE_KEEP;
-                                                int req = 0;
-                                                for (uint32_t h = start_from; h < height; ++h) {
-                                                    auto e = chain->get_header_by_height(h);
-                                                    if (e) { bcaster_ptr->request_full_block(e->block_hash); ++req; }
-                                                }
-                                                if (req > 0)
-                                                    LOG_INFO << "[EMB-DOGE] Bootstrap: requested " << req
-                                                             << " blocks (utxo_best=" << utxo_best
-                                                             << " tip=" << height
-                                                             << " MIN_BLOCKS_TO_KEEP=" << DOGE_KEEP << ")";
-                                                else
-                                                    LOG_INFO << "[EMB-DOGE] UTXO warm restart: best_height="
+
+                                                if (start_from < height) {
+                                                    doge_bs->active = true;
+                                                    doge_bs->next_height = start_from;
+                                                    doge_bs->end_height = height;
+                                                    doge_bs->next_request = start_from;
+                                                    doge_bs->total = height - start_from + 1;
+                                                    doge_bs->buffer[height] = {block, block_hash};
+                                                    doge_bs->last_drain_time =
+                                                        std::chrono::steady_clock::now();
+
+                                                    int requested = 0;
+                                                    while (doge_bs->next_request <= doge_bs->end_height &&
+                                                           (doge_bs->next_request - doge_bs->next_height)
+                                                               < doge_bs->WINDOW_SIZE) {
+                                                        if (!doge_bs->buffer.count(doge_bs->next_request)) {
+                                                            auto e = chain->get_header_by_height(
+                                                                doge_bs->next_request);
+                                                            if (e) {
+                                                                bcaster_ptr->request_full_block(
+                                                                    e->block_hash);
+                                                                ++requested;
+                                                            }
+                                                        }
+                                                        ++doge_bs->next_request;
+                                                    }
+                                                    LOG_INFO << "[EMB-DOGE] Bootstrap pipeline: "
+                                                             << doge_bs->total << " blocks ["
+                                                             << start_from << ".." << height << "]"
+                                                             << " window=" << doge_bs->WINDOW_SIZE
+                                                             << " requests=" << requested
+                                                             << " peers=" << bcaster_ptr->peer_count();
+                                                    doge_bs->start_stall_timer(ioc,
+                                                        [chain, bcaster_ptr](uint32_t h) {
+                                                            auto e = chain->get_header_by_height(h);
+                                                            if (e && bcaster_ptr)
+                                                                bcaster_ptr->request_full_block(e->block_hash);
+                                                        }, "EMB-DOGE");
+                                                    return;
+                                                } else {
+                                                    LOG_INFO << "[EMB-DOGE] UTXO warm restart: best="
                                                              << utxo_best << " — no bootstrap needed";
+                                                }
+                                            }
+
+                                            // 2. Bootstrap active: buffer → drain → refill
+                                            if (doge_bs->active) {
+                                                if (height >= doge_bs->next_height &&
+                                                    height <= doge_bs->end_height) {
+                                                    doge_bs->buffer.try_emplace(
+                                                        height, std::make_pair(block, block_hash));
+                                                } else if (height > doge_bs->end_height) {
+                                                    doge_bs->end_height = height;
+                                                    doge_bs->total = doge_bs->processed
+                                                        + (doge_bs->end_height - doge_bs->next_height + 1);
+                                                    doge_bs->buffer.try_emplace(
+                                                        height, std::make_pair(block, block_hash));
+                                                }
+
+                                                auto now = std::chrono::steady_clock::now();
+                                                auto stall = std::chrono::duration_cast<
+                                                    std::chrono::seconds>(
+                                                    now - doge_bs->last_drain_time).count();
+                                                if (stall >= doge_bs->STALL_TIMEOUT_SEC && chain && bcaster_ptr) {
+                                                    auto e = chain->get_header_by_height(
+                                                        doge_bs->next_height);
+                                                    if (e) {
+                                                        LOG_WARNING << "[EMB-DOGE] Bootstrap stall h="
+                                                            << doge_bs->next_height << " (" << stall
+                                                            << "s) — broadcast fallback";
+                                                        bcaster_ptr->request_full_block(e->block_hash);
+                                                    }
+                                                    doge_bs->last_drain_time = now;
+                                                }
+
+                                                // Drain consecutive blocks
+                                                while (doge_bs->buffer.count(doge_bs->next_height)) {
+                                                    auto node =
+                                                        doge_bs->buffer.extract(doge_bs->next_height);
+                                                    auto& [b, bh] = node.mapped();
+                                                    uint32_t h = doge_bs->next_height;
+
+                                                    auto undo = utxo->connect_block(b, h, txid_fn);
+                                                    utxo_db->put_block_undo(h, undo);
+                                                    utxo->flush(bh, h);
+                                                    utxo->prune_undo(h, DOGE_KEEP);
+
+                                                    if (explorer_enabled) {
+                                                        PackStream ps;
+                                                        ps << b;
+                                                        auto span = ps.get_span();
+                                                        std::vector<uint8_t> raw(
+                                                            reinterpret_cast<const uint8_t*>(
+                                                                span.data()),
+                                                            reinterpret_cast<const uint8_t*>(
+                                                                span.data()) + span.size());
+                                                        utxo_db->put_raw_block(h, raw);
+                                                        utxo_db->prune_raw_blocks(
+                                                            h, explorer_depth_doge);
+                                                    }
+
+                                                    if (pool) {
+                                                        pool->set_tip_height(h);
+                                                        pool->remove_for_block(b);
+                                                    }
+
+                                                    if (mm_ptr && !b.m_txs.empty()) {
+                                                        uint64_t cb_total = 0;
+                                                        for (const auto& out : b.m_txs[0].vout)
+                                                            cb_total += out.value;
+                                                        if (cb_total > 0)
+                                                            mm_ptr->update_block_coinbase(
+                                                                bh.GetHex(), cb_total);
+                                                    }
+
+                                                    if (!doge_mempool_requested && bcaster_ptr) {
+                                                        bcaster_ptr->enable_mempool_request();
+                                                        doge_mempool_requested = true;
+                                                    }
+
+                                                    ++doge_bs->next_height;
+                                                    ++doge_bs->processed;
+                                                    doge_bs->last_drain_time =
+                                                        std::chrono::steady_clock::now();
+                                                }
+
+                                                static int dbs_log = 0;
+                                                if (++dbs_log % 50 == 0 ||
+                                                    doge_bs->next_height > doge_bs->end_height) {
+                                                    LOG_INFO << "[EMB-DOGE] Bootstrap: "
+                                                             << doge_bs->processed << "/"
+                                                             << doge_bs->total
+                                                             << " buf=" << doge_bs->buffer.size();
+                                                }
+
+                                                if (chain && bcaster_ptr) {
+                                                    while (doge_bs->next_request <= doge_bs->end_height
+                                                           && (doge_bs->next_request - doge_bs->next_height)
+                                                               < doge_bs->WINDOW_SIZE) {
+                                                        if (!doge_bs->buffer.count(
+                                                                doge_bs->next_request)) {
+                                                            auto e = chain->get_header_by_height(
+                                                                doge_bs->next_request);
+                                                            if (e)
+                                                                bcaster_ptr->request_full_block(
+                                                                    e->block_hash);
+                                                        }
+                                                        ++doge_bs->next_request;
+                                                    }
+                                                }
+
+                                                if (doge_bs->next_height > doge_bs->end_height) {
+                                                    doge_bs->active = false;
+                                                    doge_bs->stop_stall_timer();
+                                                    LOG_INFO << "[EMB-DOGE] Bootstrap complete: "
+                                                             << doge_bs->processed << " blocks";
+                                                }
+                                                return;
+                                            }
+
+                                            // 3. Normal processing
+                                            if (height > utxo->get_best_height()) {
+                                                auto undo = utxo->connect_block(
+                                                    block, height, txid_fn);
+                                                utxo_db->put_block_undo(height, undo);
+                                                utxo->flush(block_hash, height);
+                                                utxo->prune_undo(height, DOGE_KEEP);
+
+                                                LOG_INFO << "[EMB-DOGE] UTXO: block " << height
+                                                         << " hash="
+                                                         << block_hash.GetHex().substr(0, 16)
+                                                         << " txs=" << block.m_txs.size()
+                                                         << " cache=" << utxo->cache_size();
+
+                                                if (!doge_mempool_requested && bcaster_ptr) {
+                                                    bcaster_ptr->enable_mempool_request();
+                                                    doge_mempool_requested = true;
+                                                    LOG_INFO << "[EMB-DOGE] Mempool relay active";
+                                                }
                                             }
                                         }
-                                        // Store raw block for explorer API
+
+                                        // Normal mode processing (after bootstrap)
                                         if (explorer_enabled && utxo_db && height > 0) {
                                             PackStream ps;
                                             ps << block;
                                             auto span = ps.get_span();
                                             std::vector<uint8_t> raw(
                                                 reinterpret_cast<const uint8_t*>(span.data()),
-                                                reinterpret_cast<const uint8_t*>(span.data()) + span.size());
+                                                reinterpret_cast<const uint8_t*>(span.data())
+                                                    + span.size());
                                             utxo_db->put_raw_block(height, raw);
                                             utxo_db->prune_raw_blocks(height, explorer_depth_doge);
                                         }
                                         if (pool) {
-                                            auto before = pool->size();
                                             pool->set_tip_height(height);
                                             pool->remove_for_block(block);
-                                            auto after = pool->size();
-                                            if (before != after) {
-                                                LOG_INFO << "[EMB-DOGE] Mempool: removed " << (before - after)
-                                                         << " txs for block " << height
-                                                         << " (remaining=" << after << ")";
-                                            }
                                             if (utxo) {
                                                 int resolved = pool->recompute_unknown_fees(utxo);
                                                 int evicted = pool->revalidate_inputs(utxo);
-                                                if (resolved > 0 || evicted > 0) {
-                                                    LOG_INFO << "[EMB-DOGE] Fee revalidation: resolved=" << resolved
-                                                             << " evicted=" << evicted
-                                                             << " pool_size=" << pool->size();
+                                                if (resolved > 0 || evicted > 0)
                                                     web_server.trigger_work_refresh_debounced();
-                                                }
                                             }
                                         }
-                                        // Update coinbase_value on discovered merged blocks that
-                                        // were added without exact reward (V35 peer detection).
-                                        // Sum all coinbase outputs for the exact block reward.
                                         if (mm_ptr && !block.m_txs.empty()) {
                                             uint64_t cb_total = 0;
                                             for (const auto& out : block.m_txs[0].vout)
                                                 cb_total += out.value;
                                             if (cb_total > 0) {
-                                                mm_ptr->update_block_coinbase(block_hash.GetHex(), cb_total);
-                                                // Also update LevelDB persistence
-                                                auto sp = web_server.get_mining_interface()->get_merged_block_store();
+                                                mm_ptr->update_block_coinbase(
+                                                    block_hash.GetHex(), cb_total);
+                                                auto sp = web_server.get_mining_interface()
+                                                    ->get_merged_block_store();
                                                 if (sp) {
-                                                    auto* ms = static_cast<c2pool::storage::MergedBlockStore*>(sp.get());
-                                                    ms->update_coinbase(block_hash.GetHex(), 98, cb_total);
+                                                    auto* ms = static_cast<
+                                                        c2pool::storage::MergedBlockStore*>(
+                                                        sp.get());
+                                                    ms->update_coinbase(
+                                                        block_hash.GetHex(), 98, cb_total);
                                                 }
                                             }
                                         }
                                     });
+                                } // doge_bs scope
 
                                 // Tip-changed handler: trigger work refresh so stratum miners
                                 // get updated merged mining targets immediately.
@@ -4951,6 +5270,8 @@ int main(int argc, char* argv[]) {
                             broadcaster->start();
                             LOG_INFO << "Merged multi-peer broadcaster: " << cfg.symbol
                                      << " → " << cfg.p2p_address << ":" << cfg.p2p_port;
+                            // Register for /api/coin_peers endpoint
+                            coin_peer_sources->push_back(broadcaster.get());
                             merged_broadcasters[cfg.chain_id] = std::move(broadcaster);
                         } else {
                             LOG_WARNING << "Unknown P2P prefix for " << cfg.symbol
