@@ -1,5 +1,24 @@
 # Build instructions — Linux (Ubuntu 24.04)
 
+## Option 1: Pre-built binary (recommended)
+
+Download `c2pool-VERSION-linux-x86_64.tar.gz` from the
+[Releases page](https://github.com/frstrtr/c2pool/releases).
+
+```bash
+VERSION="0.1.1-alpha"
+wget https://github.com/frstrtr/c2pool/releases/download/v${VERSION}/c2pool-${VERSION}-linux-x86_64.tar.gz
+tar xzf c2pool-${VERSION}-linux-x86_64.tar.gz
+cd c2pool-${VERSION}-linux-x86_64
+./start.sh
+```
+
+Dashboard: `http://localhost:8080` — Stratum: `stratum+tcp://YOUR_IP:9327`
+
+---
+
+## Option 2: Build from source
+
 This guide covers building c2pool on Ubuntu 24.04 LTS.  
 The same steps work on Ubuntu 22.04 and Debian 12 with minor version differences.
 

@@ -18,6 +18,26 @@ This guide covers building c2pool from source on macOS.
 > major versions are the most common source of build failures on untested
 > configurations.
 
+## Option 1: Pre-built binary
+
+Download from the [Releases page](https://github.com/frstrtr/c2pool/releases):
+- **Intel Mac**: `c2pool-VERSION-macos-x86_64.zip`
+- **Apple Silicon (M1/M2/M3/M4)**: `c2pool-VERSION-macos-arm64.zip`
+
+```bash
+unzip c2pool-*-macos-*.zip
+cd c2pool-*-macos-*
+./start.sh
+```
+
+Dashboard: `http://localhost:8080` — Stratum: `stratum+tcp://YOUR_IP:9327`
+
+> **macOS Gatekeeper**: On first run, macOS may block the binary. Open System Settings > Privacy & Security and click "Allow Anyway", or run: `xattr -d com.apple.quarantine c2pool`
+
+---
+
+## Option 2: Build from source
+
 ---
 
 ## Supported architectures

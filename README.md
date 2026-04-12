@@ -24,9 +24,46 @@ Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 | Ubuntu | 24.04.4 LTS | GCC 13.3 | 1.78 (Conan) | x86_64 | Working |
 | macOS | 26.3.1 (Tahoe) | Apple Clang 21.0 | 1.90 (Homebrew) | x86_64 Intel | Working |
 | macOS | — | Apple Clang | 1.90 (Homebrew) | arm64 (M-series) | Supported, untested |
-| Windows | 11 (26100) | MSVC 2022 | 1.78 (Conan) | x86_64 | In progress |
+| Windows | 11 (26100) | MSVC 2022 | 1.78 (Conan) | x86_64 | Working |
 > Other OS versions or Boost releases may require minor fixes.
 > Boost API changes between major versions are the most common source of build failures.
+
+---
+
+## Download
+
+Pre-built binaries are available on the [Releases page](https://github.com/frstrtr/c2pool/releases).
+
+| Platform | Package | Notes |
+|----------|---------|-------|
+| Linux x86_64 | `.tar.gz` | Extract and run `./start.sh` |
+| macOS Intel | `.zip` | Bundled dylibs, no Homebrew needed |
+| macOS Apple Silicon | `.zip` | Native arm64 binary |
+| Windows x86_64 | `.zip` or `setup.exe` | Installer bundles VC++ Runtime + firewall rules |
+
+### Verify downloads
+
+Each release includes a `SHA256SUMS` file. Verify after downloading:
+
+```bash
+# Linux / macOS
+sha256sum -c SHA256SUMS
+
+# Windows (PowerShell)
+Get-FileHash c2pool-*-setup.exe -Algorithm SHA256
+# Compare with the hash in SHA256SUMS
+```
+
+### Reproducible builds
+
+All release binaries are built from the tagged git commit. To verify a binary matches the source:
+
+1. Check the git tag: `git log v0.1.1-alpha --oneline -1`
+2. Build from that tag following the platform-specific guide
+3. Compare the SHA256 of your binary with the release `SHA256SUMS`
+
+> Exact binary reproducibility depends on compiler version and build environment.
+> The `SHA256SUMS` file in each release documents the official build output.
 
 ---
 
@@ -57,6 +94,10 @@ cmake .. -DCMAKE_BUILD_TYPE=Release
 cmake --build . --target c2pool -j$(sysctl -n hw.ncpu)
 ./src/c2pool/c2pool
 ```
+
+**Windows (setup.exe or build from source)**
+
+Download `c2pool-VERSION-windows-x86_64-setup.exe` from [Releases](https://github.com/frstrtr/c2pool/releases) and run the installer. Or build from source — see [doc/build-windows.md](doc/build-windows.md).
 
 That's it. No litecoind, no dogecoind, no config file. The node starts in
 **integrated P2P pool mode** with embedded LTC and DOGE SPV nodes, connects
