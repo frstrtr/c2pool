@@ -4731,9 +4731,10 @@ void MiningInterface::auto_detect_external_info()
                 boost::asio::connect(sock, endpoints);
 
                 std::string req =
-                    "GET / HTTP/1.0\r\n"
+                    "GET /ip HTTP/1.0\r\n"
                     "Host: ifconfig.me\r\n"
-                    "User-Agent: c2pool/0.1\r\n"
+                    "User-Agent: curl/8.0\r\n"
+                    "Accept: text/plain\r\n"
                     "Connection: close\r\n\r\n";
                 boost::asio::write(sock, boost::asio::buffer(req));
 
