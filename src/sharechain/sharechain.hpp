@@ -428,9 +428,9 @@ public:
     }
 
     /// Delta work between two shares.
-    uint288 get_delta_work(const hash_t& near, const hash_t& far)
+    uint288 get_delta_work(const hash_t& newer, const hash_t& older)
     {
-        return get_work(near) - get_work(far);
+        return get_work(newer) - get_work(older);
     }
 
     /// Full delta between two shares via TrackerView.
