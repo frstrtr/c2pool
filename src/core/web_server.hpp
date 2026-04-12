@@ -667,24 +667,35 @@ public:
         LOG_INFO << "MiningInterface::set_io_context this=" << this << " ctx=" << ctx; }
 
     /// Thread-safe cached callback entry.  Main thread computes + publishes;
-    /// HTTP thread reads a shared_ptr snapshot (lock-free, zero contention).
+    /// HTTP thread reads a shared_ptr snapshot (mutex-guarded for portability).
     template<typename R>
     struct CacheEntry {
         std::function<R()> fn;
-        std::atomic<std::shared_ptr<const R>> cached{std::make_shared<const R>()};
 
-        explicit CacheEntry(std::function<R()> f) : fn(std::move(f)) {}
+        explicit CacheEntry(std::function<R()> f) : fn(std::move(f)),
+            cached_(std::make_shared<const R>()) {}
 
         R refresh() {
             auto result = std::make_shared<const R>(fn());
-            cached.store(result, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                cached_ = result;
+            }
             return *result;
         }
 
         R get() const {
-            auto snap = cached.load(std::memory_order_acquire);
+            std::shared_ptr<const R> snap;
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                snap = cached_;
+            }
             return *snap;
         }
+
+    private:
+        mutable std::mutex mtx_;
+        std::shared_ptr<const R> cached_;
     };
 
     /// Zero-arg overload: RCU cache pattern.
