@@ -58,9 +58,24 @@ target_link_libraries(c2pool_node_enhanced
     nlohmann_json::nlohmann_json
 )
 
+# Inject version from git at build time
+execute_process(
+    COMMAND git describe --tags --always
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE C2POOL_GIT_VERSION
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if(NOT C2POOL_GIT_VERSION)
+    set(C2POOL_GIT_VERSION "0.1.0-alpha")
+endif()
+# Strip leading 'v'
+string(REGEX REPLACE "^v" "" C2POOL_GIT_VERSION "${C2POOL_GIT_VERSION}")
+
 # Main C2Pool Enhanced Application (refactored with mining_shares/p2p_shares separation)
 add_executable(c2pool c2pool_refactored.cpp)
-target_link_libraries(c2pool 
+target_compile_definitions(c2pool PRIVATE C2POOL_VERSION="${C2POOL_GIT_VERSION}")
+target_link_libraries(c2pool
     c2pool_node_enhanced
     c2pool_payout
     c2pool_merged_mining

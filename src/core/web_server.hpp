@@ -1142,6 +1142,11 @@ public:
     void set_external_ip(const std::string& ip) { m_external_ip = ip; }
     void set_pool_version(const std::string& ver) { m_pool_version = ver; }
 
+    /// Auto-detect public IP and version from external services.
+    /// Runs on detached threads — non-blocking. Only fetches if not
+    /// already configured. Safe to call from any thread.
+    void auto_detect_external_info();
+
     // Best share difficulty tracking (for /best_share, /miner_stats)
     void record_share_difficulty(double difficulty, const std::string& miner);
     void record_merged_share_difficulty(double difficulty, const std::string& miner);

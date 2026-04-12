@@ -676,13 +676,19 @@ void HttpSession::process_request()
                 response_body = rest_result.dump();
         }
         else if (request_.method() == http::verb::post) {
-            // Handle JSON-RPC POST request
+            // Handle JSON-RPC POST request.
+            // Accept both 1.0 and 2.0 — upgrade 1.0 to 2.0 for the library.
             std::string request_body = request_.body();
-            LOG_INFO << "Received JSON-RPC request: " << request_body;
-            
+            {
+                auto pos = request_body.find("\"1.0\"");
+                if (pos != std::string::npos) {
+                    auto ctx = request_body.rfind("jsonrpc", pos);
+                    if (ctx != std::string::npos && pos - ctx < 15)
+                        request_body.replace(pos, 5, "\"2.0\"");
+                }
+            }
+
             response_body = mining_interface_->HandleRequest(request_body);
-            
-            LOG_INFO << "Sending JSON-RPC response: " << response_body;
         }
         else {
             response.result(http::status::method_not_allowed);
@@ -846,6 +852,42 @@ void MiningInterface::setup_methods()
 
     Add("getmessageblob", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
         return getmessageblob();
+    }));
+
+    // Explorer JSON-RPC adapter — allows Python explorer to talk to c2pool
+    // as if it were a standard Bitcoin/Litecoin daemon.
+    Add("getblockchaininfo", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        if (has_explorer_chaininfo_fn())
+            return call_explorer_chaininfo("ltc");
+        return nlohmann::json{{"error", "explorer not enabled"}};
+    }));
+
+    Add("getblockhash", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        if (!has_explorer_blockhash_fn() || params.empty())
+            return nullptr;
+        uint32_t h = params[0].get<uint32_t>();
+        return call_explorer_blockhash(h, "ltc");
+    }));
+
+    Add("getblock", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        if (!has_explorer_getblock_fn() || params.empty())
+            return nullptr;
+        std::string hash = params[0].get<std::string>();
+        return call_explorer_getblock(hash, "ltc");
+    }));
+
+    Add("getmempoolinfo", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        if (has_explorer_mempoolinfo_fn())
+            return call_explorer_mempoolinfo("ltc");
+        return nlohmann::json::object();
+    }));
+
+    Add("getrawmempool", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
+        if (has_explorer_rawmempool_fn()) {
+            bool verbose = (!params.empty() && params[0].get<bool>());
+            return call_explorer_rawmempool("ltc", verbose, 500);
+        }
+        return nlohmann::json::array();
     }));
 }
 
@@ -4672,6 +4714,59 @@ nlohmann::json MiningInterface::rest_stale_rates()
         }
     }
     return result;
+}
+
+void MiningInterface::auto_detect_external_info()
+{
+    // Auto-detect public IP if not configured
+    if (m_external_ip.empty() || m_external_ip == "0.0.0.0") {
+        std::thread([this]() {
+            try {
+                boost::asio::io_context tmp_ioc;
+                boost::asio::ip::tcp::resolver resolver(tmp_ioc);
+
+                // Try ifconfig.me (returns plain text IP)
+                auto endpoints = resolver.resolve("ifconfig.me", "80");
+                boost::asio::ip::tcp::socket sock(tmp_ioc);
+                boost::asio::connect(sock, endpoints);
+
+                std::string req =
+                    "GET / HTTP/1.0\r\n"
+                    "Host: ifconfig.me\r\n"
+                    "User-Agent: c2pool/0.1\r\n"
+                    "Connection: close\r\n\r\n";
+                boost::asio::write(sock, boost::asio::buffer(req));
+
+                std::string response;
+                boost::system::error_code ec;
+                char buf[1024];
+                while (true) {
+                    size_t n = sock.read_some(boost::asio::buffer(buf), ec);
+                    if (n > 0) response.append(buf, n);
+                    if (ec) break;
+                }
+
+                auto body_pos = response.find("\r\n\r\n");
+                if (body_pos != std::string::npos) {
+                    std::string ip = response.substr(body_pos + 4);
+                    // Trim whitespace
+                    while (!ip.empty() && (ip.back() == '\n' || ip.back() == '\r'
+                           || ip.back() == ' '))
+                        ip.pop_back();
+                    if (!ip.empty() && ip.find('.') != std::string::npos) {
+                        m_external_ip = ip;
+                        LOG_INFO << "[AUTO] Public IP detected: " << ip;
+                    }
+                }
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[AUTO] Public IP detection failed: " << e.what();
+            }
+        }).detach();
+    }
+
+    // Version is set at build time via C2POOL_VERSION from git describe.
+    // No runtime GitHub fetch needed (requires HTTPS which we can't do
+    // with raw TCP sockets).
 }
 
 nlohmann::json MiningInterface::rest_node_info()

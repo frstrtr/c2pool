@@ -1363,6 +1363,13 @@ int main(int argc, char* argv[]) {
             web_server.get_mining_interface()->set_p2p_port(static_cast<uint16_t>(p2p_port));
             if (!external_ip.empty())
                 web_server.get_mining_interface()->set_external_ip(external_ip);
+#ifdef C2POOL_VERSION
+            web_server.get_mining_interface()->set_pool_version(
+                "c2pool/" C2POOL_VERSION);
+#endif
+            // Auto-detect public IP from external services
+            // (non-blocking, detached threads). Only fetches if not configured.
+            web_server.get_mining_interface()->auto_detect_external_info();
             web_server.set_dashboard_dir(dashboard_dir);
             if (!analytics_id.empty())
                 web_server.set_analytics_id(analytics_id);
