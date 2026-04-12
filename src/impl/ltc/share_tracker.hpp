@@ -1,5 +1,20 @@
 #pragma once
 
+// Portable 128-bit multiply-shift: (a * b) >> shift
+// GCC/Clang have __uint128_t; MSVC uses _umul128 intrinsic.
+#ifdef _MSC_VER
+#include <intrin.h>
+inline uint64_t mul128_shift(uint64_t a, uint64_t b, unsigned shift) {
+    uint64_t hi;
+    uint64_t lo = _umul128(a, b, &hi);
+    return (hi << (64 - shift)) | (lo >> shift);
+}
+#else
+inline uint64_t mul128_shift(uint64_t a, uint64_t b, unsigned shift) {
+    return static_cast<uint64_t>((static_cast<__uint128_t>(a) * b) >> shift);
+}
+#endif
+
 #include "share.hpp"
 #include "share_check.hpp"
 #include "config_pool.hpp"
@@ -146,8 +161,7 @@ public:
         s_decay_table.resize(chain_len);
         s_decay_table[0] = DECAY_SCALE;
         for (uint32_t d = 1; d < chain_len; ++d)
-            s_decay_table[d] = static_cast<uint64_t>(
-                (static_cast<__uint128_t>(s_decay_table[d-1]) * s_decay_per) >> DECAY_PRECISION);
+            s_decay_table[d] = mul128_shift(s_decay_table[d-1], s_decay_per, DECAY_PRECISION);
         s_table_initialized = true;
     }
 
@@ -1715,8 +1729,7 @@ public:
             if (result.total_weight >= desired_weight)
                 break;
 
-            decay_fp = static_cast<uint64_t>(
-                (static_cast<__uint128_t>(decay_fp) * decay_per) >> DECAY_PRECISION);
+            decay_fp = mul128_shift(decay_fp, decay_per, DECAY_PRECISION);
 
             auto* idx = chain.get_index(cur);
             cur = idx ? idx->tail : uint256();
