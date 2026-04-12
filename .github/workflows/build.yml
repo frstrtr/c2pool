@@ -2,80 +2,54 @@ name: CI
 
 on:
   push:
-    branches: [master, p2pool-v36-compat]
+    branches: [master, windows-build, service-update]
+    tags: ['v*']
   pull_request:
     branches: [master]
 
 jobs:
-  build:
-    name: Ubuntu 24.04 / GCC 13 / Debug
+  # ════════════════════════════════════════════════════════════════════════════
+  # Linux (Ubuntu 24.04, GCC 13, Conan)
+  # ════════════════════════════════════════════════════════════════════════════
+  linux:
+    name: Linux x86_64
     runs-on: ubuntu-24.04
     steps:
-      # ── 1. Source ──────────────────────────────────────────────────────────
-      - name: Checkout
-        uses: actions/checkout@v6
-        # No submodules — plain clone is sufficient.
+      - uses: actions/checkout@v6
 
-      # ── 2. System dependencies (not provided by Conan) ────────────────────
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            g++ cmake make \
-            libleveldb-dev \
-            libsecp256k1-dev
+            g++ cmake make libleveldb-dev libsecp256k1-dev
 
-      # ── 3. Python / Conan 2 ───────────────────────────────────────────────
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
+      - uses: actions/setup-python@v6
+        with: { python-version: '3.12' }
 
       - name: Install Conan 2
         run: pip install "conan>=2.0,<3.0"
 
-      - name: Detect Conan profile (GCC 13 + C++20)
+      - name: Detect Conan profile
         run: |
           conan profile detect --force
-          # Override cppstd to match CMakeLists.txt (CMAKE_CXX_STANDARD 20)
-          sed -i 's/compiler.cppstd=.*/compiler.cppstd=20/' \
-            "$(conan profile path default)"
-          conan profile show
+          sed -i 's/compiler.cppstd=.*/compiler.cppstd=20/' "$(conan profile path default)"
 
-      # ── 4. Conan package cache ────────────────────────────────────────────
-      # Key encodes OS + compiler version + build type + dependency manifest.
-      # Cache restores saves ~15 min of boost compilation on cache hit.
-      - name: Restore Conan package cache
+      - name: Restore Conan cache
         uses: actions/cache@v5
         with:
           path: ~/.conan2
-          key: conan2-ubuntu24-gcc13-debug-${{ hashFiles('conanfile.txt') }}
-          restore-keys: |
-            conan2-ubuntu24-gcc13-debug-
+          key: conan2-ubuntu24-gcc13-${{ hashFiles('conanfile.txt') }}
+          restore-keys: conan2-ubuntu24-gcc13-
 
-      # ── 5. Install Conan dependencies ─────────────────────────────────────
-      # Use a separate output folder so we never touch the committed build/
-      # directory (which contains developer-local absolute paths in
-      # CMakeCache.txt and CMakePresets.json).
-      - name: Install Conan dependencies
-        run: |
-          conan install . \
-            --build=missing \
-            --output-folder=build_ci \
-            --settings=build_type=Debug
+      - name: Conan install
+        run: conan install . --build=missing --output-folder=build_ci --settings=build_type=Release
 
-      # ── 6. CMake configure ────────────────────────────────────────────────
-      - name: Configure CMake
-        run: |
-          cmake -S . -B build_ci \
-            -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake \
-            -DCMAKE_BUILD_TYPE=Debug
+      - name: Configure
+        run: cmake -S . -B build_ci -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release
 
-      # ── 7. Build main binary ──────────────────────────────────────────────
-      - name: Build c2pool
+      - name: Build
         run: cmake --build build_ci --target c2pool -j$(nproc)
 
-      # ── 8. Build test targets (unit tests only — no live daemon tests) ───
       - name: Build tests
         run: |
           cmake --build build_ci \
@@ -96,17 +70,265 @@ jobs:
                     test_utxo \
             -j$(nproc)
 
-      # ── 9. Run test suite ─────────────────────────────────────────────────
-      # Live integration tests (test_phase*_live) excluded — require daemon
       - name: Run tests
         working-directory: build_ci
         run: ctest --output-on-failure -j$(nproc) --exclude-regex "LiveTest\."
 
-      # ── 10. Upload test results on failure ───────────────────────────────
-      - name: Upload test results
-        if: failure()
+      - name: Package release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          PKG="c2pool-${VERSION}-linux-x86_64"
+          mkdir -p "${PKG}/lib" "${PKG}/config" "${PKG}/web-static" "${PKG}/explorer"
+          cp build_ci/src/c2pool/c2pool "${PKG}/"
+          strip "${PKG}/c2pool"
+          for lib in libleveldb.so.1 libsecp256k1.so.2 libsnappy.so.1; do
+            found=$(find /usr/lib -name "${lib}*" -type f 2>/dev/null | head -1)
+            [ -n "$found" ] && cp "$found" "${PKG}/lib/"
+          done
+          cp start.sh "${PKG}/" && chmod +x "${PKG}/start.sh"
+          cp config/c2pool_mainnet.yaml "${PKG}/config/c2pool_mainnet.yaml.example" || true
+          cp config/c2pool_testnet.yaml "${PKG}/config/" || true
+          cp -r web-static/* "${PKG}/web-static/"
+          cp explorer/explorer.py "${PKG}/explorer/"
+          tar czf "${PKG}.tar.gz" "${PKG}/"
+          sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256"
+
+      - name: Upload release artifact
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v7
         with:
-          name: test-results
-          path: build_ci/Testing/
-          retention-days: 7
+          name: linux-x86_64
+          path: c2pool-*-linux-x86_64.tar.gz*
+
+      - name: Upload test results on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with: { name: test-results-linux, path: build_ci/Testing/, retention-days: 7 }
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # macOS Intel (x86_64, Homebrew)
+  # ════════════════════════════════════════════════════════════════════════════
+  macos-intel:
+    name: macOS x86_64
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: brew install cmake boost leveldb secp256k1 nlohmann-json yaml-cpp
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --target c2pool -j$(sysctl -n hw.ncpu)
+
+      - name: Verify binary
+        run: file build/src/c2pool/c2pool && build/src/c2pool/c2pool --help 2>&1 | head -3
+
+      - name: Package release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          PKG="c2pool-${VERSION}-macos-x86_64"
+          mkdir -p "${PKG}/lib" "${PKG}/config" "${PKG}/web-static" "${PKG}/explorer"
+          cp build/src/c2pool/c2pool "${PKG}/"
+          strip "${PKG}/c2pool"
+          # Bundle dylibs and fix rpaths
+          for dylib in $(otool -L "${PKG}/c2pool" | grep "/usr/local" | awk '{print $1}'); do
+            base=$(basename "$dylib")
+            cp "$dylib" "${PKG}/lib/${base}"
+            install_name_tool -change "$dylib" "@executable_path/lib/${base}" "${PKG}/c2pool"
+          done
+          for lib in "${PKG}"/lib/*.dylib; do
+            for ref in $(otool -L "$lib" | grep "/usr/local" | awk '{print $1}'); do
+              base=$(basename "$ref")
+              [ -f "${PKG}/lib/${base}" ] && install_name_tool -change "$ref" "@executable_path/lib/${base}" "$lib"
+            done
+            install_name_tool -id "@executable_path/lib/$(basename $lib)" "$lib"
+          done
+          cp start.sh "${PKG}/" && chmod +x "${PKG}/start.sh"
+          cp config/c2pool_mainnet.yaml "${PKG}/config/c2pool_mainnet.yaml.example" || true
+          cp -r web-static/* "${PKG}/web-static/"
+          cp explorer/explorer.py "${PKG}/explorer/"
+          zip -r "${PKG}.zip" "${PKG}/"
+          shasum -a 256 "${PKG}.zip" > "${PKG}.zip.sha256"
+
+      - name: Upload release artifact
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-x86_64
+          path: c2pool-*-macos-x86_64.zip*
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # macOS ARM (Apple Silicon, Homebrew)
+  # ════════════════════════════════════════════════════════════════════════════
+  macos-arm:
+    name: macOS arm64
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: brew install cmake boost leveldb secp256k1 nlohmann-json yaml-cpp
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --target c2pool -j$(sysctl -n hw.ncpu)
+
+      - name: Verify binary
+        run: file build/src/c2pool/c2pool && build/src/c2pool/c2pool --help 2>&1 | head -3
+
+      - name: Package release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          PKG="c2pool-${VERSION}-macos-arm64"
+          mkdir -p "${PKG}/lib" "${PKG}/config" "${PKG}/web-static" "${PKG}/explorer"
+          cp build/src/c2pool/c2pool "${PKG}/"
+          strip "${PKG}/c2pool"
+          for dylib in $(otool -L "${PKG}/c2pool" | grep "/opt/homebrew" | awk '{print $1}'); do
+            base=$(basename "$dylib")
+            cp "$dylib" "${PKG}/lib/${base}"
+            install_name_tool -change "$dylib" "@executable_path/lib/${base}" "${PKG}/c2pool"
+          done
+          for lib in "${PKG}"/lib/*.dylib; do
+            for ref in $(otool -L "$lib" | grep "/opt/homebrew" | awk '{print $1}'); do
+              base=$(basename "$ref")
+              [ -f "${PKG}/lib/${base}" ] && install_name_tool -change "$ref" "@executable_path/lib/${base}" "$lib"
+            done
+            install_name_tool -id "@executable_path/lib/$(basename $lib)" "$lib"
+          done
+          cp start.sh "${PKG}/" && chmod +x "${PKG}/start.sh"
+          cp config/c2pool_mainnet.yaml "${PKG}/config/c2pool_mainnet.yaml.example" || true
+          cp -r web-static/* "${PKG}/web-static/"
+          cp explorer/explorer.py "${PKG}/explorer/"
+          zip -r "${PKG}.zip" "${PKG}/"
+          shasum -a 256 "${PKG}.zip" > "${PKG}.zip.sha256"
+
+      - name: Upload release artifact
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-arm64
+          path: c2pool-*-macos-arm64.zip*
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Windows (MSVC 2022, Conan)
+  # ════════════════════════════════════════════════════════════════════════════
+  windows:
+    name: Windows x86_64
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with: { python-version: '3.12' }
+
+      - name: Install Conan 2
+        run: pip install "conan>=2.0,<3.0"
+
+      - name: Detect Conan profile
+        run: |
+          conan profile detect --force
+          $profile = conan profile path default
+          (Get-Content $profile) -replace 'compiler.cppstd=14','compiler.cppstd=20' | Set-Content $profile
+
+      - name: Restore Conan cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.conan2
+          key: conan2-windows-msvc194-${{ hashFiles('conanfile.txt') }}
+          restore-keys: conan2-windows-msvc194-
+
+      - name: Conan install
+        run: conan install . --build=missing --output-folder=build_ci
+
+      - name: Build secp256k1
+        run: |
+          git clone https://github.com/bitcoin-core/secp256k1 secp256k1-src
+          cmake -B secp256k1-src/build -S secp256k1-src -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_INSTALL_PREFIX="${env:GITHUB_WORKSPACE}/secp256k1" `
+            -DSECP256K1_BUILD_TESTS=OFF -DSECP256K1_BUILD_EXHAUSTIVE_TESTS=OFF `
+            -DSECP256K1_BUILD_BENCHMARK=OFF -DSECP256K1_BUILD_EXAMPLES=OFF
+          cmake --build secp256k1-src/build --config Release
+          cmake --install secp256k1-src/build --config Release
+
+      - name: Configure
+        run: |
+          cmake -S . -B build_ci -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake `
+            -DCMAKE_PREFIX_PATH="${env:GITHUB_WORKSPACE}/secp256k1"
+
+      - name: Build
+        run: cmake --build build_ci --target c2pool --config Release -j $env:NUMBER_OF_PROCESSORS
+
+      - name: Verify binary
+        run: |
+          Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-6.dll" build_ci/src/c2pool/Release/
+          build_ci/src/c2pool/Release/c2pool.exe --help 2>&1 | Select-Object -First 3
+
+      - name: Package release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          $VERSION = "${{ github.ref_name }}".TrimStart('v')
+          $PKG = "c2pool-${VERSION}-windows-x86_64"
+          New-Item -ItemType Directory -Path "${PKG}/lib","${PKG}/config","${PKG}/web-static","${PKG}/explorer" -Force
+          Copy-Item build_ci/src/c2pool/Release/c2pool.exe "${PKG}/"
+          Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-6.dll" "${PKG}/lib/"
+          Copy-Item start.bat "${PKG}/"
+          Copy-Item -Recurse web-static/* "${PKG}/web-static/"
+          Copy-Item explorer/explorer.py "${PKG}/explorer/"
+          Copy-Item config/c2pool_mainnet.yaml "${PKG}/config/c2pool_mainnet.yaml.example"
+          Copy-Item config/c2pool_testnet.yaml "${PKG}/config/" -ErrorAction SilentlyContinue
+          Compress-Archive -Path "${PKG}" -DestinationPath "${PKG}.zip"
+          (Get-FileHash "${PKG}.zip" -Algorithm SHA256).Hash + "  ${PKG}.zip" | Out-File "${PKG}.zip.sha256" -Encoding ascii
+
+      - name: Upload release artifact
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-x86_64
+          path: c2pool-*-windows-x86_64.zip*
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Release — collect artifacts and publish GitHub Release
+  # ════════════════════════════════════════════════════════════════════════════
+  release:
+    name: Publish Release
+    needs: [linux, macos-intel, macos-arm, windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+
+      - name: Create SHA256SUMS
+        run: |
+          cd artifacts
+          find . -name '*.tar.gz' -o -name '*.zip' | sort | while read f; do
+            sha256sum "$f" | sed 's|  \./[^/]*/|  |'
+          done > ../SHA256SUMS
+          cat ../SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
+            SHA256SUMS
