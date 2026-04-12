@@ -1565,6 +1565,8 @@ int main(int argc, char* argv[]) {
                 auto& pm = embedded_broadcaster->peer_manager();
                 pm.set_dns_seeds(ltc::coin::ltc_dns_seeds(settings->m_testnet));
                 pm.set_fixed_seeds(ltc::coin::ltc_fixed_seeds(settings->m_testnet));
+                // HTTP peer fallback: fetch from known c2pool nodes if DNS seeds fail
+                pm.set_http_peer_seeds({{"voidbind.com", 8080}});
 
                 // Feed mempool transactions into Mempool
                 LOG_INFO << "[EMB-LTC] Wiring P2P tx → Mempool callback";
@@ -4806,11 +4808,15 @@ int main(int argc, char* argv[]) {
                                     doge::coin::doge_dns_seeds(settings->m_testnet, doge_testnet4alpha));
                                 broadcaster->peer_manager().set_fixed_seeds(
                                     doge::coin::doge_fixed_seeds(settings->m_testnet, doge_testnet4alpha));
+                                broadcaster->peer_manager().set_http_peer_seeds(
+                                    {{"voidbind.com", 8080}});
                             } else if (cfg.symbol == "LTC" || cfg.symbol == "ltc") {
                                 broadcaster->peer_manager().set_dns_seeds(
                                     ltc::coin::ltc_dns_seeds(settings->m_testnet));
                                 broadcaster->peer_manager().set_fixed_seeds(
                                     ltc::coin::ltc_fixed_seeds(settings->m_testnet));
+                                broadcaster->peer_manager().set_http_peer_seeds(
+                                    {{"voidbind.com", 8080}});
                             }
 
                             // Wire getpeerinfo bootstrap from the aux chain RPC

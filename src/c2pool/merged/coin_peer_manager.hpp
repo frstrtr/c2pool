@@ -19,7 +19,10 @@
 #include <array>
 #include <sstream>
 
+#include <thread>
+
 #include <boost/asio.hpp>
+#include <boost/asio/ip/tcp.hpp>
 #include <nlohmann/json.hpp>
 #include <core/log.hpp>
 #include <core/filesystem.hpp>
@@ -207,6 +210,7 @@ public:
         , m_save_timer(ioc)
         , m_maintenance_timer(ioc)
         , m_fixed_seed_timer(ioc)
+        , m_http_seed_timer(ioc)
     {
     }
 
@@ -244,6 +248,15 @@ public:
         m_fixed_seeds = std::move(seeds);
     }
 
+    /// Set c2pool seed node URLs for HTTP peer discovery fallback.
+    /// When DNS seeds return 0 peers, these nodes are queried via
+    /// GET /api/coin_peers to bootstrap peer addresses.
+    /// Format: {"host:port", ...} (HTTP, no path needed)
+    void set_http_peer_seeds(std::vector<std::pair<std::string, uint16_t>> seeds)
+    {
+        m_http_peer_seeds = std::move(seeds);
+    }
+
     /// Start peer management (bootstrap + periodic refresh + maintenance).
     void start()
     {
@@ -255,6 +268,7 @@ public:
         schedule_save();
         schedule_maintenance();
         schedule_fixed_seed_fallback();
+        schedule_http_peer_fallback();
         m_running = true;
 
         auto stats = peer_stats();
@@ -274,6 +288,7 @@ public:
         m_save_timer.cancel();
         m_maintenance_timer.cancel();
         m_fixed_seed_timer.cancel();
+        m_http_seed_timer.cancel();
         save_peers();
     }
 
@@ -831,6 +846,155 @@ private:
         });
     }
 
+    /// HTTP peer discovery: fetch peers from c2pool seed nodes via
+    /// GET /api/coin_peers. Runs on a detached thread to avoid blocking
+    /// io_context. Results posted back for thread-safe addition.
+    /// Fires 90s after start (after DNS + fixed seeds have been tried).
+    void schedule_http_peer_fallback()
+    {
+        if (m_http_peer_seeds.empty()) return;
+
+        m_http_seed_timer.expires_after(std::chrono::seconds(90));
+        m_http_seed_timer.async_wait([this](const boost::system::error_code& ec) {
+            if (ec || !m_running) return;
+
+            // Only fetch if we still have very few tried peers
+            int tried = 0;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                for (auto& [k, p] : m_peers)
+                    if (p.in_tried && !p.is_protected) ++tried;
+            }
+            if (tried >= m_config.min_peers) {
+                LOG_DEBUG_COIND << "[" << m_symbol
+                    << "] Skipping HTTP peer fetch: " << tried << " tried peers";
+                return;
+            }
+
+            LOG_INFO << "[" << m_symbol << "] Fetching peers from "
+                     << m_http_peer_seeds.size() << " c2pool seed nodes...";
+
+            // Detached thread: blocking HTTP fetch, results posted to ioc
+            auto seeds = m_http_peer_seeds; // copy for thread
+            auto symbol = m_symbol;
+            auto* self = this;
+            std::thread([seeds, symbol, self]() {
+                std::vector<NetService> result;
+                // Determine JSON key: "ltc" or "doge"
+                std::string key = "ltc";
+                if (symbol == "DOGE" || symbol == "doge") key = "doge";
+
+                for (auto& [host, port] : seeds) {
+                    try {
+                        result = http_fetch_coin_peers(host, port, key);
+                        if (!result.empty()) {
+                            LOG_INFO << "[" << symbol << "] HTTP seed " << host
+                                     << ":" << port << " returned "
+                                     << result.size() << " peers";
+                            break; // got peers from one seed, done
+                        }
+                    } catch (const std::exception& e) {
+                        LOG_WARNING << "[" << symbol << "] HTTP seed "
+                            << host << ":" << port << " failed: " << e.what();
+                    }
+                }
+
+                if (!result.empty()) {
+                    boost::asio::post(self->m_ioc, [self, result]() {
+                        self->add_http_peers(result);
+                    });
+                }
+            }).detach();
+        });
+    }
+
+    /// Parse HTTP response and add peers from /api/coin_peers.
+    void add_http_peers(const std::vector<NetService>& peers)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        int added = 0;
+        for (auto& addr : peers) {
+            if (!is_valid_port(addr.port())) continue;
+            if (static_cast<int>(m_peers.size()) >= m_config.max_peers) break;
+            auto key = addr.to_string();
+            if (m_peers.count(key)) continue;
+
+            auto group = get_network_group(addr.address());
+            if (group_count(group, true) >= m_config.max_peers_per_group) continue;
+
+            auto& peer = m_peers[key];
+            peer.address = addr;
+            peer.source = PeerInfo::Source::addr_crawl; // treat like discovered
+            peer.network_group = group;
+            peer.first_seen = std::chrono::steady_clock::now();
+            peer.last_seen = std::chrono::steady_clock::now();
+            peer.max_attempts = m_config.max_connection_attempts;
+            ++added;
+        }
+        if (added > 0)
+            LOG_INFO << "[" << m_symbol << "] Added " << added
+                     << " peers from HTTP seed, " << m_peers.size() << " total";
+    }
+
+    /// Lightweight blocking HTTP GET — fetches /api/coin_peers from a
+    /// c2pool seed node. Uses raw TCP sockets (no boost::beast dependency).
+    /// Returns parsed peers for the given chain key ("ltc" or "doge").
+    static std::vector<NetService> http_fetch_coin_peers(
+        const std::string& host, uint16_t port, const std::string& chain_key)
+    {
+        std::vector<NetService> result;
+        try {
+            boost::asio::io_context tmp_ioc;
+            boost::asio::ip::tcp::resolver resolver(tmp_ioc);
+            auto endpoints = resolver.resolve(host, std::to_string(port));
+
+            boost::asio::ip::tcp::socket sock(tmp_ioc);
+            boost::asio::connect(sock, endpoints);
+
+            // Send HTTP GET
+            std::string request =
+                "GET /api/coin_peers HTTP/1.0\r\n"
+                "Host: " + host + "\r\n"
+                "User-Agent: c2pool/0.1\r\n"
+                "Connection: close\r\n\r\n";
+            boost::asio::write(sock, boost::asio::buffer(request));
+
+            // Read response
+            std::string response;
+            boost::system::error_code ec;
+            char buf[4096];
+            while (true) {
+                size_t n = sock.read_some(boost::asio::buffer(buf), ec);
+                if (n > 0) response.append(buf, n);
+                if (ec) break;
+            }
+
+            // Parse: skip HTTP headers, find JSON body
+            auto body_pos = response.find("\r\n\r\n");
+            if (body_pos == std::string::npos) return result;
+            std::string body = response.substr(body_pos + 4);
+
+            auto j = nlohmann::json::parse(body);
+            if (!j.contains(chain_key) || !j[chain_key].is_array())
+                return result;
+
+            for (auto& peer_str : j[chain_key]) {
+                std::string s = peer_str.get<std::string>();
+                // Parse "ip:port"
+                auto colon = s.rfind(':');
+                if (colon == std::string::npos) continue;
+                std::string ip = s.substr(0, colon);
+                uint16_t p = static_cast<uint16_t>(
+                    std::stoi(s.substr(colon + 1)));
+                if (!ip.empty() && p > 0)
+                    result.emplace_back(ip, p);
+            }
+        } catch (...) {
+            // Connection failed, DNS failed, parse failed — return empty
+        }
+        return result;
+    }
+
     // ─── Members ─────────────────────────────────────────────────────────
 
     boost::asio::io_context& m_ioc;
@@ -845,9 +1009,11 @@ private:
 
     GetPeerInfoFn m_getpeerinfo_fn;
 
-    // DNS + fixed seeds
+    // DNS + fixed + HTTP seeds
     std::vector<c2pool::dns::DnsSeed> m_dns_seeds;
     std::vector<NetService> m_fixed_seeds;
+    std::vector<std::pair<std::string, uint16_t>> m_http_peer_seeds;
+    boost::asio::steady_timer m_http_seed_timer;
 
     mutable std::mutex m_mutex;
     std::map<std::string, PeerInfo> m_peers;        // key = "host:port"
