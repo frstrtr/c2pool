@@ -7419,6 +7419,20 @@ void WebServer::set_merged_mining_manager(c2pool::merged::MergedMiningManager* m
 
 void WebServer::set_dashboard_dir(const std::string& dir)
 {
+    if (!dir.empty()) {
+        std::error_code ec;
+        bool exists = std::filesystem::is_directory(dir, ec);
+        if (!exists) {
+            LOG_ERROR << "Dashboard directory does NOT exist: " << dir
+                      << " — dashboard will serve JSON only. "
+                      << "Check --dashboard-dir path (spaces in path need quoting).";
+            // Don't set the dir — keep it empty so the server knows it's broken
+            return;
+        }
+        auto index = std::filesystem::path(dir) / "dashboard.html";
+        if (!std::filesystem::exists(index, ec))
+            LOG_WARNING << "Dashboard directory exists but dashboard.html not found in: " << dir;
+    }
     mining_interface_->set_dashboard_dir(dir);
     if (!dir.empty())
         LOG_INFO << "Dashboard serving from: " << dir;
