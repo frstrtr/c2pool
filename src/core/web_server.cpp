@@ -30,7 +30,12 @@
 #ifndef _WIN32
 #include <unistd.h>
 #endif
+#include <boost/version.hpp>
+#if BOOST_VERSION >= 108800
+#include <boost/process/v1.hpp>
+#else
 #include <boost/process.hpp>
+#endif
 #include <boost/algorithm/string.hpp>
 #include "btclibs/base58.h"
 #include "btclibs/bech32.h"

@@ -17,7 +17,12 @@
 
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
+#include <boost/version.hpp>
+#if BOOST_VERSION >= 108800
+#include <boost/process/v1.hpp>
+#else
 #include <boost/process.hpp>
+#endif
 #include <nlohmann/json.hpp>
 #include <jsonrpccxx/server.hpp>
 
