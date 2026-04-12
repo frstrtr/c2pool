@@ -31,13 +31,15 @@ find_package(nlohmann_json REQUIRED)
 find_package(Threads REQUIRED)
 
 # Find LevelDB for persistent storage
-# Try system library first (Linux), then Conan/vcpkg package (Windows)
-find_library(LEVELDB_LIBRARIES leveldb)
-find_path(LEVELDB_INCLUDE_DIRS leveldb/db.h)
+# Try system shared lib first (Linux — no transitive deps needed at link time).
+# Fall back to find_package for Conan/vcpkg static builds (links snappy etc.).
+find_library(LEVELDB_LIBRARIES NAMES leveldb PATHS /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib NO_CMAKE_PATH NO_CMAKE_ENVIRONMENT_PATH)
+find_path(LEVELDB_INCLUDE_DIRS leveldb/db.h PATHS /usr/include /usr/local/include NO_CMAKE_PATH NO_CMAKE_ENVIRONMENT_PATH)
 if(LEVELDB_LIBRARIES AND LEVELDB_INCLUDE_DIRS)
-    message(STATUS "LevelDB found: ${LEVELDB_LIBRARIES}")
+    message(STATUS "LevelDB found (system): ${LEVELDB_LIBRARIES}")
     message(STATUS "LevelDB includes: ${LEVELDB_INCLUDE_DIRS}")
 else()
+    # Conan/vcpkg/Homebrew — find_package handles transitive deps (snappy, crc32c)
     find_package(leveldb REQUIRED)
     message(STATUS "LevelDB found via find_package (Conan/vcpkg)")
     set(LEVELDB_LIBRARIES leveldb::leveldb)
