@@ -52,7 +52,7 @@ void NodeRPC::connect(NetService address, std::string userpass)
                 m_reconnect_timer->start(15, [this]() { connect(m_address, m_userpass); });
                 return;
             }
-            boost::asio::ip::tcp::endpoint endpoint = *results;
+            boost::asio::ip::tcp::endpoint endpoint = *results.begin();
             m_stream.async_connect(endpoint,
                 [this](boost::system::error_code ec)
                 {
@@ -122,7 +122,7 @@ void NodeRPC::sync_reconnect()
 		LOG_WARNING << "CoindRPC sync_reconnect resolve failed: " << ec.message();
 		return;
 	}
-	m_stream.connect(*results, ec);
+	m_stream.connect(*results.begin(), ec);
 	if (ec) {
 		LOG_WARNING << "CoindRPC sync_reconnect connect failed: " << ec.message();
 		return;
