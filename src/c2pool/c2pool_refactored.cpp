@@ -6103,7 +6103,7 @@ int main(int argc, char* argv[]) {
                     // Recursive retry lambda
                     auto retry_fn = std::make_shared<std::function<void()>>();
                     *retry_fn = [bcaster, pending_merged_resolve, pending_resolve_state,
-                                 retry_fn, ltc_block_hash, MAX_RETRY, RETRY_SEC]() {
+                                 retry_fn, ltc_block_hash]() {
                         auto it = pending_resolve_state->find(ltc_block_hash);
                         if (it == pending_resolve_state->end()) return;  // resolved
 
