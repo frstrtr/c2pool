@@ -3,6 +3,21 @@
 This guide covers building c2pool on Ubuntu 24.04 LTS.  
 The same steps work on Ubuntu 22.04 and Debian 12 with minor version differences.
 
+### Tested configuration
+
+| Component | Version |
+|-----------|---------|
+| Ubuntu | 24.04.4 LTS (Noble) |
+| Kernel | 6.17.0 |
+| GCC | 13.3.0 |
+| CMake | 3.28.3 |
+| Boost | 1.78.0 (via Conan) / 1.83.0 (system) |
+| LevelDB | 1.23 |
+| libsecp256k1 | 0.4.1 |
+| Architecture | x86_64 |
+
+> Other Ubuntu/Debian versions may work but are untested.
+
 > **Low-RAM warning**: if compilation is killed mid-way, reduce parallelism:
 > `cmake --build . --target c2pool -j1`
 

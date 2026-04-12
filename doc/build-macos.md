@@ -1,7 +1,22 @@
 # Build instructions — macOS (Intel & Apple Silicon)
 
 This guide covers building c2pool from source on macOS.
-Tested on macOS 15+ with Xcode Command Line Tools and Homebrew.
+
+### Tested configuration
+
+| Component | Version |
+|-----------|---------|
+| macOS | 26.3.1 (Tahoe) |
+| Xcode / Apple Clang | 21.0.0 |
+| CMake | 4.3.1 |
+| Boost | 1.90.0 |
+| LevelDB | 1.23 |
+| libsecp256k1 | 0.7.1 |
+| Architecture | x86_64 (Intel Mac Pro) |
+
+> Other macOS versions may work but are untested. Boost API changes between
+> major versions are the most common source of build failures on untested
+> configurations.
 
 ---
 
