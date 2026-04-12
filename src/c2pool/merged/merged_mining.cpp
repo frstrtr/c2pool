@@ -333,9 +333,13 @@ std::string AuxChainRPC::Send(const std::string& request)
 
 nlohmann::json AuxChainRPC::call(const std::string& method, const nlohmann::json& params)
 {
-    return m_client.CallMethod<nlohmann::json>("c2pool", method,
-        params.is_array() ? jsonrpccxx::positional_parameter(params)
-                          : jsonrpccxx::positional_parameter{params});
+    jsonrpccxx::positional_parameter pos_params;
+    if (params.is_array()) {
+        for (const auto& p : params) pos_params.push_back(p);
+    } else {
+        pos_params.push_back(params);
+    }
+    return m_client.CallMethod<nlohmann::json>("c2pool", method, pos_params);
 }
 
 AuxWork AuxChainRPC::get_work_template()
