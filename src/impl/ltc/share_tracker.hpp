@@ -2,11 +2,14 @@
 
 // Portable 128-bit multiply-shift: (a * b) >> shift
 // GCC/Clang have __uint128_t; MSVC uses _umul128 intrinsic.
+// shift must be in [1, 63] to avoid undefined behavior from 64-bit shifts.
 #ifdef _MSC_VER
 #include <intrin.h>
 inline uint64_t mul128_shift(uint64_t a, uint64_t b, unsigned shift) {
     uint64_t hi;
     uint64_t lo = _umul128(a, b, &hi);
+    if (shift == 0)  return lo;   // (a*b) >> 0 — just the low 64 bits
+    if (shift >= 64) return hi >> (shift - 64);
     return (hi << (64 - shift)) | (lo >> shift);
 }
 #else

@@ -99,12 +99,15 @@ target_link_libraries(c2pool_enhanced
 
 # Windows: Boost.Asio requires Winsock libraries; /bigobj for large translation units
 if(WIN32)
-    target_link_libraries(c2pool ws2_32 mswsock bcrypt)
-    target_link_libraries(c2pool_enhanced ws2_32 mswsock bcrypt)
+    target_link_libraries(c2pool ws2_32 mswsock bcrypt dbghelp)
+    target_link_libraries(c2pool_enhanced ws2_32 mswsock bcrypt dbghelp)
 endif()
 if(MSVC)
     target_compile_options(c2pool PRIVATE /bigobj)
     target_compile_options(c2pool_enhanced PRIVATE /bigobj)
+    # Match Linux 8MB stack (MSVC default is 1MB — deep share validation can overflow)
+    target_link_options(c2pool PRIVATE /STACK:8388608)
+    target_link_options(c2pool_enhanced PRIVATE /STACK:8388608)
 endif()
 
 # Test applications

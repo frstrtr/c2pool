@@ -67,6 +67,7 @@
 // --- Platform-specific crash handler ---
 #ifdef _WIN32
 #include <windows.h>
+#include <dbghelp.h>
 #include <io.h>
 
 static void write_crash_log(const char* reason) {
@@ -81,6 +82,59 @@ static void write_crash_log(const char* reason) {
     fprintf(f, "\n=== CRASH: %s at %s\n", reason, time_str);
     fprintf(f, "=== END CRASH ===\n");
     fclose(f);
+}
+
+// Write a minidump (.dmp) that can be analyzed in WinDbg or Visual Studio.
+// The dump includes full memory (data segments) so we can inspect stack,
+// heap objects, and the faulting instruction context.
+static void write_minidump(EXCEPTION_POINTERS* ep) {
+    auto dmp_path = core::filesystem::config_path() / "crash.dmp";
+    HANDLE hFile = CreateFileA(dmp_path.string().c_str(), GENERIC_WRITE, 0,
+                               NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+
+    MINIDUMP_EXCEPTION_INFORMATION mei;
+    mei.ThreadId = GetCurrentThreadId();
+    mei.ExceptionPointers = ep;
+    mei.ClientPointers = FALSE;
+
+    // MiniDumpWithDataSegs captures global/static data; MiniDumpWithThreadInfo
+    // captures thread times and start addresses for all threads.
+    MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), hFile,
+                      static_cast<MINIDUMP_TYPE>(MiniDumpWithDataSegs |
+                                                  MiniDumpWithThreadInfo |
+                                                  MiniDumpWithHandleData),
+                      ep ? &mei : NULL, NULL, NULL);
+    CloseHandle(hFile);
+    fprintf(stderr, "Minidump written to: %s\n", dmp_path.string().c_str());
+}
+
+// SEH (Structured Exception Handler) — catches access violations, stack
+// overflows, illegal instructions, etc. at the OS level.  Unlike C signal
+// handlers, SEH provides the full EXCEPTION_POINTERS (instruction pointer,
+// registers, exception code) which MiniDumpWriteDump needs.
+static LONG WINAPI seh_exception_handler(EXCEPTION_POINTERS* ep) {
+    const char* desc = "unknown";
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    switch (code) {
+        case EXCEPTION_ACCESS_VIOLATION:    desc = "ACCESS_VIOLATION";    break;
+        case EXCEPTION_STACK_OVERFLOW:      desc = "STACK_OVERFLOW";      break;
+        case EXCEPTION_ILLEGAL_INSTRUCTION: desc = "ILLEGAL_INSTRUCTION"; break;
+        case EXCEPTION_INT_DIVIDE_BY_ZERO:  desc = "INT_DIVIDE_BY_ZERO"; break;
+        case EXCEPTION_FLT_DIVIDE_BY_ZERO:  desc = "FLT_DIVIDE_BY_ZERO"; break;
+        case EXCEPTION_DATATYPE_MISALIGNMENT: desc = "DATATYPE_MISALIGNMENT"; break;
+    }
+
+    fprintf(stderr, "\n=== CRASH: SEH exception 0x%08lX (%s) at 0x%p ===\n",
+            code, desc, ep->ExceptionRecord->ExceptionAddress);
+
+    char msg[256];
+    snprintf(msg, sizeof(msg), "SEH 0x%08lX (%s) at 0x%p",
+             code, desc, ep->ExceptionRecord->ExceptionAddress);
+    write_crash_log(msg);
+    write_minidump(ep);
+
+    return EXCEPTION_EXECUTE_HANDLER;  // terminate after handler
 }
 
 static void c2pool_terminate_handler() {
@@ -102,6 +156,8 @@ static void c2pool_terminate_handler() {
         fprintf(stderr, "No active exception\n");
         write_crash_log("std::terminate — no exception");
     }
+    // Write a minidump even for std::terminate (no exception pointers available)
+    write_minidump(nullptr);
     fprintf(stderr, "=== END ===\n");
     _exit(134);
 }
@@ -111,6 +167,9 @@ static void segfault_handler(int sig) {
     char msg[64];
     snprintf(msg, sizeof(msg), "signal %d", sig);
     write_crash_log(msg);
+    // No EXCEPTION_POINTERS from signal context, but the minidump still
+    // captures thread stacks and data segments for post-mortem analysis.
+    write_minidump(nullptr);
     _exit(128 + sig);
 }
 
@@ -445,7 +504,11 @@ int main(int argc, char* argv[]) {
     // Install crash handlers
     std::set_terminate(c2pool_terminate_handler);
     std::signal(SIGINT, signal_handler);
-#ifndef _WIN32
+#ifdef _WIN32
+    // SEH handler catches access violations, stack overflows, etc. at OS level
+    // and writes a minidump (.dmp) for WinDbg/VS analysis.
+    SetUnhandledExceptionFilter(seh_exception_handler);
+#else
     std::signal(SIGTERM, signal_handler);  // SIGTERM not reliably delivered on Windows
 #endif
     std::signal(SIGSEGV, segfault_handler);

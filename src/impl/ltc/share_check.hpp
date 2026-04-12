@@ -1427,10 +1427,11 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
             auto wv = tracker.chain.get_chain(share.m_prev_hash, std::min(cl, int32_t(5)));
             int si = 0;
             for (auto [h, d] : wv) {
-                d.share.invoke([&](auto* obj) {
+                auto hash_copy = h;  // Apple Clang: structured bindings can't be captured in lambdas
+                d.share.invoke([&, hash_copy](auto* obj) {
                     auto att = chain::target_to_average_attempts(chain::bits_to_target(obj->m_bits));
                     auto sc = get_share_script(obj);
-                    LOG_WARNING << "[GENTX-DIAG]  walk[" << si << "] hash=" << h.ToString().substr(0,16)
+                    LOG_WARNING << "[GENTX-DIAG]  walk[" << si << "] hash=" << hash_copy.ToString().substr(0,16)
                                 << " bits=0x" << std::hex << obj->m_bits
                                 << " max_bits=0x" << obj->m_max_bits << std::dec
                                 << " att=" << att.GetHex()
@@ -1445,10 +1446,11 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
                 int si2 = 0;
                 for (auto [h, d] : full_view) {
                     if (si2 >= cl - 5) {
-                        d.share.invoke([&](auto* obj) {
+                        auto hash_copy = h;  // Apple Clang: structured bindings can't be captured
+                        d.share.invoke([&, hash_copy](auto* obj) {
                             auto att = chain::target_to_average_attempts(chain::bits_to_target(obj->m_bits));
                             auto sc = get_share_script(obj);
-                            LOG_WARNING << "[GENTX-DIAG]  walk_tail[" << si2 << "/" << cl << "] hash=" << h.ToString().substr(0,16)
+                            LOG_WARNING << "[GENTX-DIAG]  walk_tail[" << si2 << "/" << cl << "] hash=" << hash_copy.ToString().substr(0,16)
                                         << " bits=0x" << std::hex << obj->m_bits
                                         << " max_bits=0x" << obj->m_max_bits << std::dec
                                         << " att=" << att.GetHex()
