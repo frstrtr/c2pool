@@ -618,9 +618,12 @@ void MergedMiningManager::poll_loop()
 
 void MergedMiningManager::refresh_aux_work()
 {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
-
     bool any_changed = false;
+    bool pplns_was_dirty = m_pplns_dirty.load(std::memory_order_relaxed);
+
+    // ── Phase 1: RPC calls under m_mutex to update templates ──
+    {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
     for (auto& chain : m_chains) {
         try {
@@ -765,22 +768,13 @@ void MergedMiningManager::refresh_aux_work()
         }
     }
 
-    if (any_changed) {
-        // Rebuild the commitment from current work
-        std::map<uint32_t, uint256> slot_hashes;
-        for (const auto& chain : m_chains) {
-            if (!chain.current_work.block_hash.IsNull()) {
-                auto it = m_tree.slot_map.find(chain.config.chain_id);
-                if (it != m_tree.slot_map.end()) {
-                    slot_hashes[it->second] = chain.current_work.block_hash;
-                }
-            }
-        }
+    } // ── end scoped m_mutex for Phase 1 (RPC template updates) ──
 
-        if (!slot_hashes.empty()) {
-            auto proof = m_tree.compute_root(slot_hashes, 0);  // root only
-            m_cached_commitment = build_auxpow_commitment(proof.root, m_tree.size);
-        }
+    // ── Phase 2: Rebuild DOGE blocks if templates changed or PPLNS dirty ──
+    // rebuild_cached_blocks() manages its own lock acquisition/release to
+    // safely call payout_fn (which calls into tracker) without deadlock.
+    if (any_changed || pplns_was_dirty) {
+        rebuild_cached_blocks();
 
         // Notify stratum to push new work with the fresh MM commitment.
         // Without this, miners keep working on old coinbases that commit to
@@ -797,32 +791,7 @@ std::vector<uint8_t> MergedMiningManager::get_auxpow_commitment()
     return m_cached_commitment;
 }
 
-std::vector<uint8_t> MergedMiningManager::override_chain_block_hash(uint32_t chain_id, const uint256& pplns_block_hash)
-{
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    for (auto& chain : m_chains) {
-        if (chain.config.chain_id == chain_id) {
-            chain.current_work.block_hash = pplns_block_hash;
-            break;
-        }
-    }
-    // Rebuild the commitment with updated block hash and return it atomically.
-    // This avoids the race where poll_loop overwrites block_hash between
-    // override and get_auxpow_commitment().
-    std::map<uint32_t, uint256> slot_hashes;
-    for (const auto& chain : m_chains) {
-        if (!chain.current_work.block_hash.IsNull()) {
-            auto it = m_tree.slot_map.find(chain.config.chain_id);
-            if (it != m_tree.slot_map.end())
-                slot_hashes[it->second] = chain.current_work.block_hash;
-        }
-    }
-    if (!slot_hashes.empty()) {
-        auto proof = m_tree.compute_root(slot_hashes, 0);
-        m_cached_commitment = build_auxpow_commitment(proof.root, m_tree.size);
-    }
-    return m_cached_commitment;
-}
+
 
 void MergedMiningManager::try_submit_merged_blocks(
     const std::string& parent_header_hex,
@@ -910,7 +879,7 @@ void MergedMiningManager::try_submit_merged_blocks(
         // ── Extract committed root from parent coinbase ──
         // The LTC coinbase was built at stratum job time and may contain an OLDER
         // DOGE block hash than the current chain.frozen_* fields (which get
-        // overwritten on every build_merged_header_info_with_commitment call).
+        // updated on each rebuild_cached_blocks cycle).
         // We must use the snapshot that matches the committed root, not the latest.
         auto parent_cb_bytes = from_hex(parent_coinbase_hex);
         static const uint8_t MAGIC[] = {0xfa, 0xbe, 0x6d, 0x6d};
@@ -1086,22 +1055,28 @@ std::map<uint32_t, AuxWork> MergedMiningManager::get_current_work() const
     return result;
 }
 
-std::vector<MergedMiningManager::MergedHeaderInfo>
-MergedMiningManager::build_merged_header_info() const
+// ─── rebuild_cached_blocks ──────────────────────────────────────────────────
+// p2pool equivalent: set_merged_work() Phase A.
+// Builds the full DOGE block (PPLNS coinbase + merkle + header) ONCE,
+// freezes the snapshot, computes the commitment, and caches everything.
+// Stratum sessions read the cache via get_cached_header_infos_and_commitment().
+//
+// Lock strategy: snapshot chain data under m_mutex, release, call payout_fn
+// (which calls back into tracker), then re-acquire to store results + freeze.
+void MergedMiningManager::rebuild_cached_blocks()
 {
-    // Snapshot chain data under lock, then release before calling
-    // m_payout_provider (which calls back into tracker → would deadlock).
+    m_pplns_dirty.store(false, std::memory_order_relaxed);
+
+    // ── Step 1: Snapshot chain data under lock ──
     struct ChainSnapshot {
         uint32_t chain_id; uint64_t coinbase_value; int height;
         nlohmann::json block_template;
     };
     std::vector<ChainSnapshot> snapshots;
     PayoutProvider payout_fn;
-    StateRootProvider state_fn;
     {
         std::lock_guard<std::recursive_mutex> lock(m_mutex);
         payout_fn = m_payout_provider;
-        state_fn = m_state_root_provider;
         for (const auto& chain : m_chains) {
             if (chain.current_work.coinbase_value == 0) continue;
             if (chain.current_work.block_template.is_null()) continue;
@@ -1111,14 +1086,18 @@ MergedMiningManager::build_merged_header_info() const
                 chain.current_work.block_template});
         }
     }
-    // Lock released — safe to call payout_fn
+    // ── Lock released — safe to call payout_fn ──
 
-    std::vector<MergedHeaderInfo> result;
-    if (!payout_fn) return result;
+    std::vector<MergedHeaderInfo> header_infos;
+    if (!payout_fn) {
+        // No payout provider yet — cache empty results
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
+        m_cached_header_infos.clear();
+        return;
+    }
 
     for (auto& snap : snapshots)
     {
-
         const auto& tmpl = snap.block_template;
         MergedHeaderInfo info;
         info.chain_id = snap.chain_id;
@@ -1126,17 +1105,10 @@ MergedMiningManager::build_merged_header_info() const
         info.block_height = static_cast<uint32_t>(snap.height);
 
         // Build PPLNS coinbase for this chain (NO lock held — safe)
-        LOG_TRACE << "[MM-header] building header for chain " << snap.chain_id;
         auto payouts = payout_fn(snap.chain_id, snap.coinbase_value);
-        if (payouts.empty()) { LOG_TRACE << "[MM-header] empty payouts, skip"; continue; }
-        LOG_TRACE << "[MM-header] got " << payouts.size() << " payouts";
+        if (payouts.empty()) continue;
 
-        // Build coinbase hex using the same logic as build_multiaddress_block
-        // (simplified — just need the coinbase hash + tx hashes for merkle)
         uint32_t version = tmpl.value("version", 1u);
-        // AuxPoW blocks must have bit 0x100 set in the version. The template
-        // stores the base version (without 0x100) — add it here so the committed
-        // block hash matches the version used at block submission time.
         if ((version >> 16) > 0)  // has chain_id → AuxPoW chain
             version |= (1 << 8);
         std::string prev_hash_hex = tmpl.value("previousblockhash", std::string("0000000000000000000000000000000000000000000000000000000000000000"));
@@ -1144,28 +1116,19 @@ MergedMiningManager::build_merged_header_info() const
         std::string bits_hex = tmpl.value("bits", std::string("1d00ffff"));
 
         try {
-            LOG_TRACE << "[MM-header] building coinbase hex (height="
-                      << info.block_height << " payouts=" << payouts.size() << ")...";
             uint256 state_root; // zero — avoid deadlock
-            LOG_TRACE << "[MM-header] calling build_pplns_coinbase_hex...";
             std::string coinbase_hex = build_pplns_coinbase_hex(
                 info.block_height, payouts, state_root);
-            LOG_TRACE << "[MM-header] build_pplns_coinbase_hex returned len=" << coinbase_hex.size();
             if (coinbase_hex.empty()) continue;
-            LOG_TRACE << "[MM-header] computing hashes...";
 
             auto coinbase_bytes = from_hex(coinbase_hex);
-            LOG_TRACE << "[MM-header] cb_bytes=" << coinbase_bytes.size();
             uint256 cb_hash = Hash(coinbase_bytes);
-            LOG_TRACE << "[MM-header] collecting tx hashes...";
             auto tx_hashes = collect_tx_hashes(cb_hash, tmpl);
-            LOG_TRACE << "[MM-header] tx_hashes=" << tx_hashes.size() << " computing merkle...";
             uint256 merkle_root = compute_tx_merkle_root(tx_hashes);
-            LOG_TRACE << "[MM-header] merkle done, computing link...";
             info.coinbase_merkle_branches = compute_merkle_link(tx_hashes, 0);
-            LOG_INFO << "[MM-header] link done, freezing coinbase len=" << coinbase_hex.size();
             info.coinbase_hex = coinbase_hex;
-            LOG_INFO << "[MM-header] coinbase frozen, extracting scriptSig...";
+
+            // Extract scriptSig
             // Layout: version(4) + vin_count(1) + prev_hash(32) + prev_idx(4) = 41 bytes
             if (coinbase_bytes.size() > 42) {
                 size_t pos = 41;
@@ -1192,50 +1155,25 @@ MergedMiningManager::build_merged_header_info() const
             uint32_t nonce = 0;
             std::memcpy(p, &nonce, 4);
 
-            // DIAGNOSTIC: log frozen header hash for comparison at submit time
-            {
-                uint256 frozen_hdr_hash = Hash(info.block_header);
-                LOG_WARNING << "[MM-FREEZE:" << snap.chain_id << "] frozen_header_hash="
-                            << frozen_hdr_hash.GetHex()
-                            << " version=0x" << std::hex << version << std::dec
-                            << " prev=" << prev_hash_hex.substr(0, 16) << "..."
-                            << " merkle=" << merkle_root.GetHex().substr(0, 16) << "..."
-                            << " time=" << curtime
-                            << " bits=" << bits_hex
-                            << " cb_len=" << info.coinbase_hex.size()/2;
-            }
+            uint256 frozen_hdr_hash = Hash(info.block_header);
+            LOG_INFO << "[MM-cache:" << snap.chain_id << "] built DOGE block hash="
+                     << frozen_hdr_hash.GetHex().substr(0, 16)
+                     << " payouts=" << payouts.size()
+                     << " cb_len=" << coinbase_hex.size()/2;
 
-            LOG_TRACE << "[MM-header] header built, pushing result";
-            result.push_back(std::move(info));
-            LOG_TRACE << "[MM-header] chain done";
+            header_infos.push_back(std::move(info));
         } catch (const std::exception& e) {
             LOG_WARNING << "[MM:chain_" << snap.chain_id
-                        << "] build_merged_header_info failed: " << e.what();
+                        << "] rebuild_cached_blocks failed: " << e.what();
         }
     }
-    return result;
-}
 
-std::pair<std::vector<MergedMiningManager::MergedHeaderInfo>, std::vector<uint8_t>>
-MergedMiningManager::build_merged_header_info_with_commitment()
-{
-    // Step 1: Build header infos (releases lock internally for payout_fn callback).
-    // Each MergedHeaderInfo now contains coinbase_hex — the pre-built PPLNS coinbase.
-    LOG_TRACE << "[MM-commit] Step 1: building header infos...";
-    auto header_infos = build_merged_header_info();
-    LOG_TRACE << "[MM-commit] Step 1 done, " << header_infos.size() << " infos";
-
-    LOG_TRACE << "[MM-commit] Step 2: acquiring lock...";
-    std::unique_lock<std::recursive_mutex> lock(m_mutex, std::try_to_lock);
-    if (!lock.owns_lock()) {
-        LOG_INFO << "[MM-commit] mutex busy, skipping freeze";
-        return {std::move(header_infos), {}};
-    }
-    LOG_TRACE << "[MM-commit] lock acquired, freezing " << header_infos.size() << " chains";
+    // ── Step 2: Re-acquire lock, freeze snapshots, compute commitment, cache ──
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     auto now_sec = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
+
     for (const auto& hi : header_infos) {
-        LOG_TRACE << "[MM-commit] freezing chain " << hi.chain_id;
         for (auto& chain : m_chains) {
             if (chain.config.chain_id != hi.chain_id) continue;
             if (hi.block_header.size() == 80) {
@@ -1245,8 +1183,6 @@ MergedMiningManager::build_merged_header_info_with_commitment()
             chain.frozen_coinbase_hex = hi.coinbase_hex;
             chain.frozen_template = chain.current_work.block_template;
 
-            // Push into frozen history so stale stratum jobs can still submit
-            // valid merged blocks using the snapshot that matches their commitment.
             if (!chain.frozen_block_hash.IsNull()) {
                 chain.frozen_history[chain.frozen_block_hash] = {
                     chain.frozen_template,
@@ -1262,7 +1198,7 @@ MergedMiningManager::build_merged_header_info_with_commitment()
                         ++it;
                     }
                 }
-                LOG_INFO << "[MM-commit] chain " << hi.chain_id
+                LOG_INFO << "[MM-cache] chain " << hi.chain_id
                          << " frozen hash=" << chain.frozen_block_hash.GetHex().substr(0, 16)
                          << " history_size=" << chain.frozen_history.size();
             }
@@ -1270,7 +1206,7 @@ MergedMiningManager::build_merged_header_info_with_commitment()
         }
     }
 
-    LOG_TRACE << "[MM-commit] rebuilding commitment...";
+    // Rebuild commitment from PPLNS-derived block hashes
     std::map<uint32_t, uint256> slot_hashes;
     for (const auto& chain : m_chains) {
         if (!chain.current_work.block_hash.IsNull()) {
@@ -1279,13 +1215,26 @@ MergedMiningManager::build_merged_header_info_with_commitment()
                 slot_hashes[it->second] = chain.current_work.block_hash;
         }
     }
-    LOG_TRACE << "[MM-commit] slots=" << slot_hashes.size();
     if (!slot_hashes.empty()) {
         auto proof = m_tree.compute_root(slot_hashes, 0);
         m_cached_commitment = build_auxpow_commitment(proof.root, m_tree.size);
     }
-    LOG_TRACE << "[MM-commit] done, returning";
-    return {std::move(header_infos), m_cached_commitment};
+
+    // Store the cached header infos for stratum sessions to read
+    m_cached_header_infos = std::move(header_infos);
+
+    LOG_INFO << "[MM-cache] rebuild complete: " << m_cached_header_infos.size()
+             << " chains, commitment=" << m_cached_commitment.size() << " bytes";
+}
+
+// ─── get_cached_header_infos_and_commitment ─────────────────────────────────
+// Lock-free read (well, brief mutex) of pre-built DOGE block data.
+// Called by build_connection_coinbase() — replaces the per-session rebuild.
+std::pair<std::vector<MergedMiningManager::MergedHeaderInfo>, std::vector<uint8_t>>
+MergedMiningManager::get_cached_header_infos_and_commitment() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    return {m_cached_header_infos, m_cached_commitment};
 }
 
 void MergedMiningManager::set_payout_provider(PayoutProvider provider)

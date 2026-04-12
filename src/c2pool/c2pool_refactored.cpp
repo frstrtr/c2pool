@@ -1371,6 +1371,8 @@ int main(int argc, char* argv[]) {
             if (!address_explorer_prefix.empty())
                 web_server.get_mining_interface()->set_custom_explorer_links(
                     address_explorer_prefix, block_explorer_prefix, tx_explorer_prefix);
+            // Set stratum port BEFORE start() — start() launches the stratum listener.
+            web_server.set_stratum_port(static_cast<uint16_t>(stratum_port));
             // Start HTTP server immediately so loading page is served during sync.
             // Stratum won't have valid work yet, but that's fine — miners retry.
             web_server.start();
@@ -5168,9 +5170,6 @@ int main(int argc, char* argv[]) {
                     }
                 }
             }
-
-            // Set custom Stratum port if different from default
-            web_server.set_stratum_port(static_cast<uint16_t>(stratum_port));
 
             // --- V36 operational features ---
 

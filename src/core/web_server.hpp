@@ -268,8 +268,8 @@ public:
         uint256  merged_payout_hash;
         int64_t  share_version{36};     // AutoRatchet: V35 or V36
         uint64_t desired_version{36};   // Version vote (always target version)
-        // Frozen mm_commitment — built atomically with merged_coinbase_info headers
-        // by build_merged_header_info_with_commitment(). Empty if no merged mining.
+        // Frozen mm_commitment — cached from rebuild_cached_blocks().
+        // Empty if no merged mining.
         std::vector<uint8_t> frozen_mm_commitment;
         // Frozen segwit data — merkle branches and witness root change between
         // GBT updates, but the ref_hash was computed with the values at template time.

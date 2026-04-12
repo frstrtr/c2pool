@@ -1700,12 +1700,14 @@ MiningInterface::build_connection_coinbase(
         }
     }
 
-    // ── Phase 2b: MM commitment (lock-free — MM acquires its own m_mutex) ──
+    // ── Phase 2b: MM commitment (cache read — no rebuild, no mutex contention) ──
+    // DOGE blocks are pre-built by MergedMiningManager::rebuild_cached_blocks()
+    // during the refresh cycle.  We just read the cached result here.
     std::vector<uint8_t> atomic_mm_commitment;
     if (m_mm_manager) {
         auto [header_infos, fresh_commit] =
-            m_mm_manager->build_merged_header_info_with_commitment();
-        LOG_TRACE << "[build_cb] MM returned, commit_size=" << fresh_commit.size()
+            m_mm_manager->get_cached_header_infos_and_commitment();
+        LOG_TRACE << "[build_cb] MM cache read, commit_size=" << fresh_commit.size()
                   << " infos=" << header_infos.size();
         atomic_mm_commitment = std::move(fresh_commit);
         ws.merged_header_infos.clear();
@@ -2060,9 +2062,15 @@ void MiningInterface::refresh_work()
             if (pplns_outputs.empty())
                 pplns_outputs.push_back({"0000000000000000000000000000000000000000", coinbase_value});
 
-            // Get merged mining commitment if an MM manager is wired
-            if (m_mm_manager)
+            // Get merged mining commitment if an MM manager is wired.
+            // Only rebuild when PPLNS weights changed (new best_share).
+            // DOGE template changes are handled by refresh_aux_work() poll.
+            // LTC-only tip changes don't affect the DOGE block at all.
+            if (m_mm_manager) {
+                if (m_mm_manager->is_pplns_dirty())
+                    m_mm_manager->rebuild_cached_blocks();
                 mm_commitment = m_mm_manager->get_auxpow_commitment();
+            }
 
             // BIP141: compute P2Pool witness commitment from template transactions
             if (wd.m_data.contains("rules")) {
@@ -4365,12 +4373,15 @@ nlohmann::json MiningInterface::rest_sync_status()
         has_best = !h.IsNull();
     }
 
-    // Check if a valid work template exists (SPV synced + UTXO mature)
+    // Check if a valid work template exists (SPV synced + UTXO mature).
+    // The placeholder template has height=1 and coinbasevalue=5000000000 —
+    // reject it by requiring height > 100.
     bool has_work = false;
     {
         std::lock_guard<std::mutex> lock(m_work_mutex);
         has_work = !m_cached_template.is_null()
-            && m_cached_template.value("coinbasevalue", uint64_t(0)) > 0;
+            && m_cached_template.value("coinbasevalue", uint64_t(0)) > 0
+            && m_cached_template.value("height", 0) > 100;
     }
 
     // Node is truly ready when:
@@ -4407,11 +4418,12 @@ bool MiningInterface::is_node_ready()
         return false;
     }
 
-    // Check work template exists
+    // Check work template exists (not a placeholder — height > 100)
     {
         std::lock_guard<std::mutex> lock(m_work_mutex);
         if (m_cached_template.is_null() ||
-            m_cached_template.value("coinbasevalue", uint64_t(0)) == 0)
+            m_cached_template.value("coinbasevalue", uint64_t(0)) == 0 ||
+            m_cached_template.value("height", 0) <= 100)
             return false;
     }
 
@@ -7193,6 +7205,11 @@ void WebServer::trigger_work_refresh_debounced()
     // Capture previous tip hash BEFORE refresh updates it — needed for delta precompute.
     auto prev_tip = mining_interface_->rest_sharechain_tip();
     std::string prev_tip_hash = prev_tip.value("hash", "");
+
+    // Mark MM PPLNS dirty so the DOGE block gets rebuilt with fresh payouts.
+    // refresh_work() → rebuild_cached_blocks() will clear the flag and rebuild.
+    if (auto* mm = mining_interface_->get_mm_manager())
+        mm->mark_pplns_dirty();
 
     // No debounce — call refresh immediately.
     trigger_work_refresh();

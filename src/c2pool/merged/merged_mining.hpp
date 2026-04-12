@@ -186,13 +186,6 @@ public:
     // Also caches current aux work so submit_merged_blocks() can use it.
     std::vector<uint8_t> get_auxpow_commitment();
 
-    // Override the cached block hash for a chain and return the fresh auxpow commitment.
-    // Used after build_merged_header_info() computes the PPLNS-derived DOGE header —
-    // the block hash from that header must replace the daemon's createauxblock hash
-    // so mm_data is consistent with merged_coinbase_info. Returns the rebuilt commitment
-    // atomically to avoid race with poll_loop overwriting the hash.
-    std::vector<uint8_t> override_chain_block_hash(uint32_t chain_id, const uint256& pplns_block_hash);
-
     // Called after a parent block is found / share meets aux target.
     // Builds and submits merged blocks for all aux chains whose target is met.
     // parent_header_hex: 80 bytes of the parent block header
@@ -221,13 +214,26 @@ public:
         std::vector<unsigned char> coinbase_script;  // scriptSig from the merged coinbase
         std::string coinbase_hex;  // full coinbase TX hex (for freezing at submission time)
     };
-    std::vector<MergedHeaderInfo> build_merged_header_info() const;
 
-    // Atomic: build header info + compute matching auxpow commitment in one operation.
-    // Eliminates race where poll_loop updates current_work between header build and
-    // commitment generation. Returns (header_infos, fresh_mm_commitment).
+    // ─── Cached DOGE block data (p2pool: merged_work variable) ──────────
+    // Built ONCE per work cycle in refresh_aux_work() / rebuild_cached_blocks().
+    // Stratum sessions read from this cache — never rebuild per session.
+
+    // Signal that PPLNS weights changed (new best_share).  The next
+    // refresh_aux_work() cycle will rebuild the DOGE block with fresh payouts.
+    void mark_pplns_dirty() { m_pplns_dirty.store(true, std::memory_order_relaxed); }
+    bool is_pplns_dirty() const { return m_pplns_dirty.load(std::memory_order_relaxed); }
+
+    // Lock-free read of cached header_infos + commitment.
+    // Called by build_connection_coinbase() instead of the old per-session rebuild.
     std::pair<std::vector<MergedHeaderInfo>, std::vector<uint8_t>>
-    build_merged_header_info_with_commitment();
+    get_cached_header_infos_and_commitment() const;
+
+    // Force an immediate rebuild of cached DOGE blocks (PPLNS + coinbase +
+    // merkle + header + freeze + commitment).  Called from refresh_work()
+    // when PPLNS changed so the commitment is fresh before notify_all().
+    // Runs the expensive payout_fn outside m_mutex to avoid deadlock.
+    void rebuild_cached_blocks();
 
     // Check if any aux chains are configured
     bool has_chains() const { return !m_chains.empty(); }
@@ -309,7 +315,7 @@ private:
     void refresh_aux_work();
 
 public:
-    // ─── Shared helpers (used by both build_multiaddress_block and build_merged_header_info) ───
+    // ─── Shared helpers (used by both build_multiaddress_block and rebuild_cached_blocks) ───
 
     // Build canonical merged coinbase TX hex from PPLNS payouts.
     // Matches p2pool's build_canonical_merged_coinbase output ordering.
@@ -358,7 +364,7 @@ private:
         std::string                          last_tip;
         bool                                 using_fallback{false};
         int64_t                              last_update_time{0}; // monotonic seconds
-        // Frozen DOGE block data from build_merged_header_info_with_commitment.
+        // Frozen DOGE block data from rebuild_cached_blocks().
         // Contains the pre-built DOGE coinbase hex and template snapshot that
         // match the block hash committed in the LTC parent's mm_data.
         // try_submit_merged_blocks uses these instead of rebuilding.
@@ -393,8 +399,16 @@ private:
     // Current AuxPoW tree (rebuilt when chains change)
     AuxPowTree m_tree;
 
-    // Cached commitment
+    // Cached commitment (44 bytes: magic + mm_root + tree_size + nonce)
     std::vector<uint8_t> m_cached_commitment;
+
+    // Cached header_infos — built once per work cycle, read by all stratum sessions.
+    // Protected by m_mutex (writes in rebuild_cached_blocks, reads via getter).
+    std::vector<MergedHeaderInfo> m_cached_header_infos;
+
+    // PPLNS dirty flag — set by mark_pplns_dirty(), cleared by rebuild_cached_blocks().
+    // When true, next poll cycle or explicit rebuild will recompute DOGE blocks.
+    std::atomic<bool> m_pplns_dirty{false};
 
     // Per-chain payout provider (set by integration layer)
     PayoutProvider m_payout_provider;
@@ -415,9 +429,9 @@ private:
     void record_discovered_block(const ChainState& chain, bool accepted,
                                  const std::string& parent_hash = "");
 
-    // recursive_mutex: build_merged_header_info_with_commitment called from
-    // ASIO io_context can be triggered while MM timer holds the mutex on
-    // another thread → cross-thread deadlock with plain std::mutex.
+    // recursive_mutex: rebuild_cached_blocks() acquires/releases m_mutex
+    // in phases (snapshot → payout_fn → re-acquire to store).  poll_loop
+    // also holds m_mutex on the RPC thread.
     mutable std::recursive_mutex m_mutex;
 };
 
