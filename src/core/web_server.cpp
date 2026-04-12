@@ -27,7 +27,9 @@
 #include <chrono>
 #include <cmath>
 #include <fstream>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 #include <boost/process.hpp>
 #include <boost/algorithm/string.hpp>
 #include "btclibs/base58.h"

@@ -3,15 +3,14 @@ project(c2pool C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# set(BUILD_SHARED_LIBS OFF)
-# set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
-# if(NOT CMAKE_BUILD_TYPE)
-#   set(CMAKE_BUILD_TYPE Release)
-# endif()
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
 
-# set(CMAKE_CXX_FLAGS "-Wall")
-# set(CMAKE_CXX_FLAGS_DEBUG "-g")
-# set(CMAKE_CXX_FLAGS_RELEASE "-O2")
+if(MSVC)
+    # Suppress common MSVC warnings for POSIX names and unsafe CRT functions
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS _WINSOCK_DEPRECATED_NO_WARNINGS)
+endif()
 
 # Handle CMake 3.30+ policy for FindBoost removal
 if(POLICY CMP0167)
@@ -26,23 +25,36 @@ find_package(Boost REQUIRED COMPONENTS log log_setup thread filesystem system)
 
 find_package(nlohmann_json REQUIRED)
 
+# Threading (needed by LevelDB on some platforms)
+find_package(Threads REQUIRED)
+
 # Find LevelDB for persistent storage
+# Try system library first (Linux), then Conan/vcpkg package (Windows)
 find_library(LEVELDB_LIBRARIES leveldb)
 find_path(LEVELDB_INCLUDE_DIRS leveldb/db.h)
-if(NOT LEVELDB_LIBRARIES OR NOT LEVELDB_INCLUDE_DIRS)
-    message(FATAL_ERROR "LevelDB not found. Please install leveldb development package.")
+if(LEVELDB_LIBRARIES AND LEVELDB_INCLUDE_DIRS)
+    message(STATUS "LevelDB found: ${LEVELDB_LIBRARIES}")
+    message(STATUS "LevelDB includes: ${LEVELDB_INCLUDE_DIRS}")
+else()
+    find_package(leveldb REQUIRED)
+    message(STATUS "LevelDB found via find_package (Conan/vcpkg)")
+    set(LEVELDB_LIBRARIES leveldb::leveldb)
+    set(LEVELDB_INCLUDE_DIRS "")
 endif()
-message(STATUS "LevelDB found: ${LEVELDB_LIBRARIES}")
-message(STATUS "LevelDB includes: ${LEVELDB_INCLUDE_DIRS}")
 
 # Find libsecp256k1 for ECDSA signature verification
+# Try system library first (Linux), then Conan/vcpkg package (Windows)
 find_library(SECP256K1_LIBRARIES secp256k1)
 find_path(SECP256K1_INCLUDE_DIRS secp256k1.h)
-if(NOT SECP256K1_LIBRARIES OR NOT SECP256K1_INCLUDE_DIRS)
-    message(FATAL_ERROR "libsecp256k1 not found. Please install libsecp256k1-dev.")
+if(SECP256K1_LIBRARIES AND SECP256K1_INCLUDE_DIRS)
+    message(STATUS "secp256k1 found: ${SECP256K1_LIBRARIES}")
+    message(STATUS "secp256k1 includes: ${SECP256K1_INCLUDE_DIRS}")
+else()
+    find_package(secp256k1 REQUIRED)
+    message(STATUS "secp256k1 found via find_package (Conan/vcpkg)")
+    set(SECP256K1_LIBRARIES secp256k1::secp256k1)
+    set(SECP256K1_INCLUDE_DIRS "")
 endif()
-message(STATUS "secp256k1 found: ${SECP256K1_LIBRARIES}")
-message(STATUS "secp256k1 includes: ${SECP256K1_INCLUDE_DIRS}")
 
 # Enable testing only if GTest is found
 if(GTest_FOUND OR GTEST_FOUND)

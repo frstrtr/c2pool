@@ -8,9 +8,11 @@
 #include <csignal>
 #include <ctime>
 #include <memory>
+#ifndef _WIN32
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 #include <iomanip>
 #include <sstream>
 
@@ -61,8 +63,61 @@
 #include <c2pool/storage/sharechain_storage.hpp>
 #include <c2pool/storage/found_block_store.hpp>
 #include <c2pool/payout/payout_manager.hpp>
-#include <execinfo.h>  // for backtrace()
-#include <cxxabi.h>    // for __cxa_current_exception_type
+
+// --- Platform-specific crash handler ---
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+
+static void write_crash_log(const char* reason) {
+    auto crash_path = core::filesystem::config_path() / "crash.log";
+    FILE* f = fopen(crash_path.string().c_str(), "a");
+    if (!f) return;
+    time_t now = time(nullptr);
+    struct tm tm_buf;
+    localtime_s(&tm_buf, &now);
+    char time_str[64];
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &tm_buf);
+    fprintf(f, "\n=== CRASH: %s at %s\n", reason, time_str);
+    fprintf(f, "=== END CRASH ===\n");
+    fclose(f);
+}
+
+static void terminate_handler() {
+    fprintf(stderr, "\n=== std::terminate() called ===\n");
+    auto eptr = std::current_exception();
+    if (eptr) {
+        try { std::rethrow_exception(eptr); }
+        catch (const std::exception& e) {
+            fprintf(stderr, "Unhandled exception: %s\n", e.what());
+            char msg[512];
+            snprintf(msg, sizeof(msg), "std::terminate — %s", e.what());
+            write_crash_log(msg);
+        }
+        catch (...) {
+            fprintf(stderr, "Unhandled non-std exception\n");
+            write_crash_log("std::terminate — unknown exception");
+        }
+    } else {
+        fprintf(stderr, "No active exception\n");
+        write_crash_log("std::terminate — no exception");
+    }
+    fprintf(stderr, "=== END ===\n");
+    _exit(134);
+}
+
+static void segfault_handler(int sig) {
+    fprintf(stderr, "\n=== CRASH (signal %d) ===\n", sig);
+    char msg[64];
+    snprintf(msg, sizeof(msg), "signal %d", sig);
+    write_crash_log(msg);
+    _exit(128 + sig);
+}
+
+#else // POSIX
+
+#include <execinfo.h>
+#include <cxxabi.h>
 
 static void write_crash_log(const char* reason) {
     int fd = open("/tmp/c2pool_crash.log", O_WRONLY | O_CREAT | O_APPEND, 0640);
@@ -90,7 +145,6 @@ static void write_crash_log(const char* reason) {
 }
 
 static void terminate_handler() {
-    // Catch unhandled exceptions that call std::terminate
     fprintf(stderr, "\n=== std::terminate() called ===\n");
     auto eptr = std::current_exception();
     if (eptr) {
@@ -127,6 +181,8 @@ static void segfault_handler(int sig) {
     write_crash_log(msg);
     _exit(128 + sig);
 }
+
+#endif // _WIN32
 
 // Integrated merged mining
 #include <c2pool/merged/merged_mining.hpp>
@@ -389,7 +445,9 @@ int main(int argc, char* argv[]) {
     // Install crash handlers
     std::set_terminate(terminate_handler);
     std::signal(SIGINT, signal_handler);
-    std::signal(SIGTERM, signal_handler);
+#ifndef _WIN32
+    std::signal(SIGTERM, signal_handler);  // SIGTERM not reliably delivered on Windows
+#endif
     std::signal(SIGSEGV, segfault_handler);
     std::signal(SIGABRT, segfault_handler);
 

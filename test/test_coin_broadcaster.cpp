@@ -12,8 +12,13 @@
 #include <vector>
 #include <thread>
 #include <chrono>
+#ifndef _WIN32
 #include <sys/stat.h>
 #include <unistd.h>
+#else
+#include <process.h>
+#define getpid _getpid
+#endif
 
 using namespace c2pool::merged;
 using namespace ltc::coin::p2p;

@@ -87,7 +87,7 @@ target_link_libraries(c2pool
 
 # Enhanced version with explicit name (for backward compatibility)
 add_executable(c2pool_enhanced c2pool_refactored.cpp)
-target_link_libraries(c2pool_enhanced 
+target_link_libraries(c2pool_enhanced
     c2pool_node_enhanced
     c2pool_payout
     c2pool_merged_mining
@@ -96,6 +96,12 @@ target_link_libraries(c2pool_enhanced
     nlohmann_json::nlohmann_json
     ${Boost_LIBRARIES}
 )
+
+# Windows: Boost.Asio requires Winsock libraries
+if(WIN32)
+    target_link_libraries(c2pool ws2_32 mswsock bcrypt)
+    target_link_libraries(c2pool_enhanced ws2_32 mswsock bcrypt)
+endif()
 
 # Test applications
 add_executable(test_ltc_node test_ltc_node.cpp)

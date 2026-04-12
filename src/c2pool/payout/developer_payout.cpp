@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <boost/process.hpp>
 #include <nlohmann/json.hpp>
+#include <core/filesystem.hpp>
 
 namespace c2pool {
 namespace payout {
@@ -277,7 +278,7 @@ bool PayoutManager::detect_wallet_address_file() {
     // This avoids parsing wallet.dat (which requires BDB and is complex).
     // Users can create ~/.c2pool/node_address.txt with their payout address.
     const std::vector<std::string> paths = {
-        std::string(getenv("HOME") ? getenv("HOME") : ".") + "/.c2pool/node_address.txt",
+        (core::filesystem::config_path() / "node_address.txt").string(),
         "node_address.txt",
     };
     for (const auto& path : paths) {

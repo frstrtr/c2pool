@@ -3,6 +3,8 @@ boost/1.78.0
 nlohmann_json/3.12.0
 yaml-cpp/0.8.0
 gtest/1.14.0
+leveldb/1.23
+libsecp256k1/0.5.1
 
 [generators]
 CMakeDeps

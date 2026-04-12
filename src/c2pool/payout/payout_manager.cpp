@@ -10,6 +10,7 @@
 #include <fstream>
 #include <cstdlib>
 #include <filesystem>
+#include <core/filesystem.hpp>
 #include <boost/process.hpp>
 #include <nlohmann/json.hpp>
 #include <core/log.hpp>
@@ -1045,7 +1046,7 @@ void PayoutManager::set_node_owner_script(const std::string& script_hex) {
         
         // Save to config if enabled
         if (node_owner_config_.store_generated_address) {
-            std::string config_dir = std::string(getenv("HOME") ? getenv("HOME") : ".") + "/.c2pool";
+            std::string config_dir = core::filesystem::config_path().string();
             node_owner_config_.save_to_config_file(config_dir, blockchain_, network_);
         }
     } else {
@@ -1054,18 +1055,9 @@ void PayoutManager::set_node_owner_script(const std::string& script_hex) {
 }
 
 std::string PayoutManager::get_node_owner_config_path() const {
-    // Get home directory and create config path
-    const char* home = getenv("HOME");
-    if (!home) {
-        return "./node_owner_addresses.json";
-    }
-    
-    std::string config_dir = std::string(home) + "/.c2pool";
-    
-    // Create directory if it doesn't exist
+    auto config_dir = core::filesystem::config_path();
     std::filesystem::create_directories(config_dir);
-    
-    return config_dir + "/node_owner_addresses.json";
+    return (config_dir / "node_owner_addresses.json").string();
 }
 
 std::string PayoutManager::get_developer_address() const {
@@ -1173,7 +1165,7 @@ bool PayoutManager::has_node_owner_fee() const {
 }
 
 bool PayoutManager::try_load_node_owner_from_config() {
-    std::string config_dir = std::string(getenv("HOME") ? getenv("HOME") : ".") + "/.c2pool";
+    std::string config_dir = core::filesystem::config_path().string();
     bool loaded = node_owner_config_.load_from_config_file(config_dir, blockchain_, network_);
     
     if (loaded && !node_owner_config_.payout_address.empty()) {
