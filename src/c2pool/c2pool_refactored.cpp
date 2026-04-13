@@ -518,7 +518,11 @@ int main(int argc, char* argv[]) {
     core::log::Logger::init();
     
     std::cout << "\n"
-              << "  c2pool v0.1 — P2Pool rebirth in C++\n"
+#ifdef C2POOL_VERSION
+              << "  c2pool " C2POOL_VERSION " — P2Pool rebirth in C++\n"
+#else
+              << "  c2pool — P2Pool rebirth in C++\n"
+#endif
               << "  https://github.com/frstrtr/c2pool\n"
               << "\n"
               << "  Distributed under the MIT/X11 software license, see the accompanying\n"
@@ -532,7 +536,11 @@ int main(int argc, char* argv[]) {
               << "  MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.\n"
               << "\n";
     LOG_INFO    << "##############################################";
-    LOG_INFO    << "#  c2pool v0.1 -- Decentralized Mining Pool  #";
+#ifdef C2POOL_VERSION
+    LOG_INFO    << "#  c2pool " C2POOL_VERSION " -- Decentralized Mining Pool";
+#else
+    LOG_INFO    << "#  c2pool -- Decentralized Mining Pool";
+#endif
     LOG_INFO    << "#  https://github.com/frstrtr/c2pool         #";
     LOG_INFO    << "##############################################";
     LOG_WARNING << "############################################################";
@@ -1512,7 +1520,7 @@ int main(int argc, char* argv[]) {
 
             if (embedded_ltc) {
                 LOG_INFO << "╔══════════════════════════════════════════════════════════════╗";
-                LOG_INFO << "║  [EMB-LTC] Phase 4: EMBEDDED COIN NODE MODE                  ║";
+                LOG_INFO << "║  [EMB-LTC] EMBEDDED COIN NODE MODE                           ║";
                 LOG_INFO << "║  No litecoind RPC required — SPV header chain + P2P sync     ║";
                 LOG_INFO << "╚══════════════════════════════════════════════════════════════╝";
 
@@ -4769,11 +4777,15 @@ int main(int argc, char* argv[]) {
                         LOG_INFO << "DOGE P2P port overridden via --doge-p2p-port: " << doge_p2p_port;
                     }
 
-                    // Phase 5/Step 4: create DOGE HeaderChain when embedded OR P2P is available.
+                    // Create DOGE HeaderChain when embedded OR P2P is available.
                     // Even in RPC-primary mode, the HeaderChain enables live header sync
                     // and acts as fallback if the daemon goes down.
                     bool doge_has_p2p = (cfg.p2p_port > 0);
                     if ((embedded_doge || doge_has_p2p) && cfg.symbol == "DOGE" && !doge_chain) {
+                        LOG_INFO << "╔══════════════════════════════════════════════════════════════╗";
+                        LOG_INFO << "║  [EMB-DOGE] EMBEDDED DOGE NODE — MERGED MINING              ║";
+                        LOG_INFO << "║  No dogecoind RPC required — AuxPoW header chain + P2P sync ║";
+                        LOG_INFO << "╚══════════════════════════════════════════════════════════════╝";
                         auto dp = settings->m_testnet
                             ? (doge_testnet4alpha
                                 ? doge::coin::DOGEChainParams::testnet4alpha()
