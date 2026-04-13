@@ -21,7 +21,7 @@ echo ""
 
 # Start c2pool with bundled libs
 export LD_LIBRARY_PATH="$DIR/lib:${LD_LIBRARY_PATH:-}"
-"$DIR/c2pool" --config "$CONFIG" &
+"$DIR/c2pool" --config "$CONFIG" --dashboard-dir "$DIR/web-static" &
 C2POOL_PID=$!
 
 # Wait for the explorer API to be ready (callbacks wired after full init)
