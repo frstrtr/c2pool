@@ -158,7 +158,7 @@ The default mode uses embedded LTC and DOGE SPV nodes. No litecoind or
 dogecoind installation needed.
 
 ```bash
-./build/src/c2pool/c2pool --integrated --net litecoin --dashboard-dir web-static
+./build/src/c2pool/c2pool --integrated --net litecoin --embedded-ltc --embedded-doge --dashboard-dir web-static
 ```
 
 - Dashboard: `http://localhost:8080`
@@ -171,6 +171,7 @@ If you run a local litecoind, add it as a priority peer for faster sync:
 
 ```bash
 ./build/src/c2pool/c2pool --integrated --net litecoin \
+    --embedded-ltc --embedded-doge \
     --dashboard-dir web-static \
     --coind-p2p-port 9333
 ```

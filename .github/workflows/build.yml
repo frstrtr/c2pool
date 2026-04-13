@@ -220,6 +220,9 @@ jobs:
           $PKG = "c2pool-${VERSION}-windows-x86_64"
           New-Item -ItemType Directory -Path "${PKG}/lib","${PKG}/config","${PKG}/web-static","${PKG}/explorer" -Force
           Copy-Item build_ci/src/c2pool/Release/c2pool.exe "${PKG}/"
+          # DLL must be next to exe for Windows DLL search path (portable ZIP)
+          # Also copy to lib/ for Inno Setup installer compatibility
+          Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-6.dll" "${PKG}/"
           Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-6.dll" "${PKG}/lib/"
           Copy-Item start.bat "${PKG}/"
           Copy-Item -Recurse web-static/* "${PKG}/web-static/"

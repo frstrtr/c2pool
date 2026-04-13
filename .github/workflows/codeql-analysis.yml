@@ -67,9 +67,9 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/.conan2
-          key: conan2-codeql-ubuntu24-gcc13-debug-${{ hashFiles('conanfile.txt') }}
-          restore-keys: |
-            conan2-codeql-ubuntu24-gcc13-debug-
+          # Share cache with build.yml (same Release profile)
+          key: conan2-ubuntu24-gcc13-${{ hashFiles('conanfile.txt') }}
+          restore-keys: conan2-ubuntu24-gcc13-
 
       - if: matrix.build-mode == 'manual'
         name: Install Conan dependencies
@@ -77,14 +77,14 @@ jobs:
           conan install . \
             --build=missing \
             --output-folder=build_codeql \
-            --settings=build_type=Debug
+            --settings=build_type=Release
 
       - if: matrix.build-mode == 'manual'
         name: Build for CodeQL analysis
         run: |
           cmake -S . -B build_codeql \
             -DCMAKE_TOOLCHAIN_FILE=build_codeql/conan_toolchain.cmake \
-            -DCMAKE_BUILD_TYPE=Debug
+            -DCMAKE_BUILD_TYPE=Release
           cmake --build build_codeql --target c2pool -j$(nproc)
 
       # ── Analysis ──────────────────────────────────────────────────────────
