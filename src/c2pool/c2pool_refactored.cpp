@@ -535,21 +535,7 @@ int main(int argc, char* argv[]) {
               << "  EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF\n"
               << "  MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.\n"
               << "\n";
-    LOG_INFO    << "##############################################";
-#ifdef C2POOL_VERSION
-    LOG_INFO    << "#  c2pool " C2POOL_VERSION " -- Decentralized Mining Pool";
-#else
-    LOG_INFO    << "#  c2pool -- Decentralized Mining Pool";
-#endif
-    LOG_INFO    << "#  https://github.com/frstrtr/c2pool         #";
-    LOG_INFO    << "##############################################";
-    LOG_WARNING << "############################################################";
-    LOG_WARNING << "#  THIS IS EXPERIMENTAL SOFTWARE -- USE AT YOUR OWN RISK   #";
-    LOG_WARNING << "#  THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY      #";
-    LOG_WARNING << "#  OF ANY KIND, EXPRESS OR IMPLIED.                        #";
-    LOG_WARNING << "#  Distributed under the MIT/X11 software license          #";
-    LOG_WARNING << "#  See http://www.opensource.org/licenses/mit-license.php  #";
-    LOG_WARNING << "############################################################";
+    // Banner logged after file sink is configured (see post-parse section below).
 
     // Default settings
     auto settings = std::make_unique<core::Settings>();
@@ -1285,6 +1271,23 @@ int main(int argc, char* argv[]) {
                  << " max=" << log_max_total_mb << "MB"
                  << " level=" << (log_level_str.empty() ? "trace" : log_level_str);
     }
+
+    // Banner — now goes to both console AND log file
+    LOG_INFO    << "##############################################";
+#ifdef C2POOL_VERSION
+    LOG_INFO    << "#  c2pool " C2POOL_VERSION " -- Decentralized Mining Pool  #";
+#else
+    LOG_INFO    << "#  c2pool -- Decentralized Mining Pool  #";
+#endif
+    LOG_INFO    << "#  https://github.com/frstrtr/c2pool         #";
+    LOG_INFO    << "##############################################";
+    LOG_WARNING << "############################################################";
+    LOG_WARNING << "#  THIS IS EXPERIMENTAL SOFTWARE -- USE AT YOUR OWN RISK   #";
+    LOG_WARNING << "#  THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY      #";
+    LOG_WARNING << "#  OF ANY KIND, EXPRESS OR IMPLIED.                        #";
+    LOG_WARNING << "#  Distributed under the MIT/X11 software license          #";
+    LOG_WARNING << "#  See http://www.opensource.org/licenses/mit-license.php  #";
+    LOG_WARNING << "############################################################";
 
     // -----------------------------------------------------------------------
     // Post-parse: auto-detect defaults, assemble p2pool-style merged spec
