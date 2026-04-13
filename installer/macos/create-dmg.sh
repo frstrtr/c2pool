@@ -77,23 +77,35 @@ STARTEOF
     chmod +x "$APP_DIR/start.sh"
 fi
 
-# Copy secp256k1 dylib
-if [ "$ARCH" = "arm64" ]; then
-    SECP_LIB="/Users/user0/arm64-deps/lib/libsecp256k1.dylib"
-    SECP_REAL="/Users/user0/arm64-deps/lib/libsecp256k1.6.dylib"
-else
-    SECP_LIB="/usr/local/lib/libsecp256k1.dylib"
-    SECP_REAL="/usr/local/lib/libsecp256k1.6.dylib"
-fi
-if [ -f "$SECP_REAL" ]; then
+# Copy secp256k1 dylib and fix load path
+# Detect the actual linked path from the binary (Homebrew may use Cellar paths
+# like /usr/local/opt/secp256k1/lib/ instead of /usr/local/lib/)
+LINKED_SECP=$(otool -L "$APP_DIR/c2pool" | grep secp256k1 | awk '{print $1}')
+if [ -n "$LINKED_SECP" ] && [ -f "$LINKED_SECP" ]; then
+    SECP_REAL=$(realpath "$LINKED_SECP")
     cp "$SECP_REAL" "$APP_DIR/lib/libsecp256k1.6.dylib"
     ln -sf libsecp256k1.6.dylib "$APP_DIR/lib/libsecp256k1.dylib"
-    # Fix dylib load path so binary finds the bundled lib
-    install_name_tool -change "$SECP_LIB" "@executable_path/lib/libsecp256k1.6.dylib" "$APP_DIR/c2pool" 2>/dev/null || true
-    install_name_tool -change "$SECP_REAL" "@executable_path/lib/libsecp256k1.6.dylib" "$APP_DIR/c2pool" 2>/dev/null || true
-elif [ -f "$SECP_LIB" ]; then
-    cp "$SECP_LIB" "$APP_DIR/lib/libsecp256k1.dylib"
-    install_name_tool -change "$SECP_LIB" "@executable_path/lib/libsecp256k1.dylib" "$APP_DIR/c2pool" 2>/dev/null || true
+    install_name_tool -change "$LINKED_SECP" "@executable_path/lib/libsecp256k1.6.dylib" "$APP_DIR/c2pool"
+    echo "  secp256k1: $LINKED_SECP -> @executable_path/lib/libsecp256k1.6.dylib"
+else
+    # Fallback: try known paths
+    if [ "$ARCH" = "arm64" ]; then
+        SECP_SEARCH="/Users/user0/arm64-deps/lib /opt/homebrew/lib"
+    else
+        SECP_SEARCH="/usr/local/lib /usr/local/opt/secp256k1/lib"
+    fi
+    for DIR in $SECP_SEARCH; do
+        if [ -f "$DIR/libsecp256k1.6.dylib" ]; then
+            cp "$DIR/libsecp256k1.6.dylib" "$APP_DIR/lib/libsecp256k1.6.dylib"
+            ln -sf libsecp256k1.6.dylib "$APP_DIR/lib/libsecp256k1.dylib"
+            # Try all possible linked names
+            for CANDIDATE in "$DIR/libsecp256k1.dylib" "$DIR/libsecp256k1.6.dylib"; do
+                install_name_tool -change "$CANDIDATE" "@executable_path/lib/libsecp256k1.6.dylib" "$APP_DIR/c2pool" 2>/dev/null || true
+            done
+            echo "  secp256k1: $DIR -> @executable_path/lib/libsecp256k1.6.dylib"
+            break
+        fi
+    done
 fi
 
 # Add a README
