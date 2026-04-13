@@ -3327,7 +3327,13 @@ int main(int argc, char* argv[]) {
             });
 
             // Wire per-share window data for the defragmenter grid
-            web_server.get_mining_interface()->set_sharechain_window_fn([&p2p_node, &web_server]() {
+            web_server.get_mining_interface()->set_sharechain_window_fn([&p2p_node, &web_server]()
+                    -> nlohmann::json {
+                // Shared lock: clean_tracker modifies chain on compute thread
+                std::shared_lock lock(p2p_node->tracker_mutex(), std::try_to_lock);
+                if (!lock.owns_lock())
+                    return nlohmann::json::object();  // busy, return empty
+
                 nlohmann::json result;
                 auto& chain = p2p_node->tracker().chain;
                 auto& verified = p2p_node->tracker().verified;
@@ -4006,7 +4012,16 @@ int main(int argc, char* argv[]) {
             // v36 decayed PPLNS otherwise.  Also updates donation script to match.
             web_server.set_pplns_fn([&p2p_node, &auto_ratchet, &web_server](
                     const uint256& best_hash, const uint256& block_target,
-                    uint64_t subsidy, const std::vector<unsigned char>& /*donation_script*/) {
+                    uint64_t subsidy, const std::vector<unsigned char>& /*donation_script*/)
+                    -> std::map<std::vector<unsigned char>, double> {
+                // CRITICAL: acquire shared lock before accessing tracker.
+                // clean_tracker holds exclusive lock while removing shares —
+                // reading without the lock is a data race that causes
+                // use-after-free → corrupted chain walk → OOM (10 GB spike).
+                std::shared_lock lock(p2p_node->tracker_mutex(), std::try_to_lock);
+                if (!lock.owns_lock())
+                    return {};  // compute thread busy, skip this cycle
+
                 auto [share_version, desired_ver] = auto_ratchet->get_share_version(
                     p2p_node->tracker(), best_hash);
                 // Propagate v36_active to tracker for generate_share_transaction runtime PPLNS selection
@@ -4058,6 +4073,11 @@ int main(int argc, char* argv[]) {
                     const std::vector<uint256>& merkle_branches)
                     -> core::MiningInterface::RefHashResult
                 {
+                    // Shared lock: clean_tracker modifies chain on compute thread
+                    std::shared_lock lock(p2p_node->tracker_mutex(), std::try_to_lock);
+                    if (!lock.owns_lock())
+                        return {};  // compute thread busy, skip this work cycle
+
                     LOG_TRACE << "[ref_hash_fn] ENTER prev=" << frozen_prev_share.GetHex().substr(0,16);
 
                     // AutoRatchet: determine share version from network state

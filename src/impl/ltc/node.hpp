@@ -252,6 +252,10 @@ public:
     /// Set RSS memory limit in MB (abort if exceeded). Static because checked in process_shares.
     static void set_rss_limit_mb(long mb);
 
+    /// Expose tracker mutex for IO-thread callbacks that access the tracker.
+    /// Callers MUST use shared_lock(try_to_lock) — NEVER blocking lock().
+    std::shared_mutex& tracker_mutex() { return m_tracker_mutex; }
+
     /// Unified share retention: single-pass prune of chain + verified + LevelDB.
     /// Replaces multi-pass trim with work-based dead head detection and
     /// deferred destruction for verified cascade safety.
