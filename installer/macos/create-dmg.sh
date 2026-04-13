@@ -56,6 +56,11 @@ if [ -d "$REPO_ROOT/explorer" ]; then
     cp -R "$REPO_ROOT/explorer" "$APP_DIR/explorer"
 fi
 
+# Copy transition message blobs (authority-signed V36 upgrade signal)
+if [ -d "$REPO_ROOT/transition_messages" ]; then
+    cp -R "$REPO_ROOT/transition_messages" "$APP_DIR/transition_messages"
+fi
+
 # Copy start script
 if [ -f "$REPO_ROOT/start.sh" ]; then
     cp "$REPO_ROOT/start.sh" "$APP_DIR/start.sh"

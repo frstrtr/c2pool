@@ -55,6 +55,8 @@ Source: "{#PACKAGE_DIR}\explorer\*"; DestDir: "{app}\explorer"; Flags: ignorever
 Source: "{#PACKAGE_DIR}\config\*"; DestDir: "{app}\config"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; Start script
 Source: "{#PACKAGE_DIR}\start.bat"; DestDir: "{app}"; Flags: ignoreversion
+; Transition message blobs (authority-signed V36 upgrade signal)
+Source: "{#PACKAGE_DIR}\transition_messages\*"; DestDir: "{app}\transition_messages"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 ; VC++ Redistributable (installed silently, deleted after)
 Source: "{#VCREDIST_PATH}"; DestDir: "{tmp}"; Flags: deleteafterinstall
 
