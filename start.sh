@@ -13,7 +13,7 @@ if [ -f "$CONFIG" ]; then
     [ -n "$WP" ] && WEB_PORT="$WP"
 fi
 
-echo "=== c2pool v0.1.0-alpha ==="
+echo "=== c2pool v0.1.1-alpha ==="
 echo "Config:   $CONFIG"
 echo "Web:      http://0.0.0.0:${WEB_PORT}"
 echo "Explorer: http://0.0.0.0:${EXPLORER_PORT}"
