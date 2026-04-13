@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.1.1-alpha] - 2026-04-13
+
+### Stability (Critical)
+- **Fix tracker data race** — IO-thread callbacks (PPLNS, ref_hash, sharechain window) accessed the share tracker without holding the shared lock while `clean_tracker` modified it on the compute thread. This use-after-free caused corrupted chain walks, allocating 10+ GB in seconds and triggering the kernel OOM killer. All hot-path callbacks now use `shared_lock(try_to_lock)`.
+- **Fix UTXO prune startup freeze** — `prune_undo()` looped from height 0 on every restart (6.1M iterations for DOGE). Now skips already-pruned range and batches to 500 records per call.
+- **Fix memory leaks** — `m_pplns_per_tip` (unbounded map, now evicts at 200), `m_rate_buckets` (per-IP, now cleans after 1 hour), `m_pplns_precompute_thread` (detach broke re-spawn guard, now uses atomic flag).
+- **External watchdog thread** — separate `std::thread` detects event loop freezes (>30s unresponsive) and RSS limit breaches. Dumps heartbeat diagnostics, writes crash log, and aborts for core dump. Catches failures that the in-process watchdog timer cannot (since it freezes with the event loop).
+- **RSS memory watchdog** — checks process RSS every 10 seconds. Aborts cleanly before the kernel OOM killer sends uncatchable SIGKILL. Configurable via `rss_limit_mb` (default 4000 MB).
+
+### Cross-Platform
+- **Windows build support** — full MSVC 2022 compatibility: portable `mul128_shift` (no `__uint128_t`), reserved keyword renames (`near`/`far`), `/bigobj` for large TUs, Windows-specific `config_path()`, platform guards for `/proc` and `sysconf`.
+- **Windows crash diagnostics** — SEH exception handler writes MiniDump (`.dmp`) with thread stacks and data segments for WinDbg analysis. 8 MB stack for deep PPLNS recursion.
+- **Windows installer** — Inno Setup script with VC++ Runtime bundling, firewall rules (ports 9326/9327/8080/9333/22556), Start Menu shortcuts. Portable ZIP also available.
+- **macOS build support** — Apple Clang / libc++ compatibility: mutex-based `atomic<shared_ptr>` fallback, Boost 1.88-1.90 API fixes (`expires_after`, `resolver::begin`, `boost::process` v1/v2).
+- **macOS DMG packages** — `create-dmg.sh` builds distributable `.dmg` with bundled `libsecp256k1` (`install_name_tool` fixup for `@executable_path`). Both x86_64 and arm64 architectures.
+- **CI pipeline** — GitHub Actions: Linux (Ubuntu 24.04, GCC 13), macOS arm64 (Homebrew), Windows (MSVC 2022, Conan). CodeQL security analysis.
+
+### Documentation
+- **Build guides** — `doc/build-unix.md`, `doc/build-macos.md`, `doc/build-windows.md` with tested configurations, embedded SPV running instructions, SHA256 verification.
+- **macOS arm64 cross-compile guide** — secp256k1 from source, cmake toolchain, DMG packaging.
+- **KNOWN_ISSUES.md** — open issues and platform limitations.
+
+### Changed
+- Dashboard directory validated at startup (log error if path broken).
+- CI CodeQL uses Release build (avoids LevelDB C++20 scoped enum bug).
+- Releases are manual (removed CI auto-publish job).
+
 ## [0.12.0] - 2026-04-07
 
 ### Milestone
