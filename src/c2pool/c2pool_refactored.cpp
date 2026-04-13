@@ -2985,11 +2985,14 @@ int main(int argc, char* argv[]) {
 
             // Load transition message blobs from shipped + data directories
             {
-                // 1. Shipped with source: <repo>/transition_messages/
+                // 1. Next to executable: <deploy>/transition_messages/
                 auto exe_dir = std::filesystem::path(argv[0]).parent_path();
                 web_server.get_mining_interface()->load_transition_blobs(
+                    (exe_dir / "transition_messages").string());
+                // 2. Shipped with source: <repo>/transition_messages/ (build dir layout)
+                web_server.get_mining_interface()->load_transition_blobs(
                     (exe_dir / ".." / ".." / ".." / "transition_messages").string());
-                // 2. User data dir: ~/.c2pool/<net>/transition_messages/
+                // 3. User data dir: ~/.c2pool/transition_messages/
                 auto data_dir = core::filesystem::config_path();
                 web_server.get_mining_interface()->load_transition_blobs(
                     (data_dir / "transition_messages").string());
