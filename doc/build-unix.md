@@ -152,35 +152,36 @@ ctest --output-on-failure -j$(nproc)
 
 All examples assume you are in the repository root.
 
-### Integrated mode — full pool (LTC + DOGE merged mining)
+### Integrated mode — embedded SPV (no daemon required)
+
+The default mode uses embedded LTC and DOGE SPV nodes. No litecoind or
+dogecoind installation needed.
 
 ```bash
-./build/src/c2pool/c2pool \
-    --integrated \
-    --net litecoin \
-    --coind-address 127.0.0.1 --coind-rpc-port 9332 \
-    --coind-p2p-port 9333 \
-    --merged DOGE:98:127.0.0.1:44556:dogerpc:rpcpass \
-    --address YOUR_LTC_ADDRESS \
-    --give-author 2 \
-    litecoinrpc RPCPASSWORD
+./build/src/c2pool/c2pool --integrated --net litecoin --dashboard-dir web-static
 ```
 
-### Testnet smoke-test
+- Dashboard: `http://localhost:8080`
+- Stratum: `stratum+tcp://YOUR_IP:9327` (miners set LTC address as username)
+- P2P: port 9326 (sharechain peers)
+
+### With external coin daemon (optional)
+
+If you run a local litecoind, add it as a priority peer for faster sync:
 
 ```bash
-./build/src/c2pool/c2pool --integrated --testnet
+./build/src/c2pool/c2pool --integrated --net litecoin \
+    --dashboard-dir web-static \
+    --coind-p2p-port 9333
 ```
 
-### Sharechain-only node
+### With YAML config file
 
 ```bash
-./build/src/c2pool/c2pool \
-    --sharechain \
-    --net litecoin \
-    --coind-address 127.0.0.1 --coind-rpc-port 9332 \
-    litecoinrpc RPCPASSWORD
+./build/src/c2pool/c2pool --config config/c2pool_mainnet.yaml --dashboard-dir web-static
 ```
+
+See `config/c2pool_mainnet.yaml` for all available options with documentation.
 
 ### Full option reference
 
@@ -192,15 +193,33 @@ All examples assume you are in the repository root.
 
 | Port | Purpose |
 |------|--------|
-| 9338 | P2Pool sharechain peer-to-peer |
-| 9327 | Stratum mining server + HTTP API |
+| 9326 | P2Pool sharechain peer-to-peer |
+| 9327 | Stratum mining server |
+| 8080 | Web dashboard / JSON-RPC API |
+| 9333 | LTC P2P (embedded SPV) |
+| 22556 | DOGE P2P (embedded SPV) |
 
 ---
 
-## 7. Configuration file (optional)
+## 7. Data directory
 
-Pass `--config path/to/config.yaml` to load settings from YAML.  
-Templates are in `doc/configs-templates/`.
+c2pool stores its data in `~/.c2pool/`:
+
+```
+~/.c2pool/
+  debug.log                    # Main log file (rotated at 100MB)
+  sharechain_leveldb/          # Persistent sharechain storage
+  litecoin/embedded_headers/   # LTC SPV header cache
+  dogecoin/embedded_headers/   # DOGE SPV header cache
+  litecoin/utxo_leveldb/       # LTC UTXO set
+  dogecoin/utxo_leveldb/       # DOGE UTXO set
+  crash.log                    # Crash log (if any, at /tmp/c2pool_crash.log)
+```
+
+## 8. Configuration file (optional)
+
+Pass `--config path/to/config.yaml` to load settings from YAML.
+See `config/c2pool_mainnet.yaml` for all available options with documentation.
 
 ---
 

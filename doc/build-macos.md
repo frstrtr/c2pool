@@ -18,21 +18,46 @@ This guide covers building c2pool from source on macOS.
 > major versions are the most common source of build failures on untested
 > configurations.
 
-## Option 1: Pre-built binary
+## Option 1: Pre-built DMG (recommended)
 
 Download from the [Releases page](https://github.com/frstrtr/c2pool/releases):
-- **Intel Mac**: `c2pool-VERSION-macos-x86_64.zip`
-- **Apple Silicon (M1/M2/M3/M4)**: `c2pool-VERSION-macos-arm64.zip`
+- **Intel Mac**: `c2pool-VERSION-macos-x86_64.dmg`
+- **Apple Silicon (M1/M2/M3/M4)**: `c2pool-VERSION-macos-arm64.dmg`
 
 ```bash
-unzip c2pool-*-macos-*.zip
-cd c2pool-*-macos-*
+# Mount the DMG
+hdiutil attach c2pool-*-macos-*.dmg
+
+# Copy to your preferred location
+cp -R /Volumes/c2pool-*/  ~/c2pool
+
+# Unmount
+hdiutil detach /Volumes/c2pool-*
+
+# Run
+cd ~/c2pool
 ./start.sh
 ```
 
 Dashboard: `http://localhost:8080` — Stratum: `stratum+tcp://YOUR_IP:9327`
 
-> **macOS Gatekeeper**: On first run, macOS may block the binary. Open System Settings > Privacy & Security and click "Allow Anyway", or run: `xattr -d com.apple.quarantine c2pool`
+The DMG contains everything needed: the binary, bundled `libsecp256k1`, web dashboard,
+config templates, block explorer, and a start script. No additional dependencies required.
+
+> **macOS Gatekeeper**: On first run, macOS may block the binary. Open
+> System Settings > Privacy & Security and click "Allow Anyway", or run:
+> ```bash
+> xattr -dr com.apple.quarantine ~/c2pool
+> ```
+
+### Verifying the download
+
+Each release includes a `SHA256SUMS` file. Verify your download:
+
+```bash
+shasum -a 256 c2pool-*-macos-*.dmg
+# Compare output with the published SHA256SUMS
+```
 
 ---
 
@@ -167,22 +192,89 @@ c2pool stores its data in `~/.c2pool/`:
 
 ---
 
-## Universal binary (optional)
+## Cross-compiling for arm64 on an Intel Mac
 
-To build a fat binary that runs natively on both Intel and Apple Silicon:
+If you have an Intel Mac and want to build an arm64 binary (e.g. for distribution):
+
+### 1. Build secp256k1 for arm64
+
+Homebrew's secp256k1 is native-only. Cross-compile from source:
 
 ```bash
-cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"
+git clone --depth 1 --branch v0.7.1 https://github.com/bitcoin-core/secp256k1.git
+cd secp256k1
+mkdir build && cd build
+cmake .. -DCMAKE_OSX_ARCHITECTURES=arm64 \
+    -DCMAKE_INSTALL_PREFIX=$HOME/arm64-deps \
+    -DSECP256K1_BUILD_TESTS=OFF \
+    -DSECP256K1_BUILD_EXHAUSTIVE_TESTS=OFF \
+    -DSECP256K1_BUILD_BENCHMARK=OFF \
+    -DSECP256K1_BUILD_EXAMPLES=OFF
+cmake --build . -j$(sysctl -n hw.ncpu)
+cmake --install . --prefix $HOME/arm64-deps
+```
+
+### 2. Build c2pool for arm64
+
+```bash
+cd c2pool
+mkdir build-arm64 && cd build-arm64
+cmake .. -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_OSX_ARCHITECTURES=arm64 \
+    -DSECP256K1_INCLUDE_DIRS=$HOME/arm64-deps/include \
+    -DSECP256K1_LIBRARIES=$HOME/arm64-deps/lib/libsecp256k1.dylib
 cmake --build . --target c2pool -j$(sysctl -n hw.ncpu)
 ```
 
-> **Note**: Universal builds require that all Homebrew dependencies are also
-> available for both architectures. This may require additional setup.
-> For most users, building natively for your Mac's architecture is simpler.
+Binary: `build-arm64/src/c2pool/c2pool` (Mach-O arm64)
+
+> **Important**: Use a persistent location for `arm64-deps` (not `/tmp/`).
+> The arm64 secp256k1 library is needed at build time and bundled into the DMG.
+
+### 3. Build the DMG
+
+```bash
+bash installer/macos/create-dmg.sh build-arm64/src/c2pool/c2pool arm64
+```
+
+---
+
+## Building a DMG package
+
+The `installer/macos/create-dmg.sh` script packages a binary with all
+required assets into a distributable `.dmg` file:
+
+```bash
+# Native architecture
+bash installer/macos/create-dmg.sh build/src/c2pool/c2pool
+
+# Specific architecture
+bash installer/macos/create-dmg.sh build/src/c2pool/c2pool x86_64
+bash installer/macos/create-dmg.sh build-arm64/src/c2pool/c2pool arm64
+```
+
+The DMG includes: binary, `libsecp256k1.6.dylib` (with `install_name_tool`
+fixup for `@executable_path`), web-static, explorer, config, start.sh, README.
 
 ---
 
 ## Troubleshooting
+
+### `cmake` not found over SSH
+
+Homebrew binaries are at `/usr/local/bin` (Intel) or `/opt/homebrew/bin` (Apple Silicon).
+Non-login SSH sessions may not load your shell profile. Prefix commands:
+
+```bash
+export PATH=/usr/local/bin:$PATH    # Intel
+export PATH=/opt/homebrew/bin:$PATH  # Apple Silicon
+```
+
+Or add to `~/.zshenv` (loaded by all zsh sessions, including non-login):
+
+```bash
+echo 'eval "$(/usr/local/bin/brew shellenv)"' >> ~/.zshenv
+```
 
 ### `brew` not found after installation
 

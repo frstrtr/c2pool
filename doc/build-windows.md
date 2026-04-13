@@ -20,11 +20,22 @@ installed separately.
 ### Running
 
 ```
-c2pool.exe --integrated --net litecoin --dashboard-dir web-static
+c2pool.exe --integrated --net litecoin --embedded-ltc --embedded-doge --dashboard-dir web-static
 ```
 
-Dashboard: `http://localhost:8080`
-Stratum: `stratum+tcp://YOUR_IP:9327` (miners set LTC address as username)
+No litecoind or dogecoind needed — embedded SPV nodes sync via P2P.
+
+- Dashboard: `http://localhost:8080`
+- Stratum: `stratum+tcp://YOUR_IP:9327` (miners set LTC address as username)
+
+### Verifying the download
+
+Each release includes a `SHA256SUMS` file. Verify your download:
+
+```powershell
+Get-FileHash c2pool-*-windows-*.exe -Algorithm SHA256
+# Compare output with the published SHA256SUMS
+```
 
 ---
 
@@ -93,6 +104,12 @@ cmake --build . --target c2pool --config Release -j%NUMBER_OF_PROCESSORS%
 Binary: `build\src\c2pool\Release\c2pool.exe`
 
 > **First build**: ~20-30 min (Boost compiles from source via Conan).
+
+### Running from build
+
+```cmd
+build\src\c2pool\Release\c2pool.exe --integrated --net litecoin --embedded-ltc --embedded-doge --dashboard-dir web-static
+```
 
 ### Building the installer
 
