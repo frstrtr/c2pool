@@ -975,6 +975,7 @@ private:
     std::mutex m_pplns_cache_mutex;
     std::unordered_map<std::string, nlohmann::json> m_pplns_per_tip;
     std::atomic<bool> m_pplns_precompute_done{false};
+    std::atomic<bool> m_pplns_precompute_started{false};  // prevents re-spawn after detach
     // Cached full merged payouts (LTC + DOGE) — updated by cache_pplns_at_tip()
     mutable std::mutex m_merged_payouts_mutex;
     nlohmann::json m_cached_merged_payouts;

@@ -3313,7 +3313,9 @@ nlohmann::json MiningInterface::rest_sharechain_window()
 
 void MiningInterface::start_pplns_precompute()
 {
-    if (m_pplns_precompute_thread.joinable()) return;  // already running
+    // Guard: only spawn once. After detach(), joinable() is false, so
+    // the old guard allowed re-spawning. Use atomic flag instead.
+    if (m_pplns_precompute_started.exchange(true)) return;
 
     m_pplns_precompute_thread = std::thread([this]() {
         LOG_INFO << "[PPLNS-Cache] Background pre-computation thread started";
@@ -3557,6 +3559,17 @@ void MiningInterface::cache_pplns_at_tip()
     // Also store in per-tip cache (for window PPLNS overlay)
     std::lock_guard<std::mutex> lock(m_pplns_cache_mutex);
     m_pplns_per_tip[tip] = std::move(pplns);
+
+    // Evict old entries to prevent unbounded growth.
+    // Keep at most 100 entries (~50 minutes of tips at 30s intervals).
+    constexpr size_t MAX_PPLNS_CACHE = 100;
+    if (m_pplns_per_tip.size() > MAX_PPLNS_CACHE * 2) {
+        // Bulk clear — cheaper than selective eviction on unordered_map
+        // Keep only the current tip entry
+        auto current = std::move(m_pplns_per_tip[tip]);
+        m_pplns_per_tip.clear();
+        m_pplns_per_tip[tip] = std::move(current);
+    }
 }
 
 nlohmann::json MiningInterface::get_pplns_for_tip(const std::string& tip_hash)
@@ -3600,6 +3613,18 @@ bool MiningInterface::rate_check(const std::string& ip, int max_per_min)
 {
     std::lock_guard<std::mutex> lock(m_rate_mutex);
     auto now = std::chrono::steady_clock::now();
+
+    // Periodic cleanup: evict stale IPs (>1 hour idle) to prevent unbounded growth
+    static int check_counter = 0;
+    if (++check_counter >= 1000) {
+        check_counter = 0;
+        for (auto it = m_rate_buckets.begin(); it != m_rate_buckets.end(); ) {
+            auto age = std::chrono::duration_cast<std::chrono::seconds>(
+                now - it->second.last_refill).count();
+            if (age > 3600) it = m_rate_buckets.erase(it);
+            else ++it;
+        }
+    }
     auto& bucket = m_rate_buckets[ip];
 
     // Refill tokens (1 per second, up to max_per_min)
