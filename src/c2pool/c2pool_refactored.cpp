@@ -6577,15 +6577,54 @@ int main(int argc, char* argv[]) {
             // External watchdog thread — independent of io_context
             std::thread ext_watchdog([hb_ioc, now_ms,
                                       hb_think, hb_monitor, hb_ltc_sync, hb_ltc_mempool,
-                                      hb_doge_sync, hb_doge_mempool]() {
+                                      hb_doge_sync, hb_doge_mempool,
+                                      rss_limit_mb]() {
                 constexpr int CHECK_SEC = 10;
                 constexpr int FREEZE_SEC = 30;
                 // Grace period: let the event loop start up before monitoring
                 std::this_thread::sleep_for(std::chrono::seconds(FREEZE_SEC));
 
+                // RSS reader (works on Linux via /proc, returns 0 elsewhere)
+                auto read_rss_mb = []() -> long {
+#ifdef __linux__
+                    FILE* f = fopen("/proc/self/status", "r");
+                    if (!f) return 0;
+                    char line[256];
+                    long kb = 0;
+                    while (fgets(line, sizeof(line), f)) {
+                        if (strncmp(line, "VmRSS:", 6) == 0) {
+                            sscanf(line, "VmRSS: %ld", &kb);
+                            break;
+                        }
+                    }
+                    fclose(f);
+                    return kb / 1024;
+#else
+                    return 0;
+#endif
+                };
+
                 while (!g_shutdown_requested) {
                     std::this_thread::sleep_for(std::chrono::seconds(CHECK_SEC));
                     if (g_shutdown_requested) break;
+
+                    // RSS limit check — catch memory leaks before OOM killer
+                    long rss_mb = read_rss_mb();
+                    if (rss_mb > 0 && rss_limit_mb > 0 && rss_mb > rss_limit_mb) {
+                        fprintf(stderr,
+                            "\n=== RSS LIMIT EXCEEDED ===\n"
+                            "RSS: %ld MB (limit: %ld MB)\n",
+                            rss_mb, rss_limit_mb);
+                        char msg[256];
+                        snprintf(msg, sizeof(msg),
+                                 "RSS LIMIT — %ld MB > %ld MB limit",
+                                 rss_mb, rss_limit_mb);
+                        write_crash_log(msg);
+                        fprintf(stderr, "=== ABORTING (clean exit before OOM killer) ===\n");
+                        fflush(stderr);
+                        std::signal(SIGABRT, SIG_DFL);
+                        abort();
+                    }
 
                     int64_t now = now_ms();
                     int64_t last_ioc = hb_ioc->load();
