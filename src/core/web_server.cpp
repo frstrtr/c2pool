@@ -4805,6 +4805,7 @@ void MiningInterface::auto_detect_external_info()
 nlohmann::json MiningInterface::rest_node_info()
 {
     nlohmann::json result = nlohmann::json::object();
+    result["version"] = m_pool_version;
     result["external_ip"] = m_external_ip.empty() ? "0.0.0.0" : m_external_ip;
     result["worker_port"] = m_worker_port;
     result["p2p_port"] = m_p2p_port;
