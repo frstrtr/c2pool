@@ -289,15 +289,27 @@ public:
     uint32_t prune_undo(uint32_t tip_height, uint32_t keep_depth) {
         if (!m_base || tip_height <= keep_depth) return 0;
         uint32_t prune_below = tip_height - keep_depth;
+        // On first call after startup, m_oldest_undo_height is 0.
+        // Skip the already-pruned range to avoid millions of pointless
+        // LevelDB delete attempts (this was causing a 6M-iteration loop
+        // that froze the event loop for >30s on DOGE chain height ~6.1M).
+        if (m_oldest_undo_height == 0 && prune_below > 0) {
+            m_oldest_undo_height = prune_below;
+            return 0;
+        }
+        // Batch limit: prune at most 500 records per call to keep the
+        // event loop responsive even during large catch-up prunes.
+        constexpr uint32_t MAX_PRUNE_BATCH = 500;
+        uint32_t end = std::min(prune_below, m_oldest_undo_height + MAX_PRUNE_BATCH);
         uint32_t pruned = 0;
-        for (uint32_t h = m_oldest_undo_height; h < prune_below; ++h) {
+        for (uint32_t h = m_oldest_undo_height; h < end; ++h) {
             if (m_base->remove_block_undo(h))
                 ++pruned;
         }
+        m_oldest_undo_height = end;
         if (pruned > 0) {
-            m_oldest_undo_height = prune_below;
             LOG_INFO << "[UTXO] Pruned " << pruned << " undo records below height "
-                     << prune_below << " (keep_depth=" << keep_depth << ")";
+                     << end << " (keep_depth=" << keep_depth << ")";
         }
         return pruned;
     }

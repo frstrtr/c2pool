@@ -6555,6 +6555,82 @@ int main(int argc, char* argv[]) {
             watchdog_timer->expires_after(std::chrono::seconds(30));
             watchdog_timer->async_wait(*watchdog_fn);
 
+            // ── External watchdog thread ──────────────────────────────────
+            // The above watchdog runs on the io_context — if the event loop
+            // freezes, it freezes too and produces zero diagnostic output.
+            // This separate std::thread detects event loop death by checking
+            // an atomic pulse that only the io_context can bump.
+            auto hb_ioc = std::make_shared<std::atomic<int64_t>>(now_ms());
+
+            // IO-context pulse timer: proves the event loop is alive (5s)
+            auto pulse_timer = std::make_shared<boost::asio::steady_timer>(ioc);
+            auto pulse_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
+            *pulse_fn = [pulse_timer, pulse_fn, hb_ioc, now_ms](boost::system::error_code ec) {
+                if (ec) return;
+                hb_ioc->store(now_ms());
+                pulse_timer->expires_after(std::chrono::seconds(5));
+                pulse_timer->async_wait(*pulse_fn);
+            };
+            pulse_timer->expires_after(std::chrono::seconds(5));
+            pulse_timer->async_wait(*pulse_fn);
+
+            // External watchdog thread — independent of io_context
+            std::thread ext_watchdog([hb_ioc, now_ms,
+                                      hb_think, hb_monitor, hb_ltc_sync, hb_ltc_mempool,
+                                      hb_doge_sync, hb_doge_mempool]() {
+                constexpr int CHECK_SEC = 10;
+                constexpr int FREEZE_SEC = 30;
+                // Grace period: let the event loop start up before monitoring
+                std::this_thread::sleep_for(std::chrono::seconds(FREEZE_SEC));
+
+                while (!g_shutdown_requested) {
+                    std::this_thread::sleep_for(std::chrono::seconds(CHECK_SEC));
+                    if (g_shutdown_requested) break;
+
+                    int64_t now = now_ms();
+                    int64_t last_ioc = hb_ioc->load();
+                    int64_t age_sec = (now - last_ioc) / 1000;
+
+                    if (age_sec > FREEZE_SEC) {
+                        // Event loop is frozen — dump diagnostic state
+                        fprintf(stderr,
+                            "\n=== EVENT LOOP FREEZE DETECTED ===\n"
+                            "io_context unresponsive for %lld seconds\n"
+                            "Heartbeat ages (seconds since last fire):\n",
+                            (long long)age_sec);
+
+                        auto dump_hb = [&](const char* name, int64_t last) {
+                            if (last == 0)
+                                fprintf(stderr, "  %-15s not started\n", name);
+                            else
+                                fprintf(stderr, "  %-15s %lld\n", name,
+                                        (long long)((now - last) / 1000));
+                        };
+                        dump_hb("ioc_pulse", last_ioc);
+                        dump_hb("think", hb_think->load());
+                        dump_hb("monitor", hb_monitor->load());
+                        dump_hb("ltc_sync", hb_ltc_sync->load());
+                        dump_hb("ltc_mempool", hb_ltc_mempool->load());
+                        dump_hb("doge_sync", hb_doge_sync->load());
+                        dump_hb("doge_mempool", hb_doge_mempool->load());
+
+                        // Write to persistent crash log
+                        char freeze_msg[256];
+                        snprintf(freeze_msg, sizeof(freeze_msg),
+                                 "EVENT LOOP FREEZE — io_context unresponsive %llds",
+                                 (long long)age_sec);
+                        write_crash_log(freeze_msg);
+
+                        fprintf(stderr, "=== ABORTING FOR CORE DUMP ===\n");
+                        fflush(stderr);
+                        // Reset SIGABRT to default so abort() produces a core dump
+                        // (our custom handler calls _exit which prevents the dump)
+                        std::signal(SIGABRT, SIG_DFL);
+                        abort();
+                    }
+                }
+            });
+
             // HTTP cache refresh timer: update all zero-arg callback caches
             // every 2 seconds so the dashboard reads pre-computed data
             // instead of blocking on main-thread dispatch.
@@ -6596,6 +6672,10 @@ int main(int argc, char* argv[]) {
                 }
             }
             work_guard.reset();
+
+            // Stop external watchdog thread (g_shutdown_requested is already true)
+            if (ext_watchdog.joinable())
+                ext_watchdog.join();
 
             // Save stats on shutdown
             mi_ptr->save_stat_log();

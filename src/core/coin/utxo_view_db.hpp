@@ -167,15 +167,22 @@ public:
     uint32_t prune_raw_blocks(uint32_t tip_height, uint32_t keep_depth) {
         if (tip_height <= keep_depth) return 0;
         uint32_t prune_below = tip_height - keep_depth;
+        // Skip already-pruned range on first call (same fix as UTXOViewCache::prune_undo)
+        if (m_oldest_block_height == 0 && prune_below > 0) {
+            m_oldest_block_height = prune_below;
+            return 0;
+        }
+        constexpr uint32_t MAX_PRUNE_BATCH = 500;
+        uint32_t end = std::min(prune_below, m_oldest_block_height + MAX_PRUNE_BATCH);
         uint32_t pruned = 0;
-        for (uint32_t h = m_oldest_block_height; h < prune_below; ++h) {
+        for (uint32_t h = m_oldest_block_height; h < end; ++h) {
             if (remove_raw_block(h))
                 ++pruned;
         }
+        m_oldest_block_height = end;
         if (pruned > 0) {
-            m_oldest_block_height = prune_below;
             LOG_INFO << "[UTXO-DB] Pruned " << pruned << " raw blocks below height "
-                     << prune_below << " (keep_depth=" << keep_depth << ")";
+                     << end << " (keep_depth=" << keep_depth << ")";
         }
         return pruned;
     }
