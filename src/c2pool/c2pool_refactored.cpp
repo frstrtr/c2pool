@@ -1273,14 +1273,20 @@ int main(int argc, char* argv[]) {
     }
 
     // Banner — now goes to both console AND log file
-    LOG_INFO    << "##############################################";
+    {
+        // Build version line with padding to match 60-char border
+        std::string ver_line = "#  c2pool ";
 #ifdef C2POOL_VERSION
-    LOG_INFO    << "#  c2pool " C2POOL_VERSION " -- Decentralized Mining Pool  #";
-#else
-    LOG_INFO    << "#  c2pool -- Decentralized Mining Pool  #";
+        ver_line += C2POOL_VERSION;
 #endif
-    LOG_INFO    << "#  https://github.com/frstrtr/c2pool         #";
-    LOG_INFO    << "##############################################";
+        ver_line += " -- Decentralized Mining Pool";
+        while (ver_line.size() < 59) ver_line += ' ';
+        ver_line += '#';
+        LOG_INFO << "############################################################";
+        LOG_INFO << ver_line;
+        LOG_INFO << "#  https://github.com/frstrtr/c2pool                      #";
+        LOG_INFO << "############################################################";
+    }
     LOG_WARNING << "############################################################";
     LOG_WARNING << "#  THIS IS EXPERIMENTAL SOFTWARE -- USE AT YOUR OWN RISK   #";
     LOG_WARNING << "#  THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY      #";
