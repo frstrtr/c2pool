@@ -151,5 +151,13 @@ test/test_*_include.cmake
 !test/test_*.cpp
 !test/test_*.hpp
 !test/test_*.h
-CLAUDE.md
+
+# Release artifacts
+*.tar.gz
+*.tar.bz2
+*.dmg
+*.msi
+*.deb
+SHA256SUMS
+
 CLAUDE.md

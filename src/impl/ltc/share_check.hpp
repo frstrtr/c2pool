@@ -1374,6 +1374,53 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
         reinterpret_cast<const unsigned char*>(tx.data()), tx.size());
     auto txid = Hash(tx_span);
 
+    // V36 hash_link cross-check: compute prefix hash_link from our coinbase
+    // and compare with the share's stored hash_link. If states differ,
+    // the prefix (outputs/amounts) differs from what p2pool built.
+    if (dump_diag && use_v36_pplns)
+    {
+        if constexpr (requires { share.m_hash_link.m_extra_data; })
+        {
+            auto gbr = compute_gentx_before_refhash(ver);
+            // prefix = full coinbase minus last 44 bytes (ref_hash 32 + nonce 8 + locktime 4)
+            size_t prefix_len = tx.size() - 44;
+            std::vector<unsigned char> prefix(
+                reinterpret_cast<const unsigned char*>(tx.data()),
+                reinterpret_cast<const unsigned char*>(tx.data()) + prefix_len);
+            auto computed_hl = prefix_to_hash_link(prefix, gbr);
+
+            bool state_match = (computed_hl.m_state.m_data == share.m_hash_link.m_state.m_data);
+            bool extra_match = (computed_hl.m_extra_data.m_data == share.m_hash_link.m_extra_data.m_data);
+            bool len_match = (computed_hl.m_length == share.m_hash_link.m_length);
+
+            static const char* HXD = "0123456789abcdef";
+            auto hex_fn = [&](const auto& v) {
+                std::string h; for (auto b : v) { h += HXD[(uint8_t)b >> 4]; h += HXD[(uint8_t)b & 0xf]; } return h;
+            };
+
+            LOG_WARNING << "[HASHLINK-CMP] state_match=" << (state_match ? "YES" : "NO")
+                        << " extra_match=" << (extra_match ? "YES" : "NO")
+                        << " len_match=" << (len_match ? "YES" : "NO")
+                        << " c2pool_len=" << computed_hl.m_length
+                        << " share_len=" << share.m_hash_link.m_length;
+            if (!state_match) {
+                LOG_WARNING << "[HASHLINK-CMP] c2pool_state=" << hex_fn(computed_hl.m_state.m_data);
+                LOG_WARNING << "[HASHLINK-CMP] share_state =" << hex_fn(share.m_hash_link.m_state.m_data);
+            }
+            if (!extra_match) {
+                LOG_WARNING << "[HASHLINK-CMP] c2pool_extra=" << hex_fn(computed_hl.m_extra_data.m_data)
+                            << " (" << computed_hl.m_extra_data.m_data.size() << " bytes)";
+                LOG_WARNING << "[HASHLINK-CMP] share_extra =" << hex_fn(share.m_hash_link.m_extra_data.m_data)
+                            << " (" << share.m_hash_link.m_extra_data.m_data.size() << " bytes)";
+            }
+            // Also dump prefix length and the last 60 bytes for comparison
+            LOG_WARNING << "[HASHLINK-CMP] prefix_len=" << prefix_len
+                        << " gbr_len=" << gbr.size()
+                        << " prefix_tail=" << hex_fn(std::vector<unsigned char>(
+                            prefix.end() - std::min(prefix.size(), size_t(60)), prefix.end()));
+        }
+    }
+
     // One-time full coinbase hex dump for cross-implementation debugging
     {
         static int coinbase_dump_count = 0;
@@ -1798,6 +1845,15 @@ bool share_check(const ShareT& share,
             {
                 LOG_WARNING << "[GENTX-DIAG] Re-running generate_share_transaction with full dump (v36_active=" << v36_active << "):";
                 generate_share_transaction(share, tracker, true, v36_active);
+
+                // Per-share PPLNS walk dump — compare with p2pool's [PARENT-PPLNS] output.
+                // Uses same parameters as generate_share_transaction's V36 path.
+                if (v36_active && !share.m_prev_hash.IsNull()) {
+                    auto diag_chain_len = static_cast<int32_t>(PoolConfig::real_chain_length());
+                    LOG_WARNING << "[GENTX-DIAG] Per-share V36 PPLNS walk from prev="
+                                << share.m_prev_hash.GetHex().substr(0, 16) << ":";
+                    tracker.dump_v36_pplns_walk(share.m_prev_hash, diag_chain_len);
+                }
             }
 
             throw std::invalid_argument("GenerateShareTransaction mismatch — coinbase does not match PPLNS payouts");

@@ -2129,8 +2129,24 @@ void MiningInterface::refresh_work()
             }
 
             // Fallback: single output to zero-key (burn) so coinbase is always valid
-            if (pplns_outputs.empty())
+            if (pplns_outputs.empty()) {
                 pplns_outputs.push_back({"0000000000000000000000000000000000000000", coinbase_value});
+                // Diagnostic: trace WHY PPLNS is empty — this causes invalid coinbase
+                static int zero_warn = 0;
+                if (zero_warn++ < 10 || zero_warn % 100 == 0) {
+                    bool has_pplns = static_cast<bool>(m_pplns_fn);
+                    bool has_best = static_cast<bool>(m_best_share_hash_fn);
+                    uint256 best_hash;
+                    if (has_best) best_hash = m_best_share_hash_fn();
+                    LOG_WARNING << "[PPLNS-EMPTY] Falling back to zero-address burn!"
+                                << " has_pplns_fn=" << has_pplns
+                                << " has_best_fn=" << has_best
+                                << " best_hash=" << (best_hash.IsNull() ? "null" : best_hash.GetHex().substr(0, 16))
+                                << " subsidy=" << coinbase_value
+                                << " donation_script_len=" << m_donation_script.size()
+                                << " (#" << zero_warn << ")";
+                }
+            }
 
             // Get merged mining commitment if an MM manager is wired.
             // Only rebuild when PPLNS weights changed (new best_share).
@@ -2909,7 +2925,14 @@ nlohmann::json MiningInterface::rest_current_payouts()
     // These are always up-to-date with the latest share template and subsidy.
     auto cached = get_cached_pplns_outputs();
     if (!cached.empty()) {
+        // Skip zero-address burn entries (20-byte zero hash from PPLNS-empty fallback).
+        // These are not real payouts — they indicate PPLNS is not yet computed.
+        static const std::string zero_burn = "0000000000000000000000000000000000000000";
+
         for (const auto& [script_hex, amount] : cached) {
+            if (script_hex == zero_burn)
+                continue;  // Don't expose the burn placeholder to the API
+
             // script_hex is a hex-encoded scriptPubKey — decode to bytes, then to address
             auto script_bytes = ParseHex(script_hex);
             std::string addr = core::script_to_address(script_bytes, is_ltc, m_testnet);

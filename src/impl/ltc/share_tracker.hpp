@@ -34,6 +34,7 @@ inline uint64_t mul128_shift(uint64_t a, uint64_t b, unsigned shift) {
 #include <chrono>
 #include <deque>
 #include <functional>
+#include <iomanip>
 #include <map>
 #include <optional>
 #include <set>
@@ -960,23 +961,24 @@ public:
                                 LOG_INFO << "[PPLNS-RING] built: window=" << head_pplns.window_size()
                                          << " chain_len=" << CL_i32 << " build_time=" << ring_us << "us";
                             } else {
-                                // Subsequent shares: find the new deepest entry and slide
-                                // The new PPLNS start is prev_hash (one step deeper)
+                                // Subsequent shares: slide PPLNS window one step deeper.
+                                // The new window drops the shallowest entry and adds the
+                                // share at depth (chain_len - 1) from the new start.
+                                //
+                                // FIX: deep_hash IS the correct new tail entry (at depth
+                                // chain_len-1 from new start). The previous code took
+                                // deep_hash.tail (one step FURTHER), causing an off-by-one
+                                // that shifted the tail entry one position too deep each
+                                // extension — accumulating PPLNS weight errors and causing
+                                // GENTX mismatches for all V36 shares.
                                 auto ring_depth = head_pplns.window_size();
                                 if (ring_depth > 0) {
-                                    // Get the hash one past the current deepest entry
                                     auto deep_hash = chain.get_nth_parent_via_skip(
                                         prev_hash, std::min(ring_depth - 1, CL_i32 - 1));
                                     if (!deep_hash.IsNull() && chain.contains(deep_hash)) {
-                                        auto* deep_idx = chain.get_index(deep_hash);
-                                        auto deeper = deep_idx ? deep_idx->tail : uint256();
-                                        if (!deeper.IsNull() && chain.contains(deeper)) {
-                                            head_pplns.extend_backward(chain, deeper);
-                                        } else {
-                                            // Can't extend — rebuild
-                                            head_pplns.rebuild(chain, prev_hash, CL_i32);
-                                        }
+                                        head_pplns.extend_backward(chain, deep_hash);
                                     } else {
+                                        // Can't extend — rebuild from scratch
                                         head_pplns.rebuild(chain, prev_hash, CL_i32);
                                     }
                                 }
@@ -1751,6 +1753,115 @@ public:
         m_decayed_cache_valid = true;
 
         return result;
+    }
+
+    // -- Diagnostic: per-share V36 PPLNS walk dump --
+    // Walks from start_hash backward, logging every share's contribution.
+    // Output matches p2pool's [PARENT-PPLNS] stderr format for diff comparison.
+    // Call only from GENTX mismatch handler — never on the hot path.
+    void dump_v36_pplns_walk(const uint256& start_hash, int32_t max_shares)
+    {
+        if (start_hash.IsNull() || !chain.contains(start_hash))
+        {
+            LOG_WARNING << "[PPLNS-WALK] start=" << start_hash.GetHex().substr(0,16)
+                        << " NOT IN CHAIN — walk aborted";
+            return;
+        }
+
+        static constexpr uint64_t DECAY_PRECISION = 40;
+        static constexpr uint64_t DECAY_SCALE = uint64_t(1) << DECAY_PRECISION;
+        static constexpr uint64_t LN2_MICRO = 693147;
+
+        uint32_t half_life = std::max(PoolConfig::chain_length() / 4, uint32_t(1));
+        uint64_t decay_per = DECAY_SCALE - (DECAY_SCALE * LN2_MICRO) / (uint64_t(1000000) * half_life);
+
+        int32_t share_count = 0;
+        uint64_t decay_fp = DECAY_SCALE;
+        uint288 running_total;
+        uint288 running_donation;
+        std::map<std::vector<unsigned char>, uint288> per_addr_weight;
+
+        auto height = chain.get_height(start_hash);
+        auto last = chain.get_last(start_hash);
+
+        LOG_WARNING << "[PPLNS-WALK] start=" << start_hash.GetHex().substr(0, 16)
+                    << " max_shares=" << max_shares
+                    << " height=" << height
+                    << " last=" << (last.IsNull() ? "null" : last.GetHex().substr(0, 16))
+                    << " half_life=" << half_life
+                    << " decay_per=" << decay_per;
+
+        auto cur = start_hash;
+        while (!cur.IsNull() && chain.contains(cur) && share_count < max_shares)
+        {
+            chain.get_share(cur).invoke([&](auto* obj) {
+                auto target = chain::bits_to_target(obj->m_bits);
+                auto att = chain::target_to_average_attempts(target);
+                uint32_t don = obj->m_donation;
+
+                uint288 decayed_att = (att * uint288(decay_fp)) >> DECAY_PRECISION;
+                auto addr_w = decayed_att * static_cast<uint32_t>(65535 - don);
+                auto don_w  = decayed_att * don;
+
+                auto script = get_share_script(obj);
+                per_addr_weight[script] += addr_w;
+                running_total += addr_w + don_w;
+                running_donation += don_w;
+
+                // Script hex prefix (first 10 bytes, like p2pool's key.encode('hex')[:40])
+                static const char* HX = "0123456789abcdef";
+                std::string sh;
+                for (size_t i = 0; i < std::min(script.size(), size_t(20)); ++i) {
+                    sh += HX[script[i] >> 4];
+                    sh += HX[script[i] & 0xf];
+                }
+
+                LOG_WARNING << "[PPLNS-WALK]   #" << share_count
+                            << " hash=" << cur.GetHex().substr(0, 16)
+                            << " script=" << sh
+                            << " bits=0x" << std::hex << obj->m_bits << std::dec
+                            << " don=" << don
+                            << " att=" << att.GetLow64()
+                            << " decay_fp=" << decay_fp
+                            << " decayed=" << decayed_att.GetLow64()
+                            << " addr_w=" << addr_w.GetLow64()
+                            << " running=" << running_total.GetLow64();
+            });
+
+            ++share_count;
+
+            decay_fp = mul128_shift(decay_fp, decay_per, DECAY_PRECISION);
+            auto* idx = chain.get_index(cur);
+            cur = idx ? idx->tail : uint256();
+        }
+
+        // Summary matching p2pool's [PARENT-PPLNS] format
+        LOG_WARNING << "[PPLNS-WALK] SUMMARY: shares=" << share_count
+                    << " addrs=" << per_addr_weight.size()
+                    << " total_w=" << running_total.GetLow64()
+                    << " don_w=" << running_donation.GetLow64();
+        for (const auto& [script, weight] : per_addr_weight)
+        {
+            static const char* HX = "0123456789abcdef";
+            std::string sh;
+            for (size_t i = 0; i < std::min(script.size(), size_t(20)); ++i) {
+                sh += HX[script[i] >> 4];
+                sh += HX[script[i] & 0xf];
+            }
+            double pct = running_total.IsNull() ? 0.0 :
+                static_cast<double>(weight.GetLow64()) / static_cast<double>(running_total.GetLow64()) * 100.0;
+            LOG_WARNING << "[PPLNS-WALK]   " << sh
+                        << " w=" << weight.GetLow64()
+                        << " pct=" << std::fixed << std::setprecision(2) << pct << "%";
+        }
+
+        // Chain gap detection: check if walk terminated early (not at chain bottom)
+        if (share_count < max_shares && !cur.IsNull()) {
+            LOG_WARNING << "[PPLNS-WALK] CHAIN GAP: walk stopped at share #" << share_count
+                        << " — next hash " << cur.GetHex().substr(0, 16)
+                        << " is " << (chain.contains(cur) ? "IN chain (walk bug)" : "NOT IN chain (missing share)")
+                        << ". Expected " << max_shares << " shares.";
+        }
     }
 
     // -- Expected payouts from PPLNS weights --
