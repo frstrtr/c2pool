@@ -1381,9 +1381,12 @@ void NodeImpl::run_think()
             // Clear stale download set (p2pool node.py:108-141)
             m_downloading_shares.clear();
 
-            // Cap fail-count map to prevent unbounded growth
-            if (m_download_fail_count.size() > 1000)
-                m_download_fail_count.clear();
+            // Reset fail counts each think() cycle — matches p2pool which
+            // re-adds desired hashes from scratch every cycle with sleep(1)
+            // backoff.  Permanent blacklisting caused bootstrap stalls:
+            // the tail parent hash would get 3 empty replies and never be
+            // requested again, leaving the chain stuck at <CHAIN_LENGTH.
+            m_download_fail_count.clear();
 
             // Request desired shares from random peers
             if (!result.desired.empty() && !m_peers.empty()) {
