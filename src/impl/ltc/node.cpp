@@ -235,6 +235,14 @@ void NodeImpl::close_connection(const NetService& service)
     base_t::close_connection(service);
 }
 
+NodeImpl::TrackerSnapshot NodeImpl::get_tracker_snapshot() const {
+    std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+    return m_snapshot;
+}
+
+int NodeImpl::get_chain_count() const { return get_tracker_snapshot().chain_count; }
+int NodeImpl::get_verified_count() const { return get_tracker_snapshot().verified_count; }
+
 void NodeImpl::send_version(peer_ptr peer)
 {
     auto rmsg = ltc::message_version::make_raw(
@@ -1312,12 +1320,18 @@ void NodeImpl::run_think()
         uint256 prev_block;
         uint32_t bits = 0;
 
+        // Bootstrap mode: no verified chain yet → verify everything in one
+        // pass with unlimited budget.  During bootstrap, stratum isn't serving
+        // real work so no IO callbacks need the tracker lock.  Matches p2pool
+        // where think() runs synchronously on the reactor during initial sync.
+        bool bootstrap = m_tracker.verified.size() == 0;
         LOG_INFO << "[ASYNC-THINK] compute: chain=" << m_tracker.chain.size()
                  << " verified=" << m_tracker.verified.size()
                  << " heads=" << m_tracker.chain.get_heads().size()
-                 << " v_heads=" << m_tracker.verified.get_heads().size();
+                 << " v_heads=" << m_tracker.verified.get_heads().size()
+                 << (bootstrap ? " BOOTSTRAP" : "");
         auto think_t0 = std::chrono::steady_clock::now();
-        result = m_tracker.think(block_rel_height, prev_block, bits);
+        result = m_tracker.think(block_rel_height, prev_block, bits, bootstrap);
         think_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - think_t0).count();
 
@@ -1332,6 +1346,9 @@ void NodeImpl::run_think()
             best_changed = (m_best_share_hash != result.best);
             m_best_share_hash = result.best;
         }
+
+        // Publish lock-free snapshot for all IO-thread consumers
+        publish_snapshot();
 
         needs_continue = m_tracker.m_think_needs_continue;
 
@@ -1646,6 +1663,7 @@ void NodeImpl::clean_tracker()
       m_compute_thread_id.store(std::this_thread::get_id(), std::memory_order_relaxed);
 
       bool clean_best_changed = false;
+      bool bootstrap = false;
       try {
         std::unique_lock lock(m_tracker_mutex);  // exclusive
 
@@ -1658,10 +1676,12 @@ void NodeImpl::clean_tracker()
             uint256 prev_block;
             uint32_t bits = 0;
 
+            bootstrap = m_tracker.verified.size() == 0;
             LOG_INFO << "[CLEAN] think+clean starting on compute thread: chain="
-                     << m_tracker.chain.size() << " verified=" << m_tracker.verified.size();
+                     << m_tracker.chain.size() << " verified=" << m_tracker.verified.size()
+                     << (bootstrap ? " BOOTSTRAP" : "");
             auto think_t0 = std::chrono::steady_clock::now();
-            auto result = m_tracker.think(block_rel_height, prev_block, bits);
+            auto result = m_tracker.think(block_rel_height, prev_block, bits, bootstrap);
             auto think_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - think_t0).count();
 
@@ -1809,12 +1829,13 @@ void NodeImpl::clean_tracker()
             : std::function<int32_t(uint256)>([](uint256) -> int32_t { return 0; });
         uint256 prev_block;
         uint32_t bits = 0;
-        auto result = m_tracker.think(block_rel_height, prev_block, bits);
+        auto result = m_tracker.think(block_rel_height, prev_block, bits, bootstrap);
         m_last_top5_heads = std::move(result.top5_heads);
         if (!result.best.IsNull()) {
             clean_best_changed = (m_best_share_hash != result.best);
             m_best_share_hash = result.best;
         }
+        publish_snapshot();
         flush_verified_to_leveldb();
         // Work refresh deferred to IO thread (after lock release)
     }

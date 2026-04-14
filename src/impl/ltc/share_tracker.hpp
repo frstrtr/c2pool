@@ -642,9 +642,15 @@ public:
     }
 
     // -- Best-chain selection with verification and punishment --
+    // bootstrap_mode: when true, removes verification budget limit so the
+    // entire chain is verified in one call.  Used during initial sync when
+    // stratum isn't serving work — no IO needs the tracker lock.
+    // Matches p2pool where think() runs synchronously on the reactor and
+    // blocks everything else until verification completes.
     TrackerThinkResult think(const std::function<int32_t(uint256)>& block_rel_height_func,
                              const uint256& previous_block,
-                             uint32_t bits)
+                             uint32_t bits,
+                             bool bootstrap_mode = false)
     {
         // p2pool: desired is a set of (peer_addr, hash, max_timestamp, min_target)
         // The timestamp is used to filter stale requests at return time.
@@ -845,7 +851,7 @@ public:
         // p2pool avoids this problem by persisting verified status — we do too
         // now, so budgeting is a safety net for cold starts only.
         constexpr int THINK_VERIFY_BUDGET = 100;
-        int budget_remaining = THINK_VERIFY_BUDGET;
+        int budget_remaining = bootstrap_mode ? INT_MAX : THINK_VERIFY_BUDGET;
         m_think_needs_continue = false;
         {
             static int p2_skip_log = 0;

@@ -69,6 +69,36 @@ protected:
     std::atomic<bool> m_clean_running{false};
     mutable std::shared_mutex m_tracker_mutex;
 
+    // ── Lock-free stats snapshot ─────────────────────────────────────────
+    // Published by think() on the compute thread under m_tracker_mutex.
+    // Read by ALL consumers (sync_status, loading page, global_stats,
+    // graph data, etc.) WITHOUT needing the tracker lock.
+    //
+    // This is the c2pool equivalent of p2pool's reactor-thread stats
+    // variables: updated atomically each think() cycle, always available.
+    // Eliminates the systemic "0/empty" data problem where 20+ callbacks
+    // returned stale data whenever think() held the exclusive lock.
+    struct TrackerSnapshot {
+        int chain_count{0};
+        int verified_count{0};
+        int head_count{0};
+        int orphan_shares{0};
+        int dead_shares{0};
+        int fork_count{0};
+        double pool_hashrate{0};
+    };
+    void publish_snapshot() {
+        TrackerSnapshot s;
+        s.chain_count = static_cast<int>(m_tracker.chain.size());
+        s.verified_count = static_cast<int>(m_tracker.verified.size());
+        s.head_count = static_cast<int>(m_tracker.chain.get_heads().size());
+        s.fork_count = s.head_count;
+        std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+        m_snapshot = s;
+    }
+    mutable std::mutex m_snapshot_mutex;
+    TrackerSnapshot m_snapshot;
+
     // Identity of the compute thread (m_think_pool's single thread).
     // Used by TrackerReadGuard to skip shared_lock when the caller is
     // already on the compute thread (which holds exclusive lock).
@@ -342,6 +372,12 @@ public:
     ///   <  0 : block is NOT in main chain (orphaned/stale)
     using block_rel_height_fn_t = std::function<int32_t(uint256)>;
     void set_block_rel_height_fn(block_rel_height_fn_t fn) { m_block_rel_height_fn = std::move(fn); }
+
+    /// Lock-free stats snapshot — published by think(), never fails, never needs tracker lock.
+    /// Inline definition must precede callers in the same header.
+    TrackerSnapshot get_tracker_snapshot() const;
+    int get_chain_count() const;
+    int get_verified_count() const;
 
     /// Called when best_share changes (p2pool: new_work_event)
     /// Triggers immediate work update for all stratum miners.

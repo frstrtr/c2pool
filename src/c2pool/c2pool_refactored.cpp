@@ -3161,7 +3161,18 @@ int main(int argc, char* argv[]) {
             web_server.get_mining_interface()->set_sharechain_stats_fn(
                 [&p2p_node, stats_skiplist]() {
                 auto guard = p2p_node->read_tracker();
-                if (!guard) return nlohmann::json::object();
+                if (!guard) {
+                    // Tracker locked by think() — return snapshot published by
+                    // the last think() cycle.  Never return empty: the loading
+                    // page, global_stats, graph data all depend on this.
+                    auto snap = p2p_node->get_tracker_snapshot();
+                    nlohmann::json fallback;
+                    fallback["chain_height"]   = snap.chain_count;
+                    fallback["verified_count"] = snap.verified_count;
+                    fallback["fork_count"]     = snap.fork_count;
+                    fallback["total_shares"]   = snap.chain_count;
+                    return fallback;
+                }
                 nlohmann::json result;
                 auto& chain = guard->chain;
 
@@ -3539,7 +3550,13 @@ int main(int argc, char* argv[]) {
             // Lightweight tip endpoint for RealTime polling
             web_server.get_mining_interface()->set_sharechain_tip_fn([&p2p_node]() {
                 auto guard = p2p_node->read_tracker();
-                if (!guard) return nlohmann::json::object({{"hash",""}, {"height",-1}, {"total",0}});
+                if (!guard) {
+                    auto snap = p2p_node->get_tracker_snapshot();
+                    return nlohmann::json::object({
+                        {"hash",""},
+                        {"height", snap.verified_count > 0 ? snap.chain_count : -1},
+                        {"total", snap.chain_count}});
+                }
                 auto& chain = guard->chain;
                 uint256 best;
                 int32_t best_height = -1;
