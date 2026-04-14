@@ -1260,6 +1260,11 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // WAIT mode: block genesis share creation until peers deliver the
+    // sharechain.  GENESIS/AUTO start unlocked.  Set to true after
+    // startup-mode checks complete (peers delivered or mode != WAIT).
+    std::atomic<bool> share_creation_ready{startup_mode != StartupMode::WAIT};
+
     // -----------------------------------------------------------------------
     // Post-parse: add file sink (initial Logger::init() was console-only)
     // -----------------------------------------------------------------------
@@ -4422,7 +4427,7 @@ int main(int argc, char* argv[]) {
             // Wire the share creation hook so mining_submit() creates a real
             // V36 share in the tracker and broadcasts it to peers.
             web_server.get_mining_interface()->set_create_share_fn(
-                [&p2p_node, dev_donation](const core::MiningInterface::ShareCreationParams& p) {
+                [&p2p_node, dev_donation, &share_creation_ready](const core::MiningInterface::ShareCreationParams& p) {
                 // Counters for periodic status reporting
                 static std::atomic<uint64_t> s_call_count{0};
                 static std::atomic<uint64_t> s_guard_blocked{0};
@@ -4444,20 +4449,32 @@ int main(int argc, char* argv[]) {
 
                 try {
                     auto tracker_lock = p2p_node->tracker_shared_lock();
-                    // Allow null prev_share for genesis (empty chain, no peers).
-                    // p2pool creates genesis share with previous_share_hash=None.
-                    // Only block if chain has shares but best_share is null (sync issue).
-                    if (p.prev_share_hash.IsNull() && p2p_node->tracker().chain.size() > 0) {
-                        ++s_guard_blocked;
-                        static std::atomic<int64_t> s_last_warn{0};
-                        auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-                        if (now - s_last_warn.load() > 30'000'000'000LL) {
-                            s_last_warn.store(now);
-                            LOG_WARNING << "[Pool] Skipping share: null prev_share_hash"
-                                        << " (chain=" << p2p_node->tracker().chain.size()
-                                        << " verified=" << p2p_node->tracker().verified.size() << ")";
+                    if (p.prev_share_hash.IsNull()) {
+                        auto chain_sz = p2p_node->tracker().chain.size();
+                        // WAIT mode: block genesis (empty chain) until peers deliver shares
+                        if (chain_sz == 0 && !share_creation_ready.load()) {
+                            ++s_guard_blocked;
+                            static std::atomic<int64_t> s_last_wait{0};
+                            auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+                            if (now - s_last_wait.load() > 30'000'000'000LL) {
+                                s_last_wait.store(now);
+                                LOG_WARNING << "[Pool] WAIT mode: blocking genesis (waiting for peers)";
+                            }
+                            return;
                         }
-                        return;
+                        // Chain has shares but prev is null → sync issue (best not computed yet)
+                        if (chain_sz > 0) {
+                            ++s_guard_blocked;
+                            static std::atomic<int64_t> s_last_warn{0};
+                            auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+                            if (now - s_last_warn.load() > 30'000'000'000LL) {
+                                s_last_warn.store(now);
+                                LOG_WARNING << "[Pool] Skipping share: null prev_share_hash"
+                                            << " (chain=" << chain_sz
+                                            << " verified=" << p2p_node->tracker().verified.size() << ")";
+                            }
+                            return;
+                        }
                     }
 
                     // Log chain depth for diagnostics (no guard — p2pool creates
@@ -6560,6 +6577,10 @@ int main(int argc, char* argv[]) {
                     LOG_INFO << "[Sharechain] Shares available, best="
                              << best.GetHex().substr(0, 16) << "...";
                 }
+                // Startup checks done — unblock share creation.  In WAIT mode
+                // peers have delivered shares (or chain was already populated);
+                // in GENESIS/AUTO the flag was already true.
+                share_creation_ready.store(true);
             }
 
             // Work guard prevents ioc from draining when all async handlers
