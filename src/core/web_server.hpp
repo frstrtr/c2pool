@@ -1249,6 +1249,7 @@ private:
         uint64_t stale_shares;
         double current_payout;
         nlohmann::json current_payouts;   // {addr: payout_float}
+        nlohmann::json merged_current_payouts; // {ltc_addr: merged_amount}
         nlohmann::json peers;             // {incoming: N, outgoing: N}
         nlohmann::json desired_versions;  // {version_str: hashrate}
         double attempts_to_share;

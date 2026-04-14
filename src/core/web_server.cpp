@@ -6151,6 +6151,9 @@ nlohmann::json MiningInterface::rest_web_graph_data(const std::string& source, c
         else if (source == "current_payouts") {
             result.push_back({entry.time, entry.current_payouts, bin_width, 0});
         }
+        else if (source == "merged_current_payouts") {
+            result.push_back({entry.time, entry.merged_current_payouts, bin_width, 0});
+        }
         else if (source == "peers") {
             result.push_back({entry.time, entry.peers, bin_width, 0});
         }
@@ -6332,6 +6335,32 @@ void MiningInterface::update_stat_log()
         }
     }
 
+    // Merged current payouts per miner (DOGE amounts keyed by LTC address)
+    // Consistent with current_payouts: every miner in the LTC PPLNS gets a
+    // proportional share of the DOGE subsidy.  This mirrors the LTC payout
+    // distribution so both graphs always show data for the same addresses.
+    entry.merged_current_payouts = nlohmann::json::object();
+    if (m_mm_manager && !entry.current_payouts.empty()) {
+        auto chain_infos = m_mm_manager->get_chain_infos();
+        for (const auto& ci : chain_infos) {
+            if (ci.coinbase_value == 0) continue;
+            double doge_subsidy = static_cast<double>(ci.coinbase_value) / 1e8;
+            // Sum total LTC payouts to compute each miner's fraction
+            double total_ltc = 0;
+            for (auto& [addr, val] : entry.current_payouts.items())
+                if (val.is_number()) total_ltc += val.get<double>();
+            if (total_ltc <= 0) continue;
+            for (auto& [addr, val] : entry.current_payouts.items()) {
+                if (!val.is_number()) continue;
+                double ltc_amt = val.get<double>();
+                if (ltc_amt <= 0) continue;
+                double doge_amt = doge_subsidy * (ltc_amt / total_ltc);
+                double existing = entry.merged_current_payouts.value(addr, 0.0);
+                entry.merged_current_payouts[addr] = existing + doge_amt;
+            }
+        }
+    }
+
     // Desired version rates — p2pool: {version_str: hashrate}
     // Uses desired_version (what miners signal they want) not share version (what's in the chain)
     entry.desired_versions = nlohmann::json::object();
@@ -6398,8 +6427,9 @@ void MiningInterface::update_stat_log()
     {
         std::lock_guard<std::mutex> lock(m_stat_log_mutex);
         m_stat_log.push_back(entry);
-        // Keep rolling 24h window (max ~288 entries at 5min intervals)
-        double cutoff = entry.time - 86400.0;
+        // Keep rolling 31-day window to support last_month graph view
+        // (p2pool DataStream keeps up to last_year; we match last_month)
+        double cutoff = entry.time - 2678400.0;  // 31 days
         while (!m_stat_log.empty() && m_stat_log.front().time < cutoff)
             m_stat_log.erase(m_stat_log.begin());
     }
@@ -6419,6 +6449,7 @@ void MiningInterface::save_stat_log()
                     {"wc", e.worker_count}, {"mc", e.miner_count}, {"cc", e.connected_count},
                     {"sh", e.shares}, {"st", e.stale_shares},
                     {"cp", e.current_payout}, {"cps", e.current_payouts},
+                    {"mcp", e.merged_current_payouts},
                     {"pe", e.peers}, {"dv", e.desired_versions},
                     {"as", e.attempts_to_share}, {"ab", e.attempts_to_block},
                     {"bv", e.block_value}, {"mu", e.memory_usage},
@@ -6452,7 +6483,7 @@ void MiningInterface::load_stat_log()
         if (!arr.is_array()) return;
 
         auto now = std::time(nullptr);
-        double cutoff = static_cast<double>(now) - 86400.0;  // keep 24h
+        double cutoff = static_cast<double>(now) - 2678400.0;  // keep 31 days
 
         std::lock_guard<std::mutex> lock(m_stat_log_mutex);
         for (const auto& j : arr) {
@@ -6470,6 +6501,7 @@ void MiningInterface::load_stat_log()
             e.stale_shares = j.value("st", uint64_t(0));
             e.current_payout = j.value("cp", 0.0);
             e.current_payouts = j.value("cps", nlohmann::json::object());
+            e.merged_current_payouts = j.value("mcp", nlohmann::json::object());
             e.peers = j.value("pe", nlohmann::json::object());
             e.desired_versions = j.value("dv", nlohmann::json::object());
             e.attempts_to_share = j.value("as", 0.0);
