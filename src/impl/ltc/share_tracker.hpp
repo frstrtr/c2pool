@@ -316,19 +316,12 @@ public:
     ShareChain chain;
     ShareChain verified;
 
-    // Runtime v36_active flag — set by AutoRatchet when state is ACTIVATED or CONFIRMED.
-    // Used by generate_share_transaction to select PPLNS formula at runtime,
-    // matching p2pool's behavior (data.py:879, work.py:759).
-    bool is_v36_active() const { return v36_active_.load(std::memory_order_relaxed); }
-    void set_v36_active(bool active) { v36_active_.store(active, std::memory_order_relaxed); }
 
     // Set by think() Phase 2 when verification budget is exhausted.
     // Checked by run_think() to schedule a deferred continuation.
     bool m_think_needs_continue{false};
 
 private:
-    std::atomic<bool> v36_active_{false};
-
     // Retry counter for log throttling only — p2pool retries every think()
     // with no limit.  Counter is cleared on successful verification or
     // when the share is removed from the chain (on_removed signal).
@@ -940,9 +933,15 @@ public:
                     }
 
                     // Prime PPLNS cache from ring buffer (if V36 and chain long enough)
-                    if (is_v36_active()) {
-                        uint256 prev_hash;
-                        data.share.invoke([&](auto* obj) { prev_hash = obj->m_prev_hash; });
+                    // Derive from share version (matches p2pool check(): VERSION >= 36),
+                    // not the removed mutable global.
+                    uint256 prev_hash;
+                    int share_ver = 0;
+                    data.share.invoke([&](auto* obj) {
+                        prev_hash = obj->m_prev_hash;
+                        share_ver = obj->version;
+                    });
+                    if (share_ver >= 36) {
 
                         if (!prev_hash.IsNull() && chain.contains(prev_hash)) {
                             if (!pplns_active) {

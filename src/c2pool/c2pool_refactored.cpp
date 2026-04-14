@@ -2561,13 +2561,6 @@ int main(int argc, char* argv[]) {
             LOG_INFO << "[AutoRatchet] Initialized: state=" << ltc::ratchet_state_str(auto_ratchet->state())
                      << " target=V36 file=" << ratchet_path;
 
-            // Set initial v36_active on tracker from persisted ratchet state
-            if (p2p_node) {
-                p2p_node->tracker().set_v36_active(
-                    auto_ratchet->state() == ltc::RatchetState::ACTIVATED ||
-                    auto_ratchet->state() == ltc::RatchetState::CONFIRMED);
-            }
-
             if (p2p_node) {
                 // Wire block_rel_height for chain scoring.
                 // Embedded mode: use HeaderChain height diff. RPC mode: query daemon.
@@ -4059,10 +4052,6 @@ int main(int argc, char* argv[]) {
 
                 auto [share_version, desired_ver] = auto_ratchet->get_share_version(
                     *guard, best_hash);
-                // Propagate v36_active to tracker for generate_share_transaction runtime PPLNS selection
-                guard->set_v36_active(
-                    auto_ratchet->state() == ltc::RatchetState::ACTIVATED ||
-                    auto_ratchet->state() == ltc::RatchetState::CONFIRMED);
                 // Update donation script + cached version so refresh_work() and
                 // build_connection_coinbase() use the correct one.
                 auto correct_donation = ltc::PoolConfig::get_donation_script(share_version);
@@ -4116,10 +4105,6 @@ int main(int argc, char* argv[]) {
                     // AutoRatchet: determine share version from network state
                     auto [share_version, desired_ver] = auto_ratchet->get_share_version(
                         *guard, frozen_prev_share);
-                    // Propagate v36_active to tracker for verification consistency
-                    guard->set_v36_active(
-                        auto_ratchet->state() == ltc::RatchetState::ACTIVATED ||
-                        auto_ratchet->state() == ltc::RatchetState::CONFIRMED);
                     {
                         static int rv_log = 0;
                         if (rv_log++ < 5 || rv_log % 100 == 0)
