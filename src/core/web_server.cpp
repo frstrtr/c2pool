@@ -3066,12 +3066,18 @@ nlohmann::json MiningInterface::rest_connected_miners()
 
 nlohmann::json MiningInterface::rest_stratum_stats()
 {
+    // p2pool format: { pool: {...}, workers: {...} }
+    // stratum.html reads data.pool.* and data.workers.*
     nlohmann::json result = nlohmann::json::object();
     auto workers = get_stratum_workers();
+    auto now = std::time(nullptr);
+    auto now_steady = std::chrono::steady_clock::now();
 
     double total_hashrate = 0.0;
     uint64_t total_accepted = 0, total_rejected = 0, total_stale = 0;
     std::set<std::string> unique_addrs;
+    std::map<std::string, int> ip_connections;   // IP → connection count
+    std::map<std::string, std::set<std::string>> ip_workers_set; // IP → unique workers
 
     nlohmann::json workers_json = nlohmann::json::object();
     for (const auto& [sid, w] : workers) {
@@ -3081,10 +3087,19 @@ nlohmann::json MiningInterface::rest_stratum_stats()
         total_stale += w.stale;
         unique_addrs.insert(w.username);
 
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::steady_clock::now() - w.connected_at).count();
+        // Track connections per IP
+        auto colon = w.remote_endpoint.rfind(':');
+        std::string ip = (colon != std::string::npos) ? w.remote_endpoint.substr(0, colon) : w.remote_endpoint;
+        if (!ip.empty()) {
+            ip_connections[ip]++;
+            ip_workers_set[ip].insert(w.username);
+        }
 
-        // Key by worker name: "ADDRESS.worker" (like p2pool) or just "ADDRESS" if no worker suffix
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            now_steady - w.connected_at).count();
+        auto first_seen_ts = static_cast<uint64_t>(now) - static_cast<uint64_t>(elapsed);
+
+        // Key by worker name: "ADDRESS.worker" (like p2pool)
         std::string worker_key = w.worker_name.empty()
             ? w.username
             : w.username + "." + w.worker_name;
@@ -3098,46 +3113,53 @@ nlohmann::json MiningInterface::rest_stratum_stats()
             workers_json[worker_key]["accepted"] = workers_json[worker_key]["accepted"].get<uint64_t>() + w.accepted;
             workers_json[worker_key]["rejected"] = workers_json[worker_key]["rejected"].get<uint64_t>() + w.rejected;
             workers_json[worker_key]["stale"] = workers_json[worker_key]["stale"].get<uint64_t>() + w.stale;
+            workers_json[worker_key]["shares"] = workers_json[worker_key]["shares"].get<uint64_t>() + w.accepted + w.stale;
+            // Keep earliest first_seen
+            if (first_seen_ts < workers_json[worker_key]["first_seen"].get<uint64_t>())
+                workers_json[worker_key]["first_seen"] = first_seen_ts;
         } else {
             workers_json[worker_key] = {
-            {"hash_rate", w.hashrate},
-            {"dead_hash_rate", w.dead_hashrate},
-            {"connections", 1},
-            {"connection_difficulties", nlohmann::json::array({w.difficulty})},
-            {"last_seen", static_cast<uint64_t>(std::time(nullptr))},
-            {"difficulty", w.difficulty},
-            {"accepted", w.accepted},
-            {"rejected", w.rejected},
-            {"stale", w.stale},
-            {"connected_seconds", elapsed},
-            {"remote_endpoint", w.remote_endpoint}
-        };
+                {"hash_rate", w.hashrate},
+                {"dead_hash_rate", w.dead_hashrate},
+                {"connections", 1},
+                {"connection_difficulties", nlohmann::json::array({w.difficulty})},
+                {"last_seen", static_cast<uint64_t>(now)},
+                {"first_seen", first_seen_ts},
+                {"difficulty", w.difficulty},
+                {"accepted", w.accepted},
+                {"rejected", w.rejected},
+                {"stale", w.stale},
+                {"shares", w.accepted + w.stale},
+                {"connected_seconds", elapsed},
+                {"remote_endpoint", w.remote_endpoint}
+            };
         }
     }
 
-    result["difficulty"] = 1.0;
-    if (!workers.empty())
-        result["difficulty"] = workers.begin()->second.difficulty;
-    result["accepted_shares"] = total_accepted;
-    result["rejected_shares"] = total_rejected;
-    result["stale_shares"] = total_stale;
-    result["hashrate"] = total_hashrate;
-    result["active_workers"] = static_cast<int>(workers.size());
-    result["unique_addresses"] = static_cast<int>(unique_addrs.size());
-    result["workers"] = workers_json;
-
-    double total_shares = static_cast<double>(total_accepted + total_rejected + total_stale);
+    // Pool-level stats (stratum.html reads data.pool.*)
     auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::steady_clock::now() - m_stratum_start_time).count();
-    result["shares_per_minute"] = (uptime > 0) ? (total_shares * 60.0 / uptime) : 0.0;
-    result["last_share_time"] = static_cast<uint64_t>(std::time(nullptr));
-    result["uptime_seconds"] = static_cast<double>(uptime);
+        now_steady - m_stratum_start_time).count();
+    double total_shares = static_cast<double>(total_accepted + total_rejected + total_stale);
+    double submission_rate = (uptime > 0) ? (total_shares / static_cast<double>(uptime)) : 0.0;
 
-    {
-        std::lock_guard<std::mutex> lock(m_control_mutex);
-        result["mining_enabled"] = m_mining_enabled;
-        result["banned_count"] = static_cast<uint64_t>(m_banned_targets.size());
-    }
+    nlohmann::json ip_workers_json = nlohmann::json::object();
+    for (const auto& [ip, wset] : ip_workers_set)
+        ip_workers_json[ip] = static_cast<int>(wset.size());
+
+    result["pool"] = {
+        {"connections", static_cast<int>(workers.size())},
+        {"workers", static_cast<int>(unique_addrs.size())},
+        {"unique_addresses", static_cast<int>(unique_addrs.size())},
+        {"total_accepted", total_accepted},
+        {"total_rejected", total_rejected},
+        {"total_stale", total_stale},
+        {"submission_rate", submission_rate},
+        {"uptime", static_cast<double>(uptime)},
+        {"hashrate", total_hashrate},
+        {"ip_connections", ip_connections},
+        {"ip_workers", ip_workers_json}
+    };
+    result["workers"] = workers_json;
 
     return result;
 }
