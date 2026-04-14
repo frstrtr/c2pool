@@ -2684,19 +2684,25 @@ int main(int argc, char* argv[]) {
                         return p2p_node->get_peer_info_json();
                     });
                 // Wire pool hashrate from p2pool's get_pool_attempts_per_second
+                // Pool hashrate callback — caches last good value so stat_log
+                // never records 0 due to transient tracker lock contention
+                // (think+clean holds write lock ~30% of sampling intervals).
                 web_server.get_mining_interface()->set_pool_hashrate_fn(
                     [&p2p_node]() -> double {
+                        static double s_last_good = 0.0;
                         auto best = p2p_node->best_share_hash();
-                        if (best.IsNull()) return 0.0;
+                        if (best.IsNull()) return s_last_good;
                         auto guard = p2p_node->read_tracker();
-                        if (!guard) return 0.0;
-                        if (!guard->chain.contains(best)) return 0.0;
+                        if (!guard) return s_last_good;
+                        if (!guard->chain.contains(best)) return s_last_good;
                         int height = guard->chain.get_height(best);
-                        if (height < 3) return 0.0;
+                        if (height < 3) return s_last_good;
                         auto lookbehind = std::min(height - 1,
                             static_cast<int>(ltc::PoolConfig::TARGET_LOOKBEHIND));
                         auto aps = guard->get_pool_attempts_per_second(best, lookbehind, false);
-                        return static_cast<double>(aps.GetLow64());
+                        double hr = static_cast<double>(aps.GetLow64());
+                        if (hr > 0) s_last_good = hr;
+                        return s_last_good;
                     });
             } // end if (p2p_node) — P2P callbacks
 
