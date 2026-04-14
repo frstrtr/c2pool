@@ -1292,6 +1292,8 @@ void NodeImpl::run_think()
     // them. The shared_mutex + try_to_lock pattern eliminates this race:
     // no mutations occur while the compute thread holds the exclusive lock.
     boost::asio::post(m_think_pool, [this, block_rel_height]() {
+      m_compute_thread_id.store(std::this_thread::get_id(), std::memory_order_relaxed);
+
       // ── Compute thread: exclusive tracker access ──────────────────────
       // Collect results under the lock, then release before posting to IO.
       TrackerThinkResult result;
@@ -1638,6 +1640,8 @@ void NodeImpl::clean_tracker()
     m_think_running.store(true);  // block think() re-entry during clean
 
     boost::asio::post(m_think_pool, [this]() {
+      m_compute_thread_id.store(std::this_thread::get_id(), std::memory_order_relaxed);
+
       bool clean_best_changed = false;
       try {
         std::unique_lock lock(m_tracker_mutex);  // exclusive

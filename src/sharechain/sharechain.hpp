@@ -273,9 +273,11 @@ public:
 
         calculate_head_tail(share->m_hash, share->m_prev_hash, index);
         m_shares[share->m_hash] = chain_data{index, share_var};
-        // Maintain reverse map (prev → children)
-        if (!share->m_prev_hash.IsNull())
-            m_reverse[share->m_prev_hash].insert(share->m_hash);
+        // Maintain reverse map (prev → children).
+        // p2pool forest.py adds unconditionally (including None/null prev_hash).
+        // The null key is needed for tail pruning: clean_tracker Step 3 calls
+        // reverse.find(tail) where tail may be the genesis share's null prev_hash.
+        m_reverse[share->m_prev_hash].insert(share->m_hash);
 
         // p2pool DistanceSkipList: no explicit build needed at add time.
         // Skip pointers are built lazily during get_nth_parent queries.

@@ -18,6 +18,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <random>
+#include <thread>
 
 namespace ltc
 {
@@ -67,6 +68,11 @@ protected:
     std::atomic<bool> m_think_running{false};
     std::atomic<bool> m_clean_running{false};
     mutable std::shared_mutex m_tracker_mutex;
+
+    // Identity of the compute thread (m_think_pool's single thread).
+    // Used by TrackerReadGuard to skip shared_lock when the caller is
+    // already on the compute thread (which holds exclusive lock).
+    std::atomic<std::thread::id> m_compute_thread_id{};
 
     // Pending share batches queued while think() holds the mutex.
     // Drained on the IO thread after think() releases the lock.
@@ -149,12 +155,57 @@ public:
     void send_version(peer_ptr peer);
     void processing_shares(HandleSharesData& data, NetService addr);
     void processing_shares_phase2(HandleSharesData& data, NetService addr);
+    /// Direct tracker access — compute-thread-only (already holds exclusive lock)
+    /// or startup code (before compute thread exists).
+    /// IO-thread code MUST use read_tracker() instead.
     ShareTracker& tracker() { return m_tracker; }
 
-    /// Acquire shared (reader) lock on the tracker mutex.
-    /// Callers that read the tracker from the IO thread (stratum submit,
-    /// work template build) MUST hold this to prevent data races with
-    /// think()/clean_tracker() on the compute thread.
+    /// RAII guard for IO-thread tracker reads.
+    /// - IO thread: acquires shared_lock(try_to_lock). Returns falsy if busy.
+    /// - Compute thread: skips locking (exclusive already held). Always truthy.
+    /// Guard lifetime = lock lifetime. No way to hold a dangling reference.
+    class TrackerReadGuard {
+        std::shared_lock<std::shared_mutex> lock_;
+        ShareTracker& tracker_;
+        bool ok_;
+    public:
+        TrackerReadGuard(std::shared_mutex& mtx, ShareTracker& t, bool on_compute)
+            : lock_(mtx, std::defer_lock), tracker_(t)
+        {
+            if (on_compute) {
+                ok_ = true;   // exclusive lock already held by caller
+            } else {
+                lock_.try_lock();
+                ok_ = lock_.owns_lock();
+            }
+        }
+        TrackerReadGuard(TrackerReadGuard&&) = default;
+        TrackerReadGuard(const TrackerReadGuard&) = delete;
+        TrackerReadGuard& operator=(const TrackerReadGuard&) = delete;
+        TrackerReadGuard& operator=(TrackerReadGuard&&) = default;
+
+        explicit operator bool() const { return ok_; }
+        ShareTracker& operator*()  { return tracker_; }
+        ShareTracker* operator->() { return &tracker_; }
+    };
+
+    /// True if the calling thread is the compute thread (m_think_pool).
+    /// Compute thread already holds exclusive lock — shared_lock must be skipped.
+    bool is_compute_thread() const {
+        return std::this_thread::get_id() == m_compute_thread_id.load(std::memory_order_relaxed);
+    }
+
+    /// Preferred tracker accessor for IO-thread callbacks.
+    /// Returns a guard that:
+    ///   - On IO thread: acquires shared_lock(try_to_lock). Check `if (!guard)` before use.
+    ///   - On compute thread: skips locking (exclusive lock already held). Always valid.
+    TrackerReadGuard read_tracker() {
+        return TrackerReadGuard(m_tracker_mutex, m_tracker, is_compute_thread());
+    }
+
+    /// Acquire shared (reader) lock on the tracker mutex — BLOCKING.
+    /// Only for consensus-critical paths (share creation) where skipping is not acceptable.
+    /// IO-thread callers: prefer read_tracker() (non-blocking) unless you MUST have the lock.
     std::shared_lock<std::shared_mutex> tracker_shared_lock() {
         return std::shared_lock<std::shared_mutex>(m_tracker_mutex);
     }

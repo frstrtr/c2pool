@@ -2690,13 +2690,14 @@ int main(int argc, char* argv[]) {
                     [&p2p_node]() -> double {
                         auto best = p2p_node->best_share_hash();
                         if (best.IsNull()) return 0.0;
-                        auto& tracker = p2p_node->tracker();
-                        if (!tracker.chain.contains(best)) return 0.0;
-                        int height = tracker.chain.get_height(best);
+                        auto guard = p2p_node->read_tracker();
+                        if (!guard) return 0.0;
+                        if (!guard->chain.contains(best)) return 0.0;
+                        int height = guard->chain.get_height(best);
                         if (height < 3) return 0.0;
                         auto lookbehind = std::min(height - 1,
                             static_cast<int>(ltc::PoolConfig::TARGET_LOOKBEHIND));
-                        auto aps = tracker.get_pool_attempts_per_second(best, lookbehind, false);
+                        auto aps = guard->get_pool_attempts_per_second(best, lookbehind, false);
                         return static_cast<double>(aps.GetLow64());
                     });
             } // end if (p2p_node) — P2P callbacks
@@ -3055,7 +3056,9 @@ int main(int argc, char* argv[]) {
             // Latest peer share as prev → shares extend main chain tip → 33% PPLNS.
             web_server.get_mining_interface()->set_find_peer_prev_fn(
                 [&p2p_node](const uint256& best) -> uint256 {
-                    auto& chain = p2p_node->tracker().chain;
+                    auto guard = p2p_node->read_tracker();
+                    if (!guard) return best;
+                    auto& chain = guard->chain;
                     // Strategy: check the best share first, then scan heads
                     // for the most recently seen peer share.
                     uint256 best_peer;
@@ -3102,7 +3105,9 @@ int main(int argc, char* argv[]) {
                 // get_delta: extract stats for a single share
                 [&p2p_node](const uint256& hash) -> chain::StatsDelta {
                     chain::StatsDelta d;
-                    auto& chain = p2p_node->tracker().chain;
+                    auto guard = p2p_node->read_tracker();
+                    if (!guard) return d;
+                    auto& chain = guard->chain;
                     if (!chain.contains(hash))
                         return d;
                     try {
@@ -3135,7 +3140,9 @@ int main(int argc, char* argv[]) {
                 },
                 // previous: get parent share hash
                 [&p2p_node](const uint256& hash) -> uint256 {
-                    auto& chain = p2p_node->tracker().chain;
+                    auto guard = p2p_node->read_tracker();
+                    if (!guard) return uint256();
+                    auto& chain = guard->chain;
                     if (!chain.contains(hash))
                         return uint256();
                     try {
@@ -3149,8 +3156,10 @@ int main(int argc, char* argv[]) {
 
             web_server.get_mining_interface()->set_sharechain_stats_fn(
                 [&p2p_node, stats_skiplist]() {
+                auto guard = p2p_node->read_tracker();
+                if (!guard) return nlohmann::json::object();
                 nlohmann::json result;
-                auto& chain = p2p_node->tracker().chain;
+                auto& chain = guard->chain;
 
                 // Use tallest chain head (not verified best) so stats stay current during sync
                 uint256 best;
@@ -3272,11 +3281,11 @@ int main(int argc, char* argv[]) {
                 result["timeline"] = tl;
 
                 // Verified count for sync_status readiness check
-                result["verified_count"] = static_cast<int>(p2p_node->tracker().verified.size());
+                result["verified_count"] = static_cast<int>(guard->verified.size());
 
                 // Share explorer fields for classic page (/web/heads etc.)
                 {
-                    auto& verified = p2p_node->tracker().verified;
+                    auto& verified = guard->verified;
 
                     nlohmann::json heads_arr = nlohmann::json::array();
                     for (auto& [h, t] : chain.get_heads())
@@ -3349,14 +3358,12 @@ int main(int argc, char* argv[]) {
             // Wire per-share window data for the defragmenter grid
             web_server.get_mining_interface()->set_sharechain_window_fn([&p2p_node, &web_server]()
                     -> nlohmann::json {
-                // Shared lock: clean_tracker modifies chain on compute thread
-                std::shared_lock lock(p2p_node->tracker_mutex(), std::try_to_lock);
-                if (!lock.owns_lock())
-                    return nlohmann::json::object();  // busy, return empty
+                auto guard = p2p_node->read_tracker();
+                if (!guard) return nlohmann::json::object();
 
                 nlohmann::json result;
-                auto& chain = p2p_node->tracker().chain;
-                auto& verified = p2p_node->tracker().verified;
+                auto& chain = guard->chain;
+                auto& verified = guard->verified;
                 bool testnet = ltc::PoolConfig::is_testnet;
 
                 // Use tallest chain head (not verified best) so the grid stays current during sync
@@ -3527,7 +3534,9 @@ int main(int argc, char* argv[]) {
 
             // Lightweight tip endpoint for RealTime polling
             web_server.get_mining_interface()->set_sharechain_tip_fn([&p2p_node]() {
-                auto& chain = p2p_node->tracker().chain;
+                auto guard = p2p_node->read_tracker();
+                if (!guard) return nlohmann::json::object({{"hash",""}, {"height",-1}, {"total",0}});
+                auto& chain = guard->chain;
                 uint256 best;
                 int32_t best_height = -1;
                 for (const auto& [head_hash, tail_hash] : chain.get_heads()) {
@@ -3544,9 +3553,11 @@ int main(int argc, char* argv[]) {
             // Delta endpoint: return only shares newer than `since` hash
             web_server.get_mining_interface()->set_sharechain_delta_fn(
                 [&p2p_node, &web_server](const std::string& since_hash) {
+                auto guard = p2p_node->read_tracker();
+                if (!guard) return nlohmann::json::object();
                 nlohmann::json result;
-                auto& chain = p2p_node->tracker().chain;
-                auto& verified = p2p_node->tracker().verified;
+                auto& chain = guard->chain;
+                auto& verified = guard->verified;
                 bool testnet = ltc::PoolConfig::is_testnet;
 
                 uint256 best;
@@ -3673,9 +3684,11 @@ int main(int argc, char* argv[]) {
             // Wire individual share lookup for /web/share/<hash> detail page
             web_server.get_mining_interface()->set_share_lookup_fn(
                 [&p2p_node, &web_server](const std::string& hash_hex) -> nlohmann::json {
+                auto guard = p2p_node->read_tracker();
+                if (!guard) return nlohmann::json{{"error", "tracker busy"}};
                 bool testnet = ltc::PoolConfig::is_testnet;
-                auto& chain = p2p_node->tracker().chain;
-                auto& verified = p2p_node->tracker().verified;
+                auto& chain = guard->chain;
+                auto& verified = guard->verified;
 
                 uint256 hash;
                 hash.SetHex(hash_hex);
@@ -3824,7 +3837,9 @@ int main(int argc, char* argv[]) {
             // watcher in node.py:289 — detects blocks from ANY pool participant.
             p2p_node->tracker().m_on_block_found = [&p2p_node, &web_server, &is_testnet](const uint256& share_hash) {
                 auto mi = web_server.get_mining_interface();
-                auto& chain = p2p_node->tracker().chain;
+                auto guard = p2p_node->read_tracker();
+                if (!guard) return;
+                auto& chain = guard->chain;
                 if (!chain.contains(share_hash)) return;
 
                 chain.get(share_hash).share.invoke([&](auto* s) {
@@ -3874,7 +3889,9 @@ int main(int argc, char* argv[]) {
                 auto* mm = mi->get_mm_manager();
                 if (!mm || !mm->has_chains()) return;
 
-                auto& tracker_chain = p2p_node->tracker().chain;
+                auto guard = p2p_node->read_tracker();
+                if (!guard) return;
+                auto& tracker_chain = guard->chain;
                 if (!tracker_chain.contains(share_hash)) return;
 
                 bool had_v36_data = false;
@@ -3991,10 +4008,13 @@ int main(int argc, char* argv[]) {
                 if (best.IsNull())
                     return result;
 
+                auto guard = p2p_node->read_tracker();
+                if (!guard) return result;
+
                 result["best_share_hash"] = best.GetHex();
 
                 std::vector<unsigned char> blob;
-                p2p_node->tracker().chain.get(best).share.invoke([&](auto* s) {
+                guard->chain.get(best).share.invoke([&](auto* s) {
                     if constexpr (requires { s->m_message_data; })
                         blob = s->m_message_data.m_data;
                 });
@@ -4034,18 +4054,13 @@ int main(int argc, char* argv[]) {
                     const uint256& best_hash, const uint256& block_target,
                     uint64_t subsidy, const std::vector<unsigned char>& /*donation_script*/)
                     -> std::map<std::vector<unsigned char>, double> {
-                // CRITICAL: acquire shared lock before accessing tracker.
-                // clean_tracker holds exclusive lock while removing shares —
-                // reading without the lock is a data race that causes
-                // use-after-free → corrupted chain walk → OOM (10 GB spike).
-                std::shared_lock lock(p2p_node->tracker_mutex(), std::try_to_lock);
-                if (!lock.owns_lock())
-                    return {};  // compute thread busy, skip this cycle
+                auto guard = p2p_node->read_tracker();
+                if (!guard) return {};
 
                 auto [share_version, desired_ver] = auto_ratchet->get_share_version(
-                    p2p_node->tracker(), best_hash);
+                    *guard, best_hash);
                 // Propagate v36_active to tracker for generate_share_transaction runtime PPLNS selection
-                p2p_node->tracker().set_v36_active(
+                guard->set_v36_active(
                     auto_ratchet->state() == ltc::RatchetState::ACTIVATED ||
                     auto_ratchet->state() == ltc::RatchetState::CONFIRMED);
                 // Update donation script + cached version so refresh_work() and
@@ -4069,10 +4084,10 @@ int main(int argc, char* argv[]) {
                 }
 
                 if (share_version < 36) {
-                    return p2p_node->tracker().get_v35_expected_payouts(
+                    return guard->get_v35_expected_payouts(
                         best_hash, block_target, subsidy, correct_donation);
                 }
-                return p2p_node->tracker().get_expected_payouts(
+                return guard->get_expected_payouts(
                     best_hash, block_target, subsidy, correct_donation);
             });
 
@@ -4093,18 +4108,16 @@ int main(int argc, char* argv[]) {
                     const std::vector<uint256>& merkle_branches)
                     -> core::MiningInterface::RefHashResult
                 {
-                    // Shared lock: clean_tracker modifies chain on compute thread
-                    std::shared_lock lock(p2p_node->tracker_mutex(), std::try_to_lock);
-                    if (!lock.owns_lock())
-                        return {};  // compute thread busy, skip this work cycle
+                    auto guard = p2p_node->read_tracker();
+                    if (!guard) return {};
 
                     LOG_TRACE << "[ref_hash_fn] ENTER prev=" << frozen_prev_share.GetHex().substr(0,16);
 
                     // AutoRatchet: determine share version from network state
                     auto [share_version, desired_ver] = auto_ratchet->get_share_version(
-                        p2p_node->tracker(), frozen_prev_share);
+                        *guard, frozen_prev_share);
                     // Propagate v36_active to tracker for verification consistency
-                    p2p_node->tracker().set_v36_active(
+                    guard->set_v36_active(
                         auto_ratchet->state() == ltc::RatchetState::ACTIVATED ||
                         auto_ratchet->state() == ltc::RatchetState::CONFIRMED);
                     {
@@ -4177,7 +4190,7 @@ int main(int argc, char* argv[]) {
                     // If expected payout per block < DUST_THRESHOLD, ease the target
                     // so small miners still get meaningful payouts.
                     {
-                        auto& trk = p2p_node->tracker();
+                        auto& trk = *guard;
                         if (!frozen_prev_share.IsNull() && trk.chain.contains(frozen_prev_share)) {
                             int32_t lookbehind = 3600 / ltc::PoolConfig::share_period();
                             auto height = trk.chain.get_acc_height(frozen_prev_share);
@@ -4218,7 +4231,7 @@ int main(int argc, char* argv[]) {
                     // With fork shares excluded from verified, best_share (= frozen_prev)
                     // is always the main chain head. CST walks the main chain directly.
                     LOG_TRACE << "[ref_hash_fn] calling compute_share_target...";
-                    auto [share_max_bits, share_bits] = p2p_node->tracker().compute_share_target(
+                    auto [share_max_bits, share_bits] = guard->compute_share_target(
                         frozen_prev_share, timestamp, desired_target);
                     LOG_TRACE << "[ref_hash_fn] CST done, bits=" << std::hex << share_bits << std::dec;
                     // No bits guard needed: compute_share_target's ±10% clamp
@@ -4311,7 +4324,7 @@ int main(int argc, char* argv[]) {
 
                     // Chain position from tracker
                     LOG_TRACE << "[ref_hash_fn] looking up chain position...";
-                    auto& tracker = p2p_node->tracker();
+                    auto& tracker = *guard;
                     if (!params.prev_share.IsNull() && tracker.chain.contains(params.prev_share)) {
                         // Timestamp: clip to at least previous_share.timestamp + 1 (matches Python)
                         tracker.chain.get(params.prev_share).share.invoke([&](auto* prev) {
@@ -4445,6 +4458,7 @@ int main(int argc, char* argv[]) {
                 }
 
                 try {
+                    auto tracker_lock = p2p_node->tracker_shared_lock();
                     // Allow null prev_share for genesis (empty chain, no peers).
                     // p2pool creates genesis share with previous_share_hash=None.
                     // Only block if chain has shares but best_share is null (sync issue).
@@ -4508,12 +4522,7 @@ int main(int argc, char* argv[]) {
                     if (p.stale_info == 253)      stale = ltc::StaleInfo::orphan;
                     else if (p.stale_info == 254)  stale = ltc::StaleInfo::doa;
 
-                    // Create the share and add it to the tracker.
-                    // Shared lock: prevent data race with think()/clean_tracker()
-                    // on the compute thread. Without this, the PPLNS walk inside
-                    // create_local_share's cross-check sees inconsistent tracker
-                    // state → GENTX mismatch → share rejected → peers ban us.
-                    auto tracker_lock = p2p_node->tracker_shared_lock();
+                    // tracker_lock (blocking shared_lock) acquired at top of try block.
 
                     // Pass frozen fields from template time so ref_hash matches coinbase.
                     uint256 share_hash = ltc::create_local_share(
@@ -5552,10 +5561,13 @@ int main(int argc, char* argv[]) {
                     if (best.IsNull())
                         return {};
 
+                    auto guard = p2p_node->read_tracker();
+                    if (!guard) return {};
+
                     // Use block target (from min_header.bits), not share target.
                     // Matches p2pool: block_target = self.header['bits'].target
                     uint256 block_target;
-                    p2p_node->tracker().chain.get(best).share.invoke([&](auto* s) {
+                    guard->chain.get(best).share.invoke([&](auto* s) {
                         block_target = chain::bits_to_target(s->m_min_header.m_bits);
                     });
 
@@ -5565,14 +5577,14 @@ int main(int argc, char* argv[]) {
                     auto combined_donation = std::vector<unsigned char>(
                         ltc::PoolConfig::COMBINED_DONATION_SCRIPT.begin(),
                         ltc::PoolConfig::COMBINED_DONATION_SCRIPT.end());
-                    auto payouts_map = p2p_node->tracker().get_merged_expected_payouts(
+                    auto payouts_map = guard->get_merged_expected_payouts(
                         best, block_target, coinbase_value, chain_id, combined_donation,
                         operator_ltc_script, operator_merged_script);
 
                     LOG_INFO << "[MM-payout] chain_id=" << chain_id
                              << " coinbase_value=" << coinbase_value
                              << " payouts_map_size=" << payouts_map.size()
-                             << " chain_height=" << p2p_node->tracker().chain.get_height(best)
+                             << " chain_height=" << guard->chain.get_height(best)
                              << " block_target=" << block_target.GetHex().substr(0,16);
 
                     // Convert map → sorted vector for coinbase construction
@@ -5792,8 +5804,11 @@ int main(int argc, char* argv[]) {
                     try {
                         auto best = p2p_node->best_share_hash();
                         if (!best.IsNull()) {
-                            pool_monitor->run_cycle(p2p_node->tracker(), best);
-                            whale_detector->detect(p2p_node->tracker(), best, "timer");
+                            auto guard = p2p_node->read_tracker();
+                            if (guard) {
+                                pool_monitor->run_cycle(*guard, best);
+                                whale_detector->detect(*guard, best, "timer");
+                            }
                         }
                     } catch (const std::exception& e) {
                         LOG_ERROR << "[MONITOR] cycle error: " << e.what();
@@ -6470,8 +6485,10 @@ int main(int argc, char* argv[]) {
                         }
                     }
                     int scan_depth = chain_len;
+                    auto guard = p2p_node->read_tracker();
+                    if (guard) {
                     if (latest_block_ts > 0) {
-                        auto& ch = p2p_node->tracker().chain;
+                        auto& ch = guard->chain;
                         int newer = 0;
                         uint256 pos = best;
                         for (int i = 0; i < chain_len && !pos.IsNull() && ch.contains(pos); ++i) {
@@ -6487,14 +6504,15 @@ int main(int argc, char* argv[]) {
                         scan_depth = std::min(newer, chain_len);
                     }
                     if (scan_depth > 0) {
-                        auto& ch = p2p_node->tracker().chain;
+                        auto& ch = guard->chain;
                         auto heads = ch.get_heads();
                         LOG_INFO << "[BLOCK-SCAN] Scanning " << scan_depth << " shares from "
                                  << heads.size() << " head(s) (latest block ts=" << latest_block_ts
                                  << ", existing=" << existing.size() << ")";
                         for (const auto& [head_hash, _] : heads)
-                            p2p_node->tracker().scan_chain_for_blocks(head_hash, scan_depth);
+                            guard->scan_chain_for_blocks(head_hash, scan_depth);
                     }
+                    } // guard
                 }
             }
 
