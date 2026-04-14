@@ -1884,11 +1884,15 @@ MiningInterface::build_connection_coinbase(
     }
 
     LOG_TRACE << "[build_cb] calling ref_hash_fn (lock-free)...";
-    // Safety: if witness_root lost in transit (race with refresh_work),
-    // recompute from the snapshotted template transactions — matches
-    // p2pool's approach of computing segwit_data from known_txs.
+    // The witness_root for a block with only a coinbase tx is 0x00..00 (the
+    // coinbase wtxid).  This is a VALID root — p2pool uses it to compute the
+    // witness commitment.  Never recompute just because IsNull() — the zero
+    // hash is correct when template has no non-coinbase transactions.
+    // Only recompute when witness_commitment indicates segwit is needed but
+    // witness_root was genuinely never set (witness_commitment also empty).
     uint256 effective_witness_root = ws.witness_root;
-    if (effective_witness_root.IsNull() && ws.segwit_active && ws.tmpl.contains("transactions")) {
+    bool witness_root_set = !ws.witness_commitment.empty();  // commitment computed → root is valid
+    if (!witness_root_set && ws.segwit_active && ws.tmpl.contains("transactions")) {
         std::vector<uint256> wtxids;
         wtxids.push_back(uint256());  // coinbase wtxid = 0
         for (auto& tx : ws.tmpl["transactions"]) {
@@ -1900,9 +1904,10 @@ MiningInterface::build_connection_coinbase(
             wtxids.push_back(wtxid);
         }
         effective_witness_root = compute_witness_merkle_root(std::move(wtxids));
-        LOG_WARNING << "[build_cb] witness_root was null, recomputed from "
-                    << ws.tmpl["transactions"].size() << " txs: "
-                    << effective_witness_root.GetHex();
+        witness_root_set = true;
+        LOG_INFO << "[build_cb] witness_root computed from "
+                 << ws.tmpl["transactions"].size() << " txs: "
+                 << effective_witness_root.GetHex();
     }
     auto rhr = ws.ref_hash_fn(
         prev_share_hash,
@@ -6986,22 +6991,27 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                         params.witness_commitment_hex = m_cached_witness_commitment;
                         params.witness_root = m_cached_witness_root;
                     }
-                    // Safety net: if witness_root is still null, recompute from
-                    // the job's frozen tx_data (matches p2pool data.py:1024).
-                    // This handles race conditions where the root was lost in transit.
-                    const auto& txd = job ? job->tx_data : std::vector<std::string>{};
-                    if (params.witness_root.IsNull() && !txd.empty()) {
-                        std::vector<uint256> wtxids;
-                        wtxids.push_back(uint256());  // coinbase wtxid = 0
-                        for (const auto& tx_hex : txd) {
-                            auto tx_bytes = ParseHex(tx_hex);
-                            if (!tx_bytes.empty())
-                                wtxids.push_back(Hash(tx_bytes));
+                    // The zero witness_root (0x00..00) is VALID — it's the correct
+                    // root when a block has only a coinbase transaction.  Don't treat
+                    // IsNull() as "not set".  The witness_commitment_hex being non-empty
+                    // means the root was computed and should be used as-is.
+                    // Only recompute when witness_commitment is empty but segwit active.
+                    if (params.witness_commitment_hex.empty() && params.segwit_active) {
+                        const auto& txd = job ? job->tx_data : std::vector<std::string>{};
+                        if (!txd.empty()) {
+                            std::vector<uint256> wtxids;
+                            wtxids.push_back(uint256());  // coinbase wtxid = 0
+                            for (const auto& tx_hex : txd) {
+                                auto tx_bytes = ParseHex(tx_hex);
+                                if (!tx_bytes.empty())
+                                    wtxids.push_back(Hash(tx_bytes));
+                            }
+                            params.witness_root = compute_witness_merkle_root(std::move(wtxids));
+                            params.witness_commitment_hex =
+                                compute_p2pool_witness_commitment_hex(params.witness_root);
+                            LOG_INFO << "[WC-FIX] witness data computed from "
+                                     << txd.size() << " txs";
                         }
-                        params.witness_root = compute_witness_merkle_root(std::move(wtxids));
-                        LOG_WARNING << "[WC-FIX] witness_root was null, recomputed from "
-                                    << txd.size() << " txs: "
-                                    << params.witness_root.GetHex();
                     }
                 }
 
@@ -7025,10 +7035,11 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                     params.frozen_merged_payout_hash = job->frozen_ref.merged_payout_hash;
                     params.frozen_merkle_branches = job->frozen_ref.frozen_merkle_branches;
                     params.frozen_witness_root = job->frozen_ref.frozen_witness_root;
-                    // Safety: if frozen_witness_root is null, use the recomputed witness_root.
-                    // The ref_hash_fn stored the same witness_root when it ran, so using
-                    // the recomputed value keeps consistency (both come from the same tx set).
-                    if (params.frozen_witness_root.IsNull() && !params.witness_root.IsNull())
+                    // If frozen_witness_root was never set (commitment empty at ref_hash
+                    // time), propagate the current witness_root for consistency.
+                    // Note: zero root IS valid (coinbase-only block) — don't use IsNull().
+                    if (params.frozen_witness_root.IsNull() &&
+                        !params.witness_commitment_hex.empty())
                         params.frozen_witness_root = params.witness_root;
                     params.frozen_merged_coinbase_info = job->frozen_ref.frozen_merged_coinbase_info;
                     // has_frozen = true when ref_hash_fn produced valid frozen data.

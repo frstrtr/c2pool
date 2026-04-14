@@ -4295,16 +4295,10 @@ int main(int argc, char* argv[]) {
                         ltc::SegwitData sd;
                         sd.m_txid_merkle_link.m_branch = merkle_branches;
                         sd.m_txid_merkle_link.m_index  = 0;
-                        // Use raw wtxid merkle root (not the commitment hash).
-                        // NEVER fall back to witness_commitment_hex — that contains
-                        // SHA256d(root || nonce), not the raw root. Using it would
-                        // cause double-hashing in generate_share_transaction.
-                        if (!witness_root.IsNull()) {
-                            sd.m_wtxid_merkle_root = witness_root;
-                        } else {
-                            LOG_WARNING << "[ref_hash_fn] witness_root is null despite segwit_active=true"
-                                        << " — ref_hash will include zero wtxid_merkle_root";
-                        }
+                        // Use raw wtxid merkle root.  The zero root (0x00..00) is
+                        // VALID for blocks with only a coinbase transaction —
+                        // p2pool uses it as-is to compute the witness commitment.
+                        sd.m_wtxid_merkle_root = witness_root;
                         params.segwit_data = sd;
                     }
 

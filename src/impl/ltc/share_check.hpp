@@ -2183,16 +2183,11 @@ uint256 create_local_share_v35(
         sd.m_txid_merkle_link.m_branch = (has_frozen && !frozen_merkle_branches.empty())
             ? frozen_merkle_branches : merkle_branches;
         sd.m_txid_merkle_link.m_index  = 0;
-        // Same priority as V36: frozen > direct > zero fallback.
-        // NEVER extract from witness_commitment_hex (it's a p2pool commitment,
-        // not the raw root — using it causes double-hashing in verify path).
-        if (!frozen_witness_root.IsNull()) {
-            sd.m_wtxid_merkle_root = frozen_witness_root;
-        } else if (!witness_root.IsNull()) {
-            sd.m_wtxid_merkle_root = witness_root;
-        } else {
-            LOG_ERROR << "[WC-SOURCE-V35] witness_root null — GENTX mismatch expected";
-        }
+        // Priority: frozen > direct.  The zero root (0x00..00) is VALID for
+        // coinbase-only blocks — p2pool uses it to compute the OP_RETURN
+        // witness commitment.  Never treat IsNull() as "not set" here.
+        sd.m_wtxid_merkle_root = !frozen_witness_root.IsNull()
+            ? frozen_witness_root : witness_root;
         share.m_segwit_data = sd;
     }
 
@@ -2683,22 +2678,11 @@ uint256 create_local_share(
         // p2pool commitment (Hash(root, nonce)), not the raw root.
         // Storing it in m_wtxid_merkle_root causes generate_share_transaction
         // to double-hash: Hash(Hash(root, nonce), nonce) → GENTX mismatch.
-        const char* wc_source = "unknown";
-        if (!frozen_witness_root.IsNull()) {
-            sd.m_wtxid_merkle_root = frozen_witness_root;
-            wc_source = has_frozen ? "frozen" : "frozen_unflagged";
-        } else if (!witness_root.IsNull()) {
-            sd.m_wtxid_merkle_root = witness_root;
-            wc_source = "witness_root";
-        } else {
-            // No raw witness root — this should not happen after the mining_submit
-            // recomputation fix. Log error for diagnostics but use zero (not 0xFF).
-            LOG_ERROR << "[WC-SOURCE] witness_root null despite segwit_active!"
-                      << " has_frozen=" << has_frozen
-                      << " wc_hex_len=" << witness_commitment_hex.size()
-                      << " — share WILL have wrong witness commitment (GENTX mismatch)";
-            wc_source = "ZERO_FALLBACK";
-        }
+        // Priority: frozen > direct.  Zero root (0x00..00) is VALID — it's
+        // the correct witness root for coinbase-only blocks.  p2pool uses it
+        // to compute SHA256d(0x00..00 || '[P2Pool]'*4) as the OP_RETURN commitment.
+        sd.m_wtxid_merkle_root = !frozen_witness_root.IsNull()
+            ? frozen_witness_root : witness_root;
         share.m_segwit_data = sd;
     }
 
