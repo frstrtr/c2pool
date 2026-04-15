@@ -7,12 +7,22 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QPlainTextEdit>
-#include <QProcess>
 #include <QPushButton>
 #include <QSpinBox>
 #include <QTableWidget>
 #include <QTextEdit>
 #include <QWidget>
+
+class ProcessLauncher;
+
+/// Command built from the form: program + arguments, kept separate for
+/// cross-platform QProcess invocation (no shell wrapper needed).
+struct LaunchCommand {
+    QString program;
+    QStringList arguments;
+    /// Human-readable command line for the preview text box.
+    QString displayString() const;
+};
 
 /// Daemon launch-configuration page.
 ///
@@ -35,8 +45,8 @@ class PageLaunch : public QWidget
 public:
     explicit PageLaunch(QWidget* parent = nullptr);
 
-    /// Build the full shell command from current form state.
-    QString buildCommand() const;
+    /// Build the launch command from current form state.
+    LaunchCommand buildCommand() const;
     QString suggestedApiBaseUrl() const;
 
     /// Persist form state to QSettings under the "launch/" prefix.
@@ -69,7 +79,7 @@ private:
     void setupUi();
     QGroupBox* makeGroup(const QString& title);
 
-    QProcess* process_;
+    ProcessLauncher* launcher_;
 
     // ── Mode / Network ──────────────────────────────────────────────────────
     QComboBox* modeCombo_;       ///< integrated / sharechain / solo

@@ -1,4 +1,5 @@
 #include "PageLaunch.hpp"
+#include "ProcessLauncher.hpp"
 
 #include <QDir>
 #include <QFormLayout>
@@ -52,7 +53,7 @@ PortDefaults defaultsForNetwork(const QString& chain, bool testnet)
 // ─────────────────────────────────────────────────────────────────────────────
 
 PageLaunch::PageLaunch(QWidget* parent)
-    : QWidget(parent), process_(new QProcess(this))
+    : QWidget(parent), launcher_(new ProcessLauncher(this))
 {
     setupUi();
 
@@ -61,16 +62,15 @@ PageLaunch::PageLaunch(QWidget* parent)
     connect(testnetCheck_, &QCheckBox::stateChanged, this, &PageLaunch::updateNetworkDefaults);
     connect(httpPortSpin_, &QSpinBox::valueChanged, this, &PageLaunch::emitApiBaseUrlChanged);
 
-    // Process state signals → daemonStateChanged
-    connect(process_, &QProcess::started, this, [this]() {
+    // ProcessLauncher signals → daemonStateChanged
+    connect(launcher_, &ProcessLauncher::started, this, [this]() {
         launchBtn_->setEnabled(false);
         stopBtn_->setEnabled(true);
         restartBtn_->setEnabled(true);
         emit daemonStateChanged("Daemon: running", "color: #1d7f3b;");
     });
 
-    connect(process_,
-            static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished),
+    connect(launcher_, &ProcessLauncher::finished,
             this, [this](int code, QProcess::ExitStatus) {
                 launchBtn_->setEnabled(true);
                 stopBtn_->setEnabled(false);
@@ -80,12 +80,12 @@ PageLaunch::PageLaunch(QWidget* parent)
                     "color: #b04020;");
             });
 
-    connect(process_, &QProcess::errorOccurred, this, [this](QProcess::ProcessError) {
+    connect(launcher_, &ProcessLauncher::errorOccurred, this, [this](const QString& msg) {
         launchBtn_->setEnabled(true);
         stopBtn_->setEnabled(false);
         restartBtn_->setEnabled(false);
         emit daemonStateChanged(
-            QString("Daemon: error — %1").arg(process_->errorString()),
+            QString("Daemon: error — %1").arg(msg),
             "color: #b04020;");
     });
 
@@ -737,12 +737,19 @@ void PageLaunch::setupUi()
 // Command builder
 // ─────────────────────────────────────────────────────────────────────────────
 
-QString PageLaunch::buildCommand() const
+QString LaunchCommand::displayString() const
 {
     QStringList parts;
+    parts << program;
+    parts << arguments;
+    return parts.join(" ");
+}
 
-    // Binary
-    parts << binaryEdit_->text().trimmed();
+LaunchCommand PageLaunch::buildCommand() const
+{
+    LaunchCommand cmd;
+    cmd.program = binaryEdit_->text().trimmed();
+    QStringList& parts = cmd.arguments;
 
     // Mode
     const int modeIdx = modeCombo_->currentIndex();
@@ -934,7 +941,7 @@ QString PageLaunch::buildCommand() const
     else if (smode == "wait")
         parts << "--wait-for-peers";
 
-    return parts.join(" ");
+    return cmd;
 }
 
 QString PageLaunch::suggestedApiBaseUrl() const
@@ -948,7 +955,7 @@ QString PageLaunch::suggestedApiBaseUrl() const
 
 void PageLaunch::onBuildPreview()
 {
-    cmdPreview_->setPlainText(buildCommand());
+    cmdPreview_->setPlainText(buildCommand().displayString());
 }
 
 void PageLaunch::updateNetworkDefaults()
@@ -994,29 +1001,26 @@ void PageLaunch::removeSelectedMergedRow()
 
 void PageLaunch::launch()
 {
-    if (process_->state() != QProcess::NotRunning) {
+    if (launcher_->isRunning()) {
         emit daemonStateChanged("Daemon: already running", "color: #b04020;");
         return;
     }
     onBuildPreview();
-    const QString cmd = buildCommand();
-    if (cmd.trimmed().isEmpty()) {
+    const auto cmd = buildCommand();
+    if (cmd.program.isEmpty()) {
         emit daemonStateChanged("Daemon: empty command", "color: #b04020;");
         return;
     }
-    process_->setWorkingDirectory(QDir::currentPath());
-    process_->start("/bin/bash", {"-lc", cmd});
+    launcher_->start(cmd.program, cmd.arguments, QDir::currentPath());
 }
 
 void PageLaunch::stop()
 {
-    if (process_->state() == QProcess::NotRunning) {
+    if (!launcher_->isRunning()) {
         emit daemonStateChanged("Daemon: not running", "color: #888888;");
         return;
     }
-    process_->terminate();
-    if (!process_->waitForFinished(2000))
-        process_->kill();
+    launcher_->stop();
 }
 
 void PageLaunch::restart()
@@ -1027,7 +1031,7 @@ void PageLaunch::restart()
 
 bool PageLaunch::isDaemonRunning() const
 {
-    return process_->state() != QProcess::NotRunning;
+    return launcher_->isRunning();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
