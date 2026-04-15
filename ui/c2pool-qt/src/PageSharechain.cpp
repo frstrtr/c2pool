@@ -325,7 +325,17 @@ void PageSharechain::setupUI()
     pplnsTable_->setSortingEnabled(true);
     pplnsTable_->setMaximumHeight(200);
     pplnsTable_->setStyleSheet("QTableWidget { background: #0f172a; border: 1px solid #1e293b; }");
-    mainLayout->addWidget(pplnsTable_, 1);
+
+    // PPLNS treemap (squarified layout, proportional to miner weight)
+    pplnsTreemap_ = new TreemapWidget(this);
+    pplnsTreemap_->setMinimumHeight(150);
+    pplnsTreemap_->setStyleSheet("background: #020617; border: 1px solid #334155;");
+
+    // Side-by-side: treemap left, table right
+    auto* pplnsLayout = new QHBoxLayout();
+    pplnsLayout->addWidget(pplnsTreemap_, 2);
+    pplnsLayout->addWidget(pplnsTable_, 1);
+    mainLayout->addLayout(pplnsLayout, 1);
 
     // ── Share detail on hover/click ─────────────────────────────────
     shareDetailLabel_ = new QLabel(this);
@@ -416,6 +426,53 @@ void PageSharechain::setupUI()
 void PageSharechain::refresh(ApiClient* api)
 {
     if (!api) return;
+
+    // Always fetch PPLNS payouts (lightweight endpoint)
+    api->getJson("/current_merged_payouts",
+        [this](const QJsonDocument& doc) {
+            if (!doc.isObject()) return;
+            const auto payouts = doc.object();
+            double total = 0;
+            struct RawEntry { QString addr; double ltc; double doge; QString dogeAddr; };
+            std::vector<RawEntry> raw;
+            for (auto it = payouts.begin(); it != payouts.end(); ++it) {
+                RawEntry e;
+                e.addr = it.key();
+                const auto val = it.value().toObject();
+                e.ltc = val.value("amount").toDouble();
+                e.doge = 0; e.dogeAddr = "";
+                const auto merged = val.value("merged").toArray();
+                for (const auto& m : merged) {
+                    const auto mo = m.toObject();
+                    if (mo.value("symbol").toString() == "DOGE") {
+                        e.doge = mo.value("amount").toDouble();
+                        e.dogeAddr = mo.value("address").toString();
+                    }
+                }
+                total += e.ltc + e.doge * 0.001;  // Weight by effective value
+                raw.push_back(e);
+            }
+            // Sort by weight descending
+            std::sort(raw.begin(), raw.end(), [](auto& a, auto& b) {
+                return (a.ltc + a.doge * 0.001) > (b.ltc + b.doge * 0.001);
+            });
+            // Build treemap entries
+            std::vector<TreemapEntry> entries;
+            for (auto& r : raw) {
+                TreemapEntry te;
+                te.address = r.addr;
+                te.ltcAmount = r.ltc;
+                te.ltcPercent = total > 0 ? (r.ltc + r.doge * 0.001) / total : 0;
+                te.dogeAmount = r.doge;
+                te.dogeAddress = r.dogeAddr;
+                te.color = PageSharechain::colorForMiner(r.addr);
+                te.color = te.color.darker(150);
+                entries.push_back(te);
+            }
+            pplnsTreemap_->setEntries(std::move(entries));
+        },
+        [](const QString&) { }
+    );
 
     if (!initialLoadDone_) {
         // First load: fetch full window (11MB+, 30s timeout)

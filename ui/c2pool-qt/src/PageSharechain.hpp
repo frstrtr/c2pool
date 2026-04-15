@@ -8,6 +8,7 @@
 #include <QWidget>
 
 #include <QTableWidget>
+#include "TreemapWidget.hpp"
 
 #include <map>
 #include <set>
@@ -97,8 +98,9 @@ private:
     QPushButton*  selectAllBtn_;
     QPushButton*  deselectAllBtn_;
 
-    // PPLNS payout table
+    // PPLNS payout visualization
     QTableWidget* pplnsTable_;
+    TreemapWidget* pplnsTreemap_;
 
     // Share detail display (shown on hover/click)
     QLabel* shareDetailLabel_;
