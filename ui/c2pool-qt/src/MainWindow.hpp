@@ -1,16 +1,17 @@
 #pragma once
 
-#include "ApiClient.hpp"
+#include "NodeManager.hpp"
 #include "PageLaunch.hpp"
 #include "PageLogs.hpp"
 #include "PageMining.hpp"
 #include "PageOverview.hpp"
 #include "PagePeers.hpp"
+#include "PageSettings.hpp"
 #include "PageSharechain.hpp"
 #include "SseClient.hpp"
 
+#include <QComboBox>
 #include <QLabel>
-#include <QLineEdit>
 #include <QListWidget>
 #include <QMainWindow>
 #include <QPushButton>
@@ -30,13 +31,12 @@ protected:
 private:
     void refreshCurrentPage();
     void updateDaemonState(bool api_online);
-    void loadSettings();
-    void saveSettings() const;
+    void onActiveNodeChanged(const QString& profileId);
+    void rebuildNodeSelector();
 
-    ApiClient api_;
+    NodeManager nodeManager_;
 
-    QLineEdit* baseUrlEdit_;
-    QLineEdit* authTokenEdit_;
+    QComboBox* nodeSelectorCombo_;
     QListWidget* navList_;
     QStackedWidget* stack_;
 
@@ -51,6 +51,7 @@ private:
     PageLogs*      logsPage_;
     PageSharechain* sharechainPage_;
     PagePeers*     peersPage_;
+    PageSettings*  settingsPage_;
 
     SseClient sseClient_;
     QTimer refreshTimer_;

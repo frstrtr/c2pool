@@ -16,7 +16,9 @@ add_executable(c2pool-qt
     src/MainWindow.cpp
     src/ProcessLauncher.cpp
     src/ConfigSerializer.cpp
+    src/NodeManager.cpp
     src/PageLaunch.cpp
+    src/PageSettings.cpp
     src/PageOverview.cpp
     src/PageMining.cpp
     src/PageSharechain.cpp
