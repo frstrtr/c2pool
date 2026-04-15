@@ -40,7 +40,7 @@ if command -v python3 &>/dev/null; then
     python3 "$DIR/explorer/explorer.py" \
         --web-port "$EXPLORER_PORT" \
         --ltc-c2pool "http://127.0.0.1:${WEB_PORT}/api/explorer" \
-        --no-doge &
+        --doge-c2pool "http://127.0.0.1:${WEB_PORT}/api/explorer" &
     EXPLORER_PID=$!
     echo "Explorer started (PID $EXPLORER_PID)"
 else
