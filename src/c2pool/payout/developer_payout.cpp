@@ -4,7 +4,7 @@
 #include <sstream>
 #include <cstdlib>
 #include <algorithm>
-#include <boost/process.hpp>
+// popen()-based command execution — no boost::process dependency
 #include <nlohmann/json.hpp>
 #include <core/filesystem.hpp>
 
@@ -244,27 +244,25 @@ bool PayoutManager::detect_wallet_address_rpc() {
         // Try to get a receiving address
         std::string full_command = command + " getnewaddress \"c2pool_node_owner\"";
         
-        namespace bp = boost::process;
-        bp::ipstream pipe_stream;
-        bp::child rpc_process(full_command, bp::std_out > pipe_stream, bp::std_err > bp::null);
-        
+        std::string cmd = full_command + " 2>/dev/null";
+        FILE* pipe = popen(cmd.c_str(), "r");
+        if (!pipe) throw std::runtime_error("popen failed");
+        char buf[256];
         std::string line;
-        if (std::getline(pipe_stream, line) && !line.empty()) {
-            // Remove whitespace and quotes
-            address = line;
-            address.erase(0, address.find_first_not_of(" \t\r\n\""));
-            address.erase(address.find_last_not_of(" \t\r\n\"") + 1);
-            
-            rpc_process.wait();
-            
-            if (rpc_process.exit_code() == 0 && !address.empty()) {
-                LOG_INFO << "Auto-detected wallet address from RPC: " << address;
-                set_node_owner_address(address);
-                return true;
-            }
+        if (fgets(buf, sizeof(buf), pipe))
+            line = buf;
+        int status = pclose(pipe);
+
+        // Remove whitespace and quotes
+        address = line;
+        address.erase(0, address.find_first_not_of(" \t\r\n\""));
+        address.erase(address.find_last_not_of(" \t\r\n\"") + 1);
+
+        if (status == 0 && !address.empty()) {
+            LOG_INFO << "Auto-detected wallet address from RPC: " << address;
+            set_node_owner_address(address);
+            return true;
         }
-        
-        rpc_process.wait();
         
     } catch (const std::exception& e) {
         LOG_INFO << "RPC auto-detection failed: " << e.what();

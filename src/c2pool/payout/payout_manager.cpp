@@ -11,7 +11,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <core/filesystem.hpp>
-#include <boost/process.hpp>
+// popen()-based command execution — no boost::process dependency
 #include <nlohmann/json.hpp>
 #include <core/log.hpp>
 
@@ -1095,26 +1095,25 @@ bool PayoutManager::try_detect_wallet_address() {
             return false;
         }
 
-        namespace bp = boost::process;
-        bp::ipstream pipe_stream;
-        bp::child proc(cli_cmd + " getnewaddress \"c2pool_node_owner\"",
-                       bp::std_out > pipe_stream, bp::std_err > bp::null);
-
+        std::string cmd = cli_cmd + " getnewaddress \"c2pool_node_owner\" 2>/dev/null";
+        FILE* pipe = popen(cmd.c_str(), "r");
+        if (!pipe) throw std::runtime_error("popen failed");
+        char buf[256];
         std::string address;
-        if (std::getline(pipe_stream, address) && !address.empty()) {
-            // Trim whitespace and quotes
-            address.erase(0, address.find_first_not_of(" \t\r\n\""));
-            address.erase(address.find_last_not_of(" \t\r\n\"") + 1);
+        if (fgets(buf, sizeof(buf), pipe))
+            address = buf;
+        int status = pclose(pipe);
 
-            proc.wait();
-            if (proc.exit_code() == 0 && !address.empty()) {
-                LOG_INFO << "Auto-detected wallet address from RPC: " << address;
-                node_owner_config_.payout_address = address;
-                node_owner_config_.address_source = NodeOwnerPayoutConfig::AddressSource::WALLET_RPC;
-                return true;
-            }
+        // Trim whitespace and quotes
+        address.erase(0, address.find_first_not_of(" \t\r\n\""));
+        address.erase(address.find_last_not_of(" \t\r\n\"") + 1);
+
+        if (status == 0 && !address.empty()) {
+            LOG_INFO << "Auto-detected wallet address from RPC: " << address;
+            node_owner_config_.payout_address = address;
+            node_owner_config_.address_source = NodeOwnerPayoutConfig::AddressSource::WALLET_RPC;
+            return true;
         }
-        proc.wait();
     } catch (const std::exception& e) {
         LOG_INFO << "Wallet RPC auto-detection failed: " << e.what();
     }
