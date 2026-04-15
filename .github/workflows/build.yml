@@ -39,7 +39,6 @@ jobs:
         with:
           path: ~/.conan2
           key: conan2-ubuntu24-gcc13-${{ hashFiles('conanfile.txt') }}
-          restore-keys: conan2-ubuntu24-gcc13-
 
       - name: Conan install
         run: conan install . --build=missing --output-folder=build_ci --settings=build_type=Release
@@ -188,7 +187,6 @@ jobs:
         with:
           path: ~/.conan2
           key: conan2-windows-msvc194-${{ hashFiles('conanfile.txt') }}
-          restore-keys: conan2-windows-msvc194-
 
       - name: Conan install
         run: conan install . --build=missing --output-folder=build_ci
