@@ -1,6 +1,7 @@
 #include "MainWindow.hpp"
 
 #include <QCloseEvent>
+#include <QElapsedTimer>
 #include <QHBoxLayout>
 #include <QSettings>
 #include <QToolBar>
@@ -234,10 +235,16 @@ void MainWindow::refreshCurrentPage()
         if (api) miningPage_->refresh(api);
         statusLabel_->setText("Mining refreshed");
         break;
-    case 3:
-        if (api) sharechainPage_->refresh(api);
-        statusLabel_->setText("Sharechain refreshed");
+    case 3: {
+        // Sharechain window is 11MB+ -- throttle to every 30s for auto-refresh
+        static QElapsedTimer lastSharechainRefresh;
+        if (!lastSharechainRefresh.isValid() || lastSharechainRefresh.elapsed() > 25000) {
+            if (api) sharechainPage_->refresh(api);
+            lastSharechainRefresh.start();
+            statusLabel_->setText("Sharechain refreshed");
+        }
         break;
+    }
     case 4:
         if (api) logsPage_->refresh(api);
         statusLabel_->setText("Logs refreshed");

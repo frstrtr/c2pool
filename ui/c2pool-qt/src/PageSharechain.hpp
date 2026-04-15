@@ -46,8 +46,14 @@ public:
 
     QSize sizeHint() const override;
 
+signals:
+    void shareHovered(int index, const ShareEntry& share);
+    void shareClicked(int index, const ShareEntry& share);
+
 protected:
     void paintEvent(QPaintEvent* event) override;
+    void mouseMoveEvent(QMouseEvent* event) override;
+    void mousePressEvent(QMouseEvent* event) override;
     bool event(QEvent* event) override;   // for tooltip
 
 private:
@@ -94,8 +100,13 @@ private:
     // PPLNS payout table
     QTableWidget* pplnsTable_;
 
+    // Share detail display (shown on hover/click)
+    QLabel* shareDetailLabel_;
+
     // Data
     std::vector<ShareEntry> shares_;
     QStringList heads_;
     std::map<QString, int> minerCounts_;
+    QString lastTipHash_;  // for delta-based incremental updates
+    bool initialLoadDone_{false};
 };

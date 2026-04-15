@@ -6,6 +6,7 @@
 #include <QHeaderView>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QMouseEvent>
 #include <QPainter>
 #include <QToolTip>
 #include <QVBoxLayout>
@@ -133,6 +134,21 @@ bool DefragWidget::event(QEvent* event)
         return true;
     }
     return QWidget::event(event);
+}
+
+void DefragWidget::mouseMoveEvent(QMouseEvent* event)
+{
+    int idx = cellAt(event->pos());
+    if (idx >= 0 && idx < static_cast<int>(shares_.size()))
+        emit shareHovered(idx, shares_[idx]);
+}
+
+void DefragWidget::mousePressEvent(QMouseEvent* event)
+{
+    if (event->button() != Qt::LeftButton) return;
+    int idx = cellAt(event->pos());
+    if (idx >= 0 && idx < static_cast<int>(shares_.size()))
+        emit shareClicked(idx, shares_[idx]);
 }
 
 void DefragWidget::paintEvent(QPaintEvent*)
@@ -311,6 +327,53 @@ void PageSharechain::setupUI()
     pplnsTable_->setStyleSheet("QTableWidget { background: #0f172a; border: 1px solid #1e293b; }");
     mainLayout->addWidget(pplnsTable_, 1);
 
+    // ── Share detail on hover/click ─────────────────────────────────
+    shareDetailLabel_ = new QLabel(this);
+    shareDetailLabel_->setWordWrap(true);
+    shareDetailLabel_->setTextFormat(Qt::RichText);
+    shareDetailLabel_->setStyleSheet(
+        "background: #1e293b; border: 1px solid #334155; border-radius: 4px; "
+        "padding: 6px; font-size: 11px; color: #e2e8f0;");
+    shareDetailLabel_->setText("Hover or click a share cell for details");
+    shareDetailLabel_->setMaximumHeight(60);
+    mainLayout->addWidget(shareDetailLabel_);
+
+    // Wire share hover/click signals
+    connect(defragWidget_, &DefragWidget::shareHovered, this, [this](int, const ShareEntry& s) {
+        auto dt = QDateTime::fromSecsSinceEpoch(s.timestamp);
+        const double diff = s.targetBits > 0 ? static_cast<double>(s.targetBits) / 65536.0 : 0;
+        QString status = s.stale == 253 ? "ORPHAN" : s.stale == 254 ? "DOA"
+            : s.verified ? "verified" : "unverified";
+        shareDetailLabel_->setText(
+            QString("<b>%1</b> | Miner: %2 | %3 | v%4 | diff %5 | %6")
+                .arg(s.hash.left(16) + "...")
+                .arg(s.miner)
+                .arg(dt.toString("hh:mm:ss"))
+                .arg(s.version)
+                .arg(diff, 0, 'f', 2)
+                .arg(status));
+    });
+
+    connect(defragWidget_, &DefragWidget::shareClicked, this, [this](int, const ShareEntry& s) {
+        auto dt = QDateTime::fromSecsSinceEpoch(s.timestamp);
+        const double diff = s.targetBits > 0 ? static_cast<double>(s.targetBits) / 65536.0 : 0;
+        QString status = s.stale == 253 ? "<span style='color:#ef4444'>ORPHAN</span>"
+            : s.stale == 254 ? "<span style='color:#fbbf24'>DOA</span>"
+            : s.verified ? "<span style='color:#4ade80'>verified</span>"
+            : "<span style='color:#94a3b8'>unverified</span>";
+        shareDetailLabel_->setText(
+            QString("<b>Share #%1</b><br>"
+                    "Hash: %2<br>"
+                    "Miner: <b>%3</b> | Time: %4 | Version: v%5 (dv%6) | Difficulty: %7 | %8")
+                .arg(s.pos)
+                .arg(s.hash)
+                .arg(s.miner)
+                .arg(dt.toString("yyyy-MM-dd hh:mm:ss"))
+                .arg(s.version).arg(s.desiredVersion)
+                .arg(diff, 0, 'f', 2)
+                .arg(status));
+    });
+
     // ── Legend bar ───────────────────────────────────────────────────
     auto* legendLayout = new QHBoxLayout();
     auto makeLegendItem = [&](const QColor& color, const QString& label) {
@@ -354,17 +417,87 @@ void PageSharechain::refresh(ApiClient* api)
 {
     if (!api) return;
 
-    api->getJson("/sharechain/window",
-        [this](const QJsonDocument& data) {
-            if (data.isObject())
-                updateFromJson(data.object());
-            statusValue_->setText("OK");
-            statusValue_->setStyleSheet("color: #4ade80; font-size: 16px; font-weight: bold;");
-        },
-        [this](const QString& err) {
-            statusValue_->setText("ERR");
-            statusValue_->setStyleSheet("color: #ef4444; font-size: 16px; font-weight: bold;");
-        });
+    if (!initialLoadDone_) {
+        // First load: fetch full window (11MB+, 30s timeout)
+        api->getJson("/sharechain/window",
+            [this](const QJsonDocument& data) {
+                if (data.isObject()) {
+                    updateFromJson(data.object());
+                    initialLoadDone_ = true;
+                }
+                statusValue_->setText("OK");
+                statusValue_->setStyleSheet("color: #4ade80; font-size: 16px; font-weight: bold;");
+            },
+            [this](const QString&) {
+                statusValue_->setText("LOADING");
+                statusValue_->setStyleSheet("color: #fbbf24; font-size: 16px; font-weight: bold;");
+            },
+            30000);
+    } else {
+        // Subsequent refreshes: use lightweight /sharechain/tip to check for changes
+        api->getJson("/sharechain/tip",
+            [this, api](const QJsonDocument& data) {
+                if (!data.isObject()) return;
+                const auto obj = data.object();
+                const QString tipHash = obj.value("tip_hash").toString();
+                const int height = obj.value("height").toInt();
+
+                if (tipHash != lastTipHash_ && !tipHash.isEmpty()) {
+                    // Tip changed -- fetch delta since last known tip
+                    const QString deltaUrl = "/sharechain/delta?since=" + lastTipHash_;
+                    api->getJson(deltaUrl,
+                        [this](const QJsonDocument& delta) {
+                            if (delta.isObject()) {
+                                // Delta has new shares to prepend
+                                auto newShares = delta.object().value("shares").toArray();
+                                if (!newShares.isEmpty()) {
+                                    // Prepend new shares and trim to window size
+                                    for (int i = newShares.size() - 1; i >= 0; --i) {
+                                        auto o = newShares[i].toObject();
+                                        ShareEntry e;
+                                        e.hash           = o.value("H").toString();
+                                        e.shortHash      = o.value("h").toString();
+                                        e.miner          = o.value("m").toString();
+                                        e.timestamp      = static_cast<uint32_t>(o.value("t").toDouble());
+                                        e.stale          = o.value("s").toInt();
+                                        e.version        = o.value("V").toInt();
+                                        e.desiredVersion = o.value("dv").toInt();
+                                        e.verified       = o.value("v").toInt() != 0;
+                                        e.targetBits     = static_cast<uint32_t>(o.value("a").toDouble());
+                                        e.target         = static_cast<uint32_t>(o.value("b").toDouble());
+                                        shares_.insert(shares_.begin(), e);
+                                        minerCounts_[e.miner]++;
+                                    }
+                                    // Trim to window size (8640)
+                                    while (shares_.size() > 8640)
+                                        shares_.pop_back();
+                                    // Reindex positions
+                                    for (int i = 0; i < static_cast<int>(shares_.size()); ++i)
+                                        shares_[i].pos = i;
+
+                                    lastTipHash_ = delta.object().value("tip").toString();
+
+                                    // Update stats
+                                    totalSharesLabel_->setText(QString::number(shares_.size()));
+                                    rebuildMinerList();
+                                    defragWidget_->setShares(shares_, heads_);
+                                }
+                            }
+                            statusValue_->setText("OK");
+                            statusValue_->setStyleSheet("color: #4ade80; font-size: 16px; font-weight: bold;");
+                        },
+                        [this](const QString&) {
+                            // Delta failed -- fall back to full reload next time
+                            initialLoadDone_ = false;
+                        },
+                        10000);
+                }
+                // Update height display even without share changes
+                totalSharesLabel_->setText(QString::number(height));
+            },
+            [](const QString&) { },
+            4000);
+    }
 }
 
 void PageSharechain::updateFromJson(const QJsonObject& obj)
@@ -398,6 +531,9 @@ void PageSharechain::updateFromJson(const QJsonObject& obj)
     auto headsArr = obj.value("heads").toArray();
     for (auto&& v : headsArr)
         heads_.push_back(v.toString());
+
+    // Save tip hash for delta-based updates
+    lastTipHash_ = obj.value("best_hash").toString();
 
     // Stats
     int total = obj.value("total").toInt();

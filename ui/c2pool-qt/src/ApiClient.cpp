@@ -55,14 +55,15 @@ QString ApiClient::makeUrl(const QString& path) const
     return url;
 }
 
-void ApiClient::getJson(const QString& path, JsonSuccess onSuccess, Failure onFailure)
+void ApiClient::getJson(const QString& path, JsonSuccess onSuccess, Failure onFailure,
+                         int timeoutMs)
 {
     auto attempts = std::make_shared<int>(0);
     auto doRequest = std::make_shared<std::function<void()>>();
 
-    *doRequest = [this, path, onSuccess, onFailure, attempts, doRequest]() {
+    *doRequest = [this, path, onSuccess, onFailure, attempts, doRequest, timeoutMs]() {
         QNetworkRequest req(QUrl(makeUrl(path)));
-        req.setTransferTimeout(4000);
+        req.setTransferTimeout(timeoutMs);
         auto* reply = manager_.get(req);
 
         connect(reply, &QNetworkReply::finished, this, [this, reply, onSuccess, onFailure, attempts, doRequest]() {
@@ -100,14 +101,15 @@ void ApiClient::getJson(const QString& path, JsonSuccess onSuccess, Failure onFa
     (*doRequest)();
 }
 
-void ApiClient::getText(const QString& path, TextSuccess onSuccess, Failure onFailure)
+void ApiClient::getText(const QString& path, TextSuccess onSuccess, Failure onFailure,
+                         int timeoutMs)
 {
     auto attempts = std::make_shared<int>(0);
     auto doRequest = std::make_shared<std::function<void()>>();
 
-    *doRequest = [this, path, onSuccess, onFailure, attempts, doRequest]() {
+    *doRequest = [this, path, onSuccess, onFailure, attempts, doRequest, timeoutMs]() {
         QNetworkRequest req(QUrl(makeUrl(path)));
-        req.setTransferTimeout(4000);
+        req.setTransferTimeout(timeoutMs);
         auto* reply = manager_.get(req);
 
         connect(reply, &QNetworkReply::finished, this, [this, reply, onSuccess, onFailure, attempts, doRequest]() {
