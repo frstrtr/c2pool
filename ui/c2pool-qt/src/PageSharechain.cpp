@@ -48,6 +48,15 @@ DefragWidget::DefragWidget(QWidget* parent)
     : QWidget(parent)
 {
     setMouseTracking(true);
+
+    // Custom floating tooltip (follows cursor, works on Wayland)
+    floatingTip_ = new QLabel(this);
+    floatingTip_->setWindowFlags(Qt::ToolTip);
+    floatingTip_->setTextFormat(Qt::RichText);
+    floatingTip_->setStyleSheet(
+        "background: #1e293b; color: #e2e8f0; border: 1px solid #475569; "
+        "border-radius: 6px; padding: 8px; font-size: 11px;");
+    floatingTip_->hide();
 }
 
 void DefragWidget::setShares(std::vector<ShareEntry> shares, const QStringList& heads)
@@ -95,43 +104,8 @@ int DefragWidget::cellAt(QPoint pos) const
 
 bool DefragWidget::event(QEvent* event)
 {
-    if (event->type() == QEvent::ToolTip) {
-        auto* he = static_cast<QHelpEvent*>(event);
-        int idx = cellAt(he->pos());
-        if (idx >= 0) {
-            auto& s = shares_[idx];
-            QString status;
-            if (s.stale == 253) status = "<span style='color:#ef4444'>ORPHAN</span>";
-            else if (s.stale == 254) status = "<span style='color:#fbbf24'>DOA</span>";
-            else status = s.verified
-                ? "<span style='color:#4ade80'>verified</span>"
-                : "<span style='color:#94a3b8'>unverified</span>";
-
-            auto dt = QDateTime::fromSecsSinceEpoch(s.timestamp);
-            const double difficulty = s.targetBits > 0
-                ? static_cast<double>(s.targetBits) / 65536.0 : 0;
-
-            QString tip = QString(
-                "<b>Share #%1</b><br>"
-                "<b>Hash:</b> %2<br>"
-                "<b>Miner:</b> %3<br>"
-                "<b>Time:</b> %4<br>"
-                "<b>Version:</b> v%5 (desired: v%6)<br>"
-                "<b>Difficulty:</b> %7<br>"
-                "<b>Status:</b> %8")
-                .arg(s.pos)
-                .arg(s.hash.left(16) + "..." + s.hash.right(8))
-                .arg(s.miner)
-                .arg(dt.toString("yyyy-MM-dd hh:mm:ss"))
-                .arg(s.version)
-                .arg(s.desiredVersion)
-                .arg(difficulty, 0, 'f', 2)
-                .arg(status);
-            QToolTip::showText(he->globalPos(), tip, this);
-        } else {
-            QToolTip::hideText();
-        }
-        return true;
+    if (event->type() == QEvent::Leave) {
+        floatingTip_->hide();
     }
     return QWidget::event(event);
 }
@@ -139,8 +113,37 @@ bool DefragWidget::event(QEvent* event)
 void DefragWidget::mouseMoveEvent(QMouseEvent* event)
 {
     int idx = cellAt(event->pos());
-    if (idx >= 0 && idx < static_cast<int>(shares_.size()))
-        emit shareHovered(idx, shares_[idx]);
+    if (idx >= 0 && idx < static_cast<int>(shares_.size())) {
+        auto& s = shares_[idx];
+        emit shareHovered(idx, s);
+
+        // Position floating tooltip near cursor
+        auto dt = QDateTime::fromSecsSinceEpoch(s.timestamp);
+        const double diff = s.targetBits > 0 ? static_cast<double>(s.targetBits) / 65536.0 : 0;
+        QString status = s.stale == 253 ? "<span style='color:#ef4444'>ORPHAN</span>"
+            : s.stale == 254 ? "<span style='color:#fbbf24'>DOA</span>"
+            : s.verified ? "<span style='color:#4ade80'>verified</span>"
+            : "<span style='color:#94a3b8'>unverified</span>";
+
+        floatingTip_->setText(
+            QString("<b>%1</b><br>"
+                    "<b>Miner:</b> %2<br>"
+                    "<b>Time:</b> %3 | <b>v%4</b> | diff %5<br>"
+                    "<b>Status:</b> %6")
+                .arg(s.shortHash)
+                .arg(s.miner)
+                .arg(dt.toString("hh:mm:ss"))
+                .arg(s.version)
+                .arg(diff, 0, 'f', 1)
+                .arg(status));
+        floatingTip_->adjustSize();
+        // Position 14px to right and below cursor (like web dashboard)
+        QPoint globalPos = event->globalPosition().toPoint();
+        floatingTip_->move(globalPos.x() + 14, globalPos.y() + 14);
+        floatingTip_->show();
+    } else {
+        floatingTip_->hide();
+    }
 }
 
 void DefragWidget::mousePressEvent(QMouseEvent* event)
@@ -427,46 +430,56 @@ void PageSharechain::refresh(ApiClient* api)
 {
     if (!api) return;
 
-    // Always fetch PPLNS payouts (lightweight endpoint)
+    // Fetch PPLNS payouts for treemap (lightweight endpoint)
     api->getJson("/current_merged_payouts",
         [this](const QJsonDocument& doc) {
             if (!doc.isObject()) return;
             const auto payouts = doc.object();
-            double total = 0;
+            double totalLtc = 0;
             struct RawEntry { QString addr; double ltc; double doge; QString dogeAddr; };
             std::vector<RawEntry> raw;
             for (auto it = payouts.begin(); it != payouts.end(); ++it) {
                 RawEntry e;
                 e.addr = it.key();
-                const auto val = it.value().toObject();
-                e.ltc = val.value("amount").toDouble();
+                const auto val = it.value();
+                // Handle both {amount: N, merged: [...]} and plain number
+                if (val.isDouble()) {
+                    e.ltc = val.toDouble();
+                } else {
+                    e.ltc = val.toObject().value("amount").toDouble();
+                }
                 e.doge = 0; e.dogeAddr = "";
-                const auto merged = val.value("merged").toArray();
-                for (const auto& m : merged) {
-                    const auto mo = m.toObject();
-                    if (mo.value("symbol").toString() == "DOGE") {
-                        e.doge = mo.value("amount").toDouble();
-                        e.dogeAddr = mo.value("address").toString();
+                if (val.isObject()) {
+                    const auto merged = val.toObject().value("merged").toArray();
+                    for (const auto& m : merged) {
+                        const auto mo = m.toObject();
+                        if (mo.value("symbol").toString() == "DOGE") {
+                            e.doge = mo.value("amount").toDouble();
+                            e.dogeAddr = mo.value("address").toString();
+                        }
                     }
                 }
-                total += e.ltc + e.doge * 0.001;  // Weight by effective value
+                totalLtc += e.ltc;
                 raw.push_back(e);
             }
-            // Sort by weight descending
+            // Sort by LTC amount descending
             std::sort(raw.begin(), raw.end(), [](auto& a, auto& b) {
-                return (a.ltc + a.doge * 0.001) > (b.ltc + b.doge * 0.001);
+                return a.ltc > b.ltc;
             });
-            // Build treemap entries
+            // Build treemap entries weighted by LTC share
             std::vector<TreemapEntry> entries;
             for (auto& r : raw) {
                 TreemapEntry te;
                 te.address = r.addr;
                 te.ltcAmount = r.ltc;
-                te.ltcPercent = total > 0 ? (r.ltc + r.doge * 0.001) / total : 0;
+                te.ltcPercent = totalLtc > 0 ? r.ltc / totalLtc : 0;
                 te.dogeAmount = r.doge;
                 te.dogeAddress = r.dogeAddr;
+                // Use miner color from palette (same as defrag grid)
                 te.color = PageSharechain::colorForMiner(r.addr);
-                te.color = te.color.darker(150);
+                // Darken slightly for treemap background
+                te.color.setHsv(te.color.hsvHue(), te.color.hsvSaturation() * 0.7,
+                                te.color.value() * 0.5);
                 entries.push_back(te);
             }
             pplnsTreemap_->setEntries(std::move(entries));

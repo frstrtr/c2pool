@@ -60,6 +60,7 @@ protected:
 private:
     int cellAt(QPoint pos) const;
 
+    QLabel* floatingTip_{nullptr};
     std::vector<ShareEntry> shares_;
     QStringList heads_;
     std::set<QString> hiddenMiners_;
