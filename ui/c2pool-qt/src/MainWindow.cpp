@@ -22,6 +22,13 @@ MainWindow::MainWindow(QWidget* parent)
     topBar->addWidget(new QLabel("Base URL:", this));
     topBar->addWidget(baseUrlEdit_);
 
+    authTokenEdit_ = new QLineEdit(this);
+    authTokenEdit_->setEchoMode(QLineEdit::Password);
+    authTokenEdit_->setPlaceholderText("auth token (optional)");
+    authTokenEdit_->setMaximumWidth(180);
+    topBar->addWidget(new QLabel("Token:", this));
+    topBar->addWidget(authTokenEdit_);
+
     auto* applyButton = new QPushButton("Apply", this);
     auto* refreshButton = new QPushButton("Refresh", this);
     topBar->addWidget(applyButton);
@@ -71,7 +78,8 @@ MainWindow::MainWindow(QWidget* parent)
 
     connect(applyButton, &QPushButton::clicked, this, [this]() {
         api_.setBaseUrl(baseUrlEdit_->text());
-        statusLabel_->setText("Base URL applied");
+        api_.setAuthToken(authTokenEdit_->text());
+        statusLabel_->setText("Connection settings applied");
         refreshCurrentPage();
     });
 
@@ -109,6 +117,7 @@ MainWindow::MainWindow(QWidget* parent)
     loadSettings();
     launchPage_->loadSettings();
     api_.setBaseUrl(baseUrlEdit_->text());
+    api_.setAuthToken(authTokenEdit_->text());
 
     refreshTimer_.setInterval(5000);
     connect(&refreshTimer_, &QTimer::timeout, this, [this]() {
@@ -132,6 +141,7 @@ void MainWindow::loadSettings()
 {
     QSettings s;
     baseUrlEdit_->setText(s.value("ui/baseUrl", "http://127.0.0.1:8080").toString());
+    authTokenEdit_->setText(s.value("ui/authToken").toString());
     const int refreshMs = s.value("ui/refreshMs", 5000).toInt();
     refreshTimer_.setInterval(refreshMs > 0 ? refreshMs : 5000);
 }
@@ -140,6 +150,7 @@ void MainWindow::saveSettings() const
 {
     QSettings s;
     s.setValue("ui/baseUrl", baseUrlEdit_->text().trimmed());
+    s.setValue("ui/authToken", authTokenEdit_->text().trimmed());
     s.setValue("ui/refreshMs", refreshTimer_.interval());
 }
 

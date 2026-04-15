@@ -21,8 +21,13 @@ public:
     void setBaseUrl(const QString& baseUrl);
     QString baseUrl() const;
 
+    void setAuthToken(const QString& token);
+    QString authToken() const;
+
     void getJson(const QString& path, JsonSuccess onSuccess, Failure onFailure);
     void getText(const QString& path, TextSuccess onSuccess, Failure onFailure);
+    void postJson(const QString& path, const QJsonObject& body,
+                  JsonSuccess onSuccess, Failure onFailure);
     void download(const QString& path, const QString& outputPath, TextSuccess onSuccess, Failure onFailure);
 
 signals:
@@ -34,4 +39,5 @@ private:
 
     QNetworkAccessManager manager_;
     QString baseUrl_;
+    QString authToken_;
 };

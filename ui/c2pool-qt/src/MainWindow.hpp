@@ -34,6 +34,7 @@ private:
     ApiClient api_;
 
     QLineEdit* baseUrlEdit_;
+    QLineEdit* authTokenEdit_;
     QListWidget* navList_;
     QStackedWidget* stack_;
 

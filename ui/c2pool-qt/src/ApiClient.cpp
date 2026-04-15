@@ -26,13 +26,33 @@ QString ApiClient::baseUrl() const
     return baseUrl_;
 }
 
+void ApiClient::setAuthToken(const QString& token)
+{
+    authToken_ = token.trimmed();
+}
+
+QString ApiClient::authToken() const
+{
+    return authToken_;
+}
+
 QString ApiClient::makeUrl(const QString& path) const
 {
     QString p = path;
     if (!p.startsWith('/')) {
         p.prepend('/');
     }
-    return baseUrl_ + p;
+    QString url = baseUrl_ + p;
+
+    // Inject auth token for protected endpoints
+    if (!authToken_.isEmpty() &&
+        (p.startsWith("/control/") || p.startsWith("/web/log") || p.startsWith("/logs/export")))
+    {
+        url += (url.contains('?') ? "&" : "?");
+        url += "token=" + authToken_;
+    }
+
+    return url;
 }
 
 void ApiClient::getJson(const QString& path, JsonSuccess onSuccess, Failure onFailure)
@@ -114,6 +134,41 @@ void ApiClient::getText(const QString& path, TextSuccess onSuccess, Failure onFa
     };
 
     (*doRequest)();
+}
+
+void ApiClient::postJson(const QString& path, const QJsonObject& body,
+                         JsonSuccess onSuccess, Failure onFailure)
+{
+    QNetworkRequest req(QUrl(makeUrl(path)));
+    req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    req.setTransferTimeout(4000);
+
+    const QByteArray data = QJsonDocument(body).toJson(QJsonDocument::Compact);
+    auto* reply = manager_.post(req, data);
+
+    connect(reply, &QNetworkReply::finished, this, [this, reply, onSuccess, onFailure]() {
+        const auto err = reply->error();
+        const QByteArray payload = reply->readAll();
+        reply->deleteLater();
+
+        if (err != QNetworkReply::NoError) {
+            const QString message = QString("HTTP error: %1").arg(reply->errorString());
+            emit requestFailed(message);
+            onFailure(message);
+            return;
+        }
+
+        QJsonParseError parseErr;
+        const auto doc = QJsonDocument::fromJson(payload, &parseErr);
+        if (parseErr.error != QJsonParseError::NoError) {
+            const QString message = QString("JSON parse error: %1").arg(parseErr.errorString());
+            emit requestFailed(message);
+            onFailure(message);
+            return;
+        }
+
+        onSuccess(doc);
+    });
 }
 
 void ApiClient::download(const QString& path, const QString& outputPath, TextSuccess onSuccess, Failure onFailure)
