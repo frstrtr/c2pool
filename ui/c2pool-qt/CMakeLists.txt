@@ -28,3 +28,18 @@ target_link_libraries(c2pool-qt PRIVATE
     Qt6::Widgets
     Qt6::Network
 )
+
+# ── Platform-specific properties ──────────────────────────────────────────────
+if(WIN32)
+    set_target_properties(c2pool-qt PROPERTIES WIN32_EXECUTABLE TRUE)
+endif()
+if(APPLE)
+    set_target_properties(c2pool-qt PROPERTIES
+        MACOSX_BUNDLE TRUE
+        MACOSX_BUNDLE_BUNDLE_NAME "c2pool"
+        MACOSX_BUNDLE_GUI_IDENTIFIER "org.c2pool.qt"
+        MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
+    )
+endif()
+
+install(TARGETS c2pool-qt DESTINATION bin)

@@ -59,3 +59,8 @@ add_subdirectory(src)
 add_subdirectory(test)
 # add_subdirectory(benchmark)
 # add_subdirectory(temp)
+
+option(BUILD_QT_GUI "Build c2pool-qt desktop GUI (requires Qt6 >= 6.5)" OFF)
+if(BUILD_QT_GUI)
+    add_subdirectory(ui/c2pool-qt)
+endif()
