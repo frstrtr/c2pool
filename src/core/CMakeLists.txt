@@ -33,6 +33,7 @@ set(source
     address_utils.hpp address_utils.cpp
     leveldb_store.hpp leveldb_store.cpp
     address_validator.hpp address_validator.cpp
+    boost_throw_exception.cpp
 )
 
 find_package(yaml-cpp REQUIRED)
@@ -40,7 +41,7 @@ find_package(yaml-cpp REQUIRED)
 add_library(core STATIC ${source})
 target_link_libraries(core btclibs)
 
-target_link_libraries(core Boost::headers Boost::log Boost::log_setup Boost::thread Boost::filesystem Boost::exception yaml-cpp nlohmann_json::nlohmann_json ${LEVELDB_LIBRARIES})
+target_link_libraries(core Boost::headers Boost::log Boost::log_setup Boost::thread Boost::filesystem yaml-cpp nlohmann_json::nlohmann_json ${LEVELDB_LIBRARIES})
 
 # Add LevelDB include directories
 target_include_directories(core PUBLIC ${LEVELDB_INCLUDE_DIRS})
