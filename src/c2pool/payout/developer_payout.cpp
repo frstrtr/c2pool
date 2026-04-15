@@ -5,6 +5,10 @@
 #include <cstdlib>
 #include <algorithm>
 // popen()-based command execution — no boost::process dependency
+#ifdef _WIN32
+#define popen  _popen
+#define pclose _pclose
+#endif
 #include <nlohmann/json.hpp>
 #include <core/filesystem.hpp>
 
