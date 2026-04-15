@@ -54,6 +54,10 @@
 #include <impl/ltc/coin/rpc.hpp>
 #include <impl/ltc/coin/node_interface.hpp>
 
+// Qt-facing infrastructure
+#include <core/runtime_config.hpp>
+#include <core/cookie_auth.hpp>
+
 #include <boost/asio.hpp>
 #include <nlohmann/json.hpp>
 #include <yaml-cpp/yaml.h>
@@ -792,10 +796,41 @@ int main(int argc, char* argv[]) {
             node_rpc->connect(NetService(rpc_host, static_cast<uint16_t>(rpc_port)),
                               rpc_user + ":" + rpc_pass);
 
+            // Populate RuntimeConfig for /config endpoint and Qt integration
+            core::RuntimeConfig runtime_config;
+            runtime_config.testnet = settings->m_testnet;
+            runtime_config.integrated = integrated_mode;
+            runtime_config.sharechain = sharechain_mode;
+            runtime_config.blockchain = blockchain_to_symbol(blockchain);
+            runtime_config.p2p_port = p2p_port;
+            runtime_config.stratum_port = stratum_port;
+            runtime_config.http_port = http_port;
+            runtime_config.http_host = http_host;
+            runtime_config.rpc_host = rpc_host;
+            runtime_config.rpc_port = rpc_port;
+            runtime_config.coind_p2p_address = coind_p2p_address;
+            runtime_config.coind_p2p_port = coind_p2p_port;
+            runtime_config.payout_address = payout_address.empty() ? solo_address : payout_address;
+            runtime_config.node_owner_address = node_owner_address;
+            runtime_config.node_owner_fee = node_owner_fee;
+            runtime_config.dev_donation = dev_donation;
+            runtime_config.redistribute_mode = redistribute_mode_str;
+            runtime_config.seed_nodes = seed_nodes;
+            runtime_config.max_outgoing_conns = max_outgoing_conns;
+            runtime_config.merged_chain_specs = merged_chain_specs;
+            runtime_config.auto_detect_wallet = auto_detect_wallet;
+
+            // Generate cookie auth token for secure API access
+            const auto datadir = core::filesystem::config_path();
+            core::CookieAuth::generate(datadir);
+
             // Create web server with explicit port configuration
-            core::WebServer web_server(ioc, http_host, static_cast<uint16_t>(http_port), 
+            core::WebServer web_server(ioc, http_host, static_cast<uint16_t>(http_port),
                                      settings->m_testnet, enhanced_node, blockchain);
-            
+
+            // Attach runtime config for /config endpoint
+            web_server.get_mining_interface()->set_runtime_config(&runtime_config);
+
             // Wire live coin-daemon RPC so getblocktemplate/submitblock use real data
             web_server.set_coin_rpc(node_rpc.get(), &coin_node);
 
@@ -1834,8 +1869,11 @@ int main(int argc, char* argv[]) {
             }
         }
         
+        // Clean up auth cookie on shutdown
+        core::CookieAuth::cleanup(core::filesystem::config_path());
+
         LOG_INFO << "c2pool shutdown complete";
-        
+
     } catch (const std::exception& e) {
         LOG_ERROR << "Fatal error: " << e.what();
         return 1;

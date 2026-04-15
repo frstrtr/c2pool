@@ -31,6 +31,8 @@ set(source
     web_server.hpp web_server.cpp
     leveldb_store.hpp leveldb_store.cpp
     address_validator.hpp address_validator.cpp
+    runtime_config.hpp runtime_config.cpp
+    cookie_auth.hpp cookie_auth.cpp
 )
 
 find_package(yaml-cpp REQUIRED)

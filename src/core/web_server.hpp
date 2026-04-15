@@ -49,6 +49,7 @@ using tcp = net::ip::tcp;
 class MiningInterface;
 class StratumServer;
 class LitecoinRpcClient;
+struct RuntimeConfig;
 
 /// Litecoin Core RPC client for blockchain sync status
 class LitecoinRpcClient
@@ -133,6 +134,10 @@ public:
     // Log endpoints for Qt PageLogs — read directly from debug.log
     std::string rest_web_log();
     std::string rest_logs_export(const std::string& scope, int64_t from_ts, int64_t to_ts, const std::string& format);
+
+    // Runtime config (for GET /config, auth-protected)
+    void set_runtime_config(const RuntimeConfig* cfg) { m_runtime_config = cfg; }
+    nlohmann::json rest_config() const;
 
     // Track a found block for the /recent_blocks endpoint
     void record_found_block(uint64_t height, const uint256& hash, uint64_t ts = 0);
@@ -398,6 +403,7 @@ private:
     std::unique_ptr<LitecoinRpcClient> m_rpc_client;
     bool m_testnet;  // Store testnet flag
     Blockchain m_blockchain;  // Store blockchain type
+    const RuntimeConfig* m_runtime_config = nullptr;  // Aggregated config (for /config endpoint)
     std::shared_ptr<IMiningNode> m_node;  // Connection to c2pool node for difficulty tracking
     BlockchainAddressValidator m_address_validator;  // New address validator
     std::unique_ptr<c2pool::payout::PayoutManager> m_payout_manager;  // Payout management

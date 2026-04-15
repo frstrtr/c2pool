@@ -1,4 +1,6 @@
 #include "web_server.hpp"
+#include "cookie_auth.hpp"
+#include "runtime_config.hpp"
 
 // Real coin daemon RPC (optional - only linked when set_coin_rpc() is called)
 #include <impl/ltc/coin/rpc.hpp>
@@ -134,39 +136,54 @@ void HttpSession::process_request()
                 rest_result = mining_interface_->rest_sharechain_stats();
             else if (target == "/sharechain/window")
                 rest_result = mining_interface_->rest_sharechain_window();
-            else if (target == "/control/mining/start")
-                rest_result = mining_interface_->rest_control_mining_start();
-            else if (target == "/control/mining/stop")
-                rest_result = mining_interface_->rest_control_mining_stop();
-            else if (target == "/control/mining/restart")
-                rest_result = mining_interface_->rest_control_mining_restart();
-            else if (target == "/control/mining/ban")
-                rest_result = mining_interface_->rest_control_mining_ban(getQueryParam("target"));
-            else if (target == "/control/mining/unban")
-                rest_result = mining_interface_->rest_control_mining_unban(getQueryParam("target"));
-            else if (target == "/web/log") {
-                // Return plain text log (not JSON)
-                response.set(http::field::content_type, "text/plain; charset=utf-8");
-                response.body() = mining_interface_->rest_web_log();
-                response.prepare_payload();
-                send_response(std::move(response));
-                return;
-            }
-            else if (target == "/logs/export") {
-                const std::string scope = getQueryParam("scope");
-                int64_t from_ts = 0, to_ts = 0;
-                try { from_ts = std::stoll(getQueryParam("from")); } catch (...) {}
-                try { to_ts = std::stoll(getQueryParam("to")); } catch (...) {}
-                const std::string fmt = getQueryParam("format");
-                response.set(http::field::content_type,
-                    (fmt == "csv") ? "text/csv; charset=utf-8" :
-                    (fmt == "jsonl") ? "application/x-ndjson; charset=utf-8" :
-                    "text/plain; charset=utf-8");
-                response.body() = mining_interface_->rest_logs_export(scope, from_ts, to_ts, fmt);
-                response.prepare_payload();
-                send_response(std::move(response));
-                return;
-            }
+            else if (target == "/config" || target.starts_with("/control/") ||
+                     target == "/web/log" || target == "/logs/export") {
+                // Auth-protected endpoints: validate cookie token
+                const std::string token = getQueryParam("token");
+                const bool auth_ok = CookieAuth::active_cookie().empty() || CookieAuth::validate(token);
+                if (!auth_ok) {
+                    response.result(http::status::unauthorized);
+                    response.body() = R"({"error":"unauthorized","message":"invalid or missing auth token"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+
+                if (target == "/config") {
+                    rest_result = mining_interface_->rest_config();
+                } else if (target == "/control/mining/start")
+                    rest_result = mining_interface_->rest_control_mining_start();
+                else if (target == "/control/mining/stop")
+                    rest_result = mining_interface_->rest_control_mining_stop();
+                else if (target == "/control/mining/restart")
+                    rest_result = mining_interface_->rest_control_mining_restart();
+                else if (target == "/control/mining/ban")
+                    rest_result = mining_interface_->rest_control_mining_ban(getQueryParam("target"));
+                else if (target == "/control/mining/unban")
+                    rest_result = mining_interface_->rest_control_mining_unban(getQueryParam("target"));
+                else if (target == "/web/log") {
+                    response.set(http::field::content_type, "text/plain; charset=utf-8");
+                    response.body() = mining_interface_->rest_web_log();
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+                else if (target == "/logs/export") {
+                    const std::string scope = getQueryParam("scope");
+                    int64_t from_ts = 0, to_ts = 0;
+                    try { from_ts = std::stoll(getQueryParam("from")); } catch (...) {}
+                    try { to_ts = std::stoll(getQueryParam("to")); } catch (...) {}
+                    const std::string fmt = getQueryParam("format");
+                    response.set(http::field::content_type,
+                        (fmt == "csv") ? "text/csv; charset=utf-8" :
+                        (fmt == "jsonl") ? "application/x-ndjson; charset=utf-8" :
+                        "text/plain; charset=utf-8");
+                    response.body() = mining_interface_->rest_logs_export(scope, from_ts, to_ts, fmt);
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+            } // end auth-protected block
             else
                 rest_result = mining_interface_->getinfo();
 
@@ -1748,6 +1765,13 @@ nlohmann::json MiningInterface::rest_uptime()
     auto now = std::chrono::steady_clock::now();
     auto uptime_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
     return nlohmann::json(uptime_seconds);
+}
+
+nlohmann::json MiningInterface::rest_config() const
+{
+    if (m_runtime_config)
+        return m_runtime_config->to_json();
+    return nlohmann::json::object();
 }
 
 nlohmann::json MiningInterface::rest_connected_miners()
