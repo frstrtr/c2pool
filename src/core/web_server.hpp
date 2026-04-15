@@ -1152,6 +1152,7 @@ public:
     void set_worker_port(uint16_t port) { m_worker_port = port; }
     void set_external_ip(const std::string& ip) { m_external_ip = ip; }
     void set_pool_version(const std::string& ver) { m_pool_version = ver; }
+    const std::string& get_pool_version() const { return m_pool_version; }
 
     /// Auto-detect public IP and version from external services.
     /// Runs on detached threads — non-blocking. Only fetches if not

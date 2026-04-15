@@ -2516,6 +2516,9 @@ int main(int argc, char* argv[]) {
                 p2p_node = std::make_unique<ltc::Node>(&ioc, ltc_p2p_config.get());
             } // P2P node creation
             if (p2p_node) {
+#ifdef C2POOL_VERSION
+                p2p_node->set_software_version("c2pool/" C2POOL_VERSION);
+#endif
                 if (max_outgoing_conns_set) {
                     p2p_node->set_target_outbound_peers(static_cast<size_t>(max_outgoing_conns));
                     LOG_INFO << "Configured outbound peer target: " << max_outgoing_conns;

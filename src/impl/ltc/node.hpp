@@ -288,6 +288,9 @@ public:
     /// from any peer (after relaying). Use this to trigger work refresh.
     void set_on_bestblock(std::function<void()> fn) { m_on_bestblock = std::move(fn); }
 
+    /// Set the software version string announced to peers in P2P version messages.
+    void set_software_version(std::string ver) { m_software_version = std::move(ver); }
+
     /// Send a set of shares (with any needed txs) to a single peer.
     /// Skips shares that originated from that peer.
     void send_shares(peer_ptr peer, const std::vector<uint256>& share_hashes);
@@ -413,6 +416,7 @@ public:
     bool is_banned(const NetService& addr) const;
 
 protected:
+    std::string m_software_version = "/c2pool:0.1/";  // overridden by set_software_version()
     std::function<void()> m_on_bestblock;
     std::function<void()> m_on_best_share_changed;
     std::function<double()> m_local_hashrate_fn;

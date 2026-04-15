@@ -141,7 +141,7 @@ void HttpSession::process_request()
 {
     // Create HTTP response
     http::response<http::string_body> response{http::status::ok, request_.version()};
-    response.set(http::field::server, "c2pool/0.0.1");
+    response.set(http::field::server, mining_interface_->get_pool_version());
     response.set(http::field::content_type, "application/json");
 
     // CORS — only set if operator configured an origin
@@ -2708,7 +2708,7 @@ nlohmann::json MiningInterface::getinfo(const std::string& request_id)
     auto operator_blob = get_operator_message_blob();
 
     return {
-        {"version", "c2pool/0.0.1"},
+        {"version", m_pool_version},
         {"protocolversion", 70015},
         {"blocks", block_height},
         {"connections", connections},

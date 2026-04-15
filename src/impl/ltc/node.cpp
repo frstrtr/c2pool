@@ -251,7 +251,7 @@ void NodeImpl::send_version(peer_ptr peer)
         addr_t{1, peer->addr()},              // addr_to (the remote)
         addr_t{1, NetService{"0.0.0.0", ltc::PoolConfig::P2P_PORT}}, // addr_from (us)
         m_nonce,
-        "/c2pool:0.1/",
+        m_software_version,
         1,                                    // mode (always 1 for legacy compat)
         best_share_hash()                     // advertise our tallest chain head
     );
