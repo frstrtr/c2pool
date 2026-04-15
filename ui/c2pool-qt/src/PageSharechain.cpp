@@ -547,87 +547,29 @@ void PageSharechain::refresh(ApiClient* api)
         [](const QString&) { }
     );
 
-    if (!initialLoadDone_) {
-        // First load: fetch full window (11MB+, 30s timeout)
-        api->getJson("/sharechain/window",
-            [this](const QJsonDocument& data) {
-                if (data.isObject()) {
-                    updateFromJson(data.object());
-                    initialLoadDone_ = true;
-                }
-                statusValue_->setText("OK");
-                statusValue_->setStyleSheet("color: #4ade80; font-size: 16px; font-weight: bold;");
-            },
-            [this](const QString&) {
-                statusValue_->setText("LOADING");
-                statusValue_->setStyleSheet("color: #fbbf24; font-size: 16px; font-weight: bold;");
-            },
-            30000);
-    } else {
-        // Subsequent refreshes: use lightweight /sharechain/tip to check for changes
-        api->getJson("/sharechain/tip",
-            [this, api](const QJsonDocument& data) {
-                if (!data.isObject()) return;
-                const auto obj = data.object();
-                const QString tipHash = obj.value("tip_hash").toString();
-                const int height = obj.value("height").toInt();
-
-                if (tipHash != lastTipHash_ && !tipHash.isEmpty()) {
-                    // Tip changed -- fetch delta since last known tip
-                    const QString deltaUrl = "/sharechain/delta?since=" + lastTipHash_;
-                    api->getJson(deltaUrl,
-                        [this](const QJsonDocument& delta) {
-                            if (delta.isObject()) {
-                                // Delta has new shares to prepend
-                                auto newShares = delta.object().value("shares").toArray();
-                                if (!newShares.isEmpty()) {
-                                    // Prepend new shares and trim to window size
-                                    for (int i = newShares.size() - 1; i >= 0; --i) {
-                                        auto o = newShares[i].toObject();
-                                        ShareEntry e;
-                                        e.hash           = o.value("H").toString();
-                                        e.shortHash      = o.value("h").toString();
-                                        e.miner          = o.value("m").toString();
-                                        e.timestamp      = static_cast<uint32_t>(o.value("t").toDouble());
-                                        e.stale          = o.value("s").toInt();
-                                        e.version        = o.value("V").toInt();
-                                        e.desiredVersion = o.value("dv").toInt();
-                                        e.verified       = o.value("v").toInt() != 0;
-                                        e.targetBits     = static_cast<uint32_t>(o.value("a").toDouble());
-                                        e.target         = static_cast<uint32_t>(o.value("b").toDouble());
-                                        shares_.insert(shares_.begin(), e);
-                                        minerCounts_[e.miner]++;
-                                    }
-                                    // Trim to window size (8640)
-                                    while (shares_.size() > 8640)
-                                        shares_.pop_back();
-                                    // Reindex positions
-                                    for (int i = 0; i < static_cast<int>(shares_.size()); ++i)
-                                        shares_[i].pos = i;
-
-                                    lastTipHash_ = delta.object().value("tip").toString();
-
-                                    // Update stats
-                                    totalSharesLabel_->setText(QString::number(shares_.size()));
-                                    rebuildMinerList();
-                                    defragWidget_->setShares(shares_, heads_);
-                                }
-                            }
-                            statusValue_->setText("OK");
-                            statusValue_->setStyleSheet("color: #4ade80; font-size: 16px; font-weight: bold;");
-                        },
-                        [this](const QString&) {
-                            // Delta failed -- fall back to full reload next time
-                            initialLoadDone_ = false;
-                        },
-                        10000);
-                }
-                // Update height display even without share changes
-                totalSharesLabel_->setText(QString::number(height));
-            },
-            [](const QString&) { },
-            4000);
+    // Fetch full sharechain window (25MB+). Use 60s timeout for large payload.
+    // Only re-fetch if we have no shares yet or explicitly refreshing.
+    if (shares_.empty()) {
+        statusValue_->setText("LOADING");
+        statusValue_->setStyleSheet("color: #fbbf24; font-size: 16px; font-weight: bold;");
     }
+
+    api->getJson("/sharechain/window",
+        [this](const QJsonDocument& data) {
+            if (data.isObject()) {
+                updateFromJson(data.object());
+            }
+            statusValue_->setText("OK");
+            statusValue_->setStyleSheet("color: #4ade80; font-size: 16px; font-weight: bold;");
+        },
+        [this](const QString&) {
+            // On failure, keep existing data
+            if (shares_.empty()) {
+                statusValue_->setText("ERR");
+                statusValue_->setStyleSheet("color: #ef4444; font-size: 16px; font-weight: bold;");
+            }
+        },
+        60000);  // 60s timeout for 25MB+ response
 }
 
 void PageSharechain::updateFromJson(const QJsonObject& obj)
