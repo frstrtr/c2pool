@@ -2,6 +2,7 @@
 
 #include <QFormLayout>
 #include <QGroupBox>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QVBoxLayout>
@@ -55,36 +56,51 @@ PageOverview::PageOverview(QWidget* parent)
     layout->addStretch();
 }
 
+static QString formatHashrate(double hr) {
+    if (hr >= 1e15) return QString("%1 PH/s").arg(hr / 1e15, 0, 'f', 2);
+    if (hr >= 1e12) return QString("%1 TH/s").arg(hr / 1e12, 0, 'f', 2);
+    if (hr >= 1e9)  return QString("%1 GH/s").arg(hr / 1e9, 0, 'f', 2);
+    if (hr >= 1e6)  return QString("%1 MH/s").arg(hr / 1e6, 0, 'f', 2);
+    if (hr >= 1e3)  return QString("%1 KH/s").arg(hr / 1e3, 0, 'f', 2);
+    return QString("%1 H/s").arg(hr, 0, 'f', 2);
+}
+
 void PageOverview::refresh(ApiClient* api)
 {
     statusValue_->setText("Refreshing...");
 
-    // Uptime (plain text)
-    api->getText("/uptime",
-        [this](const QString& text) {
-            bool ok = false;
-            const double seconds = text.trimmed().toDouble(&ok);
-            if (ok) {
-                if (seconds < 3600)
-                    uptimeValue_->setText(QString("%1 min").arg(seconds / 60.0, 0, 'f', 1));
-                else
-                    uptimeValue_->setText(QString("%1 h").arg(seconds / 3600.0, 0, 'f', 1));
-            }
-        },
-        [](const QString&) { }
-    );
-
-    // Global stats (pool hashrate, stale ratio)
+    // Global stats: hashrate, stale ratio, difficulty, miners, uptime
     api->getJson("/global_stats",
         [this](const QJsonDocument& doc) {
             if (!doc.isObject()) return;
             const auto obj = doc.object();
-            const double hashrate = obj.value("pool_hashrate").toDouble();
-            poolHashrateValue_->setText(hashrate > 0
-                ? QString("%1 MH/s").arg(hashrate / 1e6, 0, 'f', 2)
-                : "0.00");
+
+            // Pool hashrate (field: pool_hash_rate)
+            const double hashrate = obj.value("pool_hash_rate").toDouble();
+            poolHashrateValue_->setText(formatHashrate(hashrate));
+
+            // Stale ratio (field: pool_stale_prop)
             staleRateValue_->setText(
-                QString::number(obj.value("pool_stale_ratio").toDouble(), 'f', 6));
+                QString::number(obj.value("pool_stale_prop").toDouble(), 'f', 4));
+
+            // Network difficulty (field: network_block_difficulty)
+            const double netDiff = obj.value("network_block_difficulty").toDouble();
+            if (netDiff >= 1e6)
+                networkDiffValue_->setText(QString("%1 M").arg(netDiff / 1e6, 0, 'f', 2));
+            else
+                networkDiffValue_->setText(QString::number(netDiff, 'f', 2));
+
+            // Unique miners
+            uniqueMinersValue_->setText(
+                QString::number(obj.value("unique_miners").toInt()));
+
+            // Uptime
+            const double uptime = obj.value("uptime_seconds").toDouble();
+            if (uptime < 3600)
+                uptimeValue_->setText(QString("%1 min").arg(uptime / 60.0, 0, 'f', 1));
+            else
+                uptimeValue_->setText(QString("%1 h").arg(uptime / 3600.0, 0, 'f', 1));
+
             statusValue_->setText("OK");
         },
         [this](const QString& err) {
@@ -92,20 +108,7 @@ void PageOverview::refresh(ApiClient* api)
         }
     );
 
-    // Local stats (network difficulty, connections)
-    api->getJson("/local_stats",
-        [this](const QJsonDocument& doc) {
-            if (!doc.isObject()) return;
-            const auto obj = doc.object();
-            networkDiffValue_->setText(
-                QString::number(obj.value("difficulty").toDouble(), 'f', 4));
-            peersValue_->setText(
-                QString::number(obj.value("connections").toInt()));
-        },
-        [](const QString&) { }
-    );
-
-    // Sharechain stats (height, shares, miners)
+    // Sharechain stats (height, shares, chain length)
     api->getJson("/sharechain/stats",
         [this](const QJsonDocument& doc) {
             if (!doc.isObject()) return;
@@ -113,9 +116,18 @@ void PageOverview::refresh(ApiClient* api)
             chainHeightValue_->setText(
                 QString::number(obj.value("chain_height").toInt()));
             sharesValue_->setText(
-                QString::number(obj.value("total_shares").toInt()));
-            const auto miners = obj.value("shares_by_miner").toObject();
-            uniqueMinersValue_->setText(QString::number(miners.size()));
+                QString("%1 / %2")
+                    .arg(obj.value("chain_length").toInt())
+                    .arg(obj.value("chain_height").toInt()));
+        },
+        [](const QString&) { }
+    );
+
+    // P2P peer count
+    api->getJson("/peer_list",
+        [this](const QJsonDocument& doc) {
+            if (!doc.isArray()) return;
+            peersValue_->setText(QString::number(doc.array().size()));
         },
         [](const QString&) { }
     );
@@ -125,8 +137,15 @@ void PageOverview::refresh(ApiClient* api)
         [this](const QJsonDocument& doc) {
             if (!doc.isObject()) return;
             const auto obj = doc.object();
-            const double luck = obj.value("luck_percent").toDouble();
-            luckValue_->setText(QString("%1%").arg(luck, 0, 'f', 1));
+            if (obj.value("luck_available").toBool()) {
+                const auto trend = obj.value("current_luck_trend");
+                if (!trend.isNull())
+                    luckValue_->setText(QString("%1%").arg(trend.toDouble() * 100.0, 0, 'f', 1));
+                else
+                    luckValue_->setText("calculating...");
+            } else {
+                luckValue_->setText("no blocks yet");
+            }
         },
         [](const QString&) { }
     );
@@ -136,33 +155,59 @@ void PageOverview::refresh(ApiClient* api)
         [this](const QJsonDocument& doc) {
             if (!doc.isObject()) return;
             const auto obj = doc.object();
-            const QString phase = obj.value("phase").toString("unknown");
-            v36StatusValue_->setText(phase);
+            const auto ratchet = obj.value("auto_ratchet").toObject();
+            const QString state = ratchet.value("state").toString("unknown");
+            const auto sc = obj.value("share_chain").toObject();
+            const double v36pct = sc.value("v36_percentage").toDouble();
+            v36StatusValue_->setText(
+                QString("%1 (v36: %2%)").arg(state).arg(v36pct, 0, 'f', 1));
         },
         [](const QString&) { }
     );
 
-    // Broadcaster status
+    // Broadcaster status (LTC embedded node health)
     api->getJson("/broadcaster_status",
         [this](const QJsonDocument& doc) {
             if (!doc.isObject()) return;
             const auto obj = doc.object();
-            const bool ok = obj.value("connected").toBool();
-            broadcasterValue_->setText(ok ? "connected" : "disconnected");
-            broadcasterValue_->setStyleSheet(ok ? "color: green;" : "color: red;");
+            const bool running = obj.value("running").toBool();
+            const int chains = obj.value("chains").toInt();
+            const auto peers = obj.value("peers").toArray();
+            const int found = obj.value("total_blocks_found").toInt();
+            if (running) {
+                broadcasterValue_->setText(
+                    QString("LTC: %1 peers, %2 blocks found")
+                        .arg(peers.size()).arg(found));
+                broadcasterValue_->setStyleSheet("color: green;");
+            } else {
+                broadcasterValue_->setText("disconnected");
+                broadcasterValue_->setStyleSheet("color: red;");
+            }
         },
         [](const QString&) { }
     );
 
-    // Merged mining stats
+    // Merged mining stats (DOGE)
     api->getJson("/merged_stats",
         [this](const QJsonDocument& doc) {
             if (!doc.isObject()) return;
             const auto obj = doc.object();
-            const int chains = obj.value("chains").toInt();
-            const int blocks = obj.value("total_blocks").toInt();
-            mergedStatsValue_->setText(
-                QString("%1 chain(s), %2 blocks found").arg(chains).arg(blocks));
+            const auto networks = obj.value("networks").toObject();
+            const int totalBlocks = obj.value("total_blocks").toInt();
+            const QString symbol = obj.value("symbol").toString();
+            if (networks.isEmpty()) {
+                mergedStatsValue_->setText("no merged chains");
+            } else {
+                QStringList parts;
+                for (auto it = networks.begin(); it != networks.end(); ++it) {
+                    const auto net = it.value().toObject();
+                    parts << QString("%1: h=%2, %3 blocks")
+                        .arg(it.key())
+                        .arg(net.value("current_height").toInt())
+                        .arg(net.value("blocks_found").toInt());
+                }
+                mergedStatsValue_->setText(parts.join("; "));
+            }
         },
         [](const QString&) { }
     );

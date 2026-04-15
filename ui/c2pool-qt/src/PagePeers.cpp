@@ -16,8 +16,8 @@ PagePeers::PagePeers(QWidget* parent)
     layout->addWidget(totalPeersLabel_);
 
     peerTable_ = new QTableWidget(this);
-    peerTable_->setColumnCount(5);
-    peerTable_->setHorizontalHeaderLabels({"Address", "Version", "Ping (ms)", "Tx Pool", "Direction"});
+    peerTable_->setColumnCount(4);
+    peerTable_->setHorizontalHeaderLabels({"Address", "Version", "Uptime", "Direction"});
     peerTable_->horizontalHeader()->setStretchLastSection(true);
     peerTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
     peerTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -43,14 +43,15 @@ void PagePeers::refresh(ApiClient* api)
             for (int i = 0; i < arr.size(); ++i) {
                 const auto peer = arr[i].toObject();
                 peerTable_->setItem(i, 0, new QTableWidgetItem(
-                    peer.value("addr").toString()));
+                    peer.value("address").toString()));
                 peerTable_->setItem(i, 1, new QTableWidgetItem(
-                    peer.value("sub_version").toString()));
-                peerTable_->setItem(i, 2, new QTableWidgetItem(
-                    QString::number(peer.value("ping").toDouble() * 1000.0, 'f', 0)));
+                    peer.value("version").toString()));
+                const int uptime = peer.value("uptime").toInt();
+                const QString uptimeStr = uptime >= 3600
+                    ? QString("%1h").arg(uptime / 3600)
+                    : QString("%1m").arg(uptime / 60);
+                peerTable_->setItem(i, 2, new QTableWidgetItem(uptimeStr));
                 peerTable_->setItem(i, 3, new QTableWidgetItem(
-                    QString::number(peer.value("txpool_size").toInt())));
-                peerTable_->setItem(i, 4, new QTableWidgetItem(
                     peer.value("incoming").toBool() ? "inbound" : "outbound"));
             }
             statusLabel_->setText("OK");

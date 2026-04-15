@@ -81,10 +81,12 @@ void PageMining::refresh(ApiClient* api)
 
     api->getJson("/connected_miners",
         [this](const QJsonDocument& doc) {
-            if (!doc.isObject()) return;
-            const auto obj = doc.object();
-            connectedMinersValue_->setText(
-                QString::number(obj.value("total_connected").toInt()));
+            if (doc.isArray()) {
+                connectedMinersValue_->setText(QString::number(doc.array().size()));
+            } else if (doc.isObject()) {
+                connectedMinersValue_->setText(
+                    QString::number(doc.object().value("total_connected").toInt()));
+            }
         },
         [](const QString&) { }
     );
@@ -97,38 +99,45 @@ void PageMining::refresh(ApiClient* api)
             }
 
             const auto root = doc.object();
-            const bool miningEnabled = root.value("mining_enabled").toBool(true);
-            miningStateValue_->setText(miningEnabled ? "running" : "stopped");
+            // Response has nested "pool" object with aggregate stats
+            const auto pool = root.value("pool").toObject();
 
-            acceptedValue_->setText(QString::number(root.value("accepted_shares").toInt()));
-            rejectedValue_->setText(QString::number(root.value("rejected_shares").toInt()));
+            const int workers = pool.value("workers").toInt();
+            miningStateValue_->setText(workers > 0 ? "running" : "idle");
+            connectedMinersValue_->setText(QString::number(pool.value("connections").toInt()));
 
-            const double hashrate = root.value("hashrate").toDouble();
-            hashrateValue_->setText(hashrate > 0
-                ? QString("%1 MH/s").arg(hashrate / 1e6, 0, 'f', 2)
-                : "0.00");
+            acceptedValue_->setText(QString::number(pool.value("total_accepted").toInt()));
+            rejectedValue_->setText(QString::number(pool.value("total_rejected").toInt()));
+
+            const double hashrate = pool.value("hashrate").toDouble();
+            if (hashrate >= 1e9)
+                hashrateValue_->setText(QString("%1 GH/s").arg(hashrate / 1e9, 0, 'f', 2));
+            else if (hashrate >= 1e6)
+                hashrateValue_->setText(QString("%1 MH/s").arg(hashrate / 1e6, 0, 'f', 2));
+            else
+                hashrateValue_->setText(QString("%1 H/s").arg(hashrate, 0, 'f', 2));
 
             sharesPerMinValue_->setText(
-                QString::number(root.value("shares_per_minute").toDouble(), 'f', 2));
+                QString::number(pool.value("submission_rate").toDouble(), 'f', 2));
             difficultyValue_->setText(
-                QString::number(root.value("difficulty").toDouble(), 'f', 4));
+                QString::number(pool.value("unique_addresses").toInt()));
 
-            // Per-worker breakdown (if available)
-            const auto workers = root.value("workers").toObject();
-            workersTable_->setRowCount(workers.size());
+            // Per-worker breakdown
+            const auto workerMap = root.value("workers").toObject();
+            workersTable_->setRowCount(workerMap.size());
             int row = 0;
-            for (auto it = workers.begin(); it != workers.end(); ++it, ++row) {
+            for (auto it = workerMap.begin(); it != workerMap.end(); ++it, ++row) {
                 const auto w = it.value().toObject();
                 workersTable_->setItem(row, 0, new QTableWidgetItem(it.key()));
                 workersTable_->setItem(row, 1, new QTableWidgetItem(QString::number(w.value("accepted").toInt())));
                 workersTable_->setItem(row, 2, new QTableWidgetItem(QString::number(w.value("rejected").toInt())));
-                workersTable_->setItem(row, 3, new QTableWidgetItem(QString::number(w.value("hash_rate").toDouble(), 'f', 2)));
-                workersTable_->setItem(row, 4, new QTableWidgetItem(w.value("merged_auto_converted").toBool() ? "yes" : "no"));
-                workersTable_->setItem(row, 5, new QTableWidgetItem(w.value("merged_redistributed").toBool() ? "yes" : "no"));
+                workersTable_->setItem(row, 3, new QTableWidgetItem(QString::number(w.value("hashrate").toDouble(), 'f', 2)));
+                workersTable_->setItem(row, 4, new QTableWidgetItem(w.value("auto_converted").toBool() ? "yes" : "no"));
+                workersTable_->setItem(row, 5, new QTableWidgetItem(w.value("redistributed").toBool() ? "yes" : "no"));
             }
 
-            const int active = root.value("active_workers").toInt();
-            statusValue_->setText(QString("%1 active worker(s)").arg(active));
+            statusValue_->setText(QString("%1 worker(s), %2 unique addresses")
+                .arg(workers).arg(pool.value("unique_addresses").toInt()));
         },
         [this](const QString& error) {
             statusValue_->setText(error);
