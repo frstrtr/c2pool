@@ -242,15 +242,15 @@ TEST(CoinPeerManager, AddDiscoveredPeer)
     CoinPeerManager pm(ioc, "LTC", "/tmp", cfg);
     
     // Valid port — should be added
-    pm.add_discovered_peer(NetService("10.0.0.1", 19335));
+    pm.add_discovered_peer(NetService("45.33.32.1", 19335));
     EXPECT_EQ(pm.peer_count(), 1);
     
     // Invalid port — should be rejected
-    pm.add_discovered_peer(NetService("10.0.0.2", 54321));
+    pm.add_discovered_peer(NetService("45.33.32.2", 54321));
     EXPECT_EQ(pm.peer_count(), 1);
     
     // Duplicate — should be skipped
-    pm.add_discovered_peer(NetService("10.0.0.1", 19335));
+    pm.add_discovered_peer(NetService("45.33.32.1", 19335));
     EXPECT_EQ(pm.peer_count(), 1);
 }
 
@@ -261,7 +261,7 @@ TEST(CoinPeerManager, AddDiscoveredPeer_NoPortFilter)
     // Empty valid_ports → accept any port
     CoinPeerManager pm(ioc, "TEST", "/tmp", cfg);
     
-    pm.add_discovered_peer(NetService("10.0.0.1", 54321));
+    pm.add_discovered_peer(NetService("45.33.32.1", 54321));
     EXPECT_EQ(pm.peer_count(), 1);
 }
 
@@ -286,10 +286,10 @@ TEST(CoinPeerManager, GetPeersToConnect_ReturnsAvailable)
     CoinPeerManager pm(ioc, "LTC", "/tmp", cfg);
     
     // Add some peers
-    pm.add_discovered_peer(NetService("10.0.0.1", 9333));
-    pm.add_discovered_peer(NetService("10.0.0.2", 9333));
-    pm.add_discovered_peer(NetService("10.0.0.3", 9333));
-    pm.add_discovered_peer(NetService("10.0.0.4", 9333));
+    pm.add_discovered_peer(NetService("45.33.32.1", 9333));
+    pm.add_discovered_peer(NetService("45.33.32.2", 9333));
+    pm.add_discovered_peer(NetService("45.33.32.3", 9333));
+    pm.add_discovered_peer(NetService("45.33.32.4", 9333));
     
     std::set<std::string> connected;
     auto peers = pm.get_peers_to_connect(connected);
@@ -304,9 +304,9 @@ TEST(CoinPeerManager, GetPeersToConnect_ExcludesConnected)
     PeerManagerConfig cfg;
     CoinPeerManager pm(ioc, "LTC", "/tmp", cfg);
     
-    pm.add_discovered_peer(NetService("10.0.0.1", 9333));
+    pm.add_discovered_peer(NetService("45.33.32.1", 9333));
     
-    std::set<std::string> connected = {"10.0.0.1:9333"};
+    std::set<std::string> connected = {"45.33.32.1:9333"};
     auto peers = pm.get_peers_to_connect(connected);
     EXPECT_TRUE(peers.empty());
 }
@@ -318,12 +318,12 @@ TEST(CoinPeerManager, GetPeersToConnect_RespectMaxPeers)
     cfg.max_peers = 2;
     CoinPeerManager pm(ioc, "LTC", "/tmp", cfg);
     
-    pm.add_discovered_peer(NetService("10.0.0.1", 9333));
-    pm.add_discovered_peer(NetService("10.0.0.2", 9333));
-    pm.add_discovered_peer(NetService("10.0.0.3", 9333));
+    pm.add_discovered_peer(NetService("45.33.32.1", 9333));
+    pm.add_discovered_peer(NetService("45.33.32.2", 9333));
+    pm.add_discovered_peer(NetService("45.33.32.3", 9333));
     
     // Already at max_peers
-    std::set<std::string> connected = {"10.0.0.5:9333", "10.0.0.6:9333"};
+    std::set<std::string> connected = {"45.33.32.5:9333", "45.33.32.6:9333"};
     auto peers = pm.get_peers_to_connect(connected);
     EXPECT_TRUE(peers.empty());
 }
@@ -334,8 +334,8 @@ TEST(CoinPeerManager, NotifyConnected_ResetBackoff)
     PeerManagerConfig cfg;
     CoinPeerManager pm(ioc, "LTC", "/tmp", cfg);
     
-    pm.add_discovered_peer(NetService("10.0.0.1", 9333));
-    pm.notify_connected("10.0.0.1:9333");
+    pm.add_discovered_peer(NetService("45.33.32.1", 9333));
+    pm.notify_connected("45.33.32.1:9333");
     // After connected notification, peer should be marked with reset backoff
     // (only verifiable through scoring, but should not throw)
 }
@@ -346,8 +346,8 @@ TEST(CoinPeerManager, NotifyDisconnected)
     PeerManagerConfig cfg;
     CoinPeerManager pm(ioc, "LTC", "/tmp", cfg);
     
-    pm.add_discovered_peer(NetService("10.0.0.1", 9333));
-    pm.notify_disconnected("10.0.0.1:9333");
+    pm.add_discovered_peer(NetService("45.33.32.1", 9333));
+    pm.notify_disconnected("45.33.32.1:9333");
     // Should not throw, just increment attempt count
 }
 
@@ -357,9 +357,9 @@ TEST(CoinPeerManager, BroadcastRecording)
     PeerManagerConfig cfg;
     CoinPeerManager pm(ioc, "LTC", "/tmp", cfg);
     
-    pm.add_discovered_peer(NetService("10.0.0.1", 9333));
-    pm.record_broadcast_success("10.0.0.1:9333");
-    pm.record_broadcast_failure("10.0.0.1:9333");
+    pm.add_discovered_peer(NetService("45.33.32.1", 9333));
+    pm.record_broadcast_success("45.33.32.1:9333");
+    pm.record_broadcast_failure("45.33.32.1:9333");
     // Should not throw
 }
 
@@ -384,11 +384,11 @@ TEST(CoinPeerManager, DiscoveryEnabled_MaxPeers)
     
     EXPECT_TRUE(pm.discovery_enabled());
     
-    pm.add_discovered_peer(NetService("10.0.0.1", 9333));
-    pm.add_discovered_peer(NetService("10.0.0.2", 9333));
+    pm.add_discovered_peer(NetService("45.33.32.1", 9333));
+    pm.add_discovered_peer(NetService("45.33.32.2", 9333));
     EXPECT_FALSE(pm.discovery_enabled()); // at max
     
-    pm.add_discovered_peer(NetService("10.0.0.3", 9333)); // rejected
+    pm.add_discovered_peer(NetService("45.33.32.3", 9333)); // rejected
     EXPECT_EQ(pm.peer_count(), 2);
 }
 
@@ -399,11 +399,11 @@ TEST(CoinPeerManager, PruneDead)
     cfg.max_connection_attempts = 3;
     CoinPeerManager pm(ioc, "LTC", "/tmp", cfg);
     
-    pm.add_discovered_peer(NetService("10.0.0.1", 9333));
+    pm.add_discovered_peer(NetService("45.33.32.1", 9333));
     // Simulate 3 disconnections to exhaust attempts
-    pm.notify_disconnected("10.0.0.1:9333");
-    pm.notify_disconnected("10.0.0.1:9333");
-    pm.notify_disconnected("10.0.0.1:9333");
+    pm.notify_disconnected("45.33.32.1:9333");
+    pm.notify_disconnected("45.33.32.1:9333");
+    pm.notify_disconnected("45.33.32.1:9333");
     
     pm.prune_dead_peers();
     EXPECT_EQ(pm.peer_count(), 0);
@@ -438,9 +438,9 @@ TEST(CoinPeerManager, GetPeerInfoBootstrap)
     
     pm.set_getpeerinfo_fn([]() -> std::vector<NetService> {
         return {
-            NetService("10.0.0.1", 19335),
-            NetService("10.0.0.2", 19335),
-            NetService("10.0.0.3", 54321),  // invalid port
+            NetService("45.33.32.1", 19335),
+            NetService("45.33.32.2", 19335),
+            NetService("45.33.32.3", 54321),  // invalid port
         };
     });
     
@@ -465,7 +465,7 @@ TEST(CoinPeerManager, ScoreSortedPriority)
     pm.set_local_node(NetService("192.168.1.1", 19335));
     
     // Add discovered peer (lower score)
-    pm.add_discovered_peer(NetService("10.0.0.1", 9333));
+    pm.add_discovered_peer(NetService("45.33.32.1", 9333));
     
     std::set<std::string> connected;
     auto peers = pm.get_peers_to_connect(connected);

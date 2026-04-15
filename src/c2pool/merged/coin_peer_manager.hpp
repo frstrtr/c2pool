@@ -70,6 +70,7 @@ struct PeerInfo
     enum class Source { coind, addr_crawl, manual, dns_seed, fixed_seed };
 
     NetService          address;
+    AddrClass           addr_class{AddrClass::invalid}; // cached classification (Bitcoin Core style)
     int                 score{0};
     Source              source{Source::coind};
     bool                is_protected{false};    // local daemon node — never drop
@@ -221,12 +222,23 @@ public:
     void set_getpeerinfo_fn(GetPeerInfoFn fn) { m_getpeerinfo_fn = std::move(fn); }
 
     /// Register the protected local daemon node. Score=999999, never dropped.
-    void set_local_node(const NetService& addr)
+    /// Returns true if the address is valid and was registered, false if rejected.
+    /// Allows local/private addresses (the daemon IS local), but rejects
+    /// empty/unparseable hosts via PeerEndpoint validation.
+    bool set_local_node(const NetService& addr)
     {
+        auto ep = PeerEndpoint::from(addr);
+        if (!ep) {
+            LOG_WARNING << "[" << m_symbol
+                       << "] Rejected invalid local node address: " << addr.to_string();
+            return false;
+        }
+
         std::lock_guard<std::mutex> lock(m_mutex);
-        auto key = addr.to_string();
+        auto key = ep->to_string();
         auto& peer = m_peers[key];
-        peer.address = addr;
+        peer.address = ep->to_net_service();
+        peer.addr_class = ep->addr_class();
         peer.score = 999999;
         peer.is_protected = true;
         peer.source = PeerInfo::Source::manual;
@@ -234,7 +246,9 @@ public:
         peer.last_seen = std::chrono::steady_clock::now();
         peer.max_attempts = 999999; // never give up
         m_local_node_key = key;
-        LOG_INFO << "[" << m_symbol << "] Protected local node: " << key;
+        LOG_INFO << "[" << m_symbol << "] Protected local node: " << key
+                 << " (class=" << static_cast<int>(ep->addr_class()) << ")";
+        return true;
     }
 
     /// Set DNS seeds for this chain. Call before start().
@@ -294,35 +308,18 @@ public:
     }
 
     /// Add a peer discovered via P2P addr message.
+    /// Validates via PeerEndpoint: rejects empty, unparseable, and non-routable addresses.
     void add_discovered_peer(const NetService& addr)
     {
-        if (!is_valid_port(addr.port())) return;
-
         std::lock_guard<std::mutex> lock(m_mutex);
-        if (static_cast<int>(m_peers.size()) >= m_config.max_peers) return; // capacity gating
-        auto key = addr.to_string();
-        if (m_peers.count(key)) return; // already known
-        if (m_coind_peers.count(key)) return; // daemon already has it
-
-        // Network group dedup: limit how many untried peers from the same /16
-        auto group = get_network_group(addr.address());
-        if (group_count(group, false) >= m_config.max_new_peers_per_group) return;
-        if (group_count(group, true) >= m_config.max_peers_per_group) return;
-
-        auto& peer = m_peers[key];
-        peer.address = addr;
-        peer.source = PeerInfo::Source::addr_crawl;
-        peer.network_group = group;
-        peer.first_seen = std::chrono::steady_clock::now();
-        peer.last_seen = std::chrono::steady_clock::now();
-        peer.max_attempts = m_config.max_connection_attempts;
+        try_add_peer_locked(addr, PeerInfo::Source::addr_crawl, /*require_routable=*/true);
     }
 
     /// Get list of peers that should be connected right now.
-    /// Returns up to max_connections_per_cycle peers sorted by score,
-    /// excluding already-connected and backed-off peers.
+    /// Returns up to max_connections_per_cycle validated PeerEndpoints sorted
+    /// by score, excluding already-connected, backed-off, and invalid peers.
     /// Enforces network group diversity: max 2 connections per /16 group.
-    std::vector<NetService> get_peers_to_connect(
+    std::vector<PeerEndpoint> get_peers_to_connect(
         const std::set<std::string>& connected_keys) const
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -346,17 +343,21 @@ public:
             }
         }
 
-        // Score-sorted candidates, preferring tried peers (50% bonus)
-        struct Candidate { int score; NetService addr; std::string group; };
+        // Score-sorted candidates, preferring tried peers (50% bonus).
+        // Each candidate is a validated PeerEndpoint — invalid addresses are
+        // rejected here even if they slipped into the peer table somehow.
+        struct Candidate { int score; PeerEndpoint endpoint; std::string group; };
         std::vector<Candidate> candidates;
         for (auto& [key, peer] : m_peers) {
             if (connected_keys.count(key)) continue;
             if (!peer.can_retry()) continue;
+            auto ep = PeerEndpoint::from(peer.address);
+            if (!ep) continue; // invalid address — skip silently
             int s = peer.compute_score();
             if (peer.in_tried) s += 50; // prefer verified peers
             auto grp = peer.network_group.empty()
-                ? get_network_group(peer.address.address()) : peer.network_group;
-            candidates.push_back({s, peer.address, grp});
+                ? get_network_group(ep->host()) : peer.network_group;
+            candidates.push_back({s, *ep, grp});
         }
 
         std::sort(candidates.begin(), candidates.end(),
@@ -364,12 +365,12 @@ public:
 
         // Select with group diversity: max 2 outbound connections per /16
         static constexpr int MAX_OUTBOUND_PER_GROUP = 2;
-        std::vector<NetService> result;
+        std::vector<PeerEndpoint> result;
         for (auto& c : candidates) {
             if (static_cast<int>(result.size()) >= budget) break;
             int grp_total = connected_groups[c.group];
             if (grp_total >= MAX_OUTBOUND_PER_GROUP && !c.group.empty()) continue;
-            result.push_back(c.addr);
+            result.push_back(c.endpoint);
             connected_groups[c.group]++;
         }
         return result;
@@ -486,21 +487,20 @@ public:
     const std::string& symbol() const { return m_symbol; }
 
     /// Return a random subset of verified (tried) peers for sharing via API.
-    /// Only includes peers we've successfully connected to — prevents serving
-    /// unverified addresses that could be used for eclipse attacks.
+    /// Only includes peers we've successfully connected to AND that are globally
+    /// routable — prevents serving unverified, private, or loopback addresses.
+    /// Uses PeerEndpoint::is_routable() (Bitcoin Core classification) instead
+    /// of ad-hoc string prefix matching.
     /// max_count: cap on returned peers (default 25).
-    std::vector<NetService> get_tried_peers(int max_count = 25) const
+    std::vector<PeerEndpoint> get_tried_peers(int max_count = 25) const
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        std::vector<NetService> result;
+        std::vector<PeerEndpoint> result;
         for (auto& [k, p] : m_peers) {
             if (!p.in_tried) continue;
-            // Don't share localhost, empty, or private addresses
-            auto addr = p.address.address();
-            if (addr.empty() || addr == "127.0.0.1" || addr == "::1"
-                || addr.substr(0, 4) == "192." || addr.substr(0, 3) == "10."
-                || addr.substr(0, 7) == "172.16.") continue;
-            result.push_back(p.address);
+            auto ep = PeerEndpoint::from(p.address);
+            if (!ep || !ep->is_routable()) continue;
+            result.push_back(*ep);
         }
         // Shuffle for privacy (don't reveal connection order/topology)
         if (result.size() > 1) {
@@ -508,11 +508,69 @@ public:
             std::shuffle(result.begin(), result.end(), rng);
         }
         if (static_cast<int>(result.size()) > max_count)
-            result.resize(max_count);
+            result.erase(result.begin() + max_count, result.end());
         return result;
     }
 
 private:
+    /// Unified peer validation and insertion (caller must hold m_mutex).
+    /// Validates the address via PeerEndpoint::from(), applies port filtering,
+    /// capacity gating, dedup, and network group limits.
+    ///
+    /// @param require_routable  If true, rejects private/loopback/link-local
+    ///                          addresses. Use for externally-sourced peers
+    ///                          (addr crawl, DNS, HTTP). Set false for daemon
+    ///                          peers (getpeerinfo) which may be LAN hosts.
+    /// @return true if the peer was added, false if rejected.
+    bool try_add_peer_locked(const NetService& addr, PeerInfo::Source source,
+                             bool require_routable)
+    {
+        // ── Validate via PeerEndpoint (type-safe, Bitcoin Core classification) ──
+        auto ep = PeerEndpoint::from(addr);
+        if (!ep) {
+            LOG_DEBUG_COIND << "[" << m_symbol << "] Rejected invalid peer address: "
+                           << addr.to_string();
+            return false;
+        }
+        if (require_routable && !ep->is_routable()) {
+            LOG_DEBUG_COIND << "[" << m_symbol << "] Rejected non-routable peer: "
+                           << ep->to_string() << " (class="
+                           << static_cast<int>(ep->addr_class()) << ")";
+            return false;
+        }
+
+        // ── Port filter ──
+        if (!is_valid_port(ep->port())) return false;
+
+        // ── Capacity gating ──
+        if (static_cast<int>(m_peers.size()) >= m_config.max_peers) return false;
+
+        // ── Dedup ──
+        auto key = ep->to_string();
+        if (m_peers.count(key)) return false;
+        if (source != PeerInfo::Source::coind && m_coind_peers.count(key)) return false;
+
+        // ── Network group limits (Sybil resistance) ──
+        auto group = get_network_group(ep->host());
+        bool is_untried_source = (source == PeerInfo::Source::addr_crawl
+                                || source == PeerInfo::Source::dns_seed
+                                || source == PeerInfo::Source::fixed_seed);
+        if (is_untried_source
+            && group_count(group, false) >= m_config.max_new_peers_per_group) return false;
+        if (group_count(group, true) >= m_config.max_peers_per_group) return false;
+
+        // ── Insert ──
+        auto& peer = m_peers[key];
+        peer.address = ep->to_net_service();
+        peer.addr_class = ep->addr_class();
+        peer.source = source;
+        peer.network_group = group;
+        peer.first_seen = std::chrono::steady_clock::now();
+        peer.last_seen = std::chrono::steady_clock::now();
+        peer.max_attempts = m_config.max_connection_attempts;
+        return true;
+    }
+
     bool is_valid_port(uint16_t port) const
     {
         if (m_config.valid_ports.empty()) return true;
@@ -570,22 +628,19 @@ private:
             auto peers = m_getpeerinfo_fn();
             std::lock_guard<std::mutex> lock(m_mutex);
             m_coind_peers.clear();
+            int added = 0;
             for (auto& addr : peers) {
-                if (!is_valid_port(addr.port())) continue;
-                auto key = addr.to_string();
-                m_coind_peers.insert(key);
-                if (!m_peers.count(key)) {
-                    auto& peer = m_peers[key];
-                    peer.address = addr;
-                    peer.source = PeerInfo::Source::coind;
-                    peer.network_group = get_network_group(addr.address());
-                    peer.first_seen = std::chrono::steady_clock::now();
-                    peer.last_seen = std::chrono::steady_clock::now();
-                    peer.max_attempts = m_config.max_connection_attempts;
-                }
+                // Track daemon's own peers for overlap filtering
+                auto ep = PeerEndpoint::from(addr);
+                if (ep) m_coind_peers.insert(ep->to_string());
+                // Daemon peers may be LAN — don't require routable
+                if (try_add_peer_locked(addr, PeerInfo::Source::coind,
+                                        /*require_routable=*/false))
+                    ++added;
             }
             LOG_INFO << "[" << m_symbol << "] Bootstrap: " << peers.size()
-                     << " peers from getpeerinfo, " << m_peers.size() << " total";
+                     << " peers from getpeerinfo, " << added << " new, "
+                     << m_peers.size() << " total";
         } catch (const std::exception& e) {
             LOG_WARNING << "[" << m_symbol << "] getpeerinfo failed: " << e.what();
         }
@@ -701,6 +756,7 @@ private:
 
             if (j.contains("peers") && j["peers"].is_object()) {
                 std::lock_guard<std::mutex> lock(m_mutex);
+                int loaded = 0, rejected = 0;
                 for (auto& [key, pj] : j["peers"].items()) {
                     // Parse "host:port" back into NetService
                     auto colon = key.rfind(':');
@@ -709,8 +765,17 @@ private:
                     uint16_t port = static_cast<uint16_t>(
                         std::stoul(key.substr(colon + 1)));
 
-                    auto& peer = m_peers[key];
-                    peer.address = NetService(host, port);
+                    // Validate via PeerEndpoint — reject stale invalid entries
+                    auto ep = PeerEndpoint::from(host, port);
+                    if (!ep) {
+                        ++rejected;
+                        continue;
+                    }
+
+                    auto validated_key = ep->to_string();
+                    auto& peer = m_peers[validated_key];
+                    peer.address = ep->to_net_service();
+                    peer.addr_class = ep->addr_class();
                     peer.score = pj.value("score", 0);
                     peer.source = static_cast<PeerInfo::Source>(
                         pj.value("source", 0));
@@ -718,7 +783,7 @@ private:
                     peer.in_tried = pj.value("in_tried", false);
                     peer.network_group = pj.value("network_group", "");
                     if (peer.network_group.empty()) {
-                        peer.network_group = get_network_group(host);
+                        peer.network_group = get_network_group(ep->host());
                     }
                     peer.attempt_count = pj.value("attempt_count", 0);
                     peer.backoff_sec = pj.value("backoff_sec", 30);
@@ -729,6 +794,11 @@ private:
                     peer.last_seen = std::chrono::steady_clock::now();
                     peer.max_attempts = peer.is_protected ? 999999
                         : m_config.max_connection_attempts;
+                    ++loaded;
+                }
+                if (rejected > 0) {
+                    LOG_WARNING << "[" << m_symbol << "] Rejected " << rejected
+                               << " invalid peers from saved database";
                 }
 
                 // Restore anchor connections
@@ -768,23 +838,10 @@ private:
         std::lock_guard<std::mutex> lock(m_mutex);
         int added = 0;
         for (auto& addr : peers) {
-            if (!is_valid_port(addr.port())) continue;
-            if (static_cast<int>(m_peers.size()) >= m_config.max_peers) break;
-            auto key = addr.to_string();
-            if (m_peers.count(key)) continue;
-
-            // Network group limit for DNS seeds
-            auto group = get_network_group(addr.address());
-            if (group_count(group, true) >= m_config.max_peers_per_group) continue;
-
-            auto& peer = m_peers[key];
-            peer.address = addr;
-            peer.source = PeerInfo::Source::dns_seed;
-            peer.network_group = group;
-            peer.first_seen = std::chrono::steady_clock::now();
-            peer.last_seen = std::chrono::steady_clock::now();
-            peer.max_attempts = m_config.max_connection_attempts;
-            ++added;
+            // DNS seeds should only return routable public IPs
+            if (try_add_peer_locked(addr, PeerInfo::Source::dns_seed,
+                                    /*require_routable=*/true))
+                ++added;
         }
         LOG_INFO << "[" << m_symbol << "] DNS seeds: " << peers.size()
                  << " resolved, " << added << " new peers added, "
@@ -809,21 +866,10 @@ private:
 
         int added = 0;
         for (auto& addr : m_fixed_seeds) {
-            if (static_cast<int>(m_peers.size()) >= m_config.max_peers) break;
-            auto key = addr.to_string();
-            if (m_peers.count(key)) continue;
-
-            auto group = get_network_group(addr.address());
-            if (group_count(group, true) >= m_config.max_peers_per_group) continue;
-
-            auto& peer = m_peers[key];
-            peer.address = addr;
-            peer.source = PeerInfo::Source::fixed_seed;
-            peer.network_group = group;
-            peer.first_seen = std::chrono::steady_clock::now();
-            peer.last_seen = std::chrono::steady_clock::now();
-            peer.max_attempts = m_config.max_connection_attempts;
-            ++added;
+            // Fixed seeds are curated public IPs — require routable
+            if (try_add_peer_locked(addr, PeerInfo::Source::fixed_seed,
+                                    /*require_routable=*/true))
+                ++added;
         }
         if (added > 0) {
             LOG_INFO << "[" << m_symbol << "] Loaded " << added
@@ -915,22 +961,10 @@ private:
         std::lock_guard<std::mutex> lock(m_mutex);
         int added = 0;
         for (auto& addr : peers) {
-            if (!is_valid_port(addr.port())) continue;
-            if (static_cast<int>(m_peers.size()) >= m_config.max_peers) break;
-            auto key = addr.to_string();
-            if (m_peers.count(key)) continue;
-
-            auto group = get_network_group(addr.address());
-            if (group_count(group, true) >= m_config.max_peers_per_group) continue;
-
-            auto& peer = m_peers[key];
-            peer.address = addr;
-            peer.source = PeerInfo::Source::addr_crawl; // treat like discovered
-            peer.network_group = group;
-            peer.first_seen = std::chrono::steady_clock::now();
-            peer.last_seen = std::chrono::steady_clock::now();
-            peer.max_attempts = m_config.max_connection_attempts;
-            ++added;
+            // HTTP seeds are external — require routable
+            if (try_add_peer_locked(addr, PeerInfo::Source::addr_crawl,
+                                    /*require_routable=*/true))
+                ++added;
         }
         if (added > 0)
             LOG_INFO << "[" << m_symbol << "] Added " << added

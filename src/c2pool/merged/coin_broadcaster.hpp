@@ -71,35 +71,54 @@ struct BroadcastPeer
 class CoinBroadcaster
 {
 public:
+    /// Primary constructor. Takes an optional validated PeerEndpoint for the
+    /// local daemon. If nullopt, runs in seed-only mode (peer discovery only).
+    /// The type system enforces that an invalid/empty address can never be
+    /// stored — std::optional<PeerEndpoint> is either valid or absent.
+    CoinBroadcaster(boost::asio::io_context& ioc,
+                    const std::string& symbol,
+                    const std::vector<std::byte>& prefix,
+                    std::optional<PeerEndpoint> local_daemon,
+                    const std::string& data_dir,
+                    const PeerManagerConfig& pm_config)
+        : m_ioc(ioc)
+        , m_symbol(symbol)
+        , m_prefix(prefix)
+        , m_local_daemon(std::move(local_daemon))
+        , m_peer_manager(ioc, symbol, data_dir, pm_config)
+        , m_maintenance_timer(ioc)
+    {
+    }
+
+    /// Convenience constructor: validates a raw NetService via PeerEndpoint::from().
+    /// If validation fails, silently falls back to seed-only mode.
     CoinBroadcaster(boost::asio::io_context& ioc,
                     const std::string& symbol,
                     const std::vector<std::byte>& prefix,
                     const NetService& local_daemon_addr,
                     const std::string& data_dir,
                     const PeerManagerConfig& pm_config)
-        : m_ioc(ioc)
-        , m_symbol(symbol)
-        , m_prefix(prefix)
-        , m_local_daemon_addr(local_daemon_addr)
-        , m_has_local_daemon(!local_daemon_addr.to_string().empty()
-                             && local_daemon_addr.port() > 0)
-        , m_peer_manager(ioc, symbol, data_dir, pm_config)
-        , m_maintenance_timer(ioc)
+        : CoinBroadcaster(ioc, symbol, prefix,
+                          PeerEndpoint::from(local_daemon_addr),
+                          data_dir, pm_config)
     {
+        // Log if validation rejected the address
+        if (!m_local_daemon && local_daemon_addr.port() > 0) {
+            LOG_WARNING << "[" << symbol << "] Local daemon address rejected by validation: "
+                       << local_daemon_addr.to_string()
+                       << " — running in seed-only mode";
+        }
     }
 
-    /// Constructor for seed-only mode (no local daemon specified).
+    /// Seed-only constructor (no local daemon).
     CoinBroadcaster(boost::asio::io_context& ioc,
                     const std::string& symbol,
                     const std::vector<std::byte>& prefix,
                     const std::string& data_dir,
                     const PeerManagerConfig& pm_config)
-        : m_ioc(ioc)
-        , m_symbol(symbol)
-        , m_prefix(prefix)
-        , m_has_local_daemon(false)
-        , m_peer_manager(ioc, symbol, data_dir, pm_config)
-        , m_maintenance_timer(ioc)
+        : CoinBroadcaster(ioc, symbol, prefix,
+                          std::optional<PeerEndpoint>{std::nullopt},
+                          data_dir, pm_config)
     {
     }
 
@@ -171,12 +190,14 @@ public:
     /// Start: register local node (if any), start peer manager, begin connection loop.
     void start()
     {
-        if (m_has_local_daemon) {
+        if (m_local_daemon) {
             LOG_INFO << "[" << m_symbol << "] CoinBroadcaster::start() — prefix="
-                     << m_prefix.size() << " bytes, local_daemon=" << m_local_daemon_addr.to_string()
+                     << m_prefix.size() << " bytes, local_daemon=" << m_local_daemon->to_string()
+                     << " (class=" << static_cast<int>(m_local_daemon->addr_class()) << ")"
                      << " discovery=" << m_peer_manager.discovery_enabled();
-            // Protected local daemon node — always connected, never dropped
-            m_peer_manager.set_local_node(m_local_daemon_addr);
+            // Protected local daemon node — always connected, never dropped.
+            // set_local_node validates via PeerEndpoint internally.
+            m_peer_manager.set_local_node(m_local_daemon->to_net_service());
         } else {
             LOG_INFO << "[" << m_symbol << "] CoinBroadcaster::start() — prefix="
                      << m_prefix.size() << " bytes, seed-only mode (no local daemon)"
@@ -185,14 +206,14 @@ public:
 
         m_peer_manager.start();
 
-        // Connect to local daemon immediately (if specified)
-        if (m_has_local_daemon)
-            connect_peer(m_local_daemon_addr);
+        // Connect to local daemon immediately (if validated)
+        if (m_local_daemon)
+            connect_peer(*m_local_daemon);
 
         schedule_maintenance();
-        if (m_has_local_daemon) {
+        if (m_local_daemon) {
             LOG_INFO << "[" << m_symbol << "] Multi-peer broadcaster started, local="
-                     << m_local_daemon_addr.to_string();
+                     << m_local_daemon->to_string();
         } else {
             LOG_INFO << "[" << m_symbol << "] Multi-peer broadcaster started (seed-only, "
                      << m_peer_manager.peer_count() << " seed peers)";
@@ -388,9 +409,13 @@ public:
     CoinPeerManager& peer_manager() { return m_peer_manager; }
 
 private:
-    void connect_peer(const NetService& addr)
+    /// Connect to a validated peer endpoint. The PeerEndpoint type guarantees
+    /// the address is non-empty, parseable, and has a valid port — no runtime
+    /// checks needed. Wire protocol still uses NetService internally.
+    void connect_peer(const PeerEndpoint& endpoint)
     {
-        auto key = addr.to_string();
+        auto key = endpoint.to_string();
+        auto addr = endpoint.to_net_service();
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (m_peers.count(key)) {
@@ -538,8 +563,7 @@ private:
     boost::asio::io_context& m_ioc;
     std::string m_symbol;
     std::vector<std::byte> m_prefix;
-    NetService m_local_daemon_addr;
-    bool m_has_local_daemon{true};
+    std::optional<PeerEndpoint> m_local_daemon;  // nullopt = seed-only mode
     CoinPeerManager m_peer_manager;
     boost::asio::steady_timer m_maintenance_timer;
 

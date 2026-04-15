@@ -10,6 +10,9 @@
 #include <nlohmann/json.hpp>
 #include <yaml-cpp/yaml.h>
 
+#include <optional>
+#include <string_view>
+
 enum AddrType
 {
     NET_IPV4,
@@ -207,3 +210,128 @@ struct addr_record_t : addr_t
 // {
 //     is.read(std::as_writable_bytes(std::span{&value, 1}));
 // }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Address classification — port of Bitcoin Core's CNetAddr::IsRoutable()
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// RFC-based IP address classification (Bitcoin Core netaddress.h).
+/// classify_address() computes this once; PeerEndpoint caches it.
+enum class AddrClass : uint8_t
+{
+    invalid,        // empty or unparseable
+    unspecified,    // 0.0.0.0/8, ::/128
+    loopback,       // 127.0.0.0/8, ::1
+    link_local,     // 169.254.0.0/16 (RFC3927), fe80::/10 (RFC4862)
+    private_net,    // 10/8, 172.16/12, 192.168/16 (RFC1918), fc00::/7 (RFC4193)
+    carrier_nat,    // 100.64.0.0/10 (RFC6598)
+    documentation,  // 192.0.2/24, 198.51.100/24, 203.0.113/24 (RFC5737)
+    benchmark,      // 198.18.0.0/15 (RFC2544)
+    multicast,      // 224.0.0.0/4, ff00::/8
+    routable        // globally reachable
+};
+
+/// Classify an IP address string using Bitcoin Core's rules.
+/// Returns AddrClass::invalid for empty or unparseable strings.
+AddrClass classify_address(std::string_view ip);
+
+/// True if the address is globally routable (not private, loopback, etc.).
+inline bool is_routable(std::string_view ip) { return classify_address(ip) == AddrClass::routable; }
+
+/// True if the address can be used as a connection target at all
+/// (non-empty, parseable, not unspecified 0.0.0.0). Includes local/private.
+inline bool is_connectable(std::string_view ip)
+{
+    auto c = classify_address(ip);
+    return c != AddrClass::invalid && c != AddrClass::unspecified
+        && c != AddrClass::documentation && c != AddrClass::multicast;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PeerEndpoint — validated network endpoint for peer connections.
+//
+// Invariants enforced at construction via factory (private ctor):
+//   • host is non-empty and parseable as IPv4 or IPv6
+//   • port > 0
+//   • AddrClass is computed and cached
+//
+// Unvalidated NetService stays for wire protocol / serialization.
+// PeerEndpoint is the boundary at the peer management layer.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+class PeerEndpoint
+{
+public:
+    /// Factory: validate and construct. Returns nullopt if host is empty,
+    /// unparseable, unspecified (0.0.0.0), or port is 0.
+    [[nodiscard]] static std::optional<PeerEndpoint> from(
+        const std::string& host, uint16_t port)
+    {
+        if (host.empty() || port == 0) return std::nullopt;
+        auto cls = classify_address(host);
+        if (cls == AddrClass::invalid || cls == AddrClass::unspecified) return std::nullopt;
+        return PeerEndpoint{host, port, cls};
+    }
+
+    /// Factory: validate from existing NetService.
+    [[nodiscard]] static std::optional<PeerEndpoint> from(const NetService& addr)
+    {
+        return from(addr.address(), addr.port());
+    }
+
+    // ── Accessors ──────────────────────────────────────────────────────────
+
+    const std::string& host() const noexcept { return m_host; }
+    uint16_t port() const noexcept { return m_port; }
+    AddrClass addr_class() const noexcept { return m_class; }
+
+    /// True if globally routable (not private, loopback, link-local, etc.)
+    bool is_routable() const noexcept { return m_class == AddrClass::routable; }
+
+    /// True if local: loopback or RFC1918 private.
+    bool is_local() const noexcept
+    {
+        return m_class == AddrClass::loopback || m_class == AddrClass::private_net;
+    }
+
+    std::string to_string() const { return m_host + ":" + std::to_string(m_port); }
+
+    /// Convert back to NetService for existing APIs / wire protocol.
+    NetService to_net_service() const { return NetService(m_host, m_port); }
+
+    // ── Comparison ─────────────────────────────────────────────────────────
+
+    friend bool operator==(const PeerEndpoint& a, const PeerEndpoint& b)
+    { return a.m_host == b.m_host && a.m_port == b.m_port; }
+
+    friend bool operator!=(const PeerEndpoint& a, const PeerEndpoint& b)
+    { return !(a == b); }
+
+    friend bool operator<(const PeerEndpoint& a, const PeerEndpoint& b)
+    { return std::tie(a.m_host, a.m_port) < std::tie(b.m_host, b.m_port); }
+
+    // ── JSON serialization (for peer database persistence) ─────────────────
+
+    friend void to_json(nlohmann::json& j, const PeerEndpoint& ep)
+    {
+        j = nlohmann::json{{"host", ep.m_host}, {"port", ep.m_port}};
+    }
+
+    friend void from_json(const nlohmann::json& j, PeerEndpoint& ep)
+    {
+        // Deserialize into a temporary and validate
+        std::string host = j.at("host").get<std::string>();
+        uint16_t port = j.at("port").get<uint16_t>();
+        auto maybe = PeerEndpoint::from(host, port);
+        if (!maybe) throw std::invalid_argument("invalid PeerEndpoint: " + host + ":" + std::to_string(port));
+        ep = *maybe;
+    }
+
+private:
+    PeerEndpoint(std::string host, uint16_t port, AddrClass cls)
+        : m_host(std::move(host)), m_port(port), m_class(cls) {}
+
+    std::string m_host;
+    uint16_t    m_port;
+    AddrClass   m_class;
+};

@@ -1695,21 +1695,27 @@ int main(int argc, char* argv[]) {
                     / (settings->m_testnet ? "litecoin_testnet" : "litecoin")
                     / "embedded_peers").string();
 
+                // Validate local daemon address via PeerEndpoint (same pattern as DOGE).
+                std::optional<PeerEndpoint> ltc_local_daemon;
+                std::string ltc_daemon_str = "(seed-only)";
                 if (has_local_daemon) {
                     std::string p2p_host = coind_p2p_address.empty() ? rpc_host : coind_p2p_address;
-                    NetService embedded_p2p_addr(p2p_host, static_cast<uint16_t>(
-                        coind_p2p_port > 0 ? coind_p2p_port : 19335));
-                    embedded_broadcaster = std::make_unique<c2pool::merged::CoinBroadcaster>(
-                        ioc, parent_symbol, p2p_prefix, embedded_p2p_addr,
-                        pm_data_dir, c2pool::merged::PeerManagerConfig{});
-                    LOG_INFO << "[EMB-LTC] Local daemon peer: " << embedded_p2p_addr.to_string();
-                } else {
-                    // Seed-only mode: no local daemon, rely on DNS seeds + fixed seeds
-                    embedded_broadcaster = std::make_unique<c2pool::merged::CoinBroadcaster>(
-                        ioc, parent_symbol, p2p_prefix,
-                        pm_data_dir, c2pool::merged::PeerManagerConfig{});
-                    LOG_INFO << "[EMB-LTC] Seed-only mode (no --coind-p2p-address specified)";
+                    uint16_t p2p_port = static_cast<uint16_t>(
+                        coind_p2p_port > 0 ? coind_p2p_port : 19335);
+                    ltc_local_daemon = PeerEndpoint::from(p2p_host, p2p_port);
+                    if (ltc_local_daemon) {
+                        ltc_daemon_str = ltc_local_daemon->to_string();
+                    } else {
+                        LOG_WARNING << "[EMB-LTC] Invalid local daemon address: "
+                                   << p2p_host << ":" << p2p_port
+                                   << " — falling back to seed-only mode";
+                    }
                 }
+                embedded_broadcaster = std::make_unique<c2pool::merged::CoinBroadcaster>(
+                    ioc, parent_symbol, p2p_prefix,
+                    std::move(ltc_local_daemon),
+                    pm_data_dir, c2pool::merged::PeerManagerConfig{});
+                LOG_INFO << "[EMB-LTC] Broadcaster: " << ltc_daemon_str;
 
                 // Wire DNS seeds + fixed seed fallback into peer manager
                 auto& pm = embedded_broadcaster->peer_manager();
@@ -1743,16 +1749,9 @@ int main(int argc, char* argv[]) {
                     });
 
                 embedded_broadcaster->start();
-                if (has_local_daemon) {
-                    std::string p2p_host = coind_p2p_address.empty() ? rpc_host : coind_p2p_address;
-                    LOG_INFO << "[LTC] Embedded broadcaster started, local="
-                             << p2p_host << ":" << (coind_p2p_port > 0 ? coind_p2p_port : 19335)
-                             << " + " << ltc::coin::ltc_dns_seeds(settings->m_testnet).size() << " DNS seeds";
-                } else {
-                    LOG_INFO << "[LTC] Embedded broadcaster started (seed-only), "
-                             << ltc::coin::ltc_dns_seeds(settings->m_testnet).size() << " DNS seeds + "
-                             << ltc::coin::ltc_fixed_seeds(settings->m_testnet).size() << " fixed seeds";
-                }
+                LOG_INFO << "[LTC] Embedded broadcaster started, daemon=" << ltc_daemon_str
+                         << " dns_seeds=" << ltc::coin::ltc_dns_seeds(settings->m_testnet).size()
+                         << " fixed_seeds=" << ltc::coin::ltc_fixed_seeds(settings->m_testnet).size();
                 // NOTE: set_on_new_headers and set_embedded_node are wired after web_server is created below
 
             } else {
@@ -4997,9 +4996,20 @@ int main(int argc, char* argv[]) {
                             } else if (cfg.symbol == "BTC" || cfg.symbol == "btc") {
                                 pm_cfg.valid_ports = {8333, 18333};
                             }
+                            // Validate the P2P address via PeerEndpoint.
+                            // In embedded mode with no daemon, p2p_address is empty —
+                            // PeerEndpoint::from() returns nullopt → seed-only mode.
+                            auto local_daemon = PeerEndpoint::from(cfg.p2p_address, cfg.p2p_port);
+                            std::string local_daemon_str = local_daemon
+                                ? local_daemon->to_string() : "(seed-only)";
+                            if (!local_daemon) {
+                                LOG_INFO << "[" << cfg.symbol << "] No valid local daemon P2P address"
+                                         << " ('" << cfg.p2p_address << ":" << cfg.p2p_port << "')"
+                                         << " — broadcaster will use seed-only mode";
+                            }
                             auto broadcaster = std::make_unique<c2pool::merged::CoinBroadcaster>(
                                 ioc, cfg.symbol, prefix,
-                                NetService(cfg.p2p_address, cfg.p2p_port),
+                                std::move(local_daemon),
                                 ".", pm_cfg);
 
                             // Wire DNS seeds + fixed seed fallback for merged chain
@@ -5475,7 +5485,7 @@ int main(int argc, char* argv[]) {
 
                             broadcaster->start();
                             LOG_INFO << "Merged multi-peer broadcaster: " << cfg.symbol
-                                     << " → " << cfg.p2p_address << ":" << cfg.p2p_port;
+                                     << " → " << local_daemon_str;
                             // Register for /api/coin_peers endpoint
                             coin_peer_sources->push_back(broadcaster.get());
                             merged_broadcasters[cfg.chain_id] = std::move(broadcaster);
