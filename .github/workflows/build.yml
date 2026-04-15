@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [master, p2pool-v36-compat]
+    branches: [master, p2pool-v36-compat, qt-control-panel-design]
   pull_request:
     branches: [master]
 
@@ -97,3 +97,91 @@ jobs:
           name: test-results
           path: build_ci/Testing/
           retention-days: 7
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # c2pool-qt Desktop GUI builds
+  # ══════════════════════════════════════════════════════════════════════════
+
+  qt-linux:
+    name: Qt GUI / Linux x86_64
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Qt 6.5
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.5.3'
+          modules: 'qtbase'
+          cache: true
+
+      - name: Configure
+        run: cmake -S ui/c2pool-qt -B build-qt -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build-qt -j$(nproc)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: c2pool-qt-linux-x86_64
+          path: build-qt/c2pool-qt
+          retention-days: 14
+
+  qt-macos:
+    name: Qt GUI / macOS arm64
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Qt 6
+        run: brew install qt@6
+
+      - name: Configure
+        run: |
+          cmake -S ui/c2pool-qt -B build-qt \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH=$(brew --prefix qt@6)
+
+      - name: Build
+        run: cmake --build build-qt -j$(sysctl -n hw.ncpu)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: c2pool-qt-macos-arm64
+          path: build-qt/c2pool-qt.app
+          retention-days: 14
+
+  qt-windows:
+    name: Qt GUI / Windows x86_64
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Qt 6.5
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.5.3'
+          modules: 'qtbase'
+          cache: true
+
+      - name: Configure
+        run: cmake -S ui/c2pool-qt -B build-qt -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        run: cmake --build build-qt --config Release
+
+      - name: Deploy Qt DLLs
+        run: |
+          windeployqt build-qt/Release/c2pool-qt.exe --release --no-translations
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: c2pool-qt-windows-x86_64
+          path: build-qt/Release/
+          retention-days: 14
