@@ -5,6 +5,9 @@ yaml-cpp/0.8.0
 gtest/1.14.0
 leveldb/1.23
 
+[options]
+boost/*:without_exception=False
+
 [generators]
 CMakeDeps
 CMakeToolchain
