@@ -5551,6 +5551,29 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
         result["address_warnings"] = warnings;
     }
 
+    // ── AutoRatchet effective state (matches p2pool web.py:382-391) ──
+    // c2pool has no live AutoRatchet object, so derive state from chain data.
+    // p2pool: confirmed = chain_height >= chain_length*3 AND 100% v36 shares
+    //         activated = sampling >= 95%
+    //         voting = otherwise (transition in progress)
+    {
+        std::string effective_state;
+        if (confirmed) {
+            effective_state = "confirmed";
+        } else if (sampling_signaling >= 95) {
+            effective_state = "activated";
+        } else {
+            effective_state = "voting";
+        }
+        result["auto_ratchet"] = {
+            {"state", effective_state},
+            {"persisted_state", effective_state},
+            {"activated_at", nullptr},
+            {"activated_height", nullptr},
+            {"confirmed_at", nullptr}
+        };
+    }
+
     return result;
 }
 
