@@ -140,41 +140,49 @@ void PagePeers::refreshLtcPeers(ApiClient* api)
 
 void PagePeers::refreshDogePeers(ApiClient* api)
 {
-    api->getJson("/merged_stats",
+    // Use /merged_broadcaster_status which has DOGE peers (like /broadcaster_status has LTC peers)
+    api->getJson("/merged_broadcaster_status",
         [this](const QJsonDocument& doc) {
             if (!doc.isObject()) return;
             const auto obj = doc.object();
-            const auto networks = obj.value("networks").toObject();
+            const auto peers = obj.value("peers").toArray();
+            const auto chains = obj.value("chains").toObject();
 
-            if (networks.contains("DOGE")) {
-                const auto doge = networks.value("DOGE").toObject();
-                dogeCountLabel_->setText("DOGE Merged Mining");
-
-                dogeTable_->setSortingEnabled(false);
-                dogeTable_->setRowCount(7);
-                int row = 0;
-                auto addRow = [&](const QString& prop, const QString& val, const QString& detail = {}) {
-                    dogeTable_->setItem(row, 0, new QTableWidgetItem(prop));
-                    dogeTable_->setItem(row, 1, new QTableWidgetItem(val));
-                    dogeTable_->setItem(row, 2, new QTableWidgetItem(detail));
-                    row++;
-                };
-
-                addRow("Chain ID", QString::number(doge.value("chain_id").toInt()));
-                addRow("Height", QString::number(doge.value("current_height").toInt()));
-                addRow("Difficulty", QString::number(doge.value("difficulty").toDouble() / 1e6, 'f', 2) + " M");
-                addRow("Block Value", QString::number(doge.value("block_value").toDouble(), 'f', 2) + " DOGE");
-                addRow("Blocks Found", QString::number(doge.value("blocks_found").toInt()));
-                addRow("Multi-address", doge.value("multiaddress").toBool() ? "yes" : "no");
-                addRow("Tip Hash", doge.value("current_tip").toString().left(16) + "...");
-
-                dogeTable_->setRowCount(row);
-                dogeTable_->setSortingEnabled(true);
-            } else {
-                dogeCountLabel_->setText("DOGE: not configured");
-                dogeTable_->setRowCount(0);
+            // Show DOGE chain info + peers
+            QString label = "DOGE Peers: " + QString::number(peers.size());
+            if (chains.contains("DOGE")) {
+                const auto doge = chains.value("DOGE").toObject();
+                label += QString(" | height %1 | %2 blocks found")
+                    .arg(doge.value("current_height").toInt())
+                    .arg(doge.value("blocks_found").toInt());
             }
+            dogeCountLabel_->setText(label);
+
+            // Table matches LTC peer format
+            dogeTable_->setColumnCount(4);
+            dogeTable_->setHorizontalHeaderLabels({"Address", "Version", "Height", "Status"});
+            dogeTable_->horizontalHeader()->setStretchLastSection(true);
+            dogeTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+
+            dogeTable_->setSortingEnabled(false);
+            dogeTable_->setRowCount(peers.size());
+            for (int i = 0; i < peers.size(); ++i) {
+                const auto peer = peers[i].toObject();
+                dogeTable_->setItem(i, 0, new QTableWidgetItem(
+                    peer.value("addr").toString()));
+                dogeTable_->setItem(i, 1, new QTableWidgetItem(
+                    peer.value("subver").toString()));
+                dogeTable_->setItem(i, 2, new QTableWidgetItem(
+                    QString::number(peer.value("startingheight").toInt())));
+                const bool connected = peer.value("connected").toBool();
+                auto* statusItem = new QTableWidgetItem(connected ? "connected" : "disconnected");
+                statusItem->setForeground(connected ? QColor(74, 222, 128) : QColor(239, 68, 68));
+                dogeTable_->setItem(i, 3, statusItem);
+            }
+            dogeTable_->setSortingEnabled(true);
         },
-        [](const QString&) { }
+        [this](const QString&) {
+            dogeCountLabel_->setText("DOGE: no data");
+        }
     );
 }

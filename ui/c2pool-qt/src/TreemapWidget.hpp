@@ -107,7 +107,8 @@ private:
         squarify(0, entries_.size(), 0, 0, width(), height());
     }
 
-    void resizeEvent(QResizeEvent*) override { layoutRects(); update(); }
+    void resizeEvent(QResizeEvent*) override { layoutRects(); }
+    void showEvent(QShowEvent*) override { layoutRects(); }
 
     // Squarified treemap algorithm
     void squarify(int start, int end, double x, double y, double w, double h) {

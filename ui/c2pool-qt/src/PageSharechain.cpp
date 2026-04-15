@@ -49,13 +49,14 @@ DefragWidget::DefragWidget(QWidget* parent)
 {
     setMouseTracking(true);
 
-    // Custom floating tooltip (follows cursor, works on Wayland)
-    floatingTip_ = new QLabel(this);
-    floatingTip_->setWindowFlags(Qt::ToolTip);
+    // Custom floating tooltip parented to top-level window (follows cursor)
+    floatingTip_ = new QLabel(window());
     floatingTip_->setTextFormat(Qt::RichText);
     floatingTip_->setStyleSheet(
-        "background: #1e293b; color: #e2e8f0; border: 1px solid #475569; "
-        "border-radius: 6px; padding: 8px; font-size: 11px;");
+        "QLabel { background: rgba(30,41,59,0.95); color: #e2e8f0; "
+        "border: 1px solid #475569; border-radius: 6px; padding: 8px; "
+        "font-size: 11px; }");
+    floatingTip_->setAttribute(Qt::WA_TransparentForMouseEvents);
     floatingTip_->hide();
 }
 
@@ -137,9 +138,10 @@ void DefragWidget::mouseMoveEvent(QMouseEvent* event)
                 .arg(diff, 0, 'f', 1)
                 .arg(status));
         floatingTip_->adjustSize();
-        // Position 14px to right and below cursor (like web dashboard)
-        QPoint globalPos = event->globalPosition().toPoint();
-        floatingTip_->move(globalPos.x() + 14, globalPos.y() + 14);
+        // Map cursor position to the tooltip's parent (main window)
+        QPoint inParent = mapTo(floatingTip_->parentWidget(), event->pos());
+        floatingTip_->move(inParent.x() + 14, inParent.y() + 14);
+        floatingTip_->raise();
         floatingTip_->show();
     } else {
         floatingTip_->hide();
