@@ -21,12 +21,10 @@ Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 
 | OS | Version | Compiler | Boost | Arch | Status |
 |----|---------|----------|-------|------|--------|
-| Ubuntu | 24.04.4 LTS | GCC 13.3 | 1.78 (Conan) | x86_64 | Working |
+| Ubuntu | 24.04.4 LTS | GCC 13.3 | 1.90 (Conan) | x86_64 | Working |
 | macOS | 26.3.1 (Tahoe) | Apple Clang 21.0 | 1.90 (Homebrew) | x86_64 Intel | Working |
 | macOS | — | Apple Clang | 1.90 (Homebrew) | arm64 (M-series) | Supported, untested |
-| Windows | 11 (26100) | MSVC 2022 | 1.78 (Conan) | x86_64 | Working |
-> Other OS versions or Boost releases may require minor fixes.
-> Boost API changes between major versions are the most common source of build failures.
+| Windows | 11 (26100) | MSVC 2022 | 1.90 (Conan) | x86_64 | Working |
 
 ---
 

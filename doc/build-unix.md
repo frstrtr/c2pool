@@ -30,7 +30,7 @@ The same steps work on Ubuntu 22.04 and Debian 12 with minor version differences
 | Kernel | 6.17.0 |
 | GCC | 13.3.0 |
 | CMake | 3.28.3 |
-| Boost | 1.78.0 (via Conan) / 1.83.0 (system) |
+| Boost | 1.90.0 (via Conan) |
 | LevelDB | 1.23 |
 | libsecp256k1 | 0.4.1 |
 | Architecture | x86_64 |
@@ -64,7 +64,7 @@ sudo apt-get install -y \
 | `libsecp256k1-dev` | secp256k1 — ECDSA crypto for btclibs |
 | `python3-pip` | needed to install Conan |
 
-> All other dependencies (Boost 1.78, nlohmann_json, yaml-cpp, GoogleTest, zlib,
+> All other dependencies (Boost 1.90, nlohmann_json, yaml-cpp, GoogleTest, zlib,
 > bzip2, libbacktrace) are downloaded and compiled automatically by Conan.
 
 ---
@@ -121,7 +121,7 @@ conan install .. \
 This downloads and compiles all managed dependencies into `~/.conan2/` and
 generates `conan_toolchain.cmake` and `CMakePresets.json` in `build/`.
 
-**First run**: ~15–20 min (Boost 1.78 compiles from source).  
+**First run**: ~15–20 min (Boost 1.90 compiles from source if no pre-built binary exists).  
 **Subsequent runs**: seconds (packages are cached in `~/.conan2/`).
 
 ---

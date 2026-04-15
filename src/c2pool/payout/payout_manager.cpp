@@ -11,13 +11,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <core/filesystem.hpp>
-// Boost 1.88+ ships process v2 as default; we need v1 API (ipstream, child)
-#include <boost/version.hpp>
-#if BOOST_VERSION >= 108800
-#include <boost/process/v1.hpp>
-#else
 #include <boost/process.hpp>
-#endif
 #include <nlohmann/json.hpp>
 #include <core/log.hpp>
 
@@ -1101,11 +1095,7 @@ bool PayoutManager::try_detect_wallet_address() {
             return false;
         }
 
-#if BOOST_VERSION >= 108800
-        namespace bp = boost::process::v1;
-#else
         namespace bp = boost::process;
-#endif
         bp::ipstream pipe_stream;
         bp::child proc(cli_cmd + " getnewaddress \"c2pool_node_owner\"",
                        bp::std_out > pipe_stream, bp::std_err > bp::null);

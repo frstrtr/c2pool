@@ -1,20 +1,18 @@
 #include "random.hpp"
-#include <boost/random.hpp>
+#include <random>
 #include <ctime>
 #include <cmath>
 
 namespace core::random
 {
-    using namespace boost::random;
-
-    boost::random::mt19937 generator(std::time(nullptr));
+    std::mt19937 generator(std::time(nullptr));
 
     ///[min, max)
     int random_int(int min, int max)
     {
         if (min == max)
             return min;
-        boost::random::uniform_int_distribution<> rnd(min, max - 1);
+        std::uniform_int_distribution<> rnd(min, max - 1);
         return rnd(generator);
     }
 
@@ -22,7 +20,7 @@ namespace core::random
     float random_float(float min, float max)
     {
         float Min = float(min), Max = float(max);
-        boost::random::uniform_int_distribution<> rnd(Min, Max);
+        std::uniform_int_distribution<> rnd(Min, Max);
         float res = ((float)rnd(generator) / Max);
         float range = Max - Min;
         res = (res * range) + Min;
@@ -51,14 +49,13 @@ namespace core::random
     /// l = desired mean value
     double expovariate(double l)
     {
-        boost::random::exponential_distribution<double> rnd(l);
+        std::exponential_distribution<double> rnd(l);
         return rnd(generator);
-//        return (log(RandomInt(1, RAND_MAX) + 1) - log(RAND_MAX)) / (-1 / l);
     }
 
     unsigned long long random_nonce()
     {
-        boost::random::uniform_int_distribution<unsigned long long> rnd(0, 0xFFFFFFFFFFFFFFFF);
+        std::uniform_int_distribution<unsigned long long> rnd(0, 0xFFFFFFFFFFFFFFFF);
         return rnd(generator);
     }
 
