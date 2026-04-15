@@ -33,7 +33,6 @@ set(source
     address_utils.hpp address_utils.cpp
     leveldb_store.hpp leveldb_store.cpp
     address_validator.hpp address_validator.cpp
-    boost_throw_exception.cpp
 )
 
 find_package(yaml-cpp REQUIRED)
