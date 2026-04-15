@@ -167,8 +167,10 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
     // Suggested difficulty from miner (mining.suggest_difficulty)
     double suggested_difficulty_ = 0.0;
 
-    // Periodic work-push timer
-    std::shared_ptr<boost::asio::steady_timer> work_push_timer_;
+    // Periodic work-push timer — member (not shared_ptr) so RAII guarantees
+    // the timer outlives all its callbacks.  Matches p2pool Twisted semantics
+    // where the transport/protocol object owns its timers.
+    boost::asio::steady_timer work_push_timer_;
 
 public:
     explicit StratumSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface,

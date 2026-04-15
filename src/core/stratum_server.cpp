@@ -281,6 +281,7 @@ StratumSession::StratumSession(tcp::socket socket, std::shared_ptr<MiningInterfa
     , mining_interface_(mining_interface)
     , server_(server)
     , connected_at_(std::chrono::steady_clock::now())
+    , work_push_timer_(socket_.get_executor())
 {
     subscription_id_ = generate_subscription_id();
     extranonce1_ = generate_extranonce1();
@@ -1404,21 +1405,19 @@ void StratumSession::start_periodic_work_push()
     // p2pool has no periodic push — work is pushed purely by events (new block,
     // new best_share, VARDIFF). This 30-second fallback catches edge cases where
     // an event-driven notify_all() might miss a session.
-    work_push_timer_ = std::make_shared<boost::asio::steady_timer>(socket_.get_executor());
-    work_push_timer_->expires_after(std::chrono::seconds(5));
+    work_push_timer_.expires_after(std::chrono::seconds(5));
     schedule_work_push_timer();
 }
 
 void StratumSession::schedule_work_push_timer()
 {
-    // weak_from_this(): session dies naturally when removed from sessions_ set
-    // on disconnect, instead of being kept alive by the timer's strong reference.
-    std::weak_ptr<StratumSession> weak_self = weak_from_this();
-    work_push_timer_->async_wait([weak_self](boost::system::error_code ec) {
-        if (ec) return;
-        auto self = weak_self.lock();
-        if (!self || !self->is_connected()) return;
-        self->work_push_timer_->expires_after(std::chrono::seconds(30));
+    // shared_from_this(): session stays alive until callback fires, preventing
+    // use-after-free on the member timer.  cancel_timers() closes the socket,
+    // so is_connected() returns false for any already-dequeued callbacks.
+    // Matches p2pool Twisted: transport owns timers, connectionLost is teardown.
+    work_push_timer_.async_wait([self = shared_from_this()](boost::system::error_code ec) {
+        if (ec || !self->is_connected()) return;
+        self->work_push_timer_.expires_after(std::chrono::seconds(30));
         self->schedule_work_push_timer();
         try {
             auto current_gen = self->mining_interface_->get_work_generation();
@@ -1434,10 +1433,13 @@ void StratumSession::schedule_work_push_timer()
 
 void StratumSession::cancel_timers()
 {
-    if (work_push_timer_) {
-        work_push_timer_->cancel();
-        work_push_timer_.reset();
-    }
+    // Cancel pending timer — callback fires with ec=operation_aborted → returns.
+    // Timer is a member, so it outlives all its callbacks (no use-after-free).
+    work_push_timer_.cancel();
+    // Close socket so is_connected() returns false for any already-dequeued
+    // callbacks that fire with ec=success after cancel().
+    boost::system::error_code ec;
+    socket_.close(ec);
 }
 
 // Parse multi-chain addresses from username string.
