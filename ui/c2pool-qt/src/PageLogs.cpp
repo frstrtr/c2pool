@@ -4,7 +4,9 @@
 #include <QFileDialog>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QFont>
 #include <QMessageBox>
+#include <QScrollBar>
 #include <QStandardPaths>
 #include <QUrlQuery>
 #include <QVBoxLayout>
@@ -32,13 +34,45 @@ PageLogs::PageLogs(QWidget* parent)
 
     exportButton_ = new QPushButton("Export Logs", this);
     controls->addWidget(exportButton_);
-    controls->addStretch(1);
 
+    controls->addWidget(new QLabel("  |  "));
+
+    liveTailBtn_ = new QPushButton("Live Tail: OFF", this);
+    liveTailBtn_->setCheckable(true);
+    controls->addWidget(liveTailBtn_);
+
+    liveLevelFilter_ = new QComboBox(this);
+    liveLevelFilter_->addItems({"all", "error", "warning", "info", "debug", "trace"});
+    liveLevelFilter_->setToolTip("Client-side log level filter");
+    controls->addWidget(liveLevelFilter_);
+
+    controls->addStretch(1);
     root->addLayout(controls);
 
     logView_ = new QPlainTextEdit(this);
     logView_->setReadOnly(true);
+    logView_->setMaximumBlockCount(10000);
+    logView_->setFont(QFont("Monospace", 9));
     root->addWidget(logView_);
+
+    // Live tail timer
+    liveTailTimer_.setInterval(2000);
+    connect(&liveTailTimer_, &QTimer::timeout, this, &PageLogs::fetchLiveLogs);
+
+    connect(liveTailBtn_, &QPushButton::toggled, this, [this](bool checked) {
+        liveTailActive_ = checked;
+        if (checked) {
+            liveTailBtn_->setText("Live Tail: ON");
+            liveTailBtn_->setStyleSheet("color: #1d7f3b; font-weight: bold;");
+            logView_->clear();
+            liveTailTimer_.start();
+            fetchLiveLogs();
+        } else {
+            liveTailBtn_->setText("Live Tail: OFF");
+            liveTailBtn_->setStyleSheet("");
+            liveTailTimer_.stop();
+        }
+    });
 
     connect(exportButton_, &QPushButton::clicked, this, [this]() {
         if (!api_) {
@@ -96,9 +130,48 @@ QString PageLogs::buildExportPath() const
     );
 }
 
+void PageLogs::fetchLiveLogs()
+{
+    if (!api_ || !liveTailActive_) return;
+
+    api_->getText("/web/log",
+        [this](const QString& text) {
+            const QString filter = liveLevelFilter_->currentText();
+            if (filter == "all") {
+                logView_->setPlainText(text);
+            } else {
+                // Client-side filter: show only lines containing the level keyword
+                QStringList filtered;
+                const auto lines = text.split('\n');
+                for (const auto& line : lines) {
+                    const auto upper = line.toUpper();
+                    if (filter == "error" && upper.contains("ERROR"))
+                        filtered << line;
+                    else if (filter == "warning" && (upper.contains("WARN") || upper.contains("ERROR")))
+                        filtered << line;
+                    else if (filter == "info" && (upper.contains("INFO") || upper.contains("WARN") || upper.contains("ERROR")))
+                        filtered << line;
+                    else if (filter == "debug" && !upper.contains("TRACE"))
+                        filtered << line;
+                    else if (filter == "trace")
+                        filtered << line;
+                }
+                logView_->setPlainText(filtered.join('\n'));
+            }
+            // Auto-scroll to bottom
+            auto* sb = logView_->verticalScrollBar();
+            sb->setValue(sb->maximum());
+        },
+        [](const QString&) { }
+    );
+}
+
 void PageLogs::refresh(ApiClient* api)
 {
     api_ = api;
+
+    if (liveTailActive_)
+        return;  // Don't overwrite live tail
 
     api->getText("/web/log",
         [this](const QString& text) {

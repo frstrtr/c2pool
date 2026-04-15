@@ -49,7 +49,7 @@ MainWindow::MainWindow(QWidget* parent)
     auto* layout = new QHBoxLayout(central);
 
     navList_ = new QListWidget(central);
-    navList_->addItems({"Launch", "Overview", "Mining", "Sharechain", "Logs"});
+    navList_->addItems({"Launch", "Overview", "Mining", "Sharechain", "Logs", "Peers"});
     navList_->setFixedWidth(180);
     layout->addWidget(navList_);
 
@@ -65,6 +65,8 @@ MainWindow::MainWindow(QWidget* parent)
     stack_->addWidget(miningPage_);     // index 2
     stack_->addWidget(sharechainPage_); // index 3
     stack_->addWidget(logsPage_);       // index 4
+    peersPage_ = new PagePeers(stack_);
+    stack_->addWidget(peersPage_);      // index 5
 
     layout->addWidget(stack_, 1);
     setCentralWidget(central);
@@ -196,6 +198,10 @@ void MainWindow::refreshCurrentPage()
     case 4:
         logsPage_->refresh(&api_);
         statusLabel_->setText("Logs refreshed");
+        break;
+    case 5:
+        peersPage_->refresh(&api_);
+        statusLabel_->setText("Peers refreshed");
         break;
     default:
         break;

@@ -21,6 +21,8 @@ add_executable(c2pool-qt
     src/PageMining.cpp
     src/PageSharechain.cpp
     src/PageLogs.cpp
+    src/PagePeers.cpp
+    src/SseClient.cpp
 )
 
 target_include_directories(c2pool-qt PRIVATE src)

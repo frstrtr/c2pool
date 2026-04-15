@@ -22,5 +22,12 @@ private:
     QLabel* sharesValue_;
     QLabel* uniqueMinersValue_;
     QLabel* peersValue_;
+
+    // Enhanced stats
+    QLabel* luckValue_;
+    QLabel* v36StatusValue_;
+    QLabel* broadcasterValue_;
+    QLabel* mergedStatsValue_;
+
     QLabel* statusValue_;
 };

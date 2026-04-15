@@ -37,6 +37,19 @@ PageOverview::PageOverview(QWidget* parent)
     chainForm->addRow("P2P Connections:", peersValue_);
     layout->addWidget(chainGroup);
 
+    // Enhanced stats
+    auto* extraGroup = new QGroupBox("Extended Status", this);
+    auto* extraForm = new QFormLayout(extraGroup);
+    luckValue_ = new QLabel("-");
+    extraForm->addRow("Pool Luck:", luckValue_);
+    v36StatusValue_ = new QLabel("-");
+    extraForm->addRow("V36 Status:", v36StatusValue_);
+    broadcasterValue_ = new QLabel("-");
+    extraForm->addRow("Broadcaster:", broadcasterValue_);
+    mergedStatsValue_ = new QLabel("-");
+    extraForm->addRow("Merged Mining:", mergedStatsValue_);
+    layout->addWidget(extraGroup);
+
     statusValue_ = new QLabel("Idle");
     layout->addWidget(statusValue_);
     layout->addStretch();
@@ -103,6 +116,53 @@ void PageOverview::refresh(ApiClient* api)
                 QString::number(obj.value("total_shares").toInt()));
             const auto miners = obj.value("shares_by_miner").toObject();
             uniqueMinersValue_->setText(QString::number(miners.size()));
+        },
+        [](const QString&) { }
+    );
+
+    // Luck stats
+    api->getJson("/luck_stats",
+        [this](const QJsonDocument& doc) {
+            if (!doc.isObject()) return;
+            const auto obj = doc.object();
+            const double luck = obj.value("luck_percent").toDouble();
+            luckValue_->setText(QString("%1%").arg(luck, 0, 'f', 1));
+        },
+        [](const QString&) { }
+    );
+
+    // V36 status
+    api->getJson("/v36_status",
+        [this](const QJsonDocument& doc) {
+            if (!doc.isObject()) return;
+            const auto obj = doc.object();
+            const QString phase = obj.value("phase").toString("unknown");
+            v36StatusValue_->setText(phase);
+        },
+        [](const QString&) { }
+    );
+
+    // Broadcaster status
+    api->getJson("/broadcaster_status",
+        [this](const QJsonDocument& doc) {
+            if (!doc.isObject()) return;
+            const auto obj = doc.object();
+            const bool ok = obj.value("connected").toBool();
+            broadcasterValue_->setText(ok ? "connected" : "disconnected");
+            broadcasterValue_->setStyleSheet(ok ? "color: green;" : "color: red;");
+        },
+        [](const QString&) { }
+    );
+
+    // Merged mining stats
+    api->getJson("/merged_stats",
+        [this](const QJsonDocument& doc) {
+            if (!doc.isObject()) return;
+            const auto obj = doc.object();
+            const int chains = obj.value("chains").toInt();
+            const int blocks = obj.value("total_blocks").toInt();
+            mergedStatsValue_->setText(
+                QString("%1 chain(s), %2 blocks found").arg(chains).arg(blocks));
         },
         [](const QString&) { }
     );

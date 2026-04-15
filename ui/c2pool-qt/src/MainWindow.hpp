@@ -5,7 +5,9 @@
 #include "PageLogs.hpp"
 #include "PageMining.hpp"
 #include "PageOverview.hpp"
+#include "PagePeers.hpp"
 #include "PageSharechain.hpp"
+#include "SseClient.hpp"
 
 #include <QLabel>
 #include <QLineEdit>
@@ -48,7 +50,9 @@ private:
     PageMining*    miningPage_;
     PageLogs*      logsPage_;
     PageSharechain* sharechainPage_;
+    PagePeers*     peersPage_;
 
+    SseClient sseClient_;
     QTimer refreshTimer_;
     bool lastApiOnline_{false};
 };
