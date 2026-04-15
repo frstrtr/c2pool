@@ -1,7 +1,9 @@
 #include "PageLaunch.hpp"
+#include "ConfigSerializer.hpp"
 #include "ProcessLauncher.hpp"
 
 #include <QDir>
+#include <QFileDialog>
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
@@ -674,6 +676,34 @@ void PageLaunch::setupUi()
         configFileEdit_->setPlaceholderText("path/to/config.yaml (optional)");
         configFileEdit_->setToolTip("--config  (load settings from YAML config file)");
         form->addRow("Config file:", configFileEdit_);
+
+        auto* configBtnRow = new QHBoxLayout;
+        importConfigBtn_ = new QPushButton("Import Config...");
+        importConfigBtn_->setToolTip("Load a YAML config file and populate all form fields");
+        exportConfigBtn_ = new QPushButton("Export Config...");
+        exportConfigBtn_->setToolTip("Save current form state as a YAML config file");
+        configBtnRow->addWidget(importConfigBtn_);
+        configBtnRow->addWidget(exportConfigBtn_);
+        configBtnRow->addStretch();
+        form->addRow("", configBtnRow);
+
+        connect(importConfigBtn_, &QPushButton::clicked, this, [this]() {
+            const QString path = QFileDialog::getOpenFileName(
+                this, "Import c2pool Config", QString(), "YAML files (*.yaml *.yml);;All files (*)");
+            if (path.isEmpty()) return;
+            const auto config = ConfigSerializer::loadYaml(path);
+            ConfigSerializer::toPageLaunch(config, this);
+            onBuildPreview();
+        });
+
+        connect(exportConfigBtn_, &QPushButton::clicked, this, [this]() {
+            const QString path = QFileDialog::getSaveFileName(
+                this, "Export c2pool Config", "c2pool.yaml", "YAML files (*.yaml *.yml);;All files (*)");
+            if (path.isEmpty()) return;
+            saveSettings();  // ensure QSettings is up-to-date
+            const auto config = ConfigSerializer::fromPageLaunch(this);
+            ConfigSerializer::saveYaml(config, path);
+        });
 
         messageBlobEdit_ = new QLineEdit;
         messageBlobEdit_->setPlaceholderText("hex string (optional, v36+)");

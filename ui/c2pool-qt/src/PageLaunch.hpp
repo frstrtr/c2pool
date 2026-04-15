@@ -179,6 +179,8 @@ private:
 
     // ── Advanced ────────────────────────────────────────────────────────────
     QLineEdit* configFileEdit_;      ///< --config (YAML file)
+    QPushButton* importConfigBtn_;   ///< Import YAML config into form
+    QPushButton* exportConfigBtn_;   ///< Export form state as YAML
     QLineEdit* messageBlobEdit_;     ///< --message-blob-hex
     QLineEdit* coinbaseTextEdit_;    ///< --coinbase-text
 
