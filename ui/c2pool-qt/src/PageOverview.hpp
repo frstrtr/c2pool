@@ -26,8 +26,12 @@ private:
     // Enhanced stats
     QLabel* luckValue_;
     QLabel* v36StatusValue_;
-    QLabel* broadcasterValue_;
-    QLabel* mergedStatsValue_;
+
+    // Daemon health
+    QLabel* ltcDaemonValue_;
+    QLabel* ltcHeightValue_;
+    QLabel* dogeDaemonValue_;
+    QLabel* dogeHeightValue_;
 
     QLabel* statusValue_;
 };

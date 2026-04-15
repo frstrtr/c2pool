@@ -7,6 +7,8 @@
 #include <QScrollArea>
 #include <QWidget>
 
+#include <QTableWidget>
+
 #include <map>
 #include <set>
 #include <vector>
@@ -14,14 +16,20 @@
 class ApiClient;
 
 /// Per-share data received from the /sharechain/window endpoint.
+/// API uses compact keys: H=hash, h=short_hash, m=miner, t=timestamp,
+/// s=stale, V=version, v=verified, a=target_bits, b=target, dv=desired_version
 struct ShareEntry {
-    QString hash;       // truncated hex
-    QString miner;      // hex pubkey_hash or address
-    uint32_t timestamp{0};
-    int stale{0};       // 0=none, 253=orphan, 254=doa
-    int version{0};
-    bool verified{false};
-    int pos{0};         // position in chain (0 = newest)
+    QString hash;       // H: full 64-char hex hash
+    QString shortHash;  // h: first 16-char hex
+    QString miner;      // m: miner address (ltc1q.../M.../L...)
+    uint32_t timestamp{0}; // t: unix epoch
+    int stale{0};       // s: 0=valid, 253=orphan, 254=doa
+    int version{0};     // V: share protocol version (35/36)
+    int desiredVersion{0}; // dv: desired version for signaling
+    bool verified{false};  // v: verified by local node
+    uint32_t targetBits{0}; // a: target in compact bits
+    uint32_t target{0};    // b: target value
+    int pos{0};         // computed position in display order
 };
 
 /// Custom QWidget that renders the defragmenter-style grid.
@@ -82,6 +90,9 @@ private:
     QScrollArea*  scrollArea_;
     QPushButton*  selectAllBtn_;
     QPushButton*  deselectAllBtn_;
+
+    // PPLNS payout table
+    QTableWidget* pplnsTable_;
 
     // Data
     std::vector<ShareEntry> shares_;

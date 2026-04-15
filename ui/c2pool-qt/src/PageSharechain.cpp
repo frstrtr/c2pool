@@ -3,6 +3,7 @@
 
 #include <QDateTime>
 #include <QHBoxLayout>
+#include <QHeaderView>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QPainter>
@@ -99,19 +100,32 @@ bool DefragWidget::event(QEvent* event)
         if (idx >= 0) {
             auto& s = shares_[idx];
             QString status;
-            if (s.stale == 253) status = "ORPHAN";
-            else if (s.stale == 254) status = "DOA";
-            else status = s.verified ? "verified" : "unverified";
+            if (s.stale == 253) status = "<span style='color:#ef4444'>ORPHAN</span>";
+            else if (s.stale == 254) status = "<span style='color:#fbbf24'>DOA</span>";
+            else status = s.verified
+                ? "<span style='color:#4ade80'>verified</span>"
+                : "<span style='color:#94a3b8'>unverified</span>";
 
             auto dt = QDateTime::fromSecsSinceEpoch(s.timestamp);
+            const double difficulty = s.targetBits > 0
+                ? static_cast<double>(s.targetBits) / 65536.0 : 0;
+
             QString tip = QString(
-                "%1\nMiner: %2\nTime: %3\nVer: v%4 | %5\nPos: %6")
-                .arg(s.hash)
-                .arg(s.miner.left(12) + "...")
-                .arg(dt.toString("hh:mm:ss"))
+                "<b>Share #%1</b><br>"
+                "<b>Hash:</b> %2<br>"
+                "<b>Miner:</b> %3<br>"
+                "<b>Time:</b> %4<br>"
+                "<b>Version:</b> v%5 (desired: v%6)<br>"
+                "<b>Difficulty:</b> %7<br>"
+                "<b>Status:</b> %8")
+                .arg(s.pos)
+                .arg(s.hash.left(16) + "..." + s.hash.right(8))
+                .arg(s.miner)
+                .arg(dt.toString("yyyy-MM-dd hh:mm:ss"))
                 .arg(s.version)
-                .arg(status)
-                .arg(s.pos);
+                .arg(s.desiredVersion)
+                .arg(difficulty, 0, 'f', 2)
+                .arg(status);
             QToolTip::showText(he->globalPos(), tip, this);
         } else {
             QToolTip::hideText();
@@ -171,8 +185,8 @@ void DefragWidget::paintEvent(QPaintEvent*)
             p.drawLine(x, y, x + cellSize_ - 1, y + cellSize_ - 1);
         }
 
-        // Head marker: white dot
-        if (headSet.count(s.hash) > 0) {
+        // Head marker: white dot (heads use short 16-char hex)
+        if (headSet.count(s.shortHash) > 0 || headSet.count(s.hash) > 0) {
             p.setPen(Qt::NoPen);
             p.setBrush(kHeadGlow);
             int r = std::max(1, cellSize_ / 3);
@@ -283,7 +297,19 @@ void PageSharechain::setupUI()
     minerPanel->setFixedWidth(210);
     contentLayout->addWidget(minerPanel);
 
-    mainLayout->addLayout(contentLayout, 1);
+    mainLayout->addLayout(contentLayout, 3);
+
+    // ── PPLNS payout summary ────────────────────────────────────────
+    pplnsTable_ = new QTableWidget(this);
+    pplnsTable_->setColumnCount(4);
+    pplnsTable_->setHorizontalHeaderLabels({"Miner", "Shares", "Weight %", "Est. Payout"});
+    pplnsTable_->horizontalHeader()->setStretchLastSection(true);
+    pplnsTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+    pplnsTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
+    pplnsTable_->setSortingEnabled(true);
+    pplnsTable_->setMaximumHeight(200);
+    pplnsTable_->setStyleSheet("QTableWidget { background: #0f172a; border: 1px solid #1e293b; }");
+    mainLayout->addWidget(pplnsTable_, 1);
 
     // ── Legend bar ───────────────────────────────────────────────────
     auto* legendLayout = new QHBoxLayout();
@@ -349,16 +375,21 @@ void PageSharechain::updateFromJson(const QJsonObject& obj)
     auto arr = obj.value("shares").toArray();
     shares_.reserve(arr.size());
 
-    for (auto&& v : arr) {
-        auto o = v.toObject();
+    for (int i = 0; i < arr.size(); ++i) {
+        auto o = arr[i].toObject();
         ShareEntry e;
-        e.hash      = o.value("hash").toString();
-        e.miner     = o.value("miner").toString();
-        e.timestamp = static_cast<uint32_t>(o.value("ts").toDouble());
-        e.stale     = o.value("stale").toInt();
-        e.version   = o.value("ver").toInt();
-        e.verified  = o.value("verified").toBool();
-        e.pos       = o.value("pos").toInt();
+        // Compact API keys: H=hash, h=short, m=miner, t=time, s=stale, V=ver, v=verified
+        e.hash           = o.value("H").toString();
+        e.shortHash      = o.value("h").toString();
+        e.miner          = o.value("m").toString();
+        e.timestamp      = static_cast<uint32_t>(o.value("t").toDouble());
+        e.stale          = o.value("s").toInt();
+        e.version        = o.value("V").toInt();
+        e.desiredVersion = o.value("dv").toInt();
+        e.verified       = o.value("v").toInt() != 0;
+        e.targetBits     = static_cast<uint32_t>(o.value("a").toDouble());
+        e.target         = static_cast<uint32_t>(o.value("b").toDouble());
+        e.pos            = i;
         shares_.push_back(e);
         minerCounts_[e.miner]++;
     }
@@ -396,6 +427,38 @@ void PageSharechain::updateFromJson(const QJsonObject& obj)
 
     rebuildMinerList();
     defragWidget_->setShares(shares_, heads_);
+
+    // Populate PPLNS summary table from miner share counts
+    std::vector<std::pair<QString, int>> sorted(minerCounts_.begin(), minerCounts_.end());
+    std::sort(sorted.begin(), sorted.end(),
+              [](auto& a, auto& b) { return a.second > b.second; });
+
+    pplnsTable_->setSortingEnabled(false);
+    pplnsTable_->setRowCount(static_cast<int>(sorted.size()));
+    const int totalInWindow = static_cast<int>(shares_.size());
+    const double blockValue = 6.25;  // approximate LTC block reward
+
+    for (int i = 0; i < static_cast<int>(sorted.size()); ++i) {
+        auto& [miner, count] = sorted[i];
+        const double weight = totalInWindow > 0 ? (count * 100.0 / totalInWindow) : 0;
+        const double payout = blockValue * weight / 100.0;
+
+        auto* minerItem = new QTableWidgetItem(miner);
+        minerItem->setForeground(colorForMiner(miner));
+        pplnsTable_->setItem(i, 0, minerItem);
+        pplnsTable_->setItem(i, 1, new QTableWidgetItem(QString::number(count)));
+
+        auto* weightItem = new QTableWidgetItem();
+        weightItem->setData(Qt::DisplayRole, QString("%1%").arg(weight, 0, 'f', 2));
+        weightItem->setData(Qt::UserRole, weight);  // for sorting
+        pplnsTable_->setItem(i, 2, weightItem);
+
+        auto* payoutItem = new QTableWidgetItem();
+        payoutItem->setData(Qt::DisplayRole, QString("%1 LTC").arg(payout, 0, 'f', 4));
+        payoutItem->setData(Qt::UserRole, payout);
+        pplnsTable_->setItem(i, 3, payoutItem);
+    }
+    pplnsTable_->setSortingEnabled(true);
 }
 
 void PageSharechain::rebuildMinerList()

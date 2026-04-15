@@ -45,11 +45,20 @@ PageOverview::PageOverview(QWidget* parent)
     extraForm->addRow("Pool Luck:", luckValue_);
     v36StatusValue_ = new QLabel("-");
     extraForm->addRow("V36 Status:", v36StatusValue_);
-    broadcasterValue_ = new QLabel("-");
-    extraForm->addRow("Broadcaster:", broadcasterValue_);
-    mergedStatsValue_ = new QLabel("-");
-    extraForm->addRow("Merged Mining:", mergedStatsValue_);
     layout->addWidget(extraGroup);
+
+    // Daemon health
+    auto* daemonGroup = new QGroupBox("Daemon Health", this);
+    auto* daemonForm = new QFormLayout(daemonGroup);
+    ltcDaemonValue_ = new QLabel("-");
+    daemonForm->addRow("LTC Node:", ltcDaemonValue_);
+    ltcHeightValue_ = new QLabel("-");
+    daemonForm->addRow("LTC Peers / Height:", ltcHeightValue_);
+    dogeDaemonValue_ = new QLabel("-");
+    daemonForm->addRow("DOGE Node:", dogeDaemonValue_);
+    dogeHeightValue_ = new QLabel("-");
+    daemonForm->addRow("DOGE Height / Blocks:", dogeHeightValue_);
+    layout->addWidget(daemonGroup);
 
     statusValue_ = new QLabel("Idle");
     layout->addWidget(statusValue_);
@@ -165,48 +174,59 @@ void PageOverview::refresh(ApiClient* api)
         [](const QString&) { }
     );
 
-    // Broadcaster status (LTC embedded node health)
+    // LTC daemon health (from broadcaster_status)
     api->getJson("/broadcaster_status",
         [this](const QJsonDocument& doc) {
             if (!doc.isObject()) return;
             const auto obj = doc.object();
             const bool running = obj.value("running").toBool();
-            const int chains = obj.value("chains").toInt();
             const auto peers = obj.value("peers").toArray();
             const int found = obj.value("total_blocks_found").toInt();
-            if (running) {
-                broadcasterValue_->setText(
-                    QString("LTC: %1 peers, %2 blocks found")
-                        .arg(peers.size()).arg(found));
-                broadcasterValue_->setStyleSheet("color: green;");
+
+            if (running && !peers.isEmpty()) {
+                ltcDaemonValue_->setText(
+                    QString("<span style='color:#4ade80'>connected</span> (%1 blocks found)")
+                        .arg(found));
+                // Extract height from first peer
+                int maxHeight = 0;
+                for (const auto& p : peers) {
+                    const int h = p.toObject().value("startingheight").toInt();
+                    if (h > maxHeight) maxHeight = h;
+                }
+                ltcHeightValue_->setText(
+                    QString("%1 peers, height %2").arg(peers.size()).arg(maxHeight));
             } else {
-                broadcasterValue_->setText("disconnected");
-                broadcasterValue_->setStyleSheet("color: red;");
+                ltcDaemonValue_->setText("<span style='color:#ef4444'>disconnected</span>");
+                ltcHeightValue_->setText("-");
             }
         },
         [](const QString&) { }
     );
 
-    // Merged mining stats (DOGE)
+    // DOGE daemon health (from merged_stats)
     api->getJson("/merged_stats",
         [this](const QJsonDocument& doc) {
             if (!doc.isObject()) return;
             const auto obj = doc.object();
             const auto networks = obj.value("networks").toObject();
-            const int totalBlocks = obj.value("total_blocks").toInt();
-            const QString symbol = obj.value("symbol").toString();
-            if (networks.isEmpty()) {
-                mergedStatsValue_->setText("no merged chains");
+
+            if (networks.contains("DOGE")) {
+                const auto doge = networks.value("DOGE").toObject();
+                const int height = doge.value("current_height").toInt();
+                const int blocks = doge.value("blocks_found").toInt();
+                const double diff = doge.value("difficulty").toDouble();
+
+                dogeDaemonValue_->setText(
+                    QString("<span style='color:#4ade80'>connected</span> (chain_id: %1)")
+                        .arg(doge.value("chain_id").toInt()));
+                dogeHeightValue_->setText(
+                    QString("height %1, diff %2M, %3 blocks found")
+                        .arg(height)
+                        .arg(diff / 1e6, 0, 'f', 1)
+                        .arg(blocks));
             } else {
-                QStringList parts;
-                for (auto it = networks.begin(); it != networks.end(); ++it) {
-                    const auto net = it.value().toObject();
-                    parts << QString("%1: h=%2, %3 blocks")
-                        .arg(it.key())
-                        .arg(net.value("current_height").toInt())
-                        .arg(net.value("blocks_found").toInt());
-                }
-                mergedStatsValue_->setText(parts.join("; "));
+                dogeDaemonValue_->setText("<span style='color:#94a3b8'>not configured</span>");
+                dogeHeightValue_->setText("-");
             }
         },
         [](const QString&) { }
