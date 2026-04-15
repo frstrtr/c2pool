@@ -136,6 +136,42 @@ void PageLaunch::setupUi()
         testnetCheck_ = new QCheckBox("Use testnet");
         form->addRow("Network:", testnetCheck_);
 
+        custodialCheck_ = new QCheckBox("Custodial mode (all coinbase to operator)");
+        custodialCheck_->setToolTip("--custodial");
+        form->addRow("", custodialCheck_);
+
+        vbox->addWidget(g);
+    }
+
+    // ── 1b. Embedded SPV ─────────────────────────────────────────────────────
+    {
+        auto* g = makeGroup("Embedded SPV Nodes");
+        auto* form = new QFormLayout(g);
+
+        embeddedLtcCheck_ = new QCheckBox("Embedded LTC SPV (no litecoind needed)");
+        embeddedLtcCheck_->setChecked(true);
+        embeddedLtcCheck_->setToolTip("--embedded-ltc / --no-embedded-ltc");
+        form->addRow("", embeddedLtcCheck_);
+
+        embeddedDogeCheck_ = new QCheckBox("Embedded DOGE SPV (no dogecoind needed)");
+        embeddedDogeCheck_->setChecked(true);
+        embeddedDogeCheck_->setToolTip("--embedded-doge / --no-embedded-doge");
+        form->addRow("", embeddedDogeCheck_);
+
+        dogeTestnet4Check_ = new QCheckBox("DOGE testnet4alpha (instead of testnet3)");
+        dogeTestnet4Check_->setToolTip("--doge-testnet4alpha");
+        form->addRow("", dogeTestnet4Check_);
+
+        headerCheckpointEdit_ = new QLineEdit;
+        headerCheckpointEdit_->setPlaceholderText("HEIGHT:HASH (leave blank for built-in)");
+        headerCheckpointEdit_->setToolTip("--header-checkpoint  (LTC SPV bootstrap point)");
+        form->addRow("LTC checkpoint:", headerCheckpointEdit_);
+
+        dogeHeaderCheckpointEdit_ = new QLineEdit;
+        dogeHeaderCheckpointEdit_->setPlaceholderText("HEIGHT:HASH (leave blank for built-in)");
+        dogeHeaderCheckpointEdit_->setToolTip("--doge-header-checkpoint  (DOGE SPV bootstrap point)");
+        form->addRow("DOGE checkpoint:", dogeHeaderCheckpointEdit_);
+
         vbox->addWidget(g);
     }
 
@@ -173,6 +209,47 @@ void PageLaunch::setupUi()
         httpPortSpin_->setValue(19328);
         httpPortSpin_->setToolTip("--web-port / --http-port  (dashboard/API; defaults next to worker port to avoid collisions)");
         form->addRow("HTTP API port:", httpPortSpin_);
+
+        vbox->addWidget(g);
+    }
+
+    // ── 3b. Stratum Tuning ───────────────────────────────────────────────────
+    {
+        auto* g = makeGroup("Stratum Tuning");
+        auto* form = new QFormLayout(g);
+
+        stratumMinDiffSpin_ = new QDoubleSpinBox;
+        stratumMinDiffSpin_->setRange(0.0001, 65536.0);
+        stratumMinDiffSpin_->setDecimals(4);
+        stratumMinDiffSpin_->setValue(0.0005);
+        stratumMinDiffSpin_->setToolTip("--stratum-min-diff  (per-connection vardiff floor)");
+        form->addRow("Min difficulty:", stratumMinDiffSpin_);
+
+        stratumMaxDiffSpin_ = new QDoubleSpinBox;
+        stratumMaxDiffSpin_->setRange(0.001, 1000000.0);
+        stratumMaxDiffSpin_->setDecimals(3);
+        stratumMaxDiffSpin_->setValue(65536.0);
+        stratumMaxDiffSpin_->setToolTip("--stratum-max-diff  (per-connection vardiff ceiling)");
+        form->addRow("Max difficulty:", stratumMaxDiffSpin_);
+
+        stratumTargetTimeSpin_ = new QDoubleSpinBox;
+        stratumTargetTimeSpin_->setRange(0.1, 120.0);
+        stratumTargetTimeSpin_->setDecimals(1);
+        stratumTargetTimeSpin_->setValue(3.0);
+        stratumTargetTimeSpin_->setSuffix(" sec");
+        stratumTargetTimeSpin_->setToolTip("--stratum-target-time  (target seconds per pseudoshare)");
+        form->addRow("Target time:", stratumTargetTimeSpin_);
+
+        vardiffCheck_ = new QCheckBox("Enable automatic difficulty adjustment");
+        vardiffCheck_->setChecked(true);
+        vardiffCheck_->setToolTip("--no-vardiff  (uncheck to disable vardiff)");
+        form->addRow("", vardiffCheck_);
+
+        maxCoinbaseOutputsSpin_ = new QSpinBox;
+        maxCoinbaseOutputsSpin_->setRange(1, 100000);
+        maxCoinbaseOutputsSpin_->setValue(4000);
+        maxCoinbaseOutputsSpin_->setToolTip("--max-coinbase-outputs  (max payees per block)");
+        form->addRow("Max coinbase outputs:", maxCoinbaseOutputsSpin_);
 
         vbox->addWidget(g);
     }
@@ -215,6 +292,18 @@ void PageLaunch::setupUi()
         coindP2pAddrEdit_->setPlaceholderText("same as RPC host");
         coindP2pAddrEdit_->setToolTip("--coind-p2p-address  (defaults to RPC host)");
         form->addRow("P2P address:", coindP2pAddrEdit_);
+
+        dogeP2pAddrEdit_ = new QLineEdit;
+        dogeP2pAddrEdit_->setPlaceholderText("auto-detect (override for DOGE SPV)");
+        dogeP2pAddrEdit_->setToolTip("--doge-p2p-address  (direct peer for embedded DOGE)");
+        form->addRow("DOGE P2P address:", dogeP2pAddrEdit_);
+
+        dogeP2pPortSpin_ = new QSpinBox;
+        dogeP2pPortSpin_->setRange(0, 65535);
+        dogeP2pPortSpin_->setValue(0);
+        dogeP2pPortSpin_->setSpecialValueText("auto-detect");
+        dogeP2pPortSpin_->setToolTip("--doge-p2p-port  (0 = auto-detect)");
+        form->addRow("DOGE P2P port:", dogeP2pPortSpin_);
 
         vbox->addWidget(g);
     }
@@ -269,6 +358,25 @@ void PageLaunch::setupUi()
             "  boost  - give to active miners with zero PPLNS weight\n"
             "  donate - 100% to donation address");
         form->addRow("Redistribute mode:", redistributeCombo_);
+
+        nodeOwnerMergedAddrEdit_ = new QLineEdit;
+        nodeOwnerMergedAddrEdit_->setPlaceholderText("separate DOGE fee address (optional)");
+        nodeOwnerMergedAddrEdit_->setToolTip("--node-owner-merged-address  (separate fee address for merged chains)");
+        form->addRow("Merged fee address:", nodeOwnerMergedAddrEdit_);
+
+        payoutWindowSpin_ = new QSpinBox;
+        payoutWindowSpin_->setRange(3600, 604800);
+        payoutWindowSpin_->setValue(86400);
+        payoutWindowSpin_->setSuffix(" sec");
+        payoutWindowSpin_->setToolTip("--payout-window  (PPLNS lookback period, default 86400 = 24h)");
+        form->addRow("Payout window:", payoutWindowSpin_);
+
+        storageSaveIntervalSpin_ = new QSpinBox;
+        storageSaveIntervalSpin_->setRange(10, 3600);
+        storageSaveIntervalSpin_->setValue(300);
+        storageSaveIntervalSpin_->setSuffix(" sec");
+        storageSaveIntervalSpin_->setToolTip("--storage-save-interval  (periodic database save interval)");
+        form->addRow("Storage save interval:", storageSaveIntervalSpin_);
 
         vbox->addWidget(g);
     }
@@ -327,6 +435,152 @@ void PageLaunch::setupUi()
         httpHostEdit_ = new QLineEdit("0.0.0.0");
         httpHostEdit_->setToolTip("--http-host  (bind address for HTTP API server)");
         form->addRow("HTTP bind address:", httpHostEdit_);
+
+        vbox->addWidget(g);
+    }
+
+    // ── 7b. Logging ──────────────────────────────────────────────────────────
+    {
+        auto* g = makeGroup("Logging");
+        auto* form = new QFormLayout(g);
+
+        logLevelCombo_ = new QComboBox;
+        logLevelCombo_->addItems({"trace", "debug", "info", "warning", "error"});
+        logLevelCombo_->setCurrentIndex(2);  // info
+        logLevelCombo_->setToolTip("--log-level");
+        form->addRow("Log level:", logLevelCombo_);
+
+        logFileEdit_ = new QLineEdit;
+        logFileEdit_->setPlaceholderText("debug.log (default, in data dir)");
+        logFileEdit_->setToolTip("--log-file  (custom log file path)");
+        form->addRow("Log file:", logFileEdit_);
+
+        logRotationMbSpin_ = new QSpinBox;
+        logRotationMbSpin_->setRange(1, 10000);
+        logRotationMbSpin_->setValue(100);
+        logRotationMbSpin_->setSuffix(" MB");
+        logRotationMbSpin_->setToolTip("--log-rotation-mb  (rotate log at this size)");
+        form->addRow("Rotation size:", logRotationMbSpin_);
+
+        logMaxMbSpin_ = new QSpinBox;
+        logMaxMbSpin_->setRange(1, 10000);
+        logMaxMbSpin_->setValue(50);
+        logMaxMbSpin_->setSuffix(" MB");
+        logMaxMbSpin_->setToolTip("--log-max-mb  (max total log size)");
+        form->addRow("Max log size:", logMaxMbSpin_);
+
+        vbox->addWidget(g);
+    }
+
+    // ── 7c. Performance & Limits ─────────────────────────────────────────────
+    {
+        auto* g = makeGroup("Performance & Limits");
+        auto* form = new QFormLayout(g);
+
+        p2pMaxPeersSpin_ = new QSpinBox;
+        p2pMaxPeersSpin_->setRange(1, 500);
+        p2pMaxPeersSpin_->setValue(30);
+        p2pMaxPeersSpin_->setToolTip("--p2p-max-peers  (total P2P connections)");
+        form->addRow("Max P2P peers:", p2pMaxPeersSpin_);
+
+        banDurationSpin_ = new QSpinBox;
+        banDurationSpin_->setRange(0, 86400);
+        banDurationSpin_->setValue(300);
+        banDurationSpin_->setSuffix(" sec");
+        banDurationSpin_->setToolTip("--ban-duration  (peer ban timeout)");
+        form->addRow("Ban duration:", banDurationSpin_);
+
+        rssLimitMbSpin_ = new QSpinBox;
+        rssLimitMbSpin_->setRange(256, 65536);
+        rssLimitMbSpin_->setValue(4000);
+        rssLimitMbSpin_->setSuffix(" MB");
+        rssLimitMbSpin_->setToolTip("--rss-limit-mb  (abort if memory exceeds)");
+        form->addRow("RSS limit:", rssLimitMbSpin_);
+
+        cacheSharedHashesSpin_ = new QSpinBox;
+        cacheSharedHashesSpin_->setRange(1000, 500000);
+        cacheSharedHashesSpin_->setValue(50000);
+        cacheSharedHashesSpin_->setToolTip("cache_max_shared_hashes  (de-dup set size)");
+        form->addRow("Cache shared hashes:", cacheSharedHashesSpin_);
+
+        cacheKnownTxsSpin_ = new QSpinBox;
+        cacheKnownTxsSpin_->setRange(1000, 500000);
+        cacheKnownTxsSpin_->setValue(10000);
+        cacheKnownTxsSpin_->setToolTip("cache_max_known_txs  (TX cache size)");
+        form->addRow("Cache known TXs:", cacheKnownTxsSpin_);
+
+        cacheRawSharesSpin_ = new QSpinBox;
+        cacheRawSharesSpin_->setRange(1000, 500000);
+        cacheRawSharesSpin_->setValue(50000);
+        cacheRawSharesSpin_->setToolTip("cache_max_raw_shares  (share cache size)");
+        form->addRow("Cache raw shares:", cacheRawSharesSpin_);
+
+        vbox->addWidget(g);
+    }
+
+    // ── 7d. Web & CORS ───────────────────────────────────────────────────────
+    {
+        auto* g = makeGroup("Web & CORS");
+        auto* form = new QFormLayout(g);
+
+        externalIpEdit_ = new QLineEdit;
+        externalIpEdit_->setPlaceholderText("auto-detect");
+        externalIpEdit_->setToolTip("--external-ip  (public IP for stratum URLs)");
+        form->addRow("External IP:", externalIpEdit_);
+
+        corsOriginEdit_ = new QLineEdit;
+        corsOriginEdit_->setPlaceholderText("disabled (e.g. * or https://example.com)");
+        corsOriginEdit_->setToolTip("--cors-origin  (CORS Access-Control-Allow-Origin header)");
+        form->addRow("CORS origin:", corsOriginEdit_);
+
+        dashboardDirEdit_ = new QLineEdit;
+        dashboardDirEdit_->setPlaceholderText("web-static (default)");
+        dashboardDirEdit_->setToolTip("--dashboard-dir  (path to web dashboard files)");
+        form->addRow("Dashboard dir:", dashboardDirEdit_);
+
+        vbox->addWidget(g);
+    }
+
+    // ── 7e. Block Explorer ───────────────────────────────────────────────────
+    {
+        auto* g = makeGroup("Block Explorer (embedded)");
+        auto* form = new QFormLayout(g);
+
+        explorerCheck_ = new QCheckBox("Enable embedded block explorer");
+        explorerCheck_->setToolTip("explorer  (serve block/tx data from embedded SPV)");
+        form->addRow("", explorerCheck_);
+
+        explorerUrlEdit_ = new QLineEdit;
+        explorerUrlEdit_->setPlaceholderText("auto (custom explorer base URL)");
+        explorerUrlEdit_->setToolTip("explorer_url");
+        form->addRow("Explorer URL:", explorerUrlEdit_);
+
+        explorerDepthLtcSpin_ = new QSpinBox;
+        explorerDepthLtcSpin_->setRange(1, 10000);
+        explorerDepthLtcSpin_->setValue(288);
+        explorerDepthLtcSpin_->setToolTip("explorer_depth_ltc  (blocks to retain)");
+        form->addRow("LTC depth:", explorerDepthLtcSpin_);
+
+        explorerDepthDogeSpin_ = new QSpinBox;
+        explorerDepthDogeSpin_->setRange(1, 50000);
+        explorerDepthDogeSpin_->setValue(1440);
+        explorerDepthDogeSpin_->setToolTip("explorer_depth_doge  (blocks to retain)");
+        form->addRow("DOGE depth:", explorerDepthDogeSpin_);
+
+        addrExplorerPrefixEdit_ = new QLineEdit;
+        addrExplorerPrefixEdit_->setPlaceholderText("https://blockchair.com/litecoin/address/");
+        addrExplorerPrefixEdit_->setToolTip("address_explorer_prefix");
+        form->addRow("Address explorer:", addrExplorerPrefixEdit_);
+
+        blockExplorerPrefixEdit_ = new QLineEdit;
+        blockExplorerPrefixEdit_->setPlaceholderText("https://blockchair.com/litecoin/block/");
+        blockExplorerPrefixEdit_->setToolTip("block_explorer_prefix");
+        form->addRow("Block explorer:", blockExplorerPrefixEdit_);
+
+        txExplorerPrefixEdit_ = new QLineEdit;
+        txExplorerPrefixEdit_->setPlaceholderText("https://blockchair.com/litecoin/transaction/");
+        txExplorerPrefixEdit_->setToolTip("tx_explorer_prefix");
+        form->addRow("TX explorer:", txExplorerPrefixEdit_);
 
         vbox->addWidget(g);
     }
@@ -501,10 +755,34 @@ QString PageLaunch::buildCommand() const
     const QString chain = chainCombo_->currentText();
     if (chain != "litecoin") parts << "--net" << chain;
 
+    // Custodial
+    if (custodialCheck_->isChecked()) parts << "--custodial";
+
+    // Embedded SPV
+    if (!embeddedLtcCheck_->isChecked()) parts << "--no-embedded-ltc";
+    if (!embeddedDogeCheck_->isChecked()) parts << "--no-embedded-doge";
+    if (dogeTestnet4Check_->isChecked()) parts << "--doge-testnet4alpha";
+    const QString hdrCp = headerCheckpointEdit_->text().trimmed();
+    if (!hdrCp.isEmpty()) parts << "--header-checkpoint" << hdrCp;
+    const QString dogeHdrCp = dogeHeaderCheckpointEdit_->text().trimmed();
+    if (!dogeHdrCp.isEmpty()) parts << "--doge-header-checkpoint" << dogeHdrCp;
+
     // Ports
     parts << "--p2pool-port" << QString::number(p2pPortSpin_->value());
     parts << "-w"            << QString::number(stratumPortSpin_->value());
     parts << "--web-port"    << QString::number(httpPortSpin_->value());
+
+    // Stratum tuning (only if non-default)
+    if (stratumMinDiffSpin_->value() != 0.0005)
+        parts << "--stratum-min-diff" << QString::number(stratumMinDiffSpin_->value(), 'f', 4);
+    if (stratumMaxDiffSpin_->value() != 65536.0)
+        parts << "--stratum-max-diff" << QString::number(stratumMaxDiffSpin_->value(), 'f', 3);
+    if (stratumTargetTimeSpin_->value() != 3.0)
+        parts << "--stratum-target-time" << QString::number(stratumTargetTimeSpin_->value(), 'f', 1);
+    if (!vardiffCheck_->isChecked())
+        parts << "--no-vardiff";
+    if (maxCoinbaseOutputsSpin_->value() != 4000)
+        parts << "--max-coinbase-outputs" << QString::number(maxCoinbaseOutputsSpin_->value());
 
     // Config file (must come early so CLI flags override it)
     const QString configFile = configFileEdit_->text().trimmed();
@@ -523,6 +801,10 @@ QString PageLaunch::buildCommand() const
         parts << "--coind-p2p-port" << QString::number(coindP2pPortSpin_->value());
     const QString coindP2pAddr = coindP2pAddrEdit_->text().trimmed();
     if (!coindP2pAddr.isEmpty()) parts << "--coind-p2p-address" << coindP2pAddr;
+    const QString dogeP2pAddr = dogeP2pAddrEdit_->text().trimmed();
+    if (!dogeP2pAddr.isEmpty()) parts << "--doge-p2p-address" << dogeP2pAddr;
+    if (dogeP2pPortSpin_->value() > 0)
+        parts << "--doge-p2p-port" << QString::number(dogeP2pPortSpin_->value());
 
     // Payout address
     const QString addr = addressEdit_->text().trimmed();
@@ -542,10 +824,20 @@ QString PageLaunch::buildCommand() const
     if (!nodeOwnerScript.isEmpty())
         parts << "--node-owner-script" << nodeOwnerScript;
 
+    const QString nodeOwnerMergedAddr = nodeOwnerMergedAddrEdit_->text().trimmed();
+    if (!nodeOwnerMergedAddr.isEmpty())
+        parts << "--node-owner-merged-address" << nodeOwnerMergedAddr;
+
     // Redistribute (only if non-default)
     const QString redistribute = redistributeCombo_->currentText();
     if (redistribute != "pplns")
         parts << "--redistribute" << redistribute;
+
+    // Payout window / storage
+    if (payoutWindowSpin_->value() != 86400)
+        parts << "--payout-window" << QString::number(payoutWindowSpin_->value());
+    if (storageSaveIntervalSpin_->value() != 300)
+        parts << "--storage-save-interval" << QString::number(storageSaveIntervalSpin_->value());
 
     // Merged mining
     for (int row = 0; row < mergedTable_->rowCount(); ++row) {
@@ -586,6 +878,37 @@ QString PageLaunch::buildCommand() const
         if (!trimmed.isEmpty())
             parts << "-n" << trimmed;
     }
+
+    // Logging
+    const QString logLevel = logLevelCombo_->currentText();
+    if (logLevel != "info")
+        parts << "--log-level" << logLevel;
+    const QString logFile = logFileEdit_->text().trimmed();
+    if (!logFile.isEmpty())
+        parts << "--log-file" << logFile;
+    if (logRotationMbSpin_->value() != 100)
+        parts << "--log-rotation-mb" << QString::number(logRotationMbSpin_->value());
+    if (logMaxMbSpin_->value() != 50)
+        parts << "--log-max-mb" << QString::number(logMaxMbSpin_->value());
+
+    // Performance & Limits
+    if (p2pMaxPeersSpin_->value() != 30)
+        parts << "--p2p-max-peers" << QString::number(p2pMaxPeersSpin_->value());
+    if (banDurationSpin_->value() != 300)
+        parts << "--ban-duration" << QString::number(banDurationSpin_->value());
+    if (rssLimitMbSpin_->value() != 4000)
+        parts << "--rss-limit-mb" << QString::number(rssLimitMbSpin_->value());
+
+    // Web & CORS
+    const QString extIp = externalIpEdit_->text().trimmed();
+    if (!extIp.isEmpty())
+        parts << "--external-ip" << extIp;
+    const QString corsOrigin = corsOriginEdit_->text().trimmed();
+    if (!corsOrigin.isEmpty())
+        parts << "--cors-origin" << corsOrigin;
+    const QString dashDir = dashboardDirEdit_->text().trimmed();
+    if (!dashDir.isEmpty() && dashDir != "web-static")
+        parts << "--dashboard-dir" << dashDir;
 
     // Message blob
     const QString msgBlob = messageBlobEdit_->text().trimmed();
@@ -740,6 +1063,48 @@ void PageLaunch::saveSettings() const
     s.setValue("seedNodes",     seedNodesEdit_->toPlainText());
     s.setValue("configFile",    configFileEdit_->text());
     s.setValue("messageBlob",   messageBlobEdit_->text());
+    s.setValue("coinbaseText",  coinbaseTextEdit_->text());
+
+    // New Phase 1 settings
+    s.setValue("custodial",     custodialCheck_->isChecked());
+    s.setValue("embeddedLtc",   embeddedLtcCheck_->isChecked());
+    s.setValue("embeddedDoge",  embeddedDogeCheck_->isChecked());
+    s.setValue("dogeTestnet4",  dogeTestnet4Check_->isChecked());
+    s.setValue("headerCheckpoint",     headerCheckpointEdit_->text());
+    s.setValue("dogeHeaderCheckpoint",  dogeHeaderCheckpointEdit_->text());
+    s.setValue("dogeP2pAddr",   dogeP2pAddrEdit_->text());
+    s.setValue("dogeP2pPort",   dogeP2pPortSpin_->value());
+    s.setValue("stratumMinDiff",  stratumMinDiffSpin_->value());
+    s.setValue("stratumMaxDiff",  stratumMaxDiffSpin_->value());
+    s.setValue("stratumTargetTime", stratumTargetTimeSpin_->value());
+    s.setValue("vardiff",       vardiffCheck_->isChecked());
+    s.setValue("maxCoinbaseOutputs", maxCoinbaseOutputsSpin_->value());
+    s.setValue("nodeOwnerMergedAddr", nodeOwnerMergedAddrEdit_->text());
+    s.setValue("payoutWindow",  payoutWindowSpin_->value());
+    s.setValue("storageSaveInterval", storageSaveIntervalSpin_->value());
+    s.setValue("logLevel",      logLevelCombo_->currentText());
+    s.setValue("logFile",       logFileEdit_->text());
+    s.setValue("logRotationMb", logRotationMbSpin_->value());
+    s.setValue("logMaxMb",      logMaxMbSpin_->value());
+    s.setValue("p2pMaxPeers",   p2pMaxPeersSpin_->value());
+    s.setValue("banDuration",   banDurationSpin_->value());
+    s.setValue("rssLimitMb",    rssLimitMbSpin_->value());
+    s.setValue("cacheSharedHashes", cacheSharedHashesSpin_->value());
+    s.setValue("cacheKnownTxs", cacheKnownTxsSpin_->value());
+    s.setValue("cacheRawShares", cacheRawSharesSpin_->value());
+    s.setValue("externalIp",    externalIpEdit_->text());
+    s.setValue("corsOrigin",    corsOriginEdit_->text());
+    s.setValue("dashboardDir",  dashboardDirEdit_->text());
+    s.setValue("explorer",      explorerCheck_->isChecked());
+    s.setValue("explorerUrl",   explorerUrlEdit_->text());
+    s.setValue("explorerDepthLtc",  explorerDepthLtcSpin_->value());
+    s.setValue("explorerDepthDoge", explorerDepthDogeSpin_->value());
+    s.setValue("addrExplorerPrefix",  addrExplorerPrefixEdit_->text());
+    s.setValue("blockExplorerPrefix", blockExplorerPrefixEdit_->text());
+    s.setValue("txExplorerPrefix",    txExplorerPrefixEdit_->text());
+    s.setValue("privateChain",  privateChainCheck_->isChecked());
+    s.setValue("networkId",     networkIdEdit_->text());
+    s.setValue("startupMode",   startupModeCombo_->currentData().toString());
 
     // Merged chains
     s.remove("merged");
@@ -791,6 +1156,55 @@ void PageLaunch::loadSettings()
     seedNodesEdit_->setPlainText(s.value("seedNodes").toString());
     configFileEdit_->setText(s.value("configFile").toString());
     messageBlobEdit_->setText(s.value("messageBlob").toString());
+    coinbaseTextEdit_->setText(s.value("coinbaseText").toString());
+
+    // New Phase 1 settings
+    custodialCheck_->setChecked(s.value("custodial", false).toBool());
+    embeddedLtcCheck_->setChecked(s.value("embeddedLtc", true).toBool());
+    embeddedDogeCheck_->setChecked(s.value("embeddedDoge", true).toBool());
+    dogeTestnet4Check_->setChecked(s.value("dogeTestnet4", false).toBool());
+    headerCheckpointEdit_->setText(s.value("headerCheckpoint").toString());
+    dogeHeaderCheckpointEdit_->setText(s.value("dogeHeaderCheckpoint").toString());
+    dogeP2pAddrEdit_->setText(s.value("dogeP2pAddr").toString());
+    dogeP2pPortSpin_->setValue(s.value("dogeP2pPort", 0).toInt());
+    stratumMinDiffSpin_->setValue(s.value("stratumMinDiff", 0.0005).toDouble());
+    stratumMaxDiffSpin_->setValue(s.value("stratumMaxDiff", 65536.0).toDouble());
+    stratumTargetTimeSpin_->setValue(s.value("stratumTargetTime", 3.0).toDouble());
+    vardiffCheck_->setChecked(s.value("vardiff", true).toBool());
+    maxCoinbaseOutputsSpin_->setValue(s.value("maxCoinbaseOutputs", 4000).toInt());
+    nodeOwnerMergedAddrEdit_->setText(s.value("nodeOwnerMergedAddr").toString());
+    payoutWindowSpin_->setValue(s.value("payoutWindow", 86400).toInt());
+    storageSaveIntervalSpin_->setValue(s.value("storageSaveInterval", 300).toInt());
+    {
+        const int idx = logLevelCombo_->findText(s.value("logLevel", "info").toString());
+        logLevelCombo_->setCurrentIndex(idx >= 0 ? idx : 2);
+    }
+    logFileEdit_->setText(s.value("logFile").toString());
+    logRotationMbSpin_->setValue(s.value("logRotationMb", 100).toInt());
+    logMaxMbSpin_->setValue(s.value("logMaxMb", 50).toInt());
+    p2pMaxPeersSpin_->setValue(s.value("p2pMaxPeers", 30).toInt());
+    banDurationSpin_->setValue(s.value("banDuration", 300).toInt());
+    rssLimitMbSpin_->setValue(s.value("rssLimitMb", 4000).toInt());
+    cacheSharedHashesSpin_->setValue(s.value("cacheSharedHashes", 50000).toInt());
+    cacheKnownTxsSpin_->setValue(s.value("cacheKnownTxs", 10000).toInt());
+    cacheRawSharesSpin_->setValue(s.value("cacheRawShares", 50000).toInt());
+    externalIpEdit_->setText(s.value("externalIp").toString());
+    corsOriginEdit_->setText(s.value("corsOrigin").toString());
+    dashboardDirEdit_->setText(s.value("dashboardDir").toString());
+    explorerCheck_->setChecked(s.value("explorer", false).toBool());
+    explorerUrlEdit_->setText(s.value("explorerUrl").toString());
+    explorerDepthLtcSpin_->setValue(s.value("explorerDepthLtc", 288).toInt());
+    explorerDepthDogeSpin_->setValue(s.value("explorerDepthDoge", 1440).toInt());
+    addrExplorerPrefixEdit_->setText(s.value("addrExplorerPrefix").toString());
+    blockExplorerPrefixEdit_->setText(s.value("blockExplorerPrefix").toString());
+    txExplorerPrefixEdit_->setText(s.value("txExplorerPrefix").toString());
+    privateChainCheck_->setChecked(s.value("privateChain", false).toBool());
+    networkIdEdit_->setText(s.value("networkId").toString());
+    {
+        const QString smode = s.value("startupMode", "auto").toString();
+        const int idx = startupModeCombo_->findData(smode);
+        startupModeCombo_->setCurrentIndex(idx >= 0 ? idx : 0);
+    }
 
     // Merged chains
     mergedTable_->setRowCount(0);
