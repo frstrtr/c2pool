@@ -103,11 +103,8 @@ libs/secp256k1/*
 /cmake-build-debug-coverage/
 /cmake-build-release
 *.log
-boost_1_78_0.tar.bz2
 /build
 /build-release
-/boost_1_78_0
-/boost_install
 
 /IMPLEMENTATION_PLAN.md
 
@@ -125,8 +122,8 @@ CLAUDE.md
 .claude/
 
 # Conan-generated cmake files (from conan install)
-*-Target-debug.cmake
-*-debug-x86_64-data.cmake
+*-Target-*.cmake
+*-*-x86_64-data.cmake
 *Config.cmake
 *ConfigVersion.cmake
 *Targets.cmake
