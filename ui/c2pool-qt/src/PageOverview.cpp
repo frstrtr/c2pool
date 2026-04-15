@@ -1,10 +1,12 @@
 #include "PageOverview.hpp"
 
+#include <QChart>
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QValueAxis>
 #include <QVBoxLayout>
 
 PageOverview::PageOverview(QWidget* parent)
@@ -60,9 +62,42 @@ PageOverview::PageOverview(QWidget* parent)
     daemonForm->addRow("DOGE Height / Blocks:", dogeHeightValue_);
     layout->addWidget(daemonGroup);
 
+    // Hashrate chart
+    hashrateSeries_ = new QLineSeries();
+    hashrateSeries_->setName("Pool Hashrate");
+    hashrateSeries_->setColor(QColor(74, 222, 128));
+
+    auto* chart = new QChart();
+    chart->addSeries(hashrateSeries_);
+    chart->setAnimationOptions(QChart::SeriesAnimations);
+    chart->setBackgroundBrush(QBrush(QColor(15, 23, 42)));
+    chart->setTitle("Pool Hashrate (GH/s)");
+    chart->setTitleBrush(QBrush(QColor(226, 232, 240)));
+    chart->legend()->setVisible(false);
+
+    auto* axisX = new QValueAxis();
+    axisX->setRange(0, 60);
+    axisX->setTitleText("Samples");
+    axisX->setLabelsColor(QColor(148, 163, 184));
+    axisX->setGridLineColor(QColor(51, 65, 85));
+    chart->addAxis(axisX, Qt::AlignBottom);
+    hashrateSeries_->attachAxis(axisX);
+
+    auto* axisY = new QValueAxis();
+    axisY->setTitleText("GH/s");
+    axisY->setLabelsColor(QColor(148, 163, 184));
+    axisY->setGridLineColor(QColor(51, 65, 85));
+    chart->addAxis(axisY, Qt::AlignLeft);
+    hashrateSeries_->attachAxis(axisY);
+
+    hashrateChartView_ = new QChartView(chart, this);
+    hashrateChartView_->setRenderHint(QPainter::Antialiasing);
+    hashrateChartView_->setMinimumHeight(150);
+    hashrateChartView_->setStyleSheet("background: #0f172a; border: 1px solid #1e293b; border-radius: 6px;");
+    layout->addWidget(hashrateChartView_);
+
     statusValue_ = new QLabel("Idle");
     layout->addWidget(statusValue_);
-    layout->addStretch();
 }
 
 static QString formatHashrate(double hr) {
@@ -102,6 +137,25 @@ void PageOverview::refresh(ApiClient* api)
             // Unique miners
             uniqueMinersValue_->setText(
                 QString::number(obj.value("unique_miners").toInt()));
+
+            // Append to hashrate chart
+            const double hrGhs = hashrate / 1e9;
+            hashrateSeries_->append(hashrateTickCount_++, hrGhs);
+            // Keep last 60 samples
+            while (hashrateSeries_->count() > 60)
+                hashrateSeries_->remove(0);
+            // Update axes
+            auto axes = hashrateChartView_->chart()->axes();
+            if (axes.size() >= 2) {
+                auto* axisX = static_cast<QValueAxis*>(axes[0]);
+                axisX->setRange(std::max(0, hashrateTickCount_ - 60), hashrateTickCount_);
+                // Auto-scale Y
+                double maxY = 0;
+                for (auto& pt : hashrateSeries_->points())
+                    if (pt.y() > maxY) maxY = pt.y();
+                auto* axisY = static_cast<QValueAxis*>(axes[1]);
+                axisY->setRange(0, maxY * 1.1 + 1);
+            }
 
             // Uptime
             const double uptime = obj.value("uptime_seconds").toDouble();

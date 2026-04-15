@@ -8,6 +8,8 @@
 #include <QJsonObject>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPieSeries>
+#include <QChart>
 #include <QToolTip>
 #include <QVBoxLayout>
 #include <QHelpEvent>
@@ -126,17 +128,30 @@ void DefragWidget::mouseMoveEvent(QMouseEvent* event)
             : s.verified ? "<span style='color:#4ade80'>verified</span>"
             : "<span style='color:#94a3b8'>unverified</span>";
 
+        // PPLNS enrichment for this miner
+        QString pplnsLine;
+        if (payoutCache_) {
+            auto pit = payoutCache_->find(s.miner);
+            if (pit != payoutCache_->end()) {
+                pplnsLine = QString("<br><b>PPLNS:</b> %1% weight")
+                    .arg(pit->second.first, 0, 'f', 2);
+                if (pit->second.second > 0)
+                    pplnsLine += QString(" | %1 DOGE").arg(pit->second.second, 0, 'f', 1);
+            }
+        }
+
         floatingTip_->setText(
             QString("<b>%1</b><br>"
                     "<b>Miner:</b> %2<br>"
                     "<b>Time:</b> %3 | <b>v%4</b> | diff %5<br>"
-                    "<b>Status:</b> %6")
+                    "<b>Status:</b> %6%7")
                 .arg(s.shortHash)
                 .arg(s.miner)
                 .arg(dt.toString("hh:mm:ss"))
                 .arg(s.version)
                 .arg(diff, 0, 'f', 1)
-                .arg(status));
+                .arg(status)
+                .arg(pplnsLine));
         floatingTip_->adjustSize();
         // Map cursor position to the tooltip's parent (main window)
         QPoint inParent = mapTo(floatingTip_->parentWidget(), event->pos());
@@ -333,12 +348,25 @@ void PageSharechain::setupUI()
 
     // PPLNS treemap (squarified layout, proportional to miner weight)
     pplnsTreemap_ = new TreemapWidget(this);
-    pplnsTreemap_->setMinimumHeight(150);
+    pplnsTreemap_->setMinimumHeight(120);
     pplnsTreemap_->setStyleSheet("background: #020617; border: 1px solid #334155;");
 
-    // Side-by-side: treemap left, table right
+    // PPLNS pie chart (QtCharts)
+    auto* pplnsChart = new QChart();
+    pplnsChart->setAnimationOptions(QChart::SeriesAnimations);
+    pplnsChart->setBackgroundBrush(QBrush(QColor(15, 23, 42)));
+    pplnsChart->setTitle("PPLNS Weight Distribution");
+    pplnsChart->setTitleBrush(QBrush(QColor(226, 232, 240)));
+    pplnsChart->legend()->setVisible(false);
+    pplnsPieView_ = new QChartView(pplnsChart, this);
+    pplnsPieView_->setRenderHint(QPainter::Antialiasing);
+    pplnsPieView_->setMinimumHeight(120);
+    pplnsPieView_->setStyleSheet("background: #0f172a; border: 1px solid #1e293b;");
+
+    // Layout: treemap left, pie center, table right
     auto* pplnsLayout = new QHBoxLayout();
     pplnsLayout->addWidget(pplnsTreemap_, 2);
+    pplnsLayout->addWidget(pplnsPieView_, 2);
     pplnsLayout->addWidget(pplnsTable_, 1);
     mainLayout->addLayout(pplnsLayout, 1);
 
@@ -485,6 +513,36 @@ void PageSharechain::refresh(ApiClient* api)
                 entries.push_back(te);
             }
             pplnsTreemap_->setEntries(std::move(entries));
+
+            // Build pie chart
+            auto* pie = new QPieSeries();
+            for (auto& r : raw) {
+                double pct = totalLtc > 0 ? r.ltc / totalLtc : 0;
+                if (pct < 0.01) continue;  // skip tiny slices
+                auto* slice = pie->append(
+                    QString("%1 %2%").arg(r.addr.left(8)).arg(pct * 100, 0, 'f', 1),
+                    r.ltc);
+                slice->setColor(PageSharechain::colorForMiner(r.addr));
+                slice->setBorderColor(QColor(30, 41, 59));
+                slice->setLabelVisible(pct > 0.05);
+                slice->setLabelColor(QColor(148, 163, 184));
+            }
+            auto* chart = pplnsPieView_->chart();
+            chart->removeAllSeries();
+            chart->addSeries(pie);
+
+            // Cache payouts for share tooltip enrichment
+            cachedPayouts_.clear();
+            payoutCacheForDefrag_.clear();
+            for (auto& r : raw) {
+                MinerPayout mp;
+                mp.ltc = r.ltc;
+                mp.doge = r.doge;
+                mp.pct = totalLtc > 0 ? r.ltc / totalLtc * 100.0 : 0;
+                cachedPayouts_[r.addr] = mp;
+                payoutCacheForDefrag_[r.addr] = {mp.pct, mp.doge};
+            }
+            defragWidget_->setPayoutCache(&payoutCacheForDefrag_);
         },
         [](const QString&) { }
     );

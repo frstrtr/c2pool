@@ -8,6 +8,7 @@
 #include <QWidget>
 
 #include <QTableWidget>
+#include <QChartView>
 #include "TreemapWidget.hpp"
 
 #include <map>
@@ -47,6 +48,8 @@ public:
 
     QSize sizeHint() const override;
 
+    void setPayoutCache(std::map<QString, std::pair<double,double>>* cache) { payoutCache_ = cache; }
+
 signals:
     void shareHovered(int index, const ShareEntry& share);
     void shareClicked(int index, const ShareEntry& share);
@@ -55,12 +58,13 @@ protected:
     void paintEvent(QPaintEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
-    bool event(QEvent* event) override;   // for tooltip
+    bool event(QEvent* event) override;
 
 private:
     int cellAt(QPoint pos) const;
 
     QLabel* floatingTip_{nullptr};
+    std::map<QString, std::pair<double,double>>* payoutCache_{nullptr};
     std::vector<ShareEntry> shares_;
     QStringList heads_;
     std::set<QString> hiddenMiners_;
@@ -102,6 +106,11 @@ private:
     // PPLNS payout visualization
     QTableWidget* pplnsTable_;
     TreemapWidget* pplnsTreemap_;
+    QChartView* pplnsPieView_;
+
+    // Cached PPLNS per-miner data for tooltip enrichment
+    struct MinerPayout { double ltc = 0; double doge = 0; double pct = 0; };
+    std::map<QString, MinerPayout> cachedPayouts_;
 
     // Share detail display (shown on hover/click)
     QLabel* shareDetailLabel_;
@@ -112,4 +121,5 @@ private:
     std::map<QString, int> minerCounts_;
     QString lastTipHash_;  // for delta-based incremental updates
     bool initialLoadDone_{false};
+    std::map<QString, std::pair<double,double>> payoutCacheForDefrag_; // addr -> {pct, doge}
 };

@@ -2,7 +2,9 @@
 
 #include "ApiClient.hpp"
 
+#include <QChartView>
 #include <QLabel>
+#include <QLineSeries>
 #include <QWidget>
 
 class PageOverview : public QWidget
@@ -32,6 +34,11 @@ private:
     QLabel* ltcHeightValue_;
     QLabel* dogeDaemonValue_;
     QLabel* dogeHeightValue_;
+
+    // Hashrate chart
+    QChartView* hashrateChartView_;
+    QLineSeries* hashrateSeries_;
+    int hashrateTickCount_{0};
 
     QLabel* statusValue_;
 };

@@ -8,7 +8,7 @@ set(CMAKE_AUTOUIC ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(Qt6 6.5 REQUIRED COMPONENTS Widgets Network)
+find_package(Qt6 6.5 REQUIRED COMPONENTS Widgets Network Charts)
 
 add_executable(c2pool-qt
     src/main.cpp
@@ -32,6 +32,7 @@ target_include_directories(c2pool-qt PRIVATE src)
 target_link_libraries(c2pool-qt PRIVATE
     Qt6::Widgets
     Qt6::Network
+    Qt6::Charts
 )
 
 # ── Platform-specific properties ──────────────────────────────────────────────
