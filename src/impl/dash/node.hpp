@@ -118,9 +118,11 @@ public:
         if (peer_it == m_connections.end()) return;
 
         auto& peer = peer_it->second;
+        peer->m_timeout->restart();
 
         // Version handshake (must be first message)
-        if (rmsg->m_command == "version")
+        // Command is 12-byte null-padded from wire; use prefix compare
+        if (rmsg->m_command.compare(0, 7, "version") == 0)
         {
             auto type = handle_version(std::move(rmsg), peer);
             if (type.has_value()) {
