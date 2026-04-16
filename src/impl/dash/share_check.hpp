@@ -195,9 +195,13 @@ inline uint256 share_init_verify(const DashShare& share,
 
         // share_info (non-share_data)
         ref_stream << share.m_new_transaction_hashes;
-        // transaction_hash_refs as list of VarInt pairs
-        for (auto& v : share.m_transaction_hash_refs)
-            ::Serialize(ref_stream, VarInt(v));
+        // transaction_hash_refs: ListType(VarIntType(), 2) — writes count/2 then all elements
+        {
+            uint64_t pair_count = share.m_transaction_hash_refs.size() / 2;
+            ::Serialize(ref_stream, VarInt(pair_count));
+            for (auto& v : share.m_transaction_hash_refs)
+                ::Serialize(ref_stream, VarInt(v));
+        }
         ref_stream << share.m_far_share_hash;
         ref_stream << share.m_max_bits;
         ref_stream << share.m_bits;
@@ -212,6 +216,7 @@ inline uint256 share_init_verify(const DashShare& share,
     uint256 ref_hash = check_merkle_link(hash_ref, share.m_ref_merkle_link);
 
     // ── Build hash_link_data ──
+    // Python: get_ref_hash(...) + pack.IntType(64).pack(last_txout_nonce) + pack.IntType(32).pack(0) + coinbase_payload_data
     std::vector<unsigned char> hash_link_data;
     hash_link_data.insert(hash_link_data.end(), ref_hash.data(), ref_hash.data() + 32);
     {
@@ -223,6 +228,13 @@ inline uint256 share_init_verify(const DashShare& share,
         uint32_t zero = 0;
         auto* p = reinterpret_cast<const unsigned char*>(&zero);
         hash_link_data.insert(hash_link_data.end(), p, p + 4);
+    }
+    // Append outer coinbase_payload (coinbase_payload_data in Python)
+    // Reference: data.py line 342-348
+    {
+        auto& cpd = share.m_coinbase_payload_outer.m_data;
+        if (!cpd.empty())
+            hash_link_data.insert(hash_link_data.end(), cpd.begin(), cpd.end());
     }
 
     auto gentx_before_refhash = compute_gentx_before_refhash();

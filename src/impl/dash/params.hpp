@@ -82,8 +82,8 @@ inline core::CoinParams make_coin_params(bool testnet)
     // Reference: ref/p2pool-dash/p2pool/networks/dash.py
     p.identifier_hex          = "7242ef345e1bed6b";
     p.prefix_hex              = "3b3e1286f446b891";
-    p.testnet_identifier_hex  = "6a46ef345e1bed6b";  // testnet identifier
-    p.testnet_prefix_hex      = "2b2e1286f446b891";  // testnet prefix
+    p.testnet_identifier_hex  = "b6deb1e543fe2427";  // testnet identifier
+    p.testnet_prefix_hex      = "198b644f6821e3b3";  // testnet prefix
 
     // Bootstrap
     p.bootstrap_addrs = {
