@@ -1459,7 +1459,7 @@ int main(int argc, char* argv[]) {
                             params.prev_share, chain::bits_to_target(bits));
                     }
 
-                    return ltc::compute_ref_hash_for_work(params);
+                    return ltc::compute_ref_hash_for_work(params, p2p_node->coin_params());
                 });
 
             // Wire the share creation hook so mining_submit() creates a real
@@ -1509,6 +1509,7 @@ int main(int argc, char* argv[]) {
                     // Create the share and add it to the tracker
                     uint256 share_hash = ltc::create_local_share(
                         p2p_node->tracker(),
+                        p2p_node->coin_params(),
                         min_header,
                         coinbase,
                         p.subsidy,

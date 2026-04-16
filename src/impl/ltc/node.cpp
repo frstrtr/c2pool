@@ -196,7 +196,7 @@ void NodeImpl::processing_shares(HandleSharesData& data, NetService addr)
             try
             {
                 share.ACTION({
-                    obj->m_hash = share_init_verify(*obj, true);
+                    obj->m_hash = share_init_verify(*obj, *m_tracker.m_params, true);
                 });
             }
             catch (const std::exception& e)

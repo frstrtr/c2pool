@@ -1,11 +1,13 @@
 #pragma once
 
 #include "config.hpp"
+#include "params.hpp"
 #include "share.hpp"
 #include "share_tracker.hpp"
 #include "peer.hpp"
 #include "messages.hpp"
 
+#include <core/coin_params.hpp>
 #include <pool/node.hpp>
 #include <pool/protocol.hpp>
 #include <core/message.hpp>
@@ -35,6 +37,7 @@ class NodeImpl : public pool::BaseNode<ltc::Config, ltc::ShareChain, ltc::Peer>
         ::REQUEST<uint256, peer_ptr, std::vector<uint256>, uint64_t, std::vector<uint256>>;
 
 protected:
+    core::CoinParams m_coin_params;
     ltc::Handler m_handler;
     share_getter_t m_share_getter;
     ShareTracker m_tracker;
@@ -46,11 +49,16 @@ protected:
 
 public:
     NodeImpl()
-        : m_share_getter(nullptr,
-            [](uint256, peer_ptr, std::vector<uint256>, uint64_t, std::vector<uint256>){}) {}
+        : m_coin_params(ltc::make_coin_params(false)),
+          m_share_getter(nullptr,
+            [](uint256, peer_ptr, std::vector<uint256>, uint64_t, std::vector<uint256>){})
+    {
+        m_tracker.m_params = &m_coin_params;
+    }
 
     NodeImpl(boost::asio::io_context* ctx, config_t* config)
-        : base_t(ctx, config),
+        : m_coin_params(ltc::make_coin_params(config->m_testnet)),
+          base_t(ctx, config),
           m_share_getter(ctx,
             [](uint256 req_id, peer_ptr to_peer,
                std::vector<uint256> hashes, uint64_t parents,
@@ -60,6 +68,8 @@ public:
                 to_peer->write(std::move(rmsg));
             })
     {
+        m_tracker.m_params = &m_coin_params;
+
         // Seed addr store with hardcoded bootstrap peers
         m_addrs.load(config->pool()->m_bootstrap_addrs);
         // Randomise our nonce so we detect self-connections
@@ -90,6 +100,7 @@ public:
     void send_version(peer_ptr peer);
     void processing_shares(HandleSharesData& data, NetService addr); // old handle_share
     ShareTracker& tracker() { return m_tracker; }
+    const core::CoinParams& coin_params() const { return m_coin_params; }
 
     // Async share download — response delivered to callback when sharereply arrives
     void request_shares(uint256 id, peer_ptr peer,
