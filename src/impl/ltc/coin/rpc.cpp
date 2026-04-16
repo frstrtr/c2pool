@@ -40,7 +40,7 @@ void NodeRPC::connect(NetService address, std::string userpass)
     m_http_request.set(http::field::authorization, m_auth->authorization);
 
     auto const results = m_resolver.resolve(address.address(), address.port_str());
-	boost::asio::ip::tcp::endpoint endpoint = *results;
+	boost::asio::ip::tcp::endpoint endpoint = *results.begin();
 
     m_stream.async_connect(endpoint, 
 		[&](boost::system::error_code ec)
