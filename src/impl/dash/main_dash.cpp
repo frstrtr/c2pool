@@ -104,11 +104,13 @@ int main(int argc, char* argv[])
     std::cout << "[NODE] Tracker params: share_period=" << node.coin_params().share_period
               << " chain_length=" << node.coin_params().chain_length << std::endl;
 
-    // Connect to bootstrap peer
+    // Connect to bootstrap peer (use post to ensure io_context is running)
     std::cout << "[P2P] Connecting to " << bootstrap << ":" << port << "..." << std::endl;
 
     NetService peer_addr(bootstrap + ":" + std::to_string(port));
-    node.connect(peer_addr);
+    io::post(ioc, [&]() {
+        node.connect(peer_addr);
+    });
 
     // Run IO context with timeout
     std::cout << "[P2P] Running event loop (30s)..." << std::endl;
