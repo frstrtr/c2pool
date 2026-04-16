@@ -158,3 +158,4 @@ test/test_*_include.cmake
 SHA256SUMS
 
 CLAUDE.md
+build-qt/

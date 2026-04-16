@@ -246,10 +246,10 @@ int NodeImpl::get_verified_count() const { return get_tracker_snapshot().verifie
 void NodeImpl::send_version(peer_ptr peer)
 {
     auto rmsg = ltc::message_version::make_raw(
-        ltc::PoolConfig::ADVERTISED_PROTOCOL_VERSION,
+        m_tracker.m_params->minimum_protocol_version,
         1,                                    // services
         addr_t{1, peer->addr()},              // addr_to (the remote)
-        addr_t{1, NetService{"0.0.0.0", ltc::PoolConfig::P2P_PORT}}, // addr_from (us)
+        addr_t{1, NetService{"0.0.0.0", m_tracker.m_params->p2p_port}}, // addr_from (us)
         m_nonce,
         m_software_version,
         1,                                    // mode (always 1 for legacy compat)
@@ -303,11 +303,11 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
         }
 
         // Reject peers running too-old protocol
-        if (msg->m_version < ltc::PoolConfig::MINIMUM_PROTOCOL_VERSION)
+        if (msg->m_version < m_tracker.m_params->minimum_protocol_version)
         {
             LOG_WARNING << "Peer " << msg->m_addr_from.m_endpoint.to_string()
                         << " protocol " << msg->m_version
-                        << " < minimum " << ltc::PoolConfig::MINIMUM_PROTOCOL_VERSION
+                        << " < minimum " << m_tracker.m_params->minimum_protocol_version
                         << ", disconnecting";
             throw std::runtime_error("peer protocol too old");
         }
@@ -361,7 +361,7 @@ void NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
                     try
                     {
                         share.ACTION({
-                            obj->m_hash = share_init_verify(*obj, true);
+                            obj->m_hash = share_init_verify(*obj, *m_tracker.m_params, true);
                         });
                     }
                     catch (const std::exception&)
@@ -1005,7 +1005,7 @@ void NodeImpl::load_persisted_shares()
         return;
     }
 
-    const size_t keep_per_head = PoolConfig::chain_length() * 2 + 10;
+    const size_t keep_per_head = m_tracker.m_params->chain_length * 2 + 10;
     const size_t total_in_db = all_hashes.size();
 
     // Only load the most recent shares (highest height = end of vector)
@@ -1067,7 +1067,7 @@ void NodeImpl::load_persisted_shares()
                                 g_last_pow_hash = uint256();
                                 g_last_init_is_block = false;
                                 uint256 computed_hash;
-                                share.ACTION({ computed_hash = share_init_verify(*obj, true); });
+                                share.ACTION({ computed_hash = share_init_verify(*obj, *m_tracker.m_params, true); });
                                 if (!g_last_pow_hash.IsNull())
                                     idx->pow_hash = g_last_pow_hash;
                                 if (!computed_hash.IsNull() && computed_hash != hash) {
@@ -1210,7 +1210,7 @@ void NodeImpl::prune_shares(const uint256& /*best_share*/)
     // - Remove ONE child of qualifying tail per iteration
     // - Loop up to 1000 times (gradual, not bulk)
     // - Also cascade removal to verified
-    const auto CL = static_cast<int32_t>(PoolConfig::chain_length());
+    const auto CL = static_cast<int32_t>(m_tracker.m_params->chain_length);
     const int32_t min_depth = 2 * CL + 10;
 
     for (int iter = 0; iter < 1000; ++iter)
@@ -1549,7 +1549,7 @@ void NodeImpl::heartbeat_log()
     }
     if (!walk_start.IsNull() && m_tracker.chain.contains(walk_start)) {
         int window = std::min(height, static_cast<int>(
-            std::min(size_t(3600) / PoolConfig::share_period(), size_t(height))));
+            std::min(size_t(3600) / m_tracker.m_params->share_period, size_t(height))));
         if (window > 0) {
             auto walkable = m_tracker.chain.get_height(walk_start);
             auto walk_n = std::min(window, walkable);
@@ -1609,7 +1609,7 @@ void NodeImpl::heartbeat_log()
         try {
             auto aps = m_tracker.get_pool_attempts_per_second(
                 m_best_share_hash,
-                std::min(height - 1, static_cast<int>(PoolConfig::TARGET_LOOKBEHIND)),
+                std::min(height - 1, static_cast<int>(m_tracker.m_params->target_lookbehind)),
                 /*min_work=*/false);
             double pool_hs = static_cast<double>(aps.GetLow64());
             double real_pool_hs = (stale_prop < 0.999 && pool_hs > 0)
@@ -1697,7 +1697,7 @@ void NodeImpl::clean_tracker()
 
         // Steps 2-3: Prune (still holding exclusive lock)
         auto now_sec = static_cast<int64_t>(std::time(nullptr));
-        auto CL = static_cast<int32_t>(ltc::PoolConfig::chain_length());
+        auto CL = static_cast<int32_t>(m_tracker.m_params->chain_length);
 
     // Step 2: Eat stale heads (p2pool node.py:358-378)
     // Three guards protect useful heads:

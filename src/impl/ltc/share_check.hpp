@@ -2527,7 +2527,7 @@ uint256 create_local_share(
     // V35 path: delegate to version-specific implementation
     if (share_version <= 35)
         return create_local_share_v35(
-            tracker, min_header, coinbase, subsidy, prev_share, merkle_branches,
+            tracker, params, min_header, coinbase, subsidy, prev_share, merkle_branches,
             payout_script, donation, stale_info, segwit_active, witness_commitment_hex,
             actual_coinbase_bytes, witness_root, override_max_bits, override_bits,
             frozen_absheight, frozen_abswork, frozen_far_share_hash, frozen_timestamp,
