@@ -2631,12 +2631,35 @@ int main(int argc, char* argv[]) {
 
                 // Block scan moved AFTER callbacks are wired (see below)
 
-                // When a peer announces a new best block, refresh our mining template
-                p2p_node->set_on_bestblock([&web_server, &p2p_node]() {
-                    web_server.trigger_work_refresh();
-                    // p2pool: bitcoind_work.changed → set_best_share() → think()
-                    p2p_node->run_think();
-                    LOG_INFO << "[LTC] bestblock received from P2P peer — work+think refreshed";
+                // When a peer announces a new best block, refresh our mining template.
+                // Coalesce: multiple peers (or duplicate inv) announcing the same block
+                // within a short window triggers only ONE expensive refresh cycle.
+                // p2pool is naturally immune (Twisted reactor tick coalesces), we must
+                // do it explicitly.
+                auto bestblock_timer = std::make_shared<boost::asio::steady_timer>(ioc);
+                auto bestblock_pending = std::make_shared<bool>(false);
+
+                p2p_node->set_on_bestblock([&web_server, &p2p_node,
+                                            bestblock_timer, bestblock_pending]() {
+                    // Mark that a refresh is needed
+                    *bestblock_pending = true;
+
+                    // Coalesce: cancel any pending timer and restart the 50ms window.
+                    // If bestblocks keep arriving, we keep deferring until a 50ms gap.
+                    // 50ms is imperceptible to miners but collapses N duplicate
+                    // announcements into a single MWEB+PPLNS rebuild.
+                    bestblock_timer->expires_after(std::chrono::milliseconds(50));
+                    bestblock_timer->async_wait([&web_server, &p2p_node,
+                                                 bestblock_pending](const boost::system::error_code& ec) {
+                        if (ec) return;  // cancelled by a newer bestblock — good
+                        if (!*bestblock_pending) return;
+                        *bestblock_pending = false;
+
+                        web_server.trigger_work_refresh();
+                        // p2pool: bitcoind_work.changed → set_best_share() → think()
+                        p2p_node->run_think();
+                        LOG_INFO << "[LTC] bestblock received from P2P peer — work+think refreshed";
+                    });
                 });
 
                 // When best_share changes (new share on chain), refresh work for all
