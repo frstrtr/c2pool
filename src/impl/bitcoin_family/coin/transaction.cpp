@@ -1,6 +1,6 @@
 #include "transaction.hpp"
 
-namespace ltc
+namespace bitcoin_family
 {
 
 namespace coin
@@ -21,4 +21,4 @@ MutableTransaction::MutableTransaction(const Transaction& tx) : version(tx.versi
 
 } // namespace coin
 
-} // namespace ltc
+} // namespace bitcoin_family

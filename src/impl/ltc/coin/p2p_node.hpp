@@ -1,7 +1,7 @@
 #pragma once
 
-#include "p2p_messages.hpp"
-#include "p2p_connection.hpp"
+#include <impl/bitcoin_family/coin/p2p_messages.hpp>
+#include <impl/bitcoin_family/coin/p2p_connection.hpp>
 #include "node_interface.hpp"
 
 #include <memory>
@@ -17,7 +17,7 @@
 namespace io = boost::asio;
 
 #define ADD_P2P_HANDLER(name)\
-    void handle(std::unique_ptr<ltc::coin::p2p::message_##name> msg)
+    void handle(std::unique_ptr<bitcoin_family::coin::p2p::message_##name> msg)
 namespace ltc
 {
 namespace coin
@@ -25,6 +25,9 @@ namespace coin
 
 namespace p2p
 {
+
+// Namespace alias for coin daemon P2P types (avoids collision with pool-level messages)
+namespace daemon = bitcoin_family::coin::p2p;
 
 std::string parse_net_error(const boost::system::error_code& ec);
 
@@ -51,9 +54,9 @@ private:
     ltc::interfaces::Node* m_coin;
     io::io_context* m_context;
     config_t* m_config;
-    p2p::Handler m_handler;
+    daemon::Handler m_handler;
 
-    std::unique_ptr<Connection> m_peer;
+    std::unique_ptr<daemon::Connection> m_peer;
     std::unique_ptr<core::Timer> m_reconnect_timer;
     std::unique_ptr<core::Timer> m_ping_timer;
     std::unique_ptr<core::Timer> m_timeout_timer;
@@ -92,7 +95,7 @@ public:
     // INetwork
     void connected(std::shared_ptr<core::Socket> socket) override
     {
-        m_peer = std::make_unique<Connection>(m_context, socket);
+        m_peer = std::make_unique<daemon::Connection>(m_context, socket);
         m_handshake_complete = false;
         LOG_INFO << "P2P connected to " << m_target_addr.to_string();
 
@@ -102,7 +105,7 @@ public:
             timeout("handshake timeout");
         });
 
-        auto msg_version = message_version::make_raw(
+        auto msg_version = daemon::message_version::make_raw(
             70017,
             1,
             core::timestamp(),
@@ -154,7 +157,7 @@ public:
     {
         on_activity();
 
-        p2p::Handler::result_t result;
+        daemon::Handler::result_t result;
         try 
         {
             result = m_handler.parse(rmsg);
@@ -181,7 +184,7 @@ public:
     {
         if (m_peer)
         {
-            auto rmsg = ltc::coin::p2p::message_block::make_raw(block);
+            auto rmsg = daemon::message_block::make_raw(block);
             m_peer->write(rmsg);
         } else
         {
@@ -197,7 +200,7 @@ public:
     void send_getaddr()
     {
         if (m_peer) {
-            auto msg = message_getaddr::make_raw();
+            auto msg = daemon::message_getaddr::make_raw();
             m_peer->write(msg);
         }
     }
@@ -206,7 +209,7 @@ public:
     void send_block_inv(const uint256& block_hash)
     {
         if (m_peer) {
-            auto msg = message_inv::make_raw({inventory_type(inventory_type::block, block_hash)});
+            auto msg = daemon::message_inv::make_raw({daemon::inventory_type(daemon::inventory_type::block, block_hash)});
             m_peer->write(msg);
         }
     }
@@ -283,14 +286,14 @@ private:
         if (!m_peer || !m_handshake_complete)
             return;
 
-        auto msg_ping = message_ping::make_raw(core::random::random_nonce());
+        auto msg_ping = daemon::message_ping::make_raw(core::random::random_nonce());
         m_peer->write(msg_ping);
     }
 
     ADD_P2P_HANDLER(version)
     {
         LOG_INFO << "version is?: " << msg->m_command;
-        auto verack_msg = message_verack::make_raw();
+        auto verack_msg = daemon::message_verack::make_raw();
         m_peer->write(verack_msg);
     }
 
@@ -299,12 +302,12 @@ private:
         m_peer->init_requests(
             [&](uint256 hash)
             {
-                auto getdata_msg = message_getdata::make_raw({inventory_type(inventory_type::block, hash)});
+                auto getdata_msg = daemon::message_getdata::make_raw({daemon::inventory_type(daemon::inventory_type::block, hash)});
                 m_peer->write(getdata_msg);
             },
             [&](uint256 hash)
             {
-                auto getheaders_msg = message_getheaders::make_raw(1, {}, hash);
+                auto getheaders_msg = daemon::message_getheaders::make_raw(1, {}, hash);
                 m_peer->write(getheaders_msg);
             }
         );
@@ -321,7 +324,7 @@ private:
 
     ADD_P2P_HANDLER(ping)
     {
-        auto msg_pong = message_pong::make_raw(msg->m_nonce);
+        auto msg_pong = daemon::message_pong::make_raw(msg->m_nonce);
         m_peer->write(msg_pong);
     }
     
@@ -337,16 +340,16 @@ private:
 
     ADD_P2P_HANDLER(inv)
     {
-        std::vector<inventory_type> vinv;
-        
+        std::vector<daemon::inventory_type> vinv;
+
         for (auto& inv : msg->m_invs)
         {
             switch (inv.m_type)
             {
-            case inventory_type::tx:
+            case daemon::inventory_type::tx:
                 vinv.push_back(inv);
                 break;
-            case inventory_type::block:
+            case daemon::inventory_type::block:
                 m_coin->new_block.happened(inv.m_hash);
                 break;
             default:
@@ -357,7 +360,7 @@ private:
 
         if (!vinv.empty())
         {
-            auto msg_getdata = message_getdata::make_raw(vinv);
+            auto msg_getdata = daemon::message_getdata::make_raw(vinv);
             m_peer->write(msg_getdata);
         }
     }

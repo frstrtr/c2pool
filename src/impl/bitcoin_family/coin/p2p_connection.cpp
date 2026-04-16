@@ -1,6 +1,6 @@
 #include "p2p_connection.hpp"
 
-namespace ltc
+namespace bitcoin_family
 {
     
 namespace coin
@@ -37,4 +37,4 @@ void Connection::get_header(uint256 id, BlockHeaderType response)
 
 } // namespace coin
 
-} // namespace ltc
+} // namespace bitcoin_family
