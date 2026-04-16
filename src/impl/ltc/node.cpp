@@ -94,10 +94,10 @@ void NodeImpl::close_connection(const NetService& service)
 void NodeImpl::send_version(peer_ptr peer)
 {
     auto rmsg = ltc::message_version::make_raw(
-        ltc::PoolConfig::MINIMUM_PROTOCOL_VERSION,
+        m_tracker.m_params->minimum_protocol_version,
         1,                                    // services
         addr_t{1, peer->addr()},              // addr_to (the remote)
-        addr_t{1, NetService{"0.0.0.0", ltc::PoolConfig::P2P_PORT}}, // addr_from (us)
+        addr_t{1, NetService{"0.0.0.0", m_tracker.m_params->p2p_port}}, // addr_from (us)
         m_nonce,
         "/c2pool:0.1/",
         1,                                    // mode (always 1 for legacy compat)
@@ -151,11 +151,11 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
         }
 
         // Reject peers running too-old protocol
-        if (msg->m_version < ltc::PoolConfig::MINIMUM_PROTOCOL_VERSION)
+        if (msg->m_version < m_tracker.m_params->minimum_protocol_version)
         {
             LOG_WARNING << "Peer " << msg->m_addr_from.m_endpoint.to_string()
                         << " protocol " << msg->m_version
-                        << " < minimum " << ltc::PoolConfig::MINIMUM_PROTOCOL_VERSION
+                        << " < minimum " << m_tracker.m_params->minimum_protocol_version
                         << ", disconnecting";
             throw std::runtime_error("peer protocol too old");
         }
@@ -677,7 +677,7 @@ void NodeImpl::run_think()
     // Trim stale shares to prevent unbounded memory growth.
     // Keep 2 * chain_length per head (matches Python p2pool behavior).
     // Must trim even when result.best is null (during initial sync).
-    const size_t keep_per_head = PoolConfig::chain_length() * 2 + 10;
+    const size_t keep_per_head = m_tracker.m_params->chain_length * 2 + 10;
     auto trim_chain = [&](auto& sc, const char* label, bool owns_data = true) {
         if (sc.size() <= keep_per_head)
             return;

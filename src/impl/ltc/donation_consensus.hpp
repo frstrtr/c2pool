@@ -12,6 +12,7 @@
 #include "config_pool.hpp"
 #include "share_tracker.hpp"
 
+#include <core/coin_params.hpp>
 #include <core/target_utils.hpp>
 
 #include <algorithm>
@@ -51,9 +52,10 @@ struct DonationValidationResult
 inline DonationValidationResult validate_donation_output(
     const std::vector<CoinbaseOutput>& coinbase_outputs,
     const std::map<std::vector<unsigned char>, double>& expected_payouts,
-    int64_t share_version)
+    int64_t share_version,
+    const core::CoinParams& params)
 {
-    auto donation_script = PoolConfig::get_donation_script(share_version);
+    auto donation_script = params.donation_script_func(share_version);
 
     // Look up expected donation amount
     auto it = expected_payouts.find(donation_script);
@@ -114,9 +116,10 @@ build_expected_payouts(ShareTracker& tracker,
                        const uint256& best_share_hash,
                        const uint256& block_target,
                        uint64_t subsidy,
-                       int64_t share_version)
+                       int64_t share_version,
+                       const core::CoinParams& params)
 {
-    auto donation_script = PoolConfig::get_donation_script(share_version);
+    auto donation_script = params.donation_script_func(share_version);
     return tracker.get_expected_payouts(best_share_hash, block_target, subsidy, donation_script);
 }
 

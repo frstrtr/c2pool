@@ -70,7 +70,7 @@ public:
 
         auto [height, last] = tracker.chain.get_height_and_last(best_share_hash);
         int32_t lookbehind = std::min(height - 1,
-            static_cast<int32_t>(PoolConfig::TARGET_LOOKBEHIND));
+            static_cast<int32_t>(tracker.m_params->target_lookbehind));
         if (lookbehind < 2)
             return false;
 
@@ -123,7 +123,7 @@ public:
 
         // Secondary signal: long wall-clock share drought while below baseline
         bool gap_trigger = share_gap >= static_cast<int64_t>(
-            PoolConfig::share_period() * gap_trigger_periods_);
+            tracker.m_params->share_period * gap_trigger_periods_);
 
         if (active_)
         {

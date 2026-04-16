@@ -118,7 +118,7 @@ private:
     {
         int alerts = 0;
         int32_t lookbehind = std::min(height - 1,
-            static_cast<int32_t>(3600 / PoolConfig::share_period()));
+            static_cast<int32_t>(3600 / tracker.m_params->share_period));
         if (lookbehind < 2)
             return 0;
 
@@ -181,9 +181,9 @@ private:
         std::vector<Window> windows;
         windows.push_back({"short", std::min(height, 100)});
         windows.push_back({"medium", std::min(height, 720)});
-        if (height >= static_cast<int32_t>(PoolConfig::real_chain_length()))
+        if (height >= static_cast<int32_t>(tracker.m_params->real_chain_length))
             windows.push_back({"full", std::min(height,
-                static_cast<int32_t>(PoolConfig::real_chain_length()))});
+                static_cast<int32_t>(tracker.m_params->real_chain_length))});
 
         for (auto& [label, depth] : windows)
         {
@@ -274,7 +274,7 @@ private:
 
         auto now = static_cast<uint32_t>(std::time(nullptr));
         uint32_t gap = (now > ts) ? (now - ts) : 0;
-        auto emergency_threshold = PoolConfig::share_period() * 20;
+        auto emergency_threshold = tracker.m_params->share_period * 20;
 
         if (gap > emergency_threshold)
         {
@@ -284,7 +284,7 @@ private:
                         << "s emergency_count=" << emergency_count_;
             ++alerts;
         }
-        else if (gap > PoolConfig::share_period() * 10)
+        else if (gap > tracker.m_params->share_period * 10)
         {
             LOG_WARNING << "[MONITOR-EMERGENCY] WARN gap=" << gap
                         << "s (approaching threshold=" << emergency_threshold << "s)";
@@ -298,7 +298,7 @@ private:
     {
         int alerts = 0;
         int32_t lookbehind = std::min(height - 1,
-            static_cast<int32_t>(PoolConfig::TARGET_LOOKBEHIND));
+            static_cast<int32_t>(tracker.m_params->target_lookbehind));
         if (lookbehind < 2)
             return 0;
 
@@ -310,7 +310,7 @@ private:
         // expected_target = 2^256 / (SHARE_PERIOD * aps) - 1
         uint288 two_256;
         two_256.SetHex("10000000000000000000000000000000000000000000000000000000000000000");
-        uint288 divisor = aps * static_cast<uint32_t>(PoolConfig::share_period());
+        uint288 divisor = aps * static_cast<uint32_t>(tracker.m_params->share_period);
         if (divisor.IsNull())
             return 0;
         uint288 expected_288 = two_256 / divisor;

@@ -4,6 +4,7 @@
 #include "share_check.hpp"
 #include "config_pool.hpp"
 
+#include <core/coin_params.hpp>
 #include <core/target_utils.hpp>
 #include <core/uint256.hpp>
 #include <core/netaddress.hpp>
@@ -106,6 +107,7 @@ class ShareTracker
 public:
     ShareChain chain;
     ShareChain verified;
+    const core::CoinParams* m_params = nullptr;
 
 private:
     static int64_t now_seconds()
@@ -116,6 +118,7 @@ private:
 
 public:
     ShareTracker() = default;
+    explicit ShareTracker(const core::CoinParams* params) : m_params(params) {}
     ~ShareTracker()
     {
         // verified borrows raw share pointers from chain — free its
@@ -150,7 +153,7 @@ public:
         auto [height, last] = chain.get_height_and_last(share_hash);
 
         // Need CHAIN_LENGTH + 1 depth, or the chain must be rooted (last == null)
-        if (height < static_cast<int32_t>(PoolConfig::chain_length()) + 1 && !last.IsNull())
+        if (height < static_cast<int32_t>(m_params->chain_length) + 1 && !last.IsNull())
             return false;
 
         // P2: init-phase verification (hash-link, merkle, PoW) + check-phase
@@ -158,7 +161,7 @@ public:
         {
             auto& share_var = chain.get_share(share_hash);
             share_var.ACTION({
-                auto computed_hash = verify_share(*obj, *this);
+                auto computed_hash = verify_share(*obj, *this, *m_params);
                 // verify_share runs both init (PoW/hash-link) and check (PPLNS/gentx)
                 (void)computed_hash;
             });
@@ -187,19 +190,19 @@ public:
         uint288 score_res;
 
         auto head_height = verified.get_height(share_hash);
-        if (head_height < static_cast<int32_t>(PoolConfig::chain_length()))
+        if (head_height < static_cast<int32_t>(m_params->chain_length))
             return {head_height, score_res};
 
         auto end_point = verified.get_nth_parent_key(share_hash,
-            (PoolConfig::chain_length() * 15) / 16);
+            (m_params->chain_length * 15) / 16);
 
         // Find max block_rel_height in the tail 1/16 of the chain
         std::optional<int32_t> block_height;
         auto tail_count = std::min(
-            static_cast<int32_t>(PoolConfig::chain_length() / 16),
+            static_cast<int32_t>(m_params->chain_length / 16),
             verified.get_height(end_point));
         if (tail_count <= 0)
-            return {static_cast<int32_t>(PoolConfig::chain_length()), score_res};
+            return {static_cast<int32_t>(m_params->chain_length), score_res};
 
         auto tail_view = verified.get_chain(end_point, tail_count);
         for (auto& [hash, data] : tail_view)
@@ -216,7 +219,7 @@ public:
         }
 
         if (!block_height.has_value() || block_height.value() >= 0)
-            return {static_cast<int32_t>(PoolConfig::chain_length()), score_res};
+            return {static_cast<int32_t>(m_params->chain_length), score_res};
 
         // Get accumulated work between share_hash and end_point on the verified chain
         auto interval = verified.get_interval(share_hash, end_point);
@@ -225,7 +228,7 @@ public:
             time_span = 1;
 
         score_res = interval.work / static_cast<uint32_t>(time_span);
-        return {static_cast<int32_t>(PoolConfig::chain_length()), score_res};
+        return {static_cast<int32_t>(m_params->chain_length), score_res};
     }
 
     // -- Best-chain selection with verification and punishment --
@@ -247,7 +250,7 @@ public:
             auto [head_height, last] = chain.get_height_and_last(head_hash);
             auto walk_count = last.IsNull()
                 ? head_height
-                : std::min(5, std::max(0, head_height - static_cast<int32_t>(PoolConfig::chain_length())));
+                : std::min(5, std::max(0, head_height - static_cast<int32_t>(m_params->chain_length)));
 
             if (walk_count <= 0)
                 continue;
@@ -311,10 +314,10 @@ public:
 
             auto [last_height, last_last_hash] = chain.get_height_and_last(last_hash);
 
-            auto want = std::max(static_cast<int32_t>(PoolConfig::chain_length()) - head_height, 0);
+            auto want = std::max(static_cast<int32_t>(m_params->chain_length) - head_height, 0);
             auto can = last_last_hash.IsNull()
                 ? last_height
-                : std::max(last_height - 1 - static_cast<int32_t>(PoolConfig::chain_length()), 0);
+                : std::max(last_height - 1 - static_cast<int32_t>(m_params->chain_length), 0);
             auto to_get = std::min(want, can);
 
             if (to_get > 0)
@@ -328,7 +331,7 @@ public:
             }
 
             // Request more shares if verified chain is short
-            if (head_height < static_cast<int32_t>(PoolConfig::chain_length()) && !last_last_hash.IsNull())
+            if (head_height < static_cast<int32_t>(m_params->chain_length) && !last_last_hash.IsNull())
             {
                 NetService peer;
                 chain.get_share(head_hash).invoke([&](auto* obj) {
@@ -396,7 +399,7 @@ public:
                 int32_t reason = 0;
                 {
                     auto share_version = chain.get_share(hh).version();
-                    auto lookbehind = static_cast<int32_t>(PoolConfig::chain_length());
+                    auto lookbehind = static_cast<int32_t>(m_params->chain_length);
                     if (should_punish_version(hh, share_version, lookbehind))
                         reason = 1;
                 }
@@ -479,7 +482,7 @@ public:
     {
         // MAX_TARGET: network-specific share difficulty floor
         // Mainnet: 2^236 - 1, Testnet: 2^256/20 - 1  (from PoolConfig)
-        const uint256 MAX_TARGET = PoolConfig::max_target();
+        const uint256 MAX_TARGET = m_params->max_target;
 
         if (prev_share_hash.IsNull())
             return {chain::target_to_bits_upper_bound(MAX_TARGET),
@@ -488,7 +491,7 @@ public:
         auto [height, last] = chain.get_height_and_last(prev_share_hash);
 
         // Not enough chain depth: use MAX_TARGET
-        if (height < static_cast<int32_t>(PoolConfig::TARGET_LOOKBEHIND))
+        if (height < static_cast<int32_t>(m_params->target_lookbehind))
         {
             auto max_bits = chain::target_to_bits_upper_bound(MAX_TARGET);
             return {max_bits, max_bits};
@@ -496,7 +499,7 @@ public:
 
         // Step 1: Derive target from pool hashrate
         auto aps = get_pool_attempts_per_second(prev_share_hash,
-            PoolConfig::TARGET_LOOKBEHIND, /*min_work=*/true);
+            m_params->target_lookbehind, /*min_work=*/true);
 
         uint256 pre_target;
         if (aps.IsNull())
@@ -508,7 +511,7 @@ public:
             // pre_target = 2^256 / (SHARE_PERIOD * aps) - 1
             uint288 two_256;
             two_256.SetHex("10000000000000000000000000000000000000000000000000000000000000000");
-            uint288 divisor = aps * static_cast<uint32_t>(PoolConfig::share_period());
+            uint288 divisor = aps * static_cast<uint32_t>(m_params->share_period);
             if (divisor.IsNull())
                 divisor = uint288(1);
             uint288 result = two_256 / divisor;
@@ -545,10 +548,10 @@ public:
         if (prev_ts > 0 && desired_timestamp > prev_ts)
         {
             auto time_since_share = desired_timestamp - prev_ts;
-            auto emergency_threshold = PoolConfig::share_period() * 20;
+            auto emergency_threshold = m_params->share_period * 20;
             if (time_since_share > emergency_threshold)
             {
-                auto half_life = PoolConfig::share_period() * 10;
+                auto half_life = m_params->share_period * 10;
                 auto excess = time_since_share - emergency_threshold;
                 auto halvings = excess / half_life;
                 auto remainder = excess % half_life;
@@ -710,7 +713,7 @@ public:
         static constexpr uint64_t DECAY_SCALE = uint64_t(1) << DECAY_PRECISION;
         static constexpr uint64_t LN2_MICRO = 693147;
 
-        uint32_t half_life = std::max(PoolConfig::chain_length() / 4, uint32_t(1));
+        uint32_t half_life = std::max(m_params->chain_length / 4, uint32_t(1));
         uint64_t decay_per = DECAY_SCALE - (DECAY_SCALE * LN2_MICRO) / (uint64_t(1000000) * half_life);
 
         CumulativeWeights result;
@@ -777,9 +780,9 @@ public:
                          const std::vector<unsigned char>& donation_script)
     {
         auto chain_len = std::min(chain.get_height(best_share_hash),
-                                  static_cast<int32_t>(PoolConfig::real_chain_length()));
+                                  static_cast<int32_t>(m_params->real_chain_length));
         auto max_weight = chain::target_to_average_attempts(block_target)
-                          * PoolConfig::SPREAD * 65535;
+                          * m_params->spread * 65535;
 
         // V36: use exponential depth-decay (matching Python's get_decayed_cumulative_weights)
         auto [weights, total_weight, donation_weight] = get_v36_decayed_cumulative_weights(best_share_hash, chain_len, max_weight);
@@ -952,9 +955,9 @@ public:
             return uint256{};
 
         auto max_weight = chain::target_to_average_attempts(block_target)
-                          * PoolConfig::SPREAD * 65535;
+                          * m_params->spread * 65535;
         auto chain_len = std::min(height,
-                                  static_cast<int32_t>(PoolConfig::real_chain_length()));
+                                  static_cast<int32_t>(m_params->real_chain_length));
 
         auto [weights, total_weight, donation_weight] =
             get_v36_merged_weights(prev_share_hash, chain_len, max_weight);
@@ -987,7 +990,7 @@ public:
             if (script.size() == 25 && script[0] == 0x76 && script[1] == 0xa9
                 && script[2] == 0x14 && script[23] == 0x88 && script[24] == 0xac)
             {
-                unsigned char addr_ver = PoolConfig::is_testnet ? 111 : 48;
+                unsigned char addr_ver = m_params->address_version;
                 std::vector<unsigned char> data = {addr_ver};
                 data.insert(data.end(), script.begin() + 3, script.begin() + 23);
                 return EncodeBase58Check(data);
@@ -996,7 +999,7 @@ public:
             if (script.size() == 23 && script[0] == 0xa9 && script[1] == 0x14
                 && script[22] == 0x87)
             {
-                unsigned char addr_ver = PoolConfig::is_testnet ? 58 : 50;
+                unsigned char addr_ver = m_params->address_p2sh_version;
                 std::vector<unsigned char> data = {addr_ver};
                 data.insert(data.end(), script.begin() + 2, script.begin() + 22);
                 return EncodeBase58Check(data);
@@ -1050,9 +1053,9 @@ public:
                                 const std::vector<unsigned char>& donation_script)
     {
         auto chain_len = std::min(chain.get_height(best_share_hash),
-                                  static_cast<int32_t>(PoolConfig::real_chain_length()));
+                                  static_cast<int32_t>(m_params->real_chain_length));
         auto max_weight = chain::target_to_average_attempts(block_target)
-                          * PoolConfig::SPREAD * 65535;
+                          * m_params->spread * 65535;
 
         auto [weights, total_weight, donation_weight] =
             get_merged_cumulative_weights(best_share_hash, chain_len, max_weight, chain_id);

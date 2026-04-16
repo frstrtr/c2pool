@@ -178,7 +178,7 @@ private:
             return;
 
         auto [height, last] = tracker.chain.get_height_and_last(best);
-        int32_t depth = std::min(height, static_cast<int32_t>(PoolConfig::real_chain_length()));
+        int32_t depth = std::min(height, static_cast<int32_t>(tracker.m_params->real_chain_length));
         if (depth < 1)
             return;
 
