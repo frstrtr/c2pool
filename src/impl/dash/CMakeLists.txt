@@ -20,17 +20,20 @@ add_library(dash_x11 ${DASH_X11_SOURCES})
 target_include_directories(dash_x11 PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/crypto/x11
 )
-# Pure C — no C++ flags
+# Pure C — no C++ flags needed
 set_target_properties(dash_x11 PROPERTIES LINKER_LANGUAGE C)
 
-# Dash implementation library (C++ — params, share types, node)
-# TODO: Add more sources as M3 progresses
-add_library(dash_impl INTERFACE)
-target_include_directories(dash_impl INTERFACE
+# c2pool-dash binary: M3 proof-of-concept
+add_executable(c2pool-dash main_dash.cpp)
+target_include_directories(c2pool-dash PRIVATE
     ${CMAKE_SOURCE_DIR}/src
 )
-target_link_libraries(dash_impl INTERFACE
+target_link_libraries(c2pool-dash
     dash_x11
-    bitcoin_family
     core
+    btclibs
+    Boost::system
+    Boost::thread
+    Boost::log
+    Boost::log_setup
 )
