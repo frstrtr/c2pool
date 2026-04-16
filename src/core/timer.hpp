@@ -23,7 +23,7 @@ private:
 
     void logic()
     {
-        m_timer.expires_from_now(boost::asio::chrono::seconds(m_t));
+        m_timer.expires_after(boost::asio::chrono::seconds(m_t));
         m_timer.async_wait(
             [&, destroyed = m_destroyed](const boost::system::error_code& ec)
             {
