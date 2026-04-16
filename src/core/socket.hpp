@@ -75,6 +75,7 @@ public:
         // init addrs — guard against socket being closed before init() dispatched
         boost::system::error_code ec;
         auto ep_local  = m_socket->local_endpoint(ec);
+        if (ec) { m_status = false; m_socket->close(); return; }
         auto ep_remote = m_socket->remote_endpoint(ec);
         if (ec) { m_status = false; m_socket->close(); return; }
         m_addr_local = NetService(ep_local);
