@@ -22,18 +22,24 @@ struct ChainParams
     bool    allow_min_difficulty{false}; // testnet only
     bool    no_retargeting{false};   // regtest only
     uint256 pow_limit;               // easiest allowed PoW target
-    uint256 genesis_hash;            // genesis block hash
+    uint256 genesis_hash;            // genesis block hash (SHA256d for identification)
 
-    // Optional: checkpoint for fast-sync
-    uint256  checkpoint_hash;
-    uint32_t checkpoint_height{0};
+    // Optional: checkpoint for fast-sync (skip syncing from genesis)
+    struct Checkpoint { uint32_t height{0}; uint256 hash; };
+    std::optional<Checkpoint> fast_start_checkpoint;
 
     // Halving
     uint32_t halving_interval{0};    // LTC: 840000, BTC: 210000, DOGE: 0 (no halving)
     uint64_t initial_subsidy{0};     // LTC: 5000000000, BTC: 5000000000
 
-    // PoW function reference (for header validation)
+    // PoW function: computes the hash used for difficulty comparison.
+    // LTC/DOGE: scrypt, BTC: sha256d, Dash: X11
     core::PowFunc pow_func;
+
+    // Block identity hash: SHA256d for all Bitcoin-family coins.
+    // This is the "real" block hash used for getdata/inv/prev_block references.
+    // Differs from pow_func for coins where PoW uses a different algorithm.
+    core::BlockHashFunc block_hash_func;
 
     int64_t difficulty_adjustment_interval() const {
         return (target_spacing > 0) ? (target_timespan / target_spacing) : 1;

@@ -1561,8 +1561,8 @@ int main(int argc, char* argv[]) {
                 LOG_INFO << "╚══════════════════════════════════════════════════════════════╝";
 
                 auto ltc_params = settings->m_testnet
-                    ? ltc::coin::LTCChainParams::testnet()
-                    : ltc::coin::LTCChainParams::mainnet();
+                    ? ltc::coin::make_ltc_chain_params_testnet()
+                    : ltc::coin::make_ltc_chain_params_mainnet();
 
                 // LevelDB-backed header chain for persistence across restarts
                 // Use absolute path under ~/.c2pool/ (matches sharechain + found_blocks)
