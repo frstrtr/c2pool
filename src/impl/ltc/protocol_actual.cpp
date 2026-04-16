@@ -193,11 +193,9 @@ void Actual::HANDLER(bestblock)
     LOG_INFO << "[Pool] New best block from peer " << peer->addr().to_string()
              << ": " << header_hash.ToString();
 
-    for (auto& [nonce, wpeer] : m_peers)
-    {
-        if (wpeer != peer)
-            wpeer->write(message_bestblock::make_raw(msg->m_header));
-    }
+    // p2pool does NOT relay bestblock — each node broadcasts only from its own
+    // block source (bitcoind_work.changed → best_block_header.changed).
+    // Relaying creates an amplification loop: A→B→C→A with alternating hashes.
     if (m_on_bestblock) m_on_bestblock(header_hash);
 }
 
