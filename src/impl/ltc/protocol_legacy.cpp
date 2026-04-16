@@ -232,7 +232,7 @@ void Legacy::HANDLER(bestblock)
                 wpeer->write(message_bestblock::make_raw(msg->m_header));
         }
         // Notify local work-refresh callback (e.g. to re-fetch getblocktemplate)
-        if (m_on_bestblock) m_on_bestblock();
+        if (m_on_bestblock) m_on_bestblock(header_hash);
     } catch (const std::exception& e) {
         LOG_WARNING << "[Pool] bestblock handler exception: " << e.what();
     }

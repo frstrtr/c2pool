@@ -198,7 +198,7 @@ void Actual::HANDLER(bestblock)
         if (wpeer != peer)
             wpeer->write(message_bestblock::make_raw(msg->m_header));
     }
-    if (m_on_bestblock) m_on_bestblock();
+    if (m_on_bestblock) m_on_bestblock(header_hash);
 }
 
 void Actual::HANDLER(have_tx)

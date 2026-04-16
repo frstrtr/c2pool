@@ -286,7 +286,7 @@ public:
 
     /// Register a callback invoked whenever a bestblock message is received
     /// from any peer (after relaying). Use this to trigger work refresh.
-    void set_on_bestblock(std::function<void()> fn) { m_on_bestblock = std::move(fn); }
+    void set_on_bestblock(std::function<void(const uint256&)> fn) { m_on_bestblock = std::move(fn); }
 
     /// Set the software version string announced to peers in P2P version messages.
     void set_software_version(std::string ver) { m_software_version = std::move(ver); }
@@ -417,7 +417,7 @@ public:
 
 protected:
     std::string m_software_version = "/c2pool:0.1/";  // overridden by set_software_version()
-    std::function<void()> m_on_bestblock;
+    std::function<void(const uint256&)> m_on_bestblock;
     std::function<void()> m_on_best_share_changed;
     std::function<double()> m_local_hashrate_fn;
     std::function<LocalRateStats()> m_local_rate_stats_fn;
