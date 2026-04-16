@@ -985,7 +985,7 @@ public:
 
         // Convert script bytes to base58check address string,
         // matching Python's share.address format used as dict key.
-        auto script_to_address = [](const std::vector<unsigned char>& script) -> std::string {
+        auto script_to_address = [this](const std::vector<unsigned char>& script) -> std::string {
             // P2PKH: OP_DUP OP_HASH160 <20> <hash160> OP_EQUALVERIFY OP_CHECKSIG
             if (script.size() == 25 && script[0] == 0x76 && script[1] == 0xa9
                 && script[2] == 0x14 && script[23] == 0x88 && script[24] == 0xac)

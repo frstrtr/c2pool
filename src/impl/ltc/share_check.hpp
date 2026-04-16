@@ -1754,7 +1754,7 @@ uint256 create_local_share(
             uint256 expected_gentx = generate_share_transaction(share, tracker, params);
 
             // Compute actual gentx_hash via the same hash_link path that Python uses
-            auto gst_gentx_before_refhash = compute_gentx_before_refhash(int64_t(36));
+            auto gst_gentx_before_refhash = compute_gentx_before_refhash(int64_t(36), params);
             std::vector<unsigned char> gst_hash_link_data;
             {
                 uint256 ref_hash_chk = check_merkle_link(ref_hash, share.m_ref_merkle_link);
