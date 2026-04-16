@@ -1776,7 +1776,7 @@ uint256 create_local_share(
                           << "\n  donation=" << donation;
                 return uint256();
             }
-            LOG_INFO << "create_local_share: GENTX comparison PASSED";
+            LOG_DEBUG_DIAG << "create_local_share: GENTX comparison PASSED";
         } catch (const std::exception& e) {
             LOG_ERROR << "create_local_share: GENTX comparison FAILED: " << e.what()
                       << " share=" << share_hash.GetHex();
@@ -1787,9 +1787,9 @@ uint256 create_local_share(
     // Add to tracker (heap-allocate; ShareChain takes ownership via raw pointer)
     auto* heap_share = new MergedMiningShare(share);
     tracker.add(heap_share);
-    LOG_INFO << "create_local_share: added share " << share_hash.GetHex()
-             << " height=" << share.m_absheight
-             << " prev=" << prev_share.GetHex().substr(0, 16) << "...";
+    LOG_DEBUG_DIAG << "create_local_share: added share " << share_hash.GetHex()
+                   << " height=" << share.m_absheight
+                   << " prev=" << prev_share.GetHex().substr(0, 16) << "...";
 
     return share_hash;
 }

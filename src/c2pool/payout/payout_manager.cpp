@@ -680,7 +680,7 @@ nlohmann::json PayoutManager::build_coinbase_detailed(uint64_t block_reward_sato
         result["total_amount"] = block_reward_satoshis;
         result["output_count"] = outputs.size();
         
-        LOG_INFO << "Built detailed coinbase with " << outputs.size() << " outputs, total: " << block_reward_satoshis << " satoshis";
+        LOG_DEBUG_DIAG << "Built detailed coinbase with " << outputs.size() << " outputs, total: " << block_reward_satoshis << " satoshis";
         
     } catch (const std::exception& e) {
         LOG_ERROR << "Error building detailed coinbase: " << e.what();
@@ -914,7 +914,7 @@ bool PayoutManager::validate_coinbase_transaction(const std::string& coinbase_he
             return false;
         }
         
-        LOG_INFO << "Coinbase transaction validation passed - " << tx_data.size() << " bytes";
+        LOG_DEBUG_DIAG << "Coinbase transaction validation passed - " << tx_data.size() << " bytes";
         return true;
         
     } catch (const std::exception& e) {

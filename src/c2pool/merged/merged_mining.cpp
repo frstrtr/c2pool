@@ -583,10 +583,10 @@ void MergedMiningManager::refresh_aux_work()
             }
 
             any_changed = true;
-            LOG_INFO << "[MM:" << chain.config.symbol << "] New aux work at height "
-                     << chain.current_work.height
-                     << " hash=" << chain.current_work.block_hash.GetHex().substr(0, 16) << "..."
-                     << " target=" << chain.current_work.target.GetHex().substr(0, 16) << "...";
+            LOG_DEBUG_DIAG << "[MM:" << chain.config.symbol << "] New aux work at height "
+                         << chain.current_work.height
+                         << " hash=" << chain.current_work.block_hash.GetHex().substr(0, 16) << "..."
+                         << " target=" << chain.current_work.target.GetHex().substr(0, 16) << "...";
         } catch (const std::exception& e) {
             LOG_WARNING << "[MM:" << chain.config.symbol << "] Failed to refresh: " << e.what();
         }
@@ -652,10 +652,10 @@ void MergedMiningManager::try_submit_merged_blocks(
         static int mm_check_count = 0;
         ++mm_check_count;
         if (mm_check_count <= 3 || mm_check_count % 50 == 0) {
-            LOG_INFO << "[MM:" << chain.config.symbol << "] Check #" << mm_check_count
-                     << " parent_hash=" << parent_hash.GetHex().substr(0, 20) << "..."
-                     << " aux_target=" << chain.current_work.target.GetHex().substr(0, 20) << "..."
-                     << " meets=" << (parent_hash <= chain.current_work.target ? "YES" : "no");
+            LOG_TRACE << "[MM:" << chain.config.symbol << "] Check #" << mm_check_count
+                      << " parent_hash=" << parent_hash.GetHex().substr(0, 20) << "..."
+                      << " aux_target=" << chain.current_work.target.GetHex().substr(0, 20) << "..."
+                      << " meets=" << (parent_hash <= chain.current_work.target ? "YES" : "no");
         }
         if (!(parent_hash <= chain.current_work.target)) {
             continue;  // doesn't meet this chain's target

@@ -190,6 +190,15 @@ void print_help() {
     std::cout << "  --outgoing-conns N        Alias for --max-conns\n";
     std::cout << "  --disable-upnp            Disable UPnP port forwarding\n\n";
 
+    std::cout << "LOG LEVEL (p2pool: --debug; c2pool extends with standard granularity):\n";
+    std::cout << "  --loglevel-trace          Show everything (per-share weights, all diagnostics)\n";
+    std::cout << "  --loglevel-debug          Show PPLNS distributions, stratum detail, MM polls\n";
+    std::cout << "  --loglevel-info           Normal operation (default)\n";
+    std::cout << "  --loglevel-warning        Warnings and errors only\n";
+    std::cout << "  --loglevel-error          Errors only\n";
+    std::cout << "  --loglevel-critical       Fatal only\n";
+    std::cout << "  YAML config: log_level: info\n\n";
+
     std::cout << "V36 SHARE MESSAGE BLOB (CLI operator control):\n";
     std::cout << "  --message-blob-hex HEX    Encrypted authority-signed message_data blob\n";
     std::cout << "                            to embed in locally created V36 shares\n\n";
@@ -302,6 +311,11 @@ int main(int argc, char* argv[]) {
 
     // Optional encrypted authority message_data blob for local V36 shares.
     std::string operator_message_blob_hex;
+
+    // Log severity level (default: info).  Overridden by --loglevel-* CLI flags
+    // or YAML log_level key.  Applied after init() so early startup messages
+    // still appear at trace level.
+    boost::log::trivial::severity_level log_level = boost::log::trivial::info;
 
     // Track which options were explicitly set via CLI so that --config file
     // values only fill in gaps (CLI always wins).
@@ -529,6 +543,31 @@ int main(int argc, char* argv[]) {
         else if (arg == "-n" && i + 1 < argc) {
             seed_nodes.push_back(argv[++i]);
         }
+        // Log level flags (p2pool: --debug; c2pool extends with standard granularity)
+        else if (arg == "--loglevel-trace") {
+            log_level = boost::log::trivial::trace;
+            cli_explicit.insert("log_level");
+        }
+        else if (arg == "--loglevel-debug" || arg == "--debug") {
+            log_level = boost::log::trivial::debug;
+            cli_explicit.insert("log_level");
+        }
+        else if (arg == "--loglevel-info") {
+            log_level = boost::log::trivial::info;
+            cli_explicit.insert("log_level");
+        }
+        else if (arg == "--loglevel-warning") {
+            log_level = boost::log::trivial::warning;
+            cli_explicit.insert("log_level");
+        }
+        else if (arg == "--loglevel-error") {
+            log_level = boost::log::trivial::error;
+            cli_explicit.insert("log_level");
+        }
+        else if (arg == "--loglevel-critical") {
+            log_level = boost::log::trivial::fatal;
+            cli_explicit.insert("log_level");
+        }
         // Flags accepted but ignored (p2pool compat)
         else if (arg == "--no-console") {
             // c2pool has no interactive console — silently accept
@@ -629,6 +668,17 @@ int main(int argc, char* argv[]) {
             if (!cli_explicit.count("message_blob_hex") && cfg["message_blob_hex"])
                 operator_message_blob_hex = cfg["message_blob_hex"].as<std::string>();
 
+            // Log level from YAML (CLI always wins)
+            if (!cli_explicit.count("log_level") && cfg["log_level"]) {
+                auto lvl = core::log::Logger::severity_level_from_string(
+                    cfg["log_level"].as<std::string>());
+                if (lvl)
+                    log_level = *lvl;
+                else
+                    LOG_WARNING << "Unknown log_level in config: "
+                                << cfg["log_level"].as<std::string>();
+            }
+
         } catch (const YAML::Exception& e) {
             LOG_ERROR << "Failed to load config file '" << config_file << "': " << e.what();
             return 1;
@@ -638,6 +688,12 @@ int main(int argc, char* argv[]) {
     // -----------------------------------------------------------------------
     // Post-parse: auto-detect defaults, assemble p2pool-style merged spec
     // -----------------------------------------------------------------------
+
+    // Apply user-chosen log level (Logger::init() starts at trace so early
+    // startup messages are always visible; now narrow to the requested level).
+    core::log::Logger::set_severity_level(log_level);
+    if (log_level != boost::log::trivial::info)
+        LOG_INFO << "Log level set to: " << log_level;
 
     // Auto-detect RPC port from chain type if not set
     if (rpc_port == 0) {

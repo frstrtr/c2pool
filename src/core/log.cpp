@@ -1,6 +1,8 @@
 #include "log.hpp"
 
-#include <map> 
+#include <map>
+#include <algorithm>
+#include <cctype>
 
 #include <core/filesystem.hpp>
 
@@ -115,16 +117,44 @@ void Logger::remove_category(const std::string& category)
     m_categories &= ~categories.at(category);
 }
 
-void Logger::enable_trace()
+void Logger::set_severity_level(boost::log::trivial::severity_level lvl)
 {
     logging::core::get()->set_filter(
-            logging::trivial::severity >= logging::trivial::trace);
+        logging::trivial::severity >= lvl);
+}
+
+std::optional<boost::log::trivial::severity_level>
+Logger::severity_level_from_string(const std::string& name)
+{
+    // Lowercase the input for case-insensitive matching
+    std::string lower = name;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+        [](unsigned char c) { return std::tolower(c); });
+
+    static const std::map<std::string, boost::log::trivial::severity_level> levels = {
+        {"trace",    logging::trivial::trace},
+        {"debug",    logging::trivial::debug},
+        {"info",     logging::trivial::info},
+        {"warning",  logging::trivial::warning},
+        {"error",    logging::trivial::error},
+        {"fatal",    logging::trivial::fatal},
+        {"critical", logging::trivial::fatal},   // alias
+    };
+
+    auto it = levels.find(lower);
+    if (it != levels.end())
+        return it->second;
+    return std::nullopt;
+}
+
+void Logger::enable_trace()
+{
+    set_severity_level(logging::trivial::trace);
 }
 
 void Logger::disable_trace()
 {
-    logging::core::get()->set_filter(
-            logging::trivial::severity >= logging::trivial::debug);
+    set_severity_level(logging::trivial::debug);
 }
 
 } // namespace logger

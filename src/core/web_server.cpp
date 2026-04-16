@@ -192,11 +192,11 @@ void HttpSession::process_request()
         else if (request_.method() == http::verb::post) {
             // Handle JSON-RPC POST request
             std::string request_body = request_.body();
-            LOG_INFO << "Received JSON-RPC request: " << request_body;
+            LOG_DEBUG_DIAG << "Received JSON-RPC request: " << request_body;
             
             response_body = mining_interface_->HandleRequest(request_body);
             
-            LOG_INFO << "Sending JSON-RPC response: " << response_body;
+            LOG_DEBUG_DIAG << "Sending JSON-RPC response: " << response_body;
         }
         else {
             response.result(http::status::method_not_allowed);
@@ -1010,8 +1010,8 @@ void MiningInterface::refresh_work()
             if (m_pplns_fn && m_best_share_hash_fn) {
                 auto best = m_best_share_hash_fn();
                 if (!best.IsNull()) {
-                    LOG_INFO << "refresh_work: PPLNS active, best_share=" << best.GetHex().substr(0,16) << "..."
-                             << " donation_script_len=" << m_donation_script.size();
+                    LOG_DEBUG_DIAG << "refresh_work: PPLNS active, best_share=" << best.GetHex().substr(0,16) << "..."
+                                 << " donation_script_len=" << m_donation_script.size();
                     uint32_t nbits = std::stoul(
                         wd.m_data.value("bits", "1d00ffff"), nullptr, 16);
                     uint256 block_target = chain::bits_to_target(nbits);
@@ -1067,9 +1067,9 @@ void MiningInterface::refresh_work()
                             pplns_outputs.push_back(donation_entry);
 
                         pplns_raw_scripts = true;
-                        LOG_INFO << "refresh_work: V36 PPLNS coinbase with "
-                                 << pplns_outputs.size() << " outputs (donation_last="
-                                 << found_donation << ")";
+                        LOG_DEBUG_DIAG << "refresh_work: V36 PPLNS coinbase with "
+                                     << pplns_outputs.size() << " outputs (donation_last="
+                                     << found_donation << ")";
                     }
                 }
             }
@@ -1198,7 +1198,7 @@ uint256 MiningInterface::get_cached_witness_root() const
 
 nlohmann::json MiningInterface::getwork(const std::string& request_id)
 {
-    LOG_INFO << "getwork request received";
+    LOG_DEBUG_DIAG << "getwork request received";
     
     // Get current difficulty from the c2pool node
     double current_difficulty = 1.0; // Default fallback
@@ -1220,7 +1220,7 @@ nlohmann::json MiningInterface::getwork(const std::string& request_id)
         uint256 work_target = max_target / static_cast<uint64_t>(current_difficulty * 1000000); // Scale for precision
         target_hex = work_target.GetHex();
         
-        LOG_INFO << "Using pool difficulty: " << current_difficulty << ", target: " << target_hex.substr(0, 16) << "...";
+        LOG_DEBUG_DIAG << "Using pool difficulty: " << current_difficulty << ", target: " << target_hex.substr(0, 16) << "...";
     } else {
         LOG_WARNING << "No c2pool node connected, using default difficulty: " << current_difficulty;
     }
@@ -1276,13 +1276,13 @@ nlohmann::json MiningInterface::getwork(const std::string& request_id)
     std::string work_id = std::to_string(m_work_id_counter++);
     m_active_work[work_id] = work;
     
-    LOG_INFO << "Provided work to miner, work_id=" << work_id << ", difficulty=" << current_difficulty;
+    LOG_DEBUG_DIAG << "Provided work to miner, work_id=" << work_id << ", difficulty=" << current_difficulty;
     return work;
 }
 
 nlohmann::json MiningInterface::submitwork(const std::string& nonce, const std::string& header, const std::string& mix, const std::string& request_id)
 {
-    LOG_INFO << "Work submission received - nonce: " << nonce << ", header: " << header.substr(0, 32) << "...";
+    LOG_DEBUG_DIAG << "Work submission received - nonce: " << nonce << ", header: " << header.substr(0, 32) << "...";
     
     // Validate the submitted work by computing scrypt PoW hash
     bool work_valid = false;
@@ -1307,9 +1307,9 @@ nlohmann::json MiningInterface::submitwork(const std::string& nonce, const std::
                 }
             }
             work_valid = (pow_hash <= target);
-            LOG_INFO << "PoW check: hash=" << pow_hash.GetHex().substr(0, 16)
-                     << "... target=" << target.GetHex().substr(0, 16)
-                     << "... valid=" << work_valid;
+            LOG_DEBUG_DIAG << "PoW check: hash=" << pow_hash.GetHex().substr(0, 16)
+                         << "... target=" << target.GetHex().substr(0, 16)
+                         << "... valid=" << work_valid;
         }
     }
     
@@ -2133,8 +2133,8 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
     const std::map<uint32_t, std::vector<unsigned char>>& merged_addresses,
     const JobSnapshot* job)
 {
-    LOG_INFO << "Stratum mining.submit from " << username << " for job " << job_id 
-             << " - nonce: " << nonce << ", extranonce2: " << extranonce2 << ", ntime: " << ntime;
+    LOG_DEBUG_DIAG << "Stratum mining.submit from " << username << " for job " << job_id
+                   << " - nonce: " << nonce << ", extranonce2: " << extranonce2 << ", ntime: " << ntime;
     
     // Basic share validation
     bool share_valid = true;
@@ -2168,7 +2168,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
     
     if (m_solo_mode) {
         // Solo mining mode - work directly with blockchain
-        LOG_INFO << "Solo mining share from " << username << " (difficulty: " << share_difficulty << ")";
+        LOG_DEBUG_DIAG << "Solo mining share from " << username << " (difficulty: " << share_difficulty << ")";
         
         // In solo mode, check if share meets network difficulty for block submission
         std::string payout_address = m_solo_address.empty() ? username : m_solo_address;
@@ -2180,11 +2180,11 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
             auto allocation = m_payout_manager_ptr->calculate_payout(block_reward);
             
             if (allocation.is_valid()) {
-                LOG_INFO << "Solo mining payout allocation:";
-                LOG_INFO << "  Miner (" << payout_address << "): " << allocation.miner_percent << "% = " << allocation.miner_amount << " satoshis";
-                LOG_INFO << "  Developer: " << allocation.developer_percent << "% = " << allocation.developer_amount << " satoshis (" << allocation.developer_address << ")";
+                LOG_DEBUG_DIAG << "Solo mining payout allocation:";
+                LOG_DEBUG_DIAG << "  Miner (" << payout_address << "): " << allocation.miner_percent << "% = " << allocation.miner_amount << " satoshis";
+                LOG_DEBUG_DIAG << "  Developer: " << allocation.developer_percent << "% = " << allocation.developer_amount << " satoshis (" << allocation.developer_address << ")";
                 if (allocation.node_owner_amount > 0) {
-                    LOG_INFO << "  Node owner: " << allocation.node_owner_percent << "% = " << allocation.node_owner_amount << " satoshis (" << allocation.node_owner_address << ")";
+                    LOG_DEBUG_DIAG << "  Node owner: " << allocation.node_owner_percent << "% = " << allocation.node_owner_amount << " satoshis (" << allocation.node_owner_address << ")";
                 }
                 
                 // Allocation is already baked into coinbase parts by refresh_work() →
@@ -2193,7 +2193,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
             }
         }
         
-        LOG_INFO << "Solo mining share accepted - primary payout address: " << payout_address;
+        LOG_DEBUG_DIAG << "Solo mining share accepted - primary payout address: " << payout_address;
         
         // Check if share meets network difficulty and attempt block submission
         if (m_coin_rpc && !extranonce1.empty()) {
@@ -2283,7 +2283,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                         h160 += HEX[doge_script[i] & 0x0f];
                     }
                     share_address = h160;
-                    LOG_INFO << "mining_submit: Case 4 — LTC share hash160 derived from DOGE merged address";
+                    LOG_DEBUG_DIAG << "mining_submit: Case 4 — LTC share hash160 derived from DOGE merged address";
                 }
             }
         }
@@ -2293,8 +2293,8 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
             if (m_address_fallback_fn) {
                 share_address = m_address_fallback_fn(primary_addr);
                 if (share_address.size() == 40)
-                    LOG_INFO << "mining_submit: Case 3 — redistributed share for invalid address '"
-                             << primary_addr << "'";
+                    LOG_DEBUG_DIAG << "mining_submit: Case 3 — redistributed share for invalid address '"
+                                 << primary_addr << "'";
             }
             if (share_address.size() != 40)
                 LOG_WARNING << "mining_submit: cannot resolve share address for '"
@@ -2502,7 +2502,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
 
 nlohmann::json MiningInterface::validate_address(const std::string& address)
 {
-    LOG_INFO << "Address validation request for: " << address;
+    LOG_DEBUG_DIAG << "Address validation request for: " << address;
     
     nlohmann::json result = nlohmann::json::object();
     
@@ -2521,7 +2521,7 @@ nlohmann::json MiningInterface::validate_address(const std::string& address)
                 result["error"] = validation_result.error_message;
             }
             
-            LOG_INFO << "Address validation result: " << (validation_result.is_valid ? "VALID" : "INVALID");
+            LOG_DEBUG_DIAG << "Address validation result: " << (validation_result.is_valid ? "VALID" : "INVALID");
             
         } else {
             result["valid"] = false;
@@ -2579,7 +2579,7 @@ nlohmann::json MiningInterface::build_coinbase(const nlohmann::json& params)
 
 nlohmann::json MiningInterface::validate_coinbase(const std::string& coinbase_hex)
 {
-    LOG_INFO << "Coinbase validation request - hex length: " << coinbase_hex.length();
+    LOG_DEBUG_DIAG << "Coinbase validation request - hex length: " << coinbase_hex.length();
     
     nlohmann::json result = nlohmann::json::object();
     
@@ -2599,7 +2599,7 @@ nlohmann::json MiningInterface::validate_coinbase(const std::string& coinbase_he
             result["error"] = "Coinbase transaction validation failed";
         }
         
-        LOG_INFO << "Coinbase validation result: " << (is_valid ? "VALID" : "INVALID");
+        LOG_DEBUG_DIAG << "Coinbase validation result: " << (is_valid ? "VALID" : "INVALID");
         
     } catch (const std::exception& e) {
         LOG_ERROR << "Coinbase validation error: " << e.what();
@@ -2612,7 +2612,7 @@ nlohmann::json MiningInterface::validate_coinbase(const std::string& coinbase_he
 
 nlohmann::json MiningInterface::getblockcandidate(const nlohmann::json& params)
 {
-    LOG_INFO << "Block candidate request received";
+    LOG_DEBUG_DIAG << "Block candidate request received";
     
     try {
         // Get base block template (this would normally come from the coin node)
@@ -2631,10 +2631,10 @@ nlohmann::json MiningInterface::getblockcandidate(const nlohmann::json& params)
             base_template["coinbase_hex"] = coinbase_result["coinbase_hex"];
             base_template["payout_distribution"] = true;
             
-            LOG_INFO << "Block candidate with payout distribution generated";
+            LOG_DEBUG_DIAG << "Block candidate with payout distribution generated";
         } else {
             base_template["payout_distribution"] = false;
-            LOG_INFO << "Basic block candidate generated (no payout distribution)";
+            LOG_DEBUG_DIAG << "Basic block candidate generated (no payout distribution)";
         }
         
         // Add validation info
@@ -3287,8 +3287,8 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     double new_difficulty = hashrate_tracker_.get_current_difficulty();
     if (new_difficulty != old_difficulty) {
         send_set_difficulty(new_difficulty);
-        LOG_INFO << "VARDIFF adjustment for " << username_ << ": "
-                 << old_difficulty << " -> " << new_difficulty;
+        LOG_DEBUG_DIAG << "VARDIFF adjustment for " << username_ << ": "
+                       << old_difficulty << " -> " << new_difficulty;
     }
 
     if (share_difficulty < required_difficulty) {
@@ -3338,9 +3338,9 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     mining_interface_->mining_submit(username_, job_id, extranonce1_, extranonce2, ntime, nonce, "", merged_scripts,
         &snapshot);
     
-    LOG_INFO << "Share accepted from " << username_ << " (diff=" << share_difficulty
-             << ", accepted=" << accepted_shares_ << ", stale=" << stale_shares_
-             << ", rejected=" << rejected_shares_ << ")";
+    LOG_DEBUG_DIAG << "Share accepted from " << username_ << " (diff=" << share_difficulty
+                   << ", accepted=" << accepted_shares_ << ", stale=" << stale_shares_
+                   << ", rejected=" << rejected_shares_ << ")";
     
     nlohmann::json response;
     response["id"] = request_id;
@@ -3457,8 +3457,8 @@ void StratumSession::send_notify_work(bool force_clean)
         if (tmpl.contains("curtime"))
             curtime = static_cast<uint32_t>(tmpl["curtime"].get<uint64_t>());
 
-        LOG_INFO << "send_notify_work: live template height="
-                 << tmpl.value("height", 0) << " prevhash=" << prevhash.substr(0, 16) << "...";
+        LOG_DEBUG_DIAG << "send_notify_work: live template height="
+                       << tmpl.value("height", 0) << " prevhash=" << prevhash.substr(0, 16) << "...";
     }
 
     // Encode curtime as 8-hex-char (4-byte big-endian)
