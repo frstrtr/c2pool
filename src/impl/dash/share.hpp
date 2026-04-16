@@ -5,6 +5,7 @@
 
 #include "share_types.hpp"
 #include <impl/bitcoin_family/coin/base_block.hpp>
+#include <sharechain/share.hpp>
 
 #include <core/uint256.hpp>
 #include <core/pack_types.hpp>
@@ -16,15 +17,10 @@
 namespace dash
 {
 
-// Share version constant
-static constexpr int64_t SHARE_VERSION = 16;
-
-// Dash Share v16
+// Dash Share v16 — inherits from BaseShare<uint256, 16>
 // Wire format: [VarInt type=16][VarStr packed_contents]
-struct DashShare
+struct DashShare : chain::BaseShare<uint256, 16>
 {
-    static constexpr int64_t version = 16;
-
     // === min_header (SmallBlockHeaderType) ===
     bitcoin_family::coin::SmallBlockHeaderType m_min_header;
 

@@ -28,9 +28,15 @@ public:
 };
 
 // Dash coin config (RPC/P2P endpoints)
-class CoinConfig
+class CoinConfig : protected core::Fileconfig
 {
+protected:
+    std::ofstream& get_default(std::ofstream& file) override { return file; }
+    void load() override {}
+
 public:
+    CoinConfig(const std::filesystem::path& path) : core::Fileconfig(path) {}
+
     bool m_testnet{false};
 
     struct P2PData {

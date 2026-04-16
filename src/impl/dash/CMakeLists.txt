@@ -23,7 +23,7 @@ target_include_directories(dash_x11 PUBLIC
 # Pure C — no C++ flags needed
 set_target_properties(dash_x11 PROPERTIES LINKER_LANGUAGE C)
 
-# c2pool-dash binary: M3 proof-of-concept
+# c2pool-dash binary: full Dash p2pool node
 add_executable(c2pool-dash main_dash.cpp)
 target_include_directories(c2pool-dash PRIVATE
     ${CMAKE_SOURCE_DIR}/src
@@ -32,8 +32,11 @@ target_link_libraries(c2pool-dash
     dash_x11
     core
     btclibs
+    pool
+    sharechain
     Boost::system
     Boost::thread
     Boost::log
     Boost::log_setup
+    Boost::filesystem
 )
