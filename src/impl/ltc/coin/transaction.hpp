@@ -1,5 +1,10 @@
 #pragma once
 
+// LTC transaction types: import generic primitives from bitcoin_family,
+// extend Transaction/MutableTransaction with MWEB (HogEx flag 0x08).
+
+#include <impl/bitcoin_family/coin/base_transaction.hpp>
+
 #include <core/pack.hpp>
 #include <core/opscript.hpp>
 #include <core/uint256.hpp>
@@ -10,46 +15,15 @@ namespace ltc
 namespace coin
 {
 
+// Import generic transaction primitives from bitcoin_family
+using bitcoin_family::coin::TxParams;
+using bitcoin_family::coin::TX_WITH_WITNESS;
+using bitcoin_family::coin::TX_NO_WITNESS;
+using bitcoin_family::coin::TxPrevOut;
+using bitcoin_family::coin::TxIn;
+using bitcoin_family::coin::TxOut;
+
 struct MutableTransaction;
-
-struct TxParams
-{
-    const bool allow_witness;
-
-    SER_PARAMS_OPFUNC
-};
-
-constexpr static TxParams TX_WITH_WITNESS {.allow_witness = true};
-constexpr static TxParams TX_NO_WITNESS {.allow_witness = false};
-
-class TxPrevOut
-{
-public:
-    uint256 hash;
-    uint32_t index;
-
-    SERIALIZE_METHODS(TxPrevOut) { READWRITE(obj.hash, obj.index); }
-};
-
-class TxIn
-{
-public:
-    TxPrevOut prevout;
-    OPScript scriptSig;
-    uint32_t sequence;
-    OPScriptWitness scriptWitness; //!< Only serialized through Transaction
-
-    SERIALIZE_METHODS(TxIn) { READWRITE(obj.prevout, obj.scriptSig, obj.sequence); }
-};
-
-class TxOut
-{
-public:
-    int64_t value;
-    OPScript scriptPubKey;
-
-    SERIALIZE_METHODS(TxOut) { READWRITE(obj.value, obj.scriptPubKey); }
-};
 
 class Transaction
 {
