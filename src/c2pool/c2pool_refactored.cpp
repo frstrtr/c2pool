@@ -597,6 +597,9 @@ int main(int argc, char* argv[]) {
     int         merged_coind_p2p_port = 0;
     std::string merged_coind_p2p_address;
 
+    // Log level from CLI (overrides YAML)
+    std::string cli_log_level;
+
     // Seed nodes from -n flag (p2pool compat)
     std::vector<std::string> seed_nodes;
     int max_outgoing_conns = 0;
@@ -745,6 +748,14 @@ int main(int argc, char* argv[]) {
             settings->m_testnet = true;
             cli_explicit.insert("testnet");
         }
+        // Log level (p2pool: --debug; c2pool extends with standard levels)
+        else if (arg == "--loglevel-trace")    { cli_log_level = "trace"; cli_explicit.insert("log_level"); }
+        else if (arg == "--loglevel-debug" || arg == "--debug")
+                                              { cli_log_level = "debug"; cli_explicit.insert("log_level"); }
+        else if (arg == "--loglevel-info")     { cli_log_level = "info"; cli_explicit.insert("log_level"); }
+        else if (arg == "--loglevel-warning")  { cli_log_level = "warning"; cli_explicit.insert("log_level"); }
+        else if (arg == "--loglevel-error")    { cli_log_level = "error"; cli_explicit.insert("log_level"); }
+        else if (arg == "--loglevel-critical") { cli_log_level = "fatal"; cli_explicit.insert("log_level"); }
         // Network / blockchain selection (p2pool: --net)
         else if ((arg == "--net" || arg == "--blockchain") && i + 1 < argc) {
             blockchain = parse_blockchain(argv[++i]);
@@ -1267,10 +1278,21 @@ int main(int argc, char* argv[]) {
 
     // -----------------------------------------------------------------------
     // Post-parse: add file sink (initial Logger::init() was console-only)
+    // CLI --loglevel-* overrides YAML log_level
     // -----------------------------------------------------------------------
     {
+        if (!cli_log_level.empty() && cli_explicit.count("log_level"))
+            log_level_str = cli_log_level;
+
         boost::log::core::get()->remove_all_sinks();
         core::log::Logger::init(log_file, log_rotation_size_mb, log_max_total_mb, log_level_str);
+
+        // Apply severity filter from the resolved level string
+        if (!log_level_str.empty()) {
+            auto lvl = core::log::Logger::severity_level_from_string(log_level_str);
+            if (lvl) core::log::Logger::set_severity_level(*lvl);
+        }
+
         LOG_INFO << "Logger initialized: file=" << (log_file.empty() ? "debug.log" : log_file)
                  << " rotation=" << log_rotation_size_mb << "MB"
                  << " max=" << log_max_total_mb << "MB"
@@ -5563,7 +5585,7 @@ int main(int argc, char* argv[]) {
                         }
                     }
 
-                    LOG_INFO << "[MM-payout] chain_id=" << chain_id
+                    LOG_DEBUG_DIAG << "[MM-payout] chain_id=" << chain_id
                              << " coinbase_value=" << coinbase_value
                              << " payouts=" << result.size()
                              << " mode=" << (custodial_mode ? "custodial" : "solo");
@@ -5613,7 +5635,7 @@ int main(int argc, char* argv[]) {
                         best, block_target, coinbase_value, chain_id, combined_donation,
                         operator_ltc_script, operator_merged_script);
 
-                    LOG_INFO << "[MM-payout] chain_id=" << chain_id
+                    LOG_DEBUG_DIAG << "[MM-payout] chain_id=" << chain_id
                              << " coinbase_value=" << coinbase_value
                              << " payouts_map_size=" << payouts_map.size()
                              << " chain_height=" << guard->chain.get_height(best)

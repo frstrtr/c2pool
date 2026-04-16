@@ -144,16 +144,38 @@ void Logger::remove_category(const std::string& category)
     m_categories &= ~categories.at(category);
 }
 
-void Logger::enable_trace()
+void Logger::set_severity_level(boost::log::trivial::severity_level lvl)
 {
     logging::core::get()->set_filter(
-            logging::trivial::severity >= logging::trivial::trace);
+        logging::trivial::severity >= lvl);
+}
+
+std::optional<boost::log::trivial::severity_level>
+Logger::severity_level_from_string(const std::string& name)
+{
+    // Case-insensitive lookup
+    std::string lower = name;
+    for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+    if (lower == "trace")    return logging::trivial::trace;
+    if (lower == "debug")    return logging::trivial::debug;
+    if (lower == "info")     return logging::trivial::info;
+    if (lower == "warning" || lower == "warn")
+                             return logging::trivial::warning;
+    if (lower == "error")    return logging::trivial::error;
+    if (lower == "fatal" || lower == "critical")
+                             return logging::trivial::fatal;
+    return std::nullopt;
+}
+
+void Logger::enable_trace()
+{
+    set_severity_level(logging::trivial::trace);
 }
 
 void Logger::disable_trace()
 {
-    logging::core::get()->set_filter(
-            logging::trivial::severity >= logging::trivial::debug);
+    set_severity_level(logging::trivial::debug);
 }
 
 } // namespace logger

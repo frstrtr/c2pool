@@ -1883,7 +1883,7 @@ public:
         {
             static int ep_log = 0;
             if (ep_log++ % 20 == 0) {
-                LOG_INFO << "[EP-PPLNS] v36 start=" << best_share_hash.GetHex().substr(0, 16)
+                LOG_DEBUG_DIAG << "[EP-PPLNS] v36 start=" << best_share_hash.GetHex().substr(0, 16)
                          << " chain_len=" << chain_len
                          << " subsidy=" << subsidy;
             }
@@ -1969,7 +1969,7 @@ public:
         {
             static int ep35_log = 0;
             if (ep35_log++ % 20 == 0) {
-                LOG_INFO << "[EP-PPLNS] v35 start=" << pplns_start.GetHex().substr(0, 16)
+                LOG_DEBUG_DIAG << "[EP-PPLNS] v35 start=" << pplns_start.GetHex().substr(0, 16)
                          << " max_shares=" << max_shares
                          << " desired_w=" << desired_weight.GetLow64()
                          << " subsidy=" << subsidy
@@ -2008,7 +2008,7 @@ public:
         {
             static int v35_dump = 0;
             if (v35_dump++ < 10 || v35_dump % 60 == 0) {
-                LOG_INFO << "[V35-PPLNS] subsidy=" << subsidy << " addrs=" << weights.size()
+                LOG_DEBUG_DIAG << "[V35-PPLNS] subsidy=" << subsidy << " addrs=" << weights.size()
                          << " total_w=" << total_weight.GetLow64()
                          << " max_shares=" << max_shares << " sum=" << sum
                          << " donation=" << donation_amount

@@ -39,6 +39,14 @@ public:
     static void init();
     static void init(const std::string& log_file, int rotation_size_mb, int max_total_mb, const std::string& level);
 
+    /// Apply a severity filter after init (e.g. from CLI --loglevel-* flags).
+    static void set_severity_level(boost::log::trivial::severity_level lvl);
+
+    /// Map a string ("trace","debug","info","warning","error","fatal","critical")
+    /// to a Boost.Log severity level. Returns nullopt on unknown input.
+    static std::optional<boost::log::trivial::severity_level>
+        severity_level_from_string(const std::string& name);
+
     static void add_category(const std::string& category);
     static void remove_category(const std::string& category);
 
@@ -61,6 +69,10 @@ public:
 #define LOG_DEBUG(ctg) \
     if (core::log::Logger::check_category(core::log::flags::ctg))                   \
         BOOST_LOG_TRIVIAL(debug).stream() << "(" << #ctg << ") "
+
+// Plain debug log without category gate — visible at --loglevel-debug and below.
+// Use for high-frequency diagnostics (PPLNS distributions, per-share stats, etc.)
+#define LOG_DEBUG_DIAG BOOST_LOG_TRIVIAL(debug)
 
 #define LOG_DEBUG_POOL LOG_DEBUG(POOL)
 #define LOG_DEBUG_COIND LOG_DEBUG(COIND)

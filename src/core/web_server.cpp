@@ -1941,7 +1941,7 @@ MiningInterface::build_connection_coinbase(
         uint64_t pplns_total = 0;
         for (auto& [script_hex, amt] : ws.pplns_outputs) {
             pplns_total += amt;
-            LOG_INFO << "[PPLNS-OUT] script=" << script_hex.substr(0, 40) << " amount=" << amt;
+            LOG_DEBUG_DIAG << "[PPLNS-OUT] script=" << script_hex.substr(0, 40) << " amount=" << amt;
         }
         LOG_INFO << "[build_connection_cb] subsidy=" << subsidy
                  << " pplns_total=" << pplns_total

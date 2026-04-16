@@ -947,7 +947,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
     {
         static int gst_pplns_log = 0;
         if (gst_pplns_log++ % 50 == 0) {
-            LOG_INFO << "[GST-PPLNS] v36_active=" << v36_active
+            LOG_DEBUG_DIAG << "[GST-PPLNS] v36_active=" << v36_active
                      << " use_v36_pplns=" << use_v36_pplns
                      << " ver=" << ver
                      << " start=" << share.m_prev_hash.GetHex().substr(0, 16)
@@ -1036,7 +1036,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
         auto now_d = std::chrono::steady_clock::now();
         if (now_d - last_amt_dump > std::chrono::seconds(30) && weights.size() >= 2) {
             last_amt_dump = now_d;
-            LOG_INFO << "[PPLNS-AMT] subsidy=" << subsidy
+            LOG_DEBUG_DIAG << "[PPLNS-AMT] subsidy=" << subsidy
                      << " total_weight=" << total_weight.GetLow64()
                      << " don_weight=" << total_donation_weight.GetLow64()
                      << " addrs=" << weights.size()
@@ -1044,7 +1044,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
             for (auto& [s, w] : weights) {
                 uint64_t a = (total_weight.IsNull()) ? 0 :
                     (uint288(subsidy) * w / total_weight).GetLow64();
-                LOG_INFO << "[PPLNS-AMT]   weight=" << w.GetLow64()
+                LOG_DEBUG_DIAG << "[PPLNS-AMT]   weight=" << w.GetLow64()
                          << " amount=" << a;
             }
         }
@@ -1088,13 +1088,13 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
 
     // Dump amounts for cross-impl debugging
     if (dump_diag) {
-        LOG_INFO << "[GST-AMOUNTS] subsidy=" << subsidy << " addrs=" << amounts.size()
+        LOG_DEBUG_DIAG << "[GST-AMOUNTS] subsidy=" << subsidy << " addrs=" << amounts.size()
                  << " sum=" << sum_amounts << " donation=" << donation_amount
                  << " prev=" << prev_hash.GetHex().substr(0,16);
         for (auto& [s, a] : amounts) {
             static const char* HX = "0123456789abcdef";
             std::string sh; for (size_t i = 0; i < std::min(s.size(), size_t(10)); ++i) { sh += HX[s[i]>>4]; sh += HX[s[i]&0xf]; }
-            LOG_INFO << "[GST-AMOUNTS]   " << sh << "... = " << a;
+            LOG_DEBUG_DIAG << "[GST-AMOUNTS]   " << sh << "... = " << a;
         }
     }
 
