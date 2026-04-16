@@ -28,6 +28,7 @@ inline uint64_t mul128_shift(uint64_t a, uint64_t b, unsigned shift) {
 #include <sharechain/weights_skiplist.hpp>
 #include <btclibs/base58.h>
 #include <btclibs/bech32.h>
+#include <core/coin_params.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -316,7 +317,7 @@ class ShareTracker
 public:
     ShareChain chain;
     ShareChain verified;
-
+    const core::CoinParams* m_params = nullptr;
 
     // Set by think() Phase 2 when verification budget is exhausted.
     // Checked by run_think() to schedule a deferred continuation.
@@ -461,7 +462,7 @@ public:
         // generate_share_transaction needs CHAIN_LENGTH ancestors for correct
         // PPLNS. Verifying with 3 ancestors produces wrong coinbase → GENTX-MISMATCH.
         // Phase 2 naturally extends verification when parents arrive.
-        if (acc_height < static_cast<int32_t>(PoolConfig::chain_length()) + 1 && !last.IsNull())
+        if (acc_height < static_cast<int32_t>(m_params->chain_length) + 1 && !last.IsNull())
         {
             return false;
         }
@@ -472,7 +473,7 @@ public:
             auto t0 = std::chrono::steady_clock::now();
             auto& share_var = chain.get_share(share_hash);
             share_var.ACTION({
-                auto computed_hash = verify_share(*obj, *this);
+                auto computed_hash = verify_share(*obj, *this, *m_params);
                 (void)computed_hash;
             });
             {
@@ -588,22 +589,22 @@ public:
         // unverified shares, causing short verified chains to tie on
         // chain_len with long chains and win on hashrate tiebreak.
         auto head_height = verified.get_acc_height(share_hash);
-        if (head_height < static_cast<int32_t>(PoolConfig::chain_length()))
+        if (head_height < static_cast<int32_t>(m_params->chain_length))
             return {head_height, score_res};
 
         // p2pool: end_point = self.verified.get_nth_parent_hash(
         //     share_hash, self.net.CHAIN_LENGTH*15//16)
         // SubsetTracker delegates to parent's skip list (shared navigation).
         auto end_point = verified.get_nth_parent_via_skip(share_hash,
-            (PoolConfig::chain_length() * 15) / 16);
+            (m_params->chain_length * 15) / 16);
 
         // p2pool: self.verified.get_chain(end_point, self.net.CHAIN_LENGTH//16)
         std::optional<int32_t> block_height;
         auto tail_count = std::min(
-            static_cast<int32_t>(PoolConfig::chain_length() / 16),
+            static_cast<int32_t>(m_params->chain_length / 16),
             verified.get_acc_height(end_point));
         if (tail_count <= 0)
-            return {static_cast<int32_t>(PoolConfig::chain_length()), score_res};
+            return {static_cast<int32_t>(m_params->chain_length), score_res};
 
         auto tail_view = verified.get_chain(end_point, tail_count);
         for (auto [hash, data] : tail_view)
@@ -639,7 +640,7 @@ public:
             time_span = 1;
 
         score_res = total_work / static_cast<uint32_t>(time_span);
-        return {static_cast<int32_t>(PoolConfig::chain_length()), score_res};
+        return {static_cast<int32_t>(m_params->chain_length), score_res};
     }
 
     // -- Best-chain selection with verification and punishment --
@@ -696,7 +697,7 @@ public:
                 // the true last. No special fork detection needed.
                 auto walk_count = last.IsNull()
                     ? head_height
-                    : std::min(5, std::max(0, head_height - static_cast<int32_t>(PoolConfig::chain_length())));
+                    : std::min(5, std::max(0, head_height - static_cast<int32_t>(m_params->chain_length)));
 
                 if (walk_count <= 0) {
                     ++p1_walk0;
@@ -709,7 +710,7 @@ public:
                         // Option A: skip parent requests for chains already in the
                         // pruning zone (height >= 2*CHAIN_LENGTH+10). These parents
                         // would be immediately re-pruned by clean_tracker.
-                        auto CL_prune = static_cast<int32_t>(PoolConfig::chain_length());
+                        auto CL_prune = static_cast<int32_t>(m_params->chain_length);
                         if (head_height >= 2 * CL_prune + 10) {
                             static int prune_skip_log = 0;
                             if (prune_skip_log++ % 20 == 0)
@@ -763,7 +764,7 @@ public:
                 if (!verified_one && !last.IsNull())
                 {
                     // Option A: skip if chain already in pruning zone
-                    auto CL_prune = static_cast<int32_t>(PoolConfig::chain_length());
+                    auto CL_prune = static_cast<int32_t>(m_params->chain_length);
                     if (head_height >= 2 * CL_prune + 10) {
                         static int prune_skip2_log = 0;
                         if (prune_skip2_log++ % 20 == 0)
@@ -899,7 +900,7 @@ public:
             //   want = max(self.net.CHAIN_LENGTH - head_height, 0)
             //   can = max(last_height - 1 - self.net.CHAIN_LENGTH, 0) if last_last_hash is not None else last_height
             //   get = min(want, can)
-            auto CL = static_cast<int32_t>(PoolConfig::chain_length());
+            auto CL = static_cast<int32_t>(m_params->chain_length);
             auto want = std::max(CL - head_height, 0);
             auto can = last_last_hash.IsNull()
                 ? last_height
@@ -926,7 +927,7 @@ public:
                 // instead of O(chain_len) hash map walk.
                 HeadPPLNS head_pplns;
                 bool pplns_active = false;
-                auto CL_i32 = static_cast<int32_t>(PoolConfig::chain_length());
+                auto CL_i32 = static_cast<int32_t>(m_params->chain_length);
 
                 auto chain_view = chain.get_chain(last_hash, to_get);
                 int p2_verified_count = 0;
@@ -1020,13 +1021,13 @@ public:
             }
 
             // Request more shares if verified chain is short
-            if (head_height < static_cast<int32_t>(PoolConfig::chain_length()) && !last_last_hash.IsNull())
+            if (head_height < static_cast<int32_t>(m_params->chain_length) && !last_last_hash.IsNull())
             {
                 // Option A: check MAIN chain height (not verified height).
                 // If main chain is already in pruning zone, the unverified
                 // shares exist — they just need verification, not more parents.
                 auto main_ht = chain.get_height(head_hash);
-                auto CL_prune = static_cast<int32_t>(PoolConfig::chain_length());
+                auto CL_prune = static_cast<int32_t>(m_params->chain_length);
                 if (main_ht >= 2 * CL_prune + 10) {
                     static int p2_prune_log = 0;
                     if (p2_prune_log++ % 20 == 0)
@@ -1137,7 +1138,7 @@ public:
                     int32_t reason = 0;
                     {
                         auto share_version = chain.get_share(hh).version();
-                        auto lookbehind = static_cast<int32_t>(PoolConfig::chain_length());
+                        auto lookbehind = static_cast<int32_t>(m_params->chain_length);
                         if (should_punish_version(hh, share_version, lookbehind))
                             reason = 1;
                         auto* idx = chain.get_index(hh);
@@ -1341,7 +1342,7 @@ public:
     {
         // MAX_TARGET: network-specific share difficulty floor
         // Mainnet: 2^236 - 1, Testnet: 2^256/20 - 1  (from PoolConfig)
-        const uint256 MAX_TARGET = PoolConfig::max_target();
+        const uint256 MAX_TARGET = m_params->max_target;
 
         if (prev_share_hash.IsNull() || !chain.contains(prev_share_hash))
         {
@@ -1367,12 +1368,12 @@ public:
         auto acc_height = chain.get_acc_height(prev_share_hash);
 
         // Not enough chain depth for proper difficulty calculation.
-        if (acc_height < static_cast<int32_t>(PoolConfig::TARGET_LOOKBEHIND))
+        if (acc_height < static_cast<int32_t>(m_params->target_lookbehind))
         {
             // Collapse detection: many shares exist but best chain is short
             auto total_shares = chain.size();
-            if (total_shares > 2 * PoolConfig::chain_length()
-                && acc_height < static_cast<int32_t>(PoolConfig::TARGET_LOOKBEHIND)) {
+            if (total_shares > 2 * m_params->chain_length
+                && acc_height < static_cast<int32_t>(m_params->target_lookbehind)) {
                 static int collapse_warn = 0;
                 if (collapse_warn++ < 20) {
                     // Walk raw chain to find actual contiguous height
@@ -1389,7 +1390,7 @@ public:
                                 << " walked_height=" << walked
                                 << " tails=" << chain.get_tails().size()
                                 << " heads=" << chain.get_heads().size()
-                                << " TARGET_LOOKBEHIND=" << PoolConfig::TARGET_LOOKBEHIND
+                                << " TARGET_LOOKBEHIND=" << m_params->target_lookbehind
                                 << " prev=" << prev_share_hash.GetHex().substr(0,16);
                 }
             }
@@ -1410,7 +1411,7 @@ public:
         // Use prev_share_hash directly — all shares counted equally.
         // p2pool's algorithm: aps from the entire chain, no filtering.
         auto aps = get_pool_attempts_per_second(prev_share_hash,
-            PoolConfig::TARGET_LOOKBEHIND, /*min_work=*/true);
+            m_params->target_lookbehind, /*min_work=*/true);
 
         // Full APS diagnostic for cross-implementation comparison.
         // Dumps all inputs so p2pool's values can be compared.
@@ -1418,7 +1419,7 @@ public:
             static int cst_diag = 0;
             if (cst_diag++ % 50 == 0) {
                 auto far_hash = chain.get_nth_parent_via_skip(prev_share_hash,
-                    static_cast<int32_t>(PoolConfig::TARGET_LOOKBEHIND) - 1);
+                    static_cast<int32_t>(m_params->target_lookbehind) - 1);
                 uint32_t near_ts = 0, far_ts = 0;
                 chain.get_share(prev_share_hash).invoke([&](auto* obj) { near_ts = obj->m_timestamp; });
                 if (!far_hash.IsNull() && chain.contains(far_hash))
@@ -1448,7 +1449,7 @@ public:
             // pre_target = 2^256 / (SHARE_PERIOD * aps) - 1
             uint288 two_256;
             two_256.SetHex("10000000000000000000000000000000000000000000000000000000000000000");
-            uint288 divisor = aps * static_cast<uint32_t>(PoolConfig::share_period());
+            uint288 divisor = aps * static_cast<uint32_t>(m_params->share_period);
             if (divisor.IsNull())
                 divisor = uint288(1);
             uint288 result = two_256 / divisor;
@@ -1485,10 +1486,10 @@ public:
         if (prev_ts > 0 && desired_timestamp > prev_ts)
         {
             auto time_since_share = desired_timestamp - prev_ts;
-            auto emergency_threshold = PoolConfig::share_period() * 20;
+            auto emergency_threshold = m_params->share_period * 20;
             if (time_since_share > emergency_threshold)
             {
-                auto half_life = PoolConfig::share_period() * 10;
+                auto half_life = m_params->share_period * 10;
                 auto excess = time_since_share - emergency_threshold;
                 auto halvings = excess / half_life;
                 auto remainder = excess % half_life;
@@ -1627,7 +1628,7 @@ public:
         if (height < 2) return t;
 
         auto lookback = std::min(height,
-            static_cast<int32_t>(PoolConfig::TARGET_LOOKBEHIND));
+            static_cast<int32_t>(m_params->target_lookbehind));
         auto aps = get_pool_attempts_per_second(prev_share_hash,
             lookback, /*min_work=*/true);
 
@@ -1641,8 +1642,8 @@ public:
         }
         t.pool_hashrate = pool_hr;
 
-        double share_period = static_cast<double>(PoolConfig::share_period());
-        double chain_length = static_cast<double>(PoolConfig::real_chain_length());
+        double share_period = static_cast<double>(m_params->share_period);
+        double chain_length = static_cast<double>(m_params->real_chain_length);
 
         // min_hashrate = pool_share_att / window = pool_hr / chain_length
         t.min_hashrate_normal = pool_hr / chain_length;
@@ -1697,7 +1698,7 @@ public:
         static constexpr uint64_t DECAY_SCALE = uint64_t(1) << DECAY_PRECISION;
         static constexpr uint64_t LN2_MICRO = 693147;
 
-        uint32_t half_life = std::max(PoolConfig::chain_length() / 4, uint32_t(1));
+        uint32_t half_life = std::max(m_params->chain_length / 4, uint32_t(1));
         uint64_t decay_per = DECAY_SCALE - (DECAY_SCALE * LN2_MICRO) / (uint64_t(1000000) * half_life);
 
         CumulativeWeights result;
@@ -1772,7 +1773,7 @@ public:
         static constexpr uint64_t DECAY_SCALE = uint64_t(1) << DECAY_PRECISION;
         static constexpr uint64_t LN2_MICRO = 693147;
 
-        uint32_t half_life = std::max(PoolConfig::chain_length() / 4, uint32_t(1));
+        uint32_t half_life = std::max(m_params->chain_length / 4, uint32_t(1));
         uint64_t decay_per = DECAY_SCALE - (DECAY_SCALE * LN2_MICRO) / (uint64_t(1000000) * half_life);
 
         int32_t share_count = 0;
@@ -1875,7 +1876,7 @@ public:
         // Pass REAL_CHAIN_LENGTH as max_shares — the walk naturally stops
         // when the chain ends, matching p2pool's direct iteration pattern.
         // Do NOT use cached get_height() which can be stale in multi-threaded context.
-        auto chain_len = static_cast<int32_t>(PoolConfig::real_chain_length());
+        auto chain_len = static_cast<int32_t>(m_params->real_chain_length);
         // V36: remove desired_weight cap — exponential decay handles windowing.
         // See generate_share_transaction() for detailed rationale.
         uint288 unlimited_weight;
@@ -1959,12 +1960,12 @@ public:
         // V35: max_shares = max(0, min(height, REAL_CHAIN_LENGTH) - 1)
         // Reference: data.py line 885
         auto height = chain.get_height(best_share_hash);
-        int32_t max_shares = std::max(0, std::min(height, static_cast<int32_t>(PoolConfig::real_chain_length())) - 1);
+        int32_t max_shares = std::max(0, std::min(height, static_cast<int32_t>(m_params->real_chain_length)) - 1);
 
         // V35: desired_weight = 65535 * SPREAD * target_to_average_attempts(block_target)
         // Reference: data.py line 886
         uint288 desired_weight = chain::target_to_average_attempts(block_target)
-                                 * uint288(PoolConfig::SPREAD) * uint288(65535);
+                                 * uint288(m_params->spread) * uint288(65535);
 
         {
             static int ep35_log = 0;
@@ -2226,7 +2227,7 @@ public:
         uint288 unlimited_weight;
         unlimited_weight.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
         auto chain_len = std::min(height,
-                                  static_cast<int32_t>(PoolConfig::real_chain_length()));
+                                  static_cast<int32_t>(m_params->real_chain_length));
 
         // Walk RAW chain (not verified) — matches p2pool's compute_merged_payout_hash
         // which uses tracker (raw). Using verified chain causes hash mismatch when
@@ -2407,7 +2408,7 @@ public:
                                 const std::vector<unsigned char>& operator_merged_script = {})
     {
         auto chain_len = std::min(chain.get_height(best_share_hash),
-                                  static_cast<int32_t>(PoolConfig::real_chain_length()));
+                                  static_cast<int32_t>(m_params->real_chain_length));
         // Unlimited desired_weight — exponential decay handles windowing.
         uint288 unlimited_weight;
         unlimited_weight.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");

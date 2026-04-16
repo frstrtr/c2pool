@@ -4432,7 +4432,7 @@ int main(int argc, char* argv[]) {
 
                     // V35: convert pubkey_hash to address string (uses raw bytes)
                     if (share_version <= 35) {
-                        params.address = ltc::pubkey_hash_to_address(params.pubkey_hash, params.pubkey_type);
+                        params.address = ltc::pubkey_hash_to_address(params.pubkey_hash, params.pubkey_type, p2p_node->coin_params());
                     }
 
                     // No P2WPKH reversal — c2pool stores raw witness program
@@ -4539,7 +4539,7 @@ int main(int argc, char* argv[]) {
                     }
 
                     LOG_TRACE << "[ref_hash_fn] computing ref_hash...";
-                    auto [rh, nonce] = ltc::compute_ref_hash_for_work(params);
+                    auto [rh, nonce] = ltc::compute_ref_hash_for_work(params, p2p_node->coin_params());
                     LOG_TRACE << "[ref_hash_fn] ref_hash computed";
                     core::MiningInterface::RefHashResult result;
                     result.ref_hash = rh;
@@ -4705,6 +4705,7 @@ int main(int argc, char* argv[]) {
                     // Pass frozen fields from template time so ref_hash matches coinbase.
                     uint256 share_hash = ltc::create_local_share(
                         p2p_node->tracker(),
+                        p2p_node->coin_params(),
                         min_header,
                         coinbase,
                         p.subsidy,
