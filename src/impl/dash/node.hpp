@@ -139,16 +139,62 @@ public:
                 using T = std::decay_t<decltype(msg)>;
                 if constexpr (std::is_same_v<T, std::unique_ptr<dash::message_shares>>) {
                     if (msg) {
-                        LOG_INFO << "[Dash] Received " << msg->m_shares.size() << " share(s)";
-                        for (auto& raw_share : msg->m_shares) {
-                            LOG_INFO << "[Dash] Share type=" << raw_share.type
-                                     << " size=" << raw_share.contents.size();
-                        }
+                        process_shares(msg->m_shares, service);
                     }
                 }
             }, result);
         } catch (const std::exception&) {
             // Unhandled messages (addrme, have_tx, etc.) — normal
+        }
+    }
+
+    // Process received shares: deserialize v16 → verify X11 PoW → add to tracker
+    void process_shares(std::vector<chain::RawShare>& raw_shares, const NetService& from)
+    {
+        LOG_INFO << "[Dash] Processing " << raw_shares.size() << " share(s) from " << from.to_string();
+
+        for (auto& raw_share : raw_shares)
+        {
+            if (raw_share.type != 16) {
+                LOG_WARNING << "[Dash] Unknown share type " << raw_share.type << ", skipping";
+                continue;
+            }
+
+            try {
+                // Deserialize v16 share from wire
+                auto stream = raw_share.contents.as_stream();
+                auto share_var = dash::ShareType::load(raw_share.type, stream);
+
+                // Extract share data for logging
+                share_var.ACTION({
+                    LOG_INFO << "[Dash] Share deserialized:"
+                             << " prev=" << obj->m_prev_hash.GetHex().substr(0, 16)
+                             << " height=" << obj->m_absheight
+                             << " bits=0x" << std::hex << obj->m_bits << std::dec
+                             << " subsidy=" << obj->m_subsidy
+                             << " donation=" << obj->m_donation
+                             << " payments=" << obj->m_packed_payments.size()
+                             << " timestamp=" << obj->m_timestamp;
+
+                    // Verify X11 PoW
+                    try {
+                        uint256 share_hash = dash::share_init_verify(*obj, m_coin_params, true);
+                        obj->m_hash = share_hash;
+                        LOG_INFO << "[Dash] Share VERIFIED: hash=" << share_hash.GetHex().substr(0, 16)
+                                 << " X11 PoW valid!";
+
+                        // Add to tracker
+                        auto* heap_share = new dash::DashShare(*obj);
+                        m_tracker.add(heap_share);
+                        LOG_INFO << "[Dash] Share added to tracker (total: " << m_tracker.chain.size() << ")";
+                    } catch (const std::exception& e) {
+                        LOG_WARNING << "[Dash] Share verification failed: " << e.what();
+                    }
+                });
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[Dash] Share deserialization failed: " << e.what()
+                            << " (type=" << raw_share.type << " size=" << raw_share.contents.size() << ")";
+            }
         }
     }
 
