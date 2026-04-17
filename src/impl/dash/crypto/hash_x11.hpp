@@ -109,5 +109,15 @@ inline uint256 hash_x11(std::span<const unsigned char> header)
     return hash_x11(header.data(), header.size());
 }
 
+inline uint256 hash_x11(std::span<const std::byte> data)
+{
+    return hash_x11(reinterpret_cast<const unsigned char*>(data.data()), data.size());
+}
+
+inline uint256 hash_x11(std::span<std::byte> data)
+{
+    return hash_x11(reinterpret_cast<const unsigned char*>(data.data()), data.size());
+}
+
 } // namespace crypto
 } // namespace dash
