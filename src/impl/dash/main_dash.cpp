@@ -18,6 +18,13 @@
 #include <impl/dash/coinbase_builder.hpp>
 #include <impl/dash/submit_validator.hpp>
 #include <impl/dash/pplns.hpp>
+#include <impl/dash/share_builder.hpp>
+#include <impl/dash/share_chain.hpp>
+#include <impl/dash/messages.hpp>
+
+#include <unordered_map>
+#include <deque>
+#include <mutex>
 
 #include <core/coin_params.hpp>
 #include <core/log.hpp>
@@ -317,19 +324,52 @@ int main(int argc, char* argv[])
         std::cout << "[STRATUM] disabled (pass --stratum-port 7903 to enable)" << std::endl;
     }
 
-    // Resolve miner payout script once (from --mining-address).
+    // Resolve miner payout script once (from --mining-address). Also extract
+    // the 20-byte pubkey_hash — it goes into every share we create as
+    // m_pubkey_hash, which is what Dash's PPLNS pays out to.
     std::vector<unsigned char> miner_script;
+    uint160 miner_pubkey_hash;
     if (!mining_address.empty()) {
         miner_script = dash::decode_payee_script(
             mining_address, params.address_version, params.address_p2sh_version);
+        std::vector<unsigned char> decoded;
+        if (DecodeBase58Check(mining_address, decoded, 21) && decoded.size() == 21) {
+            std::memcpy(miner_pubkey_hash.data(), decoded.data() + 1, 20);
+        }
         if (miner_script.empty()) {
             std::cerr << "[MINING] --mining-address '" << mining_address
                       << "' could not be decoded for this network" << std::endl;
         } else {
             std::cout << "[MINING] payout address: " << mining_address
-                      << " (script=" << miner_script.size() << "B)" << std::endl;
+                      << " (script=" << miner_script.size() << "B"
+                      << " pubkey_hash=" << miner_pubkey_hash.GetHex().substr(0, 16) << "...)"
+                      << std::endl;
         }
     }
+
+    // Side-map of job_id → share template (bounded history, matches
+    // stratum::Server's MAX_JOB_HISTORY). Indexed in the job-refresh closure,
+    // consumed by the submit handler.
+    std::unordered_map<std::string, dash::DashShare> share_templates;
+    std::deque<std::string> share_template_order;
+    std::mutex share_templates_mtx;
+    constexpr size_t MAX_TEMPLATE_HISTORY = 16;
+
+    auto store_template = [&](const std::string& job_id, dash::DashShare tmpl) {
+        std::lock_guard<std::mutex> lock(share_templates_mtx);
+        share_templates[job_id] = std::move(tmpl);
+        share_template_order.push_back(job_id);
+        while (share_template_order.size() > MAX_TEMPLATE_HISTORY) {
+            share_templates.erase(share_template_order.front());
+            share_template_order.pop_front();
+        }
+    };
+    auto fetch_template = [&](const std::string& job_id) -> std::optional<dash::DashShare> {
+        std::lock_guard<std::mutex> lock(share_templates_mtx);
+        auto it = share_templates.find(job_id);
+        if (it == share_templates.end()) return std::nullopt;
+        return it->second;
+    };
 
     // Submit handler: validate reconstructed block header, forward blocks.
     if (stratum_server) {
@@ -363,6 +403,34 @@ int main(int argc, char* argv[])
                     } catch (const std::exception& e) {
                         LOG_WARNING << "[SUBMIT] submitblock threw: " << e.what();
                     }
+                }
+
+                // Phase 5c/5d: promote this submit into a real v16 share.
+                // We do it for BOTH valid shares and blocks: any valid share
+                // target hit is also a valid share for peers.
+                try {
+                    auto tmpl_opt = fetch_template(s.job_id);
+                    if (!tmpl_opt) {
+                        LOG_WARNING << "[SHARE] template missing for job="
+                                    << s.job_id;
+                    } else {
+                        auto en2 = ParseHex(s.extranonce2_hex);
+                        uint32_t miner_ntime = 0, miner_nonce = 0;
+                        dash::submit::parse_be_u32_hex(s.ntime_hex, miner_ntime);
+                        dash::submit::parse_be_u32_hex(s.nonce_hex, miner_nonce);
+                        auto finalized = dash::share_builder::finalize_from_submit(
+                            *tmpl_opt, miner_ntime, miner_nonce,
+                            std::span<const unsigned char>(en2.data(), en2.size()),
+                            params);
+                        auto h = node.add_local_share(finalized);
+                        node.broadcast_share(finalized);
+                        LOG_INFO << "[SHARE] created hash="
+                                 << h.GetHex().substr(0, 16)
+                                 << " absheight=" << finalized.m_absheight
+                                 << " broadcast OK";
+                    }
+                } catch (const std::exception& e) {
+                    LOG_WARNING << "[SHARE] creation failed: " << e.what();
                 }
                 return true;
             });
@@ -399,23 +467,36 @@ int main(int argc, char* argv[])
                     payouts.push_back({miner_script, miner_value});
                 }
 
-                auto built = dash::job::build_from_work(
-                    work, payouts, pool_tag, params, share_difficulty_default);
+                // Pick a share target bits from our configured share_difficulty.
+                // (target_from_difficulty matches submit_validator's math.)
+                uint32_t share_bits = 0;
+                {
+                    uint256 st = dash::submit::target_from_difficulty(share_difficulty_default);
+                    share_bits = chain::target_to_bits_upper_bound(st);
+                    if (share_bits == 0) share_bits = 0x1f00ffff;
+                }
+
+                auto built = dash::share_builder::build(
+                    work, node.tracker(), miner_pubkey_hash, payouts, pool_tag, params,
+                    share_bits, share_difficulty_default);
                 stratum_server->set_difficulty_all(share_difficulty_default);
                 stratum_server->notify_all(built.job, built.context);
+                store_template(built.job.job_id, built.share_template);
 
                 LOG_INFO << "[JOB] id=" << built.job.job_id
                          << " height=" << work.m_height
                          << " miners=" << stratum_server->session_count()
                          << " coinb_bytes=" << built.coinbase.bytes.size()
-                         << " en_off=" << built.coinbase.extranonce_offset
+                         << " ref_off=" << built.coinbase.ref_hash_offset
+                         << " n64_off=" << built.coinbase.nonce64_offset
                          << " branches=" << built.job.merkle_branches_hex.size()
                          << " txs=" << built.context.tx_data_hex.size()
                          << " pplns_mode="
                          << (!pplns_enabled ? "disabled"
                              : pplns.used_fallback ? "fallback_solo" : "active")
                          << " payouts=" << payouts.size()
-                         << " shares_used=" << pplns.shares_used;
+                         << " shares_used=" << pplns.shares_used
+                         << " ref_hash=" << built.ref_hash.GetHex().substr(0, 16);
             } catch (const std::exception& e) {
                 LOG_WARNING << "[JOB] build failed: " << e.what();
             }

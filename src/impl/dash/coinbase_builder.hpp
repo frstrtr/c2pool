@@ -1,41 +1,44 @@
 #pragma once
 
-// Dash coinbase TX assembly for Stratum mining.
-// Produces a serialized coinbase whose scriptSig has an 8-byte extranonce2
-// placeholder, plus the coinb1/coinb2 slice indices a Stratum server needs
-// to push mining.notify work.
+// Dash coinbase TX assembly for p2pool-dash v16 compatible Stratum mining.
 //
-// Layout:
-//   coinbase_tx serialization =
-//     [ver|type : int32 LE]
-//     [VarInt 1]                             ← num_inputs = 1
-//     [TxIn:
-//        [prev_hash 32B = 0]
-//        [prev_n   uint32 = 0xFFFFFFFF]
-//        [VarStr script_sig:
-//           VarInt script_len
-//           [push_height_bip34]              ← e.g. 03 XX XX XX for mainnet
-//           [pool_tag]                       ← "/c2pool-dash:0.1/"
-//           [EXTRANONCE_PLACEHOLDER = 8 B]   ← the 8 bytes miner fills
-//        ]
-//        [sequence uint32 = 0xFFFFFFFF]
+// The layout is dictated by the hash_link mechanism documented in
+// share_check.hpp::compute_gentx_before_refhash:
+//
+//   [ver|type int32]
+//   [vin VarInt = 1]
+//   [TxIn:
+//      [prev_hash 32B zeros][prev_n 0xFFFFFFFF]
+//      [VarStr scriptSig:
+//         [BIP34 height push][pool_tag]          ← no extranonce here anymore
+//      ]
+//      [sequence 0xFFFFFFFF]
+//   ]
+//   [vout VarInt]
+//     [worker_payouts…]                          ← PPLNS splits
+//     [packed_payments…]                         ← masternode/superblock/platform
+//     [donation_output:
+//        [value i64][VarStr DONATION_SCRIPT]     ← constant tail; value usually 0
 //     ]
-//     [VarInt num_outputs]
-//       [TxOut miner_payout]
-//       [TxOut masternode + superblock + platform payments...]
-//     [locktime uint32 = 0]
-//     [optional VarStr extra_payload]        ← DIP3/DIP4 CBTX
+//     [op_return_output:
+//        [value i64 = 0][VarStr (42B):
+//           [0x6a OP_RETURN][0x28 push40]
+//           [ref_hash 32B]      ← pool fills; PPLNS commitment
+//           [nonce64 8B]        ← miner fills via Stratum extranonce2
+//        ]
+//     ]
+//   [locktime 4B = 0]
+//   [optional VarStr extra_payload]              ← DIP3/DIP4 CBTX
 //
-// Coinb1 = bytes from start through (and including) pool_tag.
-// Coinb2 = bytes from first byte after the 8-byte placeholder through end.
-// Miner fills the 8-byte placeholder with its own extranonce2.
-// Assembly: coinb1 + extranonce2(8B) + coinb2  ==  original serialization
-//                                                  with zeros replaced.
+// The 8-byte `nonce64` placeholder is the Stratum extranonce2 slot.
+// Coinb1 = bytes[0 : nonce64_offset]      ( includes ref_hash )
+// Coinb2 = bytes[nonce64_offset + 8 : ]   ( starts at locktime )
 
 #include "coin/transaction.hpp"
 #include "coin/rpc_data.hpp"
-#include "share_check.hpp"                 // decode_payee_script
+#include "share_check.hpp"                 // decode_payee_script, pubkey_hash_to_script2, DONATION_SCRIPT
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <span>
@@ -51,17 +54,23 @@
 namespace dash {
 namespace coinbase {
 
-static constexpr size_t EXTRANONCE2_SIZE = 8;
+static constexpr size_t EXTRANONCE2_SIZE = 8;          // = nonce64 width
 
-// Output of build(): raw coinbase bytes + indices of the 8-byte placeholder.
+// One miner payout row: scriptPubKey + amount (sat).
+struct MinerPayout {
+    std::vector<unsigned char> script;
+    uint64_t                   amount{0};
+};
+
+// Result of build(): raw coinbase bytes + key offsets.
 struct CoinbaseLayout {
-    std::vector<unsigned char> bytes;       // full serialized coinbase
-    size_t extranonce_offset{0};            // first byte of the 8B placeholder
-    // bytes[extranonce_offset .. extranonce_offset + EXTRANONCE2_SIZE) are zeros.
+    std::vector<unsigned char> bytes;
+    size_t ref_hash_offset{0};   // first byte of the 32B ref_hash region
+    size_t nonce64_offset{0};    // first byte of the 8B nonce64 placeholder
+                                 // (always == ref_hash_offset + 32)
 };
 
 // BIP34 minimal push of a positive integer. Writes length byte + height LE.
-// Returns the encoded push bytes.
 inline std::vector<unsigned char> push_bip34_height(uint32_t height)
 {
     std::vector<unsigned char> le;
@@ -72,8 +81,7 @@ inline std::vector<unsigned char> push_bip34_height(uint32_t height)
         h >>= 8;
     }
     if (le.empty()) le.push_back(0x00);                 // push 0 → [01 00]
-    // If top bit set, append 0x00 to avoid sign interpretation.
-    if (le.back() & 0x80) le.push_back(0x00);
+    if (le.back() & 0x80) le.push_back(0x00);           // avoid sign
 
     std::vector<unsigned char> out;
     out.reserve(1 + le.size());
@@ -82,43 +90,50 @@ inline std::vector<unsigned char> push_bip34_height(uint32_t height)
     return out;
 }
 
-// One miner payout row: scriptPubKey + amount (sat).
-struct MinerPayout {
-    std::vector<unsigned char> script;
-    uint64_t                   amount{0};
-};
+// Convert compact nbits → share difficulty (Bitcoin bdiff formula).
+inline double bits_to_difficulty(uint32_t nbits)
+{
+    uint256 target;
+    target.SetCompact(nbits);
+    if (target.IsNull()) return 0.0;
+    uint256 shifted = target >> 192;
+    uint64_t top = shifted.GetLow64();
+    if (top == 0) return 0.0;
+    const double bdiff_const = 4294901760.0;  // 0xffff0000
+    return bdiff_const / static_cast<double>(top);
+}
 
-// Build the coinbase TX. Returns serialized bytes and the offset of the
-// 8-byte extranonce placeholder within them.
+// Build the coinbase TX in the p2pool-dash v16 layout.
 //
-//   work          — parsed GBT (previous_block, coinbase_value, payments, ...)
-//   miner_payouts — one or more outputs representing the miner share (sum
-//                   should equal coinbase_value - payment_amount, but this
-//                   function does NOT enforce that — caller's responsibility)
-//   pool_tag      — arbitrary short tag in coinbase scriptSig
-//   params        — coin params (for address decoding of packed_payments)
+//   work           — parsed GBT
+//   miner_payouts  — PPLNS splits (or single miner fallback)
+//   pool_tag       — short tag in coinbase scriptSig (no extranonce)
+//   params         — coin params (used to decode "!-prefix" payees)
+//   donation_value — donation amount in sat (0 for no-donation MVP)
+//   ref_hash       — 32B PPLNS commitment embedded in OP_RETURN
 inline CoinbaseLayout build(const dash::coin::DashWorkData& work,
                             const std::vector<MinerPayout>& miner_payouts,
                             const std::string& pool_tag,
-                            const core::CoinParams& params)
+                            const core::CoinParams& params,
+                            uint64_t donation_value,
+                            const uint256& ref_hash)
 {
     using namespace dash::coin;
 
     MutableTransaction tx;
 
-    // ── Input: coinbase ─────────────────────────────────────────────────
+    // ── Input ───────────────────────────────────────────────────────────
     TxIn in;
     in.prevout.hash  = uint256::ZERO;
     in.prevout.index = 0xFFFFFFFFu;
     in.sequence      = 0xFFFFFFFFu;
-
-    // scriptSig = [BIP34 height push] [pool_tag raw bytes] [8-byte extranonce placeholder]
-    std::vector<unsigned char> script;
-    auto h_push = push_bip34_height(work.m_height);
-    script.insert(script.end(), h_push.begin(), h_push.end());
-    script.insert(script.end(), pool_tag.begin(), pool_tag.end());
-    script.resize(script.size() + EXTRANONCE2_SIZE, 0x00);
-    in.scriptSig = OPScript(script.data(), script.data() + script.size());
+    {
+        std::vector<unsigned char> script;
+        auto h_push = push_bip34_height(work.m_height);
+        script.insert(script.end(), h_push.begin(), h_push.end());
+        script.insert(script.end(), pool_tag.begin(), pool_tag.end());
+        in.scriptSig = OPScript(script.data(), script.data() + script.size());
+    }
     tx.vin.push_back(std::move(in));
 
     // ── Outputs ─────────────────────────────────────────────────────────
@@ -129,19 +144,41 @@ inline CoinbaseLayout build(const dash::coin::DashWorkData& work,
         o.scriptPubKey = OPScript(p.script.data(), p.script.data() + p.script.size());
         tx.vout.push_back(std::move(o));
     }
-    // Masternode + superblock + platform payments.
     for (const auto& p : work.m_packed_payments) {
         if (p.amount == 0) continue;
         auto ps = dash::decode_payee_script(
             p.payee, params.address_version, params.address_p2sh_version);
-        if (ps.empty()) continue;                       // skip unparseable payees
+        if (ps.empty()) continue;
         TxOut o;
         o.value = static_cast<int64_t>(p.amount);
         o.scriptPubKey = OPScript(ps.data(), ps.data() + ps.size());
         tx.vout.push_back(std::move(o));
     }
+    // Donation output: always present (so share_init_verify's gentx_before_refhash
+    // constant holds). Value may be 0 for no-donation MVP.
+    {
+        TxOut o;
+        o.value = static_cast<int64_t>(donation_value);
+        o.scriptPubKey = OPScript(
+            dash::DONATION_SCRIPT.data(),
+            dash::DONATION_SCRIPT.data() + dash::DONATION_SCRIPT.size());
+        tx.vout.push_back(std::move(o));
+    }
+    // OP_RETURN output carrying [0x6a][0x28][ref_hash 32B][nonce64 8B].
+    {
+        std::vector<unsigned char> op_ret;
+        op_ret.reserve(2 + 32 + 8);
+        op_ret.push_back(0x6a);                             // OP_RETURN
+        op_ret.push_back(0x28);                             // push 40 bytes
+        op_ret.insert(op_ret.end(), ref_hash.data(), ref_hash.data() + 32);
+        op_ret.insert(op_ret.end(), EXTRANONCE2_SIZE, 0x00); // nonce64 placeholder
+        TxOut o;
+        o.value = 0;
+        o.scriptPubKey = OPScript(op_ret.data(), op_ret.data() + op_ret.size());
+        tx.vout.push_back(std::move(o));
+    }
 
-    // ── DIP3/DIP4 CBTX ──────────────────────────────────────────────────
+    // ── DIP3/DIP4 ───────────────────────────────────────────────────────
     if (!work.m_coinbase_payload.empty()) {
         tx.version = 3;
         tx.type    = 5;
@@ -149,42 +186,54 @@ inline CoinbaseLayout build(const dash::coin::DashWorkData& work,
     }
     tx.locktime = 0;
 
-    // ── Serialize + locate placeholder ──────────────────────────────────
+    // ── Serialize ───────────────────────────────────────────────────────
     auto packed = pack(tx);
-    auto raw = packed.get_span();                       // span<byte>
+    auto raw = packed.get_span();
     CoinbaseLayout out;
     out.bytes.reserve(raw.size());
-    for (auto b : raw)
-        out.bytes.push_back(static_cast<unsigned char>(b));
+    for (auto b : raw) out.bytes.push_back(static_cast<unsigned char>(b));
 
-    // Find the zero 8-byte placeholder by searching forward from a known
-    // lower bound: the scriptSig starts after
-    //   4 (ver|type) + VarInt(1) + 32 (prev_hash) + 4 (prev_n) + VarInt(script_len)
-    // Finding the exact VarInt width is fiddly; simpler: scan for the first
-    // run of >= EXTRANONCE2_SIZE consecutive zeros that match the expected
-    // tail of scriptSig. Since we know pool_tag is non-zero, the 8-zero run
-    // immediately after pool_tag is unique.
+    // ── Locate ref_hash / nonce64 positions from the tail ───────────────
+    // Tail layout (bytes, from end of tx moving toward start):
+    //   [VarStr extra_payload]?   — length = payload_varstr_size
+    //   [locktime 4B]
+    //   [nonce64 8B]              ← EXTRANONCE2_SIZE bytes of zeros (miner fills)
+    //   [ref_hash 32B]            ← the ref_hash we just embedded
+    //   [0x28 push40]
+    //   [0x6a OP_RETURN]
+    //   [0x2a VarInt script_len 42]
+    //   [value i64 = 0]
     //
-    // Build a needle = last byte of pool_tag + 8 zeros, then locate it.
-    if (pool_tag.empty()) {
-        // Without a tag we can't disambiguate — require caller provide one.
-        throw std::runtime_error("coinbase_builder: pool_tag must be non-empty");
+    // So offsets-from-end:
+    //   nonce64_offset  = total - payload_varstr_size - 4 - 8
+    //   ref_hash_offset = total - payload_varstr_size - 4 - 8 - 32
+    size_t payload_varstr_size = 0;
+    if (tx.type != 0 && !tx.extra_payload.empty()) {
+        PackStream ps;
+        BaseScript bs; bs.m_data = tx.extra_payload;
+        ps << bs;
+        payload_varstr_size = ps.size();
     }
-    std::vector<unsigned char> needle;
-    needle.reserve(1 + EXTRANONCE2_SIZE);
-    needle.push_back(static_cast<unsigned char>(pool_tag.back()));
-    needle.insert(needle.end(), EXTRANONCE2_SIZE, 0x00);
+    const size_t total = out.bytes.size();
+    if (total < payload_varstr_size + 4 + 8 + 32)
+        throw std::runtime_error("coinbase_builder: tx shorter than known tail");
+    out.nonce64_offset  = total - payload_varstr_size - 4 - 8;
+    out.ref_hash_offset = out.nonce64_offset - 32;
 
-    auto it = std::search(out.bytes.begin(), out.bytes.end(), needle.begin(), needle.end());
-    if (it == out.bytes.end())
-        throw std::runtime_error("coinbase_builder: extranonce placeholder not found");
-    // First byte AFTER the pool_tag tail byte is the placeholder start.
-    out.extranonce_offset = static_cast<size_t>((it - out.bytes.begin()) + 1);
+    // Sanity: bytes at ref_hash_offset must equal the ref_hash we embedded.
+    if (std::memcmp(out.bytes.data() + out.ref_hash_offset, ref_hash.data(), 32) != 0)
+        throw std::runtime_error("coinbase_builder: ref_hash offset mismatch");
+    // Sanity: bytes at nonce64_offset must be 8 zero bytes.
+    for (size_t i = 0; i < EXTRANONCE2_SIZE; ++i) {
+        if (out.bytes[out.nonce64_offset + i] != 0x00)
+            throw std::runtime_error("coinbase_builder: nonce64 placeholder not zeroed");
+    }
+
     return out;
 }
 
-// Split the coinbase bytes into coinb1 / coinb2 (hex-encoded) around the
-// 8-byte extranonce2 placeholder.
+// Split coinbase bytes into coinb1 / coinb2 hex around the 8-byte nonce64
+// slot. The miner inserts its extranonce2 in that slot.
 struct CoinbSplit {
     std::string coinb1_hex;
     std::string coinb2_hex;
@@ -192,11 +241,12 @@ struct CoinbSplit {
 
 inline CoinbSplit split_coinb(const CoinbaseLayout& lay)
 {
-    if (lay.extranonce_offset + EXTRANONCE2_SIZE > lay.bytes.size())
-        throw std::runtime_error("coinbase_builder: bad extranonce offset");
-    std::span<const unsigned char> b1(lay.bytes.data(), lay.extranonce_offset);
-    std::span<const unsigned char> b2(lay.bytes.data() + lay.extranonce_offset + EXTRANONCE2_SIZE,
-                                       lay.bytes.size() - lay.extranonce_offset - EXTRANONCE2_SIZE);
+    if (lay.nonce64_offset + EXTRANONCE2_SIZE > lay.bytes.size())
+        throw std::runtime_error("split_coinb: bad nonce64 offset");
+    std::span<const unsigned char> b1(lay.bytes.data(), lay.nonce64_offset);
+    std::span<const unsigned char> b2(
+        lay.bytes.data() + lay.nonce64_offset + EXTRANONCE2_SIZE,
+        lay.bytes.size() - lay.nonce64_offset - EXTRANONCE2_SIZE);
     return CoinbSplit{HexStr(b1), HexStr(b2)};
 }
 
@@ -206,12 +256,8 @@ inline uint256 sha256d(std::span<const unsigned char> a)
     return Hash(a);
 }
 
-// Compute merkle branches for index 0 (coinbase) given the list of all
-// transaction hashes (hash at [0] is a placeholder — the miner's submit
-// provides the real coinbase hash; siblings along the path do not depend
-// on [0] even though it participates in reduction).
-//
-// Standard Bitcoin merkle tree with last-node duplication for odd layers.
+// Merkle branches for index 0 with placeholder at [0]. (Siblings along the
+// path do not depend on [0] even though it participates in the reduction.)
 inline std::vector<uint256> merkle_branches_raw(
     const std::vector<uint256>& tx_hashes_including_coinbase_placeholder)
 {
@@ -236,7 +282,6 @@ inline std::vector<uint256> merkle_branches_raw(
     return out;
 }
 
-// Convenience: hex-encode a list of raw merkle branches for Stratum notify.
 inline std::vector<std::string> merkle_branches_hex(const std::vector<uint256>& raw)
 {
     std::vector<std::string> out;
@@ -247,11 +292,6 @@ inline std::vector<std::string> merkle_branches_hex(const std::vector<uint256>& 
 
 // ── Stratum wire formatting helpers ─────────────────────────────────────────
 
-// Stratum's "prevhash" notify field is the LE byte dump of the uint256 with
-// every 4-byte word byte-reversed (historic quirk inherited from Bitcoin).
-//
-//   in :  [B0 B1 B2 B3][B4 B5 B6 B7]...[B28 B29 B30 B31]
-//   out:  [B3 B2 B1 B0][B7 B6 B5 B4]...[B31 B30 B29 B28]
 inline std::string swap4_hex(std::span<const unsigned char> data)
 {
     if (data.size() % 4 != 0) throw std::runtime_error("swap4_hex: len %4 != 0");
@@ -265,7 +305,6 @@ inline std::string swap4_hex(std::span<const unsigned char> data)
     return HexStr(out);
 }
 
-// 4-byte big-endian hex of a uint32 (what Stratum expects for version/nbits/ntime).
 inline std::string be_hex_u32(uint32_t v)
 {
     unsigned char b[4] = {
@@ -277,111 +316,5 @@ inline std::string be_hex_u32(uint32_t v)
     return HexStr(std::span<const unsigned char>(b, 4));
 }
 
-// Convert compact nbits → share difficulty (Bitcoin bdiff formula).
-//   diff = 0xffff0000 * 2^192 / (target + 1)
-inline double bits_to_difficulty(uint32_t nbits)
-{
-    uint256 target;
-    target.SetCompact(nbits);
-    if (target.IsNull()) return 0.0;
-    // Shift target right by 192 bits so we stay in double precision; the
-    // bdiff constant is 0xffff0000, i.e. 2^32 * 0xffff / 0x10000 ≈ 4.29e9.
-    // target >> 192 gives the top 64 bits as a uint64.
-    uint256 shifted = target >> 192;
-    uint64_t top = shifted.GetLow64();
-    if (top == 0) return 0.0;
-    const double bdiff_const = 4294901760.0;  // 0xffff0000
-    return bdiff_const / static_cast<double>(top);
-}
-
-// ── One-shot: DashWorkData + miner_script → stratum::Job ────────────────────
-//
-// Also returns the CoinbaseLayout so the submit path can reconstruct the
-// exact coinbase bytes with the miner's extranonce2 substituted in.
-
 } // namespace coinbase
-} // namespace dash
-
-#include <impl/dash/stratum.hpp>
-#include <random>
-#include <sstream>
-#include <iomanip>
-
-namespace dash {
-namespace job {
-
-struct BuiltJob {
-    stratum::Job        job;
-    stratum::JobContext context;              // passed to Server.notify_all for submit
-    coinbase::CoinbaseLayout coinbase;
-};
-
-inline std::string random_job_id()
-{
-    static thread_local std::mt19937_64 rng(std::random_device{}());
-    std::ostringstream ss;
-    ss << std::hex << std::setw(8) << std::setfill('0')
-       << (static_cast<uint32_t>(rng()) & 0xffffffffu);
-    return ss.str();
-}
-
-inline BuiltJob build_from_work(const dash::coin::DashWorkData& work,
-                                const std::vector<dash::coinbase::MinerPayout>& miner_payouts,
-                                const std::string& pool_tag,
-                                const core::CoinParams& params,
-                                double share_difficulty)
-{
-    using namespace dash::coinbase;
-
-    BuiltJob out;
-    out.coinbase = build(work, miner_payouts, pool_tag, params);
-    auto sp = split_coinb(out.coinbase);
-
-    // Merkle branches — coinbase placeholder at [0].
-    std::vector<uint256> layer;
-    layer.reserve(work.m_tx_hashes.size() + 1);
-    layer.push_back(uint256::ZERO);
-    for (const auto& h : work.m_tx_hashes) layer.push_back(h);
-    auto branches_raw = dash::coinbase::merkle_branches_raw(layer);
-    auto branches_hex = dash::coinbase::merkle_branches_hex(branches_raw);
-
-    auto prev_chars = work.m_previous_block.GetChars();
-    std::span<const unsigned char> prev_span(
-        reinterpret_cast<const unsigned char*>(prev_chars.data()), 32);
-
-    out.job.job_id          = random_job_id();
-    out.job.prevhash_hex    = dash::coinbase::swap4_hex(prev_span);
-    out.job.coinb1_hex      = sp.coinb1_hex;
-    out.job.coinb2_hex      = sp.coinb2_hex;
-    out.job.merkle_branches_hex = branches_hex;
-    out.job.version_hex     = dash::coinbase::be_hex_u32(static_cast<uint32_t>(work.m_version));
-    out.job.nbits_hex       = dash::coinbase::be_hex_u32(work.m_bits);
-    out.job.ntime_hex       = dash::coinbase::be_hex_u32(work.m_curtime);
-    out.job.clean_jobs      = true;
-    out.job.share_difficulty = share_difficulty;
-
-    // JobContext: exactly what the submit validator needs.
-    out.context.job_id   = out.job.job_id;
-    out.context.coinb1_bytes.assign(
-        out.coinbase.bytes.begin(),
-        out.coinbase.bytes.begin() + out.coinbase.extranonce_offset);
-    out.context.coinb2_bytes.assign(
-        out.coinbase.bytes.begin() + out.coinbase.extranonce_offset + EXTRANONCE2_SIZE,
-        out.coinbase.bytes.end());
-    out.context.merkle_branches_le.reserve(branches_raw.size());
-    for (const auto& h : branches_raw) {
-        auto c = h.GetChars();
-        out.context.merkle_branches_le.emplace_back(c.begin(), c.end());
-    }
-    out.context.prev_hash_le.assign(prev_span.begin(), prev_span.end());
-    out.context.version          = work.m_version;
-    out.context.nbits            = work.m_bits;
-    out.context.ntime            = work.m_curtime;
-    out.context.height           = work.m_height;
-    out.context.share_difficulty = share_difficulty;
-    out.context.tx_data_hex      = work.m_tx_data_hex;
-    return out;
-}
-
-} // namespace job
 } // namespace dash
