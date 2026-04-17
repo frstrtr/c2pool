@@ -191,7 +191,7 @@ public:
             auto result = m_handler.parse(rmsg);
             std::visit([&](auto& msg) { handle_msg(std::move(msg)); }, result);
         } catch (const std::exception& e) {
-            LOG_WARNING << "[DashP2P] unhandled: " << cmd;
+            LOG_TRACE << "[DashP2P] unhandled: " << cmd;
         }
     }
 
