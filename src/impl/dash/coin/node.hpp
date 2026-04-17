@@ -29,7 +29,9 @@ public:
 
     void start_p2p(const NetService& addr)
     {
+        LOG_INFO << "[DashCoin] Creating P2P node for " << addr.to_string();
         m_p2p = std::make_unique<NodeP2P<config_t>>(m_context, this, m_config);
+        LOG_INFO << "[DashCoin] P2P node created, connecting...";
         m_p2p->connect(addr);
         LOG_INFO << "[DashCoin] P2P connecting to " << addr.to_string();
     }
