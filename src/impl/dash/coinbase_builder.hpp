@@ -205,27 +205,25 @@ inline uint256 sha256d(std::span<const unsigned char> a)
 }
 
 // Compute merkle branches for index 0 (coinbase) given the list of all
-// transaction hashes (coinbase hash at [0] is ignored — the miner computes
-// it themselves). Returns 64-hex strings (not byte-reversed).
+// transaction hashes (hash at [0] is a placeholder — the miner's submit
+// provides the real coinbase hash; siblings along the path do not depend
+// on [0] even though it participates in reduction).
 //
 // Standard Bitcoin merkle tree with last-node duplication for odd layers.
-inline std::vector<std::string> merkle_branches_for_coinbase(
+inline std::vector<uint256> merkle_branches_raw(
     const std::vector<uint256>& tx_hashes_including_coinbase_placeholder)
 {
-    std::vector<std::string> out;
+    std::vector<uint256> out;
     if (tx_hashes_including_coinbase_placeholder.size() <= 1) return out;
 
     std::vector<uint256> layer = tx_hashes_including_coinbase_placeholder;
     while (layer.size() > 1) {
-        // Record sibling of index 0 at this layer.
-        out.push_back(layer[1].GetHex());
-        // Build next layer: pairs, duplicating tail if odd.
+        out.push_back(layer[1]);
         if (layer.size() % 2 == 1)
             layer.push_back(layer.back());
         std::vector<uint256> next;
         next.reserve(layer.size() / 2);
         for (size_t i = 0; i + 1 < layer.size(); i += 2) {
-            // Concat a || b, sha256d, store.
             std::vector<unsigned char> buf(64);
             std::memcpy(buf.data(),      layer[i].data(),     32);
             std::memcpy(buf.data() + 32, layer[i + 1].data(), 32);
@@ -233,6 +231,15 @@ inline std::vector<std::string> merkle_branches_for_coinbase(
         }
         layer.swap(next);
     }
+    return out;
+}
+
+// Convenience: hex-encode a list of raw merkle branches for Stratum notify.
+inline std::vector<std::string> merkle_branches_hex(const std::vector<uint256>& raw)
+{
+    std::vector<std::string> out;
+    out.reserve(raw.size());
+    for (const auto& h : raw) out.push_back(h.GetHex());
     return out;
 }
 
@@ -302,7 +309,8 @@ namespace dash {
 namespace job {
 
 struct BuiltJob {
-    stratum::Job job;
+    stratum::Job        job;
+    stratum::JobContext context;              // passed to Server.notify_all for submit
     coinbase::CoinbaseLayout coinbase;
 };
 
@@ -327,14 +335,13 @@ inline BuiltJob build_from_work(const dash::coin::DashWorkData& work,
     out.coinbase = build(work, miner_script, pool_tag, params);
     auto sp = split_coinb(out.coinbase);
 
-    // Merkle branches: prepend a zero placeholder for the coinbase slot
-    // (its real hash depends on the miner's extranonce2, so we never emit
-    // branch[0] that references it — see merkle_branches_for_coinbase).
+    // Merkle branches — coinbase placeholder at [0].
     std::vector<uint256> layer;
     layer.reserve(work.m_tx_hashes.size() + 1);
     layer.push_back(uint256::ZERO);
     for (const auto& h : work.m_tx_hashes) layer.push_back(h);
-    auto branches = dash::coinbase::merkle_branches_for_coinbase(layer);
+    auto branches_raw = dash::coinbase::merkle_branches_raw(layer);
+    auto branches_hex = dash::coinbase::merkle_branches_hex(branches_raw);
 
     auto prev_chars = work.m_previous_block.GetChars();
     std::span<const unsigned char> prev_span(
@@ -344,12 +351,33 @@ inline BuiltJob build_from_work(const dash::coin::DashWorkData& work,
     out.job.prevhash_hex    = dash::coinbase::swap4_hex(prev_span);
     out.job.coinb1_hex      = sp.coinb1_hex;
     out.job.coinb2_hex      = sp.coinb2_hex;
-    out.job.merkle_branches_hex = std::move(branches);
+    out.job.merkle_branches_hex = branches_hex;
     out.job.version_hex     = dash::coinbase::be_hex_u32(static_cast<uint32_t>(work.m_version));
     out.job.nbits_hex       = dash::coinbase::be_hex_u32(work.m_bits);
     out.job.ntime_hex       = dash::coinbase::be_hex_u32(work.m_curtime);
     out.job.clean_jobs      = true;
     out.job.share_difficulty = share_difficulty;
+
+    // JobContext: exactly what the submit validator needs.
+    out.context.job_id   = out.job.job_id;
+    out.context.coinb1_bytes.assign(
+        out.coinbase.bytes.begin(),
+        out.coinbase.bytes.begin() + out.coinbase.extranonce_offset);
+    out.context.coinb2_bytes.assign(
+        out.coinbase.bytes.begin() + out.coinbase.extranonce_offset + EXTRANONCE2_SIZE,
+        out.coinbase.bytes.end());
+    out.context.merkle_branches_le.reserve(branches_raw.size());
+    for (const auto& h : branches_raw) {
+        auto c = h.GetChars();
+        out.context.merkle_branches_le.emplace_back(c.begin(), c.end());
+    }
+    out.context.prev_hash_le.assign(prev_span.begin(), prev_span.end());
+    out.context.version          = work.m_version;
+    out.context.nbits            = work.m_bits;
+    out.context.ntime            = work.m_curtime;
+    out.context.height           = work.m_height;
+    out.context.share_difficulty = share_difficulty;
+    out.context.tx_data_hex      = work.m_tx_data_hex;
     return out;
 }
 

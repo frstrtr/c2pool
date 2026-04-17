@@ -74,8 +74,31 @@ struct SubmittedShare {
     std::string nonce_hex;
 };
 
-// Callback invoked when a miner submits a share. Returns true to accept.
-using SubmitHandler = std::function<bool(const SubmittedShare&, std::string& reject_reason)>;
+// Frozen snapshot of a job that the validator needs on submit. Kept by the
+// Server keyed by job_id so submit can reconstruct the exact block header.
+// We deliberately avoid coin-specific types here — the raw bytes / uint256s
+// are enough for the validator to run.
+struct JobContext {
+    std::string job_id;
+    std::vector<unsigned char> coinb1_bytes;     // tx bytes before the 8-byte en2 slot
+    std::vector<unsigned char> coinb2_bytes;     // tx bytes after the en2 slot
+    std::vector<std::vector<unsigned char>> merkle_branches_le;  // 32B LE each
+    std::vector<unsigned char> prev_hash_le;     // 32B LE (block prev)
+    int32_t  version{0};
+    uint32_t nbits{0};
+    uint32_t ntime{0};
+    uint32_t height{0};
+    double   share_difficulty{1.0};
+    // Raw tx "data" hex for every non-coinbase tx in the GBT. Needed to
+    // assemble the full block hex when a share turns out to be a full block.
+    std::vector<std::string> tx_data_hex;
+};
+
+// Callback invoked when a miner submits a share. The JobContext pointer may
+// be null if the job has expired (stale submit). Returns true to accept.
+using SubmitHandler = std::function<bool(const SubmittedShare&,
+                                         const JobContext*,
+                                         std::string& reject_reason)>;
 
 class Server;
 
@@ -194,20 +217,23 @@ private:
     void handle_subscribe(const nlohmann::json& id, const nlohmann::json& /*params*/)
     {
         m_subscribed = true;
-        // params: [ [["mining.set_difficulty", sid], ["mining.notify", sid]], extranonce1_hex, extranonce2_size ]
-        char buf[9];
-        std::snprintf(buf, sizeof(buf), "%08x", m_extranonce1);
-        std::string en1_hex = buf;
+        // We reserve EXTRANONCE2_SIZE (8) bytes of placeholder in the coinbase
+        // scriptSig. Since coinbase has no separate extranonce1 slot, advertise
+        // extranonce1="" so the miner inserts only its 8-byte extranonce2.
+        // Per-session identification uses a hex subscription id derived from
+        // m_extranonce1.
+        char sid[9];
+        std::snprintf(sid, sizeof(sid), "%08x", m_extranonce1);
         nlohmann::json result = nlohmann::json::array({
             nlohmann::json::array({
-                nlohmann::json::array({"mining.set_difficulty", en1_hex}),
-                nlohmann::json::array({"mining.notify", en1_hex})
+                nlohmann::json::array({"mining.set_difficulty", std::string(sid)}),
+                nlohmann::json::array({"mining.notify",         std::string(sid)})
             }),
-            en1_hex,
-            static_cast<int>(EXTRANONCE2_SIZE)
+            std::string(""),                                     // extranonce1 (empty)
+            static_cast<int>(EXTRANONCE2_SIZE)                   // extranonce2 size
         });
         respond_result(id, result);
-        LOG_INFO << "[DashStratum] " << m_peer << " subscribed extranonce1=" << en1_hex
+        LOG_INFO << "[DashStratum] " << m_peer << " subscribed sid=" << sid
                  << " extranonce2_size=" << EXTRANONCE2_SIZE;
     }
 
@@ -314,8 +340,18 @@ public:
     }
 
     // Broadcast a job to every subscribed+authorized session.
-    void notify_all(const Job& job)
+    void notify_all(const Job& job, const JobContext& ctx)
     {
+        {   // Record the job's frozen context for the submit validator.
+            std::lock_guard<std::mutex> lock(m_jobs_mtx);
+            m_job_contexts[job.job_id] = ctx;
+            m_job_order.push_back(job.job_id);
+            while (m_job_order.size() > MAX_JOB_HISTORY) {
+                m_job_contexts.erase(m_job_order.front());
+                m_job_order.pop_front();
+            }
+        }
+
         std::vector<std::shared_ptr<Session>> snapshot;
         {
             std::lock_guard<std::mutex> lock(m_sessions_mtx);
@@ -328,6 +364,22 @@ public:
             s->send_notify(job);
         m_current_job = job;
         m_has_job = true;
+    }
+
+    // Backward-compat: a notify_all without a context does nothing to the
+    // validator state (used in tests that don't need submit validation).
+    void notify_all(const Job& job)
+    {
+        notify_all(job, JobContext{});
+    }
+
+    // Look up a frozen job by id. Returns nullptr when the id is unknown
+    // (either stale beyond MAX_JOB_HISTORY or never issued).
+    const JobContext* get_job(const std::string& job_id) const
+    {
+        std::lock_guard<std::mutex> lock(m_jobs_mtx);
+        auto it = m_job_contexts.find(job_id);
+        return it == m_job_contexts.end() ? nullptr : &it->second;
     }
 
     void set_difficulty_all(double difficulty)
@@ -394,6 +446,11 @@ private:
 
     Job  m_current_job;
     bool m_has_job = false;
+
+    mutable std::mutex m_jobs_mtx;
+    std::unordered_map<std::string, JobContext> m_job_contexts;
+    std::deque<std::string> m_job_order;
+    static constexpr size_t MAX_JOB_HISTORY = 16;
 };
 
 inline void Session::handle_submit(const nlohmann::json& id, const nlohmann::json& params)
@@ -416,20 +473,22 @@ inline void Session::handle_submit(const nlohmann::json& id, const nlohmann::jso
              << " ntime=" << s.ntime_hex
              << " nonce=" << s.nonce_hex;
 
+    const JobContext* ctx = m_server->get_job(s.job_id);
+
     std::string reject_reason;
     bool accepted = true;
     auto& handler = m_server->submit_handler();
     if (handler) {
         try {
-            accepted = handler(s, reject_reason);
+            accepted = handler(s, ctx, reject_reason);
         } catch (const std::exception& e) {
             accepted = false;
             reject_reason = e.what();
         }
     } else {
-        // No validator yet — stay honest: reject rather than pretend-accept.
+        // No validator wired — stay honest: reject rather than pretend-accept.
         accepted = false;
-        reject_reason = "stratum validator not yet wired (M6 Phase 4)";
+        reject_reason = "stratum validator not yet wired";
     }
 
     if (accepted) respond_result(id, true);
