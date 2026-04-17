@@ -155,11 +155,17 @@ inline uint128 work_u128(const uint288& work288)
 using chain::bits_to_target;
 
 // Build the full Stratum Job + share template for a given GBT + miner +
-// tracker tip + share target.
+// tracker tip + share target. Coinbase outputs are computed via
+// coinbase::compute_dash_payouts (match to p2pool-dash's
+// generate_transaction formula) so broadcast shares are byte-exact with
+// what the peer regenerates during Share.check().
+//
+// miner_payouts is ignored (retained for ABI) — payouts are derived
+// internally from work + miner_pubkey_hash.
 inline BuiltJob build(const dash::coin::DashWorkData& work,
                       dash::ShareTracker& tracker,
                       const uint160& miner_pubkey_hash,
-                      const std::vector<coinbase::MinerPayout>& miner_payouts,
+                      const std::vector<coinbase::MinerPayout>& /*miner_payouts_ignored*/,
                       const std::string& pool_tag,
                       const core::CoinParams& params,
                       uint32_t share_bits,
@@ -288,17 +294,37 @@ inline BuiltJob build(const dash::coin::DashWorkData& work,
         std::span<const unsigned char>(ref_bytes.data(), ref_bytes.size()));
     out.ref_hash = hash_ref;           // empty ref_merkle_link → ref_hash == hash_ref
 
+    // ── Compute PPLNS outputs per p2pool-dash generate_transaction ─────
+    //
+    // Genesis / first 2 shares in chain: weights = {} (tracker has < 1
+    // ancestor). The formula collapses to: 2 % → miner_pubkey_hash,
+    // 98 % → DONATION (or 100 % → DONATION if miner IS donation addr).
+    //
+    // Non-genesis: TODO port p2pool's WeightsSkipList. Callers expecting
+    // peer acceptance past the 2nd share in chain will currently hit
+    // "gentx doesn't match hash_link" on p2pool-dash's check() because
+    // our empty-weights distribution ignores ancestor miner scripts.
+    std::map<std::vector<unsigned char>, uint64_t> weights;
+    uint64_t total_weight = 0;
+    auto tx_outs_ordered = dash::coinbase::compute_dash_payouts(
+        work.m_coinbase_value, work.m_packed_payments,
+        miner_pubkey_hash, weights, total_weight, params);
+
     // ── Build coinbase bytes with ref_hash embedded ─────────────────────
     out.coinbase = dash::coinbase::build(
-        work, miner_payouts, pool_tag, params,
-        /*donation_value=*/0, hash_ref);
+        work, tx_outs_ordered, pool_tag, params, hash_ref);
     auto sp = dash::coinbase::split_coinb(out.coinbase);
 
     // ── Merkle branches ─────────────────────────────────────────────────
+    // Since we advertise an empty new_transaction_hashes (coinbase-only
+    // share, until remember_tx ships), the merkle tree the peer
+    // reconstructs is just [None] → root == coinbase_txid. Our stratum
+    // job must therefore also give the miner an empty branch list so the
+    // header's merkle_root == coinbase_txid. Block submission on a full
+    // hit will then be coinbase-only — missing fees but valid per
+    // consensus.
     std::vector<uint256> layer;
-    layer.reserve(work.m_tx_hashes.size() + 1);
     layer.push_back(uint256::ZERO);
-    for (const auto& h : work.m_tx_hashes) layer.push_back(h);
     auto branches_raw = dash::coinbase::merkle_branches_raw(layer);
 
     // Fill in the remaining share_template fields that depend on layout.
@@ -353,7 +379,9 @@ inline BuiltJob build(const dash::coin::DashWorkData& work,
     out.context.ntime            = static_cast<uint32_t>(std::time(nullptr));
     out.context.height           = work.m_height;
     out.context.share_difficulty = share_difficulty;
-    out.context.tx_data_hex      = work.m_tx_data_hex;
+    // Coinbase-only blocks while remember_tx is not yet shipping tx bodies:
+    // no other txs go into the block assembled at submit time.
+    out.context.tx_data_hex.clear();
 
     return out;
 }

@@ -62,6 +62,113 @@ struct MinerPayout {
     uint64_t                   amount{0};
 };
 
+// Replica of p2pool-dash/p2pool/data.py:181-231 generate_transaction
+// tx_outs construction. Returns tx_outs in the exact on-wire order:
+//     worker_tx (sorted by script bytes, excluding DONATION) ||
+//     payments_tx (packed_payments in GBT order)             ||
+//     donation_tx (always one entry, even at value 0)
+// Does NOT include the OP_RETURN — coinbase::build() appends that.
+//
+// For genesis (no previous shares on the chain), pass an empty weights
+// map and total_weight == 0. For non-genesis shares the caller must
+// supply tracker-derived PPLNS weights from get_cumulative_weights —
+// TODO, not yet ported from p2pool's skiplist.
+//
+// Scope boundary: this builds the canonical p2pool-dash tx_outs layout.
+// Callers that want c2pool-native PPLNS must compute their own
+// distribution and build the coinbase directly.
+inline std::vector<MinerPayout> compute_dash_payouts(
+    uint64_t subsidy,
+    const std::vector<dash::coin::PackedPayment>& packed_payments,
+    const uint160& miner_pubkey_hash,
+    const std::map<std::vector<unsigned char>, uint64_t>& weights,
+    uint64_t total_weight,
+    const core::CoinParams& params)
+{
+    using Script = std::vector<unsigned char>;
+    const Script donation_script(dash::DONATION_SCRIPT.begin(),
+                                  dash::DONATION_SCRIPT.end());
+
+    // 1. payments_tx: preserves GBT order, drops zero-value entries + undecodable payees.
+    std::vector<MinerPayout> payments_tx;
+    payments_tx.reserve(packed_payments.size());
+    uint64_t total_payments = 0;
+    for (const auto& p : packed_payments) {
+        if (p.amount == 0) continue;
+        auto pm_script = dash::decode_payee_script(
+            p.payee, params.address_version, params.address_p2sh_version);
+        if (pm_script.empty()) continue;
+        MinerPayout out;
+        out.amount = p.amount;
+        out.script = std::move(pm_script);
+        payments_tx.push_back(std::move(out));
+        total_payments += p.amount;
+    }
+
+    // 2. worker_payout = subsidy - Σpayment_amounts
+    uint64_t worker_payout = (subsidy > total_payments) ? (subsidy - total_payments) : 0;
+
+    // 3. amounts[script] = worker_payout * 49 * weight / (50 * total_weight)
+    //    (empty for genesis; TODO for non-genesis once skiplist is ported).
+    std::map<Script, uint64_t> amounts;
+    if (total_weight > 0) {
+        // uint128-ish: worker_payout < 2^50, 49 < 2^6, weight < ~2^80 for a few
+        // shares; use explicit 128-bit to avoid silent overflow.
+        __uint128_t den = static_cast<__uint128_t>(total_weight) * 50;
+        for (const auto& [script, w] : weights) {
+            __uint128_t num = static_cast<__uint128_t>(w)
+                            * static_cast<__uint128_t>(worker_payout)
+                            * 49;
+            amounts[script] = static_cast<uint64_t>(num / den);
+        }
+    }
+
+    // 4. amounts[this_script] += worker_payout // 50  (2 % block-finder).
+    auto this_script = dash::pubkey_hash_to_script2(miner_pubkey_hash);
+    amounts[this_script] = amounts[this_script] + (worker_payout / 50);
+
+    // 5. amounts[DONATION] += worker_payout - Σamounts  (remainder incl. rounding).
+    uint64_t current_sum = 0;
+    for (const auto& [s, a] : amounts) current_sum += a;
+    uint64_t donation_remainder = (worker_payout > current_sum)
+        ? (worker_payout - current_sum) : 0;
+    amounts[donation_script] = amounts[donation_script] + donation_remainder;
+
+    // Sanity: Σ(amounts) == worker_payout (matches p2pool-dash assertion).
+    {
+        uint64_t check = 0;
+        for (const auto& [s, a] : amounts) check += a;
+        if (check != worker_payout)
+            throw std::runtime_error("compute_dash_payouts: amounts sum mismatch");
+    }
+
+    // 6. worker_tx = amounts sorted by script bytes, excluding DONATION,
+    //               dropping zero-value entries. std::map is already sorted.
+    std::vector<MinerPayout> worker_tx;
+    worker_tx.reserve(amounts.size());
+    for (const auto& [script, amount] : amounts) {
+        if (script == donation_script) continue;
+        if (amount == 0) continue;
+        MinerPayout out;
+        out.amount = amount;
+        out.script = script;
+        worker_tx.push_back(std::move(out));
+    }
+
+    // 7. donation_tx — always emitted even at value 0.
+    MinerPayout donation_out;
+    donation_out.amount = amounts[donation_script];
+    donation_out.script = donation_script;
+
+    // 8. Final order: worker_tx || payments_tx || donation_tx.
+    std::vector<MinerPayout> result;
+    result.reserve(worker_tx.size() + payments_tx.size() + 1);
+    for (auto& o : worker_tx)   result.push_back(std::move(o));
+    for (auto& o : payments_tx) result.push_back(std::move(o));
+    result.push_back(std::move(donation_out));
+    return result;
+}
+
 // Result of build(): raw coinbase bytes + key offsets.
 struct CoinbaseLayout {
     std::vector<unsigned char> bytes;
@@ -105,19 +212,23 @@ inline double bits_to_difficulty(uint32_t nbits)
 
 // Build the coinbase TX in the p2pool-dash v16 layout.
 //
-//   work           — parsed GBT
-//   miner_payouts  — PPLNS splits (or single miner fallback)
-//   pool_tag       — short tag in coinbase scriptSig (no extranonce)
-//   params         — coin params (used to decode "!-prefix" payees)
-//   donation_value — donation amount in sat (0 for no-donation MVP)
-//   ref_hash       — 32B PPLNS commitment embedded in OP_RETURN
+//   work             — parsed GBT
+//   tx_outs_ordered  — full output list in p2pool-dash generate_transaction
+//                      order: worker_tx || payments_tx || donation_tx.
+//                      Must end with a donation output whose script ==
+//                      DONATION_SCRIPT so gentx_before_refhash lines up.
+//                      Zero-value entries are emitted as-is (callers that
+//                      want to strip them should do so before calling).
+//   pool_tag         — short tag in coinbase scriptSig (no extranonce)
+//   params           — coin params (unused here; retained for symmetry)
+//   ref_hash         — 32B PPLNS commitment embedded in OP_RETURN
 inline CoinbaseLayout build(const dash::coin::DashWorkData& work,
-                            const std::vector<MinerPayout>& miner_payouts,
+                            const std::vector<MinerPayout>& tx_outs_ordered,
                             const std::string& pool_tag,
                             const core::CoinParams& params,
-                            uint64_t donation_value,
                             const uint256& ref_hash)
 {
+    (void)params;
     using namespace dash::coin;
 
     MutableTransaction tx;
@@ -136,32 +247,25 @@ inline CoinbaseLayout build(const dash::coin::DashWorkData& work,
     }
     tx.vin.push_back(std::move(in));
 
-    // ── Outputs ─────────────────────────────────────────────────────────
-    for (const auto& p : miner_payouts) {
-        if (p.amount == 0 || p.script.empty()) continue;
+    // ── Outputs (caller-ordered tx_outs + OP_RETURN) ────────────────────
+    //
+    // Caller (share_builder / compute_dash_payouts) has already put the
+    // tx_outs into the exact p2pool-dash generate_transaction order,
+    // including a guaranteed donation output at the tail. We trust that
+    // and just append.
+    if (tx_outs_ordered.empty())
+        throw std::runtime_error("coinbase_builder: empty tx_outs_ordered");
+    if (tx_outs_ordered.back().script !=
+        std::vector<unsigned char>(dash::DONATION_SCRIPT.begin(),
+                                    dash::DONATION_SCRIPT.end()))
+        throw std::runtime_error(
+            "coinbase_builder: last output must be DONATION_SCRIPT");
+
+    for (const auto& p : tx_outs_ordered) {
         TxOut o;
         o.value = static_cast<int64_t>(p.amount);
-        o.scriptPubKey = OPScript(p.script.data(), p.script.data() + p.script.size());
-        tx.vout.push_back(std::move(o));
-    }
-    for (const auto& p : work.m_packed_payments) {
-        if (p.amount == 0) continue;
-        auto ps = dash::decode_payee_script(
-            p.payee, params.address_version, params.address_p2sh_version);
-        if (ps.empty()) continue;
-        TxOut o;
-        o.value = static_cast<int64_t>(p.amount);
-        o.scriptPubKey = OPScript(ps.data(), ps.data() + ps.size());
-        tx.vout.push_back(std::move(o));
-    }
-    // Donation output: always present (so share_init_verify's gentx_before_refhash
-    // constant holds). Value may be 0 for no-donation MVP.
-    {
-        TxOut o;
-        o.value = static_cast<int64_t>(donation_value);
         o.scriptPubKey = OPScript(
-            dash::DONATION_SCRIPT.data(),
-            dash::DONATION_SCRIPT.data() + dash::DONATION_SCRIPT.size());
+            p.script.data(), p.script.data() + p.script.size());
         tx.vout.push_back(std::move(o));
     }
     // OP_RETURN output carrying [0x6a][0x28][ref_hash 32B][nonce64 8B].
