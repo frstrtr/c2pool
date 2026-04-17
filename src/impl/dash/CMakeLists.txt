@@ -34,6 +34,10 @@ target_link_libraries(c2pool-dash
     btclibs
     pool
     sharechain
+    c2pool_node_enhanced
+    c2pool_hashrate
+    c2pool_difficulty
+    c2pool_storage
     Boost::system
     Boost::thread
     Boost::log

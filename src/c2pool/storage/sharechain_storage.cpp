@@ -1,6 +1,5 @@
 #include "sharechain_storage.hpp"
 #include <functional>
-#include <impl/ltc/share.hpp>
 
 namespace c2pool {
 namespace storage {
@@ -35,60 +34,7 @@ bool SharechainStorage::is_available() const {
     return m_leveldb_store != nullptr;
 }
 
-template<typename ShareChainType>
-void SharechainStorage::save_sharechain(const ShareChainType& chain)
-{
-    if (!m_leveldb_store) {
-        LOG_ERROR << "LevelDB store not available";
-        return;
-    }
-
-    try {
-        // For now, log that we would save (full integration needs sharechain API)
-        LOG_INFO << "LevelDB sharechain storage is ready for persistent share storage";
-        LOG_INFO << "  Network: " << m_network_name;
-        LOG_INFO << "  Current stored shares: " << m_leveldb_store->get_share_count();
-        LOG_INFO << "  Storage path: " << m_leveldb_store->get_base_path() << "/" << m_network_name << "/sharechain_leveldb";
-        
-    } catch (const std::exception& e) {
-        LOG_ERROR << "Error with LevelDB sharechain storage: " << e.what();
-    }
-}
-
-template<typename ShareChainType>
-bool SharechainStorage::load_sharechain(ShareChainType& chain)
-{
-    if (!m_leveldb_store) {
-        LOG_WARNING << "LevelDB store not available, starting with empty sharechain";
-        return false;
-    }
-
-    try {
-        uint64_t stored_shares = m_leveldb_store->get_share_count();
-        if (stored_shares == 0) {
-            LOG_INFO << "No shares found in LevelDB storage, starting fresh";
-            return false;
-        }
-        
-        uint256 best_hash = m_leveldb_store->get_best_hash();
-        uint64_t best_height = m_leveldb_store->get_best_height();
-        
-        LOG_INFO << "LevelDB sharechain storage contains " << stored_shares << " shares";
-        LOG_INFO << "  Best height: " << best_height;
-        LOG_INFO << "  Best hash: " << best_hash.ToString().substr(0, 16) << "...";
-        
-        // For now, just report availability - full integration needs sharechain API
-        LOG_INFO << "LevelDB storage is ready for share loading and recovery";
-        
-        return stored_shares > 0;
-        
-    } catch (const std::exception& e) {
-        LOG_ERROR << "Error loading from LevelDB sharechain storage: " << e.what();
-        return false;
-    }
-}
-
-bool SharechainStorage::store_share(const uint256& hash, const std::vector<uint8_t>& serialized_data, 
+bool SharechainStorage::store_share(const uint256& hash, const std::vector<uint8_t>& serialized_data,
                  const uint256& prev_hash, uint64_t height, uint64_t timestamp,
                  const uint256& work, const uint256& target, bool is_orphan)
 {
@@ -268,57 +214,8 @@ std::vector<uint256> SharechainStorage::get_shares_by_height_range(uint64_t star
     return m_leveldb_store->get_shares_by_height_range(start_height, end_height);
 }
 
-template<typename ShareChainType>
-void SharechainStorage::schedule_periodic_save(ShareChainType& chain, boost::asio::io_context& ioc, int interval_seconds)
-{
-    auto timer = std::make_shared<boost::asio::steady_timer>(ioc);
-    
-    // Create a safe capture by copying what we need
-    auto leveldb_store_ptr = m_leveldb_store.get(); // Raw pointer for safety check
-    
-    // Use a shared_ptr to hold the recursive callback
-    auto save_task = std::make_shared<std::function<void()>>();
-    *save_task = [leveldb_store_ptr, timer, interval_seconds, save_task]() {
-        if (leveldb_store_ptr) {
-            LOG_INFO << "Periodic LevelDB storage maintenance";
-            
-            try {
-                uint64_t share_count = leveldb_store_ptr->get_share_count();
-                uint64_t best_height = leveldb_store_ptr->get_best_height();
-                
-                LOG_INFO << "LevelDB Storage Stats:";
-                LOG_INFO << "  Total shares: " << share_count;
-                LOG_INFO << "  Best height: " << best_height;
-                
-                // Periodic compaction (every hour)
-                static int compact_counter = 0;
-                if (++compact_counter >= (3600 / interval_seconds)) {
-                    LOG_INFO << "Compacting LevelDB sharechain storage...";
-                    leveldb_store_ptr->compact();
-                    compact_counter = 0;
-                }
-            } catch (const std::exception& e) {
-                LOG_ERROR << "Error in periodic LevelDB maintenance: " << e.what();
-            }
-        }
-        
-        timer->expires_after(std::chrono::seconds(interval_seconds));
-        timer->async_wait([save_task](const boost::system::error_code&) {
-            if (save_task) (*save_task)();
-        });
-    };
-    
-    // Start after initial delay
-    timer->expires_after(std::chrono::seconds(30));
-    timer->async_wait([save_task](const boost::system::error_code&) {
-        if (save_task) (*save_task)();
-    });
-}
-
-// Explicit template instantiations for common types
-template void SharechainStorage::save_sharechain<ltc::ShareChain>(const ltc::ShareChain& chain);
-template bool SharechainStorage::load_sharechain<ltc::ShareChain>(ltc::ShareChain& chain);
-template void SharechainStorage::schedule_periodic_save<ltc::ShareChain>(ltc::ShareChain& chain, boost::asio::io_context& ioc, int interval_seconds);
+// Template method bodies (save_sharechain, load_sharechain, schedule_periodic_save)
+// live in the header so any coin's ShareChain type gets implicit instantiation.
 
 } // namespace storage
 } // namespace c2pool
