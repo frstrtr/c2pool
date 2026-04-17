@@ -44,6 +44,9 @@ struct DashWorkData {
     std::vector<Transaction> m_txs;
     std::vector<uint256>  m_tx_hashes;
     std::vector<uint64_t> m_tx_fees;
+    // Raw "data" hex for each transaction — kept so we can assemble a full
+    // block to submit via submitblock when a miner wins.
+    std::vector<std::string> m_tx_data_hex;
 
     // Dash-specific ------------------------------------------------------------
     // Normalized list of masternode + superblock + platform payments, in the

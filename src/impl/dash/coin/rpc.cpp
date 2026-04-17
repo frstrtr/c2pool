@@ -290,8 +290,7 @@ DashWorkData NodeRPC::getwork()
         out.m_coinbase_flags_hex = std::move(joined);
     }
 
-    // Transactions: for initial RPC scaffolding, just keep txids and fees.
-    // Full parse into Transaction objects is deferred to share-creation phase.
+    // Transactions: keep txid, fee, and raw hex (for block submission later).
     if (gbt.contains("transactions") && gbt["transactions"].is_array()) {
         for (const auto& tx_entry : gbt["transactions"]) {
             uint64_t fee = tx_entry.is_object() ? tx_entry.value("fee", uint64_t{0}) : 0;
@@ -305,6 +304,14 @@ DashWorkData NodeRPC::getwork()
                 uint256 h;
                 h.SetHex(tx_entry["hash"].get<std::string>());
                 out.m_tx_hashes.push_back(h);
+            }
+
+            if (tx_entry.is_object() && tx_entry.contains("data") && tx_entry["data"].is_string()) {
+                out.m_tx_data_hex.push_back(tx_entry["data"].get<std::string>());
+            } else if (tx_entry.is_string()) {
+                out.m_tx_data_hex.push_back(tx_entry.get<std::string>());
+            } else {
+                out.m_tx_data_hex.emplace_back();
             }
         }
     }

@@ -16,6 +16,7 @@
 #include <impl/dash/enhanced_node.hpp>
 #include <impl/dash/stratum.hpp>
 #include <impl/dash/coinbase_builder.hpp>
+#include <impl/dash/submit_validator.hpp>
 
 #include <core/coin_params.hpp>
 #include <core/log.hpp>
@@ -321,6 +322,43 @@ int main(int argc, char* argv[])
         }
     }
 
+    // Submit handler: validate reconstructed block header, forward blocks.
+    if (stratum_server) {
+        stratum_server->set_submit_handler(
+            [&](const dash::stratum::SubmittedShare& s,
+                const dash::stratum::JobContext* ctx,
+                std::string& reject) -> bool {
+                if (!ctx) {
+                    reject = "stale job";
+                    return false;
+                }
+                auto r = dash::submit::validate(s, *ctx);
+                if (!r.valid_share) {
+                    LOG_INFO << "[SUBMIT] rejected worker=" << s.worker_name
+                             << " job=" << s.job_id
+                             << " hash=" << r.x11_hash.GetHex().substr(0, 16)
+                             << " reason=" << r.reject_reason;
+                    reject = r.reject_reason;
+                    return false;
+                }
+                LOG_INFO << "[SUBMIT] accepted worker=" << s.worker_name
+                         << " job=" << s.job_id
+                         << " hash=" << r.x11_hash.GetHex().substr(0, 16)
+                         << (r.is_block ? " *** BLOCK ***" : " share");
+                if (r.is_block && coin_rpc && coin_rpc->is_connected()) {
+                    try {
+                        bool ok = coin_rpc->submit_block_hex(r.block_hex);
+                        LOG_INFO << "[SUBMIT] submitblock result="
+                                 << (ok ? "ACCEPTED" : "rejected")
+                                 << " height=" << ctx->height;
+                    } catch (const std::exception& e) {
+                        LOG_WARNING << "[SUBMIT] submitblock threw: " << e.what();
+                    }
+                }
+                return true;
+            });
+    }
+
     // Periodic GBT → job → notify. Runs only when stratum + rpc + miner
     // script are all configured.
     auto job_timer = std::make_shared<io::steady_timer>(ioc);
@@ -334,13 +372,14 @@ int main(int argc, char* argv[])
                 auto built = dash::job::build_from_work(
                     work, miner_script, pool_tag, params, share_difficulty_default);
                 stratum_server->set_difficulty_all(share_difficulty_default);
-                stratum_server->notify_all(built.job);
+                stratum_server->notify_all(built.job, built.context);
                 LOG_INFO << "[JOB] id=" << built.job.job_id
                          << " height=" << work.m_height
                          << " miners=" << stratum_server->session_count()
                          << " coinb_bytes=" << built.coinbase.bytes.size()
                          << " en_off=" << built.coinbase.extranonce_offset
-                         << " branches=" << built.job.merkle_branches_hex.size();
+                         << " branches=" << built.job.merkle_branches_hex.size()
+                         << " txs=" << built.context.tx_data_hex.size();
             } catch (const std::exception& e) {
                 LOG_WARNING << "[JOB] build failed: " << e.what();
             }
