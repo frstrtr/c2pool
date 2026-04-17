@@ -15,6 +15,7 @@
 #include <impl/dash/coin/rpc.hpp>
 #include <impl/dash/enhanced_node.hpp>
 #include <impl/dash/stratum.hpp>
+#include <impl/dash/coinbase_builder.hpp>
 
 #include <core/coin_params.hpp>
 #include <core/log.hpp>
@@ -39,6 +40,8 @@ int main(int argc, char* argv[])
     uint16_t    dashd_rpc_port = 9998;
     std::string dashd_rpc_userpass;
     uint16_t    stratum_port   = 0;       // 0 = disabled; canonical Dash p2pool stratum port is 7903
+    std::string mining_address;           // required when stratum+rpc are wired
+    double      share_difficulty_default = 0.001;  // vardiff lands in Phase 5
     bool testnet = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -66,6 +69,12 @@ int main(int argc, char* argv[])
         }
         else if (arg == "--stratum-port" && i + 1 < argc) {
             stratum_port = static_cast<uint16_t>(std::stoul(argv[++i]));
+        }
+        else if (arg == "--mining-address" && i + 1 < argc) {
+            mining_address = argv[++i];
+        }
+        else if (arg == "--share-difficulty" && i + 1 < argc) {
+            share_difficulty_default = std::stod(argv[++i]);
         }
         // --dashd-rpc host:port:user:pass  (or host:port if anon test)
         else if (arg == "--dashd-rpc" && i + 1 < argc) {
@@ -283,15 +292,13 @@ int main(int argc, char* argv[])
         node.connect(peer_addr);
     });
 
-    // ── Stratum server (M6 Phase 3: protocol plumbing, no work push yet) ──
+    // ── Stratum server + job push (M6 Phase 4a: outbound work only) ──
     std::unique_ptr<dash::stratum::Server> stratum_server;
     if (stratum_port != 0) {
         try {
             stratum_server = std::make_unique<dash::stratum::Server>(ioc, stratum_port);
             stratum_server->start();
-            std::cout << "[STRATUM] listening on 0.0.0.0:" << stratum_port
-                      << " (Phase 3 — protocol only, no work push until Phase 4)"
-                      << std::endl;
+            std::cout << "[STRATUM] listening on 0.0.0.0:" << stratum_port << std::endl;
         } catch (const std::exception& e) {
             std::cerr << "[STRATUM] failed to open port " << stratum_port
                       << ": " << e.what() << std::endl;
@@ -299,6 +306,51 @@ int main(int argc, char* argv[])
     } else {
         std::cout << "[STRATUM] disabled (pass --stratum-port 7903 to enable)" << std::endl;
     }
+
+    // Resolve miner payout script once (from --mining-address).
+    std::vector<unsigned char> miner_script;
+    if (!mining_address.empty()) {
+        miner_script = dash::decode_payee_script(
+            mining_address, params.address_version, params.address_p2sh_version);
+        if (miner_script.empty()) {
+            std::cerr << "[MINING] --mining-address '" << mining_address
+                      << "' could not be decoded for this network" << std::endl;
+        } else {
+            std::cout << "[MINING] payout address: " << mining_address
+                      << " (script=" << miner_script.size() << "B)" << std::endl;
+        }
+    }
+
+    // Periodic GBT → job → notify. Runs only when stratum + rpc + miner
+    // script are all configured.
+    auto job_timer = std::make_shared<io::steady_timer>(ioc);
+    const std::string pool_tag = "/c2pool-dash:0.1/";
+    std::function<void(const boost::system::error_code&)> job_fn;
+    job_fn = [&, job_timer](const boost::system::error_code& ec) {
+        if (ec) return;
+        if (stratum_server && coin_rpc && coin_rpc->is_connected() && !miner_script.empty()) {
+            try {
+                auto work = coin_rpc->getwork();
+                auto built = dash::job::build_from_work(
+                    work, miner_script, pool_tag, params, share_difficulty_default);
+                stratum_server->set_difficulty_all(share_difficulty_default);
+                stratum_server->notify_all(built.job);
+                LOG_INFO << "[JOB] id=" << built.job.job_id
+                         << " height=" << work.m_height
+                         << " miners=" << stratum_server->session_count()
+                         << " coinb_bytes=" << built.coinbase.bytes.size()
+                         << " en_off=" << built.coinbase.extranonce_offset
+                         << " branches=" << built.job.merkle_branches_hex.size();
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[JOB] build failed: " << e.what();
+            }
+        }
+        job_timer->expires_after(std::chrono::seconds(10));
+        job_timer->async_wait(job_fn);
+    };
+    // Kick off after initial RPC handshake delay.
+    job_timer->expires_after(std::chrono::seconds(8));
+    job_timer->async_wait(job_fn);
 
     // Run IO context
     std::cout << "[P2P] Running event loop..." << std::endl;
