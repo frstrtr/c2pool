@@ -10,6 +10,7 @@
 #include "share_tracker.hpp"
 #include "peer.hpp"
 #include "messages.hpp"
+#include "coin/transaction.hpp"
 
 #include <core/coin_params.hpp>
 #include <core/random.hpp>
@@ -486,17 +487,71 @@ public:
     // per peer (Peer::write() takes ownership of the unique_ptr).
     void broadcast_share(const dash::DashShare& share)
     {
+        broadcast_share(share, {});
+    }
+
+    // Overload that ships tx bodies via message_remember_tx BEFORE the share,
+    // then follows with message_forget_tx so peer's remembered_txs map doesn't
+    // grow unboundedly. Mirrors p2pool-dash/p2p.py:390-394 send order:
+    //   send_remember_tx → send_shares → send_forget_tx.
+    //
+    // forget_tx MUST list the hash of every tx body sent in remember_tx
+    // (not just share.m_new_transaction_hashes) — otherwise peer's
+    // remembered_txs retains entries across broadcasts, and the next
+    // remember_tx for overlapping txs triggers 'Peer referenced transaction
+    // twice, disconnecting' (p2p.py:455-458).
+    void broadcast_share(const dash::DashShare& share,
+                         const std::vector<dash::coin::MutableTransaction>& tx_bodies)
+    {
         auto packed = pack(dash::ShareType(const_cast<dash::DashShare*>(&share)));
+
+        // Precompute hash256 of each tx body (matches what peer computes in
+        // handle_remember_tx / forget_tx — data.py hash256(tx_type.pack(tx))).
+        std::vector<uint256> tx_body_hashes;
+        tx_body_hashes.reserve(tx_bodies.size());
+        for (const auto& tx : tx_bodies) {
+            auto ps = pack(tx);
+            auto sp = ps.get_span();
+            std::vector<unsigned char> bytes(sp.size());
+            for (size_t i = 0; i < sp.size(); ++i)
+                bytes[i] = static_cast<unsigned char>(sp[i]);
+            tx_body_hashes.push_back(Hash(std::span<const unsigned char>(
+                bytes.data(), bytes.size())));
+        }
+
         size_t sent = 0;
         for (auto& [nonce, peer] : m_peers) {
             if (!peer) continue;
+
+            // 1. remember_tx with the tx bodies (empty tx_hashes means peer
+            //    must compute hash from each body; peer already has our GBT
+            //    txs in its own known_txs_var but this guarantees coverage
+            //    across mempool timing skew). Skip if there are no bodies.
+            if (!tx_bodies.empty()) {
+                auto rmem = dash::message_remember_tx::make_raw(
+                    std::vector<uint256>{},     // m_tx_hashes (empty — send full bodies)
+                    tx_bodies);                  // m_txs
+                peer->write(std::move(rmem));
+            }
+
+            // 2. the share itself
             chain::RawShare rshare(dash::DashShare::version, packed);
             auto rmsg = dash::message_shares::make_raw(
                 std::vector<chain::RawShare>{rshare});
             peer->write(std::move(rmsg));
+
+            // 3. forget_tx for EVERY body we just sent — else peer's
+            //    remembered_txs accumulates and next remember_tx with an
+            //    overlapping body is rejected as duplicate.
+            if (!tx_body_hashes.empty()) {
+                auto rforget = dash::message_forget_tx::make_raw(tx_body_hashes);
+                peer->write(std::move(rforget));
+            }
+
             ++sent;
         }
         LOG_INFO << "[Dash] broadcast_share hash=" << share.m_hash.GetHex().substr(0, 16)
+                 << " tx_refs=" << tx_bodies.size()
                  << " to " << sent << " peer(s)";
     }
 

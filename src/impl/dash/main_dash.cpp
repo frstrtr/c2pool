@@ -347,24 +347,32 @@ int main(int argc, char* argv[])
         }
     }
 
-    // Side-map of job_id → share template (bounded history, matches
-    // stratum::Server's MAX_JOB_HISTORY). Indexed in the job-refresh closure,
-    // consumed by the submit handler.
-    std::unordered_map<std::string, dash::DashShare> share_templates;
+    // Side-map of job_id → (share template, tx bodies). Bounded history,
+    // matches stratum::Server's MAX_JOB_HISTORY. Populated from the job-
+    // refresh closure; consumed by the submit handler so it can pair a
+    // newly-created share with the exact tx set it references in
+    // new_transaction_hashes (needed for message_remember_tx).
+    struct TemplateEntry {
+        dash::DashShare share;
+        std::vector<dash::coin::MutableTransaction> tx_bodies;
+    };
+    std::unordered_map<std::string, TemplateEntry> share_templates;
     std::deque<std::string> share_template_order;
     std::mutex share_templates_mtx;
     constexpr size_t MAX_TEMPLATE_HISTORY = 16;
 
-    auto store_template = [&](const std::string& job_id, dash::DashShare tmpl) {
+    auto store_template = [&](const std::string& job_id,
+                              dash::DashShare tmpl,
+                              std::vector<dash::coin::MutableTransaction> tx_bodies) {
         std::lock_guard<std::mutex> lock(share_templates_mtx);
-        share_templates[job_id] = std::move(tmpl);
+        share_templates[job_id] = TemplateEntry{std::move(tmpl), std::move(tx_bodies)};
         share_template_order.push_back(job_id);
         while (share_template_order.size() > MAX_TEMPLATE_HISTORY) {
             share_templates.erase(share_template_order.front());
             share_template_order.pop_front();
         }
     };
-    auto fetch_template = [&](const std::string& job_id) -> std::optional<dash::DashShare> {
+    auto fetch_template = [&](const std::string& job_id) -> std::optional<TemplateEntry> {
         std::lock_guard<std::mutex> lock(share_templates_mtx);
         auto it = share_templates.find(job_id);
         if (it == share_templates.end()) return std::nullopt;
@@ -419,14 +427,15 @@ int main(int argc, char* argv[])
                         dash::submit::parse_be_u32_hex(s.ntime_hex, miner_ntime);
                         dash::submit::parse_be_u32_hex(s.nonce_hex, miner_nonce);
                         auto finalized = dash::share_builder::finalize_from_submit(
-                            *tmpl_opt, miner_ntime, miner_nonce,
+                            tmpl_opt->share, miner_ntime, miner_nonce,
                             std::span<const unsigned char>(en2.data(), en2.size()),
                             params);
                         auto h = node.add_local_share(finalized);
-                        node.broadcast_share(finalized);
+                        node.broadcast_share(finalized, tmpl_opt->tx_bodies);
                         LOG_INFO << "[SHARE] created hash="
                                  << h.GetHex().substr(0, 16)
                                  << " absheight=" << finalized.m_absheight
+                                 << " tx_refs=" << tmpl_opt->tx_bodies.size()
                                  << " broadcast OK";
                     }
                 } catch (const std::exception& e) {
@@ -481,7 +490,7 @@ int main(int argc, char* argv[])
                     share_bits, share_difficulty_default);
                 stratum_server->set_difficulty_all(share_difficulty_default);
                 stratum_server->notify_all(built.job, built.context);
-                store_template(built.job.job_id, built.share_template);
+                store_template(built.job.job_id, built.share_template, built.tx_bodies);
 
                 LOG_INFO << "[JOB] id=" << built.job.job_id
                          << " height=" << work.m_height

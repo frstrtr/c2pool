@@ -17,11 +17,13 @@
 #include "share_tracker.hpp"
 #include "share_types.hpp"
 #include "coin/rpc_data.hpp"
+#include "coin/transaction.hpp"
 #include "coinbase_builder.hpp"
 #include "stratum.hpp"
 
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <random>
 #include <span>
 #include <string>
@@ -49,7 +51,30 @@ struct BuiltJob {
     uint256                  ref_hash;
     uint32_t                 share_bits{0};
     double                   share_difficulty{0.0};
+    // Full tx bodies (parallel to share_template.m_new_transaction_hashes).
+    // Shipped to peers via message_remember_tx ahead of the share so peer's
+    // known_txs_cache is populated when it validates new_transaction_hashes.
+    std::vector<dash::coin::MutableTransaction> tx_bodies;
 };
+
+// Decode a hex-encoded serialized Dash transaction into MutableTransaction.
+// Matches dash::coin::MutableTransaction::Unserialize (and p2pool-dash's
+// dash_data.tx_type wire format).
+inline std::optional<dash::coin::MutableTransaction>
+parse_tx_hex(const std::string& hex)
+{
+    if (hex.empty()) return std::nullopt;
+    auto raw = ParseHex(hex);
+    if (raw.empty()) return std::nullopt;
+    try {
+        PackStream ps(raw);
+        dash::coin::MutableTransaction tx;
+        ps >> tx;
+        return tx;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
 
 // Serialize identifier || share_data || share_info → hash_ref candidate.
 // Must byte-exactly match share_check.hpp::share_init_verify's ref_stream.
@@ -303,7 +328,31 @@ inline BuiltJob build(const dash::coin::DashWorkData& work,
     s.m_min_header.m_timestamp       = 0;                // miner will fill
     s.m_min_header.m_nonce           = 0;                // miner will fill
 
-    s.m_prev_hash        = uint256::ZERO;                // filled below if tracker has tip
+    // Determine prev_hash + absheight/abswork EARLY so downstream sections
+    // (tx_hash_to_ref walk, PPLNS weights) see the correct parent context.
+    s.m_prev_hash = uint256::ZERO;
+    s.m_absheight = 1;
+    s.m_abswork   = work_u128(
+        chain::target_to_average_attempts(chain::bits_to_target(share_bits)));
+    {
+        auto heads = tracker.chain.get_heads();
+        if (!heads.empty()) {
+            uint256 tip_hash = heads.begin()->first;
+            s.m_prev_hash = tip_hash;
+            try {
+                auto& parent_data = tracker.chain.get(tip_hash);
+                parent_data.share.invoke([&](auto* p) {
+                    using S = std::remove_pointer_t<decltype(p)>;
+                    if constexpr (std::is_same_v<S, dash::DashShare>) {
+                        s.m_absheight = p->m_absheight + 1;
+                        uint288 work288 = chain::target_to_average_attempts(
+                            chain::bits_to_target(share_bits));
+                        s.m_abswork = p->m_abswork + work_u128(work288);
+                    }
+                });
+            } catch (...) { /* keep defaults */ }
+        }
+    }
     s.m_coinbase.m_data  = std::move(coinbase_scriptSig);
     s.m_coinbase_payload.m_data = work.m_coinbase_payload;
     s.m_nonce            = share_nonce;
@@ -322,51 +371,120 @@ inline BuiltJob build(const dash::coin::DashWorkData& work,
         s.m_packed_payments.push_back(std::move(pp));
     }
 
-    // share_info (tx compression: MVP — coinbase-only shares).
+    // share_info — tx compression (mirrors p2pool-dash generate_transaction,
+    // data.py:147-170).
     //
-    // We could include the GBT's tx list in new_transaction_hashes, but
-    // p2pool-dash requires each referenced tx hash to already be in its
-    // known_txs_var (populated via its own dashd P2P subscription). Until
-    // we implement remember_tx to ship tx bodies to peers ahead of shares,
-    // we advertise an empty tx list — our share mines a coinbase-only
-    // block. The assertion at p2pool-dash/data.py:340
-    //   n == set(range(len(new_transaction_hashes)))
-    // trivially holds for empty sets.
+    // Build tx_hash_to_ref from up to 100 past shares so a tx we reference
+    // that ALREADY appeared in an ancestor's new_transaction_hashes resolves
+    // as (share_count=1+i, tx_count=j) — pointing at that ancestor — rather
+    // than (0, idx) self-ref. This is required: peer's check() regenerates
+    // transaction_hash_refs using this exact rule, and if our self-refs
+    // diverge the regenerated share_info mismatches → ValueError('share_info
+    // invalid').
+    //
+    // tx_bodies still ships ALL txs via message_remember_tx regardless of
+    // whether we self-ref or parent-ref — peer's remembered_txs / known_txs
+    // lookup covers both paths.
+    out.tx_bodies.clear();
     s.m_new_transaction_hashes.clear();
     s.m_transaction_hash_refs.clear();
-    s.m_far_share_hash         = uint256::ZERO;
+    s.m_far_share_hash = uint256::ZERO;
+    std::vector<size_t> tx_keep_idx;
+    std::map<uint256, std::pair<uint64_t, uint64_t>> tx_hash_to_ref;
+    {
+        // Walk parent chain up to 100 shares, recording tx_hash → (1+i, j).
+        // Closest (smallest share_count) wins via if-not-present check.
+        uint256 cursor = s.m_prev_hash;
+        int i_share = 0;
+        while (!cursor.IsNull() && i_share < 100
+               && tracker.chain.contains(cursor))
+        {
+            uint256 next_parent = uint256::ZERO;
+            bool got = false;
+            try {
+                auto& data = tracker.chain.get(cursor);
+                data.share.invoke([&](auto* p) {
+                    using S = std::remove_pointer_t<decltype(p)>;
+                    if constexpr (std::is_same_v<S, dash::DashShare>) {
+                        uint64_t sc = static_cast<uint64_t>(1 + i_share);
+                        for (uint64_t j = 0; j < p->m_new_transaction_hashes.size(); ++j) {
+                            const uint256& h = p->m_new_transaction_hashes[j];
+                            if (tx_hash_to_ref.find(h) == tx_hash_to_ref.end())
+                                tx_hash_to_ref[h] = {sc, j};
+                        }
+                        next_parent = p->m_prev_hash;
+                        got = true;
+                    }
+                });
+            } catch (...) { break; }
+            if (!got) break;
+            cursor = next_parent;
+            ++i_share;
+        }
+    }
+    {
+        size_t n = std::min(work.m_tx_hashes.size(), work.m_tx_data_hex.size());
+        out.tx_bodies.reserve(n);
+        tx_keep_idx.reserve(n);
+        s.m_new_transaction_hashes.reserve(n);
+        s.m_transaction_hash_refs.reserve(n * 2);
+        for (size_t i = 0; i < n; ++i) {
+            auto parsed = parse_tx_hex(work.m_tx_data_hex[i]);
+            if (!parsed) continue;  // skip malformed; peer will reject partial
+            out.tx_bodies.push_back(std::move(*parsed));
+            tx_keep_idx.push_back(i);
+
+            const uint256& tx_hash = work.m_tx_hashes[i];
+            auto it = tx_hash_to_ref.find(tx_hash);
+            if (it != tx_hash_to_ref.end()) {
+                // Parent-ref: tx already in an ancestor's new_transaction_hashes.
+                s.m_transaction_hash_refs.push_back(it->second.first);
+                s.m_transaction_hash_refs.push_back(it->second.second);
+            } else {
+                // New tx: append to our own new_transaction_hashes, self-ref.
+                s.m_new_transaction_hashes.push_back(tx_hash);
+                uint64_t idx = s.m_new_transaction_hashes.size() - 1;
+                s.m_transaction_hash_refs.push_back(0);
+                s.m_transaction_hash_refs.push_back(idx);
+            }
+        }
+    }
 
     // max_bits: use pool's configured max_target as compact.
     s.m_max_bits  = chain::target_to_bits_upper_bound(params.max_target);
     if (s.m_max_bits == 0) s.m_max_bits = 0x1f00ffff;    // extreme fallback
     s.m_bits      = share_bits;
-    s.m_timestamp = static_cast<uint32_t>(std::time(nullptr));
 
-    // absheight / abswork: chain onto the current tip if available.
-    auto heads = tracker.chain.get_heads();
-    if (!heads.empty()) {
-        uint256 tip_hash = heads.begin()->first;
-        s.m_prev_hash = tip_hash;
-        try {
-            auto& parent_data = tracker.chain.get(tip_hash);
-            parent_data.share.invoke([&](auto* p) {
-                using S = std::remove_pointer_t<decltype(p)>;
-                if constexpr (std::is_same_v<S, dash::DashShare>) {
-                    s.m_absheight = p->m_absheight + 1;
-                    uint288 work288 = chain::target_to_average_attempts(chain::bits_to_target(s.m_bits));
-                    s.m_abswork = p->m_abswork + work_u128(work288);
-                }
-            });
-        } catch (...) {
-            s.m_absheight = 1;
-            s.m_abswork   = work_u128(
-                chain::target_to_average_attempts(chain::bits_to_target(s.m_bits)));
+    // Timestamp must match p2pool-dash's clip (data.py:238-241):
+    //   clipped in [parent.ts + 1, parent.ts + 2*SHARE_PERIOD - 1]
+    // else the peer's regen != ours and share_info fails validation.
+    {
+        uint32_t desired = static_cast<uint32_t>(std::time(nullptr));
+        if (!s.m_prev_hash.IsNull() && tracker.chain.contains(s.m_prev_hash)) {
+            uint32_t parent_ts = 0;
+            bool got = false;
+            try {
+                auto& pdata = tracker.chain.get(s.m_prev_hash);
+                pdata.share.invoke([&](auto* p) {
+                    using S = std::remove_pointer_t<decltype(p)>;
+                    if constexpr (std::is_same_v<S, dash::DashShare>) {
+                        parent_ts = p->m_timestamp;
+                        got = true;
+                    }
+                });
+            } catch (...) {}
+            if (got) {
+                uint32_t period = params.share_period ? params.share_period : 20u;
+                uint32_t lo = parent_ts + 1u;
+                uint32_t hi = parent_ts + 2u * period - 1u;
+                if (desired < lo) desired = lo;
+                if (desired > hi) desired = hi;
+            }
         }
-    } else {
-        s.m_absheight = 1;
-        s.m_abswork   = work_u128(
-            chain::target_to_average_attempts(chain::bits_to_target(s.m_bits)));
+        s.m_timestamp = desired;
     }
+
+    // (absheight/abswork already set earlier from tracker tip.)
 
     s.m_ref_merkle_link = dash::MerkleLink{};            // empty; ref_hash == hash_ref
     s.m_last_txout_nonce = 0;                            // miner fills
@@ -464,15 +582,16 @@ inline BuiltJob build(const dash::coin::DashWorkData& work,
     auto sp = dash::coinbase::split_coinb(out.coinbase);
 
     // ── Merkle branches ─────────────────────────────────────────────────
-    // Since we advertise an empty new_transaction_hashes (coinbase-only
-    // share, until remember_tx ships), the merkle tree the peer
-    // reconstructs is just [None] → root == coinbase_txid. Our stratum
-    // job must therefore also give the miner an empty branch list so the
-    // header's merkle_root == coinbase_txid. Block submission on a full
-    // hit will then be coinbase-only — missing fees but valid per
-    // consensus.
+    // Merkle layer must be [ZERO (coinbase placeholder)] + EVERY tx the
+    // share references — both parent-refs and self-refs. p2pool-dash
+    // builds `[None] + other_tx_hashes` (data.py:406) where
+    // other_tx_hashes is derived from transaction_hash_refs by resolving
+    // each (share_count, tx_count) pair. Building merkle only from
+    // new_transaction_hashes would omit parent-ref txs → hash mismatch.
     std::vector<uint256> layer;
     layer.push_back(uint256::ZERO);
+    for (size_t i : tx_keep_idx)
+        layer.push_back(work.m_tx_hashes[i]);
     auto branches_raw = dash::coinbase::merkle_branches_raw(layer);
 
     // Fill in the remaining share_template fields that depend on layout.
@@ -527,9 +646,12 @@ inline BuiltJob build(const dash::coin::DashWorkData& work,
     out.context.ntime            = static_cast<uint32_t>(std::time(nullptr));
     out.context.height           = work.m_height;
     out.context.share_difficulty = share_difficulty;
-    // Coinbase-only blocks while remember_tx is not yet shipping tx bodies:
-    // no other txs go into the block assembled at submit time.
+    // Full-block submission on a block hit: ship every GBT tx that we also
+    // included in new_transaction_hashes (parallel arrays, same keep set).
     out.context.tx_data_hex.clear();
+    out.context.tx_data_hex.reserve(tx_keep_idx.size());
+    for (size_t i : tx_keep_idx)
+        out.context.tx_data_hex.push_back(work.m_tx_data_hex[i]);
 
     return out;
 }
