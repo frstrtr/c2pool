@@ -1,6 +1,10 @@
 #include "log.hpp"
 
-#include <map> 
+#include <map>
+#include <ctime>
+#include <filesystem>
+#include <iostream>
+#include <system_error>
 
 #include <core/filesystem.hpp>
 
@@ -115,6 +119,39 @@ void Logger::init(const std::string& log_file_name, int rotation_size_mb, int ma
     auto log_dir = core::filesystem::config_path();
     std::filesystem::create_directories(log_dir);
     auto debug_log = log_dir / (log_file_name.empty() ? "debug.log" : log_file_name);
+
+    // Reject degenerate rotation config: max_size must accommodate at least
+    // 2 rotated files or boost::log on startup over an oversized existing log
+    // can spend minutes in rotate_file() (collector enumerates target dir,
+    // synchronously deletes giant rotated file). Clamp to 10× rotation_size,
+    // matching Bitcoin Core's "keep ~10 backups" convention.
+    if (max_total_mb < rotation_size_mb * 2) {
+        const int clamped = rotation_size_mb * 10;
+        std::clog << "[log] max_total_mb=" << max_total_mb
+                  << " < 2x rotation_size_mb=" << rotation_size_mb
+                  << " — clamping to " << clamped << "MB\n";
+        max_total_mb = clamped;
+    }
+
+    // Pre-rotate any pre-existing log already over rotation_size. Doing this
+    // ourselves bypasses boost::log's rotate-on-first-write path, which under
+    // a debug build can stall the main thread for minutes when the existing
+    // file is many times the rotation threshold.
+    {
+        std::error_code fec;
+        auto sz = std::filesystem::file_size(debug_log, fec);
+        if (!fec && sz > static_cast<uintmax_t>(rotation_size_mb) * 1024 * 1024) {
+            std::time_t t = std::time(nullptr);
+            char ts[32];
+            std::strftime(ts, sizeof(ts), "%Y%m%d-%H%M%S", std::gmtime(&t));
+            std::filesystem::path rotated = debug_log;
+            rotated += std::string(".") + ts;
+            std::filesystem::rename(debug_log, rotated, fec);
+            std::clog << "[log] pre-rotated oversized " << debug_log.filename().string()
+                      << " (" << (sz / (1024 * 1024)) << "MB) -> "
+                      << rotated.filename().string() << "\n";
+        }
+    }
 
     auto fsSink = boost::log::add_file_log(
         boost::log::keywords::file_name = debug_log.string(),

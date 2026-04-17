@@ -614,7 +614,7 @@ int main(int argc, char* argv[]) {
     // Operational tuning (configurable via CLI or YAML)
     std::string log_file;                        // empty = default "debug.log"
     int         log_rotation_size_mb = 100;      // rotate log at N MB
-    int         log_max_total_mb     = 50;       // keep ≤N MB of rotated logs
+    int         log_max_total_mb     = 1000;     // keep ≤N MB of rotated logs (~10 backups)
     std::string log_level_str;                   // empty = default (trace)
     int         p2p_max_peers        = 30;       // max total P2P peers
     int         p2p_ban_duration     = 300;      // ban duration in seconds
