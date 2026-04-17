@@ -7517,7 +7517,7 @@ void WebServer::trigger_work_refresh()
     mining_interface_->refresh_work();
     // Push new work to all miners immediately (p2pool: new_work_event).
     // Old jobs stay valid — miner submits by job_id, which maps to frozen data.
-    // Stale shares only occur when MAX_ACTIVE_JOBS (32) is exceeded.
+    // Stale shares only occur when MAX_ACTIVE_JOBS (256) is exceeded.
     if (stratum_server_)
         stratum_server_->notify_all();
 }

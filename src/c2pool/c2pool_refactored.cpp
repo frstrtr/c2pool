@@ -614,7 +614,7 @@ int main(int argc, char* argv[]) {
     // Operational tuning (configurable via CLI or YAML)
     std::string log_file;                        // empty = default "debug.log"
     int         log_rotation_size_mb = 100;      // rotate log at N MB
-    int         log_max_total_mb     = 50;       // keep ≤N MB of rotated logs
+    int         log_max_total_mb     = 1000;     // keep ≤N MB of rotated logs (~10 backups)
     std::string log_level_str;                   // empty = default (trace)
     int         p2p_max_peers        = 30;       // max total P2P peers
     int         p2p_ban_duration     = 300;      // ban duration in seconds
@@ -2631,12 +2631,26 @@ int main(int argc, char* argv[]) {
 
                 // Block scan moved AFTER callbacks are wired (see below)
 
-                // When a peer announces a new best block, refresh our mining template
-                p2p_node->set_on_bestblock([&web_server, &p2p_node]() {
+                // When a peer announces a new best block, refresh our mining template.
+                // Leading-edge hash dedup: fire immediately for a genuinely new block,
+                // suppress all subsequent announcements of the same hash. This gives
+                // zero latency for miners while eliminating the N×800ms rebuild storm
+                // that caused the event loop freeze (13 duplicate bestblocks in 26s).
+                // p2pool is naturally immune (Twisted reactor tick + RPC polling),
+                // we must deduplicate explicitly since P2P is our primary block source.
+                auto last_bestblock = std::make_shared<uint256>();
+
+                p2p_node->set_on_bestblock([&web_server, &p2p_node,
+                                            last_bestblock](const uint256& block_hash) {
+                    if (block_hash == *last_bestblock)
+                        return;  // same block from another peer — already refreshed
+                    *last_bestblock = block_hash;
+
                     web_server.trigger_work_refresh();
                     // p2pool: bitcoind_work.changed → set_best_share() → think()
                     p2p_node->run_think();
-                    LOG_INFO << "[LTC] bestblock received from P2P peer — work+think refreshed";
+                    LOG_INFO << "[LTC] bestblock " << block_hash.ToString().substr(0, 16)
+                             << " — work+think refreshed";
                 });
 
                 // When best_share changes (new share on chain), refresh work for all

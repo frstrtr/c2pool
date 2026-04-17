@@ -5,9 +5,18 @@
 /// Backed by UTXOViewDB (LevelDB). Changes are buffered in memory and
 /// flushed atomically per block via flush().
 ///
-/// Thread safety: callers must hold external lock (shared_mutex recommended).
-/// Block handlers run on io_context thread; template builder may run on
-/// web server thread. Use read lock for get_coin(), write lock for mutations.
+/// Thread safety: internally synchronized via std::shared_mutex.
+///   - reads (get_coin/have_coin/get_value_in/compute_fee/queries) take a
+///     shared_lock
+///   - mutators (add_coin/spend_coin/connect_block/disconnect_*/flush/prune_undo)
+///     take a unique_lock
+///
+/// Every public method is safe to call from any thread. Internally, public
+/// methods delegate to private *_locked helpers so write paths can call read
+/// helpers without re-locking. This is a temporary safety net while the
+/// codebase migrates to a per-chain boost::asio strand owning the UTXO domain
+/// (see frstrtr/the/docs/c2pool-utxo-thread-race-task.md option B). Once the
+/// strand owns the data, this mutex becomes redundant and can be removed.
 ///
 /// Reference: Litecoin Core CCoinsViewCache
 
@@ -39,23 +48,13 @@ public:
     /// Retrieve a coin by outpoint. Checks cache first, then DB.
     /// Returns false if not found or spent.
     bool get_coin(const Outpoint& op, Coin& coin) {
-        // Check cache first
-        auto it = m_cache.find(op);
-        if (it != m_cache.end()) {
-            if (!it->second.has_value())
-                return false;  // cached as "spent"
-            coin = *it->second;
-            return true;
-        }
-        // Fall through to DB
-        if (m_base && m_base->get_coin(op, coin)) {
-            return true;
-        }
-        return false;
+        std::shared_lock<std::shared_mutex> lock(m_mu);
+        return get_coin_locked(op, coin);
     }
 
     /// Check if a coin exists (not spent).
     bool have_coin(const Outpoint& op) {
+        std::shared_lock<std::shared_mutex> lock(m_mu);
         auto it = m_cache.find(op);
         if (it != m_cache.end())
             return it->second.has_value();
@@ -66,8 +65,9 @@ public:
 
     /// Get the value of a specific output. Returns -1 if not found.
     int64_t get_output_value(const Outpoint& op) {
+        std::shared_lock<std::shared_mutex> lock(m_mu);
         Coin coin;
-        if (get_coin(op, coin))
+        if (get_coin_locked(op, coin))
             return coin.value;
         return -1;
     }
@@ -76,14 +76,16 @@ public:
 
     /// Add a coin to the cache. Overwrites any existing entry.
     void add_coin(const Outpoint& op, Coin coin) {
+        std::unique_lock<std::shared_mutex> lock(m_mu);
         m_cache[op] = std::move(coin);
     }
 
     /// Mark a coin as spent. Returns the coin that was spent (for undo data).
     /// Returns std::nullopt if coin was not found.
     std::optional<Coin> spend_coin(const Outpoint& op) {
+        std::unique_lock<std::shared_mutex> lock(m_mu);
         Coin coin;
-        if (!get_coin(op, coin))
+        if (!get_coin_locked(op, coin))
             return std::nullopt;
         m_cache[op] = std::nullopt;  // mark as spent
         return coin;
@@ -96,15 +98,8 @@ public:
     /// If any input is missing from the UTXO set, returns (partial_sum, false).
     template <typename TxType>
     std::pair<int64_t, bool> get_value_in(const TxType& tx) {
-        int64_t total = 0;
-        for (const auto& vin : tx.vin) {
-            Outpoint op(vin.prevout.hash, vin.prevout.index);
-            Coin coin;
-            if (!get_coin(op, coin))
-                return {total, false};
-            total += coin.value;
-        }
-        return {total, true};
+        std::shared_lock<std::shared_mutex> lock(m_mu);
+        return get_value_in_locked(tx);
     }
 
     /// Compute the total output value for a transaction.
@@ -120,7 +115,8 @@ public:
     /// Returns (fee, true) if all inputs found, (0, false) otherwise.
     template <typename TxType>
     std::pair<int64_t, bool> compute_fee(const TxType& tx) {
-        auto [value_in, found] = get_value_in(tx);
+        std::shared_lock<std::shared_mutex> lock(m_mu);
+        auto [value_in, found] = get_value_in_locked(tx);
         if (!found)
             return {0, false};
         int64_t value_out = get_value_out(tx);
@@ -140,6 +136,7 @@ public:
     /// txid_fn: function to compute txid (chain-specific: witness vs non-witness)
     template <typename BlockType, typename TxidFn>
     BlockUndo connect_block(const BlockType& block, uint32_t height, TxidFn txid_fn) {
+        std::unique_lock<std::shared_mutex> lock(m_mu);
         BlockUndo undo;
         bool first_tx = true;
 
@@ -156,9 +153,10 @@ public:
                 TxUndo tx_undo;
                 for (const auto& vin : tx.vin) {
                     Outpoint op(vin.prevout.hash, vin.prevout.index);
-                    auto spent = spend_coin(op);
-                    if (spent.has_value()) {
-                        tx_undo.spent_coins.push_back(std::move(*spent));
+                    Coin spent;
+                    if (get_coin_locked(op, spent)) {
+                        m_cache[op] = std::nullopt;  // mark as spent
+                        tx_undo.spent_coins.push_back(std::move(spent));
                     } else {
                         // Input not in UTXO — UTXO incomplete (bootstrap) or invalid tx
                         tx_undo.spent_coins.emplace_back();
@@ -177,7 +175,7 @@ public:
                 // HogEx outputs (index > 0) are MWEB pegouts with 6-block maturity
                 bool is_pegout = is_hogex && i > 0;
                 Outpoint op(txid, i);
-                add_coin(op, Coin(vout.value, vout.scriptPubKey, height, is_coinbase, is_pegout));
+                m_cache[op] = Coin(vout.value, vout.scriptPubKey, height, is_coinbase, is_pegout);
                 undo.added_outpoints.push_back(op);
             }
         }
@@ -191,6 +189,7 @@ public:
     /// 2. Restore all inputs that were spent (from tx_undos)
     /// This enables reorg handling without requesting full blocks for the old fork.
     bool disconnect_from_undo(const BlockUndo& undo) {
+        std::unique_lock<std::shared_mutex> lock(m_mu);
         // Step 1: Remove all outputs added by this block
         for (const auto& op : undo.added_outpoints)
             m_cache[op] = std::nullopt;
@@ -218,6 +217,7 @@ public:
     /// Reference: LTC validation.cpp DisconnectBlock() lines 1777-1841
     template <typename BlockType, typename TxidFn>
     bool disconnect_block(const BlockType& block, const BlockUndo& undo, TxidFn txid_fn) {
+        std::unique_lock<std::shared_mutex> lock(m_mu);
         // Step 1: Remove all added outputs
         for (const auto& op : undo.added_outpoints)
             m_cache[op] = std::nullopt;
@@ -238,7 +238,7 @@ public:
                     Outpoint op(tx.vin[j].prevout.hash, tx.vin[j].prevout.index);
                     const auto& restored = tx_undo.spent_coins[j];
                     if (!restored.is_spent())
-                        add_coin(op, restored);
+                        m_cache[op] = restored;
                 }
             }
         }
@@ -250,6 +250,7 @@ public:
     /// Write all cached changes to the backing UTXOViewDB.
     /// Clears the in-memory cache after successful write.
     bool flush(const uint256& best_block, uint32_t best_height) {
+        std::unique_lock<std::shared_mutex> lock(m_mu);
         if (!m_base)
             return false;
 
@@ -267,26 +268,35 @@ public:
     }
 
     /// Number of entries in the cache (for diagnostics).
-    size_t cache_size() const { return m_cache.size(); }
+    size_t cache_size() const {
+        std::shared_lock<std::shared_mutex> lock(m_mu);
+        return m_cache.size();
+    }
 
     /// Best block from the backing DB.
     uint256 get_best_block() const {
+        std::shared_lock<std::shared_mutex> lock(m_mu);
         return m_base ? m_base->get_best_block() : uint256();
     }
     uint32_t get_best_height() const {
+        std::shared_lock<std::shared_mutex> lock(m_mu);
         return m_base ? m_base->get_best_height() : 0;
     }
 
     /// Number of blocks connected since startup (or loaded from DB on restart).
     /// Used for coinbase maturity gate — mining blocked until this reaches
     /// the chain's COINBASE_MATURITY depth.
-    uint32_t blocks_connected() const { return m_blocks_connected; }
+    uint32_t blocks_connected() const {
+        std::shared_lock<std::shared_mutex> lock(m_mu);
+        return m_blocks_connected;
+    }
 
     /// Prune undo data older than (tip_height - keep_depth).
     /// Reference: litecoind validation.cpp PruneBlockFilesManual()
     ///   LTC: keep_depth = MIN_BLOCKS_TO_KEEP = 288 (litecoin/src/validation.h)
     ///   DOGE: keep_depth = MIN_BLOCKS_TO_KEEP = 1440 (dogecoin/src/validation.h)
     uint32_t prune_undo(uint32_t tip_height, uint32_t keep_depth) {
+        std::unique_lock<std::shared_mutex> lock(m_mu);
         if (!m_base || tip_height <= keep_depth) return 0;
         uint32_t prune_below = tip_height - keep_depth;
         // On first call after startup, m_oldest_undo_height is 0.
@@ -315,6 +325,39 @@ public:
     }
 
 private:
+    // Internal helpers — caller must hold m_mu (shared for reads, unique for writes).
+    // Lets writers (which hold a unique_lock) reuse read logic without re-acquiring.
+
+    bool get_coin_locked(const Outpoint& op, Coin& coin) const {
+        // Check cache first
+        auto it = m_cache.find(op);
+        if (it != m_cache.end()) {
+            if (!it->second.has_value())
+                return false;  // cached as "spent"
+            coin = *it->second;
+            return true;
+        }
+        // Fall through to DB
+        if (m_base && m_base->get_coin(op, coin)) {
+            return true;
+        }
+        return false;
+    }
+
+    template <typename TxType>
+    std::pair<int64_t, bool> get_value_in_locked(const TxType& tx) const {
+        int64_t total = 0;
+        for (const auto& vin : tx.vin) {
+            Outpoint op(vin.prevout.hash, vin.prevout.index);
+            Coin coin;
+            if (!get_coin_locked(op, coin))
+                return {total, false};
+            total += coin.value;
+        }
+        return {total, true};
+    }
+
+    mutable std::shared_mutex m_mu;
     UTXOViewDB* m_base;
     uint32_t m_blocks_connected{0};
     uint32_t m_oldest_undo_height{0};
