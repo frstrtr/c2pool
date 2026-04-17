@@ -466,6 +466,40 @@ public:
         return heads.begin()->first;
     }
 
+    // Add a locally-generated share into the tracker. Takes ownership of the
+    // DashShare via heap allocation matching process_shares()'s pattern.
+    // Returns the share_hash that was computed during verification. Throws on
+    // verification failure.
+    uint256 add_local_share(const dash::DashShare& share)
+    {
+        auto* heap_share = new dash::DashShare(share);
+        heap_share->m_hash = share.m_hash.IsNull()
+            ? dash::share_init_verify(*heap_share, m_coin_params, /*check_pow=*/false)
+            : share.m_hash;
+        if (!m_tracker.chain.contains(heap_share->m_hash))
+            m_tracker.add(heap_share);
+        return heap_share->m_hash;
+    }
+
+    // Broadcast a single locally-created share to every connected peer via
+    // the message_shares wire message. Pack once, build a fresh RawMessage
+    // per peer (Peer::write() takes ownership of the unique_ptr).
+    void broadcast_share(const dash::DashShare& share)
+    {
+        auto packed = pack(dash::ShareType(const_cast<dash::DashShare*>(&share)));
+        size_t sent = 0;
+        for (auto& [nonce, peer] : m_peers) {
+            if (!peer) continue;
+            chain::RawShare rshare(dash::DashShare::version, packed);
+            auto rmsg = dash::message_shares::make_raw(
+                std::vector<chain::RawShare>{rshare});
+            peer->write(std::move(rmsg));
+            ++sent;
+        }
+        LOG_INFO << "[Dash] broadcast_share hash=" << share.m_hash.GetHex().substr(0, 16)
+                 << " to " << sent << " peer(s)";
+    }
+
     void error(const message_error_type& err, const NetService& service,
                const std::source_location where = std::source_location::current()) override
     {
