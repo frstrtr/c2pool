@@ -17,6 +17,7 @@
 #include <impl/dash/stratum.hpp>
 #include <impl/dash/coinbase_builder.hpp>
 #include <impl/dash/submit_validator.hpp>
+#include <impl/dash/pplns.hpp>
 
 #include <core/coin_params.hpp>
 #include <core/log.hpp>
@@ -42,7 +43,9 @@ int main(int argc, char* argv[])
     std::string dashd_rpc_userpass;
     uint16_t    stratum_port   = 0;       // 0 = disabled; canonical Dash p2pool stratum port is 7903
     std::string mining_address;           // required when stratum+rpc are wired
-    double      share_difficulty_default = 0.001;  // vardiff lands in Phase 5
+    double      share_difficulty_default = 0.001;  // vardiff lands later
+    bool        pplns_enabled   = true;   // default: PPLNS payouts across chain contributors
+    size_t      pplns_window    = 0;      // 0 → use params.chain_length
     bool testnet = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -76,6 +79,12 @@ int main(int argc, char* argv[])
         }
         else if (arg == "--share-difficulty" && i + 1 < argc) {
             share_difficulty_default = std::stod(argv[++i]);
+        }
+        else if (arg == "--no-pplns") {
+            pplns_enabled = false;          // pay 100% of miner reward to --mining-address
+        }
+        else if (arg == "--pplns-window" && i + 1 < argc) {
+            pplns_window = static_cast<size_t>(std::stoul(argv[++i]));
         }
         // --dashd-rpc host:port:user:pass  (or host:port if anon test)
         else if (arg == "--dashd-rpc" && i + 1 < argc) {
@@ -359,27 +368,54 @@ int main(int argc, char* argv[])
             });
     }
 
-    // Periodic GBT → job → notify. Runs only when stratum + rpc + miner
-    // script are all configured.
+    // Periodic GBT → PPLNS split → job → notify.
     auto job_timer = std::make_shared<io::steady_timer>(ioc);
     const std::string pool_tag = "/c2pool-dash:0.1/";
+    const size_t eff_window = pplns_window != 0 ? pplns_window : params.chain_length;
     std::function<void(const boost::system::error_code&)> job_fn;
     job_fn = [&, job_timer](const boost::system::error_code& ec) {
         if (ec) return;
         if (stratum_server && coin_rpc && coin_rpc->is_connected() && !miner_script.empty()) {
             try {
                 auto work = coin_rpc->getwork();
+
+                // Miner value = block reward minus masternode/treasury.
+                uint64_t miner_value = (work.m_coinbase_value > work.m_payment_amount)
+                    ? work.m_coinbase_value - work.m_payment_amount : 0;
+
+                // Compute PPLNS payout distribution (or single-miner fallback).
+                std::vector<dash::coinbase::MinerPayout> payouts;
+                dash::pplns::Result pplns{};
+                if (pplns_enabled) {
+                    pplns = dash::pplns::compute_payouts(
+                        node.tracker().chain,
+                        node.best_share_hash(),
+                        eff_window,
+                        miner_value,
+                        miner_script);
+                    for (auto& p : pplns.payouts)
+                        payouts.push_back({p.script, p.amount});
+                } else {
+                    payouts.push_back({miner_script, miner_value});
+                }
+
                 auto built = dash::job::build_from_work(
-                    work, miner_script, pool_tag, params, share_difficulty_default);
+                    work, payouts, pool_tag, params, share_difficulty_default);
                 stratum_server->set_difficulty_all(share_difficulty_default);
                 stratum_server->notify_all(built.job, built.context);
+
                 LOG_INFO << "[JOB] id=" << built.job.job_id
                          << " height=" << work.m_height
                          << " miners=" << stratum_server->session_count()
                          << " coinb_bytes=" << built.coinbase.bytes.size()
                          << " en_off=" << built.coinbase.extranonce_offset
                          << " branches=" << built.job.merkle_branches_hex.size()
-                         << " txs=" << built.context.tx_data_hex.size();
+                         << " txs=" << built.context.tx_data_hex.size()
+                         << " pplns_mode="
+                         << (!pplns_enabled ? "disabled"
+                             : pplns.used_fallback ? "fallback_solo" : "active")
+                         << " payouts=" << payouts.size()
+                         << " shares_used=" << pplns.shares_used;
             } catch (const std::exception& e) {
                 LOG_WARNING << "[JOB] build failed: " << e.what();
             }
