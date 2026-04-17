@@ -28,6 +28,7 @@
 #include <core/pow.hpp>
 #include <core/target_utils.hpp>
 #include <core/uint256.hpp>
+#include <btclibs/base58.h>
 #include <btclibs/crypto/common.h>
 #include <btclibs/crypto/sha256.h>
 
@@ -277,6 +278,50 @@ inline uint256 share_init_verify(const DashShare& share,
     return share_hash;
 }
 
+// ── decode_payee_script: "!" prefix → raw hex script, else → address_to_script2
+// Reference: ref/p2pool-dash/p2pool/data.py lines 189-217
+// "!" is not in base58 alphabet, used as prefix for raw hex-encoded scripts
+inline std::vector<unsigned char> decode_payee_script(
+    const std::string& payee, uint8_t address_version, uint8_t p2sh_version)
+{
+    if (payee.empty())
+        return {};
+
+    if (payee[0] == '!') {
+        // Raw hex script: "!6a28..." → decode hex after "!"
+        std::vector<unsigned char> script;
+        auto hex = payee.substr(1);
+        script.reserve(hex.size() / 2);
+        for (size_t i = 0; i + 1 < hex.size(); i += 2)
+            script.push_back(static_cast<unsigned char>(
+                std::stoul(hex.substr(i, 2), nullptr, 16)));
+        return script;
+    }
+
+    // Regular base58 address → P2PKH or P2SH script
+    std::vector<unsigned char> decoded;
+    if (DecodeBase58Check(payee, decoded, 21) && decoded.size() == 21) {
+        uint8_t ver = decoded[0];
+        if (ver == address_version) {
+            // P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+            std::vector<unsigned char> script = {0x76, 0xa9, 0x14};
+            script.insert(script.end(), decoded.begin() + 1, decoded.end());
+            script.push_back(0x88);
+            script.push_back(0xac);
+            return script;
+        }
+        if (ver == p2sh_version) {
+            // P2SH: OP_HASH160 <20> OP_EQUAL
+            std::vector<unsigned char> script = {0xa9, 0x14};
+            script.insert(script.end(), decoded.begin() + 1, decoded.end());
+            script.push_back(0x87);
+            return script;
+        }
+    }
+
+    return {};
+}
+
 // ── pubkey_hash_to_script2 (Dash: always P2PKH, no segwit) ──────────────────
 inline std::vector<unsigned char> pubkey_hash_to_script2(const uint160& hash)
 {
@@ -463,12 +508,13 @@ uint256 generate_share_transaction(const DashShare& share, TrackerT& tracker,
         write_txout(amount, script);
 
     // Masternode/superblock/platform payments
-    // TODO: decode "!" prefix scripts for platform OP_RETURN payments
     for (auto& pay : share.m_packed_payments)
     {
         if (pay.m_amount == 0) continue;
-        // For now, skip script decoding — will be implemented in masternode.hpp
-        // This stub ensures the output count is correct for hash verification
+        auto pay_script = decode_payee_script(
+            pay.m_payee, params.address_version, params.address_p2sh_version);
+        if (!pay_script.empty())
+            write_txout(pay.m_amount, pay_script);
     }
 
     // Donation output
