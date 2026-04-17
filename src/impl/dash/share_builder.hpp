@@ -154,6 +154,110 @@ inline uint128 work_u128(const uint288& work288)
 // match share_init_verify's PoW check semantics.
 using chain::bits_to_target;
 
+// Port of p2pool-dash's tracker.get_cumulative_weights (WeightsSkipList,
+// data.py:456-491). Walks backward from start_hash accumulating per-
+// script weight, up to max_shares ancestors or desired_weight — whichever
+// comes first. The last share in the walk may be partially scaled to
+// land exactly at desired_weight (matches apply_delta's truncation).
+//
+// Per-share contribution (get_delta):
+//   att           = target_to_average_attempts(share.target)
+//   this_total    = att * 65535
+//   this_donation = att * share.donation
+//   this_worker   = att * (65535 - share.donation)
+//   weights[share.new_script] += this_worker
+//
+// desired_weight = 65535 * SPREAD * target_to_average_attempts(block_target).
+// Caller computes and passes it.
+struct CumulativeWeights {
+    std::map<std::vector<unsigned char>, uint64_t> weights;
+    uint64_t total_weight{0};
+    uint64_t donation_weight{0};
+};
+
+inline uint64_t clamp128_to_u64(__uint128_t v)
+{
+    if (v > std::numeric_limits<uint64_t>::max())
+        return std::numeric_limits<uint64_t>::max();
+    return static_cast<uint64_t>(v);
+}
+
+inline CumulativeWeights walk_cumulative_weights(
+    dash::ShareTracker& tracker,
+    uint256 start_hash,
+    uint64_t max_shares,
+    __uint128_t desired_weight)
+{
+    CumulativeWeights result;
+    if (start_hash.IsNull() || max_shares == 0 || desired_weight == 0)
+        return result;
+
+    __uint128_t acc_total = 0;
+    uint256 cur = start_hash;
+    uint64_t walked = 0;
+
+    while (!cur.IsNull()
+           && walked < max_shares
+           && acc_total < desired_weight
+           && tracker.chain.contains(cur))
+    {
+        uint256 parent_hash;
+        uint160 pubkey_hash;
+        uint32_t bits = 0;
+        uint16_t donation = 0;
+        bool got = false;
+        try {
+            auto& data = tracker.chain.get(cur);
+            data.share.invoke([&](auto* p) {
+                using S = std::remove_pointer_t<decltype(p)>;
+                if constexpr (std::is_same_v<S, dash::DashShare>) {
+                    parent_hash = p->m_prev_hash;
+                    pubkey_hash = p->m_pubkey_hash;
+                    bits        = p->m_bits;
+                    donation    = p->m_donation;
+                    got         = true;
+                }
+            });
+        } catch (...) { break; }
+        if (!got) break;
+
+        auto target = chain::bits_to_target(bits);
+        auto att288 = chain::target_to_average_attempts(target);
+        __uint128_t att = static_cast<__uint128_t>(att288.GetLow64());
+        if (att == 0) { walked++; cur = parent_hash; continue; }
+
+        __uint128_t this_total    = att * 65535u;
+        __uint128_t this_donation = att * donation;
+        __uint128_t this_worker   = att * (65535u - donation);
+        auto script = dash::pubkey_hash_to_script2(pubkey_hash);
+
+        if (acc_total + this_total > desired_weight) {
+            // Scale the last share's contribution so we hit desired_weight exactly.
+            __uint128_t remaining = desired_weight - acc_total;
+            // p2pool formula: (remaining//65535) * weight // (this_total//65535)
+            // which is equivalent to remaining * weight / this_total (exact when
+            // remaining and this_total are multiples of 65535).
+            __uint128_t scaled_worker   = remaining * this_worker   / this_total;
+            __uint128_t scaled_donation = remaining * this_donation / this_total;
+            result.weights[script] += clamp128_to_u64(scaled_worker);
+            result.donation_weight  = clamp128_to_u64(
+                static_cast<__uint128_t>(result.donation_weight) + scaled_donation);
+            result.total_weight     = clamp128_to_u64(desired_weight);
+            walked++;
+            break;
+        }
+
+        result.weights[script] += clamp128_to_u64(this_worker);
+        result.donation_weight  = clamp128_to_u64(
+            static_cast<__uint128_t>(result.donation_weight) + this_donation);
+        acc_total              += this_total;
+        result.total_weight     = clamp128_to_u64(acc_total);
+        walked++;
+        cur = parent_hash;
+    }
+    return result;
+}
+
 // Build the full Stratum Job + share template for a given GBT + miner +
 // tracker tip + share target. Coinbase outputs are computed via
 // coinbase::compute_dash_payouts (match to p2pool-dash's
@@ -296,16 +400,60 @@ inline BuiltJob build(const dash::coin::DashWorkData& work,
 
     // ── Compute PPLNS outputs per p2pool-dash generate_transaction ─────
     //
-    // Genesis / first 2 shares in chain: weights = {} (tracker has < 1
-    // ancestor). The formula collapses to: 2 % → miner_pubkey_hash,
-    // 98 % → DONATION (or 100 % → DONATION if miner IS donation addr).
+    // Walk the cumulative weights from previous_share.previous_share_hash
+    // (i.e. the parent of our new share's parent) up to
+    //   min(height, REAL_CHAIN_LENGTH) - 1 shares
+    //   65535 * SPREAD * att(block_target) weight
+    // just like data.py:181. Pass the result into compute_dash_payouts
+    // which folds in the 2 % block-finder + DONATION tail.
     //
-    // Non-genesis: TODO port p2pool's WeightsSkipList. Callers expecting
-    // peer acceptance past the 2nd share in chain will currently hit
-    // "gentx doesn't match hash_link" on p2pool-dash's check() because
-    // our empty-weights distribution ignores ancestor miner scripts.
+    // For genesis / first-in-chain shares, start_hash is null and the
+    // walk returns empty — compute_dash_payouts collapses to 2 % miner,
+    // 98 % DONATION. For miner == DONATION the whole worker_payout
+    // routes to DONATION.
     std::map<std::vector<unsigned char>, uint64_t> weights;
     uint64_t total_weight = 0;
+    if (!s.m_prev_hash.IsNull() && tracker.chain.contains(s.m_prev_hash)) {
+        // height of our new share's parent (share count in chain).
+        int32_t parent_height = 0;
+        try { parent_height = tracker.chain.get_height(s.m_prev_hash); }
+        catch (...) { parent_height = 0; }
+
+        // Pull previous_share.previous_share_hash (= start of the walk).
+        uint256 walk_start = uint256::ZERO;
+        try {
+            auto& pdata = tracker.chain.get(s.m_prev_hash);
+            pdata.share.invoke([&](auto* p) {
+                using S = std::remove_pointer_t<decltype(p)>;
+                if constexpr (std::is_same_v<S, dash::DashShare>)
+                    walk_start = p->m_prev_hash;
+            });
+        } catch (...) { /* walk_start stays zero → walk returns empty */ }
+
+        uint64_t max_shares = (parent_height > 1)
+            ? static_cast<uint64_t>(std::min<int32_t>(
+                  parent_height,
+                  static_cast<int32_t>(params.real_chain_length
+                      ? params.real_chain_length : params.chain_length)))
+            : 0;
+        if (max_shares > 0) max_shares -= 1;
+
+        // desired_weight = 65535 * SPREAD * att(block_target).
+        __uint128_t desired_weight = 0;
+        {
+            auto block_target = chain::bits_to_target(work.m_bits);
+            auto att288       = chain::target_to_average_attempts(block_target);
+            __uint128_t att   = static_cast<__uint128_t>(att288.GetLow64());
+            __uint128_t spread = params.spread ? params.spread : 10u;
+            desired_weight    = att * 65535u * spread;
+        }
+
+        auto cw = walk_cumulative_weights(tracker, walk_start,
+                                          max_shares, desired_weight);
+        weights      = std::move(cw.weights);
+        total_weight = cw.total_weight;
+    }
+
     auto tx_outs_ordered = dash::coinbase::compute_dash_payouts(
         work.m_coinbase_value, work.m_packed_payments,
         miner_pubkey_hash, weights, total_weight, params);
