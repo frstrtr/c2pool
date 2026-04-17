@@ -14,6 +14,7 @@
 #include <impl/dash/coin/node.hpp>
 #include <impl/dash/coin/rpc.hpp>
 #include <impl/dash/enhanced_node.hpp>
+#include <impl/dash/stratum.hpp>
 
 #include <core/coin_params.hpp>
 #include <core/log.hpp>
@@ -37,6 +38,7 @@ int main(int argc, char* argv[])
     std::string dashd_rpc_host;
     uint16_t    dashd_rpc_port = 9998;
     std::string dashd_rpc_userpass;
+    uint16_t    stratum_port   = 0;       // 0 = disabled; canonical Dash p2pool stratum port is 7903
     bool testnet = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -61,6 +63,9 @@ int main(int argc, char* argv[])
             } else {
                 dashd_host = addr;
             }
+        }
+        else if (arg == "--stratum-port" && i + 1 < argc) {
+            stratum_port = static_cast<uint16_t>(std::stoul(argv[++i]));
         }
         // --dashd-rpc host:port:user:pass  (or host:port if anon test)
         else if (arg == "--dashd-rpc" && i + 1 < argc) {
@@ -278,6 +283,23 @@ int main(int argc, char* argv[])
         node.connect(peer_addr);
     });
 
+    // ── Stratum server (M6 Phase 3: protocol plumbing, no work push yet) ──
+    std::unique_ptr<dash::stratum::Server> stratum_server;
+    if (stratum_port != 0) {
+        try {
+            stratum_server = std::make_unique<dash::stratum::Server>(ioc, stratum_port);
+            stratum_server->start();
+            std::cout << "[STRATUM] listening on 0.0.0.0:" << stratum_port
+                      << " (Phase 3 — protocol only, no work push until Phase 4)"
+                      << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "[STRATUM] failed to open port " << stratum_port
+                      << ": " << e.what() << std::endl;
+        }
+    } else {
+        std::cout << "[STRATUM] disabled (pass --stratum-port 7903 to enable)" << std::endl;
+    }
+
     // Run IO context
     std::cout << "[P2P] Running event loop..." << std::endl;
 
@@ -289,8 +311,10 @@ int main(int argc, char* argv[])
         std::cout << "[STATUS] shares=" << node.tracker().chain.size()
                   << " headers=" << header_chain.height()
                   << "/" << header_chain.size()
-                  << (header_chain.is_synced() ? " SYNCED" : " syncing")
-                  << std::endl;
+                  << (header_chain.is_synced() ? " SYNCED" : " syncing");
+        if (stratum_server)
+            std::cout << " miners=" << stratum_server->session_count();
+        std::cout << std::endl;
         status.expires_after(std::chrono::seconds(10));
         status.async_wait(status_fn);
     };
