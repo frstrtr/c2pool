@@ -94,14 +94,20 @@ int main(int argc, char* argv[])
             std::stoul(prefix_hex.substr(i, 2), nullptr, 16));
     }
 
-    // Set dashd wire prefix (0xbf0c6bbd for mainnet, 0xcee2caff for testnet)
+    // Set dashd wire prefix (pchMessageStart bytes in order)
     {
-        uint32_t magic = testnet ? 0xcee2caff : 0xbf0c6bbd;
         config->coin()->m_p2p.prefix.resize(4);
-        config->coin()->m_p2p.prefix[0] = static_cast<std::byte>(magic & 0xFF);
-        config->coin()->m_p2p.prefix[1] = static_cast<std::byte>((magic >> 8) & 0xFF);
-        config->coin()->m_p2p.prefix[2] = static_cast<std::byte>((magic >> 16) & 0xFF);
-        config->coin()->m_p2p.prefix[3] = static_cast<std::byte>((magic >> 24) & 0xFF);
+        if (testnet) {
+            config->coin()->m_p2p.prefix[0] = std::byte{0xce};
+            config->coin()->m_p2p.prefix[1] = std::byte{0xe2};
+            config->coin()->m_p2p.prefix[2] = std::byte{0xca};
+            config->coin()->m_p2p.prefix[3] = std::byte{0xff};
+        } else {
+            config->coin()->m_p2p.prefix[0] = std::byte{0xbf};
+            config->coin()->m_p2p.prefix[1] = std::byte{0x0c};
+            config->coin()->m_p2p.prefix[2] = std::byte{0x6b};
+            config->coin()->m_p2p.prefix[3] = std::byte{0xbd};
+        }
     }
 
     // Add bootstrap
@@ -147,9 +153,10 @@ int main(int argc, char* argv[])
         // Wire new_headers event → header chain
         coin_node->new_headers.subscribe([&](std::vector<dash::coin::BlockHeaderType> headers) {
             int accepted = header_chain.add_headers(headers);
-            if (accepted > 0) {
+            if (accepted > 0 && headers.size() >= 2000) {
+                // More headers available — continue sync
                 auto locator = header_chain.get_locator();
-                coin_node->send_getheaders(1, locator, uint256());
+                coin_node->send_getheaders(70230, locator, uint256());
             }
         });
 
@@ -176,7 +183,10 @@ int main(int argc, char* argv[])
             init_timer->async_wait([&, init_timer](const boost::system::error_code& ec) {
                 if (ec) return;
                 auto locator = header_chain.get_locator();
-                coin_node->send_getheaders(1, locator, uint256());
+                // If chain is empty, use genesis as locator
+                if (locator.empty())
+                    locator.push_back(chain_params.genesis_hash);
+                coin_node->send_getheaders(70230, locator, uint256());
                 LOG_INFO << "[DASH] Sent initial getheaders (locator=" << locator.size() << " entries)";
             });
         });
