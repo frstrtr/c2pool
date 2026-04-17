@@ -82,15 +82,23 @@ inline std::vector<unsigned char> push_bip34_height(uint32_t height)
     return out;
 }
 
+// One miner payout row: scriptPubKey + amount (sat).
+struct MinerPayout {
+    std::vector<unsigned char> script;
+    uint64_t                   amount{0};
+};
+
 // Build the coinbase TX. Returns serialized bytes and the offset of the
 // 8-byte extranonce placeholder within them.
 //
-//   work         — parsed GBT (previous_block, coinbase_value, payments, ...)
-//   miner_script — scriptPubKey for the miner payout (from address/pubkey)
-//   pool_tag     — arbitrary short tag for the coinbase script (e.g. "/c2pool-dash:0.1/")
-//   params       — coin params (for address version decoding in packed_payments)
+//   work          — parsed GBT (previous_block, coinbase_value, payments, ...)
+//   miner_payouts — one or more outputs representing the miner share (sum
+//                   should equal coinbase_value - payment_amount, but this
+//                   function does NOT enforce that — caller's responsibility)
+//   pool_tag      — arbitrary short tag in coinbase scriptSig
+//   params        — coin params (for address decoding of packed_payments)
 inline CoinbaseLayout build(const dash::coin::DashWorkData& work,
-                            const std::vector<unsigned char>& miner_script,
+                            const std::vector<MinerPayout>& miner_payouts,
                             const std::string& pool_tag,
                             const core::CoinParams& params)
 {
@@ -109,22 +117,16 @@ inline CoinbaseLayout build(const dash::coin::DashWorkData& work,
     auto h_push = push_bip34_height(work.m_height);
     script.insert(script.end(), h_push.begin(), h_push.end());
     script.insert(script.end(), pool_tag.begin(), pool_tag.end());
-    // Record position where the 8-byte placeholder begins *within the scriptSig*.
-    size_t script_en_offset = script.size();
     script.resize(script.size() + EXTRANONCE2_SIZE, 0x00);
-
     in.scriptSig = OPScript(script.data(), script.data() + script.size());
     tx.vin.push_back(std::move(in));
 
     // ── Outputs ─────────────────────────────────────────────────────────
-    // Miner receives the block reward minus all masternode+treasury payments.
-    uint64_t miner_value = (work.m_coinbase_value > work.m_payment_amount)
-        ? work.m_coinbase_value - work.m_payment_amount
-        : 0;
-    {
+    for (const auto& p : miner_payouts) {
+        if (p.amount == 0 || p.script.empty()) continue;
         TxOut o;
-        o.value = static_cast<int64_t>(miner_value);
-        o.scriptPubKey = OPScript(miner_script.data(), miner_script.data() + miner_script.size());
+        o.value = static_cast<int64_t>(p.amount);
+        o.scriptPubKey = OPScript(p.script.data(), p.script.data() + p.script.size());
         tx.vout.push_back(std::move(o));
     }
     // Masternode + superblock + platform payments.
@@ -324,7 +326,7 @@ inline std::string random_job_id()
 }
 
 inline BuiltJob build_from_work(const dash::coin::DashWorkData& work,
-                                const std::vector<unsigned char>& miner_script,
+                                const std::vector<dash::coinbase::MinerPayout>& miner_payouts,
                                 const std::string& pool_tag,
                                 const core::CoinParams& params,
                                 double share_difficulty)
@@ -332,7 +334,7 @@ inline BuiltJob build_from_work(const dash::coin::DashWorkData& work,
     using namespace dash::coinbase;
 
     BuiltJob out;
-    out.coinbase = build(work, miner_script, pool_tag, params);
+    out.coinbase = build(work, miner_payouts, pool_tag, params);
     auto sp = split_coinb(out.coinbase);
 
     // Merkle branches — coinbase placeholder at [0].
