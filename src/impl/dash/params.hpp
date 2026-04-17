@@ -37,7 +37,7 @@ inline core::CoinParams make_coin_params(bool testnet)
     p.pow_func = [](std::span<const unsigned char> header) -> uint256 {
         return dash::crypto::hash_x11(header);
     };
-    p.block_hash_func = core::pow::sha256d;  // Block identity is SHA256d
+    p.block_hash_func = p.pow_func;  // Dash: block identity is also X11
 
     // Subsidy: 50 DASH halving every 210240 blocks
     // Reference: ref/dashcore/src/chainparams.cpp nSubsidyHalvingInterval=210240
