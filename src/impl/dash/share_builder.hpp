@@ -212,18 +212,18 @@ inline BuiltJob build(const dash::coin::DashWorkData& work,
         s.m_packed_payments.push_back(std::move(pp));
     }
 
-    // share_info (tx compression: MVP — all tx hashes go into
-    // new_transaction_hashes; every tx gets a (share_count=0, tx_count=i)
-    // ref so the p2pool-dash peer assertion
+    // share_info (tx compression: MVP — coinbase-only shares).
+    //
+    // We could include the GBT's tx list in new_transaction_hashes, but
+    // p2pool-dash requires each referenced tx hash to already be in its
+    // known_txs_var (populated via its own dashd P2P subscription). Until
+    // we implement remember_tx to ship tx bodies to peers ahead of shares,
+    // we advertise an empty tx list — our share mines a coinbase-only
+    // block. The assertion at p2pool-dash/data.py:340
     //   n == set(range(len(new_transaction_hashes)))
-    // holds (see p2pool-dash/p2pool/data.py:340).
-    s.m_new_transaction_hashes = work.m_tx_hashes;
+    // trivially holds for empty sets.
+    s.m_new_transaction_hashes.clear();
     s.m_transaction_hash_refs.clear();
-    s.m_transaction_hash_refs.reserve(work.m_tx_hashes.size() * 2);
-    for (uint64_t i = 0; i < work.m_tx_hashes.size(); ++i) {
-        s.m_transaction_hash_refs.push_back(0);   // share_count
-        s.m_transaction_hash_refs.push_back(i);   // tx_count
-    }
     s.m_far_share_hash         = uint256::ZERO;
 
     // max_bits: use pool's configured max_target as compact.
@@ -262,7 +262,25 @@ inline BuiltJob build(const dash::coin::DashWorkData& work,
     s.m_last_txout_nonce = 0;                            // miner fills
     // m_hash_link filled after coinbase is built (needs ref_hash_offset)
     s.m_merkle_link = dash::MerkleLink{};                // filled after merkle branches
-    s.m_coinbase_payload_outer.m_data = work.m_coinbase_payload;
+    // contents['coinbase_payload'] on the p2pool-dash wire is the
+    // VarStr-packed form (VarInt length prefix + payload bytes) — see
+    // p2pool-dash/p2pool/data.py:278-289. The outer field's VarStrType
+    // wraps that with a second length prefix. Feed the VarStr-packed form
+    // here so check_hash_link's continuation byte stream matches the real
+    // coinbase (which has a VarInt length between locktime and payload per
+    // CBTX tx_type serialization).
+    s.m_coinbase_payload_outer.m_data.clear();
+    if (!work.m_coinbase_payload.empty()) {
+        PackStream ps;
+        BaseScript inner;
+        inner.m_data = work.m_coinbase_payload;
+        ps << inner;  // VarStrType serialization: VarInt length + bytes
+        auto sp = ps.get_span();
+        s.m_coinbase_payload_outer.m_data.resize(sp.size());
+        for (size_t i = 0; i < sp.size(); ++i)
+            s.m_coinbase_payload_outer.m_data[i] =
+                static_cast<unsigned char>(sp[i]);
+    }
 
     // ── ref_hash from share metadata ────────────────────────────────────
     auto ref_bytes = ref_stream_bytes(s, params);
