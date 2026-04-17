@@ -402,6 +402,9 @@ int main(int argc, char* argv[])
                          << " job=" << s.job_id
                          << " hash=" << r.x11_hash.GetHex().substr(0, 16)
                          << (r.is_block ? " *** BLOCK ***" : " share");
+                // Feed hashrate tracker so per-worker estimates update.
+                enhanced_node->track_mining_share_submission(
+                    s.worker_name, ctx->share_difficulty);
                 if (r.is_block && coin_rpc && coin_rpc->is_connected()) {
                     try {
                         bool ok = coin_rpc->submit_block_hex(r.block_hex);
@@ -455,6 +458,14 @@ int main(int argc, char* argv[])
         if (stratum_server && coin_rpc && coin_rpc->is_connected() && !miner_script.empty()) {
             try {
                 auto work = coin_rpc->getwork();
+
+                // Feed network difficulty from GBT to the adjustment engine.
+                {
+                    auto net_target = chain::bits_to_target(work.m_bits);
+                    double net_diff = chain::target_to_difficulty(net_target);
+                    enhanced_node->get_difficulty_engine()
+                        .set_network_difficulty(net_diff);
+                }
 
                 // Miner value = block reward minus masternode/treasury.
                 uint64_t miner_value = (work.m_coinbase_value > work.m_payment_amount)
@@ -537,11 +548,24 @@ int main(int argc, char* argv[])
     };
     status.async_wait(status_fn);
 
+    // Enhanced-node stats timer (every 60s): hashrate, vardiff, share counts.
+    io::steady_timer enh_stats(ioc, std::chrono::seconds(60));
+    std::function<void(const boost::system::error_code&)> enh_stats_fn;
+    enh_stats_fn = [&](const boost::system::error_code& ec) {
+        if (ec) return;
+        enhanced_node->log_sharechain_stats();
+        enh_stats.expires_after(std::chrono::seconds(60));
+        enh_stats.async_wait(enh_stats_fn);
+    };
+    enh_stats.async_wait(enh_stats_fn);
+
     try {
         ioc.run();
     } catch (const std::exception& e) {
         std::cerr << "[ERROR] " << e.what() << std::endl;
     }
+
+    enhanced_node->shutdown();
 
     std::cout << std::endl;
     std::cout << "[RESULT] Final state:" << std::endl;
