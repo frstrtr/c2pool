@@ -24,7 +24,10 @@ target_include_directories(dash_x11 PUBLIC
 set_target_properties(dash_x11 PROPERTIES LINKER_LANGUAGE C)
 
 # c2pool-dash binary: full Dash p2pool node
-add_executable(c2pool-dash main_dash.cpp)
+add_executable(c2pool-dash
+    main_dash.cpp
+    coin/rpc.cpp
+)
 target_include_directories(c2pool-dash PRIVATE
     ${CMAKE_SOURCE_DIR}/src
 )

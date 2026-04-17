@@ -12,6 +12,7 @@
 #include <impl/dash/crypto/hash_x11.hpp>
 #include <impl/dash/coin/header_chain.hpp>
 #include <impl/dash/coin/node.hpp>
+#include <impl/dash/coin/rpc.hpp>
 #include <impl/dash/enhanced_node.hpp>
 
 #include <core/coin_params.hpp>
@@ -33,11 +34,14 @@ int main(int argc, char* argv[])
     uint16_t port = 8999;
     std::string dashd_host;
     uint16_t dashd_port = 9999;
+    std::string dashd_rpc_host;
+    uint16_t    dashd_rpc_port = 9998;
+    std::string dashd_rpc_userpass;
     bool testnet = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--testnet") { testnet = true; port = 18999; dashd_port = 19999; }
+        if (arg == "--testnet") { testnet = true; port = 18999; dashd_port = 19999; dashd_rpc_port = 19998; }
         else if (arg == "--bootstrap" && i + 1 < argc) {
             std::string addr = argv[++i];
             auto colon = addr.find(':');
@@ -56,6 +60,29 @@ int main(int argc, char* argv[])
                 dashd_port = static_cast<uint16_t>(std::stoul(addr.substr(colon + 1)));
             } else {
                 dashd_host = addr;
+            }
+        }
+        // --dashd-rpc host:port:user:pass  (or host:port if anon test)
+        else if (arg == "--dashd-rpc" && i + 1 < argc) {
+            std::string s = argv[++i];
+            // Split by ':' into at most 4 parts: host, port, user, pass
+            // (pass may itself contain ':' — everything after the third ':' is pass).
+            auto a = s.find(':');
+            if (a == std::string::npos) { dashd_rpc_host = s; continue; }
+            dashd_rpc_host = s.substr(0, a);
+            auto b = s.find(':', a + 1);
+            if (b == std::string::npos) {
+                dashd_rpc_port = static_cast<uint16_t>(std::stoul(s.substr(a + 1)));
+            } else {
+                dashd_rpc_port = static_cast<uint16_t>(std::stoul(s.substr(a + 1, b - (a + 1))));
+                auto c = s.find(':', b + 1);
+                if (c == std::string::npos) {
+                    // host:port:userpass  (treat remainder as already-formatted user:pass,
+                    // though typically this variant means just user with empty pass).
+                    dashd_rpc_userpass = s.substr(b + 1);
+                } else {
+                    dashd_rpc_userpass = s.substr(b + 1, c - (b + 1)) + ":" + s.substr(c + 1);
+                }
             }
         }
     }
@@ -201,6 +228,47 @@ int main(int argc, char* argv[])
         std::cout << "[DASHD] Connecting to " << dashd_host << ":" << dashd_port << std::endl;
     } else {
         std::cout << "[DASHD] No --dashd specified, running without coin daemon P2P" << std::endl;
+    }
+
+    // ── Coin RPC (dashd JSON-RPC for GBT + submitblock) ──
+    dash::interfaces::Node coin_iface;
+    std::unique_ptr<dash::coin::NodeRPC> coin_rpc;
+    if (!dashd_rpc_host.empty()) {
+        coin_rpc = std::make_unique<dash::coin::NodeRPC>(&ioc, &coin_iface, testnet);
+        io::post(ioc, [&]() {
+            NetService rpc_addr(dashd_rpc_host + ":" + std::to_string(dashd_rpc_port));
+            coin_rpc->connect(rpc_addr, dashd_rpc_userpass);
+        });
+
+        // After a short delay (to let RPC handshake complete), do a first GBT
+        // call to exercise the pipeline end-to-end and print a summary.
+        auto gbt_timer = std::make_shared<io::steady_timer>(ioc, std::chrono::seconds(5));
+        gbt_timer->async_wait([&, gbt_timer](const boost::system::error_code& ec) {
+            if (ec || !coin_rpc || !coin_rpc->is_connected()) return;
+            try {
+                auto work = coin_rpc->getwork();
+                LOG_INFO << "[DashRPC] GBT: height=" << work.m_height
+                         << " coinbasevalue=" << work.m_coinbase_value
+                         << " payment_amount=" << work.m_payment_amount
+                         << " txs=" << work.m_tx_hashes.size()
+                         << " payments=" << work.m_packed_payments.size()
+                         << " payload_bytes=" << work.m_coinbase_payload.size()
+                         << " bits=0x" << std::hex << work.m_bits << std::dec;
+                for (const auto& p : work.m_packed_payments) {
+                    LOG_INFO << "[DashRPC]   payment: "
+                             << p.payee.substr(0, std::min<size_t>(p.payee.size(), 40))
+                             << (p.payee.size() > 40 ? "..." : "")
+                             << " amount=" << p.amount;
+                }
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[DashRPC] getwork() failed: " << e.what();
+            }
+        });
+
+        std::cout << "[DASHD-RPC] Connecting to " << dashd_rpc_host << ":" << dashd_rpc_port
+                  << (dashd_rpc_userpass.empty() ? " (no auth)" : " (basic auth)") << std::endl;
+    } else {
+        std::cout << "[DASHD-RPC] No --dashd-rpc specified, running without RPC (mining disabled)" << std::endl;
     }
 
     // ── Connect to p2pool peer ──
