@@ -12,6 +12,7 @@
 #include <impl/dash/crypto/hash_x11.hpp>
 #include <impl/dash/coin/header_chain.hpp>
 #include <impl/dash/coin/node.hpp>
+#include <impl/dash/enhanced_node.hpp>
 
 #include <core/coin_params.hpp>
 #include <core/log.hpp>
@@ -144,6 +145,12 @@ int main(int argc, char* argv[])
     // ── Pool Node ──
     dash::DashNodeImpl node(&ioc, config.get(), testnet);
     std::cout << "[NODE] DashNodeImpl created" << std::endl;
+
+    // ── Enhanced Node (vardiff, hashrate tracking, mining interface) ──
+    // Template-instantiated for Dash via impl/dash/enhanced_node.hpp.
+    // Storage is null (like LTC path); chain persistence belongs to DashNodeImpl.
+    auto enhanced_node = std::make_shared<dash::EnhancedNode>(testnet);
+    std::cout << "[ENHANCED] dash::EnhancedNode created (vardiff + hashrate)" << std::endl;
 
     // ── Coin P2P Node (dashd connection) ──
     std::unique_ptr<dash::coin::Node<dash::Config>> coin_node;
