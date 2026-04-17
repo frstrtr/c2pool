@@ -4478,6 +4478,20 @@ nlohmann::json MiningInterface::rest_web_currency_info()
             result["tx_explorer_url_prefix"]      = "https://blockchair.com/dogecoin/transaction/";
         }
         break;
+    case Blockchain::DASH:
+        result["symbol"] = "DASH";
+        result["name"] = "Dash";
+        result["block_period"] = 150;  // 2.5 min average
+        if (!m_custom_address_explorer.empty()) {
+            result["address_explorer_url_prefix"] = m_custom_address_explorer;
+            result["block_explorer_url_prefix"]   = m_custom_block_explorer;
+            result["tx_explorer_url_prefix"]      = m_custom_tx_explorer;
+        } else {
+            result["address_explorer_url_prefix"] = "https://blockchair.com/dash/address/";
+            result["block_explorer_url_prefix"]   = "https://blockchair.com/dash/block/";
+            result["tx_explorer_url_prefix"]      = "https://blockchair.com/dash/transaction/";
+        }
+        break;
     }
 
     // Expose explorer state so dashboard JS can link to internal explorer
@@ -4866,6 +4880,10 @@ nlohmann::json MiningInterface::rest_node_info()
     case Blockchain::DOGECOIN:
         result["network"] = m_testnet ? "dogecoin_testnet" : "dogecoin";
         result["symbol"] = "DOGE";
+        break;
+    case Blockchain::DASH:
+        result["network"] = m_testnet ? "dash_testnet" : "dash";
+        result["symbol"] = "DASH";
         break;
     }
     return result;

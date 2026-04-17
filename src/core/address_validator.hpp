@@ -20,6 +20,7 @@ enum class Blockchain {
     MONERO,
     ZCASH,
     DOGECOIN,
+    DASH,
     DIGIBYTE,
     UNKNOWN
 };
@@ -89,6 +90,7 @@ private:
     void initialize_monero_configs();
     void initialize_zcash_configs();
     void initialize_dogecoin_configs();
+    void initialize_dash_configs();
     
     // Validation helpers
     bool validate_base58check(const std::string& address, const BlockchainConfig& config, AddressValidationResult& result) const;

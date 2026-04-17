@@ -19,6 +19,7 @@ BlockchainAddressValidator::BlockchainAddressValidator()
     initialize_monero_configs();
     initialize_zcash_configs();
     initialize_dogecoin_configs();
+    initialize_dash_configs();
 }
 
 BlockchainAddressValidator::BlockchainAddressValidator(Blockchain primary_blockchain, Network primary_network)
@@ -30,6 +31,7 @@ BlockchainAddressValidator::BlockchainAddressValidator(Blockchain primary_blockc
     initialize_monero_configs();
     initialize_zcash_configs();
     initialize_dogecoin_configs();
+    initialize_dash_configs();
 }
 
 void BlockchainAddressValidator::initialize_litecoin_configs() {
@@ -164,6 +166,27 @@ void BlockchainAddressValidator::initialize_dogecoin_configs() {
     doge_mainnet.max_length = 34;
     
     m_configs[Blockchain::DOGECOIN][Network::MAINNET] = doge_mainnet;
+}
+
+void BlockchainAddressValidator::initialize_dash_configs() {
+    BlockchainConfig dash_mainnet;
+    dash_mainnet.blockchain = Blockchain::DASH;
+    dash_mainnet.network = Network::MAINNET;
+    dash_mainnet.p2pkh_versions = {76};    // X addresses
+    dash_mainnet.p2sh_versions = {16};     // 7 addresses
+    dash_mainnet.min_length = 25;
+    dash_mainnet.max_length = 34;
+
+    BlockchainConfig dash_testnet;
+    dash_testnet.blockchain = Blockchain::DASH;
+    dash_testnet.network = Network::TESTNET;
+    dash_testnet.p2pkh_versions = {140};   // y addresses
+    dash_testnet.p2sh_versions = {19};     // 8/9 addresses
+    dash_testnet.min_length = 25;
+    dash_testnet.max_length = 34;
+
+    m_configs[Blockchain::DASH][Network::MAINNET] = dash_mainnet;
+    m_configs[Blockchain::DASH][Network::TESTNET] = dash_testnet;
 }
 
 AddressValidationResult BlockchainAddressValidator::validate_address(const std::string& address) const {
@@ -533,6 +556,7 @@ std::string BlockchainAddressValidator::get_blockchain_name(Blockchain blockchai
         case Blockchain::MONERO: return "Monero";
         case Blockchain::ZCASH: return "Zcash";
         case Blockchain::DOGECOIN: return "Dogecoin";
+        case Blockchain::DASH: return "Dash";
         default: return "Unknown";
     }
 }
