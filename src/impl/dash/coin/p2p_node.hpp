@@ -184,11 +184,14 @@ public:
     {
         on_activity();
 
+        // Trim null-padded command for clean logging
+        std::string cmd = rmsg->m_command;
+        while (!cmd.empty() && cmd.back() == '\0') cmd.pop_back();
         try {
             auto result = m_handler.parse(rmsg);
             std::visit([&](auto& msg) { handle_msg(std::move(msg)); }, result);
         } catch (const std::exception& e) {
-            LOG_ERROR << "[DashP2P] parse error (" << rmsg->m_command << "): " << e.what();
+            LOG_WARNING << "[DashP2P] unhandled: " << cmd;
         }
     }
 
@@ -330,7 +333,6 @@ private:
         {
             auto header = static_cast<BlockHeaderType>(block);
             auto packed_header = pack(header);
-            // Dash uses X11 for block identity hash
             auto blockhash = dash::crypto::hash_x11(packed_header.get_span());
             try { m_peer->get_header(blockhash, header); } catch (const std::invalid_argument&) {}
             vheaders.push_back(header);
