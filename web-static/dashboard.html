@@ -1785,7 +1785,8 @@
                 <div class="stat-card">
                     <h3><span class="icon">💰</span> Miners Block Value</h3>
                     <div class="stat-value warning"><span id="block_value_miner">-</span> <small class="symbol-small" id="block_value_symbol">-</small></div>
-                    <div class="stat-sub" style="color: #c3a634; font-size: 1.1em; margin-top: -4px;">+<span id="merged_block_value">-</span> DOGE</div>
+                    <div class="stat-sub" id="merged_block_sub" style="color: #c3a634; font-size: 1.1em; margin-top: -4px;">+<span id="merged_block_value">-</span> <span id="merged_block_symbol">DOGE</span></div>
+                    <div class="stat-sub" id="payments_block_sub" style="color: #9c27b0; font-size: 0.9em; margin-top: -4px; display: none;">MN/Gov: <span id="block_value_payments_display">0</span> <span id="payments_symbol"></span></div>
                     <div class="stat-detail" style="white-space: nowrap;">Expected: <span id="time_to_block">-</span> <span style="color: #c3a634;">|</span> <span style="color: #c3a634;"><span id="time_to_merged_block">-</span></span></div>
                 </div>
                 
@@ -2752,6 +2753,7 @@
         d3.json('../web/currency_info', function(info) {
             currency_info = info || {};
             var sym = (info && info.symbol) || 'COIN';
+            window.currencySymbol = sym;
             var chainName = (info && info.name) || sym;
             d3.selectAll('.symbol-small').text(sym);
             d3.select('#currency-symbol').text(sym);
@@ -2864,14 +2866,16 @@
 
         function renderMergedStats(local_stats, global_stats, merged_stats) {
             if (merged_stats && merged_stats.block_value) {
+                d3.select('#merged_block_sub').style('display', 'block');
                 d3.select('#merged_block_value').text(d3.format(',.0f')(merged_stats.block_value));
+                d3.select('#merged_block_symbol').text(merged_stats.symbol || 'DOGE');
                 var time_to_block = local_stats.attempts_to_block / global_stats.pool_hash_rate;
                 var time_to_merged = local_stats.attempts_to_merged_block ?
                     local_stats.attempts_to_merged_block / global_stats.pool_hash_rate :
                     time_to_block / 1000;
                 d3.select('#time_to_merged_block').text(isFinite(time_to_merged) ? format_dt(time_to_merged) : '\u221E');
             } else {
-                d3.select('#merged_block_value').text('N/A');
+                d3.select('#merged_block_sub').style('display', 'none');
                 d3.select('#time_to_merged_block').text('N/A');
             }
         }
@@ -2909,14 +2913,26 @@
                 d3.select('#block_value').text(d3.format('.4f')(local_stats.block_value));
                 d3.select('#block_value_payments').text(d3.format('.4f')(local_stats.block_value_payments || 0));
                 d3.select('#block_value_miner').text(d3.format('.4f')(local_stats.block_value_miner || local_stats.block_value));
+
+                // Show masternode/governance payment split for Dash
+                var paymentAmount = local_stats.block_value_payments || 0;
+                if (paymentAmount > 0 && paymentAmount < local_stats.block_value) {
+                    d3.select('#payments_block_sub').style('display', 'block');
+                    d3.select('#block_value_payments_display').text(d3.format('.4f')(paymentAmount));
+                    d3.select('#payments_symbol').text(window.currencySymbol || '');
+                } else {
+                    d3.select('#payments_block_sub').style('display', 'none');
+                }
                 
                 // Node fee percentage and computed amounts
                 var nodeFee = local_stats.fee != null ? local_stats.fee : 0;
                 d3.select('#node_fee_percent').text(d3.format('.1f')(nodeFee));
-                // Display computed node fee amounts per block
-                if (local_stats.node_fee_ltc != null) {
-                    d3.select('#payout_totamount').text(d3.format('.4f')(local_stats.node_fee_ltc));
-                    d3.select('#node_payout_symbol').text('LTC');
+                // Display computed node fee amounts per block (coin-aware)
+                var primaryFee = local_stats.node_fee_ltc || local_stats.node_fee_dash || null;
+                var primarySym = local_stats.node_fee_dash != null ? 'DASH' : (window.currencySymbol || 'LTC');
+                if (primaryFee != null) {
+                    d3.select('#payout_totamount').text(d3.format('.4f')(primaryFee));
+                    d3.select('#node_payout_symbol').text(primarySym);
                 }
                 if (local_stats.node_fee_doge != null) {
                     d3.select('#node_merged_amount').text(d3.format(',.2f')(local_stats.node_fee_doge));

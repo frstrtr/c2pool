@@ -4192,17 +4192,24 @@ nlohmann::json MiningInterface::rest_local_stats()
 
     // block_value in coins (not satoshis)
     double block_value = 0.0;
+    double payment_amount = 0.0;
     {
         std::lock_guard<std::mutex> lock(m_work_mutex);
-        if (!m_cached_template.is_null())
+        if (!m_cached_template.is_null()) {
             block_value = m_cached_template.value("coinbasevalue", uint64_t(0)) / 1e8;
+            // Dash: payment_amount = masternode + superblock + platform payments
+            // These are deducted from miner payout before PPLNS distribution
+            payment_amount = m_cached_template.value("payment_amount", uint64_t(0)) / 1e8;
+        }
     }
     result["block_value"] = block_value;
-    // Deduct total fee (node fee + dev donation) from miner portion
-    // donation_proportion already represents the combined fee ratio
+    // Miner portion: subsidy minus protocol payments (masternode/superblock) minus node fee
+    // For LTC/DOGE: payment_amount=0, so block_value_miner = block_value * (1 - fee)
+    // For Dash: block_value_miner = (subsidy - payment_amount) * (1 - fee)
     double fee_ratio = m_pool_fee_percent / 100.0;
-    result["block_value_miner"] = block_value * (1.0 - fee_ratio);
-    result["block_value_payments"] = block_value;  // total including fees
+    double miner_subsidy = std::max(0.0, block_value - payment_amount);
+    result["block_value_miner"] = miner_subsidy * (1.0 - fee_ratio);
+    result["block_value_payments"] = payment_amount;
 
     // Node fee amounts per block: fee% × (local_hashrate / pool_hashrate) × block_value
     // Matches p2pool: operator gets fee% of THIS node's contribution, not the whole block.
@@ -4210,7 +4217,17 @@ nlohmann::json MiningInterface::rest_local_stats()
         double local_hr = m_stratum_hashrate_fn ? m_stratum_hashrate_fn() : 0.0;
         double pool_hr = m_pool_hashrate_fn ? m_pool_hashrate_fn() : 0.0;
         double node_share = (pool_hr > 0 && local_hr > 0) ? local_hr / pool_hr : 0.0;
-        result["node_fee_ltc"] = block_value * fee_ratio * node_share;
+        // Use blockchain-appropriate key for backward compatibility
+        double primary_fee = miner_subsidy * fee_ratio * node_share;
+        switch (m_blockchain) {
+        case Blockchain::DASH:
+            result["node_fee_dash"] = primary_fee; break;
+        case Blockchain::DOGECOIN:
+            result["node_fee_doge"] = primary_fee;
+            result["node_fee_ltc"] = primary_fee; break;  // compat
+        default:
+            result["node_fee_ltc"] = primary_fee; break;
+        }
         if (m_mm_manager) {
             auto chain_infos = m_mm_manager->get_chain_infos();
             for (const auto& ci : chain_infos) {
