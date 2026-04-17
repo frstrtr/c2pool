@@ -257,10 +257,11 @@ inline uint256 share_init_verify(const DashShare& share,
     header_stream << share.m_min_header.m_bits;
     header_stream << share.m_min_header.m_nonce;
 
-    // share_hash = SHA256d(header) — block identity
+    // Dash: both BLOCKHASH_FUNC and POW_FUNC are X11
+    // share_hash = X11(header) — block identity AND PoW check
     auto hdr_span = std::span<const unsigned char>(
         reinterpret_cast<const unsigned char*>(header_stream.data()), header_stream.size());
-    uint256 share_hash = Hash(hdr_span);
+    uint256 share_hash = params.pow_func(hdr_span);
 
     // ── X11 PoW check ──
     if (check_pow)
@@ -269,9 +270,7 @@ inline uint256 share_init_verify(const DashShare& share,
         if (target.IsNull())
             throw std::invalid_argument("share target is zero");
 
-        uint256 pow_hash = params.pow_func(hdr_span);
-
-        if (pow_hash > target)
+        if (share_hash > target)
             throw std::invalid_argument("share PoW hash does not meet target");
     }
 
