@@ -15,6 +15,7 @@ struct Peer
     std::string m_other_subversion;
     uint64_t m_other_services{0};
     uint64_t m_nonce{0};
+    uint256 m_best_share;
     std::set<uint256> m_remote_txs;
     std::map<uint256, coin::Transaction> m_remembered_txs;
 };
