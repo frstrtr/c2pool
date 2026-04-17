@@ -29,6 +29,8 @@
 #include <core/coin_params.hpp>
 #include <core/log.hpp>
 #include <core/uint256.hpp>
+#include <core/web_server.hpp>
+#include <core/address_validator.hpp>
 
 #include <boost/asio.hpp>
 
@@ -54,6 +56,10 @@ int main(int argc, char* argv[])
     bool        pplns_enabled   = true;   // default: PPLNS payouts across chain contributors
     size_t      pplns_window    = 0;      // 0 → use params.chain_length
     bool testnet = false;
+    std::string http_host       = "127.0.0.1";   // dashboard bind host
+    uint16_t    http_port       = 0;             // 0 = disable dashboard; e.g. 7904
+    std::string dashboard_dir;                   // static files for web dashboard
+    std::string http_cors_origin;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -92,6 +98,18 @@ int main(int argc, char* argv[])
         }
         else if (arg == "--pplns-window" && i + 1 < argc) {
             pplns_window = static_cast<size_t>(std::stoul(argv[++i]));
+        }
+        else if (arg == "--http-port" && i + 1 < argc) {
+            http_port = static_cast<uint16_t>(std::stoul(argv[++i]));
+        }
+        else if (arg == "--http-host" && i + 1 < argc) {
+            http_host = argv[++i];
+        }
+        else if (arg == "--dashboard-dir" && i + 1 < argc) {
+            dashboard_dir = argv[++i];
+        }
+        else if (arg == "--cors-origin" && i + 1 < argc) {
+            http_cors_origin = argv[++i];
         }
         // --dashd-rpc host:port:user:pass  (or host:port if anon test)
         else if (arg == "--dashd-rpc" && i + 1 < argc) {
@@ -209,6 +227,33 @@ int main(int argc, char* argv[])
     // Storage is null (like LTC path); chain persistence belongs to DashNodeImpl.
     auto enhanced_node = std::make_shared<dash::EnhancedNode>(testnet);
     std::cout << "[ENHANCED] dash::EnhancedNode created (vardiff + hashrate)" << std::endl;
+
+    // ── Web dashboard (optional; enabled when --http-port > 0) ──────────
+    // Coin-agnostic path: constructor takes IMiningNode (our EnhancedNode)
+    // and Blockchain::DASH. We do NOT call set_coin_rpc() — that signature
+    // is hardcoded to ltc::coin::NodeRPC* and would require ICoinRPC
+    // extraction. Our GBT/submitblock path stays in the existing stratum
+    // handler. The dashboard serves mining stats via IMiningNode only.
+    // set_stratum_port(0) prevents WebServer from launching its own
+    // StratumServer (we run dash::stratum::Server ourselves).
+    std::unique_ptr<core::WebServer> web_server;
+    if (http_port != 0) {
+        web_server = std::make_unique<core::WebServer>(
+            ioc, http_host, http_port, testnet,
+            std::static_pointer_cast<core::IMiningNode>(enhanced_node),
+            Blockchain::DASH);
+        web_server->set_stratum_port(0);  // we own stratum; don't auto-launch
+        auto* mi = web_server->get_mining_interface();
+        if (!http_cors_origin.empty()) mi->set_cors_origin(http_cors_origin);
+        if (stratum_port != 0)         mi->set_worker_port(stratum_port);
+        if (!dashboard_dir.empty())    web_server->set_dashboard_dir(dashboard_dir);
+#ifdef C2POOL_VERSION
+        mi->set_pool_version("c2pool-dash/" C2POOL_VERSION);
+#endif
+        web_server->start();
+        std::cout << "[WEB] dashboard listening on " << http_host << ":"
+                  << http_port << std::endl;
+    }
 
     // ── Coin P2P Node (dashd connection) ──
     std::unique_ptr<dash::coin::Node<dash::Config>> coin_node;
@@ -565,6 +610,7 @@ int main(int argc, char* argv[])
         std::cerr << "[ERROR] " << e.what() << std::endl;
     }
 
+    if (web_server) web_server->stop();
     enhanced_node->shutdown();
 
     std::cout << std::endl;
