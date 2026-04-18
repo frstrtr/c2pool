@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 #include <ctime>
+#include <functional>
 
 #include <boost/asio.hpp>
 #include <nlohmann/json.hpp>
@@ -196,13 +197,21 @@ public:
         // This stub satisfies the IMiningNode interface.
     }
 
+    // Optional overrides — used by coin targets that own their own tracker
+    // (c2pool-dash passes DashNodeImpl accessors). Leave unset and the
+    // defaults below fall back to m_chain/m_connections.
+    void set_total_shares_fn(std::function<uint64_t()> fn) { m_total_shares_fn = std::move(fn); }
+    void set_connected_peers_fn(std::function<size_t()> fn) { m_connected_peers_fn = std::move(fn); }
+
     uint64_t get_total_mining_shares() const override
     {
+        if (m_total_shares_fn) return m_total_shares_fn();
         return m_chain ? static_cast<uint64_t>(m_chain->size()) : 0;
     }
 
     size_t get_connected_peers_count() const override
     {
+        if (m_connected_peers_fn) return m_connected_peers_fn();
         return m_connections.size();
     }
 
@@ -219,6 +228,10 @@ public:
     storage::SharechainStorage* get_storage() const { return m_storage.get(); }
     hashrate::HashrateTracker* get_hashrate_tracker() const { return m_hashrate_tracker.get(); }
     difficulty::DifficultyAdjustmentEngine& get_difficulty_engine() { return m_difficulty_adjustment_engine; }
+
+private:
+    std::function<uint64_t()> m_total_shares_fn;
+    std::function<size_t()>   m_connected_peers_fn;
 };
 
 } // namespace node

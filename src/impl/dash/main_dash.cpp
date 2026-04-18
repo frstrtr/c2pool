@@ -226,6 +226,13 @@ int main(int argc, char* argv[])
     // Template-instantiated for Dash via impl/dash/enhanced_node.hpp.
     // Storage is null (like LTC path); chain persistence belongs to DashNodeImpl.
     auto enhanced_node = std::make_shared<dash::EnhancedNode>(testnet);
+    // IMiningNode overrides sourced from DashNodeImpl so /api/mining/stats
+    // shows real peer + share counts (the base template's defaults read
+    // m_chain/m_connections which are null in the default constructor).
+    enhanced_node->set_total_shares_fn(
+        [&node]() -> uint64_t { return node.tracker().chain.size(); });
+    enhanced_node->set_connected_peers_fn(
+        [&node]() -> size_t { return node.peer_count(); });
     std::cout << "[ENHANCED] dash::EnhancedNode created (vardiff + hashrate)" << std::endl;
 
     // ── Web dashboard (optional; enabled when --http-port > 0) ──────────

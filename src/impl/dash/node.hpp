@@ -467,6 +467,10 @@ public:
         return heads.begin()->first;
     }
 
+    // Number of handshaked p2pool peers (BaseNode keeps m_peers protected;
+    // expose for dashboard /api/mining/stats via IMiningNode).
+    size_t peer_count() const { return base_t::m_peers.size(); }
+
     // Add a locally-generated share into the tracker. Takes ownership of the
     // DashShare via heap allocation matching process_shares()'s pattern.
     // Returns the share_hash that was computed during verification. Throws on
