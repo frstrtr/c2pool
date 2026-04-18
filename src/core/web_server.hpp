@@ -563,6 +563,14 @@ public:
 
     // Pool hashrate (H/s) — from P2P node's get_pool_attempts_per_second
     void set_pool_hashrate_fn(std::function<double()> fn) { m_pool_hashrate_fn = thread_safe_wrap(std::move(fn)); }
+
+    // Bypass the is_node_ready() + has_work gating. Used by coin targets
+    // (e.g. c2pool-dash) that drive their own work pipeline and don't rely
+    // on WebServer's internal refresh_work()/m_cached_template. When true,
+    // is_node_ready() returns true immediately and sync_status reports
+    // has_work=true regardless of the cached template.
+    void set_dashboard_always_ready(bool v) { m_dashboard_always_ready.store(v, std::memory_order_relaxed); }
+    bool is_dashboard_always_ready() const { return m_dashboard_always_ready.load(std::memory_order_relaxed); }
     double get_pool_hashrate() const { return m_pool_hashrate_fn ? m_pool_hashrate_fn() : 0.0; }
 
     // Rate monitor stats for p2pool-style status (DOA%, time window)
@@ -1024,6 +1032,7 @@ private:
     uint16_t m_cached_miner_count{0};
     double m_cached_pool_hashrate{0};
     std::function<double()> m_pool_hashrate_fn;
+    std::atomic<bool> m_dashboard_always_ready{false};
 
     // THE checkpoint callbacks (set by node layer)
     checkpoint_store_fn_t m_checkpoint_latest_fn;

@@ -4575,7 +4575,11 @@ nlohmann::json MiningInterface::rest_sync_status()
     // The placeholder template has height=1 and coinbasevalue=5000000000 —
     // reject it by requiring height > 100.
     bool has_work = false;
-    {
+    if (m_dashboard_always_ready.load(std::memory_order_relaxed)) {
+        // Coin-driven work pipelines (c2pool-dash) manage their own work;
+        // report has_work=true so the loading gate doesn't stall.
+        has_work = true;
+    } else {
         std::lock_guard<std::mutex> lock(m_work_mutex);
         has_work = !m_cached_template.is_null()
             && m_cached_template.value("coinbasevalue", uint64_t(0)) > 0
@@ -4607,6 +4611,12 @@ nlohmann::json MiningInterface::rest_sync_status()
 
 bool MiningInterface::is_node_ready()
 {
+    // Coin targets that drive their own work pipeline (c2pool-dash) can
+    // bypass the internal readiness gate — their dashboard is ready as
+    // soon as the HTTP server is up.
+    if (m_dashboard_always_ready.load(std::memory_order_relaxed))
+        return true;
+
     // Check sharechain has verified shares
     if (m_sharechain_stats_fn) {
         auto sc = m_sharechain_stats_fn();
