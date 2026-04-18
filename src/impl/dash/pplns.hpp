@@ -83,9 +83,17 @@ inline Result compute_payouts(
 
     // Aggregate weight by pubkey_hash. Key on pubkey hex for deterministic
     // iteration; value carries the original uint160 for script building.
+    // Per-share weight splits into worker portion and donation portion —
+    // p2pool-dash WeightsSkipList returns (weights, total_weight,
+    // donation_weight) where each share contributes:
+    //   worker_w   = w * (65535 - share.donation) / 65535
+    //   donation_w = w * share.donation          / 65535
+    // and total_weight = Σ(worker_w) + donation_weight. Shares with
+    // donation=0 behave identically to the previous all-worker path.
     struct Entry { uint160 pubkey_hash; double weight{0.0}; };
     std::map<std::string, Entry> by_key;
-    double total_weight = 0.0;
+    double worker_total_weight = 0.0;
+    double donation_weight     = 0.0;
     size_t shares_seen  = 0;
 
     try {
@@ -96,11 +104,19 @@ inline Result compute_payouts(
                 if constexpr (std::is_same_v<S, dash::DashShare>) {
                     double w = dash::coinbase::bits_to_difficulty(obj->m_bits);
                     if (w <= 0.0) return;
+                    double dono_frac = static_cast<double>(obj->m_donation)
+                                     / 65535.0;
+                    if (dono_frac < 0.0) dono_frac = 0.0;
+                    if (dono_frac > 1.0) dono_frac = 1.0;
+                    double worker_w = w * (1.0 - dono_frac);
+                    double dono_w   = w * dono_frac;
+
                     std::string key = obj->m_pubkey_hash.ToString();
                     auto& e = by_key[key];
                     e.pubkey_hash = obj->m_pubkey_hash;
-                    e.weight += w;
-                    total_weight += w;
+                    e.weight += worker_w;
+                    worker_total_weight += worker_w;
+                    donation_weight += dono_w;
                     shares_seen += 1;
                 }
             });
@@ -110,6 +126,7 @@ inline Result compute_payouts(
         use_fallback();
         return r;
     }
+    double total_weight = worker_total_weight + donation_weight;
 
     r.total_weight = total_weight;
     r.shares_used  = shares_seen;
@@ -138,20 +155,17 @@ inline Result compute_payouts(
         return r;
     }
 
-    // Dust-drop residue + rounding → DONATION_SCRIPT. Matches p2pool-dash
-    // data.py:685 get_expected_payouts:
-    //   res[DONATION_SCRIPT] = res.get(DONATION_SCRIPT, 0)
-    //                        + subsidy - sum(res.itervalues())
-    // This is what /current_payouts and per-share PPLNS tooltips need to
-    // render (the donation line the dashboard displays). The amount is
-    // typically tiny (rounding leftover + occasional dust), which is why
-    // donation shows as a small slice in the treemap.
-    if (miner_value > allocated) {
+    // Donation line — ALWAYS emitted (matches p2pool-dash data.py:685
+    // get_expected_payouts unconditional res[DONATION_SCRIPT] = ...
+    // entry). The amount is miner_value - Σworkers; typically a tiny
+    // rounding leftover, sometimes 0. Emitting zero-value donations keeps
+    // the dashboard tooltip consistent across every share (no missing
+    // donation line when integer arithmetic happens to sum exactly).
+    {
         std::vector<unsigned char> donation_script(
             dash::DONATION_SCRIPT.begin(), dash::DONATION_SCRIPT.end());
-        uint64_t residue = miner_value - allocated;
-        // Merge if a worker happens to share the donation script hash
-        // (shouldn't happen on a real chain, but stay defensive).
+        uint64_t residue = (miner_value > allocated)
+                         ? (miner_value - allocated) : 0;
         auto existing = std::find_if(tentative.begin(), tentative.end(),
             [&](const Payout& p) { return p.script == donation_script; });
         if (existing != tentative.end()) {

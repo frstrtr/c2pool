@@ -63,6 +63,7 @@ int main(int argc, char* argv[])
     uint16_t    stratum_port   = 0;       // 0 = disabled; canonical Dash p2pool stratum port is 7903
     std::string mining_address;           // required when stratum+rpc are wired
     double      share_difficulty_default = 0.001;  // vardiff lands later
+    double      donation_percentage = 1.0;  // p2pool-dash default (main.py:1110)
     bool        pplns_enabled   = true;   // default: PPLNS payouts across chain contributors
     size_t      pplns_window    = 0;      // 0 → use params.chain_length
     bool testnet = false;
@@ -121,6 +122,12 @@ int main(int argc, char* argv[])
         }
         else if (arg == "--pplns-window" && i + 1 < argc) {
             pplns_window = static_cast<size_t>(std::stoul(argv[++i]));
+        }
+        else if ((arg == "--donation-percentage" || arg == "--donation")
+                 && i + 1 < argc) {
+            donation_percentage = std::stod(argv[++i]);
+            if (donation_percentage < 0.0)   donation_percentage = 0.0;
+            if (donation_percentage > 100.0) donation_percentage = 100.0;
         }
         else if (arg == "--http-port" && i + 1 < argc) {
             http_port = static_cast<uint16_t>(std::stoul(argv[++i]));
@@ -1395,9 +1402,11 @@ int main(int argc, char* argv[])
                     if (share_bits == 0) share_bits = 0x1f00ffff;
                 }
 
+                uint16_t donation_bps = static_cast<uint16_t>(std::min(
+                    65535.0, std::max(0.0, 65535.0 * donation_percentage / 100.0)));
                 auto built = dash::share_builder::build(
                     work, node.tracker(), miner_pubkey_hash, payouts, pool_tag, params,
-                    share_bits, share_difficulty_default);
+                    share_bits, share_difficulty_default, donation_bps);
 
                 // Publish the coinbase's mineable tx_outs to /current_payouts.
                 // Driven off built.tx_outs_mineable (worker_tx || donation_tx,
