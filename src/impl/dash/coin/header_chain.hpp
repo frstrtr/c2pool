@@ -86,6 +86,20 @@ inline DashChainParams make_dash_chain_params_mainnet() {
         return dash::crypto::hash_x11(data);
     };
     p.block_hash_func = p.pow_func;
+
+    // Fast-start checkpoint: Dash mainnet block 2400000 (2025-01-04).
+    // Cold start skips 2.4M headers of validation, saving ~30s syncing
+    // from genesis. A CLI override (--dash-header-checkpoint) can bump
+    // this forward for even faster first-starts. Matches c2pool-ltc's
+    // --header-checkpoint pattern.
+    //
+    // chosen to be ~50k blocks behind current tip; old enough that
+    // stale binaries still work without override, recent enough to
+    // skip nearly all historical sync cost.
+    p.fast_start_checkpoint = DashChainParams::Checkpoint{};
+    p.fast_start_checkpoint->height = 2400000;
+    p.fast_start_checkpoint->hash.SetHex(
+        "000000000000002883c9151a37092287c1773c5a4d175a8f688373daa631f934");
     return p;
 }
 
@@ -223,23 +237,11 @@ public:
             }
             load_from_db();
         }
-        // Seed genesis as stub if chain is empty (so block 1's prev_hash resolves)
-        if (m_tip.IsNull() && !m_params.genesis_hash.IsNull()) {
-            IndexEntry genesis;
-            genesis.hash = m_params.genesis_hash;
-            genesis.height = 0;
-            genesis.chain_work = uint256::ONE;
-            genesis.prev_hash = uint256::ZERO;
-            genesis.status = HEADER_VALID_CHAIN;
-            m_headers[m_params.genesis_hash] = genesis;
-            m_height_index[0] = m_params.genesis_hash;
-            m_tip = m_params.genesis_hash;
-            m_tip_height = 0;
-            m_best_work = genesis.chain_work;
-            persist_header(genesis);
-            persist_tip();
-            LOG_INFO << "[EMB-DASH] Genesis seeded: " << m_params.genesis_hash.GetHex().substr(0, 16);
-        }
+        // Prefer fast-start checkpoint over genesis when chain is empty.
+        // Matches c2pool-ltc init order: an anchor block jumps us past
+        // millions of irrelevant headers, saving ~30s of cold-sync time.
+        // (A CLI --dash-header-checkpoint may further bump this via
+        // set_dynamic_checkpoint() after init returns.)
         if (m_tip.IsNull() && m_params.fast_start_checkpoint.has_value()) {
             auto& cp = m_params.fast_start_checkpoint.value();
             IndexEntry entry;
@@ -255,7 +257,26 @@ public:
             m_best_work = entry.chain_work;
             persist_header(entry);
             persist_tip();
-            LOG_INFO << "[EMB-DASH] Fast-start checkpoint: height=" << cp.height;
+            LOG_INFO << "[EMB-DASH] Fast-start checkpoint: height=" << cp.height
+                     << " hash=" << cp.hash.GetHex().substr(0, 16);
+        }
+        // Fall back to genesis as stub when no checkpoint is configured
+        // (so block 1's prev_hash resolves).
+        if (m_tip.IsNull() && !m_params.genesis_hash.IsNull()) {
+            IndexEntry genesis;
+            genesis.hash = m_params.genesis_hash;
+            genesis.height = 0;
+            genesis.chain_work = uint256::ONE;
+            genesis.prev_hash = uint256::ZERO;
+            genesis.status = HEADER_VALID_CHAIN;
+            m_headers[m_params.genesis_hash] = genesis;
+            m_height_index[0] = m_params.genesis_hash;
+            m_tip = m_params.genesis_hash;
+            m_tip_height = 0;
+            m_best_work = genesis.chain_work;
+            persist_header(genesis);
+            persist_tip();
+            LOG_INFO << "[EMB-DASH] Genesis seeded: " << m_params.genesis_hash.GetHex().substr(0, 16);
         }
         return true;
     }
