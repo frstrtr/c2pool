@@ -363,10 +363,14 @@ int main(int argc, char* argv[])
             // map). Without pplns_current the zoom panel hides.
             if (mi_ptr) {
                 result["pplns_current"] = mi_ptr->rest_current_payouts();
+                // Per-share map — EXACT match only. get_pplns_for_tip() returns
+                // a fallback entry on miss, which would flood the map with the
+                // same payouts for every share. The hover-zoom JS falls back
+                // to pplns_current on its own for uncached shares.
                 nlohmann::json pplns_map = nlohmann::json::object();
                 for (const auto& s : result["shares"]) {
                     std::string sh = s["h"].get<std::string>();
-                    auto p = mi_ptr->get_pplns_for_tip(sh);
+                    auto p = mi_ptr->get_pplns_for_tip_exact(sh);
                     if (!p.empty()) pplns_map[sh] = std::move(p);
                 }
                 if (!pplns_map.empty()) result["pplns"] = std::move(pplns_map);
@@ -390,6 +394,87 @@ int main(int argc, char* argv[])
         web_server->start();
         std::cout << "[WEB] dashboard listening on " << http_host << ":"
                   << http_port << std::endl;
+
+        // Background per-share PPLNS precomputer for the Sharechain Explorer.
+        // Mirrors LTC's start_pplns_precompute(): walk the window, compute
+        // PPLNS from each share's perspective, store under the share's short
+        // hash so the hover-zoom treemap shows the distribution as it was at
+        // that share's tip — not the current tip for every share.
+        std::thread([&node, &params, testnet, mi]() {
+            const uint8_t p2pkh_ver = testnet ? 140 : 76;
+            const uint8_t p2sh_ver  = testnet ?  19 : 16;
+            constexpr uint64_t disp_subsidy = 100'000'000ULL;
+            std::vector<unsigned char> dummy = {0x76,0xa9,0x14,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0x88,0xac};
+            auto& chain = node.tracker().chain;
+
+            auto compute_one = [&](const uint256& h) -> bool {
+                try {
+                    auto r = dash::pplns::compute_payouts(
+                        chain, h, params.chain_length, disp_subsidy, dummy);
+                    if (r.used_fallback || r.payouts.empty()) return false;
+                    nlohmann::json pplns_json = nlohmann::json::object();
+                    for (const auto& p : r.payouts) {
+                        std::string addr = core::script_to_address(
+                            p.script, "" /*no bech32*/, p2pkh_ver, p2sh_ver);
+                        if (addr.empty()) addr = HexStr(p.script);
+                        pplns_json[addr] = p.amount / 1e8;
+                    }
+                    std::string short_hash = h.GetHex().substr(0, 16);
+                    mi->store_pplns_for_tip(short_hash, std::move(pplns_json));
+                    return true;
+                } catch (...) { return false; }
+            };
+
+            // Wait for the chain to reach full depth before the first pass so
+            // early shares (at chain position 0..N where N < chain_length)
+            // don't all degrade to used_fallback. If we never reach full depth
+            // (startup on a sparse network) still proceed after 5 min.
+            for (int i = 0; i < 300; ++i) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                if (node.tracker().chain.size() >=
+                    static_cast<size_t>(params.chain_length)) break;
+            }
+
+            LOG_INFO << "[PPLNS-Precompute] starting (chain.size="
+                     << node.tracker().chain.size() << ")";
+
+            // Main loop: every 20s, scan the current window from best and fill
+            // PPLNS for any share not yet cached (exact match). New tips
+            // arriving during the run get picked up on the next pass.
+            while (true) {
+                uint256 best = node.best_share_hash();
+                if (best.IsNull()) {
+                    std::this_thread::sleep_for(std::chrono::seconds(20));
+                    continue;
+                }
+                int32_t height = chain.get_height(best);
+                int32_t walk = std::min(height, static_cast<int32_t>(params.chain_length));
+                std::vector<uint256> hashes;
+                hashes.reserve(walk);
+                try {
+                    for (auto&& [h, data] : chain.get_chain(best, walk))
+                        hashes.push_back(h);
+                } catch (...) {
+                    std::this_thread::sleep_for(std::chrono::seconds(20));
+                    continue;
+                }
+
+                int scanned = 0, computed = 0;
+                for (const auto& h : hashes) {
+                    ++scanned;
+                    std::string sh = h.GetHex().substr(0, 16);
+                    if (!mi->get_pplns_for_tip_exact(sh).empty()) continue;
+                    if (compute_one(h)) ++computed;
+                    // Yield so we don't hog the tracker.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+                if (computed > 0) {
+                    LOG_INFO << "[PPLNS-Precompute] pass: scanned=" << scanned
+                             << " new_cached=" << computed;
+                }
+                std::this_thread::sleep_for(std::chrono::seconds(20));
+            }
+        }).detach();
     }
 
     // ── Coin P2P Node (dashd connection) ──
