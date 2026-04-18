@@ -2229,15 +2229,15 @@
                             <div class="legend-swatch" style="background:#9c27b0"></div>
                             <span>Node fee share</span>
                         </div>
-                        <div class="legend-item">
+                        <div class="legend-item" id="legend-ltc-block">
                             <div class="legend-swatch" style="background:#28a745;border:2px solid #ffd700;box-shadow:0 0 3px rgba(255,215,0,0.5)"></div>
-                            <span style="color:#0070dd;font-weight:600">LTC block</span>
+                            <span id="legend-ltc-block-label" style="color:#0070dd;font-weight:600">LTC block</span>
                         </div>
-                        <div class="legend-item">
+                        <div class="legend-item" id="legend-doge-block">
                             <div class="legend-swatch" style="background:#28a745;border:2px solid #00e5ff"></div>
                             <span style="color:#a335ee;font-weight:600">DOGE block</span>
                         </div>
-                        <div class="legend-item">
+                        <div class="legend-item" id="legend-twin-block">
                             <div class="legend-swatch" style="background:linear-gradient(135deg,#ff8000,#cc6600);border:2px solid #ffaa00;box-shadow:0 0 6px rgba(255,128,0,0.5)"></div>
                             <span style="color:#ff8000;font-weight:600">Twin block</span>
                         </div>
@@ -2788,17 +2788,20 @@
             // Coin-specific legend relabeling. Dash uses a single share
             // version (v16) with no V35/V36 transition — hide the V35/V36
             // rows and rename "V36 (others)" to the native-coin label.
+            // Dash isn't merge-mined, so hide the DOGE + Twin block rows
+            // too, and relabel "LTC block" → "DASH block".
             if (info && info.symbol === 'DASH') {
-                var r1 = document.getElementById('defrag-row-v36native');
-                if (r1) r1.style.display = 'none';
-                var r2 = document.getElementById('defrag-row-v36sig');
-                if (r2) r2.style.display = 'none';
-                var lsig = document.getElementById('legend-v36sig');
-                if (lsig) lsig.style.display = 'none';
-                var l35 = document.getElementById('legend-v35only');
-                if (l35) l35.style.display = 'none';
+                var hideIds = ['defrag-row-v36native', 'defrag-row-v36sig',
+                               'legend-v36sig', 'legend-v35only',
+                               'legend-doge-block', 'legend-twin-block'];
+                hideIds.forEach(function(id) {
+                    var el = document.getElementById(id);
+                    if (el) el.style.display = 'none';
+                });
                 var lab = document.getElementById('legend-v36native-label');
                 if (lab) lab.textContent = 'Dash v16 share';
+                var blkLabel = document.getElementById('legend-ltc-block-label');
+                if (blkLabel) blkLabel.textContent = 'DASH block';
             }
 
             // Now load everything else
