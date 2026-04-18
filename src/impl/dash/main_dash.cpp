@@ -34,12 +34,18 @@
 
 #include <boost/asio.hpp>
 
+#include <iomanip>
 #include <iostream>
 #include <string>
 #include <thread>
 #include <chrono>
 
 namespace io = boost::asio;
+
+// D3 (parity audit): latest miner-value (subsidy - masternode/superblock
+// payments) published from the JOB cycle. Background PPLNS precomputer
+// reads this so dashboard tooltip amounts match real network subsidy.
+static std::atomic<uint64_t> g_latest_miner_value{0};
 
 int main(int argc, char* argv[])
 {
@@ -418,9 +424,17 @@ int main(int argc, char* argv[])
         std::thread([&node, &params, testnet, mi]() {
             const uint8_t p2pkh_ver = testnet ? 140 : 76;
             const uint8_t p2sh_ver  = testnet ?  19 : 16;
-            constexpr uint64_t disp_subsidy = 100'000'000ULL;
             std::vector<unsigned char> dummy = {0x76,0xa9,0x14,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0x88,0xac};
             auto& chain = node.tracker().chain;
+            // D3 (parity audit): use the real miner-value from the latest
+            // GBT so tooltip amounts reflect actual Dash subsidy (~1.77 DASH
+            // post-halving) rather than a fixed 1e8 stand-in. Percentages
+            // don't change either way — but absolute amounts become truthful.
+            // g_latest_miner_value is published from the JOB cycle below.
+            auto current_subsidy = [&]() -> uint64_t {
+                uint64_t v = g_latest_miner_value.load();
+                return v > 0 ? v : 100'000'000ULL;
+            };
 
             // Single PPLNS computation. Must be called with a shared_lock on
             // node.tracker_mutex() already held by the caller — compute_payouts
@@ -432,7 +446,7 @@ int main(int argc, char* argv[])
             auto compute_one_locked = [&](const uint256& h) -> std::optional<nlohmann::json> {
                 try {
                     auto r = dash::pplns::compute_payouts(
-                        chain, h, params.chain_length, disp_subsidy, dummy);
+                        chain, h, params.chain_length, current_subsidy(), dummy);
                     if (r.used_fallback || r.payouts.empty()) return std::nullopt;
                     nlohmann::json pplns_json = nlohmann::json::object();
                     for (const auto& p : r.payouts) {
@@ -845,6 +859,9 @@ int main(int argc, char* argv[])
                 // Miner value = block reward minus masternode/treasury.
                 uint64_t miner_value = (work.m_coinbase_value > work.m_payment_amount)
                     ? work.m_coinbase_value - work.m_payment_amount : 0;
+                // D3: publish the current miner-value so the background
+                // PPLNS precomputer uses a real subsidy for tooltip amounts.
+                g_latest_miner_value.store(miner_value);
 
                 // Compute PPLNS payout distribution (or single-miner fallback).
                 std::vector<dash::coinbase::MinerPayout> payouts;
@@ -936,17 +953,35 @@ int main(int argc, char* argv[])
     // Run IO context
     std::cout << "[P2P] Running event loop..." << std::endl;
 
-    // Status timer
+    // B5 (parity audit): heartbeat with peers + hashrate + verified count
+    // so operator sees ongoing state at a glance. LTC has `heartbeat_log`
+    // with similar fields; Dash's existing [STATUS] line only covered
+    // shares / headers / miners.
     io::steady_timer status(ioc, std::chrono::seconds(10));
     std::function<void(const boost::system::error_code&)> status_fn;
     status_fn = [&](const boost::system::error_code& ec) {
         if (ec) return;
         std::cout << "[STATUS] shares=" << node.tracker().chain.size()
+                  << " verified=" << node.tracker().verified.size()
+                  << " peers=" << node.peer_count()
                   << " headers=" << header_chain.height()
                   << "/" << header_chain.size()
                   << (header_chain.is_synced() ? " SYNCED" : " syncing");
         if (stratum_server)
             std::cout << " miners=" << stratum_server->session_count();
+        // Pool hashrate (X11 H/s from sharechain attempts-per-second).
+        try {
+            double hps = node.pool_hashrate();
+            if (hps > 0) {
+                const char* unit = "H/s";
+                double v = hps;
+                if (v > 1e9) { v /= 1e9; unit = "GH/s"; }
+                else if (v > 1e6) { v /= 1e6; unit = "MH/s"; }
+                else if (v > 1e3) { v /= 1e3; unit = "KH/s"; }
+                std::cout << " hash=" << std::fixed
+                          << std::setprecision(2) << v << unit;
+            }
+        } catch (...) {}
         std::cout << std::endl;
         status.expires_after(std::chrono::seconds(10));
         status.async_wait(status_fn);
@@ -964,6 +999,23 @@ int main(int argc, char* argv[])
     };
     enh_stats.async_wait(enh_stats_fn);
 
+    // B4 (parity audit): graceful shutdown on SIGINT/SIGTERM. Uses asio
+    // signal_set which runs the handler on the io_context thread — clean
+    // interleave with every other asio timer. Handler flushes the LevelDB
+    // persistence buffers (verified + removals) so we don't lose state on
+    // exit, then calls ioc.stop() so the ioc.run() below returns.
+    boost::asio::signal_set signals(ioc, SIGINT, SIGTERM);
+    signals.async_wait([&](const boost::system::error_code& ec, int sig) {
+        if (ec) return;
+        std::cout << "\n[Dash] Received signal " << sig
+                  << ", flushing state + shutting down..." << std::endl;
+        try { node.shutdown_storage(); }
+        catch (const std::exception& e) {
+            LOG_WARNING << "[Dash] shutdown_storage: " << e.what();
+        }
+        ioc.stop();
+    });
+
     try {
         ioc.run();
     } catch (const std::exception& e) {
@@ -972,6 +1024,9 @@ int main(int argc, char* argv[])
 
     if (web_server) web_server->stop();
     enhanced_node->shutdown();
+    // Safety net: flush buffers again in case we exited without hitting
+    // the signal handler (uncaught exception from ioc.run()).
+    try { node.shutdown_storage(); } catch (...) {}
 
     std::cout << std::endl;
     std::cout << "[RESULT] Final state:" << std::endl;
