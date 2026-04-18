@@ -163,9 +163,14 @@ public:
         load_persisted_shares();
 
         m_tracker.m_on_share_verified = [this](const uint256& hash) {
+            // Flush immediately. Batching to 50 meant shares persisted
+            // during the window between persist_share() and the batch
+            // flush could come back unverified after a restart — the
+            // LevelDB entry existed but its is_verified metadata marker
+            // did not. One LevelDB write per ~20s share is negligible
+            // and eliminates the reload-unverified class of bugs.
             m_verified_flush_buf.push_back(hash);
-            if (m_verified_flush_buf.size() >= 50)
-                flush_verified_to_leveldb();
+            flush_verified_to_leveldb();
         };
         m_tracker.chain.on_removed([this](const uint256& hash) {
             m_removal_flush_buf.push_back(hash);
@@ -1064,8 +1069,27 @@ public:
                 } catch (...) {}
             }
         }
+        // Reconciliation: any share in our local chain that isn't flagged
+        // verified in LevelDB (e.g. persisted before a prior batch flush
+        // fired, so the is_verified marker never landed). We wrote those
+        // shares ourselves after share_init_verify accepted them, so they
+        // are trustworthy — promote them to verified here and flush so
+        // the next restart doesn't repeat this walk.
+        int reconciled = 0;
+        for (const auto& h : all_hashes) {
+            if (!m_tracker.chain.contains(h)) continue;
+            if (m_tracker.verified.contains(h)) continue;
+            try {
+                auto& share_var = m_tracker.chain.get_share(h);
+                m_tracker.verified.add(share_var);
+                m_verified_flush_buf.push_back(h);
+                ++reconciled;
+            } catch (...) {}
+        }
+        if (reconciled > 0) flush_verified_to_leveldb();
         LOG_INFO << "[Dash] Loaded " << loaded << " shares from LevelDB "
-                 << "(pre-verified=" << pre_verified << ")";
+                 << "(pre-verified=" << pre_verified
+                 << " reconciled=" << reconciled << ")";
 
         // Prune shares we skipped — stale DB entries not in active window.
         if (skip > 0) {

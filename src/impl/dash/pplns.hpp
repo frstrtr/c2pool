@@ -138,12 +138,27 @@ inline Result compute_payouts(
         return r;
     }
 
-    // Dust-drop residue + rounding → largest payout gets the difference.
+    // Dust-drop residue + rounding → DONATION_SCRIPT. Matches p2pool-dash
+    // data.py:685 get_expected_payouts:
+    //   res[DONATION_SCRIPT] = res.get(DONATION_SCRIPT, 0)
+    //                        + subsidy - sum(res.itervalues())
+    // This is what /current_payouts and per-share PPLNS tooltips need to
+    // render (the donation line the dashboard displays). The amount is
+    // typically tiny (rounding leftover + occasional dust), which is why
+    // donation shows as a small slice in the treemap.
     if (miner_value > allocated) {
+        std::vector<unsigned char> donation_script(
+            dash::DONATION_SCRIPT.begin(), dash::DONATION_SCRIPT.end());
         uint64_t residue = miner_value - allocated;
-        auto it = std::max_element(tentative.begin(), tentative.end(),
-            [](const Payout& a, const Payout& b) { return a.amount < b.amount; });
-        it->amount += residue;
+        // Merge if a worker happens to share the donation script hash
+        // (shouldn't happen on a real chain, but stay defensive).
+        auto existing = std::find_if(tentative.begin(), tentative.end(),
+            [&](const Payout& p) { return p.script == donation_script; });
+        if (existing != tentative.end()) {
+            existing->amount += residue;
+        } else {
+            tentative.push_back({std::move(donation_script), residue});
+        }
     }
 
     // Deterministic coinbase output order: sort by script bytes.
