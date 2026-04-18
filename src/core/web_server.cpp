@@ -2956,6 +2956,13 @@ nlohmann::json MiningInterface::rest_current_payouts()
                     addr = resolve_addr(p2pkh);
                 }
             }
+            // OP_RETURN payment (Dash platform payout uses the "!" prefix
+            // encoding — scriptPubKey starts with 0x6a OP_RETURN + payload).
+            // These aren't decodable to an address; p2pool-dash surfaces them
+            // as "platform" rather than raw bytes. Matches dashboard parity.
+            if (addr.empty() && !script_bytes.empty() && script_bytes[0] == 0x6a) {
+                addr = "platform (OP_RETURN)";
+            }
             if (addr.empty())
                 addr = script_hex;
             // p2pool returns coins (not satoshis)
