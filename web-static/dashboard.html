@@ -5927,7 +5927,11 @@
                 document.getElementById('defrag-dead').textContent = dead;
                 document.getElementById('defrag-verified').textContent = verified;
                 document.getElementById('defrag-chain-len').textContent = data.chain_length || '-';
-                document.getElementById('defrag-blocks').textContent = ltcBlocks + ' LTC / ' + dogeBlocks + ' DOGE';
+                var _primarySym = (typeof currency_info !== 'undefined' && currency_info.symbol) ? currency_info.symbol : 'LTC';
+                var _hasMerged = (typeof currency_info !== 'undefined' && currency_info.merged_symbol);
+                document.getElementById('defrag-blocks').textContent = _hasMerged
+                    ? (ltcBlocks + ' ' + _primarySym + ' / ' + dogeBlocks + ' ' + currency_info.merged_symbol)
+                    : (ltcBlocks + ' ' + _primarySym);
                 document.getElementById('defrag-fee').textContent = fee;
                 document.getElementById('defrag-v36native').textContent = v36native;
                 document.getElementById('defrag-v36sig').textContent = v36sig;
@@ -6114,12 +6118,13 @@
                     var fitAddr = Math.max(6, Math.min(fitPct * 0.5, r.w / 14, 11));
                     var fitVer = Math.max(6, Math.min(fitPct * 0.4, 9));
 
-                    // LTC %
+                    // Primary-chain % (LTC / DASH / etc)
                     if (r.w > 28 && r.h > 14) {
                         var el = document.createElement('div');
                         el.className = 'pm-pct';
                         el.style.fontSize = fitPct + 'px';
-                        el.textContent = (r.pct * 100).toFixed(1) + (r.w > 60 ? '% LTC' : '%');
+                        var _pctSym = (typeof currency_info !== 'undefined' && currency_info.symbol) ? currency_info.symbol : 'LTC';
+                        el.textContent = (r.pct * 100).toFixed(1) + (r.w > 60 ? '% ' + _pctSym : '%');
                         cell.appendChild(el);
                     }
                     // DOGE %
@@ -6219,7 +6224,7 @@
                             if (mHr > 0) hrLine = '<div style="color:var(--text-secondary)">' + format_hashrate(mHr) + '</div>';
                             tooltip.innerHTML =
                                 '<div style="color:var(--primary);font-weight:700;margin-bottom:4px">' + r.addr + '</div>' +
-                                '<div style="font-weight:600">' + (r.pct*100).toFixed(2) + '% \u2014 ' + r.amt.toFixed(8) + ' LTC</div>' +
+                                '<div style="font-weight:600">' + (r.pct*100).toFixed(2) + '% \u2014 ' + r.amt.toFixed(8) + ' ' + ((typeof currency_info !== 'undefined' && currency_info.symbol) ? currency_info.symbol : 'LTC') + '</div>' +
                                 dogeLine + hrLine + verLine +
                                 '<div style="color:var(--text-muted);font-size:0.75em;margin-top:4px">Click to view on Blockchair</div>';
                             tooltip.style.display = 'block';
