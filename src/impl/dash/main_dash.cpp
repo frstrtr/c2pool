@@ -70,6 +70,8 @@ int main(int argc, char* argv[])
     uint16_t    http_port       = 0;             // 0 = disable dashboard; e.g. 7904
     std::string dashboard_dir;                   // static files for web dashboard
     std::string http_cors_origin;
+    bool        explorer_enabled = false;
+    std::string explorer_url;                    // override for Explorer nav link
     // p2pool-dash/p2p.py:704 defaults desired_outgoing_conns=10. Matching
     // that here: 4 was below the bootstrap count (we have 4 bootstrap hosts)
     // so try_connect_more_peers never expanded past the initial connects.
@@ -131,6 +133,13 @@ int main(int argc, char* argv[])
         }
         else if (arg == "--cors-origin" && i + 1 < argc) {
             http_cors_origin = argv[++i];
+        }
+        else if (arg == "--explorer") {
+            explorer_enabled = true;
+        }
+        else if (arg == "--explorer-url" && i + 1 < argc) {
+            explorer_enabled = true;
+            explorer_url = argv[++i];
         }
         else if (arg == "--target-peers" && i + 1 < argc) {
             target_outbound_peers = static_cast<size_t>(std::stoul(argv[++i]));
@@ -344,6 +353,11 @@ int main(int argc, char* argv[])
         if (!http_cors_origin.empty()) mi->set_cors_origin(http_cors_origin);
         if (stratum_port != 0)         mi->set_worker_port(stratum_port);
         if (!dashboard_dir.empty())    web_server->set_dashboard_dir(dashboard_dir);
+        if (explorer_enabled) {
+            web_server->set_explorer_enabled(true);
+            if (!explorer_url.empty())
+                web_server->set_explorer_url(explorer_url);
+        }
 #ifdef C2POOL_VERSION
         mi->set_pool_version("c2pool-dash/" C2POOL_VERSION);
 #endif
