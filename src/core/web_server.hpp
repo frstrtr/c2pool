@@ -601,6 +601,30 @@ public:
         std::lock_guard<std::mutex> l(m_work_mutex);
         return m_cached_pplns_outputs;
     }
+
+    // Exact-match lookup (no fallback). Returns empty object if missing.
+    // Used by coins that want to know "did we actually cache PPLNS for this
+    // share?" rather than always falling back to an arbitrary entry.
+    nlohmann::json get_pplns_for_tip_exact(const std::string& tip_key) {
+        std::lock_guard<std::mutex> lock(m_pplns_cache_mutex);
+        auto it = m_pplns_per_tip.find(tip_key);
+        return (it != m_pplns_per_tip.end()) ? it->second : nlohmann::json::object();
+    }
+
+    // Store a per-share PPLNS snapshot under the given key (full or short
+    // share hash — the sharechain_window_fn must look up by the same form).
+    // Used by coins that drive their own PPLNS precomputation loop instead of
+    // going through start_pplns_precompute / refresh_work.
+    void store_pplns_for_tip(const std::string& tip_key, nlohmann::json pplns) {
+        std::lock_guard<std::mutex> lock(m_pplns_cache_mutex);
+        m_pplns_per_tip[tip_key] = std::move(pplns);
+        constexpr size_t MAX_PPLNS_CACHE = 5000;
+        if (m_pplns_per_tip.size() > MAX_PPLNS_CACHE * 2) {
+            auto keep = std::move(m_pplns_per_tip[tip_key]);
+            m_pplns_per_tip.clear();
+            m_pplns_per_tip[tip_key] = std::move(keep);
+        }
+    }
     // THE state root for sharechain anchoring (used by merged coinbase too)
     uint256 get_the_state_root() const { std::lock_guard<std::mutex> l(m_work_mutex); return m_cached_the_state_root; }
     // String-based overload for donation script

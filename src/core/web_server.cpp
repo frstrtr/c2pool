@@ -3615,12 +3615,13 @@ void MiningInterface::cache_pplns_at_tip()
     std::lock_guard<std::mutex> lock(m_pplns_cache_mutex);
     m_pplns_per_tip[tip] = std::move(pplns);
 
-    // Evict old entries to prevent unbounded growth.
-    // Keep at most 100 entries (~50 minutes of tips at 30s intervals).
-    constexpr size_t MAX_PPLNS_CACHE = 100;
+    // Evict old entries to prevent unbounded growth. Cap at 5000 so Dash's
+    // chain_length=4320 precompute + live tip churn both fit. LTC's older
+    // 100-entry comment was sized for live tips only; precompute now stores
+    // one entry per share in the window, so the cap has to be larger than
+    // the biggest window we serve.
+    constexpr size_t MAX_PPLNS_CACHE = 5000;
     if (m_pplns_per_tip.size() > MAX_PPLNS_CACHE * 2) {
-        // Bulk clear — cheaper than selective eviction on unordered_map
-        // Keep only the current tip entry
         auto current = std::move(m_pplns_per_tip[tip]);
         m_pplns_per_tip.clear();
         m_pplns_per_tip[tip] = std::move(current);
