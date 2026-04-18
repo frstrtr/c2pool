@@ -245,6 +245,20 @@ private:
                  << " services=0x" << std::hex << msg->m_services << std::dec
                  << " subver=" << msg->m_subversion;
 
+        // SPV C5 (parity audit): warn when dashd protocol is too old for
+        // Dash v20+ features we depend on — DIP3 CBTX extra_payload,
+        // ChainLocks, v16 share masternode payment fields. 70230 is the
+        // minimum that carries all of these correctly; older dashd would
+        // silently build mismatched coinbases at block-find time.
+        constexpr uint32_t MIN_DASHD_PROTO = 70230;
+        if (msg->m_version < MIN_DASHD_PROTO) {
+            LOG_WARNING << "[DashP2P] dashd protocol " << msg->m_version
+                        << " < minimum " << MIN_DASHD_PROTO
+                        << " (v20+). Mining with this peer may produce "
+                        << "invalid blocks (missing DIP3 payload, stale "
+                        << "masternode fields). Upgrade dashd.";
+        }
+
         if (m_on_peer_height && msg->m_start_height > 0)
             m_on_peer_height(msg->m_start_height);
 
