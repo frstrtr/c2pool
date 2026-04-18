@@ -522,6 +522,103 @@ int main(int argc, char* argv[])
             t["height"] = best.IsNull() ? 0 : chain.get_height(best);
             return t;
         });
+        // Individual share lookup for /web/share/<hash> (share.html).
+        // Returns the full share-detail JSON the dashboard's share page
+        // expects (share_data, block header+gentx, local metadata).
+        // Without this wiring /web/share returns "share not found" so
+        // clicking any share on the Explorer grid shows a blank page.
+        mi->set_share_lookup_fn(
+            [&node, testnet, p2pkh_ver = (testnet ? 140 : 76),
+             p2sh_ver = (testnet ? 19 : 16)]
+            (const std::string& hash_hex) -> nlohmann::json {
+                uint256 hash;
+                hash.SetHex(hash_hex);
+                if (hash.IsNull())
+                    return nlohmann::json{{"error", "share not found"}};
+
+                std::shared_lock lock(node.tracker_mutex());
+                auto& chain = node.tracker().chain;
+                auto& verified = node.tracker().verified;
+                if (!chain.contains(hash))
+                    return nlohmann::json{{"error", "share not found"}};
+
+                nlohmann::json result;
+                auto& entry = chain.get(hash);
+                auto* idx = chain.get_index(hash);
+                // Dash doesn't tag shares as block-solutions in the chain
+                // index the way LTC does; block-found is driven separately
+                // through the found_blocks store. Leave the client's
+                // is_block_solution flag false here.
+                result["is_block_solution"] = false;
+                result["is_doge_block"] = false;  // Dash doesn't merge-mine
+
+                entry.share.invoke([&](auto* obj) {
+                    using S = std::remove_pointer_t<decltype(obj)>;
+                    if constexpr (!std::is_same_v<S, dash::DashShare>) return;
+                    result["parent"] = obj->m_prev_hash.GetHex();
+                    result["far_parent"] = obj->m_far_share_hash.GetHex();
+                    result["type_name"] = "V" + std::to_string(S::version);
+                    result["version"] = S::version;
+
+                    nlohmann::json local_j;
+                    local_j["verified"] = verified.contains(hash);
+                    local_j["time_first_seen"] = idx ? idx->time_seen : 0;
+                    local_j["peer_first_received_from"] = obj->peer_addr.to_string();
+                    result["local"] = local_j;
+
+                    auto script = dash::pubkey_hash_to_script2(obj->m_pubkey_hash);
+                    std::string addr = core::script_to_address(
+                        script, "" /*no bech32*/, p2pkh_ver, p2sh_ver);
+
+                    double target_diff = chain::target_to_difficulty(
+                        chain::bits_to_target(obj->m_bits));
+                    double max_target_diff = chain::target_to_difficulty(
+                        chain::bits_to_target(obj->m_max_bits));
+
+                    nlohmann::json sd;
+                    sd["timestamp"]       = obj->m_timestamp;
+                    sd["target"]          = obj->m_bits;
+                    sd["max_target"]      = obj->m_max_bits;
+                    sd["payout_address"]  = addr.empty() ? HexStr(script) : addr;
+                    sd["donation"]        = static_cast<double>(obj->m_donation) / 65536.0;
+                    sd["stale_info"]      = static_cast<int>(obj->m_stale_info);
+                    sd["nonce"]           = obj->m_nonce;
+                    sd["desired_version"] = obj->m_desired_version;
+                    sd["absheight"]       = obj->m_absheight;
+                    sd["abswork"]         = obj->m_abswork.GetHex();
+                    sd["difficulty"]      = target_diff;
+                    sd["min_difficulty"]  = max_target_diff;
+                    sd["subsidy"]         = static_cast<double>(obj->m_subsidy) / 1e8;
+                    sd["payment_amount"]  = static_cast<double>(obj->m_payment_amount) / 1e8;
+                    result["share_data"] = sd;
+
+                    auto& hdr = obj->m_min_header;
+                    nlohmann::json hdr_j;
+                    hdr_j["version"]        = hdr.m_version;
+                    hdr_j["previous_block"] = hdr.m_previous_block.GetHex();
+                    hdr_j["merkle_root"]    = "";
+                    hdr_j["timestamp"]      = hdr.m_timestamp;
+                    hdr_j["target"]         = hdr.m_bits;
+                    hdr_j["nonce"]          = hdr.m_nonce;
+
+                    nlohmann::json gentx_j;
+                    gentx_j["hash"]             = "";
+                    gentx_j["coinbase"]         = HexStr(obj->m_coinbase.m_data);
+                    gentx_j["value"]            = static_cast<double>(obj->m_subsidy) / 1e8;
+                    gentx_j["last_txout_nonce"] = obj->m_last_txout_nonce;
+
+                    nlohmann::json block_j;
+                    block_j["hash"]                     = hash.GetHex();
+                    block_j["header"]                   = hdr_j;
+                    block_j["gentx"]                    = gentx_j;
+                    block_j["other_transaction_hashes"] = nlohmann::json::array();
+                    result["block"] = block_j;
+
+                    result["children"] = nlohmann::json::array();
+                });
+                return result;
+            });
+
         // Dash p2pool uses protocol 1700 (not LTC's 3600).
         mi->set_protocol_version(1700);
         // Canonical Dash p2pool ports for node_info (dashboard miner URL).
