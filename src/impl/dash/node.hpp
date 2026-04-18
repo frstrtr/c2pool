@@ -14,6 +14,7 @@
 
 #include <core/coin_params.hpp>
 #include <core/random.hpp>
+#include <nlohmann/json.hpp>
 #include <pool/node.hpp>
 #include <pool/protocol.hpp>
 #include <core/message.hpp>
@@ -470,6 +471,41 @@ public:
     // Number of handshaked p2pool peers (BaseNode keeps m_peers protected;
     // expose for dashboard /api/mining/stats via IMiningNode).
     size_t peer_count() const { return base_t::m_peers.size(); }
+
+    // Peer list for /peer_list dashboard endpoint. Each entry matches the
+    // shape p2pool-dash/dashboard expects: address, version, subversion,
+    // incoming (always false — we initiate peer connections), best_share.
+    nlohmann::json peer_info_json() const
+    {
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& [nonce, peer] : base_t::m_peers) {
+            if (!peer) continue;
+            nlohmann::json p;
+            p["address"]    = peer->addr().to_string();
+            p["incoming"]   = false;   // we currently only initiate outbound
+            p["version"]    = peer->m_other_version.value_or(0);
+            p["subversion"] = peer->m_other_subversion;
+            p["services"]   = peer->m_other_services;
+            p["best_share"] = peer->m_best_share.IsNull() ? "" : peer->m_best_share.GetHex();
+            p["nonce"]      = static_cast<uint64_t>(nonce);
+            arr.push_back(std::move(p));
+        }
+        return arr;
+    }
+
+    // Pool hashrate from sharechain attempts-per-second (matches p2pool).
+    double pool_hashrate()
+    {
+        auto best = best_share_hash();
+        if (best.IsNull()) return 0.0;
+        if (!m_tracker.chain.contains(best)) return 0.0;
+        int32_t height = m_tracker.chain.get_height(best);
+        if (height < 3) return 0.0;
+        int32_t lookbehind = std::min(height - 1,
+            static_cast<int32_t>(m_coin_params.target_lookbehind));
+        auto aps = m_tracker.get_pool_attempts_per_second(best, lookbehind);
+        return static_cast<double>(aps.GetLow64());
+    }
 
     // Add a locally-generated share into the tracker. Takes ownership of the
     // DashShare via heap allocation matching process_shares()'s pattern.
