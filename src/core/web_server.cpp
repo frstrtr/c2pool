@@ -2915,6 +2915,17 @@ nlohmann::json MiningInterface::rest_current_payouts()
     nlohmann::json result = nlohmann::json::object();
     bool is_ltc = (m_blockchain == Blockchain::LITECOIN);
 
+    // Script-to-address resolver — picks chain-specific version bytes so
+    // Dash payouts render as 'X...' not Bitcoin '1...'.
+    auto resolve_addr = [this, is_ltc](const std::vector<unsigned char>& s) -> std::string {
+        if (m_blockchain == Blockchain::DASH) {
+            uint8_t p2pkh = m_testnet ? 140 : 76;   // Dash: 'y' / 'X'
+            uint8_t p2sh  = m_testnet ?  19 : 16;   // Dash: '7'
+            return core::script_to_address(s, "", p2pkh, p2sh);
+        }
+        return core::script_to_address(s, is_ltc, m_testnet);
+    };
+
     // Primary source: cached PPLNS outputs from the coinbase builder.
     // These are always up-to-date with the latest share template and subsidy.
     auto cached = get_cached_pplns_outputs();
@@ -2929,7 +2940,7 @@ nlohmann::json MiningInterface::rest_current_payouts()
 
             // script_hex is a hex-encoded scriptPubKey — decode to bytes, then to address
             auto script_bytes = ParseHex(script_hex);
-            std::string addr = core::script_to_address(script_bytes, is_ltc, m_testnet);
+            std::string addr = resolve_addr(script_bytes);
             if (addr.empty() && script_bytes.size() > 33 && script_bytes.back() == 0xac) {
                 // P2PK: PUSH<len> <pubkey> OP_CHECKSIG → hash pubkey → P2PKH address
                 size_t pk_len = script_bytes[0];
@@ -2942,7 +2953,7 @@ nlohmann::json MiningInterface::rest_current_payouts()
                     p2pkh.insert(p2pkh.end(), rip, rip + 20);
                     p2pkh.push_back(0x88);
                     p2pkh.push_back(0xac);
-                    addr = core::script_to_address(p2pkh, is_ltc, m_testnet);
+                    addr = resolve_addr(p2pkh);
                 }
             }
             if (addr.empty())

@@ -589,6 +589,14 @@ public:
     RateStats get_stratum_rate_stats() const { return m_stratum_rate_stats_fn ? m_stratum_rate_stats_fn() : RateStats{}; }
 
     // Current PPLNS outputs for payout display
+    // Coin targets (c2pool-dash) that compute PPLNS outside the
+    // refresh_work() path can push the current distribution here so
+    // /current_payouts reflects the live sharechain.
+    void set_cached_pplns_outputs(std::vector<std::pair<std::string, uint64_t>> v) {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        m_cached_pplns_outputs = std::move(v);
+    }
+
     std::vector<std::pair<std::string, uint64_t>> get_cached_pplns_outputs() const {
         std::lock_guard<std::mutex> l(m_work_mutex);
         return m_cached_pplns_outputs;
