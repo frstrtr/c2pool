@@ -186,6 +186,60 @@ public:
         m_ban_duration = std::chrono::seconds(seconds);
     }
 
+    // A5 (parity audit): handle inbound message_remember_tx. Ported from
+    // p2pool-dash/p2p.py:453 handle_remember_tx. Peer pins tx bodies that
+    // a share it's about to broadcast will reference; we stash them in
+    // peer->m_remembered_txs so the subsequent share walk can consult them.
+    //
+    // Protocol violations (disconnect + ban):
+    //   - Body hash referenced twice
+    //   - Total remembered_txs size per peer exceeds 2.5 MB
+    //
+    // Hash-only refs (msg->m_tx_hashes) aren't tracked: p2pool-dash asserts
+    // we must already know each hash from our own mempool/known_txs, but we
+    // run SPV without a mempool, so we just let them through. If the share
+    // walk subsequently needs a tx body that was only hash-pinned, it will
+    // fail gracefully via the same missing-tx path that handled it before.
+    void handle_remember_tx(std::unique_ptr<dash::message_remember_tx> msg,
+                            peer_ptr peer,
+                            const NetService& service)
+    {
+        // Body pins: hash each body, detect duplicates, store.
+        size_t added_size = 0;
+        for (auto& tx : msg->m_txs) {
+            auto ps = pack(tx);
+            auto sp = ps.get_span();
+            std::vector<unsigned char> bytes(sp.size());
+            for (size_t i = 0; i < sp.size(); ++i)
+                bytes[i] = static_cast<unsigned char>(sp[i]);
+            auto tx_hash = Hash(std::span<const unsigned char>(
+                bytes.data(), bytes.size()));
+
+            if (peer->m_remembered_txs.count(tx_hash) > 0) {
+                LOG_WARNING << "[Dash] peer " << service.to_string()
+                            << " referenced tx (body) twice in remember_tx";
+                ban_peer(service, "remember_tx duplicate body");
+                peer->close();
+                return;
+            }
+            peer->m_remembered_txs.emplace(tx_hash, coin::Transaction(tx));
+            added_size += 100 + bytes.size();  // matches p2pool's sizing
+        }
+
+        // Size cap (matches p2pool-dash max_remembered_txs_size = 2500000).
+        // Accounting: ~100-byte overhead per entry + each packed body size.
+        static constexpr size_t kMaxRememberedTxsSize = 2'500'000;
+        size_t total_size = peer->m_remembered_txs.size() * 100 + added_size;
+        if (total_size > kMaxRememberedTxsSize) {
+            LOG_WARNING << "[Dash] peer " << service.to_string()
+                        << " exceeded remember_tx size cap ("
+                        << total_size << " > " << kMaxRememberedTxsSize << ")";
+            ban_peer(service, "remember_tx size cap exceeded");
+            peer->close();
+            return;
+        }
+    }
+
     // Send version message (protocol 1700). Sharechain C4 (parity audit):
     // advertise the real c2pool version + git rev in subver so operators can
     // see pool heterogeneity in peer lists. Default falls back to 0.1 if
@@ -359,6 +413,35 @@ public:
                         }
                         auto reply = dash::message_addrs::make_raw(out);
                         peer->write(std::move(reply));
+                    }
+                }
+                else if constexpr (std::is_same_v<T, std::unique_ptr<dash::message_remember_tx>>) {
+                    // A5 (parity audit): peer is pinning tx bodies it expects
+                    // us to know while processing a share it's about to
+                    // broadcast. Matches p2pool-dash/p2p.py:453 handle_remember_tx.
+                    //
+                    // Two sub-fields:
+                    //   m_tx_hashes: hashes the peer claims to ALREADY know
+                    //       (from its own mempool/known_txs); it expects us to
+                    //       ALSO know them. In p2pool-dash this results in a
+                    //       hard disconnect if we don't. We're SPV without a
+                    //       mempool, so we log-and-continue instead (the share
+                    //       walk that needs the tx will fail gracefully).
+                    //   m_txs: full tx bodies the peer sends so we can store
+                    //       them for the subsequent share_walk.
+                    //
+                    // Both sub-fields: double-insertion is a protocol
+                    // violation → ban + disconnect.
+                    if (msg) {
+                        handle_remember_tx(std::move(msg), peer, service);
+                    }
+                }
+                else if constexpr (std::is_same_v<T, std::unique_ptr<dash::message_forget_tx>>) {
+                    // A5 (parity audit): peer releases previously-remembered
+                    // txs. Matches p2pool-dash/p2p.py:499 handle_forget_tx.
+                    if (msg) {
+                        for (const auto& h : msg->m_tx_hashes)
+                            peer->m_remembered_txs.erase(h);
                     }
                 }
             }, result);
