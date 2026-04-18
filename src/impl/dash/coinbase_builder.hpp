@@ -70,13 +70,11 @@ struct MinerPayout {
 // Does NOT include the OP_RETURN — coinbase::build() appends that.
 //
 // For genesis (no previous shares on the chain), pass an empty weights
-// map and total_weight == 0. For non-genesis shares the caller must
-// supply tracker-derived PPLNS weights from get_cumulative_weights —
-// TODO, not yet ported from p2pool's skiplist.
-//
-// Scope boundary: this builds the canonical p2pool-dash tx_outs layout.
-// Callers that want c2pool-native PPLNS must compute their own
-// distribution and build the coinbase directly.
+// map and total_weight == 0. For non-genesis shares the caller supplies
+// tracker-derived PPLNS weights from share_builder::walk_cumulative_weights
+// (a linear port of p2pool-dash's WeightsSkipList — O(N) per call rather
+// than the Python upstream's O(log N), but consensus-equivalent since
+// chain_length=4320 makes the walk cheap).
 inline std::vector<MinerPayout> compute_dash_payouts(
     uint64_t subsidy,
     const std::vector<dash::coin::PackedPayment>& packed_payments,
@@ -109,7 +107,8 @@ inline std::vector<MinerPayout> compute_dash_payouts(
     uint64_t worker_payout = (subsidy > total_payments) ? (subsidy - total_payments) : 0;
 
     // 3. amounts[script] = worker_payout * 49 * weight / (50 * total_weight)
-    //    (empty for genesis; TODO for non-genesis once skiplist is ported).
+    //    (skipped for genesis where total_weight==0; populated for
+    //    non-genesis shares via walk_cumulative_weights).
     std::map<Script, uint64_t> amounts;
     if (total_weight > 0) {
         // uint128-ish: worker_payout < 2^50, 49 < 2^6, weight < ~2^80 for a few
