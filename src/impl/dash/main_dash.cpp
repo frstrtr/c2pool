@@ -1121,6 +1121,9 @@ int main(int argc, char* argv[])
                              : pplns.used_fallback ? "fallback_solo" : "active")
                          << " payouts=" << payouts.size()
                          << " shares_used=" << pplns.shares_used
+                         // p2pool-dash-parity walk (WeightsSkipList port):
+                         << " parity_walked=" << built.pplns_walked
+                         << " parity_scripts=" << built.pplns_scripts
                          << " ref_hash=" << built.ref_hash.GetHex().substr(0, 16);
             } catch (const std::exception& e) {
                 LOG_WARNING << "[JOB] build failed: " << e.what();

@@ -55,6 +55,11 @@ struct BuiltJob {
     // Shipped to peers via message_remember_tx ahead of the share so peer's
     // known_txs_cache is populated when it validates new_transaction_hashes.
     std::vector<dash::coin::MutableTransaction> tx_bodies;
+    // Diagnostics from the p2pool-dash-parity PPLNS walk (non-genesis only).
+    // Lets operators verify from [JOB] logs that the WeightsSkipList port
+    // is firing with the expected share count + recipient count.
+    size_t   pplns_walked{0};     // ancestors walked by walk_cumulative_weights
+    size_t   pplns_scripts{0};    // distinct recipient scripts with non-zero weight
 };
 
 // Decode a hex-encoded serialized Dash transaction into MutableTransaction.
@@ -297,6 +302,15 @@ inline CumulativeWeights walk_cumulative_weights(
         result.weights[script] = scale(w);
     result.donation_weight = scale(acc_donation);
     result.total_weight    = scale(acc_total);
+
+    // Diagnostic: non-genesis PPLNS is the peer-parity-critical path.
+    // Log walked count + unique scripts so operators can verify the
+    // WeightsSkipList port is firing when shares are built.
+    LOG_DEBUG_OTHER << "[PPLNS walk] walked=" << walked
+                    << " scripts=" << result.weights.size()
+                    << " total_weight=" << result.total_weight
+                    << " donation=" << result.donation_weight
+                    << " shift=" << shift;
     return result;
 }
 
@@ -587,6 +601,8 @@ inline BuiltJob build(const dash::coin::DashWorkData& work,
                                           max_shares, desired_weight);
         weights      = std::move(cw.weights);
         total_weight = cw.total_weight;
+        out.pplns_walked  = static_cast<size_t>(max_shares > 0 ? max_shares : 0);
+        out.pplns_scripts = weights.size();
     }
 
     auto tx_outs_ordered = dash::coinbase::compute_dash_payouts(
