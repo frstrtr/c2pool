@@ -529,6 +529,92 @@ int main(int argc, char* argv[])
             t["height"] = best.IsNull() ? 0 : chain.get_height(best);
             return t;
         });
+        // Sharechain delta endpoint — returns shares newer than `since`
+        // so the dashboard's RealTime mode can incrementally prepend
+        // shares on SSE tip notifications without refetching the full
+        // 4320-share window. Without this the client receives the SSE
+        // event but the delta fetch returns an empty array, so nothing
+        // animates. Ports LTC's set_sharechain_delta_fn wiring
+        // (c2pool_refactored.cpp:3613-3738) adapted to DashShare.
+        mi->set_sharechain_delta_fn(
+            [&node, &params, testnet,
+             p2pkh_ver = (testnet ? 140 : 76),
+             p2sh_ver  = (testnet ? 19 : 16),
+             mi_ptr = web_server->get_mining_interface()]
+            (const std::string& since_hash) -> nlohmann::json {
+                std::shared_lock lock(node.tracker_mutex());
+                auto& chain = node.tracker().chain;
+                auto& verified = node.tracker().verified;
+
+                uint256 best;
+                int32_t best_height = -1;
+                for (const auto& [head_hash, tail_hash] : chain.get_heads()) {
+                    auto h = chain.get_height(head_hash);
+                    if (h > best_height) { best = head_hash; best_height = h; }
+                }
+
+                nlohmann::json shares_arr = nlohmann::json::array();
+                int count = 0;
+                if (!best.IsNull()) {
+                    int walk = std::min(static_cast<int>(chain.get_height(best)),
+                                        static_cast<int>(params.chain_length));
+                    try {
+                        auto view = chain.get_chain(best, walk);
+                        for (auto [hash, data] : view) {
+                            std::string short_h = hash.GetHex().substr(0, 16);
+                            if (short_h == since_hash || hash.GetHex() == since_hash)
+                                break;
+                            nlohmann::json s;
+                            s["h"] = short_h;
+                            s["H"] = hash.GetHex();
+                            s["p"] = count;
+                            s["v"] = verified.contains(hash) ? 1 : 0;
+                            data.share.invoke([&](auto* obj) {
+                                using S = std::remove_pointer_t<decltype(obj)>;
+                                if constexpr (std::is_same_v<S, dash::DashShare>) {
+                                    s["t"]  = obj->m_timestamp;
+                                    s["V"]  = S::version;
+                                    s["s"]  = static_cast<int>(obj->m_stale_info);
+                                    s["b"]  = obj->m_bits;
+                                    s["a"]  = obj->m_absheight;
+                                    s["dv"] = obj->m_desired_version;
+                                    auto script = dash::pubkey_hash_to_script2(obj->m_pubkey_hash);
+                                    std::string addr = core::script_to_address(
+                                        script, "" /*no bech32*/, p2pkh_ver, p2sh_ver);
+                                    s["m"] = addr.empty() ? HexStr(script) : addr;
+                                }
+                            });
+                            shares_arr.push_back(std::move(s));
+                            if (++count >= 200) break;  // safety cap
+                        }
+                    } catch (...) {}
+                }
+
+                nlohmann::json heads_arr = nlohmann::json::array();
+                for (auto& [hh, _] : chain.get_heads())
+                    heads_arr.push_back(hh.GetHex().substr(0, 16));
+
+                nlohmann::json result;
+                result["shares"] = std::move(shares_arr);
+                result["count"]  = count;
+                result["tip"]    = best.IsNull() ? "" : best.GetHex().substr(0, 16);
+                result["heads"]  = std::move(heads_arr);
+                result["blocks"] = nlohmann::json::array();  // no LTC block solutions
+
+                // Per-share PPLNS for the zoom-tooltip panel on the new shares.
+                if (count > 0 && mi_ptr) {
+                    nlohmann::json pplns_map = nlohmann::json::object();
+                    for (const auto& sj : result["shares"]) {
+                        std::string sh = sj["h"].get<std::string>();
+                        auto p = mi_ptr->get_pplns_for_tip_exact(sh);
+                        if (!p.empty()) pplns_map[sh] = std::move(p);
+                    }
+                    if (!pplns_map.empty())
+                        result["pplns"] = std::move(pplns_map);
+                }
+                return result;
+            });
+
         // Individual share lookup for /web/share/<hash> (share.html).
         // Returns the full share-detail JSON the dashboard's share page
         // expects (share_data, block header+gentx, local metadata).
