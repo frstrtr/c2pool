@@ -68,6 +68,8 @@ int main(int argc, char* argv[])
     uint16_t    http_port       = 0;             // 0 = disable dashboard; e.g. 7904
     std::string dashboard_dir;                   // static files for web dashboard
     std::string http_cors_origin;
+    size_t      target_outbound_peers = 4;       // C3 (parity audit): outbound
+    int         peer_ban_duration_sec = 300;     // C3 (parity audit): ban len
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -118,6 +120,12 @@ int main(int argc, char* argv[])
         }
         else if (arg == "--cors-origin" && i + 1 < argc) {
             http_cors_origin = argv[++i];
+        }
+        else if (arg == "--target-peers" && i + 1 < argc) {
+            target_outbound_peers = static_cast<size_t>(std::stoul(argv[++i]));
+        }
+        else if (arg == "--ban-duration" && i + 1 < argc) {
+            peer_ban_duration_sec = std::stoi(argv[++i]);
         }
         // --dashd-rpc host:port:user:pass  (or host:port if anon test)
         else if (arg == "--dashd-rpc" && i + 1 < argc) {
@@ -601,6 +609,23 @@ int main(int argc, char* argv[])
                      << " txs=" << block.m_txs.size();
         });
 
+        // SPV C1 (parity audit): expose dashd header-sync progress to the
+        // dashboard so the parent-chain panel shows height/target instead
+        // of "Height: -". Coin-agnostic — the dashboard already reads
+        // data.spv keys when present.
+        if (web_server) {
+            auto* mi3 = web_server->get_mining_interface();
+            mi3->set_spv_progress_fn([&header_chain, &coin_node]() -> nlohmann::json {
+                nlohmann::json r;
+                r["dash_height"] = static_cast<int>(header_chain.height());
+                r["dash_tip_count"] = static_cast<int>(header_chain.size());
+                r["dash_synced"] = header_chain.is_synced();
+                // Connection status to local dashd
+                r["dashd_connected"] = coin_node && coin_node->has_p2p();
+                return r;
+            });
+        }
+
         // SPV A1 (parity audit): wire ChainLock-aware block verifier now
         // that coin_node exists. record_found_block schedules
         // verify_found_block at 30s/150s/300s/… intervals; this callback
@@ -700,7 +725,10 @@ int main(int argc, char* argv[])
     // peer from the addr store (populated via message_addrs responses from
     // handshaked peers). Mirrors the LTC NodeImpl::start_outbound_connections
     // pattern but keeps Dash's simpler one-dial-per-tick cadence.
-    constexpr size_t TARGET_OUTBOUND_PEERS = 4;
+    // C3 (parity audit): outbound-peer target now comes from --target-peers
+    // CLI flag (default 4). --ban-duration tunes the peer-ban expiry too.
+    const size_t TARGET_OUTBOUND_PEERS = target_outbound_peers;
+    node.set_ban_duration(peer_ban_duration_sec);
     auto outbound_timer = std::make_shared<io::steady_timer>(ioc);
     std::function<void(const boost::system::error_code&)> outbound_fn;
     outbound_fn = [&, outbound_timer](const boost::system::error_code& ec) {
