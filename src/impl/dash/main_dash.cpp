@@ -274,17 +274,19 @@ int main(int argc, char* argv[])
         });
         // Best share hash for the dashboard's head indicator.
         mi->set_best_share_hash_fn([&node]() { return node.best_share_hash(); });
-        // Peer list for /local_stats (legacy p2pool format: array of
-        // {incoming: bool} objects). Our connect-out peers count as outgoing.
+        // Peer list for /peer_list and /local_stats — real address + version.
         mi->set_peer_info_fn([&node]() -> nlohmann::json {
-            nlohmann::json arr = nlohmann::json::array();
-            size_t n = node.peer_count();
-            for (size_t i = 0; i < n; ++i)
-                arr.push_back({{"incoming", false}});
-            return arr;
+            return node.peer_info_json();
+        });
+        // Pool hashrate from sharechain attempts-per-second (p2pool formula).
+        mi->set_pool_hashrate_fn([&node]() -> double {
+            return node.pool_hashrate();
         });
         // Dash p2pool uses protocol 1700 (not LTC's 3600).
         mi->set_protocol_version(1700);
+        // Canonical Dash p2pool ports for node_info (dashboard miner URL).
+        mi->set_p2p_port(port);
+        if (stratum_port == 0) mi->set_worker_port(7903);
         web_server->start();
         std::cout << "[WEB] dashboard listening on " << http_host << ":"
                   << http_port << std::endl;
