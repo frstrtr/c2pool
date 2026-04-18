@@ -1279,17 +1279,17 @@ int main(int argc, char* argv[])
                     work, node.tracker(), miner_pubkey_hash, payouts, pool_tag, params,
                     share_bits, share_difficulty_default);
 
-                // Publish the coinbase's actual tx_outs to /current_payouts.
-                // Driven off built.tx_outs (worker_tx || payments_tx ||
-                // donation_tx) so the dashboard's "Current Payouts" shows
-                // exactly what the miner would collect, including the
-                // DONATION_SCRIPT tail. dash::pplns::compute_payouts omits
-                // donation (it folds the residue into workers); compute_dash_payouts
-                // emits it explicitly and that's what actually lands in the block.
+                // Publish the coinbase's mineable tx_outs to /current_payouts.
+                // Driven off built.tx_outs_mineable (worker_tx || donation_tx,
+                // masternode/platform entries excluded) so the dashboard's
+                // "Current Payouts" only surfaces payouts a miner can earn
+                // a share of. Masternode + platform payments come from
+                // dashd's GBT and are consensus-fixed — they don't belong in
+                // the pool's payout view.
                 if (web_server) {
                     std::vector<std::pair<std::string,uint64_t>> pplns_cache;
-                    pplns_cache.reserve(built.tx_outs.size());
-                    for (const auto& o : built.tx_outs) {
+                    pplns_cache.reserve(built.tx_outs_mineable.size());
+                    for (const auto& o : built.tx_outs_mineable) {
                         if (o.amount == 0) continue;  // drop zero entries
                         pplns_cache.emplace_back(HexStr(o.script), o.amount);
                     }

@@ -25,6 +25,7 @@
 #include <cstring>
 #include <optional>
 #include <random>
+#include <set>
 #include <span>
 #include <string>
 #include <vector>
@@ -61,10 +62,14 @@ struct BuiltJob {
     size_t   pplns_walked{0};     // ancestors walked by walk_cumulative_weights
     size_t   pplns_scripts{0};    // distinct recipient scripts with non-zero weight
     // The exact coinbase output list fed into the generated block:
-    // worker_tx || payments_tx || donation_tx. main_dash.cpp exposes this
-    // on /current_payouts so the dashboard shows the same breakdown the
-    // miner actually gets paid (incl. the donation entry).
+    // worker_tx || payments_tx || donation_tx. Full view.
     std::vector<dash::coinbase::MinerPayout> tx_outs;
+    // Mineable subset of tx_outs: worker_tx || donation_tx only. Excludes
+    // payments_tx (masternode/superblock/platform) because those are
+    // consensus-required outputs from dashd's GBT — they can't be earned
+    // by mining. /current_payouts uses this to show only the PPLNS +
+    // donation entries that a miner would actually collect a share of.
+    std::vector<dash::coinbase::MinerPayout> tx_outs_mineable;
 };
 
 // Decode a hex-encoded serialized Dash transaction into MutableTransaction.
@@ -614,6 +619,25 @@ inline BuiltJob build(const dash::coin::DashWorkData& work,
         work.m_coinbase_value, work.m_packed_payments,
         miner_pubkey_hash, weights, total_weight, params);
     out.tx_outs = tx_outs_ordered;
+
+    // Mineable subset: skip scripts that match a packed_payments entry
+    // (masternode/superblock/platform). compute_dash_payouts emits those
+    // in the middle of the list between worker_tx and donation_tx; the
+    // script identity is stable so a set lookup filters them cleanly.
+    {
+        std::set<std::vector<unsigned char>> payment_scripts;
+        for (const auto& p : work.m_packed_payments) {
+            if (p.amount == 0) continue;
+            auto s = dash::decode_payee_script(
+                p.payee, params.address_version, params.address_p2sh_version);
+            if (!s.empty()) payment_scripts.insert(std::move(s));
+        }
+        out.tx_outs_mineable.reserve(tx_outs_ordered.size());
+        for (const auto& o : tx_outs_ordered) {
+            if (payment_scripts.count(o.script)) continue;
+            out.tx_outs_mineable.push_back(o);
+        }
+    }
 
     // ── Build coinbase bytes with ref_hash embedded ─────────────────────
     out.coinbase = dash::coinbase::build(
