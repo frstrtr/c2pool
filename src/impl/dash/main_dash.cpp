@@ -70,6 +70,7 @@ int main(int argc, char* argv[])
     std::string http_cors_origin;
     size_t      target_outbound_peers = 4;       // C3 (parity audit): outbound
     int         peer_ban_duration_sec = 300;     // C3 (parity audit): ban len
+    std::string header_checkpoint_str;            // empty → use params.fast_start_checkpoint default
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -126,6 +127,12 @@ int main(int argc, char* argv[])
         }
         else if (arg == "--ban-duration" && i + 1 < argc) {
             peer_ban_duration_sec = std::stoi(argv[++i]);
+        }
+        else if (arg == "--dash-header-checkpoint" && i + 1 < argc) {
+            // Format: HEIGHT:HASH   e.g. 2450000:000000000000001b...
+            // Empty string disables the hardcoded mainnet default
+            // (starts from genesis).
+            header_checkpoint_str = argv[++i];
         }
         // --dashd-rpc host:port:user:pass  (or host:port if anon test)
         else if (arg == "--dashd-rpc" && i + 1 < argc) {
@@ -239,6 +246,44 @@ int main(int argc, char* argv[])
     auto chain_params = testnet
         ? dash::coin::make_dash_chain_params_testnet()
         : dash::coin::make_dash_chain_params_mainnet();
+
+    // CLI override for the fast-start checkpoint. Format: HEIGHT:HASH.
+    // Empty string / "off" / "genesis" disables the hardcoded default
+    // and starts from the Dash genesis block.
+    if (!header_checkpoint_str.empty()) {
+        if (header_checkpoint_str == "off" || header_checkpoint_str == "genesis") {
+            chain_params.fast_start_checkpoint.reset();
+            std::cout << "[HEADERS] checkpoint disabled — starting from genesis"
+                      << std::endl;
+        } else {
+            auto colon = header_checkpoint_str.find(':');
+            if (colon != std::string::npos) {
+                uint32_t cp_h = static_cast<uint32_t>(
+                    std::stoul(header_checkpoint_str.substr(0, colon)));
+                uint256 cp_hash;
+                cp_hash.SetHex(header_checkpoint_str.substr(colon + 1));
+                if (!cp_hash.IsNull()) {
+                    chain_params.fast_start_checkpoint =
+                        dash::coin::DashChainParams::Checkpoint{cp_h, cp_hash};
+                    std::cout << "[HEADERS] CLI checkpoint override: height="
+                              << cp_h << " hash="
+                              << cp_hash.GetHex().substr(0, 16) << std::endl;
+                } else {
+                    std::cerr << "[HEADERS] invalid --dash-header-checkpoint hash"
+                              << std::endl;
+                    return 1;
+                }
+            }
+        }
+    } else if (chain_params.fast_start_checkpoint.has_value()) {
+        std::cout << "[HEADERS] using default checkpoint: height="
+                  << chain_params.fast_start_checkpoint->height
+                  << " hash="
+                  << chain_params.fast_start_checkpoint->hash.GetHex().substr(0, 16)
+                  << " (override with --dash-header-checkpoint HEIGHT:HASH, "
+                     "disable with --dash-header-checkpoint off)"
+                  << std::endl;
+    }
 
     std::string header_db_path = std::string(getenv("HOME") ? getenv("HOME") : ".")
         + "/.c2pool/" + coin_name + "/embedded_headers";
