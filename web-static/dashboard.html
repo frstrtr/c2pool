@@ -5926,11 +5926,27 @@
                 return ((hash % 360) + 360) % 360;
             },
 
-            // Squarified treemap: place items into rows trying to keep aspect ratio ~1
+            // Squarified treemap: place items into rows trying to keep aspect ratio ~1.
+            // Entries below MIN_VIS_FRAC get their area floored so the rect stays
+            // clickable/visible even when the real payout share is sub-percent.
+            // The cell's displayed label still reflects the real pct. Larger
+            // entries absorb the adjustment proportionally so the full treemap
+            // fills the box. Without this floor, donation slices (~0.06-0.15%)
+            // are sub-pixel and effectively invisible.
             treemap: function(data, x, y, w, h) {
                 var rects = [];
-                var items = data.map(function(d) { return { addr: d.addr, pct: d.pct, area: d.pct }; });
-                this._layoutRow(items, x, y, w, h, rects);
+                var MIN_VIS_FRAC = 0.015;  // ~1.5% floor → visible ~20×20 px cell
+                var boosted = data.map(function(d) {
+                    return { addr: d.addr, pct: d.pct,
+                             area: Math.max(d.pct, MIN_VIS_FRAC) };
+                });
+                var totalBoosted = 0;
+                boosted.forEach(function(it) { totalBoosted += it.area; });
+                if (totalBoosted > 1.0) {
+                    // Renormalize so the entire box is filled without spillover.
+                    boosted.forEach(function(it) { it.area /= totalBoosted; });
+                }
+                this._layoutRow(boosted, x, y, w, h, rects);
                 return rects;
             },
 
