@@ -279,11 +279,14 @@ int main(int argc, char* argv[])
         // everyone into a redirect loop to loading.html.
         mi->set_dashboard_always_ready(true);
         // Sharechain stats for the dashboard (chain height + verified count).
+        // HTTP-thread callback — takes shared_lock so main-ioc writers
+        // (tracker.add in share handlers) don't race on unordered_map.
         mi->set_sharechain_stats_fn([&node]() {
+            std::shared_lock lock(node.tracker_mutex());
             nlohmann::json j;
             int h = static_cast<int>(node.tracker().chain.size());
             j["chain_height"]   = h;
-            j["verified_count"] = h;  // node tracks single verified chain
+            j["verified_count"] = h;
             j["total_shares"]   = h;
             j["fork_count"]     = static_cast<int>(node.tracker().chain.get_heads().size());
             return j;
@@ -303,6 +306,11 @@ int main(int argc, char* argv[])
         // each with the fields the dashboard JS expects (h, H, p, v, t, b,
         // a, dv, m).
         mi->set_sharechain_window_fn([&node, &params, testnet, mi_ptr = web_server->get_mining_interface()]() -> nlohmann::json {
+            // HTTP-thread callback. Hold shared_lock across the whole chain
+            // walk so writers on the main ioc thread block until we're done
+            // iterating. The walk is bounded by chain_length (4320) and
+            // returns 500 KB JSON — a few ms under lock is acceptable.
+            std::shared_lock lock(node.tracker_mutex());
             nlohmann::json result;
             auto& chain = node.tracker().chain;
             auto& verified = node.tracker().verified;
@@ -379,9 +387,16 @@ int main(int argc, char* argv[])
         });
         // Sharechain tip for readiness checks.
         mi->set_sharechain_tip_fn([&node]() -> nlohmann::json {
+            // HTTP-thread callback. Inline the heads lookup + height under a
+            // single shared_lock so both reads see the same snapshot —
+            // calling best_share_hash() here would take + release, opening
+            // a race window where `best` exists but gets removed before
+            // get_height. shared_mutex forbids recursive shared locking.
+            std::shared_lock lock(node.tracker_mutex());
             nlohmann::json t;
             auto& chain = node.tracker().chain;
-            uint256 best = node.best_share_hash();
+            auto heads = chain.get_heads();
+            uint256 best = heads.empty() ? uint256() : heads.begin()->first;
             t["hash"]   = best.IsNull() ? "" : best.GetHex();
             t["height"] = best.IsNull() ? 0 : chain.get_height(best);
             return t;
@@ -407,11 +422,18 @@ int main(int argc, char* argv[])
             std::vector<unsigned char> dummy = {0x76,0xa9,0x14,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0x88,0xac};
             auto& chain = node.tracker().chain;
 
-            auto compute_one = [&](const uint256& h) -> bool {
+            // Single PPLNS computation. Must be called with a shared_lock on
+            // node.tracker_mutex() already held by the caller — compute_payouts
+            // walks the chain internally and we cannot let writers modify
+            // m_shares mid-walk. The store_pplns_for_tip call itself uses its
+            // own mutex (m_pplns_cache_mutex) and does not need the tracker
+            // lock, so callers may release before storing if they want to
+            // shorten the critical section.
+            auto compute_one_locked = [&](const uint256& h) -> std::optional<nlohmann::json> {
                 try {
                     auto r = dash::pplns::compute_payouts(
                         chain, h, params.chain_length, disp_subsidy, dummy);
-                    if (r.used_fallback || r.payouts.empty()) return false;
+                    if (r.used_fallback || r.payouts.empty()) return std::nullopt;
                     nlohmann::json pplns_json = nlohmann::json::object();
                     for (const auto& p : r.payouts) {
                         std::string addr = core::script_to_address(
@@ -419,59 +441,83 @@ int main(int argc, char* argv[])
                         if (addr.empty()) addr = HexStr(p.script);
                         pplns_json[addr] = p.amount / 1e8;
                     }
-                    std::string short_hash = h.GetHex().substr(0, 16);
-                    mi->store_pplns_for_tip(short_hash, std::move(pplns_json));
-                    return true;
-                } catch (...) { return false; }
+                    return pplns_json;
+                } catch (...) { return std::nullopt; }
             };
 
-            // Wait for the chain to reach full depth before the first pass so
-            // early shares (at chain position 0..N where N < chain_length)
-            // don't all degrade to used_fallback. If we never reach full depth
-            // (startup on a sparse network) still proceed after 5 min.
+            // Wait for the chain to reach full depth before the first pass.
+            // chain.size() is a read — protect with shared_lock each check.
             for (int i = 0; i < 300; ++i) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
-                if (node.tracker().chain.size() >=
-                    static_cast<size_t>(params.chain_length)) break;
+                size_t sz;
+                {
+                    std::shared_lock lock(node.tracker_mutex());
+                    sz = node.tracker().chain.size();
+                }
+                if (sz >= static_cast<size_t>(params.chain_length)) break;
             }
 
-            LOG_INFO << "[PPLNS-Precompute] starting (chain.size="
-                     << node.tracker().chain.size() << ")";
+            {
+                std::shared_lock lock(node.tracker_mutex());
+                LOG_INFO << "[PPLNS-Precompute] starting (chain.size="
+                         << node.tracker().chain.size() << ")";
+            }
 
-            // Main loop: every 20s, scan the current window from best and fill
-            // PPLNS for any share not yet cached (exact match). New tips
-            // arriving during the run get picked up on the next pass.
+            // Main loop. Two-phase per pass:
+            //   Phase 1 — snapshot the window's share hashes under a brief
+            //             shared_lock, release. Hashes are value types, safe
+            //             to iterate unlocked.
+            //   Phase 2 — for each uncached hash, take the shared_lock and
+            //             run compute_payouts while holding it. Release
+            //             between shares so writers get windows to run.
+            // This gives us predictable 2-8ms lock durations per share
+            // instead of one 8-9 second monolithic read lock.
             while (true) {
-                uint256 best = node.best_share_hash();
-                if (best.IsNull()) {
-                    std::this_thread::sleep_for(std::chrono::seconds(20));
-                    continue;
-                }
-                int32_t height = chain.get_height(best);
-                int32_t walk = std::min(height, static_cast<int32_t>(params.chain_length));
                 std::vector<uint256> hashes;
-                hashes.reserve(walk);
-                try {
-                    for (auto&& [h, data] : chain.get_chain(best, walk))
-                        hashes.push_back(h);
-                } catch (...) {
-                    std::this_thread::sleep_for(std::chrono::seconds(20));
-                    continue;
+                {
+                    std::shared_lock lock(node.tracker_mutex());
+                    auto heads = chain.get_heads();
+                    if (heads.empty()) goto sleep_and_retry;
+                    uint256 best = heads.begin()->first;
+                    if (best.IsNull()) goto sleep_and_retry;
+                    int32_t height = chain.get_height(best);
+                    int32_t walk = std::min(height, static_cast<int32_t>(params.chain_length));
+                    hashes.reserve(walk);
+                    try {
+                        for (auto&& [h, data] : chain.get_chain(best, walk))
+                            hashes.push_back(h);
+                    } catch (...) { goto sleep_and_retry; }
                 }
 
-                int scanned = 0, computed = 0;
-                for (const auto& h : hashes) {
-                    ++scanned;
-                    std::string sh = h.GetHex().substr(0, 16);
-                    if (!mi->get_pplns_for_tip_exact(sh).empty()) continue;
-                    if (compute_one(h)) ++computed;
-                    // Yield so we don't hog the tracker.
-                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                {
+                    int scanned = 0, computed = 0;
+                    for (const auto& h : hashes) {
+                        ++scanned;
+                        std::string sh = h.GetHex().substr(0, 16);
+                        if (!mi->get_pplns_for_tip_exact(sh).empty()) continue;
+
+                        std::optional<nlohmann::json> result;
+                        {
+                            std::shared_lock lock(node.tracker_mutex());
+                            // Share might have been pruned between phase 1
+                            // and here. Skip if it's no longer in the chain.
+                            if (!chain.contains(h)) continue;
+                            result = compute_one_locked(h);
+                        }
+                        if (result) {
+                            mi->store_pplns_for_tip(sh, std::move(*result));
+                            ++computed;
+                        }
+                        // Yield between shares so writers can progress.
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    }
+                    if (computed > 0) {
+                        LOG_INFO << "[PPLNS-Precompute] pass: scanned=" << scanned
+                                 << " new_cached=" << computed;
+                    }
                 }
-                if (computed > 0) {
-                    LOG_INFO << "[PPLNS-Precompute] pass: scanned=" << scanned
-                             << " new_cached=" << computed;
-                }
+
+            sleep_and_retry:
                 std::this_thread::sleep_for(std::chrono::seconds(20));
             }
         }).detach();
