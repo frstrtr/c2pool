@@ -340,16 +340,19 @@ int main(int argc, char* argv[])
         // everyone into a redirect loop to loading.html.
         mi->set_dashboard_always_ready(true);
         // Sharechain stats for the dashboard (chain height + verified count).
-        // HTTP-thread callback — takes shared_lock so main-ioc writers
-        // (tracker.add in share handlers) don't race on unordered_map.
+        // HTTP-thread callback — D1/D2 (parity audit): reads from the
+        // atomically-published TrackerSnapshot so we don't contend with
+        // share-arrival writers on the main tracker mutex. The snapshot
+        // is refreshed after every tracker mutation (process_shares,
+        // sharereply, add_local_share, prune, LevelDB load). Matches
+        // LTC's TrackerSnapshot path (c2pool_refactored.cpp:3206).
         mi->set_sharechain_stats_fn([&node]() {
-            std::shared_lock lock(node.tracker_mutex());
+            auto snap = node.get_tracker_snapshot();
             nlohmann::json j;
-            int h = static_cast<int>(node.tracker().chain.size());
-            j["chain_height"]   = h;
-            j["verified_count"] = h;
-            j["total_shares"]   = h;
-            j["fork_count"]     = static_cast<int>(node.tracker().chain.get_heads().size());
+            j["chain_height"]   = snap.chain_count;
+            j["verified_count"] = snap.verified_count;
+            j["total_shares"]   = snap.chain_count;
+            j["fork_count"]     = snap.fork_count;
             return j;
         });
         // Best share hash for the dashboard's head indicator.
