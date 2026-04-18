@@ -302,7 +302,7 @@ int main(int argc, char* argv[])
         // Walk up to CHAIN_LENGTH shares from the best head and serialize
         // each with the fields the dashboard JS expects (h, H, p, v, t, b,
         // a, dv, m).
-        mi->set_sharechain_window_fn([&node, &params, testnet]() -> nlohmann::json {
+        mi->set_sharechain_window_fn([&node, &params, testnet, mi_ptr = web_server->get_mining_interface()]() -> nlohmann::json {
             nlohmann::json result;
             auto& chain = node.tracker().chain;
             auto& verified = node.tracker().verified;
@@ -357,6 +357,20 @@ int main(int argc, char* argv[])
             }
             result["shares"] = shares_arr;
             result["total"]  = static_cast<int>(shares_arr.size());
+
+            // Per-share PPLNS zoom tooltip on the Sharechain Explorer reads
+            // pplns_current (fallback for all shares) and pplns (per-share
+            // map). Without pplns_current the zoom panel hides.
+            if (mi_ptr) {
+                result["pplns_current"] = mi_ptr->rest_current_payouts();
+                nlohmann::json pplns_map = nlohmann::json::object();
+                for (const auto& s : result["shares"]) {
+                    std::string sh = s["h"].get<std::string>();
+                    auto p = mi_ptr->get_pplns_for_tip(sh);
+                    if (!p.empty()) pplns_map[sh] = std::move(p);
+                }
+                if (!pplns_map.empty()) result["pplns"] = std::move(pplns_map);
+            }
             return result;
         });
         // Sharechain tip for readiness checks.
