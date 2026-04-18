@@ -51,6 +51,12 @@ protected:
     std::unordered_map<uint256, int, dash::ShareHasher> m_download_fail_count;
     std::map<uint256, NetService> m_pending_share_reqs;
 
+    // Outbound-dial throttle: record when we last attempted each addr so a
+    // periodic tick doesn't hammer the same unreachable peer. Factory::Client
+    // fires and forgets — no failure callback — so without this we'd redial
+    // the first iteration order entry forever.
+    std::map<NetService, std::chrono::steady_clock::time_point> m_dial_attempts;
+
 public:
     DashNodeImpl()
         : m_coin_params(dash::make_coin_params(false)),
@@ -164,6 +170,10 @@ public:
                 // Trigger share download now that peer is in m_peers
                 if (!peer->m_best_share.IsNull() && !m_chain->contains(peer->m_best_share))
                     download_shares(peer, peer->m_best_share);
+
+                // Request more peer addresses for outbound expansion.
+                auto getaddrs = dash::message_getaddrs::make_raw(uint32_t{8});
+                peer->write(std::move(getaddrs));
             }
             return;
         }
@@ -188,10 +198,75 @@ public:
                         handle_sharereq(std::move(msg), peer);
                     }
                 }
+                else if constexpr (std::is_same_v<T, std::unique_ptr<dash::message_addrs>>) {
+                    if (msg) {
+                        size_t added = 0;
+                        for (const auto& rec : msg->m_addrs) {
+                            if (!base_t::m_addrs.check(rec.m_endpoint)) {
+                                core::AddrValue v{rec.m_services,
+                                                  rec.m_timestamp,
+                                                  rec.m_timestamp};
+                                base_t::m_addrs.add(rec.m_endpoint, v);
+                                ++added;
+                            }
+                        }
+                        if (added > 0) {
+                            LOG_INFO << "[Dash] addrs: +" << added
+                                     << " peer(s) from " << peer->addr().to_string()
+                                     << " (store=" << base_t::m_addrs.len() << ")";
+                        }
+                    }
+                }
+                else if constexpr (std::is_same_v<T, std::unique_ptr<dash::message_getaddrs>>) {
+                    // Reply with a small sample from our addr store.
+                    if (msg) {
+                        uint32_t want = msg->m_count ? msg->m_count : 8;
+                        std::vector<addr_record_t> out;
+                        for (const auto& [addr, val] : base_t::m_addrs.get_all()) {
+                            if (out.size() >= want) break;
+                            out.emplace_back(val.m_service, addr, val.m_last_seen);
+                        }
+                        auto reply = dash::message_addrs::make_raw(out);
+                        peer->write(std::move(reply));
+                    }
+                }
             }, result);
         } catch (const std::exception&) {
             // Unhandled messages (addrme, have_tx, etc.) — normal
         }
+    }
+
+    // Attempt outbound connections from addr store up to m_target_outbound.
+    // Called periodically from an ioc timer in main_dash.cpp. Runs once per
+    // tick — each call picks at most one new peer to dial so we spread
+    // DNS resolutions across ticks.
+    void try_connect_more_peers(size_t target_outbound)
+    {
+        if (m_peers.size() >= target_outbound) return;
+
+        const auto now = std::chrono::steady_clock::now();
+        constexpr auto kDialCooldown = std::chrono::minutes(10);
+
+        std::vector<NetService> candidates;
+        for (const auto& [addr, val] : base_t::m_addrs.get_all()) {
+            if (base_t::m_connections.contains(addr)) continue;
+            auto it = m_dial_attempts.find(addr);
+            if (it != m_dial_attempts.end() && (now - it->second) < kDialCooldown) continue;
+            candidates.push_back(addr);
+        }
+
+        if (candidates.empty()) return;
+
+        static thread_local std::mt19937 rng{std::random_device{}()};
+        std::uniform_int_distribution<size_t> pick(0, candidates.size() - 1);
+        const auto& addr = candidates[pick(rng)];
+
+        m_dial_attempts[addr] = now;
+        LOG_INFO << "[Dash] Dialing outbound peer " << addr.to_string()
+                 << " (store=" << base_t::m_addrs.len()
+                 << " peers=" << m_peers.size() << "/" << target_outbound
+                 << " candidates=" << candidates.size() << ")";
+        base_t::connect(addr);
     }
 
     // ── Share request/reply handlers ────────────────────────────────────────

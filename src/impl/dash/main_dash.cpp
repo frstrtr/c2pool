@@ -461,6 +461,26 @@ int main(int argc, char* argv[])
         node.connect(peer_addr);
     });
 
+    // ── Periodic outbound peer expansion ─────────────────────────────
+    // Every 30s, if we're below the target outbound count, dial one more
+    // peer from the addr store (populated via message_addrs responses from
+    // handshaked peers). Mirrors the LTC NodeImpl::start_outbound_connections
+    // pattern but keeps Dash's simpler one-dial-per-tick cadence.
+    constexpr size_t TARGET_OUTBOUND_PEERS = 4;
+    auto outbound_timer = std::make_shared<io::steady_timer>(ioc);
+    std::function<void(const boost::system::error_code&)> outbound_fn;
+    outbound_fn = [&, outbound_timer](const boost::system::error_code& ec) {
+        if (ec) return;
+        try { node.try_connect_more_peers(TARGET_OUTBOUND_PEERS); }
+        catch (const std::exception& e) {
+            LOG_WARNING << "[Dash] outbound dial failed: " << e.what();
+        }
+        outbound_timer->expires_after(std::chrono::seconds(30));
+        outbound_timer->async_wait(outbound_fn);
+    };
+    outbound_timer->expires_after(std::chrono::seconds(15));
+    outbound_timer->async_wait(outbound_fn);
+
     // ── Stratum server + job push (M6 Phase 4a: outbound work only) ──
     std::unique_ptr<dash::stratum::Server> stratum_server;
     if (stratum_port != 0) {

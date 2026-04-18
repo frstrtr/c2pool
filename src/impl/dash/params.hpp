@@ -85,9 +85,16 @@ inline core::CoinParams make_coin_params(bool testnet)
     p.testnet_identifier_hex  = "b6deb1e543fe2427";  // testnet identifier
     p.testnet_prefix_hex      = "198b644f6821e3b3";  // testnet prefix
 
-    // Bootstrap
+    // Bootstrap hosts. rov.p2p-spb.xyz is the upstream p2pool-dash default;
+    // the others are known live Dash p2pool nodes also listed in the LTC
+    // bootstrap set (same operators run multi-chain pools). Multiple hosts
+    // are critical because the Dash p2pool network is sparse and a single
+    // bootstrap with a stale addr cache leaves us unable to expand peers.
     p.bootstrap_addrs = {
         "rov.p2p-spb.xyz",
+        "usa.p2p-spb.xyz",
+        "5.188.104.245",
+        "31.25.241.224",
     };
 
     // Donation script: P2PKH for XdgF55wEHBRWwbuBniNYH4GvvaoYMgL84u
