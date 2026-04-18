@@ -4255,7 +4255,10 @@ nlohmann::json MiningInterface::rest_local_stats()
         }
 
         // 2. No work template yet
-        {
+        // Coin targets that drive their own work pipeline (c2pool-dash)
+        // don't populate m_cached_template; suppress this warning when
+        // the dashboard-always-ready flag is set.
+        if (!m_dashboard_always_ready.load(std::memory_order_relaxed)) {
             std::lock_guard<std::mutex> lock(m_work_mutex);
             if (!m_work_valid)
                 warnings.push_back("No block template received yet — waiting for daemon connection");
@@ -4387,7 +4390,7 @@ nlohmann::json MiningInterface::rest_local_stats()
 
     // p2pool-compat: version and protocol_version
     result["version"] = m_pool_version;
-    result["protocol_version"] = 3600;  // V36 share format
+    result["protocol_version"] = m_protocol_version.load(std::memory_order_relaxed);
 
     return result;
 }
@@ -5261,6 +5264,12 @@ nlohmann::json MiningInterface::rest_miner_payouts(const std::string& address)
 
 nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cached_sc)
 {
+    // V35→V36 transition tracking is LTC-specific. Other blockchains
+    // (e.g. Dash v16) don't have a pending transition, so return an
+    // empty object to keep the dashboard's transition banners hidden.
+    if (m_blockchain != Blockchain::LITECOIN)
+        return nlohmann::json::object();
+
     // Matches p2pool's get_version_signaling() — all fields the dashboard JS expects.
     constexpr int TARGET_VERSION = 36;
     const std::map<int, std::string> share_type_names = {

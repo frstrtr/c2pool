@@ -571,6 +571,11 @@ public:
     // has_work=true regardless of the cached template.
     void set_dashboard_always_ready(bool v) { m_dashboard_always_ready.store(v, std::memory_order_relaxed); }
     bool is_dashboard_always_ready() const { return m_dashboard_always_ready.load(std::memory_order_relaxed); }
+
+    // Override the p2pool-compat protocol_version reported by /local_stats.
+    // Default 3600 matches LTC/V36; Dash uses 1700.
+    void set_protocol_version(int v) { m_protocol_version.store(v, std::memory_order_relaxed); }
+    int  get_protocol_version() const { return m_protocol_version.load(std::memory_order_relaxed); }
     double get_pool_hashrate() const { return m_pool_hashrate_fn ? m_pool_hashrate_fn() : 0.0; }
 
     // Rate monitor stats for p2pool-style status (DOA%, time window)
@@ -1033,6 +1038,7 @@ private:
     double m_cached_pool_hashrate{0};
     std::function<double()> m_pool_hashrate_fn;
     std::atomic<bool> m_dashboard_always_ready{false};
+    std::atomic<int> m_protocol_version{3600};
 
     // THE checkpoint callbacks (set by node layer)
     checkpoint_store_fn_t m_checkpoint_latest_fn;
