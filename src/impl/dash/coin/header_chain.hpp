@@ -472,6 +472,25 @@ private:
                 m_height_index[new_height] = bhash;
             } else {
                 rebuild_height_index(bhash);
+                // SPV B4 (parity audit): alert on deep reorgs — operator
+                // visibility for serious network events. Threshold 3 blocks
+                // since Dash ChainLocks make anything deeper very rare.
+                int32_t depth = static_cast<int32_t>(old_height)
+                              - static_cast<int32_t>(new_height) + 1;
+                if (old_height > new_height && depth >= 3) {
+                    LOG_WARNING << "[EMB-DASH] DEEP REORG: old_tip="
+                                << old_tip.GetHex().substr(0, 16)
+                                << "@" << old_height << " → new_tip="
+                                << bhash.GetHex().substr(0, 16)
+                                << "@" << new_height
+                                << " (depth=" << depth << ")";
+                } else if (old_height > 0) {
+                    LOG_INFO << "[EMB-DASH] reorg: old_tip="
+                             << old_tip.GetHex().substr(0, 16)
+                             << "@" << old_height << " → new_tip="
+                             << bhash.GetHex().substr(0, 16)
+                             << "@" << new_height;
+                }
             }
             m_pending_tip_change.fired = true;
             m_pending_tip_change.old_tip = old_tip;

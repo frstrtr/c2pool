@@ -261,6 +261,14 @@ private:
         auto msg_sendheaders = message_sendheaders::make_raw();
         m_peer->write(msg_sendheaders);
 
+        // SPV A4 (parity audit): ask peer for full mempool summary.
+        // Peer replies with `inv` which our inv-handler already processes
+        // → we learn about pending txs without waiting for new-tx pushes.
+        // Closes the startup window where transactions sent during our
+        // connection-setup gap would be invisible until they land in a block.
+        auto msg_mempool = message_mempool::make_raw();
+        m_peer->write(msg_mempool);
+
         LOG_INFO << "[DashP2P] Handshake complete with " << m_target_addr.to_string();
     }
 
@@ -273,7 +281,21 @@ private:
     void handle_msg(std::unique_ptr<message_pong>) {}
     void handle_msg(std::unique_ptr<message_alert>) {}
     void handle_msg(std::unique_ptr<message_getaddr>) {}
-    void handle_msg(std::unique_ptr<message_reject>) {}
+    // SPV A3 (parity audit): log rejects instead of silently dropping.
+    // Dashd sends these when our submitblock / getdata / etc. is malformed
+    // or the message it references doesn't validate. Without the log a
+    // submitblock failure leaves no diagnostic trail.
+    void handle_msg(std::unique_ptr<message_reject> msg)
+    {
+        if (!msg) return;
+        LOG_WARNING << "[DashP2P] reject from peer:"
+                    << " msg=" << msg->m_message
+                    << " ccode=0x" << std::hex << static_cast<int>(msg->m_ccode) << std::dec
+                    << " reason='" << msg->m_reason << "'"
+                    << " data=" << (msg->m_data.IsNull()
+                                    ? std::string("-")
+                                    : msg->m_data.GetHex().substr(0, 16));
+    }
     void handle_msg(std::unique_ptr<message_notfound>) {}
     void handle_msg(std::unique_ptr<message_feefilter>) {}
     void handle_msg(std::unique_ptr<message_sendheaders>) {}

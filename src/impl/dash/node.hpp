@@ -144,6 +144,24 @@ public:
             throw std::runtime_error("peer protocol too old");
         }
 
+        // Sharechain B6 (parity audit): self-connect / duplicate-nonce
+        // detection. Each node randomizes m_nonce at startup; a peer sending
+        // our own nonce back in its version message means the outbound socket
+        // looped back to us (or a misbehaving peer). Returning nullopt tells
+        // pool::BaseNode to close_connection() gracefully — no error log.
+        if (msg->m_nonce == m_nonce) {
+            LOG_INFO << "[Dash] self-connect detected (nonce match), dropping";
+            return std::nullopt;
+        }
+        // Duplicate connection from a peer we already have — reject the new
+        // socket. Matches p2pool.net's self_nonce tracking.
+        if (m_peers.contains(msg->m_nonce)) {
+            LOG_INFO << "[Dash] duplicate peer nonce "
+                     << std::hex << msg->m_nonce << std::dec
+                     << ", dropping second connection";
+            return std::nullopt;
+        }
+
         peer->m_other_version = msg->m_version;
         peer->m_other_subversion = msg->m_subversion;
         peer->m_nonce = msg->m_nonce;
@@ -205,6 +223,27 @@ public:
                 else if constexpr (std::is_same_v<T, std::unique_ptr<dash::message_sharereq>>) {
                     if (msg) {
                         handle_sharereq(std::move(msg), peer);
+                    }
+                }
+                else if constexpr (std::is_same_v<T, std::unique_ptr<dash::message_bestblock>>) {
+                    // Sharechain A3 (parity audit): peer advertises its tip.
+                    // If we don't have it, kick off recursive parent download
+                    // from this peer. Without this handler we miss tip
+                    // announcements between share broadcasts.
+                    if (msg) {
+                        auto packed = pack(msg->m_header);
+                        auto tip_hash = dash::crypto::hash_x11(packed.get_span());
+                        peer->m_best_share = tip_hash;
+                        std::shared_lock lock(m_tracker_mutex);
+                        bool known = m_tracker.chain.contains(tip_hash);
+                        lock.unlock();
+                        if (!known) {
+                            LOG_INFO << "[Dash] bestblock from "
+                                     << peer->addr().to_string()
+                                     << " tip=" << tip_hash.GetHex().substr(0, 16)
+                                     << " (unknown, downloading)";
+                            download_shares(peer, tip_hash);
+                        }
                     }
                 }
                 else if constexpr (std::is_same_v<T, std::unique_ptr<dash::message_addrs>>) {
@@ -530,6 +569,8 @@ public:
                         LOG_INFO << "[Dash] Share VERIFIED: hash=" << share_hash.GetHex().substr(0, 16)
                                  << " X11 PoW valid!";
 
+                        uint256 prev_hash = obj->m_prev_hash;
+                        bool need_parent = false;
                         std::unique_lock lock(m_tracker_mutex);
                         if (!m_tracker.chain.contains(share_hash)) {
                             auto* heap_share = new dash::DashShare(*obj);
@@ -538,8 +579,29 @@ public:
                             if (!m_tracker.verified.contains(share_hash))
                                 m_tracker.verified.add(entry.share);
                             auto sz = m_tracker.chain.size();
+                            // Sharechain A4 (parity audit): if parent is
+                            // missing, trigger recursive download from the
+                            // peer that sent us this share. Without this
+                            // hook a share arriving during a network blip
+                            // stays orphaned until restart.
+                            need_parent = !prev_hash.IsNull()
+                                       && !m_tracker.chain.contains(prev_hash)
+                                       && m_downloading_shares.find(prev_hash)
+                                            == m_downloading_shares.end();
                             lock.unlock();
                             LOG_INFO << "[Dash] Share added to tracker (total: " << sz << ")";
+                        } else {
+                            lock.unlock();
+                        }
+                        if (need_parent) {
+                            auto peer_it = m_connections.find(from);
+                            if (peer_it != m_connections.end()) {
+                                LOG_INFO << "[Dash] Share references unknown parent "
+                                         << prev_hash.GetHex().substr(0, 16)
+                                         << ", requesting from "
+                                         << from.to_string();
+                                download_shares(peer_it->second, prev_hash);
+                            }
                         }
                     } catch (const std::exception& e) {
                         LOG_WARNING << "[Dash] Share verification failed: " << e.what();
