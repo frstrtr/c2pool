@@ -516,17 +516,24 @@ int main(int argc, char* argv[])
             std::shared_lock lock(node.tracker_mutex());
             nlohmann::json t;
             auto& chain = node.tracker().chain;
-            auto heads = chain.get_heads();
-            uint256 best = heads.empty() ? uint256() : heads.begin()->first;
+            // Pick the MAX-HEIGHT head so /sharechain/tip matches what
+            // /sharechain/window and /sharechain/delta use. Using
+            // `heads.begin()->first` returned an arbitrary head (hash
+            // order) — so when two heads existed (forks) the SSE tip
+            // push disagreed with the window's best, and the client's
+            // _rtTipHash would never converge. Fixed: max-by-height,
+            // matching set_sharechain_window_fn + set_sharechain_delta_fn.
+            uint256 best;
+            int32_t best_height = -1;
+            for (const auto& [head_hash, tail_hash] : chain.get_heads()) {
+                auto h = chain.get_height(head_hash);
+                if (h > best_height) { best = head_hash; best_height = h; }
+            }
             // D4 (parity audit): return the short (16-char) hash so the
             // key passed to MiningInterface::cache_pplns_at_tip matches
-            // the short-hash keys that the PPLNS precompute thread stores
-            // (web_server.cpp:3497). Mismatched keys meant cache_pplns_at_tip
-            // entries were dead weight — lookups by short hash via
-            // get_pplns_for_tip_exact never found them. Matches LTC
-            // c2pool_refactored.cpp:3606 which already uses substr(0, 16).
+            // the short-hash keys that the PPLNS precompute thread stores.
             t["hash"]   = best.IsNull() ? "" : best.GetHex().substr(0, 16);
-            t["height"] = best.IsNull() ? 0 : chain.get_height(best);
+            t["height"] = best_height < 0 ? 0 : best_height;
             return t;
         });
         // Sharechain delta endpoint — returns shares newer than `since`
