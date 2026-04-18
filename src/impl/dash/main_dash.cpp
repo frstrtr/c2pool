@@ -458,7 +458,14 @@ int main(int argc, char* argv[])
             auto& chain = node.tracker().chain;
             auto heads = chain.get_heads();
             uint256 best = heads.empty() ? uint256() : heads.begin()->first;
-            t["hash"]   = best.IsNull() ? "" : best.GetHex();
+            // D4 (parity audit): return the short (16-char) hash so the
+            // key passed to MiningInterface::cache_pplns_at_tip matches
+            // the short-hash keys that the PPLNS precompute thread stores
+            // (web_server.cpp:3497). Mismatched keys meant cache_pplns_at_tip
+            // entries were dead weight — lookups by short hash via
+            // get_pplns_for_tip_exact never found them. Matches LTC
+            // c2pool_refactored.cpp:3606 which already uses substr(0, 16).
+            t["hash"]   = best.IsNull() ? "" : best.GetHex().substr(0, 16);
             t["height"] = best.IsNull() ? 0 : chain.get_height(best);
             return t;
         });
