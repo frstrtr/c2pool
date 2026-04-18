@@ -527,6 +527,66 @@ public:
     //   (b) picked random from all candidates (no peer-quality scoring)
     // Both fixed: target=10 (matches p2pool-dash/p2p.py:704 default) and
     // get_good_peers() ranks by longevity × recency × randomness.
+    // Periodic ancestor backfill. When a head's walkable chain depth
+    // is shallower than the PPLNS window (e.g. new fork that just
+    // appeared, or recovered from a network blip), the initial
+    // download_shares fire during handshake/bestblock may have hit
+    // peers without the needed history — each such attempt increments
+    // fail_count and after MAX_EMPTY_RETRIES the hash is blacklisted.
+    //
+    // This tick walks each head to its tail, finds the tail's
+    // m_prev_hash, and if not in our chain AND not currently being
+    // downloaded, requests it. Clears fail_count first so the
+    // hashes that hit 3/3 earlier get another chance — different
+    // peers may have the history we need.
+    //
+    // Fires every 30 s from main_dash.cpp. p2pool-dash's equivalent
+    // is the handle_shares → download_shares recursive cascade plus
+    // bestblock triggers, but those only fire on gossip. Adding a
+    // periodic fallback keeps the window filling even when the
+    // network is quiet.
+    void backfill_ancestors()
+    {
+        if (m_peers.empty()) return;
+        std::vector<uint256> targets;
+        {
+            std::shared_lock lock(m_tracker_mutex);
+            auto& chain = m_tracker.chain;
+            for (auto& [head_hash, _tail] : chain.get_heads()) {
+                try {
+                    int32_t depth = chain.get_height(head_hash);
+                    if (depth >= static_cast<int32_t>(m_coin_params.chain_length))
+                        continue;  // already deep enough
+                    // Walk head → tail, capture tail's m_prev_hash.
+                    uint256 tail_prev;
+                    bool have_tail = false;
+                    for (auto [h, data] : chain.get_chain(head_hash, depth)) {
+                        data.share.invoke([&](auto* obj) {
+                            using S = std::remove_pointer_t<decltype(obj)>;
+                            if constexpr (std::is_same_v<S, dash::DashShare>) {
+                                tail_prev = obj->m_prev_hash;
+                                have_tail = true;
+                            }
+                        });
+                    }
+                    if (have_tail && !tail_prev.IsNull()
+                        && !chain.contains(tail_prev)
+                        && m_downloading_shares.find(tail_prev) == m_downloading_shares.end())
+                    {
+                        targets.push_back(tail_prev);
+                    }
+                } catch (...) {}
+            }
+        }
+        // Reset fail_count so retries go again — different peers may have it.
+        for (auto& h : targets) m_download_fail_count.erase(h);
+        for (auto& h : targets) {
+            LOG_INFO << "[Dash] Backfill tick: requesting ancestor "
+                     << h.GetHex().substr(0, 16);
+            download_shares(peer_ptr{}, h);
+        }
+    }
+
     void try_connect_more_peers(size_t target_outbound)
     {
         // Use m_connections.size() (TCP-level) not m_peers.size()
