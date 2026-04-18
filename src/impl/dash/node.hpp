@@ -116,6 +116,13 @@ protected:
     TrackerSnapshot    m_snapshot;
 
 public:
+    // Fired whenever a new share has been ingested (process_shares,
+    // sharereply, add_local_share) and publish_snapshot() has updated the
+    // tracker snapshot. main_dash.cpp uses this to drive the SSE push +
+    // precompute_delta pipeline — mirrors LTC's trigger_work_refresh_debounced
+    // on the WebServer. Takes the new best-share hash.
+    std::function<void(const uint256&)> m_on_new_share;
+
     DashNodeImpl()
         : m_coin_params(dash::make_coin_params(false)),
           m_share_getter(nullptr,
@@ -775,6 +782,7 @@ public:
                                 persist_share(*obj);
                                 if (became_verified && m_tracker.m_on_share_verified)
                                     m_tracker.m_on_share_verified(share_hash);
+                                if (m_on_new_share) m_on_new_share(share_hash);
                             }
                         } catch (const std::exception& e) {
                             LOG_WARNING << "[Dash] Share verification failed in download: " << e.what();
@@ -863,6 +871,7 @@ public:
                             persist_share(*obj);
                             if (became_verified && m_tracker.m_on_share_verified)
                                 m_tracker.m_on_share_verified(share_hash);
+                            if (m_on_new_share) m_on_new_share(share_hash);
                             LOG_INFO << "[Dash] Share added to tracker (total: " << sz << ")";
                         } else {
                             lock.unlock();
@@ -1158,6 +1167,7 @@ public:
         persist_share(*heap_share);
         if (became_verified && m_tracker.m_on_share_verified)
             m_tracker.m_on_share_verified(heap_share->m_hash);
+        if (m_on_new_share) m_on_new_share(heap_share->m_hash);
         return heap_share->m_hash;
     }
 
