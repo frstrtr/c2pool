@@ -501,19 +501,30 @@ int main(int argc, char* argv[])
 
         // C2: persistent save timer (every 100s). Graph_db rolls a 31-day
         // window via update_stat_log eviction so the file stays bounded.
-        auto stats_timer = std::make_shared<io::steady_timer>(ioc);
-        std::function<void(const boost::system::error_code&)> stats_fn;
-        stats_fn = [mi, stats_timer, &stats_fn](const boost::system::error_code& ec) {
+        //
+        // Wrapping the self-rescheduling std::function in shared_ptr avoids
+        // the dangling-capture corner case where `[&stats_fn]` holds a
+        // pointer to a stack local whose value the std::function_handler
+        // chain can see as moved-from once asio has copied it into the
+        // operation queue. Using a heap-owned std::function and capturing
+        // the shared_ptr by value gives the lambda a stable, live handle
+        // to itself across every async_wait iteration. Same pattern used
+        // by c2pool-ltc's long-lived self-rescheduling timers.
+        auto stat_save_timer = std::make_shared<io::steady_timer>(ioc);
+        auto stat_save_fn = std::make_shared<
+            std::function<void(const boost::system::error_code&)>>();
+        *stat_save_fn = [mi, stat_save_timer, stat_save_fn]
+                        (const boost::system::error_code& ec) {
             if (ec) return;
             try { mi->save_stat_log(); }
             catch (const std::exception& e) {
                 LOG_WARNING << "[Dash] save_stat_log: " << e.what();
             }
-            stats_timer->expires_after(std::chrono::seconds(100));
-            stats_timer->async_wait(stats_fn);
+            stat_save_timer->expires_after(std::chrono::seconds(100));
+            stat_save_timer->async_wait(*stat_save_fn);
         };
-        stats_timer->expires_after(std::chrono::seconds(100));
-        stats_timer->async_wait(stats_fn);
+        stat_save_timer->expires_after(std::chrono::seconds(100));
+        stat_save_timer->async_wait(*stat_save_fn);
 
         // Background per-share PPLNS precomputer for the Sharechain Explorer.
         // Mirrors LTC's start_pplns_precompute(): walk the window, compute
