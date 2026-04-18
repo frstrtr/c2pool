@@ -82,6 +82,39 @@ protected:
     // the first iteration order entry forever.
     std::map<NetService, std::chrono::steady_clock::time_point> m_dial_attempts;
 
+    // D1 (parity audit): atomically-published tracker snapshot. Writers
+    // call publish_snapshot() after tracker mutations (process_shares,
+    // sharereply, add_local_share) so HTTP-thread stats callbacks can
+    // read chain/verified/head counts without taking m_tracker_mutex.
+    // Mirrors ltc::NodeImpl::TrackerSnapshot (node.hpp:84-103).
+    // A dedicated small mutex is used so a stats reader doesn't have to
+    // contend with a share-arrival writer on the big tracker mutex.
+public:
+    struct TrackerSnapshot {
+        int chain_count{0};
+        int verified_count{0};
+        int head_count{0};
+        int fork_count{0};
+    };
+    TrackerSnapshot get_tracker_snapshot() const {
+        std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+        return m_snapshot;
+    }
+protected:
+    void publish_snapshot() {
+        // Must be called with m_tracker_mutex held (unique or shared) so
+        // the sizes we read are consistent with what just mutated.
+        TrackerSnapshot s;
+        s.chain_count    = static_cast<int>(m_tracker.chain.size());
+        s.verified_count = static_cast<int>(m_tracker.verified.size());
+        s.head_count     = static_cast<int>(m_tracker.chain.get_heads().size());
+        s.fork_count     = s.head_count;
+        std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+        m_snapshot = s;
+    }
+    mutable std::mutex m_snapshot_mutex;
+    TrackerSnapshot    m_snapshot;
+
 public:
     DashNodeImpl()
         : m_coin_params(dash::make_coin_params(false)),
@@ -682,6 +715,7 @@ public:
                                     m_tracker.verified.add(entry.share);
                                     became_verified = true;
                                 }
+                                publish_snapshot();  // D1: push stats to atomic snapshot
                                 lock.unlock();
                                 persist_share(*obj);
                                 if (became_verified && m_tracker.m_on_share_verified)
@@ -769,6 +803,7 @@ public:
                                        && !m_tracker.chain.contains(prev_hash)
                                        && m_downloading_shares.find(prev_hash)
                                             == m_downloading_shares.end();
+                            publish_snapshot();  // D1: push stats to atomic snapshot
                             lock.unlock();
                             persist_share(*obj);
                             if (became_verified && m_tracker.m_on_share_verified)
@@ -975,6 +1010,11 @@ public:
             m_storage->remove_shares_batch(to_prune);
             LOG_INFO << "[Dash] Pruned " << skip << " stale shares from LevelDB";
         }
+
+        // D1: publish initial snapshot after bulk load so HTTP stats
+        // callbacks see the warm-loaded tracker counts before the first
+        // share arrival.
+        publish_snapshot();
     }
 
     // Access
@@ -1057,6 +1097,7 @@ public:
                     m_tracker.verified.add(entry.share);
                     became_verified = true;
                 }
+                publish_snapshot();  // D1: push stats to atomic snapshot
             }
         }
         persist_share(*heap_share);
@@ -1120,6 +1161,8 @@ public:
             ++removed;
         }
         size_t after = m_tracker.chain.size();
+        if (removed > 0)
+            publish_snapshot();  // D1: update stats now that counts shrank
         lock.unlock();
         if (removed > 0) {
             LOG_INFO << "[Dash] prune: " << before << " → " << after
