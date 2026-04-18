@@ -34,8 +34,10 @@
 
 #include <boost/asio.hpp>
 
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <core/filesystem.hpp>
 #include <string>
 #include <thread>
 #include <chrono>
@@ -412,9 +414,42 @@ int main(int argc, char* argv[])
         // Canonical Dash p2pool ports for node_info (dashboard miner URL).
         mi->set_p2p_port(port);
         if (stratum_port == 0) mi->set_worker_port(7903);
+
+        // C2 (parity audit): operator stats history for dashboard graphs.
+        // WebServer already runs update_stat_log every 60s on its own
+        // timer; we just need to tell MiningInterface where to persist
+        // samples and load any existing history. Timer below writes to
+        // disk every 100s matching LTC / p2pool graph_db cadence.
+        {
+            std::string net_label = testnet ? "dash_testnet" : "dash";
+            std::filesystem::path graph_db = core::filesystem::config_path()
+                                           / net_label / "graph_db";
+            mi->set_stat_log_path(graph_db.string());
+            try { mi->load_stat_log(); }
+            catch (const std::exception& e) {
+                LOG_WARNING << "[Dash] load_stat_log: " << e.what();
+            }
+        }
+
         web_server->start();
         std::cout << "[WEB] dashboard listening on " << http_host << ":"
                   << http_port << std::endl;
+
+        // C2: persistent save timer (every 100s). Graph_db rolls a 31-day
+        // window via update_stat_log eviction so the file stays bounded.
+        auto stats_timer = std::make_shared<io::steady_timer>(ioc);
+        std::function<void(const boost::system::error_code&)> stats_fn;
+        stats_fn = [mi, stats_timer, &stats_fn](const boost::system::error_code& ec) {
+            if (ec) return;
+            try { mi->save_stat_log(); }
+            catch (const std::exception& e) {
+                LOG_WARNING << "[Dash] save_stat_log: " << e.what();
+            }
+            stats_timer->expires_after(std::chrono::seconds(100));
+            stats_timer->async_wait(stats_fn);
+        };
+        stats_timer->expires_after(std::chrono::seconds(100));
+        stats_timer->async_wait(stats_fn);
 
         // Background per-share PPLNS precomputer for the Sharechain Explorer.
         // Mirrors LTC's start_pplns_precompute(): walk the window, compute
@@ -1048,6 +1083,13 @@ int main(int argc, char* argv[])
         try { node.shutdown_storage(); }
         catch (const std::exception& e) {
             LOG_WARNING << "[Dash] shutdown_storage: " << e.what();
+        }
+        // C2: final graph_db save so we don't lose recent samples.
+        if (web_server) {
+            try { web_server->get_mining_interface()->save_stat_log(); }
+            catch (const std::exception& e) {
+                LOG_WARNING << "[Dash] save_stat_log on shutdown: " << e.what();
+            }
         }
         ioc.stop();
     });
