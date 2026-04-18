@@ -702,6 +702,68 @@ public:
         return heap_share->m_hash;
     }
 
+    // Sharechain B2 (parity audit): p2pool-style tail-drop pruning.
+    // Matches node.py:381-398 exactly: for each tail in the chain, if all
+    // of its downstream heads are at height >= 2*CHAIN_LENGTH+10, remove
+    // ONE child of that tail per iteration. Loop up to 1000 iterations per
+    // call so a single pass can evict ~350 shares on a 9000-share tracker
+    // without hogging the lock indefinitely. Direct port of
+    // ltc::NodeImpl::prune_shares (ltc/node.cpp:1206-1268).
+    void prune_shares()
+    {
+        const auto CL = static_cast<int32_t>(m_tracker.m_params->chain_length);
+        const int32_t min_depth = 2 * CL + 10;
+
+        std::unique_lock lock(m_tracker_mutex);
+        size_t before = m_tracker.chain.size();
+        int removed = 0;
+        for (int iter = 0; iter < 1000; ++iter)
+        {
+            uint256 to_remove;
+            bool found = false;
+            auto tails_copy = m_tracker.chain.get_tails();
+            for (auto& [tail_hash, head_hashes] : tails_copy)
+            {
+                int32_t min_height = std::numeric_limits<int32_t>::max();
+                for (auto& hh : head_hashes) {
+                    if (!m_tracker.chain.contains(hh)) continue;
+                    try {
+                        min_height = std::min(min_height, m_tracker.chain.get_height(hh));
+                    } catch (...) { continue; }
+                }
+                if (min_height < min_depth) continue;
+
+                auto& rev = m_tracker.chain.get_reverse();
+                auto rev_it = rev.find(tail_hash);
+                if (rev_it != rev.end() && !rev_it->second.empty()) {
+                    to_remove = *rev_it->second.begin();
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) break;
+            if (!m_tracker.chain.contains(to_remove)) continue;
+
+            // p2pool node.py:393 safety check: the parent we'd be promoting
+            // to new-tail must actually currently be a tail. Skip otherwise
+            // to avoid creating a disconnected chain segment.
+            auto* idx = m_tracker.chain.get_index(to_remove);
+            if (!idx) continue;
+            if (!m_tracker.chain.get_tails().contains(idx->tail)) continue;
+
+            if (m_tracker.verified.contains(to_remove))
+                m_tracker.verified.remove(to_remove, /*owns_data=*/false);
+            m_tracker.chain.remove(to_remove);
+            ++removed;
+        }
+        size_t after = m_tracker.chain.size();
+        lock.unlock();
+        if (removed > 0) {
+            LOG_INFO << "[Dash] prune: " << before << " → " << after
+                     << " (removed " << removed << ")";
+        }
+    }
+
     // Broadcast a single locally-created share to every connected peer via
     // the message_shares wire message. Pack once, build a fresh RawMessage
     // per peer (Peer::write() takes ownership of the unique_ptr).

@@ -646,6 +646,29 @@ int main(int argc, char* argv[])
     outbound_timer->expires_after(std::chrono::seconds(15));
     outbound_timer->async_wait(outbound_fn);
 
+    // ── Tracker pruning (B2 from parity audit) ───────────────────────
+    // p2pool-style tail-drop keeps the chain at 2*CL+10 = ~8650 shares.
+    // Without this, live tracker grew to 10k+ within minutes — unbounded
+    // leak. Fires every 60s; node.prune_shares() does up to 1000
+    // removals per call (~350 in practice on first pass, ~1 per share
+    // arrival steady-state). Separate timer so it never blocks the JOB
+    // cycle or share-arrival path.
+    auto prune_timer = std::make_shared<io::steady_timer>(ioc);
+    std::function<void(const boost::system::error_code&)> prune_fn;
+    prune_fn = [&, prune_timer](const boost::system::error_code& ec) {
+        if (ec) return;
+        try { node.prune_shares(); }
+        catch (const std::exception& e) {
+            LOG_WARNING << "[Dash] prune_shares threw: " << e.what();
+        }
+        prune_timer->expires_after(std::chrono::seconds(60));
+        prune_timer->async_wait(prune_fn);
+    };
+    // First prune 90s in — gives the initial sharechain download time to
+    // complete before we start evicting.
+    prune_timer->expires_after(std::chrono::seconds(90));
+    prune_timer->async_wait(prune_fn);
+
     // ── Stratum server + job push (M6 Phase 4a: outbound work only) ──
     std::unique_ptr<dash::stratum::Server> stratum_server;
     if (stratum_port != 0) {
