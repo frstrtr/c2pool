@@ -1110,42 +1110,58 @@ public:
     std::shared_mutex& tracker_mutex() { return m_tracker_mutex; }
     const core::CoinParams& coin_params() const { return m_coin_params; }
 
-    // Caller MUST already hold m_tracker_mutex (shared or unique). Picks
-    // the "best" head among forks by composite score:
-    //   1. Greater walkable chain depth wins (chain.get_height) — so a
-    //      head with 4320 ancestors beats a head with 415. Without this
-    //      the window would collapse to the shorter fork (e.g. 416/4320).
-    //   2. On equal depth, greater cumulative abswork wins — matches
-    //      p2pool's set_best_share preference.
+    // Caller MUST already hold m_tracker_mutex (shared or unique).
     //
-    // Rationale: a deep, well-connected chain is the one we have enough
-    // history for; a shallow shallow-work fork may be a newly-started
-    // branch we haven't fetched ancestors for yet, or a peer's isolated
-    // sub-chain. Prefer the view with more context. p2pool's tracker.think()
-    // does this via DecoratedShare scoring (length + work + age).
+    // Picks the "best" head approximating p2pool's tracker.think() logic:
+    //   1. Primary: highest absheight (= latest network work seen). This
+    //      is what moves the tip forward in real time — the freshly
+    //      mined fork wins over a stale deep chain.
+    //   2. Tiebreak on equal absheight: greater cumulative abswork.
+    //   3. Second tiebreak: greater walkable chain depth (ancestor count)
+    //      so within the same absheight/work we pick the view with the
+    //      most history.
+    //
+    // Rationale: when a fork dies (no new shares) and the active chain
+    // advances on a different fork, the dead head keeps max walkable
+    // depth locally but its absheight freezes. p2pool-dash's best_share
+    // tracks the live tip; so should we. If the active fork doesn't
+    // have its full ancestors locally yet, sharereq fetches them and
+    // the window backfills naturally.
     uint256 best_share_hash_nolock() const
     {
         uint256 best;
-        int32_t best_depth = -1;
-        uint128 best_work{};
+        uint32_t best_absheight = 0;
+        uint128  best_work{};
+        int32_t  best_depth = -1;
         auto& chain_nc = const_cast<dash::ShareChain&>(m_tracker.chain);
         for (auto& [head_hash, _unused] : chain_nc.get_heads()) {
             try {
-                int32_t depth = chain_nc.get_height(head_hash);
                 auto& entry = chain_nc.get(head_hash);
-                uint128 work{};
+                uint32_t absh = 0;
+                uint128  work{};
                 entry.share.invoke([&](auto* obj) {
                     using S = std::remove_pointer_t<decltype(obj)>;
                     if constexpr (std::is_same_v<S, dash::DashShare>) {
+                        absh = obj->m_absheight;
                         work = obj->m_abswork;
                     }
                 });
-                bool better = (depth > best_depth)
-                           || (depth == best_depth && best_work < work);
-                if (best.IsNull() || better) {
+                int32_t depth = chain_nc.get_height(head_hash);
+                bool better = false;
+                if (best.IsNull()) {
+                    better = true;
+                } else if (absh != best_absheight) {
+                    better = absh > best_absheight;
+                } else if (best_work < work || work < best_work) {
+                    better = best_work < work;
+                } else {
+                    better = depth > best_depth;
+                }
+                if (better) {
                     best = head_hash;
-                    best_depth = depth;
+                    best_absheight = absh;
                     best_work = work;
+                    best_depth = depth;
                 }
             } catch (...) {}
         }
