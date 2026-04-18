@@ -2181,11 +2181,11 @@
                             <span class="label">Node Fee</span>
                             <span class="value" id="defrag-fee" style="color:#9c27b0">-</span>
                         </div>
-                        <div class="defrag-stat-row">
-                            <span class="label">V36 Native</span>
+                        <div class="defrag-stat-row" id="defrag-row-v36native">
+                            <span class="label" id="defrag-label-v36native">V36 Native</span>
                             <span class="value" id="defrag-v36native" style="color:#00e676">-</span>
                         </div>
-                        <div class="defrag-stat-row">
+                        <div class="defrag-stat-row" id="defrag-row-v36sig">
                             <span class="label">V36 Signaling</span>
                             <span class="value" id="defrag-v36sig" style="color:#0097a7">-</span>
                         </div>
@@ -2201,15 +2201,15 @@
                             <div class="legend-swatch" style="background:#00b0ff"></div>
                             <span>This Node</span>
                         </div>
-                        <div class="legend-item">
+                        <div class="legend-item" id="legend-v36native">
                             <div class="legend-swatch" style="background:#00e676"></div>
-                            <span>V36 (others)</span>
+                            <span id="legend-v36native-label">V36 (others)</span>
                         </div>
-                        <div class="legend-item">
+                        <div class="legend-item" id="legend-v36sig">
                             <div class="legend-swatch" style="background:#26c6da"></div>
                             <span>V36 signaling</span>
                         </div>
-                        <div class="legend-item">
+                        <div class="legend-item" id="legend-v35only">
                             <div class="legend-swatch" style="background:#2e7d32"></div>
                             <span>V35 only</span>
                         </div>
@@ -2783,6 +2783,22 @@
                         nav.appendChild(a);
                     }
                 }
+            }
+
+            // Coin-specific legend relabeling. Dash uses a single share
+            // version (v16) with no V35/V36 transition — hide the V35/V36
+            // rows and rename "V36 (others)" to the native-coin label.
+            if (info && info.symbol === 'DASH') {
+                var r1 = document.getElementById('defrag-row-v36native');
+                if (r1) r1.style.display = 'none';
+                var r2 = document.getElementById('defrag-row-v36sig');
+                if (r2) r2.style.display = 'none';
+                var lsig = document.getElementById('legend-v36sig');
+                if (lsig) lsig.style.display = 'none';
+                var l35 = document.getElementById('legend-v35only');
+                if (l35) l35.style.display = 'none';
+                var lab = document.getElementById('legend-v36native-label');
+                if (lab) lab.textContent = 'Dash v16 share';
             }
 
             // Now load everything else
@@ -5434,11 +5450,18 @@
                 if (share.fee) return '#9c27b0';
 
                 var isMine = this.myAddress && share.m === this.myAddress;
-                var isV36Native = share.V >= 36;
-                var isV36Signal = !isV36Native && share.dv && share.dv >= 36;
+                // Dash shares are v16 (no V35/V36 distinction). Treat the
+                // native coin-share version as "native" so Dash shares use
+                // the bright green (not the dim V35-only shade). Falls
+                // through to LTC semantics (V>=36 native, dv>=36 signaling)
+                // when the share isn't Dash.
+                var isDashNative = share.V === 16;
+                var isV36Native = !isDashNative && share.V >= 36;
+                var isV36Signal = !isV36Native && !isDashNative
+                                 && share.dv && share.dv >= 36;
 
-                if (isV36Native) {
-                    // V36 native — brightest: cyan-green / bright blue
+                if (isV36Native || isDashNative) {
+                    // Native for this coin — brightest.
                     return isMine ? '#00b0ff' : '#00e676';
                 }
                 if (isV36Signal) {
@@ -8111,7 +8134,8 @@
                 defrag.updateStats({
                     shares: defrag.shares, window_size: defrag.windowSize,
                     my_address: defrag.myAddress, heads: delta.heads,
-                    blocks: delta.blocks, doge_blocks: delta.doge_blocks
+                    blocks: delta.blocks, doge_blocks: delta.doge_blocks,
+                    chain_length: delta.chain_length
                 });
                 loadShareLinks();
                 refreshPayoutsV36();
