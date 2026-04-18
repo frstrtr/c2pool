@@ -217,7 +217,14 @@ inline CumulativeWeights walk_cumulative_weights(
     if (start_hash.IsNull() || max_shares == 0 || desired_weight == 0)
         return result;
 
+    // Accumulate in __uint128_t the whole way — on Dash mainnet the raw
+    // att-per-share is ~2^59 which, summed over the full chain window,
+    // exceeds 2^64. Scaling happens once at the end so ratios (which are
+    // all that matter for compute_dash_payouts) are preserved.
     __uint128_t acc_total = 0;
+    __uint128_t acc_donation = 0;
+    std::map<std::vector<unsigned char>, __uint128_t> acc_weights;
+
     uint256 cur = start_hash;
     uint64_t walked = 0;
 
@@ -259,27 +266,37 @@ inline CumulativeWeights walk_cumulative_weights(
         if (acc_total + this_total > desired_weight) {
             // Scale the last share's contribution so we hit desired_weight exactly.
             __uint128_t remaining = desired_weight - acc_total;
-            // p2pool formula: (remaining//65535) * weight // (this_total//65535)
-            // which is equivalent to remaining * weight / this_total (exact when
-            // remaining and this_total are multiples of 65535).
             __uint128_t scaled_worker   = remaining * this_worker   / this_total;
             __uint128_t scaled_donation = remaining * this_donation / this_total;
-            result.weights[script] += clamp128_to_u64(scaled_worker);
-            result.donation_weight  = clamp128_to_u64(
-                static_cast<__uint128_t>(result.donation_weight) + scaled_donation);
-            result.total_weight     = clamp128_to_u64(desired_weight);
+            acc_weights[script] += scaled_worker;
+            acc_donation        += scaled_donation;
+            acc_total            = desired_weight;
             walked++;
             break;
         }
 
-        result.weights[script] += clamp128_to_u64(this_worker);
-        result.donation_weight  = clamp128_to_u64(
-            static_cast<__uint128_t>(result.donation_weight) + this_donation);
-        acc_total              += this_total;
-        result.total_weight     = clamp128_to_u64(acc_total);
+        acc_weights[script] += this_worker;
+        acc_donation        += this_donation;
+        acc_total           += this_total;
         walked++;
         cur = parent_hash;
     }
+
+    // Scale down so acc_total fits in uint64_t. Right-shift all weights +
+    // total + donation by the same amount preserves ratios exactly (mod
+    // floor-rounding which is fine for payout denominators).
+    unsigned shift = 0;
+    {
+        __uint128_t t = acc_total;
+        while (t > std::numeric_limits<uint64_t>::max()) { t >>= 1; ++shift; }
+    }
+    auto scale = [shift](__uint128_t v) -> uint64_t {
+        return static_cast<uint64_t>(v >> shift);
+    };
+    for (const auto& [script, w] : acc_weights)
+        result.weights[script] = scale(w);
+    result.donation_weight = scale(acc_donation);
+    result.total_weight    = scale(acc_total);
     return result;
 }
 
