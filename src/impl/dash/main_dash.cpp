@@ -743,6 +743,21 @@ int main(int argc, char* argv[])
                 enhanced_node->track_mining_share_submission(
                     s.worker_name, ctx->share_difficulty);
                 if (r.is_block && coin_rpc && coin_rpc->is_connected()) {
+                    // SPV A2 (parity audit): broadcast via dashd P2P BEFORE
+                    // the RPC call so the network sees our block ~1-2s
+                    // earlier. Fire-and-forget; RPC is the authoritative
+                    // acceptance signal.
+                    if (coin_node && coin_node->has_p2p()) {
+                        try {
+                            auto bytes = ParseHex(r.block_hex);
+                            coin_node->submit_block_raw(
+                                std::span<const unsigned char>(bytes.data(), bytes.size()));
+                            LOG_INFO << "[SUBMIT] P2P block broadcast sent (bytes="
+                                     << bytes.size() << ")";
+                        } catch (const std::exception& e) {
+                            LOG_WARNING << "[SUBMIT] P2P block broadcast threw: " << e.what();
+                        }
+                    }
                     try {
                         bool ok = coin_rpc->submit_block_hex(r.block_hex);
                         LOG_INFO << "[SUBMIT] submitblock result="

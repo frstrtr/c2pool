@@ -42,6 +42,15 @@ public:
             m_p2p->submit_block(block);
     }
 
+    // Raw-bytes P2P broadcast. Pass-through for submit_block_raw — callers
+    // that already have a packed block (e.g. from submit_validator) can
+    // skip the deserialize/reserialize round-trip.
+    void submit_block_raw(std::span<const unsigned char> block_bytes)
+    {
+        if (m_p2p)
+            m_p2p->submit_block_raw(block_bytes);
+    }
+
     void send_getheaders(uint32_t version, const std::vector<uint256>& locator, const uint256& stop)
     {
         if (m_p2p)

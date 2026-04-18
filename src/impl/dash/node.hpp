@@ -111,16 +111,24 @@ public:
         send_version(peer);
     }
 
-    // Send version message (protocol 1700)
+    // Send version message (protocol 1700). Sharechain C4 (parity audit):
+    // advertise the real c2pool version + git rev in subver so operators can
+    // see pool heterogeneity in peer lists. Default falls back to 0.1 if
+    // C2POOL_VERSION wasn't passed at build time.
     void send_version(peer_ptr peer)
     {
+#ifdef C2POOL_VERSION
+        std::string subver = std::string("/c2pool-dash:") + C2POOL_VERSION + "/";
+#else
+        std::string subver = "/c2pool-dash:0.1/";
+#endif
         auto rmsg = dash::message_version::make_raw(
             m_coin_params.minimum_protocol_version,
             0,                                    // services
             addr_t{0, peer->addr()},              // addr_to
             addr_t{0, NetService{"0.0.0.0", m_coin_params.p2p_port}},
             m_nonce,
-            "/c2pool-dash:0.1/",
+            subver,
             1,                                    // mode
             best_share_hash()
         );
