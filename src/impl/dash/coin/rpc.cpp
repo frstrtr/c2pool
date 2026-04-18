@@ -196,6 +196,7 @@ nlohmann::json NodeRPC::getblocktemplate(const std::vector<std::string>& rules)
 nlohmann::json NodeRPC::getnetworkinfo()       { return call_method("getnetworkinfo"); }
 nlohmann::json NodeRPC::getblockchaininfo()    { return call_method("getblockchaininfo"); }
 nlohmann::json NodeRPC::getmininginfo()        { return call_method("getmininginfo"); }
+nlohmann::json NodeRPC::getpeerinfo()          { return call_method("getpeerinfo"); }
 
 nlohmann::json NodeRPC::getblockheader(const uint256& header, bool verbose)
 {
