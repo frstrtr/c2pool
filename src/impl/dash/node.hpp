@@ -19,6 +19,7 @@
 #include <pool/protocol.hpp>
 #include <core/message.hpp>
 #include <core/reply_matcher.hpp>
+#include <c2pool/storage/sharechain_storage.hpp>
 
 #include <random>
 #include <set>
@@ -60,6 +61,14 @@ protected:
     // same thread as writers, asio serializes handlers.
     mutable std::shared_mutex m_tracker_mutex;
 
+    // B1 persistence (from parity audit): LevelDB store for the sharechain.
+    // Shares get appended to m_verified_flush_buf on transition-to-verified
+    // and flushed in batches of 50. Removed shares accumulate in
+    // m_removal_flush_buf and get batch-deleted alongside the next flush.
+    std::unique_ptr<c2pool::storage::SharechainStorage> m_storage;
+    std::vector<uint256> m_verified_flush_buf;
+    std::vector<uint256> m_removal_flush_buf;
+
     // Outbound-dial throttle: record when we last attempted each addr so a
     // periodic tick doesn't hammer the same unreachable peer. Factory::Client
     // fires and forgets — no failure callback — so without this we'd redial
@@ -99,6 +108,21 @@ public:
 
         // Route chain pointer
         m_chain = &m_tracker.chain;
+
+        // B1 persistence (parity audit): open LevelDB + wire share-verified
+        // + share-removed callbacks. Mirrors ltc/node.hpp:161-178.
+        std::string net_name = testnet ? "dash_testnet" : "dash";
+        m_storage = std::make_unique<c2pool::storage::SharechainStorage>(net_name);
+        load_persisted_shares();
+
+        m_tracker.m_on_share_verified = [this](const uint256& hash) {
+            m_verified_flush_buf.push_back(hash);
+            if (m_verified_flush_buf.size() >= 50)
+                flush_verified_to_leveldb();
+        };
+        m_tracker.chain.on_removed([this](const uint256& hash) {
+            m_removal_flush_buf.push_back(hash);
+        });
     }
 
     // INetwork
@@ -518,8 +542,15 @@ public:
                                 auto* heap_share = new dash::DashShare(*obj);
                                 m_tracker.add(heap_share);
                                 auto& entry = m_tracker.chain.get(share_hash);
-                                if (!m_tracker.verified.contains(share_hash))
+                                bool became_verified = false;
+                                if (!m_tracker.verified.contains(share_hash)) {
                                     m_tracker.verified.add(entry.share);
+                                    became_verified = true;
+                                }
+                                lock.unlock();
+                                persist_share(*obj);
+                                if (became_verified && m_tracker.m_on_share_verified)
+                                    m_tracker.m_on_share_verified(share_hash);
                             }
                         } catch (const std::exception& e) {
                             LOG_WARNING << "[Dash] Share verification failed in download: " << e.what();
@@ -579,13 +610,16 @@ public:
 
                         uint256 prev_hash = obj->m_prev_hash;
                         bool need_parent = false;
+                        bool became_verified = false;
                         std::unique_lock lock(m_tracker_mutex);
                         if (!m_tracker.chain.contains(share_hash)) {
                             auto* heap_share = new dash::DashShare(*obj);
                             m_tracker.add(heap_share);
                             auto& entry = m_tracker.chain.get(share_hash);
-                            if (!m_tracker.verified.contains(share_hash))
+                            if (!m_tracker.verified.contains(share_hash)) {
                                 m_tracker.verified.add(entry.share);
+                                became_verified = true;
+                            }
                             auto sz = m_tracker.chain.size();
                             // Sharechain A4 (parity audit): if parent is
                             // missing, trigger recursive download from the
@@ -597,6 +631,9 @@ public:
                                        && m_downloading_shares.find(prev_hash)
                                             == m_downloading_shares.end();
                             lock.unlock();
+                            persist_share(*obj);
+                            if (became_verified && m_tracker.m_on_share_verified)
+                                m_tracker.m_on_share_verified(share_hash);
                             LOG_INFO << "[Dash] Share added to tracker (total: " << sz << ")";
                         } else {
                             lock.unlock();
@@ -619,6 +656,180 @@ public:
                 LOG_WARNING << "[Dash] Share deserialization failed: " << e.what()
                             << " (type=" << raw_share.type << " size=" << raw_share.contents.size() << ")";
             }
+        }
+    }
+
+    // B1 persistence: serialize + persist a single share to LevelDB.
+    // Safe to call with the tracker lock held — LevelDB has its own mutex.
+    // Format matches LTC: [8 bytes version LE][packed share bytes] — so
+    // the load-side code can treat it identically. Mirrors
+    // ltc/node.cpp:512-549.
+    void persist_share(const dash::DashShare& share)
+    {
+        if (!m_storage || !m_storage->is_available()) return;
+        try {
+            // Pack via ShareType variant so DashFormatter's Write runs —
+            // matches load_persisted_shares which deserializes via
+            // dash::load_share / ShareType::load.
+            PackStream ps = pack(dash::ShareType(
+                const_cast<dash::DashShare*>(&share)));
+            auto span = ps.get_span();
+            std::vector<uint8_t> bytes;
+            bytes.reserve(8 + span.size());
+            uint64_t ver = dash::DashShare::version;
+            bytes.resize(8);
+            std::memcpy(bytes.data(), &ver, 8);
+            bytes.insert(bytes.end(),
+                         reinterpret_cast<const uint8_t*>(span.data()),
+                         reinterpret_cast<const uint8_t*>(span.data()) + span.size());
+
+            uint256 target = chain::bits_to_target(share.m_bits);
+            uint256 abswork_256;
+            // m_abswork is uint128 (16 bytes); splat into low half of uint256.
+            // const_cast is safe — we only read from the source.
+            std::memcpy(abswork_256.begin(),
+                        const_cast<uint128&>(share.m_abswork).begin(), 16);
+
+            c2pool::storage::SharechainStorage::ShareBatchEntry entry;
+            entry.hash = share.m_hash;
+            entry.serialized_data = std::move(bytes);
+            entry.prev_hash = share.m_prev_hash;
+            entry.height = share.m_absheight;
+            entry.timestamp = share.m_timestamp;
+            entry.work = abswork_256;
+            entry.target = target;
+            m_storage->store_shares_batch({std::move(entry)});
+        } catch (const std::exception& e) {
+            LOG_WARNING << "[Dash] persist_share failed for "
+                        << share.m_hash.GetHex().substr(0, 16)
+                        << ": " << e.what();
+        }
+    }
+
+    // B1 persistence: flush queued verified-hash markers into LevelDB
+    // metadata. Mirrors ltc/node.cpp:1138-1152.
+    void flush_verified_to_leveldb()
+    {
+        if (m_verified_flush_buf.empty() || !m_storage || !m_storage->is_available())
+            return;
+        std::vector<std::pair<uint256, uint256>> hash_pow_pairs;
+        hash_pow_pairs.reserve(m_verified_flush_buf.size());
+        for (const auto& hash : m_verified_flush_buf) {
+            // Dash doesn't cache a separate pow_hash on the index (X11 is
+            // fast enough to recompute on restart); store a zeroed placeholder.
+            hash_pow_pairs.emplace_back(hash, uint256());
+        }
+        m_storage->mark_shares_verified_with_pow(hash_pow_pairs);
+        m_verified_flush_buf.clear();
+    }
+
+    // B1 persistence: flush queued removed-share hashes from LevelDB.
+    // Called after prune_shares cycles so the on-disk store mirrors the
+    // in-memory tracker. Mirrors ltc/node.cpp shutdown/clean flow.
+    void flush_removals_to_leveldb()
+    {
+        if (m_removal_flush_buf.empty() || !m_storage || !m_storage->is_available())
+            return;
+        size_t n = m_removal_flush_buf.size();
+        m_storage->remove_shares_batch(m_removal_flush_buf);
+        m_removal_flush_buf.clear();
+        LOG_INFO << "[Dash] flushed " << n << " share removals to LevelDB";
+    }
+
+    // B1 persistence: graceful-shutdown helper — flush both buffers before
+    // the process exits. main_dash.cpp should wire this to a SIGINT/SIGTERM
+    // handler.
+    void shutdown_storage()
+    {
+        flush_verified_to_leveldb();
+        flush_removals_to_leveldb();
+        if (m_storage) m_storage->log_storage_stats();
+    }
+
+    // B1 persistence: reload sharechain from LevelDB at startup. Walks the
+    // height index ascending (oldest → newest), caps at 2*CL+10 newest, and
+    // pre-populates the verified chain for shares marked is_verified in
+    // stored metadata. Skips running share_init_verify — by design, once a
+    // share has been persisted as verified we trust that.
+    // Mirrors ltc/node.cpp:984-1136.
+    void load_persisted_shares()
+    {
+        if (!m_storage || !m_storage->is_available()) return;
+
+        auto t0 = std::chrono::steady_clock::now();
+        auto all_hashes = m_storage->get_shares_by_height_range(0, UINT64_MAX);
+        auto scan_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        LOG_INFO << "[Dash] LevelDB scan: " << all_hashes.size() << " shares ("
+                 << scan_ms << "ms)";
+        if (all_hashes.empty()) return;
+
+        const size_t keep_per_head = m_coin_params.chain_length * 2 + 10;
+        const size_t total_in_db = all_hashes.size();
+        size_t skip = 0;
+        if (total_in_db > keep_per_head) {
+            skip = total_in_db - keep_per_head;
+            LOG_INFO << "[Dash] LevelDB has " << total_in_db
+                     << " shares, loading only newest " << keep_per_head
+                     << " (skipping " << skip << " old shares)";
+        }
+
+        int loaded = 0;
+        std::vector<uint256> verified_hashes;
+        for (size_t i = skip; i < total_in_db; ++i) {
+            const auto& hash = all_hashes[i];
+            std::vector<uint8_t> data;
+            core::ShareMetadata meta;
+            if (!m_storage->load_share(hash, data, meta)) continue;
+            if (data.size() < 8) continue;
+
+            try {
+                uint64_t ver;
+                std::memcpy(&ver, data.data(), 8);
+                std::vector<unsigned char> share_bytes(data.begin() + 8, data.end());
+                // Deserialize via ShareType::load — bypass RawShare since
+                // we already know the version and have raw bytes (not
+                // VarStr-wrapped).
+                PackStream ps(share_bytes);
+                auto share_var = dash::ShareType::load(
+                    static_cast<int64_t>(ver), ps);
+                share_var.ACTION({ obj->m_hash = hash; });
+
+                if (!m_tracker.chain.contains(hash)) {
+                    auto* heap_share = new dash::DashShare();
+                    share_var.ACTION({ *heap_share = *obj; });
+                    m_tracker.add(heap_share);
+                    ++loaded;
+                    if (meta.is_verified) verified_hashes.push_back(hash);
+                    if (loaded % 1000 == 0)
+                        LOG_INFO << "[Dash] loading: " << loaded << "/"
+                                 << (total_in_db - skip);
+                }
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[Dash] load_share " << hash.GetHex().substr(0, 16)
+                            << ": " << e.what();
+            }
+        }
+
+        int pre_verified = 0;
+        for (const auto& vh : verified_hashes) {
+            if (m_tracker.chain.contains(vh) && !m_tracker.verified.contains(vh)) {
+                try {
+                    auto& share_var = m_tracker.chain.get_share(vh);
+                    m_tracker.verified.add(share_var);
+                    ++pre_verified;
+                } catch (...) {}
+            }
+        }
+        LOG_INFO << "[Dash] Loaded " << loaded << " shares from LevelDB "
+                 << "(pre-verified=" << pre_verified << ")";
+
+        // Prune shares we skipped — stale DB entries not in active window.
+        if (skip > 0) {
+            std::vector<uint256> to_prune(all_hashes.begin(),
+                                          all_hashes.begin() + skip);
+            m_storage->remove_shares_batch(to_prune);
+            LOG_INFO << "[Dash] Pruned " << skip << " stale shares from LevelDB";
         }
     }
 
@@ -692,13 +903,21 @@ public:
         heap_share->m_hash = share.m_hash.IsNull()
             ? dash::share_init_verify(*heap_share, m_coin_params, /*check_pow=*/false)
             : share.m_hash;
-        std::unique_lock lock(m_tracker_mutex);
-        if (!m_tracker.chain.contains(heap_share->m_hash)) {
-            m_tracker.add(heap_share);
-            auto& entry = m_tracker.chain.get(heap_share->m_hash);
-            if (!m_tracker.verified.contains(heap_share->m_hash))
-                m_tracker.verified.add(entry.share);
+        bool became_verified = false;
+        {
+            std::unique_lock lock(m_tracker_mutex);
+            if (!m_tracker.chain.contains(heap_share->m_hash)) {
+                m_tracker.add(heap_share);
+                auto& entry = m_tracker.chain.get(heap_share->m_hash);
+                if (!m_tracker.verified.contains(heap_share->m_hash)) {
+                    m_tracker.verified.add(entry.share);
+                    became_verified = true;
+                }
+            }
         }
+        persist_share(*heap_share);
+        if (became_verified && m_tracker.m_on_share_verified)
+            m_tracker.m_on_share_verified(heap_share->m_hash);
         return heap_share->m_hash;
     }
 
@@ -761,6 +980,10 @@ public:
         if (removed > 0) {
             LOG_INFO << "[Dash] prune: " << before << " → " << after
                      << " (removed " << removed << ")";
+            // B1 integration: evicted hashes were captured in
+            // m_removal_flush_buf via chain.on_removed; batch-delete
+            // them from LevelDB so the store mirrors the tracker.
+            flush_removals_to_leveldb();
         }
     }
 

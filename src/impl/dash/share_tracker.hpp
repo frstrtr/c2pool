@@ -20,6 +20,11 @@ public:
     ShareChain verified;
     const core::CoinParams* m_params = nullptr;
 
+    // B1 persistence hook: fires when a share transitions into verified.
+    // ltc::NodeImpl sets this from its constructor to append to
+    // m_verified_flush_buf which gets flushed to LevelDB in batches.
+    std::function<void(const uint256&)> m_on_share_verified;
+
     ShareTracker() = default;
     explicit ShareTracker(const core::CoinParams* params) : m_params(params) {}
 
