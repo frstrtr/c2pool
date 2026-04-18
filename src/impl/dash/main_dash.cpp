@@ -68,7 +68,11 @@ int main(int argc, char* argv[])
     uint16_t    http_port       = 0;             // 0 = disable dashboard; e.g. 7904
     std::string dashboard_dir;                   // static files for web dashboard
     std::string http_cors_origin;
-    size_t      target_outbound_peers = 4;       // C3 (parity audit): outbound
+    // p2pool-dash/p2p.py:704 defaults desired_outgoing_conns=10. Matching
+    // that here: 4 was below the bootstrap count (we have 4 bootstrap hosts)
+    // so try_connect_more_peers never expanded past the initial connects.
+    // With 10 the tick fills from addr_store until we reach 10 active peers.
+    size_t      target_outbound_peers = 10;
     int         peer_ban_duration_sec = 300;     // C3 (parity audit): ban len
     std::string header_checkpoint_str;            // empty → use params.fast_start_checkpoint default
 
@@ -789,10 +793,17 @@ int main(int argc, char* argv[])
     // ── Periodic outbound peer expansion ─────────────────────────────
     // Every 30s, if we're below the target outbound count, dial one more
     // peer from the addr store (populated via message_addrs responses from
-    // handshaked peers). Mirrors the LTC NodeImpl::start_outbound_connections
-    // pattern but keeps Dash's simpler one-dial-per-tick cadence.
+    // handshaked peers). Mirrors p2pool-dash/p2p.py:667 ClientFactory.think
+    // and LTC's NodeImpl::start_outbound_connections — dial multiple per
+    // tick until target reached.
+    //
     // C3 (parity audit): outbound-peer target now comes from --target-peers
-    // CLI flag (default 4). --ban-duration tunes the peer-ban expiry too.
+    // CLI flag (default 10, matching p2pool-dash/p2p.py:704
+    // desired_outgoing_conns). --ban-duration tunes the peer-ban expiry.
+    //
+    // First-fire at 5s (was 15s) so expansion beyond the bootstrap set
+    // starts promptly — previously a 15s delay + target=4 meant the tick
+    // never dialed after bootstrap filled target.
     const size_t TARGET_OUTBOUND_PEERS = target_outbound_peers;
     node.set_ban_duration(peer_ban_duration_sec);
     auto outbound_timer = std::make_shared<io::steady_timer>(ioc);
@@ -809,10 +820,10 @@ int main(int argc, char* argv[])
         catch (const std::exception& e) {
             LOG_WARNING << "[Dash] outbound dial failed: " << e.what();
         }
-        outbound_timer->expires_after(std::chrono::seconds(30));
+        outbound_timer->expires_after(std::chrono::seconds(15));
         outbound_timer->async_wait(outbound_fn);
     };
-    outbound_timer->expires_after(std::chrono::seconds(15));
+    outbound_timer->expires_after(std::chrono::seconds(5));
     outbound_timer->async_wait(outbound_fn);
 
     // ── Tracker pruning (B2 from parity audit) ───────────────────────

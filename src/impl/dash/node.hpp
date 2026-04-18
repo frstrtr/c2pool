@@ -418,8 +418,20 @@ public:
                 }
                 else if constexpr (std::is_same_v<T, std::unique_ptr<dash::message_addrs>>) {
                     if (msg) {
-                        size_t added = 0;
+                        size_t added = 0, filtered = 0;
+                        const uint16_t expected_port = m_coin_params.p2p_port;
                         for (const auto& rec : msg->m_addrs) {
+                            // Port filter: reject entries whose port isn't
+                            // our network's canonical p2pool port (8999 on
+                            // mainnet, 18999 on testnet). Dash sharechain
+                            // operators have historically shared mixed
+                            // mainnet/testnet addr lists; without the filter
+                            // the store fills with unreachable cross-network
+                            // entries that cost us dial attempts.
+                            if (rec.m_endpoint.port() != expected_port) {
+                                ++filtered;
+                                continue;
+                            }
                             if (!base_t::m_addrs.check(rec.m_endpoint)) {
                                 core::AddrValue v{rec.m_services,
                                                   rec.m_timestamp,
@@ -428,9 +440,13 @@ public:
                                 ++added;
                             }
                         }
-                        if (added > 0) {
+                        if (added > 0 || filtered > 0) {
                             LOG_INFO << "[Dash] addrs: +" << added
-                                     << " peer(s) from " << peer->addr().to_string()
+                                     << " peer(s)"
+                                     << (filtered ? " (" + std::to_string(filtered)
+                                                    + " wrong-port filtered)"
+                                                  : "")
+                                     << " from " << peer->addr().to_string()
                                      << " (store=" << base_t::m_addrs.len() << ")";
                         }
                     }
@@ -483,38 +499,77 @@ public:
         }
     }
 
-    // Attempt outbound connections from addr store up to m_target_outbound.
-    // Called periodically from an ioc timer in main_dash.cpp. Runs once per
-    // tick — each call picks at most one new peer to dial so we spread
-    // DNS resolutions across ticks.
+    // Attempt outbound connections from addr store up to target_outbound.
+    // Called periodically from an ioc timer in main_dash.cpp. Matches
+    // p2pool-dash/p2p.py:667 (ClientFactory.think) — dial until desired
+    // count is reached, using p2pool's scoring formula via
+    // BaseNode::get_good_peers() so we prefer long-known + recently-seen
+    // peers over random picks. Per-addr cooldown prevents hammering an
+    // unreachable host.
+    //
+    // Each tick dials UP TO (target - live) candidates (capped at 3 per
+    // tick to spread DNS/TCP load). Prior behavior:
+    //   (a) short-circuited when bootstrap filled target exactly
+    //       (target was 4 = bootstrap count → never expanded from addr
+    //       store)
+    //   (b) picked random from all candidates (no peer-quality scoring)
+    // Both fixed: target=10 (matches p2pool-dash/p2p.py:704 default) and
+    // get_good_peers() ranks by longevity × recency × randomness.
     void try_connect_more_peers(size_t target_outbound)
     {
-        if (m_peers.size() >= target_outbound) return;
+        // Use m_connections.size() (TCP-level) not m_peers.size()
+        // (authenticated only): a dialing peer mid-handshake counts as
+        // "in progress" so we don't redial it.
+        const size_t live = base_t::m_connections.size();
+        if (live >= target_outbound) return;
+        const size_t needed = target_outbound - live;
 
         const auto now = std::chrono::steady_clock::now();
         constexpr auto kDialCooldown = std::chrono::minutes(10);
 
-        std::vector<NetService> candidates;
-        for (const auto& [addr, val] : base_t::m_addrs.get_all()) {
-            if (base_t::m_connections.contains(addr)) continue;
-            if (is_banned(addr)) continue;  // B3
+        // Ask for extra candidates — good_peers() can return already-
+        // connected / banned / cooldown-blocked peers that we'll skip below.
+        auto good = base_t::get_good_peers(needed + 16);
+
+        const uint16_t expected_port = m_coin_params.p2p_port;
+        const size_t dial_cap = std::min<size_t>(needed, 3);
+        size_t dialed = 0;
+        size_t skipped_connected = 0, skipped_banned = 0, skipped_cooldown = 0,
+               skipped_wrong_port = 0;
+        for (const auto& ap : good) {
+            if (dialed >= dial_cap) break;
+            const auto& addr = ap.addr;
+            // Belt-and-suspenders port filter: on mainnet our port is 8999
+            // but historical addr-store entries may include cross-network
+            // ports (testnet 18999) from older sessions. Ingest-side filter
+            // rejects new ones; this filter rejects the legacy entries.
+            if (addr.port() != expected_port)         { ++skipped_wrong_port; continue; }
+            if (base_t::m_connections.contains(addr)) { ++skipped_connected;  continue; }
+            if (is_banned(addr))                      { ++skipped_banned;     continue; }
             auto it = m_dial_attempts.find(addr);
-            if (it != m_dial_attempts.end() && (now - it->second) < kDialCooldown) continue;
-            candidates.push_back(addr);
+            if (it != m_dial_attempts.end() && (now - it->second) < kDialCooldown) {
+                ++skipped_cooldown;
+                continue;
+            }
+            m_dial_attempts[addr] = now;
+            LOG_INFO << "[Dash] Dialing outbound peer " << addr.to_string()
+                     << " (store=" << base_t::m_addrs.len()
+                     << " peers=" << live + dialed << "/" << target_outbound
+                     << " good=" << good.size() << ")";
+            base_t::connect(addr);
+            ++dialed;
         }
 
-        if (candidates.empty()) return;
-
-        static thread_local std::mt19937 rng{std::random_device{}()};
-        std::uniform_int_distribution<size_t> pick(0, candidates.size() - 1);
-        const auto& addr = candidates[pick(rng)];
-
-        m_dial_attempts[addr] = now;
-        LOG_INFO << "[Dash] Dialing outbound peer " << addr.to_string()
-                 << " (store=" << base_t::m_addrs.len()
-                 << " peers=" << m_peers.size() << "/" << target_outbound
-                 << " candidates=" << candidates.size() << ")";
-        base_t::connect(addr);
+        if (dialed == 0) {
+            LOG_INFO << "[Dash] no outbound candidates dialed "
+                     << "(peers=" << live << "/" << target_outbound
+                     << " store=" << base_t::m_addrs.len()
+                     << " good=" << good.size()
+                     << " skip: connected=" << skipped_connected
+                     << " banned=" << skipped_banned
+                     << " cooldown=" << skipped_cooldown
+                     << " wrong_port=" << skipped_wrong_port << ")";
+        }
     }
 
     // ── Share request/reply handlers ────────────────────────────────────────
