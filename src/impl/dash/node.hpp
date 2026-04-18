@@ -1172,56 +1172,49 @@ public:
 
     // Caller MUST already hold m_tracker_mutex (shared or unique).
     //
-    // Picks the "best" head approximating p2pool's tracker.think() logic:
-    //   1. Primary: highest absheight (= latest network work seen). This
-    //      is what moves the tip forward in real time — the freshly
-    //      mined fork wins over a stale deep chain.
-    //   2. Tiebreak on equal absheight: greater cumulative abswork.
-    //   3. Second tiebreak: greater walkable chain depth (ancestor count)
-    //      so within the same absheight/work we pick the view with the
-    //      most history.
+    // LTC-style picker: max walkable chain depth primary, timestamp
+    // tiebreak. Matches c2pool-ltc's c2pool_refactored.cpp:3412+ which
+    // picks `max chain.get_height(head_hash)` for all three (tip,
+    // window, delta) endpoints.
     //
-    // Rationale: when a fork dies (no new shares) and the active chain
-    // advances on a different fork, the dead head keeps max walkable
-    // depth locally but its absheight freezes. p2pool-dash's best_share
-    // tracks the live tip; so should we. If the active fork doesn't
-    // have its full ancestors locally yet, sharereq fetches them and
-    // the window backfills naturally.
+    // Why not absheight-primary: when a fork appears with higher
+    // absheight but its ancestors aren't locally backfilled, picking
+    // it makes the window collapse to the fork's shallow depth
+    // (400 vs 4320). Every dashboard endpoint then sees a tiny window.
+    // Backfill_ancestors() runs every 30 s and pulls the fork's
+    // ancestors over time — once that fork's depth overtakes the
+    // former best, it naturally wins and the tip updates.
+    // Timestamp tiebreak: on equal depth, prefer the head whose share
+    // timestamp is most recent (live tip).
     uint256 best_share_hash_nolock() const
     {
         uint256 best;
-        uint32_t best_absheight = 0;
-        uint128  best_work{};
         int32_t  best_depth = -1;
+        uint32_t best_ts = 0;
         auto& chain_nc = const_cast<dash::ShareChain&>(m_tracker.chain);
         for (auto& [head_hash, _unused] : chain_nc.get_heads()) {
             try {
+                int32_t depth = chain_nc.get_height(head_hash);
+                uint32_t ts = 0;
                 auto& entry = chain_nc.get(head_hash);
-                uint32_t absh = 0;
-                uint128  work{};
                 entry.share.invoke([&](auto* obj) {
                     using S = std::remove_pointer_t<decltype(obj)>;
                     if constexpr (std::is_same_v<S, dash::DashShare>) {
-                        absh = obj->m_absheight;
-                        work = obj->m_abswork;
+                        ts = obj->m_timestamp;
                     }
                 });
-                int32_t depth = chain_nc.get_height(head_hash);
                 bool better = false;
                 if (best.IsNull()) {
                     better = true;
-                } else if (absh != best_absheight) {
-                    better = absh > best_absheight;
-                } else if (best_work < work || work < best_work) {
-                    better = best_work < work;
-                } else {
+                } else if (depth != best_depth) {
                     better = depth > best_depth;
+                } else {
+                    better = ts > best_ts;
                 }
                 if (better) {
                     best = head_hash;
-                    best_absheight = absh;
-                    best_work = work;
                     best_depth = depth;
+                    best_ts = ts;
                 }
             } catch (...) {}
         }
