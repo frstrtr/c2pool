@@ -187,8 +187,24 @@ int main(int argc, char* argv[])
         }
     }
 
-    // Add bootstrap
+    // Add bootstrap(s). Start with user-supplied --bootstrap, then fold in the
+    // coin_params defaults so the addr store is seeded with multiple live
+    // Dash p2pool hosts. Without this the upstream bootstrap's relayed list
+    // is almost entirely stale and peer expansion stays stuck at 1.
     config->pool()->m_bootstrap_addrs.emplace_back(bootstrap + ":" + std::to_string(port));
+    {
+        auto params = dash::make_coin_params(testnet);
+        for (const auto& host : params.bootstrap_addrs) {
+            std::string hp = host + ":" + std::to_string(port);
+            NetService svc(hp);
+            // Dedup against --bootstrap
+            bool already = false;
+            for (const auto& existing : config->pool()->m_bootstrap_addrs) {
+                if (existing == svc) { already = true; break; }
+            }
+            if (!already) config->pool()->m_bootstrap_addrs.push_back(svc);
+        }
+    }
     config->coin()->m_testnet = testnet;
 
     // Verify p2pool prefix
@@ -454,12 +470,16 @@ int main(int argc, char* argv[])
         std::cout << "[DASHD-RPC] No --dashd-rpc specified, running without RPC (mining disabled)" << std::endl;
     }
 
-    // ── Connect to p2pool peer ──
-    std::cout << "[P2P] Connecting to " << bootstrap << ":" << port << "..." << std::endl;
-    NetService peer_addr(bootstrap + ":" + std::to_string(port));
-    io::post(ioc, [&]() {
-        node.connect(peer_addr);
-    });
+    // ── Connect to p2pool peer(s) ──
+    // Dial every bootstrap addr up front so we never wait on the 30s outbound
+    // timer to randomly pick a live one. On a sparse network like Dash's, the
+    // upstream bootstrap's relayed addr list is mostly stale — immediate
+    // parallel dials to all known-good operators give us fast multi-peer
+    // convergence.
+    for (const auto& b : config->pool()->m_bootstrap_addrs) {
+        std::cout << "[P2P] Connecting to " << b.to_string() << "..." << std::endl;
+        io::post(ioc, [&, addr = b]() { node.connect(addr); });
+    }
 
     // ── Periodic outbound peer expansion ─────────────────────────────
     // Every 30s, if we're below the target outbound count, dial one more
@@ -667,8 +687,13 @@ int main(int argc, char* argv[])
                     for (const auto& p : payouts) {
                         pplns_cache.emplace_back(HexStr(p.script), p.amount);
                     }
-                    web_server->get_mining_interface()
-                        ->set_cached_pplns_outputs(std::move(pplns_cache));
+                    auto* mi = web_server->get_mining_interface();
+                    mi->set_cached_pplns_outputs(std::move(pplns_cache));
+                    // /current_merged_payouts is the dashboard's primary source
+                    // for the Payouts table and the PPLNS distribution treemap.
+                    // For Dash (no merged mining) the result is just current_payouts
+                    // wrapped in {amount, merged:[]} — cache_pplns_at_tip handles it.
+                    mi->cache_pplns_at_tip();
                 }
 
                 // Pick a share target bits from our configured share_difficulty.
