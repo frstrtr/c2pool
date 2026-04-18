@@ -282,6 +282,76 @@ int main(int argc, char* argv[])
         mi->set_pool_hashrate_fn([&node]() -> double {
             return node.pool_hashrate();
         });
+        // Sharechain window for /sharechain/window (Transparency Explorer).
+        // Walk up to CHAIN_LENGTH shares from the best head and serialize
+        // each with the fields the dashboard JS expects (h, H, p, v, t, b,
+        // a, dv, m).
+        mi->set_sharechain_window_fn([&node, &params, testnet]() -> nlohmann::json {
+            nlohmann::json result;
+            auto& chain = node.tracker().chain;
+            auto& verified = node.tracker().verified;
+
+            uint256 best;
+            int32_t best_height = -1;
+            for (const auto& [head_hash, tail_hash] : chain.get_heads()) {
+                auto h = chain.get_height(head_hash);
+                if (h > best_height) { best = head_hash; best_height = h; }
+            }
+            result["best_hash"]    = best.IsNull() ? "" : best.GetHex();
+            result["chain_length"] = static_cast<int>(chain.size());
+            result["window_size"]  = static_cast<int>(params.chain_length);
+            result["my_address"]   = "";
+            result["fee_hash160"]  = "";
+
+            nlohmann::json shares_arr = nlohmann::json::array();
+            const uint8_t p2pkh_ver = testnet ? 140 : 76;
+            const uint8_t p2sh_ver  = testnet ?  19 : 16;
+            if (!best.IsNull()) {
+                int height = chain.get_height(best);
+                int walk = std::min(height, static_cast<int>(params.chain_length));
+                if (walk > 0) {
+                    try {
+                        int pos = 0;
+                        auto view = chain.get_chain(best, walk);
+                        for (auto [hash, data] : view) {
+                            nlohmann::json s;
+                            s["h"] = hash.GetHex().substr(0, 16);
+                            s["H"] = hash.GetHex();
+                            s["p"] = pos++;
+                            s["v"] = verified.contains(hash) ? 1 : 0;
+                            data.share.invoke([&](auto* obj) {
+                                using S = std::remove_pointer_t<decltype(obj)>;
+                                if constexpr (std::is_same_v<S, dash::DashShare>) {
+                                    s["t"]  = obj->m_timestamp;
+                                    s["V"]  = S::version;       // 16 for Dash v16
+                                    s["s"]  = static_cast<int>(obj->m_stale_info);
+                                    s["b"]  = obj->m_bits;
+                                    s["a"]  = obj->m_absheight;
+                                    s["dv"] = obj->m_desired_version;
+                                    auto script = dash::pubkey_hash_to_script2(obj->m_pubkey_hash);
+                                    std::string addr = core::script_to_address(
+                                        script, "" /*no bech32*/, p2pkh_ver, p2sh_ver);
+                                    s["m"] = addr.empty() ? HexStr(script) : addr;
+                                }
+                            });
+                            shares_arr.push_back(std::move(s));
+                        }
+                    } catch (...) {}
+                }
+            }
+            result["shares"] = shares_arr;
+            result["total"]  = static_cast<int>(shares_arr.size());
+            return result;
+        });
+        // Sharechain tip for readiness checks.
+        mi->set_sharechain_tip_fn([&node]() -> nlohmann::json {
+            nlohmann::json t;
+            auto& chain = node.tracker().chain;
+            uint256 best = node.best_share_hash();
+            t["hash"]   = best.IsNull() ? "" : best.GetHex();
+            t["height"] = best.IsNull() ? 0 : chain.get_height(best);
+            return t;
+        });
         // Dash p2pool uses protocol 1700 (not LTC's 3600).
         mi->set_protocol_version(1700);
         // Canonical Dash p2pool ports for node_info (dashboard miner URL).
@@ -537,7 +607,7 @@ int main(int argc, char* argv[])
     std::function<void(const boost::system::error_code&)> job_fn;
     job_fn = [&, job_timer](const boost::system::error_code& ec) {
         if (ec) return;
-        if (stratum_server && coin_rpc && coin_rpc->is_connected() && !miner_script.empty()) {
+        if (coin_rpc && coin_rpc->is_connected() && !miner_script.empty()) {
             try {
                 auto work = coin_rpc->getwork();
 
@@ -569,6 +639,18 @@ int main(int argc, char* argv[])
                     payouts.push_back({miner_script, miner_value});
                 }
 
+                // Publish PPLNS outputs to the dashboard (/current_payouts).
+                // Format: vector<pair<script_hex, amount_sat>>.
+                if (web_server) {
+                    std::vector<std::pair<std::string,uint64_t>> pplns_cache;
+                    pplns_cache.reserve(payouts.size());
+                    for (const auto& p : payouts) {
+                        pplns_cache.emplace_back(HexStr(p.script), p.amount);
+                    }
+                    web_server->get_mining_interface()
+                        ->set_cached_pplns_outputs(std::move(pplns_cache));
+                }
+
                 // Pick a share target bits from our configured share_difficulty.
                 // (target_from_difficulty matches submit_validator's math.)
                 uint32_t share_bits = 0;
@@ -581,13 +663,17 @@ int main(int argc, char* argv[])
                 auto built = dash::share_builder::build(
                     work, node.tracker(), miner_pubkey_hash, payouts, pool_tag, params,
                     share_bits, share_difficulty_default);
-                stratum_server->set_difficulty_all(share_difficulty_default);
-                stratum_server->notify_all(built.job, built.context);
-                store_template(built.job.job_id, built.share_template, built.tx_bodies);
+                size_t miner_count = 0;
+                if (stratum_server) {
+                    stratum_server->set_difficulty_all(share_difficulty_default);
+                    stratum_server->notify_all(built.job, built.context);
+                    store_template(built.job.job_id, built.share_template, built.tx_bodies);
+                    miner_count = stratum_server->session_count();
+                }
 
                 LOG_INFO << "[JOB] id=" << built.job.job_id
                          << " height=" << work.m_height
-                         << " miners=" << stratum_server->session_count()
+                         << " miners=" << miner_count
                          << " coinb_bytes=" << built.coinbase.bytes.size()
                          << " ref_off=" << built.coinbase.ref_hash_offset
                          << " n64_off=" << built.coinbase.nonce64_offset
