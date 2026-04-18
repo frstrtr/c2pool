@@ -138,8 +138,22 @@ inline std::vector<MinerPayout> compute_dash_payouts(
     {
         uint64_t check = 0;
         for (const auto& [s, a] : amounts) check += a;
-        if (check != worker_payout)
+        if (check != worker_payout) {
+            LOG_WARNING << "[compute_dash_payouts] sum mismatch: worker_payout="
+                        << worker_payout << " check=" << check
+                        << " diff=" << (check > worker_payout
+                                        ? (check - worker_payout)
+                                        : (worker_payout - check))
+                        << " total_weight=" << total_weight
+                        << " weights_count=" << weights.size()
+                        << " this_script_in_weights="
+                        << (weights.count(this_script) ? "yes" : "no")
+                        << " subsidy=" << subsidy
+                        << " total_payments=" << total_payments
+                        << " current_sum_before_donation=" << current_sum
+                        << " donation_remainder=" << donation_remainder;
             throw std::runtime_error("compute_dash_payouts: amounts sum mismatch");
+        }
     }
 
     // 6. worker_tx = amounts sorted by script bytes, excluding DONATION,
