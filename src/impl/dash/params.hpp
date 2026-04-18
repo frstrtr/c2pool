@@ -75,8 +75,12 @@ inline core::CoinParams make_coin_params(bool testnet)
     p.block_max_size           = 2000000;
     p.block_max_weight         = 2000000;  // Dash has no segwit weight
 
-    // Max target: standard bdiff difficulty 1 = 0xFFFF * 2^208
-    p.max_target.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    // Max target: standard bdiff difficulty 1 = 0xFFFF * 2^208.
+    // Matches p2pool-dash/p2pool/networks/dash.py MAX_TARGET. The prior
+    // value (0x00000fff... ≈ 2^256/2^20 − 1) was the old p2pool-dash
+    // "way too easy" target — ~4096× easier — used briefly to let CPU
+    // miners land shares during bring-up. Reverted for mainnet parity.
+    p.max_target.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
 
     // Network identification
     // Reference: ref/p2pool-dash/p2pool/networks/dash.py
