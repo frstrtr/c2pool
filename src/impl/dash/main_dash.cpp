@@ -384,6 +384,29 @@ int main(int argc, char* argv[])
         });
         // Best share hash for the dashboard's head indicator.
         mi->set_best_share_hash_fn([&node]() { return node.best_share_hash(); });
+
+        // On every new share ingest: invalidate the window cache, refresh
+        // the per-tip PPLNS snapshot, precompute the window-delta for the
+        // incoming since= parameter, and push an SSE event to RealTime
+        // dashboard clients. Mirrors LTC's trigger_work_refresh_debounced
+        // (web_server.cpp:7596-7625) on every share arrival — without this
+        // the /sharechain/stream endpoint stays idle and the explorer
+        // doesn't auto-refresh per-share PPLNS.
+        {
+            std::string prev_hash_buf;  // captured by lambda (main-thread only)
+            node.m_on_new_share = [mi_ptr = web_server->get_mining_interface(),
+                                   prev_hash_buf = std::string()]
+                                  (const uint256& new_tip) mutable {
+                mi_ptr->invalidate_window_cache();
+                mi_ptr->cache_pplns_at_tip();
+                mi_ptr->precompute_delta(prev_hash_buf);
+                prev_hash_buf = new_tip.GetHex();
+                if (mi_ptr->sse_subscriber_count() > 0) {
+                    auto tip = mi_ptr->rest_sharechain_tip();
+                    mi_ptr->sse_push(tip.dump());
+                }
+            };
+        }
         // Peer list for /peer_list and /local_stats — real address + version.
         mi->set_peer_info_fn([&node]() -> nlohmann::json {
             return node.peer_info_json();
