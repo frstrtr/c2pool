@@ -8,7 +8,9 @@
 #include "p2p_connection.hpp"
 #include "node_interface.hpp"
 
+#include <deque>
 #include <memory>
+#include <set>
 
 #include <boost/asio.hpp>
 
@@ -58,6 +60,39 @@ class NodeP2P : public core::ICommunicator, public core::INetwork, public core::
     uint32_t m_peer_version{0};
     std::string m_peer_subver;
     uint32_t m_peer_start_height{0};
+
+    // SPV B2 (parity audit): per BIP 130, peer has asked us to announce
+    // new blocks via `headers` rather than `inv`. We don't generate
+    // unsolicited block announcements today (A2 broadcasts a full `block`
+    // message directly), so this is bookkeeping only — the flag is
+    // consulted by any future block-announcement path to stay in sync
+    // with the peer's preference.
+    bool m_peer_wants_headers = false;
+
+    // SPV B3 (parity audit): dedup requested inv hashes so a flapping
+    // peer doesn't make us issue duplicate getdata for the same block/tx.
+    // Bounded ring of recent hashes — presence in this ring means we
+    // already asked for the body. Sized for ~5 min of network noise at
+    // mainnet rates (blocks every 2.5 min, txs a few per second).
+    static constexpr size_t kSeenInvRingCap = 2048;
+    std::set<uint256> m_seen_inv_hashes;
+    std::deque<uint256> m_seen_inv_order;
+
+    bool inv_already_requested(const uint256& h) const
+    {
+        return m_seen_inv_hashes.count(h) > 0;
+    }
+
+    void mark_inv_requested(const uint256& h)
+    {
+        if (m_seen_inv_hashes.insert(h).second) {
+            m_seen_inv_order.push_back(h);
+            while (m_seen_inv_order.size() > kSeenInvRingCap) {
+                m_seen_inv_hashes.erase(m_seen_inv_order.front());
+                m_seen_inv_order.pop_front();
+            }
+        }
+    }
 
     using PeerHeightCallback = std::function<void(uint32_t)>;
     PeerHeightCallback m_on_peer_height;
@@ -353,7 +388,14 @@ private:
     }
     void handle_msg(std::unique_ptr<message_notfound>) {}
     void handle_msg(std::unique_ptr<message_feefilter>) {}
-    void handle_msg(std::unique_ptr<message_sendheaders>) {}
+    // SPV B2 (parity audit): BIP 130 — peer prefers `headers` over `inv`
+    // for new-block announcements. Record the preference. No behavior
+    // change today (we don't announce blocks unsolicited), but a future
+    // block-relay path can consult m_peer_wants_headers to stay in sync.
+    void handle_msg(std::unique_ptr<message_sendheaders>)
+    {
+        m_peer_wants_headers = true;
+    }
     void handle_msg(std::unique_ptr<message_sendcmpct>) {}
     void handle_msg(std::unique_ptr<message_sendaddrv2>) {}
     void handle_msg(std::unique_ptr<message_mempool>) {}
@@ -370,16 +412,23 @@ private:
             auto btype = inv.base_type();
             switch (btype) {
             case inventory_type::tx:
+                // SPV B3 (parity audit): skip invs we've already asked for.
+                if (inv_already_requested(inv.m_hash)) continue;
+                mark_inv_requested(inv.m_hash);
                 requests.push_back(inv);
                 break;
             case inventory_type::block:
                 m_coin->new_block.happened(inv.m_hash);
+                if (inv_already_requested(inv.m_hash)) continue;
+                mark_inv_requested(inv.m_hash);
                 requests.push_back(inv);
                 break;
             default:
                 if (static_cast<uint32_t>(btype) == DASH_MSG_CLSIG) {
                     // Request the clsig body. On receipt we'll record
                     // the ChainLock via handle_msg(message_clsig).
+                    if (inv_already_requested(inv.m_hash)) continue;
+                    mark_inv_requested(inv.m_hash);
                     requests.push_back(inv);
                 }
                 break;
