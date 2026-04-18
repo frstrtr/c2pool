@@ -81,6 +81,33 @@ struct CoinParams
     // Share version
     uint32_t current_share_version = 0;      // 36 (LTC), 16 (Dash)
 
+    // =======================================================================
+    // Stratum vardiff config (matches upstream ref per coin)
+    // =======================================================================
+    //
+    // LTC defaults match p2pool-merged-v36/bitcoin/stratum.py (jtoomim's
+    // two-trigger algorithm with N−1 interval denominator).
+    //
+    // Dash overrides match p2pool-dash/dash/stratum.py + networks/dash.py
+    // (ASIC-tuned three-trigger algorithm with quickup support and tighter
+    // clip bounds; uses N interval denominator).
+    struct VardiffConfig
+    {
+        double target_share_rate = 3.0;      // target seconds per pseudoshare
+        uint32_t shares_trigger  = 12;       // trigger 1: adjust after this many shares
+        double timeout_mult      = 10.0;     // trigger 2: adjust if time > mult * N * rate
+        // Quickup trigger (p2pool-dash only; set quickup_shares = 0 to disable):
+        uint32_t quickup_shares  = 0;        // trigger 3: need at least N shares
+        double quickup_divisor   = 3.0;      // trigger 3: fire if time < target_time/divisor
+        double min_adjust        = 0.1;      // clip(ratio, min, max) bounds
+        double max_adjust        = 10.0;
+        // Denominator policy for actual_rate calculation:
+        //   false → N−1 intervals (matches p2pool-merged-v36 LTC: del [0])
+        //   true  → N shares      (matches p2pool-dash: no del)
+        bool use_full_window     = false;
+    };
+    VardiffConfig vardiff;
+
     // Runtime state
     bool is_testnet = false;
 

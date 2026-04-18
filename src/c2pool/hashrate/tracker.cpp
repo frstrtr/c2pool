@@ -114,6 +114,18 @@ void HashrateTracker::set_target_time_per_mining_share(double target_seconds) {
     target_time_per_mining_share_ = target_seconds;
 }
 
+void HashrateTracker::set_vardiff_params(const core::CoinParams::VardiffConfig& cfg) {
+    std::lock_guard<std::mutex> lock(shares_mutex_);
+    target_time_per_mining_share_ = cfg.target_share_rate;
+    vardiff_trigger_              = cfg.shares_trigger;
+    vardiff_timeout_              = cfg.timeout_mult;
+    vardiff_min_adj_              = cfg.min_adjust;
+    vardiff_max_adj_              = cfg.max_adjust;
+    vardiff_quickup_n_            = cfg.quickup_shares;
+    vardiff_quickup_div_          = cfg.quickup_divisor;
+    vardiff_full_window_          = cfg.use_full_window;
+}
+
 void HashrateTracker::enable_vardiff(bool enabled) {
     std::lock_guard<std::mutex> lock(shares_mutex_);
     vardiff_enabled_ = enabled;
@@ -128,18 +140,26 @@ void HashrateTracker::set_difficulty_hint(double hint) {
     }
 }
 
-// Matches p2pool's stratum vardiff algorithm (stratum.py:546-573).
-// Matches p2pool's stratum vardiff algorithm (stratum.py:546-573).
-// Adjusts difficulty to target ~target_time_per_mining_share_ seconds per pseudoshare.
+// Per-session pseudoshare vardiff. Behavior depends on vardiff_* instance
+// fields — defaults match upstream p2pool-merged-v36 LTC (stratum.py:568-594);
+// Dash overrides via set_vardiff_params to match p2pool-dash/dash/stratum.py
+// which adds a quickup trigger and uses the full-N window denominator.
 //
-// Two triggers (matching p2pool exactly):
-//   1) Normal: after VARDIFF_TRIGGER shares accumulated.
-//   2) Timeout: elapsed time exceeds TIMEOUT_MULT * N * target_time.
+// LTC ref (2-trigger):
+//   if N > 12 or elapsed > 10*N*share_rate:
+//     del recent_shares[0]  →  ratio = elapsed / ((N−1) * share_rate)
+//     target *= clip(ratio, 0.1, 10.0)
 //
-// No quick-ramp — it causes oscillation when natural variance produces
-// 2 back-to-back shares at the correct difficulty level.
-// No cooldown — p2pool doesn't use one; the window reset after each
-// adjustment means VARDIFF_TRIGGER shares must accumulate again.
+// Dash ref (3-trigger with quickup):
+//   num_shares = len(recent_shares)
+//   target_time = num_shares * share_rate
+//   should_adjust = num_shares >= 8
+//                OR (num_shares >= 1 and elapsed > 5 * target_time)
+//                OR (num_shares >= 2 and elapsed < target_time / 3)
+//   if should_adjust:
+//     actual_rate = elapsed / num_shares
+//     adjustment = clip(actual_rate / share_rate, 0.5, 2.0)
+//     target *= adjustment
 void HashrateTracker::adjust_difficulty() {
     if (!vardiff_enabled_)
         return;
@@ -151,35 +171,55 @@ void HashrateTracker::adjust_difficulty() {
     auto now = clock::now();
 
     double elapsed = std::chrono::duration<double>(now - recent_share_times_.front()).count();
+    double target_time = static_cast<double>(num_shares) * target_time_per_mining_share_;
 
     bool should_adjust = false;
 
-    // Trigger 1 (p2pool): enough shares accumulated
-    if (num_shares > VARDIFF_TRIGGER)
+    // Trigger 1: enough shares accumulated.
+    // LTC upstream uses strict >, p2pool-dash uses >=. Matching each by
+    // comparing against the coin-configured value: >= for Dash (quickup
+    // on), > for LTC (quickup off, trigger just reads "more than N").
+    if (vardiff_quickup_n_ > 0) {
+        if (num_shares >= vardiff_trigger_)
+            should_adjust = true;
+    } else {
+        if (num_shares > vardiff_trigger_)
+            should_adjust = true;
+    }
+
+    // Trigger 2: time since first share > timeout_mult * N * share_rate.
+    if (elapsed > vardiff_timeout_ * target_time)
         should_adjust = true;
 
-    // Trigger 2 (p2pool): time since first share > TIMEOUT_MULT * N * target_time
-    if (elapsed > TIMEOUT_MULT * static_cast<double>(num_shares) * target_time_per_mining_share_)
+    // Trigger 3 (Dash quickup — disabled for LTC since vardiff_quickup_n_ == 0):
+    // if enough shares AND they came in faster than target_time/divisor.
+    if (vardiff_quickup_n_ > 0
+        && num_shares >= vardiff_quickup_n_
+        && elapsed < target_time / vardiff_quickup_div_) {
         should_adjust = true;
+    }
 
     if (!should_adjust)
         return;
 
-    // p2pool algorithm (stratum.py:572-577):
-    //   old_time = self.recent_shares[0]
-    //   del self.recent_shares[0]          # remove first → len becomes N-1
-    //   ratio = (now - old_time) / (len(self.recent_shares) * share_rate)
-    //   target *= clip(ratio, 0.1, 10.0)
-    //
-    // N timestamps define N-1 intervals. elapsed spans from first to last.
-    // p2pool uses (N-1) in the denominator (after deleting [0]).
-    // We must do the same: num_shares - 1 intervals.
-    size_t intervals = num_shares - 1;  // N timestamps → N-1 intervals (matches p2pool del [0])
-    double ratio = (intervals > 0) ? elapsed / (static_cast<double>(intervals) * target_time_per_mining_share_) : 1.0;
+    // Denominator policy:
+    //   use_full_window=true (Dash): divisor = N
+    //   use_full_window=false (LTC): divisor = N−1 (matches del recent_shares[0])
+    double denom_shares;
+    if (vardiff_full_window_) {
+        denom_shares = static_cast<double>(num_shares);
+    } else {
+        denom_shares = static_cast<double>(num_shares > 1 ? num_shares - 1 : 1);
+    }
 
-    // Avoid extreme ratios from sub-millisecond bursts
-    ratio = std::max(MIN_ADJUST, std::min(MAX_ADJUST, ratio));
+    double ratio = (denom_shares > 0 && target_time_per_mining_share_ > 0)
+        ? elapsed / (denom_shares * target_time_per_mining_share_)
+        : 1.0;
 
+    // Clip to coin-configured bounds (LTC: 0.1/10.0; Dash: 0.5/2.0).
+    ratio = std::max(vardiff_min_adj_, std::min(vardiff_max_adj_, ratio));
+
+    // In p2pool: target *= ratio  →  in diff space: diff /= ratio.
     double new_difficulty = current_difficulty_ / ratio;
     new_difficulty = std::max(min_difficulty_, std::min(max_difficulty_, new_difficulty));
 
@@ -191,7 +231,7 @@ void HashrateTracker::adjust_difficulty() {
         current_difficulty_ = new_difficulty;
     }
 
-    // Reset window — keep only the most recent timestamp (matches p2pool)
+    // Reset window — keep only the most recent timestamp (matches both refs).
     recent_share_times_.clear();
     recent_share_times_.push_back(now);
 }

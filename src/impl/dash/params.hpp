@@ -82,6 +82,22 @@ inline core::CoinParams make_coin_params(bool testnet)
     // miners land shares during bring-up. Reverted for mainnet parity.
     p.max_target.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
 
+    // Vardiff (matches p2pool-dash/dash/stratum.py:1071-1138 +
+    // p2pool-dash/networks/dash.py:25-39):
+    //   STRATUM_SHARE_RATE=10, VARDIFF_SHARES_TRIGGER=8,
+    //   VARDIFF_TIMEOUT_MULT=5, VARDIFF_QUICKUP_SHARES=2,
+    //   VARDIFF_QUICKUP_DIVISOR=3, VARDIFF_MIN_ADJUST=0.5,
+    //   VARDIFF_MAX_ADJUST=2.0
+    // Uses the full N window (no del[0]) — ASIC-tuned three-trigger algo.
+    p.vardiff.target_share_rate = 10.0;
+    p.vardiff.shares_trigger    = 8;
+    p.vardiff.timeout_mult      = 5.0;
+    p.vardiff.quickup_shares    = 2;
+    p.vardiff.quickup_divisor   = 3.0;
+    p.vardiff.min_adjust        = 0.5;
+    p.vardiff.max_adjust        = 2.0;
+    p.vardiff.use_full_window   = true;
+
     // Network identification
     // Reference: ref/p2pool-dash/p2pool/networks/dash.py
     p.identifier_hex          = "7242ef345e1bed6b";

@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 #include <core/log.hpp>
 #include <core/uint256.hpp>
+#include <core/coin_params.hpp>
 
 namespace c2pool {
 namespace hashrate {
@@ -43,10 +44,18 @@ private:
 
     // Vardiff state (high-resolution)
     std::deque<time_point> recent_share_times_;   // timestamps of recent submissions
-    static constexpr size_t VARDIFF_TRIGGER = 12; // normal adjust after N shares (p2pool: >12)
-    static constexpr double TIMEOUT_MULT   = 10.0; // p2pool: time > 10*N*share_rate
-    static constexpr double MIN_ADJUST     = 0.1;  // p2pool: clip(ratio, 0.1, 10.0)
-    static constexpr double MAX_ADJUST     = 10.0;  // p2pool: clip(ratio, 0.1, 10.0)
+
+    // Vardiff tuning — instance fields so each coin can override.
+    // Defaults match upstream p2pool-merged-v36 (LTC): 12-share trigger,
+    // 10× timeout, clip(0.1, 10.0), N−1 interval denominator, no quickup.
+    // Dash overrides these in dash::stratum::Session via set_vardiff_params.
+    uint32_t vardiff_trigger_   = 12;
+    double   vardiff_timeout_   = 10.0;
+    double   vardiff_min_adj_   = 0.1;
+    double   vardiff_max_adj_   = 10.0;
+    uint32_t vardiff_quickup_n_ = 0;     // 0 = disabled
+    double   vardiff_quickup_div_ = 3.0;
+    bool     vardiff_full_window_ = false; // false = N−1 (LTC), true = N (Dash)
 
     // Whether vardiff auto-adjustment is active (only for stratum per-connection trackers)
     bool vardiff_enabled_ = false;
@@ -70,6 +79,12 @@ public:
     void set_difficulty_bounds(double min_difficulty, double max_difficulty);
     void set_target_time_per_mining_share(double target_seconds);
     void enable_vardiff(bool enabled = true);
+
+    /// Apply per-coin vardiff tuning. Defaults in CoinParams::VardiffConfig
+    /// already match upstream p2pool-merged-v36 (LTC) behavior, so calling
+    /// this from LTC is a no-op. Dash calls with its p2pool-dash-tuned
+    /// params (10s share rate, 8-share trigger, quickup, 0.5/2.0 clip).
+    void set_vardiff_params(const core::CoinParams::VardiffConfig& cfg);
 
     // Backward compatibility
     void record_share_submission(double difficulty, bool accepted) {

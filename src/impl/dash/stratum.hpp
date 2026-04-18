@@ -37,6 +37,8 @@
 #include <nlohmann/json.hpp>
 
 #include <core/log.hpp>
+#include <core/coin_params.hpp>
+#include <c2pool/hashrate/tracker.hpp>
 
 namespace dash {
 namespace stratum {
@@ -105,11 +107,7 @@ class Server;
 class Session : public std::enable_shared_from_this<Session>
 {
 public:
-    Session(tcp::socket socket, Server* server, uint32_t extranonce1)
-        : m_socket(std::move(socket))
-        , m_server(server)
-        , m_extranonce1(extranonce1)
-    {}
+    Session(tcp::socket socket, Server* server, uint32_t extranonce1);
 
     void start()
     {
@@ -150,6 +148,23 @@ public:
         m_current_difficulty = difficulty;
         send_json(msg);
     }
+
+    // Record an accepted share into this session's vardiff tracker, and
+    // push a new mining.set_difficulty if the tracker's current_difficulty
+    // moved by more than 1% since the last push. Matches per-session
+    // vardiff behavior of p2pool-dash/dash/stratum.py:1071-1138.
+    void record_share_and_adjust(double share_difficulty)
+    {
+        m_tracker.record_mining_share_submission(share_difficulty, true);
+        double new_diff = m_tracker.get_current_difficulty();
+        double denom = std::max(m_current_difficulty, 0.0001);
+        if (std::abs(new_diff - m_current_difficulty) / denom > 0.01)
+            send_set_difficulty(new_diff);
+    }
+
+    // Access the per-session tracker (for stats / hashrate display).
+    c2pool::hashrate::HashrateTracker& tracker() { return m_tracker; }
+    const c2pool::hashrate::HashrateTracker& tracker() const { return m_tracker; }
 
     // Push mining.notify — miners switch to this job.
     void send_notify(const Job& job)
@@ -235,6 +250,14 @@ private:
         respond_result(id, result);
         LOG_INFO << "[DashStratum] " << m_peer << " subscribed sid=" << sid
                  << " extranonce2_size=" << EXTRANONCE2_SIZE;
+
+        // Push the session's initial vardiff difficulty (set in ctor from
+        // Server::initial_difficulty). The server-wide set_difficulty_all()
+        // called from the JOB cycle would normally arrive before the first
+        // mining.notify, but doing it here guarantees the miner always has
+        // a per-session target even if it submits before JOB #1.
+        if (m_tracker.get_current_difficulty() > 0.0)
+            send_set_difficulty(m_tracker.get_current_difficulty());
     }
 
     void handle_authorize(const nlohmann::json& id, const nlohmann::json& params)
@@ -312,6 +335,10 @@ private:
 
     double m_current_difficulty   = 0.0;
     double m_suggested_difficulty = 0.0;
+
+    // Per-session vardiff tracker (ported from c2pool-ltc StratumSession).
+    // Tuning is applied at construction from Server::vardiff_config().
+    c2pool::hashrate::HashrateTracker m_tracker;
 };
 
 class Server
@@ -323,6 +350,27 @@ public:
         , m_port(port)
         , m_rng(std::random_device{}())
     {}
+
+    // Per-coin vardiff tuning + difficulty bounds. Applied to each
+    // Session's HashrateTracker at accept time. Defaults keep vardiff
+    // off; callers must enable explicitly after setting the config.
+    void set_vardiff_config(const core::CoinParams::VardiffConfig& cfg,
+                            double min_difficulty,
+                            double max_difficulty,
+                            double initial_difficulty)
+    {
+        m_vardiff_config    = cfg;
+        m_min_difficulty    = min_difficulty;
+        m_max_difficulty    = max_difficulty;
+        m_initial_difficulty = initial_difficulty;
+        m_vardiff_enabled   = true;
+    }
+
+    const core::CoinParams::VardiffConfig& vardiff_config() const { return m_vardiff_config; }
+    double min_difficulty()    const { return m_min_difficulty; }
+    double max_difficulty()    const { return m_max_difficulty; }
+    double initial_difficulty() const { return m_initial_difficulty; }
+    bool   vardiff_enabled()   const { return m_vardiff_enabled; }
 
     void start()
     {
@@ -451,7 +499,35 @@ private:
     std::unordered_map<std::string, JobContext> m_job_contexts;
     std::deque<std::string> m_job_order;
     static constexpr size_t MAX_JOB_HISTORY = 16;
+
+    // Vardiff config pushed to every new Session via its constructor.
+    core::CoinParams::VardiffConfig m_vardiff_config;
+    double m_min_difficulty    = 0.001;
+    double m_max_difficulty    = 65536.0;
+    double m_initial_difficulty = 0.001;
+    bool   m_vardiff_enabled   = false;
 };
+
+// Defined here (out of line) because Session ctor needs Server's vardiff
+// config accessors, which are declared above Session would be if inline.
+inline Session::Session(tcp::socket socket, Server* server, uint32_t extranonce1)
+    : m_socket(std::move(socket))
+    , m_server(server)
+    , m_extranonce1(extranonce1)
+{
+    if (server && server->vardiff_enabled()) {
+        m_tracker.set_difficulty_bounds(server->min_difficulty(),
+                                        server->max_difficulty());
+        m_tracker.set_vardiff_params(server->vardiff_config());
+        m_tracker.enable_vardiff(true);
+        // set_difficulty_bounds() initializes current_difficulty_ to min;
+        // bump to the requested initial value (typically the network share
+        // floor) so the first mining.set_difficulty push matches the
+        // operator-configured starting point.
+        m_tracker.set_difficulty_hint(server->initial_difficulty());
+        m_current_difficulty = m_tracker.get_current_difficulty();
+    }
+}
 
 inline void Session::handle_submit(const nlohmann::json& id, const nlohmann::json& params)
 {
@@ -491,8 +567,21 @@ inline void Session::handle_submit(const nlohmann::json& id, const nlohmann::jso
         reject_reason = "stratum validator not yet wired";
     }
 
-    if (accepted) respond_result(id, true);
-    else          respond_error(id, -23, reject_reason.empty() ? "rejected" : reject_reason);
+    if (accepted) {
+        respond_result(id, true);
+        // Feed per-session vardiff tracker. Use the session's *current*
+        // difficulty (what the miner was actually scanning at after the
+        // last set_difficulty push) rather than the job's pool-floor
+        // share_difficulty. Matches p2pool-dash/dash/stratum.py, where
+        // recent_shares stores only timestamps but hashrate accounting
+        // uses self.target (the miner's current target).
+        double d = m_current_difficulty > 0.0
+            ? m_current_difficulty
+            : (ctx ? ctx->share_difficulty : 0.001);
+        record_share_and_adjust(d);
+    } else {
+        respond_error(id, -23, reject_reason.empty() ? "rejected" : reject_reason);
+    }
 }
 
 } // namespace stratum
