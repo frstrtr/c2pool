@@ -13,6 +13,7 @@
 #include <impl/dash/coin/header_chain.hpp>
 #include <impl/dash/coin/node.hpp>
 #include <impl/dash/coin/rpc.hpp>
+#include <impl/dash/broadcaster.hpp>
 #include <impl/dash/enhanced_node.hpp>
 #include <impl/dash/stratum.hpp>
 #include <impl/dash/coinbase_builder.hpp>
@@ -75,6 +76,10 @@ int main(int argc, char* argv[])
     size_t      target_outbound_peers = 10;
     int         peer_ban_duration_sec = 300;     // C3 (parity audit): ban len
     std::string header_checkpoint_str;            // empty → use params.fast_start_checkpoint default
+    // DashBroadcaster pool size — matches p2pool-dash DashNetworkBroadcaster
+    // max_peers=20 (broadcaster.py:118). The primary dashd connection
+    // counts as 1; the broadcaster pool fills the other 19.
+    size_t      dashd_max_peers = 20;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -137,6 +142,9 @@ int main(int argc, char* argv[])
             // Empty string disables the hardcoded mainnet default
             // (starts from genesis).
             header_checkpoint_str = argv[++i];
+        }
+        else if (arg == "--dashd-max-peers" && i + 1 < argc) {
+            dashd_max_peers = static_cast<size_t>(std::stoul(argv[++i]));
         }
         // --dashd-rpc host:port:user:pass  (or host:port if anon test)
         else if (arg == "--dashd-rpc" && i + 1 < argc) {
@@ -653,6 +661,11 @@ int main(int argc, char* argv[])
 
     // ── Coin P2P Node (dashd connection) ──
     std::unique_ptr<dash::coin::Node<dash::Config>> coin_node;
+    // ── DashBroadcaster pool (Phase 1 multi-peer block propagation) ──
+    // Declared in the outer main() scope so the web_server peer_info_fn
+    // lambda (set_coin_peer_info_fn) and the submit handler both see the
+    // SAME unique_ptr slot. Constructed later once coin_rpc is live.
+    std::unique_ptr<dash::DashBroadcaster> broadcaster;
     if (!dashd_host.empty()) {
         coin_node = std::make_unique<dash::coin::Node<dash::Config>>(&ioc, config.get());
 
@@ -694,14 +707,18 @@ int main(int argc, char* argv[])
                 r["dashd_connected"] = coin_node && coin_node->has_p2p();
                 return r;
             });
-            // Wire the dashd P2P peer into the "Parent Chain Peers" panel.
-            // broadcaster_status consumes this when m_mm_manager is null
-            // (Dash has no merged mining) so the dashboard no longer shows
-            // "Embedded node not enabled" — it shows the actual dashd
-            // SPV connection with addr/subver/height/uptime.
-            mi3->set_coin_peer_info_fn([&coin_node]() -> nlohmann::json {
-                if (coin_node) return coin_node->peer_info_json();
-                return nlohmann::json::array();
+            // Wire the dashd P2P peers (primary + broadcaster pool) into the
+            // "Parent Chain Peers" panel. broadcaster_status consumes this
+            // when m_mm_manager is null (Dash has no merged mining) so the
+            // dashboard shows ALL dashd connections — primary SPV + pool
+            // slots dialed via getpeerinfo discovery — with addr, subver,
+            // height, uptime. Matches p2pool-dash dashboard parity
+            // (max_peers=20).
+            mi3->set_coin_peer_info_fn([&coin_node, &broadcaster]() -> nlohmann::json {
+                nlohmann::json primary = nlohmann::json::array();
+                if (coin_node) primary = coin_node->peer_info_json();
+                if (broadcaster) return broadcaster->peer_info_json_all(primary);
+                return primary;
             });
         }
 
@@ -786,6 +803,29 @@ int main(int argc, char* argv[])
                   << (dashd_rpc_userpass.empty() ? " (no auth)" : " (basic auth)") << std::endl;
     } else {
         std::cout << "[DASHD-RPC] No --dashd-rpc specified, running without RPC (mining disabled)" << std::endl;
+    }
+
+    // ── DashBroadcaster (Phase 1: RPC getpeerinfo discovery → pool of
+    //    dashd P2P connections for redundant block broadcast) ──
+    // Mirrors p2pool-dash DashNetworkBroadcaster (max_peers=20). Primary
+    // coin_node handles header sync + ChainLocks. Broadcaster pool is
+    // block-propagation only — avoids duplicate header/chainlock events.
+    // (broadcaster was forward-declared up near the web_server setup so
+    //  the peer_info_fn lambda can see it.)
+    if (coin_node && coin_rpc && dashd_max_peers > 1) {
+        NetService primary_addr(dashd_host + ":" + std::to_string(dashd_port));
+        broadcaster = std::make_unique<dash::DashBroadcaster>(
+            ioc, config.get(), coin_rpc.get(),
+            primary_addr,
+            dashd_max_peers > 0 ? dashd_max_peers - 1 : 0);
+        broadcaster->start(/*initial_delay_sec=*/15, /*interval_sec=*/30);
+        std::cout << "[DASHD-POOL] Broadcaster started — target=" << dashd_max_peers
+                  << " peers (1 primary + " << (dashd_max_peers - 1)
+                  << " pool via getpeerinfo discovery)" << std::endl;
+    } else {
+        std::cout << "[DASHD-POOL] Broadcaster disabled "
+                  << "(--dashd-max-peers=" << dashd_max_peers
+                  << ", need RPC + P2P + >=2 peers)" << std::endl;
     }
 
     // ── Connect to p2pool peer(s) ──
@@ -977,10 +1017,17 @@ int main(int argc, char* argv[])
                     if (coin_node && coin_node->has_p2p()) {
                         try {
                             auto bytes = ParseHex(r.block_hex);
-                            coin_node->submit_block_raw(
-                                std::span<const unsigned char>(bytes.data(), bytes.size()));
+                            std::span<const unsigned char> span(
+                                bytes.data(), bytes.size());
+                            coin_node->submit_block_raw(span);
                             LOG_INFO << "[SUBMIT] P2P block broadcast sent (bytes="
                                      << bytes.size() << ")";
+                            // Fan-out via DashBroadcaster pool so the
+                            // block reaches 20 dashd peers in parallel
+                            // rather than just the single primary SPV.
+                            // Matches p2pool-dash broadcaster behavior.
+                            if (broadcaster)
+                                broadcaster->submit_block_raw_all(span);
                         } catch (const std::exception& e) {
                             LOG_WARNING << "[SUBMIT] P2P block broadcast threw: " << e.what();
                         }

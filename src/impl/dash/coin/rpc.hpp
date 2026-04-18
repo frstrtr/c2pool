@@ -67,6 +67,12 @@ public:
     // Submit a pre-serialized block (hex). Returns true if dashd accepted.
     bool submit_block_hex(const std::string& block_hex);
 
+    // getpeerinfo — returns the array dashd emits (each element has
+    // addr, subver, version, startingheight, inbound, conntime, ...).
+    // Used by DashBroadcaster to discover peer endpoints to connect
+    // to for redundant block propagation.
+    nlohmann::json getpeerinfo();
+
 private:
     // jsonrpccxx::IClientConnector contract.
     std::string Send(const std::string& request) override;
