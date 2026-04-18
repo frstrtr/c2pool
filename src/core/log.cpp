@@ -133,10 +133,27 @@ void Logger::init(const std::string& log_file_name, int rotation_size_mb, int ma
         max_total_mb = clamped;
     }
 
-    // Pre-rotate any pre-existing log already over rotation_size. Doing this
-    // ourselves bypasses boost::log's rotate-on-first-write path, which under
-    // a debug build can stall the main thread for minutes when the existing
-    // file is many times the rotation threshold.
+    // Dedicated subdirectory for rotated logs. boost::log's file collector
+    // scans `target` and treats every file matching the rotation pattern as
+    // a managed backup it must account for under max_size. If the active log
+    // and the rotated logs share a directory with anything else (operator
+    // backups, prior runs' debug.log.<timestamp>, etc.), those orphans get
+    // pulled into the cap accounting and rotation grinds. Isolating rotation
+    // to its own subdir means only files this process produced are managed.
+    //
+    // The 2026-04-19 contabo abort was caused by exactly this: a 1.2GB
+    // operator-renamed debug.log.crashed-* file sitting next to the active
+    // log. When the active hit rotation_size, scan_for_files saw 1.3GB of
+    // managed bytes against a 1GB cap and froze the io_context for 40s
+    // while doing the math + delete. The watchdog tripped and aborted.
+    auto rotated_dir = log_dir / "logs";
+    std::filesystem::create_directories(rotated_dir);
+
+    // Pre-rotate any pre-existing log already over rotation_size, into the
+    // rotated_dir so it gets normal cap accounting from the start. Bypasses
+    // boost::log's rotate-on-first-write path which under a debug build can
+    // stall the main thread for minutes when the existing file is many
+    // times the rotation threshold.
     {
         std::error_code fec;
         auto sz = std::filesystem::file_size(debug_log, fec);
@@ -144,11 +161,11 @@ void Logger::init(const std::string& log_file_name, int rotation_size_mb, int ma
             std::time_t t = std::time(nullptr);
             char ts[32];
             std::strftime(ts, sizeof(ts), "%Y%m%d-%H%M%S", std::gmtime(&t));
-            std::filesystem::path rotated = debug_log;
-            rotated += std::string(".") + ts;
+            std::filesystem::path rotated =
+                rotated_dir / (debug_log.filename().string() + std::string(".") + ts);
             std::filesystem::rename(debug_log, rotated, fec);
             std::clog << "[log] pre-rotated oversized " << debug_log.filename().string()
-                      << " (" << (sz / (1024 * 1024)) << "MB) -> "
+                      << " (" << (sz / (1024 * 1024)) << "MB) -> logs/"
                       << rotated.filename().string() << "\n";
         }
     }
@@ -158,7 +175,7 @@ void Logger::init(const std::string& log_file_name, int rotation_size_mb, int ma
         boost::log::keywords::rotation_size = rotation_size_mb * 1024 * 1024,
         boost::log::keywords::open_mode = std::ios_base::app,
         boost::log::keywords::min_free_space = 30 * 1024 * 1024,
-        boost::log::keywords::target = log_dir.string(),
+        boost::log::keywords::target = rotated_dir.string(),
         boost::log::keywords::max_size = max_total_mb * 1024 * 1024
     );
     fsSink->set_formatter(logFmt);
