@@ -436,12 +436,8 @@ int main(int argc, char* argv[])
             auto& chain = node.tracker().chain;
             auto& verified = node.tracker().verified;
 
-            uint256 best;
-            int32_t best_height = -1;
-            for (const auto& [head_hash, tail_hash] : chain.get_heads()) {
-                auto h = chain.get_height(head_hash);
-                if (h > best_height) { best = head_hash; best_height = h; }
-            }
+            uint256 best = node.best_share_hash_nolock();  // shared best-head picker
+            int32_t best_height = best.IsNull() ? 0 : chain.get_height(best);
             result["best_hash"]    = best.IsNull() ? "" : best.GetHex();
             result["chain_length"] = static_cast<int>(chain.size());
             result["window_size"]  = static_cast<int>(params.chain_length);
@@ -508,32 +504,20 @@ int main(int argc, char* argv[])
         });
         // Sharechain tip for readiness checks.
         mi->set_sharechain_tip_fn([&node]() -> nlohmann::json {
-            // HTTP-thread callback. Inline the heads lookup + height under a
-            // single shared_lock so both reads see the same snapshot —
-            // calling best_share_hash() here would take + release, opening
-            // a race window where `best` exists but gets removed before
-            // get_height. shared_mutex forbids recursive shared locking.
+            // HTTP-thread callback. All sharechain endpoints (tip, window,
+            // delta) agree on best-head selection by delegating to
+            // best_share_hash_nolock() — highest cumulative abswork, not
+            // arbitrary map order. When two forks exist the head with
+            // more work is "best"; without this the client's _rtTipHash
+            // could track a stale head while new shares grew a different
+            // fork and SSE pushes never reached the client.
             std::shared_lock lock(node.tracker_mutex());
-            nlohmann::json t;
             auto& chain = node.tracker().chain;
-            // Pick the MAX-HEIGHT head so /sharechain/tip matches what
-            // /sharechain/window and /sharechain/delta use. Using
-            // `heads.begin()->first` returned an arbitrary head (hash
-            // order) — so when two heads existed (forks) the SSE tip
-            // push disagreed with the window's best, and the client's
-            // _rtTipHash would never converge. Fixed: max-by-height,
-            // matching set_sharechain_window_fn + set_sharechain_delta_fn.
-            uint256 best;
-            int32_t best_height = -1;
-            for (const auto& [head_hash, tail_hash] : chain.get_heads()) {
-                auto h = chain.get_height(head_hash);
-                if (h > best_height) { best = head_hash; best_height = h; }
-            }
-            // D4 (parity audit): return the short (16-char) hash so the
-            // key passed to MiningInterface::cache_pplns_at_tip matches
-            // the short-hash keys that the PPLNS precompute thread stores.
+            uint256 best = node.best_share_hash_nolock();
+            int32_t height = best.IsNull() ? 0 : chain.get_height(best);
+            nlohmann::json t;
             t["hash"]   = best.IsNull() ? "" : best.GetHex().substr(0, 16);
-            t["height"] = best_height < 0 ? 0 : best_height;
+            t["height"] = height;
             return t;
         });
         // Sharechain delta endpoint — returns shares newer than `since`
@@ -553,12 +537,7 @@ int main(int argc, char* argv[])
                 auto& chain = node.tracker().chain;
                 auto& verified = node.tracker().verified;
 
-                uint256 best;
-                int32_t best_height = -1;
-                for (const auto& [head_hash, tail_hash] : chain.get_heads()) {
-                    auto h = chain.get_height(head_hash);
-                    if (h > best_height) { best = head_hash; best_height = h; }
-                }
+                uint256 best = node.best_share_hash_nolock();  // shared picker
 
                 nlohmann::json shares_arr = nlohmann::json::array();
                 int count = 0;

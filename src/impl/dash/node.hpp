@@ -1110,13 +1110,43 @@ public:
     std::shared_mutex& tracker_mutex() { return m_tracker_mutex; }
     const core::CoinParams& coin_params() const { return m_coin_params; }
 
+    // Caller MUST already hold m_tracker_mutex (shared or unique). Picks
+    // the head with the highest cumulative abswork — matches p2pool's
+    // best-share selection and keeps best_share/window/tip/delta in
+    // agreement across forks. Using `heads.begin()->first` previously
+    // returned an arbitrary-order head, so when a newer share at a
+    // higher absheight created a side chain the client saw the tip
+    // stay frozen even as new shares arrived.
+    uint256 best_share_hash_nolock() const
+    {
+        uint256 best;
+        uint128 best_work{};
+        bool    first = true;
+        auto& chain_nc = const_cast<dash::ShareChain&>(m_tracker.chain);
+        for (auto& [head_hash, _unused] : chain_nc.get_heads()) {
+            try {
+                auto& entry = chain_nc.get(head_hash);
+                uint128 work{};
+                entry.share.invoke([&](auto* obj) {
+                    using S = std::remove_pointer_t<decltype(obj)>;
+                    if constexpr (std::is_same_v<S, dash::DashShare>) {
+                        work = obj->m_abswork;
+                    }
+                });
+                if (first || best_work < work) {
+                    best = head_hash;
+                    best_work = work;
+                    first = false;
+                }
+            } catch (...) {}
+        }
+        return best;
+    }
+
     uint256 best_share_hash() const
     {
         std::shared_lock lock(m_tracker_mutex);
-        auto heads = m_tracker.chain.get_heads();
-        if (heads.empty())
-            return uint256();
-        return heads.begin()->first;
+        return best_share_hash_nolock();
     }
 
     // Number of handshaked p2pool peers (BaseNode keeps m_peers protected;
