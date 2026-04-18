@@ -1200,6 +1200,26 @@ int main(int argc, char* argv[])
     outbound_timer->expires_after(std::chrono::seconds(5));
     outbound_timer->async_wait(outbound_fn);
 
+    // ── Ancestor backfill (periodic sharereq for shallow heads) ──────
+    // When a head's walkable depth is < chain_length, this tick finds
+    // its tail and requests the missing parent. Without it, heads that
+    // appear during a network blip stay stuck at their initial depth
+    // (handshake/bestblock events triggered one download which failed,
+    // and nothing retries). Runs every 30 s.
+    auto backfill_timer = std::make_shared<io::steady_timer>(ioc);
+    std::function<void(const boost::system::error_code&)> backfill_fn;
+    backfill_fn = [&, backfill_timer](const boost::system::error_code& ec) {
+        if (ec) return;
+        try { node.backfill_ancestors(); }
+        catch (const std::exception& e) {
+            LOG_WARNING << "[Dash] backfill_ancestors threw: " << e.what();
+        }
+        backfill_timer->expires_after(std::chrono::seconds(30));
+        backfill_timer->async_wait(backfill_fn);
+    };
+    backfill_timer->expires_after(std::chrono::seconds(20));
+    backfill_timer->async_wait(backfill_fn);
+
     // ── Tracker pruning (B2 from parity audit) ───────────────────────
     // p2pool-style tail-drop keeps the chain at 2*CL+10 = ~8650 shares.
     // Without this, live tracker grew to 10k+ within minutes — unbounded
