@@ -309,7 +309,15 @@ private:
 
     void handle_msg(std::unique_ptr<message_pong>) {}
     void handle_msg(std::unique_ptr<message_alert>) {}
-    void handle_msg(std::unique_ptr<message_getaddr>) {}
+    // SPV B1 (parity audit): peer asked for our peer list. We're an SPV
+    // client behind dashd, not a crawler — reply with an empty addr list
+    // so the peer knows we responded. Silent drop would have dashd keep
+    // re-asking and eventually mark us as a non-responding node.
+    void handle_msg(std::unique_ptr<message_getaddr>)
+    {
+        auto reply = message_addr::make_raw({});
+        m_peer->write(reply);
+    }
     // SPV A1 (parity audit): Dash ChainLock message. Peer sends clsig
     // unsolicited (or via getdata) when an LLMQ has aggregated a
     // ChainLockSig for a block. Record it so the submit-handler /
