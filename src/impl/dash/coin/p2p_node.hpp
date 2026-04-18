@@ -177,6 +177,21 @@ public:
         }
     }
 
+    // SPV A2 (parity audit): ship already-serialized block bytes to dashd
+    // alongside the submitblock RPC, for fast P2P propagation on block-find.
+    // Avoids a full BlockType round-trip deserialize just to re-serialize;
+    // the submit validator built the exact bytes dashd expects (80-byte
+    // header + VarInt tx count + coinbase + txs).
+    void submit_block_raw(std::span<const unsigned char> block_bytes)
+    {
+        if (!m_peer) return;
+        PackStream ps(std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(block_bytes.data()),
+            block_bytes.size()));
+        auto rmsg = std::make_unique<RawMessage>("block", std::move(ps));
+        m_peer->write(rmsg);
+    }
+
     bool is_connected() const { return m_peer != nullptr && m_handshake_complete; }
 
     // ICommunicator — message dispatch
