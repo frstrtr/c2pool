@@ -58,6 +58,13 @@ public:
     }
 
     bool has_p2p() const { return m_p2p != nullptr; }
+
+    // SPV A1: true if a ChainLock has been received for this block hash.
+    // Queried by main_dash.cpp submit handler after submitblock to mark
+    // a FoundBlock as ChainLock-finalized (vs just dashd-accepted).
+    bool is_chainlocked(const uint256& block_hash) const {
+        return chainlocked_blocks.count(block_hash) > 0;
+    }
 };
 
 } // namespace coin

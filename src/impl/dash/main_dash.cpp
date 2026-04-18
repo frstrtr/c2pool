@@ -415,6 +415,7 @@ int main(int argc, char* argv[])
         mi->set_p2p_port(port);
         if (stratum_port == 0) mi->set_worker_port(7903);
 
+
         // C2 (parity audit): operator stats history for dashboard graphs.
         // WebServer already runs update_stat_log every 60s on its own
         // timer; we just need to tell MiningInterface where to persist
@@ -599,6 +600,25 @@ int main(int argc, char* argv[])
             LOG_INFO << "[DASH] Full block: " << bhash.GetHex().substr(0, 16)
                      << " txs=" << block.m_txs.size();
         });
+
+        // SPV A1 (parity audit): wire ChainLock-aware block verifier now
+        // that coin_node exists. record_found_block schedules
+        // verify_found_block at 30s/150s/300s/… intervals; this callback
+        // returns 1 when dashd's LLMQ-aggregated ChainLock for our block
+        // has arrived, promoting the FoundBlock status pending → confirmed.
+        // clsig handler in p2p_node.hpp populates coin_node's chainlocked
+        // map; this callback just queries it.
+        if (web_server) {
+            auto* mi2 = web_server->get_mining_interface();
+            mi2->add_chain_verify_fn("DASH", [&coin_node](const std::string& hash_hex) -> int {
+                if (!coin_node) return 0;
+                try {
+                    uint256 h;
+                    h.SetHex(hash_hex);
+                    return coin_node->is_chainlocked(h) ? 1 : 0;
+                } catch (...) { return 0; }
+            });
+        }
 
         // Start dashd P2P after io_context starts
         config->coin()->m_p2p.address = NetService(dashd_host + ":" + std::to_string(dashd_port));

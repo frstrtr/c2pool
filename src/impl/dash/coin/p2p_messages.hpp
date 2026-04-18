@@ -77,6 +77,27 @@ BEGIN_MESSAGE(headers)
     }
 END_MESSAGE()
 
+// SPV A1 (parity audit): Dash ChainLockSig (clsig) message.
+// Reference: dashcore/src/chainlock/clsig.h — ChainLockSig struct.
+// Wire layout: nHeight(i32 LE) + blockHash(32B LE) + sig(96B BLS blob).
+// Peers push this unsolicited when a ChainLock is freshly aggregated,
+// and also on demand via inv+getdata(MSG_CLSIG=29). Parsing the sig is
+// not required — we treat it as opaque bytes; the fact that we received
+// the message at all is dashd's signal that the block is finalized.
+BEGIN_MESSAGE(clsig)
+    MESSAGE_FIELDS
+    (
+        (int32_t, m_height),
+        (uint256, m_block_hash),
+        (std::vector<uint8_t>, m_sig)
+    )
+    {
+        READWRITE(obj.m_height);
+        READWRITE(obj.m_block_hash);
+        READWRITE(Using<ArrayType<DefaultFormat, 96>>(obj.m_sig));
+    }
+END_MESSAGE()
+
 using Handler = MessageHandler<
     message_version,
     message_verack,
@@ -98,7 +119,8 @@ using Handler = MessageHandler<
     message_feefilter,
     message_mempool,
     message_sendcmpct,
-    message_sendaddrv2
+    message_sendaddrv2,
+    message_clsig
 >;
 
 } // namespace p2p
