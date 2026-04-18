@@ -694,6 +694,13 @@ int main(int argc, char* argv[])
                     // For Dash (no merged mining) the result is just current_payouts
                     // wrapped in {amount, merged:[]} — cache_pplns_at_tip handles it.
                     mi->cache_pplns_at_tip();
+                    // The /sharechain/window response is cached by best_hash etag
+                    // and only refreshed when invalidated (LTC calls this from
+                    // trigger_work_refresh_debounced). Dash drives work from the
+                    // JOB loop, so invalidate here — otherwise the explorer stays
+                    // frozen at the best_hash seen when the cache was first filled
+                    // and new shares never show up.
+                    mi->invalidate_window_cache();
                 }
 
                 // Pick a share target bits from our configured share_difficulty.
