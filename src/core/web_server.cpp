@@ -6456,10 +6456,30 @@ void MiningInterface::update_stat_log()
     entry.current_payouts = nlohmann::json::object();
     {
         auto cached = get_cached_pplns_outputs();
-        bool is_ltc = (m_blockchain == Blockchain::LITECOIN);
+        // Chain-aware address encoding. The legacy is_ltc bool overload
+        // only covers LTC/BTC version bytes; Dash needs 76/16 mainnet,
+        // 140/19 testnet. Pick the right pair per blockchain so graph_db
+        // samples carry human-readable addresses (not Bitcoin fallback
+        // encodings). Parity-audit D-tier followup shipped alongside C2.
+        auto [p2pkh_ver, p2sh_ver, hrp] = [&]()
+            -> std::tuple<uint8_t, uint8_t, std::string>
+        {
+            switch (m_blockchain) {
+            case Blockchain::LITECOIN:
+                return m_testnet ? std::make_tuple<uint8_t, uint8_t, std::string>(0x6f, 0x3a, "tltc")
+                                 : std::make_tuple<uint8_t, uint8_t, std::string>(0x30, 0x32, "ltc");
+            case Blockchain::DASH:
+                return m_testnet ? std::make_tuple<uint8_t, uint8_t, std::string>(140, 19, "")
+                                 : std::make_tuple<uint8_t, uint8_t, std::string>(76, 16, "");
+            case Blockchain::BITCOIN:
+            default:
+                return m_testnet ? std::make_tuple<uint8_t, uint8_t, std::string>(0x6f, 0xc4, "tb")
+                                 : std::make_tuple<uint8_t, uint8_t, std::string>(0x00, 0x05, "bc");
+            }
+        }();
         for (const auto& [script_hex, amount] : cached) {
             auto script_bytes = ParseHex(script_hex);
-            std::string addr = core::script_to_address(script_bytes, is_ltc, m_testnet);
+            std::string addr = core::script_to_address(script_bytes, hrp, p2pkh_ver, p2sh_ver);
             if (addr.empty()) addr = script_hex;
             double coin_amt = static_cast<double>(amount) / 1e8;
             if (entry.current_payouts.contains(addr))
