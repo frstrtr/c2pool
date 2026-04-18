@@ -650,6 +650,12 @@ int main(int argc, char* argv[])
     std::function<void(const boost::system::error_code&)> outbound_fn;
     outbound_fn = [&, outbound_timer](const boost::system::error_code& ec) {
         if (ec) return;
+        // B3: sweep expired ban entries before dialing so recovered peers
+        // can re-enter the candidate pool.
+        try { node.expire_bans(); }
+        catch (const std::exception& e) {
+            LOG_WARNING << "[Dash] expire_bans threw: " << e.what();
+        }
         try { node.try_connect_more_peers(TARGET_OUTBOUND_PEERS); }
         catch (const std::exception& e) {
             LOG_WARNING << "[Dash] outbound dial failed: " << e.what();

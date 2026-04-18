@@ -69,6 +69,13 @@ protected:
     std::vector<uint256> m_verified_flush_buf;
     std::vector<uint256> m_removal_flush_buf;
 
+    // B3 (parity audit): peer ban list. A peer that sends us an invalid
+    // share (failed X11 PoW, bad hash_link, bad merkle_link, bad payments)
+    // gets added here with an expiry timestamp. Inbound + outbound paths
+    // consult is_banned() before connecting. LTC analogue: node.cpp:1383-1396.
+    std::map<NetService, std::chrono::steady_clock::time_point> m_ban_list;
+    std::chrono::seconds m_ban_duration{300}; // 5 min default — matches LTC
+
     // Outbound-dial throttle: record when we last attempted each addr so a
     // periodic tick doesn't hammer the same unreachable peer. Factory::Client
     // fires and forgets — no failure callback — so without this we'd redial
@@ -130,9 +137,53 @@ public:
     void connected(std::shared_ptr<core::Socket> socket) override
     {
         auto addr = socket->get_addr();
+        // B3 (parity audit): reject the connection if the remote is in our
+        // ban list. Match LTC pattern at ltc/node.cpp:129.
+        if (is_banned(addr)) {
+            LOG_INFO << "[Dash] rejecting connection from banned peer "
+                     << addr.to_string();
+            base_t::close_connection(addr);
+            return;
+        }
         base_t::connected(socket);
         auto peer = m_connections[addr];
         send_version(peer);
+    }
+
+    // B3: is the given peer currently banned? Matches ltc/node.cpp:1915.
+    bool is_banned(const NetService& addr) const
+    {
+        auto it = m_ban_list.find(addr);
+        if (it == m_ban_list.end()) return false;
+        return it->second > std::chrono::steady_clock::now();
+    }
+
+    // B3: add a peer to the ban list. Called from share-verify failure
+    // paths so peers pushing invalid shares cost bandwidth only once. A
+    // 5-minute cooldown is long enough to deter spam + short enough that
+    // transient bugs don't exile otherwise-good operators forever.
+    void ban_peer(const NetService& addr, const std::string& reason)
+    {
+        if (addr.port() == 0) return;
+        auto expiry = std::chrono::steady_clock::now() + m_ban_duration;
+        m_ban_list[addr] = expiry;
+        LOG_WARNING << "[Dash] banning peer " << addr.to_string()
+                    << " for " << m_ban_duration.count() << "s: " << reason;
+    }
+
+    // B3: sweep expired entries. Called opportunistically from the
+    // periodic outbound-dial timer so the list doesn't grow forever.
+    void expire_bans()
+    {
+        auto now = std::chrono::steady_clock::now();
+        for (auto it = m_ban_list.begin(); it != m_ban_list.end(); ) {
+            if (it->second <= now) it = m_ban_list.erase(it);
+            else ++it;
+        }
+    }
+
+    void set_ban_duration(int seconds) {
+        m_ban_duration = std::chrono::seconds(seconds);
     }
 
     // Send version message (protocol 1700). Sharechain C4 (parity audit):
@@ -330,6 +381,7 @@ public:
         std::vector<NetService> candidates;
         for (const auto& [addr, val] : base_t::m_addrs.get_all()) {
             if (base_t::m_connections.contains(addr)) continue;
+            if (is_banned(addr)) continue;  // B3
             auto it = m_dial_attempts.find(addr);
             if (it != m_dial_attempts.end() && (now - it->second) < kDialCooldown) continue;
             candidates.push_back(addr);
@@ -554,6 +606,10 @@ public:
                             }
                         } catch (const std::exception& e) {
                             LOG_WARNING << "[Dash] Share verification failed in download: " << e.what();
+                            // B3: the peer sent us a share that fails PoW /
+                            // hashlink / merkle — ban it so we stop wasting
+                            // bandwidth on future downloads from it.
+                            ban_peer(peer_addr, std::string("bad share: ") + e.what());
                         }
                     });
                 }
@@ -650,11 +706,16 @@ public:
                         }
                     } catch (const std::exception& e) {
                         LOG_WARNING << "[Dash] Share verification failed: " << e.what();
+                        // B3: ban the peer that pushed this share —
+                        // PoW/hashlink/merkle failure is a protocol violation.
+                        ban_peer(from, std::string("bad share push: ") + e.what());
                     }
                 });
             } catch (const std::exception& e) {
                 LOG_WARNING << "[Dash] Share deserialization failed: " << e.what()
                             << " (type=" << raw_share.type << " size=" << raw_share.contents.size() << ")";
+                // B3: malformed wire data = protocol violation. Ban.
+                ban_peer(from, std::string("malformed share: ") + e.what());
             }
         }
     }
