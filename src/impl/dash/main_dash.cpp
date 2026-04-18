@@ -834,18 +834,20 @@ int main(int argc, char* argv[])
                     }
                     auto* mi = web_server->get_mining_interface();
                     mi->set_cached_pplns_outputs(std::move(pplns_cache));
-                    // /current_merged_payouts is the dashboard's primary source
-                    // for the Payouts table and the PPLNS distribution treemap.
-                    // For Dash (no merged mining) the result is just current_payouts
-                    // wrapped in {amount, merged:[]} — cache_pplns_at_tip handles it.
-                    mi->cache_pplns_at_tip();
-                    // The /sharechain/window response is cached by best_hash etag
-                    // and only refreshed when invalidated (LTC calls this from
-                    // trigger_work_refresh_debounced). Dash drives work from the
-                    // JOB loop, so invalidate here — otherwise the explorer stays
-                    // frozen at the best_hash seen when the cache was first filled
-                    // and new shares never show up.
-                    mi->invalidate_window_cache();
+                    // /current_merged_payouts + /sharechain/window are both
+                    // keyed on the sharechain tip. The JOB cycle fires every
+                    // 10 s but the tip only changes when a new share lands
+                    // (~20 s on Dash). Gate the cache invalidations on an
+                    // actual tip change — P3(b) from the next-session plan.
+                    // Matches LTC (trigger_work_refresh_debounced is called
+                    // only on share arrivals, not on a timer).
+                    static uint256 s_last_cached_tip;
+                    uint256 cur_tip = node.best_share_hash();
+                    if (cur_tip != s_last_cached_tip) {
+                        s_last_cached_tip = cur_tip;
+                        mi->cache_pplns_at_tip();
+                        mi->invalidate_window_cache();
+                    }
                 }
 
                 // Pick a share target bits from our configured share_difficulty.
