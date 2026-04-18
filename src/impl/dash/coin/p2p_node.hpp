@@ -99,6 +99,7 @@ class NodeP2P : public core::ICommunicator, public core::INetwork, public core::
 
     using PeerHeightCallback = std::function<void(uint32_t)>;
     PeerHeightCallback m_on_peer_height;
+    std::function<void(const std::vector<NetService>&)> m_addr_callback;
 
     void ensure_timeout_timer()
     {
@@ -232,12 +233,88 @@ public:
 
     bool is_connected() const { return m_peer != nullptr && m_handshake_complete; }
 
-    // Accessors for dashboard peer-info rendering (dashd SPV side).
+    // LTC-surface parity methods (Phase 2 CoinBroadcaster port).
+    // The templated CoinBroadcasterT expects these method names so the
+    // same source calls into either LTC's NodeP2P or Dash's NodeP2P.
+
+    bool is_handshake_complete() const { return m_handshake_complete; }
+
+    // Dashd peer state accessors.
     const NetService& target_addr() const { return m_target_addr; }
     uint32_t           peer_version() const { return m_peer_version; }
     const std::string& peer_subver() const { return m_peer_subver; }
     uint32_t           peer_start_height() const { return m_peer_start_height; }
     int64_t            connect_time_epoch() const { return m_connect_time_epoch; }
+    uint64_t           peer_services() const { return m_peer_services; }
+    uint32_t           peer_uptime_sec() const {
+        // Return epoch of connect, matching ltc::NodeP2P::peer_uptime_sec
+        // (confusingly named — returns conntime epoch, not uptime).
+        return static_cast<uint32_t>(m_connect_time_epoch);
+    }
+
+    // Bitcoin NODE_BLOOM (bit 2) — Dash v20+ doesn't advertise bloom by
+    // default, so peer_has_bloom is informational; the broadcaster only
+    // uses it to decide whether to send BIP 35 mempool (which Dash
+    // doesn't need for its sharechain).
+    bool peer_has_bloom() const { return (m_peer_services & 4) != 0; }
+
+    // BIP 152 / BIP 339 — not used on Dash mainnet. Return false so the
+    // broadcaster's compact-block / wtxid-relay paths remain inactive.
+    bool supports_compact_blocks() const { return false; }
+    bool peer_wtxidrelay() const { return false; }
+
+    // Broadcaster fan-out entrypoints.
+    void send_block_inv(const uint256& block_hash)
+    {
+        if (!m_peer) return;
+        auto msg = message_inv::make_raw(
+            std::vector<inventory_type>{
+                inventory_type(inventory_type::block, block_hash)});
+        m_peer->write(msg);
+    }
+
+    void request_full_block(const uint256& block_hash)
+    {
+        if (!m_peer) return;
+        auto msg = message_getdata::make_raw(
+            std::vector<inventory_type>{
+                inventory_type(inventory_type::block, block_hash)});
+        m_peer->write(msg);
+    }
+
+    void request_block(const uint256& block_hash) { request_full_block(block_hash); }
+
+    void send_getaddr()
+    {
+        if (!m_peer) return;
+        auto msg = message_getaddr::make_raw();
+        m_peer->write(msg);
+    }
+
+    void send_mempool()
+    {
+        if (!m_peer) return;
+        auto msg = message_mempool::make_raw();
+        m_peer->write(msg);
+    }
+
+    // BIP 35 mempool request toggle — Dash doesn't use this (no bloom
+    // filtering / sharechain fee tracking at the SPV layer), so this is
+    // a no-op accepted for broadcaster surface parity.
+    void enable_mempool_request() {}
+
+    // Peer addr callback for broadcaster-driven peer discovery. Fires
+    // whenever dashd sends us a message_addr (unsolicited or in response
+    // to getaddr). Used by CoinPeerManager to learn about new dashd
+    // endpoints without depending on RPC getpeerinfo.
+    using AddrCallback = std::function<void(const std::vector<NetService>&)>;
+    void set_addr_callback(AddrCallback cb) { m_addr_callback = std::move(cb); }
+
+    // AuxPoW parsers — DOGE-only in the LTC tree. Dash has neither AuxPoW
+    // nor MWEB so both are no-ops. Defined to satisfy the broadcaster
+    // template surface.
+    template <typename F> void set_raw_headers_parser(F&&) {}
+    template <typename F> void set_raw_block_parser(F&&) {}
 
     // ICommunicator — message dispatch
     void handle(std::unique_ptr<RawMessage> rmsg, const NetService& service) override
@@ -343,6 +420,17 @@ private:
         // connection-setup gap would be invisible until they land in a block.
         auto msg_mempool = message_mempool::make_raw();
         m_peer->write(msg_mempool);
+
+        // Phase 2 peer discovery: ask the peer for its addr list so we
+        // can seed the CoinPeerManager's candidate pool. Fires only when
+        // a set_addr_callback is wired (DashCoinBroadcaster sets it).
+        // Without this send, dashd returns nothing — addr messages are
+        // push-only and a full getaddr is required to elicit the list
+        // on-demand.
+        if (m_addr_callback) {
+            auto msg_getaddr = message_getaddr::make_raw();
+            m_peer->write(msg_getaddr);
+        }
 
         LOG_INFO << "[DashP2P] Handshake complete with " << m_target_addr.to_string();
     }
@@ -503,6 +591,13 @@ private:
     void handle_msg(std::unique_ptr<message_addr> msg)
     {
         LOG_INFO << "[DashP2P] Received " << msg->m_addrs.size() << " addr entries";
+        if (!m_addr_callback) return;
+        std::vector<NetService> endpoints;
+        endpoints.reserve(msg->m_addrs.size());
+        for (const auto& rec : msg->m_addrs) {
+            endpoints.push_back(rec.m_endpoint);
+        }
+        if (!endpoints.empty()) m_addr_callback(endpoints);
     }
 };
 
