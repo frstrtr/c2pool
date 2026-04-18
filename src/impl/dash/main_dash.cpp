@@ -250,6 +250,23 @@ int main(int argc, char* argv[])
 #ifdef C2POOL_VERSION
         mi->set_pool_version("c2pool-dash/" C2POOL_VERSION);
 #endif
+        // Dash drives its own work pipeline (GBT via coin_rpc, stratum via
+        // dash::stratum::Server) — bypass WebServer's internal has_work /
+        // is_node_ready gate so the loading page doesn't stall / force
+        // everyone into a redirect loop to loading.html.
+        mi->set_dashboard_always_ready(true);
+        // Sharechain stats for the dashboard (chain height + verified count).
+        mi->set_sharechain_stats_fn([&node]() {
+            nlohmann::json j;
+            int h = static_cast<int>(node.tracker().chain.size());
+            j["chain_height"]   = h;
+            j["verified_count"] = h;  // node tracks single verified chain
+            j["total_shares"]   = h;
+            j["fork_count"]     = static_cast<int>(node.tracker().chain.get_heads().size());
+            return j;
+        });
+        // Best share hash for the dashboard's head indicator.
+        mi->set_best_share_hash_fn([&node]() { return node.best_share_hash(); });
         web_server->start();
         std::cout << "[WEB] dashboard listening on " << http_host << ":"
                   << http_port << std::endl;
