@@ -458,6 +458,9 @@ public:
                             if (!m_tracker.chain.contains(share_hash)) {
                                 auto* heap_share = new dash::DashShare(*obj);
                                 m_tracker.add(heap_share);
+                                auto& entry = m_tracker.chain.get(share_hash);
+                                if (!m_tracker.verified.contains(share_hash))
+                                    m_tracker.verified.add(entry.share);
                             }
                         } catch (const std::exception& e) {
                             LOG_WARNING << "[Dash] Share verification failed in download: " << e.what();
@@ -518,6 +521,15 @@ public:
                         if (!m_tracker.chain.contains(share_hash)) {
                             auto* heap_share = new dash::DashShare(*obj);
                             m_tracker.add(heap_share);
+                            // share_init_verify above ran X11 PoW + hash_link +
+                            // merkle_link checks, so this share is semantically
+                            // verified. Mark it in the verified set so the
+                            // dashboard colors it as such instead of grey.
+                            // p2pool's CHAIN_LENGTH+1 gate is about PPLNS depth
+                            // for gentx comparison, not PoW validity.
+                            auto& entry = m_tracker.chain.get(share_hash);
+                            if (!m_tracker.verified.contains(share_hash))
+                                m_tracker.verified.add(entry.share);
                             LOG_INFO << "[Dash] Share added to tracker (total: " << m_tracker.chain.size() << ")";
                         }
                     } catch (const std::exception& e) {
@@ -592,8 +604,12 @@ public:
         heap_share->m_hash = share.m_hash.IsNull()
             ? dash::share_init_verify(*heap_share, m_coin_params, /*check_pow=*/false)
             : share.m_hash;
-        if (!m_tracker.chain.contains(heap_share->m_hash))
+        if (!m_tracker.chain.contains(heap_share->m_hash)) {
             m_tracker.add(heap_share);
+            auto& entry = m_tracker.chain.get(heap_share->m_hash);
+            if (!m_tracker.verified.contains(heap_share->m_hash))
+                m_tracker.verified.add(entry.share);
+        }
         return heap_share->m_hash;
     }
 
