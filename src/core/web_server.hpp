@@ -915,6 +915,12 @@ public:
     using coin_peer_info_fn = std::function<nlohmann::json()>;
     void set_ltc_peer_info_fn(coin_peer_info_fn fn) { m_ltc_peer_info_fn = thread_safe_wrap(std::move(fn)); }
     void set_doge_peer_info_fn(coin_peer_info_fn fn) { m_doge_peer_info_fn = thread_safe_wrap(std::move(fn)); }
+    // Generic coin peer-info for non-LTC paths (e.g. Dash SPV). Consumed by
+    // rest_broadcaster_status when m_mm_manager is null (no merged mining).
+    // The dashboard's "Parent Chain Peers" panel expects an array of
+    // {addr, subver, startingheight, conntime, connected} objects plus a
+    // running=true top-level flag.
+    void set_coin_peer_info_fn(coin_peer_info_fn fn) { m_coin_peer_info_fn = thread_safe_wrap(std::move(fn)); }
 
     // Callback fired whenever a block submission is attempted.
     // Arguments: header hex (first 80 bytes), stale_info (none=accepted, orphan=stale prev, doa=daemon rejected).
@@ -1195,6 +1201,7 @@ private:
     std::shared_ptr<void> m_merged_block_store;  // MergedBlockStore (opaque)
     coin_peer_info_fn m_ltc_peer_info_fn;
     coin_peer_info_fn m_doge_peer_info_fn;
+    coin_peer_info_fn m_coin_peer_info_fn;
     block_verify_fn_t m_block_verify_fn;  // default (parent chain)
     std::map<std::string, block_verify_fn_t> m_chain_verify_fns; // per-chain
     void verify_found_block(size_t index);

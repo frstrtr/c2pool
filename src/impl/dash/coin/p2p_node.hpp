@@ -60,6 +60,9 @@ class NodeP2P : public core::ICommunicator, public core::INetwork, public core::
     uint32_t m_peer_version{0};
     std::string m_peer_subver;
     uint32_t m_peer_start_height{0};
+    // Unix epoch seconds set when handshake completes; dashboard uses
+    // (now - this) to render uptime for the dashd peer row.
+    int64_t  m_connect_time_epoch{0};
 
     // SPV B2 (parity audit): per BIP 130, peer has asked us to announce
     // new blocks via `headers` rather than `inv`. We don't generate
@@ -229,6 +232,13 @@ public:
 
     bool is_connected() const { return m_peer != nullptr && m_handshake_complete; }
 
+    // Accessors for dashboard peer-info rendering (dashd SPV side).
+    const NetService& target_addr() const { return m_target_addr; }
+    uint32_t           peer_version() const { return m_peer_version; }
+    const std::string& peer_subver() const { return m_peer_subver; }
+    uint32_t           peer_start_height() const { return m_peer_start_height; }
+    int64_t            connect_time_epoch() const { return m_connect_time_epoch; }
+
     // ICommunicator — message dispatch
     void handle(std::unique_ptr<RawMessage> rmsg, const NetService& service) override
     {
@@ -315,6 +325,7 @@ private:
         );
 
         m_handshake_complete = true;
+        m_connect_time_epoch = static_cast<int64_t>(std::time(nullptr));
         ensure_timeout_timer();
         m_timeout_timer->restart(IDLE_TIMEOUT_SEC);
 
