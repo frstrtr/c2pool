@@ -310,6 +310,24 @@ private:
     void handle_msg(std::unique_ptr<message_pong>) {}
     void handle_msg(std::unique_ptr<message_alert>) {}
     void handle_msg(std::unique_ptr<message_getaddr>) {}
+    // SPV A1 (parity audit): Dash ChainLock message. Peer sends clsig
+    // unsolicited (or via getdata) when an LLMQ has aggregated a
+    // ChainLockSig for a block. Record it so the submit-handler /
+    // record_found_block flow can mark the block as ChainLock-confirmed.
+    // We trust dashd's network-level LLMQ validation and don't re-verify
+    // the 96-byte BLS sig — that requires BLS + quorum state we don't
+    // track. The fact that dashd forwarded the message IS the validation.
+    void handle_msg(std::unique_ptr<message_clsig> msg)
+    {
+        if (!msg) return;
+        auto bhash = msg->m_block_hash;
+        auto h = msg->m_height;
+        LOG_INFO << "[DashP2P] ChainLock: height=" << h
+                 << " block=" << bhash.GetHex().substr(0, 16);
+        m_coin->chainlocked_blocks[bhash] = h;
+        m_coin->new_chainlock.happened({bhash, h});
+    }
+
     // SPV A3 (parity audit): log rejects instead of silently dropping.
     // Dashd sends these when our submitblock / getdata / etc. is malformed
     // or the message it references doesn't validate. Without the log a
@@ -335,6 +353,9 @@ private:
     void handle_msg(std::unique_ptr<message_inv> msg)
     {
         std::vector<inventory_type> requests;
+        // MSG_CLSIG = 29 (dashcore/src/protocol.h:522). Not in our generic
+        // inventory_type enum — compare raw uint32 value. SPV A1 path.
+        static constexpr uint32_t DASH_MSG_CLSIG = 29;
 
         for (auto& inv : msg->m_invs)
         {
@@ -348,6 +369,11 @@ private:
                 requests.push_back(inv);
                 break;
             default:
+                if (static_cast<uint32_t>(btype) == DASH_MSG_CLSIG) {
+                    // Request the clsig body. On receipt we'll record
+                    // the ChainLock via handle_msg(message_clsig).
+                    requests.push_back(inv);
+                }
                 break;
             }
         }
