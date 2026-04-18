@@ -586,6 +586,12 @@ int main(int argc, char* argv[])
                 result["tip"]    = best.IsNull() ? "" : best.GetHex().substr(0, 16);
                 result["heads"]  = std::move(heads_arr);
                 result["blocks"] = nlohmann::json::array();  // no LTC block solutions
+                // Include chain_length so the dashboard's 'Chain Length'
+                // stat stays populated on SSE deltas (it would blank out
+                // to '-' otherwise since _rtFetchDelta calls updateStats
+                // with only the delta fields).
+                result["chain_length"] = static_cast<int>(chain.size());
+                result["window_size"]  = static_cast<int>(params.chain_length);
 
                 // Per-share PPLNS for the zoom-tooltip panel on the new shares.
                 if (count > 0 && mi_ptr) {

@@ -1111,20 +1111,27 @@ public:
     const core::CoinParams& coin_params() const { return m_coin_params; }
 
     // Caller MUST already hold m_tracker_mutex (shared or unique). Picks
-    // the head with the highest cumulative abswork — matches p2pool's
-    // best-share selection and keeps best_share/window/tip/delta in
-    // agreement across forks. Using `heads.begin()->first` previously
-    // returned an arbitrary-order head, so when a newer share at a
-    // higher absheight created a side chain the client saw the tip
-    // stay frozen even as new shares arrived.
+    // the "best" head among forks by composite score:
+    //   1. Greater walkable chain depth wins (chain.get_height) — so a
+    //      head with 4320 ancestors beats a head with 415. Without this
+    //      the window would collapse to the shorter fork (e.g. 416/4320).
+    //   2. On equal depth, greater cumulative abswork wins — matches
+    //      p2pool's set_best_share preference.
+    //
+    // Rationale: a deep, well-connected chain is the one we have enough
+    // history for; a shallow shallow-work fork may be a newly-started
+    // branch we haven't fetched ancestors for yet, or a peer's isolated
+    // sub-chain. Prefer the view with more context. p2pool's tracker.think()
+    // does this via DecoratedShare scoring (length + work + age).
     uint256 best_share_hash_nolock() const
     {
         uint256 best;
+        int32_t best_depth = -1;
         uint128 best_work{};
-        bool    first = true;
         auto& chain_nc = const_cast<dash::ShareChain&>(m_tracker.chain);
         for (auto& [head_hash, _unused] : chain_nc.get_heads()) {
             try {
+                int32_t depth = chain_nc.get_height(head_hash);
                 auto& entry = chain_nc.get(head_hash);
                 uint128 work{};
                 entry.share.invoke([&](auto* obj) {
@@ -1133,10 +1140,12 @@ public:
                         work = obj->m_abswork;
                     }
                 });
-                if (first || best_work < work) {
+                bool better = (depth > best_depth)
+                           || (depth == best_depth && best_work < work);
+                if (best.IsNull() || better) {
                     best = head_hash;
+                    best_depth = depth;
                     best_work = work;
-                    first = false;
                 }
             } catch (...) {}
         }
