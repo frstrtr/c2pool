@@ -801,13 +801,43 @@ int main(int argc, char* argv[])
                             LOG_WARNING << "[SUBMIT] P2P block broadcast threw: " << e.what();
                         }
                     }
+                    bool rpc_accepted = false;
                     try {
-                        bool ok = coin_rpc->submit_block_hex(r.block_hex);
+                        rpc_accepted = coin_rpc->submit_block_hex(r.block_hex);
                         LOG_INFO << "[SUBMIT] submitblock result="
-                                 << (ok ? "ACCEPTED" : "rejected")
+                                 << (rpc_accepted ? "ACCEPTED" : "rejected")
                                  << " height=" << ctx->height;
                     } catch (const std::exception& e) {
                         LOG_WARNING << "[SUBMIT] submitblock threw: " << e.what();
+                    }
+                    // C1 (parity audit): record the block find so
+                    // /recent_blocks exposes it to the dashboard. Only
+                    // record on RPC-ACCEPTED — the P2P pre-broadcast is
+                    // best-effort and dashd rejection of the block (bad
+                    // coinbase, missing ChainLock, etc.) should not surface
+                    // as a "found" entry.
+                    if (rpc_accepted) {
+                        try {
+                            auto* mi = web_server ? web_server->get_mining_interface() : nullptr;
+                            if (mi) {
+                                // X11 of header == the block's identifier on
+                                // Dash mainnet.
+                                mi->record_found_block(
+                                    ctx->height,
+                                    r.x11_hash,
+                                    static_cast<uint64_t>(std::time(nullptr)),
+                                    "DASH",
+                                    s.worker_name,
+                                    /*share_hash=*/"",
+                                    chain::target_to_difficulty(
+                                        chain::bits_to_target(ctx->nbits)),
+                                    ctx->share_difficulty,
+                                    /*pool_hashrate=*/0.0, // filled by impl
+                                    /*subsidy=*/0);         // filled by impl
+                            }
+                        } catch (const std::exception& e) {
+                            LOG_WARNING << "[SUBMIT] record_found_block: " << e.what();
+                        }
                     }
                 }
 
