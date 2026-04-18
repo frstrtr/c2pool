@@ -1266,32 +1266,6 @@ int main(int argc, char* argv[])
                     payouts.push_back({miner_script, miner_value});
                 }
 
-                // Publish PPLNS outputs to the dashboard (/current_payouts).
-                // Format: vector<pair<script_hex, amount_sat>>.
-                if (web_server) {
-                    std::vector<std::pair<std::string,uint64_t>> pplns_cache;
-                    pplns_cache.reserve(payouts.size());
-                    for (const auto& p : payouts) {
-                        pplns_cache.emplace_back(HexStr(p.script), p.amount);
-                    }
-                    auto* mi = web_server->get_mining_interface();
-                    mi->set_cached_pplns_outputs(std::move(pplns_cache));
-                    // /current_merged_payouts + /sharechain/window are both
-                    // keyed on the sharechain tip. The JOB cycle fires every
-                    // 10 s but the tip only changes when a new share lands
-                    // (~20 s on Dash). Gate the cache invalidations on an
-                    // actual tip change — P3(b) from the next-session plan.
-                    // Matches LTC (trigger_work_refresh_debounced is called
-                    // only on share arrivals, not on a timer).
-                    static uint256 s_last_cached_tip;
-                    uint256 cur_tip = node.best_share_hash();
-                    if (cur_tip != s_last_cached_tip) {
-                        s_last_cached_tip = cur_tip;
-                        mi->cache_pplns_at_tip();
-                        mi->invalidate_window_cache();
-                    }
-                }
-
                 // Pick a share target bits from our configured share_difficulty.
                 // (target_from_difficulty matches submit_validator's math.)
                 uint32_t share_bits = 0;
@@ -1304,6 +1278,39 @@ int main(int argc, char* argv[])
                 auto built = dash::share_builder::build(
                     work, node.tracker(), miner_pubkey_hash, payouts, pool_tag, params,
                     share_bits, share_difficulty_default);
+
+                // Publish the coinbase's actual tx_outs to /current_payouts.
+                // Driven off built.tx_outs (worker_tx || payments_tx ||
+                // donation_tx) so the dashboard's "Current Payouts" shows
+                // exactly what the miner would collect, including the
+                // DONATION_SCRIPT tail. dash::pplns::compute_payouts omits
+                // donation (it folds the residue into workers); compute_dash_payouts
+                // emits it explicitly and that's what actually lands in the block.
+                if (web_server) {
+                    std::vector<std::pair<std::string,uint64_t>> pplns_cache;
+                    pplns_cache.reserve(built.tx_outs.size());
+                    for (const auto& o : built.tx_outs) {
+                        if (o.amount == 0) continue;  // drop zero entries
+                        pplns_cache.emplace_back(HexStr(o.script), o.amount);
+                    }
+                    auto* mi = web_server->get_mining_interface();
+                    mi->set_cached_pplns_outputs(std::move(pplns_cache));
+                    // /current_merged_payouts + /sharechain/window are both
+                    // keyed on the sharechain tip. The JOB cycle fires every
+                    // 10 s but the tip only changes when a new share lands
+                    // (~20 s on Dash). Gate invalidations on an actual tip
+                    // change — P3(b) from the next-session plan. Matches LTC
+                    // (trigger_work_refresh_debounced is called only on
+                    // share arrivals, not on a timer).
+                    static uint256 s_last_cached_tip;
+                    uint256 cur_tip = node.best_share_hash();
+                    if (cur_tip != s_last_cached_tip) {
+                        s_last_cached_tip = cur_tip;
+                        mi->cache_pplns_at_tip();
+                        mi->invalidate_window_cache();
+                    }
+                }
+
                 size_t miner_count = 0;
                 if (stratum_server) {
                     // Do NOT call set_difficulty_all() here — each Session's

@@ -60,6 +60,11 @@ struct BuiltJob {
     // is firing with the expected share count + recipient count.
     size_t   pplns_walked{0};     // ancestors walked by walk_cumulative_weights
     size_t   pplns_scripts{0};    // distinct recipient scripts with non-zero weight
+    // The exact coinbase output list fed into the generated block:
+    // worker_tx || payments_tx || donation_tx. main_dash.cpp exposes this
+    // on /current_payouts so the dashboard shows the same breakdown the
+    // miner actually gets paid (incl. the donation entry).
+    std::vector<dash::coinbase::MinerPayout> tx_outs;
 };
 
 // Decode a hex-encoded serialized Dash transaction into MutableTransaction.
@@ -608,6 +613,7 @@ inline BuiltJob build(const dash::coin::DashWorkData& work,
     auto tx_outs_ordered = dash::coinbase::compute_dash_payouts(
         work.m_coinbase_value, work.m_packed_payments,
         miner_pubkey_hash, weights, total_weight, params);
+    out.tx_outs = tx_outs_ordered;
 
     // ── Build coinbase bytes with ref_hash embedded ─────────────────────
     out.coinbase = dash::coinbase::build(
