@@ -5209,7 +5209,15 @@
                                 continue;
                             }
                             if (bt < 0.35) {
-                                // COALESCE: particles gather into square (reverse dissolve)
+                                // COALESCE: particles gather into square (reverse dissolve).
+                                // Draw a faint placeholder at the destination cell so we
+                                // don't leave scattered black holes during the ~1 s gather
+                                // phase (particles animate at the coalesce point, not at
+                                // the destination).
+                                ctx.globalAlpha = 0.25;
+                                ctx.fillStyle = animColors[i];
+                                ctx.fillRect(dst.x, dst.y, cs, cs);
+                                ctx.globalAlpha = 1;
                                 var cT = bt / 0.35;
                                 var coreAlpha = cT;
                                 var coreShrink = 0.3 + cT * 0.7;
@@ -5237,7 +5245,12 @@
                                 x = dst.x; y = dst.y; scale = 0; shadowAlpha = 0;
                                 ctx.globalAlpha = 0;
                             } else if (bt < 0.65) {
-                                // HOLD: show address + PPLNS % on scaled square
+                                // HOLD: show address + PPLNS % on scaled square.
+                                // Same placeholder at destination so grid stays
+                                // filled during the HOLD phase (~1 s).
+                                ctx.globalAlpha = 0.25;
+                                ctx.fillStyle = animColors[i];
+                                ctx.fillRect(dst.x, dst.y, cs, cs);
                                 var holdT = (bt - 0.35) / 0.3;
                                 ctx.globalAlpha = 1;
                                 // Shadow
@@ -8254,8 +8267,17 @@
                     };
                 }
 
-                // Prepend new shares, dedup by hash, trim to window size
+                // Prepend new shares, dedup by hash, trim to window size.
+                // Effective cap = max(current shares.length, high-water mark)
+                // clamped to server's windowSize. That way when the window
+                // isn't fully backfilled yet (e.g. Dash showing 4001/4320),
+                // every new share still evicts the oldest and the dying
+                // red-gradient animation fires. Without this the window
+                // simply grows silently until it hits 4320 and evictions
+                // never visibly happen.
                 var newShares = delta.shares;
+                defrag._maxShareCount = Math.max(defrag._maxShareCount || 0,
+                                                  defrag.shares.length);
                 var merged = newShares.concat(defrag.shares);
                 var seen = {};
                 merged = merged.filter(function(s) {
@@ -8263,8 +8285,10 @@
                     seen[s.h] = true;
                     return true;
                 });
-                if (merged.length > defrag.windowSize)
-                    merged = merged.slice(0, defrag.windowSize);
+                var effectiveCap = Math.min(defrag.windowSize,
+                                             Math.max(defrag._maxShareCount, 1));
+                if (merged.length > effectiveCap)
+                    merged = merged.slice(0, effectiveCap);
                 defrag.shares = merged;
 
                 // Update sets
