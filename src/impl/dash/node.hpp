@@ -22,6 +22,7 @@
 
 #include <random>
 #include <set>
+#include <shared_mutex>
 
 namespace dash
 {
@@ -50,6 +51,14 @@ protected:
     static constexpr int MAX_EMPTY_RETRIES = 3;
     std::unordered_map<uint256, int, dash::ShareHasher> m_download_fail_count;
     std::map<uint256, NetService> m_pending_share_reqs;
+
+    // Guards m_tracker.chain + m_tracker.verified against concurrent readers
+    // (HTTP worker thread, PPLNS precompute thread) vs main-ioc writers
+    // (share arrival handlers). Mirrors ltc::NodeImpl::m_tracker_mutex
+    // (node.hpp:73). Writers take unique_lock, cross-thread readers take
+    // shared_lock. Main-ioc readers (JOB cycle) don't need the lock —
+    // same thread as writers, asio serializes handlers.
+    mutable std::shared_mutex m_tracker_mutex;
 
     // Outbound-dial throttle: record when we last attempted each addr so a
     // periodic tick doesn't hammer the same unreachable peer. Factory::Client
@@ -447,7 +456,9 @@ public:
                 LOG_INFO << "[Dash] Received " << reply.m_items.size()
                          << " shares for download request";
 
-                // Verify and add each share
+                // Verify and add each share. X11 PoW verification runs
+                // WITHOUT the tracker lock (CPU-heavy, safe to run unlocked).
+                // Only chain mutations take the exclusive lock.
                 for (auto& share_var : reply.m_items)
                 {
                     share_var.invoke([&](auto* obj) {
@@ -455,6 +466,7 @@ public:
                             uint256 share_hash = dash::share_init_verify(*obj, m_coin_params, true);
                             obj->m_hash = share_hash;
 
+                            std::unique_lock lock(m_tracker_mutex);
                             if (!m_tracker.chain.contains(share_hash)) {
                                 auto* heap_share = new dash::DashShare(*obj);
                                 m_tracker.add(heap_share);
@@ -518,19 +530,16 @@ public:
                         LOG_INFO << "[Dash] Share VERIFIED: hash=" << share_hash.GetHex().substr(0, 16)
                                  << " X11 PoW valid!";
 
+                        std::unique_lock lock(m_tracker_mutex);
                         if (!m_tracker.chain.contains(share_hash)) {
                             auto* heap_share = new dash::DashShare(*obj);
                             m_tracker.add(heap_share);
-                            // share_init_verify above ran X11 PoW + hash_link +
-                            // merkle_link checks, so this share is semantically
-                            // verified. Mark it in the verified set so the
-                            // dashboard colors it as such instead of grey.
-                            // p2pool's CHAIN_LENGTH+1 gate is about PPLNS depth
-                            // for gentx comparison, not PoW validity.
                             auto& entry = m_tracker.chain.get(share_hash);
                             if (!m_tracker.verified.contains(share_hash))
                                 m_tracker.verified.add(entry.share);
-                            LOG_INFO << "[Dash] Share added to tracker (total: " << m_tracker.chain.size() << ")";
+                            auto sz = m_tracker.chain.size();
+                            lock.unlock();
+                            LOG_INFO << "[Dash] Share added to tracker (total: " << sz << ")";
                         }
                     } catch (const std::exception& e) {
                         LOG_WARNING << "[Dash] Share verification failed: " << e.what();
@@ -545,10 +554,12 @@ public:
 
     // Access
     ShareTracker& tracker() { return m_tracker; }
+    std::shared_mutex& tracker_mutex() { return m_tracker_mutex; }
     const core::CoinParams& coin_params() const { return m_coin_params; }
 
     uint256 best_share_hash() const
     {
+        std::shared_lock lock(m_tracker_mutex);
         auto heads = m_tracker.chain.get_heads();
         if (heads.empty())
             return uint256();
@@ -583,7 +594,14 @@ public:
     // Pool hashrate from sharechain attempts-per-second (matches p2pool).
     double pool_hashrate()
     {
-        auto best = best_share_hash();
+        // best_share_hash() takes its own shared_lock; take it again here
+        // explicitly around the lookup+walk so the whole computation sees a
+        // consistent chain snapshot. std::shared_mutex is recursive-safe for
+        // shared locks on the same thread.
+        std::shared_lock lock(m_tracker_mutex);
+        auto heads = m_tracker.chain.get_heads();
+        if (heads.empty()) return 0.0;
+        uint256 best = heads.begin()->first;
         if (best.IsNull()) return 0.0;
         if (!m_tracker.chain.contains(best)) return 0.0;
         int32_t height = m_tracker.chain.get_height(best);
@@ -604,6 +622,7 @@ public:
         heap_share->m_hash = share.m_hash.IsNull()
             ? dash::share_init_verify(*heap_share, m_coin_params, /*check_pow=*/false)
             : share.m_hash;
+        std::unique_lock lock(m_tracker_mutex);
         if (!m_tracker.chain.contains(heap_share->m_hash)) {
             m_tracker.add(heap_share);
             auto& entry = m_tracker.chain.get(heap_share->m_hash);
