@@ -694,6 +694,15 @@ int main(int argc, char* argv[])
                 r["dashd_connected"] = coin_node && coin_node->has_p2p();
                 return r;
             });
+            // Wire the dashd P2P peer into the "Parent Chain Peers" panel.
+            // broadcaster_status consumes this when m_mm_manager is null
+            // (Dash has no merged mining) so the dashboard no longer shows
+            // "Embedded node not enabled" — it shows the actual dashd
+            // SPV connection with addr/subver/height/uptime.
+            mi3->set_coin_peer_info_fn([&coin_node]() -> nlohmann::json {
+                if (coin_node) return coin_node->peer_info_json();
+                return nlohmann::json::array();
+            });
         }
 
         // SPV A1 (parity audit): wire ChainLock-aware block verifier now

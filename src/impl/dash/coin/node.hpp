@@ -3,6 +3,7 @@
 #include <memory>
 
 #include <boost/asio.hpp>
+#include <nlohmann/json.hpp>
 
 #include "p2p_node.hpp"
 #include "node_interface.hpp"
@@ -58,6 +59,27 @@ public:
     }
 
     bool has_p2p() const { return m_p2p != nullptr; }
+
+    // Dashboard peer-info renderer: one-peer array (dashd SPV is always
+    // exactly one connection) in the shape the web_server broadcaster
+    // panel expects. Returns empty array before handshake completes so
+    // the dashboard shows zero peers rather than partial/garbage state.
+    nlohmann::json peer_info_json() const {
+        auto arr = nlohmann::json::array();
+        if (!m_p2p || !m_p2p->is_connected()) return arr;
+        nlohmann::json p;
+        p["addr"]           = m_p2p->target_addr().to_string();
+        p["connected"]      = true;
+        p["incoming"]       = false;
+        p["subver"]         = m_p2p->peer_subver();
+        p["version"]        = m_p2p->peer_version();
+        p["startingheight"] = m_p2p->peer_start_height();
+        // conntime in unix epoch seconds — dashboard computes uptime as
+        // (now - conntime). Matches LTC peer_info shape.
+        p["conntime"]       = m_p2p->connect_time_epoch();
+        arr.push_back(std::move(p));
+        return arr;
+    }
 
     // SPV A1: true if a ChainLock has been received for this block hash.
     // Queried by main_dash.cpp submit handler after submitblock to mark

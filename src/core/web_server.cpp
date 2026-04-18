@@ -5994,18 +5994,38 @@ nlohmann::json MiningInterface::rest_discovered_merged_blocks()
 nlohmann::json MiningInterface::rest_broadcaster_status()
 {
     nlohmann::json result = nlohmann::json::object();
-    if (!m_mm_manager || !m_mm_manager->has_chains()) {
-        result["running"] = false;
-        result["last_broadcast"] = nullptr;
+
+    // LTC / merged-mining path: broadcaster is driven by MM manager.
+    if (m_mm_manager && m_mm_manager->has_chains()) {
+        result["running"] = true;
+        result["enabled"] = true;
+        result["chains"] = m_mm_manager->chain_count();
+        result["total_blocks_found"] = m_mm_manager->get_total_blocks();
+        if (m_ltc_peer_info_fn)
+            result["peers"] = m_ltc_peer_info_fn();
         return result;
     }
-    result["running"] = true;
-    result["enabled"] = true;
-    result["chains"] = m_mm_manager->chain_count();
-    result["total_blocks_found"] = m_mm_manager->get_total_blocks();
-    // LTC P2P peer info
-    if (m_ltc_peer_info_fn)
-        result["peers"] = m_ltc_peer_info_fn();
+
+    // Non-merged path (e.g. Dash SPV): coin_peer_info_fn provides the
+    // daemon P2P peer list so the dashboard's "Parent Chain Peers" panel
+    // can render dashd connections. Runs true iff the callback is wired
+    // AND at least one peer is connected.
+    if (m_coin_peer_info_fn) {
+        auto peers = m_coin_peer_info_fn();
+        bool any_connected = false;
+        if (peers.is_array()) {
+            for (const auto& p : peers)
+                if (p.value("connected", false)) { any_connected = true; break; }
+        }
+        result["running"] = any_connected;
+        result["enabled"] = true;
+        result["peers"] = std::move(peers);
+        result["total_blocks_found"] = 0;  // no coin-side found-block counter yet
+        return result;
+    }
+
+    result["running"] = false;
+    result["last_broadcast"] = nullptr;
     return result;
 }
 
