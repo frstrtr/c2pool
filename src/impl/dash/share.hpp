@@ -7,6 +7,7 @@
 #include <impl/bitcoin_family/coin/base_block.hpp>
 #include <sharechain/share.hpp>
 
+#include <core/netaddress.hpp>
 #include <core/uint256.hpp>
 #include <core/pack_types.hpp>
 
@@ -56,6 +57,12 @@ struct DashShare : chain::BaseShare<uint256, 16>
 
     // Identity hash (computed, not serialized)
     uint256 m_hash;
+
+    // Ingestion metadata — the peer we learned this share from. Not part
+    // of the on-wire format; populated in load_share so the dashboard /
+    // audit trail can show which peer gossiped each share (matches LTC
+    // share.hpp's NetService peer_addr field).
+    NetService peer_addr;
 };
 
 } // namespace dash

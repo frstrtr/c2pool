@@ -169,7 +169,9 @@ inline ShareType load_share(chain::RawShare& rshare, NetService peer_addr)
 {
     auto stream = rshare.contents.as_stream();
     auto share = ShareType::load(rshare.type, stream);
-    // TODO: set peer_addr on the share
+    // Propagate ingestion source to the share so the dashboard / audit
+    // trail can show which peer gossiped it. Matches LTC share.hpp:260.
+    share.ACTION({ obj->peer_addr = peer_addr; });
     return share;
 }
 
