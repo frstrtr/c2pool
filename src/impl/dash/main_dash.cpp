@@ -777,8 +777,23 @@ int main(int argc, char* argv[])
     if (stratum_port != 0) {
         try {
             stratum_server = std::make_unique<dash::stratum::Server>(ioc, stratum_port);
+            // Per-session vardiff tuned to p2pool-dash mainnet (10s share
+            // rate, 8-share trigger, quickup 2/3, 0.5/2.0 clip). Initial
+            // difficulty comes from --share-difficulty (default 0.001 =
+            // p2pool-dash MIN_DIFFICULTY_FLOOR). Bounds are set wide enough
+            // that real ASIC hashrates can push diff to thousands.
+            stratum_server->set_vardiff_config(
+                params.vardiff,
+                /*min_difficulty=*/0.001,
+                /*max_difficulty=*/1e12,
+                /*initial_difficulty=*/share_difficulty_default);
             stratum_server->start();
-            std::cout << "[STRATUM] listening on 0.0.0.0:" << stratum_port << std::endl;
+            std::cout << "[STRATUM] listening on 0.0.0.0:" << stratum_port
+                      << " (vardiff: share_rate=" << params.vardiff.target_share_rate
+                      << "s trigger=" << params.vardiff.shares_trigger
+                      << " clip=" << params.vardiff.min_adjust
+                      << "/" << params.vardiff.max_adjust << ")"
+                      << std::endl;
         } catch (const std::exception& e) {
             std::cerr << "[STRATUM] failed to open port " << stratum_port
                       << ": " << e.what() << std::endl;
@@ -1038,7 +1053,11 @@ int main(int argc, char* argv[])
                     share_bits, share_difficulty_default);
                 size_t miner_count = 0;
                 if (stratum_server) {
-                    stratum_server->set_difficulty_all(share_difficulty_default);
+                    // Do NOT call set_difficulty_all() here — each Session's
+                    // HashrateTracker holds its own per-miner vardiff target
+                    // and pushes its own mining.set_difficulty after every
+                    // accepted share (matches p2pool-dash's per-session
+                    // vardiff). A pool-wide broadcast would stomp on that.
                     stratum_server->notify_all(built.job, built.context);
                     store_template(built.job.job_id, built.share_template, built.tx_bodies);
                     miner_count = stratum_server->session_count();
