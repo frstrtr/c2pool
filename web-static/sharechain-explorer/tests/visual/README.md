@@ -49,36 +49,42 @@ diff.png          red-highlighted pixel diff
 mock-server.log   server stdout/stderr
 ```
 
-## Measured state (2026-04-20, explorer-module HEAD)
+## Measured state (2026-04-19, explorer-module HEAD)
 
 Current inline-vs-bundled delta on the 200-share fixture screenshot
 of `#defrag-canvas`:
 
 ```
-diff pixels: 1755 / 34960 (5.020%)
+diff pixels: 257 / 34960 (0.735%)
 threshold:   7.00%   (default — set via env THRESHOLD)
 → PASS
 ```
 
-The 5% residual comes from three known sources, each of which future
-increments can close:
+The 0.7% residual traces to two remaining sources:
 
-1. **Cell border-pixel anti-aliasing.** Inline paints with a fill-
-   then-stroke pattern that produces a slightly different border
-   tone than the bundled single-fill cells. Needle-move → 1–2% by
-   adding a matching stroke pass to `buildPaintProgram`.
-2. **V35/V35→V36 cells.** Inline uses hard-coded hex; bundled uses
-   the same hex via `LTC_COLOR_PALETTE` but the rendering order of
-   overlapping cells in adjacent rows sometimes differs by 1 pixel
-   at row boundaries. Closes when Phase B #11 particles + cards add
-   consistent z-ordering.
-3. **Bundled's marginLeft offset** is computed fresh per paint,
-   which can round differently at wide-viewport widths than the
-   inline defrag's cached value. Likely <1 percentage point.
+1. **Hour-axis labels + tick lines.** Inline paints `NNh` text in
+   the left margin plus row-boundary tick strokes across the grid
+   (dashboard.html:4716-4740). The bundled static renderer does
+   not reproduce these yet. Visible as red text in the left margin
+   and faint horizontal lines in `diff.png`.
+2. **Block-cell borders.** Inline wraps LTC blocks in a 2 px gold
+   stroke, DOGE blocks in cyan, twin blocks in orange
+   (dashboard.html:4759-4775). The bundled renderer emits the
+   solid fill but no stroke. Visible as ~4 orange rectangles in
+   `diff.png` on a typical fixture.
 
-Threshold default is **7%**. Tighten to **2%** once Phase B #11
-closes animation-frame drift, and to **0.1%** once pixel-exact
-parity is required (likely Phase 2 repo split).
+Earlier 5.02% delta (pre `ed473911`) traced predominantly to
+missing `my_address` auto-adoption in the bundled path — inline
+read it from `/sharechain/window` while bundled relied on a
+`window.currency_info` shim that isn't populated in the visual-
+test setup. The RealtimeOrchestrator now mirrors inline behaviour:
+if the caller did not supply a `userContext.myAddress`, the
+server-provided `my_address` wins. Fixed in `_effectiveUserContext`
+in `src/explorer/realtime.ts`.
+
+Threshold default is **7%**. Tighten to **1%** once the hour-axis
+labels and block-border passes land, and to **0.1%** once pixel-
+exact parity is required (likely Phase 2 repo split).
 
 ## CI
 

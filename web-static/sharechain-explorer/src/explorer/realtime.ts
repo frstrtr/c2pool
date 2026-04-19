@@ -145,6 +145,12 @@ export class RealtimeOrchestrator {
   private _currentLayout: GridLayout | null = null;
   private _statsCache: RealtimeStats | null = null;
   private _statsTipAtCompute: string | null = null;
+  /** Effective userContext used for rendering. Server-provided
+   *  `my_address` (/sharechain/window) overrides an empty or undefined
+   *  myAddress on the caller's config, matching inline dashboard.html
+   *  behaviour (:4624). A non-empty config.userContext.myAddress wins
+   *  — callers who want to override the server always can. */
+  private _effectiveUserContext: UserContext;
 
   constructor(config: RealtimeConfig) {
     const layoutParams: LayoutParams = {
@@ -165,6 +171,7 @@ export class RealtimeOrchestrator {
       ...(config.onError ? { onError: config.onError } : {}),
     };
     this.anim = createAnimationController();
+    this._effectiveUserContext = { ...config.userContext };
   }
 
   async start(): Promise<void> {
@@ -211,8 +218,8 @@ export class RealtimeOrchestrator {
     if (this._statsCache !== null && this._statsTipAtCompute === this._lastAppliedTip) {
       return this._statsCache;
     }
-    const threshold = this.config.userContext.shareVersion;
-    const myAddr = this.config.userContext.myAddress;
+    const threshold = this._effectiveUserContext.shareVersion;
+    const myAddr = this._effectiveUserContext.myAddress;
     const s: RealtimeStats = {
       shares: this.window.shares.length,
       chainLength: this.window.chainLength ?? null,
@@ -296,7 +303,7 @@ export class RealtimeOrchestrator {
         track: 'wave' as const,
         x, y,
         size: layout.cellSize,
-        color: getColor(s, this.config.userContext, this.config.palette),
+        color: getColor(s, this._effectiveUserContext, this.config.palette),
         alpha: 1,
       };
     });
@@ -329,6 +336,20 @@ export class RealtimeOrchestrator {
       const shares = this.extractShares(raw);
       const tip = shares.length > 0 ? this.config.hashOf(shares[0]!) : undefined;
       const meta = this.extractMeta(raw);
+      // Adopt server-provided my_address when the caller didn't supply
+      // one — matches inline dashboard.html's behaviour so "mine"
+      // colouring works out-of-the-box.
+      const callerAddr = this.config.userContext.myAddress;
+      if ((callerAddr === undefined || callerAddr === '')
+          && raw !== null && typeof raw === 'object') {
+        const sa = (raw as { my_address?: unknown }).my_address;
+        if (typeof sa === 'string' && sa.length > 0) {
+          this._effectiveUserContext = {
+            ...this._effectiveUserContext,
+            myAddress: sa,
+          };
+        }
+      }
       this.window = {
         shares,
         ...(tip !== undefined ? { tip } : {}),
@@ -561,7 +582,7 @@ export class RealtimeOrchestrator {
       evictedHashes: [...merge.evicted],
       oldLayout,
       newLayout,
-      userContext: this.config.userContext,
+      userContext: this._effectiveUserContext,
       palette: this.config.palette,
       hashOf: this.config.hashOf,
       fast: this.config.fastAnimation,
