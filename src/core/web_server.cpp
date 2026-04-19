@@ -3622,9 +3622,12 @@ nlohmann::json MiningInterface::get_pplns_for_tip(const std::string& tip_hash)
     auto it = m_pplns_per_tip.find(tip_hash);
     if (it != m_pplns_per_tip.end())
         return it->second;
-    // Fallback: return any cached entry (unordered_map, no ordering)
-    if (!m_pplns_per_tip.empty())
-        return m_pplns_per_tip.begin()->second;
+    // Cache miss — return empty. The previous fallback (returning an arbitrary
+    // entry when the requested tip wasn't cached) was both incorrect (callers
+    // check !empty to gate inclusion, so they ended up storing some other
+    // share's PPLNS data labelled as the requested share's) and the dominant
+    // memory consumer in the process (heaptrack identified ~17000 deep JSON
+    // copies per refresh, every 2s). Honest miss is the right answer.
     return nlohmann::json::object();
 }
 
