@@ -71,6 +71,19 @@ const DEFAULT_LAYOUT_PARAMS: LayoutParams = Object.freeze({
   minHeight: 40,
 });
 
+/** Convert a Bitcoin-style compact-bits value to a floating-point
+ *  difficulty. Verbatim from dashboard.html:5875-5884. */
+function bitsToDifficulty(bits: number): number {
+  if (!bits) return 0;
+  const exp = (bits >> 24) & 0xff;
+  let mant = bits & 0x7fffff;
+  if (bits & 0x800000) mant = 0;
+  if (mant === 0) return 0;
+  const target_top = mant * Math.pow(256, exp - 3);
+  if (target_top <= 0) return 0;
+  return (0xffff * Math.pow(256, 26)) / target_top;
+}
+
 export interface RealtimeConfig {
   transport: Transport;
   userContext: UserContext;
@@ -525,6 +538,22 @@ export class RealtimeOrchestrator {
     }
 
     const newLayout = this.updateLayout();
+    // Compute per-share PPLNS weight fraction across the union of old
+    // and new shares so dying/born card text reads "X.XXX%" (reference
+    // dashboard.html:4921-4923 / 4941-4951). Uses difficulty derived
+    // from the share's compact-bits field `b` (reference
+    // `bitsToDifficulty`, :5875).
+    const diffOf = (s: ShareForClassify): number => {
+      const b = (s as unknown as { b?: number }).b;
+      return typeof b === 'number' ? bitsToDifficulty(b) : 0;
+    };
+    let totalDiff = 0;
+    for (const s of oldShares)            totalDiff += diffOf(s);
+    for (const s of this.window.shares)   totalDiff += diffOf(s);
+    const pplnsOf = totalDiff > 0
+      ? (s: ShareForClassify): number => diffOf(s) / totalDiff
+      : undefined;
+
     const plan = buildAnimationPlan({
       oldShares,
       newShares: this.window.shares,
@@ -536,6 +565,7 @@ export class RealtimeOrchestrator {
       palette: this.config.palette,
       hashOf: this.config.hashOf,
       fast: this.config.fastAnimation,
+      ...(pplnsOf ? { pplnsOf } : {}),
     });
 
     if (this.anim.isRunning()) {
