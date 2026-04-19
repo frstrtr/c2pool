@@ -38,6 +38,15 @@ export {
   type GridRenderer,
   type CanvasLike,
 } from './grid-paint.js';
+export {
+  DeltaMergerPlugin,
+  mergeDelta,
+  type DeltaShare,
+  type WindowSnapshot,
+  type DeltaPayload,
+  type MergeOptions,
+  type MergeResult,
+} from './delta.js';
 
 // Convenience: register every Explorer baseline plugin on a host.
 import type { Host } from '../host.js';
@@ -45,6 +54,7 @@ import { registerBaseline as registerSharedBaseline } from '../index.js';
 import { GridLayoutPlugin as _grid } from './grid-layout.js';
 import { ColorsPlugin as _colors } from './colors.js';
 import { GridCanvasPlugin as _canvas } from './grid-paint.js';
+import { DeltaMergerPlugin as _delta } from './delta.js';
 
 /** Register SharedCore baseline plus Explorer-specific plugins. */
 export function registerExplorerBaseline(host: Host): void {
@@ -52,4 +62,5 @@ export function registerExplorerBaseline(host: Host): void {
   host.registry.register(_grid);
   host.registry.register(_colors);
   host.registry.register(_canvas);
+  host.registry.register(_delta);
 }
