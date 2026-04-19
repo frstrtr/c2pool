@@ -1,6 +1,6 @@
 {
   "version": "0.1.0-alpha",
-  "generated": "2026-04-19T18:10:45.630Z",
+  "generated": "2026-04-19T18:45:49.558Z",
   "files": [
     "sharechain-explorer.js",
     "shared-core.js"
@@ -10,14 +10,14 @@
     "shared-core.js.map"
   ],
   "integrity": {
-    "sharechain-explorer.js": "sha384-A7iv0yT76SxMW5PCEuINPJxSDdjMX6lKHykX51FkbhOblkBfX9JCzWF3SmVOZgn0",
-    "sharechain-explorer.js.map": "sha384-R6QwFYpO/irkSkmU7W8IrJOHkby0dkRUqOEIn506gaz6l4U/JgZ2SXs67kyFduTi",
+    "sharechain-explorer.js": "sha384-yNt12rjxM7NJrzc3nZIUZa+LB9LzFK++PYzKmdz43csoxW/DKevuLmiNDMfDpXXT",
+    "sharechain-explorer.js.map": "sha384-eIN4ZXuq7eIiSB01izZ4nQczC16ZBb/9RdpNIdNBkPZttLjDctrJDvDieYrAiIra",
     "shared-core.js": "sha384-fLK/ciO7Ip2VNtUazZBKnenRgTfVKRjVYUCGQCnZgovE6Y/l+jpxBZkziKl21EBw",
     "shared-core.js.map": "sha384-cNe7eMGecoXitiz9msnxaJ9mEZUWLhnGDyhpk9Xe4UOjKZ909m17gYWKJo6yTEwT"
   },
   "sizes": {
-    "sharechain-explorer.js": 34756,
-    "sharechain-explorer.js.map": 166007,
+    "sharechain-explorer.js": 36905,
+    "sharechain-explorer.js.map": 177294,
     "shared-core.js": 25700,
     "shared-core.js.map": 113705
   }

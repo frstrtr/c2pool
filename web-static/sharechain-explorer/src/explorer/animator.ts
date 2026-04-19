@@ -31,6 +31,7 @@ import type {
   UserContext,
 } from './colors.js';
 import { getColor } from './colors.js';
+import { lerpColor, applyAlpha } from './color-utils.js';
 
 // ── Input / output types ────────────────────────────────────────────
 
@@ -129,8 +130,19 @@ const DYING_STAGGER_MS = 150;
 const BORN_STAGGER_MS  = 150;
 /** Per-share wave-animation duration (dashboard.html:5150, "/ 600"). */
 const WAVE_PER_SHARE_MS = 600;
+/** Peak scale at the top of the wave lift (dashboard.html:5164,
+ *  "scale = 1 + 0.35 * pop"). */
+const WAVE_PEAK_SCALE = 1.35;
 /** Birth "spawn" y offset below the grid, expressed in cell-sizes. */
 const BORN_Y_BELOW_CELLS = 2;
+/** Initial scale of a born share before landing. Cards aren't shipped
+ *  yet so we use a fixed 3× rather than the text-width-derived
+ *  bornScale from dashboard.html:4959. Full bornScale arrives with
+ *  card overlays (Phase B #7). */
+const BORN_INITIAL_SCALE = 3;
+/** Dying scale — rises slightly before dissolving. Full rise+hold+
+ *  dissolve with card arrives Phase B #7. */
+const DYING_RISE_SCALE = 1.10;
 
 export function buildAnimationPlan(input: AnimationInput): AnimationPlan {
   const timing = computePhaseTiming(input.fast === true);
@@ -200,9 +212,13 @@ export function buildAnimationPlan(input: AnimationInput): AnimationPlan {
     const cells: CellFrame[] = [];
 
     // WAVE cells — stagger tail-first per dashboard.html:5146-5151.
-    // distFromTail = (N-1) - newIndex; fraction = distFromTail/(N-1);
-    // shareStart = fraction * phase2Dur * 0.7; per-share duration 600ms.
+    // Lift-slide-land sub-phases from :5156-5167:
+    //   ease < 0.2      → liftA = ease/0.2, no slide yet
+    //   0.2 ≤ ease < 0.8 → lift held, slide = (ease-0.2)/0.6
+    //   ease ≥ 0.8      → slide done, land = (ease-0.8)/0.2
+    //   pop = liftA * (1 - landA);  scale = 1 + 0.35 * pop
     const shareCountMinus1 = input.newShares.length - 1;
+    const baseSize = input.newLayout.cellSize;
     for (const entry of waveList) {
       const oldPos = cellPosition(input.oldLayout, entry.oldIndex);
       const newPos = cellPosition(input.newLayout, entry.newIndex);
@@ -211,48 +227,75 @@ export function buildAnimationPlan(input: AnimationInput): AnimationPlan {
       const fraction = shareCountMinus1 > 0 ? distFromTail / shareCountMinus1 : 0;
       const shareStart = fraction * phase2Dur * 0.7;
       const shareT = clamp01(((t - phase2Start) - shareStart) / WAVE_PER_SHARE_MS);
-      const e = 1 - Math.pow(1 - shareT, 3);  // easeOut-cubic, matches dashboard:5151
-      const x = lerp(oldPos.x, newPos.x, e);
-      const y = lerp(oldPos.y, newPos.y, e);
+      const ease = 1 - Math.pow(1 - shareT, 3);  // easeOut-cubic
+      let liftA: number, slideA: number, landA: number;
+      if (ease < 0.2) {
+        liftA  = ease / 0.2;
+        slideA = 0;
+        landA  = 0;
+      } else if (ease < 0.8) {
+        liftA  = 1;
+        slideA = (ease - 0.2) / 0.6;
+        landA  = 0;
+      } else {
+        liftA  = 1;
+        slideA = 1;
+        landA  = (ease - 0.8) / 0.2;
+      }
+      const pop = liftA * (1 - landA);
+      const scale = 1 + (WAVE_PEAK_SCALE - 1) * pop;
+      const size = baseSize * scale;
+      const xCentre = lerp(oldPos.x, newPos.x, slideA) + baseSize / 2;
+      const yCentre = lerp(oldPos.y, newPos.y, slideA) + baseSize / 2;
       const color = colorForHash(entry.hash, input.newShares, newIndexByHash);
       cells.push({
         shareHash: entry.hash,
         track: 'wave',
-        x, y,
-        size: input.newLayout.cellSize,
+        x: xCentre - size / 2,
+        y: yCentre - size / 2,
+        size,
         color,
         alpha: 1,
       });
     }
 
-    // DYING cells — held in their old positions during phase 1, then
-    // shrink/dissolve. For this commit they disappear at phase1 end
-    // by clamping alpha to 0; full particle/rise effects land next.
+    // DYING cells — slight rise scale, colour lerps to palette.dead,
+    // alpha fades over the share's stagger window. Full particle
+    // dissolution + miner-addr card are a later commit.
     for (let i = 0; i < dyingList.length; i++) {
       const entry = dyingList[i];
       if (entry === undefined) continue;
       const oldPos = cellPosition(input.oldLayout, entry.oldIndex);
       if (oldPos === null) continue;
       const dStart = phase1Start + i * DYING_STAGGER_MS;
-      const dRaw   = (t - dStart) / phase1Dur;
-      const dt = clamp01(dRaw);
-      const color = colorForHash(entry.hash, input.oldShares, oldIndexByHash);
-      // Alpha fades to 0 at the end of its stagger window — placeholder
-      // until the rise+dissolve effect lands.
+      const dt = clamp01((t - dStart) / phase1Dur);
+      const origColor = colorForHash(entry.hash, input.oldShares, oldIndexByHash);
+      // Colour lerps toward red over the first 60% of the stagger,
+      // then holds at red through dissolution.
+      const colorT = clamp01(dt / 0.6);
+      const lerped = lerpColor(origColor, input.palette.dead, colorT);
+      // Alpha decays linearly to 0.
       const alpha = 1 - dt;
+      const colorWithAlpha = applyAlpha(lerped, alpha);
+      // Rise: 1 → DYING_RISE_SCALE over first 30%, then holds.
+      const riseT = clamp01(dt / 0.3);
+      const scale = 1 + (DYING_RISE_SCALE - 1) * riseT;
+      const size = baseSize * scale;
       cells.push({
         shareHash: entry.hash,
         track: 'dying',
-        x: oldPos.x,
-        y: oldPos.y,
-        size: input.newLayout.cellSize,
-        color,
+        x: oldPos.x + baseSize / 2 - size / 2,
+        y: oldPos.y + baseSize / 2 - size / 2,
+        size,
+        color: colorWithAlpha,
         alpha,
       });
     }
 
-    // BORN cells — spawn from below the grid, fly into new position
-    // over phase 3. Position interpolation only for this commit.
+    // BORN cells — spawn from below grid, fly into new position over
+    // phase 3. Colour coalesces from `palette.unverified` to the
+    // share's final palette colour. Shrinks from BORN_INITIAL_SCALE
+    // down to 1× on landing (dashboard.html:5116-5119 formula).
     const bornYBelow = input.newLayout.cssHeight + BORN_Y_BELOW_CELLS * input.newLayout.cellSize;
     for (let i = 0; i < bornList.length; i++) {
       const entry = bornList[i];
@@ -260,22 +303,30 @@ export function buildAnimationPlan(input: AnimationInput): AnimationPlan {
       const newPos = cellPosition(input.newLayout, entry.newIndex);
       if (newPos === null) continue;
       const bStart = phase3Start + i * BORN_STAGGER_MS;
-      const bRaw = (t - bStart) / phase3Dur;
-      const bt = clamp01(bRaw);
+      const bt = clamp01((t - bStart) / phase3Dur);
       const e = easeInOut(bt);
-      const spawnX = newPos.x;
-      const spawnY = bornYBelow;
-      const x = lerp(spawnX, newPos.x, e);
-      const y = lerp(spawnY, newPos.y, e);
-      const color = colorForHash(entry.hash, input.newShares, newIndexByHash);
-      // Alpha fades in from 0 to 1 over first 30% of its stagger slice.
+      const x = lerp(newPos.x, newPos.x, e);  // spawn & target share column
+      const y = lerp(bornYBelow, newPos.y, e);
+      const finalColor = colorForHash(entry.hash, input.newShares, newIndexByHash);
+      // Colour coalesces from unverified (muted grey) to the final
+      // palette colour over the first 70% of the stagger slice.
+      const colorT = clamp01(bt / 0.7);
+      const lerped = lerpColor(input.palette.unverified, finalColor, colorT);
+      // Alpha fades in from 0 to 1 over first 30%.
       const alpha = clamp01(bt / 0.3);
+      const colorWithAlpha = applyAlpha(lerped, alpha);
+      // Scale: BORN_INITIAL_SCALE → 1 over the last 20% (land phase,
+      // matches dashboard.html:5116-5119).
+      const landT = clamp01((bt - 0.8) / 0.2);
+      const scale = BORN_INITIAL_SCALE - (BORN_INITIAL_SCALE - 1) * landT;
+      const size = input.newLayout.cellSize * scale;
       cells.push({
         shareHash: entry.hash,
         track: 'born',
-        x, y,
-        size: input.newLayout.cellSize,
-        color,
+        x: x + input.newLayout.cellSize / 2 - size / 2,
+        y: y + input.newLayout.cellSize / 2 - size / 2,
+        size,
+        color: colorWithAlpha,
         alpha,
       });
     }

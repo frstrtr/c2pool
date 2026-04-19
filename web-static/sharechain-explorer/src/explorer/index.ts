@@ -31,6 +31,7 @@ export {
 export {
   GridCanvasPlugin,
   buildPaintProgram,
+  buildAnimatedPaintProgram,
   executePaintProgram,
   createGridRenderer,
   type PaintCommand,
@@ -38,6 +39,14 @@ export {
   type GridRenderer,
   type CanvasLike,
 } from './grid-paint.js';
+export {
+  ColorUtilsPlugin,
+  parseHexColor,
+  lerpColor,
+  applyAlpha,
+  lerpColorWithAlpha,
+  type Rgb,
+} from './color-utils.js';
 export {
   DeltaMergerPlugin,
   mergeDelta,
@@ -73,6 +82,7 @@ import { ColorsPlugin as _colors } from './colors.js';
 import { GridCanvasPlugin as _canvas } from './grid-paint.js';
 import { DeltaMergerPlugin as _delta } from './delta.js';
 import { AnimatorPlugin as _anim } from './animator.js';
+import { ColorUtilsPlugin as _cu } from './color-utils.js';
 
 /** Register SharedCore baseline plus Explorer-specific plugins. */
 export function registerExplorerBaseline(host: Host): void {
@@ -82,4 +92,5 @@ export function registerExplorerBaseline(host: Host): void {
   host.registry.register(_canvas);
   host.registry.register(_delta);
   host.registry.register(_anim);
+  host.registry.register(_cu);
 }

@@ -141,21 +141,33 @@ test('wave: staggering — tail moves before head', () => {
     oldShares: shares,
     newShares: reordered,
   }));
-  // Early in phase 2: the share with highest newIndex (tail = 'a')
-  // has started moving; the share with lowest newIndex (head = 'd')
-  // has not yet.
-  const earlyT = plan.phase2Start + 10;  // 10 ms into phase 2
+  // Sample well into phase 2 (200 ms) — enough for the tail-first
+  // stagger to have pushed share 'a' (newIndex=3, distFromTail=0,
+  // shareStart=0) into its slide phase while 'd' (newIndex=0,
+  // distFromTail=3, shareStart = 0.7 * phase2Dur) has not yet begun.
+  const earlyT = plan.phase2Start + 200;
   const f = plan.frameAt(earlyT);
   const byHash = Object.fromEntries(f.cells.map((c) => [c.shareHash, c]));
-  const headX0 = LAYOUT.marginLeft + 0 * LAYOUT.step;  // d target
-  const tailX0Old = LAYOUT.marginLeft + 0 * LAYOUT.step;  // a was at 0
-  // d: still near old col 3 (hasn't started)
+
+  // Cells report their centred top-left (x) plus `size` (which may be
+  // > cellSize during the lift-slide-land pop). Compare centres so the
+  // assertion is invariant to in-place scaling.
+  const centreX = (cell: { x: number; size: number }) => cell.x + cell.size / 2;
+  const colCentre = (col: number) =>
+    LAYOUT.marginLeft + col * LAYOUT.step + LAYOUT.cellSize / 2;
+
+  // d hasn't started moving — centre still near old col 3.
   assert.ok(byHash.d !== undefined);
-  assert.ok(Math.abs(byHash.d!.x - (LAYOUT.marginLeft + 3 * LAYOUT.step)) < 0.01);
-  // a: has started interpolating toward new col 3
-  const aOldX = LAYOUT.marginLeft + 0 * LAYOUT.step;
-  assert.ok(byHash.a!.x > aOldX, 'tail should have moved');
-  void headX0; void tailX0Old;
+  assert.ok(
+    Math.abs(centreX(byHash.d!) - colCentre(3)) < 1,
+    `d should be near old col 3 centre (got ${centreX(byHash.d!)} vs ${colCentre(3)})`,
+  );
+  // a has slid toward new col 3 — centre past old col 0.
+  assert.ok(byHash.a !== undefined);
+  assert.ok(
+    centreX(byHash.a!) > colCentre(0) + 1,
+    `tail centre should have advanced (got ${centreX(byHash.a!)} vs old ${colCentre(0)})`,
+  );
 });
 
 // ── DYING track ────────────────────────────────────────────────────

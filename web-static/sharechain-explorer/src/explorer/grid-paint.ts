@@ -123,6 +123,36 @@ export interface CanvasLike {
   fillText(text: string, x: number, y: number): void;
 }
 
+/** Build a paint program from an animator frame. Each CellFrame's
+ *  `size` field is used directly so scale/transform effects carry
+ *  through without the cell-size-based maths buildPaintProgram does
+ *  for static frames. Cells with alpha ≤ 0 are skipped. */
+export function buildAnimatedPaintProgram(
+  frame: import('./animator.js').FrameSpec,
+  dpr: number,
+): PaintCommand[] {
+  const cmds: PaintCommand[] = [];
+  cmds.push({ op: 'setTransform', dpr });
+  cmds.push({
+    op: 'fillBackground',
+    w: frame.layout.cssWidth,
+    h: frame.layout.cssHeight,
+    color: frame.backgroundColor,
+  });
+  for (const cell of frame.cells) {
+    if (cell.alpha <= 0) continue;
+    cmds.push({
+      op: 'fillCell',
+      x: cell.x,
+      y: cell.y,
+      w: cell.size,
+      h: cell.size,
+      color: cell.color,
+    });
+  }
+  return cmds;
+}
+
 /** Execute a paint program against a canvas context. */
 export function executePaintProgram(
   ctx: CanvasLike,
