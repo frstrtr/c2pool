@@ -47,6 +47,23 @@ export {
   type MergeOptions,
   type MergeResult,
 } from './delta.js';
+export {
+  AnimatorPlugin,
+  buildAnimationPlan,
+  createAnimationController,
+  computePhaseTiming,
+  easeInOut,
+  lerp,
+  clamp01,
+  SKIP_ANIMATION_NEW_COUNT_THRESHOLD,
+  type AnimationInput,
+  type AnimationPlan,
+  type AnimationController,
+  type AnimTrack,
+  type CellFrame,
+  type FrameSpec,
+  type PhaseTiming,
+} from './animator.js';
 
 // Convenience: register every Explorer baseline plugin on a host.
 import type { Host } from '../host.js';
@@ -55,6 +72,7 @@ import { GridLayoutPlugin as _grid } from './grid-layout.js';
 import { ColorsPlugin as _colors } from './colors.js';
 import { GridCanvasPlugin as _canvas } from './grid-paint.js';
 import { DeltaMergerPlugin as _delta } from './delta.js';
+import { AnimatorPlugin as _anim } from './animator.js';
 
 /** Register SharedCore baseline plus Explorer-specific plugins. */
 export function registerExplorerBaseline(host: Host): void {
@@ -63,4 +81,5 @@ export function registerExplorerBaseline(host: Host): void {
   host.registry.register(_colors);
   host.registry.register(_canvas);
   host.registry.register(_delta);
+  host.registry.register(_anim);
 }
