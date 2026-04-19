@@ -17,14 +17,39 @@ export {
   type GridLayout,
   type CellPosition,
 } from './grid-layout.js';
+export {
+  ColorsPlugin,
+  classifyShare,
+  getColor,
+  LTC_COLOR_PALETTE,
+  type ColorPalette,
+  type ShareForClassify,
+  type ShareClass,
+  type UserContext,
+  type StaleInfo,
+} from './colors.js';
+export {
+  GridCanvasPlugin,
+  buildPaintProgram,
+  executePaintProgram,
+  createGridRenderer,
+  type PaintCommand,
+  type BuildPaintOptions,
+  type GridRenderer,
+  type CanvasLike,
+} from './grid-paint.js';
 
 // Convenience: register every Explorer baseline plugin on a host.
 import type { Host } from '../host.js';
 import { registerBaseline as registerSharedBaseline } from '../index.js';
 import { GridLayoutPlugin as _grid } from './grid-layout.js';
+import { ColorsPlugin as _colors } from './colors.js';
+import { GridCanvasPlugin as _canvas } from './grid-paint.js';
 
 /** Register SharedCore baseline plus Explorer-specific plugins. */
 export function registerExplorerBaseline(host: Host): void {
   registerSharedBaseline(host);
   host.registry.register(_grid);
+  host.registry.register(_colors);
+  host.registry.register(_canvas);
 }
