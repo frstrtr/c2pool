@@ -5913,7 +5913,39 @@
             }
         };
 
-        // Initialize defrag viewer on page load
+        // ── Phase B #9 feature flag ───────────────────────────────
+        // Set ?new-explorer=1 in the URL (or localStorage.c2p_new_explorer=1)
+        // to activate the extracted @c2pool/sharechain-explorer bundle
+        // in place of this inline `defrag` renderer. Default OFF —
+        // migration discipline per frstrtr/the/docs
+        // (c2pool-explorer-plugin-architecture.md §16.2) says the
+        // inline path stays until pixel-diff parity is confirmed.
+        //
+        // Known limitations while the flag is on:
+        //   - Right-hand stats panel stays at "-" (bundled path does
+        //     not yet update #defrag-total etc).
+        //   - RealTime toggle button is inert (bundled is always live).
+        //   - Hover-zoom + per-share PPLNS treemap not yet ported.
+        // These land in subsequent Phase B commits.
+        window.__c2pBundledExplorer = (function() {
+            try {
+                var p = new URLSearchParams(location.search);
+                if (p.has('new-explorer')) return p.get('new-explorer') !== '0';
+            } catch (e) { /* Older browsers without URLSearchParams */ }
+            try { return localStorage.getItem('c2p_new_explorer') === '1'; }
+            catch (e) { return false; }
+        })();
+        if (window.__c2pBundledExplorer) {
+            // Disarm every inline defrag method so the RealTime toggle,
+            // auto-refresh timer, and any other call site silently no-
+            // ops — the bundled renderer mounted below takes over.
+            Object.keys(defrag).forEach(function(k) {
+                if (typeof defrag[k] === 'function') defrag[k] = function() {};
+            });
+            console.info('[c2pool] bundled Explorer enabled — inline defrag disarmed');
+        }
+
+        // Initialize defrag viewer on page load (no-op when flag on).
         defrag.init();
 
         // Share link helpers — sourced from defrag data, not legacy endpoints
@@ -8086,6 +8118,47 @@
                     }
                 }
             });
+        }
+    </script>
+    <!-- Phase B #9: bundled-explorer bootstrap. Only fetches the bundle
+         when the flag is set (see flag block above). Production path
+         (flag off) never loads the bundle, so CSP footprint + bytes
+         are unchanged for default users. -->
+    <script type="module">
+        if (window.__c2pBundledExplorer) {
+            import('./sharechain-explorer/dist/sharechain-explorer.js')
+                .then(function(mod) {
+                    var canvas = document.getElementById('defrag-canvas');
+                    var wrap = canvas && canvas.parentElement;
+                    if (!canvas || !wrap) {
+                        console.error('[c2pool bundled] defrag-canvas or wrap not found');
+                        return;
+                    }
+                    var transport = mod.createHttpTransport({ baseUrl: '..' });
+                    var rt = mod.createRealtime({
+                        canvas: canvas,
+                        transport: transport,
+                        userContext: {
+                            myAddress: (window.currency_info && window.currency_info.my_address) || undefined,
+                            shareVersion: 36,
+                        },
+                        containerWidth: function() { return wrap.clientWidth; },
+                        onError: function(err) {
+                            console.error('[c2pool bundled] error', err);
+                        },
+                    });
+                    rt.start().then(function() {
+                        window.__explorerBundled = rt;
+                        console.info('[c2pool bundled] Explorer started');
+                    });
+                    // Hide the inline stats panel inputs until Phase B
+                    // wires stat updates into the bundled path.
+                    var loading = document.getElementById('defrag-loading');
+                    if (loading) loading.style.display = 'none';
+                })
+                .catch(function(err) {
+                    console.error('[c2pool bundled] failed to load bundle', err);
+                });
         }
     </script>
 </body>
