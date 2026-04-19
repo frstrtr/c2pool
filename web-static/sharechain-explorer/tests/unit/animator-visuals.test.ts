@@ -85,86 +85,162 @@ test('wave: peak scale does not exceed WAVE_PEAK_SCALE (1.35)', () => {
   assert.ok(peak >= LAYOUT.cellSize * 1.2, `peak ${peak} should be well above cellSize`);
 });
 
-// ── DYING colour + alpha + rise scale ──────────────────────────────
+// ── DYING colour + rise scale + card + particles ──────────────────
 
-test('dying: colour lerps toward palette.dead and alpha decays', () => {
+test('dying: colour lerps origColor → palette.dead during RISE', () => {
   const plan = buildAnimationPlan(input({
     oldShares: [sh('c')],
     newShares: [],
     evictedHashes: ['c'],
   }));
+  // t=0 (start of rise): cell is at its origin colour (riseEase=0).
   const t0 = plan.frameAt(0);
   const c0 = t0.cells.find((x) => x.shareHash === 'c');
   assert.ok(c0);
-  // Colour shows full alpha (rgba(...,1))
   assert.match(c0?.color ?? '', /rgba\([^)]+,1\)$/);
-  // Mid-phase: alpha ~0.5
-  const tMid = plan.frameAt(plan.phase1Dur * 0.5);
-  const cMid = tMid.cells.find((x) => x.shareHash === 'c');
-  assert.ok(cMid);
-  assert.match(cMid?.color ?? '', /rgba\([^)]+,0\.5\)$/);
-  // End of phase1: alpha = 0 → colour skipped in paint
+  // Well into rise (≈ dt=0.25 ≈ riseT=0.83): colour near palette.dead.
+  const tLate = plan.frameAt(plan.phase1Dur * 0.25);
+  const cLate = tLate.cells.find((x) => x.shareHash === 'c');
+  assert.ok(cLate);
+  assert.match(cLate?.color ?? '', /rgba\([^)]+,1\)$/);
+  // End of phase1 (dt>=1): cell removed from list (particles carry visual).
   const tEnd = plan.frameAt(plan.phase1Dur);
   const cEnd = tEnd.cells.find((x) => x.shareHash === 'c');
-  assert.ok(cEnd);
-  assert.ok((cEnd?.alpha ?? 1) <= 0.01);
+  assert.equal(cEnd, undefined);
 });
 
-test('dying: rise scale grows then holds', () => {
+test('dying: rise scale grows to dyingScale within RISE phase', () => {
   const plan = buildAnimationPlan(input({
     oldShares: [sh('d')],
     newShares: [],
     evictedHashes: ['d'],
+    dyingScale: 5,
   }));
   const base = LAYOUT.cellSize;
   const early = plan.frameAt(10).cells.find((x) => x.shareHash === 'd');
-  const mid   = plan.frameAt(plan.phase1Dur * 0.5).cells.find((x) => x.shareHash === 'd');
-  assert.ok(early && mid);
-  // Rises over first 30% → at 50% size should already be at DYING_RISE_SCALE
-  assert.ok(mid!.size > early!.size);
-  assert.ok(mid!.size <= base * 1.10 + 0.01);
+  // HOLD window: dt in [0.3, 0.55). Sample at dt=0.4 → phase1Dur*0.4.
+  const hold = plan.frameAt(plan.phase1Dur * 0.4).cells.find((x) => x.shareHash === 'd');
+  assert.ok(early && hold);
+  assert.ok(hold!.size > early!.size);
+  // HOLD: cell at full dyingScale
+  assert.ok(Math.abs(hold!.size - base * 5) < 0.01);
+});
+
+test('dying HOLD emits a card overlay with miner + PPLNS text', () => {
+  const plan = buildAnimationPlan(input({
+    oldShares: [sh('c', { m: 'XMINERADDR123' })],
+    newShares: [],
+    evictedHashes: ['c'],
+    pplnsOf: () => 0.01234,  // → "1.234%"
+  }));
+  // Sample at dt=0.4 (within HOLD, 0.3-0.55).
+  const f = plan.frameAt(plan.phase1Dur * 0.4);
+  assert.equal(f.cards.length, 1);
+  const card = f.cards[0]!;
+  assert.equal(card.kind, 'dying');
+  assert.equal(card.addrText, 'XMINERADDR');   // sliced to 10 chars
+  assert.equal(card.pctText, '1.234%');
+});
+
+test('dying HOLD card shows "--" when pplnsOf is absent', () => {
+  const plan = buildAnimationPlan(input({
+    oldShares: [sh('c')],
+    newShares: [],
+    evictedHashes: ['c'],
+  }));
+  const f = plan.frameAt(plan.phase1Dur * 0.4);
+  assert.equal(f.cards[0]?.pctText, '--');
+});
+
+test('dying DISSOLVE emits particles; HOLD does not', () => {
+  const plan = buildAnimationPlan(input({
+    oldShares: [sh('x')],
+    newShares: [],
+    evictedHashes: ['x'],
+  }));
+  // In HOLD window → no particles.
+  const fHold = plan.frameAt(plan.phase1Dur * 0.4);
+  assert.equal(fHold.particles.length, 0);
+  // In DISSOLVE window (dt=0.75 → well into dissolve, ashT=(0.75-0.55)/0.45 ≈ 0.44)
+  const fDiss = plan.frameAt(plan.phase1Dur * 0.75);
+  assert.ok(fDiss.particles.length > 0);
+  assert.ok(fDiss.particles.length <= 20);
+});
+
+test('particles are deterministic for a given rngSeed', () => {
+  const mk = (seed: number) =>
+    buildAnimationPlan(input({
+      oldShares: [sh('x')],
+      newShares: [],
+      evictedHashes: ['x'],
+      rngSeed: seed,
+    })).frameAt(2400).particles;
+  const a1 = mk(42);
+  const a2 = mk(42);
+  const b  = mk(43);
+  assert.deepEqual(a1, a2);
+  assert.notDeepEqual(a1, b);
 });
 
 // ── BORN colour + alpha + shrink scale ─────────────────────────────
 
-test('born: colour coalesces from unverified to final coin colour', () => {
+test('born COALESCE grows a core toward the final coin colour', () => {
   const plan = buildAnimationPlan(input({
     oldShares: [],
     newShares: [sh('n')],
     addedHashes: ['n'],
   }));
-  // Early in phase 3: colour still near palette.unverified
-  const early = plan.frameAt(plan.phase3Start + 100).cells.find((x) => x.shareHash === 'n');
-  assert.ok(early);
-  // Late: colour near palette.native (since share is V36 full-verified)
-  const late = plan.frameAt(plan.phase3Start + plan.phase3Dur - 10).cells.find((x) => x.shareHash === 'n');
-  assert.ok(late);
-  // We can't strict-equal the hex (rgb() form is produced by lerpColor
-  // at exactly t=1 the lerp still wraps in rgba(...)). Just assert the
-  // components are consistent with palette transition.
-  assert.match(early?.color ?? '', /^rgba\(/);
-  assert.match(late?.color ?? '', /^rgba\(/);
+  // Mid-coalesce (bt ≈ 0.2 → cT ≈ 0.57). Coalesce cell should exist and
+  // have a colour in rgba() form (since lerpColor wraps in rgba).
+  const mid = plan.frameAt(plan.phase3Start + plan.phase3Dur * 0.2);
+  const bornCell = mid.cells.find((x) => x.shareHash === 'n');
+  assert.ok(bornCell);
+  assert.match(bornCell?.color ?? '', /^rgba\(/);
 });
 
-test('born: scale shrinks from 3x toward 1x over last 20%', () => {
+test('born LAND shrinks from bornScale to 1x; HOLD stays at bornScale', () => {
   const plan = buildAnimationPlan(input({
     newShares: [sh('n')],
     addedHashes: ['n'],
+    bornScale: 5,
   }));
   const base = LAYOUT.cellSize;
-  // At t = phase3Start: scale at BORN_INITIAL_SCALE (3x)
-  const start = plan.frameAt(plan.phase3Start + 1).cells.find((x) => x.shareHash === 'n');
-  assert.ok(start);
-  assert.ok(Math.abs(start!.size - 3 * base) < base * 0.05);
-  // At phase3Start + phase3Dur * 0.9: scale mid-land
-  const midLand = plan.frameAt(plan.phase3Start + plan.phase3Dur * 0.9).cells.find((x) => x.shareHash === 'n');
-  assert.ok(midLand);
-  assert.ok(midLand!.size < 3 * base);
-  assert.ok(midLand!.size > base);
-  // At phase3 end: scale = 1
-  const end = plan.frameAt(plan.phase3Start + plan.phase3Dur).cells.find((x) => x.shareHash === 'n');
+  // HOLD window: bt in [0.35, 0.65). Sample at 0.5.
+  const hold = plan.frameAt(plan.phase3Start + plan.phase3Dur * 0.5)
+    .cells.find((x) => x.shareHash === 'n');
+  assert.ok(hold);
+  assert.ok(Math.abs(hold!.size - base * 5) < 0.01);
+  // LAND entry (bt=0.66): scale still near bornScale.
+  const landStart = plan.frameAt(plan.phase3Start + plan.phase3Dur * 0.66)
+    .cells.find((x) => x.shareHash === 'n');
+  assert.ok(landStart);
+  assert.ok(landStart!.size > base * 4);
+  // LAND end (bt=1.0): scale = 1.
+  const end = plan.frameAt(plan.phase3Start + plan.phase3Dur)
+    .cells.find((x) => x.shareHash === 'n');
   assert.ok(end);
   assert.ok(Math.abs(end!.size - base) < 0.5);
+});
+
+test('born HOLD emits a card overlay; COALESCE emits particles', () => {
+  const plan = buildAnimationPlan(input({
+    newShares: [sh('n', { m: 'XBORNMINER9' })],
+    addedHashes: ['n'],
+    pplnsOf: () => 0.00999,
+  }));
+  // HOLD at bt≈0.5 → centre of HOLD.
+  const holdT = plan.phase3Start + plan.phase3Dur * 0.5;
+  const holdF = plan.frameAt(holdT);
+  assert.equal(holdF.cards.length, 1);
+  const card = holdF.cards[0]!;
+  assert.equal(card.kind, 'born');
+  assert.equal(card.addrText, 'XBORNMINER');
+  assert.equal(card.pctText, '0.999%');
+  // COALESCE at bt≈0.2 → particles > 0, no card.
+  const coalesceT = plan.phase3Start + plan.phase3Dur * 0.2;
+  const coalesceF = plan.frameAt(coalesceT);
+  assert.equal(coalesceF.cards.length, 0);
+  assert.ok(coalesceF.particles.length > 0);
 });
 
 // ── Animated paint program ────────────────────────────────────────

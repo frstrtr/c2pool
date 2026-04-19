@@ -267,6 +267,8 @@ export class RealtimeOrchestrator {
     if (layout.shareCount === 0 && this.window.shares.length === 0) {
       return {
         cells: [],
+        particles: [],
+        cards: [],
         backgroundColor: this.config.backgroundColor,
         layout,
       };
@@ -287,6 +289,8 @@ export class RealtimeOrchestrator {
     });
     return {
       cells,
+      particles: [],
+      cards: [],
       backgroundColor: this.config.backgroundColor,
       layout,
     };

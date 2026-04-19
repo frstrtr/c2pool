@@ -126,7 +126,14 @@ export interface CanvasLike {
 /** Build a paint program from an animator frame. Each CellFrame's
  *  `size` field is used directly so scale/transform effects carry
  *  through without the cell-size-based maths buildPaintProgram does
- *  for static frames. Cells with alpha ≤ 0 are skipped. */
+ *  for static frames. Cells with alpha ≤ 0 are skipped.
+ *
+ *  Paint order (z-ascending):
+ *    1. setTransform + background
+ *    2. cells (grid + born land + dying rise)
+ *    3. particles (ash + coalesce)
+ *    4. card overlays (dying HOLD + born HOLD) — drawn last, on top
+ *       of everything, matching dashboard.html ordering. */
 export function buildAnimatedPaintProgram(
   frame: import('./animator.js').FrameSpec,
   dpr: number,
@@ -148,6 +155,97 @@ export function buildAnimatedPaintProgram(
       w: cell.size,
       h: cell.size,
       color: cell.color,
+    });
+  }
+  // Particles render as small fillCell commands. Their colour already
+  // includes the alpha channel (rgba(...)).
+  for (const p of frame.particles) {
+    if (p.size <= 0) continue;
+    cmds.push({
+      op: 'fillCell',
+      x: p.x,
+      y: p.y,
+      w: p.size,
+      h: p.size,
+      color: p.color,
+    });
+  }
+  // Card overlays: shadow → glow → fill → inner highlight → text (with
+  // shadow pass first for legibility). Matches reference dashboard.html
+  // sequence for both dying (:5301-5327) and born (:5089-5112) cards.
+  for (const card of frame.cards) {
+    const half = card.size / 2;
+    // Shadow — offset +6 +6, slightly larger (+4 +4).
+    cmds.push({
+      op: 'fillCell',
+      x: card.cx - half + 6,
+      y: card.cy - half + 6,
+      w: card.size + 4,
+      h: card.size + 4,
+      color: card.shadowColor,
+    });
+    // Glow — extends −4 / +8.
+    cmds.push({
+      op: 'fillCell',
+      x: card.cx - half - 4,
+      y: card.cy - half - 4,
+      w: card.size + 8,
+      h: card.size + 8,
+      color: card.glowColor,
+    });
+    // Solid fill.
+    cmds.push({
+      op: 'fillCell',
+      x: card.cx - half,
+      y: card.cy - half,
+      w: card.size,
+      h: card.size,
+      color: card.fillColor,
+    });
+    // Inner highlight — inset by 3px.
+    cmds.push({
+      op: 'fillCell',
+      x: card.cx - half + 3,
+      y: card.cy - half + 3,
+      w: card.size - 6,
+      h: card.size - 6,
+      color: card.innerHighlight,
+    });
+    // Address text with shadow.
+    const addrFont = `bold ${card.fontSize}px Monaco,Consolas,monospace`;
+    cmds.push({
+      op: 'textCenter',
+      text: card.addrText,
+      x: card.cx + 1,
+      y: card.cy - card.fontSize * 0.8 + 1,
+      color: 'rgba(0,0,0,0.8)',
+      font: addrFont,
+    });
+    cmds.push({
+      op: 'textCenter',
+      text: card.addrText,
+      x: card.cx,
+      y: card.cy - card.fontSize * 0.8,
+      color: card.addrColor,
+      font: addrFont,
+    });
+    // PCT text (slightly larger) with shadow.
+    const pctFont = `bold ${card.fontSize + 2}px Monaco,Consolas,monospace`;
+    cmds.push({
+      op: 'textCenter',
+      text: card.pctText,
+      x: card.cx + 1,
+      y: card.cy + card.fontSize * 0.8 + 1,
+      color: 'rgba(0,0,0,0.8)',
+      font: pctFont,
+    });
+    cmds.push({
+      op: 'textCenter',
+      text: card.pctText,
+      x: card.cx,
+      y: card.cy + card.fontSize * 0.8,
+      color: card.pctColor,
+      font: pctFont,
     });
   }
   return cmds;

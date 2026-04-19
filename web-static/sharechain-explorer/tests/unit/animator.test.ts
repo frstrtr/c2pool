@@ -186,62 +186,55 @@ test('dying: in old but not in new → present in frame during phase 1, gone by 
   assert.equal(dying.length, 1);
   assert.equal(dying[0]?.shareHash, 'c');
   assert.equal(dying[0]?.alpha, 1);
-  // At phase1 end, alpha has decayed to 0 for the earliest-staggered dying share.
-  const fMid = plan.frameAt(plan.phase1Start + plan.phase1Dur);
-  const midDying = fMid.cells.filter((x) => x.track === 'dying');
-  assert.equal(midDying.length, 1);
-  assert.ok((midDying[0]?.alpha ?? 1) <= 0.01);
+  // At phase1 end: dt>=1 so the cell is removed from the list entirely.
+  const fEnd = plan.frameAt(plan.phase1Start + plan.phase1Dur);
+  const endDying = fEnd.cells.filter((x) => x.track === 'dying');
+  assert.equal(endDying.length, 0);
 });
 
-test('dying: multi-dying stagger (last-first)', () => {
+test('dying: multi-dying stagger (last-first) — first advances past RISE onset', () => {
   const o = [sh('x'), sh('y'), sh('z')];       // indices 0,1,2
   const plan = buildAnimationPlan(makeInput({
     oldShares: o,
     newShares: [],
     evictedHashes: ['x', 'y', 'z'],
   }));
-  // Stagger is last-first → z (index 2) goes first, stagger i=0; y i=1; x i=2.
-  // At t = 0, z has alpha=1 (started), x and y alpha=1 also since raw<0 → clamp
-  // check at t = 150ms: z ≈ 0.95, y just started, x still ~1.
-  const f = plan.frameAt(150);
+  // Stagger (ordered largest-oldIndex first): z=0 (stagger 0ms), y=1
+  // (150ms), x=2 (300ms). At t=200ms, z is 200ms into its RISE; y has
+  // 50ms of RISE; x hasn't started. Compare scale (size) — tail-first
+  // means z > y > x in size at this instant.
+  const f = plan.frameAt(200);
   const byHash = Object.fromEntries(f.cells.map((c) => [c.shareHash, c]));
-  assert.ok((byHash.z?.alpha ?? 0) < (byHash.x?.alpha ?? 0));
+  assert.ok(byHash.z && byHash.y && byHash.x);
+  assert.ok((byHash.z!.size) > (byHash.y!.size));
+  assert.ok((byHash.y!.size) > (byHash.x!.size));
 });
 
 // ── BORN track ────────────────────────────────────────────────────
 
-test('born: spawns below grid then flies into position', () => {
+test('born: coalesces near bornFinalY then lands at the new grid slot', () => {
   const plan = buildAnimationPlan(makeInput({
     oldShares: [],
     newShares: [sh('new0')],
     addedHashes: ['new0'],
   }));
-  // t = phase3Start: just starting, should be near spawn position
+  // At phase3Start (rawBt=0, "not started"): cell painted at destination
+  // so the grid has no gap (matches dashboard.html:5049-5054 fallback).
   const fStart = plan.frameAt(plan.phase3Start);
   const born = fStart.cells.filter((c) => c.track === 'born');
   assert.equal(born.length, 1);
-  // y should still be well below the grid
-  assert.ok((born[0]?.y ?? 0) > LAYOUT.cssHeight);
-  // alpha should be near 0 at very start
-  assert.ok((born[0]?.alpha ?? 1) <= 0.02);
-  // t = phase3Start + phase3Dur: landed
+  assert.equal(born[0]?.alpha, 1);
+  // Mid-coalesce (bt≈0.2): cell is at bornFinalY (below destination
+  // row) during particle gather — reference :5046-5047.
+  const fCoalesce = plan.frameAt(plan.phase3Start + plan.phase3Dur * 0.2);
+  const coalesceCell = fCoalesce.cells.find((c) => c.shareHash === 'new0');
+  assert.ok(coalesceCell);
+  assert.ok(coalesceCell!.y > 1, 'coalesce core should not be at dst row');
+  // End of phase3: cell landed at destination (y≈0).
   const fLanded = plan.frameAt(plan.phase3Start + plan.phase3Dur);
   const landed = fLanded.cells.filter((c) => c.track === 'born');
   assert.equal(landed[0]?.alpha, 1);
-  // final y should be 0 (top row)
   assert.ok(Math.abs((landed[0]?.y ?? -1) - 0) < 0.01);
-});
-
-test('born: alpha fades in over first 30% of its lifetime', () => {
-  const plan = buildAnimationPlan(makeInput({
-    newShares: [sh('b')],
-    addedHashes: ['b'],
-  }));
-  const t15pct = plan.phase3Start + plan.phase3Dur * 0.15;
-  const f = plan.frameAt(t15pct);
-  const b = f.cells[0];
-  // 15% of 30%-ramp ≈ 0.5 alpha
-  assert.ok((b?.alpha ?? -1) > 0.3 && (b?.alpha ?? -1) < 0.7);
 });
 
 // ── Controller lifecycle ──────────────────────────────────────────
