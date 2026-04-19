@@ -14,6 +14,7 @@ import type { PluginDescriptor } from '../registry.js';
 export type StaleInfo = 0 | 1 | 2;
 
 export interface ShareForClassify {
+  h: string;            // short-hash per spec §5.1 (16 hex)
   s: StaleInfo;
   v: 0 | 1;
   V: number;

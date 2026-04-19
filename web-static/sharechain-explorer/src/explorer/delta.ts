@@ -16,11 +16,12 @@
 
 import type { PluginDescriptor } from '../registry.js';
 
-/** Subset of the share shape delta merging cares about. Full shares
- *  pass through as opaque payloads. */
+/** Subset of the share shape delta merging cares about: just a
+ *  short-hash for dedup/ordering. Full shares pass through as opaque
+ *  payloads. No index signature — the constraint is deliberately
+ *  minimal so strict interfaces (e.g. ShareForClassify) satisfy it. */
 export interface DeltaShare {
   h: string;  // short-hash (16 hex); spec §5 contract — dedup key
-  [key: string]: unknown;
 }
 
 export interface WindowSnapshot<S extends DeltaShare = DeltaShare> {

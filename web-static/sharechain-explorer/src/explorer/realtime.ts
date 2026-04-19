@@ -1,0 +1,471 @@
+// Realtime orchestrator — wires Transport subscribeStream + fetchDelta
+// + mergeDelta + Animator + renderer into the complete live-updates
+// flow. Decomposed so the state machine (RealtimeOrchestrator) is
+// pure and testable in Node; the DOM/RAF adapter (createRealtime)
+// is a thin wrapper.
+//
+// Behaviour (spec §5 + §6):
+//   1. start() fetches the full window, then subscribes to the tip
+//      stream.
+//   2. Each tip event triggers fetchDelta(since=currentTip).
+//   3. mergeDelta → if fork_switch, full refresh. Otherwise apply
+//      new shares and build an AnimationPlan.
+//   4. If already animating, queue the new plan (current tip
+//      sequence wins — out-of-order tips ignored).
+//   5. If added-count ≥ skipAnimationThreshold, skip the animation
+//      and render directly.
+//   6. renderer loop paints each RAF frame until animation idle.
+//
+// Provides capability `realtime.orchestrator`.
+
+import type { PluginDescriptor } from '../registry.js';
+import type {
+  Transport,
+  TipEvent,
+  RequestOptions,
+  StreamSubscription,
+} from '../transport/types.js';
+import type { ExplorerError } from '../errors.js';
+import type { GridLayout } from './grid-layout.js';
+import { computeGridLayout } from './grid-layout.js';
+import type {
+  ColorPalette,
+  ShareForClassify,
+  UserContext,
+} from './colors.js';
+import { LTC_COLOR_PALETTE } from './colors.js';
+import {
+  mergeDelta,
+  type DeltaPayload,
+  type WindowSnapshot,
+} from './delta.js';
+import {
+  buildAnimationPlan,
+  createAnimationController,
+  SKIP_ANIMATION_NEW_COUNT_THRESHOLD,
+  type AnimationController,
+  type AnimationPlan,
+  type FrameSpec,
+} from './animator.js';
+import {
+  buildAnimatedPaintProgram,
+  createGridRenderer,
+  executePaintProgram,
+  type PaintCommand,
+  type GridRenderer,
+} from './grid-paint.js';
+import { getColor } from './colors.js';
+
+export interface LayoutParams {
+  cellSize: number;
+  gap: number;
+  marginLeft: number;
+  minHeight: number;
+}
+
+const DEFAULT_LAYOUT_PARAMS: LayoutParams = Object.freeze({
+  cellSize: 10,
+  gap: 1,
+  marginLeft: 38,
+  minHeight: 40,
+});
+
+export interface RealtimeConfig {
+  transport: Transport;
+  userContext: UserContext;
+  palette?: Readonly<ColorPalette>;
+  windowSize?: number;
+  hashOf?: (share: ShareForClassify) => string;
+  layoutParams?: Partial<LayoutParams>;
+  containerWidth: () => number;
+  skipAnimationThreshold?: number;
+  backgroundColor?: string;
+  fastAnimation?: boolean;
+  /** Called whenever a structured ExplorerError surfaces from the
+   *  Transport or contract-validation path. */
+  onError?: (err: ExplorerError) => void;
+}
+
+export interface RealtimeState {
+  window: WindowSnapshot<ShareForClassify>;
+  animating: boolean;
+  hasQueued: boolean;
+  started: boolean;
+  shareCount: number;
+  lastAppliedTip: string | null;
+  deltaInFlight: boolean;
+}
+
+/** Pure state machine — no DOM, no requestAnimationFrame. Drive it
+ *  via start()/stop() and fetch frames via currentFrame(now). */
+export class RealtimeOrchestrator {
+  private readonly config: Required<Omit<RealtimeConfig, 'onError' | 'layoutParams'>> & {
+    onError?: (err: ExplorerError) => void;
+    layoutParams: LayoutParams;
+  };
+  private readonly anim: AnimationController;
+  private window: WindowSnapshot<ShareForClassify> = { shares: [] };
+  private subscription: StreamSubscription | null = null;
+  private abort: AbortController | null = null;
+  private _started = false;
+  private _stopped = false;
+  private _deltaInFlight = false;
+  private _lastAppliedTip: string | null = null;
+  private _pendingTip: string | null = null;
+  private _hasQueued = false;
+  private _currentLayout: GridLayout | null = null;
+
+  constructor(config: RealtimeConfig) {
+    const layoutParams: LayoutParams = {
+      ...DEFAULT_LAYOUT_PARAMS,
+      ...(config.layoutParams ?? {}),
+    };
+    this.config = {
+      transport: config.transport,
+      userContext: config.userContext,
+      palette: config.palette ?? LTC_COLOR_PALETTE,
+      windowSize: config.windowSize ?? 4320,
+      hashOf: config.hashOf ?? ((s) => (s as unknown as { h: string }).h),
+      containerWidth: config.containerWidth,
+      skipAnimationThreshold: config.skipAnimationThreshold ?? SKIP_ANIMATION_NEW_COUNT_THRESHOLD,
+      backgroundColor: config.backgroundColor ?? '#0d0d1a',
+      fastAnimation: config.fastAnimation ?? false,
+      layoutParams,
+      ...(config.onError ? { onError: config.onError } : {}),
+    };
+    this.anim = createAnimationController();
+  }
+
+  async start(): Promise<void> {
+    if (this._started) return;
+    if (this._stopped) throw new Error('RealtimeOrchestrator: stopped');
+    this._started = true;
+    this.abort = new AbortController();
+    await this.rebuildWindow();
+    this.subscribe();
+  }
+
+  async stop(): Promise<void> {
+    if (!this._started || this._stopped) return;
+    this._stopped = true;
+    this.abort?.abort();
+    this.subscription?.unsubscribe();
+    this.subscription = null;
+    this.anim.reset();
+  }
+
+  /** Force a full window re-fetch (e.g. operator clicked refresh). */
+  async refresh(): Promise<void> {
+    if (!this._started || this._stopped) return;
+    await this.rebuildWindow();
+  }
+
+  getState(): Readonly<RealtimeState> {
+    return {
+      window: this.window,
+      animating: this.anim.isRunning(),
+      hasQueued: this._hasQueued,
+      started: this._started,
+      shareCount: this.window.shares.length,
+      lastAppliedTip: this._lastAppliedTip,
+      deltaInFlight: this._deltaInFlight,
+    };
+  }
+
+  /** Return the frame to paint at time `now`. Returns a static frame
+   *  (no cells moving) when no animation is running. Returns null if
+   *  the window is empty AND there's nothing to paint. */
+  currentFrame(now: number): FrameSpec | null {
+    const animFrame = this.anim.tick(now);
+    if (animFrame !== null) return animFrame;
+    // Idle: emit a static frame so the renderer can re-paint on resize.
+    return this.buildStaticFrame();
+  }
+
+  /** Render a static snapshot frame (no animation). */
+  buildStaticFrame(): FrameSpec | null {
+    const layout = this.updateLayout();
+    if (layout.shareCount === 0 && this.window.shares.length === 0) {
+      return {
+        cells: [],
+        backgroundColor: this.config.backgroundColor,
+        layout,
+      };
+    }
+    const cells = this.window.shares.map((s, i) => {
+      const col = i % layout.cols;
+      const row = Math.floor(i / layout.cols);
+      const x = layout.marginLeft + col * layout.step;
+      const y = row * layout.step;
+      return {
+        shareHash: this.config.hashOf(s),
+        track: 'wave' as const,
+        x, y,
+        size: layout.cellSize,
+        color: getColor(s, this.config.userContext, this.config.palette),
+        alpha: 1,
+      };
+    });
+    return {
+      cells,
+      backgroundColor: this.config.backgroundColor,
+      layout,
+    };
+  }
+
+  // ── internal ──────────────────────────────────────────────────────
+
+  private updateLayout(): GridLayout {
+    const layout = computeGridLayout({
+      ...this.config.layoutParams,
+      shareCount: this.window.shares.length,
+      containerWidth: this.config.containerWidth(),
+    });
+    this._currentLayout = layout;
+    return layout;
+  }
+
+  private async rebuildWindow(): Promise<void> {
+    try {
+      const signal = this.abort?.signal;
+      const opts: RequestOptions = signal !== undefined ? { signal } : {};
+      const raw = await this.config.transport.fetchWindow(opts);
+      const shares = this.extractShares(raw);
+      const tip = shares.length > 0 ? this.config.hashOf(shares[0]!) : undefined;
+      this.window = tip !== undefined ? { shares, tip } : { shares };
+      this._lastAppliedTip = tip ?? null;
+      this.anim.reset();
+    } catch (err) {
+      this.emitError(err);
+    }
+  }
+
+  private subscribe(): void {
+    if (this.subscription !== null) this.subscription.unsubscribe();
+    this.subscription = this.config.transport.subscribeStream(
+      (ev) => this.onTip(ev),
+      (err) => this.emitError(err),
+      () => this.onReconnect(),
+    );
+  }
+
+  private onTip(ev: TipEvent): void {
+    if (this._stopped) return;
+    if (ev.hash === this._lastAppliedTip) return;  // dedup
+    if (ev.hash === this._pendingTip) return;      // dedup in-flight
+    this._pendingTip = ev.hash;
+    if (this._deltaInFlight) return;                // coalesce: one request at a time
+    void this.fetchAndApply();
+  }
+
+  private async onReconnect(): Promise<void> {
+    if (this._stopped) return;
+    // Catch-up per delta v1 §A.3 — fetch tip, apply if changed.
+    try {
+      const signal = this.abort?.signal;
+      const opts: RequestOptions = signal !== undefined ? { signal } : {};
+      const tipRaw = await this.config.transport.fetchTip(opts);
+      const hash = (tipRaw as { hash?: unknown } | null)?.hash;
+      if (typeof hash === 'string' && hash !== this._lastAppliedTip) {
+        this._pendingTip = hash;
+        if (!this._deltaInFlight) void this.fetchAndApply();
+      }
+    } catch (err) {
+      this.emitError(err);
+    }
+  }
+
+  private async fetchAndApply(): Promise<void> {
+    if (this._stopped) return;
+    if (this._deltaInFlight) return;
+    const pendingAtStart = this._pendingTip;
+    if (pendingAtStart === null) return;
+    const since = this.window.tip;
+    if (since === undefined) {
+      // No baseline to delta against — rebuild the whole window.
+      this._deltaInFlight = true;
+      try {
+        await this.rebuildWindow();
+      } finally {
+        this._deltaInFlight = false;
+        this._pendingTip = null;
+      }
+      return;
+    }
+    this._deltaInFlight = true;
+    try {
+      const signal = this.abort?.signal;
+      const opts: RequestOptions = signal !== undefined ? { signal } : {};
+      const raw = await this.config.transport.fetchDelta(since, opts);
+      this.applyDelta(raw);
+    } catch (err) {
+      this.emitError(err);
+    } finally {
+      this._deltaInFlight = false;
+    }
+    // If another tip arrived while we were fetching, drain it.
+    if (this._pendingTip !== null && this._pendingTip !== pendingAtStart) {
+      void this.fetchAndApply();
+    } else {
+      this._pendingTip = null;
+    }
+  }
+
+  private applyDelta(raw: unknown): void {
+    const delta = this.normaliseDelta(raw);
+    const oldShares = this.window.shares;
+    const oldLayout = this._currentLayout ?? this.updateLayout();
+    const merge = mergeDelta(this.window, delta, { windowSize: this.config.windowSize });
+
+    // Swap state.
+    const newTip = merge.tip;
+    this.window = newTip !== undefined
+      ? { shares: merge.shares as readonly ShareForClassify[], tip: newTip }
+      : { shares: merge.shares as readonly ShareForClassify[] };
+    this._lastAppliedTip = newTip ?? null;
+
+    if (merge.forkSwitch) {
+      // Can't smoothly animate a reorg — full refresh.
+      void this.rebuildWindow();
+      return;
+    }
+
+    if (merge.added.length === 0 && merge.evicted.length === 0) {
+      // Tip advance with no window-visible change — skip animation.
+      return;
+    }
+
+    if (merge.added.length >= this.config.skipAnimationThreshold) {
+      // Bulk update — skip animation, reset the animator so the next
+      // idle frame renders the new static state.
+      this.anim.reset();
+      return;
+    }
+
+    const newLayout = this.updateLayout();
+    const plan = buildAnimationPlan({
+      oldShares,
+      newShares: this.window.shares,
+      addedHashes: merge.added.map((s) => this.config.hashOf(s)),
+      evictedHashes: [...merge.evicted],
+      oldLayout,
+      newLayout,
+      userContext: this.config.userContext,
+      palette: this.config.palette,
+      hashOf: this.config.hashOf,
+      fast: this.config.fastAnimation,
+    });
+
+    if (this.anim.isRunning()) {
+      this.anim.queueNext(plan);
+      this._hasQueued = true;
+    } else {
+      this.anim.start(plan, this.nowMs());
+      this._hasQueued = false;
+    }
+  }
+
+  private extractShares(raw: unknown): readonly ShareForClassify[] {
+    if (raw === null || typeof raw !== 'object') return [];
+    const arr = (raw as { shares?: unknown }).shares;
+    if (!Array.isArray(arr)) return [];
+    return arr as readonly ShareForClassify[];
+  }
+
+  private normaliseDelta(raw: unknown): DeltaPayload<ShareForClassify> {
+    if (raw === null || typeof raw !== 'object') {
+      return { shares: [] };
+    }
+    const obj = raw as Record<string, unknown>;
+    const shares = Array.isArray(obj.shares) ? (obj.shares as ShareForClassify[]) : [];
+    const out: DeltaPayload<ShareForClassify> = { shares };
+    if (typeof obj.tip === 'string') out.tip = obj.tip;
+    if (typeof obj.window_size === 'number') out.window_size = obj.window_size;
+    if (obj.fork_switch === true) out.fork_switch = true;
+    return out;
+  }
+
+  private emitError(err: unknown): void {
+    if (!this.config.onError) return;
+    const error = (typeof err === 'object' && err !== null && 'type' in err)
+      ? err as ExplorerError
+      : { type: 'internal', message: 'realtime error', cause: err } as ExplorerError;
+    this.config.onError(error);
+  }
+
+  private nowMs(): number {
+    return typeof performance !== 'undefined' ? performance.now() : Date.now();
+  }
+}
+
+// ── DOM adapter ───────────────────────────────────────────────────
+
+export interface RealtimeDOMOptions extends RealtimeConfig {
+  canvas: HTMLCanvasElement;
+  /** Optional override; defaults to window.devicePixelRatio. */
+  getDevicePixelRatio?: () => number;
+}
+
+export interface RealtimeController {
+  start(): Promise<void>;
+  stop(): Promise<void>;
+  refresh(): Promise<void>;
+  getState(): Readonly<RealtimeState>;
+}
+
+export function createRealtime(opts: RealtimeDOMOptions): RealtimeController {
+  const orchestrator = new RealtimeOrchestrator(opts);
+  const renderer: GridRenderer = createGridRenderer(opts.canvas);
+  const ctx2d = opts.canvas.getContext('2d');
+  if (ctx2d === null) throw new Error('createRealtime: canvas context unavailable');
+  const getDpr = opts.getDevicePixelRatio ?? (() => window.devicePixelRatio || 1);
+  let raf: number | null = null;
+  let stopped = false;
+
+  const loop = (now: number): void => {
+    if (stopped) return;
+    const frame = orchestrator.currentFrame(now);
+    if (frame !== null) {
+      const dpr = getDpr();
+      opts.canvas.style.width = `${frame.layout.cssWidth}px`;
+      opts.canvas.style.height = `${frame.layout.cssHeight}px`;
+      opts.canvas.width = Math.round(frame.layout.cssWidth * dpr);
+      opts.canvas.height = Math.round(frame.layout.cssHeight * dpr);
+      const program: PaintCommand[] = buildAnimatedPaintProgram(frame, dpr);
+      executePaintProgram(ctx2d as unknown as import('./grid-paint.js').CanvasLike, program);
+    }
+    raf = window.requestAnimationFrame(loop);
+  };
+
+  return {
+    async start() {
+      stopped = false;
+      await orchestrator.start();
+      raf = window.requestAnimationFrame(loop);
+    },
+    async stop() {
+      stopped = true;
+      if (raf !== null) window.cancelAnimationFrame(raf);
+      raf = null;
+      await orchestrator.stop();
+      renderer.destroy();
+    },
+    refresh: () => orchestrator.refresh(),
+    getState: () => orchestrator.getState(),
+  };
+}
+
+// ── Plugin ────────────────────────────────────────────────────────
+
+export const RealtimePlugin: PluginDescriptor = {
+  id: 'explorer.realtime.default',
+  version: '1.0.0',
+  sdk: '^1.0',
+  kind: 'loader',
+  provides: ['realtime.orchestrator'],
+  slots: ['explorer.data.realtime'],
+  priority: 0,
+  capabilities: {
+    'realtime.orchestrator': { RealtimeOrchestrator, createRealtime },
+  },
+};

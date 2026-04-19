@@ -48,6 +48,16 @@ export {
   type Rgb,
 } from './color-utils.js';
 export {
+  RealtimePlugin,
+  RealtimeOrchestrator,
+  createRealtime,
+  type RealtimeConfig,
+  type RealtimeDOMOptions,
+  type RealtimeController,
+  type RealtimeState,
+  type LayoutParams,
+} from './realtime.js';
+export {
   DeltaMergerPlugin,
   mergeDelta,
   type DeltaShare,
@@ -83,6 +93,7 @@ import { GridCanvasPlugin as _canvas } from './grid-paint.js';
 import { DeltaMergerPlugin as _delta } from './delta.js';
 import { AnimatorPlugin as _anim } from './animator.js';
 import { ColorUtilsPlugin as _cu } from './color-utils.js';
+import { RealtimePlugin as _rt } from './realtime.js';
 
 /** Register SharedCore baseline plus Explorer-specific plugins. */
 export function registerExplorerBaseline(host: Host): void {
@@ -93,4 +104,5 @@ export function registerExplorerBaseline(host: Host): void {
   host.registry.register(_delta);
   host.registry.register(_anim);
   host.registry.register(_cu);
+  host.registry.register(_rt);
 }
