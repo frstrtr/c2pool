@@ -1,0 +1,8 @@
+node_modules/
+*.log
+.DS_Store
+coverage/
+# dist/ and resources-manifest.json ARE committed at phase 1 so c2pool's
+# C++-only CI can serve/embed the bundle without running npm. This flips
+# at repo-strategy phase 2 when the sibling explorer-modules repo takes
+# over the build pipeline.

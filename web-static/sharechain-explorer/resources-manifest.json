@@ -1,0 +1,18 @@
+{
+  "version": "0.1.0-alpha",
+  "generated": "2026-04-19T15:40:03.757Z",
+  "files": [
+    "shared-core.js"
+  ],
+  "filesDev": [
+    "shared-core.js.map"
+  ],
+  "integrity": {
+    "shared-core.js": "sha384-iUgVSSREOIew5HhvHBXYlt4cdwk9SBJ/v/taCLQlDunVHO8dNJq07jynf2WAZuHs",
+    "shared-core.js.map": "sha384-mE7iNNX9yvCv1uqXaoLR+p8NVWg0I4Bhkr5nONPkAvgKE9zVVaPNlOJ09o18wTFC"
+  },
+  "sizes": {
+    "shared-core.js": 13344,
+    "shared-core.js.map": 61556
+  }
+}
