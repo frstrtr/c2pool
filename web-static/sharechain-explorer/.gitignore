@@ -2,6 +2,10 @@ node_modules/
 *.log
 .DS_Store
 coverage/
+# Visual regression transient outputs — screenshots + diff images
+# regenerate on every `npm run visual` run. Fixtures are tracked but
+# captured PNGs are not.
+tests/visual/out/
 # dist/ and resources-manifest.json ARE committed at phase 1 so c2pool's
 # C++-only CI can serve/embed the bundle without running npm. This flips
 # at repo-strategy phase 2 when the sibling explorer-modules repo takes
