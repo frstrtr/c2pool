@@ -156,16 +156,17 @@ export class RealtimeOrchestrator {
 
   async start(): Promise<void> {
     if (this._started) return;
-    if (this._stopped) throw new Error('RealtimeOrchestrator: stopped');
     this._started = true;
+    this._stopped = false;
     this.abort = new AbortController();
     await this.rebuildWindow();
     this.subscribe();
   }
 
   async stop(): Promise<void> {
-    if (!this._started || this._stopped) return;
+    if (!this._started) return;
     this._stopped = true;
+    this._started = false;  // allow a subsequent start() (toggle support)
     this.abort?.abort();
     this.subscription?.unsubscribe();
     this.subscription = null;

@@ -8203,6 +8203,46 @@
                         if (hoveredIdx !== -1) { hoveredIdx = -1; hoverPanel && hoverPanel.hide(); }
                     }
 
+                    // Phase B #13 — override the inline toggleRealTime
+                    // to drive the bundled orchestrator. When the flag
+                    // is on the inline SSE / polling code (lines 7939-
+                    // 7997) never runs; clicks on #realtime-btn instead
+                    // stop/start the bundled path.
+                    function setRtButtonOn() {
+                        var btn = document.getElementById('realtime-btn');
+                        if (!btn) return;
+                        btn.textContent = 'RealTime: SSE';
+                        btn.style.background = '#28a745';
+                        btn.style.color = '#fff';
+                        btn.style.borderColor = '#28a745';
+                    }
+                    function setRtButtonOff() {
+                        var btn = document.getElementById('realtime-btn');
+                        if (!btn) return;
+                        btn.textContent = 'RealTime: OFF';
+                        btn.style.background = 'var(--card-bg)';
+                        btn.style.color = 'var(--text-muted)';
+                        btn.style.borderColor = 'var(--border)';
+                    }
+                    // Initial state: bundled Realtime is auto-started.
+                    setRtButtonOn();
+                    window.toggleRealTime = function() {
+                        var explorer = window.__explorerBundled;
+                        if (!explorer) return;
+                        var state = explorer.getState();
+                        if (state.started) {
+                            explorer.stop().then(function() {
+                                setRtButtonOff();
+                                console.info('[c2pool bundled] RealTime OFF');
+                            });
+                        } else {
+                            explorer.start().then(function() {
+                                setRtButtonOn();
+                                console.info('[c2pool bundled] RealTime ON');
+                            });
+                        }
+                    };
+
                     // Phase B #10 — mirror inline defrag stat panel
                     // writes from rt.getState().stats. 250 ms poll is
                     // the same cadence the inline path used via SSE

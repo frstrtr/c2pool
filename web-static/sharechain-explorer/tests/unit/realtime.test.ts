@@ -275,6 +275,40 @@ test('stop: unsubscribes and stops processing tips', async () => {
   assert.equal(calls, 0);
 });
 
+// ── restart after stop (toggle support) ──────────────────────────
+
+test('restart: start/stop/start cycle works', async () => {
+  let windowCalls = 0;
+  const transport = makeTransport({
+    window: { shares: [sh('a')] },
+    deltaForSince: () => ({ shares: [sh('b')] }),
+  });
+  const origFetch = transport.fetchWindow;
+  transport.fetchWindow = async () => {
+    windowCalls++;
+    return origFetch.call(transport);
+  };
+  const o = new RealtimeOrchestrator({
+    transport,
+    userContext: CONTEXT,
+    containerWidth: CONTAINER_WIDTH,
+  });
+  await o.start();
+  assert.equal(o.getState().started, true);
+  await o.stop();
+  assert.equal(o.getState().started, false);
+  // Restart fetches the window again.
+  await o.start();
+  assert.equal(o.getState().started, true);
+  assert.ok(windowCalls >= 2, `expected >= 2 window fetches, got ${windowCalls}`);
+  // After restart, tips are processed.
+  transport.fireTip({ hash: 'b', height: 2 });
+  await new Promise((r) => setTimeout(r, 0));
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(o.getState().window.tip, 'b');
+  await o.stop();
+});
+
 // ── reconnect catch-up ────────────────────────────────────────────
 
 test('reconnect: fetches tip, applies delta if changed', async () => {
