@@ -8150,11 +8150,57 @@
                     rt.start().then(function() {
                         window.__explorerBundled = rt;
                         console.info('[c2pool bundled] Explorer started');
+                        startStatPoll();
                     });
-                    // Hide the inline stats panel inputs until Phase B
-                    // wires stat updates into the bundled path.
                     var loading = document.getElementById('defrag-loading');
                     if (loading) loading.style.display = 'none';
+
+                    // Phase B #10 — mirror inline defrag stat panel
+                    // writes from rt.getState().stats. 250 ms poll is
+                    // the same cadence the inline path used via SSE
+                    // coalescing (imperceptible delay; cheap on the
+                    // cached stats).
+                    var statEls = {
+                        total:     document.getElementById('defrag-total'),
+                        chainLen:  document.getElementById('defrag-chain-len'),
+                        verified:  document.getElementById('defrag-verified'),
+                        mine:      document.getElementById('defrag-mine'),
+                        stale:     document.getElementById('defrag-stale'),
+                        dead:      document.getElementById('defrag-dead'),
+                        fee:       document.getElementById('defrag-fee'),
+                        v36native: document.getElementById('defrag-v36native'),
+                        v36sig:    document.getElementById('defrag-v36sig'),
+                        blocks:    document.getElementById('defrag-blocks'),
+                    };
+                    var statTimer = null;
+                    var lastTipWritten = null;
+                    function startStatPoll() {
+                        if (statTimer !== null) return;
+                        statTimer = setInterval(writeStats, 250);
+                        writeStats();
+                    }
+                    function writeStats() {
+                        if (!window.__explorerBundled) return;
+                        var state = window.__explorerBundled.getState();
+                        // Cache identity gate — only touch the DOM when
+                        // the stats object actually changes.
+                        if (state.lastAppliedTip === lastTipWritten) return;
+                        lastTipWritten = state.lastAppliedTip;
+                        var s = state.stats;
+                        if (statEls.total)     statEls.total.textContent     = String(s.shares);
+                        if (statEls.chainLen)  statEls.chainLen.textContent  = s.chainLength !== null ? String(s.chainLength) : '-';
+                        if (statEls.verified)  statEls.verified.textContent  = String(s.verified);
+                        if (statEls.mine)      statEls.mine.textContent      = String(s.mine);
+                        if (statEls.stale)     statEls.stale.textContent     = String(s.stale);
+                        if (statEls.dead)      statEls.dead.textContent      = String(s.dead);
+                        if (statEls.fee)       statEls.fee.textContent       = String(s.fee);
+                        if (statEls.v36native) statEls.v36native.textContent = String(s.v36native);
+                        if (statEls.v36sig)    statEls.v36sig.textContent    = String(s.v36signaling);
+                        if (statEls.blocks)    statEls.blocks.textContent    = s.primaryBlocks + ' LTC / ' + s.dogeBlocks + ' DOGE';
+                    }
+                    window.addEventListener('beforeunload', function() {
+                        if (statTimer !== null) clearInterval(statTimer);
+                    });
                 })
                 .catch(function(err) {
                     console.error('[c2pool bundled] failed to load bundle', err);

@@ -55,6 +55,7 @@ export {
   type RealtimeDOMOptions,
   type RealtimeController,
   type RealtimeState,
+  type RealtimeStats,
   type LayoutParams,
 } from './realtime.js';
 export {

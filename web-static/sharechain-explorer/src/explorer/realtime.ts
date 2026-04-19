@@ -86,6 +86,20 @@ export interface RealtimeConfig {
   onError?: (err: ExplorerError) => void;
 }
 
+export interface RealtimeStats {
+  shares: number;
+  chainLength: number | null;
+  verified: number;
+  mine: number;
+  stale: number;         // share.s === 1
+  dead: number;          // share.s === 2
+  fee: number;           // share.fee truthy
+  v36native: number;     // share.V >= shareVersion threshold
+  v36signaling: number;  // share.V < threshold && share.dv >= threshold
+  primaryBlocks: number;
+  dogeBlocks: number;
+}
+
 export interface RealtimeState {
   window: WindowSnapshot<ShareForClassify>;
   animating: boolean;
@@ -94,6 +108,7 @@ export interface RealtimeState {
   shareCount: number;
   lastAppliedTip: string | null;
   deltaInFlight: boolean;
+  stats: RealtimeStats;
 }
 
 /** Pure state machine — no DOM, no requestAnimationFrame. Drive it
@@ -114,6 +129,8 @@ export class RealtimeOrchestrator {
   private _pendingTip: string | null = null;
   private _hasQueued = false;
   private _currentLayout: GridLayout | null = null;
+  private _statsCache: RealtimeStats | null = null;
+  private _statsTipAtCompute: string | null = null;
 
   constructor(config: RealtimeConfig) {
     const layoutParams: LayoutParams = {
@@ -169,7 +186,43 @@ export class RealtimeOrchestrator {
       shareCount: this.window.shares.length,
       lastAppliedTip: this._lastAppliedTip,
       deltaInFlight: this._deltaInFlight,
+      stats: this.currentStats(),
     };
+  }
+
+  /** Compute a stat snapshot from the current window. Cached by
+   *  tip-hash so repeated polls on the same tip are O(1). */
+  private currentStats(): RealtimeStats {
+    if (this._statsCache !== null && this._statsTipAtCompute === this._lastAppliedTip) {
+      return this._statsCache;
+    }
+    const threshold = this.config.userContext.shareVersion;
+    const myAddr = this.config.userContext.myAddress;
+    const s: RealtimeStats = {
+      shares: this.window.shares.length,
+      chainLength: this.window.chainLength ?? null,
+      verified: 0,
+      mine: 0,
+      stale: 0,
+      dead: 0,
+      fee: 0,
+      v36native: 0,
+      v36signaling: 0,
+      primaryBlocks: this.window.primaryBlocks?.length ?? 0,
+      dogeBlocks: this.window.dogeBlocks?.length ?? 0,
+    };
+    for (const share of this.window.shares) {
+      if (share.s === 2) s.dead++;
+      else if (share.s === 1) s.stale++;
+      if (share.v) s.verified++;
+      if (share.fee) s.fee++;
+      if (myAddr !== undefined && myAddr !== '' && share.m === myAddr) s.mine++;
+      if (share.V >= threshold) s.v36native++;
+      else if (share.dv >= threshold) s.v36signaling++;
+    }
+    this._statsCache = s;
+    this._statsTipAtCompute = this._lastAppliedTip;
+    return s;
   }
 
   /** Return the frame to paint at time `now`. Returns a static frame
@@ -232,12 +285,43 @@ export class RealtimeOrchestrator {
       const raw = await this.config.transport.fetchWindow(opts);
       const shares = this.extractShares(raw);
       const tip = shares.length > 0 ? this.config.hashOf(shares[0]!) : undefined;
-      this.window = tip !== undefined ? { shares, tip } : { shares };
+      const meta = this.extractMeta(raw);
+      this.window = {
+        shares,
+        ...(tip !== undefined ? { tip } : {}),
+        ...meta,
+      };
       this._lastAppliedTip = tip ?? null;
+      this._statsCache = null;  // invalidate cache for new window
       this.anim.reset();
     } catch (err) {
       this.emitError(err);
     }
+  }
+
+  /** Capture optional top-level metadata (chain_length, blocks,
+   *  doge_blocks) from window / delta responses. Returns only defined
+   *  fields so exactOptionalPropertyTypes stays happy. */
+  private extractMeta(raw: unknown): {
+    chainLength?: number;
+    primaryBlocks?: readonly string[];
+    dogeBlocks?: readonly string[];
+  } {
+    if (raw === null || typeof raw !== 'object') return {};
+    const obj = raw as Record<string, unknown>;
+    const out: {
+      chainLength?: number;
+      primaryBlocks?: readonly string[];
+      dogeBlocks?: readonly string[];
+    } = {};
+    if (typeof obj.chain_length === 'number') out.chainLength = obj.chain_length;
+    if (Array.isArray(obj.blocks)) {
+      out.primaryBlocks = obj.blocks.filter((x): x is string => typeof x === 'string');
+    }
+    if (Array.isArray(obj.doge_blocks)) {
+      out.dogeBlocks = obj.doge_blocks.filter((x): x is string => typeof x === 'string');
+    }
+    return out;
   }
 
   private subscribe(): void {
@@ -317,12 +401,32 @@ export class RealtimeOrchestrator {
     const oldLayout = this._currentLayout ?? this.updateLayout();
     const merge = mergeDelta(this.window, delta, { windowSize: this.config.windowSize });
 
-    // Swap state.
+    // Swap state. Re-capture any top-level meta from the delta body
+    // (chain_length + block lists — spec §5.3 keeps them mirrored).
+    const deltaMeta = this.extractMeta(raw);
     const newTip = merge.tip;
-    this.window = newTip !== undefined
-      ? { shares: merge.shares as readonly ShareForClassify[], tip: newTip }
-      : { shares: merge.shares as readonly ShareForClassify[] };
+    const newShares = merge.shares as readonly ShareForClassify[];
+    this.window = {
+      shares: newShares,
+      ...(newTip !== undefined ? { tip: newTip } : {}),
+      ...(deltaMeta.chainLength !== undefined
+          ? { chainLength: deltaMeta.chainLength }
+          : this.window.chainLength !== undefined
+          ? { chainLength: this.window.chainLength }
+          : {}),
+      ...(deltaMeta.primaryBlocks !== undefined
+          ? { primaryBlocks: deltaMeta.primaryBlocks }
+          : this.window.primaryBlocks !== undefined
+          ? { primaryBlocks: this.window.primaryBlocks }
+          : {}),
+      ...(deltaMeta.dogeBlocks !== undefined
+          ? { dogeBlocks: deltaMeta.dogeBlocks }
+          : this.window.dogeBlocks !== undefined
+          ? { dogeBlocks: this.window.dogeBlocks }
+          : {}),
+    };
     this._lastAppliedTip = newTip ?? null;
+    this._statsCache = null;  // invalidate cache after merge
 
     if (merge.forkSwitch) {
       // Can't smoothly animate a reorg — full refresh.

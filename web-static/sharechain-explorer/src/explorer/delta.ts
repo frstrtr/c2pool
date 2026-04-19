@@ -27,6 +27,12 @@ export interface DeltaShare {
 export interface WindowSnapshot<S extends DeltaShare = DeltaShare> {
   shares: readonly S[];  // newest first (shares[0] is the tip)
   tip?: string;          // short-hash of current tip
+  // Optional metadata captured from /sharechain/window and kept in
+  // sync across merges. Used by the stat-panel emission (Phase B #10)
+  // to preserve parity with the inline dashboard.html renderer.
+  chainLength?: number | undefined;
+  primaryBlocks?: readonly string[] | undefined;
+  dogeBlocks?: readonly string[] | undefined;
 }
 
 export interface DeltaPayload<S extends DeltaShare = DeltaShare> {

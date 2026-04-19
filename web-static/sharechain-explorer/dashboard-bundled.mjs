@@ -72,12 +72,20 @@ function startStatsLoop() {
   statsTimer = setInterval(() => {
     if (!rt) return;
     const s = rt.getState();
-    statsEl.textContent =
-      `${s.shareCount} shares` +
-      (s.window.tip ? ` — tip ${s.window.tip.slice(0, 12)}…` : '') +
-      (s.animating ? ' — animating' : '') +
-      (s.hasQueued ? ' (queued)' : '') +
-      (s.deltaInFlight ? ' — fetching' : '');
+    const st = s.stats;
+    const parts = [
+      `${s.shareCount} shares`,
+      s.window.tip ? `tip ${s.window.tip.slice(0, 12)}…` : null,
+      st.chainLength !== null ? `chain ${st.chainLength}` : null,
+      `v36 ${st.v36native}/${st.v36signaling}`,
+      st.mine > 0 ? `mine ${st.mine}` : null,
+      st.stale + st.dead > 0 ? `stale ${st.stale}·${st.dead}` : null,
+      st.primaryBlocks + st.dogeBlocks > 0 ? `blocks ${st.primaryBlocks}·${st.dogeBlocks}` : null,
+      s.animating ? 'animating' : null,
+      s.hasQueued ? 'queued' : null,
+      s.deltaInFlight ? 'fetching' : null,
+    ].filter(Boolean);
+    statsEl.textContent = parts.join(' — ');
   }, 250);
 }
 
