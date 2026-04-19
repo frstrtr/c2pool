@@ -26,14 +26,21 @@ export function createHttpTransport(opts: HttpTransportOptions): Transport {
   const base = opts.baseUrl.replace(/\/+$/, '');
   const url = (path: string) => `${base}${path}`;
 
-  const doGet = async (path: string, signal?: AbortSignal): Promise<unknown> => {
+  const doGet = async (
+    path: string,
+    reqOpts?: RequestOptions,
+  ): Promise<unknown> => {
     const headers: Record<string, string> = { Accept: 'application/json' };
     if (opts.authHeader !== undefined) {
       const h = typeof opts.authHeader === 'string' ? opts.authHeader : await opts.authHeader();
       if (h) headers.Authorization = h;
     }
+    // Middleware-injected headers take precedence.
+    if (reqOpts?.headers) {
+      for (const [k, v] of Object.entries(reqOpts.headers)) headers[k] = v;
+    }
     const fetchInit: RequestInit = { method: 'GET', headers };
-    if (signal !== undefined) fetchInit.signal = signal;
+    if (reqOpts?.signal !== undefined) fetchInit.signal = reqOpts.signal;
     const resp = await fetch(url(path), fetchInit);
     if (!resp.ok) {
       const retryAfterHeader = resp.headers.get('Retry-After');
@@ -50,25 +57,25 @@ export function createHttpTransport(opts: HttpTransportOptions): Transport {
 
   return {
     kind: 'http',
-    fetchWindow:        (o) => doGet('/sharechain/window', o?.signal),
-    fetchTip:           (o) => doGet('/sharechain/tip', o?.signal),
+    fetchWindow:        (o) => doGet('/sharechain/window', o),
+    fetchTip:           (o) => doGet('/sharechain/tip', o),
     fetchDelta:         (since, o) =>
-      doGet(`/sharechain/delta?since=${encodeURIComponent(since)}`, o?.signal),
-    fetchStats:         (o) => doGet('/sharechain/stats', o?.signal),
+      doGet(`/sharechain/delta?since=${encodeURIComponent(since)}`, o),
+    fetchStats:         (o) => doGet('/sharechain/stats', o),
     fetchShareDetail:   (h, o) =>
-      doGet(`/web/share/${encodeURIComponent(h)}`, o?.signal),
+      doGet(`/web/share/${encodeURIComponent(h)}`, o),
     negotiate:          async (o) => {
       try {
-        const r = (await doGet('/api/negotiate', o?.signal)) as { apiVersion?: unknown };
+        const r = (await doGet('/api/negotiate', o)) as { apiVersion?: unknown };
         if (typeof r?.apiVersion === 'string') return { apiVersion: r.apiVersion };
       } catch {
         // negotiate endpoint not mandatory; fall through to default
       }
       return { apiVersion: opts.clientApiVersion ?? '1.0' } satisfies NegotiateResult;
     },
-    fetchCurrentPayouts: (o) => doGet('/pplns/current', o?.signal),
+    fetchCurrentPayouts: (o) => doGet('/pplns/current', o),
     fetchMinerDetail:    (addr, o) =>
-      doGet(`/pplns/miner/${encodeURIComponent(addr)}`, o?.signal),
+      doGet(`/pplns/miner/${encodeURIComponent(addr)}`, o),
 
     subscribeStream(onTip, onError, onReconnect): StreamSubscription {
       const EventSourceCtor =

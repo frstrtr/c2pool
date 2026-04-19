@@ -17,6 +17,8 @@ export interface NegotiateResult {
 
 export interface RequestOptions {
   signal?: AbortSignal;
+  /** Additional request headers, mergeable by middleware (e.g. auth). */
+  headers?: Record<string, string>;
 }
 
 export interface StreamSubscription {

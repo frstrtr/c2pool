@@ -12,7 +12,7 @@ export const ErrorTaxonomyMiddleware: PluginDescriptor = {
   sdk: '^1.0',
   kind: 'middleware',
   middlewareOf: 'transport',
-  priority: 100,  // outermost
+  priority: 50,  // innermost (wraps terminal); retries + cache see normalised errors
 
   async request(req, next) {
     try {

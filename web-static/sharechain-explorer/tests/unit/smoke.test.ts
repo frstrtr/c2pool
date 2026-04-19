@@ -141,7 +141,16 @@ test('Middleware chain: error-taxonomy normalises thrown errors', async () => {
     ...mockTransport(),
     fetchWindow: async () => { throw { status: 429, retryAfter: 2000 }; },
   };
-  await host.init({ kind: 'shared-core', transport: angryTransport });
+  // Bound retries and skip timeout so this test fences in ~ms, not the
+  // D7 unbounded production default.
+  await host.init({
+    kind: 'shared-core',
+    transport: angryTransport,
+    plugins: {
+      'core.transport.retry': { baseMs: 1, capMs: 2, multiplier: 2, jitterPct: 0, maxAttempts: 1 },
+      'core.transport.timeout': false,
+    },
+  });
   const wrapped = host.transport!;
   await assert.rejects(
     async () => { await wrapped.fetchWindow(); },

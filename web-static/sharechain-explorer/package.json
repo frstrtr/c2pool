@@ -15,7 +15,7 @@
     "build": "node esbuild.config.mjs",
     "build:dev": "node esbuild.config.mjs --dev",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test tests/unit/*.test.ts",
+    "test": "node --import tsx --test \"tests/unit/*.test.ts\"",
     "manifest": "node scripts/emit-manifest.mjs",
     "clean": "rm -rf dist"
   },

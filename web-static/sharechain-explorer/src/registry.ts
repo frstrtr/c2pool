@@ -39,7 +39,14 @@ export interface PluginDescriptor {
   middlewareOf?: 'transport' | 'events';
   priority?: number;
   permissions?: readonly Permission[];
-  defaultConfig?: Readonly<Record<string, unknown>>;
+  /** Plugin-defined default config. Opaque to the SDK; the plugin
+   *  asserts its own shape internally. */
+  defaultConfig?: Readonly<object>;
+
+  /** Capability implementations keyed by capability name. Consumers
+   *  fetch via `host.getCapability<T>(name)`. Value is opaque to the
+   *  SDK — plugin authors document the shape they expose. */
+  capabilities?: Record<string, unknown>;
 
   init?(host: HostFacade, config: unknown): Promise<void> | void;
   activate?(ctx: ActivationContext): Promise<void> | void;

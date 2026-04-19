@@ -159,6 +159,13 @@ export class Host implements HostFacade {
     return this.registry.capabilities(name, explicit)[0];
   }
 
+  /** Resolve a capability and return its impl value. Caller supplies the
+   *  expected type; no runtime type checking. */
+  getCapability<T = unknown>(name: string): T | undefined {
+    const p = this.resolveCapability(name);
+    return p?.capabilities?.[name] as T | undefined;
+  }
+
   /** Tracks an async operation so destroy() can await it. */
   track<T>(p: Promise<T>): Promise<T> {
     return this.pending.track(p);

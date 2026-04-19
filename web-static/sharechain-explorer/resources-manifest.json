@@ -1,6 +1,6 @@
 {
   "version": "0.1.0-alpha",
-  "generated": "2026-04-19T15:40:03.757Z",
+  "generated": "2026-04-19T16:12:16.144Z",
   "files": [
     "shared-core.js"
   ],
@@ -8,11 +8,11 @@
     "shared-core.js.map"
   ],
   "integrity": {
-    "shared-core.js": "sha384-iUgVSSREOIew5HhvHBXYlt4cdwk9SBJ/v/taCLQlDunVHO8dNJq07jynf2WAZuHs",
-    "shared-core.js.map": "sha384-mE7iNNX9yvCv1uqXaoLR+p8NVWg0I4Bhkr5nONPkAvgKE9zVVaPNlOJ09o18wTFC"
+    "shared-core.js": "sha384-fLK/ciO7Ip2VNtUazZBKnenRgTfVKRjVYUCGQCnZgovE6Y/l+jpxBZkziKl21EBw",
+    "shared-core.js.map": "sha384-cNe7eMGecoXitiz9msnxaJ9mEZUWLhnGDyhpk9Xe4UOjKZ909m17gYWKJo6yTEwT"
   },
   "sizes": {
-    "shared-core.js": 13344,
-    "shared-core.js.map": 61556
+    "shared-core.js": 25700,
+    "shared-core.js.map": 113705
   }
 }
