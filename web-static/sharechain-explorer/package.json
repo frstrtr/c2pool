@@ -17,6 +17,8 @@
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test \"tests/unit/*.test.ts\"",
     "manifest": "node scripts/emit-manifest.mjs",
+    "size": "node scripts/check-bundle-size.mjs",
+    "verify": "npm run typecheck && npm run build && npm test && npm run manifest && npm run size",
     "clean": "rm -rf dist"
   },
   "devDependencies": {
