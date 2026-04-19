@@ -33,6 +33,11 @@ export interface WindowSnapshot<S extends DeltaShare = DeltaShare> {
   chainLength?: number | undefined;
   primaryBlocks?: readonly string[] | undefined;
   dogeBlocks?: readonly string[] | undefined;
+  // PPLNS data captured from /sharechain/window pplns_current +
+  // pplns fields (Phase B #12 hover-zoom). Orchestrator stores
+  // parsed PPLNSEntry[] so render paths don't re-parse on hover.
+  pplnsCurrent?: ReadonlyArray<{ addr: string; amt: number; pct: number }> | undefined;
+  pplnsByShare?: ReadonlyMap<string, ReadonlyArray<{ addr: string; amt: number; pct: number }>> | undefined;
 }
 
 export interface DeltaPayload<S extends DeltaShare = DeltaShare> {

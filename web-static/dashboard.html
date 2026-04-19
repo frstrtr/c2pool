@@ -8151,9 +8151,57 @@
                         window.__explorerBundled = rt;
                         console.info('[c2pool bundled] Explorer started');
                         startStatPoll();
+                        startHoverZoom();
                     });
                     var loading = document.getElementById('defrag-loading');
                     if (loading) loading.style.display = 'none';
+
+                    // Phase B #12 — hover-zoom per-share PPLNS treemap.
+                    // Mirrors dashboard.html:5686+ via bundled plugin.
+                    var hoverPanel = null;
+                    var hoveredIdx = -1;
+                    function startHoverZoom() {
+                        hoverPanel = mod.createHoverZoomPanel({ size: 240 });
+                        canvas.addEventListener('mousemove', onMouseMove);
+                        canvas.addEventListener('mouseleave', onMouseLeave);
+                    }
+                    function onMouseMove(ev) {
+                        if (!window.__explorerBundled) return;
+                        var state = window.__explorerBundled.getState();
+                        var shares = state.window.shares;
+                        if (shares.length === 0) return;
+                        var layout = mod.computeGridLayout({
+                            shareCount: shares.length,
+                            containerWidth: wrap.clientWidth,
+                            cellSize: 10,
+                            gap: 1,
+                            marginLeft: 38,
+                            minHeight: 40,
+                        });
+                        var rect = canvas.getBoundingClientRect();
+                        var x = ev.clientX - rect.left;
+                        var y = ev.clientY - rect.top;
+                        var idx = mod.cellAtPoint(layout, x, y);
+                        if (idx === null) {
+                            if (hoveredIdx !== -1) { hoveredIdx = -1; hoverPanel.hide(); }
+                            return;
+                        }
+                        if (idx === hoveredIdx) return;
+                        hoveredIdx = idx;
+                        var share = shares[idx];
+                        if (!share) { hoverPanel.hide(); return; }
+                        var pplns = window.__explorerBundled.getPPLNSForShare(share.h);
+                        var myAddr = (window.currency_info && window.currency_info.my_address) || undefined;
+                        hoverPanel.show(
+                            { h: share.h, m: share.m },
+                            pplns,
+                            ev.clientX, ev.clientY,
+                            myAddr ? { myAddress: myAddr } : undefined,
+                        );
+                    }
+                    function onMouseLeave() {
+                        if (hoveredIdx !== -1) { hoveredIdx = -1; hoverPanel && hoverPanel.hide(); }
+                    }
 
                     // Phase B #10 — mirror inline defrag stat panel
                     // writes from rt.getState().stats. 250 ms poll is

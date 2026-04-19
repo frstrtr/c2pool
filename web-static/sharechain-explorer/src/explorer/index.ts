@@ -59,6 +59,20 @@ export {
   type LayoutParams,
 } from './realtime.js';
 export {
+  PPLNSPlugin,
+  parsePPLNS,
+  type PPLNSEntry,
+} from './pplns.js';
+export {
+  HoverZoomPlugin,
+  buildHoverZoomProgram,
+  createHoverZoomPanel,
+  type HoverZoomBuildOptions,
+  type HoverZoomPanel,
+  type HoverZoomPanelOptions,
+  type HoverZoomShare,
+} from './hover-zoom.js';
+export {
   DeltaMergerPlugin,
   mergeDelta,
   type DeltaShare,
@@ -95,6 +109,8 @@ import { DeltaMergerPlugin as _delta } from './delta.js';
 import { AnimatorPlugin as _anim } from './animator.js';
 import { ColorUtilsPlugin as _cu } from './color-utils.js';
 import { RealtimePlugin as _rt } from './realtime.js';
+import { PPLNSPlugin as _pplns } from './pplns.js';
+import { HoverZoomPlugin as _hover } from './hover-zoom.js';
 
 /** Register SharedCore baseline plus Explorer-specific plugins. */
 export function registerExplorerBaseline(host: Host): void {
@@ -106,4 +122,6 @@ export function registerExplorerBaseline(host: Host): void {
   host.registry.register(_anim);
   host.registry.register(_cu);
   host.registry.register(_rt);
+  host.registry.register(_pplns);
+  host.registry.register(_hover);
 }

@@ -12,6 +12,9 @@
 import {
   createHttpTransport,
   createRealtime,
+  createHoverZoomPanel,
+  computeGridLayout,
+  cellAtPoint,
 } from './dist/sharechain-explorer.js';
 
 const params   = new URL(location.href).searchParams;
@@ -62,6 +65,8 @@ function setStatus(label, kind = '') {
 // ── Connection state ────────────────────────────────────────────
 let rt = null;
 let statsTimer = null;
+let hoverPanel = null;
+let hoveredIdx = -1;
 
 function stopStatsLoop() {
   if (statsTimer !== null) { clearInterval(statsTimer); statsTimer = null; }
@@ -122,11 +127,62 @@ async function connect() {
     setStatus('connected', 'ok');
     log('info', 'connected');
     startStatsLoop();
+    startHover();
     window.__explorer = rt;
   } catch (err) {
     setStatus('connection failed', 'err');
     log('error', String(err?.message ?? err));
   }
+}
+
+function startHover() {
+  stopHover();
+  hoverPanel = createHoverZoomPanel({ size: 240 });
+  canvas.addEventListener('mousemove', onMouseMove);
+  canvas.addEventListener('mouseleave', onMouseLeave);
+}
+function stopHover() {
+  canvas.removeEventListener('mousemove', onMouseMove);
+  canvas.removeEventListener('mouseleave', onMouseLeave);
+  if (hoverPanel) { hoverPanel.destroy(); hoverPanel = null; }
+  hoveredIdx = -1;
+}
+function onMouseMove(ev) {
+  if (!rt || !hoverPanel) return;
+  const state = rt.getState();
+  const shares = state.window.shares;
+  if (shares.length === 0) return;
+  const layout = computeGridLayout({
+    shareCount: shares.length,
+    containerWidth: wrap.clientWidth,
+    cellSize: 10,
+    gap: 1,
+    marginLeft: 38,
+    minHeight: 40,
+  });
+  const rect = canvas.getBoundingClientRect();
+  const x = ev.clientX - rect.left;
+  const y = ev.clientY - rect.top;
+  const idx = cellAtPoint(layout, x, y);
+  if (idx === null) {
+    if (hoveredIdx !== -1) { hoveredIdx = -1; hoverPanel.hide(); }
+    return;
+  }
+  if (idx === hoveredIdx) return;
+  hoveredIdx = idx;
+  const share = shares[idx];
+  if (!share) { hoverPanel.hide(); return; }
+  const pplns = rt.getPPLNSForShare(share.h);
+  const myAddr = addrInput.value.trim();
+  hoverPanel.show(
+    { h: share.h, m: share.m },
+    pplns,
+    ev.clientX, ev.clientY,
+    myAddr ? { myAddress: myAddr } : undefined,
+  );
+}
+function onMouseLeave() {
+  if (hoveredIdx !== -1) { hoveredIdx = -1; hoverPanel && hoverPanel.hide(); }
 }
 
 async function disconnect() {
@@ -137,6 +193,7 @@ async function disconnect() {
     window.__explorer = null;
   }
   stopStatsLoop();
+  stopHover();
   setStatus('idle');
   statsEl.textContent = '';
 }

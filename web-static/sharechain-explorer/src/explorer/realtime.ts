@@ -39,6 +39,7 @@ import {
   type DeltaPayload,
   type WindowSnapshot,
 } from './delta.js';
+import { parsePPLNS, type PPLNSEntry } from './pplns.js';
 import {
   buildAnimationPlan,
   createAnimationController,
@@ -235,6 +236,30 @@ export class RealtimeOrchestrator {
     return this.buildStaticFrame();
   }
 
+  /** Return the PPLNS distribution for a specific share, falling back
+   *  (per dashboard.html:5647-5663): exact hash match → walk backward
+   *  (toward newer shares) for nearest cached entry → pplns_current. */
+  getPPLNSForShare(shortHash: string | undefined): readonly PPLNSEntry[] {
+    if (shortHash !== undefined && this.window.pplnsByShare) {
+      const exact = this.window.pplnsByShare.get(shortHash);
+      if (exact !== undefined) return exact;
+      // Walk toward head (newer) from share's index.
+      const shares = this.window.shares;
+      for (let i = 0; i < shares.length; i++) {
+        const s = shares[i]!;
+        if (this.config.hashOf(s) === shortHash) {
+          for (let j = i; j >= 0; j--) {
+            const cand = this.config.hashOf(shares[j]!);
+            const got = this.window.pplnsByShare.get(cand);
+            if (got !== undefined) return got;
+          }
+          break;
+        }
+      }
+    }
+    return this.window.pplnsCurrent ?? [];
+  }
+
   /** Render a static snapshot frame (no animation). */
   buildStaticFrame(): FrameSpec | null {
     const layout = this.updateLayout();
@@ -299,13 +324,16 @@ export class RealtimeOrchestrator {
     }
   }
 
-  /** Capture optional top-level metadata (chain_length, blocks,
-   *  doge_blocks) from window / delta responses. Returns only defined
-   *  fields so exactOptionalPropertyTypes stays happy. */
+  /** Capture optional top-level metadata from window / delta
+   *  responses: chain_length, blocks, doge_blocks, pplns_current,
+   *  pplns. Returns only defined fields so exactOptionalPropertyTypes
+   *  stays happy. */
   private extractMeta(raw: unknown): {
     chainLength?: number;
     primaryBlocks?: readonly string[];
     dogeBlocks?: readonly string[];
+    pplnsCurrent?: readonly PPLNSEntry[];
+    pplnsByShare?: ReadonlyMap<string, readonly PPLNSEntry[]>;
   } {
     if (raw === null || typeof raw !== 'object') return {};
     const obj = raw as Record<string, unknown>;
@@ -313,6 +341,8 @@ export class RealtimeOrchestrator {
       chainLength?: number;
       primaryBlocks?: readonly string[];
       dogeBlocks?: readonly string[];
+      pplnsCurrent?: readonly PPLNSEntry[];
+      pplnsByShare?: ReadonlyMap<string, readonly PPLNSEntry[]>;
     } = {};
     if (typeof obj.chain_length === 'number') out.chainLength = obj.chain_length;
     if (Array.isArray(obj.blocks)) {
@@ -320,6 +350,18 @@ export class RealtimeOrchestrator {
     }
     if (Array.isArray(obj.doge_blocks)) {
       out.dogeBlocks = obj.doge_blocks.filter((x): x is string => typeof x === 'string');
+    }
+    if (obj.pplns_current !== undefined) {
+      const parsed = parsePPLNS(obj.pplns_current);
+      if (parsed.length > 0) out.pplnsCurrent = parsed;
+    }
+    if (obj.pplns !== null && typeof obj.pplns === 'object' && !Array.isArray(obj.pplns)) {
+      const m = new Map<string, readonly PPLNSEntry[]>();
+      for (const [shortHash, payload] of Object.entries(obj.pplns as Record<string, unknown>)) {
+        const parsed = parsePPLNS(payload);
+        if (parsed.length > 0) m.set(shortHash, parsed);
+      }
+      if (m.size > 0) out.pplnsByShare = m;
     }
     return out;
   }
@@ -402,8 +444,33 @@ export class RealtimeOrchestrator {
     const merge = mergeDelta(this.window, delta, { windowSize: this.config.windowSize });
 
     // Swap state. Re-capture any top-level meta from the delta body
-    // (chain_length + block lists — spec §5.3 keeps them mirrored).
+    // (chain_length + block lists + pplns — spec §5.3 keeps them
+    // mirrored). PPLNS maps merge additively: delta entries win;
+    // prior entries survive if not overridden.
     const deltaMeta = this.extractMeta(raw);
+    let mergedPplnsByShare: ReadonlyMap<string, readonly PPLNSEntry[]> | undefined;
+    if (deltaMeta.pplnsByShare !== undefined || this.window.pplnsByShare !== undefined) {
+      const combined = new Map<string, readonly PPLNSEntry[]>();
+      if (this.window.pplnsByShare !== undefined) {
+        for (const [h, e] of this.window.pplnsByShare) combined.set(h, e);
+      }
+      if (deltaMeta.pplnsByShare !== undefined) {
+        for (const [h, e] of deltaMeta.pplnsByShare) combined.set(h, e);
+      }
+      // Bound growth: cap at 2 × windowSize (matches architecture doc
+      // §2 "up to 10000 entries" with the LRU rule from delta v1 §C.2).
+      const cap = this.config.windowSize * 2;
+      if (combined.size > cap) {
+        const toDrop = combined.size - cap;
+        const it = combined.keys();
+        for (let i = 0; i < toDrop; i++) {
+          const k = it.next();
+          if (k.done) break;
+          combined.delete(k.value);
+        }
+      }
+      mergedPplnsByShare = combined;
+    }
     const newTip = merge.tip;
     const newShares = merge.shares as readonly ShareForClassify[];
     this.window = {
@@ -424,6 +491,12 @@ export class RealtimeOrchestrator {
           : this.window.dogeBlocks !== undefined
           ? { dogeBlocks: this.window.dogeBlocks }
           : {}),
+      ...(deltaMeta.pplnsCurrent !== undefined
+          ? { pplnsCurrent: deltaMeta.pplnsCurrent }
+          : this.window.pplnsCurrent !== undefined
+          ? { pplnsCurrent: this.window.pplnsCurrent }
+          : {}),
+      ...(mergedPplnsByShare !== undefined ? { pplnsByShare: mergedPplnsByShare } : {}),
     };
     this._lastAppliedTip = newTip ?? null;
     this._statsCache = null;  // invalidate cache after merge
@@ -515,6 +588,8 @@ export interface RealtimeController {
   stop(): Promise<void>;
   refresh(): Promise<void>;
   getState(): Readonly<RealtimeState>;
+  /** PPLNS distribution for a specific share (hover-zoom lookup). */
+  getPPLNSForShare(shortHash: string | undefined): readonly PPLNSEntry[];
 }
 
 export function createRealtime(opts: RealtimeDOMOptions): RealtimeController {
@@ -556,6 +631,7 @@ export function createRealtime(opts: RealtimeDOMOptions): RealtimeController {
     },
     refresh: () => orchestrator.refresh(),
     getState: () => orchestrator.getState(),
+    getPPLNSForShare: (h) => orchestrator.getPPLNSForShare(h),
   };
 }
 
