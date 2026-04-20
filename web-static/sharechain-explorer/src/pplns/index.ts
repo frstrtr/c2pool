@@ -15,6 +15,11 @@ import { parseSnapshot, parseMinerDetail } from './parse.js';
 import { render, resolveContainer } from './render.js';
 import { LTC_COIN_PPLNS_DESCRIPTOR } from './classify.js';
 import { renderMinerDetail, type DetailPanelHandle } from './detail.js';
+import {
+  renderToolbar,
+  minerVersionKey,
+  type ToolbarState,
+} from './toolbar.js';
 import type {
   PplnsController,
   PplnsEvent,
@@ -92,6 +97,43 @@ function buildController(
   let detailPanel: DetailPanelHandle | null = null;
   let detailAbortCtl: AbortController | null = null;
 
+  // Split the caller's container into a toolbar row + grid area so
+  // render() can clear the grid without wiping the toolbar. When
+  // showToolbar is false the grid takes the full container.
+  const showToolbar = options.showToolbar ?? true;
+  while (container.firstChild !== null) {
+    container.removeChild(container.firstChild);
+  }
+  container.style.display = 'flex';
+  container.style.flexDirection = 'column';
+  const toolbarEl = showToolbar ? document.createElement('div') : null;
+  if (toolbarEl !== null) {
+    toolbarEl.style.flex = '0 0 auto';
+    container.appendChild(toolbarEl);
+  }
+  const gridEl = document.createElement('div');
+  gridEl.style.flex = '1 1 auto';
+  gridEl.style.minHeight = '0';
+  gridEl.style.position = 'relative';
+  container.appendChild(gridEl);
+
+  // Version-filter state lives alongside the existing filter (options.filter
+  // still applies as an outer and; toolbar chips refine further).
+  let versionKeys: Set<string> = new Set();
+  const applyCombinedFilter = (): void => {
+    const userFilter = options.filter ?? null;
+    if (versionKeys.size === 0) {
+      state.filter = userFilter;
+      return;
+    }
+    const keys = versionKeys;
+    const predicate = (m: PplnsMiner): boolean => {
+      if (!keys.has(minerVersionKey(m, coin))) return false;
+      return userFilter === null || userFilter(m);
+    };
+    state.filter = predicate;
+  };
+
   const emit = (ev: PplnsEvent, payload: unknown) => {
     const set = listeners.get(ev);
     if (set === undefined) return;
@@ -120,7 +162,7 @@ function buildController(
         return;
       }
       detailPanel = renderMinerDetail({
-        host: container,
+        host: gridEl,
         detail,
         coin,
         onClose: () => { detailPanel = null; },
@@ -145,11 +187,42 @@ function buildController(
     }
   };
 
+  const paintToolbar = (): void => {
+    if (toolbarEl === null) return;
+    const ts: ToolbarState = {
+      sort:              state.sort,
+      search:            state.search ?? '',
+      activeVersionKeys: versionKeys,
+    };
+    renderToolbar({
+      host: toolbarEl,
+      state: ts,
+      snapshot: state.snapshot,
+      coin,
+      callbacks: {
+        onSortChange: (key) => {
+          state.sort = key;
+          paintFromState();
+        },
+        onSearchChange: (prefix) => {
+          state.search = prefix.length > 0 ? prefix : null;
+          paintFromState();
+        },
+        onVersionKeysChange: (next) => {
+          versionKeys = new Set(next);
+          applyCombinedFilter();
+          paintFromState();
+        },
+      },
+    });
+  };
+
   const paintFromState = () => {
     if (destroyed) return;
+    paintToolbar();
     if (state.snapshot === null) return;
     render({
-      container,
+      container: gridEl,
       snapshot: applyViewTransforms(state.snapshot, state),
       coin,
       opts: {
@@ -207,11 +280,12 @@ function buildController(
   // Initial fetch.
   void refresh();
 
-  // ResizeObserver → repaint on container resize.
+  // ResizeObserver → repaint on grid area resize. Toolbar sits above
+  // the grid and doesn't need to be observed.
   const resize = isDemo || typeof ResizeObserver === 'undefined'
     ? null
     : new ResizeObserver(() => { paintFromState(); });
-  if (resize !== null) resize.observe(container);
+  if (resize !== null) resize.observe(gridEl);
 
   const controller: PplnsController = {
     refresh,

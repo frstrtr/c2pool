@@ -142,6 +142,10 @@ export interface PplnsViewOptions {
   showVersionBadge?: boolean;
   showHashrate?: boolean;
   showMerged?: boolean;
+  /** Render the sort / filter / search toolbar above the grid.
+   *  Default true. Set false for compact embeds that supply their
+   *  own controls. */
+  showToolbar?: boolean;
   refreshIntervalMs?: number | null;
   onMinerClick?: ((miner: PplnsMiner) => void) | null;
   onMinerOpenLink?: ((miner: PplnsMiner, symbol?: string) => void) | null;
