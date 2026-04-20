@@ -14,6 +14,8 @@
 #include <QTextEdit>
 #include <QWidget>
 
+class SettingsStore;
+
 /// Daemon launch-configuration page.
 ///
 /// Provides a complete GUI form covering every important c2pool CLI flag:
@@ -33,7 +35,12 @@ class PageLaunch : public QWidget
 {
     Q_OBJECT
 public:
-    explicit PageLaunch(QWidget* parent = nullptr);
+    /** SettingsStore is optional — when passed, load/save route
+     *  through the active profile's launch group
+     *  (profiles/<active>/launch/*); when null, the legacy
+     *  top-level [launch] group is used. MainWindow passes one so
+     *  connection-profile switches reload the form correctly. */
+    explicit PageLaunch(SettingsStore* settings = nullptr, QWidget* parent = nullptr);
 
     /// Build the full shell command from current form state.
     QString buildCommand() const;
@@ -68,7 +75,12 @@ private slots:
 private:
     void setupUi();
     QGroupBox* makeGroup(const QString& title);
+    /** Return the QSettings group prefix the form persists to:
+     *  "profiles/<active>/launch" when settings_ is set,
+     *  "launch" otherwise. */
+    QString launchGroupPath() const;
 
+    SettingsStore* settings_{nullptr};
     QProcess* process_;
 
     // ── Mode / Network ──────────────────────────────────────────────────────

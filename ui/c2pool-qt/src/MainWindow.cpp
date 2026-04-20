@@ -1,8 +1,15 @@
 #include "MainWindow.hpp"
 
+#include <QAction>
 #include <QCloseEvent>
+#include <QComboBox>
 #include <QHBoxLayout>
+#include <QInputDialog>
+#include <QMenu>
+#include <QMessageBox>
+#include <QSignalBlocker>
 #include <QToolBar>
+#include <QToolButton>
 #include <QVBoxLayout>
 #include <QWidget>
 
@@ -12,9 +19,69 @@ MainWindow::MainWindow(SettingsStore* settings, QWidget* parent)
     setWindowTitle("c2pool-qt");
     resize(1200, 760);
 
-    // ── Top toolbar: Base URL + Apply / Refresh ───────────────────────────
+    // ── Top toolbar: Profile + Base URL + Apply / Refresh ─────────────────
     auto* topBar = addToolBar("Connection");
     topBar->setMovable(false);
+
+    // Connection-profile switcher (§7 step 10). Selecting an entry
+    // flips SettingsStore::activeProfile, which cascades to
+    // PageLaunch.loadSettings() + CoinBridge::coinChanged so the
+    // launch form and the embedded dashboards re-bind to the new
+    // coin without a window reload.
+    topBar->addWidget(new QLabel("Profile:", this));
+    profileCombo_ = new QComboBox(this);
+    profileCombo_->setMinimumWidth(180);
+    topBar->addWidget(profileCombo_);
+
+    auto* manageButton = new QToolButton(this);
+    manageButton->setText("\u2026");  // ellipsis
+    manageButton->setToolTip("Manage connection profiles");
+    manageButton->setPopupMode(QToolButton::InstantPopup);
+    auto* manageMenu = new QMenu(manageButton);
+    manageMenu->addAction("New profile\u2026", this, [this]() {
+        bool ok = false;
+        const QString name = QInputDialog::getText(this, tr("New profile"),
+            tr("Profile name:"), QLineEdit::Normal, QString(), &ok).trimmed();
+        if (!ok || name.isEmpty()) return;
+        if (settings_->profileNames().contains(name)) {
+            QMessageBox::warning(this, tr("New profile"),
+                tr("A profile named \"%1\" already exists.").arg(name));
+            return;
+        }
+        settings_->createProfile(name);
+        settings_->setActiveProfile(name);
+    });
+    manageMenu->addAction("Rename current\u2026", this, [this]() {
+        const QString cur = settings_->activeProfile();
+        bool ok = false;
+        const QString name = QInputDialog::getText(this, tr("Rename profile"),
+            tr("New name for \"%1\":").arg(cur),
+            QLineEdit::Normal, cur, &ok).trimmed();
+        if (!ok || name.isEmpty() || name == cur) return;
+        if (settings_->profileNames().contains(name)) {
+            QMessageBox::warning(this, tr("Rename profile"),
+                tr("A profile named \"%1\" already exists.").arg(name));
+            return;
+        }
+        settings_->renameProfile(cur, name);
+    });
+    manageMenu->addAction("Delete current", this, [this]() {
+        const QString cur = settings_->activeProfile();
+        if (settings_->profileNames().size() <= 1) {
+            QMessageBox::information(this, tr("Delete profile"),
+                tr("Cannot delete the last remaining profile."));
+            return;
+        }
+        const auto r = QMessageBox::question(this, tr("Delete profile"),
+            tr("Delete profile \"%1\"? Its launch config and secrets "
+               "will be removed.").arg(cur));
+        if (r != QMessageBox::Yes) return;
+        settings_->deleteProfile(cur);
+    });
+    manageButton->setMenu(manageMenu);
+    topBar->addWidget(manageButton);
+
+    topBar->addSeparator();
 
     baseUrlEdit_ = new QLineEdit("http://127.0.0.1:8080", this);
     baseUrlEdit_->setMinimumWidth(320);
@@ -46,7 +113,7 @@ MainWindow::MainWindow(SettingsStore* settings, QWidget* parent)
     layout->addWidget(navList_);
 
     stack_ = new QStackedWidget(central);
-    launchPage_     = new PageLaunch(stack_);
+    launchPage_     = new PageLaunch(settings_, stack_);
     overviewPage_   = new PageOverview(stack_);
     miningPage_     = new PageMining(stack_);
 
@@ -145,6 +212,40 @@ MainWindow::MainWindow(SettingsStore* settings, QWidget* parent)
         statusLabel_->setText(message);
     });
 
+    // ── Profile combo wiring ──────────────────────────────────────────────
+    reloadProfileCombo();
+    connect(profileCombo_, &QComboBox::activated, this, [this](int idx) {
+        const QString name = profileCombo_->itemText(idx);
+        if (name.isEmpty() || name == settings_->activeProfile()) return;
+        // Persist the current launch form to the outgoing profile first
+        // so edits aren't lost by the profile flip.
+        launchPage_->saveSettings();
+        settings_->setActiveProfile(name);
+    });
+    // Listen for profile/name changes (including rename/delete/set).
+    // profileChanged fires on activeProfile flip; changed(profiles/names)
+    // fires on create/rename/delete (the combo needs to repopulate).
+    connect(settings_, &SettingsStore::profileChanged, this,
+            [this](const QString& newActive) {
+                launchPage_->loadSettings();
+                // Sync the base URL too — per-profile in future, for now
+                // the form's suggested URL reflects the new launch values.
+                const QString url = launchPage_->suggestedApiBaseUrl();
+                if (!url.isEmpty()) {
+                    baseUrlEdit_->setText(url);
+                    api_.setBaseUrl(url);
+                }
+                reloadProfileCombo();
+                statusLabel_->setText(tr("Profile: %1").arg(newActive));
+                refreshCurrentPage();
+            });
+    connect(settings_, &SettingsStore::changed, this,
+            [this](const QString& key) {
+                if (key == QStringLiteral("profiles/names")) {
+                    reloadProfileCombo();
+                }
+            });
+
     loadSettings();
     launchPage_->loadSettings();
     api_.setBaseUrl(baseUrlEdit_->text());
@@ -178,6 +279,17 @@ void MainWindow::saveSettings() const
 {
     settings_->setUiBaseUrl(baseUrlEdit_->text().trimmed());
     settings_->setUiRefreshMs(refreshTimer_.interval());
+}
+
+void MainWindow::reloadProfileCombo()
+{
+    // Signal-block so repopulating doesn't fire activated and recurse
+    // through setActiveProfile.
+    const QSignalBlocker blocker(profileCombo_);
+    profileCombo_->clear();
+    profileCombo_->addItems(settings_->profileNames());
+    const int idx = profileCombo_->findText(settings_->activeProfile());
+    if (idx >= 0) profileCombo_->setCurrentIndex(idx);
 }
 
 void MainWindow::updateDaemonState(bool api_online)

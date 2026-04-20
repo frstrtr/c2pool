@@ -12,6 +12,7 @@
 #include "bridges/SettingsBridge.hpp"
 #include "bridges/SharechainBridge.hpp"
 
+#include <QComboBox>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -38,10 +39,15 @@ private:
     void updateDaemonState(bool api_online);
     void loadSettings();
     void saveSettings() const;
+    /** Rebuild the profile combo contents from SettingsStore and
+     *  select the currently active profile; signals are blocked so
+     *  this is safe to call from change handlers. */
+    void reloadProfileCombo();
 
     SettingsStore* settings_;
     ApiClient api_;
 
+    QComboBox* profileCombo_;
     QLineEdit* baseUrlEdit_;
     QListWidget* navList_;
     QStackedWidget* stack_;
