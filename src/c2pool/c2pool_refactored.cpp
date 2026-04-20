@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -8,6 +9,7 @@
 #include <csignal>
 #include <ctime>
 #include <memory>
+#include <vector>
 #ifndef _WIN32
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -517,25 +519,9 @@ int main(int argc, char* argv[]) {
     // Initialize logging
     core::log::Logger::init();
     
-    std::cout << "\n"
-#ifdef C2POOL_VERSION
-              << "  c2pool " C2POOL_VERSION " — P2Pool rebirth in C++\n"
-#else
-              << "  c2pool — P2Pool rebirth in C++\n"
-#endif
-              << "  https://github.com/frstrtr/c2pool\n"
-              << "\n"
-              << "  Distributed under the MIT/X11 software license, see the accompanying\n"
-              << "  file LICENSE or http://www.opensource.org/licenses/mit-license.php.\n"
-              << "\n"
-              << "  THIS IS EXPERIMENTAL SOFTWARE.\n"
-              << "  USE AT YOUR OWN RISK.\n"
-              << "\n"
-              << "  THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND,\n"
-              << "  EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF\n"
-              << "  MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.\n"
-              << "\n";
-    // Banner logged after file sink is configured (see post-parse section below).
+    // Banner intentionally deferred — only the bordered log-file banner is
+    // emitted (see post-parse section below). Printing an unbordered copy
+    // here too cluttered journalctl output with duplicate headers.
 
     // Default settings
     auto settings = std::make_unique<core::Settings>();
@@ -1299,28 +1285,51 @@ int main(int argc, char* argv[]) {
                  << " level=" << (log_level_str.empty() ? "trace" : log_level_str);
     }
 
-    // Banner — now goes to both console AND log file
+    // Banner — dynamic-width bordered frame, sized to the longest line
+    // so long git-describe version strings don't push a `#` past the
+    // border.
+    //
+    // Layout: "# " + " " + content + " " + " #", so the full frame width
+    // is inner + 4. The min inner-width floor keeps the frame tidy even
+    // when content is short.
+    auto frame_rows = [](const std::vector<std::string>& lines,
+                         std::vector<std::string>& out) {
+        size_t inner = 0;
+        for (const auto& l : lines) inner = std::max(inner, l.size());
+        inner = std::max<size_t>(inner, 56);
+        const std::string border(inner + 4, '#');
+        out.push_back(border);
+        for (const auto& l : lines) {
+            std::string row = "#  ";
+            row += l;
+            row.append(inner - l.size(), ' ');
+            row += "  #";
+            out.push_back(std::move(row));
+        }
+        out.push_back(border);
+    };
+
     {
-        // Build version line with padding to match 60-char border
-        std::string ver_line = "#  c2pool ";
+        std::string ver = "c2pool ";
 #ifdef C2POOL_VERSION
-        ver_line += C2POOL_VERSION;
+        ver += C2POOL_VERSION;
 #endif
-        ver_line += " -- Decentralized Mining Pool";
-        while (ver_line.size() < 59) ver_line += ' ';
-        ver_line += '#';
-        LOG_INFO << "############################################################";
-        LOG_INFO << ver_line;
-        LOG_INFO << "#  https://github.com/frstrtr/c2pool                      #";
-        LOG_INFO << "############################################################";
+        ver += " -- Decentralized Mining Pool";
+        std::vector<std::string> rows;
+        frame_rows({ver, "https://github.com/frstrtr/c2pool"}, rows);
+        for (const auto& r : rows) LOG_INFO << r;
     }
-    LOG_WARNING << "############################################################";
-    LOG_WARNING << "#  THIS IS EXPERIMENTAL SOFTWARE -- USE AT YOUR OWN RISK   #";
-    LOG_WARNING << "#  THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY      #";
-    LOG_WARNING << "#  OF ANY KIND, EXPRESS OR IMPLIED.                        #";
-    LOG_WARNING << "#  Distributed under the MIT/X11 software license          #";
-    LOG_WARNING << "#  See http://www.opensource.org/licenses/mit-license.php  #";
-    LOG_WARNING << "############################################################";
+    {
+        std::vector<std::string> rows;
+        frame_rows({
+            "THIS IS EXPERIMENTAL SOFTWARE -- USE AT YOUR OWN RISK",
+            "THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY",
+            "OF ANY KIND, EXPRESS OR IMPLIED.",
+            "Distributed under the MIT/X11 software license",
+            "See http://www.opensource.org/licenses/mit-license.php",
+        }, rows);
+        for (const auto& r : rows) LOG_WARNING << r;
+    }
 
     // -----------------------------------------------------------------------
     // Post-parse: auto-detect defaults, assemble p2pool-style merged spec
