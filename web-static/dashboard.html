@@ -37,6 +37,12 @@
             min-height: 100vh;
             line-height: 1.6;
             width: 100%;
+            /* During maximize, the OS compositor can briefly scale the
+               previous frame buffer to the new viewport — making
+               absolutely-positioned grid children momentarily appear
+               beyond viewport width. Clip at body so the user never
+               sees the transient horizontal overflow. */
+            overflow-x: hidden;
         }
         
         .container {
@@ -798,14 +804,18 @@
         .defrag-canvas-wrap {
             /* flex:1 + min-width:0 so the wrap shrinks to its flex
                slot instead of taking intrinsic (canvas-driven) width
-               during transient resize frames. Eliminates the
-               "canvas fills whole screen then shrinks to fit legend"
-               flash on maximize. */
+               during transient resize frames. `contain: layout size`
+               isolates the wrap's sizing from its canvas child so
+               the OS compositor can't scale the old pixel buffer
+               past the new flex slot during maximize. */
             flex: 1 1 0;
             min-width: 0;
+            max-width: 100%;
+            contain: layout;
         }
         .defrag-sidebar {
             flex: 0 0 220px;
+            max-width: 220px;
         }
         @media (max-width: 900px) {
             .defrag-container { flex-direction: column; }
