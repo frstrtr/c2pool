@@ -6317,13 +6317,17 @@
             });
         }
 
-        // Re-render PPLNS treemap on window resize
-        var _pplnsResizeTimer;
+        // Re-render PPLNS treemap on window resize. rAF coalesces to
+        // the browser's ~60 Hz paint cadence — smooth live resize
+        // without the 200 ms delay the previous setTimeout debouncer
+        // produced.
+        var _pplnsResizeRaf = 0;
         window.addEventListener('resize', function() {
-            clearTimeout(_pplnsResizeTimer);
-            _pplnsResizeTimer = setTimeout(function() {
+            if (_pplnsResizeRaf) return;
+            _pplnsResizeRaf = requestAnimationFrame(function() {
+                _pplnsResizeRaf = 0;
                 if (_cachedPPLNSPayouts) renderMainPPLNS(_cachedPPLNSPayouts);
-            }, 200);
+            });
         });
 
         // Create a single colored share cell (22x22 square) with tooltip + click
