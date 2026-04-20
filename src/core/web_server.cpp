@@ -3399,11 +3399,8 @@ void MiningInterface::start_pplns_precompute()
 
             // Need meaningful chain
             bool chain_ok = false;
-            if (m_sharechain_tip_fn) {
-                auto tip = m_sharechain_tip_fn();
-                if (tip.contains("height") && tip["height"].get<int>() > 100)
-                    chain_ok = true;
-            }
+            if (auto tip = get_sharechain_tip(); tip && tip->height > 100)
+                chain_ok = true;
             if (!chain_ok) continue;
 
             // Need valid work template with real block target
@@ -3608,13 +3605,10 @@ void MiningInterface::start_pplns_precompute()
 
 void MiningInterface::cache_pplns_at_tip()
 {
-    // Get current tip hash
-    std::string tip;
-    if (m_sharechain_tip_fn) {
-        auto t = m_sharechain_tip_fn();
-        if (t.contains("hash")) tip = t["hash"].get<std::string>();
-    }
-    if (tip.empty()) return;
+    // Get current tip hash — absent tip = no-op (sharechain not ready yet).
+    auto maybe_tip = get_sharechain_tip();
+    if (!maybe_tip || maybe_tip->hash.empty()) return;
+    std::string tip = maybe_tip->hash;
 
     // Compute full merged PPLNS (LTC + DOGE with donation) and cache
     auto pplns = compute_current_merged_payouts();
@@ -3758,11 +3752,16 @@ size_t MiningInterface::sse_subscriber_count() const
     return m_sse_subscribers.size();
 }
 
-nlohmann::json MiningInterface::rest_sharechain_tip()
+std::optional<SharechainTip> MiningInterface::get_sharechain_tip()
 {
     if (m_sharechain_tip_fn)
         return m_sharechain_tip_fn();
-    return nlohmann::json::object({{"hash", ""}, {"height", 0}});
+    return std::nullopt;
+}
+
+nlohmann::json MiningInterface::rest_sharechain_tip()
+{
+    return to_json(get_sharechain_tip());
 }
 
 nlohmann::json MiningInterface::rest_sharechain_delta(const std::string& since_hash)
@@ -5964,12 +5963,9 @@ nlohmann::json MiningInterface::rest_pplns_current()
     {
         std::string tip;
         int32_t     chain_length = 0;
-        if (m_sharechain_tip_fn) {
-            auto t = m_sharechain_tip_fn();
-            if (t.contains("hash") && t["hash"].is_string())
-                tip = t["hash"].get<std::string>();
-            if (t.contains("height") && t["height"].is_number())
-                chain_length = t["height"].get<int32_t>();
+        if (auto t = get_sharechain_tip()) {
+            tip = t->hash;
+            chain_length = static_cast<int32_t>(t->height);
         }
         // Short-hash (16 hex) per spec §5.1 "short-hash of current tip".
         if (tip.size() > 16) tip = tip.substr(0, 16);
@@ -7856,8 +7852,10 @@ void WebServer::trigger_work_refresh()
 void WebServer::trigger_work_refresh_debounced()
 {
     // Capture previous tip hash BEFORE refresh updates it — needed for delta precompute.
-    auto prev_tip = mining_interface_->rest_sharechain_tip();
-    std::string prev_tip_hash = prev_tip.value("hash", "");
+    // Absent tip (fresh bootstrap, no shares yet) → empty prev_tip_hash, precompute_delta
+    // treats that as "no prior baseline" and the SSE consumers reconcile at first emission.
+    auto prev_tip = mining_interface_->get_sharechain_tip();
+    std::string prev_tip_hash = prev_tip ? prev_tip->hash : std::string{};
 
     // Mark MM PPLNS dirty so the DOGE block gets rebuilt with fresh payouts.
     // refresh_work() → rebuild_cached_blocks() will clear the flag and rebuild.
@@ -7878,10 +7876,9 @@ void WebServer::trigger_work_refresh_debounced()
     // tip notification — this single-entry cache gives ~100% hit rate.
     mining_interface_->precompute_delta(prev_tip_hash);
 
-    // Push SSE event to RealTime subscribers
+    // Push SSE event to RealTime subscribers — serialize at the edge, not before.
     if (mining_interface_->sse_subscriber_count() > 0) {
-        auto tip = mining_interface_->rest_sharechain_tip();
-        mining_interface_->sse_push(tip.dump());
+        mining_interface_->sse_push(to_json(mining_interface_->get_sharechain_tip()).dump());
     }
 }
 
