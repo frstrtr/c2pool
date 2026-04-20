@@ -4580,7 +4580,8 @@
             cellSize: 10,       // runtime-tuned by autoFitCellSize()
             gap: 1,
             minCellSize: 4,
-            maxCellSize: 24,
+            maxCellSize: 120,   // generous cap so sparse windows grow
+                                // cells big enough to fill a tall wrap
             cols: 0,
             rows: 0,
             hoveredIdx: -1,
@@ -8190,7 +8191,7 @@
                         },
                         containerWidth:  function() { return wrap.clientWidth; },
                         containerHeight: function() { return wrap.clientHeight; },
-                        minCellSize: 4, maxCellSize: 24,
+                        minCellSize: 4,   // default maxCellSize (120) kicks in
                         onError: function(err) {
                             console.error('[c2pool bundled] error', err);
                         },

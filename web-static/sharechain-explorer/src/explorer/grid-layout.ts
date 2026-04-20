@@ -74,7 +74,11 @@ export function computeGridLayout(opts: GridLayoutOptions): GridLayout {
   let cellSize = opts.cellSize;
   if (opts.autoFit === true && opts.containerHeight !== undefined && shareCount > 0) {
     const minCs = Math.max(1, opts.minCellSize ?? 4);
-    const maxCs = Math.max(minCs, opts.maxCellSize ?? opts.cellSize);
+    // Default max of 120 lets sparse windows (e.g. 200 shares) grow
+    // cells big enough to actually fill a viewport-sized container;
+    // the `opts.cellSize` is still respected when explicitly larger.
+    // Callers pin a smaller cap if they need tighter bounds.
+    const maxCs = Math.max(minCs, opts.maxCellSize ?? Math.max(opts.cellSize, 120));
     const availH = Math.max(opts.minHeight, opts.containerHeight - containerPadding);
     let chosen = minCs;
     for (let cs = maxCs; cs >= minCs; cs--) {

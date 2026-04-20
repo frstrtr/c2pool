@@ -115,7 +115,7 @@ async function connect() {
       userContext: { myAddress: myAddress || undefined, shareVersion: 36 },
       containerWidth:  () => wrap.clientWidth,
       containerHeight: () => wrap.clientHeight,
-      minCellSize: 4, maxCellSize: 24,
+      minCellSize: 4,   // default maxCellSize (120) kicks in
       fastAnimation: qsFast,
       onError: (err) => {
         setStatus('error', 'err');

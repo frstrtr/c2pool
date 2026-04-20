@@ -169,7 +169,7 @@
         userContext: { myAddress, shareVersion: 36 },
         containerWidth:  () => wrap.clientWidth,
         containerHeight: () => wrap.clientHeight,
-        minCellSize: 4, maxCellSize: 24,
+        minCellSize: 4,   // default maxCellSize (120) kicks in
         fastAnimation: false,
         onError: (err) => {
           setStatus('error', 'err');
