@@ -2140,7 +2140,7 @@
                 <a href="#" style="color:var(--text-muted);font-size:0.8rem;text-decoration:none">Back to top</a>
             </div>
             <div id="pplns-loading" class="section-loading">Loading PPLNS distribution...<div class="progress-track"><div class="progress-bar"></div></div></div>
-            <div class="pplns-main-grid" id="pplns-main-grid" style="position:relative;border-radius:8px;overflow:visible;min-height:60px"></div>
+            <div class="pplns-main-grid" id="pplns-main-grid" style="position:relative;border-radius:8px;overflow:hidden;min-height:60px"></div>
             <div id="pplns-main-tooltip" style="display:none;position:fixed;z-index:9999;background:#1e1e38;border:1px solid var(--border);border-radius:8px;padding:8px 12px;pointer-events:none;font-size:0.82rem;box-shadow:0 6px 20px rgba(0,0,0,0.5);width:320px"></div>
         </div>
 
@@ -6317,18 +6317,31 @@
             });
         }
 
-        // Re-render PPLNS treemap on window resize. rAF coalesces to
-        // the browser's ~60 Hz paint cadence — smooth live resize
-        // without the 200 ms delay the previous setTimeout debouncer
-        // produced.
-        var _pplnsResizeRaf = 0;
-        window.addEventListener('resize', function() {
-            if (_pplnsResizeRaf) return;
-            _pplnsResizeRaf = requestAnimationFrame(function() {
-                _pplnsResizeRaf = 0;
-                if (_cachedPPLNSPayouts) renderMainPPLNS(_cachedPPLNSPayouts);
-            });
-        });
+        // Re-render PPLNS treemap when its container resizes.
+        // ResizeObserver is the right API here — it fires AFTER the
+        // browser has finished layout on the element, so
+        // grid.clientWidth/Height are guaranteed to be the final
+        // post-maximize/restore values. Window 'resize' events can
+        // fire while the browser is mid-transition, which produced
+        // a one-frame "cells bigger than container" flash. rAF
+        // coalesces multiple observer ticks to the browser's paint
+        // cadence. Falls back to window.resize on older browsers.
+        (function wirePplnsResize() {
+            var _raf = 0;
+            function schedule() {
+                if (_raf) return;
+                _raf = requestAnimationFrame(function() {
+                    _raf = 0;
+                    if (_cachedPPLNSPayouts) renderMainPPLNS(_cachedPPLNSPayouts);
+                });
+            }
+            var grid = document.getElementById('pplns-main-grid');
+            if (grid && typeof ResizeObserver === 'function') {
+                new ResizeObserver(schedule).observe(grid);
+            } else {
+                window.addEventListener('resize', schedule);
+            }
+        })();
 
         // Create a single colored share cell (22x22 square) with tooltip + click
         function makeShareCell(fullHash, share) {
