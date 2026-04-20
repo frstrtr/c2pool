@@ -42,6 +42,37 @@ export const LTC_COIN_PPLNS_DESCRIPTOR: CoinPplnsDescriptor = {
   addressExplorer: 'https://blockchair.com/litecoin/address/',
 };
 
+// ── Dash family ──────────────────────────────────────────────────────
+// c2pool-dash uses share v16 as its current tip (reference_dash_implementation.md
+// + p2pool-dash protocol v1700). No signalling boundary is active in the
+// Dash family right now — there's no pending version upgrade like the LTC
+// V35→V36 transition — so the classifier reduces to two states: current
+// (v16+) vs stale (anything below). If/when the next boundary lands, extend
+// the palette with a 'v16-to-vXX' signaling key and update classify().
+
+export const DASH_VERSION_BADGES: VersionBadgeConfig = {
+  palette: Object.freeze({
+    v16:     { label: 'V16',      color: '#66bb6a', severity: 'ok' },
+    stale:   { label: 'STALE',    color: '#ff6b6b', severity: 'warn' },
+    unknown: { label: '?',        color: '#555577', severity: 'muted' },
+  }),
+  classify(miner: Pick<PplnsMiner, 'version' | 'desiredVersion'>): string {
+    const v = miner.version;
+    if (typeof v !== 'number') return 'unknown';
+    if (v >= 16) return 'v16';
+    return 'stale';
+  },
+};
+
+export const DASH_COIN_PPLNS_DESCRIPTOR: CoinPplnsDescriptor = {
+  // Dash is solo-merged or stand-alone; no auxiliary chains feed back
+  // into its PPLNS payouts under c2pool-dash.
+  mergedChains: [],
+  versionBadges: DASH_VERSION_BADGES,
+  formatHashrate: formatHashrate,
+  addressExplorer: 'https://blockchair.com/dash/address/',
+};
+
 /** Default hashrate formatter: pick unit so the mantissa is ∈ [1,1000).
  *  Caps at P (petahash). Returns "0" for non-positive input. */
 export function formatHashrate(hps: number): string {

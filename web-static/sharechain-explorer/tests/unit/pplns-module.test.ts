@@ -10,6 +10,8 @@ import { parseSnapshot } from '../../src/pplns/parse.js';
 import {
   LTC_VERSION_BADGES,
   LTC_COIN_PPLNS_DESCRIPTOR,
+  DASH_VERSION_BADGES,
+  DASH_COIN_PPLNS_DESCRIPTOR,
   formatHashrate,
 } from '../../src/pplns/classify.js';
 import { render } from '../../src/pplns/render.js';
@@ -161,6 +163,20 @@ test('LTC_VERSION_BADGES: classify matches spec', () => {
   assert.equal(c({ version: 35, desiredVersion: 36 }), 'v35-to-v36');
   assert.equal(c({ version: 35, desiredVersion: 35 }), 'v35-only');
   assert.equal(c({}), 'unknown');
+});
+
+test('DASH_VERSION_BADGES: classify matches spec (v16 boundary)', () => {
+  const c = DASH_VERSION_BADGES.classify;
+  assert.equal(c({ version: 16 }), 'v16');
+  assert.equal(c({ version: 17 }), 'v16');    // ≥16 stays current
+  assert.equal(c({ version: 15 }), 'stale');
+  assert.equal(c({}), 'unknown');
+});
+
+test('DASH_COIN_PPLNS_DESCRIPTOR: no merged chains, Dash explorer link', () => {
+  assert.deepEqual(DASH_COIN_PPLNS_DESCRIPTOR.mergedChains, []);
+  assert.match(DASH_COIN_PPLNS_DESCRIPTOR.addressExplorer!,
+               /blockchair\.com\/dash\/address/);
 });
 
 test('formatHashrate: scales through k/M/G/T/P', () => {
