@@ -50,6 +50,7 @@ add_executable(c2pool-qt
     src/PageSharechain.cpp
     src/PageLogs.cpp
     src/PageEmbedded.cpp
+    src/bridges/SharechainBridge.cpp
 )
 
 # Step 2 embedded-web smoke-test resource: qrc:///test/hello.html.
