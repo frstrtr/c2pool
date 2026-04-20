@@ -158,6 +158,44 @@ jobs:
           retention-days: 7
 
   # ════════════════════════════════════════════════════════════════════════════
+  # c2pool-qt leak-regression harness (Qt hybrid step 14, delta v1 §E.2)
+  # Builds ui/c2pool-qt/ with C2POOL_QT_BUILD_TESTS=ON and runs the
+  # mount/destroy × 100 harness under xvfb, asserting no orphan
+  # QtWebEngineProcess helpers remain.
+  # ════════════════════════════════════════════════════════════════════════════
+  qt-webengine:
+    name: Qt WebEngine leak gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Qt6 + WebEngine + xvfb
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake g++ \
+            qt6-base-dev qt6-webengine-dev qt6-webchannel-dev \
+            qt6-tools-dev \
+            libgl1-mesa-dev libegl1-mesa-dev \
+            libxkbcommon-dev libnss3 libxcomposite1 libxdamage1 \
+            libxrandr2 libxtst6 libatk1.0-0 libatk-bridge2.0-0 \
+            libasound2t64 libdrm2 libgbm1 \
+            xvfb
+
+      - name: Configure
+        run: cmake -S ui/c2pool-qt -B build-qt -DC2POOL_QT_BUILD_TESTS=ON
+
+      - name: Build leak harness
+        run: cmake --build build-qt --target c2pool-qt_test_embedded_leak -j$(nproc)
+
+      - name: Run leak harness under xvfb
+        env:
+          QTWEBENGINE_DISABLE_SANDBOX: '1'
+        run: |
+          xvfb-run -a --server-args="-screen 0 1280x800x24" \
+            timeout 180 ./build-qt/c2pool-qt_test_embedded_leak
+
+  # ════════════════════════════════════════════════════════════════════════════
   # macOS (Apple Silicon arm64 — GitHub only provides ARM runners now)
   # Intel x86_64 macOS binary is built locally; see doc/build-macos.md
   # ════════════════════════════════════════════════════════════════════════════
