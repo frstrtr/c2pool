@@ -6136,9 +6136,16 @@ nlohmann::json MiningInterface::rest_pplns_miner(const std::string& address)
     // recent_shares: scan the current window for this miner's shares.
     // Spec says "last N shares (configurable, default 50)"; we emit up
     // to 50 newest-first.
+    //
+    // While walking we also collect (t, V, dv) tuples so we can
+    // compress them into version_history afterwards. Storing in a
+    // local vector avoids assuming window order — we sort ascending
+    // before compressing.
     nlohmann::json recent = nlohmann::json::array();
     int    shares_total = 0;
     double first_seen_at = 0;
+    struct VerPoint { int64_t t; int v; int dv; };
+    std::vector<VerPoint> ver_pts;
     if (m_sharechain_window_fn) {
         auto window = m_sharechain_window_fn();
         if (window.contains("shares") && window["shares"].is_array()) {
@@ -6155,6 +6162,11 @@ nlohmann::json MiningInterface::rest_pplns_miner(const std::string& address)
                     if (s.contains("V")) r["V"] = s["V"];
                     recent.push_back(std::move(r));
                 }
+                const int v  = s.value("V",  0);
+                const int dv = s.value("dv", 0);
+                if (v > 0 && t > 0) {
+                    ver_pts.push_back({static_cast<int64_t>(t), v, dv});
+                }
             }
         }
     }
@@ -6167,6 +6179,29 @@ nlohmann::json MiningInterface::rest_pplns_miner(const std::string& address)
     out["shares_total"]  = shares_total;
     if (first_seen_at > 0) out["first_seen_at"] = static_cast<int64_t>(first_seen_at);
     out["recent_shares"] = std::move(recent);
+
+    // version_history: compress the per-share (V, dv) stream into
+    // transitions. First observed pair is always emitted, then each
+    // pair that differs from the previous. Capped at 16 entries —
+    // a runaway toggler shouldn't balloon the response.
+    if (!ver_pts.empty()) {
+        std::sort(ver_pts.begin(), ver_pts.end(),
+            [](const VerPoint& a, const VerPoint& b) { return a.t < b.t; });
+        nlohmann::json vh = nlohmann::json::array();
+        int prev_v = -1, prev_dv = -1;
+        for (const auto& p : ver_pts) {
+            if (p.v == prev_v && p.dv == prev_dv) continue;
+            nlohmann::json entry;
+            entry["t"]       = p.t;
+            entry["version"] = p.v;
+            if (p.dv > 0) entry["desired_version"] = p.dv;
+            vh.push_back(std::move(entry));
+            prev_v  = p.v;
+            prev_dv = p.dv;
+            if (vh.size() >= 16) break;
+        }
+        if (!vh.empty()) out["version_history"] = std::move(vh);
+    }
 
     // Hashrate (rolling + bucketed series) from the ring.
     const double hps = m_hashrate_ring.hashrate(address);
