@@ -35,7 +35,8 @@ namespace dash {
 namespace submit {
 
 struct ValidationResult {
-    bool     valid_share{false};        // hash <= share target
+    bool     valid_share{false};        // hash <= stratum (vardiff) target — pseudoshare accepted
+    bool     valid_real_share{false};   // hash <= pool real_share_target — broadcastable p2pool share
     bool     is_block{false};           // hash <= block target
     uint256  x11_hash;                  // the 80-byte X11 result
     uint256  merkle_root;               // computed root — for logging only
@@ -43,11 +44,13 @@ struct ValidationResult {
     std::string reject_reason;
 };
 
-// Compute share target from bdiff-style difficulty:
-//   target = 0xffff_0000 * 2^192 / difficulty
-// For diff=1 this produces the canonical bdiff1 target (compact 0x1d00ffff).
-// Very small diffs (< ~1.5e-5) would overflow the uint64 top word; we clamp
-// the target to all-ones (equivalent to "accept every hash").
+// Compute share target from bdiff-style difficulty.
+// Dash uses DUMB_SCRYPT_DIFF=1 (no LTC 65536 multiplier), so bdiff-1
+// target is MAX_TARGET = 0xffff * 2^208 = 0x00000000_ffff0000_... (compact 0x1d00ffff).
+// Reference: p2pool-dash/p2pool/dash/data.py difficulty_to_target
+//   target = (0xffff0000 * 2^192 + 1) / (difficulty + 1) ≈ 0xffff * 2^208 / diff
+// We approximate with top64 = 0xffff*2^32 / diff, then shift 176 bits so the
+// high 16 bits of top64 land at bit position 208 (0xffff << 208).
 inline uint256 target_from_difficulty(double diff)
 {
     constexpr double C = 65535.0 * 4294967296.0;         // 0xffff * 2^32
@@ -61,15 +64,14 @@ inline uint256 target_from_difficulty(double diff)
     }
     double v = C / diff;
     if (v >= U64_MAX_D) {
-        // Target overflows the uint256 encoding we use (top64 << 192);
-        // cap at all-ones (near-max uint256) — effectively permissive.
+        // top64 would overflow; cap at all-ones (effectively permissive).
         for (int i = 0; i < 32; ++i) t.data()[i] = 0xff;
         return t;
     }
     uint64_t top64 = static_cast<uint64_t>(v);
     if (top64 == 0) top64 = 1;
     t = uint256(top64);
-    t <<= 192;
+    t <<= 176;
     return t;
 }
 
@@ -170,13 +172,22 @@ inline ValidationResult validate(const stratum::SubmittedShare& s,
     // 5. X11 PoW hash.
     r.x11_hash = dash::crypto::hash_x11(hdr.data(), 80);
 
-    // 6. Compare to share and block targets.
+    // 6. Compare to block, real-share, and stratum (vardiff) targets.
+    //
+    // Three tiers (p2pool-dash convention):
+    //   block   : hash ≤ block_target            — submit to dashd
+    //   real    : hash ≤ real_share_target       — broadcast as p2pool share
+    //                                              (real_share_target ≤ MAX_TARGET,
+    //                                               encoded by share_info.bits)
+    //   stratum : hash ≤ stratum_target          — pseudoshare, local PPLNS +
+    //                                              stratum stats only, NOT broadcast
     uint256 block_target;
     block_target.SetCompact(ctx.nbits);
-    uint256 share_target = target_from_difficulty(ctx.share_difficulty);
+    uint256 stratum_target = target_from_difficulty(ctx.share_difficulty);
 
-    r.is_block    = (r.x11_hash <= block_target);
-    r.valid_share = r.is_block || (r.x11_hash <= share_target);
+    r.is_block         = (r.x11_hash <= block_target);
+    r.valid_real_share = r.is_block || (r.x11_hash <= ctx.real_share_target);
+    r.valid_share      = r.valid_real_share || (r.x11_hash <= stratum_target);
     if (!r.valid_share) {
         r.reject_reason = "low difficulty share (hash > target)";
         return r;
