@@ -115,7 +115,6 @@ MainWindow::MainWindow(SettingsStore* settings, QWidget* parent)
     stack_ = new QStackedWidget(central);
     launchPage_     = new PageLaunch(settings_, stack_);
     overviewPage_   = new PageOverview(stack_);
-    miningPage_     = new PageMining(stack_);
 
     // Bridges. SharechainBridge + PplnsBridge carry data; SettingsBridge
     // routes JS view-state writes to SettingsStore per
@@ -125,6 +124,15 @@ MainWindow::MainWindow(SettingsStore* settings, QWidget* parent)
     sharechainBridge_ = new SharechainBridge(&api_, this);
     settingsBridge_   = new SettingsBridge(settings_, this);
     coinBridge_       = new CoinBridge(settings_, this);
+    pplnsBridge_      = new PplnsBridge(&api_, this);
+
+    // PageMining hybrid split (§7 step 11) — native controls on top,
+    // embedded PPLNS View bundle on the bottom for the miner list.
+    // Uses the same bridge tri as the standalone PPLNS tab so the two
+    // surfaces see identical bridge state.
+    miningPage_ = new PageMining(
+        { pplnsBridge_, sharechainBridge_, settingsBridge_, coinBridge_ },
+        stack_);
 
     // Sharechain page — hybrid: the Explorer JS bundle running inside
     // a QWebEngineView, talking to native c2pool via SharechainBridge
@@ -145,7 +153,6 @@ MainWindow::MainWindow(SettingsStore* settings, QWidget* parent)
     // pattern, different bundle. Reuses the sharechain tip stream
     // (PPLNS View spec §5.4 — single SSE socket serves both views).
     // Per hybrid-architecture.md §8 step 12.
-    pplnsBridge_ = new PplnsBridge(&api_, this);
     PageEmbedded::Config pplnsCfg;
     pplnsCfg.qrcUrl = QStringLiteral(
         "qrc:///sharechain-explorer/pplns-embed.html");
