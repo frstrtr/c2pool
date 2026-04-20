@@ -1,11 +1,12 @@
 #pragma once
 
 #include "ApiClient.hpp"
+#include "PageEmbedded.hpp"
 #include "PageLaunch.hpp"
 #include "PageLogs.hpp"
 #include "PageMining.hpp"
 #include "PageOverview.hpp"
-#include "PageSharechain.hpp"
+#include "bridges/SharechainBridge.hpp"
 
 #include <QLabel>
 #include <QLineEdit>
@@ -42,11 +43,12 @@ private:
     QLabel* connectionStateLabel_;
     QLabel* statusLabel_;
 
-    PageLaunch*    launchPage_;
-    PageOverview*  overviewPage_;
-    PageMining*    miningPage_;
-    PageLogs*      logsPage_;
-    PageSharechain* sharechainPage_;
+    PageLaunch*       launchPage_;
+    PageOverview*     overviewPage_;
+    PageMining*       miningPage_;
+    PageLogs*         logsPage_;
+    PageEmbedded*     sharechainPage_;
+    SharechainBridge* sharechainBridge_;
 
     QTimer refreshTimer_;
     bool lastApiOnline_{false};

@@ -47,19 +47,31 @@ add_executable(c2pool-qt
     src/PageLaunch.cpp
     src/PageOverview.cpp
     src/PageMining.cpp
-    src/PageSharechain.cpp
     src/PageLogs.cpp
     src/PageEmbedded.cpp
     src/bridges/SharechainBridge.cpp
 )
 
 # Step 2 embedded-web smoke-test resource: qrc:///test/hello.html.
-# Step 7+ adds the real Explorer bundle under qrc:///sharechain-explorer/.
 qt_add_resources(c2pool-qt "test_resources"
     PREFIX "/test"
     BASE   "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/test"
     FILES
         "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/test/hello.html"
+)
+
+# Step 7 — real Explorer bundle at qrc:///sharechain-explorer/. The
+# embed host (dashboard-embed.html) loads the esbuild-produced
+# dist/sharechain-explorer.js via an ES-module import; both travel
+# together. A later refactor step can switch BASE to a generated
+# file list from resources-manifest.json.
+set(C2POOL_EXPLORER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../web-static/sharechain-explorer")
+qt_add_resources(c2pool-qt "explorer_bundle"
+    PREFIX "/sharechain-explorer"
+    BASE   "${C2POOL_EXPLORER_DIR}"
+    FILES
+        "${C2POOL_EXPLORER_DIR}/dashboard-embed.html"
+        "${C2POOL_EXPLORER_DIR}/dist/sharechain-explorer.js"
 )
 
 target_include_directories(c2pool-qt PRIVATE src)

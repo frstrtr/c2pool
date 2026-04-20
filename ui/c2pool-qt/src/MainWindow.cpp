@@ -50,7 +50,23 @@ MainWindow::MainWindow(QWidget* parent)
     launchPage_     = new PageLaunch(stack_);
     overviewPage_   = new PageOverview(stack_);
     miningPage_     = new PageMining(stack_);
-    sharechainPage_ = new PageSharechain(stack_);
+
+    // Sharechain page — hybrid: the Explorer JS bundle running inside
+    // a QWebEngineView, talking to native c2pool via SharechainBridge
+    // over QtWebChannel. Bundle lives at
+    // qrc:///sharechain-explorer/dashboard-embed.html.
+    // Per frstrtr/the/docs/c2pool-qt-hybrid-architecture.md §8 step 7.
+    sharechainBridge_ = new SharechainBridge(&api_, this);
+    PageEmbedded::Config sharechainCfg;
+    sharechainCfg.qrcUrl = QStringLiteral(
+        "qrc:///sharechain-explorer/dashboard-embed.html");
+    sharechainCfg.bridges = { sharechainBridge_ };
+    sharechainCfg.bridgeObjectName = QStringLiteral("qtBridge");
+#ifdef C2POOL_QT_DEV_BUNDLE
+    sharechainCfg.devReloadEnabled = true;
+#endif
+    sharechainPage_ = new PageEmbedded(sharechainCfg, stack_);
+
     logsPage_       = new PageLogs(stack_);
 
     stack_->addWidget(launchPage_);     // index 0
@@ -179,8 +195,10 @@ void MainWindow::refreshCurrentPage()
         statusLabel_->setText("Mining refreshed");
         break;
     case 3:
-        sharechainPage_->refresh(&api_);
-        statusLabel_->setText("Sharechain refreshed");
+        // Sharechain is driven by the embedded JS bundle via
+        // SharechainBridge; it self-refreshes through QtTransport +
+        // the tip SSE stream. No native poke needed.
+        statusLabel_->setText("Sharechain (embedded)");
         break;
     case 4:
         logsPage_->refresh(&api_);
