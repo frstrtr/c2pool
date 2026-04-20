@@ -6,6 +6,7 @@
 #include "PageLogs.hpp"
 #include "PageMining.hpp"
 #include "PageOverview.hpp"
+#include "PageSettings.hpp"
 #include "SettingsStore.hpp"
 #include "bridges/CoinBridge.hpp"
 #include "bridges/PplnsBridge.hpp"
@@ -61,6 +62,7 @@ private:
     PageOverview*     overviewPage_;
     PageMining*       miningPage_;
     PageLogs*         logsPage_;
+    PageSettings*     settingsPage_;
     PageEmbedded*     sharechainPage_;
     PageEmbedded*     pplnsPage_;
     SharechainBridge* sharechainBridge_;

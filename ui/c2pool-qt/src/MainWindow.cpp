@@ -108,7 +108,7 @@ MainWindow::MainWindow(SettingsStore* settings, QWidget* parent)
     auto* layout = new QHBoxLayout(central);
 
     navList_ = new QListWidget(central);
-    navList_->addItems({"Launch", "Overview", "Mining", "Sharechain", "PPLNS", "Logs"});
+    navList_->addItems({"Launch", "Overview", "Mining", "Sharechain", "PPLNS", "Logs", "Settings"});
     navList_->setFixedWidth(180);
     layout->addWidget(navList_);
 
@@ -164,6 +164,7 @@ MainWindow::MainWindow(SettingsStore* settings, QWidget* parent)
     pplnsPage_ = new PageEmbedded(pplnsCfg, stack_);
 
     logsPage_       = new PageLogs(stack_);
+    settingsPage_   = new PageSettings(settings_, stack_);
 
     stack_->addWidget(launchPage_);     // index 0
     stack_->addWidget(overviewPage_);   // index 1
@@ -171,6 +172,19 @@ MainWindow::MainWindow(SettingsStore* settings, QWidget* parent)
     stack_->addWidget(sharechainPage_); // index 3
     stack_->addWidget(pplnsPage_);      // index 4
     stack_->addWidget(logsPage_);       // index 5
+    stack_->addWidget(settingsPage_);   // index 6
+
+    // Settings page Import can touch any key — rebuild every UI
+    // surface that mirrors SettingsStore so nothing drifts.
+    connect(settingsPage_, &PageSettings::settingsImported, this,
+            [this]() {
+                reloadProfileCombo();
+                launchPage_->loadSettings();
+                baseUrlEdit_->setText(settings_->uiBaseUrl());
+                api_.setBaseUrl(baseUrlEdit_->text());
+                refreshTimer_.setInterval(settings_->uiRefreshMs());
+                statusLabel_->setText(tr("Settings imported"));
+            });
 
     layout->addWidget(stack_, 1);
     setCentralWidget(central);
@@ -349,6 +363,13 @@ void MainWindow::refreshCurrentPage()
     case 5:
         logsPage_->refresh(&api_);
         statusLabel_->setText("Logs refreshed");
+        break;
+    case 6:
+        // PageSettings is self-refreshing via SettingsStore signals;
+        // reload on tab entry to pick up any external writes (toolbar
+        // combo, keychain daemon prompts).
+        settingsPage_->reload();
+        statusLabel_->setText("Settings");
         break;
     default:
         break;

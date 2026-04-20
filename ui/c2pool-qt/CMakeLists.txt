@@ -59,6 +59,7 @@ add_executable(c2pool-qt
     src/PageOverview.cpp
     src/PageMining.cpp
     src/PageLogs.cpp
+    src/PageSettings.cpp
     src/PageEmbedded.cpp
     src/SettingsStore.cpp
     src/bridges/SharechainBridge.cpp
