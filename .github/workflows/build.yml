@@ -106,6 +106,33 @@ jobs:
         with: { name: test-results-linux, path: build_ci/Testing/, retention-days: 7 }
 
   # ════════════════════════════════════════════════════════════════════════════
+  # Web-static JS verify (typecheck + build + tests + bundle-size gate)
+  # Covers web-static/sharechain-explorer/: the Explorer + PPLNS View
+  # bundles + Plugin SDK. Fast job (< 1 min); runs regardless of path so
+  # it also catches changes that land via package.json or test fixtures.
+  # ════════════════════════════════════════════════════════════════════════════
+  web-static:
+    name: Web-static verify
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: web-static/sharechain-explorer
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web-static/sharechain-explorer/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify (typecheck + build + test + manifest + size)
+        run: npm run verify
+
+  # ════════════════════════════════════════════════════════════════════════════
   # macOS (Apple Silicon arm64 — GitHub only provides ARM runners now)
   # Intel x86_64 macOS binary is built locally; see doc/build-macos.md
   # ════════════════════════════════════════════════════════════════════════════
