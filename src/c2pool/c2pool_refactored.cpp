@@ -3586,28 +3586,38 @@ int main(int argc, char* argv[]) {
             });
 
             // Lightweight tip endpoint for RealTime polling
-            web_server.get_mining_interface()->set_sharechain_tip_fn([&p2p_node]() {
-                auto guard = p2p_node->read_tracker();
-                if (!guard) {
-                    auto snap = p2p_node->get_tracker_snapshot();
-                    return nlohmann::json::object({
-                        {"hash",""},
-                        {"height", snap.verified_count > 0 ? snap.chain_count : -1},
-                        {"total", snap.chain_count}});
-                }
-                auto& chain = guard->chain;
-                uint256 best;
-                int32_t best_height = -1;
-                for (const auto& [head_hash, tail_hash] : chain.get_heads()) {
-                    auto h = chain.get_height(head_hash);
-                    if (h > best_height) { best = head_hash; best_height = h; }
-                }
-                return nlohmann::json::object({
-                    {"hash", best.IsNull() ? "" : best.GetHex().substr(0, 16)},
-                    {"height", best_height},
-                    {"total", static_cast<int>(chain.size())}
+            // Lightweight tip endpoint for RealTime polling.
+            // Returns std::nullopt when the sharechain is still bootstrapping
+            // (no tracker snapshot AND no heads yet).  Typed struct everywhere;
+            // JSON produced only at the REST/SSE edge via core::to_json.
+            web_server.get_mining_interface()->set_sharechain_tip_fn(
+                [&p2p_node]() -> std::optional<core::SharechainTip> {
+                    auto guard = p2p_node->read_tracker();
+                    if (!guard) {
+                        auto snap = p2p_node->get_tracker_snapshot();
+                        if (snap.chain_count == 0)
+                            return std::nullopt;
+                        core::SharechainTip t;
+                        t.hash   = "";
+                        t.height = snap.verified_count > 0 ? snap.chain_count : -1;
+                        t.total  = snap.chain_count;
+                        return t;
+                    }
+                    auto& chain = guard->chain;
+                    uint256 best;
+                    int32_t best_height = -1;
+                    for (const auto& [head_hash, tail_hash] : chain.get_heads()) {
+                        auto h = chain.get_height(head_hash);
+                        if (h > best_height) { best = head_hash; best_height = h; }
+                    }
+                    if (best.IsNull() && chain.size() == 0)
+                        return std::nullopt;
+                    core::SharechainTip t;
+                    t.hash   = best.IsNull() ? "" : best.GetHex().substr(0, 16);
+                    t.height = best_height;
+                    t.total  = static_cast<int>(chain.size());
+                    return t;
                 });
-            });
 
             // Delta endpoint: return only shares newer than `since` hash
             web_server.get_mining_interface()->set_sharechain_delta_fn(
@@ -5464,13 +5474,26 @@ int main(int argc, char* argv[]) {
 
                                 // Tip-changed handler: trigger work refresh so stratum miners
                                 // get updated merged mining targets immediately.
+                                // Tip-changed handler.  Mirrors the LTC handler's structure:
+                                //   1. dispatch to ioc so all web_server / UTXO / bcaster access
+                                //      happens on the main thread (the tip callback itself fires
+                                //      on the header-parser pool thread).
+                                //   2. wrap in try/catch so a downstream exception can't reach
+                                //      std::terminate (previously, a null-JSON read in the work
+                                //      refresh chain killed the whole process on fresh installs).
+                                //   3. gate work refresh on merged-mining readiness so we don't
+                                //      fire thousands of no-op refreshes during header sync.
                                 doge_chain->set_on_tip_changed(
-                                    [bcaster_ptr, &web_server,
+                                    [bcaster_ptr, &web_server, &ioc,
                                      chain = doge_chain.get(),
                                      utxo = doge_utxo_cache.get(),
                                      utxo_db = doge_utxo_db.get()](
                                         const uint256& old_tip, uint32_t old_height,
                                         const uint256& new_tip, uint32_t new_height) {
+                                        boost::asio::post(ioc,
+                                            [bcaster_ptr, &web_server, chain, utxo, utxo_db,
+                                             old_tip, old_height, new_tip, new_height]() {
+                                      try {
                                         bool is_reorg = (new_height <= old_height);
                                         LOG_WARNING << "[EMB-DOGE] Chain tip changed: "
                                                     << old_tip.GetHex().substr(0, 16) << " (h=" << old_height << ") → "
@@ -5494,10 +5517,34 @@ int main(int argc, char* argv[]) {
                                             }
                                         }
 
-                                        // Request the new tip's full block for mempool cleanup
+                                        // Request the new tip's full block for UTXO build + mempool cleanup.
+                                        // Always fires during sync — the block body drives UTXO construction.
                                         if (bcaster_ptr)
                                             bcaster_ptr->request_full_block(new_tip);
-                                        web_server.trigger_work_refresh_debounced();
+
+                                        // Merged-mining readiness gate.  aux_chain_embedded's
+                                        // get_work_template() would return empty AuxWork until
+                                        // both conditions below hold, so firing work refresh
+                                        // earlier is wasted on every 2000-header batch.
+                                        bool doge_ready = chain->is_synced()
+                                            && utxo
+                                            && utxo->blocks_connected() >= core::coin::DOGE_MINING_GATE_DEPTH;
+                                        if (doge_ready) {
+                                            web_server.trigger_work_refresh_debounced();
+                                        } else {
+                                            LOG_DEBUG_COIND << "[EMB-DOGE] Skipping work refresh at h="
+                                                      << new_height
+                                                      << " — not merged-mining-ready (chain_synced="
+                                                      << (chain->is_synced() ? "y" : "n")
+                                                      << " utxo_connected="
+                                                      << (utxo ? utxo->blocks_connected() : 0)
+                                                      << "/" << core::coin::DOGE_MINING_GATE_DEPTH
+                                                      << ")";
+                                        }
+                                      } catch (const std::exception& e) {
+                                        LOG_ERROR << "[EMB-DOGE] Tip handler error: " << e.what();
+                                      }
+                                            }); // end post(ioc)
                                     });
                                 LOG_INFO << "[EMB-DOGE] Chain reorg handler registered";
 

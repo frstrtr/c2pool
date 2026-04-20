@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <functional>
 #include <thread>
@@ -96,6 +97,37 @@ private:
     void handle_error(beast::error_code ec, char const* what);
 };
 
+/// Best-tip snapshot of the sharechain.
+///
+/// Producer is internal (share tracker). Consumers are both internal
+/// (work refresh, delta precompute) and external (REST `/sharechain/tip`,
+/// SSE push). The struct is the authoritative representation; JSON is
+/// produced only at the external edge via `to_json()`.
+///
+/// `std::optional<SharechainTip>` — preferred over a sentinel value — is
+/// the canonical "no tip yet" signal. Callers that dereference without
+/// checking are a compile error, eliminating the whole class of null-JSON
+/// `.value()` crashes that arise when consuming an uninitialized cache.
+struct SharechainTip {
+    std::string hash;       // short-hex (16 chars) of the best head
+    int64_t     height = 0;
+    int32_t     total  = 0; // total shares known to the tracker
+};
+
+/// Serialize an optional tip to the wire JSON.  Absent tip preserves the
+/// legacy REST shape `{"hash":"","height":-1,"total":0}` so existing
+/// clients (dashboards, SSE subscribers) keep working unchanged.
+inline nlohmann::json to_json(const std::optional<SharechainTip>& tip)
+{
+    if (!tip)
+        return nlohmann::json::object({{"hash", ""}, {"height", -1}, {"total", 0}});
+    return nlohmann::json::object({
+        {"hash",   tip->hash},
+        {"height", tip->height},
+        {"total",  tip->total},
+    });
+}
+
 /// Stratum mining configuration — tuneable from CLI, YAML, or API.
 struct StratumConfig {
     double min_difficulty       = 0.0005;   // floor for per-connection vardiff
@@ -176,6 +208,10 @@ public:
     // Returns cached+serialized window JSON string (for ETag/cache layer)
     std::pair<std::string, std::string> get_cached_window_response(); // {json_body, etag}
     nlohmann::json rest_sharechain_tip();
+    // Typed accessor for internal consumers.  Preferred over
+    // rest_sharechain_tip() inside the server — no stringly-typed field
+    // lookups, and the optional forces the caller to handle "no tip".
+    std::optional<SharechainTip> get_sharechain_tip();
     nlohmann::json rest_sharechain_delta(const std::string& since_hash);
     nlohmann::json rest_control_mining_start();
     nlohmann::json rest_control_mining_stop();
@@ -512,8 +548,13 @@ public:
     using sharechain_window_fn_t = std::function<nlohmann::json()>;
     void set_sharechain_window_fn(sharechain_window_fn_t fn) { m_sharechain_window_fn = thread_safe_wrap(std::move(fn)); }
 
-    // Sharechain tip callback — returns {hash, height} for lightweight polling
-    using sharechain_tip_fn_t = std::function<nlohmann::json()>;
+    // Sharechain tip callback — strongly-typed "maybe no tip yet".
+    // Returning std::nullopt is the explicit, compile-enforced signal for
+    // "sharechain empty, bootstrap in progress"; CacheEntry's default
+    // value for this type is also std::nullopt, so the pre-first-refresh
+    // race window produces a safe absent state instead of a null JSON
+    // that would explode in a downstream `.value()` call.
+    using sharechain_tip_fn_t = std::function<std::optional<SharechainTip>()>;
     void set_sharechain_tip_fn(sharechain_tip_fn_t fn) { m_sharechain_tip_fn = thread_safe_wrap(std::move(fn)); }
 
     // Sharechain delta callback — returns shares newer than given hash
