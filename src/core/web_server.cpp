@@ -392,6 +392,32 @@ void HttpSession::process_request()
                 rest_result = mining_interface_->rest_merged_stats();
             else if (target == "/current_merged_payouts")
                 rest_result = mining_interface_->rest_current_merged_payouts();
+            else if (target == "/pplns/current")
+                rest_result = mining_interface_->rest_pplns_current();
+            else if (target.rfind("/pplns/miner/", 0) == 0) {
+                // /pplns/miner/<address> — extract address from path.
+                std::string addr = target.substr(std::string("/pplns/miner/").size());
+                // URL-decode (spec §5.2 "MUST be URL-encoded by the client").
+                std::string decoded;
+                decoded.reserve(addr.size());
+                for (size_t i = 0; i < addr.size(); ++i) {
+                    if (addr[i] == '%' && i + 2 < addr.size()) {
+                        auto hex = addr.substr(i + 1, 2);
+                        try {
+                            decoded.push_back(static_cast<char>(
+                                std::stoi(hex, nullptr, 16)));
+                            i += 2;
+                        } catch (...) {
+                            decoded.push_back(addr[i]);
+                        }
+                    } else if (addr[i] == '+') {
+                        decoded.push_back(' ');
+                    } else {
+                        decoded.push_back(addr[i]);
+                    }
+                }
+                rest_result = mining_interface_->rest_pplns_miner(decoded);
+            }
             else if (target == "/recent_merged_blocks")
                 rest_result = mining_interface_->rest_recent_merged_blocks();
             else if (target == "/all_merged_blocks")
@@ -5862,6 +5888,283 @@ nlohmann::json MiningInterface::rest_current_merged_payouts()
         return m_cached_merged_payouts;
     return nlohmann::json::object();
 }
+
+namespace {
+
+// Name mapping for the top-level "coin" field.
+// frstrtr/the/docs/c2pool-pplns-view-module-task.md §5.1 expects the
+// short symbol (e.g. "LTC"), not a class-name or lowercase variant.
+const char* blockchain_short_symbol(Blockchain b)
+{
+    switch (b) {
+        case Blockchain::LITECOIN: return "LTC";
+        case Blockchain::BITCOIN:  return "BTC";
+        case Blockchain::DOGECOIN: return "DOGE";
+        case Blockchain::DIGIBYTE: return "DGB";
+        case Blockchain::ETHEREUM: return "ETH";
+        case Blockchain::MONERO:   return "XMR";
+        case Blockchain::ZCASH:    return "ZEC";
+        case Blockchain::UNKNOWN:
+        default:                   return "UNKNOWN";
+    }
+}
+
+} // namespace
+
+nlohmann::json MiningInterface::rest_pplns_current()
+{
+    // Shape per frstrtr/the/docs/c2pool-pplns-view-module-task.md §5.1.
+    //
+    // Strategy: the existing merged-payouts cache already carries
+    // primary amount + per-miner DOGE split (cached every 2s on the
+    // main thread via cache_pplns_at_tip → compute_current_merged_payouts).
+    // We enrich it here with per-miner aggregates (shares_in_window,
+    // version, desired_version, last_share_at) derived by a single
+    // walk over the sharechain window. hashrate_hps is deferred to a
+    // follow-up; spec tolerates its absence.
+
+    // Snapshot the payouts cache under the mutex, then release.
+    nlohmann::json cache;
+    {
+        std::lock_guard<std::mutex> lock(m_merged_payouts_mutex);
+        cache = m_cached_merged_payouts;
+    }
+
+    // Build enrichment table from the current window. Non-fatal if the
+    // window isn't available — the module degrades gracefully.
+    struct Enrich {
+        int    shares_in_window = 0;
+        int    version          = 0;
+        int    desired_version  = 0;
+        double last_share_at    = 0;
+    };
+    std::unordered_map<std::string, Enrich> enrich;
+    if (m_sharechain_window_fn) {
+        auto window = m_sharechain_window_fn();
+        if (window.contains("shares") && window["shares"].is_array()) {
+            for (const auto& s : window["shares"]) {
+                std::string addr;
+                if (s.contains("m") && s["m"].is_string())
+                    addr = s["m"].get<std::string>();
+                if (addr.empty()) continue;
+                auto& e = enrich[addr];
+                e.shares_in_window++;
+                double t = s.value("t", 0.0);
+                if (t > e.last_share_at) {
+                    e.last_share_at   = t;
+                    e.version         = s.value("V",  0);
+                    e.desired_version = s.value("dv", 0);
+                }
+            }
+        }
+    }
+
+    // Compose output.
+    nlohmann::json out;
+    {
+        std::string tip;
+        int32_t     chain_length = 0;
+        if (m_sharechain_tip_fn) {
+            auto t = m_sharechain_tip_fn();
+            if (t.contains("hash") && t["hash"].is_string())
+                tip = t["hash"].get<std::string>();
+            if (t.contains("height") && t["height"].is_number())
+                chain_length = t["height"].get<int32_t>();
+        }
+        // Short-hash (16 hex) per spec §5.1 "short-hash of current tip".
+        if (tip.size() > 16) tip = tip.substr(0, 16);
+        out["tip"]          = tip;
+        out["window_size"]  = chain_length > 0 ? chain_length : 4320;
+        out["coin"]         = blockchain_short_symbol(m_blockchain);
+    }
+    out["computed_at"]    = static_cast<int64_t>(std::time(nullptr));
+    out["schema_version"] = "1.0";
+
+    // Walk the cache to aggregate primary + per-chain merged totals,
+    // and build the miners[] array.
+    double total_primary = 0;
+    std::map<std::string, double> merged_totals;
+    std::vector<std::pair<std::string, nlohmann::json>> miners;
+    miners.reserve(cache.is_object() ? cache.size() : 0);
+
+    if (cache.is_object()) {
+        for (const auto& [addr, entry] : cache.items()) {
+            double amount = 0;
+            if (entry.is_number()) {
+                amount = entry.get<double>();
+            } else if (entry.is_object() && entry.contains("amount")) {
+                amount = entry["amount"].get<double>();
+            }
+            if (!(amount > 0)) continue;
+            total_primary += amount;
+
+            nlohmann::json m;
+            m["address"] = addr;
+            m["amount"]  = amount;
+            m["pct"]     = 0;     // filled below once total is known
+            // Enrichment from sharechain window.
+            auto eit = enrich.find(addr);
+            if (eit != enrich.end()) {
+                m["shares_in_window"] = eit->second.shares_in_window;
+                if (eit->second.version > 0)
+                    m["version"] = eit->second.version;
+                if (eit->second.desired_version > 0)
+                    m["desired_version"] = eit->second.desired_version;
+                if (eit->second.last_share_at > 0)
+                    m["last_share_at"] = static_cast<int64_t>(eit->second.last_share_at);
+            }
+            // Merged-chain breakdown.
+            nlohmann::json merged_arr = nlohmann::json::array();
+            if (entry.is_object() && entry.contains("merged")
+                && entry["merged"].is_array()) {
+                for (const auto& mm : entry["merged"]) {
+                    double mm_amount = mm.value("amount", 0.0);
+                    if (!(mm_amount > 0)) continue;
+                    std::string sym = mm.value("symbol", std::string("DOGE"));
+                    std::string mm_addr = mm.value("address", std::string(""));
+                    if (mm_addr.empty() && mm.contains("addr"))
+                        mm_addr = mm.value("addr", std::string(""));
+                    merged_totals[sym] += mm_amount;
+                    nlohmann::json me;
+                    me["symbol"]  = sym;
+                    me["address"] = mm_addr;
+                    me["amount"]  = mm_amount;
+                    me["pct"]     = 0;   // filled below
+                    if (mm.contains("source") && mm["source"].is_string())
+                        me["source"] = mm["source"];
+                    merged_arr.push_back(std::move(me));
+                }
+            }
+            m["merged"] = std::move(merged_arr);
+            miners.emplace_back(addr, std::move(m));
+        }
+    }
+
+    // Sort by primary amount desc, ties broken by address lex-asc
+    // (spec §5.1 contract rule).
+    std::sort(miners.begin(), miners.end(),
+        [](const auto& a, const auto& b) {
+            const double aa = a.second.value("amount", 0.0);
+            const double bb = b.second.value("amount", 0.0);
+            if (aa != bb) return aa > bb;
+            return a.first < b.first;
+        });
+
+    // Fill pct fields now that totals are known.
+    for (auto& [addr, entry] : miners) {
+        (void)addr;
+        double amt = entry.value("amount", 0.0);
+        entry["pct"] = total_primary > 0 ? amt / total_primary : 0.0;
+        if (entry.contains("merged") && entry["merged"].is_array()) {
+            for (auto& mm : entry["merged"]) {
+                std::string sym = mm.value("symbol", std::string(""));
+                double mt = merged_totals[sym];
+                mm["pct"] = mt > 0 ? mm.value("amount", 0.0) / mt : 0.0;
+            }
+        }
+    }
+
+    // Emit aggregate totals.
+    out["total_primary"] = total_primary;
+    nlohmann::json chains_arr = nlohmann::json::array();
+    nlohmann::json totals_obj = nlohmann::json::object();
+    for (const auto& [sym, tot] : merged_totals) {
+        chains_arr.push_back(sym);
+        totals_obj[sym] = tot;
+    }
+    out["merged_chains"] = std::move(chains_arr);
+    out["merged_totals"] = std::move(totals_obj);
+
+    // Emit miners array in sorted order.
+    nlohmann::json miners_arr = nlohmann::json::array();
+    miners_arr.get_ptr<nlohmann::json::array_t*>()->reserve(miners.size());
+    for (auto& [addr, entry] : miners) {
+        (void)addr;
+        miners_arr.push_back(std::move(entry));
+    }
+    out["miners"] = std::move(miners_arr);
+    return out;
+}
+
+nlohmann::json MiningInterface::rest_pplns_miner(const std::string& address)
+{
+    // Shape per frstrtr/the/docs/c2pool-pplns-view-module-task.md §5.2.
+    // First-cut implementation: project from the /pplns/current miner
+    // list and augment with recent_shares + sharechain lifetime counts.
+    // Defers hashrate_series / version_history to a follow-up — the
+    // current sharechain window gives us cadence, not a long-horizon
+    // time-series.
+    if (address.empty()) {
+        nlohmann::json err;
+        err["error"] = "miner_not_found";
+        return err;
+    }
+
+    const auto current = rest_pplns_current();
+    nlohmann::json out;
+    out["address"] = address;
+
+    // Scan miners[] for an exact match.
+    bool in_window = false;
+    if (current.contains("miners") && current["miners"].is_array()) {
+        for (const auto& m : current["miners"]) {
+            if (m.value("address", std::string("")) == address) {
+                out["amount"]           = m.value("amount", 0.0);
+                out["pct"]              = m.value("pct", 0.0);
+                if (m.contains("shares_in_window"))
+                    out["shares_in_window"] = m["shares_in_window"];
+                if (m.contains("version"))
+                    out["version"] = m["version"];
+                if (m.contains("desired_version"))
+                    out["desired_version"] = m["desired_version"];
+                if (m.contains("last_share_at"))
+                    out["last_share_at"] = m["last_share_at"];
+                if (m.contains("merged"))
+                    out["merged"] = m["merged"];
+                in_window = true;
+                break;
+            }
+        }
+    }
+    out["in_window"] = in_window;
+
+    // recent_shares: scan the current window for this miner's shares.
+    // Spec says "last N shares (configurable, default 50)"; we emit up
+    // to 50 newest-first.
+    nlohmann::json recent = nlohmann::json::array();
+    int    shares_total = 0;
+    double first_seen_at = 0;
+    if (m_sharechain_window_fn) {
+        auto window = m_sharechain_window_fn();
+        if (window.contains("shares") && window["shares"].is_array()) {
+            for (const auto& s : window["shares"]) {
+                if (s.value("m", std::string("")) != address) continue;
+                ++shares_total;
+                const double t = s.value("t", 0.0);
+                if (first_seen_at == 0 || t < first_seen_at) first_seen_at = t;
+                if (recent.size() < 50) {
+                    nlohmann::json r;
+                    if (s.contains("h")) r["h"] = s["h"];
+                    if (s.contains("t")) r["t"] = s["t"];
+                    if (s.contains("s")) r["s"] = s["s"];
+                    if (s.contains("V")) r["V"] = s["V"];
+                    recent.push_back(std::move(r));
+                }
+            }
+        }
+    }
+    if (!in_window && shares_total == 0) {
+        nlohmann::json err;
+        err["error"]   = "miner_not_found";
+        err["address"] = address;
+        return err;
+    }
+    out["shares_total"]  = shares_total;
+    if (first_seen_at > 0) out["first_seen_at"] = static_cast<int64_t>(first_seen_at);
+    out["recent_shares"] = std::move(recent);
+    return out;
+}
+
 
 nlohmann::json MiningInterface::rest_recent_merged_blocks()
 {

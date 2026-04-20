@@ -218,7 +218,9 @@ public:
 
     // Merged mining endpoints
     nlohmann::json rest_merged_stats();              // /merged_stats — merged mining statistics
-    nlohmann::json rest_current_merged_payouts();    // /current_merged_payouts — cached wrapper
+    nlohmann::json rest_current_merged_payouts();    // /current_merged_payouts — cached wrapper (legacy shape)
+    nlohmann::json rest_pplns_current();             // /pplns/current — spec §5.1 shape
+    nlohmann::json rest_pplns_miner(const std::string& address);  // /pplns/miner/<addr> — spec §5.2
     nlohmann::json compute_current_merged_payouts(); // full computation (main thread only)
     nlohmann::json rest_recent_merged_blocks();      // /recent_merged_blocks — recent merged blocks
     nlohmann::json rest_all_merged_blocks();         // /all_merged_blocks — all merged blocks
