@@ -122,7 +122,10 @@ jobs:
 
       - uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          # Node 22 — node --test supports glob expansion natively
+          # (Node 20 requires the shell to pre-expand the quoted glob,
+          # which fails on CI's bash + JSON-quoted package.json script).
+          node-version: '22'
           cache: npm
           cache-dependency-path: web-static/sharechain-explorer/package-lock.json
 
@@ -191,8 +194,21 @@ jobs:
       - name: Run leak harness under xvfb
         env:
           QTWEBENGINE_DISABLE_SANDBOX: '1'
+          # Force software GL throughout — the GitHub Ubuntu runner
+          # has no GPU, so QtWebEngine's default `use-gl desktop` fails
+          # as soon as Chromium tries to get an OpenGL context. Mesa
+          # swrast serves as a CPU fallback.
+          LIBGL_ALWAYS_SOFTWARE: '1'
+          QT_OPENGL: software
+          QT_QUICK_BACKEND: software
+          QTWEBENGINE_CHROMIUM_FLAGS: >-
+            --no-sandbox
+            --disable-gpu
+            --disable-dev-shm-usage
+            --disable-software-rasterizer
+            --use-gl=swiftshader
         run: |
-          xvfb-run -a --server-args="-screen 0 1280x800x24" \
+          xvfb-run -a --server-args="-screen 0 1280x800x24 +extension GLX +render -noreset" \
             timeout 180 ./build-qt/c2pool-qt_test_embedded_leak
 
   # ════════════════════════════════════════════════════════════════════════════
