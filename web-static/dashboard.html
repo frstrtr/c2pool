@@ -4656,35 +4656,24 @@
                 this.canvas.addEventListener('mouseleave', function() { self.hideTooltip(); });
                 this.canvas.addEventListener('click', function(e) { self.onClick(e); });
 
-                // ResizeObserver + hide-during-resize pattern, tuned
-                // for GNOME/Mutter on Wayland (Ubuntu 24.04). On
-                // maximize, the Wayland compositor stretches the
-                // previous Chrome window buffer to the new viewport
-                // BEFORE Chrome redraws — producing a visible "scales
-                // out" flash of the old canvas bitmap inside the new,
-                // larger wrap. CSS/JS inside the page can't stop the
-                // compositor from doing that. What we CAN do is hide
-                // the canvas during the resize burst so what stretches
-                // is a plain dark wrap, not cells.
-                //
-                // First observer tick hides the canvas. A 120 ms
-                // trailing debounce waits for the compositor animation
-                // to settle, then renders and reveals.
+                // ResizeObserver on the canvas wrap with a short
+                // trailing debounce. The OS compositor's maximize
+                // animation fires multiple observer ticks with
+                // intermediate widths (scaling the previous frame
+                // buffer to the new viewport mid-transition); each
+                // synchronous render at a transient width caused the
+                // visible "scales out" flash. A 60 ms trailing timer
+                // collapses the burst into a single render at the
+                // final layout — 60 ms is ~3 frames, imperceptible on
+                // manual drag but plenty for maximize to settle.
                 var wrap = this.canvas.parentElement;
                 var rzTimer = 0;
-                var rzHiding = false;
                 function rzSchedule() {
-                    if (!rzHiding) {
-                        rzHiding = true;
-                        self.canvas.style.visibility = 'hidden';
-                    }
                     if (rzTimer) clearTimeout(rzTimer);
                     rzTimer = setTimeout(function() {
                         rzTimer = 0;
-                        rzHiding = false;
                         if (self.shares.length > 0) self.render();
-                        self.canvas.style.visibility = 'visible';
-                    }, 120);
+                    }, 60);
                 }
                 if (wrap && typeof ResizeObserver === 'function') {
                     new ResizeObserver(rzSchedule).observe(wrap);
@@ -6383,31 +6372,21 @@
             });
         }
 
-        // Re-render PPLNS treemap with a hide-during-resize pattern.
-        // See the sharechain explorer handler for the Wayland
-        // compositor-stretching rationale. First observer tick hides
-        // the grid's cells; a 120 ms trailing debounce waits for the
-        // Mutter maximize animation to settle, then renders and
-        // restores visibility. What the compositor stretches during
-        // the animation is the empty dark wrap, not cells — so no
-        // visible "cells scale out of container" flash.
+        // Re-render PPLNS treemap when its container resizes, with a
+        // short 60 ms trailing debounce. See sharechain explorer
+        // comment above — maximize animation fires multiple transient
+        // observer ticks; rendering only at the settled final size
+        // eliminates the "cells scale out of container" flash.
         (function wirePplnsResize() {
             var tm = 0;
-            var hiding = false;
-            var grid = document.getElementById('pplns-main-grid');
             function schedule() {
-                if (!hiding && grid) {
-                    hiding = true;
-                    grid.style.visibility = 'hidden';
-                }
                 if (tm) clearTimeout(tm);
                 tm = setTimeout(function() {
                     tm = 0;
-                    hiding = false;
                     if (_cachedPPLNSPayouts) renderMainPPLNS(_cachedPPLNSPayouts);
-                    if (grid) grid.style.visibility = 'visible';
-                }, 120);
+                }, 60);
             }
+            var grid = document.getElementById('pplns-main-grid');
             if (grid && typeof ResizeObserver === 'function') {
                 new ResizeObserver(schedule).observe(grid);
             } else {
