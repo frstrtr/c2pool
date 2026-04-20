@@ -57,6 +57,7 @@ MainWindow::MainWindow(SettingsStore* settings, QWidget* parent)
     // JS plugins see the same allow-list everywhere.
     sharechainBridge_ = new SharechainBridge(&api_, this);
     settingsBridge_   = new SettingsBridge(settings_, this);
+    coinBridge_       = new CoinBridge(settings_, this);
 
     // Sharechain page — hybrid: the Explorer JS bundle running inside
     // a QWebEngineView, talking to native c2pool via SharechainBridge
@@ -66,7 +67,7 @@ MainWindow::MainWindow(SettingsStore* settings, QWidget* parent)
     PageEmbedded::Config sharechainCfg;
     sharechainCfg.qrcUrl = QStringLiteral(
         "qrc:///sharechain-explorer/dashboard-embed.html");
-    sharechainCfg.bridges = { sharechainBridge_, settingsBridge_ };
+    sharechainCfg.bridges = { sharechainBridge_, settingsBridge_, coinBridge_ };
     sharechainCfg.bridgeObjectName = QStringLiteral("qtBridge");
 #ifdef C2POOL_QT_DEV_BUNDLE
     sharechainCfg.devReloadEnabled = true;
@@ -81,7 +82,7 @@ MainWindow::MainWindow(SettingsStore* settings, QWidget* parent)
     PageEmbedded::Config pplnsCfg;
     pplnsCfg.qrcUrl = QStringLiteral(
         "qrc:///sharechain-explorer/pplns-embed.html");
-    pplnsCfg.bridges = { pplnsBridge_, sharechainBridge_, settingsBridge_ };
+    pplnsCfg.bridges = { pplnsBridge_, sharechainBridge_, settingsBridge_, coinBridge_ };
     pplnsCfg.bridgeObjectName = QStringLiteral("qtBridge");
 #ifdef C2POOL_QT_DEV_BUNDLE
     pplnsCfg.devReloadEnabled = true;

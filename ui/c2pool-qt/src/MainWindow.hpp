@@ -7,6 +7,7 @@
 #include "PageMining.hpp"
 #include "PageOverview.hpp"
 #include "SettingsStore.hpp"
+#include "bridges/CoinBridge.hpp"
 #include "bridges/PplnsBridge.hpp"
 #include "bridges/SettingsBridge.hpp"
 #include "bridges/SharechainBridge.hpp"
@@ -59,6 +60,7 @@ private:
     SharechainBridge* sharechainBridge_;
     PplnsBridge*      pplnsBridge_;
     SettingsBridge*   settingsBridge_;
+    CoinBridge*       coinBridge_;
 
     QTimer refreshTimer_;
     bool lastApiOnline_{false};
