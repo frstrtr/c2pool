@@ -817,6 +817,13 @@
             display: block;
             cursor: crosshair;
             image-rendering: pixelated;
+            /* Visual safety net: even if a transient render computes
+               a stale cssW/cssH between the viewport change and the
+               ResizeObserver firing, the canvas can't paint outside
+               its wrap. Prevents the "fills whole screen then shrinks"
+               flash on maximize. */
+            max-width: 100%;
+            max-height: 100%;
         }
         .defrag-sidebar {
             display: flex;
@@ -4627,9 +4634,32 @@
                 this.canvas.addEventListener('mouseleave', function() { self.hideTooltip(); });
                 this.canvas.addEventListener('click', function(e) { self.onClick(e); });
 
-                window.addEventListener('resize', function() {
-                    if (self.shares.length > 0) self.render();
-                });
+                // ResizeObserver on the CANVAS WRAP rather than
+                // window.resize. The browser's maximize animation
+                // fires window.resize multiple times with transient
+                // dimensions — in one of those frames
+                // .defrag-canvas-wrap reports full-viewport width
+                // (before the CSS grid's 220 px sidebar column settles),
+                // so the canvas briefly sizes to the whole screen then
+                // snaps back. ResizeObserver fires only after the
+                // observed element's layout is fully settled, so the
+                // render uses the final post-animation dimensions.
+                // rAF coalesces multi-step animations. Falls back to
+                // window.resize on older browsers.
+                var _rzRaf = 0;
+                function _rzSchedule() {
+                    if (_rzRaf) return;
+                    _rzRaf = requestAnimationFrame(function() {
+                        _rzRaf = 0;
+                        if (self.shares.length > 0) self.render();
+                    });
+                }
+                var wrap = this.canvas.parentElement;
+                if (wrap && typeof ResizeObserver === 'function') {
+                    new ResizeObserver(_rzSchedule).observe(wrap);
+                } else {
+                    window.addEventListener('resize', _rzSchedule);
+                }
             },
 
             load: function() {
