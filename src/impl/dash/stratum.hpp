@@ -91,6 +91,14 @@ struct JobContext {
     uint32_t ntime{0};
     uint32_t height{0};
     double   share_difficulty{1.0};
+    // Pool-level share target encoded by share_info.bits of the share template
+    // this job was built against. A submit with pow_hash ≤ real_share_target
+    // qualifies as a real p2pool share (broadcastable), independent of the
+    // per-session stratum difficulty. Set by share_builder::build(). Defaults
+    // to all-ones so a missing-population bug is visible as "every submit is a
+    // real share" rather than a silent drop. See p2pool-dash data.py:144-145
+    // — bits is clipped to [pre_target3/30, pre_target3] ≤ MAX_TARGET.
+    uint256  real_share_target{};
     // Raw tx "data" hex for every non-coinbase tx in the GBT. Needed to
     // assemble the full block hex when a share turns out to be a full block.
     std::vector<std::string> tx_data_hex;

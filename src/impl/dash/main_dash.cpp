@@ -1350,7 +1350,9 @@ int main(int argc, char* argv[])
                 LOG_INFO << "[SUBMIT] accepted worker=" << s.worker_name
                          << " job=" << s.job_id
                          << " hash=" << r.x11_hash.GetHex().substr(0, 16)
-                         << (r.is_block ? " *** BLOCK ***" : " share");
+                         << (r.is_block ? " *** BLOCK ***"
+                             : r.valid_real_share ? " real_share"
+                             : " pseudoshare");
                 // Feed hashrate tracker so per-worker estimates update.
                 enhanced_node->track_mining_share_submission(
                     s.worker_name, ctx->share_difficulty);
@@ -1417,9 +1419,18 @@ int main(int argc, char* argv[])
                     }
                 }
 
-                // Phase 5c/5d: promote this submit into a real v16 share.
-                // We do it for BOTH valid shares and blocks: any valid share
-                // target hit is also a valid share for peers.
+                // Promote this submit into a real v16 share ONLY if the hash
+                // meets the pool's real_share_target (≤ MAX_TARGET). Shares
+                // that only meet the miner's stratum target are pseudoshares:
+                // they count for stratum stats (already tracked above) and
+                // local PPLNS credit, but broadcasting them would produce
+                // protocol-invalid shares (share.target > MAX_TARGET) that
+                // peers reject as PeerMisbehavingError('share target invalid').
+                // See p2pool-dash data.py:356-358.
+                if (!r.valid_real_share) {
+                    // Accepted as a pseudoshare; nothing to broadcast.
+                    return true;
+                }
                 try {
                     auto tmpl_opt = fetch_template(s.job_id);
                     if (!tmpl_opt) {

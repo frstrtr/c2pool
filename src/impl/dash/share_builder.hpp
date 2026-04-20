@@ -494,7 +494,26 @@ inline BuiltJob build(const dash::coin::DashWorkData& work,
     // max_bits: use pool's configured max_target as compact.
     s.m_max_bits  = chain::target_to_bits_upper_bound(params.max_target);
     if (s.m_max_bits == 0) s.m_max_bits = 0x1f00ffff;    // extreme fallback
-    s.m_bits      = share_bits;
+
+    // bits: clamp the caller's desired share_bits to pool range. p2pool-dash
+    // data.py:145 does:
+    //   bits = FloatingInteger.from_target_upper_bound(
+    //            clip(desired_target, (pre_target3/30, pre_target3)))
+    // with pre_target3 = MAX_TARGET for a bootstrap chain (height <
+    // TARGET_LOOKBEHIND). A peer receiving a share with bits.target > MAX_TARGET
+    // raises PeerMisbehavingError('share target invalid') at data.py:356-358,
+    // so this clamp is a consensus requirement, not an aesthetic one.
+    // Vardiff tightening (pre_target3 < MAX_TARGET once the chain grows past
+    // TARGET_LOOKBEHIND) is a separate follow-up — for now we clamp to the
+    // MAX_TARGET upper bound only; the lower bound (pre_target3/30) is not
+    // enforced by peers, only by the creator's self-consistency check.
+    {
+        uint256 desired = chain::bits_to_target(share_bits);
+        if (desired > params.max_target) desired = params.max_target;
+        uint32_t clamped_bits = chain::target_to_bits_upper_bound(desired);
+        if (clamped_bits == 0) clamped_bits = s.m_max_bits;
+        s.m_bits = clamped_bits;
+    }
 
     // Timestamp must match p2pool-dash's clip (data.py:238-241):
     //   clipped in [parent.ts + 1, parent.ts + 2*SHARE_PERIOD - 1]
@@ -709,6 +728,10 @@ inline BuiltJob build(const dash::coin::DashWorkData& work,
     out.context.ntime            = static_cast<uint32_t>(std::time(nullptr));
     out.context.height           = work.m_height;
     out.context.share_difficulty = share_difficulty;
+    // Real share target = target encoded by the final (clamped) share_info.bits.
+    // Submit validator uses this to split pseudoshares (stratum credit only)
+    // from real p2pool shares (broadcast to peers). See stratum.hpp JobContext.
+    out.context.real_share_target = chain::bits_to_target(s.m_bits);
     // Full-block submission on a block hit: ship every GBT tx that we also
     // included in new_transaction_hashes (parallel arrays, same keep set).
     out.context.tx_data_hex.clear();
