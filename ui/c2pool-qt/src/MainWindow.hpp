@@ -6,6 +6,7 @@
 #include "PageLogs.hpp"
 #include "PageMining.hpp"
 #include "PageOverview.hpp"
+#include "bridges/PplnsBridge.hpp"
 #include "bridges/SharechainBridge.hpp"
 
 #include <QLabel>
@@ -48,7 +49,9 @@ private:
     PageMining*       miningPage_;
     PageLogs*         logsPage_;
     PageEmbedded*     sharechainPage_;
+    PageEmbedded*     pplnsPage_;
     SharechainBridge* sharechainBridge_;
+    PplnsBridge*      pplnsBridge_;
 
     QTimer refreshTimer_;
     bool lastApiOnline_{false};

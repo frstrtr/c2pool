@@ -50,6 +50,7 @@ add_executable(c2pool-qt
     src/PageLogs.cpp
     src/PageEmbedded.cpp
     src/bridges/SharechainBridge.cpp
+    src/bridges/PplnsBridge.cpp
 )
 
 # Step 2 embedded-web smoke-test resource: qrc:///test/hello.html.
@@ -72,6 +73,8 @@ qt_add_resources(c2pool-qt "explorer_bundle"
     FILES
         "${C2POOL_EXPLORER_DIR}/dashboard-embed.html"
         "${C2POOL_EXPLORER_DIR}/dist/sharechain-explorer.js"
+        "${C2POOL_EXPLORER_DIR}/pplns-embed.html"
+        "${C2POOL_EXPLORER_DIR}/dist/pplns-view.js"
 )
 
 target_include_directories(c2pool-qt PRIVATE src)

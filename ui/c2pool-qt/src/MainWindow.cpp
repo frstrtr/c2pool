@@ -42,7 +42,7 @@ MainWindow::MainWindow(QWidget* parent)
     auto* layout = new QHBoxLayout(central);
 
     navList_ = new QListWidget(central);
-    navList_->addItems({"Launch", "Overview", "Mining", "Sharechain", "Logs"});
+    navList_->addItems({"Launch", "Overview", "Mining", "Sharechain", "PPLNS", "Logs"});
     navList_->setFixedWidth(180);
     layout->addWidget(navList_);
 
@@ -67,13 +67,29 @@ MainWindow::MainWindow(QWidget* parent)
 #endif
     sharechainPage_ = new PageEmbedded(sharechainCfg, stack_);
 
+    // PPLNS View page — second hybrid surface. Same PageEmbedded
+    // pattern, different bundle. Reuses the sharechain tip stream
+    // (PPLNS View spec §5.4 — single SSE socket serves both views).
+    // Per hybrid-architecture.md §8 step 12.
+    pplnsBridge_ = new PplnsBridge(&api_, this);
+    PageEmbedded::Config pplnsCfg;
+    pplnsCfg.qrcUrl = QStringLiteral(
+        "qrc:///sharechain-explorer/pplns-embed.html");
+    pplnsCfg.bridges = { pplnsBridge_, sharechainBridge_ };
+    pplnsCfg.bridgeObjectName = QStringLiteral("qtBridge");
+#ifdef C2POOL_QT_DEV_BUNDLE
+    pplnsCfg.devReloadEnabled = true;
+#endif
+    pplnsPage_ = new PageEmbedded(pplnsCfg, stack_);
+
     logsPage_       = new PageLogs(stack_);
 
     stack_->addWidget(launchPage_);     // index 0
     stack_->addWidget(overviewPage_);   // index 1
     stack_->addWidget(miningPage_);     // index 2
     stack_->addWidget(sharechainPage_); // index 3
-    stack_->addWidget(logsPage_);       // index 4
+    stack_->addWidget(pplnsPage_);      // index 4
+    stack_->addWidget(logsPage_);       // index 5
 
     layout->addWidget(stack_, 1);
     setCentralWidget(central);
@@ -201,6 +217,12 @@ void MainWindow::refreshCurrentPage()
         statusLabel_->setText("Sharechain (embedded)");
         break;
     case 4:
+        // PPLNS View is also driven by its embedded JS bundle
+        // (pplns-view.js) via PplnsBridge; it reuses the sharechain
+        // tip stream for refresh triggers. No native poke needed.
+        statusLabel_->setText("PPLNS (embedded)");
+        break;
+    case 5:
         logsPage_->refresh(&api_);
         statusLabel_->setText("Logs refreshed");
         break;

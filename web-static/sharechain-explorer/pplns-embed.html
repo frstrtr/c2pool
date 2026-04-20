@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<!--
+  c2pool-qt embedded PPLNS View host.
+
+  Served from qrc:///sharechain-explorer/pplns-embed.html inside a
+  QWebEngineView (Qt step 12). The JS PPLNS View bundle runs here
+  unchanged — it consumes a Transport; we build one from the two
+  bridges exposed by MainWindow over QWebChannel:
+
+    qtBridge.pplns      — fetchCurrentPayouts + fetchMinerDetail + cancel
+    qtBridge.sharechain — subscribeStream (tip events trigger refetch)
+
+  Reusing the sharechain tip stream for PPLNS is per
+  frstrtr/the/docs/c2pool-pplns-view-module-task.md §5.4 — one SSE
+  socket, both views see the same tip, tip-to-payout consistency
+  guaranteed.
+
+  CSP matches the Explorer embed (delta v1 §B.3).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self' 'unsafe-inline' qrc:; style-src 'self' 'unsafe-inline' qrc:; connect-src 'self' qrc:; img-src 'self' data: qrc:;">
+<title>PPLNS View (embedded)</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0d0d1a; height: 100%; overflow: hidden; }
+  body {
+    color: #e6e6ff;
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  #wrap {
+    width: 100%; height: 100vh; position: relative;
+    padding: 8px; box-sizing: border-box;
+  }
+  #tree {
+    width: 100%; height: calc(100vh - 60px);
+    position: relative; background: #0d0d1a; overflow: hidden;
+  }
+  #status {
+    position: absolute; right: 12px; top: 10px;
+    font-size: 12px; color: #9999bb;
+  }
+  #status.err { color: #dc3545; }
+  #log {
+    position: absolute; left: 12px; bottom: 10px; right: 12px;
+    max-height: 40px; overflow-y: auto;
+    font-family: Monaco, Consolas, monospace; font-size: 11px;
+    color: #77778a;
+  }
+</style>
+</head>
+<body>
+  <div id="wrap">
+    <div id="tree"></div>
+    <div id="status">connecting…</div>
+    <div id="log"></div>
+  </div>
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+  <script type="module">
+    import {
+      PplnsView,
+      LTC_COIN_PPLNS_DESCRIPTOR,
+    } from './dist/pplns-view.js';
+
+    const statusEl = document.getElementById('status');
+    const logEl    = document.getElementById('log');
+    const tree     = document.getElementById('tree');
+
+    function setStatus(txt, kind) {
+      statusEl.textContent = txt;
+      statusEl.className = kind === 'err' ? 'err' : '';
+    }
+    function log(level, msg, ctx) {
+      const stamp = new Date().toISOString().split('T')[1].slice(0, 8);
+      const line = `[${stamp}] ${level.padEnd(5)} ${msg}` +
+                   (ctx !== undefined ? '  ' + JSON.stringify(ctx) : '');
+      logEl.textContent = (line + '\n' + logEl.textContent).slice(0, 2000);
+    }
+
+    // ── QtPplnsTransport — PPLNS ops + tip-stream reuse ──────────────
+    class QtPplnsTransport {
+      constructor(pplnsBridge, sharechainBridge) {
+        this.kind = 'qt';
+        this.pplnsBridge       = pplnsBridge;
+        this.sharechainBridge  = sharechainBridge;
+        this._nextId   = 1;
+        this._pending  = new Map();
+        pplnsBridge.responseReady.connect((id, payload) => {
+          const p = this._pending.get(id);
+          if (!p) return;
+          this._pending.delete(id);
+          p.resolve(payload);
+        });
+        pplnsBridge.responseFailed.connect((id, err) => {
+          const p = this._pending.get(id);
+          if (!p) return;
+          this._pending.delete(id);
+          p.reject(err);
+        });
+      }
+      _call(method, args, opts) {
+        const id = this._nextId++;
+        if (opts && opts.signal) {
+          opts.signal.addEventListener('abort',
+            () => this.pplnsBridge.cancelRequest(id));
+        }
+        return new Promise((resolve, reject) => {
+          this._pending.set(id, { resolve, reject });
+          this.pplnsBridge[method](id, ...args);
+        });
+      }
+      // Explorer ops — not used by PPLNS View module, stub cleanly.
+      fetchWindow()       { return Promise.reject(explorerUnsupported('fetchWindow')); }
+      fetchTip()          { return Promise.reject(explorerUnsupported('fetchTip')); }
+      fetchDelta()        { return Promise.reject(explorerUnsupported('fetchDelta')); }
+      fetchStats()        { return Promise.reject(explorerUnsupported('fetchStats')); }
+      fetchShareDetail()  { return Promise.reject(explorerUnsupported('fetchShareDetail')); }
+      async negotiate()   { return { apiVersion: '1.0.0' }; }
+      // PPLNS ops (real).
+      fetchCurrentPayouts(opts)    { return this._call('getCurrentPayouts', [],         opts); }
+      fetchMinerDetail(addr, opts) { return this._call('getMinerDetail',    [addr],     opts); }
+      // Tip stream — reuse the sharechain bridge's SSE (spec §5.4).
+      subscribeStream(onTip, onError, onReconnect) {
+        if (!this.sharechainBridge) {
+          return { unsubscribe: () => {} };
+        }
+        const tipH = (ev) => onTip(ev);
+        const rcH  = () => { if (onReconnect) onReconnect(); };
+        this.sharechainBridge.tipChanged.connect(tipH);
+        this.sharechainBridge.tipReconnected.connect(rcH);
+        this.sharechainBridge.startStream();
+        return {
+          unsubscribe: () => {
+            try { this.sharechainBridge.tipChanged.disconnect(tipH); } catch {}
+            try { this.sharechainBridge.tipReconnected.disconnect(rcH); } catch {}
+            // Don't call stopStream — the Sharechain tab may still need it.
+          },
+        };
+      }
+    }
+    function explorerUnsupported(op) {
+      return {
+        type: 'transport',
+        message: 'QtPplnsTransport does not implement ' + op +
+                 ' — PPLNS View does not use Explorer ops',
+      };
+    }
+
+    // ── Boot ─────────────────────────────────────────────────────────
+    function onChannelReady(channel) {
+      const pplnsBridge = channel.objects.pplns;
+      const shareBridge = channel.objects.sharechain;
+      if (!pplnsBridge) {
+        setStatus('no pplns bridge', 'err');
+        log('error', 'QWebChannel did not expose pplns');
+        return;
+      }
+      const transport = new QtPplnsTransport(pplnsBridge, shareBridge);
+      try {
+        const ctrl = PplnsView.init({
+          container: tree,
+          transport,
+          coin: LTC_COIN_PPLNS_DESCRIPTOR,
+          showVersionBadge: true,
+          showHashrate: true,
+          showMerged: true,
+        });
+        ctrl.on('ready', () => {
+          setStatus('connected');
+          log('info', 'PPLNS View started via QtPplnsTransport');
+        });
+        ctrl.on('error', (err) => {
+          setStatus('error', 'err');
+          log('error', err.message || String(err), { type: err.type });
+        });
+        window.__pplnsQt = ctrl;
+        window.addEventListener('beforeunload', () => {
+          try { ctrl.destroy(); } catch {}
+        });
+      } catch (err) {
+        setStatus('failed to start', 'err');
+        log('error', String(err && err.message ? err.message : err));
+      }
+    }
+
+    if (typeof QWebChannel !== 'function') {
+      setStatus('QWebChannel unavailable', 'err');
+      log('error', 'qwebchannel.js did not load');
+    } else {
+      new QWebChannel(qt.webChannelTransport, onChannelReady);
+    }
+  </script>
+</body>
+</html>
