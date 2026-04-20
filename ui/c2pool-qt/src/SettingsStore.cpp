@@ -7,11 +7,19 @@
 #include <QSettings>
 #include <QTimer>
 
+#ifdef C2POOL_QT_USE_KEYCHAIN
+#  include <qt6keychain/keychain.h>
+#endif
+
 namespace {
 
 constexpr const char* DEFAULT_PROFILE   = "default";
 constexpr const char* DEFAULT_BASE_URL  = "http://127.0.0.1:8080";
 constexpr int         DEFAULT_REFRESH_MS = 5000;
+
+#ifdef C2POOL_QT_USE_KEYCHAIN
+constexpr const char* KEYCHAIN_SERVICE  = "c2pool Qt Control Panel";
+#endif
 
 } // namespace
 
@@ -307,6 +315,66 @@ QString SettingsStore::secretsKey(const QString& profile, const QString& key) co
     return QStringLiteral("secrets/%1/%2").arg(profile, key);
 }
 
+#ifdef C2POOL_QT_USE_KEYCHAIN
+
+void SettingsStore::readSecret(const QString& key,
+                               std::function<void(QString, bool)> cb)
+{
+    // Per doc §6: account is "<profile>/<key>" under a single
+    // keychain service. QKeychain jobs are async — the .then lambda
+    // fires on the GUI thread once the backend returns.
+    auto* job = new QKeychain::ReadPasswordJob(
+        QString::fromLatin1(KEYCHAIN_SERVICE), this);
+    job->setKey(secretsKey(activeProfile(), key));
+    connect(job, &QKeychain::ReadPasswordJob::finished, this, [job, cb]() {
+        const bool ok = job->error() == QKeychain::NoError;
+        if (cb) cb(ok ? job->textData() : QString(), ok);
+        job->deleteLater();
+    });
+    job->start();
+}
+
+void SettingsStore::writeSecret(const QString& key, const QString& value,
+                                std::function<void(bool)> cb)
+{
+    auto* job = new QKeychain::WritePasswordJob(
+        QString::fromLatin1(KEYCHAIN_SERVICE), this);
+    job->setKey(secretsKey(activeProfile(), key));
+    job->setTextData(value);
+    const QString path = secretsKey(activeProfile(), key);
+    connect(job, &QKeychain::WritePasswordJob::finished, this, [this, job, cb, path]() {
+        const bool ok = job->error() == QKeychain::NoError;
+        if (ok) emit changed(path);
+        if (cb) cb(ok);
+        job->deleteLater();
+    });
+    job->start();
+}
+
+void SettingsStore::deleteSecret(const QString& key, std::function<void(bool)> cb)
+{
+    auto* job = new QKeychain::DeletePasswordJob(
+        QString::fromLatin1(KEYCHAIN_SERVICE), this);
+    job->setKey(secretsKey(activeProfile(), key));
+    const QString path = secretsKey(activeProfile(), key);
+    connect(job, &QKeychain::DeletePasswordJob::finished, this, [this, job, cb, path]() {
+        // EntryNotFound is treated as success — caller wanted it gone.
+        const bool ok = job->error() == QKeychain::NoError
+                     || job->error() == QKeychain::EntryNotFound;
+        if (ok) emit changed(path);
+        if (cb) cb(ok);
+        job->deleteLater();
+    });
+    job->start();
+}
+
+#else  // C2POOL_QT_USE_KEYCHAIN
+
+// QSettings-fallback implementation — kept for systems where
+// qtkeychain isn't available at build time. Stores plaintext under
+// [secrets/<profile>/<key>]; risk is documented at the schema level
+// so a future migration can transparently upgrade to keychain.
+
 void SettingsStore::readSecret(const QString& key,
                                std::function<void(QString, bool)> cb)
 {
@@ -314,7 +382,7 @@ void SettingsStore::readSecret(const QString& key,
     const QVariant v = QSettings{}.value(path);
     const QString str = v.toString();
     // Defer via single-shot timer so callbacks are always async —
-    // matches the keychain-backed implementation's contract.
+    // matches the keychain-backed path's contract.
     QTimer::singleShot(0, this, [cb, str]() {
         if (cb) cb(str, !str.isEmpty());
     });
@@ -336,6 +404,8 @@ void SettingsStore::deleteSecret(const QString& key, std::function<void(bool)> c
     emit changed(path);
     QTimer::singleShot(0, this, [cb]() { if (cb) cb(true); });
 }
+
+#endif  // C2POOL_QT_USE_KEYCHAIN
 
 void SettingsStore::loadRpcCredentials(
     std::function<void(QString, QString, bool)> cb)

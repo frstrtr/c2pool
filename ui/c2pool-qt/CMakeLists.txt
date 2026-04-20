@@ -36,6 +36,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(C2POOL_QT_USE_KEYCHAIN
     "Store secrets in OS keychain via qtkeychain (fallback to QSettings)"
     ON)
+
+# qtkeychain is a SOFT dependency — the option controls whether we
+# try to find it. If enabled but the package isn't installed, fall
+# back to QSettings secrets (SettingsStore carries both code paths).
+if(C2POOL_QT_USE_KEYCHAIN)
+    find_package(Qt6Keychain CONFIG QUIET)
+    if(NOT Qt6Keychain_FOUND)
+        message(STATUS "Qt6Keychain not found — SettingsStore will use QSettings secrets fallback. "
+                       "Install qtkeychain-qt6-dev (or equivalent) to enable OS keychain storage.")
+    endif()
+endif()
 option(C2POOL_QT_DEV_BUNDLE
     "Allow loading the JS bundle from a filesystem path (dev only)"
     OFF)
@@ -90,11 +101,14 @@ target_link_libraries(c2pool-qt PRIVATE
 
 # Propagate the dev-bundle flag as a compile definition so C++ code in
 # subsequent steps can `#ifdef C2POOL_QT_DEV_BUNDLE` to branch between
-# the qrc:/// resource path and a filesystem path. The keychain flag
-# is consumed when the settings bridge lands.
+# the qrc:/// resource path and a filesystem path.
 if(C2POOL_QT_DEV_BUNDLE)
     target_compile_definitions(c2pool-qt PRIVATE C2POOL_QT_DEV_BUNDLE=1)
 endif()
-if(C2POOL_QT_USE_KEYCHAIN)
+# C2POOL_QT_USE_KEYCHAIN is defined only when qtkeychain was found,
+# so the C++ code can `#ifdef C2POOL_QT_USE_KEYCHAIN` to reach the
+# keychain branch without guessing whether the library is linkable.
+if(C2POOL_QT_USE_KEYCHAIN AND Qt6Keychain_FOUND)
     target_compile_definitions(c2pool-qt PRIVATE C2POOL_QT_USE_KEYCHAIN=1)
+    target_link_libraries(c2pool-qt PRIVATE Qt6Keychain::Qt6Keychain)
 endif()
