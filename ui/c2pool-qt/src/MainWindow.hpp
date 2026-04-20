@@ -6,6 +6,7 @@
 #include "PageLogs.hpp"
 #include "PageMining.hpp"
 #include "PageOverview.hpp"
+#include "SettingsStore.hpp"
 #include "bridges/PplnsBridge.hpp"
 #include "bridges/SharechainBridge.hpp"
 
@@ -22,7 +23,10 @@ class MainWindow : public QMainWindow
 {
     Q_OBJECT
 public:
-    explicit MainWindow(QWidget* parent = nullptr);
+    /** SettingsStore is constructed in main() before MainWindow so
+     *  schema migrations run first. MainWindow borrows the reference;
+     *  ownership stays in main(). */
+    explicit MainWindow(SettingsStore* settings, QWidget* parent = nullptr);
 
 protected:
     void closeEvent(QCloseEvent* event) override;
@@ -33,6 +37,7 @@ private:
     void loadSettings();
     void saveSettings() const;
 
+    SettingsStore* settings_;
     ApiClient api_;
 
     QLineEdit* baseUrlEdit_;

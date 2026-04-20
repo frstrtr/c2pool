@@ -2,13 +2,12 @@
 
 #include <QCloseEvent>
 #include <QHBoxLayout>
-#include <QSettings>
 #include <QToolBar>
 #include <QVBoxLayout>
 #include <QWidget>
 
-MainWindow::MainWindow(QWidget* parent)
-    : QMainWindow(parent)
+MainWindow::MainWindow(SettingsStore* settings, QWidget* parent)
+    : QMainWindow(parent), settings_(settings)
 {
     setWindowTitle("c2pool-qt");
     resize(1200, 760);
@@ -162,17 +161,15 @@ void MainWindow::closeEvent(QCloseEvent* event)
 
 void MainWindow::loadSettings()
 {
-    QSettings s;
-    baseUrlEdit_->setText(s.value("ui/baseUrl", "http://127.0.0.1:8080").toString());
-    const int refreshMs = s.value("ui/refreshMs", 5000).toInt();
+    baseUrlEdit_->setText(settings_->uiBaseUrl());
+    const int refreshMs = settings_->uiRefreshMs();
     refreshTimer_.setInterval(refreshMs > 0 ? refreshMs : 5000);
 }
 
 void MainWindow::saveSettings() const
 {
-    QSettings s;
-    s.setValue("ui/baseUrl", baseUrlEdit_->text().trimmed());
-    s.setValue("ui/refreshMs", refreshTimer_.interval());
+    settings_->setUiBaseUrl(baseUrlEdit_->text().trimmed());
+    settings_->setUiRefreshMs(refreshTimer_.interval());
 }
 
 void MainWindow::updateDaemonState(bool api_online)
