@@ -368,7 +368,7 @@ void PageLaunch::setupUi()
             for (int i = 0; i < 16; ++i)
                 id += HEX[std::rand() % 16];
             networkIdEdit_->setText(id);
-            updateCommandPreview();
+            onBuildPreview();
         });
         idRow->addWidget(generateIdBtn_);
         form->addRow("Network ID:", idRow);
@@ -388,7 +388,7 @@ void PageLaunch::setupUi()
             "genesis: Create new chain immediately, don't wait for peers\n"
             "wait: Never create genesis, wait indefinitely for peers to sync");
         connect(startupModeCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged),
-                this, [this](int) { updateCommandPreview(); });
+                this, [this](int) { onBuildPreview(); });
         form->addRow("Startup mode:", startupModeCombo_);
 
         connect(privateChainCheck_, &QCheckBox::stateChanged, this, [this](int state) {
@@ -405,7 +405,7 @@ void PageLaunch::setupUi()
                 privateStatusLabel_->setText("Public p2pool network");
                 privateStatusLabel_->setStyleSheet("color: green; font-weight: bold;");
             }
-            updateCommandPreview();
+            onBuildPreview();
         });
 
         vbox->addWidget(g);
