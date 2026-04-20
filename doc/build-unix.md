@@ -257,6 +257,39 @@ sudo apt-get install -y libleveldb-dev
 The Conan profile must match the original build. If you changed compiler
 version or build type, packages will recompile once and then be cached.
 
+### `conan install` hangs / fails downloading from sourceware.org (bzip2)
+
+The Conan Center recipe for `bzip2` fetches sources from `sourceware.org`,
+which frequently times out mid-transfer even when the site loads fine in a
+browser. Symptom:
+
+```
+bzip2/1.0.8: WARN: network: Download failed, check server, possibly try again
+HTTPSConnectionPool(host='sourceware.org', port=443): Read timed out.
+bzip2/1.0.8: Waiting 5 seconds to retry...
+```
+
+Fix — add Conan Center's backup sources mirror to `~/.conan2/global.conf`:
+
+```
+core.sources:download_urls=["https://c3i.jfrog.io/artifactory/conan-center-backup-sources/", "origin"]
+core.net.http:max_retries=1
+core.net.http:timeout=120
+```
+
+This tells Conan to try the reliable JFrog mirror first and fall back to
+the recipe's `origin` URL only if that fails. SHA256 is validated against
+`conandata.yml` either way, so integrity is preserved.
+
+The same fallback covers other flaky upstream hosts (GNU FTP, savannah,
+kernel.org) — Conan Center backs up every source tarball its recipes use.
+
+Verify the config took effect:
+
+```bash
+conan config show "core.sources:*"
+```
+
 ### CMake 3.30+ / FindBoost warning
 
 The project already handles `CMP0167` — no manual workaround needed.
