@@ -37,12 +37,6 @@
             min-height: 100vh;
             line-height: 1.6;
             width: 100%;
-            /* During maximize, the OS compositor can briefly scale the
-               previous frame buffer to the new viewport — making
-               absolutely-positioned grid children momentarily appear
-               beyond viewport width. Clip at body so the user never
-               sees the transient horizontal overflow. */
-            overflow-x: hidden;
         }
         
         .container {
@@ -802,20 +796,13 @@
             margin-top: 12px;
         }
         .defrag-canvas-wrap {
-            /* flex:1 + min-width:0 so the wrap shrinks to its flex
-               slot instead of taking intrinsic (canvas-driven) width
-               during transient resize frames. `contain: layout size`
-               isolates the wrap's sizing from its canvas child so
-               the OS compositor can't scale the old pixel buffer
-               past the new flex slot during maximize. */
+            /* flex:1 + min-width:0 so the canvas column takes its
+               flex slot independent of canvas intrinsic width. */
             flex: 1 1 0;
             min-width: 0;
-            max-width: 100%;
-            contain: layout;
         }
         .defrag-sidebar {
             flex: 0 0 220px;
-            max-width: 220px;
         }
         @media (max-width: 900px) {
             .defrag-container { flex-direction: column; }
@@ -839,13 +826,6 @@
             display: block;
             cursor: crosshair;
             image-rendering: pixelated;
-            /* Visual safety net: even if a transient render computes
-               a stale cssW/cssH between the viewport change and the
-               ResizeObserver firing, the canvas can't paint outside
-               its wrap. Prevents the "fills whole screen then shrinks"
-               flash on maximize. */
-            max-width: 100%;
-            max-height: 100%;
         }
         .defrag-sidebar {
             display: flex;
@@ -4656,24 +4636,15 @@
                 this.canvas.addEventListener('mouseleave', function() { self.hideTooltip(); });
                 this.canvas.addEventListener('click', function(e) { self.onClick(e); });
 
-                // ResizeObserver on the canvas wrap with a short
-                // trailing debounce. The OS compositor's maximize
-                // animation fires multiple observer ticks with
-                // intermediate widths (scaling the previous frame
-                // buffer to the new viewport mid-transition); each
-                // synchronous render at a transient width caused the
-                // visible "scales out" flash. A 60 ms trailing timer
-                // collapses the burst into a single render at the
-                // final layout — 60 ms is ~3 frames, imperceptible on
-                // manual drag but plenty for maximize to settle.
+                // ResizeObserver on the canvas wrap fires after the
+                // observed element's layout is settled. Synchronous
+                // render in the callback ensures the canvas bitmap
+                // matches the new container size in the same frame
+                // the layout change commits. Falls back to
+                // window.resize on older browsers.
                 var wrap = this.canvas.parentElement;
-                var rzTimer = 0;
                 function rzSchedule() {
-                    if (rzTimer) clearTimeout(rzTimer);
-                    rzTimer = setTimeout(function() {
-                        rzTimer = 0;
-                        if (self.shares.length > 0) self.render();
-                    }, 60);
+                    if (self.shares.length > 0) self.render();
                 }
                 if (wrap && typeof ResizeObserver === 'function') {
                     new ResizeObserver(rzSchedule).observe(wrap);
@@ -6372,25 +6343,19 @@
             });
         }
 
-        // Re-render PPLNS treemap when its container resizes, with a
-        // short 60 ms trailing debounce. See sharechain explorer
-        // comment above — maximize animation fires multiple transient
-        // observer ticks; rendering only at the settled final size
-        // eliminates the "cells scale out of container" flash.
+        // Re-render PPLNS treemap when its container resizes.
+        // ResizeObserver fires after the observed element's layout
+        // settles. Sync render so cell positions update in the same
+        // frame the new container dimensions land.
         (function wirePplnsResize() {
-            var tm = 0;
-            function schedule() {
-                if (tm) clearTimeout(tm);
-                tm = setTimeout(function() {
-                    tm = 0;
-                    if (_cachedPPLNSPayouts) renderMainPPLNS(_cachedPPLNSPayouts);
-                }, 60);
+            function go() {
+                if (_cachedPPLNSPayouts) renderMainPPLNS(_cachedPPLNSPayouts);
             }
             var grid = document.getElementById('pplns-main-grid');
             if (grid && typeof ResizeObserver === 'function') {
-                new ResizeObserver(schedule).observe(grid);
+                new ResizeObserver(go).observe(grid);
             } else {
-                window.addEventListener('resize', schedule);
+                window.addEventListener('resize', go);
             }
         })();
 
