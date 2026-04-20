@@ -49,42 +49,43 @@ diff.png          red-highlighted pixel diff
 mock-server.log   server stdout/stderr
 ```
 
-## Measured state (2026-04-19, explorer-module HEAD)
+## Measured state (2026-04-20, explorer-module HEAD)
 
 Current inline-vs-bundled delta on the 200-share fixture screenshot
 of `#defrag-canvas`:
 
 ```
-diff pixels: 257 / 34960 (0.735%)
-threshold:   7.00%   (default — set via env THRESHOLD)
+diff pixels: 0 / 34960 (0.000%)
+threshold:   0.50%   (default — set via env THRESHOLD)
 → PASS
 ```
 
-The 0.7% residual traces to two remaining sources:
+Pixel-byte-identical. All earlier "tighten later" items landed:
 
-1. **Hour-axis labels + tick lines.** Inline paints `NNh` text in
-   the left margin plus row-boundary tick strokes across the grid
-   (dashboard.html:4716-4740). The bundled static renderer does
-   not reproduce these yet. Visible as red text in the left margin
-   and faint horizontal lines in `diff.png`.
-2. **Block-cell borders.** Inline wraps LTC blocks in a 2 px gold
-   stroke, DOGE blocks in cyan, twin blocks in orange
-   (dashboard.html:4759-4775). The bundled renderer emits the
-   solid fill but no stroke. Visible as ~4 orange rectangles in
-   `diff.png` on a typical fixture.
+1. ✓ **my_address auto-adoption** — RealtimeOrchestrator reads
+   `my_address` from `/sharechain/window` when the caller didn't
+   supply one, matching inline dashboard.html:4624
+   (`_effectiveUserContext` in `src/explorer/realtime.ts`).
+2. ✓ **Block-cell borders** — CellFrame.stroke carries a
+   `{color, lineWidth}` overlay; buildStaticFrame + the animator
+   wave track emit LTC gold, DOGE cyan, twin orange per
+   dashboard.html:4759-4775. Twin also overrides the fill to
+   `#ff8000`.
+3. ✓ **Tip-marker triangle** — CellFrame.tipMark drives a
+   `fillTriangle` paint command on the tip share's top-left
+   corner, suppressed when the tip is also a block
+   (dashboard.html:4778-4787).
+4. ✓ **Hour-axis labels + tick lines** — `buildHourAxis` in
+   realtime.ts walks each row, labels hour-boundary transitions
+   with `Xh` (right-aligned in the left margin) and draws
+   0.5-px rgba(140,140,180,0.2) strokes across the grid
+   (dashboard.html:4705-4740). Requires shares to carry `t`
+   (unix seconds).
 
-Earlier 5.02% delta (pre `ed473911`) traced predominantly to
-missing `my_address` auto-adoption in the bundled path — inline
-read it from `/sharechain/window` while bundled relied on a
-`window.currency_info` shim that isn't populated in the visual-
-test setup. The RealtimeOrchestrator now mirrors inline behaviour:
-if the caller did not supply a `userContext.myAddress`, the
-server-provided `my_address` wins. Fixed in `_effectiveUserContext`
-in `src/explorer/realtime.ts`.
-
-Threshold default is **7%**. Tighten to **1%** once the hour-axis
-labels and block-border passes land, and to **0.1%** once pixel-
-exact parity is required (likely Phase 2 repo split).
+Threshold default is **0.5%** — comfortable margin for OS /
+anti-aliasing / font-rendering noise when CI runs on different
+hardware. Tighten to **0.1%** if stricter parity becomes
+necessary.
 
 ## CI
 

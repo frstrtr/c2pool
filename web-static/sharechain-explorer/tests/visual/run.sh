@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 PORT="${PORT:-18082}"
-THRESHOLD="${THRESHOLD:-0.07}"
+THRESHOLD="${THRESHOLD:-0.005}"
 
 echo "[1/4] generating fixtures"
 node fixtures/generate.mjs

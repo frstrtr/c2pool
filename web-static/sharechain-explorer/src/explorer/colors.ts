@@ -22,6 +22,10 @@ export interface ShareForClassify {
   m: string;
   fee?: number;
   blk?: number;
+  /** Unix seconds — share.t. Used for hour-axis labels. */
+  t?: number;
+  /** Compact-bits difficulty — share.b. Used by pplnsOf for card %. */
+  b?: number;
 }
 
 export type ShareClass =

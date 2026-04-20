@@ -13,11 +13,12 @@ import pixelmatch from 'pixelmatch';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OUT = join(HERE, 'out');
 
-// Default 7% — current measured delta (explorer-baseline-v0 vs
-// explorer-module HEAD as of 2026-04-20) is ~5%, so 7% allows small
-// OS/font noise. Tighten as Phase B #11 particles + card overlays
-// close visual gaps. Override via CLI arg or THRESHOLD env var.
-const threshold = Number(process.argv[2] ?? process.env.THRESHOLD ?? 0.07);
+// Default 0.5% — measured inline-vs-bundled delta on current
+// explorer-module HEAD is 0.000% (pixel-byte-identical after the
+// block-border + tip-marker + hour-axis decoration pass landed).
+// 0.5% gives a comfortable margin for OS/font/anti-aliasing noise
+// on different CI hardware. Override via CLI arg or THRESHOLD env.
+const threshold = Number(process.argv[2] ?? process.env.THRESHOLD ?? 0.005);
 
 function loadPng(path) {
   const buf = readFileSync(path);

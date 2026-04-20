@@ -26,7 +26,10 @@ export type PaintCommand =
   | { op: 'fillBackground'; w: number; h: number; color: string }
   | { op: 'fillCell'; x: number; y: number; w: number; h: number; color: string }
   | { op: 'strokeRect'; x: number; y: number; w: number; h: number; color: string; lineWidth: number }
-  | { op: 'textCenter'; text: string; x: number; y: number; color: string; font: string };
+  | { op: 'textCenter'; text: string; x: number; y: number; color: string; font: string }
+  | { op: 'textRight';  text: string; x: number; y: number; color: string; font: string }
+  | { op: 'strokeLine'; x1: number; y1: number; x2: number; y2: number; color: string; lineWidth: number }
+  | { op: 'fillTriangle'; x1: number; y1: number; x2: number; y2: number; x3: number; y3: number; color: string };
 
 export interface BuildPaintOptions {
   layout: GridLayout;
@@ -121,6 +124,12 @@ export interface CanvasLike {
   fillRect(x: number, y: number, w: number, h: number): void;
   strokeRect(x: number, y: number, w: number, h: number): void;
   fillText(text: string, x: number, y: number): void;
+  beginPath(): void;
+  moveTo(x: number, y: number): void;
+  lineTo(x: number, y: number): void;
+  closePath(): void;
+  fill(): void;
+  stroke(): void;
 }
 
 /** Build a paint program from an animator frame. Each CellFrame's
@@ -155,6 +164,52 @@ export function buildAnimatedPaintProgram(
       w: cell.size,
       h: cell.size,
       color: cell.color,
+    });
+    // Block-border stroke (dashboard.html:4759-4775). Inset by 0.5 on
+    // each axis + shrink by 1 matches the reference
+    // `strokeRect(x+0.5, y+0.5, cs-1, cs-1)`.
+    if (cell.stroke !== undefined) {
+      cmds.push({
+        op: 'strokeRect',
+        x: cell.x + 0.5,
+        y: cell.y + 0.5,
+        w: cell.size - 1,
+        h: cell.size - 1,
+        color: cell.stroke.color,
+        lineWidth: cell.stroke.lineWidth,
+      });
+    }
+    // Tip-marker triangle (dashboard.html:4778-4787) — top-left
+    // corner, 4×4 right-triangle, white fill.
+    if (cell.tipMark === true) {
+      cmds.push({
+        op: 'fillTriangle',
+        x1: cell.x,         y1: cell.y,
+        x2: cell.x + 4,     y2: cell.y,
+        x3: cell.x,         y3: cell.y + 4,
+        color: '#ffffff',
+      });
+    }
+  }
+  // Hour-axis tick lines — rendered on top of cells but below labels.
+  for (const line of frame.axisLines) {
+    cmds.push({
+      op: 'strokeLine',
+      x1: line.x1, y1: line.y1,
+      x2: line.x2, y2: line.y2,
+      color: line.color,
+      lineWidth: line.lineWidth,
+    });
+  }
+  // Hour-axis labels in the left margin.
+  for (const label of frame.axisLabels) {
+    cmds.push({
+      op: 'textRight',
+      text: label.text,
+      x: label.x,
+      y: label.y,
+      color: label.color,
+      font: label.font,
     });
   }
   // Particles render as small fillCell commands. Their colour already
@@ -280,6 +335,30 @@ export function executePaintProgram(
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         ctx.fillText(cmd.text, cmd.x, cmd.y);
+        break;
+      case 'textRight':
+        ctx.fillStyle = cmd.color;
+        ctx.font = cmd.font;
+        ctx.textAlign = 'right';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(cmd.text, cmd.x, cmd.y);
+        break;
+      case 'strokeLine':
+        ctx.strokeStyle = cmd.color;
+        ctx.lineWidth = cmd.lineWidth;
+        ctx.beginPath();
+        ctx.moveTo(cmd.x1, cmd.y1);
+        ctx.lineTo(cmd.x2, cmd.y2);
+        ctx.stroke();
+        break;
+      case 'fillTriangle':
+        ctx.fillStyle = cmd.color;
+        ctx.beginPath();
+        ctx.moveTo(cmd.x1, cmd.y1);
+        ctx.lineTo(cmd.x2, cmd.y2);
+        ctx.lineTo(cmd.x3, cmd.y3);
+        ctx.closePath();
+        ctx.fill();
         break;
     }
   }

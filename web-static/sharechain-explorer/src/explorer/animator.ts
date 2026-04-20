@@ -65,6 +65,14 @@ export interface AnimationInput {
   minerOf?: (share: ShareForClassify) => string;
   /** Seed for deterministic particle positions/velocities. Default 0. */
   rngSeed?: number;
+  /** Short-hashes of shares that solved an LTC block — cells get a
+   *  gold stroke, twin (LTC+DOGE) cells get an orange fill + stroke. */
+  primaryBlockHashes?: ReadonlySet<string>;
+  /** Short-hashes of shares that solved a DOGE block. */
+  dogeBlockHashes?: ReadonlySet<string>;
+  /** Short-hash of the tip share — gets a small white triangle marker
+   *  in its top-left corner, except when it's also a block. */
+  tipHash?: string;
 }
 
 export type AnimTrack = 'dying' | 'wave' | 'born';
@@ -77,6 +85,29 @@ export interface CellFrame {
   size: number;
   color: string;
   alpha: number;
+  /** Coloured border stroke painted on top of the cell fill.
+   *  Used for block markers (LTC gold, DOGE cyan, twin orange). */
+  stroke?: { color: string; lineWidth: number };
+  /** Paint a tiny white tip-triangle in the top-left corner of the
+   *  cell — set only on the tip share when no block marker applies. */
+  tipMark?: boolean;
+}
+
+/** Hour-axis label in the left margin. */
+export interface AxisLabel {
+  text: string;
+  x: number;     // anchor x; drawn right-aligned on the text command
+  y: number;
+  color: string;
+  font: string;
+}
+
+/** Horizontal tick line at an hour boundary, drawn across the grid. */
+export interface AxisLine {
+  x1: number; y1: number;
+  x2: number; y2: number;
+  color: string;
+  lineWidth: number;
 }
 
 export interface ParticleFrame {
@@ -119,6 +150,11 @@ export interface FrameSpec {
   cells: readonly CellFrame[];
   particles: readonly ParticleFrame[];
   cards: readonly CardOverlayFrame[];
+  /** Hour-axis labels (in the left margin). Empty when timestamps
+   *  aren't available or no hour boundary rows exist. */
+  axisLabels: readonly AxisLabel[];
+  /** Horizontal tick lines at hour boundaries. */
+  axisLines: readonly AxisLine[];
   backgroundColor: string;
   layout: GridLayout;
 }
@@ -420,8 +456,20 @@ export function buildAnimationPlan(input: AnimationInput): AnimationPlan {
       const size = baseSize * scale;
       const xCentre = lerp(oldPos.x, newPos.x, slideA) + baseSize / 2;
       const yCentre = lerp(oldPos.y, newPos.y, slideA) + baseSize / 2;
-      const color = colorForHash(entry.hash, input.newShares, newIndexByHash);
-      cells.push({
+      let color = colorForHash(entry.hash, input.newShares, newIndexByHash);
+      const isLtc = input.primaryBlockHashes?.has(entry.hash) ?? false;
+      const isDoge = input.dogeBlockHashes?.has(entry.hash) ?? false;
+      const isTip = input.tipHash !== undefined && input.tipHash === entry.hash;
+      let stroke: { color: string; lineWidth: number } | undefined;
+      if (isLtc && isDoge) {
+        color = '#ff8000';              // twin orange fill
+        stroke = { color: '#ffaa00', lineWidth: 2 };
+      } else if (isLtc) {
+        stroke = { color: '#ffd700', lineWidth: 2 };
+      } else if (isDoge) {
+        stroke = { color: '#00e5ff', lineWidth: 2 };
+      }
+      const cell: CellFrame = {
         shareHash: entry.hash,
         track: 'wave',
         x: xCentre - size / 2,
@@ -429,7 +477,10 @@ export function buildAnimationPlan(input: AnimationInput): AnimationPlan {
         size,
         color,
         alpha: 1,
-      });
+      };
+      if (stroke) cell.stroke = stroke;
+      if (isTip && !isLtc && !isDoge) cell.tipMark = true;
+      cells.push(cell);
     }
 
     // ═══ DYING (phase 1) ═══
@@ -656,6 +707,8 @@ export function buildAnimationPlan(input: AnimationInput): AnimationPlan {
       cells,
       particles,
       cards,
+      axisLabels: [],     // animator paths don't emit axis (wave/dying/born)
+      axisLines: [],
       backgroundColor: '#0d0d1a',
       layout,
     };

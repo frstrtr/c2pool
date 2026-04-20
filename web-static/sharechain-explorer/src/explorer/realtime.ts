@@ -71,6 +71,69 @@ const DEFAULT_LAYOUT_PARAMS: LayoutParams = Object.freeze({
   minHeight: 40,
 });
 
+/** Compute hour-axis labels + row tick lines for the static grid view.
+ *  Verbatim from dashboard.html:4705-4740: walk each row, average the
+ *  age of the shares in that row (now - share.t), label rows whose
+ *  hour bucket has changed. Returns empty arrays when timestamps
+ *  aren't available or no hour boundaries exist. */
+function buildHourAxis(
+  shares: readonly ShareForClassify[],
+  layout: GridLayout,
+): {
+  labels: readonly import('./animator.js').AxisLabel[];
+  lines:  readonly import('./animator.js').AxisLine[];
+} {
+  const labels: import('./animator.js').AxisLabel[] = [];
+  const lines:  import('./animator.js').AxisLine[]  = [];
+  if (shares.length === 0 || layout.cols === 0) return { labels, lines };
+  // Need timestamps — if none of the shares have `t`, bail out.
+  let anyT = false;
+  for (const s of shares) { if (typeof s.t === 'number') { anyT = true; break; } }
+  if (!anyT) return { labels, lines };
+
+  const now = Date.now() / 1000;
+  const step = layout.step;
+  const ml = layout.marginLeft;
+  const cssW = layout.cssWidth;
+  const font = 'bold 11px -apple-system, sans-serif';
+
+  let lastHour = -1;
+  for (let r = 0; r < layout.rows; r++) {
+    const start = r * layout.cols;
+    const end = Math.min(start + layout.cols, shares.length);
+    if (start >= end) break;
+    let sum = 0;
+    let count = 0;
+    for (let j = start; j < end; j++) {
+      const s = shares[j];
+      if (s !== undefined && typeof s.t === 'number') {
+        sum += (now - s.t);
+        count++;
+      }
+    }
+    if (count === 0) continue;
+    const avgAge = sum / count;
+    const hour = Math.floor(avgAge / 3600);
+    if (hour === lastHour || hour < 0) continue;
+    lastHour = hour;
+    const yLabel = r * step + step / 2;
+    labels.push({
+      text: hour + 'h',
+      x: ml - 4,
+      y: yLabel,
+      color: '#b0b0cc',
+      font,
+    });
+    lines.push({
+      x1: ml,   y1: r * step,
+      x2: cssW, y2: r * step,
+      color: 'rgba(140,140,180,0.2)',
+      lineWidth: 0.5,
+    });
+  }
+  return { labels, lines };
+}
+
 /** Convert a Bitcoin-style compact-bits value to a floating-point
  *  difficulty. Verbatim from dashboard.html:5875-5884. */
 function bitsToDifficulty(bits: number): number {
@@ -289,28 +352,58 @@ export class RealtimeOrchestrator {
         cells: [],
         particles: [],
         cards: [],
+        axisLabels: [],
+        axisLines: [],
         backgroundColor: this.config.backgroundColor,
         layout,
       };
     }
-    const cells = this.window.shares.map((s, i) => {
+    const primarySet = new Set(this.window.primaryBlocks ?? []);
+    const dogeSet    = new Set(this.window.dogeBlocks ?? []);
+    const tipHash    = this.window.shares.length > 0
+      ? this.config.hashOf(this.window.shares[0]!)
+      : undefined;
+    const cs = layout.cellSize;
+    type CF = import('./animator.js').CellFrame;
+    const cells: CF[] = this.window.shares.map((s, i): CF => {
       const col = i % layout.cols;
       const row = Math.floor(i / layout.cols);
       const x = layout.marginLeft + col * layout.step;
       const y = row * layout.step;
-      return {
-        shareHash: this.config.hashOf(s),
-        track: 'wave' as const,
+      const h = this.config.hashOf(s);
+      const isLtc = primarySet.has(h) || s.blk === 1;
+      const isDoge = dogeSet.has(h);
+      let color = getColor(s, this._effectiveUserContext, this.config.palette);
+      let stroke: { color: string; lineWidth: number } | undefined;
+      if (isLtc && isDoge) {
+        color = '#ff8000';
+        stroke = { color: '#ffaa00', lineWidth: 2 };
+      } else if (isLtc) {
+        stroke = { color: '#ffd700', lineWidth: 2 };
+      } else if (isDoge) {
+        stroke = { color: '#00e5ff', lineWidth: 2 };
+      }
+      const cell: CF = {
+        shareHash: h,
+        track: 'wave',
         x, y,
-        size: layout.cellSize,
-        color: getColor(s, this._effectiveUserContext, this.config.palette),
+        size: cs,
+        color,
         alpha: 1,
       };
+      if (stroke) cell.stroke = stroke;
+      if (h === tipHash && !isLtc && !isDoge) cell.tipMark = true;
+      return cell;
     });
+    // Hour-axis labels + tick lines (dashboard.html:4705-4740). Skip
+    // when shares don't carry timestamps.
+    const axis = buildHourAxis(this.window.shares, layout);
     return {
       cells,
       particles: [],
       cards: [],
+      axisLabels: axis.labels,
+      axisLines: axis.lines,
       backgroundColor: this.config.backgroundColor,
       layout,
     };
@@ -587,6 +680,9 @@ export class RealtimeOrchestrator {
       hashOf: this.config.hashOf,
       fast: this.config.fastAnimation,
       ...(pplnsOf ? { pplnsOf } : {}),
+      primaryBlockHashes: new Set(this.window.primaryBlocks ?? []),
+      dogeBlockHashes:    new Set(this.window.dogeBlocks ?? []),
+      ...(this.window.tip !== undefined ? { tipHash: this.window.tip } : {}),
     });
 
     if (this.anim.isRunning()) {
