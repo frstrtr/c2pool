@@ -81,6 +81,20 @@ pip install "conan>=2.0,<3.0" --break-system-packages
 > Alternatively, use a venv:
 > `python3 -m venv ~/.conan-venv && source ~/.conan-venv/bin/activate && pip install conan`
 
+`pip` installs `conan` into `~/.local/bin`, which may not be on your `PATH`.
+Add it for the current shell, and append the same line to `~/.bashrc` (or
+`~/.zshrc`) so it sticks across sessions:
+
+```bash
+export PATH="$PATH:$HOME/.local/bin"
+```
+
+Verify `conan` is now resolvable:
+
+```bash
+command -v conan   # should print /home/<you>/.local/bin/conan
+```
+
 Create the default toolchain profile (auto-detects GCC 13):
 
 ```bash

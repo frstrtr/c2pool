@@ -71,6 +71,7 @@ All release binaries are built from the tagged git commit. To verify a binary ma
 ```bash
 sudo apt-get install -y g++ cmake make libleveldb-dev libsecp256k1-dev python3-pip
 pip install "conan>=2.0,<3.0" --break-system-packages
+export PATH="$PATH:$HOME/.local/bin"   # so `conan` is on PATH (add to ~/.bashrc to persist)
 conan profile detect --force
 
 git clone https://github.com/frstrtr/c2pool.git
