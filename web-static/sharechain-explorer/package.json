@@ -25,6 +25,7 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "esbuild": "^0.24.0",
+    "fast-check": "^4.7.0",
     "pixelmatch": "^6.0.0",
     "pngjs": "^7.0.0",
     "puppeteer-core": "^23.11.1",
