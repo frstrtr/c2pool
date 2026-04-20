@@ -132,6 +132,31 @@ jobs:
       - name: Verify (typecheck + build + test + manifest + size)
         run: npm run verify
 
+      - name: Install Chrome for pixel-regression harness
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            google-chrome-stable || \
+          sudo apt-get install -y --no-install-recommends chromium-browser
+          # Export the first one that exists so capture.mjs picks it up.
+          for bin in /usr/bin/google-chrome-stable /usr/bin/google-chrome /usr/bin/chromium /usr/bin/chromium-browser; do
+            if [ -x "$bin" ]; then
+              echo "CHROME_BIN=$bin" >> "$GITHUB_ENV"
+              break
+            fi
+          done
+
+      - name: Visual pixel-diff harness
+        run: npm run visual
+
+      - name: Upload visual diff artefacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: visual-diff-out
+          path: web-static/sharechain-explorer/tests/visual/out/
+          retention-days: 7
+
   # ════════════════════════════════════════════════════════════════════════════
   # macOS (Apple Silicon arm64 — GitHub only provides ARM runners now)
   # Intel x86_64 macOS binary is built locally; see doc/build-macos.md
