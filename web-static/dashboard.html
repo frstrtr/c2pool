@@ -6238,16 +6238,23 @@
                         var el = document.createElement('div');
                         el.className = 'pm-doge';
                         el.style.fontSize = Math.max(8, fitPct * 0.8) + 'px';
-                        if (hasDoge) {
-                            var dp = dogeTotal > 0 ? (r.doge / dogeTotal * 100).toFixed(1) : '0';
-                            el.style.color = '#ffd700';
-                            el.textContent = dp + (r.w > 60 ? '% DOGE' : '% D');
-                        } else if (isV35Only) {
+                        if (isV35Only) {
+                            // V35-only miner — structurally excluded from DOGE
+                            // by the transitional-phase signaling gate. Red.
                             el.style.color = '#ff6b6b';
-                            el.textContent = r.w > 50 ? 'NO DOGE' : '0% D';
+                            el.textContent = r.w > 50 ? 'NO DOGE' : 'V35';
                         } else {
-                            el.style.color = 'rgba(255,255,255,0.3)';
-                            el.textContent = '\u2014';
+                            // V36 native or V35 signaling V36 — in the DOGE
+                            // class via auto-convert. Show current %; gold
+                            // even at 0% so transient fetch-race states don't
+                            // read as "missing DOGE". (A V36-signaling share
+                            // in the best chain always contributes non-zero
+                            // merged weight; 0% only appears briefly if the
+                            // /current_merged_payouts cache is refreshing.)
+                            el.style.color = '#ffd700';
+                            var dp = (hasDoge && dogeTotal > 0)
+                                ? (r.doge / dogeTotal * 100).toFixed(1) : '0.0';
+                            el.textContent = dp + (r.w > 60 ? '% DOGE' : '% D');
                         }
                         cell.appendChild(el);
                     }
@@ -6324,6 +6331,11 @@
                                 }
                             } else if (isV35Only) {
                                 dogeLine = '<div style="color:#ff6b6b;font-weight:600">0 DOGE \u2014 upgrade to V36!</div>';
+                            } else {
+                                // V36-signaling but 0 DOGE in current cache —
+                                // transient (merged-payouts cache refreshing
+                                // after a new tip). Next poll resolves it.
+                                dogeLine = '<div style="color:#ffd700;font-weight:600">0% DOGE (pending next tip)</div>';
                             }
                             var hrLine = '';
                             var mHr = defrag.minerHashrates ? defrag.minerHashrates[r.addr] : 0;
