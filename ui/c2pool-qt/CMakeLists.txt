@@ -63,6 +63,7 @@ add_executable(c2pool-qt
     src/SettingsStore.cpp
     src/bridges/SharechainBridge.cpp
     src/bridges/PplnsBridge.cpp
+    src/bridges/SettingsBridge.cpp
 )
 
 # Step 2 embedded-web smoke-test resource: qrc:///test/hello.html.

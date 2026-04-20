@@ -50,16 +50,23 @@ MainWindow::MainWindow(SettingsStore* settings, QWidget* parent)
     overviewPage_   = new PageOverview(stack_);
     miningPage_     = new PageMining(stack_);
 
+    // Bridges. SharechainBridge + PplnsBridge carry data; SettingsBridge
+    // routes JS view-state writes to SettingsStore per
+    // frstrtr/the/docs/c2pool-qt-hybrid-architecture.md §4.3.
+    // SettingsBridge is a single instance shared across every embed —
+    // JS plugins see the same allow-list everywhere.
+    sharechainBridge_ = new SharechainBridge(&api_, this);
+    settingsBridge_   = new SettingsBridge(settings_, this);
+
     // Sharechain page — hybrid: the Explorer JS bundle running inside
     // a QWebEngineView, talking to native c2pool via SharechainBridge
     // over QtWebChannel. Bundle lives at
     // qrc:///sharechain-explorer/dashboard-embed.html.
-    // Per frstrtr/the/docs/c2pool-qt-hybrid-architecture.md §8 step 7.
-    sharechainBridge_ = new SharechainBridge(&api_, this);
+    // Per §8 step 7.
     PageEmbedded::Config sharechainCfg;
     sharechainCfg.qrcUrl = QStringLiteral(
         "qrc:///sharechain-explorer/dashboard-embed.html");
-    sharechainCfg.bridges = { sharechainBridge_ };
+    sharechainCfg.bridges = { sharechainBridge_, settingsBridge_ };
     sharechainCfg.bridgeObjectName = QStringLiteral("qtBridge");
 #ifdef C2POOL_QT_DEV_BUNDLE
     sharechainCfg.devReloadEnabled = true;
@@ -74,7 +81,7 @@ MainWindow::MainWindow(SettingsStore* settings, QWidget* parent)
     PageEmbedded::Config pplnsCfg;
     pplnsCfg.qrcUrl = QStringLiteral(
         "qrc:///sharechain-explorer/pplns-embed.html");
-    pplnsCfg.bridges = { pplnsBridge_, sharechainBridge_ };
+    pplnsCfg.bridges = { pplnsBridge_, sharechainBridge_, settingsBridge_ };
     pplnsCfg.bridgeObjectName = QStringLiteral("qtBridge");
 #ifdef C2POOL_QT_DEV_BUNDLE
     pplnsCfg.devReloadEnabled = true;

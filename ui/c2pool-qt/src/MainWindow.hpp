@@ -8,6 +8,7 @@
 #include "PageOverview.hpp"
 #include "SettingsStore.hpp"
 #include "bridges/PplnsBridge.hpp"
+#include "bridges/SettingsBridge.hpp"
 #include "bridges/SharechainBridge.hpp"
 
 #include <QLabel>
@@ -57,6 +58,7 @@ private:
     PageEmbedded*     pplnsPage_;
     SharechainBridge* sharechainBridge_;
     PplnsBridge*      pplnsBridge_;
+    SettingsBridge*   settingsBridge_;
 
     QTimer refreshTimer_;
     bool lastApiOnline_{false};
