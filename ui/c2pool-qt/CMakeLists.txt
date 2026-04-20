@@ -115,3 +115,39 @@ if(C2POOL_QT_USE_KEYCHAIN AND Qt6Keychain_FOUND)
     target_compile_definitions(c2pool-qt PRIVATE C2POOL_QT_USE_KEYCHAIN=1)
     target_link_libraries(c2pool-qt PRIVATE Qt6Keychain::Qt6Keychain)
 endif()
+
+# ── Step 14 leak-regression gate ─────────────────────────────────────
+# mount→destroy × 100 of PageEmbedded; asserts no leaked QtWebEngine
+# helper processes. Runs under QT_QPA_PLATFORM=offscreen so it doesn't
+# need a display. Off by default so a plain c2pool-qt build stays
+# minimal; enable with -DC2POOL_QT_BUILD_TESTS=ON.
+option(C2POOL_QT_BUILD_TESTS
+    "Build c2pool-qt leak-regression + smoke tests"
+    OFF)
+
+if(C2POOL_QT_BUILD_TESTS)
+    add_executable(c2pool-qt_test_embedded_leak
+        test/test_embedded_leak.cpp
+        src/PageEmbedded.cpp
+    )
+    # Reuse the test_resources + explorer_bundle qrc blobs so the
+    # harness can load qrc:///test/hello.html without rebuilding the
+    # resource tree.
+    qt_add_resources(c2pool-qt_test_embedded_leak "test_resources_leak"
+        PREFIX "/test"
+        BASE   "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/test"
+        FILES  "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/test/hello.html"
+    )
+    target_include_directories(c2pool-qt_test_embedded_leak PRIVATE src)
+    target_link_libraries(c2pool-qt_test_embedded_leak PRIVATE
+        Qt6::Widgets
+        Qt6::Network
+        Qt6::WebEngineCore
+        Qt6::WebEngineWidgets
+        Qt6::WebChannel
+    )
+    if(C2POOL_QT_DEV_BUNDLE)
+        target_compile_definitions(c2pool-qt_test_embedded_leak PRIVATE
+            C2POOL_QT_DEV_BUNDLE=1)
+    endif()
+endif()
