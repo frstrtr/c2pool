@@ -4656,25 +4656,29 @@
                 this.canvas.addEventListener('mouseleave', function() { self.hideTooltip(); });
                 this.canvas.addEventListener('click', function(e) { self.onClick(e); });
 
-                // ResizeObserver on the canvas wrap — fires only after
-                // the observed element's layout is settled, so we get
-                // the final post-maximize size. Render SYNCHRONOUSLY
-                // in the callback (not via rAF): the ResizeObserver
-                // callback runs before the browser's next paint, so a
-                // synchronous render updates the canvas bitmap in the
-                // SAME frame the layout change is committed — no
-                // interstitial paint where the old canvas is shown in
-                // the new box. This eliminates the "fills whole screen
-                // then shrinks" flash.
+                // ResizeObserver on the canvas wrap with a short
+                // trailing debounce. The OS compositor's maximize
+                // animation fires multiple observer ticks with
+                // intermediate widths (scaling the previous frame
+                // buffer to the new viewport mid-transition); each
+                // synchronous render at a transient width caused the
+                // visible "scales out" flash. A 60 ms trailing timer
+                // collapses the burst into a single render at the
+                // final layout — 60 ms is ~3 frames, imperceptible on
+                // manual drag but plenty for maximize to settle.
                 var wrap = this.canvas.parentElement;
+                var rzTimer = 0;
+                function rzSchedule() {
+                    if (rzTimer) clearTimeout(rzTimer);
+                    rzTimer = setTimeout(function() {
+                        rzTimer = 0;
+                        if (self.shares.length > 0) self.render();
+                    }, 60);
+                }
                 if (wrap && typeof ResizeObserver === 'function') {
-                    new ResizeObserver(function() {
-                        if (self.shares.length > 0) self.render();
-                    }).observe(wrap);
+                    new ResizeObserver(rzSchedule).observe(wrap);
                 } else {
-                    window.addEventListener('resize', function() {
-                        if (self.shares.length > 0) self.render();
-                    });
+                    window.addEventListener('resize', rzSchedule);
                 }
             },
 
@@ -4767,8 +4771,13 @@
                 var dpr = this.dpr;
                 var ml = this.marginLeft;
 
-                // Reset canvas width so parent can shrink freely on resize.
-                canvas.style.width = '0px';
+                // Read parent dimensions directly. We used to zero the
+                // canvas first (`canvas.style.width = '0px'`) so the
+                // flex slot wasn't pinned to canvas-intrinsic width —
+                // but the flex container already has `min-width: 0`
+                // and `contain: layout`, so canvas content doesn't
+                // contribute to the wrap's width. Zeroing added a
+                // transient 0-px layout state visible during maximize.
                 var parent = canvas.parentElement;
                 var containerWidth  = parent.clientWidth - 16;
                 var containerHeight = parent.clientHeight - 16;
@@ -6363,22 +6372,25 @@
             });
         }
 
-        // Re-render PPLNS treemap when its container resizes.
-        // ResizeObserver fires after the observed element's layout
-        // settles, and BEFORE the browser's next paint. Render
-        // synchronously in the callback so cell positions update in
-        // the same frame the container's new dimensions land —
-        // prevents stale cells from being visible at old positions
-        // in the new container.
+        // Re-render PPLNS treemap when its container resizes, with a
+        // short 60 ms trailing debounce. See sharechain explorer
+        // comment above — maximize animation fires multiple transient
+        // observer ticks; rendering only at the settled final size
+        // eliminates the "cells scale out of container" flash.
         (function wirePplnsResize() {
-            function go() {
-                if (_cachedPPLNSPayouts) renderMainPPLNS(_cachedPPLNSPayouts);
+            var tm = 0;
+            function schedule() {
+                if (tm) clearTimeout(tm);
+                tm = setTimeout(function() {
+                    tm = 0;
+                    if (_cachedPPLNSPayouts) renderMainPPLNS(_cachedPPLNSPayouts);
+                }, 60);
             }
             var grid = document.getElementById('pplns-main-grid');
             if (grid && typeof ResizeObserver === 'function') {
-                new ResizeObserver(go).observe(grid);
+                new ResizeObserver(schedule).observe(grid);
             } else {
-                window.addEventListener('resize', go);
+                window.addEventListener('resize', schedule);
             }
         })();
 
