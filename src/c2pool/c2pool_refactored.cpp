@@ -1289,15 +1289,15 @@ int main(int argc, char* argv[]) {
     // so long git-describe version strings don't push a `#` past the
     // border.
     //
-    // Layout: "# " + " " + content + " " + " #", so the full frame width
-    // is inner + 4. The min inner-width floor keeps the frame tidy even
-    // when content is short.
+    // Row layout: "#  " + content + padding(inner-size) + "  #" → inner+6
+    // chars. Border matches. The min inner-width floor keeps the frame
+    // tidy when content is short.
     auto frame_rows = [](const std::vector<std::string>& lines,
                          std::vector<std::string>& out) {
         size_t inner = 0;
         for (const auto& l : lines) inner = std::max(inner, l.size());
         inner = std::max<size_t>(inner, 56);
-        const std::string border(inner + 4, '#');
+        const std::string border(inner + 6, '#');
         out.push_back(border);
         for (const auto& l : lines) {
             std::string row = "#  ";
