@@ -24,6 +24,7 @@
 #include <core/uint256.hpp>
 #include <core/mining_node_interface.hpp>
 #include <core/address_validator.hpp>
+#include <core/hashrate_ring.hpp>
 #include <c2pool/payout/payout_manager.hpp>
 #include <c2pool/hashrate/tracker.hpp>
 #include <core/address_utils.hpp>
@@ -1231,6 +1232,11 @@ private:
     };
     BestDifficulty m_best_difficulty;
     mutable std::mutex m_best_diff_mutex;
+
+    // Per-miner rolling hashrate ring populated by
+    // record_share_difficulty; consumed by rest_pplns_current
+    // (hashrate_hps) + rest_pplns_miner (hashrate_series).
+    HashrateRing m_hashrate_ring;
 
     // Stat log for /web/log JSON endpoint (rolling 24h window)
     struct StatLogEntry {

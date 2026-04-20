@@ -6013,6 +6013,11 @@ nlohmann::json MiningInterface::rest_pplns_current()
                 if (eit->second.last_share_at > 0)
                     m["last_share_at"] = static_cast<int64_t>(eit->second.last_share_at);
             }
+            // Rolling hashrate (H/s) from the in-memory ring populated
+            // by record_share_difficulty. Tolerates 0 silently — the
+            // spec treats hashrate_hps as optional.
+            const double hps = m_hashrate_ring.hashrate(addr);
+            if (hps > 0) m["hashrate_hps"] = hps;
             // Merged-chain breakdown.
             nlohmann::json merged_arr = nlohmann::json::array();
             if (entry.is_object() && entry.contains("merged")
@@ -6162,6 +6167,21 @@ nlohmann::json MiningInterface::rest_pplns_miner(const std::string& address)
     out["shares_total"]  = shares_total;
     if (first_seen_at > 0) out["first_seen_at"] = static_cast<int64_t>(first_seen_at);
     out["recent_shares"] = std::move(recent);
+
+    // Hashrate (rolling + bucketed series) from the ring.
+    const double hps = m_hashrate_ring.hashrate(address);
+    if (hps > 0) out["hashrate_hps"] = hps;
+    auto series = m_hashrate_ring.series(address);
+    if (!series.empty()) {
+        nlohmann::json series_json = nlohmann::json::array();
+        for (const auto& p : series) {
+            nlohmann::json point;
+            point["t"]   = p.t;
+            point["hps"] = p.hps;
+            series_json.push_back(std::move(point));
+        }
+        out["hashrate_series"] = std::move(series_json);
+    }
     return out;
 }
 
@@ -6567,6 +6587,11 @@ nlohmann::json MiningInterface::rest_web_graph_data(const std::string& source, c
 
 void MiningInterface::record_share_difficulty(double difficulty, const std::string& miner)
 {
+    // Feed the rolling-hashrate ring. Independent of the best-diff
+    // tracking below; the ring has its own internal lock.
+    m_hashrate_ring.record(miner, difficulty,
+        static_cast<int64_t>(std::time(nullptr)));
+
     std::lock_guard<std::mutex> lock(m_best_diff_mutex);
     auto now_ts = static_cast<uint64_t>(std::time(nullptr));
     if (difficulty > m_best_difficulty.all_time) {
