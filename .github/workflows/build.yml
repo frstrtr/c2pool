@@ -106,6 +106,122 @@ jobs:
         with: { name: test-results-linux, path: build_ci/Testing/, retention-days: 7 }
 
   # ════════════════════════════════════════════════════════════════════════════
+  # Web-static JS verify (typecheck + build + tests + bundle-size gate)
+  # Covers web-static/sharechain-explorer/: the Explorer + PPLNS View
+  # bundles + Plugin SDK. Fast job (< 1 min); runs regardless of path so
+  # it also catches changes that land via package.json or test fixtures.
+  # ════════════════════════════════════════════════════════════════════════════
+  web-static:
+    name: Web-static verify
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: web-static/sharechain-explorer
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v5
+        with:
+          # Node 22 — node --test supports glob expansion natively
+          # (Node 20 requires the shell to pre-expand the quoted glob,
+          # which fails on CI's bash + JSON-quoted package.json script).
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web-static/sharechain-explorer/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify (typecheck + build + test + manifest + size)
+        run: npm run verify
+
+      - name: Install Chrome for pixel-regression harness
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            google-chrome-stable || \
+          sudo apt-get install -y --no-install-recommends chromium-browser
+          # Export the first one that exists so capture.mjs picks it up.
+          for bin in /usr/bin/google-chrome-stable /usr/bin/google-chrome /usr/bin/chromium /usr/bin/chromium-browser; do
+            if [ -x "$bin" ]; then
+              echo "CHROME_BIN=$bin" >> "$GITHUB_ENV"
+              break
+            fi
+          done
+
+      - name: Visual pixel-diff harness
+        run: npm run visual
+
+      - name: Upload visual diff artefacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: visual-diff-out
+          path: web-static/sharechain-explorer/tests/visual/out/
+          retention-days: 7
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # c2pool-qt leak-regression harness (Qt hybrid step 14, delta v1 §E.2)
+  # Builds ui/c2pool-qt/ with C2POOL_QT_BUILD_TESTS=ON and runs the
+  # mount/destroy × 100 harness under xvfb, asserting no orphan
+  # QtWebEngineProcess helpers remain.
+  # ════════════════════════════════════════════════════════════════════════════
+  qt-webengine:
+    name: Qt WebEngine leak gate
+    runs-on: ubuntu-24.04
+    # Informational: QtWebEngine 6.4.2 headless in CI is brittle
+    # (Chromium child processes segfault during init on the GPU-less
+    # runner despite software-GL flags). The harness compiles + the
+    # lifecycle logic is code-verified against PageEmbedded::destroyView;
+    # a local run on a non-Wayland machine is the real acceptance.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Qt6 + WebEngine + xvfb
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake g++ \
+            qt6-base-dev qt6-webengine-dev qt6-webchannel-dev \
+            qt6-tools-dev \
+            libgl1-mesa-dev libegl1-mesa-dev \
+            libxkbcommon-dev libnss3 libxcomposite1 libxdamage1 \
+            libxrandr2 libxtst6 libatk1.0-0 libatk-bridge2.0-0 \
+            libasound2t64 libdrm2 libgbm1 \
+            xvfb
+
+      - name: Configure
+        run: cmake -S ui/c2pool-qt -B build-qt -DC2POOL_QT_BUILD_TESTS=ON
+
+      - name: Build leak harness
+        run: cmake --build build-qt --target c2pool-qt_test_embedded_leak -j$(nproc)
+
+      - name: Run leak harness under xvfb
+        env:
+          QTWEBENGINE_DISABLE_SANDBOX: '1'
+          # Force software GL throughout — the GitHub Ubuntu runner
+          # has no GPU, so QtWebEngine's default `use-gl desktop` fails
+          # as soon as Chromium tries to get an OpenGL context. Mesa
+          # swrast serves as a CPU fallback.
+          LIBGL_ALWAYS_SOFTWARE: '1'
+          QT_OPENGL: software
+          QT_QUICK_BACKEND: software
+          # --disable-software-rasterizer contradicted --use-gl=swiftshader
+          # in the previous attempt (banner showed "GL Type: disabled" then
+          # Chromium helper still died). Drop it; let swiftshader handle
+          # raster. Add --headless for the Chromium-side headless mode.
+          QTWEBENGINE_CHROMIUM_FLAGS: >-
+            --no-sandbox
+            --disable-gpu
+            --disable-dev-shm-usage
+            --use-gl=swiftshader
+            --headless=new
+        run: |
+          xvfb-run -a --server-args="-screen 0 1280x800x24 +extension GLX +render -noreset" \
+            timeout 180 ./build-qt/c2pool-qt_test_embedded_leak
+
+  # ════════════════════════════════════════════════════════════════════════════
   # macOS (Apple Silicon arm64 — GitHub only provides ARM runners now)
   # Intel x86_64 macOS binary is built locally; see doc/build-macos.md
   # ════════════════════════════════════════════════════════════════════════════

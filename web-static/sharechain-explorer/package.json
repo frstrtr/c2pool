@@ -1,0 +1,35 @@
+{
+  "name": "@c2pool/sharechain-explorer",
+  "version": "0.1.0-alpha",
+  "private": true,
+  "description": "Pluggable sharechain explorer + PPLNS view modules on a shared plugin SDK",
+  "type": "module",
+  "main": "./dist/shared-core.js",
+  "types": "./dist/shared-core.d.ts",
+  "files": [
+    "dist/",
+    "src/",
+    "schemas/"
+  ],
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "build:dev": "node esbuild.config.mjs --dev",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test \"tests/unit/*.test.ts\"",
+    "manifest": "node scripts/emit-manifest.mjs",
+    "size": "node scripts/check-bundle-size.mjs",
+    "verify": "npm run typecheck && npm run build && npm test && npm run manifest && npm run size",
+    "visual": "bash tests/visual/run.sh",
+    "clean": "rm -rf dist"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.24.0",
+    "fast-check": "^4.7.0",
+    "pixelmatch": "^6.0.0",
+    "pngjs": "^7.0.0",
+    "puppeteer-core": "^23.11.1",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

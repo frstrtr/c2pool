@@ -791,13 +791,22 @@
 
         /* ── Defragmenter Sharechain Viewer ──────────────────── */
         .defrag-container {
-            display: grid;
-            grid-template-columns: 1fr 220px;
+            display: flex;
             gap: 16px;
             margin-top: 12px;
         }
+        .defrag-canvas-wrap {
+            /* flex:1 + min-width:0 so the canvas column takes its
+               flex slot independent of canvas intrinsic width. */
+            flex: 1 1 0;
+            min-width: 0;
+        }
+        .defrag-sidebar {
+            flex: 0 0 220px;
+        }
         @media (max-width: 900px) {
-            .defrag-container { grid-template-columns: 1fr; }
+            .defrag-container { flex-direction: column; }
+            .defrag-sidebar { flex: 0 0 auto; }
         }
         .defrag-canvas-wrap {
             background: #0d0d1a;
@@ -806,7 +815,12 @@
             padding: 8px;
             position: relative;
             overflow: hidden;
-            min-height: 120px;
+            /* Give the wrap a viewport-derived height so defrag.render()
+               can solve for a cellSize that fills width AND height with
+               the 8640-share window. Override via --defrag-fill-h (e.g.
+               #defrag-section { --defrag-fill-h: 75vh }). */
+            height: var(--defrag-fill-h, calc(100vh - 280px));
+            min-height: 240px;
         }
         #defrag-canvas {
             display: block;
@@ -1001,6 +1015,14 @@
         }
 
         /* Main PPLNS treemap cells */
+        /* Same viewport-derived fill pattern as .defrag-canvas-wrap so
+           the treemap scales to the panel on resize. Override via
+           --pplns-fill-h on an ancestor if a different target height
+           is needed. */
+        .pplns-main-grid {
+            height: var(--pplns-fill-h, calc(100vh - 280px));
+            min-height: 240px;
+        }
         .pplns-main-cell {
             position: absolute;
             overflow: hidden;
@@ -2127,7 +2149,7 @@
                 <a href="#" style="color:var(--text-muted);font-size:0.8rem;text-decoration:none">Back to top</a>
             </div>
             <div id="pplns-loading" class="section-loading">Loading PPLNS distribution...<div class="progress-track"><div class="progress-bar"></div></div></div>
-            <div class="pplns-main-grid" id="pplns-main-grid" style="position:relative;border-radius:8px;overflow:visible;min-height:60px"></div>
+            <div class="pplns-main-grid" id="pplns-main-grid" style="position:relative;border-radius:8px;overflow:hidden;min-height:60px"></div>
             <div id="pplns-main-tooltip" style="display:none;position:fixed;z-index:9999;background:#1e1e38;border:1px solid var(--border);border-radius:8px;padding:8px 12px;pointer-events:none;font-size:0.82rem;box-shadow:0 6px 20px rgba(0,0,0,0.5);width:320px"></div>
         </div>
 
@@ -4572,8 +4594,11 @@
             pplnsCache: {},    // share_hash → [{addr, pct, amt}] from server
             pplnsFallback: [], // initial load PPLNS for shares without per-hash data
             zoomPanel: null,   // floating zoom panel element
-            cellSize: 10,
+            cellSize: 10,       // runtime-tuned by autoFitCellSize()
             gap: 1,
+            minCellSize: 4,
+            maxCellSize: 120,   // generous cap so sparse windows grow
+                                // cells big enough to fill a tall wrap
             cols: 0,
             rows: 0,
             hoveredIdx: -1,
@@ -4611,9 +4636,21 @@
                 this.canvas.addEventListener('mouseleave', function() { self.hideTooltip(); });
                 this.canvas.addEventListener('click', function(e) { self.onClick(e); });
 
-                window.addEventListener('resize', function() {
+                // ResizeObserver on the canvas wrap fires after the
+                // observed element's layout is settled. Synchronous
+                // render in the callback ensures the canvas bitmap
+                // matches the new container size in the same frame
+                // the layout change commits. Falls back to
+                // window.resize on older browsers.
+                var wrap = this.canvas.parentElement;
+                function rzSchedule() {
                     if (self.shares.length > 0) self.render();
-                });
+                }
+                if (wrap && typeof ResizeObserver === 'function') {
+                    new ResizeObserver(rzSchedule).observe(wrap);
+                } else {
+                    window.addEventListener('resize', rzSchedule);
+                }
             },
 
             load: function() {
@@ -4669,18 +4706,57 @@
 
             marginLeft: 38,  // px reserved for time axis labels
 
+            // Fractional-cellSize search: for each integer col count,
+            // the cellSize that exactly fills the constraining
+            // dimension is `min(availW/cols, availH/rows) - gap`. Pick
+            // the col count that maximises that cellSize — so the
+            // grid genuinely fills both width and height, not just
+            // "fits under both". Returns { cellSize, cols } — the
+            // render path reuses `cols` directly to avoid re-flooring
+            // below an optimal value.
+            autoFitLayout: function(containerW, containerH) {
+                var N = Math.max(1, this.shares.length);
+                var ml = this.marginLeft;
+                var gap = this.gap;
+                var gridW = Math.max(1, containerW - ml);
+                var availH = Math.max(40, containerH);
+                var minCs = this.minCellSize, maxCs = this.maxCellSize;
+                var maxCols = Math.max(1, Math.floor(gridW / (minCs + gap)));
+                var bestCs = -Infinity, bestCols = 1;
+                for (var c = 1; c <= maxCols; c++) {
+                    var r = Math.ceil(N / c);
+                    var stepW = gridW / c;
+                    var stepH = availH / r;
+                    var step = Math.min(stepW, stepH);
+                    var cs = step - gap;
+                    if (cs < minCs || cs > maxCs) continue;
+                    if (cs > bestCs) { bestCs = cs; bestCols = c; }
+                }
+                if (bestCs === -Infinity) return { cellSize: minCs, cols: Math.max(1, Math.floor(gridW / (minCs + gap))) };
+                return { cellSize: bestCs, cols: bestCols };
+            },
+
             render: function() {
                 var canvas = this.canvas;
                 var ctx = this.ctx;
                 var dpr = this.dpr;
-                var step = this.cellSize + this.gap;
                 var ml = this.marginLeft;
 
-                // Reset canvas width so parent can shrink freely on resize
-                canvas.style.width = '0px';
-                var containerWidth = canvas.parentElement.clientWidth - 16;
-                var gridWidth = containerWidth - ml;
-                this.cols = Math.max(1, Math.floor(gridWidth / step));
+                // Read parent dimensions directly. We used to zero the
+                // canvas first (`canvas.style.width = '0px'`) so the
+                // flex slot wasn't pinned to canvas-intrinsic width —
+                // but the flex container already has `min-width: 0`
+                // and `contain: layout`, so canvas content doesn't
+                // contribute to the wrap's width. Zeroing added a
+                // transient 0-px layout state visible during maximize.
+                var parent = canvas.parentElement;
+                var containerWidth  = parent.clientWidth - 16;
+                var containerHeight = parent.clientHeight - 16;
+                var fit = this.autoFitLayout(containerWidth, containerHeight);
+                this.cellSize = fit.cellSize;
+                var step = this.cellSize + this.gap;
+
+                this.cols = fit.cols;
                 this.rows = Math.ceil(this.shares.length / this.cols);
 
                 var cssW = ml + this.cols * step;
@@ -4871,7 +4947,21 @@
                 }
                 this._animRunning = true;
                 var self = this;
+
+                // Fold auto-fit into the animation path too so the wave
+                // renders at the same cell size as the next static frame
+                // — avoids a visible pop at animation end when the
+                // container resized since the last render.
+                var canvas = this.canvas;
+                var parent = canvas.parentElement;
+                var containerWidth  = parent.clientWidth - 16;
+                var containerHeight = parent.clientHeight - 16;
+                var fit = this.autoFitLayout(containerWidth, containerHeight);
+                this.cellSize = fit.cellSize;
                 var step = this.cellSize + this.gap;
+                this.cols = fit.cols;
+                this.rows = Math.ceil(this.shares.length / this.cols);
+
                 var ml = this.marginLeft;
                 var cs = this.cellSize;
                 var cols = this.cols;
@@ -5913,7 +6003,39 @@
             }
         };
 
-        // Initialize defrag viewer on page load
+        // ── Phase B #9 feature flag ───────────────────────────────
+        // Set ?new-explorer=1 in the URL (or localStorage.c2p_new_explorer=1)
+        // to activate the extracted @c2pool/sharechain-explorer bundle
+        // in place of this inline `defrag` renderer. Default OFF —
+        // migration discipline per frstrtr/the/docs
+        // (c2pool-explorer-plugin-architecture.md §16.2) says the
+        // inline path stays until pixel-diff parity is confirmed.
+        //
+        // Known limitations while the flag is on:
+        //   - Right-hand stats panel stays at "-" (bundled path does
+        //     not yet update #defrag-total etc).
+        //   - RealTime toggle button is inert (bundled is always live).
+        //   - Hover-zoom + per-share PPLNS treemap not yet ported.
+        // These land in subsequent Phase B commits.
+        window.__c2pBundledExplorer = (function() {
+            try {
+                var p = new URLSearchParams(location.search);
+                if (p.has('new-explorer')) return p.get('new-explorer') !== '0';
+            } catch (e) { /* Older browsers without URLSearchParams */ }
+            try { return localStorage.getItem('c2p_new_explorer') === '1'; }
+            catch (e) { return false; }
+        })();
+        if (window.__c2pBundledExplorer) {
+            // Disarm every inline defrag method so the RealTime toggle,
+            // auto-refresh timer, and any other call site silently no-
+            // ops — the bundled renderer mounted below takes over.
+            Object.keys(defrag).forEach(function(k) {
+                if (typeof defrag[k] === 'function') defrag[k] = function() {};
+            });
+            console.info('[c2pool] bundled Explorer enabled — inline defrag disarmed');
+        }
+
+        // Initialize defrag viewer on page load (no-op when flag on).
         defrag.init();
 
         // Share link helpers — sourced from defrag data, not legacy endpoints
@@ -6031,10 +6153,12 @@
                 entries.sort(function(a, b) { return b.amt - a.amt; });
                 entries.forEach(function(e) { e.pct = total > 0 ? e.amt / total : 0; });
 
+                // Take both dimensions from the container so the
+                // treemap tracks whatever CSS height the .pplns-main-grid
+                // class (or a --pplns-fill-h override) set — matches the
+                // sharechain explorer's container-scaling.
                 var w = grid.clientWidth;
-                var vh = window.innerHeight || document.documentElement.clientHeight;
-                var h = Math.max(vh * 0.75, Math.min(w * 0.55, vh * 0.85));
-                grid.style.height = h + 'px';
+                var h = Math.max(grid.clientHeight, 240);
 
                 // Squarified treemap layout (standalone — carries all fields)
                 var rects = [];
@@ -6219,14 +6343,21 @@
             });
         }
 
-        // Re-render PPLNS treemap on window resize
-        var _pplnsResizeTimer;
-        window.addEventListener('resize', function() {
-            clearTimeout(_pplnsResizeTimer);
-            _pplnsResizeTimer = setTimeout(function() {
+        // Re-render PPLNS treemap when its container resizes.
+        // ResizeObserver fires after the observed element's layout
+        // settles. Sync render so cell positions update in the same
+        // frame the new container dimensions land.
+        (function wirePplnsResize() {
+            function go() {
                 if (_cachedPPLNSPayouts) renderMainPPLNS(_cachedPPLNSPayouts);
-            }, 200);
-        });
+            }
+            var grid = document.getElementById('pplns-main-grid');
+            if (grid && typeof ResizeObserver === 'function') {
+                new ResizeObserver(go).observe(grid);
+            } else {
+                window.addEventListener('resize', go);
+            }
+        })();
 
         // Create a single colored share cell (22x22 square) with tooltip + click
         function makeShareCell(fullHash, share) {
@@ -8086,6 +8217,183 @@
                     }
                 }
             });
+        }
+    </script>
+    <!-- Phase B #9: bundled-explorer bootstrap. Only fetches the bundle
+         when the flag is set (see flag block above). Production path
+         (flag off) never loads the bundle, so CSP footprint + bytes
+         are unchanged for default users. -->
+    <script type="module">
+        if (window.__c2pBundledExplorer) {
+            import('./sharechain-explorer/dist/sharechain-explorer.js')
+                .then(function(mod) {
+                    var canvas = document.getElementById('defrag-canvas');
+                    var wrap = canvas && canvas.parentElement;
+                    if (!canvas || !wrap) {
+                        console.error('[c2pool bundled] defrag-canvas or wrap not found');
+                        return;
+                    }
+                    var transport = mod.createHttpTransport({ baseUrl: '..' });
+                    var rt = mod.createRealtime({
+                        canvas: canvas,
+                        transport: transport,
+                        userContext: {
+                            myAddress: (window.currency_info && window.currency_info.my_address) || undefined,
+                            shareVersion: 36,
+                        },
+                        containerWidth:  function() { return wrap.clientWidth; },
+                        containerHeight: function() { return wrap.clientHeight; },
+                        minCellSize: 4,   // default maxCellSize (120) kicks in
+                        onError: function(err) {
+                            console.error('[c2pool bundled] error', err);
+                        },
+                    });
+                    rt.start().then(function() {
+                        window.__explorerBundled = rt;
+                        console.info('[c2pool bundled] Explorer started');
+                        startStatPoll();
+                        startHoverZoom();
+                    });
+                    var loading = document.getElementById('defrag-loading');
+                    if (loading) loading.style.display = 'none';
+
+                    // Phase B #12 — hover-zoom per-share PPLNS treemap.
+                    // Mirrors dashboard.html:5686+ via bundled plugin.
+                    var hoverPanel = null;
+                    var hoveredIdx = -1;
+                    function startHoverZoom() {
+                        hoverPanel = mod.createHoverZoomPanel({ size: 240 });
+                        canvas.addEventListener('mousemove', onMouseMove);
+                        canvas.addEventListener('mouseleave', onMouseLeave);
+                    }
+                    function onMouseMove(ev) {
+                        if (!window.__explorerBundled) return;
+                        var state = window.__explorerBundled.getState();
+                        var shares = state.window.shares;
+                        if (shares.length === 0) return;
+                        var layout = mod.computeGridLayout({
+                            shareCount: shares.length,
+                            containerWidth: wrap.clientWidth,
+                            cellSize: 10,
+                            gap: 1,
+                            marginLeft: 38,
+                            minHeight: 40,
+                        });
+                        var rect = canvas.getBoundingClientRect();
+                        var x = ev.clientX - rect.left;
+                        var y = ev.clientY - rect.top;
+                        var idx = mod.cellAtPoint(layout, x, y);
+                        if (idx === null) {
+                            if (hoveredIdx !== -1) { hoveredIdx = -1; hoverPanel.hide(); }
+                            return;
+                        }
+                        if (idx === hoveredIdx) return;
+                        hoveredIdx = idx;
+                        var share = shares[idx];
+                        if (!share) { hoverPanel.hide(); return; }
+                        var pplns = window.__explorerBundled.getPPLNSForShare(share.h);
+                        var myAddr = (window.currency_info && window.currency_info.my_address) || undefined;
+                        hoverPanel.show(
+                            { h: share.h, m: share.m },
+                            pplns,
+                            ev.clientX, ev.clientY,
+                            myAddr ? { myAddress: myAddr } : undefined,
+                        );
+                    }
+                    function onMouseLeave() {
+                        if (hoveredIdx !== -1) { hoveredIdx = -1; hoverPanel && hoverPanel.hide(); }
+                    }
+
+                    // Phase B #13 — override the inline toggleRealTime
+                    // to drive the bundled orchestrator. When the flag
+                    // is on the inline SSE / polling code (lines 7939-
+                    // 7997) never runs; clicks on #realtime-btn instead
+                    // stop/start the bundled path.
+                    function setRtButtonOn() {
+                        var btn = document.getElementById('realtime-btn');
+                        if (!btn) return;
+                        btn.textContent = 'RealTime: SSE';
+                        btn.style.background = '#28a745';
+                        btn.style.color = '#fff';
+                        btn.style.borderColor = '#28a745';
+                    }
+                    function setRtButtonOff() {
+                        var btn = document.getElementById('realtime-btn');
+                        if (!btn) return;
+                        btn.textContent = 'RealTime: OFF';
+                        btn.style.background = 'var(--card-bg)';
+                        btn.style.color = 'var(--text-muted)';
+                        btn.style.borderColor = 'var(--border)';
+                    }
+                    // Initial state: bundled Realtime is auto-started.
+                    setRtButtonOn();
+                    window.toggleRealTime = function() {
+                        var explorer = window.__explorerBundled;
+                        if (!explorer) return;
+                        var state = explorer.getState();
+                        if (state.started) {
+                            explorer.stop().then(function() {
+                                setRtButtonOff();
+                                console.info('[c2pool bundled] RealTime OFF');
+                            });
+                        } else {
+                            explorer.start().then(function() {
+                                setRtButtonOn();
+                                console.info('[c2pool bundled] RealTime ON');
+                            });
+                        }
+                    };
+
+                    // Phase B #10 — mirror inline defrag stat panel
+                    // writes from rt.getState().stats. 250 ms poll is
+                    // the same cadence the inline path used via SSE
+                    // coalescing (imperceptible delay; cheap on the
+                    // cached stats).
+                    var statEls = {
+                        total:     document.getElementById('defrag-total'),
+                        chainLen:  document.getElementById('defrag-chain-len'),
+                        verified:  document.getElementById('defrag-verified'),
+                        mine:      document.getElementById('defrag-mine'),
+                        stale:     document.getElementById('defrag-stale'),
+                        dead:      document.getElementById('defrag-dead'),
+                        fee:       document.getElementById('defrag-fee'),
+                        v36native: document.getElementById('defrag-v36native'),
+                        v36sig:    document.getElementById('defrag-v36sig'),
+                        blocks:    document.getElementById('defrag-blocks'),
+                    };
+                    var statTimer = null;
+                    var lastTipWritten = null;
+                    function startStatPoll() {
+                        if (statTimer !== null) return;
+                        statTimer = setInterval(writeStats, 250);
+                        writeStats();
+                    }
+                    function writeStats() {
+                        if (!window.__explorerBundled) return;
+                        var state = window.__explorerBundled.getState();
+                        // Cache identity gate — only touch the DOM when
+                        // the stats object actually changes.
+                        if (state.lastAppliedTip === lastTipWritten) return;
+                        lastTipWritten = state.lastAppliedTip;
+                        var s = state.stats;
+                        if (statEls.total)     statEls.total.textContent     = String(s.shares);
+                        if (statEls.chainLen)  statEls.chainLen.textContent  = s.chainLength !== null ? String(s.chainLength) : '-';
+                        if (statEls.verified)  statEls.verified.textContent  = String(s.verified);
+                        if (statEls.mine)      statEls.mine.textContent      = String(s.mine);
+                        if (statEls.stale)     statEls.stale.textContent     = String(s.stale);
+                        if (statEls.dead)      statEls.dead.textContent      = String(s.dead);
+                        if (statEls.fee)       statEls.fee.textContent       = String(s.fee);
+                        if (statEls.v36native) statEls.v36native.textContent = String(s.v36native);
+                        if (statEls.v36sig)    statEls.v36sig.textContent    = String(s.v36signaling);
+                        if (statEls.blocks)    statEls.blocks.textContent    = s.primaryBlocks + ' LTC / ' + s.dogeBlocks + ' DOGE';
+                    }
+                    window.addEventListener('beforeunload', function() {
+                        if (statTimer !== null) clearInterval(statTimer);
+                    });
+                })
+                .catch(function(err) {
+                    console.error('[c2pool bundled] failed to load bundle', err);
+                });
         }
     </script>
 </body>

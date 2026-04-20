@@ -24,6 +24,7 @@
 #include <core/uint256.hpp>
 #include <core/mining_node_interface.hpp>
 #include <core/address_validator.hpp>
+#include <core/hashrate_ring.hpp>
 #include <c2pool/payout/payout_manager.hpp>
 #include <c2pool/hashrate/tracker.hpp>
 #include <core/address_utils.hpp>
@@ -218,7 +219,9 @@ public:
 
     // Merged mining endpoints
     nlohmann::json rest_merged_stats();              // /merged_stats — merged mining statistics
-    nlohmann::json rest_current_merged_payouts();    // /current_merged_payouts — cached wrapper
+    nlohmann::json rest_current_merged_payouts();    // /current_merged_payouts — cached wrapper (legacy shape)
+    nlohmann::json rest_pplns_current();             // /pplns/current — spec §5.1 shape
+    nlohmann::json rest_pplns_miner(const std::string& address);  // /pplns/miner/<addr> — spec §5.2
     nlohmann::json compute_current_merged_payouts(); // full computation (main thread only)
     nlohmann::json rest_recent_merged_blocks();      // /recent_merged_blocks — recent merged blocks
     nlohmann::json rest_all_merged_blocks();         // /all_merged_blocks — all merged blocks
@@ -1229,6 +1232,11 @@ private:
     };
     BestDifficulty m_best_difficulty;
     mutable std::mutex m_best_diff_mutex;
+
+    // Per-miner rolling hashrate ring populated by
+    // record_share_difficulty; consumed by rest_pplns_current
+    // (hashrate_hps) + rest_pplns_miner (hashrate_series).
+    HashrateRing m_hashrate_ring;
 
     // Stat log for /web/log JSON endpoint (rolling 24h window)
     struct StatLogEntry {

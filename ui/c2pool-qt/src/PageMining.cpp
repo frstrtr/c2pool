@@ -1,41 +1,54 @@
 #include "PageMining.hpp"
 
+#include "PageEmbedded.hpp"
+
 #include <QFormLayout>
 #include <QGroupBox>
-#include <QHeaderView>
 #include <QHBoxLayout>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QSplitter>
 #include <QVBoxLayout>
 
-PageMining::PageMining(QWidget* parent)
+PageMining::PageMining(QList<QObject*> embedBridges, QWidget* parent)
     : QWidget(parent)
 {
     auto* layout = new QVBoxLayout(this);
+    layout->setContentsMargins(0, 0, 0, 0);
+
+    // Vertical splitter — native controls + stats on top, embedded
+    // PPLNS miner-list view on bottom. User can drag the handle to
+    // resize either half; default 40/60 favours the miner list.
+    auto* splitter = new QSplitter(Qt::Vertical, this);
+    layout->addWidget(splitter, 1);
+
+    // ── Top: native controls + aggregate stats ──────────────────────
+    auto* topWidget = new QWidget(splitter);
+    auto* topLayout = new QVBoxLayout(topWidget);
+    topLayout->setContentsMargins(8, 8, 8, 4);
 
     auto* controlsLayout = new QHBoxLayout();
-    startButton_ = new QPushButton("Start Mining", this);
-    stopButton_ = new QPushButton("Stop Mining", this);
-    restartButton_ = new QPushButton("Restart Mining", this);
+    startButton_ = new QPushButton("Start Mining", topWidget);
+    stopButton_ = new QPushButton("Stop Mining", topWidget);
+    restartButton_ = new QPushButton("Restart Mining", topWidget);
     controlsLayout->addWidget(startButton_);
     controlsLayout->addWidget(stopButton_);
     controlsLayout->addWidget(restartButton_);
     controlsLayout->addStretch();
-    layout->addLayout(controlsLayout);
+    topLayout->addLayout(controlsLayout);
 
     auto* banLayout = new QHBoxLayout();
-    minerInput_ = new QLineEdit(this);
+    minerInput_ = new QLineEdit(topWidget);
     minerInput_->setPlaceholderText("Miner address or worker id");
-    banButton_ = new QPushButton("Ban", this);
-    unbanButton_ = new QPushButton("Unban", this);
+    banButton_ = new QPushButton("Ban", topWidget);
+    unbanButton_ = new QPushButton("Unban", topWidget);
     banLayout->addWidget(minerInput_, 1);
     banLayout->addWidget(banButton_);
     banLayout->addWidget(unbanButton_);
-    layout->addLayout(banLayout);
+    topLayout->addLayout(banLayout);
 
-    // Aggregate stratum stats
-    auto* statsGroup = new QGroupBox("Stratum Statistics", this);
+    auto* statsGroup = new QGroupBox("Stratum Statistics", topWidget);
     auto* statsForm = new QFormLayout(statsGroup);
     connectedMinersValue_ = new QLabel("-");
     statsForm->addRow("Connected miners:", connectedMinersValue_);
@@ -51,21 +64,33 @@ PageMining::PageMining(QWidget* parent)
     statsForm->addRow("Shares/min:", sharesPerMinValue_);
     difficultyValue_ = new QLabel("-");
     statsForm->addRow("Share difficulty:", difficultyValue_);
-    layout->addWidget(statsGroup);
+    topLayout->addWidget(statsGroup);
 
-    // Per-worker table (populated when workers connect)
-    layout->addWidget(new QLabel("Workers:", this));
-    workersTable_ = new QTableWidget(this);
-    workersTable_->setColumnCount(6);
-    workersTable_->setHorizontalHeaderLabels({
-        "Worker", "Accepted", "Rejected", "Hashrate", "AutoConv", "Redistrib"
-    });
-    workersTable_->horizontalHeader()->setStretchLastSection(true);
-    workersTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
-    layout->addWidget(workersTable_);
+    statusValue_ = new QLabel("Idle", topWidget);
+    topLayout->addWidget(statusValue_);
 
-    statusValue_ = new QLabel("Idle");
-    layout->addWidget(statusValue_);
+    splitter->addWidget(topWidget);
+
+    // ── Bottom: embedded PPLNS View — miner list, sort/filter,
+    // drill-down, plugin slots. Same bundle as the standalone PPLNS
+    // tab; the bridges are shared by MainWindow so both surfaces
+    // see the same bridge state.
+    if (!embedBridges.isEmpty()) {
+        PageEmbedded::Config cfg;
+        cfg.qrcUrl = QStringLiteral(
+            "qrc:///sharechain-explorer/pplns-embed.html");
+        cfg.bridges = embedBridges;
+        cfg.bridgeObjectName = QStringLiteral("qtBridge");
+#ifdef C2POOL_QT_DEV_BUNDLE
+        cfg.devReloadEnabled = true;
+#endif
+        pplnsEmbed_ = new PageEmbedded(cfg, splitter);
+        splitter->addWidget(pplnsEmbed_);
+        splitter->setStretchFactor(0, 2);   // controls: 40 %
+        splitter->setStretchFactor(1, 3);   // miner list: 60 %
+    } else {
+        splitter->setStretchFactor(0, 1);
+    }
 
     connect(startButton_, &QPushButton::clicked, this, &PageMining::onStartMining);
     connect(stopButton_, &QPushButton::clicked, this, &PageMining::onStopMining);
@@ -112,20 +137,6 @@ void PageMining::refresh(ApiClient* api)
                 QString::number(root.value("shares_per_minute").toDouble(), 'f', 2));
             difficultyValue_->setText(
                 QString::number(root.value("difficulty").toDouble(), 'f', 4));
-
-            // Per-worker breakdown (if available)
-            const auto workers = root.value("workers").toObject();
-            workersTable_->setRowCount(workers.size());
-            int row = 0;
-            for (auto it = workers.begin(); it != workers.end(); ++it, ++row) {
-                const auto w = it.value().toObject();
-                workersTable_->setItem(row, 0, new QTableWidgetItem(it.key()));
-                workersTable_->setItem(row, 1, new QTableWidgetItem(QString::number(w.value("accepted").toInt())));
-                workersTable_->setItem(row, 2, new QTableWidgetItem(QString::number(w.value("rejected").toInt())));
-                workersTable_->setItem(row, 3, new QTableWidgetItem(QString::number(w.value("hash_rate").toDouble(), 'f', 2)));
-                workersTable_->setItem(row, 4, new QTableWidgetItem(w.value("merged_auto_converted").toBool() ? "yes" : "no"));
-                workersTable_->setItem(row, 5, new QTableWidgetItem(w.value("merged_redistributed").toBool() ? "yes" : "no"));
-            }
 
             const int active = root.value("active_workers").toInt();
             statusValue_->setText(QString("%1 active worker(s)").arg(active));
