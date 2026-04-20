@@ -818,8 +818,13 @@
             /* Give the wrap a viewport-derived height so defrag.render()
                can solve for a cellSize that fills width AND height with
                the 8640-share window. Override via --defrag-fill-h (e.g.
-               #defrag-section { --defrag-fill-h: 75vh }). */
-            height: var(--defrag-fill-h, calc(100vh - 280px));
+               #defrag-section { --defrag-fill-h: 75vh }).
+               Uses max(px floor, vh proportion) instead of the older
+               `calc(100vh - 280px)` so browser-zoom doesn't crush the
+               widget: at 150% zoom the fixed 280px header offset eats
+               a disproportionately large fraction of CSS viewport
+               height. vh scales naturally with zoom. */
+            height: var(--defrag-fill-h, max(320px, 78vh));
             min-height: 240px;
         }
         #defrag-canvas {
@@ -1018,9 +1023,12 @@
         /* Same viewport-derived fill pattern as .defrag-canvas-wrap so
            the treemap scales to the panel on resize. Override via
            --pplns-fill-h on an ancestor if a different target height
-           is needed. */
+           is needed. See the .defrag-canvas-wrap comment for why we
+           use max(px, vh) rather than calc(100vh - Npx) — browser
+           zoom makes the fixed header-height subtraction crush the
+           widget disproportionately. */
         .pplns-main-grid {
-            height: var(--pplns-fill-h, calc(100vh - 280px));
+            height: var(--pplns-fill-h, max(320px, 78vh));
             min-height: 240px;
         }
         .pplns-main-cell {
