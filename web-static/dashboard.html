@@ -4634,31 +4634,25 @@
                 this.canvas.addEventListener('mouseleave', function() { self.hideTooltip(); });
                 this.canvas.addEventListener('click', function(e) { self.onClick(e); });
 
-                // ResizeObserver on the CANVAS WRAP rather than
-                // window.resize. The browser's maximize animation
-                // fires window.resize multiple times with transient
-                // dimensions — in one of those frames
-                // .defrag-canvas-wrap reports full-viewport width
-                // (before the CSS grid's 220 px sidebar column settles),
-                // so the canvas briefly sizes to the whole screen then
-                // snaps back. ResizeObserver fires only after the
-                // observed element's layout is fully settled, so the
-                // render uses the final post-animation dimensions.
-                // rAF coalesces multi-step animations. Falls back to
-                // window.resize on older browsers.
-                var _rzRaf = 0;
-                function _rzSchedule() {
-                    if (_rzRaf) return;
-                    _rzRaf = requestAnimationFrame(function() {
-                        _rzRaf = 0;
-                        if (self.shares.length > 0) self.render();
-                    });
-                }
+                // ResizeObserver on the canvas wrap — fires only after
+                // the observed element's layout is settled, so we get
+                // the final post-maximize size. Render SYNCHRONOUSLY
+                // in the callback (not via rAF): the ResizeObserver
+                // callback runs before the browser's next paint, so a
+                // synchronous render updates the canvas bitmap in the
+                // SAME frame the layout change is committed — no
+                // interstitial paint where the old canvas is shown in
+                // the new box. This eliminates the "fills whole screen
+                // then shrinks" flash.
                 var wrap = this.canvas.parentElement;
                 if (wrap && typeof ResizeObserver === 'function') {
-                    new ResizeObserver(_rzSchedule).observe(wrap);
+                    new ResizeObserver(function() {
+                        if (self.shares.length > 0) self.render();
+                    }).observe(wrap);
                 } else {
-                    window.addEventListener('resize', _rzSchedule);
+                    window.addEventListener('resize', function() {
+                        if (self.shares.length > 0) self.render();
+                    });
                 }
             },
 
@@ -6348,28 +6342,21 @@
         }
 
         // Re-render PPLNS treemap when its container resizes.
-        // ResizeObserver is the right API here — it fires AFTER the
-        // browser has finished layout on the element, so
-        // grid.clientWidth/Height are guaranteed to be the final
-        // post-maximize/restore values. Window 'resize' events can
-        // fire while the browser is mid-transition, which produced
-        // a one-frame "cells bigger than container" flash. rAF
-        // coalesces multiple observer ticks to the browser's paint
-        // cadence. Falls back to window.resize on older browsers.
+        // ResizeObserver fires after the observed element's layout
+        // settles, and BEFORE the browser's next paint. Render
+        // synchronously in the callback so cell positions update in
+        // the same frame the container's new dimensions land —
+        // prevents stale cells from being visible at old positions
+        // in the new container.
         (function wirePplnsResize() {
-            var _raf = 0;
-            function schedule() {
-                if (_raf) return;
-                _raf = requestAnimationFrame(function() {
-                    _raf = 0;
-                    if (_cachedPPLNSPayouts) renderMainPPLNS(_cachedPPLNSPayouts);
-                });
+            function go() {
+                if (_cachedPPLNSPayouts) renderMainPPLNS(_cachedPPLNSPayouts);
             }
             var grid = document.getElementById('pplns-main-grid');
             if (grid && typeof ResizeObserver === 'function') {
-                new ResizeObserver(schedule).observe(grid);
+                new ResizeObserver(go).observe(grid);
             } else {
-                window.addEventListener('resize', schedule);
+                window.addEventListener('resize', go);
             }
         })();
 
