@@ -48,8 +48,15 @@ function fullHash(short) {
   return s;
 }
 
-const SHARE_COUNT = 200;    // smaller than 4320 for test speed
-const WINDOW_SIZE = 200;
+// Defaults to 200 so the pixel-diff harness stays quick + byte-stable.
+// Override via FIXTURE_SHARES env var for manual preview against a
+// realistic chain window:
+//   FIXTURE_SHARES=8640 node fixtures/generate.mjs   (LTC mainnet)
+//   FIXTURE_SHARES=4320 node fixtures/generate.mjs   (LTC testnet-ish)
+const FIXTURE_SHARES = Number(process.env.FIXTURE_SHARES ?? 200);
+const SHARE_COUNT = Number.isFinite(FIXTURE_SHARES) && FIXTURE_SHARES > 0
+  ? Math.floor(FIXTURE_SHARES) : 200;
+const WINDOW_SIZE = SHARE_COUNT;
 const NOW = 1776550560;
 
 const shares = [];
