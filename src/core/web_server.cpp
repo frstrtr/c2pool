@@ -6509,11 +6509,29 @@ void MiningInterface::save_stat_log()
 {
     if (m_stat_log_path.empty()) return;
     try {
-        nlohmann::json arr = nlohmann::json::array();
+        // Snapshot under brief lock — copies a compact std::vector of structs.
+        // The expensive part is the JSON expansion + serialization, which we
+        // do entry-by-entry below WITHOUT the lock so HTTP endpoints reading
+        // m_stat_log don't block on disk I/O. Previously this function held
+        // the lock while building a giant in-memory nlohmann::json array of
+        // every entry, then dumped it — heaptrack on contabo identified that
+        // path as a top peak consumer (60+ MB transient per 100s save call,
+        // contributing to heap fragmentation and observed RSS growth).
+        std::vector<StatLogEntry> snapshot;
         {
             std::lock_guard<std::mutex> lock(m_stat_log_mutex);
-            for (const auto& e : m_stat_log) {
-                arr.push_back({
+            snapshot = m_stat_log;
+        }
+        // Stream-dump: peak transient memory is one entry's JSON, not all of them.
+        std::string tmp = m_stat_log_path + ".new";
+        {
+            std::ofstream f(tmp, std::ios::trunc);
+            f << '[';
+            bool first = true;
+            for (const auto& e : snapshot) {
+                if (!first) f << ',';
+                first = false;
+                nlohmann::json one = {
                     {"t", e.time}, {"phr", e.pool_hash_rate}, {"psp", e.pool_stale_prop},
                     {"lhr", e.local_hash_rates}, {"ldhr", e.local_dead_hash_rates},
                     {"wc", e.worker_count}, {"mc", e.miner_count}, {"cc", e.connected_count},
@@ -6524,18 +6542,14 @@ void MiningInterface::save_stat_log()
                     {"as", e.attempts_to_share}, {"ab", e.attempts_to_block},
                     {"bv", e.block_value}, {"mu", e.memory_usage},
                     {"wl", e.work_latency}, {"tr", e.traffic}
-                });
+                };
+                f << one.dump();
             }
-        }
-        // Atomic write: write to .new, fsync, rename
-        std::string tmp = m_stat_log_path + ".new";
-        {
-            std::ofstream f(tmp, std::ios::trunc);
-            f << arr.dump();
+            f << ']';
             f.flush();
         }
         std::filesystem::rename(tmp, m_stat_log_path);
-        LOG_INFO << "[StatLog] Saved " << arr.size() << " entries to " << m_stat_log_path;
+        LOG_INFO << "[StatLog] Saved " << snapshot.size() << " entries to " << m_stat_log_path;
     } catch (const std::exception& ex) {
         LOG_WARNING << "[StatLog] Save failed: " << ex.what();
     }
