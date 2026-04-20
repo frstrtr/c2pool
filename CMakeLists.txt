@@ -22,7 +22,7 @@ find_package(GTest QUIET)
 
 # Try modern BoostConfig first, fallback to FindBoost for older systems
 # system is header-only since Boost 1.69; only request it if the config provides it
-find_package(Boost REQUIRED COMPONENTS log log_setup thread filesystem)
+find_package(Boost REQUIRED COMPONENTS log log_setup thread filesystem exception)
 find_package(Boost QUIET OPTIONAL_COMPONENTS system)
 
 find_package(nlohmann_json REQUIRED)
