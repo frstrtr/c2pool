@@ -3594,10 +3594,11 @@ int main(int argc, char* argv[]) {
                 return result;
             });
 
+            // Lightweight tip endpoint for RealTime polling
             // Lightweight tip endpoint for RealTime polling.
             // Returns std::nullopt when the sharechain is still bootstrapping
-            // (no tracker snapshot available AND no heads yet).  Typed struct
-            // elsewhere — JSON is produced only at the REST/SSE edge.
+            // (no tracker snapshot AND no heads yet).  Typed struct everywhere;
+            // JSON produced only at the REST/SSE edge via core::to_json.
             web_server.get_mining_interface()->set_sharechain_tip_fn(
                 [&p2p_node]() -> std::optional<core::SharechainTip> {
                     auto guard = p2p_node->read_tracker();
@@ -5480,13 +5481,15 @@ int main(int argc, char* argv[]) {
                                     });
                                 } // doge_bs scope
 
+                                // Tip-changed handler: trigger work refresh so stratum miners
+                                // get updated merged mining targets immediately.
                                 // Tip-changed handler.  Mirrors the LTC handler's structure:
                                 //   1. dispatch to ioc so all web_server / UTXO / bcaster access
                                 //      happens on the main thread (the tip callback itself fires
                                 //      on the header-parser pool thread).
                                 //   2. wrap in try/catch so a downstream exception can't reach
                                 //      std::terminate (previously, a null-JSON read in the work
-                                //      refresh chain killed the whole process).
+                                //      refresh chain killed the whole process on fresh installs).
                                 //   3. gate work refresh on merged-mining readiness so we don't
                                 //      fire thousands of no-op refreshes during header sync.
                                 doge_chain->set_on_tip_changed(
@@ -5531,7 +5534,7 @@ int main(int argc, char* argv[]) {
                                         // Merged-mining readiness gate.  aux_chain_embedded's
                                         // get_work_template() would return empty AuxWork until
                                         // both conditions below hold, so firing work refresh
-                                        // earlier is wasted work on every 2000-header batch.
+                                        // earlier is wasted on every 2000-header batch.
                                         bool doge_ready = chain->is_synced()
                                             && utxo
                                             && utxo->blocks_connected() >= core::coin::DOGE_MINING_GATE_DEPTH;
