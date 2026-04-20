@@ -72,26 +72,54 @@ export function computeGridLayout(opts: GridLayoutOptions): GridLayout {
   const shareCount = Math.max(0, opts.shareCount | 0);
 
   let cellSize = opts.cellSize;
+  let autoCols: number | null = null;
   if (opts.autoFit === true && opts.containerHeight !== undefined && shareCount > 0) {
+    // Fractional-cellSize search: for each integer column count, the
+    // cellSize that exactly fills the constraining dimension is
+    // `min(availW/cols, availH/rows) - gap`. Pick the column count
+    // that maximises that cellSize — so the grid genuinely fills
+    // both width and height, not just "fits under both".
+    //
+    // Empty-container pathologies are guarded:
+    //   - availW ≤ 0 or availH ≤ 0 → fall through to non-autoFit path.
+    //   - No col count yields cellSize ≥ minCellSize → pick minCellSize
+    //     with the cols that at least fit the shares (floor(availW/step)).
     const minCs = Math.max(1, opts.minCellSize ?? 4);
     // Default max of 120 lets sparse windows (e.g. 200 shares) grow
-    // cells big enough to actually fill a viewport-sized container;
-    // the `opts.cellSize` is still respected when explicitly larger.
-    // Callers pin a smaller cap if they need tighter bounds.
+    // cells big enough to fill a viewport-sized container without
+    // the size being overridden by the caller's `cellSize` input.
     const maxCs = Math.max(minCs, opts.maxCellSize ?? Math.max(opts.cellSize, 120));
     const availH = Math.max(opts.minHeight, opts.containerHeight - containerPadding);
-    let chosen = minCs;
-    for (let cs = maxCs; cs >= minCs; cs--) {
-      const step = cs + gap;
-      const cols = Math.max(1, Math.floor(gridWidth / step));
-      const rows = Math.ceil(shareCount / cols);
-      if (rows * step <= availH) { chosen = cs; break; }
+    if (gridWidth > 0 && availH > 0) {
+      // Bound the col search: cols ≥ ceil(shareCount / rowsMax) where
+      // rowsMax = floor(availH / (minCs + gap)); cols ≤ floor(availW /
+      // (minCs + gap)). Clamps loop count to O(availW / minCs)
+      // iterations (~600 for a 2500-px-wide viewport).
+      const maxCols = Math.max(1, Math.floor(gridWidth / (minCs + gap)));
+      let bestCs = -Infinity;
+      let bestCols = 1;
+      for (let c = 1; c <= maxCols; c++) {
+        const r = Math.ceil(shareCount / c);
+        const stepW = gridWidth / c;
+        const stepH = availH / r;
+        const step = Math.min(stepW, stepH);
+        const cs = step - gap;
+        if (cs < minCs || cs > maxCs) continue;
+        if (cs > bestCs) { bestCs = cs; bestCols = c; }
+      }
+      if (bestCs > -Infinity) {
+        cellSize = bestCs;
+        autoCols = bestCols;
+      } else {
+        // No col count produced cellSize in [minCs, maxCs]. Clamp to
+        // minCs and use its natural col count.
+        cellSize = minCs;
+      }
     }
-    cellSize = chosen;
   }
 
   const step = cellSize + gap;
-  const cols = Math.max(1, Math.floor(gridWidth / step));
+  const cols = autoCols ?? Math.max(1, Math.floor(gridWidth / step));
   const rows = shareCount === 0 ? 0 : Math.ceil(shareCount / cols);
   const cssWidth = marginLeft + cols * step;
   const cssHeight = Math.max(rows * step, opts.minHeight);

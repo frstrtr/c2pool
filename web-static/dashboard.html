@@ -4677,25 +4677,34 @@
 
             marginLeft: 38,  // px reserved for time axis labels
 
-            // Pick the largest cellSize s.t. the N shares laid out at
-            // `gap` pitch fit within both containerW and containerH.
-            // Returns the cellSize to use (clamped to [minCellSize,
-            // maxCellSize]).
-            autoFitCellSize: function(containerW, containerH) {
+            // Fractional-cellSize search: for each integer col count,
+            // the cellSize that exactly fills the constraining
+            // dimension is `min(availW/cols, availH/rows) - gap`. Pick
+            // the col count that maximises that cellSize — so the
+            // grid genuinely fills both width and height, not just
+            // "fits under both". Returns { cellSize, cols } — the
+            // render path reuses `cols` directly to avoid re-flooring
+            // below an optimal value.
+            autoFitLayout: function(containerW, containerH) {
                 var N = Math.max(1, this.shares.length);
                 var ml = this.marginLeft;
                 var gap = this.gap;
                 var gridW = Math.max(1, containerW - ml);
-                var minH = 40;
-                // Walk sizes from max down; first one that fits wins.
-                for (var cs = this.maxCellSize; cs >= this.minCellSize; cs--) {
-                    var step = cs + gap;
-                    var cols = Math.max(1, Math.floor(gridW / step));
-                    var rows = Math.ceil(N / cols);
-                    var reqH = rows * step;
-                    if (reqH <= Math.max(containerH, minH)) return cs;
+                var availH = Math.max(40, containerH);
+                var minCs = this.minCellSize, maxCs = this.maxCellSize;
+                var maxCols = Math.max(1, Math.floor(gridW / (minCs + gap)));
+                var bestCs = -Infinity, bestCols = 1;
+                for (var c = 1; c <= maxCols; c++) {
+                    var r = Math.ceil(N / c);
+                    var stepW = gridW / c;
+                    var stepH = availH / r;
+                    var step = Math.min(stepW, stepH);
+                    var cs = step - gap;
+                    if (cs < minCs || cs > maxCs) continue;
+                    if (cs > bestCs) { bestCs = cs; bestCols = c; }
                 }
-                return this.minCellSize;
+                if (bestCs === -Infinity) return { cellSize: minCs, cols: Math.max(1, Math.floor(gridW / (minCs + gap))) };
+                return { cellSize: bestCs, cols: bestCols };
             },
 
             render: function() {
@@ -4709,11 +4718,11 @@
                 var parent = canvas.parentElement;
                 var containerWidth  = parent.clientWidth - 16;
                 var containerHeight = parent.clientHeight - 16;
-                this.cellSize = this.autoFitCellSize(containerWidth, containerHeight);
+                var fit = this.autoFitLayout(containerWidth, containerHeight);
+                this.cellSize = fit.cellSize;
                 var step = this.cellSize + this.gap;
 
-                var gridWidth = containerWidth - ml;
-                this.cols = Math.max(1, Math.floor(gridWidth / step));
+                this.cols = fit.cols;
                 this.rows = Math.ceil(this.shares.length / this.cols);
 
                 var cssW = ml + this.cols * step;
@@ -4913,10 +4922,10 @@
                 var parent = canvas.parentElement;
                 var containerWidth  = parent.clientWidth - 16;
                 var containerHeight = parent.clientHeight - 16;
-                this.cellSize = this.autoFitCellSize(containerWidth, containerHeight);
+                var fit = this.autoFitLayout(containerWidth, containerHeight);
+                this.cellSize = fit.cellSize;
                 var step = this.cellSize + this.gap;
-                var gridWidth = containerWidth - this.marginLeft;
-                this.cols = Math.max(1, Math.floor(gridWidth / step));
+                this.cols = fit.cols;
                 this.rows = Math.ceil(this.shares.length / this.cols);
 
                 var ml = this.marginLeft;
