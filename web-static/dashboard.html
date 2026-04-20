@@ -791,13 +791,25 @@
 
         /* ── Defragmenter Sharechain Viewer ──────────────────── */
         .defrag-container {
-            display: grid;
-            grid-template-columns: 1fr 220px;
+            display: flex;
             gap: 16px;
             margin-top: 12px;
         }
+        .defrag-canvas-wrap {
+            /* flex:1 + min-width:0 so the wrap shrinks to its flex
+               slot instead of taking intrinsic (canvas-driven) width
+               during transient resize frames. Eliminates the
+               "canvas fills whole screen then shrinks to fit legend"
+               flash on maximize. */
+            flex: 1 1 0;
+            min-width: 0;
+        }
+        .defrag-sidebar {
+            flex: 0 0 220px;
+        }
         @media (max-width: 900px) {
-            .defrag-container { grid-template-columns: 1fr; }
+            .defrag-container { flex-direction: column; }
+            .defrag-sidebar { flex: 0 0 auto; }
         }
         .defrag-canvas-wrap {
             background: #0d0d1a;
