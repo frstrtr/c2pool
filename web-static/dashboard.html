@@ -1006,6 +1006,14 @@
         }
 
         /* Main PPLNS treemap cells */
+        /* Same viewport-derived fill pattern as .defrag-canvas-wrap so
+           the treemap scales to the panel on resize. Override via
+           --pplns-fill-h on an ancestor if a different target height
+           is needed. */
+        .pplns-main-grid {
+            height: var(--pplns-fill-h, calc(100vh - 280px));
+            min-height: 240px;
+        }
         .pplns-main-cell {
             position: absolute;
             overflow: hidden;
@@ -6119,10 +6127,12 @@
                 entries.sort(function(a, b) { return b.amt - a.amt; });
                 entries.forEach(function(e) { e.pct = total > 0 ? e.amt / total : 0; });
 
+                // Take both dimensions from the container so the
+                // treemap tracks whatever CSS height the .pplns-main-grid
+                // class (or a --pplns-fill-h override) set — matches the
+                // sharechain explorer's container-scaling.
                 var w = grid.clientWidth;
-                var vh = window.innerHeight || document.documentElement.clientHeight;
-                var h = Math.max(vh * 0.75, Math.min(w * 0.55, vh * 0.85));
-                grid.style.height = h + 'px';
+                var h = Math.max(grid.clientHeight, 240);
 
                 // Squarified treemap layout (standalone — carries all fields)
                 var rects = [];
