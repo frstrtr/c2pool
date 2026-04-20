@@ -401,9 +401,23 @@ inline std::vector<uint256> merkle_branches_raw(
 
 inline std::vector<std::string> merkle_branches_hex(const std::vector<uint256>& raw)
 {
+    // Stratum convention for merkle branches: send the LE internal bytes
+    // directly as hex, NOT the reversed display form. cpuminer ParseHex's
+    // the hex into a byte array and uses those bytes verbatim in its
+    // merkle walk (SHA256d(root_LE || branch_LE)). Our server walks the
+    // same way using h.GetChars() (LE internal). Using h.GetHex() here —
+    // which reverses bytes for the block-explorer display form — made
+    // the miner's walk produce a different root than the server's, every
+    // submit failed with "hash > target" (hash was essentially random).
+    // Reference: p2pool-dash dash/stratum.py packs merkle branches as
+    //   [pack.IntType(256).pack(s).encode('hex') for s in link.branch]
+    // which is LE bytes as hex — NOT the reversed display form.
     std::vector<std::string> out;
     out.reserve(raw.size());
-    for (const auto& h : raw) out.push_back(h.GetHex());
+    for (const auto& h : raw) {
+        auto c = h.GetChars();
+        out.push_back(HexStr(std::span<const unsigned char>(c.data(), c.size())));
+    }
     return out;
 }
 
