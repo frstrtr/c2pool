@@ -167,7 +167,9 @@
         canvas,
         transport,
         userContext: { myAddress, shareVersion: 36 },
-        containerWidth: () => wrap.clientWidth,
+        containerWidth:  () => wrap.clientWidth,
+        containerHeight: () => wrap.clientHeight,
+        minCellSize: 4, maxCellSize: 24,
         fastAnimation: false,
         onError: (err) => {
           setStatus('error', 'err');

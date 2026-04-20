@@ -806,7 +806,12 @@
             padding: 8px;
             position: relative;
             overflow: hidden;
-            min-height: 120px;
+            /* Give the wrap a viewport-derived height so defrag.render()
+               can solve for a cellSize that fills width AND height with
+               the 8640-share window. Override via --defrag-fill-h (e.g.
+               #defrag-section { --defrag-fill-h: 75vh }). */
+            height: var(--defrag-fill-h, calc(100vh - 280px));
+            min-height: 240px;
         }
         #defrag-canvas {
             display: block;
@@ -4572,8 +4577,10 @@
             pplnsCache: {},    // share_hash → [{addr, pct, amt}] from server
             pplnsFallback: [], // initial load PPLNS for shares without per-hash data
             zoomPanel: null,   // floating zoom panel element
-            cellSize: 10,
+            cellSize: 10,       // runtime-tuned by autoFitCellSize()
             gap: 1,
+            minCellSize: 4,
+            maxCellSize: 24,
             cols: 0,
             rows: 0,
             hoveredIdx: -1,
@@ -4669,16 +4676,41 @@
 
             marginLeft: 38,  // px reserved for time axis labels
 
+            // Pick the largest cellSize s.t. the N shares laid out at
+            // `gap` pitch fit within both containerW and containerH.
+            // Returns the cellSize to use (clamped to [minCellSize,
+            // maxCellSize]).
+            autoFitCellSize: function(containerW, containerH) {
+                var N = Math.max(1, this.shares.length);
+                var ml = this.marginLeft;
+                var gap = this.gap;
+                var gridW = Math.max(1, containerW - ml);
+                var minH = 40;
+                // Walk sizes from max down; first one that fits wins.
+                for (var cs = this.maxCellSize; cs >= this.minCellSize; cs--) {
+                    var step = cs + gap;
+                    var cols = Math.max(1, Math.floor(gridW / step));
+                    var rows = Math.ceil(N / cols);
+                    var reqH = rows * step;
+                    if (reqH <= Math.max(containerH, minH)) return cs;
+                }
+                return this.minCellSize;
+            },
+
             render: function() {
                 var canvas = this.canvas;
                 var ctx = this.ctx;
                 var dpr = this.dpr;
-                var step = this.cellSize + this.gap;
                 var ml = this.marginLeft;
 
-                // Reset canvas width so parent can shrink freely on resize
+                // Reset canvas width so parent can shrink freely on resize.
                 canvas.style.width = '0px';
-                var containerWidth = canvas.parentElement.clientWidth - 16;
+                var parent = canvas.parentElement;
+                var containerWidth  = parent.clientWidth - 16;
+                var containerHeight = parent.clientHeight - 16;
+                this.cellSize = this.autoFitCellSize(containerWidth, containerHeight);
+                var step = this.cellSize + this.gap;
+
                 var gridWidth = containerWidth - ml;
                 this.cols = Math.max(1, Math.floor(gridWidth / step));
                 this.rows = Math.ceil(this.shares.length / this.cols);
@@ -4871,7 +4903,21 @@
                 }
                 this._animRunning = true;
                 var self = this;
+
+                // Fold auto-fit into the animation path too so the wave
+                // renders at the same cell size as the next static frame
+                // — avoids a visible pop at animation end when the
+                // container resized since the last render.
+                var canvas = this.canvas;
+                var parent = canvas.parentElement;
+                var containerWidth  = parent.clientWidth - 16;
+                var containerHeight = parent.clientHeight - 16;
+                this.cellSize = this.autoFitCellSize(containerWidth, containerHeight);
                 var step = this.cellSize + this.gap;
+                var gridWidth = containerWidth - this.marginLeft;
+                this.cols = Math.max(1, Math.floor(gridWidth / step));
+                this.rows = Math.ceil(this.shares.length / this.cols);
+
                 var ml = this.marginLeft;
                 var cs = this.cellSize;
                 var cols = this.cols;
@@ -8142,7 +8188,9 @@
                             myAddress: (window.currency_info && window.currency_info.my_address) || undefined,
                             shareVersion: 36,
                         },
-                        containerWidth: function() { return wrap.clientWidth; },
+                        containerWidth:  function() { return wrap.clientWidth; },
+                        containerHeight: function() { return wrap.clientHeight; },
+                        minCellSize: 4, maxCellSize: 24,
                         onError: function(err) {
                             console.error('[c2pool bundled] error', err);
                         },

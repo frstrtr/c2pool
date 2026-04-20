@@ -10,12 +10,22 @@ import type { PluginDescriptor } from '../registry.js';
 export interface GridLayoutOptions {
   shareCount: number;
   containerWidth: number;  // clientWidth of the canvas's parent, pre-adjustment
-  cellSize: number;        // in CSS px
+  cellSize: number;        // in CSS px — used as the MAX when autoFit is on
   gap: number;             // in CSS px
   marginLeft: number;      // reserved strip on the left for the time axis
   minHeight: number;       // floor so the canvas isn't zero-height when empty
   /** Optional outer chrome to subtract from containerWidth. Default 16. */
   containerPadding?: number;
+  /** When true, solve for the largest cellSize ∈ [minCellSize,
+   *  maxCellSize ?? cellSize] such that the grid's laid-out height
+   *  fits containerHeight. Requires containerHeight. Default false. */
+  autoFit?: boolean;
+  /** Container height in CSS px. Only meaningful when autoFit = true. */
+  containerHeight?: number;
+  /** Floor for auto-fit sizing. Default 4. */
+  minCellSize?: number;
+  /** Ceiling for auto-fit sizing. Default cellSize. */
+  maxCellSize?: number;
 }
 
 export interface GridLayout {
@@ -48,16 +58,36 @@ const DEFAULTS = {
 
 /** Given a container size and share count, compute grid geometry.
  *  Columns are chosen so the grid fills the available width without
- *  overflowing: cols = floor((W - marginLeft) / step), clamped to ≥1. */
+ *  overflowing: cols = floor((W - marginLeft) / step), clamped to ≥1.
+ *
+ *  When `autoFit` is true and `containerHeight` is provided, the
+ *  cellSize is solved for so the full N-share window also fits
+ *  vertically — picks the largest cellSize in [minCellSize,
+ *  maxCellSize ?? cellSize] that leaves `rows * step ≤ containerHeight`. */
 export function computeGridLayout(opts: GridLayoutOptions): GridLayout {
-  const cellSize = opts.cellSize;
   const gap = opts.gap;
   const marginLeft = opts.marginLeft;
   const containerPadding = opts.containerPadding ?? DEFAULTS.containerPadding;
-  const step = cellSize + gap;
   const gridWidth = Math.max(0, opts.containerWidth - containerPadding - marginLeft);
-  const cols = Math.max(1, Math.floor(gridWidth / step));
   const shareCount = Math.max(0, opts.shareCount | 0);
+
+  let cellSize = opts.cellSize;
+  if (opts.autoFit === true && opts.containerHeight !== undefined && shareCount > 0) {
+    const minCs = Math.max(1, opts.minCellSize ?? 4);
+    const maxCs = Math.max(minCs, opts.maxCellSize ?? opts.cellSize);
+    const availH = Math.max(opts.minHeight, opts.containerHeight - containerPadding);
+    let chosen = minCs;
+    for (let cs = maxCs; cs >= minCs; cs--) {
+      const step = cs + gap;
+      const cols = Math.max(1, Math.floor(gridWidth / step));
+      const rows = Math.ceil(shareCount / cols);
+      if (rows * step <= availH) { chosen = cs; break; }
+    }
+    cellSize = chosen;
+  }
+
+  const step = cellSize + gap;
+  const cols = Math.max(1, Math.floor(gridWidth / step));
   const rows = shareCount === 0 ? 0 : Math.ceil(shareCount / cols);
   const cssWidth = marginLeft + cols * step;
   const cssHeight = Math.max(rows * step, opts.minHeight);

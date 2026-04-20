@@ -155,6 +155,14 @@ export interface RealtimeConfig {
   hashOf?: (share: ShareForClassify) => string;
   layoutParams?: Partial<LayoutParams>;
   containerWidth: () => number;
+  /** When provided, enables grid-layout auto-fit: cellSize is solved
+   *  for so the full share window fits both containerWidth AND
+   *  containerHeight at the largest possible cellSize. Bounds come
+   *  from layoutParams.cellSize (= max) and minCellSize/maxCellSize
+   *  (= override). Omit for fixed-cellSize behaviour. */
+  containerHeight?: () => number;
+  minCellSize?: number;
+  maxCellSize?: number;
   skipAnimationThreshold?: number;
   backgroundColor?: string;
   fastAnimation?: boolean;
@@ -191,10 +199,16 @@ export interface RealtimeState {
 /** Pure state machine — no DOM, no requestAnimationFrame. Drive it
  *  via start()/stop() and fetch frames via currentFrame(now). */
 export class RealtimeOrchestrator {
-  private readonly config: Required<Omit<RealtimeConfig, 'onError' | 'layoutParams'>> & {
-    onError?: (err: ExplorerError) => void;
-    layoutParams: LayoutParams;
-  };
+  private readonly config:
+      Required<Omit<RealtimeConfig,
+        'onError' | 'layoutParams' | 'containerHeight' | 'minCellSize' | 'maxCellSize'>>
+    & {
+      onError?: (err: ExplorerError) => void;
+      layoutParams: LayoutParams;
+      containerHeight?: () => number;
+      minCellSize?: number;
+      maxCellSize?: number;
+    };
   private readonly anim: AnimationController;
   private window: WindowSnapshot<ShareForClassify> = { shares: [] };
   private subscription: StreamSubscription | null = null;
@@ -231,7 +245,10 @@ export class RealtimeOrchestrator {
       backgroundColor: config.backgroundColor ?? '#0d0d1a',
       fastAnimation: config.fastAnimation ?? false,
       layoutParams,
-      ...(config.onError ? { onError: config.onError } : {}),
+      ...(config.onError       ? { onError:       config.onError       } : {}),
+      ...(config.containerHeight ? { containerHeight: config.containerHeight } : {}),
+      ...(config.minCellSize !== undefined ? { minCellSize: config.minCellSize } : {}),
+      ...(config.maxCellSize !== undefined ? { maxCellSize: config.maxCellSize } : {}),
     };
     this.anim = createAnimationController();
     this._effectiveUserContext = { ...config.userContext };
@@ -412,10 +429,19 @@ export class RealtimeOrchestrator {
   // ── internal ──────────────────────────────────────────────────────
 
   private updateLayout(): GridLayout {
+    const autoFit = this.config.containerHeight !== undefined;
     const layout = computeGridLayout({
       ...this.config.layoutParams,
       shareCount: this.window.shares.length,
       containerWidth: this.config.containerWidth(),
+      ...(autoFit ? {
+        autoFit: true,
+        containerHeight: this.config.containerHeight!(),
+        ...(this.config.minCellSize !== undefined
+          ? { minCellSize: this.config.minCellSize } : {}),
+        ...(this.config.maxCellSize !== undefined
+          ? { maxCellSize: this.config.maxCellSize } : {}),
+      } : {}),
     });
     this._currentLayout = layout;
     return layout;

@@ -113,7 +113,9 @@ async function connect() {
       canvas,
       transport,
       userContext: { myAddress: myAddress || undefined, shareVersion: 36 },
-      containerWidth: () => wrap.clientWidth,
+      containerWidth:  () => wrap.clientWidth,
+      containerHeight: () => wrap.clientHeight,
+      minCellSize: 4, maxCellSize: 24,
       fastAnimation: qsFast,
       onError: (err) => {
         setStatus('error', 'err');

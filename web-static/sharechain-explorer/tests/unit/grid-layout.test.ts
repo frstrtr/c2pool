@@ -160,6 +160,66 @@ test('iterCells: empty layout yields nothing', () => {
   assert.equal(Array.from(iterCells(l)).length, 0);
 });
 
+// ── auto-fit cellSize ─────────────────────────────────────────────
+
+test('autoFit off (default): cellSize preserved from opts', () => {
+  const l = computeGridLayout({
+    ...BASE, shareCount: 8640, containerWidth: 2000, cellSize: 10,
+  });
+  assert.equal(l.cellSize, 10);
+});
+
+test('autoFit on: picks largest cellSize that fits height', () => {
+  const l = computeGridLayout({
+    ...BASE, shareCount: 8640,
+    containerWidth: 2000,
+    containerHeight: 900,
+    cellSize: 10, maxCellSize: 24, minCellSize: 4,
+    autoFit: true,
+  });
+  assert.ok(l.cellSize > 4 && l.cellSize <= 24,
+    `autoFit cellSize ${l.cellSize} outside [4,24]`);
+  assert.ok(l.rows * l.step <= 900,
+    `auto-fit violated containerHeight: rows*step=${l.rows * l.step} > 900`);
+});
+
+test('autoFit on: tiny container → min cellSize', () => {
+  const l = computeGridLayout({
+    ...BASE, shareCount: 8640,
+    containerWidth: 200, containerHeight: 100,
+    cellSize: 10, maxCellSize: 24, minCellSize: 4,
+    autoFit: true,
+  });
+  assert.equal(l.cellSize, 4);
+});
+
+test('autoFit on: large container → max cellSize', () => {
+  const l = computeGridLayout({
+    ...BASE, shareCount: 100,
+    containerWidth: 4000, containerHeight: 2000,
+    cellSize: 10, maxCellSize: 24, minCellSize: 4,
+    autoFit: true,
+  });
+  assert.equal(l.cellSize, 24);
+});
+
+test('autoFit on: cellSize scales with resize', () => {
+  const tall = computeGridLayout({
+    ...BASE, shareCount: 8640,
+    containerWidth: 2000, containerHeight: 900,
+    cellSize: 10, maxCellSize: 24, minCellSize: 4,
+    autoFit: true,
+  });
+  const short = computeGridLayout({
+    ...BASE, shareCount: 8640,
+    containerWidth: 2000, containerHeight: 300,
+    cellSize: 10, maxCellSize: 24, minCellSize: 4,
+    autoFit: true,
+  });
+  assert.ok(tall.cellSize > short.cellSize,
+    `tall ${tall.cellSize} not greater than short ${short.cellSize}`);
+});
+
 // ── plugin registration ────────────────────────────────────────────
 
 test('GridLayoutPlugin: resolvable via host.getCapability', async () => {
