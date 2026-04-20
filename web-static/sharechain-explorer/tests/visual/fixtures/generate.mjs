@@ -95,16 +95,37 @@ const minerTotals = {};
 for (const sh of shares) {
   minerTotals[sh.m] = (minerTotals[sh.m] ?? 0) + 1;
 }
+// Per-miner log-normal multiplier so realistic pool skew shows up in
+// the PPLNS treemap — one or two "whale" miners tower over the rest
+// instead of everyone getting amount = n * constant.
+const minerMultiplier = {};
+for (const m of Object.keys(minerTotals)) {
+  // mulberry32 → uniform in [0,1). Box-Muller → Normal(0, 1).
+  const u1 = Math.max(1e-9, rng());
+  const u2 = rng();
+  const z  = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+  // σ=0.9 gives meaningful (but not extreme) spread; e^0.9 ≈ 2.46 at 1σ.
+  minerMultiplier[m] = Math.exp(z * 0.9);
+}
 let totalCurrent = 0;
 for (const [m, n] of Object.entries(minerTotals)) {
-  const amt = n * 0.00123456;
+  const amt = n * 0.00123456 * minerMultiplier[m];
   pplns_current[m] = amt;
   totalCurrent += amt;
 }
-// Per-share PPLNS (just use the same distribution for every share so
-// the hover-zoom exercises rendering deterministically)
+
+// Per-share PPLNS — jitter each miner's share around its base amount
+// so the hover-zoom sees a distinct distribution per hovered share
+// (not a flat repeat of pplns_current). Deterministic via the seeded
+// rng; same input fixture → same output every run.
 for (const sh of shares) {
-  pplns[sh.h] = { ...pplns_current };
+  const entry = {};
+  for (const [m, base] of Object.entries(pplns_current)) {
+    // ±30% multiplicative jitter.
+    const jitter = 0.7 + rng() * 0.6;
+    entry[m] = base * jitter;
+  }
+  pplns[sh.h] = entry;
 }
 
 const windowPayload = {
