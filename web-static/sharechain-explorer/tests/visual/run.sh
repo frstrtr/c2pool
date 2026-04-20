@@ -8,6 +8,8 @@ cd "$(dirname "$0")"
 PORT="${PORT:-18082}"
 THRESHOLD="${THRESHOLD:-0.005}"
 
+mkdir -p out
+
 echo "[1/4] generating fixtures"
 node fixtures/generate.mjs
 
