@@ -43,6 +43,48 @@ export interface PplnsSnapshot {
   miners: readonly PplnsMiner[];
 }
 
+// ── Per-miner drill-down (spec §5.2) ───────────────────────────────
+
+export interface HashrateSeriesPoint {
+  t: number;
+  hps: number;
+}
+
+export interface VersionHistoryPoint {
+  t: number;
+  version: number;
+  desiredVersion?: number;
+}
+
+export interface RecentShare {
+  /** Short-hash prefix (same scheme as Explorer spec). */
+  h: string;
+  /** Unix epoch seconds. */
+  t: number;
+  /** Stale flag — 0 = counted, 1 = pruned by dead-chain check. */
+  s?: number;
+  /** Share version. */
+  V?: number;
+}
+
+export interface PplnsMinerDetail {
+  address: string;
+  inWindow: boolean;
+  amount?: number;
+  pct?: number;
+  sharesInWindow?: number;
+  sharesTotal?: number;
+  firstSeenAt?: number;
+  lastShareAt?: number;
+  hashrateHps?: number;
+  hashrateSeries?: readonly HashrateSeriesPoint[];
+  version?: number;
+  desiredVersion?: number;
+  versionHistory?: readonly VersionHistoryPoint[];
+  merged: readonly MergedPayout[];
+  recentShares?: readonly RecentShare[];
+}
+
 // ── Coin descriptor extension fields ───────────────────────────────
 
 export interface MergedChainDescriptor {

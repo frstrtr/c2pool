@@ -11,9 +11,10 @@
 import type { Transport } from '../transport/types.js';
 import { PendingTracker } from '../abort.js';
 import type { ExplorerError } from '../errors.js';
-import { parseSnapshot } from './parse.js';
+import { parseSnapshot, parseMinerDetail } from './parse.js';
 import { render, resolveContainer } from './render.js';
 import { LTC_COIN_PPLNS_DESCRIPTOR } from './classify.js';
+import { renderMinerDetail, type DetailPanelHandle } from './detail.js';
 import type {
   PplnsController,
   PplnsEvent,
@@ -88,12 +89,59 @@ function buildController(
   let abortCtl: AbortController | null = null;
   let streamSub: { unsubscribe(): void } | null = null;
   let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let detailPanel: DetailPanelHandle | null = null;
+  let detailAbortCtl: AbortController | null = null;
 
   const emit = (ev: PplnsEvent, payload: unknown) => {
     const set = listeners.get(ev);
     if (set === undefined) return;
     for (const cb of Array.from(set)) {
       try { cb(payload); } catch { /* caller error — swallow */ }
+    }
+  };
+
+  // Default click handler: fetch miner detail, render the drill-down
+  // panel. Callers can override by supplying their own onMinerClick.
+  const openDetailPanel = async (address: string): Promise<void> => {
+    if (detailPanel !== null) {
+      detailPanel.close();
+      detailPanel = null;
+    }
+    if (detailAbortCtl !== null) detailAbortCtl.abort();
+    detailAbortCtl = new AbortController();
+    try {
+      const raw = await tracker.track(
+        transport.fetchMinerDetail(address, { signal: detailAbortCtl.signal }),
+      );
+      if (destroyed) return;
+      const detail = parseMinerDetail(raw);
+      if (detail === null) {
+        emit('error', { type: 'parse', message: 'Invalid miner detail payload' });
+        return;
+      }
+      detailPanel = renderMinerDetail({
+        host: container,
+        detail,
+        coin,
+        onClose: () => { detailPanel = null; },
+      });
+    } catch (err) {
+      if (destroyed) return;
+      const typed = asExplorerError(err);
+      emit('error', typed);
+      if (options.onError !== undefined && options.onError !== null) {
+        options.onError(typed);
+      }
+    }
+  };
+
+  const userClickHandler = options.onMinerClick;
+  const clickHandler = (miner: PplnsMiner): void => {
+    emit('miner-clicked', miner);
+    if (userClickHandler !== undefined && userClickHandler !== null) {
+      userClickHandler(miner);
+    } else {
+      void openDetailPanel(miner.address);
     }
   };
 
@@ -110,9 +158,7 @@ function buildController(
         showHashrate:     options.showHashrate     ?? DEFAULTS.showHashrate,
         showMerged:       options.showMerged       ?? DEFAULTS.showMerged,
       },
-      ...(options.onMinerClick
-        ? { onMinerClick: options.onMinerClick }
-        : {}),
+      onMinerClick: clickHandler,
     });
   };
 
@@ -182,9 +228,15 @@ function buildController(
       paintFromState();
     },
     selectMiner(address) {
-      if (address === null) return;
+      if (address === null) {
+        if (detailPanel !== null) {
+          detailPanel.close();
+          detailPanel = null;
+        }
+        return;
+      }
       const miner = state.snapshot?.miners.find((m) => m.address === address);
-      if (miner !== undefined) emit('miner-clicked', miner);
+      if (miner !== undefined) clickHandler(miner);
     },
     getState() {
       return { ...state };
@@ -193,6 +245,8 @@ function buildController(
       if (destroyed) return;
       destroyed = true;
       if (abortCtl !== null) abortCtl.abort();
+      if (detailAbortCtl !== null) detailAbortCtl.abort();
+      if (detailPanel !== null) detailPanel.close();
       if (streamSub !== null) streamSub.unsubscribe();
       if (pollTimer !== null) clearInterval(pollTimer);
       if (resize !== null) resize.disconnect();
@@ -337,7 +391,61 @@ function createDemoTransport(cfg: DemoCfg): Transport {
     fetchShareDetail:    () => stub({}),
     negotiate:           async () => ({ apiVersion: '1.0.0' }),
     fetchCurrentPayouts: () => stub(snapshot),
-    fetchMinerDetail:    () => stub({}),
+    fetchMinerDetail:    (address) => stub(synthMinerDetail(
+      miners.find((m) => m.address === address), cfg.seed)),
     subscribeStream:     () => ({ unsubscribe: () => { /* noop */ } }),
+  };
+}
+
+function synthMinerDetail(
+  miner: PplnsMiner | undefined,
+  seed: number,
+): unknown {
+  if (miner === undefined) return { error: 'miner_not_found' };
+  const rng = mulberry32((seed * 7919) >>> 0);
+  const now = Math.floor(Date.now() / 1000);
+  const base = miner.hashrateHps ?? 0;
+  const series = [];
+  for (let i = 30; i >= 0; i--) {
+    const jitter = 0.85 + rng() * 0.3;
+    series.push({ t: now - i * 120, hps: Math.max(0, Math.floor(base * jitter)) });
+  }
+  // Simulate version signalling in the last third of the window.
+  const history = miner.version === 36
+    ? [{ t: now - 8000, version: 36, desired_version: 36 }]
+    : [
+        { t: now - 10000, version: 35, desired_version: 35 },
+        { t: now - 4000,  version: 35, desired_version: 36 },
+      ];
+  const recent = [];
+  const shareHashChars = '0123456789abcdef';
+  for (let i = 0; i < 12; i++) {
+    let h = '';
+    for (let j = 0; j < 16; j++) {
+      h += shareHashChars[Math.floor(rng() * 16)];
+    }
+    recent.push({
+      h,
+      t: now - i * 60 - Math.floor(rng() * 30),
+      s: rng() < 0.08 ? 1 : 0,
+      V: miner.version ?? 36,
+    });
+  }
+  return {
+    address: miner.address,
+    in_window: true,
+    amount: miner.amount,
+    pct: miner.pct,
+    shares_in_window: miner.sharesInWindow ?? 0,
+    shares_total:     (miner.sharesInWindow ?? 0) + Math.floor(rng() * 5000),
+    first_seen_at:    now - 86400 * 7 - Math.floor(rng() * 86400 * 30),
+    last_share_at:    miner.lastShareAt ?? now,
+    hashrate_hps:     miner.hashrateHps ?? 0,
+    hashrate_series:  series,
+    version:          miner.version,
+    desired_version:  miner.desiredVersion,
+    version_history:  history,
+    merged: miner.merged.map((m) => ({ ...m, source: 'auto-convert' })),
+    recent_shares: recent,
   };
 }

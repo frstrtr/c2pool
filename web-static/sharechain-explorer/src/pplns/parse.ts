@@ -12,8 +12,12 @@
 import type {
   PplnsSnapshot,
   PplnsMiner,
+  PplnsMinerDetail,
   MergedPayout,
   MergedSource,
+  HashrateSeriesPoint,
+  VersionHistoryPoint,
+  RecentShare,
 } from './types.js';
 
 export function parseSnapshot(raw: unknown): PplnsSnapshot {
@@ -128,6 +132,76 @@ function parseNewShape(obj: Record<string, unknown>): PplnsSnapshot {
   if (coinLabel !== undefined) snap.coin = coinLabel;
   if (typeof obj.computed_at === 'number') snap.computedAt = obj.computed_at;
   return snap;
+}
+
+export function parseMinerDetail(raw: unknown): PplnsMinerDetail | null {
+  // Per spec §5.2. Returns null on anything that isn't an object — the
+  // caller decides how to surface the error (404 / network / parse).
+  if (raw === null || typeof raw !== 'object') return null;
+  const o = raw as Record<string, unknown>;
+  const address = str(o.address);
+  if (address === undefined) return null;
+
+  const detail: PplnsMinerDetail = {
+    address,
+    inWindow: o.in_window === true,
+    merged: Array.isArray(o.merged)
+      ? o.merged
+          .map((x) => parseMergedEntry(x))
+          .filter((x): x is MergedPayout => x !== null)
+      : [],
+  };
+  if (typeof o.amount === 'number')           detail.amount          = o.amount;
+  if (typeof o.pct === 'number')              detail.pct             = o.pct;
+  if (typeof o.shares_in_window === 'number') detail.sharesInWindow  = o.shares_in_window;
+  if (typeof o.shares_total === 'number')     detail.sharesTotal     = o.shares_total;
+  if (typeof o.first_seen_at === 'number')    detail.firstSeenAt     = o.first_seen_at;
+  if (typeof o.last_share_at === 'number')    detail.lastShareAt     = o.last_share_at;
+  if (typeof o.hashrate_hps === 'number')     detail.hashrateHps     = o.hashrate_hps;
+  if (typeof o.version === 'number')          detail.version         = o.version;
+  if (typeof o.desired_version === 'number')  detail.desiredVersion  = o.desired_version;
+
+  if (Array.isArray(o.hashrate_series)) {
+    const pts: HashrateSeriesPoint[] = [];
+    for (const p of o.hashrate_series) {
+      if (p === null || typeof p !== 'object') continue;
+      const po = p as Record<string, unknown>;
+      const t = num(po.t, NaN);
+      const hps = num(po.hps, NaN);
+      if (Number.isFinite(t) && Number.isFinite(hps)) pts.push({ t, hps });
+    }
+    if (pts.length > 0) detail.hashrateSeries = pts;
+  }
+  if (Array.isArray(o.version_history)) {
+    const pts: VersionHistoryPoint[] = [];
+    for (const p of o.version_history) {
+      if (p === null || typeof p !== 'object') continue;
+      const po = p as Record<string, unknown>;
+      const t = num(po.t, NaN);
+      const version = num(po.version, NaN);
+      if (!Number.isFinite(t) || !Number.isFinite(version)) continue;
+      const point: VersionHistoryPoint = { t, version };
+      if (typeof po.desired_version === 'number') point.desiredVersion = po.desired_version;
+      pts.push(point);
+    }
+    if (pts.length > 0) detail.versionHistory = pts;
+  }
+  if (Array.isArray(o.recent_shares)) {
+    const rs: RecentShare[] = [];
+    for (const p of o.recent_shares) {
+      if (p === null || typeof p !== 'object') continue;
+      const po = p as Record<string, unknown>;
+      const h = str(po.h);
+      const t = num(po.t, NaN);
+      if (h === undefined || !Number.isFinite(t)) continue;
+      const share: RecentShare = { h, t };
+      if (typeof po.s === 'number') share.s = po.s;
+      if (typeof po.V === 'number') share.V = po.V;
+      rs.push(share);
+    }
+    if (rs.length > 0) detail.recentShares = rs;
+  }
+  return detail;
 }
 
 function parseLegacyShape(obj: Record<string, unknown>): PplnsSnapshot {
