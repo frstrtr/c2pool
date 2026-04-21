@@ -157,14 +157,19 @@ void HttpSession::process_request()
     response.set("X-Frame-Options", "DENY");
     response.set("Referrer-Policy", "no-referrer");
 
+    // Admin endpoints accept both GET and POST so CLI tools can POST
+    // mutations without falling through to the JSON-RPC handler.
+    bool is_admin_path = std::string(request_.target()).substr(0, 16) == "/api/admin/pool/";
+
     try {
         std::string response_body;
-        
+
         if (request_.method() == http::verb::options) {
             // Handle CORS preflight
             response_body = "";
         }
-        else if (request_.method() == http::verb::get) {
+        else if (request_.method() == http::verb::get
+                 || (is_admin_path && request_.method() == http::verb::post)) {
             // Path-based REST routing for p2pool-compatible endpoints
             std::string raw_target(request_.target());
             std::string target(raw_target);
