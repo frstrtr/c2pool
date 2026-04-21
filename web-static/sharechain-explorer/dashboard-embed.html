@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<!--
+  c2pool-qt embedded Explorer host.
+
+  Served from qrc:///sharechain-explorer/dashboard-embed.html inside a
+  QWebEngineView. Bridges (SharechainBridge, etc.) are exposed through
+  QWebChannel and consumed by an inline QtTransport that satisfies the
+  same 9-operation Transport interface HttpTransport does — see
+  frstrtr/the/docs/c2pool-qt-hybrid-architecture.md §4.2 and
+  web-static/sharechain-explorer/src/transport/types.ts.
+
+  CSP matches browser-dashboard policy from delta v1 §B.3:
+    default-src 'none'; script-src 'self' 'unsafe-inline' qrc:;
+    style-src 'self' 'unsafe-inline' qrc:; connect-src 'self' qrc:;
+    img-src 'self' data: qrc:;
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self' 'unsafe-inline' qrc:; style-src 'self' 'unsafe-inline' qrc:; connect-src 'self' qrc:; img-src 'self' data: qrc:;">
+<title>Sharechain Explorer (embedded)</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0d0d1a; height: 100%; overflow: hidden; }
+  body {
+    color: #e6e6ff;
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  #wrap {
+    width: 100%; height: 100vh; position: relative;
+    padding: 8px; box-sizing: border-box;
+  }
+  canvas#grid {
+    width: 100%; height: calc(100vh - 60px);
+    display: block; background: #0d0d1a;
+  }
+  #status {
+    position: absolute; right: 12px; top: 10px;
+    font-size: 12px; color: #9999bb;
+  }
+  #status.err { color: #dc3545; }
+  #log {
+    position: absolute; left: 12px; bottom: 10px; right: 12px;
+    max-height: 40px; overflow-y: auto;
+    font-family: Monaco, Consolas, monospace; font-size: 11px;
+    color: #77778a;
+  }
+</style>
+</head>
+<body>
+  <div id="wrap">
+    <canvas id="grid"></canvas>
+    <div id="status">connecting…</div>
+    <div id="log"></div>
+  </div>
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+  <script type="module">
+    import {
+      createRealtime,
+    } from './dist/sharechain-explorer.js';
+
+    const statusEl = document.getElementById('status');
+    const logEl    = document.getElementById('log');
+    const canvas   = document.getElementById('grid');
+    const wrap     = document.getElementById('wrap');
+
+    function setStatus(txt, kind) {
+      statusEl.textContent = txt;
+      statusEl.className = kind === 'err' ? 'err' : '';
+    }
+    function log(level, msg, ctx) {
+      const stamp = new Date().toISOString().split('T')[1].slice(0, 8);
+      const line = `[${stamp}] ${level.padEnd(5)} ${msg}` +
+                   (ctx !== undefined ? '  ' + JSON.stringify(ctx) : '');
+      logEl.textContent = (line + '\n' + logEl.textContent).slice(0, 2000);
+    }
+
+    // ── QtTransport — 9-op Transport over a SharechainBridge ─────────
+    class QtTransport {
+      constructor(bridge) {
+        this.kind    = 'qt';
+        this.bridge  = bridge;
+        this._nextId = 1;
+        this._pending = new Map();
+        bridge.responseReady.connect((id, payload) => {
+          const p = this._pending.get(id);
+          if (!p) return;
+          this._pending.delete(id);
+          p.resolve(payload);
+        });
+        bridge.responseFailed.connect((id, err) => {
+          const p = this._pending.get(id);
+          if (!p) return;
+          this._pending.delete(id);
+          p.reject(err);
+        });
+      }
+      _call(method, args, opts) {
+        const id = this._nextId++;
+        if (opts && opts.signal) {
+          opts.signal.addEventListener('abort', () => this.bridge.cancelRequest(id));
+        }
+        return new Promise((resolve, reject) => {
+          this._pending.set(id, { resolve, reject });
+          this.bridge[method](id, ...args);
+        });
+      }
+      fetchWindow(opts)       { return this._call('getWindow',      [],           opts); }
+      fetchTip(opts)          { return this._call('getTip',         [],           opts); }
+      fetchDelta(since, opts) { return this._call('getDelta',       [since],      opts); }
+      fetchStats(opts)        { return this._call('getStats',       [],           opts); }
+      fetchShareDetail(h, o)  { return this._call('getShareDetail', [h],          o   ); }
+      async negotiate(opts) {
+        try {
+          const o = await this._call('negotiate', [], opts);
+          return { apiVersion: (o && o.apiVersion) || '1.0.0' };
+        } catch (err) {
+          // Orchestrator tolerates negotiate failures; assume v1.
+          return { apiVersion: '1.0.0' };
+        }
+      }
+      // PPLNS ops land with PplnsBridge (step 9 / PagePPLNS). For now
+      // return structured errors so callers fall through cleanly.
+      fetchCurrentPayouts() {
+        return Promise.reject({
+          type: 'transport',
+          message: 'PplnsBridge not yet wired — PPLNS ops unavailable in Qt hybrid mode',
+        });
+      }
+      fetchMinerDetail() {
+        return Promise.reject({
+          type: 'transport',
+          message: 'PplnsBridge not yet wired — PPLNS ops unavailable in Qt hybrid mode',
+        });
+      }
+      subscribeStream(onTip, onError, onReconnect) {
+        const tipH = (ev) => onTip(ev);
+        const rcH  = () => { if (onReconnect) onReconnect(); };
+        this.bridge.tipChanged.connect(tipH);
+        this.bridge.tipReconnected.connect(rcH);
+        this.bridge.startStream();
+        return {
+          unsubscribe: () => {
+            try { this.bridge.tipChanged.disconnect(tipH); } catch {}
+            try { this.bridge.tipReconnected.disconnect(rcH); } catch {}
+            try { this.bridge.stopStream(); } catch {}
+          },
+        };
+      }
+    }
+
+    // ── Boot: open QWebChannel, grab bridges, start the Explorer ────
+    function onChannelReady(channel) {
+      const bridge = channel.objects.sharechain;
+      if (!bridge) {
+        setStatus('no sharechain bridge', 'err');
+        log('error', 'QWebChannel did not expose sharechain');
+        return;
+      }
+      const transport = new QtTransport(bridge);
+      const coinBridge = channel.objects.coin;       // optional — step 9 adds
+      const myAddress = coinBridge && coinBridge.myAddress
+        ? coinBridge.myAddress
+        : undefined;
+
+      const rt = createRealtime({
+        canvas,
+        transport,
+        userContext: { myAddress, shareVersion: 36 },
+        containerWidth:  () => wrap.clientWidth,
+        containerHeight: () => wrap.clientHeight,
+        minCellSize: 4,   // default maxCellSize (120) kicks in
+        fastAnimation: false,
+        onError: (err) => {
+          setStatus('error', 'err');
+          log('error', err.message || String(err), { type: err.type });
+        },
+      });
+      rt.start().then(() => {
+        setStatus('connected');
+        log('info', 'Explorer started via QtTransport');
+        window.__explorerQt = rt;
+      }).catch((err) => {
+        setStatus('failed to start', 'err');
+        log('error', String(err && err.message ? err.message : err));
+      });
+
+      window.addEventListener('beforeunload', () => {
+        try { rt.stop(); } catch {}
+      });
+    }
+
+    if (typeof QWebChannel !== 'function') {
+      setStatus('QWebChannel unavailable', 'err');
+      log('error', 'qwebchannel.js did not load — check qrc:///qtwebchannel/ registration');
+    } else {
+      new QWebChannel(qt.webChannelTransport, onChannelReady);
+    }
+  </script>
+</body>
+</html>

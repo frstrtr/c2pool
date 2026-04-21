@@ -1,0 +1,11 @@
+{
+  "budgets": {
+    "shared-core.js":        { "bytes": 40960,  "warnAt": 0.90, "role": "SharedCore (plugin-arch §12.1 + M1 cap)" },
+    "sharechain-explorer.js":{ "bytes": 122880, "warnAt": 0.90, "role": "Explorer bundle (M1 cap 120 KB)" },
+    "pplns-view.js":         { "bytes": 61440,  "warnAt": 0.90, "role": "PPLNS View bundle (M1 cap 60 KB)" }
+  },
+  "optional": {
+    "note": "Every optional plugin capped at 30 KB. Enforced per-file at plugin publish time.",
+    "perPluginBytes": 30720
+  }
+}

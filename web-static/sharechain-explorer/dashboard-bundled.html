@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="dark" />
+<!-- Same CSP as delta v1 §B.3 / the demo page. Production dashboard.html
+     stays untouched; this is a parallel bundled-mode surface for visual
+     A/B vs the inline renderer. Spec §11 step 2 migration discipline. -->
+<meta http-equiv="Content-Security-Policy" content="
+  default-src 'none';
+  script-src 'self' 'unsafe-inline';
+  connect-src 'self';
+  img-src 'self' data:;
+  style-src 'self' 'unsafe-inline';
+  font-src 'self';
+  frame-ancestors 'none';
+  base-uri 'none';
+  form-action 'none'
+">
+<title>c2pool Explorer (bundled) — live</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #0d0d1a; color: #e0e0f0;
+               font-family: -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { padding: 12px 16px; border-bottom: 1px solid #3a3a5a;
+           display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  header h1 { margin: 0; font-size: 14px; font-weight: 600; }
+  header .stats { font-size: 12px; color: #8888a0;
+                  font-family: Monaco, Consolas, monospace; }
+  header label { font-size: 12px; color: #8888a0; }
+  header input[type=text] {
+    background: #252540; color: #e0e0f0; border: 1px solid #3a3a5a;
+    padding: 4px 8px; border-radius: 4px; font: inherit; min-width: 220px;
+  }
+  header button {
+    background: #252540; color: #e0e0f0; border: 1px solid #3a3a5a;
+    padding: 4px 12px; border-radius: 4px; cursor: pointer; font: inherit;
+  }
+  header button:hover { background: #3a3a5a; }
+  header .status.ok   { color: #66bb6a; }
+  header .status.err  { color: #ff6b6b; }
+  header .status.warn { color: #ffc107; }
+  #grid-wrap { padding: 12px 16px; overflow-x: auto; }
+  canvas { display: block; background: #0d0d1a; }
+  #log {
+    font: 11px Monaco, Consolas, monospace; color: #8888a0;
+    padding: 8px 16px; border-top: 1px solid #3a3a5a; max-height: 120px;
+    overflow-y: auto; white-space: pre-wrap;
+  }
+  .note { font-size: 12px; color: #8888a0; padding: 6px 16px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>c2pool Explorer (bundled)</h1>
+  <label>base URL
+    <input id="base-url" type="text" placeholder="http://127.0.0.1:8080" />
+  </label>
+  <label>my address
+    <input id="my-address" type="text" placeholder="(optional)" />
+  </label>
+  <button id="connect">connect</button>
+  <button id="disconnect">disconnect</button>
+  <button id="refresh">refresh</button>
+  <span class="status" id="status">idle</span>
+  <span class="stats" id="stats"></span>
+</header>
+<div class="note">
+  Parallel A/B surface — run alongside <code>dashboard.html</code> in a separate tab
+  pointing at the same c2pool server to visually compare the bundled pipeline
+  against the inline one. Deployed at <code>web-static/sharechain-explorer/dashboard-bundled.html</code>;
+  no changes to production <code>dashboard.html</code> until parity is verified.
+</div>
+<main id="grid-wrap">
+  <canvas id="grid" aria-label="Share chain grid"></canvas>
+</main>
+<pre id="log"></pre>
+<script type="module" src="./dashboard-bundled.mjs"></script>
+</body>
+</html>

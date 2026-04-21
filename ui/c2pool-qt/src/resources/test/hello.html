@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self' 'unsafe-inline' qrc:; style-src 'self' 'unsafe-inline' qrc:;">
+<title>PageEmbedded smoke test</title>
+<style>
+  body {
+    background: #0d0d1a;
+    color: #e6e6ff;
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh; margin: 0;
+  }
+  .panel {
+    text-align: center;
+    padding: 32px 48px;
+    border: 1px solid #333355;
+    border-radius: 12px;
+    background: #1a1a2f;
+  }
+  h1 { margin: 0 0 8px; font-size: 20px; }
+  p  { margin: 4px 0; color: #9999bb; }
+  code { background: #2a2a44; padding: 2px 6px; border-radius: 4px; }
+  #bridge-status { margin-top: 12px; }
+</style>
+</head>
+<body>
+  <div class="panel">
+    <h1>PageEmbedded — smoke test</h1>
+    <p>Served from <code id="src"></code>.</p>
+    <p id="bridge-status">Waiting for QWebChannel…</p>
+  </div>
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+  <script>
+    document.getElementById('src').textContent = location.href;
+    if (typeof QWebChannel === 'function') {
+      new QWebChannel(qt.webChannelTransport, function(channel) {
+        var names = Object.keys(channel.objects);
+        var s = document.getElementById('bridge-status');
+        s.textContent = names.length > 0
+          ? 'QWebChannel OK — bridges: ' + names.join(', ')
+          : 'QWebChannel OK — no bridges registered (smoke-test mode)';
+        s.style.color = '#00e676';
+      });
+    } else {
+      document.getElementById('bridge-status').textContent =
+        'QWebChannel unavailable — check qwebchannel.js load';
+      document.getElementById('bridge-status').style.color = '#dc3545';
+    }
+  </script>
+</body>
+</html>

@@ -1,5 +1,7 @@
 #include "PageLaunch.hpp"
 
+#include "SettingsStore.hpp"
+
 #include <QDir>
 #include <QFormLayout>
 #include <QGroupBox>
@@ -51,8 +53,8 @@ PortDefaults defaultsForNetwork(const QString& chain, bool testnet)
 // Construction
 // ─────────────────────────────────────────────────────────────────────────────
 
-PageLaunch::PageLaunch(QWidget* parent)
-    : QWidget(parent), process_(new QProcess(this))
+PageLaunch::PageLaunch(SettingsStore* settings, QWidget* parent)
+    : QWidget(parent), settings_(settings), process_(new QProcess(this))
 {
     setupUi();
 
@@ -368,7 +370,7 @@ void PageLaunch::setupUi()
             for (int i = 0; i < 16; ++i)
                 id += HEX[std::rand() % 16];
             networkIdEdit_->setText(id);
-            updateCommandPreview();
+            onBuildPreview();
         });
         idRow->addWidget(generateIdBtn_);
         form->addRow("Network ID:", idRow);
@@ -388,7 +390,7 @@ void PageLaunch::setupUi()
             "genesis: Create new chain immediately, don't wait for peers\n"
             "wait: Never create genesis, wait indefinitely for peers to sync");
         connect(startupModeCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged),
-                this, [this](int) { updateCommandPreview(); });
+                this, [this](int) { onBuildPreview(); });
         form->addRow("Startup mode:", startupModeCombo_);
 
         connect(privateChainCheck_, &QCheckBox::stateChanged, this, [this](int state) {
@@ -405,7 +407,7 @@ void PageLaunch::setupUi()
                 privateStatusLabel_->setText("Public p2pool network");
                 privateStatusLabel_->setStyleSheet("color: green; font-weight: bold;");
             }
-            updateCommandPreview();
+            onBuildPreview();
         });
 
         vbox->addWidget(g);
@@ -711,10 +713,19 @@ bool PageLaunch::isDaemonRunning() const
 // QSettings persistence
 // ─────────────────────────────────────────────────────────────────────────────
 
+QString PageLaunch::launchGroupPath() const
+{
+    if (settings_) {
+        return QStringLiteral("profiles/%1/launch")
+            .arg(settings_->activeProfile());
+    }
+    return QStringLiteral("launch");
+}
+
 void PageLaunch::saveSettings() const
 {
     QSettings s;
-    s.beginGroup("launch");
+    s.beginGroup(launchGroupPath());
     s.setValue("binary",        binaryEdit_->text());
     s.setValue("mode",          modeCombo_->currentIndex());
     s.setValue("chain",         chainCombo_->currentText());
@@ -758,7 +769,7 @@ void PageLaunch::saveSettings() const
 void PageLaunch::loadSettings()
 {
     QSettings s;
-    s.beginGroup("launch");
+    s.beginGroup(launchGroupPath());
     binaryEdit_->setText(s.value("binary", "./build/bin/c2pool").toString());
     modeCombo_->setCurrentIndex(s.value("mode", 1).toInt());
     {
