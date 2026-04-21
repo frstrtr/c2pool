@@ -158,3 +158,6 @@ test/test_*_include.cmake
 SHA256SUMS
 
 CLAUDE.md
+
+external-logs/
+tools/

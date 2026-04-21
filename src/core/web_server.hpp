@@ -1191,6 +1191,40 @@ public:
     using peer_info_fn_t = std::function<nlohmann::json()>;
     void set_peer_info_fn(peer_info_fn_t fn) { m_peer_info_fn = thread_safe_wrap(std::move(fn)); }
 
+    // ── Runtime admin callbacks (pool peer bans + whitelist) ─────────────
+    // Dispatched to NodeImpl on the io_context thread via thread_safe_wrap.
+    // All endpoints gated by loopback-only check in process_request.
+    using admin_list_bans_fn_t        = std::function<nlohmann::json()>;
+    using admin_ban_ip_fn_t           = std::function<nlohmann::json(const std::string& ip, int duration_sec)>;
+    using admin_unban_ip_fn_t         = std::function<nlohmann::json(const std::string& ip)>;
+    using admin_list_whitelist_fn_t   = std::function<nlohmann::json()>;
+    using admin_whitelist_add_fn_t    = std::function<nlohmann::json(const std::string& host, uint16_t port)>;
+    using admin_whitelist_remove_fn_t = std::function<nlohmann::json(const std::string& host, uint16_t port)>;
+    using admin_list_peers_fn_t       = std::function<nlohmann::json()>;
+    using admin_drop_peer_fn_t        = std::function<nlohmann::json(const std::string& ip)>;
+    using admin_dial_peer_fn_t        = std::function<nlohmann::json(const std::string& host, uint16_t port)>;
+
+    void set_admin_list_bans_fn(admin_list_bans_fn_t fn)             { m_admin_list_bans_fn = thread_safe_wrap(std::move(fn)); }
+    void set_admin_ban_ip_fn(admin_ban_ip_fn_t fn)                   { m_admin_ban_ip_fn = thread_safe_wrap(std::move(fn)); }
+    void set_admin_unban_ip_fn(admin_unban_ip_fn_t fn)               { m_admin_unban_ip_fn = thread_safe_wrap(std::move(fn)); }
+    void set_admin_list_whitelist_fn(admin_list_whitelist_fn_t fn)   { m_admin_list_whitelist_fn = thread_safe_wrap(std::move(fn)); }
+    void set_admin_whitelist_add_fn(admin_whitelist_add_fn_t fn)     { m_admin_whitelist_add_fn = thread_safe_wrap(std::move(fn)); }
+    void set_admin_whitelist_remove_fn(admin_whitelist_remove_fn_t fn) { m_admin_whitelist_remove_fn = thread_safe_wrap(std::move(fn)); }
+    void set_admin_list_peers_fn(admin_list_peers_fn_t fn)           { m_admin_list_peers_fn = thread_safe_wrap(std::move(fn)); }
+    void set_admin_drop_peer_fn(admin_drop_peer_fn_t fn)             { m_admin_drop_peer_fn = thread_safe_wrap(std::move(fn)); }
+    void set_admin_dial_peer_fn(admin_dial_peer_fn_t fn)             { m_admin_dial_peer_fn = thread_safe_wrap(std::move(fn)); }
+
+    bool has_admin_fns() const { return !!m_admin_list_bans_fn; }
+    nlohmann::json call_admin_list_bans()      { return m_admin_list_bans_fn(); }
+    nlohmann::json call_admin_ban_ip(const std::string& ip, int d)       { return m_admin_ban_ip_fn(ip, d); }
+    nlohmann::json call_admin_unban_ip(const std::string& ip)             { return m_admin_unban_ip_fn(ip); }
+    nlohmann::json call_admin_list_whitelist()                           { return m_admin_list_whitelist_fn(); }
+    nlohmann::json call_admin_whitelist_add(const std::string& h, uint16_t p) { return m_admin_whitelist_add_fn(h, p); }
+    nlohmann::json call_admin_whitelist_remove(const std::string& h, uint16_t p) { return m_admin_whitelist_remove_fn(h, p); }
+    nlohmann::json call_admin_list_peers()                               { return m_admin_list_peers_fn(); }
+    nlohmann::json call_admin_drop_peer(const std::string& ip)            { return m_admin_drop_peer_fn(ip); }
+    nlohmann::json call_admin_dial_peer(const std::string& h, uint16_t p) { return m_admin_dial_peer_fn(h, p); }
+
     // Port configuration for /node_info
     void set_p2p_port(uint16_t port) { m_p2p_port = port; }
     void set_worker_port(uint16_t port) { m_worker_port = port; }
@@ -1238,6 +1272,16 @@ private:
     explorer_mempoolinfo_fn_t  m_explorer_mempoolinfo_fn;
     explorer_rawmempool_fn_t   m_explorer_rawmempool_fn;
     explorer_mempoolentry_fn_t m_explorer_mempoolentry_fn;
+    // Admin callbacks (runtime pool peer ban/whitelist management)
+    admin_list_bans_fn_t        m_admin_list_bans_fn;
+    admin_ban_ip_fn_t           m_admin_ban_ip_fn;
+    admin_unban_ip_fn_t         m_admin_unban_ip_fn;
+    admin_list_whitelist_fn_t   m_admin_list_whitelist_fn;
+    admin_whitelist_add_fn_t    m_admin_whitelist_add_fn;
+    admin_whitelist_remove_fn_t m_admin_whitelist_remove_fn;
+    admin_list_peers_fn_t       m_admin_list_peers_fn;
+    admin_drop_peer_fn_t        m_admin_drop_peer_fn;
+    admin_dial_peer_fn_t        m_admin_dial_peer_fn;
     // Primary payout address for legacy API
     std::string m_payout_address;
 

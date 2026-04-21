@@ -1,0 +1,92 @@
+#!/bin/bash
+# c2pool-admin — runtime pool peer ban/whitelist management.
+#
+# Talks to the loopback-only /api/admin/pool/* endpoints on the c2pool
+# HTTP server. For remote hosts, SSH-tunnel the HTTP port:
+#
+#   ssh -L 8080:127.0.0.1:8080 c2pool@host
+#   c2pool-admin whitelist list
+#
+# Usage:
+#   c2pool-admin bans list
+#   c2pool-admin ban <ip> [duration_sec]
+#   c2pool-admin unban <ip>
+#   c2pool-admin whitelist list
+#   c2pool-admin whitelist add <host:port>
+#   c2pool-admin whitelist remove <host:port>
+#   c2pool-admin peers list
+#   c2pool-admin peers drop <ip>
+#   c2pool-admin peers dial <host:port>
+#
+# Env:
+#   C2POOL_HTTP_URL  default http://127.0.0.1:8080
+
+set -e
+URL="${C2POOL_HTTP_URL:-http://127.0.0.1:8080}"
+API="${URL}/api/admin/pool"
+
+hit() {
+    local method="$1" path="$2"
+    curl -sSf -X "$method" "${API}${path}"
+    echo
+}
+
+split_hp() {
+    local hp="$1"
+    HOST="${hp%:*}"
+    PORT="${hp##*:}"
+    if [ -z "$HOST" ] || [ "$HOST" = "$PORT" ]; then
+        echo "error: expected host:port, got '$hp'" >&2
+        exit 2
+    fi
+}
+
+cmd="${1:-}"; shift || true
+sub="${1:-}"; shift || true
+
+case "$cmd" in
+    bans)
+        case "$sub" in
+            list)   hit GET "/bans/list" ;;
+            *)      echo "usage: $0 bans list" >&2; exit 2 ;;
+        esac
+        ;;
+    ban)
+        ip="$sub"; dur="${1:-}"
+        [ -z "$ip" ] && { echo "usage: $0 ban <ip> [duration_sec]" >&2; exit 2; }
+        q="ip=${ip}"
+        [ -n "$dur" ] && q="${q}&duration=${dur}"
+        hit POST "/bans/add?${q}"
+        ;;
+    unban)
+        ip="$sub"
+        [ -z "$ip" ] && { echo "usage: $0 unban <ip>" >&2; exit 2; }
+        hit POST "/bans/remove?ip=${ip}"
+        ;;
+    whitelist)
+        action="${1:-}"; shift || true
+        case "$sub" in
+            list)   hit GET "/whitelist/list" ;;
+            add)    split_hp "$action"; hit POST "/whitelist/add?host=${HOST}&port=${PORT}" ;;
+            remove|rm) split_hp "$action"; hit POST "/whitelist/remove?host=${HOST}&port=${PORT}" ;;
+            *)      echo "usage: $0 whitelist [list|add host:port|remove host:port]" >&2; exit 2 ;;
+        esac
+        ;;
+    peers)
+        action="${1:-}"; shift || true
+        case "$sub" in
+            list)   hit GET "/peers/list" ;;
+            drop)   [ -z "$action" ] && { echo "usage: $0 peers drop <ip>" >&2; exit 2; }
+                    hit POST "/peers/drop?ip=${action}" ;;
+            dial)   split_hp "$action"; hit POST "/peers/dial?host=${HOST}&port=${PORT}" ;;
+            *)      echo "usage: $0 peers [list|drop ip|dial host:port]" >&2; exit 2 ;;
+        esac
+        ;;
+    ""|help|-h|--help)
+        sed -n '2,22p' "$0"
+        ;;
+    *)
+        echo "unknown command: $cmd (try: $0 help)" >&2
+        exit 2
+        ;;
+esac
