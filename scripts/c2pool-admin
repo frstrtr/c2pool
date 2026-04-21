@@ -17,6 +17,8 @@
 #   c2pool-admin peers list
 #   c2pool-admin peers drop <ip>
 #   c2pool-admin peers dial <host:port>
+#   c2pool-admin coin peers list <ltc|doge>
+#   c2pool-admin coin peer add <ltc|doge> <host:port>
 #
 # Env:
 #   C2POOL_HTTP_URL  default http://127.0.0.1:8080
@@ -24,10 +26,17 @@
 set -e
 URL="${C2POOL_HTTP_URL:-http://127.0.0.1:8080}"
 API="${URL}/api/admin/pool"
+COIN_API="${URL}/api/admin/coin"
 
 hit() {
     local method="$1" path="$2"
     curl -sSf -X "$method" "${API}${path}"
+    echo
+}
+
+hit_coin() {
+    local method="$1" path="$2"
+    curl -sSf -X "$method" "${COIN_API}${path}"
     echo
 }
 
@@ -82,8 +91,33 @@ case "$cmd" in
             *)      echo "usage: $0 peers [list|drop ip|dial host:port]" >&2; exit 2 ;;
         esac
         ;;
+    coin)
+        # coin peers list <chain>     /  coin peer add <chain> <host:port>
+        action="${1:-}"; shift || true
+        case "$sub" in
+            peers)
+                if [ "$action" != "list" ]; then
+                    echo "usage: $0 coin peers list <chain>" >&2; exit 2
+                fi
+                chain="${1:-ltc}"
+                hit_coin GET "/peers/list?chain=${chain}"
+                ;;
+            peer)
+                if [ "$action" != "add" ]; then
+                    echo "usage: $0 coin peer add <chain> <host:port>" >&2; exit 2
+                fi
+                chain="${1:-}"; hp="${2:-}"
+                [ -z "$chain" ] || [ -z "$hp" ] && { echo "usage: $0 coin peer add <chain> <host:port>" >&2; exit 2; }
+                split_hp "$hp"
+                hit_coin POST "/peer/add?chain=${chain}&host=${HOST}&port=${PORT}"
+                ;;
+            *)
+                echo "usage: $0 coin [peers list <chain>|peer add <chain> <host:port>]" >&2; exit 2
+                ;;
+        esac
+        ;;
     ""|help|-h|--help)
-        sed -n '2,22p' "$0"
+        sed -n '2,24p' "$0"
         ;;
     *)
         echo "unknown command: $cmd (try: $0 help)" >&2
