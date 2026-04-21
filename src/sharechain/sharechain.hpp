@@ -6,6 +6,8 @@
 #include <unordered_set>
 #include <set>
 #include <cstdint>
+#include <chrono>
+#include <cstdio>
 #include <stdexcept>
 
 #include <sharechain/share.hpp>
@@ -665,6 +667,26 @@ public:
     /// 4-branch structure with signals firing at exact p2pool locations.
     bool remove(const hash_t& hash, bool owns_data = true)
     {
+        // ── DIAG: bucket-chain capture at entry ──
+        // Purpose: on a future clean_tracker freeze (contabo 2026-04-21 hit a
+        // 40s spin inside unordered_map::_M_find_before_node at bucket 2332),
+        // we need to see the hashtable's shape at each remove attempt. If a
+        // bucket starts with a very long chain, it is suspect for either a
+        // cycle or pathological clustering. Cheap (O(1)) and only fires inside
+        // clean_tracker so volume is low.
+        auto _t0_ns = std::chrono::steady_clock::now();
+        const auto _bucket = m_shares.bucket(hash);
+        const auto _bucket_sz = m_shares.bucket_size(_bucket);
+        const auto _total = m_shares.size();
+        const auto _nbuckets = m_shares.bucket_count();
+        if (_bucket_sz > 50 || _total > 100000 || m_shares.load_factor() > 2.0f) {
+            std::fprintf(stderr,
+                "[forest::remove ENTRY] hash=%.16s bucket=%zu bucket_sz=%zu "
+                "total=%zu buckets=%zu load_factor=%.3f\n",
+                hash.GetHex().c_str(), _bucket, _bucket_sz,
+                _total, _nbuckets, m_shares.load_factor());
+        }
+
         auto it = m_shares.find(hash);
         if (it == m_shares.end())
             return false;
@@ -815,6 +837,18 @@ public:
             it->second.share.destroy();
         delete idx;
         m_shares.erase(it);
+
+        // ── DIAG: remove wall time. Anything over 50 ms inside a single
+        // remove() on a healthy chain is suspect and worth capturing.
+        const auto _elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - _t0_ns).count();
+        if (_elapsed_us > 50000) {
+            std::fprintf(stderr,
+                "[forest::remove SLOW] hash=%.16s branch=%d elapsed_ms=%.3f "
+                "bucket=%zu bucket_sz=%zu total=%zu load=%.3f\n",
+                hash.GetHex().c_str(), branch, _elapsed_us / 1000.0,
+                _bucket, _bucket_sz, m_shares.size(), m_shares.load_factor());
+        }
         return true;
     }
 

@@ -1747,9 +1747,20 @@ void NodeImpl::clean_tracker()
 
             if (to_remove.empty()) break;
 
+            size_t _dh_idx = 0;
             for (const auto& h : to_remove)
             {
                 try {
+                    // DIAG: per-remove marker so a freeze inside chain.contains()
+                    // or verified.remove() leaves the last touched hash in the log.
+                    std::fprintf(stderr,
+                        "[drop-heads-PRE] drop_idx=%zu/%zu hash=%.16s "
+                        "chain_size=%zu\n",
+                        _dh_idx, to_remove.size(), h.GetHex().c_str(),
+                        m_tracker.chain.size());
+                    std::fflush(stderr);
+                    ++_dh_idx;
+
                     if (m_tracker.verified.contains(h))
                         m_tracker.verified.remove(h, /*owns_data=*/false);
                     if (m_tracker.chain.contains(h))
@@ -1799,9 +1810,24 @@ void NodeImpl::clean_tracker()
             if (to_remove.empty()) break;
 
             // p2pool node.py:392-398
+            size_t _drop_idx = 0;
             for (const auto& aftertail : to_remove)
             {
                 try {
+                    // DIAG: contabo 2026-04-21 froze 40s inside
+                    // unordered_map::contains() on an aftertail at bucket 2332.
+                    // If we spin here again this is the last line flushed —
+                    // gives us the iter index, which aftertail triggered it,
+                    // and the queue size to correlate with the freeze.
+                    std::fprintf(stderr,
+                        "[drop-tails-PRE] iter=%d drop_idx=%zu/%zu aftertail=%.16s "
+                        "chain_size=%zu\n",
+                        iter, _drop_idx, to_remove.size(),
+                        aftertail.GetHex().c_str(),
+                        m_tracker.chain.size());
+                    std::fflush(stderr);
+                    ++_drop_idx;
+
                     if (!m_tracker.chain.contains(aftertail)) continue;
                     // p2pool node.py:393: if items[aftertail].previous_hash not in tails: continue
                     auto* idx = m_tracker.chain.get_index(aftertail);
