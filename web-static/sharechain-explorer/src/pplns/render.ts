@@ -99,17 +99,42 @@ function buildCell(c: CellOpts): HTMLElement {
     ));
   }
   if (opts.showMerged && w > 35 && h > 28 && coin.mergedChains.length > 0) {
+    // Version-badge severity splits the "no entry" case:
+    //   • 'warn' (V35-only, not signaling V36) — structurally excluded
+    //     from merged payouts. Red `NO {SYM}` matches dashboard.html's
+    //     semantics (transitional signaling gate at share_tracker.hpp:2675).
+    //   • anything else (V36 native, V35→V36 signaling, or unknown) —
+    //     in the merged-mining class via auto-convert. Gold `0.0% {SYM}`
+    //     even at zero so transient mid-tip cache states don't read as
+    //     "missing merged". Matches dashboard.html df5c2fa0 relabel.
+    const badgeKey = coin.versionBadges.classify(miner);
+    const badge = coin.versionBadges.palette[badgeKey];
+    const isExcluded = badge !== undefined && badge.severity === 'warn';
     for (const chain of coin.mergedChains) {
       const entry = miner.merged.find((m) => m.symbol === chain.symbol);
-      if (entry === undefined && chain.alwaysShow !== true) continue;
+      if (entry === undefined && chain.alwaysShow !== true && !isExcluded) {
+        // In-class miner with no accrued amount yet — show 0% (still
+        // informative, collapses the old em-dash).
+      }
       const row = document.createElement('div');
       row.className = 'pv-merged';
-      row.style.cssText =
-        `font-size:${Math.max(9, fontSize(w, h) - 2)}px;color:${chain.color};` +
-        `font-weight:600;line-height:1.1;`;
-      row.textContent = entry !== undefined
-        ? `${(entry.pct * 100).toFixed(1)}% ${chain.tooltipLabel}`
-        : `— no ${chain.tooltipLabel}`;
+      const baseSize = Math.max(9, fontSize(w, h) - 2);
+      if (entry !== undefined) {
+        row.style.cssText =
+          `font-size:${baseSize}px;color:${chain.color};` +
+          `font-weight:600;line-height:1.1;`;
+        row.textContent = `${(entry.pct * 100).toFixed(1)}% ${chain.tooltipLabel}`;
+      } else if (isExcluded) {
+        row.style.cssText =
+          `font-size:${baseSize}px;color:#ff6b6b;` +
+          `font-weight:600;line-height:1.1;`;
+        row.textContent = `NO ${chain.tooltipLabel}`;
+      } else {
+        row.style.cssText =
+          `font-size:${baseSize}px;color:${chain.color};` +
+          `font-weight:600;line-height:1.1;`;
+        row.textContent = `0.0% ${chain.tooltipLabel}`;
+      }
       cell.appendChild(row);
     }
   }

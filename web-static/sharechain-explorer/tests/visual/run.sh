@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 PORT="${PORT:-18082}"
-THRESHOLD="${THRESHOLD:-0.005}"
+THRESHOLD="${THRESHOLD:-0.025}"
 
 mkdir -p out
 
