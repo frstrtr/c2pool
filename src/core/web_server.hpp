@@ -1222,6 +1222,17 @@ public:
     nlohmann::json call_admin_drop_peer(const std::string& ip)            { return m_admin_drop_peer_fn(ip); }
     nlohmann::json call_admin_dial_peer(const std::string& h, uint16_t p) { return m_admin_dial_peer_fn(h, p); }
 
+    // ── Embedded-coin admin (LTC/DOGE seed peer management) ──────────────
+    // Operates on the CoinPeerManager for the requested chain; adds
+    // peers discovered out-of-band (config, DNS recovery, operator input).
+    using admin_coin_list_peers_fn_t = std::function<nlohmann::json(const std::string& chain)>;
+    using admin_coin_add_peer_fn_t   = std::function<nlohmann::json(const std::string& chain, const std::string& host, uint16_t port)>;
+    void set_admin_coin_list_peers_fn(admin_coin_list_peers_fn_t fn) { m_admin_coin_list_peers_fn = thread_safe_wrap(std::move(fn)); }
+    void set_admin_coin_add_peer_fn(admin_coin_add_peer_fn_t fn)     { m_admin_coin_add_peer_fn = thread_safe_wrap(std::move(fn)); }
+    bool has_admin_coin_fns() const { return !!m_admin_coin_add_peer_fn; }
+    nlohmann::json call_admin_coin_list_peers(const std::string& c)  { return m_admin_coin_list_peers_fn(c); }
+    nlohmann::json call_admin_coin_add_peer(const std::string& c, const std::string& h, uint16_t p) { return m_admin_coin_add_peer_fn(c, h, p); }
+
     // Port configuration for /node_info
     void set_p2p_port(uint16_t port) { m_p2p_port = port; }
     void set_worker_port(uint16_t port) { m_worker_port = port; }
@@ -1279,6 +1290,8 @@ private:
     admin_list_peers_fn_t       m_admin_list_peers_fn;
     admin_drop_peer_fn_t        m_admin_drop_peer_fn;
     admin_dial_peer_fn_t        m_admin_dial_peer_fn;
+    admin_coin_list_peers_fn_t  m_admin_coin_list_peers_fn;
+    admin_coin_add_peer_fn_t    m_admin_coin_add_peer_fn;
     // Primary payout address for legacy API
     std::string m_payout_address;
 

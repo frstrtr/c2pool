@@ -5610,6 +5610,71 @@ int main(int argc, char* argv[]) {
                 }
                 web_server.set_merged_mining_manager(mm_manager.get());
 
+                // ── Embedded-coin admin API (LTC/DOGE runtime seed-peer add) ─
+                // Dispatches on `chain`: "ltc" → embedded_broadcaster,
+                // other symbols → merged_broadcasters map (matched by symbol()).
+                {
+                    auto* coin_mi = web_server.get_mining_interface();
+                    auto* emb_ltc_ptr = embedded_broadcaster.get();
+                    auto* mbs = &merged_broadcasters;
+
+                    auto resolve_pm = [emb_ltc_ptr, mbs](const std::string& chain_in)
+                        -> c2pool::merged::CoinPeerManager*
+                    {
+                        // lowercase chain string
+                        std::string c = chain_in;
+                        std::transform(c.begin(), c.end(), c.begin(),
+                            [](unsigned char ch){ return std::tolower(ch); });
+                        if ((c == "ltc" || c == "litecoin") && emb_ltc_ptr)
+                            return &emb_ltc_ptr->peer_manager();
+                        for (auto& [cid, bc] : *mbs) {
+                            std::string s = bc->symbol();
+                            std::transform(s.begin(), s.end(), s.begin(),
+                                [](unsigned char ch){ return std::tolower(ch); });
+                            if (s == c) return &bc->peer_manager();
+                        }
+                        return nullptr;
+                    };
+
+                    coin_mi->set_admin_coin_list_peers_fn(
+                        [resolve_pm](const std::string& chain) -> nlohmann::json {
+                            auto* pm = resolve_pm(chain);
+                            if (!pm) return {{"ok", false}, {"error", "unknown chain: " + chain}};
+                            auto tried = pm->get_tried_peers(200);
+                            auto stats = pm->peer_stats();
+                            auto arr = nlohmann::json::array();
+                            for (auto& ep : tried)
+                                arr.push_back({{"host", ep.host()},
+                                               {"port", ep.port()}});
+                            return {{"ok", true}, {"chain", chain},
+                                    {"stats", {{"total", stats.total},
+                                               {"tried", stats.tried},
+                                               {"new", stats.new_peers},
+                                               {"unique_groups", stats.unique_groups},
+                                               {"anchors", stats.anchor_count}}},
+                                    {"peers", arr}};
+                        });
+
+                    coin_mi->set_admin_coin_add_peer_fn(
+                        [resolve_pm](const std::string& chain,
+                                     const std::string& host, uint16_t port)
+                            -> nlohmann::json {
+                            if (host.empty() || port == 0)
+                                return {{"ok", false}, {"error", "host and port required"}};
+                            auto* pm = resolve_pm(chain);
+                            if (!pm) return {{"ok", false}, {"error", "unknown chain: " + chain}};
+                            NetService addr(host, port);
+                            pm->add_discovered_peer(addr);
+                            auto stats = pm->peer_stats();
+                            return {{"ok", true}, {"action", "peer_add"},
+                                    {"chain", chain}, {"target", addr.to_string()},
+                                    {"stats", {{"total", stats.total},
+                                               {"tried", stats.tried},
+                                               {"new", stats.new_peers}}}};
+                        });
+                    LOG_INFO << "[Admin] Coin-peer admin API enabled (loopback-only)";
+                }
+
                 // Wire the merged payout provider so that aux chain block
                 // construction uses the correct payout distribution.
                 auto* mi = web_server.get_mining_interface();

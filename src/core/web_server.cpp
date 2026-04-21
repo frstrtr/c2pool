@@ -159,7 +159,8 @@ void HttpSession::process_request()
 
     // Admin endpoints accept both GET and POST so CLI tools can POST
     // mutations without falling through to the JSON-RPC handler.
-    bool is_admin_path = std::string(request_.target()).substr(0, 16) == "/api/admin/pool/";
+    // Covers /api/admin/pool/* AND /api/admin/coin/*.
+    bool is_admin_path = std::string(request_.target()).substr(0, 11) == "/api/admin/";
 
     try {
         std::string response_body;
@@ -592,6 +593,53 @@ void HttpSession::process_request()
                         rest_result = mining_interface_->call_admin_dial_peer(h, p);
                     } else {
                         rest_result = nlohmann::json{{"ok", false}, {"error", "Unknown admin endpoint"}};
+                    }
+                }
+                // ── Admin API: embedded-coin peer management ──────────────
+                else if (target.substr(0, 16) == "/api/admin/coin/") {
+                    auto remote_addr = socket_.remote_endpoint().address();
+                    if (!remote_addr.is_loopback()) {
+                        response.result(http::status::forbidden);
+                        response.body() = R"({"error":"Admin API is local-only"})";
+                        response.prepare_payload();
+                        send_response(std::move(response));
+                        return;
+                    }
+                    if (!mining_interface_->has_admin_coin_fns()) {
+                        response.result(http::status::not_found);
+                        response.body() = R"({"error":"Coin admin API not enabled"})";
+                        response.prepare_payload();
+                        send_response(std::move(response));
+                        return;
+                    }
+
+                    std::string ep = target.substr(16); // after "/api/admin/coin/"
+                    auto qpos = ep.find('?');
+                    if (qpos != std::string::npos) ep = ep.substr(0, qpos);
+
+                    std::string chain = getQueryParam("chain");
+                    if (chain.empty()) chain = "ltc";
+
+                    if (ep == "peers/list") {
+                        rest_result = mining_interface_->call_admin_coin_list_peers(chain);
+                    } else if (ep == "peer/add") {
+                        std::string host = getQueryParam("host");
+                        uint16_t port = 0;
+                        // Host may be "A.B.C.D:PORT" (combined) OR "A.B.C.D" with separate ?port=
+                        if (!host.empty()) {
+                            auto colon = host.rfind(':');
+                            if (colon != std::string::npos) {
+                                try { port = static_cast<uint16_t>(std::stoul(host.substr(colon + 1))); } catch (...) {}
+                                host = host.substr(0, colon);
+                            }
+                        }
+                        std::string port_q = getQueryParam("port");
+                        if (!port_q.empty()) {
+                            try { port = static_cast<uint16_t>(std::stoul(port_q)); } catch (...) {}
+                        }
+                        rest_result = mining_interface_->call_admin_coin_add_peer(chain, host, port);
+                    } else {
+                        rest_result = nlohmann::json{{"ok", false}, {"error", "Unknown coin admin endpoint"}};
                     }
                 }
                 else
