@@ -3198,11 +3198,31 @@ int main(int argc, char* argv[]) {
 
             web_server.get_mining_interface()->set_sharechain_stats_fn(
                 [&p2p_node, stats_skiplist]() {
+                // Cache of the last FULL result (tracker-guarded path).  On
+                // busy we return this instead of a 4-field minimal snapshot,
+                // so consumers like rest_version_signaling keep seeing the
+                // vote/sampling fields — otherwise V36 voting flaps to 0.0%
+                // whenever think() holds the tracker lock (frequent during
+                // bootstrap).  Same pattern as pool_hashrate_fn's s_last_good.
+                static std::mutex s_cache_mutex;
+                static nlohmann::json s_last_good;
+
                 auto guard = p2p_node->read_tracker();
                 if (!guard) {
-                    // Tracker locked by think() — return snapshot published by
-                    // the last think() cycle.  Never return empty: the loading
-                    // page, global_stats, graph data all depend on this.
+                    // Prefer last-good full result if we have one; otherwise
+                    // fall back to the snapshot so the loading page still works.
+                    std::lock_guard<std::mutex> lock(s_cache_mutex);
+                    if (!s_last_good.is_null()) {
+                        // Refresh volatile fields from the live snapshot so
+                        // chain_height/verified_count don't lag by a think cycle.
+                        auto snap = p2p_node->get_tracker_snapshot();
+                        nlohmann::json out = s_last_good;
+                        out["chain_height"]   = snap.chain_count;
+                        out["verified_count"] = snap.verified_count;
+                        out["fork_count"]     = snap.fork_count;
+                        out["total_shares"]   = snap.chain_count;
+                        return out;
+                    }
                     auto snap = p2p_node->get_tracker_snapshot();
                     nlohmann::json fallback;
                     fallback["chain_height"]   = snap.chain_count;
@@ -3364,6 +3384,13 @@ int main(int argc, char* argv[]) {
                     result["my_share_hashes"] = nlohmann::json::array();
                 }
 
+                {
+                    // Publish the full result into the last-good cache so the
+                    // busy-path can hand it back without the vote/sampling
+                    // fields going to zero.
+                    std::lock_guard<std::mutex> lock(s_cache_mutex);
+                    s_last_good = result;
+                }
                 return result;
             });
 
