@@ -2721,6 +2721,33 @@ int main(int argc, char* argv[]) {
                     [&p2p_node]() -> nlohmann::json {
                         return p2p_node->get_peer_info_json();
                     });
+
+                // ── Runtime admin API (pool peer ban + whitelist) ────────
+                // Persistence: ~/.c2pool/pool_whitelist.json — survives restart.
+                {
+                    auto wl_path = core::filesystem::config_path() / "pool_whitelist.json";
+                    p2p_node->set_whitelist_path(wl_path.string());
+                }
+                auto* admin_mi = web_server.get_mining_interface();
+                admin_mi->set_admin_list_bans_fn(
+                    [&p2p_node]() { return p2p_node->admin_list_bans(); });
+                admin_mi->set_admin_ban_ip_fn(
+                    [&p2p_node](const std::string& ip, int d) { return p2p_node->admin_ban_ip(ip, d); });
+                admin_mi->set_admin_unban_ip_fn(
+                    [&p2p_node](const std::string& ip) { return p2p_node->admin_unban_ip(ip); });
+                admin_mi->set_admin_list_whitelist_fn(
+                    [&p2p_node]() { return p2p_node->admin_list_whitelist(); });
+                admin_mi->set_admin_whitelist_add_fn(
+                    [&p2p_node](const std::string& h, uint16_t p) { return p2p_node->admin_whitelist_add(h, p); });
+                admin_mi->set_admin_whitelist_remove_fn(
+                    [&p2p_node](const std::string& h, uint16_t p) { return p2p_node->admin_whitelist_remove(h, p); });
+                admin_mi->set_admin_list_peers_fn(
+                    [&p2p_node]() { return p2p_node->admin_list_peers(); });
+                admin_mi->set_admin_drop_peer_fn(
+                    [&p2p_node](const std::string& ip) { return p2p_node->admin_drop_peer(ip); });
+                admin_mi->set_admin_dial_peer_fn(
+                    [&p2p_node](const std::string& h, uint16_t p) { return p2p_node->admin_dial_peer(h, p); });
+                LOG_INFO << "[Admin] Runtime admin API enabled (loopback-only)";
                 // Wire pool hashrate from p2pool's get_pool_attempts_per_second
                 // Pool hashrate callback — caches last good value so stat_log
                 // never records 0 due to transient tracker lock contention

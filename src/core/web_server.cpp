@@ -513,6 +513,83 @@ void HttpSession::process_request()
             }
 
             else {
+                // ── Admin API endpoints (loopback-only) ───────────────────
+                if (target.substr(0, 16) == "/api/admin/pool/") {
+                    auto remote_addr = socket_.remote_endpoint().address();
+                    if (!remote_addr.is_loopback()) {
+                        response.result(http::status::forbidden);
+                        response.body() = R"({"error":"Admin API is local-only"})";
+                        response.prepare_payload();
+                        send_response(std::move(response));
+                        return;
+                    }
+                    if (!mining_interface_->has_admin_fns()) {
+                        response.result(http::status::not_found);
+                        response.body() = R"({"error":"Admin API not enabled"})";
+                        response.prepare_payload();
+                        send_response(std::move(response));
+                        return;
+                    }
+
+                    std::string ep = target.substr(16); // after "/api/admin/pool/"
+                    // strip query string
+                    auto qpos = ep.find('?');
+                    if (qpos != std::string::npos) ep = ep.substr(0, qpos);
+
+                    auto parse_host_port = [&](uint16_t& port_out) -> std::string {
+                        std::string host = getQueryParam("host");
+                        std::string ip_q = getQueryParam("ip");
+                        port_out = 0;
+                        if (!host.empty()) {
+                            auto colon = host.rfind(':');
+                            if (colon != std::string::npos) {
+                                try { port_out = static_cast<uint16_t>(std::stoul(host.substr(colon + 1))); } catch (...) {}
+                                host = host.substr(0, colon);
+                            }
+                        } else {
+                            host = ip_q;
+                        }
+                        std::string port_q = getQueryParam("port");
+                        if (!port_q.empty()) {
+                            try { port_out = static_cast<uint16_t>(std::stoul(port_q)); } catch (...) {}
+                        }
+                        return host;
+                    };
+
+                    if (ep == "bans/list") {
+                        rest_result = mining_interface_->call_admin_list_bans();
+                    } else if (ep == "bans/add") {
+                        std::string ip = getQueryParam("ip");
+                        int dur = 0;
+                        try { auto d = getQueryParam("duration"); if (!d.empty()) dur = std::stoi(d); } catch (...) {}
+                        rest_result = mining_interface_->call_admin_ban_ip(ip, dur);
+                    } else if (ep == "bans/remove") {
+                        std::string ip = getQueryParam("ip");
+                        rest_result = mining_interface_->call_admin_unban_ip(ip);
+                    } else if (ep == "whitelist/list") {
+                        rest_result = mining_interface_->call_admin_list_whitelist();
+                    } else if (ep == "whitelist/add") {
+                        uint16_t p = 0;
+                        std::string h = parse_host_port(p);
+                        rest_result = mining_interface_->call_admin_whitelist_add(h, p);
+                    } else if (ep == "whitelist/remove") {
+                        uint16_t p = 0;
+                        std::string h = parse_host_port(p);
+                        rest_result = mining_interface_->call_admin_whitelist_remove(h, p);
+                    } else if (ep == "peers/list") {
+                        rest_result = mining_interface_->call_admin_list_peers();
+                    } else if (ep == "peers/drop") {
+                        std::string ip = getQueryParam("ip");
+                        rest_result = mining_interface_->call_admin_drop_peer(ip);
+                    } else if (ep == "peers/dial") {
+                        uint16_t p = 0;
+                        std::string h = parse_host_port(p);
+                        rest_result = mining_interface_->call_admin_dial_peer(h, p);
+                    } else {
+                        rest_result = nlohmann::json{{"ok", false}, {"error", "Unknown admin endpoint"}};
+                    }
+                }
+                else
                 // ── Explorer API endpoints (loopback-only) ────────────────
                 if (target.substr(0, 14) == "/api/explorer/") {
                     // Loopback guard: only accept requests from 127.0.0.1 / ::1
