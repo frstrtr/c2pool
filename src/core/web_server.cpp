@@ -620,7 +620,7 @@ void HttpSession::process_request()
                         std::string ext = resolved.extension().string();
                         std::string mime = "application/octet-stream";
                         if (ext == ".html" || ext == ".htm") mime = "text/html; charset=utf-8";
-                        else if (ext == ".js")   mime = "application/javascript; charset=utf-8";
+                        else if (ext == ".js" || ext == ".mjs") mime = "application/javascript; charset=utf-8";
                         else if (ext == ".css")  mime = "text/css; charset=utf-8";
                         else if (ext == ".json") mime = "application/json; charset=utf-8";
                         else if (ext == ".ico")  mime = "image/x-icon";
@@ -4534,6 +4534,17 @@ nlohmann::json MiningInterface::rest_web_currency_info()
     // Mode indicators for conditional UI
     result["embedded"] = (m_embedded_node != nullptr);
     result["has_rpc"]  = (m_coin_rpc != nullptr);
+
+    // p2pool share version for the current coin — consumed by the
+    // bundled @c2pool/sharechain-explorer to classify share cells.
+    // Dash = v16, LTC/DOGE/BTC = v36.
+    switch (m_blockchain) {
+    case Blockchain::DASH:     result["share_version"] = 16; break;
+    case Blockchain::LITECOIN:
+    case Blockchain::BITCOIN:
+    case Blockchain::DOGECOIN:
+    default:                   result["share_version"] = 36; break;
+    }
 
     return result;
 }
