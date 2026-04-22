@@ -972,10 +972,22 @@ int main(int argc, char* argv[])
                      << " txs=" << n_txs;
 
             // Connect this block into the UTXO cache, persist to LevelDB.
-            // See Phase U comment near header_chain init for the
-            // height-derivation rationale.
+            // Height is derived from header_chain by bhash lookup — NOT
+            // header_chain.height() (which is the chain tip, so blocks
+            // that arrive out-of-order during bootstrap / reorg would
+            // all be tagged with the tip height). Fall back to the tip
+            // height if the hash isn't in the chain yet (e.g., the
+            // block arrived before its header propagated — rare).
             try {
-                auto height = static_cast<uint32_t>(header_chain.height());
+                uint32_t height;
+                auto entry = header_chain.get_header(bhash);
+                if (entry) {
+                    height = entry->height;
+                } else {
+                    height = static_cast<uint32_t>(header_chain.height());
+                    LOG_WARNING << "[UTXO] block " << bhash.GetHex().substr(0, 16)
+                                << " not in header_chain; using tip height=" << height;
+                }
                 auto undo = utxo_cache.connect_block(block, height,
                                                     &dash::coin::dash_txid);
                 bool flushed = utxo_cache.flush(bhash, height);
