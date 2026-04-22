@@ -387,6 +387,13 @@ int main(int argc, char* argv[])
             j["verified_count"] = snap.verified_count;
             j["total_shares"]   = snap.chain_count;
             j["fork_count"]     = snap.fork_count;
+            // §5.5 — head_count is the number of disconnected chain heads
+            // currently tracked. Cheap O(heads) under shared_lock.
+            {
+                std::shared_lock lock(node.tracker_mutex());
+                j["head_count"] = static_cast<int>(
+                    node.tracker().chain.get_heads().size());
+            }
             return j;
         });
         // Best share hash for the dashboard's head indicator.
@@ -483,6 +490,20 @@ int main(int argc, char* argv[])
             result["shares"] = shares_arr;
             result["total"]  = static_cast<int>(shares_arr.size());
 
+            // §5.1 — heads / blocks / doge_blocks overlays.
+            // heads = short hashes of all tracked chain heads (for
+            // the "Verified Heads" row + head-ring marker).
+            // blocks = short hashes of shares that solved a DASH block
+            // on the parent chain (gold border overlay).
+            // doge_blocks = always empty on Dash (no merged mining);
+            // present to match the coin-agnostic contract.
+            nlohmann::json heads_arr = nlohmann::json::array();
+            for (auto& [hh, _] : chain.get_heads())
+                heads_arr.push_back(hh.GetHex().substr(0, 16));
+            result["heads"]       = std::move(heads_arr);
+            result["blocks"]      = nlohmann::json::array();  // TODO: populate from found_blocks_db
+            result["doge_blocks"] = nlohmann::json::array();  // N/A for Dash
+
             // Per-share PPLNS zoom tooltip on the Sharechain Explorer reads
             // pplns_current (fallback for all shares) and pplns (per-share
             // map). Without pplns_current the zoom panel hides.
@@ -518,6 +539,7 @@ int main(int argc, char* argv[])
             nlohmann::json t;
             t["hash"]   = best.IsNull() ? "" : best.GetHex().substr(0, 16);
             t["height"] = height;
+            t["total"]  = static_cast<int>(chain.size());  // §5.2 informational
             return t;
         });
         // Sharechain delta endpoint — returns shares newer than `since`
@@ -584,8 +606,9 @@ int main(int argc, char* argv[])
                 result["shares"] = std::move(shares_arr);
                 result["count"]  = count;
                 result["tip"]    = best.IsNull() ? "" : best.GetHex().substr(0, 16);
-                result["heads"]  = std::move(heads_arr);
-                result["blocks"] = nlohmann::json::array();  // no LTC block solutions
+                result["heads"]       = std::move(heads_arr);
+                result["blocks"]      = nlohmann::json::array();  // no parent-chain block solutions
+                result["doge_blocks"] = nlohmann::json::array();  // §5.3 — N/A for Dash
                 // Include chain_length so the dashboard's 'Chain Length'
                 // stat stays populated on SSE deltas (it would blank out
                 // to '-' otherwise since _rtFetchDelta calls updateStats
