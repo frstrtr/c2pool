@@ -10,6 +10,7 @@
 
 #include <deque>
 #include <iomanip>
+#include <map>
 #include <memory>
 #include <set>
 #include <sstream>
@@ -81,6 +82,19 @@ class NodeP2P : public core::ICommunicator, public core::INetwork, public core::
     // peers send us addrv2 (with the broader address type set) going
     // forward — Dash protocol 70230+ always supports it.
     bool m_peer_supports_addrv2 = false;
+
+    // BIP 152 (Phase S2) cmpctblock relay state. On inv(MSG_BLOCK) we
+    // request the compact form via getdata(MSG_CMPCT_BLOCK); the peer
+    // replies with `cmpctblock`, which we either reassemble immediately
+    // (prefilled + mempool hits cover every index) or complete via a
+    // getblocktxn → blocktxn round-trip. `m_pending_cmpctblocks` keeps
+    // the partially-downloaded context keyed by blockhash until
+    // blocktxn finishes it off; on failure we fall back to plain
+    // getdata(MSG_BLOCK). Peer's `sendcmpct(announce)` preference and
+    // version are recorded for future outbound-announce decisions.
+    bool     m_peer_sendcmpct_announce = false;
+    uint64_t m_peer_sendcmpct_version  = 0;
+    std::map<uint256, std::unique_ptr<vendor::PartiallyDownloadedBlock>> m_pending_cmpctblocks;
 
     // SPV B3 (parity audit): dedup requested inv hashes so a flapping
     // peer doesn't make us issue duplicate getdata for the same block/tx.
@@ -429,15 +443,16 @@ private:
         auto msg_sendheaders = message_sendheaders::make_raw();
         m_peer->write(msg_sendheaders);
 
-        // BIP 152 (Phase S2): negotiate compact-block relay. announce=false
-        // means low-bandwidth mode — peer announces new tips via `inv` as
-        // usual, and only sends cmpctblock if we follow up with getdata.
-        // That matches our pre-BIP-152 flow and lets us receive cmpctblock
-        // bodies without pushing us into always-on high-bandwidth mode
-        // before reassembly is wired (Phase M mempool). version=2 is
-        // wtxid-based short IDs; Dash has no segwit so v1/v2 are
-        // equivalent, but every Dash peer understands v2.
-        auto msg_sendcmpct = message_sendcmpct::make_raw(false, uint64_t{2});
+        // BIP 152 (Phase S2): negotiate compact-block relay.
+        // Dashcore pins CMPCTBLOCKS_VERSION=1 (dashcore/src/net_processing.cpp)
+        // — BIP 152 v2's wtxid short-IDs are meaningless on a segwit-free
+        // chain, so v2 sendcmpct messages are silently dropped on the
+        // receive side, leaving `m_provides_cmpctblocks=false` and
+        // prompting the peer to ignore our later getdata(MSG_CMPCT_BLOCK).
+        // announce=false keeps us in low-bandwidth mode: peers announce
+        // tips via headers (BIP 130) as usual; we promote to
+        // getdata(MSG_CMPCT_BLOCK) on arrival (see handle_msg(headers)).
+        auto msg_sendcmpct = message_sendcmpct::make_raw(false, uint64_t{1});
         m_peer->write(msg_sendcmpct);
 
         // SPV A4 (parity audit): ask peer for full mempool summary.
@@ -529,53 +544,155 @@ private:
     {
         m_peer_wants_headers = true;
     }
-    // BIP 152 sendcmpct (Phase S2): peer is negotiating compact-block
-    // relay. The handler currently only records the peer's announcement
-    // preference + protocol version; a follow-on commit wires the
-    // unsolicited cmpctblock push path and the getblocktxn round-trip.
+    // BIP 152 sendcmpct (Phase S2): record the peer's announcement
+    // preference and protocol version. announce=true would let peers
+    // push cmpctblock unsolicited for tip-relay latency savings; we
+    // don't honour that on our side yet (no cmpctblock push), but
+    // peers that signal it will try pushing to us — the receive path
+    // handles either.
     void handle_msg(std::unique_ptr<message_sendcmpct> msg)
     {
         if (!msg) return;
+        m_peer_sendcmpct_announce = msg->m_announce;
+        m_peer_sendcmpct_version  = msg->m_version;
         LOG_DEBUG_COIND << "[DashP2P] sendcmpct announce=" << (msg->m_announce ? 1 : 0)
                         << " version=" << msg->m_version
                         << " from " << m_target_addr.to_string();
     }
 
     // BIP 152 cmpctblock (Phase S2): peer is relaying a new tip via
-    // header + short IDs + prefilled coinbase. Phase-M will reconstruct
-    // via mempool; today, without a mempool, we just log the arrival
-    // and drop the payload. A follow-on commit will issue getblocktxn
-    // to fetch the full tx set and reassemble.
+    // header + short IDs + prefilled coinbase. Try to reassemble using
+    // whatever transactions we can source locally (prefilled coinbase
+    // always, mempool TBD in Phase M). If any index is still missing,
+    // send `getblocktxn` for those indexes and stash the
+    // PartiallyDownloadedBlock keyed by blockhash so the follow-up
+    // `blocktxn` completes it. On reassembly failure, fall back to
+    // plain getdata(MSG_BLOCK).
     void handle_msg(std::unique_ptr<message_cmpctblock> msg)
     {
         if (!msg) return;
-        LOG_INFO << "[DashP2P] cmpctblock prefilled="
-                 << msg->m_cmpct.BlockTxCount()
-                 << " (BIP 152 reassembly not yet wired — Phase S2 stage 2)";
+
+        // Block hash: Dash uses X11 for both PoW and identity.
+        auto packed_header = pack(msg->m_cmpct.header);
+        auto blockhash = dash::crypto::hash_x11(packed_header.get_span());
+
+        // Fire the inv-style notification so higher-level listeners
+        // learn of the new tip immediately (same semantics as the
+        // `inv(MSG_BLOCK)` → `new_block` path).
+        m_coin->new_block.happened(blockhash);
+
+        auto pdob = std::make_unique<vendor::PartiallyDownloadedBlock>(
+            /*mempool_provider=*/nullptr,  // Phase M wires the real one
+            /*max_block_tx_count=*/2000000 // Dash mainnet block_max_size
+        );
+
+        std::vector<std::pair<uint256, vendor::CTransactionRef>> extra_txn;
+        auto status = pdob->InitData(msg->m_cmpct, extra_txn);
+        if (status == vendor::READ_STATUS_INVALID
+            || status == vendor::READ_STATUS_FAILED) {
+            // Malformed or short-ID collision — fall back to full block.
+            LOG_DEBUG_COIND << "[DashP2P] cmpctblock " << blockhash.GetHex().substr(0, 16)
+                            << " InitData failed (status=" << status
+                            << "), falling back to getdata(MSG_BLOCK)";
+            auto getdata_full = message_getdata::make_raw(
+                {inventory_type(inventory_type::block, blockhash)});
+            m_peer->write(getdata_full);
+            return;
+        }
+
+        // Count how many txs InitData couldn't fill — those are what we
+        // need to fetch via getblocktxn.
+        const size_t total = pdob->header.IsNull()
+                                 ? 0
+                                 : msg->m_cmpct.BlockTxCount();
+        std::vector<uint16_t> missing_indexes;
+        missing_indexes.reserve(total);
+        for (size_t i = 0; i < total; ++i) {
+            if (!pdob->IsTxAvailable(i))
+                missing_indexes.push_back(static_cast<uint16_t>(i));
+        }
+
+        LOG_INFO << "[DashP2P] cmpctblock " << blockhash.GetHex().substr(0, 16)
+                 << " total_txs=" << total
+                 << " missing=" << missing_indexes.size();
+
+        if (missing_indexes.empty()) {
+            // Complete on arrival — reassemble and fire full_block.
+            finalize_cmpctblock(blockhash, std::move(pdob), {});
+            return;
+        }
+
+        // Send getblocktxn for the missing subset; stash the context.
+        vendor::BlockTransactionsRequest req;
+        req.blockhash = blockhash;
+        req.indexes = std::move(missing_indexes);
+        auto msg_getblocktxn = message_getblocktxn::make_raw(req);
+        m_peer->write(msg_getblocktxn);
+        m_pending_cmpctblocks[blockhash] = std::move(pdob);
     }
 
-    // BIP 152 getblocktxn (Phase S2): peer is asking us for missing
-    // transactions from a compact block we sent. c2pool-dash isn't a
-    // full-block source today (no mempool snapshot, no local block
-    // cache), so reply is empty. Stage-2 wiring will populate when we
-    // start advertising via cmpctblock ourselves.
+    // BIP 152 getblocktxn (Phase S2): peer is asking us for tx bodies
+    // from a compact block we ostensibly announced. c2pool-dash neither
+    // announces via cmpctblock nor caches block bodies locally, so
+    // this should never happen. Log once at DEBUG level and drop —
+    // peer will time out and fetch via inv/getdata from elsewhere.
     void handle_msg(std::unique_ptr<message_getblocktxn> msg)
     {
         if (!msg) return;
-        LOG_DEBUG_COIND << "[DashP2P] getblocktxn indexes="
-                        << msg->m_req.indexes.size()
-                        << " (reply path not wired yet)";
+        LOG_DEBUG_COIND << "[DashP2P] unexpected getblocktxn (c2pool-dash does "
+                        << "not serve block bodies) indexes="
+                        << msg->m_req.indexes.size();
     }
 
     // BIP 152 blocktxn (Phase S2): peer's reply to our getblocktxn.
-    // We don't issue getblocktxn yet, so receiving one is unexpected —
-    // log and drop.
+    // Look up the PartiallyDownloadedBlock we stashed at cmpctblock
+    // time and complete it via FillBlock. On success emit full_block;
+    // on failure fall back to plain getdata(MSG_BLOCK).
     void handle_msg(std::unique_ptr<message_blocktxn> msg)
     {
         if (!msg) return;
-        LOG_DEBUG_COIND << "[DashP2P] unexpected blocktxn txn_count="
-                        << msg->m_txs.txn.size();
+        auto it = m_pending_cmpctblocks.find(msg->m_txs.blockhash);
+        if (it == m_pending_cmpctblocks.end()) {
+            LOG_DEBUG_COIND << "[DashP2P] unmatched blocktxn for "
+                            << msg->m_txs.blockhash.GetHex().substr(0, 16);
+            return;
+        }
+        auto blockhash = msg->m_txs.blockhash;
+        auto pdob = std::move(it->second);
+        m_pending_cmpctblocks.erase(it);
+        finalize_cmpctblock(blockhash, std::move(pdob), std::move(msg->m_txs.txn));
     }
+
+private:
+    void finalize_cmpctblock(const uint256& blockhash,
+                             std::unique_ptr<vendor::PartiallyDownloadedBlock> pdob,
+                             std::vector<vendor::CTransactionRef> vtx_missing)
+    {
+        BlockType block;
+        auto status = pdob->FillBlock(block, vtx_missing);
+        if (status != vendor::READ_STATUS_OK) {
+            LOG_DEBUG_COIND << "[DashP2P] cmpctblock " << blockhash.GetHex().substr(0, 16)
+                            << " FillBlock failed (status=" << status
+                            << "), falling back to getdata(MSG_BLOCK)";
+            auto getdata_full = message_getdata::make_raw(
+                {inventory_type(inventory_type::block, blockhash)});
+            m_peer->write(getdata_full);
+            return;
+        }
+
+        // Reassembled. Plumb the block through the same entry points
+        // handle_msg(message_block) uses so higher layers see the
+        // reconstructed block identical to one that arrived as a full
+        // `block` message.
+        auto header = static_cast<BlockHeaderType>(block);
+        try { m_peer->get_block(blockhash, block); } catch (...) {}
+        try { m_peer->get_header(blockhash, header); } catch (...) {}
+        LOG_INFO << "[DashP2P] cmpctblock reassembled " << blockhash.GetHex().substr(0, 16)
+                 << " txs=" << block.m_txs.size();
+        m_coin->full_block.happened(block);
+    }
+
+public:
     // BIP 155: peer wants to receive addrv2 from us (and is telling us
     // they understand BIP 155). Remember the preference so our reply to
     // any future getaddr from them uses addrv2.
@@ -606,7 +723,14 @@ private:
                 m_coin->new_block.happened(inv.m_hash);
                 if (inv_already_requested(inv.m_hash)) continue;
                 mark_inv_requested(inv.m_hash);
-                requests.push_back(inv);
+                // BIP 152 (Phase S2): upgrade block inv → MSG_CMPCT_BLOCK.
+                // Peer may reply with either `cmpctblock` (handled by our
+                // reassembly path) or fall back to a full `block` message
+                // (handled by handle_msg(message_block) unchanged). Either
+                // way the `full_block` event fires and higher layers are
+                // oblivious to which wire form arrived.
+                requests.push_back(inventory_type(
+                    inventory_type::cmpct_block, inv.m_hash));
                 break;
             default:
                 if (static_cast<uint32_t>(btype) == DASH_MSG_CLSIG) {
@@ -660,15 +784,24 @@ private:
         if (!vheaders.empty()) {
             m_coin->new_headers.happened(vheaders);
 
-            // Small batch = new block announcement → request full block
+            // Small batch = new block announcement → request the block.
+            // BIP 152 (Phase S2): ask for the compact form first; peer
+            // may reply with `cmpctblock` (handed to our reassembly
+            // path) or fall back to a full `block` message (handed to
+            // handle_msg(message_block) unchanged). This is the
+            // new-tip announce path for Dash mainnet — BIP 130
+            // `sendheaders` replaces inv(MSG_BLOCK) for tip relay to
+            // peers that signalled `sendheaders`, so the cmpct upgrade
+            // has to happen here as well as in handle_msg(message_inv).
             if (vheaders.size() <= 3 && m_peer) {
                 for (auto& hdr : vheaders) {
                     auto packed = pack(hdr);
                     auto bhash = dash::crypto::hash_x11(packed.get_span());
                     auto getdata = message_getdata::make_raw(
-                        {inventory_type(inventory_type::block, bhash)});
+                        {inventory_type(inventory_type::cmpct_block, bhash)});
                     m_peer->write(getdata);
-                    LOG_INFO << "[DashP2P] Requesting full block " << bhash.GetHex().substr(0, 16);
+                    LOG_INFO << "[DashP2P] Requesting block (cmpct) "
+                             << bhash.GetHex().substr(0, 16);
                 }
             }
         }
