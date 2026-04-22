@@ -723,14 +723,19 @@ public:
                 m_coin->new_block.happened(inv.m_hash);
                 if (inv_already_requested(inv.m_hash)) continue;
                 mark_inv_requested(inv.m_hash);
-                // BIP 152 (Phase S2): upgrade block inv → MSG_CMPCT_BLOCK.
-                // Peer may reply with either `cmpctblock` (handled by our
-                // reassembly path) or fall back to a full `block` message
-                // (handled by handle_msg(message_block) unchanged). Either
-                // way the `full_block` event fires and higher layers are
-                // oblivious to which wire form arrived.
-                requests.push_back(inventory_type(
-                    inventory_type::cmpct_block, inv.m_hash));
+                // BIP 152: upgrade block inv → MSG_CMPCT_BLOCK **only when
+                // the peer has signaled support via sendcmpct**. Dashcore
+                // pushes its sendcmpct message right after accepting our
+                // verack, so by the time we process any inv from that peer
+                // the flag is set if they're BIP 152-capable. Peers that
+                // didn't signal get a plain MSG_BLOCK request — the
+                // existing reliable path.
+                if (m_peer_sendcmpct_version > 0) {
+                    requests.push_back(inventory_type(
+                        inventory_type::cmpct_block, inv.m_hash));
+                } else {
+                    requests.push_back(inv);
+                }
                 break;
             default:
                 if (static_cast<uint32_t>(btype) == DASH_MSG_CLSIG) {
@@ -785,22 +790,23 @@ public:
             m_coin->new_headers.happened(vheaders);
 
             // Small batch = new block announcement → request the block.
-            // BIP 152 (Phase S2): ask for the compact form first; peer
-            // may reply with `cmpctblock` (handed to our reassembly
-            // path) or fall back to a full `block` message (handed to
-            // handle_msg(message_block) unchanged). This is the
-            // new-tip announce path for Dash mainnet — BIP 130
-            // `sendheaders` replaces inv(MSG_BLOCK) for tip relay to
-            // peers that signalled `sendheaders`, so the cmpct upgrade
-            // has to happen here as well as in handle_msg(message_inv).
+            // BIP 152: request the compact form when the peer signalled
+            // sendcmpct support, otherwise plain MSG_BLOCK. Same gating
+            // as the inv-upgrade path in handle_msg(message_inv) — keeps
+            // us off the cmpct route for peers that won't answer it.
             if (vheaders.size() <= 3 && m_peer) {
+                const bool use_cmpct = m_peer_sendcmpct_version > 0;
+                const auto inv_type = use_cmpct
+                                          ? inventory_type::cmpct_block
+                                          : inventory_type::block;
                 for (auto& hdr : vheaders) {
                     auto packed = pack(hdr);
                     auto bhash = dash::crypto::hash_x11(packed.get_span());
                     auto getdata = message_getdata::make_raw(
-                        {inventory_type(inventory_type::cmpct_block, bhash)});
+                        {inventory_type(inv_type, bhash)});
                     m_peer->write(getdata);
-                    LOG_INFO << "[DashP2P] Requesting block (cmpct) "
+                    LOG_INFO << "[DashP2P] Requesting block "
+                             << (use_cmpct ? "(cmpct) " : "(full) ")
                              << bhash.GetHex().substr(0, 16);
                 }
             }

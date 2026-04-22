@@ -332,6 +332,21 @@ int main(int argc, char* argv[])
     std::cout << "[HEADERS] Initialized: height=" << header_chain.height()
               << " headers=" << header_chain.size() << std::endl;
 
+    // ── Phase U step 2: in-memory UTXOViewCache ──────────────────────────
+    // No persistent backing yet (null UTXOViewDB*). Cache is hydrated
+    // block-by-block from full_block events as we run — not a complete
+    // UTXO set on its own. Phase U step 3 attaches the LevelDB backing;
+    // step 4 (bootstrap) fills the historical gap.
+    //
+    // Height tracking: the generic connect_block template wants an
+    // explicit height per block. header_chain.height() is the authoritative
+    // tip height once headers have synced, and full_block events arrive
+    // AFTER the corresponding header (dashd sends headers-first per BIP
+    // 130 and our own getdata is header-triggered), so height() at event
+    // time equals the block's own height — no separate lookup needed.
+    dash::coin::UtxoViewCache utxo_cache(/*db=*/nullptr);
+    std::atomic<uint64_t> utxo_blocks_seen{0};
+
     // ── Pool Node ──
     dash::DashNodeImpl node(&ioc, config.get(), testnet);
     std::cout << "[NODE] DashNodeImpl created" << std::endl;
@@ -936,12 +951,30 @@ int main(int argc, char* argv[])
             LOG_INFO << "[DASH] New block announced: " << hash.GetHex().substr(0, 16);
         });
 
-        // Wire full_block event → log
+        // Wire full_block event → log + UTXO connect_block (Phase U step 2)
         coin_node->full_block.subscribe([&](dash::coin::BlockType block) {
             auto hdr = static_cast<dash::coin::BlockHeaderType>(block);
             auto bhash = dash::coin::x11_hash(hdr);
+            size_t n_txs = block.m_txs.size();
             LOG_INFO << "[DASH] Full block: " << bhash.GetHex().substr(0, 16)
-                     << " txs=" << block.m_txs.size();
+                     << " txs=" << n_txs;
+
+            // Connect this block into the UTXO cache. See Phase U comment
+            // near header_chain init for the height-derivation rationale.
+            try {
+                auto height = static_cast<uint32_t>(header_chain.height());
+                auto undo = utxo_cache.connect_block(block, height,
+                                                    &dash::coin::dash_txid);
+                auto seen = utxo_blocks_seen.fetch_add(1) + 1;
+                LOG_INFO << "[UTXO] connected " << bhash.GetHex().substr(0, 16)
+                         << " height=" << height
+                         << " txs=" << n_txs
+                         << " added_ops=" << undo.added_outpoints.size()
+                         << " blocks_seen=" << seen;
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[UTXO] connect_block failed for "
+                            << bhash.GetHex().substr(0, 16) << ": " << e.what();
+            }
         });
 
         // SPV C1 (parity audit): expose dashd header-sync progress to the
