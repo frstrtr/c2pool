@@ -332,11 +332,11 @@ int main(int argc, char* argv[])
     std::cout << "[HEADERS] Initialized: height=" << header_chain.height()
               << " headers=" << header_chain.size() << std::endl;
 
-    // ── Phase U step 2: in-memory UTXOViewCache ──────────────────────────
-    // No persistent backing yet (null UTXOViewDB*). Cache is hydrated
-    // block-by-block from full_block events as we run — not a complete
-    // UTXO set on its own. Phase U step 3 attaches the LevelDB backing;
-    // step 4 (bootstrap) fills the historical gap.
+    // ── Phase U: UTXOViewCache + LevelDB persistence ─────────────────────
+    // Step 2 wired an in-memory cache on full_block arrival; step 3
+    // attaches LevelDB so the set survives restarts. Cache still hydrates
+    // block-by-block from live full_block events — step 4 (bootstrap)
+    // will fill the historical gap.
     //
     // Height tracking: the generic connect_block template wants an
     // explicit height per block. header_chain.height() is the authoritative
@@ -344,7 +344,19 @@ int main(int argc, char* argv[])
     // AFTER the corresponding header (dashd sends headers-first per BIP
     // 130 and our own getdata is header-triggered), so height() at event
     // time equals the block's own height — no separate lookup needed.
-    dash::coin::UtxoViewCache utxo_cache(/*db=*/nullptr);
+    std::string utxo_db_path = std::string(getenv("HOME") ? getenv("HOME") : ".")
+        + "/.c2pool/" + coin_name + "/utxo_view_db";
+    dash::coin::UtxoViewDB utxo_db(utxo_db_path);
+    if (!utxo_db.open()) {
+        std::cerr << "[WARN] Failed to open UTXO LevelDB at " << utxo_db_path
+                  << " — running with in-memory UTXO cache only" << std::endl;
+    }
+    dash::coin::UtxoViewCache utxo_cache(
+        utxo_db.is_open() ? &utxo_db : nullptr);
+    std::cout << "[UTXO] initialized: db=" << (utxo_db.is_open() ? "open" : "memory-only")
+              << " path=" << utxo_db_path
+              << " best_height=" << utxo_cache.get_best_height()
+              << std::endl;
     std::atomic<uint64_t> utxo_blocks_seen{0};
 
     // ── Pool Node ──
@@ -959,17 +971,25 @@ int main(int argc, char* argv[])
             LOG_INFO << "[DASH] Full block: " << bhash.GetHex().substr(0, 16)
                      << " txs=" << n_txs;
 
-            // Connect this block into the UTXO cache. See Phase U comment
-            // near header_chain init for the height-derivation rationale.
+            // Connect this block into the UTXO cache, persist to LevelDB.
+            // See Phase U comment near header_chain init for the
+            // height-derivation rationale.
             try {
                 auto height = static_cast<uint32_t>(header_chain.height());
                 auto undo = utxo_cache.connect_block(block, height,
                                                     &dash::coin::dash_txid);
+                bool flushed = utxo_cache.flush(bhash, height);
+                bool undo_saved = false;
+                if (utxo_db.is_open()) {
+                    undo_saved = utxo_db.put_block_undo(height, undo);
+                }
                 auto seen = utxo_blocks_seen.fetch_add(1) + 1;
                 LOG_INFO << "[UTXO] connected " << bhash.GetHex().substr(0, 16)
                          << " height=" << height
                          << " txs=" << n_txs
                          << " added_ops=" << undo.added_outpoints.size()
+                         << " flushed=" << (flushed ? 1 : 0)
+                         << " undo_saved=" << (undo_saved ? 1 : 0)
                          << " blocks_seen=" << seen;
             } catch (const std::exception& e) {
                 LOG_WARNING << "[UTXO] connect_block failed for "
