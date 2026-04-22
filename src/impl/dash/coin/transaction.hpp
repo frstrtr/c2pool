@@ -40,6 +40,12 @@ struct MutableTransaction
 
     bool HasWitness() const { return false; } // Dash has no segwit
 
+    // Dash has no MWEB / HogEx. The field exists only so the
+    // generic `core::coin::UTXOViewCache::connect_block<BlockType>`
+    // template (shared with LTC) can treat every Dash tx as a normal
+    // (non-pegout) block tx without specialisation. Always false.
+    static constexpr bool m_hogEx = false;
+
     template <typename StreamType>
     void Serialize(StreamType& s) const
     {

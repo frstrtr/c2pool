@@ -14,6 +14,13 @@
 #include <impl/dash/coin/node.hpp>
 #include <impl/dash/coin/rpc.hpp>
 #include <impl/dash/coin/chain_seeds.hpp>
+// Phase U step 1: UTXO adapter layer. Inclusion here is intentional —
+// the adapter is a compile-time shape shim right now (no live
+// UtxoViewCache instance constructed yet), so including it from
+// main_dash.cpp guarantees the static_asserts + type aliases are
+// exercised on every build of c2pool-dash, even before later Phase U
+// steps start consuming the types at runtime.
+#include <impl/dash/coin/utxo_adapter.hpp>
 #include <impl/dash/broadcaster.hpp>
 #include <impl/dash/broadcaster_full.hpp>
 #include <impl/dash/enhanced_node.hpp>
