@@ -21,6 +21,7 @@
 // exercised on every build of c2pool-dash, even before later Phase U
 // steps start consuming the types at runtime.
 #include <impl/dash/coin/utxo_adapter.hpp>
+#include <core/coin/block_bootstrapper.hpp>
 #include <impl/dash/broadcaster.hpp>
 #include <impl/dash/broadcaster_full.hpp>
 #include <impl/dash/enhanced_node.hpp>
@@ -357,7 +358,6 @@ int main(int argc, char* argv[])
               << " path=" << utxo_db_path
               << " best_height=" << utxo_cache.get_best_height()
               << std::endl;
-    std::atomic<uint64_t> utxo_blocks_seen{0};
 
     // ── Pool Node ──
     dash::DashNodeImpl node(&ioc, config.get(), testnet);
@@ -963,50 +963,16 @@ int main(int argc, char* argv[])
             LOG_INFO << "[DASH] New block announced: " << hash.GetHex().substr(0, 16);
         });
 
-        // Wire full_block event → log + UTXO connect_block (Phase U step 2)
+        // Lightweight arrival log on the primary dashd connection. UTXO
+        // bookkeeping moves to the broadcaster callback below so every
+        // peer's full blocks feed the same pipeline and we don't
+        // double-connect the LAN dashd's block (it appears both as the
+        // primary coin_node AND as a broadcaster peer slot).
         coin_node->full_block.subscribe([&](dash::coin::BlockType block) {
             auto hdr = static_cast<dash::coin::BlockHeaderType>(block);
             auto bhash = dash::coin::x11_hash(hdr);
-            size_t n_txs = block.m_txs.size();
             LOG_INFO << "[DASH] Full block: " << bhash.GetHex().substr(0, 16)
-                     << " txs=" << n_txs;
-
-            // Connect this block into the UTXO cache, persist to LevelDB.
-            // Height is derived from header_chain by bhash lookup — NOT
-            // header_chain.height() (which is the chain tip, so blocks
-            // that arrive out-of-order during bootstrap / reorg would
-            // all be tagged with the tip height). Fall back to the tip
-            // height if the hash isn't in the chain yet (e.g., the
-            // block arrived before its header propagated — rare).
-            try {
-                uint32_t height;
-                auto entry = header_chain.get_header(bhash);
-                if (entry) {
-                    height = entry->height;
-                } else {
-                    height = static_cast<uint32_t>(header_chain.height());
-                    LOG_WARNING << "[UTXO] block " << bhash.GetHex().substr(0, 16)
-                                << " not in header_chain; using tip height=" << height;
-                }
-                auto undo = utxo_cache.connect_block(block, height,
-                                                    &dash::coin::dash_txid);
-                bool flushed = utxo_cache.flush(bhash, height);
-                bool undo_saved = false;
-                if (utxo_db.is_open()) {
-                    undo_saved = utxo_db.put_block_undo(height, undo);
-                }
-                auto seen = utxo_blocks_seen.fetch_add(1) + 1;
-                LOG_INFO << "[UTXO] connected " << bhash.GetHex().substr(0, 16)
-                         << " height=" << height
-                         << " txs=" << n_txs
-                         << " added_ops=" << undo.added_outpoints.size()
-                         << " flushed=" << (flushed ? 1 : 0)
-                         << " undo_saved=" << (undo_saved ? 1 : 0)
-                         << " blocks_seen=" << seen;
-            } catch (const std::exception& e) {
-                LOG_WARNING << "[UTXO] connect_block failed for "
-                            << bhash.GetHex().substr(0, 16) << ": " << e.what();
-            }
+                     << " txs=" << block.m_txs.size();
         });
 
         // SPV C1 (parity audit): expose dashd header-sync progress to the
@@ -1188,6 +1154,200 @@ int main(int argc, char* argv[])
             dash::coin::dash_dns_seeds(testnet));
         broadcaster->peer_manager().set_fixed_seeds(
             dash::coin::dash_fixed_seeds(testnet));
+
+        // ── Phase U step 4: rolling-288-block UTXO bootstrap pipeline ──
+        // Port of LTC's `c2pool_refactored.cpp:2055..2240` pattern.
+        // Target range is [max(utxo_best+1, tip - DASH_MIN_BLOCKS_TO_KEEP), tip]
+        // — NOT a genesis replay, NOT an assumeUTXO snapshot; just the
+        // last 288 blocks of reorg-safe coverage, matching the same
+        // anchoring LTC/DOGE already use in production. Template
+        // construction + fee computation in later phases consumes the
+        // rolling window; deeper UTXO lookups fall through to the
+        // still-trusted dashd RPC until it gets removed.
+        auto dash_bs = std::make_shared<
+            core::coin::BlockBootstrapState<dash::coin::BlockType>>();
+
+        broadcaster->set_on_full_block(
+            [utxo = &utxo_cache,
+             utxo_db_ptr = &utxo_db,
+             chain = &header_chain,
+             bcaster = broadcaster.get(),
+             dash_bs, &ioc](
+                const std::string& /*peer_key*/,
+                const dash::coin::BlockType& block) {
+                auto packed_hdr = pack(
+                    static_cast<const dash::coin::BlockHeaderType&>(block));
+                auto block_hash = dash::crypto::hash_x11(
+                    packed_hdr.get_span());
+
+                uint32_t height = 0;
+                auto entry = chain->get_header(block_hash);
+                if (entry) {
+                    height = entry->height;
+                } else {
+                    auto prev_entry = chain->get_header(block.m_previous_block);
+                    if (prev_entry) height = prev_entry->height + 1;
+                }
+                if (height == 0) {
+                    // Header race — block arrived ahead of its own header.
+                    // Drop silently; bootstrap will catch it on the next
+                    // tip or via stall-timer fallback.
+                    return;
+                }
+
+                constexpr uint32_t DASH_KEEP = dash::coin::DASH_MIN_BLOCKS_TO_KEEP;
+                static bool dash_bootstrap_done = false;
+
+                // ── 1. Bootstrap trigger ────────────────────────────────
+                if (!dash_bootstrap_done && !dash_bs->active
+                    && chain && bcaster && height > DASH_KEEP) {
+                    dash_bootstrap_done = true;
+                    uint32_t utxo_best = utxo->get_best_height();
+                    uint32_t start_from =
+                        (utxo_best > 0 && utxo_best >= height - DASH_KEEP)
+                        ? utxo_best + 1
+                        : height - DASH_KEEP;
+
+                    if (start_from < height) {
+                        dash_bs->active = true;
+                        dash_bs->next_height = start_from;
+                        dash_bs->end_height = height;
+                        dash_bs->next_request = start_from;
+                        dash_bs->total = height - start_from + 1;
+                        dash_bs->buffer[height] =
+                            std::make_pair(block, block_hash);
+                        dash_bs->last_drain_time =
+                            std::chrono::steady_clock::now();
+
+                        // Broadcast initial window across all connected
+                        // peers so at least one responds even if the
+                        // peer that delivered the tip is slow.
+                        int requested = 0;
+                        while (dash_bs->next_request <= dash_bs->end_height
+                               && (dash_bs->next_request - dash_bs->next_height)
+                                      < dash_bs->WINDOW_SIZE) {
+                            if (!dash_bs->buffer.count(dash_bs->next_request)) {
+                                auto e = chain->get_header_by_height(
+                                    dash_bs->next_request);
+                                if (e) {
+                                    bcaster->request_full_block(e->hash);
+                                    ++requested;
+                                }
+                            }
+                            ++dash_bs->next_request;
+                        }
+                        LOG_INFO << "[EMB-DASH] Bootstrap pipeline: "
+                                 << dash_bs->total << " blocks ["
+                                 << start_from << ".." << height << "]"
+                                 << " window=" << dash_bs->WINDOW_SIZE
+                                 << " requests=" << requested
+                                 << " peers=" << bcaster->peer_count();
+                        dash_bs->start_stall_timer(ioc,
+                            [chain, bcaster](uint32_t h) {
+                                auto e = chain->get_header_by_height(h);
+                                if (e && bcaster)
+                                    bcaster->request_full_block(e->hash);
+                            }, "EMB-DASH");
+                        return;
+                    } else {
+                        LOG_INFO << "[EMB-DASH] UTXO warm restart: best="
+                                 << utxo_best << " — no bootstrap needed";
+                    }
+                }
+
+                // ── 2. Bootstrap active: buffer → drain → refill ─────
+                if (dash_bs->active) {
+                    if (height >= dash_bs->next_height
+                        && height <= dash_bs->end_height) {
+                        dash_bs->buffer.try_emplace(
+                            height, std::make_pair(block, block_hash));
+                    } else if (height > dash_bs->end_height) {
+                        // New block mined mid-bootstrap — extend range.
+                        dash_bs->end_height = height;
+                        dash_bs->total = dash_bs->processed
+                            + (dash_bs->end_height - dash_bs->next_height + 1);
+                        dash_bs->buffer.try_emplace(
+                            height, std::make_pair(block, block_hash));
+                    }
+
+                    // Stall fallback: if nothing drained for 30 s, re-ask
+                    // the stuck height from all peers.
+                    auto now = std::chrono::steady_clock::now();
+                    auto stall = std::chrono::duration_cast<std::chrono::seconds>(
+                        now - dash_bs->last_drain_time).count();
+                    if (stall >= dash_bs->STALL_TIMEOUT_SEC && chain && bcaster) {
+                        auto e = chain->get_header_by_height(dash_bs->next_height);
+                        if (e) {
+                            LOG_WARNING << "[EMB-DASH] Bootstrap stall h="
+                                        << dash_bs->next_height << " ("
+                                        << stall << "s) — broadcast fallback";
+                            bcaster->request_full_block(e->hash);
+                        }
+                        dash_bs->last_drain_time = now;
+                    }
+
+                    while (dash_bs->buffer.count(dash_bs->next_height)) {
+                        auto node_ex = dash_bs->buffer.extract(dash_bs->next_height);
+                        auto& [b, bh] = node_ex.mapped();
+                        uint32_t h = dash_bs->next_height;
+
+                        try {
+                            auto undo = utxo->connect_block(
+                                b, h, &dash::coin::dash_txid);
+                            utxo_db_ptr->put_block_undo(h, undo);
+                            utxo->flush(bh, h);
+                            utxo->prune_undo(h, DASH_KEEP);
+                        } catch (const std::exception& e) {
+                            LOG_WARNING << "[EMB-DASH] connect_block failed at h="
+                                        << h << ": " << e.what();
+                        }
+
+                        ++dash_bs->next_height;
+                        ++dash_bs->processed;
+                        dash_bs->last_drain_time =
+                            std::chrono::steady_clock::now();
+
+                        // Refill window via round-robin target.
+                        if (dash_bs->next_request <= dash_bs->end_height) {
+                            auto e = chain->get_header_by_height(dash_bs->next_request);
+                            if (e) {
+                                bcaster->request_full_block_targeted(
+                                    e->hash, dash_bs->peer_rotation++);
+                            }
+                            ++dash_bs->next_request;
+                        }
+
+                        if (dash_bs->next_height > dash_bs->end_height) {
+                            LOG_INFO << "[EMB-DASH] Bootstrap complete: "
+                                     << dash_bs->processed << " blocks processed"
+                                     << " utxo_best=" << utxo->get_best_height();
+                            dash_bs->active = false;
+                            dash_bs->stop_stall_timer();
+                            dash_bs->buffer.clear();
+                            return;
+                        }
+                    }
+                    return;  // while bootstrap active, skip steady-state path
+                }
+
+                // ── 3. Steady state: single connect per new tip ────────
+                try {
+                    auto undo = utxo->connect_block(
+                        block, height, &dash::coin::dash_txid);
+                    utxo_db_ptr->put_block_undo(height, undo);
+                    utxo->flush(block_hash, height);
+                    utxo->prune_undo(height, DASH_KEEP);
+                    LOG_INFO << "[UTXO] connected "
+                             << block_hash.GetHex().substr(0, 16)
+                             << " height=" << height
+                             << " txs=" << block.m_txs.size()
+                             << " added_ops=" << undo.added_outpoints.size();
+                } catch (const std::exception& e) {
+                    LOG_WARNING << "[UTXO] connect_block failed for "
+                                << block_hash.GetHex().substr(0, 16)
+                                << ": " << e.what();
+                }
+            });
 
         // Seed initial candidates via dashd RPC getpeerinfo — the same
         // flow the Phase 1 broadcaster used. After seed, addr-crawl via

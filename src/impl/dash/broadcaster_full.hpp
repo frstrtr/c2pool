@@ -291,6 +291,43 @@ public:
 
     CoinPeerManager& peer_manager() { return m_peer_manager; }
 
+    /// Broadcast a `getdata(MSG_BLOCK, hash)` to every connected peer.
+    /// Used by the bootstrap pipeline's initial window + stall-timer
+    /// fallback so at least one peer responds. Same pattern as LTC's
+    /// CoinBroadcaster::request_full_block (c2pool/merged/coin_broadcaster.hpp).
+    void request_full_block(const uint256& block_hash)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        int sent = 0;
+        for (auto& [key, peer] : m_peers) {
+            try {
+                peer->node_p2p.request_full_block(block_hash);
+                ++sent;
+            } catch (...) {}
+        }
+        if (sent > 0) {
+            LOG_INFO << "[DASH] Full block requested from " << sent
+                     << " peer(s): " << block_hash.GetHex().substr(0, 16) << "...";
+        }
+    }
+
+    /// Targeted single-peer fetch for bootstrap window refill — spreads
+    /// load via round-robin (peer_idx % peer_count). Returns true if
+    /// the request was sent. Same pattern as LTC.
+    bool request_full_block_targeted(const uint256& block_hash, size_t peer_idx)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_peers.empty()) return false;
+        auto it = m_peers.begin();
+        std::advance(it, peer_idx % m_peers.size());
+        try {
+            it->second->node_p2p.request_full_block(block_hash);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
 private:
     /// Connect to a validated peer endpoint. PeerEndpoint guarantees
     /// non-empty parseable addr with valid port — no runtime checks.
