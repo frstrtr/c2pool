@@ -27,6 +27,7 @@ set_target_properties(dash_x11 PROPERTIES LINKER_LANGUAGE C)
 add_executable(c2pool-dash
     main_dash.cpp
     coin/rpc.cpp
+    coin/vendor/blockencodings.cpp
 )
 target_include_directories(c2pool-dash PRIVATE
     ${CMAKE_SOURCE_DIR}/src

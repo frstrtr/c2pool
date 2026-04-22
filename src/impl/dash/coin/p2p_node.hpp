@@ -429,6 +429,17 @@ private:
         auto msg_sendheaders = message_sendheaders::make_raw();
         m_peer->write(msg_sendheaders);
 
+        // BIP 152 (Phase S2): negotiate compact-block relay. announce=false
+        // means low-bandwidth mode — peer announces new tips via `inv` as
+        // usual, and only sends cmpctblock if we follow up with getdata.
+        // That matches our pre-BIP-152 flow and lets us receive cmpctblock
+        // bodies without pushing us into always-on high-bandwidth mode
+        // before reassembly is wired (Phase M mempool). version=2 is
+        // wtxid-based short IDs; Dash has no segwit so v1/v2 are
+        // equivalent, but every Dash peer understands v2.
+        auto msg_sendcmpct = message_sendcmpct::make_raw(false, uint64_t{2});
+        m_peer->write(msg_sendcmpct);
+
         // SPV A4 (parity audit): ask peer for full mempool summary.
         // Peer replies with `inv` which our inv-handler already processes
         // → we learn about pending txs without waiting for new-tx pushes.
@@ -518,7 +529,53 @@ private:
     {
         m_peer_wants_headers = true;
     }
-    void handle_msg(std::unique_ptr<message_sendcmpct>) {}
+    // BIP 152 sendcmpct (Phase S2): peer is negotiating compact-block
+    // relay. The handler currently only records the peer's announcement
+    // preference + protocol version; a follow-on commit wires the
+    // unsolicited cmpctblock push path and the getblocktxn round-trip.
+    void handle_msg(std::unique_ptr<message_sendcmpct> msg)
+    {
+        if (!msg) return;
+        LOG_DEBUG_COIND << "[DashP2P] sendcmpct announce=" << (msg->m_announce ? 1 : 0)
+                        << " version=" << msg->m_version
+                        << " from " << m_target_addr.to_string();
+    }
+
+    // BIP 152 cmpctblock (Phase S2): peer is relaying a new tip via
+    // header + short IDs + prefilled coinbase. Phase-M will reconstruct
+    // via mempool; today, without a mempool, we just log the arrival
+    // and drop the payload. A follow-on commit will issue getblocktxn
+    // to fetch the full tx set and reassemble.
+    void handle_msg(std::unique_ptr<message_cmpctblock> msg)
+    {
+        if (!msg) return;
+        LOG_INFO << "[DashP2P] cmpctblock prefilled="
+                 << msg->m_cmpct.BlockTxCount()
+                 << " (BIP 152 reassembly not yet wired — Phase S2 stage 2)";
+    }
+
+    // BIP 152 getblocktxn (Phase S2): peer is asking us for missing
+    // transactions from a compact block we sent. c2pool-dash isn't a
+    // full-block source today (no mempool snapshot, no local block
+    // cache), so reply is empty. Stage-2 wiring will populate when we
+    // start advertising via cmpctblock ourselves.
+    void handle_msg(std::unique_ptr<message_getblocktxn> msg)
+    {
+        if (!msg) return;
+        LOG_DEBUG_COIND << "[DashP2P] getblocktxn indexes="
+                        << msg->m_req.indexes.size()
+                        << " (reply path not wired yet)";
+    }
+
+    // BIP 152 blocktxn (Phase S2): peer's reply to our getblocktxn.
+    // We don't issue getblocktxn yet, so receiving one is unexpected —
+    // log and drop.
+    void handle_msg(std::unique_ptr<message_blocktxn> msg)
+    {
+        if (!msg) return;
+        LOG_DEBUG_COIND << "[DashP2P] unexpected blocktxn txn_count="
+                        << msg->m_txs.txn.size();
+    }
     // BIP 155: peer wants to receive addrv2 from us (and is telling us
     // they understand BIP 155). Remember the preference so our reply to
     // any future getaddr from them uses addrv2.

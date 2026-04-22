@@ -6,6 +6,7 @@
 
 #include "transaction.hpp"
 #include "block.hpp"
+#include "vendor/blockencodings.hpp"
 
 #include <impl/bitcoin_family/coin/base_p2p_messages.hpp>
 
@@ -89,6 +90,40 @@ END_MESSAGE()
 // and also on demand via inv+getdata(MSG_CLSIG=29). Parsing the sig is
 // not required — we treat it as opaque bytes; the fact that we received
 // the message at all is dashd's signal that the block is finalized.
+// ── BIP 152 compact-block messages (Phase S2) ─────────────────────────────
+// Wire types vendored from dashcore at src/impl/dash/coin/vendor/; see
+// vendor/README.md for the adaptation notes.
+
+BEGIN_MESSAGE(cmpctblock)
+    MESSAGE_FIELDS
+    (
+        (vendor::CBlockHeaderAndShortTxIDs, m_cmpct)
+    )
+    {
+        READWRITE(obj.m_cmpct);
+    }
+END_MESSAGE()
+
+BEGIN_MESSAGE(getblocktxn)
+    MESSAGE_FIELDS
+    (
+        (vendor::BlockTransactionsRequest, m_req)
+    )
+    {
+        READWRITE(obj.m_req);
+    }
+END_MESSAGE()
+
+BEGIN_MESSAGE(blocktxn)
+    MESSAGE_FIELDS
+    (
+        (vendor::BlockTransactions, m_txs)
+    )
+    {
+        READWRITE(obj.m_txs);
+    }
+END_MESSAGE()
+
 BEGIN_MESSAGE(clsig)
     MESSAGE_FIELDS
     (
@@ -126,6 +161,9 @@ using Handler = MessageHandler<
     message_sendcmpct,
     message_sendaddrv2,
     message_addrv2,
+    message_cmpctblock,
+    message_getblocktxn,
+    message_blocktxn,
     message_clsig
 >;
 
