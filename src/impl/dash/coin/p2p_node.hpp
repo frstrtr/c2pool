@@ -9,8 +9,11 @@
 #include "node_interface.hpp"
 
 #include <deque>
+#include <iomanip>
 #include <memory>
 #include <set>
+#include <sstream>
+#include <string>
 
 #include <boost/asio.hpp>
 
@@ -71,6 +74,13 @@ class NodeP2P : public core::ICommunicator, public core::INetwork, public core::
     // consulted by any future block-announcement path to stay in sync
     // with the peer's preference.
     bool m_peer_wants_headers = false;
+
+    // BIP 155 (Phase S1): set when the peer sends `sendaddrv2`. Governs
+    // whether our getaddr reply uses `addrv2` (BIP 155) or classic `addr`.
+    // We also send our own `sendaddrv2` unconditionally before verack so
+    // peers send us addrv2 (with the broader address type set) going
+    // forward — Dash protocol 70230+ always supports it.
+    bool m_peer_supports_addrv2 = false;
 
     // SPV B3 (parity audit): dedup requested inv hashes so a flapping
     // peer doesn't make us issue duplicate getdata for the same block/tx.
@@ -384,6 +394,12 @@ private:
         if (m_on_peer_height && msg->m_start_height > 0)
             m_on_peer_height(msg->m_start_height);
 
+        // BIP 155: signal addrv2 support before verack. Dashcore always
+        // sends it in this position; peers that support BIP 155 will
+        // reply with addrv2 instead of addr when relaying addresses.
+        auto sendaddrv2_msg = message_sendaddrv2::make_raw();
+        m_peer->write(sendaddrv2_msg);
+
         auto verack_msg = message_verack::make_raw();
         m_peer->write(verack_msg);
     }
@@ -444,13 +460,20 @@ private:
     void handle_msg(std::unique_ptr<message_pong>) {}
     void handle_msg(std::unique_ptr<message_alert>) {}
     // SPV B1 (parity audit): peer asked for our peer list. We're an SPV
-    // client behind dashd, not a crawler — reply with an empty addr list
-    // so the peer knows we responded. Silent drop would have dashd keep
+    // client behind dashd, not a crawler — reply with an empty list so
+    // the peer knows we responded. Silent drop would have dashd keep
     // re-asking and eventually mark us as a non-responding node.
+    // BIP 155: use `addrv2` if the peer signaled it via `sendaddrv2`,
+    // else classic `addr`. Either way empty until we start crawling.
     void handle_msg(std::unique_ptr<message_getaddr>)
     {
-        auto reply = message_addr::make_raw({});
-        m_peer->write(reply);
+        if (m_peer_supports_addrv2) {
+            auto reply = message_addrv2::make_raw({});
+            m_peer->write(reply);
+        } else {
+            auto reply = message_addr::make_raw({});
+            m_peer->write(reply);
+        }
     }
     // SPV A1 (parity audit): Dash ChainLock message. Peer sends clsig
     // unsolicited (or via getdata) when an LLMQ has aggregated a
@@ -496,7 +519,13 @@ private:
         m_peer_wants_headers = true;
     }
     void handle_msg(std::unique_ptr<message_sendcmpct>) {}
-    void handle_msg(std::unique_ptr<message_sendaddrv2>) {}
+    // BIP 155: peer wants to receive addrv2 from us (and is telling us
+    // they understand BIP 155). Remember the preference so our reply to
+    // any future getaddr from them uses addrv2.
+    void handle_msg(std::unique_ptr<message_sendaddrv2>)
+    {
+        m_peer_supports_addrv2 = true;
+    }
     void handle_msg(std::unique_ptr<message_mempool>) {}
 
     void handle_msg(std::unique_ptr<message_inv> msg)
@@ -598,6 +627,82 @@ private:
             endpoints.push_back(rec.m_endpoint);
         }
         if (!endpoints.empty()) m_addr_callback(endpoints);
+    }
+
+    // BIP 155 addrv2 receive path. Decodes networkID-tagged records back
+    // into NetService endpoints for the peer-manager callback. IPv4 and
+    // IPv6 are materialized; TORV3/I2P/CJDNS are logged but not dialed
+    // (we don't speak those transports today); TORV2 is rejected per the
+    // BIP 155 deprecation. Record count is capped at MAX_ADDRV2_RECORDS
+    // (1000) per spec; per-record address length must match the networkID.
+    void handle_msg(std::unique_ptr<message_addrv2> msg)
+    {
+        if (!msg) return;
+        const size_t total = msg->m_addrs.size();
+        if (total == 0) return;
+        const size_t limit = std::min<size_t>(total, MAX_ADDRV2_RECORDS);
+        if (total > MAX_ADDRV2_RECORDS) {
+            LOG_WARNING << "[DashP2P] addrv2 record count " << total
+                        << " exceeds BIP 155 cap " << MAX_ADDRV2_RECORDS
+                        << ", truncating";
+        }
+
+        std::vector<NetService> endpoints;
+        endpoints.reserve(limit);
+        size_t ipv4 = 0, ipv6 = 0, torv3 = 0, i2p = 0, cjdns = 0, bad = 0;
+
+        for (size_t i = 0; i < limit; ++i) {
+            const auto& rec = msg->m_addrs[i];
+            const size_t expected = bip155_address_size(rec.m_network_id);
+            if (rec.m_network_id == static_cast<uint8_t>(BIP155Network::TORV2)) {
+                ++bad;
+                continue;
+            }
+            if (expected == 0 || rec.m_addr.size() != expected) {
+                ++bad;
+                continue;
+            }
+
+            switch (static_cast<BIP155Network>(rec.m_network_id)) {
+                case BIP155Network::IPV4: {
+                    const auto& a = rec.m_addr;
+                    std::string ip =
+                        std::to_string(a[0]) + "." + std::to_string(a[1]) + "." +
+                        std::to_string(a[2]) + "." + std::to_string(a[3]);
+                    endpoints.emplace_back(std::move(ip), rec.m_port);
+                    ++ipv4;
+                    break;
+                }
+                case BIP155Network::IPV6: {
+                    const auto& a = rec.m_addr;
+                    std::ostringstream oss;
+                    for (int k = 0; k < 16; k += 2) {
+                        if (k > 0) oss << ':';
+                        oss << std::hex << std::setfill('0') << std::setw(2)
+                            << static_cast<unsigned>(a[k]) << std::setw(2)
+                            << static_cast<unsigned>(a[k + 1]);
+                    }
+                    endpoints.emplace_back(oss.str(), rec.m_port);
+                    ++ipv6;
+                    break;
+                }
+                case BIP155Network::TORV3: ++torv3; break;
+                case BIP155Network::I2P:   ++i2p;   break;
+                case BIP155Network::CJDNS: ++cjdns; break;
+                default: ++bad; break;
+            }
+        }
+
+        LOG_INFO << "[DashP2P] addrv2: " << total << " records"
+                 << " (ipv4=" << ipv4
+                 << " ipv6=" << ipv6
+                 << " torv3=" << torv3
+                 << " i2p=" << i2p
+                 << " cjdns=" << cjdns
+                 << " rejected=" << bad << ")";
+
+        if (m_addr_callback && !endpoints.empty())
+            m_addr_callback(endpoints);
     }
 };
 

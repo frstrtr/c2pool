@@ -44,6 +44,11 @@ using bitcoin_family::coin::p2p::message_feefilter;
 using bitcoin_family::coin::p2p::message_mempool;
 using bitcoin_family::coin::p2p::message_sendcmpct;
 using bitcoin_family::coin::p2p::message_sendaddrv2;
+using bitcoin_family::coin::p2p::BIP155Network;
+using bitcoin_family::coin::p2p::bip155_address_size;
+using bitcoin_family::coin::p2p::MAX_ADDRV2_RECORDS;
+using bitcoin_family::coin::p2p::btc_addrv2_record_t;
+using bitcoin_family::coin::p2p::message_addrv2;
 
 // ── Dash-specific messages (no segwit, no MWEB) ──
 
@@ -120,6 +125,7 @@ using Handler = MessageHandler<
     message_mempool,
     message_sendcmpct,
     message_sendaddrv2,
+    message_addrv2,
     message_clsig
 >;
 
