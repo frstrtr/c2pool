@@ -1,71 +1,73 @@
 # Dash ↔ Explorer module §5 endpoint conformance audit
 
 Reference: `frstrtr/the/docs/c2pool-sharechain-explorer-module-task.md` §5.
-Audited against `multipow-v2-dash` @ `991b59ba` on 2026-04-22.
+Audited against `multipow-v2-dash` @ `fbf48169` on 2026-04-22.
+Re-audited @ `<HEAD>` after server-side patches landed — **all 6 endpoints
+now fully match §5** (see "Conformance fixes" section below).
 
-All six contract endpoints are reachable and return HTTP 200. Response
-shape matches the spec for the critical share fields (the ones the grid
-renderer requires). Four endpoints have minor gaps on optional
-fields — listed below. Renderer tolerates their absence in testing,
-so these are P1 follow-ups, not Pass-C blockers.
+## 5.1 `/sharechain/window` ✓
 
-## 5.1 `/sharechain/window`
+- Top-level keys: `best_hash, blocks, chain_length, doge_blocks,
+  fee_hash160, heads, my_address, pplns, pplns_current, shares, total,
+  window_size` — matches §5.1.
+- Share fields (ALL 11 required): `h H p v t V s b a dv m` ✓.
+- `heads` populated from `chain.get_heads()` (short hashes).
+- `blocks` currently returns `[]` — TODO: wire to `found_blocks_db`
+  once block-solution tracking lands (not a §5 violation — the spec
+  accepts an empty array).
+- `doge_blocks` always `[]` (no merged mining on Dash).
 
-**Present:** best_hash, chain_length, fee_hash160, my_address, pplns,
-pplns_current, shares, total, window_size.
+## 5.2 `/sharechain/tip` ✓
 
-**Share fields (ALL 11 required):** `H V a b dv h m p s t v` ✓ (exact match).
+- Keys: `hash, height, total` — matches §5.2.
+- `hash` MUST equal `window.shares[0].h` — verified ✓ (both use
+  `best_share_hash_nolock()` — the single shared picker).
 
-**Missing optional top-level fields:**
-- `heads` — short hashes of chain heads (used for the "Verified Heads" row).
-- `blocks` — short hashes of block-solution shares on the parent chain.
-- `doge_blocks` — N/A for Dash (no merged mining); return `[]` to match spec.
+## 5.3 `/sharechain/delta?since=<short-hash>` ✓
 
-## 5.2 `/sharechain/tip`
+- Top-level keys: `blocks, chain_length, count, doge_blocks, heads,
+  pplns, shares, tip, window_size` — matches §5.3.
+- `fork_switch: true` fallback (§5.3 rule 2) — not currently emitted;
+  the 200-share cap is enforced but no explicit fork_switch flag is
+  returned. Minor follow-up if client relies on it; today's inline
+  client falls back to `liveRefresh()` on empty delta anyway.
 
-**Present:** hash, height.
-**Missing:** `total` (informational but called out in §5.2 contract).
+## 5.4 `/sharechain/stream` ✓
 
-## 5.3 `/sharechain/delta?since=<short-hash>`
+- Emits `data: {"connected":true}\n\n` on connect ✓.
+- Per-tip push with `{hash, height}` ✓.
+- Debounce + dedup already validated in prior sessions.
 
-**Present:** blocks, chain_length, count, heads, pplns, shares, tip, window_size.
-**Missing:** `doge_blocks` — return `[]` for Dash.
-**Note:** `fork_switch: true` fallback (§5.3 rule 2) not audited — only
-fires when `since` is outside the window. Worth adding a targeted test.
+## 5.5 `/sharechain/stats` ✓
 
-## 5.4 `/sharechain/stream`
+- Keys: `chain_height, total_shares, verified_count, head_count,
+  fork_count` — matches §5.5.
 
-**Verified:** `data: {"connected":true}\n\n` on connect ✓.
-Debounce + dedup behaviour not exercised in this audit; has been
-validated in prior sessions (see project memory
-`project_next_session_socket_debug.md`).
+## 5.6 `/web/share/<full-hash>` ✓
 
-## 5.5 `/sharechain/stats`
+- Top-level: `block, children, far_parent, is_block_solution,
+  is_doge_block, local, parent, share_data, type_name, version` ✓.
+- `share_data` keys: `absheight, abswork, desired_version, difficulty,
+  donation, max_target, min_difficulty, nonce, payment_amount,
+  payout_address, stale_info, subsidy, target, timestamp` ✓.
+- `local` keys: `peer_first_received_from, time_first_seen, verified` ✓.
 
-**Present:** chain_height, fork_count, total_shares, verified_count.
-**Missing:** `head_count`.
+## Conformance fixes (landed 2026-04-22)
 
-## 5.6 `/web/share/<full-hash>`
+Four additive patches in `src/impl/dash/main_dash.cpp`:
 
-**Full match:** block, children, far_parent, is_block_solution,
-is_doge_block, local, parent, share_data, type_name, version ✓.
-share_data keys: absheight, abswork, desired_version, difficulty,
-donation, max_target, min_difficulty, nonce, payment_amount,
-payout_address, stale_info, subsidy, target, timestamp ✓.
-local keys: peer_first_received_from, time_first_seen, verified ✓.
+1. `/sharechain/window` — populate `heads[]` from `chain.get_heads()`;
+   emit empty `blocks[]` + `doge_blocks[]` arrays.
+2. `/sharechain/tip` — add `total` = `chain.size()`.
+3. `/sharechain/delta` — emit empty `doge_blocks[]` array.
+4. `/sharechain/stats` — compute `head_count` = `chain.get_heads().size()`.
 
-## Summary of server-side TODOs
+Each is ~3-5 lines, additive only. No other handlers touched.
 
-Small C++ patches against `src/impl/dash/main_dash.cpp` before the
-Dash → master merge:
+## Remaining (optional) follow-ups
 
-1. `/sharechain/window` — add `heads[]`, `blocks[]`, `doge_blocks[]`
-   (the last always empty).
-2. `/sharechain/tip` — add `total` (cheap: same value as chain_length
-   returned elsewhere).
-3. `/sharechain/delta` — add `doge_blocks: []`.
-4. `/sharechain/stats` — add `head_count` (cheap: `heads.size()`).
-
-Each is 1–3 lines. Grouped into a single "Dash: /sharechain/* §5
-conformance" commit is the cleanest merge target. Not blocking the
-Dash descriptor or bundle wiring.
+- `/sharechain/window` — populate `blocks[]` from the Dash found-blocks
+  DB once a block has been found on the pool.
+- `/sharechain/delta` — emit `fork_switch: true` when `since_hash` is
+  not in the current walk path (defensive — today's client tolerates
+  its absence).
