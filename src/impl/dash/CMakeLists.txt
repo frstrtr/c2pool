@@ -42,6 +42,9 @@ target_link_libraries(c2pool-dash
     c2pool_hashrate
     c2pool_difficulty
     c2pool_storage
+    dashbls           # Phase L: dashpay/bls-signatures (Apache 2.0) for ChainLock sig verify
+    gmp               # dashbls's relic uses gmp when found; safe to link unconditionally
+    pthread           # mimalloc/relic
     Boost::system
     Boost::thread
     Boost::log

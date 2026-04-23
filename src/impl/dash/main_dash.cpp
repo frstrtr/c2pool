@@ -28,6 +28,17 @@
 #include <impl/dash/coin/vendor/quorum_tail.hpp>
 #include <impl/dash/coin/sml_db.hpp>
 #include <impl/dash/coin/quorum_manager.hpp>
+
+// Phase L step 0 smoke test: include dashbls's public BLS header and
+// static-assert that its primitive sizes match what we vendored as
+// std::array byte counts in vendor/llmq_commitment.hpp. If these
+// asserts ever fire, the upstream BLS sizes have changed and we need
+// to revisit the opaque byte storage in CFinalCommitment.
+#include <dashbls/bls.hpp>
+static_assert(bls::G1Element::SIZE == 48,
+              "BLS G1 element (pubkey) size changed — update vendor");
+static_assert(bls::G2Element::SIZE == 96,
+              "BLS G2 element (signature) size changed — update vendor");
 #include <core/coin/block_bootstrapper.hpp>
 #include <impl/dash/broadcaster.hpp>
 #include <impl/dash/broadcaster_full.hpp>
