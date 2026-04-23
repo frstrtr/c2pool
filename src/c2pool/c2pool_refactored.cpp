@@ -2666,8 +2666,13 @@ int main(int argc, char* argv[]) {
                 // miners. Debounced (100ms) to coalesce P2P share bursts into one
                 // notification — matches p2pool's Twisted reactor tick coalescing.
                 // New blocks use trigger_work_refresh() (immediate, above).
+                // Also refresh tip-driven HTTP caches (sharechain_stats, …) so
+                // dashboard consumers see fresh data without forcing a 1 Hz
+                // background clone of the whole stats tree.
                 p2p_node->set_on_best_share_changed([&web_server]() {
                     web_server.trigger_work_refresh_debounced();
+                    if (auto* mi = web_server.get_mining_interface())
+                        mi->refresh_tip_sensitive_caches();
                 });
 
                 // Wire local hashrate callback (from stratum server)
@@ -3429,6 +3434,14 @@ int main(int argc, char* argv[]) {
                 }
                 return result;
             });
+            // sharechain_stats is the dominant HTTP-cache allocator (per
+            // heaptrack: 127 MB peak, 75M std::map node allocs over a 17-min
+            // run).  Move it off the 1 Hz periodic refresh timer onto the
+            // tip-change signal — the payload only meaningfully changes when
+            // a new share lands (~6×/min at SHARE_PERIOD=10s), not every
+            // second.  A 30s safety-fallback in refresh_http_caches still
+            // fires it if no tip event arrives (dead chain, no peers).
+            web_server.get_mining_interface()->mark_last_cache_tip_driven();
 
             // SPV sync progress for loading page.
             // doge_utxo_ptr is declared in outer scope — set after DOGE UTXO init.
