@@ -27,6 +27,7 @@
 #include <impl/dash/coin/vendor/llmq_commitment.hpp>
 #include <impl/dash/coin/vendor/quorum_tail.hpp>
 #include <impl/dash/coin/sml_db.hpp>
+#include <impl/dash/coin/quorum_manager.hpp>
 #include <core/coin/block_bootstrapper.hpp>
 #include <impl/dash/broadcaster.hpp>
 #include <impl/dash/broadcaster_full.hpp>
@@ -392,6 +393,16 @@ int main(int argc, char* argv[])
     std::cout << "[SML] initialized: entries=" << sml->size()
               << " best_height=" << sml_db->get_best_height()
               << " best_hash=" << sml_db->get_best_hash().GetHex().substr(0, 16)
+              << std::endl;
+
+    // ── Phase C-QUO step 3: in-memory LLMQ quorum tracker ──
+    // No persistence at MVP — cold-start mnlistdiff(zeros, tip) returns
+    // the full active quorum set in newQuorums alongside the SML
+    // (~400 KB for both combined). On restart we re-bootstrap from a
+    // peer; persistence is a Phase L optimization if reconstruction
+    // proves slow in practice.
+    auto quorums = std::make_shared<dash::coin::QuorumManager>();
+    std::cout << "[QUO] initialized: in-memory only (no persistence at MVP)"
               << std::endl;
 
     // ── Pool Node ──
@@ -1532,12 +1543,14 @@ int main(int argc, char* argv[])
         // Misbehaving(100) + per-peer ban comes in iteration 2 after we
         // confirm CalcHash() is bit-exact correct.
         broadcaster->set_on_mnlistdiff(
-            [sml, sml_db, cbtx_root = last_cbtx_mnlist_root,
+            [sml, sml_db, quorums,
+             cbtx_root = last_cbtx_mnlist_root,
              cbtx_height = last_cbtx_block_height, &ioc](
                 const std::string& peer_key,
                 const dash::coin::vendor::CSimplifiedMNListDiff& diff) {
                 io::post(ioc,
-                    [sml, sml_db, cbtx_root, cbtx_height, peer_key, diff]() {
+                    [sml, sml_db, quorums,
+                     cbtx_root, cbtx_height, peer_key, diff]() {
                   try {
                     // Validate base. Cold start: base == ZERO is fine.
                     // Steady state: base must match our current best.
@@ -1588,13 +1601,38 @@ int main(int argc, char* argv[])
                                     << " (vs CBTX@h=" << *cbtx_height << ")"
                                     << " — log-only at MVP, applied anyway";
                     }
+
+                    // ── Phase C-QUO step 3: structured tail → quorums ─
+                    // Runs AFTER SML application. Failure here logs a
+                    // warning and continues — SML sync stays alive
+                    // (the MVP correctness gate). This is the optional,
+                    // fail-safe layer over the opaque tail in
+                    // smldiff.hpp; once we've observed N consecutive
+                    // clean parses against mainnet we can promote the
+                    // tail to first-class structured fields.
+                    dash::coin::vendor::QuorumTail qtail;
+                    if (dash::coin::vendor::parse_quorum_tail(
+                            diff.quorum_tail, qtail)) {
+                        auto qr = quorums->apply(qtail);
+                        LOG_INFO << "[QUO] applied: +"
+                                 << qr.added_or_updated << "/-"
+                                 << qr.deleted
+                                 << " active=" << qr.active_after
+                                 << " cl_sigs=" << qr.cl_sigs_cached
+                                 << " (tail=" << diff.quorum_tail.size() << "B)";
+                    } else {
+                        LOG_WARNING << "[QUO] tail parse failed — "
+                                       "quorum tracking skipped for this "
+                                       "diff (SML sync unaffected)";
+                    }
                   } catch (const std::exception& e) {
                     LOG_ERROR << "[SML] diff handler error: " << e.what();
                   }
                 });
             });
         LOG_INFO << "[EMB-DASH] SML diff handler registered "
-                    "(apply_diff + LevelDB flush + CBTX root verification)";
+                    "(apply_diff + LevelDB flush + CBTX root verification "
+                    "+ structured quorum tail)";
 
         // ── Phase C-SML step 6: tip-changed → request_mnlistdiff ──
         // Augment the existing tip-changed handler with an SML sync
