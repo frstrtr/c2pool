@@ -799,10 +799,45 @@ public:
     }
 
     /// Refresh all zero-arg callback caches.  Call from main thread periodically.
+    ///
+    /// Tip-driven entries (opted in via mark_last_cache_tip_driven()) are NOT
+    /// fired here unless their group hasn't been refreshed for
+    /// TIP_CACHE_FALLBACK_SEC — that's a safety net for pathological cases
+    /// (dead chain, no peers) where on_best_share_changed would otherwise
+    /// never fire.  Normally they're refreshed only when a new share lands,
+    /// which is ~6×/min at SHARE_PERIOD=10s vs the 1 Hz periodic — the
+    /// difference is what keeps the HTTP-cache allocator churn down.
+    static constexpr int64_t TIP_CACHE_FALLBACK_SEC = 30;
     void refresh_http_caches() {
         for (auto& fn : m_cache_refresh_fns) {
             try { fn(); } catch (...) {}
         }
+        auto now_ts = static_cast<int64_t>(std::time(nullptr));
+        if (now_ts - m_last_tip_refresh_ts.load() >= TIP_CACHE_FALLBACK_SEC) {
+            for (auto& fn : m_tip_cache_refresh_fns) {
+                try { fn(); } catch (...) {}
+            }
+            m_last_tip_refresh_ts.store(now_ts);
+        }
+    }
+
+    /// Fired from on_best_share_changed — refresh only tip-driven caches.
+    /// Cheap: matches sharechain tip event cadence (~6×/min), not 1 Hz.
+    void refresh_tip_sensitive_caches() {
+        for (auto& fn : m_tip_cache_refresh_fns) {
+            try { fn(); } catch (...) {}
+        }
+        m_last_tip_refresh_ts.store(static_cast<int64_t>(std::time(nullptr)));
+    }
+
+    /// Opt-in: move the most-recently-registered cache entry from the
+    /// periodic (1 Hz) list to the tip-driven list.  Call immediately after
+    /// set_<whatever>_fn() for callbacks whose payload depends on the
+    /// sharechain tip (stats histograms, PPLNS, version signaling, etc.).
+    void mark_last_cache_tip_driven() {
+        if (m_cache_refresh_fns.empty()) return;
+        m_tip_cache_refresh_fns.push_back(std::move(m_cache_refresh_fns.back()));
+        m_cache_refresh_fns.pop_back();
     }
     void schedule_block_verification(const std::string& block_hash);
 
@@ -923,6 +958,8 @@ private:
     boost::asio::io_context*     m_context        = nullptr;
     std::thread::id              m_main_thread_id;          // set by set_io_context()
     std::vector<std::function<void()>> m_cache_refresh_fns; // populated by thread_safe_wrap
+    std::vector<std::function<void()>> m_tip_cache_refresh_fns; // opted in via mark_last_cache_tip_driven()
+    std::atomic<int64_t>               m_last_tip_refresh_ts{0};
     std::atomic<bool>       m_work_valid{false};
     std::atomic<uint64_t>   m_work_generation{0};       // incremented on each refresh_work()
     std::atomic<int64_t>    m_last_work_update_time{0}; // monotonic seconds since epoch
