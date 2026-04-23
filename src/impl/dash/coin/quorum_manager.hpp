@@ -126,6 +126,11 @@ public:
 
     size_t active_count() const { return m_active.size(); }
 
+    // Expose active entries by const reference for iteration. Used by
+    // chainlock_verify.hpp to walk the LLMQ_400_60 candidates when
+    // selecting the signing quorum.
+    const std::vector<Entry>& active_entries() const { return m_active; }
+
     // Per-type counts for logging / dashboard.
     std::unordered_map<uint8_t, size_t> active_by_type() const
     {

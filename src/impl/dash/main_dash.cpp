@@ -29,6 +29,7 @@
 #include <impl/dash/coin/sml_db.hpp>
 #include <impl/dash/coin/quorum_manager.hpp>
 #include <impl/dash/coin/bls_verify.hpp>
+#include <impl/dash/coin/chainlock_verify.hpp>
 
 // Phase L static asserts: tie the upstream dashbls element sizes to
 // the std::array byte counts in vendor/llmq_commitment.hpp. If these
