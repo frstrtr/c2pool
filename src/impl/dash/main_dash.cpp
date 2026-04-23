@@ -24,6 +24,8 @@
 #include <impl/dash/coin/vendor/cbtx.hpp>
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>
 #include <impl/dash/coin/vendor/smldiff.hpp>
+#include <impl/dash/coin/vendor/llmq_commitment.hpp>
+#include <impl/dash/coin/vendor/quorum_tail.hpp>
 #include <impl/dash/coin/sml_db.hpp>
 #include <core/coin/block_bootstrapper.hpp>
 #include <impl/dash/broadcaster.hpp>
