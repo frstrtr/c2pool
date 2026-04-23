@@ -22,6 +22,7 @@
 // steps start consuming the types at runtime.
 #include <impl/dash/coin/utxo_adapter.hpp>
 #include <impl/dash/coin/vendor/cbtx.hpp>
+#include <impl/dash/coin/vendor/simplifiedmns.hpp>
 #include <core/coin/block_bootstrapper.hpp>
 #include <impl/dash/broadcaster.hpp>
 #include <impl/dash/broadcaster_full.hpp>
