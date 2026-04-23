@@ -30,6 +30,8 @@
 #include <impl/dash/coin/block.hpp>
 #include <impl/dash/config.hpp>
 
+#include <array>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -149,6 +151,14 @@ public:
     using MnListDiffCallback = std::function<void(
         const std::string& peer_key,
         const dash::coin::vendor::CSimplifiedMNListDiff& diff)>;
+    // Phase L step 3: ChainLock arrival fan-out. main_dash.cpp registers
+    // a single consumer that runs verify_chainlock against QuorumManager
+    // + HeaderChain it owns.
+    using ClsigCallback = std::function<void(
+        const std::string& peer_key,
+        int32_t height,
+        const uint256& block_hash,
+        const std::array<uint8_t, 96>& sig)>;
 
     void set_on_new_block(BlockCallback cb)     { m_on_new_block   = std::move(cb); }
     void set_on_new_tx(TxCallback cb)           { m_on_new_tx      = std::move(cb); }
@@ -156,6 +166,7 @@ public:
     void set_on_full_block(FullBlockCallback cb){ m_on_full_block  = std::move(cb); }
     void set_on_peer_height(PeerHeightCallback cb) { m_on_peer_height = std::move(cb); }
     void set_on_mnlistdiff(MnListDiffCallback cb) { m_on_mnlistdiff = std::move(cb); }
+    void set_on_clsig(ClsigCallback cb) { m_on_clsig = std::move(cb); }
 
     /// Start: register local node (if any), start peer manager, begin
     /// connection maintenance loop.
@@ -419,6 +430,15 @@ private:
                     if (m_on_mnlistdiff) m_on_mnlistdiff(pk, diff);
                 });
 
+            // Phase L step 3: fan ChainLock arrivals out to verifier.
+            peer->node_p2p.set_on_clsig(
+                [this](const std::string& pk,
+                       int32_t h,
+                       const uint256& bhash,
+                       const std::array<uint8_t, 96>& sig) {
+                    if (m_on_clsig) m_on_clsig(pk, h, bhash, sig);
+                });
+
             peer->node_p2p.connect(addr);
             m_peers[key] = std::move(peer);
         }
@@ -533,6 +553,7 @@ private:
     FullBlockCallback  m_on_full_block;
     PeerHeightCallback m_on_peer_height;
     MnListDiffCallback m_on_mnlistdiff;
+    ClsigCallback      m_on_clsig;
 };
 
 } // namespace dash

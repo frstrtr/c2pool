@@ -1662,6 +1662,63 @@ int main(int argc, char* argv[])
                     "(apply_diff + LevelDB flush + CBTX root verification "
                     "+ structured quorum tail)";
 
+        // ── Phase L step 3: ChainLock verifier wiring ──
+        // Receives clsigs from broadcaster fan-out (any peer that
+        // pushes one). Runs the full verify recipe (request_id →
+        // signing-pool → selected-quorum → sign_hash → BLS Verify) via
+        // chainlock_verify.hpp. Mismatch policy at MVP: LOG-ONLY,
+        // chainlocked_blocks already updated by p2p_node.hpp's relay-
+        // trust path. Iteration 2 (after N clean MATCH blocks) gates
+        // the chainlocked_blocks update on verify success.
+        broadcaster->set_on_clsig(
+            [quorums, chain = &header_chain, &ioc](
+                const std::string& peer_key,
+                int32_t height,
+                const uint256& bhash,
+                const std::array<uint8_t, 96>& sig) {
+                io::post(ioc,
+                    [quorums, chain, peer_key, height, bhash, sig]() {
+                  try {
+                    auto r = dash::coin::verify_chainlock(
+                        height, bhash, sig, *quorums, *chain);
+                    using S = dash::coin::ChainLockVerifyResult::Status;
+                    switch (r.status) {
+                    case S::VALID:
+                        LOG_INFO << "[CLSIG] verified height=" << height
+                                 << " block=" << bhash.GetHex().substr(0, 16)
+                                 << " quorum=" << r.selected_quorum_hash.GetHex().substr(0, 16)
+                                 << " pool=" << r.pool_size
+                                 << " peer=" << peer_key;
+                        break;
+                    case S::INVALID_SIG:
+                        LOG_WARNING << "[CLSIG] verify FAILED (bad sig) height=" << height
+                                    << " block=" << bhash.GetHex().substr(0, 16)
+                                    << " selected_quorum=" << r.selected_quorum_hash.GetHex().substr(0, 16)
+                                    << " pool=" << r.pool_size
+                                    << " peer=" << peer_key
+                                    << " — log-only at MVP, relay-trust "
+                                       "record retained";
+                        break;
+                    case S::NO_POOL:
+                        LOG_WARNING << "[CLSIG] no signing pool height=" << height
+                                    << " (anchor h=" << (height - dash::coin::clsig_detail::CHAINLOCKS_SIGN_OFFSET)
+                                    << " has no LLMQ_400_60 quorums in our active set) "
+                                       "— SML/QUO sync not yet primed";
+                        break;
+                    case S::NO_SELECTED:
+                        LOG_WARNING << "[CLSIG] pool exists but no quorum selected "
+                                       "(unexpected) height=" << height;
+                        break;
+                    }
+                  } catch (const std::exception& e) {
+                    LOG_ERROR << "[CLSIG] verify exception: " << e.what();
+                  }
+                });
+            });
+        LOG_INFO << "[EMB-DASH] ChainLock verifier registered "
+                    "(BLS verify against derived signing quorum, "
+                    "log-only mismatch at MVP)";
+
         // ── Phase C-SML step 6: tip-changed → request_mnlistdiff ──
         // Augment the existing tip-changed handler with an SML sync
         // trigger. On every tip advance: send getmnlistd(prev_best,

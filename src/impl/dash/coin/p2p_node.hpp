@@ -135,6 +135,19 @@ class NodeP2P : public core::ICommunicator, public core::INetwork, public core::
         const vendor::CSimplifiedMNListDiff& diff)>;
     MnListDiffCallback m_on_mnlistdiff;
 
+    // Phase L step 3: ChainLock arrival callback. Higher layer (main_dash.cpp)
+    // owns QuorumManager + HeaderChain and runs verify_chainlock; this
+    // P2P-level handler just forwards the wire fields. Fired AFTER the
+    // existing relay-trust record so the submit path stays unchanged
+    // even if the verifier later proves the sig invalid (log-only at
+    // MVP per the SML iteration plan).
+    using ClsigCallback = std::function<void(
+        const std::string& peer_key,
+        int32_t height,
+        const uint256& block_hash,
+        const std::array<uint8_t, 96>& sig)>;
+    ClsigCallback m_on_clsig;
+
     void ensure_timeout_timer()
     {
         if (!m_timeout_timer)
@@ -332,6 +345,7 @@ public:
     }
 
     void set_on_mnlistdiff(MnListDiffCallback cb) { m_on_mnlistdiff = std::move(cb); }
+    void set_on_clsig(ClsigCallback cb) { m_on_clsig = std::move(cb); }
 
     void send_getaddr()
     {
@@ -542,6 +556,18 @@ private:
                  << " block=" << bhash.GetHex().substr(0, 16);
         m_coin->chainlocked_blocks[bhash] = h;
         m_coin->new_chainlock.happened({bhash, h});
+
+        // Phase L step 3: forward to higher-layer verifier. The
+        // verifier owns QuorumManager + HeaderChain and runs the
+        // full BLS sig + selected-quorum check. Mismatch policy at
+        // MVP is log-only — the relay-trust record above already
+        // updated chainlocked_blocks so submit paths stay unchanged.
+        // Iteration 2 will gate chainlocked_blocks on verify success.
+        if (m_on_clsig && msg->m_sig.size() == 96) {
+            std::array<uint8_t, 96> sig_arr{};
+            std::memcpy(sig_arr.data(), msg->m_sig.data(), 96);
+            m_on_clsig(m_target_addr.to_string(), h, bhash, sig_arr);
+        }
     }
 
     // SPV A3 (parity audit): log rejects instead of silently dropping.
