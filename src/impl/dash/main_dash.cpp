@@ -28,13 +28,12 @@
 #include <impl/dash/coin/vendor/quorum_tail.hpp>
 #include <impl/dash/coin/sml_db.hpp>
 #include <impl/dash/coin/quorum_manager.hpp>
+#include <impl/dash/coin/bls_verify.hpp>
 
-// Phase L step 0 smoke test: include dashbls's public BLS header and
-// static-assert that its primitive sizes match what we vendored as
-// std::array byte counts in vendor/llmq_commitment.hpp. If these
-// asserts ever fire, the upstream BLS sizes have changed and we need
-// to revisit the opaque byte storage in CFinalCommitment.
-#include <dashbls/bls.hpp>
+// Phase L static asserts: tie the upstream dashbls element sizes to
+// the std::array byte counts in vendor/llmq_commitment.hpp. If these
+// fire, upstream changed the wire format and we have to revisit
+// CFinalCommitment's opaque pubkey/sig storage.
 static_assert(bls::G1Element::SIZE == 48,
               "BLS G1 element (pubkey) size changed — update vendor");
 static_assert(bls::G2Element::SIZE == 96,
@@ -227,6 +226,23 @@ int main(int argc, char* argv[])
         uint256 h = dash::crypto::hash_x11(zeros, 80);
         std::cout << "[X11] self-test: " << h.GetHex().substr(0, 16) << "... OK" << std::endl;
     }
+
+    // Phase L step 1: BLS verifier self-test. Generates a deterministic
+    // keypair, signs + verifies (positive case), and verifies a bit-
+    // flipped message fails (negative case). Catches: dashbls failed
+    // to link, relic_conf.h built for wrong arch, relic init failure,
+    // BasicSchemeMPL Verify silently broken. Hard-aborts on failure
+    // because Phase L's clsig verification is consensus-critical —
+    // running with a broken BLS verifier would silently accept
+    // invalid ChainLocks.
+    if (!dash::coin::bls_self_test_basic()) {
+        std::cerr << "[BLS] self-test FAILED — aborting. Check that "
+                     "dashbls linked correctly (libdashbls.a) and "
+                     "relic_conf.h was generated for this arch."
+                  << std::endl;
+        return 1;
+    }
+    std::cout << "[BLS] self-test: BasicSchemeMPL sign+verify OK" << std::endl;
 
     // Create params
     auto params = dash::make_coin_params(testnet);
