@@ -126,6 +126,27 @@ struct TxCompressionFormat
     }
 };
 
+// Fixed-size raw byte sequence — no length prefix, just N bytes
+// written/read directly. Used by Phase C-SML for opaque BLS public
+// keys (48 B), key IDs (20 B), and BLS signatures (96 B) — we don't
+// validate them at MVP, just pass-through-correct serialization so
+// merkle-root calculations match dashcore bit-exact.
+template <size_t N>
+struct RawBytesFormat
+{
+    template <typename Stream>
+    static void Write(Stream& s, const std::array<uint8_t, N>& arr)
+    {
+        s.write(std::as_bytes(std::span{arr}));
+    }
+
+    template <typename Stream>
+    static void Read(Stream& s, std::array<uint8_t, N>& arr)
+    {
+        s.read(std::as_writable_bytes(std::span{arr}));
+    }
+};
+
 // Differential compact-size vector encoding. Vendored verbatim from
 // dashcore/src/blockencodings.h (DifferenceFormatter), re-expressed as
 // a c2pool per-vector Format rather than a per-element Formatter.

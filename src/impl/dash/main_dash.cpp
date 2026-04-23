@@ -21,6 +21,7 @@
 // exercised on every build of c2pool-dash, even before later Phase U
 // steps start consuming the types at runtime.
 #include <impl/dash/coin/utxo_adapter.hpp>
+#include <impl/dash/coin/vendor/cbtx.hpp>
 #include <core/coin/block_bootstrapper.hpp>
 #include <impl/dash/broadcaster.hpp>
 #include <impl/dash/broadcaster_full.hpp>
@@ -1194,6 +1195,30 @@ int main(int argc, char* argv[])
                     // Drop silently; bootstrap will catch it on the next
                     // tip or via stall-timer fallback.
                     return;
+                }
+
+                // Phase C-SML step 1 smoke test: parse the coinbase's CCbTx
+                // extra payload and log a one-line summary. Every Dash
+                // block since DIP-0008 carries a type-5 coinbase with the
+                // SML merkle root we'll later verify against. Throttled
+                // to every 64th block during bootstrap (would otherwise
+                // emit 288 lines on first cold start) and every steady-
+                // state tip, so production logs stay readable.
+                if (!block.m_txs.empty()) {
+                    const auto& cb = block.m_txs[0];
+                    if (cb.type == 5 && !cb.extra_payload.empty()) {
+                        static uint32_t s_cbtx_seen = 0;
+                        ++s_cbtx_seen;
+                        bool log_this = (s_cbtx_seen <= 3)
+                                     || (s_cbtx_seen % 64 == 0);
+                        dash::coin::vendor::CCbTx cbtx;
+                        if (dash::coin::vendor::parse_cbtx(cb.extra_payload, cbtx)) {
+                            if (log_this) {
+                                LOG_INFO << "[CBTX] block_h=" << height
+                                         << " " << cbtx.short_str();
+                            }
+                        }
+                    }
                 }
 
                 constexpr uint32_t DASH_KEEP = dash::coin::DASH_MIN_BLOCKS_TO_KEEP;
