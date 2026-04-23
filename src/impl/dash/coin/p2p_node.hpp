@@ -125,6 +125,16 @@ class NodeP2P : public core::ICommunicator, public core::INetwork, public core::
     PeerHeightCallback m_on_peer_height;
     std::function<void(const std::vector<NetService>&)> m_addr_callback;
 
+    // Phase C-SML step 4: mnlistdiff arrival callback. Higher layer
+    // (DashCoinBroadcaster) registers this to consume diffs and push
+    // them through apply_diff + LevelDB persistence (steps 5-7).
+    // Passing the diff by const-ref keeps a single copy live; the
+    // handler synchronously runs the broadcaster-side dispatch.
+    using MnListDiffCallback = std::function<void(
+        const std::string& peer_key,
+        const vendor::CSimplifiedMNListDiff& diff)>;
+    MnListDiffCallback m_on_mnlistdiff;
+
     void ensure_timeout_timer()
     {
         if (!m_timeout_timer)
@@ -307,6 +317,21 @@ public:
     }
 
     void request_block(const uint256& block_hash) { request_full_block(block_hash); }
+
+    // Phase C-SML step 4: ask this peer for the SML diff between two
+    // blocks. base_block_hash = uint256::ZERO requests the full SML at
+    // target_block_hash. Reply arrives async via handle_msg(mnlistdiff)
+    // which fans out to m_on_mnlistdiff.
+    void request_mnlistdiff(const uint256& base_block_hash,
+                            const uint256& target_block_hash)
+    {
+        if (!m_peer) return;
+        auto msg = message_getmnlistd::make_raw(
+            base_block_hash, target_block_hash);
+        m_peer->write(msg);
+    }
+
+    void set_on_mnlistdiff(MnListDiffCallback cb) { m_on_mnlistdiff = std::move(cb); }
 
     void send_getaddr()
     {
@@ -536,6 +561,38 @@ private:
     }
     void handle_msg(std::unique_ptr<message_notfound>) {}
     void handle_msg(std::unique_ptr<message_feefilter>) {}
+
+    // Phase C-SML step 4: peer asks US for an SML diff. We don't serve
+    // mnlistdiff (we're a consumer, not a full validator with SML build
+    // state). Drop silently — same shape as our `handle_msg(mempool)`
+    // no-op. Logging at debug only because honest peers don't ask us
+    // for mnlistdiff except by mistake.
+    void handle_msg(std::unique_ptr<message_getmnlistd> msg)
+    {
+        if (!msg) return;
+        LOG_DEBUG_COIND << "[DashP2P] ignoring getmnlistd from peer "
+                        << "(c2pool-dash is mnlistdiff consumer only)";
+    }
+
+    // Phase C-SML step 4: incoming SML diff (response to our
+    // request_mnlistdiff). Forward to broadcaster via callback. The
+    // broadcaster owns apply_diff + persistence + CBTX root verification
+    // (steps 5-7).
+    void handle_msg(std::unique_ptr<message_mnlistdiff> msg)
+    {
+        if (!msg) return;
+        const auto& diff = msg->m_diff;
+        LOG_INFO << "[DashP2P] mnlistdiff base="
+                 << diff.baseBlockHash.GetHex().substr(0, 16)
+                 << " block=" << diff.blockHash.GetHex().substr(0, 16)
+                 << " mnList=" << diff.mnList.size()
+                 << " deletedMNs=" << diff.deletedMNs.size()
+                 << " quorum_tail=" << diff.quorum_tail.size() << "B";
+        if (m_on_mnlistdiff) {
+            m_on_mnlistdiff(m_target_addr.to_string(), diff);
+        }
+    }
+
     // SPV B2 (parity audit): BIP 130 — peer prefers `headers` over `inv`
     // for new-block announcements. Record the preference. No behavior
     // change today (we don't announce blocks unsolicited), but a future

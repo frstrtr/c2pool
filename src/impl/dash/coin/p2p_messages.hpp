@@ -7,6 +7,7 @@
 #include "transaction.hpp"
 #include "block.hpp"
 #include "vendor/blockencodings.hpp"
+#include "vendor/smldiff.hpp"
 
 #include <impl/bitcoin_family/coin/base_p2p_messages.hpp>
 
@@ -138,6 +139,38 @@ BEGIN_MESSAGE(clsig)
     }
 END_MESSAGE()
 
+// ── Phase C-SML step 4: Simplified MN List sync messages ──────────────
+// Wire commands (dashcore protocol.cpp:68-69):
+//   "getmnlistd"  — request: baseBlockHash + blockHash
+//   "mnlistdiff"  — reply:   full diff struct (see vendor/smldiff.hpp)
+// Used to maintain a local SML for CBTX merkleRootMNList verification
+// and (in later phases) ChainLock signature validation. Dashcore full
+// nodes do NOT receive mnlistdiff (they Misbehaving(100) on receipt) —
+// the protocol is exclusively for light clients, which c2pool-dash now
+// is on the SML axis.
+
+BEGIN_MESSAGE(getmnlistd)
+    MESSAGE_FIELDS
+    (
+        (uint256, m_base_block_hash),
+        (uint256, m_block_hash)
+    )
+    {
+        READWRITE(obj.m_base_block_hash);
+        READWRITE(obj.m_block_hash);
+    }
+END_MESSAGE()
+
+BEGIN_MESSAGE(mnlistdiff)
+    MESSAGE_FIELDS
+    (
+        (vendor::CSimplifiedMNListDiff, m_diff)
+    )
+    {
+        READWRITE(obj.m_diff);
+    }
+END_MESSAGE()
+
 using Handler = MessageHandler<
     message_version,
     message_verack,
@@ -164,7 +197,9 @@ using Handler = MessageHandler<
     message_cmpctblock,
     message_getblocktxn,
     message_blocktxn,
-    message_clsig
+    message_clsig,
+    message_getmnlistd,
+    message_mnlistdiff
 >;
 
 } // namespace p2p

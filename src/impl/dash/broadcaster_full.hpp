@@ -144,12 +144,18 @@ public:
     using HeadersCallback   = std::function<void(const std::string&, const std::vector<dash::coin::BlockHeaderType>&)>;
     using FullBlockCallback = std::function<void(const std::string&, const dash::coin::BlockType&)>;
     using PeerHeightCallback = std::function<void(uint32_t)>;
+    // Phase C-SML step 4: SML diff arrival callback. Higher layer
+    // (main_dash.cpp tip-changed handler in step 6) consumes diffs.
+    using MnListDiffCallback = std::function<void(
+        const std::string& peer_key,
+        const dash::coin::vendor::CSimplifiedMNListDiff& diff)>;
 
     void set_on_new_block(BlockCallback cb)     { m_on_new_block   = std::move(cb); }
     void set_on_new_tx(TxCallback cb)           { m_on_new_tx      = std::move(cb); }
     void set_on_new_headers(HeadersCallback cb) { m_on_new_headers = std::move(cb); }
     void set_on_full_block(FullBlockCallback cb){ m_on_full_block  = std::move(cb); }
     void set_on_peer_height(PeerHeightCallback cb) { m_on_peer_height = std::move(cb); }
+    void set_on_mnlistdiff(MnListDiffCallback cb) { m_on_mnlistdiff = std::move(cb); }
 
     /// Start: register local node (if any), start peer manager, begin
     /// connection maintenance loop.
@@ -328,6 +334,29 @@ public:
         }
     }
 
+    /// Phase C-SML step 4: ask one peer for an SML diff. Targeted
+    /// (single-peer) because the response can be ~400 KB on cold
+    /// start; broadcasting would multiply bandwidth across peers
+    /// for no gain. Round-robin via peer_idx so steady-state diffs
+    /// spread load. Returns the peer key that was asked, or empty
+    /// string if no peer was available.
+    std::string request_mnlistdiff_targeted(const uint256& base_block_hash,
+                                            const uint256& target_block_hash,
+                                            size_t peer_idx)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_peers.empty()) return {};
+        auto it = m_peers.begin();
+        std::advance(it, peer_idx % m_peers.size());
+        try {
+            it->second->node_p2p.request_mnlistdiff(
+                base_block_hash, target_block_hash);
+            return it->first;
+        } catch (...) {
+            return {};
+        }
+    }
+
 private:
     /// Connect to a validated peer endpoint. PeerEndpoint guarantees
     /// non-empty parseable addr with valid port — no runtime checks.
@@ -379,6 +408,16 @@ private:
             if (m_on_peer_height)
                 peer->node_p2p.set_on_peer_height(
                     [this](uint32_t h) { m_on_peer_height(h); });
+
+            // Phase C-SML step 4: fan SML diffs out to broadcaster
+            // consumer. Always-armed because the per-peer dispatch is
+            // cheap and main_dash.cpp may register the callback after
+            // some peers have already connected.
+            peer->node_p2p.set_on_mnlistdiff(
+                [this](const std::string& pk,
+                       const dash::coin::vendor::CSimplifiedMNListDiff& diff) {
+                    if (m_on_mnlistdiff) m_on_mnlistdiff(pk, diff);
+                });
 
             peer->node_p2p.connect(addr);
             m_peers[key] = std::move(peer);
@@ -493,6 +532,7 @@ private:
     HeadersCallback    m_on_new_headers;
     FullBlockCallback  m_on_full_block;
     PeerHeightCallback m_on_peer_height;
+    MnListDiffCallback m_on_mnlistdiff;
 };
 
 } // namespace dash
