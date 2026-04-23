@@ -23,6 +23,7 @@
 #include <impl/dash/coin/utxo_adapter.hpp>
 #include <impl/dash/coin/vendor/cbtx.hpp>
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>
+#include <impl/dash/coin/vendor/smldiff.hpp>
 #include <core/coin/block_bootstrapper.hpp>
 #include <impl/dash/broadcaster.hpp>
 #include <impl/dash/broadcaster_full.hpp>
