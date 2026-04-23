@@ -433,6 +433,14 @@ int main(int argc, char* argv[])
     std::cout << "[QUO] initialized: in-memory only (no persistence at MVP)"
               << std::endl;
 
+    // ── Phase L step 4: shared ChainLock-blocks set ──
+    // Updated by the on_clsig callback (relay-trust at MVP) and read
+    // by the tip-changed reorg handler to refuse reorgs that would
+    // disconnect a CL'd block. Iteration 2 hardening will gate writes
+    // on verify-success only.
+    auto chainlocked_blocks =
+        std::make_shared<std::map<uint256, int32_t>>();
+
     // ── Pool Node ──
     dash::DashNodeImpl node(&ioc, config.get(), testnet);
     std::cout << "[NODE] DashNodeImpl created" << std::endl;
@@ -1479,6 +1487,7 @@ int main(int argc, char* argv[])
              chain = &header_chain,
              utxo = &utxo_cache,
              utxo_db_ptr = &utxo_db,
+             chainlocked_blocks,
              dash_bs, &ioc](
                 const uint256& old_tip, uint32_t old_height,
                 const uint256& new_tip, uint32_t new_height) {
@@ -1486,7 +1495,8 @@ int main(int argc, char* argv[])
                 // header (header-sync worker or message handler). Post
                 // to ioc so bcaster/UTXO access stays single-threaded.
                 io::post(ioc,
-                    [bcaster, chain, utxo, utxo_db_ptr, dash_bs,
+                    [bcaster, chain, utxo, utxo_db_ptr,
+                     chainlocked_blocks, dash_bs,
                      old_tip, old_height, new_tip, new_height]() {
                   try {
                     bool is_reorg = (new_height <= old_height);
@@ -1496,6 +1506,51 @@ int main(int argc, char* argv[])
                                 << new_tip.GetHex().substr(0, 16)
                                 << " (h=" << new_height << ")"
                                 << (is_reorg ? " [REORG]" : "");
+
+                    // ── Phase L step 4: CL-aware reorg refusal ──
+                    // Walk old fork backward from old_tip; if any
+                    // block is in chainlocked_blocks AND would be
+                    // disconnected by this reorg, refuse outright.
+                    // (We need to know fork_height first; do a quick
+                    // ancestor walk to find the common point, then
+                    // re-walk old_tip → fork checking for CLs.)
+                    if (is_reorg && chainlocked_blocks
+                        && !chainlocked_blocks->empty() && chain) {
+                        // Find fork height by walking new_tip ancestors
+                        // into a set, then walking old_tip until we
+                        // hit one. Capped at 32 hops — anything deeper
+                        // shouldn't happen on Dash mainnet given
+                        // ChainLocks finalize within seconds.
+                        std::set<uint256> new_anc;
+                        {
+                            uint256 cur = new_tip;
+                            for (int i = 0; i < 32 && !cur.IsNull(); ++i) {
+                                new_anc.insert(cur);
+                                auto e = chain->get_header(cur);
+                                if (!e) break;
+                                cur = e->prev_hash;
+                            }
+                        }
+                        uint256 cur = old_tip;
+                        for (int i = 0; i < 32 && !cur.IsNull(); ++i) {
+                            if (new_anc.count(cur)) break;  // hit fork
+                            auto cl_it = chainlocked_blocks->find(cur);
+                            if (cl_it != chainlocked_blocks->end()) {
+                                LOG_WARNING << "[EMB-DASH] reorg blocked by "
+                                               "ChainLock at h=" << cl_it->second
+                                            << " block=" << cur.GetHex().substr(0, 16)
+                                            << " — refusing to disconnect "
+                                               "(old_tip=" << old_tip.GetHex().substr(0, 16)
+                                            << " h=" << old_height
+                                            << " → new_tip=" << new_tip.GetHex().substr(0, 16)
+                                            << " h=" << new_height << ")";
+                                return;  // refuse: skip disconnect_block walk
+                            }
+                            auto e = chain->get_header(cur);
+                            if (!e) break;
+                            cur = e->prev_hash;
+                        }
+                    }
 
                     if (is_reorg && utxo && utxo_db_ptr && chain) {
                         // Walk new chain backward to collect ancestors.
@@ -1671,14 +1726,19 @@ int main(int argc, char* argv[])
         // trust path. Iteration 2 (after N clean MATCH blocks) gates
         // the chainlocked_blocks update on verify success.
         broadcaster->set_on_clsig(
-            [quorums, chain = &header_chain, &ioc](
+            [quorums, chain = &header_chain, chainlocked_blocks, &ioc](
                 const std::string& peer_key,
                 int32_t height,
                 const uint256& bhash,
                 const std::array<uint8_t, 96>& sig) {
                 io::post(ioc,
-                    [quorums, chain, peer_key, height, bhash, sig]() {
+                    [quorums, chain, chainlocked_blocks,
+                     peer_key, height, bhash, sig]() {
                   try {
+                    // Relay-trust record (MVP). Iteration 2 will gate
+                    // this write on verify-success below.
+                    (*chainlocked_blocks)[bhash] = height;
+
                     auto r = dash::coin::verify_chainlock(
                         height, bhash, sig, *quorums, *chain);
                     using S = dash::coin::ChainLockVerifyResult::Status;
