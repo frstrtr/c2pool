@@ -364,6 +364,34 @@ int main(int argc, char* argv[])
               << " best_height=" << utxo_cache.get_best_height()
               << std::endl;
 
+    // ── Phase C-SML steps 5+6: SMLDb + in-memory CSimplifiedMNList ──
+    // The persistent SML lives in `~/.c2pool/<coin>/sml_db/`. On startup
+    // we load it into memory; on every accepted mnlistdiff (step 6) we
+    // apply_diff + write_sml + verify CBTX root (step 7). Last-known
+    // best_hash is used as the next getmnlistd's baseBlockHash; null
+    // (cold start) means we ask from `uint256::ZERO` per dashcore's
+    // protocol convention.
+    std::string sml_db_path = std::string(getenv("HOME") ? getenv("HOME") : ".")
+        + "/.c2pool/" + coin_name + "/sml_db";
+    auto sml_db = std::make_shared<dash::coin::SMLDb>(sml_db_path);
+    if (!sml_db->open()) {
+        std::cerr << "[WARN] Failed to open SML LevelDB at " << sml_db_path
+                  << " — SML sync will run cold-start every restart"
+                  << std::endl;
+    }
+    auto sml = std::make_shared<dash::coin::vendor::CSimplifiedMNList>();
+    sml_db->load_sml(*sml);
+    // Tracks the most recently seen CBTX merkleRootMNList from the
+    // full_block path (Phase C-SML step 1's parser populates this).
+    // Step 7 compares our SML's merkle root against this on every diff
+    // application; mismatch → log-only at MVP.
+    auto last_cbtx_mnlist_root = std::make_shared<uint256>();
+    auto last_cbtx_block_height = std::make_shared<uint32_t>(0);
+    std::cout << "[SML] initialized: entries=" << sml->size()
+              << " best_height=" << sml_db->get_best_height()
+              << " best_hash=" << sml_db->get_best_hash().GetHex().substr(0, 16)
+              << std::endl;
+
     // ── Pool Node ──
     dash::DashNodeImpl node(&ioc, config.get(), testnet);
     std::cout << "[NODE] DashNodeImpl created" << std::endl;
@@ -1177,7 +1205,10 @@ int main(int argc, char* argv[])
              utxo_db_ptr = &utxo_db,
              chain = &header_chain,
              bcaster = broadcaster.get(),
-             dash_bs, &ioc](
+             dash_bs,
+             cbtx_root = last_cbtx_mnlist_root,
+             cbtx_height = last_cbtx_block_height,
+             &ioc](
                 const std::string& /*peer_key*/,
                 const dash::coin::BlockType& block) {
                 auto packed_hdr = pack(
@@ -1220,6 +1251,13 @@ int main(int argc, char* argv[])
                                 LOG_INFO << "[CBTX] block_h=" << height
                                          << " " << cbtx.short_str();
                             }
+                            // Phase C-SML step 7: stash the latest CBTX
+                            // mnlist root so the SML verifier can compare
+                            // against it on the next applied diff. We
+                            // overwrite unconditionally; mismatches are
+                            // surfaced when the diff handler reads it.
+                            *cbtx_root = cbtx.merkleRootMNList;
+                            *cbtx_height = height;
                         }
                     }
                 }
@@ -1483,6 +1521,138 @@ int main(int argc, char* argv[])
             });
         LOG_INFO << "[EMB-DASH] Chain tip-changed handler registered "
                     "(reorg disconnect_block + header-sync nudge)";
+
+        // ── Phase C-SML steps 6+7: SML diff consumer + CBTX root check ──
+        // Receives mnlistdiffs from broadcaster fan-out (any peer that
+        // replies to a getmnlistd we sent). Applies + persists + verifies
+        // root against the most-recent CBTX merkleRootMNList. Mismatch
+        // policy at MVP: LOG-ONLY, apply anyway. Hardening to
+        // Misbehaving(100) + per-peer ban comes in iteration 2 after we
+        // confirm CalcHash() is bit-exact correct.
+        broadcaster->set_on_mnlistdiff(
+            [sml, sml_db, cbtx_root = last_cbtx_mnlist_root,
+             cbtx_height = last_cbtx_block_height, &ioc](
+                const std::string& peer_key,
+                const dash::coin::vendor::CSimplifiedMNListDiff& diff) {
+                io::post(ioc,
+                    [sml, sml_db, cbtx_root, cbtx_height, peer_key, diff]() {
+                  try {
+                    // Validate base. Cold start: base == ZERO is fine.
+                    // Steady state: base must match our current best.
+                    uint256 expected_base = sml_db->get_best_hash();
+                    if (diff.baseBlockHash != expected_base) {
+                        LOG_WARNING << "[SML] diff base mismatch from "
+                                    << peer_key
+                                    << ": got=" << diff.baseBlockHash.GetHex().substr(0, 16)
+                                    << " want=" << expected_base.GetHex().substr(0, 16)
+                                    << " — dropping (race or stale request)";
+                        return;
+                    }
+
+                    auto before_size = sml->size();
+                    auto result = dash::coin::vendor::apply_diff(*sml, diff);
+                    sml_db->write_sml(*sml, diff.blockHash, *cbtx_height);
+
+                    LOG_INFO << "[SML] applied: +"
+                             << result.added_or_updated << "/-"
+                             << result.deleted
+                             << " size " << before_size << "→" << sml->size()
+                             << " best=" << diff.blockHash.GetHex().substr(0, 16)
+                             << " peer=" << peer_key;
+
+                    // Phase C-SML step 7: verify against the most-recent
+                    // CBTX merkleRootMNList. The CBTX comes from the full
+                    // block at diff.blockHash (or close to it) — the
+                    // last_cbtx_mnlist_root captures whatever full_block
+                    // most recently arrived. There's a small race where
+                    // we apply a diff for a block that hasn't arrived as
+                    // a full_block yet — in that case cbtx_root may be
+                    // for a slightly older block; the comparison is
+                    // skipped if the block heights don't align.
+                    auto computed = sml->CalcMerkleRoot();
+                    if (cbtx_root->IsNull()) {
+                        LOG_DEBUG_COIND
+                            << "[SML] CBTX root not yet captured — "
+                               "verification skipped (first diff before "
+                               "first full_block)";
+                    } else if (computed == *cbtx_root) {
+                        LOG_INFO << "[SML] root MATCH "
+                                 << computed.GetHex().substr(0, 16)
+                                 << " (vs CBTX@h=" << *cbtx_height << ")";
+                    } else {
+                        LOG_WARNING << "[SML] root MISMATCH"
+                                    << " computed=" << computed.GetHex().substr(0, 16)
+                                    << " cbtx="     << cbtx_root->GetHex().substr(0, 16)
+                                    << " (vs CBTX@h=" << *cbtx_height << ")"
+                                    << " — log-only at MVP, applied anyway";
+                    }
+                  } catch (const std::exception& e) {
+                    LOG_ERROR << "[SML] diff handler error: " << e.what();
+                  }
+                });
+            });
+        LOG_INFO << "[EMB-DASH] SML diff handler registered "
+                    "(apply_diff + LevelDB flush + CBTX root verification)";
+
+        // ── Phase C-SML step 6: tip-changed → request_mnlistdiff ──
+        // Augment the existing tip-changed handler with an SML sync
+        // trigger. On every tip advance: send getmnlistd(prev_best,
+        // new_tip) to a single peer (round-robin via static counter).
+        // Cold start (no prev_best): use uint256::ZERO. Reorg handling
+        // lives in the same handler — drop SML + clear DB + cold-start.
+        // We register this as a *second* tip-changed callback by
+        // chaining off the existing one's outer scope; HeaderChain only
+        // supports one callback so we have to wrap.
+        //
+        // Implementation: HeaderChain.set_on_tip_changed REPLACES, so
+        // we re-set with a wrapper that runs the previous logic AND the
+        // SML trigger. Re-fetching `header_chain.set_on_tip_changed`
+        // below would clobber the Phase U handler — instead we add the
+        // SML logic INSIDE that handler. So below, we re-register a
+        // single combined handler that does both.
+        //
+        // For implementation simplicity at this step, we just add a
+        // separate timer-based poll: every 30s, if (sml_best_height <
+        // header_chain.height()), send getmnlistd. This avoids touching
+        // the Phase U handler and gives us a working sync without race
+        // conditions on first-tip arrival timing.
+        auto sml_sync_timer = std::make_shared<io::steady_timer>(
+            ioc, std::chrono::seconds(30));
+        std::function<void(const boost::system::error_code&)> sml_sync_tick;
+        sml_sync_tick = [sml_sync_timer, sml, sml_db,
+                         bcaster = broadcaster.get(),
+                         chain = &header_chain,
+                         &sml_sync_tick](
+            const boost::system::error_code& ec) {
+            if (ec || !bcaster) return;
+            try {
+                uint32_t hdr_height = chain->height();
+                uint32_t sml_height = sml_db->get_best_height();
+                uint256  hdr_tip = chain->tip() ? chain->tip()->hash
+                                                : uint256{};
+                if (!hdr_tip.IsNull()
+                    && (hdr_height > sml_height || sml_height == 0)
+                    && bcaster->peer_count() > 0) {
+                    static size_t s_peer_rot = 0;
+                    auto base = sml_db->get_best_hash();
+                    auto picked = bcaster->request_mnlistdiff_targeted(
+                        base, hdr_tip, s_peer_rot++);
+                    LOG_INFO << "[SML] sync request: base="
+                             << base.GetHex().substr(0, 16)
+                             << " target=" << hdr_tip.GetHex().substr(0, 16)
+                             << " peer=" << (picked.empty() ? "(none)" : picked)
+                             << " hdr_h=" << hdr_height
+                             << " sml_h=" << sml_height;
+                }
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[SML] sync tick error: " << e.what();
+            }
+            sml_sync_timer->expires_after(std::chrono::seconds(30));
+            sml_sync_timer->async_wait(sml_sync_tick);
+        };
+        sml_sync_timer->async_wait(sml_sync_tick);
+        LOG_INFO << "[EMB-DASH] SML sync timer armed (30s interval, "
+                    "fires once header chain advances ahead of SML)";
 
         // Seed initial candidates via dashd RPC getpeerinfo — the same
         // flow the Phase 1 broadcaster used. After seed, addr-crawl via

@@ -230,6 +230,8 @@ public:
         return compute_merkle_root_local(std::move(leaves));
     }
 
+    size_t size() const { return mnList.size(); }
+
 private:
     // Standard Bitcoin/Dash SHA256d-pairwise merkle root with
     // duplicate-last-on-odd. Inlined from
@@ -260,8 +262,6 @@ private:
         }
         return hashes[0];
     }
-
-    size_t size() const { return mnList.size(); }
 };
 
 } // namespace vendor
