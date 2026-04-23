@@ -2783,6 +2783,10 @@ int main(int argc, char* argv[]) {
                         if (hr > 0) s_last_good = hr;
                         return s_last_good;
                     });
+                // pool_hashrate is derived from the sharechain tip — move off
+                // the 1 Hz periodic timer onto the tip-change signal, same
+                // reasoning as sharechain_stats.
+                web_server.get_mining_interface()->mark_last_cache_tip_driven();
             } // end if (p2p_node) — P2P callbacks
 
             // When a block submission is attempted, record the found block
@@ -3660,6 +3664,8 @@ int main(int argc, char* argv[]) {
                 }
                 return result;
             });
+            // Window data is the dashboard defragmenter grid — tip-sensitive.
+            web_server.get_mining_interface()->mark_last_cache_tip_driven();
 
             // Lightweight tip endpoint for RealTime polling
             // Lightweight tip endpoint for RealTime polling.
@@ -3694,6 +3700,9 @@ int main(int argc, char* argv[]) {
                     t.total  = static_cast<int>(chain.size());
                     return t;
                 });
+            // The tip endpoint is literally the sharechain tip — fire on tip
+            // change, not on the 1 Hz periodic timer.
+            web_server.get_mining_interface()->mark_last_cache_tip_driven();
 
             // Delta endpoint: return only shares newer than `since` hash
             web_server.get_mining_interface()->set_sharechain_delta_fn(
