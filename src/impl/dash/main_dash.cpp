@@ -36,6 +36,7 @@
 #include <unordered_map>
 #include <deque>
 #include <mutex>
+#include <set>
 
 #include <core/coin_params.hpp>
 #include <core/log.hpp>
@@ -1348,6 +1349,112 @@ int main(int argc, char* argv[])
                                 << ": " << e.what();
                 }
             });
+
+        // ── Phase U polish: tip-changed handler (reorg + sync nudge) ──
+        // Port of LTC's c2pool_refactored.cpp:2354 pattern. Two roles:
+        //   1. Reorg disconnect_block: when the new tip is at lower-or-
+        //      equal height, walk both chains backward to a common
+        //      ancestor and `disconnect_from_undo` every old-fork block
+        //      whose undo we still hold (rolling 288 window). ChainLocks
+        //      make deep reorgs vanishingly rare on Dash, but 1-2-block
+        //      tip flutter between network halves seeing different
+        //      cmpctblock pushes is plausible — without this, the UTXO
+        //      retains stale outputs from the abandoned fork.
+        //   2. Header-sync-complete trigger: after every tip advance,
+        //      nudge peers for the new tip's full block. This removes
+        //      the 0–5 min latency between header sync finishing and
+        //      the first unsolicited full_block arrival that would
+        //      otherwise trigger the bootstrap pipeline. Skipped while
+        //      bootstrap is already draining (would just queue duplicate
+        //      getdata for the same hash).
+        header_chain.set_on_tip_changed(
+            [bcaster = broadcaster.get(),
+             chain = &header_chain,
+             utxo = &utxo_cache,
+             utxo_db_ptr = &utxo_db,
+             dash_bs, &ioc](
+                const uint256& old_tip, uint32_t old_height,
+                const uint256& new_tip, uint32_t new_height) {
+                // Callback fires on whichever thread persisted the
+                // header (header-sync worker or message handler). Post
+                // to ioc so bcaster/UTXO access stays single-threaded.
+                io::post(ioc,
+                    [bcaster, chain, utxo, utxo_db_ptr, dash_bs,
+                     old_tip, old_height, new_tip, new_height]() {
+                  try {
+                    bool is_reorg = (new_height <= old_height);
+                    LOG_WARNING << "[EMB-DASH] Chain tip changed: "
+                                << old_tip.GetHex().substr(0, 16)
+                                << " (h=" << old_height << ") → "
+                                << new_tip.GetHex().substr(0, 16)
+                                << " (h=" << new_height << ")"
+                                << (is_reorg ? " [REORG]" : "");
+
+                    if (is_reorg && utxo && utxo_db_ptr && chain) {
+                        // Walk new chain backward to collect ancestors.
+                        std::set<uint256> new_ancestors;
+                        {
+                            uint256 cur = new_tip;
+                            while (!cur.IsNull()) {
+                                new_ancestors.insert(cur);
+                                auto e = chain->get_header(cur);
+                                if (!e) break;
+                                cur = e->prev_hash;
+                            }
+                        }
+                        // Walk old chain backward until we hit an
+                        // ancestor of the new chain — that's the fork.
+                        uint256 fork_hash;
+                        uint32_t fork_height = 0;
+                        {
+                            uint256 cur = old_tip;
+                            while (!cur.IsNull()) {
+                                if (new_ancestors.count(cur)) {
+                                    fork_hash = cur;
+                                    auto e = chain->get_header(cur);
+                                    if (e) fork_height = e->height;
+                                    break;
+                                }
+                                auto e = chain->get_header(cur);
+                                if (!e) break;
+                                cur = e->prev_hash;
+                            }
+                        }
+
+                        if (!fork_hash.IsNull() && fork_height < old_height) {
+                            int disconnected = 0;
+                            for (uint32_t h = old_height; h > fork_height; --h) {
+                                core::coin::BlockUndo undo;
+                                if (utxo_db_ptr->get_block_undo(h, undo)) {
+                                    utxo->disconnect_from_undo(undo);
+                                    utxo_db_ptr->remove_block_undo(h);
+                                    ++disconnected;
+                                }
+                            }
+                            utxo->flush(fork_hash, fork_height);
+                            LOG_WARNING << "[EMB-DASH] UTXO reorg: disconnected "
+                                        << disconnected << " blocks (h="
+                                        << old_height << "→" << fork_height
+                                        << ") fork="
+                                        << fork_hash.GetHex().substr(0, 16);
+                        }
+                    }
+
+                    // Header-sync nudge: ask peers for new tip block so
+                    // bootstrap pipeline / steady-state connect_block
+                    // doesn't wait on an unsolicited announce. Skip
+                    // while bootstrap is draining (already in-flight).
+                    if (bcaster && (!dash_bs || !dash_bs->active)) {
+                        bcaster->request_full_block(new_tip);
+                    }
+                  } catch (const std::exception& e) {
+                    LOG_ERROR << "[EMB-DASH] Tip-changed handler error: "
+                              << e.what();
+                  }
+                });
+            });
+        LOG_INFO << "[EMB-DASH] Chain tip-changed handler registered "
+                    "(reorg disconnect_block + header-sync nudge)";
 
         // Seed initial candidates via dashd RPC getpeerinfo — the same
         // flow the Phase 1 broadcaster used. After seed, addr-crawl via
