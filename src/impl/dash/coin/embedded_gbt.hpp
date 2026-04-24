@@ -28,13 +28,19 @@
 #include <impl/dash/coin/mempool.hpp>
 #include <impl/dash/coin/subsidy.hpp>
 #include <impl/dash/coin/rpc_data.hpp>
+#include <impl/dash/coin/quorum_root.hpp>
+#include <impl/dash/coin/quorum_manager.hpp>
+#include <impl/dash/coin/vendor/cbtx.hpp>
+#include <impl/dash/coin/vendor/simplifiedmns.hpp>
 
 #include <core/uint256.hpp>
+#include <core/pack.hpp>
 #include <core/log.hpp>
 
 #include <cstdint>
 #include <ctime>
 #include <string>
+#include <vector>
 
 namespace dash {
 namespace coin {
@@ -157,6 +163,129 @@ inline bool gbt_xcheck(const DashWorkData& embedded,
                  << " mempool_txs=" << embedded.m_txs.size();
     }
     return ok;
+}
+
+/// Phase C-TEMPLATE step 6: build a CCbTx struct (extra_payload of
+/// the coinbase tx) from local SML + QuorumManager state.
+///
+/// We populate the fields we can compute now:
+///   - nVersion = VERSION_CLSIG_AND_BALANCE (3) — Dash mainnet has
+///     been on v3 since DEPLOYMENT_V20 activated at h=1,987,776.
+///   - nHeight = prev_height + 1
+///   - merkleRootMNList   = sml.CalcMerkleRoot()  [Phase C-SML]
+///   - merkleRootQuorums  = compute_merkle_root_quorums(qmgr)
+///                          [Phase C-TEMPLATE step 4c]
+///
+/// The fields we CANNOT YET compute (left zeroed — known shadow
+/// MISMATCH):
+///   - bestCLHeightDiff / bestCLSignature: Phase L records
+///     ChainLock acceptance into chainlocked_blocks but does NOT
+///     yet cache the raw 96-byte sig nor the "best" (highest)
+///     accepted height for the cycle. Wiring needs a small extension
+///     to the on_clsig handler — deferred to a follow-up step.
+///   - creditPoolBalance: requires the asset-lock state machine
+///     (DIP-0027) which tracks deposits/withdrawals across cycles.
+///     Not built yet — shadow will MISMATCH against any post-V20
+///     block that has had asset-lock activity.
+inline vendor::CCbTx build_embedded_cbtx(
+    uint32_t prev_height,
+    const vendor::CSimplifiedMNList& sml,
+    const QuorumManager& qmgr)
+{
+    vendor::CCbTx c;
+    c.nVersion           = vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+    c.nHeight            = static_cast<int32_t>(prev_height + 1);
+    // CalcMerkleRoot() is non-const upstream (it caches); take a
+    // mutable copy to call into it without breaking const-correctness
+    // of the caller. The cost is one ~450 KB SML vector copy per 5s
+    // shadow tick — within budget for log-only validation.
+    auto sml_mut = sml;
+    c.merkleRootMNList   = sml_mut.CalcMerkleRoot();
+    c.merkleRootQuorums  = compute_merkle_root_quorums(qmgr);
+    c.bestCLHeightDiff   = 0;
+    c.bestCLSignature    = {};      // all-zero = "no chainlock"
+    c.creditPoolBalance  = 0;
+    return c;
+}
+
+/// Encode a CCbTx struct to wire bytes. Equivalent to dashcore's
+/// SetTxPayload(coinbase, ccbtx) — produces what would go into the
+/// coinbase tx's extra_payload field.
+inline std::vector<unsigned char> encode_cbtx(const vendor::CCbTx& c)
+{
+    auto stream = ::pack(c);
+    auto sp = stream.get_span();
+    return std::vector<unsigned char>(
+        reinterpret_cast<const unsigned char*>(sp.data()),
+        reinterpret_cast<const unsigned char*>(sp.data()) + sp.size());
+}
+
+/// Cross-check our embedded CCbTx against the RPC's coinbase_payload.
+/// Parses the RPC bytes back into a CCbTx and compares field-by-field.
+/// The two roots are the high-value comparison: a match here proves
+/// our SML and QuorumManager are in lockstep with dashd. Mismatches
+/// on bestCL* / creditPool are EXPECTED until we wire those phases —
+/// they're logged at INFO (not WARNING) so they don't pollute alerts.
+inline bool cbtx_xcheck(const vendor::CCbTx& embedded,
+                        const std::vector<unsigned char>& rpc_payload)
+{
+    vendor::CCbTx rpc_cbtx;
+    if (!vendor::parse_cbtx(rpc_payload, rpc_cbtx)) {
+        LOG_WARNING << "[CBTX-XCHECK] could not parse RPC payload ("
+                    << rpc_payload.size() << " B) — skipping shadow";
+        return false;
+    }
+
+    bool roots_ok = true;
+    if (embedded.nVersion != rpc_cbtx.nVersion) {
+        LOG_WARNING << "[CBTX-XCHECK] nVersion differs: embedded="
+                    << embedded.nVersion << " rpc=" << rpc_cbtx.nVersion;
+        roots_ok = false;
+    }
+    if (embedded.nHeight != rpc_cbtx.nHeight) {
+        LOG_WARNING << "[CBTX-XCHECK] nHeight differs: embedded="
+                    << embedded.nHeight << " rpc=" << rpc_cbtx.nHeight;
+        roots_ok = false;
+    }
+    if (embedded.merkleRootMNList != rpc_cbtx.merkleRootMNList) {
+        LOG_WARNING << "[CBTX-XCHECK] merkleRootMNList MISMATCH "
+                    << "embedded=" << embedded.merkleRootMNList.GetHex().substr(0, 16)
+                    << " rpc="     << rpc_cbtx.merkleRootMNList.GetHex().substr(0, 16);
+        roots_ok = false;
+    }
+    if (embedded.merkleRootQuorums != rpc_cbtx.merkleRootQuorums) {
+        LOG_WARNING << "[CBTX-XCHECK] merkleRootQuorums MISMATCH "
+                    << "embedded=" << embedded.merkleRootQuorums.GetHex().substr(0, 16)
+                    << " rpc="     << rpc_cbtx.merkleRootQuorums.GetHex().substr(0, 16);
+        roots_ok = false;
+    }
+
+    // Expected-mismatch fields: log at INFO so we can see drift but
+    // don't fire the WARNING channel until those phases wire.
+    if (rpc_cbtx.nVersion >= vendor::CCbTx::VERSION_CLSIG_AND_BALANCE) {
+        if (embedded.bestCLHeightDiff != rpc_cbtx.bestCLHeightDiff
+            || embedded.bestCLSignature != rpc_cbtx.bestCLSignature) {
+            LOG_INFO << "[CBTX-XCHECK] bestCL* differs (expected — "
+                        "Phase L cycle-best wiring not yet built): "
+                     << "embedded.diff=" << embedded.bestCLHeightDiff
+                     << " rpc.diff="     << rpc_cbtx.bestCLHeightDiff
+                     << " embedded.sig=" << (embedded.bestCLSignature == std::array<uint8_t, 96>{} ? "null" : "set")
+                     << " rpc.sig="      << (rpc_cbtx.has_best_cl_signature() ? "set" : "null");
+        }
+        if (embedded.creditPoolBalance != rpc_cbtx.creditPoolBalance) {
+            LOG_INFO << "[CBTX-XCHECK] creditPoolBalance differs "
+                        "(expected — asset-lock state machine not built): "
+                     << "embedded=" << embedded.creditPoolBalance
+                     << " rpc="     << rpc_cbtx.creditPoolBalance;
+        }
+    }
+
+    if (roots_ok) {
+        LOG_INFO << "[CBTX-XCHECK] roots match h=" << embedded.nHeight
+                 << " mnlist=" << embedded.merkleRootMNList.GetHex().substr(0, 16)
+                 << " quorums=" << embedded.merkleRootQuorums.GetHex().substr(0, 16);
+    }
+    return roots_ok;
 }
 
 } // namespace coin

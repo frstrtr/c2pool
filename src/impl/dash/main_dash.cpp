@@ -1694,6 +1694,21 @@ int main(int argc, char* argv[])
                         dash::coin::gbt_xcheck(embedded, work);
                     }
                 }
+
+                // ── Phase C-TEMPLATE step 6: embedded CCbTx vs RPC ──
+                // Build the CCbTx (coinbase extra_payload) from local
+                // SML + QuorumManager state and compare against
+                // dashd's. Roots match here = our SML + QUO sync are
+                // bit-exact aligned with dashd. bestCL* + creditPool
+                // are EXPECTED to mismatch until Phase L cycle-best
+                // wiring + asset-lock state machine ship.
+                if (sml && quorums && !sml->mnList.empty()
+                    && header_chain.height() > 0
+                    && !work.m_coinbase_payload.empty()) {
+                    auto cbtx = dash::coin::build_embedded_cbtx(
+                        header_chain.height(), *sml, *quorums);
+                    dash::coin::cbtx_xcheck(cbtx, work.m_coinbase_payload);
+                }
             } catch (const std::exception& e) {
                 LOG_WARNING << "[DashRPC] getwork() failed: " << e.what();
             }
