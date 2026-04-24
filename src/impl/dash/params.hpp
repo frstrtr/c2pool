@@ -55,11 +55,19 @@ inline core::CoinParams make_coin_params(bool testnet)
     p.segwit_activation_version = 0;  // no segwit
 
     // ===== Pool-level (net) =====
-    // Reference: ref/p2pool-dash/p2pool/networks/dash.py
+    // Reference: ref/p2pool-dash/p2pool/networks/dash.py (mainnet)
+    //            ref/p2pool-dash/p2pool/networks/dash_testnet.py (testnet)
     p.p2p_port    = 8999;
     p.worker_port = 7903;
 
     if (testnet) {
+        // p2pool-dash testnet sharechain port is 18999 (mainnet+10000).
+        // Without this override the outbound peer dialer's expected_port
+        // stays at mainnet's 8999 → every real testnet peer (port 18999)
+        // is rejected as wrong_port (node.hpp:618). Federation then only
+        // works via inbound connections, and once the address store is
+        // exhausted (`good=4 wrong_port=4`) outbound dialing dies entirely.
+        p.p2p_port          = 18999;
         p.share_period      = 20;
         p.chain_length      = 4320;
         p.real_chain_length  = 4320;

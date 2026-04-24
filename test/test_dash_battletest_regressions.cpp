@@ -98,6 +98,27 @@ TEST(DashBugRegressions, Bug7_TestnetMaxTarget_IsP2PoolTestnetCompatible)
            "than mainnet";
 }
 
+TEST(DashBugRegressions, TestnetSharechainPortDiffersFromMainnet)
+{
+    // Discovered 2026-04-24 while investigating the testbed wrong_port
+    // filter: params.hpp set p.p2p_port = 8999 unconditionally. The
+    // testnet branch never overrode it, so DashNodeImpl's outbound peer
+    // dialer rejected every real testnet peer (port 18999) as wrong_port
+    // (node.hpp:618 `addr.port() != expected_port`). Federation then
+    // worked only via inbound connections; once the address store was
+    // exhausted, outbound dialing died entirely.
+    auto mainnet = dash::make_coin_params(false);
+    auto testnet = dash::make_coin_params(true);
+
+    EXPECT_EQ(mainnet.p2p_port, 8999u)
+        << "mainnet sharechain port regressed";
+    EXPECT_EQ(testnet.p2p_port, 18999u)
+        << "testnet sharechain port regressed — outbound dialer will reject "
+           "every real testnet peer as wrong_port";
+    EXPECT_NE(testnet.p2p_port, mainnet.p2p_port)
+        << "testnet must NOT inherit mainnet's sharechain port";
+}
+
 TEST(DashBugRegressions, Bug7_TestnetVsMainnetTargetRatio)
 {
     // Sanity: the testnet target should be roughly 2^(228-208) = 2^20 ~= 1e6
