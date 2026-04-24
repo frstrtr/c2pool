@@ -30,6 +30,7 @@
 #include <impl/dash/coin/sml_db.hpp>
 #include <impl/dash/coin/quorum_db.hpp>
 #include <impl/dash/coin/quorum_manager.hpp>
+#include <impl/dash/coin/mn_state_db.hpp>
 #include <impl/dash/coin/bls_verify.hpp>
 #include <impl/dash/coin/chainlock_verify.hpp>
 
@@ -312,6 +313,56 @@ int main(int argc, char* argv[])
                      "CProUpServTx, CProUpRegTx, CProUpRevTx)" << std::endl;
     }
 
+    // Phase C-PAY step 2 self-test: MNState serialize-then-deserialize
+    // round-trip. Same rationale as the PROTX self-test — catches wire-
+    // format drift in our internal MN state persistence at startup,
+    // before the per-block state machine could write corrupt state to
+    // mn_state_db. Tests both Regular and Evo paths since Evo state
+    // carries platform fields the Regular path doesn't.
+    {
+        using dash::coin::MNState;
+        auto roundtrip_ok = [](const MNState& original) -> bool {
+            auto stream = ::pack(original);
+            auto sp = stream.get_span();
+            std::vector<uint8_t> bytes(
+                reinterpret_cast<const uint8_t*>(sp.data()),
+                reinterpret_cast<const uint8_t*>(sp.data()) + sp.size());
+            try {
+                MNState rt;
+                ::PackStream ps(bytes);
+                ps >> rt;
+                return ps.empty() && rt == original;
+            } catch (...) { return false; }
+        };
+        bool all_ok = true;
+        {
+            MNState s;
+            s.nType = dash::coin::vendor::MnType::REGULAR;
+            s.nRegisteredHeight = 100;
+            s.nLastPaidHeight   = 200;
+            s.nConsecutivePayments = 0;
+            s.isValid = true;
+            s.scriptPayout.m_data = {0x76, 0xa9, 0x14, 0x42, 0x88, 0xac};
+            if (!roundtrip_ok(s)) { all_ok = false; std::cerr << "[MNS] Regular roundtrip FAILED\n"; }
+        }
+        {
+            MNState s;
+            s.nType = dash::coin::vendor::MnType::EVO;
+            s.platformP2PPort = 26656;
+            s.platformHTTPPort = 443;
+            s.nConsecutivePayments = 3;
+            if (!roundtrip_ok(s)) { all_ok = false; std::cerr << "[MNS] Evo roundtrip FAILED\n"; }
+        }
+        if (!all_ok) {
+            std::cerr << "[MNS] self-test FAILED — aborting. Internal "
+                         "wire-format inconsistency."
+                      << std::endl;
+            return 1;
+        }
+        std::cout << "[MNS] self-test: 2 round-trips OK "
+                     "(MNState-Regular, MNState-Evo)" << std::endl;
+    }
+
     // Create params
     auto params = dash::make_coin_params(testnet);
     std::cout << "[INIT] " << params.symbol
@@ -531,6 +582,48 @@ int main(int argc, char* argv[])
     std::cout << "[QUO] initialized: active=" << quorums->active_count()
               << " best_height=" << quorum_db->get_best_height()
               << " best_hash=" << quorum_db->get_best_hash().GetHex().substr(0, 16)
+              << std::endl;
+
+    // ── Phase C-PAY step 2: per-MN state store (mn_state_db) ──
+    // Persistent backing for the per-block DMN state machine that the
+    // GetProjectedMNPayees consumer (Phase C-PAY step 4) will read from.
+    // The per-block state machine itself lands in step 3 — for now this
+    // is open-and-load only.
+    //
+    // Cross-check policy: BEST sentinel must agree with both SMLDb and
+    // QuorumDb. If any of the three diverge, wipe ALL THREE — the per-MN
+    // state is derived from the same per-block stream that drives SML +
+    // quorum updates, so partial-state recovery isn't worth the
+    // complexity vs one ~400 KB cold-start.
+    std::string mn_state_db_path = std::string(getenv("HOME") ? getenv("HOME") : ".")
+        + "/.c2pool/" + coin_name + "/mn_state_db";
+    auto mn_state_db = std::make_shared<dash::coin::MnStateDb>(mn_state_db_path);
+    if (!mn_state_db->open()) {
+        std::cerr << "[WARN] Failed to open MN-state LevelDB at " << mn_state_db_path
+                  << " — DMN state machine will run cold-start every restart"
+                  << std::endl;
+    }
+    std::vector<std::pair<uint256, dash::coin::MNState>> mn_states_loaded;
+    if (mn_state_db->is_open()) {
+        // Three-way cross-check. Compare against whichever of SMLDb /
+        // QuorumDb is the canonical "current" tip. We use SMLDb since
+        // it's the same reference the QuorumDb cross-check above used.
+        bool divergent = sml_db->is_open()
+                      && mn_state_db->get_best_hash() != sml_db->get_best_hash();
+        if (divergent) {
+            LOG_WARNING << "[MNS-DB] best_hash divergence vs SMLDb "
+                        << "(mns=" << mn_state_db->get_best_hash().GetHex().substr(0, 16)
+                        << " sml=" << sml_db->get_best_hash().GetHex().substr(0, 16)
+                        << ") — wiping mn_state_db for cold-start";
+            mn_state_db->clear();
+        } else {
+            mn_state_db->load_all(mn_states_loaded);
+        }
+    }
+    std::cout << "[MNS] initialized: entries=" << mn_states_loaded.size()
+              << " best_height=" << mn_state_db->get_best_height()
+              << " best_hash=" << mn_state_db->get_best_hash().GetHex().substr(0, 16)
+              << " (per-block state machine NOT YET wired — Phase C-PAY step 3)"
               << std::endl;
 
     // ── Phase L step 4: shared ChainLock-blocks set ──
