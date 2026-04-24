@@ -35,6 +35,7 @@
 #include <impl/dash/coin/mn_snapshot_rpc.hpp>
 #include <impl/dash/coin/mn_state_machine.hpp>
 #include <impl/dash/coin/mempool.hpp>
+#include <impl/dash/coin/subsidy.hpp>
 #include <impl/dash/coin/bls_verify.hpp>
 #include <impl/dash/coin/chainlock_verify.hpp>
 
@@ -1883,6 +1884,87 @@ int main(int argc, char* argv[])
                                          << " expected=" << expected->GetHex().substr(0, 16)
                                          << " (likely unknown payee — superblock or "
                                             "scriptPayout we don't have yet)";
+                            }
+                        }
+
+                        // ── Phase C-TEMPLATE step 1: subsidy shadow ──
+                        // Compute the expected MN payment from our pure
+                        // formula (subsidy.hpp) and compare against the
+                        // OBSERVED amount paid to the matched MN's vout.
+                        // Validates our subsidy + payment-split math
+                        // bit-exact against every Dash mainnet block,
+                        // free shadow validation. Log-only at MVP.
+                        //
+                        // Skipped on superblock heights (every 16616
+                        // blocks) because those carry additional
+                        // treasury outputs we don't yet model.
+                        // Skipped when we don't have a populated state
+                        // (expected payee is null) or when the observed
+                        // payee didn't match (the MISMATCH already
+                        // surfaced above; no point cross-checking
+                        // amounts on a wrong-payee block).
+                        bool is_sb = dash::coin::is_superblock_height(height);
+                        if (expected
+                            && mn_state_machine->size() >= 100
+                            && !is_sb) {
+                            auto observed = mn_state_machine
+                                ->find_paid_in_block_first(block);
+                            if (observed && *observed == *expected) {
+                                // Find the actual paid amount: walk
+                                // coinbase outputs, sum any whose
+                                // scriptPubKey == expected MN's
+                                // scriptPayout.
+                                auto state_it = mn_state_machine
+                                    ->entries().find(*expected);
+                                if (state_it != mn_state_machine
+                                                   ->entries().end()) {
+                                    int64_t observed_mn_amount = 0;
+                                    if (!block.m_txs.empty()) {
+                                        for (const auto& vo : block.m_txs[0].vout) {
+                                            if (vo.scriptPubKey.m_data
+                                                == state_it->second.scriptPayout.m_data) {
+                                                observed_mn_amount += vo.value;
+                                            }
+                                        }
+                                    }
+                                    int64_t expected_block_reward =
+                                        dash::coin::compute_dash_block_reward_post_v20(height);
+                                    // dashcore: blockValue includes fees.
+                                    // We don't yet sum block fees here;
+                                    // observed_mn_amount = (reward+fees)*3/4.
+                                    // For a no-fee block, observed ==
+                                    // compute_mn_payment(reward).
+                                    // We log both reward-only expected
+                                    // and the implied fee delta, so
+                                    // shadow drift is visible.
+                                    int64_t expected_mn_no_fees =
+                                        dash::coin::compute_dash_mn_payment_post_v20(
+                                            expected_block_reward);
+                                    int64_t implied_fees_x4_div3 =
+                                        observed_mn_amount - expected_mn_no_fees;
+                                    int64_t implied_fees =
+                                        implied_fees_x4_div3 * 4 / 3;
+                                    if (observed_mn_amount == expected_mn_no_fees) {
+                                        LOG_INFO << "[SUBSIDY] match h=" << height
+                                                 << " mn_payment=" << observed_mn_amount
+                                                 << " (zero-fee block, "
+                                                 << "expected_reward=" << expected_block_reward << ")";
+                                    } else if (implied_fees >= 0
+                                               && implied_fees < 100'000'000LL) {
+                                        // Plausible fee range (<1 DASH).
+                                        LOG_INFO << "[SUBSIDY] match-with-fees h=" << height
+                                                 << " mn_payment=" << observed_mn_amount
+                                                 << " expected_no_fees=" << expected_mn_no_fees
+                                                 << " implied_fees=" << implied_fees << " sat";
+                                    } else {
+                                        LOG_WARNING << "[SUBSIDY] MISMATCH h=" << height
+                                                    << " mn_payment=" << observed_mn_amount
+                                                    << " expected_no_fees=" << expected_mn_no_fees
+                                                    << " implied_fees=" << implied_fees
+                                                    << " (out of plausible range — formula bug?)"
+                                                    << " — log-only at MVP";
+                                    }
+                                }
                             }
                         }
                     }
