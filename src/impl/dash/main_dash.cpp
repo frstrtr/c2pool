@@ -2043,22 +2043,37 @@ int main(int argc, char* argv[])
                                         << tx.extra_payload.size() << " B";
                             continue;
                         }
+                        // Phase C-TEMPLATE step 4: locate the matching
+                        // active entry + populate its mining_height
+                        // (idempotent — height is constant for a given
+                        // quorum). Dedup logging via mining_height
+                        // already-set check: only log on FIRST observe
+                        // (per-peer fan-out causes duplicate
+                        // on_full_block invocations for the same block).
+                        bool first_observation = false;
                         bool in_active = false;
                         if (quorums) {
-                            for (const auto& e : quorums->active_entries()) {
-                                if (e.key.llmqType == p.commitment.llmqType
-                                    && e.key.quorumHash == p.commitment.quorumHash) {
-                                    in_active = true;
-                                    break;
+                            auto* e = quorums->find_mutable(
+                                p.commitment.llmqType,
+                                p.commitment.quorumHash);
+                            if (e) {
+                                in_active = true;
+                                if (e->mining_height == 0) {
+                                    e->mining_height = height;
+                                    first_observation = true;
                                 }
                             }
                         }
-                        LOG_INFO << "[QC-MINED] block_h=" << height
-                                 << " llmqType=" << int(p.commitment.llmqType)
-                                 << " quorumHash=" << p.commitment.quorumHash.GetHex().substr(0, 16)
-                                 << " quorumIndex=" << p.commitment.quorumIndex
-                                 << " mined_payload_h=" << p.nHeight
-                                 << " " << (in_active ? "ACTIVE" : "ORPHAN");
+                        if (first_observation || !in_active) {
+                            // Log on first observation OR on orphan
+                            // (suppress duplicate per-peer firings of
+                            // already-recorded ACTIVE quorums).
+                            LOG_INFO << "[QC-MINED] block_h=" << height
+                                     << " llmqType=" << int(p.commitment.llmqType)
+                                     << " quorumHash=" << p.commitment.quorumHash.GetHex().substr(0, 16)
+                                     << " quorumIndex=" << p.commitment.quorumIndex
+                                     << " " << (in_active ? "ACTIVE-NEW" : "ORPHAN");
+                        }
                     }
 
                     // ── Phase C-MEMPOOL step 1+2: confirm-eviction ──

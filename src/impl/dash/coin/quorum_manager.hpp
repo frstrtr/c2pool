@@ -59,7 +59,41 @@ public:
     struct Entry {
         ActiveKey                  key;
         vendor::CFinalCommitment   commitment;
+        // Phase C-TEMPLATE step 4 prep: the block height where this
+        // quorum's qfcommit tx was mined. Populated by the
+        // [QC-MINED] scanner in main_dash on_full_block when the tx
+        // is observed. 0 = unknown (mnlistdiff added the quorum but
+        // we haven't yet seen the corresponding qfcommit tx — happens
+        // for quorums added before our header checkpoint, or while
+        // bootstrap is still draining).
+        //
+        // dashcore's GetMinedCommitmentsUntilBlock orders quorums by
+        // mining height (newest first per llmqType), which feeds
+        // CalcCbTxMerkleRootQuorums. Without this field we can't
+        // mirror that ordering in step 4c's compute_merkle_root_quorums.
+        //
+        // NOT YET PERSISTED. QuorumDb still serializes only the
+        // commitment; on restart, mining_height resets to 0 and
+        // repopulates as we observe blocks. Persistence lands in the
+        // same commit as compute_merkle_root_quorums (when it
+        // actually starts to matter).
+        uint32_t                   mining_height{0};
     };
+
+    // Look up an entry by (llmqType, quorumHash) and return a mutable
+    // pointer for in-place state updates (used by the qfcommit
+    // scanner to set mining_height when a type-6 tx is observed).
+    // Returns nullptr if not in active set.
+    Entry* find_mutable(uint8_t llmqType, const uint256& quorumHash)
+    {
+        for (auto& e : m_active) {
+            if (e.key.llmqType == llmqType
+                && e.key.quorumHash == quorumHash) {
+                return &e;
+            }
+        }
+        return nullptr;
+    }
 
     // Apply a parsed quorum tail. Mutates the active set in place.
     // Returns the count of inserts/replaces and deletes for logging.
