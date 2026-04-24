@@ -686,6 +686,45 @@ inline BuiltJob build(const dash::coin::DashWorkData& work,
         gentx_before.size());
     s.m_merkle_link.m_branch = branches_raw;             // index always 0
 
+    // ── [GENTX-OUTS] cross-impl diagnostic — 2026-04-24 ─────────────────
+    // p2pool-dash federation rejects every c2pool share as 'gentx doesn't
+    // match hash_link'. Dump the (amount, script) list + key inputs so we
+    // can compare with the same output from p2pool's regenerated gentx
+    // when share.check() fails. First differing entry = root cause.
+    {
+        static const char* HX = "0123456789abcdef";
+        auto hex_fn = [&](const std::vector<unsigned char>& v) {
+            std::string h; h.reserve(v.size() * 2);
+            for (auto b : v) { h += HX[b >> 4]; h += HX[b & 0xf]; }
+            return h;
+        };
+        LOG_INFO << "[GENTX-OUTS] subsidy=" << work.m_coinbase_value
+                 << " worker_payout(post-payments)="
+                 << (work.m_coinbase_value > [&]() {
+                        uint64_t tot = 0;
+                        for (auto& p : work.m_packed_payments) tot += p.amount;
+                        return tot;
+                    }() ? (work.m_coinbase_value - [&]() {
+                        uint64_t tot = 0;
+                        for (auto& p : work.m_packed_payments) tot += p.amount;
+                        return tot;
+                    }()) : 0)
+                 << " walked=" << out.pplns_walked
+                 << " scripts=" << out.pplns_scripts
+                 << " total_weight=" << total_weight
+                 << " n_outs=" << tx_outs_ordered.size();
+        for (size_t i = 0; i < tx_outs_ordered.size(); ++i) {
+            const auto& o = tx_outs_ordered[i];
+            LOG_INFO << "[GENTX-OUTS]  out[" << i << "] amount=" << o.amount
+                     << " script=" << hex_fn(o.script);
+        }
+        LOG_INFO << "[GENTX-OUTS] hash_link.length=" << s.m_hash_link.m_length
+                 << " state=" << hex_fn(std::vector<unsigned char>(
+                        s.m_hash_link.m_state.m_data.begin(),
+                        s.m_hash_link.m_state.m_data.end()))
+                 << " extra=" << hex_fn(s.m_hash_link.m_extra_data.m_data);
+    }
+
     // ── Stratum Job ─────────────────────────────────────────────────────
     auto prev_chars = work.m_previous_block.GetChars();
     std::span<const unsigned char> prev_span(
