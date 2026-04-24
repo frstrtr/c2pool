@@ -1,0 +1,367 @@
+#pragma once
+
+/// Phase C-MEMPOOL step 1: in-memory Dash mempool.
+///
+/// Adapted from src/impl/ltc/coin/mempool.hpp (~735 LOC) with these
+/// Dash-specific simplifications:
+///   - No segwit → no TX_WITH_WITNESS / TX_NO_WITNESS distinction; just
+///     `pack(tx)` and `dash::coin::dash_txid()`.
+///   - No weight calculation → just base_size = sizeof serialized tx.
+///   - No wtxid index (BIP 152 v2 never reaches Dash; we already pin
+///     CMPCTBLOCKS_VERSION=1 in Phase U).
+///   - Special-tx (type 1-4 ProTx, type 5 CCbTx, type 6 quorum
+///     commitment) are stored as opaque MutableTransaction blobs;
+///     consumers (Phase C-PAY's state machine, future block-template
+///     builder) decode their own way.
+///
+/// Step 1 SCOPE:
+///   - Storage layer (add/remove/contains/size/all_txs)
+///   - UTXO-based fee computation (when utxo arg passed)
+///   - LRU size-cap eviction (300 MB default)
+///   - Confirm-eviction via remove_for_block with double-spend conflict
+///     detection
+///   - Lock-protected (single std::mutex)
+///
+/// DEFERRED (later steps):
+///   - Feerate-sorted index for block-template selection (step 2)
+///   - BIP 35 mempool initial sync drain (step 3 — wire is already in
+///     p2p_node.hpp, no consumer yet)
+///   - revalidate_inputs / recompute_unknown_fees (step 2)
+///   - Orphan-children removal after conflict eviction (step 2)
+///   - Lightweight summary API for the explorer/dashboard (step 4)
+
+#include "block.hpp"
+#include "transaction.hpp"
+#include "utxo_adapter.hpp"
+
+#include <core/uint256.hpp>
+#include <core/pack.hpp>
+#include <core/hash.hpp>
+#include <core/log.hpp>
+#include <core/coin/utxo_view_cache.hpp>
+
+#include <atomic>
+#include <cstdint>
+#include <ctime>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <utility>
+#include <vector>
+
+namespace dash {
+namespace coin {
+
+struct MempoolEntry {
+    MutableTransaction tx;
+    uint256  txid;
+    uint32_t base_size{0};
+    uint64_t fee{0};            // satoshi (computed from UTXO when available)
+    bool     fee_known{false};
+    time_t   time_added{0};
+
+    double feerate_satvb() const {
+        return (fee_known && base_size > 0)
+            ? static_cast<double>(fee) / base_size
+            : 0.0;
+    }
+};
+
+class Mempool {
+public:
+    static constexpr size_t DEFAULT_MAX_BYTES   = 300ULL * 1024 * 1024;
+    static constexpr time_t DEFAULT_EXPIRY_SECS = 14 * 24 * 3600;
+
+    explicit Mempool(size_t max_bytes  = DEFAULT_MAX_BYTES,
+                     time_t expiry_sec = DEFAULT_EXPIRY_SECS)
+        : m_max_bytes(max_bytes)
+        , m_expiry_sec(expiry_sec)
+    {}
+
+    Mempool(const Mempool&) = delete;
+    Mempool& operator=(const Mempool&) = delete;
+
+    void set_utxo(::core::coin::UTXOViewCache* u) { m_utxo.store(u); }
+
+    // ── Mutation ────────────────────────────────────────────────────
+
+    /// Add a transaction. Returns false if already known. When `utxo`
+    /// is passed (or set_utxo was called), attempts fee computation;
+    /// falls back to fee_known=false on missing-input.
+    bool add_tx(const MutableTransaction& tx)
+    {
+        return add_tx(tx, m_utxo.load());
+    }
+
+    bool add_tx(const MutableTransaction& tx,
+                ::core::coin::UTXOViewCache* utxo)
+    {
+        uint256 txid = dash_txid(tx);
+
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_pool.count(txid)) return false;
+
+        MempoolEntry entry;
+        entry.tx         = tx;
+        entry.txid       = txid;
+        auto packed      = ::pack(tx);
+        entry.base_size  = static_cast<uint32_t>(packed.size());
+        entry.time_added = std::time(nullptr);
+
+        compute_fee_locked(entry, utxo);
+
+        // LRU eviction if over size cap.
+        int evicted = 0;
+        while (m_total_bytes + entry.base_size > m_max_bytes
+               && !m_time_index.empty()) {
+            evict_one_locked(m_time_index.begin()->second);
+            ++evicted;
+        }
+
+        m_pool[txid] = std::move(entry);
+        auto& stored = m_pool[txid];
+        m_time_index.emplace(stored.time_added, txid);
+        m_total_bytes += stored.base_size;
+
+        // Spent-outputs index for double-spend conflict detection.
+        for (const auto& vin : stored.tx.vin) {
+            m_spent_outputs[std::make_pair(
+                vin.prevout.hash, vin.prevout.index)] = txid;
+        }
+
+        // Periodic stats — every 100 entries + first 5 + every eviction.
+        if (m_pool.size() % 100 == 0 || m_pool.size() <= 5 || evicted > 0) {
+            LOG_INFO << "[MEMPOOL] add txid=" << txid.GetHex().substr(0, 16)
+                     << " size=" << m_pool.size()
+                     << " bytes=" << m_total_bytes << "/" << m_max_bytes
+                     << " base=" << stored.base_size
+                     << " fee=" << (stored.fee_known
+                                    ? std::to_string(stored.fee) : "?")
+                     << (evicted > 0 ? " evict=" + std::to_string(evicted) : "");
+        }
+        return true;
+    }
+
+    void remove_tx(const uint256& txid)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        remove_tx_locked(txid);
+    }
+
+    /// Eviction on block confirm. Two phases:
+    ///   1. Remove every confirmed tx by txid.
+    ///   2. Remove mempool txs that spend the same outputs as confirmed
+    ///      txs (double-spend conflicts).
+    void remove_for_block(const dash::coin::BlockType& block)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        int removed = 0, conflicts = 0;
+
+        // Phase 1
+        for (const auto& mtx : block.m_txs) {
+            uint256 txid = dash_txid(mtx);
+            if (m_pool.count(txid)) ++removed;
+            remove_tx_locked(txid);
+        }
+
+        // Phase 2
+        for (const auto& mtx : block.m_txs) {
+            for (const auto& vin : mtx.vin) {
+                auto key = std::make_pair(vin.prevout.hash,
+                                          vin.prevout.index);
+                auto it = m_spent_outputs.find(key);
+                if (it == m_spent_outputs.end()) continue;
+                auto conflict_txid = it->second;
+                if (m_pool.count(conflict_txid)) {
+                    LOG_INFO << "[MEMPOOL] removing conflict tx "
+                             << conflict_txid.GetHex().substr(0, 16)
+                             << " (spends same input as confirmed tx "
+                             << dash_txid(mtx).GetHex().substr(0, 16) << ")";
+                    ++conflicts;
+                }
+                remove_tx_locked(conflict_txid);
+            }
+        }
+
+        if (removed > 0 || conflicts > 0) {
+            LOG_INFO << "[MEMPOOL] block cleanup removed=" << removed
+                     << " conflicts=" << conflicts
+                     << " remaining=" << m_pool.size();
+        }
+    }
+
+    void evict_expired()
+    {
+        time_t cutoff = std::time(nullptr) - m_expiry_sec;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        int evicted = 0;
+        while (!m_time_index.empty()
+               && m_time_index.begin()->first < cutoff) {
+            evict_one_locked(m_time_index.begin()->second);
+            ++evicted;
+        }
+        if (evicted > 0) {
+            LOG_INFO << "[MEMPOOL] expiry sweep evicted " << evicted
+                     << " entries (older than " << (m_expiry_sec / 3600)
+                     << "h), remaining=" << m_pool.size();
+        }
+    }
+
+    void clear()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_pool.clear();
+        m_time_index.clear();
+        m_spent_outputs.clear();
+        m_total_bytes = 0;
+    }
+
+    // ── Queries ────────────────────────────────────────────────────
+
+    bool contains(const uint256& txid) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_pool.count(txid) > 0;
+    }
+
+    size_t size() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_pool.size();
+    }
+
+    size_t byte_size() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_total_bytes;
+    }
+
+    uint64_t total_known_fees() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        uint64_t sum = 0;
+        for (const auto& [_, e] : m_pool) {
+            if (e.fee_known) sum += e.fee;
+        }
+        return sum;
+    }
+
+    std::optional<MempoolEntry> get_entry(const uint256& txid) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_pool.find(txid);
+        if (it == m_pool.end()) return std::nullopt;
+        return it->second;
+    }
+
+    std::vector<uint256> all_txids() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<uint256> out;
+        out.reserve(m_pool.size());
+        for (auto& [txid, _] : m_pool) out.push_back(txid);
+        return out;
+    }
+
+    /// Snapshot of all transactions keyed by txid. Used (eventually)
+    /// by BIP 152 compact-block reconstruction + by block-template
+    /// builder in Phase C-TEMPLATE.
+    std::map<uint256, MutableTransaction> all_txs_map() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::map<uint256, MutableTransaction> out;
+        for (const auto& [txid, e] : m_pool) out[txid] = e.tx;
+        return out;
+    }
+
+private:
+    mutable std::mutex                                 m_mutex;
+    std::map<uint256, MempoolEntry>                    m_pool;
+    std::multimap<time_t, uint256>                     m_time_index;
+    std::map<std::pair<uint256, uint32_t>, uint256>    m_spent_outputs;
+    size_t                                             m_total_bytes{0};
+    size_t                                             m_max_bytes;
+    time_t                                             m_expiry_sec;
+    std::atomic<::core::coin::UTXOViewCache*>          m_utxo{nullptr};
+
+    void evict_one_locked(const uint256& txid)
+    {
+        remove_tx_locked(txid);
+    }
+
+    void remove_tx_locked(const uint256& txid)
+    {
+        auto it = m_pool.find(txid);
+        if (it == m_pool.end()) return;
+
+        // Drop from time index.
+        auto rng = m_time_index.equal_range(it->second.time_added);
+        for (auto rit = rng.first; rit != rng.second; ++rit) {
+            if (rit->second == txid) {
+                m_time_index.erase(rit);
+                break;
+            }
+        }
+
+        // Drop from spent-outputs index.
+        for (const auto& vin : it->second.tx.vin) {
+            auto key = std::make_pair(vin.prevout.hash, vin.prevout.index);
+            auto sit = m_spent_outputs.find(key);
+            if (sit != m_spent_outputs.end() && sit->second == txid) {
+                m_spent_outputs.erase(sit);
+            }
+        }
+
+        m_total_bytes -= it->second.base_size;
+        m_pool.erase(it);
+    }
+
+    /// Compute fee = sum(input_values) - sum(output_values).
+    /// Inputs come from UTXO set (confirmed); falls back to parent
+    /// mempool tx outputs (CPFP / chain-of-unconfirmed). Sets
+    /// entry.fee_known on success.
+    bool compute_fee_locked(MempoolEntry& entry,
+                            ::core::coin::UTXOViewCache* utxo)
+    {
+        if (!utxo) {
+            entry.fee_known = false;
+            return false;
+        }
+        uint64_t in_sum = 0, out_sum = 0;
+        for (const auto& vin : entry.tx.vin) {
+            ::core::coin::Outpoint op(vin.prevout.hash, vin.prevout.index);
+            ::core::coin::Coin coin;
+            if (utxo->get_coin(op, coin)) {
+                in_sum += static_cast<uint64_t>(coin.value);
+                continue;
+            }
+            // Try parent mempool tx (CPFP).
+            auto pit = m_pool.find(vin.prevout.hash);
+            if (pit != m_pool.end()
+                && vin.prevout.index < pit->second.tx.vout.size()) {
+                in_sum += static_cast<uint64_t>(
+                    pit->second.tx.vout[vin.prevout.index].value);
+                continue;
+            }
+            entry.fee_known = false;
+            entry.fee = 0;
+            return false;
+        }
+        for (const auto& vout : entry.tx.vout) {
+            out_sum += static_cast<uint64_t>(vout.value);
+        }
+        if (in_sum < out_sum) {
+            // Negative fee — invalid tx; mark unknown so we don't
+            // poison block templates with garbage values.
+            entry.fee_known = false;
+            entry.fee = 0;
+            return false;
+        }
+        entry.fee = in_sum - out_sum;
+        entry.fee_known = true;
+        return true;
+    }
+};
+
+} // namespace coin
+} // namespace dash

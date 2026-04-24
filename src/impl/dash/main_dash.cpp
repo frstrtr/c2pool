@@ -34,6 +34,7 @@
 #include <impl/dash/coin/mn_snapshot.hpp>
 #include <impl/dash/coin/mn_snapshot_rpc.hpp>
 #include <impl/dash/coin/mn_state_machine.hpp>
+#include <impl/dash/coin/mempool.hpp>
 #include <impl/dash/coin/bls_verify.hpp>
 #include <impl/dash/coin/chainlock_verify.hpp>
 
@@ -812,6 +813,26 @@ int main(int argc, char* argv[])
     std::cout << "[MNS] initialized: entries=" << mn_state_machine->size()
               << " best_height=" << mn_state_db->get_best_height()
               << " best_hash=" << mn_state_db->get_best_hash().GetHex().substr(0, 16)
+              << std::endl;
+
+    // ── Phase C-MEMPOOL step 1: in-memory tx pool ──
+    // Wires up new_tx events from broadcaster fan-out (any peer) into
+    // an in-memory store with optional UTXO-based fee computation.
+    // Block-confirm eviction lives in the on_full_block handler below
+    // (mempool->remove_for_block(block) fires alongside the existing
+    // SML/QUO/MnStateMachine consumers).
+    //
+    // Step 1 is storage + eviction only. The block-template builder
+    // (Phase C-TEMPLATE) consumes from this pool via all_txs_map() +
+    // a feerate-sorted index that lands in step 2.
+    //
+    // No persistence — dashcore doesn't persist mempool either; on
+    // restart we'll re-fetch via the BIP 35 `mempool` message that
+    // p2p_node already sends per-peer (line ~497).
+    auto dash_mempool = std::make_shared<dash::coin::Mempool>();
+    dash_mempool->set_utxo(&utxo_cache);
+    std::cout << "[MEMPOOL] initialized: empty (will refill via P2P relay + "
+                 "BIP 35 mempool drain on first peer handshake)"
               << std::endl;
 
     // ── Phase L step 4: shared ChainLock-blocks set ──
@@ -1715,6 +1736,31 @@ int main(int argc, char* argv[])
         auto dash_bs = std::make_shared<
             core::coin::BlockBootstrapState<dash::coin::BlockType>>();
 
+        // ── Phase C-MEMPOOL step 1: new_tx subscriber ──
+        // Per-peer fan-out from broadcaster: every tx that any peer
+        // pushes (relay) lands here. Mempool stores it (deduping by
+        // txid via dash_txid()). Bootstrap drain via BIP 35 mempool
+        // request happens automatically when a peer completes
+        // handshake (p2p_node.hpp:497 already sends it).
+        broadcaster->set_on_new_tx(
+            [dash_mempool, &ioc](
+                const std::string& /*peer_key*/,
+                const dash::coin::Transaction& tx) {
+                // Transaction is the immutable wire form (no Serialize
+                // method exposed); fields mirror MutableTransaction
+                // 1:1, so just direct-copy them across.
+                io::post(ioc, [dash_mempool, tx]() {
+                    dash::coin::MutableTransaction m;
+                    m.vin           = tx.vin;
+                    m.vout          = tx.vout;
+                    m.version       = tx.version;
+                    m.type          = tx.type;
+                    m.locktime      = tx.locktime;
+                    m.extra_payload = tx.extra_payload;
+                    dash_mempool->add_tx(m);
+                });
+            });
+
         broadcaster->set_on_full_block(
             [utxo = &utxo_cache,
              utxo_db_ptr = &utxo_db,
@@ -1724,6 +1770,7 @@ int main(int argc, char* argv[])
              cbtx_root = last_cbtx_mnlist_root,
              cbtx_height = last_cbtx_block_height,
              mn_state_db, mn_state_machine,
+             dash_mempool,
              &ioc](
                 const std::string& /*peer_key*/,
                 const dash::coin::BlockType& block) {
@@ -1838,6 +1885,15 @@ int main(int argc, char* argv[])
                                             "scriptPayout we don't have yet)";
                             }
                         }
+                    }
+
+                    // ── Phase C-MEMPOOL step 1: confirm-eviction ──
+                    // Remove confirmed txs (Phase 1: by-txid) +
+                    // double-spend conflicts (Phase 2: by spent
+                    // outputs) from mempool. Logs counts when non-zero
+                    // via [MEMPOOL] block cleanup line.
+                    if (dash_mempool) {
+                        dash_mempool->remove_for_block(block);
                     }
                 }
 
