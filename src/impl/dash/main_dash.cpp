@@ -39,6 +39,7 @@
 #include <impl/dash/coin/quorum_root.hpp>
 #include <impl/dash/coin/embedded_gbt.hpp>
 #include <impl/dash/coin/credit_pool.hpp>
+#include <impl/dash/coin/credit_pool_db.hpp>
 #include <impl/dash/coin/bls_verify.hpp>
 #include <impl/dash/coin/chainlock_verify.hpp>
 
@@ -675,18 +676,47 @@ int main(int argc, char* argv[])
     auto last_cbtx_credit_pool = std::make_shared<int64_t>(0);
     auto last_cbtx_credit_pool_height = std::make_shared<uint32_t>(0);
 
-    // Phase C-TEMPLATE step 13: DIP-0027 credit-pool state machine.
-    // Apply per-block asset-lock/unlock deltas on top of a seed
-    // balance pulled from the first observed CCbTx. Computed value
-    // feeds build_embedded_cbtx() for bit-exact CCbTx.creditPoolBalance
-    // even on blocks WITH asset-lock activity (closes the last
-    // [CBTX-XCHECK] gap).
+    // Phase C-TEMPLATE step 13 + 13b: DIP-0027 credit-pool state
+    // machine + persistence. Apply per-block asset-lock/unlock deltas
+    // on top of a seed balance pulled from the first observed CCbTx.
     //
-    // In-memory at MVP. Persistence + sentinel cross-check (CreditPoolDb)
-    // is the natural step 13b follow-up, mirroring SMLDb/QuorumDb/
-    // MnStateDb. Cold-start re-seeds from the first post-restart
-    // observed CCbTx — same window as Phase L's CLSIG cycle reset.
+    // Persistence via CreditPoolDb: on every successful apply we
+    // write_state(best_hash, best_height, balance, initialized).
+    // On startup we load the persisted state and re-hydrate
+    // CreditPool, eliminating the cold-start re-seed window.
+    //
+    // Sentinel cross-check on best_hash vs SMLDb (same fail-safe
+    // pattern as the other dbs): on divergence wipe the credit pool
+    // db so a fresh re-seed from the next observed CCbTx happens.
+    std::string credit_pool_db_path = std::string(getenv("HOME") ? getenv("HOME") : ".")
+        + "/.c2pool/" + coin_name + "/credit_pool_db";
+    auto credit_pool_db = std::make_shared<dash::coin::CreditPoolDb>(credit_pool_db_path);
+    if (!credit_pool_db->open()) {
+        std::cerr << "[WARN] Failed to open credit-pool LevelDB at "
+                  << credit_pool_db_path
+                  << " — credit pool will re-seed every restart"
+                  << std::endl;
+    }
     auto credit_pool = std::make_shared<dash::coin::CreditPool>();
+    if (credit_pool_db->is_open()) {
+        bool divergent = sml_db->is_open()
+                      && !credit_pool_db->get_best_hash().IsNull()
+                      && credit_pool_db->get_best_hash() != sml_db->get_best_hash();
+        if (divergent) {
+            LOG_WARNING << "[CP-DB] best_hash divergence vs SMLDb "
+                        << "(cp="  << credit_pool_db->get_best_hash().GetHex().substr(0, 16)
+                        << " sml=" << sml_db->get_best_hash().GetHex().substr(0, 16)
+                        << ") — wiping credit_pool_db for re-seed";
+            credit_pool_db->clear();
+        } else if (credit_pool_db->is_initialized()) {
+            credit_pool->seed(credit_pool_db->get_balance(),
+                              credit_pool_db->get_best_height());
+        }
+    }
+    std::cout << "[CP] initialized: balance=" << credit_pool->balance()
+              << " height=" << credit_pool->height()
+              << " initialized=" << (credit_pool->initialized() ? "yes" : "no")
+              << std::endl;
     std::cout << "[SML] initialized: entries=" << sml->size()
               << " best_height=" << sml_db->get_best_height()
               << " best_hash=" << sml_db->get_best_hash().GetHex().substr(0, 16)
@@ -1898,7 +1928,7 @@ int main(int argc, char* argv[])
              cbtx_height = last_cbtx_block_height,
              cbtx_credit_pool = last_cbtx_credit_pool,
              cbtx_credit_pool_height = last_cbtx_credit_pool_height,
-             credit_pool,
+             credit_pool, credit_pool_db,
              mn_state_db, mn_state_machine,
              dash_mempool,
              quorums,
@@ -2000,6 +2030,17 @@ int main(int argc, char* argv[])
                                             cbtx.creditPoolBalance,
                                             height);
                                     }
+                                }
+                                // Step 13b: persist after every apply
+                                // so a restart between blocks doesn't
+                                // lose the running balance.
+                                if (credit_pool_db
+                                    && credit_pool_db->is_open()) {
+                                    credit_pool_db->write_state(
+                                        block_hash,
+                                        height,
+                                        credit_pool->balance(),
+                                        credit_pool->initialized());
                                 }
                             }
 
@@ -2490,6 +2531,7 @@ int main(int argc, char* argv[])
              chainlocked_blocks,
              sml, sml_db, quorums, quorum_db,
              mn_state_db, mn_state_machine,
+             credit_pool, credit_pool_db,
              dash_bs, &ioc](
                 const uint256& old_tip, uint32_t old_height,
                 const uint256& new_tip, uint32_t new_height) {
@@ -2500,6 +2542,7 @@ int main(int argc, char* argv[])
                     [bcaster, chain, utxo, utxo_db_ptr,
                      chainlocked_blocks, sml, sml_db, quorums, quorum_db,
                      mn_state_db, mn_state_machine,
+                     credit_pool, credit_pool_db,
                      dash_bs,
                      old_tip, old_height, new_tip, new_height]() {
                   try {
@@ -2639,10 +2682,12 @@ int main(int argc, char* argv[])
                         if (mn_state_machine) {
                             mn_state_machine->load({});
                         }
+                        if (credit_pool) credit_pool->clear();
                         sml_db->clear();
                         quorum_db->clear();
                         if (mn_state_db) mn_state_db->clear();
-                        LOG_WARNING << "[EMB-DASH] SML+QuorumDb+MnStateDb reorg drop: "
+                        if (credit_pool_db) credit_pool_db->clear();
+                        LOG_WARNING << "[EMB-DASH] SML+QuorumDb+MnStateDb+CreditPoolDb reorg drop: "
                                        "cleared sml_n=" << sml_n
                                     << " quo_n=" << quo_n
                                     << " mns_n=" << mns_n
