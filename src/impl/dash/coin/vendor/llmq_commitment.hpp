@@ -168,6 +168,49 @@ struct CFinalCommitment
     }
 };
 
+// ── CFinalCommitmentTxPayload ─────────────────────────────────────────────
+//
+// The wrapping payload for type-6 (TRANSACTION_QUORUM_COMMITMENT)
+// special txs. Each accepted Dash block can carry one or more of
+// these — they're how a successfully-finalized DKG cycle's commitment
+// gets committed to the chain.
+//
+// We parse them in on_full_block to track per-quorum mining heights
+// (Phase C-TEMPLATE step 3 prep): merkleRootQuorums computation needs
+// to order quorums by mining height (newest-first per llmqType), and
+// mnlistdiff alone doesn't carry that info — only the chain does.
+//
+// Vendored from dashcore/src/llmq/commitment.h:147-165 @ cfad414.
+struct CFinalCommitmentTxPayload
+{
+    static constexpr uint16_t SPECIALTX_TYPE = 6;
+    static constexpr uint16_t CURRENT_VERSION = 1;
+
+    uint16_t          nVersion{CURRENT_VERSION};
+    uint32_t          nHeight{0};
+    CFinalCommitment  commitment;
+
+    SERIALIZE_METHODS(CFinalCommitmentTxPayload)
+    {
+        READWRITE(obj.nVersion, obj.nHeight, obj.commitment);
+    }
+};
+
+inline bool parse_qfcommit_payload(const std::vector<unsigned char>& bytes,
+                                   CFinalCommitmentTxPayload& out)
+{
+    if (bytes.empty()) return false;
+    try {
+        ::PackStream s(bytes);
+        s >> out;
+        // Match the strict-tail policy from parse_protx_payload — an
+        // unconsumed remainder is a wire-format drift smell.
+        return s.cursor_size() == 0;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
 } // namespace vendor
 } // namespace coin
 } // namespace dash

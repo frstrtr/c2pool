@@ -1772,6 +1772,7 @@ int main(int argc, char* argv[])
              cbtx_height = last_cbtx_block_height,
              mn_state_db, mn_state_machine,
              dash_mempool,
+             quorums,
              &ioc](
                 const std::string& /*peer_key*/,
                 const dash::coin::BlockType& block) {
@@ -2007,6 +2008,57 @@ int main(int argc, char* argv[])
                                 }
                             }
                         }
+                    }
+
+                    // ── Phase C-TEMPLATE step 3 prep: qfcommit scanner ──
+                    // Walk non-coinbase txs for type-6
+                    // (TRANSACTION_QUORUM_COMMITMENT). Each parsed
+                    // CFinalCommitmentTxPayload tells us a quorum was
+                    // MINED in this block. We need this for the
+                    // merkleRootQuorums computation later — mnlistdiff
+                    // alone gives us the active set but NOT each
+                    // quorum's mining height.
+                    //
+                    // Step 3 SCOPE this commit: log-only data layer.
+                    // Step 4 will: (a) extend QuorumManager::Entry +
+                    // QuorumDb with mining_height; (b) wire this
+                    // scanner to UPDATE that field; (c) add
+                    // [QUORUMS-XCHECK] shadow vs observed
+                    // CCbTx.merkleRootQuorums.
+                    //
+                    // Cross-check vs current QuorumManager: log
+                    // ORPHAN if the qfcommit's quorum isn't in our
+                    // active set (mnlistdiff race — diff for the
+                    // quorum's containing block hasn't arrived yet,
+                    // or we missed it).
+                    for (size_t i = 1; i < block.m_txs.size(); ++i) {
+                        const auto& tx = block.m_txs[i];
+                        if (tx.type != 6) continue;
+                        if (tx.extra_payload.empty()) continue;
+                        dash::coin::vendor::CFinalCommitmentTxPayload p;
+                        if (!dash::coin::vendor::parse_qfcommit_payload(
+                                tx.extra_payload, p)) {
+                            LOG_WARNING << "[QC-MINED] block_h=" << height
+                                        << " parse FAILED — payload "
+                                        << tx.extra_payload.size() << " B";
+                            continue;
+                        }
+                        bool in_active = false;
+                        if (quorums) {
+                            for (const auto& e : quorums->active_entries()) {
+                                if (e.key.llmqType == p.commitment.llmqType
+                                    && e.key.quorumHash == p.commitment.quorumHash) {
+                                    in_active = true;
+                                    break;
+                                }
+                            }
+                        }
+                        LOG_INFO << "[QC-MINED] block_h=" << height
+                                 << " llmqType=" << int(p.commitment.llmqType)
+                                 << " quorumHash=" << p.commitment.quorumHash.GetHex().substr(0, 16)
+                                 << " quorumIndex=" << p.commitment.quorumIndex
+                                 << " mined_payload_h=" << p.nHeight
+                                 << " " << (in_active ? "ACTIVE" : "ORPHAN");
                     }
 
                     // ── Phase C-MEMPOOL step 1+2: confirm-eviction ──
