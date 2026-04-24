@@ -1777,18 +1777,30 @@ int main(int argc, char* argv[])
                         }
                     }
 
-                    // ── Phase C-PAY step 4: per-block state machine ──
-                    // Replaces the step 1 smoke-test scanner with the
-                    // real consumer. Walks special txs + collateral
-                    // spends + coinbase outputs to mutate the live MN
-                    // state. Persists via mn_state_db.write_all after
-                    // every block (matches SMLDb / QuorumDb cadence).
+                    // ── Phase C-PAY step 4 + 5: state machine + projection ──
                     //
-                    // Logged only when something interesting happens
-                    // (registered/updated/revoked/spent/paid > 0) so
-                    // bootstrap doesn't flood logs with zero-delta
-                    // lines for the ~3000 blocks of cold-start scan.
+                    // Step 5 (this block): BEFORE applying mutations,
+                    // capture the "expected payee" from current state
+                    // (which represents post-block-(H-1), i.e. dashcore's
+                    // prevList for block H). Apply mutations (state
+                    // machine), then OBSERVE which MN actually got paid
+                    // by walking coinbase outputs. Log [PAY] match if
+                    // they agree, [PAY] MISMATCH otherwise. Log-only at
+                    // MVP; consensus-impacting consumer (e.g. dropping
+                    // bad blocks) waits for ~1 week clean-soak telemetry.
+                    //
+                    // [PAY] silence — three normal cases produce no log:
+                    //  a) state machine empty (pre-bootstrap or
+                    //     bootstrap not yet wired) — no expected, no
+                    //     observed → nothing to compare
+                    //  b) coinbase paid an unknown address (e.g.
+                    //     superblock budget output) — no observed
+                    //  c) state machine populated with EXPECTED == OBSERVED
+                    //     and we want clean logs — emit [PAY] match
+                    //     ONLY when state has at least 100 MNs (cheap
+                    //     gating to silence the cold-bootstrap noise)
                     {
+                        auto expected = mn_state_machine->find_expected_payee();
                         auto r = mn_state_machine->apply_block(block, height);
                         if (mn_state_db->is_open()
                             && (r.registered + r.updated + r.revoked
@@ -1799,8 +1811,6 @@ int main(int argc, char* argv[])
                         }
                         if (r.registered + r.updated + r.revoked
                             + r.spent > 0) {
-                            // Don't log paid-only events (every block
-                            // pays a MN; would be one log per block).
                             LOG_INFO << "[MNS] applied: +R" << r.registered
                                      << "/U" << r.updated
                                      << "/V" << r.revoked
@@ -1808,6 +1818,25 @@ int main(int argc, char* argv[])
                                      << " paid=" << r.paid
                                      << " total=" << r.total_after
                                      << " (h=" << height << ")";
+                        }
+                        // Step 5 verification — only meaningful when state
+                        // has been bootstrapped (>=100 MNs threshold).
+                        if (expected && mn_state_machine->size() >= 100) {
+                            auto observed = mn_state_machine->find_paid_in_block_first(block);
+                            if (observed && *observed == *expected) {
+                                LOG_INFO << "[PAY] match h=" << height
+                                         << " payee=" << expected->GetHex().substr(0, 16);
+                            } else if (observed) {
+                                LOG_WARNING << "[PAY] MISMATCH h=" << height
+                                            << " expected=" << expected->GetHex().substr(0, 16)
+                                            << " observed=" << observed->GetHex().substr(0, 16)
+                                            << " — log-only at MVP";
+                            } else {
+                                LOG_INFO << "[PAY] no-observed h=" << height
+                                         << " expected=" << expected->GetHex().substr(0, 16)
+                                         << " (likely unknown payee — superblock or "
+                                            "scriptPayout we don't have yet)";
+                            }
                         }
                     }
                 }

@@ -77,6 +77,7 @@
 #include <core/uint256.hpp>
 
 #include <cstdint>
+#include <cstring>
 #include <map>
 #include <optional>
 #include <span>
@@ -146,6 +147,73 @@ public:
             if (st.scriptPayout.m_data == script) return h;
         }
         return std::nullopt;
+    }
+
+    // Walk a block's coinbase outputs and return the FIRST output that
+    // matches a known MN's scriptPayout. Used by step 5 to cross-check
+    // projection vs observation. Returns nullopt if nothing matched
+    // (DMN state empty pre-bootstrap, OR coinbase paid an unknown
+    // address — e.g. superblock budget output).
+    std::optional<uint256> find_paid_in_block_first(
+        const dash::coin::BlockType& block) const
+    {
+        if (block.m_txs.empty()) return std::nullopt;
+        for (const auto& vout : block.m_txs[0].vout) {
+            if (auto m = find_by_payout_script(vout.scriptPubKey.m_data)) {
+                return m;
+            }
+        }
+        return std::nullopt;
+    }
+
+    // Phase C-PAY step 5: vendor of dashcore
+    // CDeterministicMNList::GetMNPayee() @ cfad414 (deterministicmns.cpp:184).
+    //
+    // For Dash mainnet at height > 2,128,896 (MN_RR activation), the
+    // Evo 4-in-a-row bonus path is DEAD (`if isv19Active &&
+    // !isMNRewardReallocation` evaluates to false). All current and
+    // future blocks just use the standard CompareByLastPaid scan.
+    // c2pool-dash's header checkpoint is at h=2.4M so we always
+    // operate post-MN_RR — we omit the Evo bonus path with a TODO
+    // for testnet support pre-1,066,900.
+    //
+    // CompareByLastPaid_GetHeight (line 158-167):
+    //   h = nLastPaidHeight
+    //   if nPoSeRevivedHeight > h: h = nPoSeRevivedHeight
+    //   else if h == 0: h = nRegisteredHeight
+    //
+    // CompareByLastPaid (line 169-177):
+    //   ah == bh: tiebreak by proTxHash ascending
+    //   else:     ah < bh
+    //
+    // CRITICAL: tiebreaker uses dashcore's uint256 operator< which is
+    // memcmp(LE-byte) — NOT c2pool's CompareTo (BE-integer). Same
+    // gotcha as Bug A in vendor/simplifiedmns.hpp's sort. We use
+    // std::memcmp directly to match dashcore's wire semantics.
+    std::optional<uint256> find_expected_payee() const
+    {
+        std::optional<uint256> best_hash;
+        int best_h = 0;
+        for (const auto& [hash, st] : m_entries) {
+            if (!st.isValid) continue;
+            int h = static_cast<int>(st.nLastPaidHeight);
+            if (st.nPoSeRevivedHeight != 0
+                && static_cast<int>(st.nPoSeRevivedHeight) > h) {
+                h = static_cast<int>(st.nPoSeRevivedHeight);
+            } else if (h == 0) {
+                h = static_cast<int>(st.nRegisteredHeight);
+            }
+            bool better = !best_hash.has_value()
+                       || h < best_h
+                       || (h == best_h
+                           && std::memcmp(hash.data(),
+                                          best_hash->data(), 32) < 0);
+            if (better) {
+                best_h    = h;
+                best_hash = hash;
+            }
+        }
+        return best_hash;
     }
 
     // Dump entire current state for persistence (mn_state_db.write_all).
