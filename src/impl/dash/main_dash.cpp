@@ -3343,6 +3343,12 @@ int main(int argc, char* argv[])
     struct TemplateEntry {
         dash::DashShare share;
         std::vector<dash::coin::MutableTransaction> tx_bodies;
+        // Phase C-CUTOVER step 2: track which GBT path produced this
+        // template. Used by the submit handler to escalate
+        // [SUBMIT-SANITY] log severity when an embedded-built block
+        // gets rejected by RPC — that's a critical "our embedded
+        // build has a consensus bug" signal.
+        bool built_by_embedded{false};
     };
     std::unordered_map<std::string, TemplateEntry> share_templates;
     std::deque<std::string> share_template_order;
@@ -3351,9 +3357,11 @@ int main(int argc, char* argv[])
 
     auto store_template = [&](const std::string& job_id,
                               dash::DashShare tmpl,
-                              std::vector<dash::coin::MutableTransaction> tx_bodies) {
+                              std::vector<dash::coin::MutableTransaction> tx_bodies,
+                              bool built_by_embedded) {
         std::lock_guard<std::mutex> lock(share_templates_mtx);
-        share_templates[job_id] = TemplateEntry{std::move(tmpl), std::move(tx_bodies)};
+        share_templates[job_id] = TemplateEntry{
+            std::move(tmpl), std::move(tx_bodies), built_by_embedded};
         share_template_order.push_back(job_id);
         while (share_template_order.size() > MAX_TEMPLATE_HISTORY) {
             share_templates.erase(share_template_order.front());
@@ -3459,6 +3467,31 @@ int main(int argc, char* argv[])
                         } catch (const std::exception& e) {
                             LOG_WARNING << "[SUBMIT] submitblock threw: " << e.what();
                         }
+                    }
+
+                    // Phase C-CUTOVER step 2: submit-side sanity hop.
+                    // If the template was built via embedded AND RPC
+                    // is available AND RPC said reject — this is a
+                    // critical signal that our embedded build has a
+                    // consensus bug. The block is already on the
+                    // network via P2P; the sanity-hop just escalates
+                    // visibility so the operator investigates BEFORE
+                    // mining the next embedded-built block.
+                    auto tmpl_for_sanity = fetch_template(s.job_id);
+                    bool used_embedded = tmpl_for_sanity
+                        && tmpl_for_sanity->built_by_embedded;
+                    if (used_embedded && rpc_attempted && !rpc_accepted) {
+                        LOG_WARNING << "[SUBMIT-SANITY] *** EMBEDDED-BUILT "
+                                       "BLOCK REJECTED BY RPC *** height="
+                                    << ctx->height
+                                    << " hash=" << r.x11_hash.GetHex().substr(0, 16)
+                                    << " — block_hex retained for diff vs "
+                                       "dashd's getblocktemplate: "
+                                    << r.block_hex.substr(0, 80) << "...";
+                    } else if (used_embedded && rpc_accepted) {
+                        LOG_INFO << "[SUBMIT-SANITY] embedded-built block "
+                                    "ACCEPTED by RPC h=" << ctx->height
+                                 << " — embedded path validated end-to-end";
                     }
 
                     // record_found_block: fire on either RPC acceptance
@@ -3569,6 +3602,7 @@ int main(int argc, char* argv[])
         // state machine); falls through to RPC if that fails AND
         // RPC is available.
         std::optional<dash::coin::DashWorkData> work_opt;
+        bool work_built_by_embedded = false;
         if (use_embedded_gbt) {
             if (sml && quorums && mn_state_machine && dash_mempool
                 && header_chain.height() > 0
@@ -3612,6 +3646,7 @@ int main(int argc, char* argv[])
                             cp_value);
                         w.m_coinbase_payload = dash::coin::encode_cbtx(cbtx);
                         work_opt = std::move(w);
+                        work_built_by_embedded = true;
                     }
                 } catch (const std::exception& e) {
                     LOG_WARNING << "[JOB] embedded GBT build threw: " << e.what()
@@ -3733,7 +3768,8 @@ int main(int argc, char* argv[])
                     // accepted share (matches p2pool-dash's per-session
                     // vardiff). A pool-wide broadcast would stomp on that.
                     stratum_server->notify_all(built.job, built.context);
-                    store_template(built.job.job_id, built.share_template, built.tx_bodies);
+                    store_template(built.job.job_id, built.share_template,
+                                   built.tx_bodies, work_built_by_embedded);
                     miner_count = stratum_server->session_count();
                 }
 
