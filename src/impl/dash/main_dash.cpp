@@ -100,6 +100,12 @@ int main(int argc, char* argv[])
     std::string dashd_rpc_host;
     uint16_t    dashd_rpc_port = 9998;
     std::string dashd_rpc_userpass;
+    // Phase C-CUTOVER: source of GBT work driving stratum jobs.
+    //   "auto"     — embedded when --dashd-rpc absent, RPC otherwise (default)
+    //   "embedded" — force embedded GBT (works without --dashd-rpc; cross-checks
+    //                against RPC when present)
+    //   "rpc"      — force RPC GBT (legacy behavior; requires --dashd-rpc)
+    std::string gbt_source = "auto";
     std::string dash_mn_snapshot_path;     // --dash-mn-snapshot operator override
     std::string dump_mn_snapshot_output;   // --dump-mn-snapshot one-shot dumper
     uint16_t    stratum_port   = 0;       // 0 = disabled; canonical Dash p2pool stratum port is 7903
@@ -232,6 +238,17 @@ int main(int argc, char* argv[])
                 } else {
                     dashd_rpc_userpass = s.substr(b + 1, c - (b + 1)) + ":" + s.substr(c + 1);
                 }
+            }
+        }
+        // --gbt-source auto|embedded|rpc
+        else if (arg == "--gbt-source" && i + 1 < argc) {
+            std::string s = argv[++i];
+            if (s == "auto" || s == "embedded" || s == "rpc") {
+                gbt_source = s;
+            } else {
+                std::cerr << "[ARG] --gbt-source must be auto|embedded|rpc, got: "
+                          << s << std::endl;
+                return 2;
             }
         }
     }
@@ -3530,11 +3547,105 @@ int main(int argc, char* argv[])
     const std::string pool_tag = "/c2pool-dash:0.1/";
     const size_t eff_window = pplns_window != 0 ? pplns_window : params.chain_length;
     std::function<void(const boost::system::error_code&)> job_fn;
+    // Resolve gbt_source policy once. "auto" picks embedded when no RPC
+    // configured, otherwise RPC.
+    const bool use_embedded_gbt =
+        (gbt_source == "embedded")
+     || (gbt_source == "auto" && dashd_rpc_host.empty());
+    LOG_INFO << "[JOB] GBT source policy: requested=" << gbt_source
+             << " resolved=" << (use_embedded_gbt ? "embedded" : "rpc")
+             << " (--dashd-rpc " << (dashd_rpc_host.empty() ? "absent" : "present") << ")";
+
     job_fn = [&, job_timer](const boost::system::error_code& ec) {
         if (ec) return;
-        if (coin_rpc && coin_rpc->is_connected() && !miner_script.empty()) {
+        if (miner_script.empty()) {
+            job_timer->expires_after(std::chrono::seconds(10));
+            job_timer->async_wait(job_fn);
+            return;
+        }
+        // Phase C-CUTOVER: build work via either embedded or RPC,
+        // depending on resolved policy. Embedded path requires the
+        // full consensus state to be populated (SML, Quorums, MN
+        // state machine); falls through to RPC if that fails AND
+        // RPC is available.
+        std::optional<dash::coin::DashWorkData> work_opt;
+        if (use_embedded_gbt) {
+            if (sml && quorums && mn_state_machine && dash_mempool
+                && header_chain.height() > 0
+                && !sml->mnList.empty()
+                && mn_state_machine->size() >= 100) {
+                try {
+                    auto tip_entry = header_chain.tip();
+                    if (tip_entry) {
+                        // MTP-11 from header_chain.
+                        std::vector<uint32_t> times;
+                        times.reserve(11);
+                        for (uint32_t back = 0; back < 11; ++back) {
+                            uint32_t h = header_chain.height();
+                            if (back > h) break;
+                            auto e = header_chain.get_header_by_height(h - back);
+                            if (!e) break;
+                            times.push_back(e->header.m_timestamp);
+                        }
+                        std::sort(times.begin(), times.end());
+                        uint32_t mtp = times.empty() ? 0
+                            : times[times.size() / 2];
+                        uint32_t bits = header_chain.next_work_required();
+                        if (bits == 0) bits = 0x1d00ffff; // safety pre-DGW window
+                        auto coin_params_for_addr = dash::make_coin_params(testnet);
+                        auto w = dash::coin::build_embedded_workdata(
+                            header_chain.height(),
+                            tip_entry->hash,
+                            *mn_state_machine,
+                            *dash_mempool,
+                            bits, mtp,
+                            coin_params_for_addr.address_version,
+                            coin_params_for_addr.address_p2sh_version);
+                        // CCbTx payload — pack and attach.
+                        int64_t cp_value =
+                            credit_pool && credit_pool->initialized()
+                                ? credit_pool->balance()
+                                : *last_cbtx_credit_pool;
+                        auto cbtx = dash::coin::build_embedded_cbtx(
+                            header_chain.height(), *sml, *quorums,
+                            best_clsig->height, best_clsig->sig,
+                            cp_value);
+                        w.m_coinbase_payload = dash::coin::encode_cbtx(cbtx);
+                        work_opt = std::move(w);
+                    }
+                } catch (const std::exception& e) {
+                    LOG_WARNING << "[JOB] embedded GBT build threw: " << e.what()
+                                << " — will try RPC fallback if available";
+                }
+            } else {
+                static int skip_log = 0;
+                if (++skip_log <= 5 || skip_log % 24 == 0) {
+                    LOG_INFO << "[JOB] embedded GBT not yet ready: "
+                             << "header_h=" << header_chain.height()
+                             << " sml=" << (sml ? sml->mnList.size() : 0)
+                             << " mns=" << (mn_state_machine ? mn_state_machine->size() : 0)
+                             << " — waiting for state to populate";
+                }
+            }
+        }
+        // Fall through to RPC if embedded didn't produce work AND RPC
+        // is available (only happens with --gbt-source=auto OR
+        // explicit --gbt-source=rpc).
+        if (!work_opt && coin_rpc && coin_rpc->is_connected()) {
             try {
-                auto work = coin_rpc->getwork();
+                work_opt = coin_rpc->getwork();
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[JOB] RPC getwork threw: " << e.what();
+            }
+        }
+        if (!work_opt) {
+            // No work source available this tick. Reschedule and wait.
+            job_timer->expires_after(std::chrono::seconds(5));
+            job_timer->async_wait(job_fn);
+            return;
+        }
+        try {
+            auto& work = *work_opt;
 
                 // Feed network difficulty from GBT to the adjustment engine.
                 {
@@ -3643,9 +3754,8 @@ int main(int argc, char* argv[])
                          << " parity_walked=" << built.pplns_walked
                          << " parity_scripts=" << built.pplns_scripts
                          << " ref_hash=" << built.ref_hash.GetHex().substr(0, 16);
-            } catch (const std::exception& e) {
-                LOG_WARNING << "[JOB] build failed: " << e.what();
-            }
+        } catch (const std::exception& e) {
+            LOG_WARNING << "[JOB] build failed: " << e.what();
         }
         job_timer->expires_after(std::chrono::seconds(10));
         job_timer->async_wait(job_fn);
