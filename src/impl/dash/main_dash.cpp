@@ -897,6 +897,21 @@ int main(int argc, char* argv[])
     auto chainlocked_blocks =
         std::make_shared<std::map<uint256, int32_t>>();
 
+    // ── Phase C-SUBMIT step 2: pending-block roundtrip tracker ──
+    // When a block is submitted via P2P, record {hash, send_epoch_ms}.
+    // on_full_block matches the hash → confirms roundtrip + erases.
+    // A periodic timer warns about any pending older than 60 s — that
+    // means we sent a block but it never came back as a peer-relayed
+    // full block, which on Dash mainnet means the block was rejected
+    // somewhere upstream. Without this we just send-and-pray; the
+    // admin has no way to know if a found block actually landed.
+    struct PendingBlock {
+        uint64_t  sent_at_ms{0};
+        uint32_t  height{0};
+    };
+    auto pending_block_submits =
+        std::make_shared<std::map<uint256, PendingBlock>>();
+
     // ── Phase C-TEMPLATE step 7: best-CLSIG cycle tracker ──
     // Records the highest-height verified ChainLock signature seen
     // so far, with its block hash and raw 96-byte sig. Drives the
@@ -1932,6 +1947,7 @@ int main(int argc, char* argv[])
              mn_state_db, mn_state_machine,
              dash_mempool,
              quorums,
+             pending_block_submits,
              &ioc](
                 const std::string& /*peer_key*/,
                 const dash::coin::BlockType& block) {
@@ -1939,6 +1955,25 @@ int main(int argc, char* argv[])
                     static_cast<const dash::coin::BlockHeaderType&>(block));
                 auto block_hash = dash::crypto::hash_x11(
                     packed_hdr.get_span());
+
+                // Phase C-SUBMIT step 2: roundtrip confirmation. If we
+                // submitted this block earlier, the hash matches a
+                // pending entry. Compute latency and erase.
+                if (pending_block_submits) {
+                    auto it = pending_block_submits->find(block_hash);
+                    if (it != pending_block_submits->end()) {
+                        uint64_t now_ms = static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch()).count());
+                        uint64_t latency_ms = now_ms - it->second.sent_at_ms;
+                        LOG_INFO << "[SUBMIT] roundtrip CONFIRMED hash="
+                                 << block_hash.GetHex().substr(0, 16)
+                                 << " h=" << it->second.height
+                                 << " latency_ms=" << latency_ms
+                                 << " — block accepted by network";
+                        pending_block_submits->erase(it);
+                    }
+                }
 
                 uint32_t height = 0;
                 auto entry = chain->get_header(block_hash);
@@ -3195,6 +3230,41 @@ int main(int argc, char* argv[])
     prune_timer->expires_after(std::chrono::seconds(90));
     prune_timer->async_wait(prune_fn);
 
+    // ── Phase C-SUBMIT step 2: roundtrip-warning timer ──
+    // Every 30 s, scan pending_block_submits. Anything older than 60 s
+    // never came back as a peer-relayed full block — log WARNING + drop.
+    // Keeps the map bounded and surfaces silent rejects.
+    auto submit_warn_timer = std::make_shared<io::steady_timer>(ioc);
+    std::function<void(const boost::system::error_code&)> submit_warn_fn;
+    submit_warn_fn = [submit_warn_timer, pending_block_submits, &submit_warn_fn]
+        (const boost::system::error_code& ec) {
+        if (ec) return;
+        if (pending_block_submits) {
+            uint64_t now_ms = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count());
+            for (auto it = pending_block_submits->begin();
+                 it != pending_block_submits->end(); ) {
+                uint64_t age_ms = now_ms - it->second.sent_at_ms;
+                if (age_ms > 60'000) {
+                    LOG_WARNING << "[SUBMIT] *** ROUNDTRIP TIMEOUT *** "
+                                   "block hash=" << it->first.GetHex().substr(0, 16)
+                                << " h=" << it->second.height
+                                << " age_ms=" << age_ms
+                                << " — submitted but never observed back "
+                                   "from peers; likely rejected upstream";
+                    it = pending_block_submits->erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        submit_warn_timer->expires_after(std::chrono::seconds(30));
+        submit_warn_timer->async_wait(submit_warn_fn);
+    };
+    submit_warn_timer->expires_after(std::chrono::seconds(30));
+    submit_warn_timer->async_wait(submit_warn_fn);
+
     // ── Stratum server + job push (M6 Phase 4a: outbound work only) ──
     std::unique_ptr<dash::stratum::Server> stratum_server;
     if (stratum_port != 0) {
@@ -3338,6 +3408,22 @@ int main(int argc, char* argv[])
                         }
                     } catch (const std::exception& e) {
                         LOG_WARNING << "[SUBMIT] P2P block broadcast threw: " << e.what();
+                    }
+
+                    // Phase C-SUBMIT step 2: register for roundtrip
+                    // confirmation. on_full_block matches the hash and
+                    // erases on confirm; periodic timer warns on
+                    // anything pending >60 s.
+                    if (p2p_sent) {
+                        uint64_t now_ms = static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch()).count());
+                        (*pending_block_submits)[r.x11_hash] =
+                            PendingBlock{now_ms, ctx->height};
+                        LOG_INFO << "[SUBMIT] roundtrip-pending hash="
+                                 << r.x11_hash.GetHex().substr(0, 16)
+                                 << " h=" << ctx->height
+                                 << " pending=" << pending_block_submits->size();
                     }
 
                     // Optional: RPC submitblock as authoritative confirmation
