@@ -83,6 +83,10 @@ static_assert(bls::G2Element::SIZE == 96,
 #include <string>
 #include <thread>
 #include <chrono>
+#include <csignal>
+#include <execinfo.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace io = boost::asio;
 
@@ -91,8 +95,86 @@ namespace io = boost::asio;
 // reads this so dashboard tooltip amounts match real network subsidy.
 static std::atomic<uint64_t> g_latest_miner_value{0};
 
+// ── Crash diagnostics ──
+// Battle-test 2026-04-24: c2pool-dash mainnet soak SIGSEGV'd after 2.5h
+// during peer-disconnect cascade. Apport ate the core; no backtrace
+// captured. Adding the same SIGSEGV/SIGABRT handler that c2pool_refactored
+// (LTC) has so the next mainnet crash dumps to stderr + /tmp/c2pool_dash_crash.log
+// without needing ulimit/sudo/core_pattern dance. Mirrors
+// c2pool_refactored.cpp:181-242.
+static void dash_write_crash_log(const char* reason)
+{
+    int fd = open("/tmp/c2pool_dash_crash.log",
+                  O_WRONLY | O_CREAT | O_APPEND, 0640);
+    if (fd < 0) return;
+    FILE* f = fdopen(fd, "a");
+    if (!f) { close(fd); return; }
+    time_t now = time(nullptr);
+    struct tm tm_buf;
+    localtime_r(&now, &tm_buf);
+    char time_str[64];
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S %Z", &tm_buf);
+    fprintf(f, "\n=== CRASH: %s at %s ===\n", reason, time_str);
+    void* frames[64];
+    int n = backtrace(frames, 64);
+    char** syms = backtrace_symbols(frames, n);
+    if (syms) {
+        for (int i = 0; i < n; ++i)
+            fprintf(f, "  %s\n", syms[i]);
+        free(syms);
+    }
+    fprintf(f, "=== END CRASH ===\n");
+    fclose(f);
+}
+
+static void dash_segfault_handler(int sig)
+{
+    void* frames[64];
+    int n = backtrace(frames, 64);
+    fprintf(stderr, "\n=== c2pool-dash CRASH (signal %d) ===\n", sig);
+    backtrace_symbols_fd(frames, n, STDERR_FILENO);
+    fprintf(stderr, "=== END CRASH ===\n");
+    char msg[64];
+    snprintf(msg, sizeof(msg), "signal %d", sig);
+    dash_write_crash_log(msg);
+    _exit(128 + sig);
+}
+
+static void dash_terminate_handler()
+{
+    fprintf(stderr, "\n=== c2pool-dash std::terminate() ===\n");
+    auto eptr = std::current_exception();
+    if (eptr) {
+        try { std::rethrow_exception(eptr); }
+        catch (const std::exception& e) {
+            fprintf(stderr, "Unhandled exception: %s\n", e.what());
+            char msg[512];
+            snprintf(msg, sizeof(msg), "std::terminate — %s", e.what());
+            dash_write_crash_log(msg);
+        }
+        catch (...) {
+            fprintf(stderr, "Unhandled non-std exception\n");
+            dash_write_crash_log("std::terminate — unknown exception");
+        }
+    } else {
+        dash_write_crash_log("std::terminate — no exception");
+    }
+    void* frames[64];
+    int n = backtrace(frames, 64);
+    backtrace_symbols_fd(frames, n, STDERR_FILENO);
+    fprintf(stderr, "=== END ===\n");
+    _exit(134);
+}
+
 int main(int argc, char* argv[])
 {
+    // Install crash diagnostics FIRST so any failure during init is captured.
+    std::set_terminate(dash_terminate_handler);
+    std::signal(SIGSEGV, dash_segfault_handler);
+    std::signal(SIGABRT, dash_segfault_handler);
+    std::signal(SIGBUS,  dash_segfault_handler);
+    std::signal(SIGFPE,  dash_segfault_handler);
+
     std::string bootstrap = "rov.p2p-spb.xyz";
     uint16_t port = 8999;
     std::string dashd_host;
