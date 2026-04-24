@@ -2481,8 +2481,39 @@ int main(int argc, char* argv[])
                     //     ONLY when state has at least 100 MNs (cheap
                     //     gating to silence the cold-bootstrap noise)
                     {
-                        auto expected = mn_state_machine->find_expected_payee();
-                        auto r = mn_state_machine->apply_block(block, height);
+                        // Phase C-PAY OOO-block guard: bootstrap window
+                        // blocks arrive in peer-response order, not chain
+                        // order. apply_block has no idempotency check —
+                        // re-applying a block at h <= best_height resets
+                        // nLastPaidHeight backwards (Pass 3 sets it to the
+                        // re-applied block's height regardless of prior
+                        // value), corrupting the projection. Skip the MN
+                        // apply (and the [PAY] verification, which would
+                        // be meaningless against re-applied state) for
+                        // blocks already reflected in persisted state.
+                        // Other state machines (credit_pool, quorums, GBT)
+                        // continue to receive this block — they have their
+                        // own ordering / idempotency semantics.
+                        //
+                        // Observed live 2026-04-25: bootstrap window
+                        // delivered h=2460530..2460543 in random order
+                        // (peer-response timing) AFTER snapshot at h=2460544
+                        // had populated state with nLastPaidHeight up to
+                        // 2460544. Each re-applied earlier block bumped
+                        // SOME MN's nLastPaidHeight backwards. Net effect:
+                        // expected payee converged to whichever MN was
+                        // bumped by the EARLIEST re-applied bootstrap block
+                        // (lowest resulting nLastPaidHeight) → constant
+                        // expected hash forever, 100% [PAY] MISMATCH rate.
+                        const bool already_in_state =
+                            mn_state_db->is_open()
+                            && height <= mn_state_db->get_best_height();
+                        std::optional<uint256> expected;
+                        dash::coin::MnStateMachine::ApplyResult r{};
+                        if (!already_in_state) {
+                            expected = mn_state_machine->find_expected_payee();
+                            r = mn_state_machine->apply_block(block, height);
+                        }
                         if (mn_state_db->is_open()
                             && (r.registered + r.updated + r.revoked
                                 + r.spent + r.paid > 0)) {
