@@ -73,6 +73,12 @@ public:
         std::vector<QuorumManager::CLSig> cl_sigs;
 
         // ── Active set ('Q' keys) ───────────────────────────────────
+        // Phase C-TEMPLATE step 4 schema: per-entry value is now
+        // [4B LE mining_height] + pack(CFinalCommitment). Detect old
+        // format (no mining_height prefix) by trying the new format
+        // first; if commitment-parse fails, fall back to old format
+        // (mining_height = 0). On next observed qfcommit, the
+        // scanner repopulates correctly.
         auto qkeys = m_store.list_keys(std::string(1, 'Q'),
                                        /*limit=*/100000);
         active.reserve(qkeys.size());
@@ -81,21 +87,50 @@ public:
             if (key.size() != 34 || key[0] != 'Q') continue;
             std::vector<uint8_t> data;
             if (!m_store.get(key, data)) { ++bad; continue; }
-            try {
-                vendor::CFinalCommitment c;
-                ::PackStream s(data);
-                s >> c;
-                QuorumManager::ActiveKey k{
-                    static_cast<uint8_t>(key[1]),
-                    {}};
-                std::memcpy(k.quorumHash.data(),
-                            key.data() + 2, 32);
-                active.push_back(QuorumManager::Entry{k, std::move(c)});
-            } catch (const std::exception& ex) {
-                ++bad;
-                LOG_WARNING << "[QUO-DB] commitment deserialize failed: "
-                            << ex.what();
+            uint32_t mining_height = 0;
+            vendor::CFinalCommitment c;
+            bool parsed = false;
+            // Try new format: [4B mining_height] + commitment.
+            if (data.size() >= 4) {
+                try {
+                    uint32_t mh = uint32_t(data[0])
+                                | (uint32_t(data[1]) << 8)
+                                | (uint32_t(data[2]) << 16)
+                                | (uint32_t(data[3]) << 24);
+                    std::vector<uint8_t> tail(data.begin() + 4, data.end());
+                    ::PackStream s(tail);
+                    vendor::CFinalCommitment cn;
+                    s >> cn;
+                    if (s.cursor_size() == 0) {
+                        mining_height = mh;
+                        c = std::move(cn);
+                        parsed = true;
+                    }
+                } catch (...) {}
             }
+            // Fall back to old format: pack(commitment) directly.
+            if (!parsed) {
+                try {
+                    ::PackStream s(data);
+                    s >> c;
+                    parsed = true;
+                    // mining_height stays 0 — qfcommit scanner will
+                    // populate on next block observation.
+                } catch (const std::exception& ex) {
+                    ++bad;
+                    LOG_WARNING << "[QUO-DB] commitment deserialize failed: "
+                                << ex.what();
+                    continue;
+                }
+            }
+            QuorumManager::ActiveKey k{
+                static_cast<uint8_t>(key[1]),
+                {}};
+            std::memcpy(k.quorumHash.data(),
+                        key.data() + 2, 32);
+            QuorumManager::Entry entry{k, std::move(c)};
+            entry.mining_height = mining_height;
+            active.push_back(std::move(entry));
         }
 
         // ── Cached cl_sigs ('C' keys, ordered by 2B LE index) ──────
@@ -156,14 +191,23 @@ public:
                                             /*limit=*/100000);
         for (auto& k : existing_c) batch.remove(k);
 
-        // Insert active set.
+        // Insert active set. Phase C-TEMPLATE step 4 wire format:
+        // [4B LE mining_height] + pack(CFinalCommitment). mining_height
+        // = 0 means "not yet observed" (scanner-driven, populated on
+        // first qfcommit tx observation).
         for (const auto& e : qm.active_entries()) {
             auto key = make_quorum_key(e.key.llmqType, e.key.quorumHash);
             auto stream = ::pack(e.commitment);
             auto sp = stream.get_span();
-            std::vector<uint8_t> data(
-                reinterpret_cast<const uint8_t*>(sp.data()),
-                reinterpret_cast<const uint8_t*>(sp.data()) + sp.size());
+            std::vector<uint8_t> data;
+            data.reserve(4 + sp.size());
+            data.push_back(uint8_t( e.mining_height        & 0xFF));
+            data.push_back(uint8_t((e.mining_height >>  8) & 0xFF));
+            data.push_back(uint8_t((e.mining_height >> 16) & 0xFF));
+            data.push_back(uint8_t((e.mining_height >> 24) & 0xFF));
+            data.insert(data.end(),
+                        reinterpret_cast<const uint8_t*>(sp.data()),
+                        reinterpret_cast<const uint8_t*>(sp.data()) + sp.size());
             batch.put(key, data);
         }
 

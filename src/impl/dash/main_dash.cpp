@@ -36,6 +36,7 @@
 #include <impl/dash/coin/mn_state_machine.hpp>
 #include <impl/dash/coin/mempool.hpp>
 #include <impl/dash/coin/subsidy.hpp>
+#include <impl/dash/coin/quorum_root.hpp>
 #include <impl/dash/coin/bls_verify.hpp>
 #include <impl/dash/coin/chainlock_verify.hpp>
 
@@ -1823,6 +1824,46 @@ int main(int argc, char* argv[])
                             // surfaced when the diff handler reads it.
                             *cbtx_root = cbtx.merkleRootMNList;
                             *cbtx_height = height;
+
+                            // ── Phase C-TEMPLATE step 4c: merkleRootQuorums shadow ──
+                            // Compute OUR merkleRootQuorums from
+                            // current QuorumManager state and compare
+                            // to OBSERVED cbtx.merkleRootQuorums.
+                            // Validates the entire quorum-tracking
+                            // pipeline (mnlistdiff sync + qfcommit
+                            // mining-height tracking + per-type
+                            // ordering + final lexicographic sort)
+                            // bit-exact against every observed Dash
+                            // mainnet block.
+                            //
+                            // Skipped when cbtx.merkleRootQuorums is
+                            // null (rare — legacy CCbTx version 1
+                            // doesn't carry it; current mainnet uses
+                            // v2+ which always does).
+                            //
+                            // Skipped when QuorumManager is empty (no
+                            // bootstrap state yet). Once populated,
+                            // expect MISMATCH during catch-up (our
+                            // active set lags the chain by 1 mnlistdiff
+                            // cycle), MATCH at tip in steady state.
+                            if (quorums
+                                && quorums->active_count() > 0
+                                && !cbtx.merkleRootQuorums.IsNull()) {
+                                auto computed_qroot =
+                                    dash::coin::compute_merkle_root_quorums(*quorums);
+                                if (computed_qroot == cbtx.merkleRootQuorums) {
+                                    LOG_INFO << "[QUORUMS-XCHECK] match h=" << height
+                                             << " root=" << computed_qroot.GetHex().substr(0, 16)
+                                             << " active=" << quorums->active_count();
+                                } else {
+                                    LOG_WARNING << "[QUORUMS-XCHECK] MISMATCH h=" << height
+                                                << " computed=" << computed_qroot.GetHex().substr(0, 16)
+                                                << " observed=" << cbtx.merkleRootQuorums.GetHex().substr(0, 16)
+                                                << " active=" << quorums->active_count()
+                                                << " (expected during catch-up; should converge at tip)"
+                                                << " — log-only at MVP";
+                                }
+                            }
                         }
                     }
 
