@@ -924,6 +924,16 @@ int main(int argc, char* argv[])
      || (gbt_source == "auto" && dashd_rpc_host.empty());
     auto embedded_fail_count = std::make_shared<int>(0);
 
+    // ── Phase C-CUTOVER step 5: liveness watchdog ──
+    // Track wall-clock of last on_full_block. Dashboard derives
+    // seconds-since-last-block; threshold breach (>600 s = 10 min,
+    // well above Dash's 2.5 min target spacing) surfaces as a
+    // warning string the frontend can render. Captures both
+    // singleton-dashd-dropped AND broadcaster-swarm-lost in one
+    // signal: if no peer is feeding us blocks, we have a problem
+    // regardless of which path failed.
+    auto last_full_block_epoch_ms = std::make_shared<std::atomic<uint64_t>>(0);
+
     // ── Phase C-CUTOVER step 4: shadow-validation counters ──
     // Surfaces match/mismatch totals for the four [*-XCHECK] channels
     // on the dashboard /sync_status panel, so soak operators can
@@ -1599,6 +1609,7 @@ int main(int argc, char* argv[])
                 [&header_chain, &coin_node, sml, sml_db, quorums, quorum_db,
                  chainlocked_blocks, soak_counters, credit_pool, credit_pool_db,
                  best_clsig, pending_block_submits, embedded_fail_count,
+                 last_full_block_epoch_ms,
                  gbt_source, dashd_rpc_host,
                  use_embedded_gbt]() -> nlohmann::json {
                 nlohmann::json r;
@@ -1699,6 +1710,50 @@ int main(int argc, char* argv[])
                 if (pending_block_submits) {
                     cut["pending_block_submits"] =
                         static_cast<int>(pending_block_submits->size());
+                }
+
+                // Phase C-CUTOVER step 5: liveness watchdog. Compute
+                // seconds-since-last-full-block; emit a warning string
+                // the frontend can render verbatim when the threshold
+                // breaches. Captures BOTH singleton dashd drop AND
+                // broadcaster swarm loss in one signal.
+                if (last_full_block_epoch_ms) {
+                    uint64_t last_ms = last_full_block_epoch_ms->load(
+                        std::memory_order_relaxed);
+                    uint64_t now_ms = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count());
+                    if (last_ms == 0) {
+                        // No full block observed since startup yet —
+                        // distinct from "lost contact" (we never had it).
+                        cut["liveness_state"] = "warming_up";
+                        cut["seconds_since_last_full_block"] = -1;
+                    } else {
+                        int64_t age_s = static_cast<int64_t>((now_ms - last_ms) / 1000);
+                        cut["seconds_since_last_full_block"] = age_s;
+                        // Threshold: 600 s (10 min). Dash mainnet target
+                        // spacing is 150 s (2.5 min); going 4× without
+                        // any block is a strong "something's wrong"
+                        // signal across all peer paths.
+                        if (age_s > 600) {
+                            cut["liveness_state"] = "lost_contact";
+                            cut["liveness_warning"] =
+                                std::string("LOST CONTACT WITH EMBEDDED DASH DAEMON — ")
+                                + "no full block observed for "
+                                + std::to_string(age_s) + " s "
+                                + "(threshold 600 s). Check dashd singleton "
+                                + "connection AND broadcaster peer count.";
+                        } else if (age_s > 300) {
+                            cut["liveness_state"] = "stale";
+                            cut["liveness_warning"] =
+                                std::string("STALE — last block was ")
+                                + std::to_string(age_s) + " s ago "
+                                + "(target spacing 150 s). Network may be "
+                                + "slow OR our peer paths may be degrading.";
+                        } else {
+                            cut["liveness_state"] = "healthy";
+                        }
+                    }
                 }
                 r["dash_cutover"] = std::move(cut);
 
@@ -2044,6 +2099,7 @@ int main(int argc, char* argv[])
              quorums,
              pending_block_submits,
              soak_counters,
+             last_full_block_epoch_ms,
              &ioc](
                 const std::string& /*peer_key*/,
                 const dash::coin::BlockType& block) {
@@ -2051,6 +2107,12 @@ int main(int argc, char* argv[])
                     static_cast<const dash::coin::BlockHeaderType&>(block));
                 auto block_hash = dash::crypto::hash_x11(
                     packed_hdr.get_span());
+
+                // Phase C-CUTOVER step 5: liveness heartbeat.
+                last_full_block_epoch_ms->store(static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count()),
+                    std::memory_order_relaxed);
 
                 // Phase C-SUBMIT step 2: roundtrip confirmation. If we
                 // submitted this block earlier, the hash matches a
