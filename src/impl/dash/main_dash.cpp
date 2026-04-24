@@ -33,6 +33,7 @@
 #include <impl/dash/coin/mn_state_db.hpp>
 #include <impl/dash/coin/mn_snapshot.hpp>
 #include <impl/dash/coin/mn_snapshot_rpc.hpp>
+#include <impl/dash/coin/mn_state_machine.hpp>
 #include <impl/dash/coin/bls_verify.hpp>
 #include <impl/dash/coin/chainlock_verify.hpp>
 
@@ -800,10 +801,17 @@ int main(int argc, char* argv[])
         }
     }
 
-    std::cout << "[MNS] initialized: entries=" << mn_states_loaded.size()
+    // ── Phase C-PAY step 4: per-block DMN state machine ──
+    // Owns the in-memory MN state + applies per-block updates from
+    // observed special-tx records + collateral spends + coinbase
+    // payee outputs. Persisted via mn_state_db.write_all on every
+    // block (matches the SMLDb / QuorumDb cadence).
+    auto mn_state_machine = std::make_shared<dash::coin::MnStateMachine>();
+    mn_state_machine->load(std::move(mn_states_loaded));
+
+    std::cout << "[MNS] initialized: entries=" << mn_state_machine->size()
               << " best_height=" << mn_state_db->get_best_height()
               << " best_hash=" << mn_state_db->get_best_hash().GetHex().substr(0, 16)
-              << " (per-block state machine NOT YET wired — Phase C-PAY step 4)"
               << std::endl;
 
     // ── Phase L step 4: shared ChainLock-blocks set ──
@@ -1605,6 +1613,10 @@ int main(int argc, char* argv[])
                     if (mn_state_db->is_open()) {
                         mn_state_db->write_all(filtered, snap->block_hash, snap->height);
                     }
+                    // Step 4: feed the bootstrap state into the live
+                    // state machine so subsequent on_full_block updates
+                    // mutate from a populated baseline (not empty).
+                    mn_state_machine->load(filtered);
                     LOG_INFO << "[MNS-SNAP] RPC bootstrap applied: "
                              << filtered.size() << " entries"
                              << " (snapshot height=" << snap->height
@@ -1711,6 +1723,7 @@ int main(int argc, char* argv[])
              dash_bs,
              cbtx_root = last_cbtx_mnlist_root,
              cbtx_height = last_cbtx_block_height,
+             mn_state_db, mn_state_machine,
              &ioc](
                 const std::string& /*peer_key*/,
                 const dash::coin::BlockType& block) {
@@ -1764,61 +1777,37 @@ int main(int argc, char* argv[])
                         }
                     }
 
-                    // ── Phase C-PAY step 1 smoke test ──────────────────
-                    // Scan non-coinbase txs for ProTx variants (type 1=
-                    // ProRegTx, 2=ProUpServTx, 3=ProUpRegTx, 4=ProUpRevTx)
-                    // and log a one-line summary. DATA-LAYER ONLY at this
-                    // step — the actual DMN state machine that consumes
-                    // these to track nLastPaidHeight + scriptPayout +
-                    // etc. lands in a follow-up commit. The smoke test
-                    // exists to prove the parser is bit-exact against
-                    // real mainnet ProTx records before we wire any
-                    // state-mutating logic on top.
+                    // ── Phase C-PAY step 4: per-block state machine ──
+                    // Replaces the step 1 smoke-test scanner with the
+                    // real consumer. Walks special txs + collateral
+                    // spends + coinbase outputs to mutate the live MN
+                    // state. Persists via mn_state_db.write_all after
+                    // every block (matches SMLDb / QuorumDb cadence).
                     //
-                    // Throttling: log every parsed ProTx (they're rare —
-                    // a few per day on mainnet). If a parse fails we log
-                    // it as a WARNING so a wire-format drift becomes
-                    // visible immediately.
-                    for (size_t i = 1; i < block.m_txs.size(); ++i) {
-                        const auto& tx = block.m_txs[i];
-                        if (tx.type < 1 || tx.type > 4) continue;
-                        if (tx.extra_payload.empty()) continue;
-                        std::string ok;
-                        switch (tx.type) {
-                          case 1: {
-                            dash::coin::vendor::CProRegTx p;
-                            if (dash::coin::vendor::parse_protx_payload(tx.extra_payload, p))
-                                ok = p.short_str();
-                            break;
-                          }
-                          case 2: {
-                            dash::coin::vendor::CProUpServTx p;
-                            if (dash::coin::vendor::parse_protx_payload(tx.extra_payload, p))
-                                ok = p.short_str();
-                            break;
-                          }
-                          case 3: {
-                            dash::coin::vendor::CProUpRegTx p;
-                            if (dash::coin::vendor::parse_protx_payload(tx.extra_payload, p))
-                                ok = p.short_str();
-                            break;
-                          }
-                          case 4: {
-                            dash::coin::vendor::CProUpRevTx p;
-                            if (dash::coin::vendor::parse_protx_payload(tx.extra_payload, p))
-                                ok = p.short_str();
-                            break;
-                          }
+                    // Logged only when something interesting happens
+                    // (registered/updated/revoked/spent/paid > 0) so
+                    // bootstrap doesn't flood logs with zero-delta
+                    // lines for the ~3000 blocks of cold-start scan.
+                    {
+                        auto r = mn_state_machine->apply_block(block, height);
+                        if (mn_state_db->is_open()
+                            && (r.registered + r.updated + r.revoked
+                                + r.spent + r.paid > 0)) {
+                            mn_state_db->write_all(
+                                mn_state_machine->snapshot(),
+                                block_hash, height);
                         }
-                        if (!ok.empty()) {
-                            LOG_INFO << "[PROTX] block_h=" << height
-                                     << " type=" << int(tx.type)
-                                     << " " << ok;
-                        } else {
-                            LOG_WARNING << "[PROTX] block_h=" << height
-                                        << " type=" << int(tx.type)
-                                        << " parse FAILED — payload "
-                                        << tx.extra_payload.size() << " B";
+                        if (r.registered + r.updated + r.revoked
+                            + r.spent > 0) {
+                            // Don't log paid-only events (every block
+                            // pays a MN; would be one log per block).
+                            LOG_INFO << "[MNS] applied: +R" << r.registered
+                                     << "/U" << r.updated
+                                     << "/V" << r.revoked
+                                     << " -S" << r.spent
+                                     << " paid=" << r.paid
+                                     << " total=" << r.total_after
+                                     << " (h=" << height << ")";
                         }
                     }
                 }
@@ -2001,6 +1990,7 @@ int main(int argc, char* argv[])
              utxo_db_ptr = &utxo_db,
              chainlocked_blocks,
              sml, sml_db, quorums, quorum_db,
+             mn_state_db, mn_state_machine,
              dash_bs, &ioc](
                 const uint256& old_tip, uint32_t old_height,
                 const uint256& new_tip, uint32_t new_height) {
@@ -2010,6 +2000,7 @@ int main(int argc, char* argv[])
                 io::post(ioc,
                     [bcaster, chain, utxo, utxo_db_ptr,
                      chainlocked_blocks, sml, sml_db, quorums, quorum_db,
+                     mn_state_db, mn_state_machine,
                      dash_bs,
                      old_tip, old_height, new_tip, new_height]() {
                   try {
@@ -2138,19 +2129,30 @@ int main(int argc, char* argv[])
                     // start path already handles this).
                     if (is_reorg && sml && sml_db && quorums && quorum_db
                         && (!sml->mnList.empty()
-                            || quorums->active_count() > 0)) {
+                            || quorums->active_count() > 0
+                            || (mn_state_machine && mn_state_machine->size() > 0))) {
                         size_t sml_n = sml->mnList.size();
                         size_t quo_n = quorums->active_count();
+                        size_t mns_n = mn_state_machine
+                            ? mn_state_machine->size() : 0;
                         sml->mnList.clear();
                         quorums->clear();
+                        if (mn_state_machine) {
+                            mn_state_machine->load({});
+                        }
                         sml_db->clear();
                         quorum_db->clear();
-                        LOG_WARNING << "[EMB-DASH] SML+QuorumDb reorg drop: "
+                        if (mn_state_db) mn_state_db->clear();
+                        LOG_WARNING << "[EMB-DASH] SML+QuorumDb+MnStateDb reorg drop: "
                                        "cleared sml_n=" << sml_n
                                     << " quo_n=" << quo_n
+                                    << " mns_n=" << mns_n
                                     << " — next sync tick will cold-start "
                                        "from new tip "
-                                    << new_tip.GetHex().substr(0, 16);
+                                    << new_tip.GetHex().substr(0, 16)
+                                    << " (MnStateDb will re-bootstrap from "
+                                       "snapshot/RPC; per-block state machine "
+                                       "re-applies forward from snapshot height)";
                     }
 
                     // Header-sync nudge: ask peers for new tip block so
