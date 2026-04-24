@@ -36,6 +36,7 @@
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
 #include <core/log.hpp>
+#include <core/address_utils.hpp>
 
 #include <cstdint>
 #include <ctime>
@@ -54,7 +55,9 @@ inline DashWorkData build_embedded_workdata(
     const MnStateMachine& mnstates,
     const Mempool& mempool,
     uint32_t bits_for_next,
-    uint32_t mtp_at_tip)
+    uint32_t mtp_at_tip,
+    uint8_t  address_version,
+    uint8_t  address_p2sh_version)
 {
     DashWorkData w;
     w.m_height          = prev_height + 1;
@@ -91,22 +94,35 @@ inline DashWorkData build_embedded_workdata(
     }
 
     // MN payee → packed_payment. dashcore GBT returns "payee" as a
-    // base58 address; we don't yet reverse-encode arbitrary scripts
-    // back to base58, so we use the c2pool "!hex" raw-script
-    // convention from share_check.hpp::decode_payee_script.
+    // base58 address. We use script_to_address() to produce the same
+    // wire form for standard P2PKH/P2SH scripts. Unrecognized script
+    // types fall back to the c2pool "!hex" raw-script convention from
+    // share_check.hpp::decode_payee_script — preserves bytes for
+    // share_check verification while keeping the GBT API clean.
     auto expected = mnstates.find_expected_payee();
     if (expected) {
         auto it = mnstates.entries().find(*expected);
         if (it != mnstates.entries().end() && mn_payment > 0) {
-            std::string hex_script;
-            hex_script.reserve(it->second.scriptPayout.m_data.size() * 2);
-            static const char* digits = "0123456789abcdef";
-            for (uint8_t b : it->second.scriptPayout.m_data) {
-                hex_script.push_back(digits[(b >> 4) & 0xF]);
-                hex_script.push_back(digits[b & 0xF]);
-            }
+            const auto& script = it->second.scriptPayout.m_data;
+            // Dash mainnet has no bech32 (P2WPKH/P2WSH inactive); pass
+            // empty hrp so script_to_address() falls through cleanly.
+            std::string addr = ::core::script_to_address(
+                script, /*bech32_hrp=*/"",
+                address_version, address_p2sh_version);
             PackedPayment pp;
-            pp.payee  = "!" + hex_script;
+            if (!addr.empty()) {
+                pp.payee = std::move(addr);
+            } else {
+                // Non-standard script: fall back to !hex.
+                std::string hex_script;
+                hex_script.reserve(script.size() * 2);
+                static const char* digits = "0123456789abcdef";
+                for (uint8_t b : script) {
+                    hex_script.push_back(digits[(b >> 4) & 0xF]);
+                    hex_script.push_back(digits[b & 0xF]);
+                }
+                pp.payee = "!" + hex_script;
+            }
             pp.amount = static_cast<uint64_t>(mn_payment);
             w.m_packed_payments.push_back(std::move(pp));
         }
@@ -157,15 +173,25 @@ inline bool gbt_xcheck(const DashWorkData& embedded,
                     << " rpc=" << rpc.m_packed_payments.size();
     } else {
         for (size_t i = 0; i < embedded.m_packed_payments.size(); ++i) {
-            // Note: payee comparison may differ in encoding (base58 vs
-            // "!hex") even when they refer to the same script. Compare
-            // amounts strictly; payee compared loosely (substring).
+            // Step 12: both sides emit base58 for standard P2PKH/P2SH
+            // scripts now, so payee compares strictly. Non-standard
+            // scripts still fall back to "!hex" on our side; if dashd
+            // also returns the script-hex form for the same input,
+            // strings still match. Mismatches on the payee field now
+            // surface real wire-form drift.
             if (embedded.m_packed_payments[i].amount
                 != rpc.m_packed_payments[i].amount) {
                 ok = false;
                 LOG_WARNING << "[GBT-XCHECK] payment[" << i << "].amount "
                             << "embedded=" << embedded.m_packed_payments[i].amount
                             << " rpc=" << rpc.m_packed_payments[i].amount;
+            }
+            if (embedded.m_packed_payments[i].payee
+                != rpc.m_packed_payments[i].payee) {
+                ok = false;
+                LOG_WARNING << "[GBT-XCHECK] payment[" << i << "].payee "
+                            << "embedded=" << embedded.m_packed_payments[i].payee.substr(0, 40)
+                            << " rpc=" << rpc.m_packed_payments[i].payee.substr(0, 40);
             }
         }
     }

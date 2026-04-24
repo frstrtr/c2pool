@@ -1745,13 +1745,16 @@ int main(int argc, char* argv[])
                         uint32_t embedded_bits = computed_bits != 0
                             ? computed_bits
                             : work.m_bits;
+                        auto coin_params_for_addr = dash::make_coin_params(testnet);
                         auto embedded = dash::coin::build_embedded_workdata(
                             header_chain.height(),
                             tip_entry->hash,
                             *mn_state_machine,
                             *dash_mempool,
                             embedded_bits,
-                            mtp);
+                            mtp,
+                            coin_params_for_addr.address_version,
+                            coin_params_for_addr.address_p2sh_version);
                         dash::coin::gbt_xcheck(embedded, work);
                     }
                 }
