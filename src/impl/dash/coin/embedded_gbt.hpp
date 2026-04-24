@@ -140,6 +140,13 @@ inline bool gbt_xcheck(const DashWorkData& embedded,
     report("payment_amount",  embedded.m_payment_amount, rpc.m_payment_amount);
     report("bits",            embedded.m_bits,           rpc.m_bits);
     report("mintime",         embedded.m_mintime,        rpc.m_mintime);
+    // Step 10: version. We always emit 0x20000000 (BIP9 default,
+    // top-bit set, no signaling). On Dash mainnet steady-state this
+    // matches because V19/V20/MN_RR all activated long ago. A
+    // mismatch flags either (a) testnet/devnet with an active BIP9
+    // deployment we don't model, or (b) a new mainnet softfork
+    // window we need to wire up.
+    report("version",         embedded.m_version,        rpc.m_version);
     report("previous_block",
         embedded.m_previous_block.GetHex(),
         rpc.m_previous_block.GetHex());
