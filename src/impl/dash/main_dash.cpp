@@ -919,9 +919,15 @@ int main(int argc, char* argv[])
     // resolved policy + the embedded-fail counter that drives
     // hysteresis fallback. Actual job_fn that consumes them lives
     // ~2000 lines down.
-    const bool use_embedded_gbt =
-        (gbt_source == "embedded")
-     || (gbt_source == "auto" && dashd_rpc_host.empty());
+    //
+    // Phase C-CUTOVER step 6 (default flip): "auto" now resolves to
+    // EMBEDDED whenever the embedded path is available, even when
+    // --dashd-rpc is also configured. Previously auto preferred RPC
+    // when both were available; now embedded is the default and RPC
+    // serves as cross-check + sanity-hop + hysteresis fallback only.
+    // Operators wanting the legacy RPC-primary behavior must pass
+    // --gbt-source rpc explicitly.
+    const bool use_embedded_gbt = (gbt_source != "rpc");
     auto embedded_fail_count = std::make_shared<int>(0);
 
     // ── Phase C-CUTOVER step 5: liveness watchdog ──
