@@ -3589,6 +3589,20 @@ int main(int argc, char* argv[])
              << " resolved=" << (use_embedded_gbt ? "embedded" : "rpc")
              << " (--dashd-rpc " << (dashd_rpc_host.empty() ? "absent" : "present") << ")";
 
+    // Phase C-CUTOVER step 3: auto-fallback hysteresis. When --gbt-source
+    // is "embedded" AND --dashd-rpc is also configured, count consecutive
+    // embedded-build failures. After EMBEDDED_FAIL_THRESHOLD failures in
+    // a row, temporarily fall through to RPC for one work cycle so
+    // miners don't go workless. A single embedded success resets the
+    // counter. Acts as a circuit breaker against transient embedded-build
+    // failures (e.g. mn_state_machine drained mid-reorg).
+    //
+    // Disabled when --gbt-source=embedded but no RPC (no fallback
+    // available — counter still counts but we just keep retrying
+    // embedded; logs will show the issue).
+    constexpr int EMBEDDED_FAIL_THRESHOLD = 3;
+    auto embedded_fail_count = std::make_shared<int>(0);
+
     job_fn = [&, job_timer](const boost::system::error_code& ec) {
         if (ec) return;
         if (miner_script.empty()) {
@@ -3603,7 +3617,18 @@ int main(int argc, char* argv[])
         // RPC is available.
         std::optional<dash::coin::DashWorkData> work_opt;
         bool work_built_by_embedded = false;
-        if (use_embedded_gbt) {
+        // Hysteresis: skip embedded build for one cycle if we've
+        // failed too many times in a row AND RPC is available.
+        const bool skip_embedded_this_tick =
+            *embedded_fail_count >= EMBEDDED_FAIL_THRESHOLD
+            && coin_rpc && coin_rpc->is_connected();
+        if (use_embedded_gbt && skip_embedded_this_tick) {
+            LOG_WARNING << "[JOB] embedded GBT failed "
+                        << *embedded_fail_count
+                        << " consecutive ticks — falling back to RPC "
+                           "for this cycle (success will reset counter)";
+        }
+        if (use_embedded_gbt && !skip_embedded_this_tick) {
             if (sml && quorums && mn_state_machine && dash_mempool
                 && header_chain.height() > 0
                 && !sml->mnList.empty()
@@ -3647,19 +3672,29 @@ int main(int argc, char* argv[])
                         w.m_coinbase_payload = dash::coin::encode_cbtx(cbtx);
                         work_opt = std::move(w);
                         work_built_by_embedded = true;
+                        if (*embedded_fail_count > 0) {
+                            LOG_INFO << "[JOB] embedded GBT recovered after "
+                                     << *embedded_fail_count
+                                     << " consecutive failures — counter reset";
+                            *embedded_fail_count = 0;
+                        }
                     }
                 } catch (const std::exception& e) {
+                    ++(*embedded_fail_count);
                     LOG_WARNING << "[JOB] embedded GBT build threw: " << e.what()
-                                << " — will try RPC fallback if available";
+                                << " — will try RPC fallback if available "
+                                << "(consecutive_failures=" << *embedded_fail_count << ")";
                 }
             } else {
+                ++(*embedded_fail_count);
                 static int skip_log = 0;
                 if (++skip_log <= 5 || skip_log % 24 == 0) {
                     LOG_INFO << "[JOB] embedded GBT not yet ready: "
                              << "header_h=" << header_chain.height()
                              << " sml=" << (sml ? sml->mnList.size() : 0)
                              << " mns=" << (mn_state_machine ? mn_state_machine->size() : 0)
-                             << " — waiting for state to populate";
+                             << " — waiting for state to populate "
+                             << "(consecutive_failures=" << *embedded_fail_count << ")";
                 }
             }
         }
