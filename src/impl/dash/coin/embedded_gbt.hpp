@@ -53,14 +53,19 @@ inline DashWorkData build_embedded_workdata(
     const uint256& prev_hash,
     const MnStateMachine& mnstates,
     const Mempool& mempool,
-    uint32_t bits_for_next)
+    uint32_t bits_for_next,
+    uint32_t mtp_at_tip)
 {
     DashWorkData w;
     w.m_height          = prev_height + 1;
     w.m_previous_block  = prev_hash;
     w.m_bits            = bits_for_next;
     w.m_curtime         = static_cast<uint32_t>(std::time(nullptr));
-    w.m_mintime         = w.m_curtime - 7200;   // TODO: real MTP
+    // Step 8: real median-time-past from header_chain. dashcore
+    // requires curtime > MTP for the candidate block to be valid;
+    // GBT returns MTP+1 as mintime so miners don't accidentally
+    // produce stale-time blocks.
+    w.m_mintime         = mtp_at_tip + 1;
     w.m_version         = 0x20000000;           // TODO: real BIP9 bits
 
     // Subsidy + tx selection.
@@ -134,6 +139,7 @@ inline bool gbt_xcheck(const DashWorkData& embedded,
     report("coinbase_value",  embedded.m_coinbase_value, rpc.m_coinbase_value);
     report("payment_amount",  embedded.m_payment_amount, rpc.m_payment_amount);
     report("bits",            embedded.m_bits,           rpc.m_bits);
+    report("mintime",         embedded.m_mintime,        rpc.m_mintime);
     report("previous_block",
         embedded.m_previous_block.GetHex(),
         rpc.m_previous_block.GetHex());

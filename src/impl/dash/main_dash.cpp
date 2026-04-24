@@ -1705,12 +1705,32 @@ int main(int argc, char* argv[])
                     && dash_mempool && header_chain.height() > 0) {
                     auto tip_entry = header_chain.tip();
                     if (tip_entry) {
+                        // Step 8: median-time-past of the last 11
+                        // headers (BIP 113 / dashcore). When fewer
+                        // than 11 are available (early bootstrap),
+                        // use what we have. Mirror dashcore's
+                        // GetMedianTimePast: sort, take pmedian[n/2]
+                        // (upper-middle for even sizes).
+                        std::vector<uint32_t> times;
+                        times.reserve(11);
+                        for (uint32_t back = 0; back < 11; ++back) {
+                            uint32_t h = header_chain.height();
+                            if (back > h) break;
+                            auto e = header_chain.get_header_by_height(h - back);
+                            if (!e) break;
+                            times.push_back(e->header.m_timestamp);
+                        }
+                        std::sort(times.begin(), times.end());
+                        uint32_t mtp = times.empty()
+                            ? 0
+                            : times[times.size() / 2];
                         auto embedded = dash::coin::build_embedded_workdata(
                             header_chain.height(),
                             tip_entry->hash,
                             *mn_state_machine,
                             *dash_mempool,
-                            work.m_bits);   // borrow bits from RPC for now
+                            work.m_bits,    // borrow bits from RPC for now
+                            mtp);
                         dash::coin::gbt_xcheck(embedded, work);
                     }
                 }
