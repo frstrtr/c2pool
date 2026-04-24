@@ -31,6 +31,7 @@
 #include <impl/dash/coin/quorum_db.hpp>
 #include <impl/dash/coin/quorum_manager.hpp>
 #include <impl/dash/coin/mn_state_db.hpp>
+#include <impl/dash/coin/mn_snapshot.hpp>
 #include <impl/dash/coin/bls_verify.hpp>
 #include <impl/dash/coin/chainlock_verify.hpp>
 
@@ -91,6 +92,7 @@ int main(int argc, char* argv[])
     std::string dashd_rpc_host;
     uint16_t    dashd_rpc_port = 9998;
     std::string dashd_rpc_userpass;
+    std::string dash_mn_snapshot_path;     // --dash-mn-snapshot operator override
     uint16_t    stratum_port   = 0;       // 0 = disabled; canonical Dash p2pool stratum port is 7903
     std::string mining_address;           // required when stratum+rpc are wired
     double      share_difficulty_default = 0.001;  // vardiff lands later
@@ -128,6 +130,9 @@ int main(int argc, char* argv[])
             } else {
                 bootstrap = addr;
             }
+        }
+        else if (arg == "--dash-mn-snapshot" && i + 1 < argc) {
+            dash_mn_snapshot_path = argv[++i];
         }
         else if (arg == "--dashd" && i + 1 < argc) {
             std::string addr = argv[++i];
@@ -361,6 +366,58 @@ int main(int argc, char* argv[])
         }
         std::cout << "[MNS] self-test: 2 round-trips OK "
                      "(MNState-Regular, MNState-Evo)" << std::endl;
+    }
+
+    // Phase C-PAY step 3 self-test: DMN snapshot encode→decode
+    // round-trip + integrity-hash check. Synthesizes a tiny snapshot
+    // (3 entries: 1 Regular, 1 Evo, 1 with non-trivial scriptPayout),
+    // serializes via encode_snapshot(), computes the SHA256d pin from
+    // the encoded bytes, then decodes via decode_snapshot() asserting
+    // the pin check fires and the entries round-trip exactly. Catches
+    // file-format drift at startup BEFORE the loader could
+    // mis-interpret a real shipped snapshot and corrupt mn_state_db.
+    {
+        using namespace dash::coin;
+        DmnSnapshot snap;
+        snap.version    = SNAPSHOT_VERSION;
+        snap.height     = 2460000;
+        snap.block_hash.SetHex("00000000000000010203040506070809");
+        for (int i = 0; i < 3; ++i) {
+            uint256 h;
+            h.SetHex(std::string(2, '0' + char(i)));
+            MNState s;
+            s.nType = (i == 1) ? vendor::MnType::EVO : vendor::MnType::REGULAR;
+            s.nRegisteredHeight = 100 + i;
+            s.nLastPaidHeight   = 200 + i;
+            if (i == 2) s.scriptPayout.m_data = {0x76, 0xa9, 0x14, 0x42, 0x88, 0xac};
+            if (i == 1) { s.platformP2PPort = 26656; s.platformHTTPPort = 443; }
+            snap.entries.emplace_back(h, std::move(s));
+        }
+        auto bytes = encode_snapshot(snap);
+        auto pin = sha256d_bytes(std::span<const uint8_t>(bytes.data(), bytes.size()));
+        DmnSnapshot rt;
+        bool ok = decode_snapshot(bytes, pin, rt);
+        if (!ok || rt.height != snap.height || rt.entries.size() != 3
+            || !(rt.entries[0].second == snap.entries[0].second)
+            || !(rt.entries[1].second == snap.entries[1].second)
+            || !(rt.entries[2].second == snap.entries[2].second)) {
+            std::cerr << "[MNS-SNAP] self-test FAILED — aborting. "
+                         "File format inconsistency."
+                      << std::endl;
+            return 1;
+        }
+        // Also verify the integrity check rejects tampered bytes.
+        auto tampered = bytes;
+        if (!tampered.empty()) tampered[tampered.size() / 2] ^= 0x01;
+        DmnSnapshot junk;
+        if (decode_snapshot(tampered, pin, junk)) {
+            std::cerr << "[MNS-SNAP] self-test FAILED — tampered "
+                         "bytes accepted with valid pin. Aborting."
+                      << std::endl;
+            return 1;
+        }
+        std::cout << "[MNS-SNAP] self-test: encode/decode round-trip + "
+                     "integrity-hash reject-tampered OK" << std::endl;
     }
 
     // Create params
@@ -620,10 +677,54 @@ int main(int argc, char* argv[])
             mn_state_db->load_all(mn_states_loaded);
         }
     }
+
+    // ── Phase C-PAY step 3 (Path C): bootstrap from DMN snapshot ──
+    // If MnStateDb is empty (cold-start, OR fresh wipe from divergence
+    // check above), try to bootstrap from a trusted DMN snapshot. The
+    // forward-only per-block state machine alone can't recover MNs
+    // registered before the header checkpoint — see
+    // memory/project_dash_phase_c_pay_pathA.md and
+    // src/impl/dash/coin/mn_snapshot.hpp for the architectural rationale.
+    //
+    // Source priority (each falls through to the next on failure):
+    //   1. --dash-mn-snapshot <path> (operator override)
+    //   2. In-tree pinned snapshots (known_snapshots() — empty until
+    //      the maintainer-side script is wired in step 3b)
+    //   3. dashd-RPC `protx list registered` (if --dashd-rpc set;
+    //      wired in a follow-up commit, this commit's API is
+    //      RPC-agnostic)
+    // Source absence is non-fatal: per-block state machine starts with
+    // empty DMN set; projections are wrong until enough blocks have
+    // accumulated. [PAY] match/mismatch logging will show the gap.
+    if (mn_states_loaded.empty()) {
+        dash::coin::DmnSnapshot snap;
+        if (dash::coin::try_load_any_snapshot(dash_mn_snapshot_path, snap)) {
+            // Cross-check against SML if loaded — drop entries for MNs
+            // that have unregistered since the snapshot was cut.
+            auto filtered = sml->mnList.empty()
+                ? snap.entries
+                : dash::coin::filter_snapshot_against_sml(snap, *sml);
+            if (mn_state_db->is_open()) {
+                mn_state_db->write_all(filtered, snap.block_hash, snap.height);
+            }
+            mn_states_loaded = std::move(filtered);
+            LOG_INFO << "[MNS-SNAP] bootstrap applied: "
+                     << mn_states_loaded.size() << " entries"
+                     << " (snapshot height=" << snap.height
+                     << " block=" << snap.block_hash.GetHex().substr(0, 16) << ")";
+        } else {
+            LOG_INFO << "[MNS-SNAP] no bootstrap source available "
+                        "(no --dash-mn-snapshot, no in-tree pin, no "
+                        "RPC fetch wired yet) — DMN state will start "
+                        "EMPTY; projections wrong until forward-only "
+                        "state machine repopulates";
+        }
+    }
+
     std::cout << "[MNS] initialized: entries=" << mn_states_loaded.size()
               << " best_height=" << mn_state_db->get_best_height()
               << " best_hash=" << mn_state_db->get_best_hash().GetHex().substr(0, 16)
-              << " (per-block state machine NOT YET wired — Phase C-PAY step 3)"
+              << " (per-block state machine NOT YET wired — Phase C-PAY step 4)"
               << std::endl;
 
     // ── Phase L step 4: shared ChainLock-blocks set ──
