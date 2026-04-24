@@ -1286,22 +1286,22 @@ int main(int argc, char* argv[])
             return result;
         });
         // Sharechain tip for readiness checks.
-        mi->set_sharechain_tip_fn([&node]() -> nlohmann::json {
+        // Master moved this from raw-JSON callback to typed SharechainTip
+        // (web_server.hpp:112) so the cached tip can survive the JSON
+        // refactor without the dashboard tripping on `.value()`.
+        mi->set_sharechain_tip_fn([&node]() -> std::optional<core::SharechainTip> {
             // HTTP-thread callback. All sharechain endpoints (tip, window,
             // delta) agree on best-head selection by delegating to
             // best_share_hash_nolock() — highest cumulative abswork, not
-            // arbitrary map order. When two forks exist the head with
-            // more work is "best"; without this the client's _rtTipHash
-            // could track a stale head while new shares grew a different
-            // fork and SSE pushes never reached the client.
+            // arbitrary map order.
             std::shared_lock lock(node.tracker_mutex());
             auto& chain = node.tracker().chain;
             uint256 best = node.best_share_hash_nolock();
             int32_t height = best.IsNull() ? 0 : chain.get_height(best);
-            nlohmann::json t;
-            t["hash"]   = best.IsNull() ? "" : best.GetHex().substr(0, 16);
-            t["height"] = height;
-            t["total"]  = static_cast<int>(chain.size());  // §5.2 informational
+            core::SharechainTip t;
+            t.hash   = best.IsNull() ? "" : best.GetHex().substr(0, 16);
+            t.height = height;
+            t.total  = static_cast<int32_t>(chain.size());  // §5.2 informational
             return t;
         });
         // Sharechain delta endpoint — returns shares newer than `since`
