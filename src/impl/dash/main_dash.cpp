@@ -1887,13 +1887,19 @@ int main(int argc, char* argv[])
                         }
                     }
 
-                    // ── Phase C-MEMPOOL step 1: confirm-eviction ──
-                    // Remove confirmed txs (Phase 1: by-txid) +
-                    // double-spend conflicts (Phase 2: by spent
-                    // outputs) from mempool. Logs counts when non-zero
-                    // via [MEMPOOL] block cleanup line.
+                    // ── Phase C-MEMPOOL step 1+2: confirm-eviction ──
+                    // step 1: Remove confirmed txs (Phase 1: by-txid)
+                    //         + double-spend conflicts (Phase 2: by
+                    //         spent outputs) from mempool. Logs via
+                    //         [MEMPOOL] block cleanup line.
+                    // step 2: Re-attempt fee computation for entries
+                    //         marked fee_known=false. New UTXOs from
+                    //         this block may resolve previously-unknown
+                    //         inputs (parent tx in this block →
+                    //         child mempool tx fee now computable).
                     if (dash_mempool) {
                         dash_mempool->remove_for_block(block);
+                        dash_mempool->recompute_unknown_fees(utxo);
                     }
                 }
 

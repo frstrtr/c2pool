@@ -14,21 +14,26 @@
 ///     consumers (Phase C-PAY's state machine, future block-template
 ///     builder) decode their own way.
 ///
-/// Step 1 SCOPE:
-///   - Storage layer (add/remove/contains/size/all_txs)
-///   - UTXO-based fee computation (when utxo arg passed)
-///   - LRU size-cap eviction (300 MB default)
-///   - Confirm-eviction via remove_for_block with double-spend conflict
-///     detection
-///   - Lock-protected (single std::mutex)
+/// Step 1 SCOPE: storage layer + UTXO fee + LRU size-cap eviction +
+/// confirm-eviction + double-spend conflict detection. All thread-safe
+/// via single std::mutex.
+///
+/// Step 2 ADDS:
+///   - Feerate-sorted index (m_feerate_index) maintained on add/remove
+///   - get_sorted_txs_with_fees(max_bytes): highest-feerate-first
+///     selection up to a byte cap, with stale-input guard. Phase
+///     C-TEMPLATE prerequisite.
+///   - recompute_unknown_fees(utxo): re-attempts fee computation for
+///     entries marked fee_known=false (typically after a block
+///     connect added their inputs to UTXO).
 ///
 /// DEFERRED (later steps):
-///   - Feerate-sorted index for block-template selection (step 2)
-///   - BIP 35 mempool initial sync drain (step 3 — wire is already in
+///   - BIP 35 mempool initial sync drain (step 3 — wire already in
 ///     p2p_node.hpp, no consumer yet)
-///   - revalidate_inputs / recompute_unknown_fees (step 2)
-///   - Orphan-children removal after conflict eviction (step 2)
-///   - Lightweight summary API for the explorer/dashboard (step 4)
+///   - revalidate_inputs (evict txs whose inputs got spent without
+///     us catching it via remove_for_block conflict path)
+///   - Orphan-children removal after conflict eviction
+///   - Lightweight summary API for the explorer/dashboard
 
 #include "block.hpp"
 #include "transaction.hpp"
@@ -129,6 +134,14 @@ public:
                 vin.prevout.hash, vin.prevout.index)] = txid;
         }
 
+        // Feerate-sorted index (step 2) — only if fee was known.
+        // Unknown-fee txs sit out of the sorted view until
+        // recompute_unknown_fees() resolves them after a UTXO update.
+        // Uses negative feerate as the multimap key so begin() = best.
+        if (stored.fee_known) {
+            m_feerate_index.emplace(stored.feerate_satvb(), txid);
+        }
+
         // Periodic stats — every 100 entries + first 5 + every eviction.
         if (m_pool.size() % 100 == 0 || m_pool.size() <= 5 || evicted > 0) {
             LOG_INFO << "[MEMPOOL] add txid=" << txid.GetHex().substr(0, 16)
@@ -213,7 +226,37 @@ public:
         m_pool.clear();
         m_time_index.clear();
         m_spent_outputs.clear();
+        m_feerate_index.clear();
         m_total_bytes = 0;
+    }
+
+    /// Re-attempt fee computation for entries marked fee_known=false.
+    /// Call after a block-connect: the block's outputs are now in
+    /// UTXO and may resolve previously-unknown inputs. Returns the
+    /// number of newly-resolved entries.
+    int recompute_unknown_fees(::core::coin::UTXOViewCache* utxo)
+    {
+        if (!utxo) return 0;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        int resolved = 0, still_unknown = 0;
+        uint64_t resolved_fees = 0;
+        for (auto& [txid, entry] : m_pool) {
+            if (entry.fee_known) continue;
+            if (compute_fee_locked(entry, utxo)) {
+                m_feerate_index.emplace(entry.feerate_satvb(), txid);
+                resolved_fees += entry.fee;
+                ++resolved;
+            } else {
+                ++still_unknown;
+            }
+        }
+        if (resolved > 0 || still_unknown > 0) {
+            LOG_INFO << "[MEMPOOL] fee revalidation: resolved=" << resolved
+                     << " still_unknown=" << still_unknown
+                     << " resolved_fees=" << resolved_fees << " sat"
+                     << " pool_size=" << m_pool.size();
+        }
+        return resolved;
     }
 
     // ── Queries ────────────────────────────────────────────────────
@@ -274,11 +317,78 @@ public:
         return out;
     }
 
+    /// Phase C-TEMPLATE prerequisite — fee-aware tx selection.
+    /// Returns transactions sorted by feerate (highest first) up to
+    /// `max_bytes` of base-size budget. Transactions with unknown
+    /// fees are EXCLUDED — they'd poison the coinbasevalue if we
+    /// included them at fee=0 vs dashd's GBT (which always knows
+    /// fees because it sees the full mempool with full UTXO).
+    ///
+    /// Stale-input guard: re-checks each candidate's inputs against
+    /// the live UTXO + parent-mempool chain before including. Catches
+    /// the brief window between tip-change and full_block arrival
+    /// where remove_for_block hasn't yet evicted now-double-spent
+    /// txs.
+    ///
+    /// Returns (selected, total_fees_sat).
+    struct SelectedTx {
+        MutableTransaction tx;
+        uint64_t           fee{0};
+        uint32_t           base_size{0};
+    };
+
+    std::pair<std::vector<SelectedTx>, uint64_t>
+    get_sorted_txs_with_fees(uint32_t max_bytes) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<SelectedTx> result;
+        uint64_t total_fees = 0;
+        uint32_t total_bytes = 0;
+        auto* utxo = m_utxo.load();
+
+        for (const auto& [feerate, txid] : m_feerate_index) {
+            (void)feerate;
+            auto pit = m_pool.find(txid);
+            if (pit == m_pool.end()) continue;
+            const auto& entry = pit->second;
+            if (!entry.fee_known) continue;
+            if (total_bytes + entry.base_size > max_bytes) continue;
+
+            // Stale-input guard.
+            if (utxo) {
+                bool ok = true;
+                for (const auto& vin : entry.tx.vin) {
+                    ::core::coin::Outpoint op(
+                        vin.prevout.hash, vin.prevout.index);
+                    ::core::coin::Coin coin;
+                    if (utxo->get_coin(op, coin)) continue;
+                    // Parent-mempool chain (CPFP).
+                    auto parent = m_pool.find(vin.prevout.hash);
+                    if (parent != m_pool.end()
+                        && vin.prevout.index < parent->second.tx.vout.size()) {
+                        continue;
+                    }
+                    ok = false;
+                    break;
+                }
+                if (!ok) continue;
+            }
+
+            total_bytes += entry.base_size;
+            total_fees  += entry.fee;
+            result.push_back({entry.tx, entry.fee, entry.base_size});
+        }
+        return {std::move(result), total_fees};
+    }
+
 private:
     mutable std::mutex                                 m_mutex;
     std::map<uint256, MempoolEntry>                    m_pool;
     std::multimap<time_t, uint256>                     m_time_index;
     std::map<std::pair<uint256, uint32_t>, uint256>    m_spent_outputs;
+    // Step 2: feerate-sorted index. greater<double> means begin() =
+    // highest feerate, so iteration is best-first.
+    std::multimap<double, uint256, std::greater<double>> m_feerate_index;
     size_t                                             m_total_bytes{0};
     size_t                                             m_max_bytes;
     time_t                                             m_expiry_sec;
@@ -295,11 +405,22 @@ private:
         if (it == m_pool.end()) return;
 
         // Drop from time index.
-        auto rng = m_time_index.equal_range(it->second.time_added);
-        for (auto rit = rng.first; rit != rng.second; ++rit) {
+        auto trng = m_time_index.equal_range(it->second.time_added);
+        for (auto rit = trng.first; rit != trng.second; ++rit) {
             if (rit->second == txid) {
                 m_time_index.erase(rit);
                 break;
+            }
+        }
+
+        // Drop from feerate index (only present if fee was known).
+        if (it->second.fee_known) {
+            auto frng = m_feerate_index.equal_range(it->second.feerate_satvb());
+            for (auto rit = frng.first; rit != frng.second; ++rit) {
+                if (rit->second == txid) {
+                    m_feerate_index.erase(rit);
+                    break;
+                }
             }
         }
 
