@@ -333,6 +333,22 @@ int main(int argc, char* argv[])
                 return 2;
             }
         }
+        // ── LTC/DOGE-parity aliases ──────────────────────────────────────
+        // c2pool LTC/DOGE use --embedded-{ltc,doge} / --no-embedded-{ltc,doge}
+        // / --standalone. Mirror that surface for c2pool-dash so operators
+        // don't have to learn a Dash-only --gbt-source vocabulary.
+        //   --embedded-dash        → gbt_source=auto  (embedded with RPC
+        //                            cross-check + 3-strike fallback)
+        //   --no-embedded-dash     → gbt_source=rpc   (RPC daemon only)
+        //   --standalone           → gbt_source=rpc   (matches LTC semantics)
+        // --gbt-source is retained for explicit "embedded only, no fallback"
+        // (gbt_source=embedded) which has no LTC equivalent.
+        else if (arg == "--embedded-dash") {
+            gbt_source = "auto";
+        }
+        else if (arg == "--no-embedded-dash" || arg == "--standalone") {
+            gbt_source = "rpc";
+        }
     }
 
     std::cout << "╔══════════════════════════════════════════════════════════╗" << std::endl;
