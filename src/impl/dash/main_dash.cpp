@@ -914,6 +914,30 @@ int main(int argc, char* argv[])
     auto chainlocked_blocks =
         std::make_shared<std::map<uint256, int32_t>>();
 
+    // ── Phase C-CUTOVER: resolve GBT source policy + share state ──
+    // Declared early so the dashboard lambda below can capture the
+    // resolved policy + the embedded-fail counter that drives
+    // hysteresis fallback. Actual job_fn that consumes them lives
+    // ~2000 lines down.
+    const bool use_embedded_gbt =
+        (gbt_source == "embedded")
+     || (gbt_source == "auto" && dashd_rpc_host.empty());
+    auto embedded_fail_count = std::make_shared<int>(0);
+
+    // ── Phase C-CUTOVER step 4: shadow-validation counters ──
+    // Surfaces match/mismatch totals for the four [*-XCHECK] channels
+    // on the dashboard /sync_status panel, so soak operators can
+    // monitor cutover health at a glance instead of grepping logs.
+    struct SoakCounters {
+        std::atomic<uint64_t> gbt_match{0},      gbt_mismatch{0};
+        std::atomic<uint64_t> cbtx_match{0},     cbtx_mismatch{0};
+        std::atomic<uint64_t> quorums_match{0},  quorums_mismatch{0};
+        std::atomic<uint64_t> creditpool_match{0}, creditpool_mismatch{0};
+        std::atomic<uint64_t> sml_match{0},      sml_mismatch{0};
+        std::atomic<uint64_t> roundtrip_confirms{0}, roundtrip_timeouts{0};
+    };
+    auto soak_counters = std::make_shared<SoakCounters>();
+
     // ── Phase C-SUBMIT step 2: pending-block roundtrip tracker ──
     // When a block is submitted via P2P, record {hash, send_epoch_ms}.
     // on_full_block matches the hash → confirms roundtrip + erases.
@@ -1573,7 +1597,10 @@ int main(int argc, char* argv[])
             auto* mi3 = web_server->get_mining_interface();
             mi3->set_spv_progress_fn(
                 [&header_chain, &coin_node, sml, sml_db, quorums, quorum_db,
-                 chainlocked_blocks]() -> nlohmann::json {
+                 chainlocked_blocks, soak_counters, credit_pool, credit_pool_db,
+                 best_clsig, pending_block_submits, embedded_fail_count,
+                 gbt_source, dashd_rpc_host,
+                 use_embedded_gbt]() -> nlohmann::json {
                 nlohmann::json r;
                 r["dash_height"] = static_cast<int>(header_chain.height());
                 r["dash_tip_count"] = static_cast<int>(header_chain.size());
@@ -1628,6 +1655,53 @@ int main(int argc, char* argv[])
                     r["dash_chainlocks_verified"] =
                         static_cast<int>(chainlocked_blocks->size());
                 }
+
+                // ── Phase C-CUTOVER step 4: cutover panel data ──
+                // Operator-visible signals for the embedded GBT
+                // soak phase. Surfaces:
+                //   gbt_source       — requested + resolved policy
+                //   shadow counters  — per-channel match/mismatch totals
+                //   credit_pool      — current balance + initialized state
+                //   best_clsig       — height of best observed verified CL
+                //   pending_submits  — in-flight roundtrip count
+                //   embedded_fails   — current consecutive-fail counter
+                nlohmann::json cut;
+                cut["gbt_source_requested"] = gbt_source;
+                cut["gbt_source_resolved"]  = use_embedded_gbt ? "embedded" : "rpc";
+                cut["dashd_rpc_present"]    = !dashd_rpc_host.empty();
+                cut["embedded_fail_count"]  = embedded_fail_count
+                    ? *embedded_fail_count : 0;
+                if (soak_counters) {
+                    nlohmann::json sc;
+                    sc["gbt_match"]            = static_cast<uint64_t>(soak_counters->gbt_match);
+                    sc["gbt_mismatch"]         = static_cast<uint64_t>(soak_counters->gbt_mismatch);
+                    sc["cbtx_match"]           = static_cast<uint64_t>(soak_counters->cbtx_match);
+                    sc["cbtx_mismatch"]        = static_cast<uint64_t>(soak_counters->cbtx_mismatch);
+                    sc["quorums_match"]        = static_cast<uint64_t>(soak_counters->quorums_match);
+                    sc["quorums_mismatch"]     = static_cast<uint64_t>(soak_counters->quorums_mismatch);
+                    sc["creditpool_match"]     = static_cast<uint64_t>(soak_counters->creditpool_match);
+                    sc["creditpool_mismatch"]  = static_cast<uint64_t>(soak_counters->creditpool_mismatch);
+                    sc["roundtrip_confirms"]   = static_cast<uint64_t>(soak_counters->roundtrip_confirms);
+                    sc["roundtrip_timeouts"]   = static_cast<uint64_t>(soak_counters->roundtrip_timeouts);
+                    cut["shadow_counters"] = std::move(sc);
+                }
+                if (credit_pool) {
+                    nlohmann::json cp;
+                    cp["balance"]     = static_cast<int64_t>(credit_pool->balance());
+                    cp["height"]      = static_cast<int>(credit_pool->height());
+                    cp["initialized"] = credit_pool->initialized();
+                    cp["persisted"]   = credit_pool_db && credit_pool_db->is_open();
+                    cut["credit_pool"] = std::move(cp);
+                }
+                if (best_clsig) {
+                    cut["best_clsig_height"] = static_cast<int>(best_clsig->height);
+                }
+                if (pending_block_submits) {
+                    cut["pending_block_submits"] =
+                        static_cast<int>(pending_block_submits->size());
+                }
+                r["dash_cutover"] = std::move(cut);
+
                 return r;
             });
             // Wire the dashd P2P peers (primary + broadcaster pool) into the
@@ -1825,7 +1899,9 @@ int main(int argc, char* argv[])
                             mtp,
                             coin_params_for_addr.address_version,
                             coin_params_for_addr.address_p2sh_version);
-                        dash::coin::gbt_xcheck(embedded, work);
+                        bool m = dash::coin::gbt_xcheck(embedded, work);
+                        if (m) ++soak_counters->gbt_match;
+                        else   ++soak_counters->gbt_mismatch;
                     }
                 }
 
@@ -1852,7 +1928,9 @@ int main(int argc, char* argv[])
                         header_chain.height(), *sml, *quorums,
                         best_clsig->height, best_clsig->sig,
                         credit_pool_value);
-                    dash::coin::cbtx_xcheck(cbtx, work.m_coinbase_payload);
+                    bool cm = dash::coin::cbtx_xcheck(cbtx, work.m_coinbase_payload);
+                    if (cm) ++soak_counters->cbtx_match;
+                    else    ++soak_counters->cbtx_mismatch;
                 }
             } catch (const std::exception& e) {
                 LOG_WARNING << "[DashRPC] getwork() failed: " << e.what();
@@ -1965,6 +2043,7 @@ int main(int argc, char* argv[])
              dash_mempool,
              quorums,
              pending_block_submits,
+             soak_counters,
              &ioc](
                 const std::string& /*peer_key*/,
                 const dash::coin::BlockType& block) {
@@ -1983,6 +2062,7 @@ int main(int argc, char* argv[])
                             std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::system_clock::now().time_since_epoch()).count());
                         uint64_t latency_ms = now_ms - it->second.sent_at_ms;
+                        ++soak_counters->roundtrip_confirms;
                         LOG_INFO << "[SUBMIT] roundtrip CONFIRMED hash="
                                  << block_hash.GetHex().substr(0, 16)
                                  << " h=" << it->second.height
@@ -2068,6 +2148,7 @@ int main(int argc, char* argv[])
                                     credit_pool->apply_block(block, height);
                                     if (credit_pool->balance()
                                         != cbtx.creditPoolBalance) {
+                                        ++soak_counters->creditpool_mismatch;
                                         LOG_WARNING << "[CREDITPOOL-XCHECK] "
                                             "MISMATCH h=" << height
                                             << " computed="
@@ -2081,6 +2162,8 @@ int main(int argc, char* argv[])
                                         credit_pool->seed(
                                             cbtx.creditPoolBalance,
                                             height);
+                                    } else {
+                                        ++soak_counters->creditpool_match;
                                     }
                                 }
                                 // Step 13b: persist after every apply
@@ -2123,10 +2206,12 @@ int main(int argc, char* argv[])
                                 auto computed_qroot =
                                     dash::coin::compute_merkle_root_quorums(*quorums);
                                 if (computed_qroot == cbtx.merkleRootQuorums) {
+                                    ++soak_counters->quorums_match;
                                     LOG_INFO << "[QUORUMS-XCHECK] match h=" << height
                                              << " root=" << computed_qroot.GetHex().substr(0, 16)
                                              << " active=" << quorums->active_count();
                                 } else {
+                                    ++soak_counters->quorums_mismatch;
                                     LOG_WARNING << "[QUORUMS-XCHECK] MISMATCH h=" << height
                                                 << " computed=" << computed_qroot.GetHex().substr(0, 16)
                                                 << " observed=" << cbtx.merkleRootQuorums.GetHex().substr(0, 16)
@@ -3253,7 +3338,8 @@ int main(int argc, char* argv[])
     // Keeps the map bounded and surfaces silent rejects.
     auto submit_warn_timer = std::make_shared<io::steady_timer>(ioc);
     std::function<void(const boost::system::error_code&)> submit_warn_fn;
-    submit_warn_fn = [submit_warn_timer, pending_block_submits, &submit_warn_fn]
+    submit_warn_fn = [submit_warn_timer, pending_block_submits, soak_counters,
+                      &submit_warn_fn]
         (const boost::system::error_code& ec) {
         if (ec) return;
         if (pending_block_submits) {
@@ -3264,6 +3350,7 @@ int main(int argc, char* argv[])
                  it != pending_block_submits->end(); ) {
                 uint64_t age_ms = now_ms - it->second.sent_at_ms;
                 if (age_ms > 60'000) {
+                    ++soak_counters->roundtrip_timeouts;
                     LOG_WARNING << "[SUBMIT] *** ROUNDTRIP TIMEOUT *** "
                                    "block hash=" << it->first.GetHex().substr(0, 16)
                                 << " h=" << it->second.height
@@ -3580,28 +3667,19 @@ int main(int argc, char* argv[])
     const std::string pool_tag = "/c2pool-dash:0.1/";
     const size_t eff_window = pplns_window != 0 ? pplns_window : params.chain_length;
     std::function<void(const boost::system::error_code&)> job_fn;
-    // Resolve gbt_source policy once. "auto" picks embedded when no RPC
-    // configured, otherwise RPC.
-    const bool use_embedded_gbt =
-        (gbt_source == "embedded")
-     || (gbt_source == "auto" && dashd_rpc_host.empty());
+    // gbt_source policy + embedded_fail_count declared earlier (so the
+    // dashboard lambda can capture them). Log the resolved decision
+    // here once, near the rest of the job_timer setup, for grep-ability.
     LOG_INFO << "[JOB] GBT source policy: requested=" << gbt_source
              << " resolved=" << (use_embedded_gbt ? "embedded" : "rpc")
              << " (--dashd-rpc " << (dashd_rpc_host.empty() ? "absent" : "present") << ")";
 
-    // Phase C-CUTOVER step 3: auto-fallback hysteresis. When --gbt-source
-    // is "embedded" AND --dashd-rpc is also configured, count consecutive
-    // embedded-build failures. After EMBEDDED_FAIL_THRESHOLD failures in
-    // a row, temporarily fall through to RPC for one work cycle so
-    // miners don't go workless. A single embedded success resets the
-    // counter. Acts as a circuit breaker against transient embedded-build
-    // failures (e.g. mn_state_machine drained mid-reorg).
-    //
-    // Disabled when --gbt-source=embedded but no RPC (no fallback
-    // available — counter still counts but we just keep retrying
-    // embedded; logs will show the issue).
+    // Phase C-CUTOVER step 3: auto-fallback hysteresis threshold.
+    // When --gbt-source=embedded AND --dashd-rpc is also configured,
+    // after EMBEDDED_FAIL_THRESHOLD consecutive embedded-build
+    // failures we fall through to RPC for one cycle. A single
+    // embedded success resets the counter.
     constexpr int EMBEDDED_FAIL_THRESHOLD = 3;
-    auto embedded_fail_count = std::make_shared<int>(0);
 
     job_fn = [&, job_timer](const boost::system::error_code& ec) {
         if (ec) return;
