@@ -764,6 +764,7 @@ int main(int argc, char* argv[])
     // Source absence is non-fatal: per-block state machine starts with
     // empty DMN set; projections are wrong until enough blocks have
     // accumulated. [PAY] match/mismatch logging will show the gap.
+    bool mns_needs_rpc_bootstrap = false;
     if (mn_states_loaded.empty()) {
         dash::coin::DmnSnapshot snap;
         if (dash::coin::try_load_any_snapshot(dash_mn_snapshot_path, snap)) {
@@ -780,12 +781,22 @@ int main(int argc, char* argv[])
                      << mn_states_loaded.size() << " entries"
                      << " (snapshot height=" << snap.height
                      << " block=" << snap.block_hash.GetHex().substr(0, 16) << ")";
+        } else if (!dashd_rpc_host.empty()) {
+            // No file-based snapshot available, but operator has a
+            // dashd-RPC configured — defer to the post-RPC-connect
+            // bootstrap path (Phase C-PAY step 3b2). The actual
+            // build_snapshot_via_rpc() call fires on the same 5s
+            // timer that exercises the GBT pipeline below.
+            mns_needs_rpc_bootstrap = true;
+            LOG_INFO << "[MNS-SNAP] no file-based snapshot, --dashd-rpc "
+                        "set — will fetch fresh DMN list from RPC "
+                        "after handshake settles (Phase C-PAY step 3b2)";
         } else {
             LOG_INFO << "[MNS-SNAP] no bootstrap source available "
                         "(no --dash-mn-snapshot, no in-tree pin, no "
-                        "RPC fetch wired yet) — DMN state will start "
-                        "EMPTY; projections wrong until forward-only "
-                        "state machine repopulates";
+                        "--dashd-rpc) — DMN state will start EMPTY; "
+                        "projections wrong until forward-only state "
+                        "machine repopulates";
         }
     }
 
@@ -1575,6 +1586,37 @@ int main(int argc, char* argv[])
         auto gbt_timer = std::make_shared<io::steady_timer>(ioc, std::chrono::seconds(5));
         gbt_timer->async_wait([&, gbt_timer](const boost::system::error_code& ec) {
             if (ec || !coin_rpc || !coin_rpc->is_connected()) return;
+
+            // Phase C-PAY step 3b2: RPC bootstrap fallback for MnStateDb.
+            // Fires here (same 5s timer) only when the file-based
+            // snapshot path failed AND --dashd-rpc is set. Honors the
+            // "RPC stays optional" instruction — never required, only
+            // used when the operator already has a dashd anyway.
+            if (mns_needs_rpc_bootstrap) {
+                auto coin_params_dump = dash::make_coin_params(testnet);
+                auto snap = dash::coin::build_snapshot_via_rpc(
+                    *coin_rpc,
+                    coin_params_dump.address_version,
+                    coin_params_dump.address_p2sh_version);
+                if (snap) {
+                    auto filtered = sml->mnList.empty()
+                        ? snap->entries
+                        : dash::coin::filter_snapshot_against_sml(*snap, *sml);
+                    if (mn_state_db->is_open()) {
+                        mn_state_db->write_all(filtered, snap->block_hash, snap->height);
+                    }
+                    LOG_INFO << "[MNS-SNAP] RPC bootstrap applied: "
+                             << filtered.size() << " entries"
+                             << " (snapshot height=" << snap->height
+                             << " block=" << snap->block_hash.GetHex().substr(0, 16) << ")";
+                } else {
+                    LOG_WARNING << "[MNS-SNAP] RPC bootstrap failed — "
+                                   "DMN state stays empty (forward-only "
+                                   "state machine will populate over time)";
+                }
+                mns_needs_rpc_bootstrap = false;
+            }
+
             try {
                 auto work = coin_rpc->getwork();
                 LOG_INFO << "[DashRPC] GBT: height=" << work.m_height
