@@ -310,4 +310,16 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${CMAKE_SOURCE_DIR}/src
     )
     gtest_add_tests(test_dash_subsidy "" AUTO)
+
+    add_executable(test_dash_battletest_regressions test_dash_battletest_regressions.cpp)
+    target_link_libraries(test_dash_battletest_regressions PRIVATE
+        GTest::gtest_main GTest::gtest
+        core ltc dash_x11 c2pool_difficulty
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_include_directories(test_dash_battletest_regressions PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+    )
+    gtest_add_tests(test_dash_battletest_regressions "" AUTO)
 endif()
