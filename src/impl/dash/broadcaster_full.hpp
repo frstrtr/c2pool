@@ -198,8 +198,15 @@ public:
     {
         m_running = false;
         m_maintenance_timer.cancel();
+        m_graveyard_timer.cancel();
         m_peer_manager.stop();
         std::lock_guard<std::mutex> lock(m_mutex);
+        // Move live peers into the graveyard so async callbacks still see
+        // valid m_target_addr when they unwind. The graveyard itself is
+        // drained on process exit by ~vector destruction; by that point
+        // io_context has stopped so no more callbacks can fire.
+        for (auto& [k, p] : m_peers)
+            if (p) retire_to_graveyard_locked(std::move(p));
         m_peers.clear();
     }
 
@@ -336,6 +343,10 @@ public:
                         << peer_key << " threw: " << e.what();
         }
         m_peer_manager.record_broadcast_failure(peer_key);
+        // Bug 3 mitigation: defer destruction so in-flight async callbacks
+        // on this NodeP2P see m_target_addr alive when they fire. See the
+        // GRAVEYARD_TTL block at the bottom of this class.
+        retire_to_graveyard(std::move(it->second));
         m_peers.erase(it);
     }
 
@@ -481,9 +492,71 @@ private:
         LOG_INFO << "[DASH] Disconnecting P2P peer: " << key;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            m_peers.erase(key);
+            auto it = m_peers.find(key);
+            if (it != m_peers.end()) {
+                // Bug 3 mitigation: graveyard, not direct erase.
+                retire_to_graveyard(std::move(it->second));
+                m_peers.erase(it);
+            }
         }
         m_peer_manager.notify_disconnected(key);
+    }
+
+    // Bug 3 mitigation: defer destruction of disconnected peers so any
+    // in-flight async callback (NodeP2P::connected, message handlers, timers)
+    // sees a valid m_target_addr when it unwinds. After GRAVEYARD_TTL seconds
+    // the io_context has no remaining handlers referencing the peer; safe
+    // to destruct.
+    //
+    // Caller MUST hold m_mutex.
+    void retire_to_graveyard_locked(std::unique_ptr<DashBroadcastPeer> peer)
+    {
+        if (!peer) return;
+        m_graveyard.push_back({std::move(peer),
+                               std::chrono::steady_clock::now() + GRAVEYARD_TTL});
+        if (m_graveyard.size() == 1)
+            schedule_graveyard_drain();
+    }
+
+    // Wrapper that locks for callers that don't already hold m_mutex.
+    void retire_to_graveyard(std::unique_ptr<DashBroadcastPeer> peer)
+    {
+        // Heuristic: callers that already hold the lock pass the unique_ptr
+        // directly; the helper above handles them. Distinct external entry
+        // point retained for clarity in disconnect_peer paths that lock
+        // around a tighter scope than the enclosing function.
+        retire_to_graveyard_locked(std::move(peer));
+    }
+
+    void schedule_graveyard_drain()
+    {
+        m_graveyard_timer.expires_after(std::chrono::seconds(5));
+        m_graveyard_timer.async_wait(
+            [this](const boost::system::error_code& ec) {
+                if (ec) return;
+                drain_graveyard();
+                std::lock_guard<std::mutex> lock(m_mutex);
+                if (!m_graveyard.empty() && m_running)
+                    schedule_graveyard_drain();
+            });
+    }
+
+    void drain_graveyard()
+    {
+        const auto now = std::chrono::steady_clock::now();
+        std::vector<std::unique_ptr<DashBroadcastPeer>> to_destroy;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            auto it = m_graveyard.begin();
+            while (it != m_graveyard.end() && it->die_at <= now) {
+                to_destroy.push_back(std::move(it->peer));
+                ++it;
+            }
+            m_graveyard.erase(m_graveyard.begin(), it);
+        }
+        // Destruction outside the mutex — peer destructor may invoke
+        // callbacks/log calls that themselves take other locks.
+        to_destroy.clear();
     }
 
     void schedule_maintenance()
@@ -577,6 +650,25 @@ private:
     mutable std::mutex                                        m_mutex;
     std::map<std::string, std::unique_ptr<DashBroadcastPeer>> m_peers;
     bool                                                      m_running{true};
+
+    // Bug 3 mitigation (use-after-free during peer disconnect/reconnect cascade):
+    // NodeP2P doesn't inherit enable_shared_from_this and DashBroadcastPeer
+    // holds it by value. When m_peers.erase() destructs the slot, any
+    // in-flight async callback (connect/read/timer) that captured `this`
+    // UAFs on the freed m_target_addr string → garbage in to_string() →
+    // boost::log codecvt crashes on non-UTF8 bytes.
+    //
+    // Until the proper shared_from_this refactor lands, defer destruction
+    // by GRAVEYARD_TTL seconds. Callers move erased peers here and a timer
+    // pops the front when its TTL expires. By then all in-flight async
+    // ops on the dead peer have either completed or seen ec=cancelled.
+    static constexpr std::chrono::seconds GRAVEYARD_TTL{30};
+    struct DeferredPeer {
+        std::unique_ptr<DashBroadcastPeer>      peer;
+        std::chrono::steady_clock::time_point   die_at;
+    };
+    std::vector<DeferredPeer>                                 m_graveyard;
+    boost::asio::steady_timer                                 m_graveyard_timer{m_ioc};
 
     BlockCallback      m_on_new_block;
     TxCallback         m_on_new_tx;
