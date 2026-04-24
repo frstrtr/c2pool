@@ -1801,13 +1801,29 @@ int main(int argc, char* argv[])
         // header_chain.height()), send getmnlistd. This avoids touching
         // the Phase U handler and gives us a working sync without race
         // conditions on first-tip arrival timing.
-        auto sml_sync_timer = std::make_shared<io::steady_timer>(
-            ioc, std::chrono::seconds(30));
-        std::function<void(const boost::system::error_code&)> sml_sync_tick;
-        sml_sync_tick = [sml_sync_timer, sml, sml_db,
-                         bcaster = broadcaster.get(),
-                         chain = &header_chain,
-                         &sml_sync_tick](
+        // Chained-timer pattern: the persistent std::function is held
+        // via shared_ptr on the heap and is NEVER passed directly to
+        // async_wait. Each schedule() call hands async_wait a fresh
+        // wrapper lambda that captures `tick` by value and invokes
+        // (*tick)(ec) when fired. Direct passing of the persistent
+        // std::function caused boost::asio's perfect-forwarding to
+        // move-from the lvalue on first dispatch, leaving the function
+        // empty; the second fire then crashed dereferencing an empty
+        // std::function (apport core 03:55 / Thread 1 SIGSEGV).
+        auto sml_sync_timer = std::make_shared<io::steady_timer>(ioc);
+        auto sml_sync_tick =
+            std::make_shared<std::function<void(const boost::system::error_code&)>>();
+        auto sml_schedule = [sml_sync_timer, sml_sync_tick]() {
+            sml_sync_timer->expires_after(std::chrono::seconds(30));
+            sml_sync_timer->async_wait(
+                [sml_sync_tick](const boost::system::error_code& ec) {
+                    if (*sml_sync_tick) (*sml_sync_tick)(ec);
+                });
+        };
+        *sml_sync_tick = [sml_sync_timer, sml, sml_db,
+                          bcaster = broadcaster.get(),
+                          chain = &header_chain,
+                          sml_schedule](
             const boost::system::error_code& ec) {
             if (ec || !bcaster) return;
             try {
@@ -1832,10 +1848,9 @@ int main(int argc, char* argv[])
             } catch (const std::exception& e) {
                 LOG_WARNING << "[SML] sync tick error: " << e.what();
             }
-            sml_sync_timer->expires_after(std::chrono::seconds(30));
-            sml_sync_timer->async_wait(sml_sync_tick);
+            sml_schedule();
         };
-        sml_sync_timer->async_wait(sml_sync_tick);
+        sml_schedule();
         LOG_INFO << "[EMB-DASH] SML sync timer armed (30s interval, "
                     "fires once header chain advances ahead of SML)";
 
