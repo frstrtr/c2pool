@@ -205,7 +205,8 @@ inline vendor::CCbTx build_embedded_cbtx(
     const vendor::CSimplifiedMNList& sml,
     const QuorumManager& qmgr,
     int32_t  best_cl_height,
-    const std::array<uint8_t, 96>& best_cl_sig)
+    const std::array<uint8_t, 96>& best_cl_sig,
+    int64_t  last_observed_credit_pool)
 {
     vendor::CCbTx c;
     c.nVersion           = vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
@@ -232,7 +233,12 @@ inline vendor::CCbTx build_embedded_cbtx(
         c.bestCLSignature  = {};
     }
 
-    c.creditPoolBalance  = 0;
+    // Step 11: seed creditPoolBalance from the most recently
+    // observed CCbTx. Until the asset-lock state machine (DIP-0027)
+    // ships, this is the best we can do — and it's correct for any
+    // block where no asset-lock OR asset-unlock activity occurred
+    // since we last observed (the common case on mainnet).
+    c.creditPoolBalance  = last_observed_credit_pool;
     return c;
 }
 
@@ -312,12 +318,19 @@ inline bool cbtx_xcheck(const vendor::CCbTx& embedded,
                 roots_ok = false;
             }
         }
-        // creditPoolBalance: still pre-implementation. Always INFO.
+        // creditPoolBalance: step 11 seeds this from the most
+        // recently observed CCbTx. Mismatches after step 11 mean
+        // asset-lock OR asset-unlock activity occurred in the
+        // candidate block we're templating, and the embedded path
+        // needs the (not-yet-built) DIP-0027 state machine to catch
+        // up. INFO until the state machine ships.
         if (embedded.creditPoolBalance != rpc_cbtx.creditPoolBalance) {
+            int64_t delta = rpc_cbtx.creditPoolBalance - embedded.creditPoolBalance;
             LOG_INFO << "[CBTX-XCHECK] creditPoolBalance differs "
-                        "(expected — asset-lock state machine not built): "
-                     << "embedded=" << embedded.creditPoolBalance
-                     << " rpc="     << rpc_cbtx.creditPoolBalance;
+                        "(expected — asset-lock activity not yet "
+                        "tracked): embedded=" << embedded.creditPoolBalance
+                     << " rpc=" << rpc_cbtx.creditPoolBalance
+                     << " delta=" << delta;
         }
     }
 

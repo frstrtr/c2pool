@@ -666,6 +666,19 @@ int main(int argc, char* argv[])
     // application; mismatch → log-only at MVP.
     auto last_cbtx_mnlist_root = std::make_shared<uint256>();
     auto last_cbtx_block_height = std::make_shared<uint32_t>(0);
+
+    // Phase C-TEMPLATE step 11: track the most recently observed
+    // CCbTx.creditPoolBalance. Until the asset-lock state machine
+    // (DIP-0027) is built we cannot derive this field locally — but
+    // for blocks with no asset-lock activity (the common case) the
+    // pool balance is unchanged from the previous block, so seeding
+    // build_embedded_cbtx() with the last observed value is correct.
+    // Mismatch then becomes a real signal: it means asset-lock OR
+    // asset-unlock activity occurred in the block we're about to
+    // template, and the embedded path needs the state machine to
+    // catch up. Logged at INFO until the state machine ships.
+    auto last_cbtx_credit_pool = std::make_shared<int64_t>(0);
+    auto last_cbtx_credit_pool_height = std::make_shared<uint32_t>(0);
     std::cout << "[SML] initialized: entries=" << sml->size()
               << " best_height=" << sml_db->get_best_height()
               << " best_hash=" << sml_db->get_best_hash().GetHex().substr(0, 16)
@@ -1755,7 +1768,8 @@ int main(int argc, char* argv[])
                     && !work.m_coinbase_payload.empty()) {
                     auto cbtx = dash::coin::build_embedded_cbtx(
                         header_chain.height(), *sml, *quorums,
-                        best_clsig->height, best_clsig->sig);
+                        best_clsig->height, best_clsig->sig,
+                        *last_cbtx_credit_pool);
                     dash::coin::cbtx_xcheck(cbtx, work.m_coinbase_payload);
                 }
             } catch (const std::exception& e) {
@@ -1862,6 +1876,8 @@ int main(int argc, char* argv[])
              dash_bs,
              cbtx_root = last_cbtx_mnlist_root,
              cbtx_height = last_cbtx_block_height,
+             cbtx_credit_pool = last_cbtx_credit_pool,
+             cbtx_credit_pool_height = last_cbtx_credit_pool_height,
              mn_state_db, mn_state_machine,
              dash_mempool,
              quorums,
@@ -1915,6 +1931,16 @@ int main(int argc, char* argv[])
                             // surfaced when the diff handler reads it.
                             *cbtx_root = cbtx.merkleRootMNList;
                             *cbtx_height = height;
+
+                            // Phase C-TEMPLATE step 11: stash latest
+                            // observed creditPoolBalance for the GBT
+                            // shadow. v3+ only — older blocks don't
+                            // carry the field.
+                            if (cbtx.nVersion >= dash::coin::vendor
+                                    ::CCbTx::VERSION_CLSIG_AND_BALANCE) {
+                                *cbtx_credit_pool = cbtx.creditPoolBalance;
+                                *cbtx_credit_pool_height = height;
+                            }
 
                             // ── Phase C-TEMPLATE step 4c: merkleRootQuorums shadow ──
                             // Compute OUR merkleRootQuorums from
