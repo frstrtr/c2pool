@@ -165,8 +165,8 @@ inline bool gbt_xcheck(const DashWorkData& embedded,
     return ok;
 }
 
-/// Phase C-TEMPLATE step 6: build a CCbTx struct (extra_payload of
-/// the coinbase tx) from local SML + QuorumManager state.
+/// Phase C-TEMPLATE step 6/7: build a CCbTx struct (extra_payload
+/// of the coinbase tx) from local SML + QuorumManager state.
 ///
 /// We populate the fields we can compute now:
 ///   - nVersion = VERSION_CLSIG_AND_BALANCE (3) — Dash mainnet has
@@ -175,22 +175,24 @@ inline bool gbt_xcheck(const DashWorkData& embedded,
 ///   - merkleRootMNList   = sml.CalcMerkleRoot()  [Phase C-SML]
 ///   - merkleRootQuorums  = compute_merkle_root_quorums(qmgr)
 ///                          [Phase C-TEMPLATE step 4c]
+///   - bestCLHeightDiff / bestCLSignature: from the Phase C-TEMPLATE
+///     step 7 best-CLSIG tracker. dashcore's CalcCbTxBestChainlock
+///     formula: bestCLHeightDiff = (cb_height - 1) - bestCLHeight.
+///     If best_cl_height == 0 (we haven't observed a CLSIG since
+///     restart), we leave the fields zero — same wire shape dashd
+///     uses for "no chainlock for the window".
 ///
-/// The fields we CANNOT YET compute (left zeroed — known shadow
-/// MISMATCH):
-///   - bestCLHeightDiff / bestCLSignature: Phase L records
-///     ChainLock acceptance into chainlocked_blocks but does NOT
-///     yet cache the raw 96-byte sig nor the "best" (highest)
-///     accepted height for the cycle. Wiring needs a small extension
-///     to the on_clsig handler — deferred to a follow-up step.
+/// The field we CANNOT YET compute (left zeroed — known shadow
+/// MISMATCH at INFO):
 ///   - creditPoolBalance: requires the asset-lock state machine
 ///     (DIP-0027) which tracks deposits/withdrawals across cycles.
-///     Not built yet — shadow will MISMATCH against any post-V20
-///     block that has had asset-lock activity.
+///     Not built yet.
 inline vendor::CCbTx build_embedded_cbtx(
     uint32_t prev_height,
     const vendor::CSimplifiedMNList& sml,
-    const QuorumManager& qmgr)
+    const QuorumManager& qmgr,
+    int32_t  best_cl_height,
+    const std::array<uint8_t, 96>& best_cl_sig)
 {
     vendor::CCbTx c;
     c.nVersion           = vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
@@ -202,8 +204,21 @@ inline vendor::CCbTx build_embedded_cbtx(
     auto sml_mut = sml;
     c.merkleRootMNList   = sml_mut.CalcMerkleRoot();
     c.merkleRootQuorums  = compute_merkle_root_quorums(qmgr);
-    c.bestCLHeightDiff   = 0;
-    c.bestCLSignature    = {};      // all-zero = "no chainlock"
+
+    // bestCL fields: only set when we have an actual best.
+    // dashcore's formula is heightDiff = (cb_height - 1) - bestCLHeight.
+    // best_cl_height == 0 ⇒ no CLSIG seen ⇒ leave both zero, matching
+    // the pre-V20 / no-CL wire shape.
+    if (best_cl_height > 0
+        && best_cl_height <= static_cast<int32_t>(prev_height)) {
+        c.bestCLHeightDiff = static_cast<uint32_t>(
+            static_cast<int32_t>(prev_height) - best_cl_height);
+        c.bestCLSignature  = best_cl_sig;
+    } else {
+        c.bestCLHeightDiff = 0;
+        c.bestCLSignature  = {};
+    }
+
     c.creditPoolBalance  = 0;
     return c;
 }
@@ -260,18 +275,31 @@ inline bool cbtx_xcheck(const vendor::CCbTx& embedded,
         roots_ok = false;
     }
 
-    // Expected-mismatch fields: log at INFO so we can see drift but
-    // don't fire the WARNING channel until those phases wire.
+    // bestCL* comparison: severity depends on whether we have a
+    // best yet. If our best_cl_height==0 (no CLSIG observed since
+    // restart), mismatch is EXPECTED — log at INFO. Once we have
+    // a best, mismatches become real drift signals — log at WARNING.
     if (rpc_cbtx.nVersion >= vendor::CCbTx::VERSION_CLSIG_AND_BALANCE) {
+        bool we_have_best = (embedded.bestCLSignature != std::array<uint8_t, 96>{});
         if (embedded.bestCLHeightDiff != rpc_cbtx.bestCLHeightDiff
             || embedded.bestCLSignature != rpc_cbtx.bestCLSignature) {
-            LOG_INFO << "[CBTX-XCHECK] bestCL* differs (expected — "
-                        "Phase L cycle-best wiring not yet built): "
-                     << "embedded.diff=" << embedded.bestCLHeightDiff
-                     << " rpc.diff="     << rpc_cbtx.bestCLHeightDiff
-                     << " embedded.sig=" << (embedded.bestCLSignature == std::array<uint8_t, 96>{} ? "null" : "set")
-                     << " rpc.sig="      << (rpc_cbtx.has_best_cl_signature() ? "set" : "null");
+            if (!we_have_best) {
+                LOG_INFO << "[CBTX-XCHECK] bestCL* differs (expected — "
+                            "no verified CLSIG observed since restart): "
+                         << "embedded.diff=" << embedded.bestCLHeightDiff
+                         << " rpc.diff="     << rpc_cbtx.bestCLHeightDiff
+                         << " rpc.sig="      << (rpc_cbtx.has_best_cl_signature() ? "set" : "null");
+            } else {
+                LOG_WARNING << "[CBTX-XCHECK] bestCL* MISMATCH "
+                            << "embedded.diff=" << embedded.bestCLHeightDiff
+                            << " rpc.diff="     << rpc_cbtx.bestCLHeightDiff
+                            << " sigs_match="
+                            << (embedded.bestCLSignature == rpc_cbtx.bestCLSignature
+                                ? "yes" : "no");
+                roots_ok = false;
+            }
         }
+        // creditPoolBalance: still pre-implementation. Always INFO.
         if (embedded.creditPoolBalance != rpc_cbtx.creditPoolBalance) {
             LOG_INFO << "[CBTX-XCHECK] creditPoolBalance differs "
                         "(expected — asset-lock state machine not built): "

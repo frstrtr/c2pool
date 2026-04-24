@@ -846,6 +846,26 @@ int main(int argc, char* argv[])
     auto chainlocked_blocks =
         std::make_shared<std::map<uint256, int32_t>>();
 
+    // ── Phase C-TEMPLATE step 7: best-CLSIG cycle tracker ──
+    // Records the highest-height verified ChainLock signature seen
+    // so far, with its block hash and raw 96-byte sig. Drives the
+    // bestCLSignature + bestCLHeightDiff fields of the embedded
+    // CCbTx (Phase C-TEMPLATE step 6 left them zero pending this).
+    //
+    // Updated only inside the on_clsig VALID branch — same gating
+    // policy as chainlocked_blocks (iteration-2 hardening).
+    //
+    // NOT persisted: on restart, best resets to height=0 / null sig
+    // until the next clsig arrives. dashd's mempool / steady-state
+    // CLSIG fan-out fills it within seconds, so the gap is shorter
+    // than the Phase L cold-start hole already documented.
+    struct DashBestClsig {
+        int32_t                       height{0};
+        uint256                       bhash;
+        std::array<uint8_t, 96>       sig{};
+    };
+    auto best_clsig = std::make_shared<DashBestClsig>();
+
     // ── Pool Node ──
     dash::DashNodeImpl node(&ioc, config.get(), testnet);
     std::cout << "[NODE] DashNodeImpl created" << std::endl;
@@ -1706,7 +1726,8 @@ int main(int argc, char* argv[])
                     && header_chain.height() > 0
                     && !work.m_coinbase_payload.empty()) {
                     auto cbtx = dash::coin::build_embedded_cbtx(
-                        header_chain.height(), *sml, *quorums);
+                        header_chain.height(), *sml, *quorums,
+                        best_clsig->height, best_clsig->sig);
                     dash::coin::cbtx_xcheck(cbtx, work.m_coinbase_payload);
                 }
             } catch (const std::exception& e) {
@@ -2692,7 +2713,7 @@ int main(int argc, char* argv[])
         // a [CLSIG] verify FAILED is always the peer's fault and not
         // a bug in our verifier or QuorumManager state.
         broadcaster->set_on_clsig(
-            [quorums, chain = &header_chain, chainlocked_blocks,
+            [quorums, chain = &header_chain, chainlocked_blocks, best_clsig,
              coin_node_ptr = coin_node.get(),
              bcaster = broadcaster.get(), &ioc](
                 const std::string& peer_key,
@@ -2700,7 +2721,8 @@ int main(int argc, char* argv[])
                 const uint256& bhash,
                 const std::array<uint8_t, 96>& sig) {
                 io::post(ioc,
-                    [quorums, chain, chainlocked_blocks, coin_node_ptr,
+                    [quorums, chain, chainlocked_blocks, best_clsig,
+                     coin_node_ptr,
                      bcaster, peer_key, height, bhash, sig]() {
                   try {
                     auto r = dash::coin::verify_chainlock(
@@ -2715,6 +2737,14 @@ int main(int argc, char* argv[])
                         if (coin_node_ptr) {
                             coin_node_ptr->chainlocked_blocks[bhash] = height;
                             coin_node_ptr->new_chainlock.happened({bhash, height});
+                        }
+                        // Phase C-TEMPLATE step 7: update best-CLSIG
+                        // tracker (highest-height verified sig wins).
+                        // Equal-height same-block clsigs are no-ops.
+                        if (height > best_clsig->height) {
+                            best_clsig->height = height;
+                            best_clsig->bhash  = bhash;
+                            best_clsig->sig    = sig;
                         }
                         LOG_INFO << "[CLSIG] verified height=" << height
                                  << " block=" << bhash.GetHex().substr(0, 16)
