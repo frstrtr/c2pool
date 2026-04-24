@@ -85,16 +85,18 @@ struct DmnSnapshotPin
 /// entry at the TOP each release; we keep the previous pins around
 /// for old install paths that haven't pulled the new snapshot yet.
 ///
-/// Empty by default — populated when the maintainer-side script
-/// (tools/dash_dump_dmn.py) is wired in step 3b. Until then the
-/// loader returns false and the per-block state machine starts from
-/// an empty DMN set (incomplete projections, but no false data).
+/// To produce a new entry:
+///   c2pool-dash --dump-mn-snapshot data/dash/dmn_snapshot_h<H>.dat \
+///               --dashd-rpc HOST:PORT:USER:PASS [--testnet]
+/// then paste the printed `{ path, pin }` line at the TOP of v below.
 inline const std::vector<DmnSnapshotPin>& known_snapshots()
 {
     static const std::vector<DmnSnapshotPin> v = {
-        // Example (commented out until first snapshot generated):
-        // { "data/dash/dmn_snapshot_h2460000.dat",
-        //   uint256{}.SetHexFromString("00000000…") },
+        // Phase C-PAY step 3c: first in-tree snapshot (2026-04-24).
+        // Sourced from dashrpc on .24 against block 0000000000000008…
+        // at height 2460249. 2936 active MN entries, 747904 B on disk.
+        { "data/dash/dmn_snapshot_h2460249.dat",
+          uint256S("4b5e59b62b7c9c867598a3fbbe5ade7a3f25f7273a142919a765e5c4cae601c7") },
     };
     return v;
 }
