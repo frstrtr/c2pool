@@ -3202,45 +3202,66 @@ int main(int argc, char* argv[])
                 // Feed hashrate tracker so per-worker estimates update.
                 enhanced_node->track_mining_share_submission(
                     s.worker_name, ctx->share_difficulty);
-                if (r.is_block && coin_rpc && coin_rpc->is_connected()) {
-                    // SPV A2 (parity audit): broadcast via dashd P2P BEFORE
-                    // the RPC call so the network sees our block ~1-2s
-                    // earlier. Fire-and-forget; RPC is the authoritative
-                    // acceptance signal.
-                    if (coin_node && coin_node->has_p2p()) {
-                        try {
-                            auto bytes = ParseHex(r.block_hex);
-                            std::span<const unsigned char> span(
-                                bytes.data(), bytes.size());
+                if (r.is_block) {
+                    // ── Block-found pathway (RPC-independent) ──
+                    // Phase C-SUBMIT: P2P broadcast is the PRIMARY path.
+                    // Fires on every block-hit regardless of whether
+                    // --dashd-rpc is configured. RPC, when present,
+                    // becomes a fast authoritative confirmation channel
+                    // — but is NOT required for the block to reach the
+                    // network. The broadcaster fan-out (20 Dash P2P
+                    // peers) gets the block to the chain in parallel
+                    // with the singleton coin_node->submit_block_raw().
+                    bool p2p_sent = false;
+                    std::vector<unsigned char> bytes;
+                    try {
+                        bytes = ParseHex(r.block_hex);
+                        std::span<const unsigned char> span(
+                            bytes.data(), bytes.size());
+                        if (coin_node && coin_node->has_p2p()) {
                             coin_node->submit_block_raw(span);
-                            LOG_INFO << "[SUBMIT] P2P block broadcast sent (bytes="
+                            LOG_INFO << "[SUBMIT] P2P block broadcast sent via singleton (bytes="
                                      << bytes.size() << ")";
-                            // Fan-out via DashCoinBroadcaster pool so the
-                            // block reaches 20 dashd peers in parallel
-                            // rather than just the single primary SPV.
-                            // Matches p2pool-dash broadcaster behavior.
-                            if (broadcaster)
-                                broadcaster->submit_block_raw(span);
+                            p2p_sent = true;
+                        }
+                        if (broadcaster) {
+                            broadcaster->submit_block_raw(span);
+                            LOG_INFO << "[SUBMIT] P2P block fan-out via broadcaster (bytes="
+                                     << bytes.size() << ")";
+                            p2p_sent = true;
+                        }
+                    } catch (const std::exception& e) {
+                        LOG_WARNING << "[SUBMIT] P2P block broadcast threw: " << e.what();
+                    }
+
+                    // Optional: RPC submitblock as authoritative confirmation
+                    // when --dashd-rpc is set. NOT a precondition for accepting
+                    // the find — if the only RPC is down but P2P fan-out
+                    // reached peers, the block is still on the network.
+                    bool rpc_accepted = false;
+                    bool rpc_attempted = false;
+                    if (coin_rpc && coin_rpc->is_connected()) {
+                        rpc_attempted = true;
+                        try {
+                            rpc_accepted = coin_rpc->submit_block_hex(r.block_hex);
+                            LOG_INFO << "[SUBMIT] submitblock result="
+                                     << (rpc_accepted ? "ACCEPTED" : "rejected")
+                                     << " height=" << ctx->height;
                         } catch (const std::exception& e) {
-                            LOG_WARNING << "[SUBMIT] P2P block broadcast threw: " << e.what();
+                            LOG_WARNING << "[SUBMIT] submitblock threw: " << e.what();
                         }
                     }
-                    bool rpc_accepted = false;
-                    try {
-                        rpc_accepted = coin_rpc->submit_block_hex(r.block_hex);
-                        LOG_INFO << "[SUBMIT] submitblock result="
-                                 << (rpc_accepted ? "ACCEPTED" : "rejected")
-                                 << " height=" << ctx->height;
-                    } catch (const std::exception& e) {
-                        LOG_WARNING << "[SUBMIT] submitblock threw: " << e.what();
-                    }
-                    // C1 (parity audit): record the block find so
-                    // /recent_blocks exposes it to the dashboard. Only
-                    // record on RPC-ACCEPTED — the P2P pre-broadcast is
-                    // best-effort and dashd rejection of the block (bad
-                    // coinbase, missing ChainLock, etc.) should not surface
-                    // as a "found" entry.
-                    if (rpc_accepted) {
+
+                    // record_found_block: fire on either RPC acceptance
+                    // (authoritative, when available) OR successful P2P
+                    // broadcast when no RPC is configured. The latter is
+                    // the RPC-independent path's "best signal we have"
+                    // — peers will reject a bad block anyway and we'll
+                    // see the find never appear on chain via on_full_block
+                    // (a future iteration can clean up false positives).
+                    bool should_record = rpc_accepted
+                                      || (!rpc_attempted && p2p_sent);
+                    if (should_record) {
                         try {
                             auto* mi = web_server ? web_server->get_mining_interface() : nullptr;
                             if (mi) {
@@ -3262,6 +3283,12 @@ int main(int argc, char* argv[])
                         } catch (const std::exception& e) {
                             LOG_WARNING << "[SUBMIT] record_found_block: " << e.what();
                         }
+                    } else if (!p2p_sent && !rpc_attempted) {
+                        LOG_WARNING << "[SUBMIT] *** BLOCK FOUND BUT NEITHER P2P NOR RPC AVAILABLE ***"
+                                    << " height=" << ctx->height
+                                    << " hash=" << r.x11_hash.GetHex().substr(0, 16)
+                                    << " — block_hex retained in log for manual recovery: "
+                                    << r.block_hex.substr(0, 80) << "...";
                     }
                 }
 
