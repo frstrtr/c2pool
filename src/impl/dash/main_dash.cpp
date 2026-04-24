@@ -38,6 +38,7 @@
 #include <impl/dash/coin/subsidy.hpp>
 #include <impl/dash/coin/quorum_root.hpp>
 #include <impl/dash/coin/embedded_gbt.hpp>
+#include <impl/dash/coin/credit_pool.hpp>
 #include <impl/dash/coin/bls_verify.hpp>
 #include <impl/dash/coin/chainlock_verify.hpp>
 
@@ -668,17 +669,24 @@ int main(int argc, char* argv[])
     auto last_cbtx_block_height = std::make_shared<uint32_t>(0);
 
     // Phase C-TEMPLATE step 11: track the most recently observed
-    // CCbTx.creditPoolBalance. Until the asset-lock state machine
-    // (DIP-0027) is built we cannot derive this field locally — but
-    // for blocks with no asset-lock activity (the common case) the
-    // pool balance is unchanged from the previous block, so seeding
-    // build_embedded_cbtx() with the last observed value is correct.
-    // Mismatch then becomes a real signal: it means asset-lock OR
-    // asset-unlock activity occurred in the block we're about to
-    // template, and the embedded path needs the state machine to
-    // catch up. Logged at INFO until the state machine ships.
+    // CCbTx.creditPoolBalance — used as the seed for the credit pool
+    // state machine (step 13) AND as a fallback during the cold-start
+    // window before the state machine is initialized.
     auto last_cbtx_credit_pool = std::make_shared<int64_t>(0);
     auto last_cbtx_credit_pool_height = std::make_shared<uint32_t>(0);
+
+    // Phase C-TEMPLATE step 13: DIP-0027 credit-pool state machine.
+    // Apply per-block asset-lock/unlock deltas on top of a seed
+    // balance pulled from the first observed CCbTx. Computed value
+    // feeds build_embedded_cbtx() for bit-exact CCbTx.creditPoolBalance
+    // even on blocks WITH asset-lock activity (closes the last
+    // [CBTX-XCHECK] gap).
+    //
+    // In-memory at MVP. Persistence + sentinel cross-check (CreditPoolDb)
+    // is the natural step 13b follow-up, mirroring SMLDb/QuorumDb/
+    // MnStateDb. Cold-start re-seeds from the first post-restart
+    // observed CCbTx — same window as Phase L's CLSIG cycle reset.
+    auto credit_pool = std::make_shared<dash::coin::CreditPool>();
     std::cout << "[SML] initialized: entries=" << sml->size()
               << " best_height=" << sml_db->get_best_height()
               << " best_hash=" << sml_db->get_best_hash().GetHex().substr(0, 16)
@@ -1769,10 +1777,19 @@ int main(int argc, char* argv[])
                 if (sml && quorums && !sml->mnList.empty()
                     && header_chain.height() > 0
                     && !work.m_coinbase_payload.empty()) {
+                    // Phase C-TEMPLATE step 13: prefer the CreditPool
+                    // state machine's running balance once it's been
+                    // seeded; fall back to the last observed CCbTx
+                    // value during the cold-start window before the
+                    // first observed block.
+                    int64_t credit_pool_value =
+                        credit_pool && credit_pool->initialized()
+                            ? credit_pool->balance()
+                            : *last_cbtx_credit_pool;
                     auto cbtx = dash::coin::build_embedded_cbtx(
                         header_chain.height(), *sml, *quorums,
                         best_clsig->height, best_clsig->sig,
-                        *last_cbtx_credit_pool);
+                        credit_pool_value);
                     dash::coin::cbtx_xcheck(cbtx, work.m_coinbase_payload);
                 }
             } catch (const std::exception& e) {
@@ -1881,6 +1898,7 @@ int main(int argc, char* argv[])
              cbtx_height = last_cbtx_block_height,
              cbtx_credit_pool = last_cbtx_credit_pool,
              cbtx_credit_pool_height = last_cbtx_credit_pool_height,
+             credit_pool,
              mn_state_db, mn_state_machine,
              dash_mempool,
              quorums,
@@ -1943,6 +1961,46 @@ int main(int argc, char* argv[])
                                     ::CCbTx::VERSION_CLSIG_AND_BALANCE) {
                                 *cbtx_credit_pool = cbtx.creditPoolBalance;
                                 *cbtx_credit_pool_height = height;
+
+                                // Phase C-TEMPLATE step 13: drive the
+                                // CreditPool state machine.
+                                //
+                                // Two cases:
+                                //  (a) UNINITIALIZED — seed from this
+                                //      observed value. The CCbTx field
+                                //      reports the AFTER-block balance,
+                                //      so subsequent on_full_block calls
+                                //      apply deltas on top.
+                                //  (b) INITIALIZED — apply this block's
+                                //      asset-lock/unlock deltas, then
+                                //      cross-check our running balance
+                                //      against the just-observed value.
+                                //      Mismatch ⇒ [CREDITPOOL-XCHECK]
+                                //      WARNING (real drift signal — our
+                                //      DIP-0027 accounting disagrees
+                                //      with consensus).
+                                if (!credit_pool->initialized()) {
+                                    credit_pool->seed(
+                                        cbtx.creditPoolBalance, height);
+                                } else {
+                                    credit_pool->apply_block(block, height);
+                                    if (credit_pool->balance()
+                                        != cbtx.creditPoolBalance) {
+                                        LOG_WARNING << "[CREDITPOOL-XCHECK] "
+                                            "MISMATCH h=" << height
+                                            << " computed="
+                                            << credit_pool->balance()
+                                            << " observed="
+                                            << cbtx.creditPoolBalance
+                                            << " delta="
+                                            << (cbtx.creditPoolBalance
+                                                - credit_pool->balance())
+                                            << " — re-seeding from observed";
+                                        credit_pool->seed(
+                                            cbtx.creditPoolBalance,
+                                            height);
+                                    }
+                                }
                             }
 
                             // ── Phase C-TEMPLATE step 4c: merkleRootQuorums shadow ──
