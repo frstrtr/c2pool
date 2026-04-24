@@ -75,12 +75,27 @@ inline core::CoinParams make_coin_params(bool testnet)
     p.block_max_size           = 2000000;
     p.block_max_weight         = 2000000;  // Dash has no segwit weight
 
-    // Max target: standard bdiff difficulty 1 = 0xFFFF * 2^208.
-    // Matches p2pool-dash/p2pool/networks/dash.py MAX_TARGET. The prior
-    // value (0x00000fff... ≈ 2^256/2^20 − 1) was the old p2pool-dash
-    // "way too easy" target — ~4096× easier — used briefly to let CPU
-    // miners land shares during bring-up. Reverted for mainnet parity.
-    p.max_target.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
+    // Max target — DIFFERENT for mainnet vs testnet. Discovered via
+    // testnet battle-test 2026-04-24 (Bug 7 root cause).
+    //
+    // Mainnet (p2pool-dash/networks/dash.py:17):
+    //   MAX_TARGET = 0xFFFF * 2**208  ≈ 0x00000000ffff0000... (bdiff 1)
+    //   Standard Bitcoin/Dash difficulty-1 target.
+    //
+    // Testnet (p2pool-dash/networks/dash_testnet.py):
+    //   MAX_TARGET = 2**256//2**20 - 1 ≈ 0x00000fffffffffff... (~4096× easier)
+    //   p2pool-dash testnet allows much-easier shares so CPU miners can
+    //   land them quickly during testing. If c2pool uses mainnet's value
+    //   on testnet, we clamp the share's bits to mainnet diff-1, then
+    //   p2pool computes share.target = mainnet target, then verifies
+    //   pow_hash <= target — and cpuminer hashes (which only met testnet's
+    //   easier target) reliably fail this check ⇒ 'share PoW invalid'
+    //   on every share to a p2pool-dash peer.
+    if (testnet) {
+        p.max_target.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    } else {
+        p.max_target.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
+    }
 
     // Vardiff (matches p2pool-dash/dash/stratum.py:1071-1138 +
     // p2pool-dash/networks/dash.py:25-39):
