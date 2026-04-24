@@ -1522,6 +1522,7 @@ int main(int argc, char* argv[])
              utxo = &utxo_cache,
              utxo_db_ptr = &utxo_db,
              chainlocked_blocks,
+             sml, sml_db, quorums, quorum_db,
              dash_bs, &ioc](
                 const uint256& old_tip, uint32_t old_height,
                 const uint256& new_tip, uint32_t new_height) {
@@ -1530,7 +1531,8 @@ int main(int argc, char* argv[])
                 // to ioc so bcaster/UTXO access stays single-threaded.
                 io::post(ioc,
                     [bcaster, chain, utxo, utxo_db_ptr,
-                     chainlocked_blocks, dash_bs,
+                     chainlocked_blocks, sml, sml_db, quorums, quorum_db,
+                     dash_bs,
                      old_tip, old_height, new_tip, new_height]() {
                   try {
                     bool is_reorg = (new_height <= old_height);
@@ -1636,6 +1638,43 @@ int main(int argc, char* argv[])
                         }
                     }
 
+                    // ── Phase C-SML reorg drop-and-refetch (Tier 1.3) ──
+                    // SML state is anchored to a specific best_block.
+                    // After a reorg, the persisted SML reflects the OLD
+                    // chain — the next mnlistdiff request would go out
+                    // with baseBlockHash = old-chain tip, which the
+                    // peer would reject (or worse, return a diff
+                    // relative to a block we no longer accept).
+                    //
+                    // Cheap fix: clear SML in-memory + on-disk and
+                    // clear QuorumManager + QuorumDb. Next 30s sync
+                    // tick will fire getmnlistd(zero, new_tip), peer
+                    // returns ~400 KB cold-start diff, both stores
+                    // re-populate. ChainLock verify temporarily
+                    // returns NO_POOL until quorum tail repopulates;
+                    // that window is bounded by the next sync tick
+                    // (~30 s) and is acceptable for the rare reorg
+                    // case.
+                    //
+                    // Skipped if there's no SML state to drop (cold-
+                    // start path already handles this).
+                    if (is_reorg && sml && sml_db && quorums && quorum_db
+                        && (!sml->mnList.empty()
+                            || quorums->active_count() > 0)) {
+                        size_t sml_n = sml->mnList.size();
+                        size_t quo_n = quorums->active_count();
+                        sml->mnList.clear();
+                        quorums->clear();
+                        sml_db->clear();
+                        quorum_db->clear();
+                        LOG_WARNING << "[EMB-DASH] SML+QuorumDb reorg drop: "
+                                       "cleared sml_n=" << sml_n
+                                    << " quo_n=" << quo_n
+                                    << " — next sync tick will cold-start "
+                                       "from new tip "
+                                    << new_tip.GetHex().substr(0, 16);
+                    }
+
                     // Header-sync nudge: ask peers for new tip block so
                     // bootstrap pipeline / steady-state connect_block
                     // doesn't wait on an unsolicited announce. Skip
@@ -1650,7 +1689,8 @@ int main(int argc, char* argv[])
                 });
             });
         LOG_INFO << "[EMB-DASH] Chain tip-changed handler registered "
-                    "(reorg disconnect_block + header-sync nudge)";
+                    "(reorg disconnect_block + SML/QuorumDb drop "
+                    "+ header-sync nudge)";
 
         // ── Phase C-SML steps 6+7: SML diff consumer + CBTX root check ──
         // Receives mnlistdiffs from broadcaster fan-out (any peer that
