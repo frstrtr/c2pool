@@ -194,12 +194,27 @@ public:
     {
         std::optional<uint256> best_hash;
         int best_h = 0;
+        // Defensive: dashd's protx info JSON reports "lastPaidHeight": -1
+        // (and PoSeRevivedHeight: -1, PoSeBanHeight: -1) as sentinel for
+        // "never paid / never revived / never banned". Snapshots dumped by
+        // earlier c2pool versions stored those sentinels as UINT32_MAX
+        // (uint32_t wrap of int -1). When cast back to `int` for the
+        // CompareByLastPaid_GetHeight scoring, UINT32_MAX → -1, which beats
+        // every positive height — the lowest-proTxHash never-paid MN wins
+        // forever, producing a constant `expected` across all heights and
+        // a 100% [PAY] MISMATCH rate. Normalize here so a buggy in-tree
+        // snapshot still produces correct payee selection without re-dump.
+        constexpr uint32_t SENTINEL = std::numeric_limits<uint32_t>::max();
+        auto sane_height = [](uint32_t v) -> uint32_t {
+            return (v == SENTINEL) ? 0u : v;
+        };
         for (const auto& [hash, st] : m_entries) {
             if (!st.isValid) continue;
-            int h = static_cast<int>(st.nLastPaidHeight);
-            if (st.nPoSeRevivedHeight != 0
-                && static_cast<int>(st.nPoSeRevivedHeight) > h) {
-                h = static_cast<int>(st.nPoSeRevivedHeight);
+            uint32_t lastPaid = sane_height(st.nLastPaidHeight);
+            uint32_t revived  = sane_height(st.nPoSeRevivedHeight);
+            int h = static_cast<int>(lastPaid);
+            if (revived != 0 && static_cast<int>(revived) > h) {
+                h = static_cast<int>(revived);
             } else if (h == 0) {
                 h = static_cast<int>(st.nRegisteredHeight);
             }

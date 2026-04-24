@@ -61,11 +61,27 @@ inline std::optional<MNState> mn_state_from_protx_info(
         m.nType = (typeStr == "Evo")
             ? vendor::MnType::EVO
             : vendor::MnType::REGULAR;
-        m.nRegisteredHeight   = s.value("registeredHeight", 0);
-        m.nLastPaidHeight     = s.value("lastPaidHeight", 0);
+        // dashd reports -1 (signed int) in JSON for "never paid / never
+        // revived / never banned" sentinel. Reading via s.value(..., 0)
+        // returns int(-1); implicit conversion to uint32_t wraps to
+        // UINT32_MAX. Then static_cast<int>(UINT32_MAX) in
+        // find_expected_payee → -1, which beats every positive height
+        // → that MN always wins the min-find. Result observed live on
+        // mainnet: expected payee constant = lowest-hash never-paid MN
+        // for all blocks → 100% [PAY] MISMATCH rate against dashd's
+        // actual selection. Normalize -1 → 0 here, matching the
+        // semantics that drive find_expected_payee's `if (h == 0)
+        // h = nRegisteredHeight` fallback.
+        auto take_height_or_zero = [&](const char* key) -> uint32_t {
+            if (!s.contains(key)) return 0;
+            int64_t v = s.value(key, int64_t{0});
+            return (v < 0) ? 0u : static_cast<uint32_t>(v);
+        };
+        m.nRegisteredHeight    = take_height_or_zero("registeredHeight");
+        m.nLastPaidHeight      = take_height_or_zero("lastPaidHeight");
         m.nConsecutivePayments = s.value("consecutivePayments", 0);
-        m.nPoSeRevivedHeight  = s.value("PoSeRevivedHeight", 0);
-        m.nPoSeBanHeight      = s.value("PoSeBanHeight", 0);
+        m.nPoSeRevivedHeight   = take_height_or_zero("PoSeRevivedHeight");
+        m.nPoSeBanHeight       = take_height_or_zero("PoSeBanHeight");
         m.nRevocationReason   = s.value("revocationReason", 0);
         // PoSeBanHeight == -1 in dashcore JSON when not banned; we
         // default to 0. dashd emits int, value() casts cleanly.
