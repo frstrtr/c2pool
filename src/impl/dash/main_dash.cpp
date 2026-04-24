@@ -3135,6 +3135,26 @@ int main(int argc, char* argv[])
                                  << " peer=" << peer_key;
                         break;
                     case S::INVALID_SIG:
+                        // Bug 1 (iteration-2c rollback, 2026-04-24):
+                        // Iteration-2b assumed BLS verify failure = malicious
+                        // peer, and disconnected. Battle-test on Dash testnet
+                        // proved that's wrong: when our QuorumManager pool has
+                        // SOME LLMQ_400_60 quorums but not the SPECIFIC one
+                        // that signed the CLSIG (because our SML lags chain
+                        // tip by 1+ mnlistdiff cycle), the deterministic
+                        // selection algorithm picks the WRONG quorum from our
+                        // pool, BLS verify fails on the wrong pubkey, and we
+                        // mis-classify an honest CLSIG as malicious. Effect
+                        // observed: every honest peer banned during catch-up,
+                        // peer pool collapses, sync stalls.
+                        //
+                        // Returning to log-only behavior. Real consensus
+                        // safety on CLSIGs comes from the GATED WRITES path
+                        // above (chainlocked_blocks only updated on VALID),
+                        // not from peer banning. A smarter ban policy
+                        // (e.g. rate-limit per peer over 60s window after
+                        // dash_synced+SML-at-tip is achieved) is the proper
+                        // iteration-2c follow-up.
                         LOG_WARNING << "[CLSIG] verify FAILED (bad sig) height=" << height
                                     << " block=" << bhash.GetHex().substr(0, 16)
                                     << " selected_quorum=" << r.selected_quorum_hash.GetHex().substr(0, 16)
@@ -3142,19 +3162,9 @@ int main(int argc, char* argv[])
                                     << " qver=" << r.quorum_nversion
                                     << " scheme=" << (r.scheme_legacy ? "legacy" : "basic")
                                     << " peer=" << peer_key
-                                    << " — clsig DROPPED, peer disconnected "
-                                       "(iteration-2b)";
-                        // Iteration-2b: disconnect-on-bad-sig.
-                        // No-op for singleton dashd (its peer key isn't
-                        // tracked by the broadcaster). NO_POOL and
-                        // NO_SELECTED stay log-only because those are
-                        // OUR side (our QuorumManager state isn't yet
-                        // primed for this height) — not the peer's
-                        // fault.
-                        if (bcaster) {
-                            bcaster->disconnect_peer(
-                                peer_key, "bad clsig (BLS verify failed)");
-                        }
+                                    << " — clsig DROPPED, peer NOT disconnected "
+                                       "(iteration-2c: catch-up window indistinguishable "
+                                       "from malicious)";
                         break;
                     case S::NO_POOL:
                         LOG_WARNING << "[CLSIG] no signing pool height=" << height
