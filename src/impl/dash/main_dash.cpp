@@ -1887,7 +1887,55 @@ int main(int argc, char* argv[])
                             }
                         }
 
-                        // ── Phase C-TEMPLATE step 1: subsidy shadow ──
+                        // ── Phase C-TEMPLATE step 2: subsidy×fees cross-check ──
+                        // Cross-validates our subsidy formula AND fee-
+                        // computation pipeline against every observed
+                        // mainnet block, WITHOUT needing populated MN
+                        // state. Two independent paths to the same
+                        // number:
+                        //   way 1 (observation): observed_total
+                        //     = sum(coinbase_vouts)
+                        //     = block_reward + total_block_fees
+                        //   way 2 (calculation): expected_total
+                        //     = compute_dash_block_reward_post_v20(h)
+                        //     + computed_block_fees(block, utxo)
+                        // Match: our formula + UTXO + fee math are
+                        // correct. Mismatch (when fees computable):
+                        // either subsidy formula bug OR UTXO
+                        // incompleteness (which would produce a SHIFT
+                        // in one direction, easy to spot).
+                        if (!dash::coin::is_superblock_height(height)) {
+                            int64_t observed_total =
+                                dash::coin::observed_coinbase_value(block);
+                            auto fees_opt = dash::coin::computed_block_fees(
+                                block, utxo);
+                            int64_t expected_reward =
+                                dash::coin::compute_dash_block_reward_post_v20(height);
+                            if (fees_opt.has_value()) {
+                                int64_t expected_total =
+                                    expected_reward + *fees_opt;
+                                if (observed_total == expected_total) {
+                                    LOG_INFO << "[SUBSIDY-XCHECK] match h=" << height
+                                             << " coinbase=" << observed_total
+                                             << " (reward=" << expected_reward
+                                             << " + fees=" << *fees_opt << ")";
+                                } else {
+                                    LOG_WARNING << "[SUBSIDY-XCHECK] MISMATCH h=" << height
+                                                << " observed=" << observed_total
+                                                << " expected=" << expected_total
+                                                << " (reward=" << expected_reward
+                                                << " + fees=" << *fees_opt << ")"
+                                                << " diff=" << (observed_total - expected_total)
+                                                << " — log-only at MVP";
+                                }
+                            }
+                            // If fees_opt nullopt: rolling-288 UTXO
+                            // doesn't cover all inputs (cold-start) —
+                            // skip this block silently and try again
+                            // on the next.
+                        }
+
+                        // ── Phase C-TEMPLATE step 1: per-MN subsidy shadow ──
                         // Compute the expected MN payment from our pure
                         // formula (subsidy.hpp) and compare against the
                         // OBSERVED amount paid to the matched MN's vout.
