@@ -37,6 +37,7 @@
 #include <impl/dash/coin/mempool.hpp>
 #include <impl/dash/coin/subsidy.hpp>
 #include <impl/dash/coin/quorum_root.hpp>
+#include <impl/dash/coin/embedded_gbt.hpp>
 #include <impl/dash/coin/bls_verify.hpp>
 #include <impl/dash/coin/chainlock_verify.hpp>
 
@@ -1666,6 +1667,32 @@ int main(int argc, char* argv[])
                              << p.payee.substr(0, std::min<size_t>(p.payee.size(), 40))
                              << (p.payee.size() > 40 ? "..." : "")
                              << " amount=" << p.amount;
+                }
+
+                // ── Phase C-TEMPLATE step 5: embedded GBT vs RPC ──
+                // Build OUR equivalent and cross-check against RPC's
+                // answer. Skipped when MnStateMachine isn't populated
+                // (no snapshot bootstrap → no expected payee → can't
+                // produce a meaningful payment line). The compared
+                // fields cover the parts we currently produce: height,
+                // coinbase_value, payment_amount, bits, prev_hash,
+                // payment_amounts. Other fields (CCbTx payload,
+                // version bits, mintime, mempool tx selection diff)
+                // are NOT yet compared; documented in
+                // embedded_gbt.hpp's preamble.
+                if (mn_state_machine
+                    && mn_state_machine->size() >= 100
+                    && dash_mempool && header_chain.height() > 0) {
+                    auto tip_entry = header_chain.tip();
+                    if (tip_entry) {
+                        auto embedded = dash::coin::build_embedded_workdata(
+                            header_chain.height(),
+                            tip_entry->hash,
+                            *mn_state_machine,
+                            *dash_mempool,
+                            work.m_bits);   // borrow bits from RPC for now
+                        dash::coin::gbt_xcheck(embedded, work);
+                    }
                 }
             } catch (const std::exception& e) {
                 LOG_WARNING << "[DashRPC] getwork() failed: " << e.what();
