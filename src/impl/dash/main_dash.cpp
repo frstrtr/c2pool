@@ -1702,12 +1702,13 @@ int main(int argc, char* argv[])
         broadcaster->set_on_mnlistdiff(
             [sml, sml_db, quorums, quorum_db,
              cbtx_root = last_cbtx_mnlist_root,
-             cbtx_height = last_cbtx_block_height, &ioc](
+             cbtx_height = last_cbtx_block_height,
+             bcaster = broadcaster.get(), &ioc](
                 const std::string& peer_key,
                 const dash::coin::vendor::CSimplifiedMNListDiff& diff) {
                 io::post(ioc,
                     [sml, sml_db, quorums, quorum_db,
-                     cbtx_root, cbtx_height, peer_key, diff]() {
+                     cbtx_root, cbtx_height, bcaster, peer_key, diff]() {
                   try {
                     // Validate base. Cold start: base == ZERO is fine.
                     // Steady state: base must match our current best.
@@ -1756,8 +1757,9 @@ int main(int argc, char* argv[])
                                        << "applied without verification";
                     } else if (!root_ok) {
                         // ROLLBACK: restore in-memory, leave disk alone,
-                        // skip quorum tail entirely. Iteration-2b will
-                        // also disconnect the peer.
+                        // skip quorum tail entirely. Iteration-2b: also
+                        // disconnect the peer (no-op for singleton dashd
+                        // path, which isn't broadcaster-tracked).
                         sml->mnList = std::move(sml_snapshot);
                         LOG_WARNING << "[SML] root MISMATCH"
                                     << " computed=" << computed.GetHex().substr(0, 16)
@@ -1765,8 +1767,12 @@ int main(int argc, char* argv[])
                                     << " (vs diff.cbTx@h=" << diff_cbtx.nHeight
                                     << " block=" << diff.blockHash.GetHex().substr(0, 16) << ")"
                                     << " peer=" << peer_key
-                                    << " — diff REVERTED, quorum tail SKIPPED "
-                                       "(iteration-2b: ban peer)";
+                                    << " — diff REVERTED, quorum tail SKIPPED, "
+                                       "peer disconnected";
+                        if (bcaster) {
+                            bcaster->disconnect_peer(
+                                peer_key, "bad mnlistdiff (root MISMATCH)");
+                        }
                         return;
                     } else {
                         sml_db->write_sml(*sml, diff.blockHash, *cbtx_height);
@@ -1844,14 +1850,15 @@ int main(int argc, char* argv[])
         // a bug in our verifier or QuorumManager state.
         broadcaster->set_on_clsig(
             [quorums, chain = &header_chain, chainlocked_blocks,
-             coin_node_ptr = coin_node.get(), &ioc](
+             coin_node_ptr = coin_node.get(),
+             bcaster = broadcaster.get(), &ioc](
                 const std::string& peer_key,
                 int32_t height,
                 const uint256& bhash,
                 const std::array<uint8_t, 96>& sig) {
                 io::post(ioc,
                     [quorums, chain, chainlocked_blocks, coin_node_ptr,
-                     peer_key, height, bhash, sig]() {
+                     bcaster, peer_key, height, bhash, sig]() {
                   try {
                     auto r = dash::coin::verify_chainlock(
                         height, bhash, sig, *quorums, *chain);
@@ -1882,8 +1889,19 @@ int main(int argc, char* argv[])
                                     << " qver=" << r.quorum_nversion
                                     << " scheme=" << (r.scheme_legacy ? "legacy" : "basic")
                                     << " peer=" << peer_key
-                                    << " — clsig DROPPED, no chainlocked_blocks "
-                                       "update (iteration-2b: ban peer)";
+                                    << " — clsig DROPPED, peer disconnected "
+                                       "(iteration-2b)";
+                        // Iteration-2b: disconnect-on-bad-sig.
+                        // No-op for singleton dashd (its peer key isn't
+                        // tracked by the broadcaster). NO_POOL and
+                        // NO_SELECTED stay log-only because those are
+                        // OUR side (our QuorumManager state isn't yet
+                        // primed for this height) — not the peer's
+                        // fault.
+                        if (bcaster) {
+                            bcaster->disconnect_peer(
+                                peer_key, "bad clsig (BLS verify failed)");
+                        }
                         break;
                     case S::NO_POOL:
                         LOG_WARNING << "[CLSIG] no signing pool height=" << height

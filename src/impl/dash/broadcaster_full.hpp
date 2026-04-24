@@ -308,6 +308,37 @@ public:
 
     CoinPeerManager& peer_manager() { return m_peer_manager; }
 
+    /// Iteration-2b hardening: disconnect a single peer by key + record a
+    /// broadcast failure (hurts their Wilson-score in CoinPeerManager so
+    /// they're deprioritized for redial). Called from the on_clsig
+    /// INVALID_SIG branch and the on_mnlistdiff root MISMATCH branch in
+    /// main_dash. No-op if the key isn't in m_peers — this is the
+    /// natural exemption for the singleton dashd path (its peer key is
+    /// the dashd address, which broadcaster doesn't track).
+    ///
+    /// `reason` shows up in the log line for forensics.
+    void disconnect_peer(const std::string& peer_key,
+                         const std::string& reason)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_peers.find(peer_key);
+        if (it == m_peers.end()) {
+            // Not a broadcaster-tracked peer — likely the singleton
+            // dashd path. Don't drop our trusted seed.
+            return;
+        }
+        LOG_WARNING << "[DASH] Disconnecting peer " << peer_key
+                    << " (Misbehaving — " << reason << ")";
+        try {
+            it->second->node_p2p.disconnect();
+        } catch (const std::exception& e) {
+            LOG_WARNING << "[DASH] disconnect_peer "
+                        << peer_key << " threw: " << e.what();
+        }
+        m_peer_manager.record_broadcast_failure(peer_key);
+        m_peers.erase(it);
+    }
+
     /// Broadcast a `getdata(MSG_BLOCK, hash)` to every connected peer.
     /// Used by the bootstrap pipeline's initial window + stall-timer
     /// fallback so at least one peer responds. Same pattern as LTC's
