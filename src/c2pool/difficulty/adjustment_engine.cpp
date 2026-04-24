@@ -107,7 +107,23 @@ void DifficultyAdjustmentEngine::set_network_difficulty(double diff) {
     network_difficulty_ = diff;
     uint256 max_target;
     max_target.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
-    network_target_ = max_target / static_cast<uint64_t>(diff);
+
+    // Testnet found-via-battle-test: diff can be sub-1.0 (e.g. 0.000244
+    // on Dash testnet at low-hashrate periods). static_cast<uint64_t>(0.0002)
+    // truncates to 0 → uint256 / 0 throws "Division by zero" and kills the
+    // job_fn cycle every tick. Two cases:
+    //   diff >= 1.0: standard formula (mainnet + common testnet > 1.0)
+    //   diff <  1.0: target = max_target * (1/diff). For typical testnet
+    //                values like 0.000244, 1/diff ≈ 4096 which fits a
+    //                single uint256 multiply with no overflow risk
+    //                (max_target's top byte is 0x00).
+    if (diff >= 1.0) {
+        network_target_ = max_target / static_cast<uint64_t>(diff);
+    } else {
+        uint64_t inv = static_cast<uint64_t>(1.0 / diff);
+        if (inv == 0) inv = 1;  // belt-and-suspenders against extreme inputs
+        network_target_ = max_target * inv;
+    }
     last_network_update_ = static_cast<uint64_t>(std::time(nullptr));
     LOG_INFO << "Network difficulty set: " << network_difficulty_
              << " (target: " << network_target_.ToString().substr(0, 16) << "...)";
