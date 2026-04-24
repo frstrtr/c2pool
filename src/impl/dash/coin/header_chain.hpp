@@ -298,6 +298,19 @@ public:
         return m_best_work;
     }
 
+    // Phase C-TEMPLATE step 9: bits the next block must satisfy.
+    // Wraps DarkGravityWave3 over the current tip + 24-block window.
+    // Returns 0 when we don't yet have enough headers to retarget
+    // (caller should fall back to RPC / not produce a template).
+    uint32_t next_work_required() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_tip.IsNull() || m_tip_height < DGW_PAST_BLOCKS) return 0;
+        auto get_ancestor = [this](uint32_t h) -> std::optional<IndexEntry> {
+            return this->get_header_by_height_internal(h);
+        };
+        return dark_gravity_wave(get_ancestor, m_tip_height, m_params);
+    }
+
     size_t size() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_headers.size();

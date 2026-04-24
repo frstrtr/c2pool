@@ -1724,12 +1724,20 @@ int main(int argc, char* argv[])
                         uint32_t mtp = times.empty()
                             ? 0
                             : times[times.size() / 2];
+                        // Step 9: compute next bits via DarkGravityWave3
+                        // from header_chain. Falls back to work.m_bits
+                        // (RPC borrow) only when we don't yet have a
+                        // 24-block window — pre-checkpoint cold-start.
+                        uint32_t computed_bits = header_chain.next_work_required();
+                        uint32_t embedded_bits = computed_bits != 0
+                            ? computed_bits
+                            : work.m_bits;
                         auto embedded = dash::coin::build_embedded_workdata(
                             header_chain.height(),
                             tip_entry->hash,
                             *mn_state_machine,
                             *dash_mempool,
-                            work.m_bits,    // borrow bits from RPC for now
+                            embedded_bits,
                             mtp);
                         dash::coin::gbt_xcheck(embedded, work);
                     }
