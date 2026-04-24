@@ -1958,10 +1958,6 @@ int main(int argc, char* argv[])
                             auto observed = mn_state_machine
                                 ->find_paid_in_block_first(block);
                             if (observed && *observed == *expected) {
-                                // Find the actual paid amount: walk
-                                // coinbase outputs, sum any whose
-                                // scriptPubKey == expected MN's
-                                // scriptPayout.
                                 auto state_it = mn_state_machine
                                     ->entries().find(*expected);
                                 if (state_it != mn_state_machine
@@ -1975,43 +1971,39 @@ int main(int argc, char* argv[])
                                             }
                                         }
                                     }
-                                    int64_t expected_block_reward =
+                                    // Now uses real computed_block_fees
+                                    // from step 2 (was a "implied_fees"
+                                    // back-calculation in the original).
+                                    // dashcore: GetMasternodePayment(
+                                    // height, block_value=reward+fees).
+                                    int64_t reward =
                                         dash::coin::compute_dash_block_reward_post_v20(height);
-                                    // dashcore: blockValue includes fees.
-                                    // We don't yet sum block fees here;
-                                    // observed_mn_amount = (reward+fees)*3/4.
-                                    // For a no-fee block, observed ==
-                                    // compute_mn_payment(reward).
-                                    // We log both reward-only expected
-                                    // and the implied fee delta, so
-                                    // shadow drift is visible.
-                                    int64_t expected_mn_no_fees =
-                                        dash::coin::compute_dash_mn_payment_post_v20(
-                                            expected_block_reward);
-                                    int64_t implied_fees_x4_div3 =
-                                        observed_mn_amount - expected_mn_no_fees;
-                                    int64_t implied_fees =
-                                        implied_fees_x4_div3 * 4 / 3;
-                                    if (observed_mn_amount == expected_mn_no_fees) {
-                                        LOG_INFO << "[SUBSIDY] match h=" << height
-                                                 << " mn_payment=" << observed_mn_amount
-                                                 << " (zero-fee block, "
-                                                 << "expected_reward=" << expected_block_reward << ")";
-                                    } else if (implied_fees >= 0
-                                               && implied_fees < 100'000'000LL) {
-                                        // Plausible fee range (<1 DASH).
-                                        LOG_INFO << "[SUBSIDY] match-with-fees h=" << height
-                                                 << " mn_payment=" << observed_mn_amount
-                                                 << " expected_no_fees=" << expected_mn_no_fees
-                                                 << " implied_fees=" << implied_fees << " sat";
-                                    } else {
-                                        LOG_WARNING << "[SUBSIDY] MISMATCH h=" << height
-                                                    << " mn_payment=" << observed_mn_amount
-                                                    << " expected_no_fees=" << expected_mn_no_fees
-                                                    << " implied_fees=" << implied_fees
-                                                    << " (out of plausible range — formula bug?)"
-                                                    << " — log-only at MVP";
+                                    auto fees_opt = dash::coin::computed_block_fees(
+                                        block, utxo);
+                                    if (fees_opt.has_value()) {
+                                        int64_t expected_mn =
+                                            dash::coin::compute_dash_mn_payment_post_v20(
+                                                reward + *fees_opt);
+                                        if (observed_mn_amount == expected_mn) {
+                                            LOG_INFO << "[MN-PAY] match h=" << height
+                                                     << " mn_payment=" << observed_mn_amount
+                                                     << " (reward=" << reward
+                                                     << " + fees=" << *fees_opt
+                                                     << " ×3/4)";
+                                        } else {
+                                            LOG_WARNING << "[MN-PAY] MISMATCH h=" << height
+                                                        << " observed=" << observed_mn_amount
+                                                        << " expected=" << expected_mn
+                                                        << " (reward=" << reward
+                                                        << " + fees=" << *fees_opt
+                                                        << " ×3/4)"
+                                                        << " diff=" << (observed_mn_amount - expected_mn)
+                                                        << " — log-only at MVP";
+                                        }
                                     }
+                                    // No fees_opt → cold-start UTXO
+                                    // incompleteness; SUBSIDY-XCHECK
+                                    // will skip this block too. Silent.
                                 }
                             }
                         }
