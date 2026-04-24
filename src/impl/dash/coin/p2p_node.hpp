@@ -554,15 +554,17 @@ private:
         auto h = msg->m_height;
         LOG_INFO << "[DashP2P] ChainLock: height=" << h
                  << " block=" << bhash.GetHex().substr(0, 16);
-        m_coin->chainlocked_blocks[bhash] = h;
-        m_coin->new_chainlock.happened({bhash, h});
 
-        // Phase L step 3: forward to higher-layer verifier. The
-        // verifier owns QuorumManager + HeaderChain and runs the
-        // full BLS sig + selected-quorum check. Mismatch policy at
-        // MVP is log-only — the relay-trust record above already
-        // updated chainlocked_blocks so submit paths stay unchanged.
-        // Iteration 2 will gate chainlocked_blocks on verify success.
+        // Iteration-2 hardening: chainlocked_blocks write was MOVED to
+        // the on_clsig callback in main_dash, gated on BLS verify
+        // success. The eager relay-trust write here was spoofable —
+        // any peer could send us a fake clsig blob and we'd record
+        // their target block as ChainLock-finalized. Now we wait for
+        // verify_chainlock() to confirm via real BLS + quorum lookup.
+        //
+        // new_chainlock event is also gated by the callback (no current
+        // subscribers, but if one ever lands it should see the same
+        // verify discipline).
         if (m_on_clsig && msg->m_sig.size() == 96) {
             std::array<uint8_t, 96> sig_arr{};
             std::memcpy(sig_arr.data(), msg->m_sig.data(), 96);

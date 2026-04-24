@@ -1681,57 +1681,71 @@ int main(int argc, char* argv[])
                         return;
                     }
 
+                    // ── Iteration-2 hardening: snapshot before apply ──
+                    // Pre-iteration-2 path: apply → write_sml → verify.
+                    // On root MISMATCH we'd log and keep the bad state.
+                    // Now: snapshot in-memory, apply, compute root,
+                    // and if MISMATCH revert in-memory + skip the disk
+                    // write + skip the quorum tail apply (the quorum
+                    // tail came from the same possibly-malicious peer
+                    // and can't be trusted independently of the SML).
+                    // Cost: one ~450 KB vector copy per diff. Trivial.
+                    auto sml_snapshot = sml->mnList;
+
                     auto before_size = sml->size();
                     auto result = dash::coin::vendor::apply_diff(*sml, diff);
-                    sml_db->write_sml(*sml, diff.blockHash, *cbtx_height);
 
-                    LOG_INFO << "[SML] applied: +"
-                             << result.added_or_updated << "/-"
-                             << result.deleted
-                             << " size " << before_size << "→" << sml->size()
-                             << " best=" << diff.blockHash.GetHex().substr(0, 16)
-                             << " peer=" << peer_key;
-
-                    // Phase C-SML step 7: verify against the CBTX
-                    // EMBEDDED IN THIS DIFF. The diff carries diff.cbTx
-                    // which is the actual coinbase tx of diff.blockHash
-                    // — guaranteed to be for the same block whose SML
-                    // state we just applied. Using the cbTx from the
-                    // diff itself (rather than a cached cbtx_root from
-                    // some prior on_full_block arrival) eliminates a
-                    // state-coordination race where the cached root was
-                    // for a different height than the SML's current
-                    // best_block, producing spurious mismatches.
+                    // Compute root BEFORE persisting to disk so a
+                    // MISMATCH leaves disk untouched.
                     auto computed = sml->CalcMerkleRoot();
                     dash::coin::vendor::CCbTx diff_cbtx;
-                    if (!dash::coin::vendor::parse_cbtx(
-                            diff.cbTx.extra_payload, diff_cbtx)) {
+                    bool root_parsed = dash::coin::vendor::parse_cbtx(
+                        diff.cbTx.extra_payload, diff_cbtx);
+                    bool root_ok = root_parsed
+                                && computed == diff_cbtx.merkleRootMNList;
+
+                    if (!root_parsed) {
+                        // Can't verify — best-effort, treat as match
+                        // (the diff's own CBTX is malformed; rare).
+                        // Apply anyway, but log the gap explicitly.
+                        sml_db->write_sml(*sml, diff.blockHash, *cbtx_height);
                         LOG_WARNING << "[SML] could not parse CBTX from "
                                        "mnlistdiff (CCbTx payload "
                                        << diff.cbTx.extra_payload.size()
-                                       << " B) — root verification skipped";
-                    } else if (computed == diff_cbtx.merkleRootMNList) {
-                        LOG_INFO << "[SML] root MATCH "
-                                 << computed.GetHex().substr(0, 16)
-                                 << " (vs diff.cbTx@h=" << diff_cbtx.nHeight
-                                 << " block=" << diff.blockHash.GetHex().substr(0, 16) << ")";
-                    } else {
+                                       << " B) — root verification skipped, "
+                                       << "applied without verification";
+                    } else if (!root_ok) {
+                        // ROLLBACK: restore in-memory, leave disk alone,
+                        // skip quorum tail entirely. Iteration-2b will
+                        // also disconnect the peer.
+                        sml->mnList = std::move(sml_snapshot);
                         LOG_WARNING << "[SML] root MISMATCH"
                                     << " computed=" << computed.GetHex().substr(0, 16)
                                     << " cbtx="     << diff_cbtx.merkleRootMNList.GetHex().substr(0, 16)
                                     << " (vs diff.cbTx@h=" << diff_cbtx.nHeight
                                     << " block=" << diff.blockHash.GetHex().substr(0, 16) << ")"
-                                    << " — log-only at MVP, applied anyway";
+                                    << " peer=" << peer_key
+                                    << " — diff REVERTED, quorum tail SKIPPED "
+                                       "(iteration-2b: ban peer)";
+                        return;
+                    } else {
+                        sml_db->write_sml(*sml, diff.blockHash, *cbtx_height);
+                        LOG_INFO << "[SML] applied: +"
+                                 << result.added_or_updated << "/-"
+                                 << result.deleted
+                                 << " size " << before_size << "→" << sml->size()
+                                 << " best=" << diff.blockHash.GetHex().substr(0, 16)
+                                 << " peer=" << peer_key;
+                        LOG_INFO << "[SML] root MATCH "
+                                 << computed.GetHex().substr(0, 16)
+                                 << " (vs diff.cbTx@h=" << diff_cbtx.nHeight
+                                 << " block=" << diff.blockHash.GetHex().substr(0, 16) << ")";
                     }
 
                     // ── Phase C-QUO step 3: structured tail → quorums ─
-                    // Runs AFTER SML application. Failure here logs a
-                    // warning and continues — SML sync stays alive
-                    // (the MVP correctness gate). This is the optional,
-                    // fail-safe layer over the opaque tail in
-                    // smldiff.hpp; once we've observed N consecutive
-                    // clean parses against mainnet we can promote the
-                    // tail to first-class structured fields.
+                    // Only reached when root parsed (root match OR root
+                    // unparseable best-effort). On root MISMATCH we
+                    // returned above without touching the quorum state.
                     dash::coin::vendor::QuorumTail qtail;
                     if (dash::coin::vendor::parse_quorum_tail(
                             diff.quorum_tail, qtail)) {
@@ -1769,33 +1783,49 @@ int main(int argc, char* argv[])
                     "(apply_diff + LevelDB flush + CBTX root verification "
                     "+ structured quorum tail)";
 
-        // ── Phase L step 3: ChainLock verifier wiring ──
-        // Receives clsigs from broadcaster fan-out (any peer that
-        // pushes one). Runs the full verify recipe (request_id →
-        // signing-pool → selected-quorum → sign_hash → BLS Verify) via
-        // chainlock_verify.hpp. Mismatch policy at MVP: LOG-ONLY,
-        // chainlocked_blocks already updated by p2p_node.hpp's relay-
-        // trust path. Iteration 2 (after N clean MATCH blocks) gates
-        // the chainlocked_blocks update on verify success.
+        // ── Phase L step 3 + iteration-2 hardening: ChainLock verifier ──
+        // Receives clsigs from broadcaster fan-out + the singleton
+        // dashd P2P. Runs the full verify recipe (request_id →
+        // signing-pool → selected-quorum → sign_hash → BLS Verify)
+        // and ONLY records ChainLock acceptance on verify success.
+        //
+        // Pre-iteration-2: chainlocked_blocks was written eagerly by
+        // p2p_node.hpp on every clsig before verification. That made
+        // the "is this block ChainLock-finalized?" check spoofable —
+        // a peer could send us a fake clsig for our own found block
+        // and we'd report it as CL'd. Now both writes (the shared
+        // reorg-refusal map AND coin_node->chainlocked_blocks for the
+        // FoundBlock CL-finalization check) sit inside the VALID
+        // branch only.
+        //
+        // Misbehaving / peer-disconnect on INVALID_SIG is deferred to
+        // iteration-2b — we want more soak telemetry to be confident
+        // a [CLSIG] verify FAILED is always the peer's fault and not
+        // a bug in our verifier or QuorumManager state.
         broadcaster->set_on_clsig(
-            [quorums, chain = &header_chain, chainlocked_blocks, &ioc](
+            [quorums, chain = &header_chain, chainlocked_blocks,
+             coin_node_ptr = coin_node.get(), &ioc](
                 const std::string& peer_key,
                 int32_t height,
                 const uint256& bhash,
                 const std::array<uint8_t, 96>& sig) {
                 io::post(ioc,
-                    [quorums, chain, chainlocked_blocks,
+                    [quorums, chain, chainlocked_blocks, coin_node_ptr,
                      peer_key, height, bhash, sig]() {
                   try {
-                    // Relay-trust record (MVP). Iteration 2 will gate
-                    // this write on verify-success below.
-                    (*chainlocked_blocks)[bhash] = height;
-
                     auto r = dash::coin::verify_chainlock(
                         height, bhash, sig, *quorums, *chain);
                     using S = dash::coin::ChainLockVerifyResult::Status;
                     switch (r.status) {
                     case S::VALID:
+                        // GATED WRITES: only record CL acceptance on
+                        // verified BLS signature. Both maps update
+                        // atomically here.
+                        (*chainlocked_blocks)[bhash] = height;
+                        if (coin_node_ptr) {
+                            coin_node_ptr->chainlocked_blocks[bhash] = height;
+                            coin_node_ptr->new_chainlock.happened({bhash, height});
+                        }
                         LOG_INFO << "[CLSIG] verified height=" << height
                                  << " block=" << bhash.GetHex().substr(0, 16)
                                  << " quorum=" << r.selected_quorum_hash.GetHex().substr(0, 16)
@@ -1812,18 +1842,19 @@ int main(int argc, char* argv[])
                                     << " qver=" << r.quorum_nversion
                                     << " scheme=" << (r.scheme_legacy ? "legacy" : "basic")
                                     << " peer=" << peer_key
-                                    << " — log-only at MVP, relay-trust "
-                                       "record retained";
+                                    << " — clsig DROPPED, no chainlocked_blocks "
+                                       "update (iteration-2b: ban peer)";
                         break;
                     case S::NO_POOL:
                         LOG_WARNING << "[CLSIG] no signing pool height=" << height
                                     << " (anchor h=" << (height - dash::coin::clsig_detail::CHAINLOCKS_SIGN_OFFSET)
                                     << " has no LLMQ_400_60 quorums in our active set) "
-                                       "— SML/QUO sync not yet primed";
+                                       "— SML/QUO sync not yet primed, clsig DROPPED";
                         break;
                     case S::NO_SELECTED:
                         LOG_WARNING << "[CLSIG] pool exists but no quorum selected "
-                                       "(unexpected) height=" << height;
+                                       "(unexpected) height=" << height
+                                    << " — clsig DROPPED";
                         break;
                     }
                   } catch (const std::exception& e) {
@@ -1832,8 +1863,8 @@ int main(int argc, char* argv[])
                 });
             });
         LOG_INFO << "[EMB-DASH] ChainLock verifier registered "
-                    "(BLS verify against derived signing quorum, "
-                    "log-only mismatch at MVP)";
+                    "(BLS verify gates chainlocked_blocks writes — "
+                    "iteration-2 hardening)";
 
         // ── Phase C-SML step 6: tip-changed → request_mnlistdiff ──
         // Augment the existing tip-changed handler with an SML sync
