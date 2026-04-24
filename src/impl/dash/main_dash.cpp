@@ -32,6 +32,7 @@
 #include <impl/dash/coin/quorum_manager.hpp>
 #include <impl/dash/coin/mn_state_db.hpp>
 #include <impl/dash/coin/mn_snapshot.hpp>
+#include <impl/dash/coin/mn_snapshot_rpc.hpp>
 #include <impl/dash/coin/bls_verify.hpp>
 #include <impl/dash/coin/chainlock_verify.hpp>
 
@@ -93,6 +94,7 @@ int main(int argc, char* argv[])
     uint16_t    dashd_rpc_port = 9998;
     std::string dashd_rpc_userpass;
     std::string dash_mn_snapshot_path;     // --dash-mn-snapshot operator override
+    std::string dump_mn_snapshot_output;   // --dump-mn-snapshot one-shot dumper
     uint16_t    stratum_port   = 0;       // 0 = disabled; canonical Dash p2pool stratum port is 7903
     std::string mining_address;           // required when stratum+rpc are wired
     double      share_difficulty_default = 0.001;  // vardiff lands later
@@ -133,6 +135,9 @@ int main(int argc, char* argv[])
         }
         else if (arg == "--dash-mn-snapshot" && i + 1 < argc) {
             dash_mn_snapshot_path = argv[++i];
+        }
+        else if (arg == "--dump-mn-snapshot" && i + 1 < argc) {
+            dump_mn_snapshot_output = argv[++i];
         }
         else if (arg == "--dashd" && i + 1 < argc) {
             std::string addr = argv[++i];
@@ -228,6 +233,69 @@ int main(int argc, char* argv[])
     std::cout << "║           c2pool-dash — Dash p2pool node                ║" << std::endl;
     std::cout << "╚══════════════════════════════════════════════════════════╝" << std::endl;
     std::cout << std::endl;
+
+    // ── --dump-mn-snapshot one-shot path (Phase C-PAY step 3b) ────────
+    // Maintainer-side workflow: connect to a trusted dashd via RPC,
+    // fetch all registered MNs + their state, encode to the binary
+    // snapshot file format, write to disk, print SHA256d pin. Exits
+    // immediately afterward — does NOT proceed to normal pool startup.
+    //
+    // Usage:
+    //   c2pool-dash --dump-mn-snapshot data/dash/dmn_snapshot_h<H>.dat \
+    //               --dashd-rpc HOST:PORT:USER:PASS [--testnet]
+    //
+    // The printed SHA256d goes into mn_snapshot.hpp known_snapshots[].
+    if (!dump_mn_snapshot_output.empty()) {
+        if (dashd_rpc_host.empty()) {
+            std::cerr << "[--dump-mn-snapshot] requires --dashd-rpc to be set"
+                      << std::endl;
+            return 1;
+        }
+        boost::asio::io_context dump_ioc;
+        dash::interfaces::Node dump_iface;
+        auto dump_rpc = std::make_unique<dash::coin::NodeRPC>(
+            &dump_ioc, &dump_iface, testnet);
+        boost::asio::post(dump_ioc, [&]() {
+            NetService rpc_addr(dashd_rpc_host + ":" + std::to_string(dashd_rpc_port));
+            dump_rpc->connect(rpc_addr, dashd_rpc_userpass);
+        });
+        // Fire the dump after a 5s delay (matches the existing
+        // RPC-handshake-settle pattern in the rest of main_dash).
+        int exit_code = 0;
+        auto dump_timer = std::make_shared<boost::asio::steady_timer>(
+            dump_ioc, std::chrono::seconds(5));
+        dump_timer->async_wait(
+            [&, dump_timer](const boost::system::error_code& ec) {
+            if (ec) return;
+            if (!dump_rpc || !dump_rpc->is_connected()) {
+                std::cerr << "[--dump-mn-snapshot] RPC not connected after 5s — aborting"
+                          << std::endl;
+                exit_code = 2;
+                dump_ioc.stop();
+                return;
+            }
+            auto coin_params = dash::make_coin_params(testnet);
+            auto snap = dash::coin::build_snapshot_via_rpc(
+                *dump_rpc,
+                coin_params.address_version,
+                coin_params.address_p2sh_version);
+            if (!snap) {
+                std::cerr << "[--dump-mn-snapshot] RPC fetch failed"
+                          << std::endl;
+                exit_code = 3;
+            } else if (!dash::coin::write_snapshot_file(
+                           *snap, dump_mn_snapshot_output)) {
+                std::cerr << "[--dump-mn-snapshot] write failed"
+                          << std::endl;
+                exit_code = 4;
+            } else {
+                std::cout << "[--dump-mn-snapshot] OK — file written + pin printed above" << std::endl;
+            }
+            dump_ioc.stop();
+        });
+        dump_ioc.run();
+        return exit_code;
+    }
 
     // X11 self-test
     {

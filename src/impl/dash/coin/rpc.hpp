@@ -73,6 +73,18 @@ public:
     // to for redundant block propagation.
     nlohmann::json getpeerinfo();
 
+    // Phase C-PAY step 3b: protx info / list — used by the DMN
+    // snapshot dumper (--dump-mn-snapshot) and (in step 3b2) the
+    // optional bootstrap fallback when --dashd-rpc is configured.
+    //
+    // protx_list_registered() returns ["proRegTxHash", ...] of all
+    // currently-registered MNs. protx_info(hash) returns the full
+    // protx_info JSON for a single MN (with the dmnstate.cpp:39+
+    // field shape — version, registeredHeight, lastPaidHeight,
+    // payoutAddress, pubKeyOperator, etc.).
+    nlohmann::json protx_list_registered();
+    nlohmann::json protx_info(const uint256& proRegTxHash);
+
 private:
     // jsonrpccxx::IClientConnector contract.
     std::string Send(const std::string& request) override;

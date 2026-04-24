@@ -198,6 +198,18 @@ nlohmann::json NodeRPC::getblockchaininfo()    { return call_method("getblockcha
 nlohmann::json NodeRPC::getmininginfo()        { return call_method("getmininginfo"); }
 nlohmann::json NodeRPC::getpeerinfo()          { return call_method("getpeerinfo"); }
 
+nlohmann::json NodeRPC::protx_list_registered()
+{
+    // dashd: `protx list registered` → array of proRegTxHash strings.
+    // RPC syntax wires "protx" as the method with positional params.
+    return call_method("protx", {std::string("list"), std::string("registered")});
+}
+
+nlohmann::json NodeRPC::protx_info(const uint256& proRegTxHash)
+{
+    return call_method("protx", {std::string("info"), proRegTxHash.GetHex()});
+}
+
 nlohmann::json NodeRPC::getblockheader(const uint256& header, bool verbose)
 {
     return call_method("getblockheader", {header, verbose});
