@@ -10,10 +10,13 @@
 //     verifier to reach (it indexes into newQuorums by uint16 position
 //     within the most-recent diff).
 //
-// No persistence at MVP — cold-start mnlistdiff(zeros, tip) returns the
-// full active quorum set in newQuorums alongside the SML, so we
-// re-bootstrap from peers in ~400 KB once. Persistence is a Phase L
-// optimization if reconstruction-on-restart proves slow in practice.
+// Persistence is via QuorumDb (sister of SMLDb): on every accepted
+// mnlistdiff we apply() in-memory, then flush state to LevelDB. On
+// startup main_dash loads from QuorumDb via replace_state() before any
+// diff arrives. Without persistence, ChainLock verify returns NO_POOL
+// after every restart until a cold-start mnlistdiff(zero, tip) refills
+// the active set — which never happens in steady state because the
+// next diff is incremental.
 //
 // Thread-safety: all mutation goes through the on_mnlistdiff handler
 // which posts to ioc; reads from other threads (Phase L's clsig
@@ -145,6 +148,31 @@ public:
         m_latest_cl_sigs.clear();
     }
 
+    // Latest cached quorumsCLSigs from the most recent diff. Each entry
+    // is (96-byte recovered BLS sig, vector<uint16_t> indices into the
+    // most-recent diff's newQuorums). Persistence flushes this so a
+    // restart between two mnlistdiffs doesn't lose the cycle map Phase L
+    // reaches into.
+    using CLSig = std::pair<
+        std::array<uint8_t, vendor::CFinalCommitment::BLS_SIG_SIZE>,
+        std::vector<uint16_t>>;
+
+    const std::vector<CLSig>& latest_cl_sigs() const
+    {
+        return m_latest_cl_sigs;
+    }
+
+    // Bulk-replace state — used by QuorumDb::load_into() to warm the
+    // active set + latest CL sigs from disk before the first incremental
+    // diff arrives. On post-restart steady state this avoids needing a
+    // full cold-start mnlistdiff(zero, tip).
+    void replace_state(std::vector<Entry>&& active,
+                       std::vector<CLSig>&& cl_sigs)
+    {
+        m_active        = std::move(active);
+        m_latest_cl_sigs = std::move(cl_sigs);
+    }
+
 private:
     std::vector<Entry> m_active;
 
@@ -152,9 +180,7 @@ private:
     // cycle-shuffle verifier. Indices reference m_active positions of
     // the entries inserted from THIS diff; on the next diff they go
     // stale and we replace them.
-    std::vector<std::pair<
-        std::array<uint8_t, vendor::CFinalCommitment::BLS_SIG_SIZE>,
-        std::vector<uint16_t>>> m_latest_cl_sigs;
+    std::vector<CLSig> m_latest_cl_sigs;
 };
 
 } // namespace coin

@@ -27,6 +27,7 @@
 #include <impl/dash/coin/vendor/llmq_commitment.hpp>
 #include <impl/dash/coin/vendor/quorum_tail.hpp>
 #include <impl/dash/coin/sml_db.hpp>
+#include <impl/dash/coin/quorum_db.hpp>
 #include <impl/dash/coin/quorum_manager.hpp>
 #include <impl/dash/coin/bls_verify.hpp>
 #include <impl/dash/coin/chainlock_verify.hpp>
@@ -423,14 +424,47 @@ int main(int argc, char* argv[])
               << " best_hash=" << sml_db->get_best_hash().GetHex().substr(0, 16)
               << std::endl;
 
-    // ── Phase C-QUO step 3: in-memory LLMQ quorum tracker ──
-    // No persistence at MVP — cold-start mnlistdiff(zeros, tip) returns
-    // the full active quorum set in newQuorums alongside the SML
-    // (~400 KB for both combined). On restart we re-bootstrap from a
-    // peer; persistence is a Phase L optimization if reconstruction
-    // proves slow in practice.
+    // ── Phase C-QUO step 3 + persistence: LLMQ quorum tracker + QuorumDb ──
+    // QuorumDb persists the active quorum set so a restart between two
+    // mnlistdiffs doesn't leave QuorumManager empty. Without it,
+    // ChainLock verify returns NO_POOL after every restart in steady
+    // state (incremental diffs don't refill the active set; a full
+    // cold-start would require base=ZERO, which we only ask for when
+    // SMLDb is empty).
+    //
+    // Consistency: QuorumDb's BEST sentinel must match SMLDb's. If
+    // they diverge (crash mid-flush, manual db edit, schema upgrade)
+    // we wipe BOTH and force cold-start. Cheap (~400 KB once) and
+    // simpler than partial-write recovery.
+    std::string quorum_db_path = std::string(getenv("HOME") ? getenv("HOME") : ".")
+        + "/.c2pool/" + coin_name + "/quorum_db";
+    auto quorum_db = std::make_shared<dash::coin::QuorumDb>(quorum_db_path);
+    if (!quorum_db->open()) {
+        std::cerr << "[WARN] Failed to open Quorum LevelDB at " << quorum_db_path
+                  << " — quorum tracker will run cold-start every restart"
+                  << std::endl;
+    }
     auto quorums = std::make_shared<dash::coin::QuorumManager>();
-    std::cout << "[QUO] initialized: in-memory only (no persistence at MVP)"
+    if (quorum_db->is_open()) {
+        // Cross-check the two BEST sentinels. If they don't agree, the
+        // stored quorum state is stale relative to the SML; wipe both
+        // for a clean cold-start.
+        if (sml_db->is_open()
+            && quorum_db->get_best_hash() != sml_db->get_best_hash()) {
+            LOG_WARNING << "[QUO-DB] best_hash divergence vs SMLDb "
+                        << "(quo=" << quorum_db->get_best_hash().GetHex().substr(0, 16)
+                        << " sml=" << sml_db->get_best_hash().GetHex().substr(0, 16)
+                        << ") — wiping both for cold-start";
+            quorum_db->clear();
+            sml_db->clear();
+            sml->mnList.clear();
+        } else {
+            quorum_db->load_into(*quorums);
+        }
+    }
+    std::cout << "[QUO] initialized: active=" << quorums->active_count()
+              << " best_height=" << quorum_db->get_best_height()
+              << " best_hash=" << quorum_db->get_best_hash().GetHex().substr(0, 16)
               << std::endl;
 
     // ── Phase L step 4: shared ChainLock-blocks set ──
@@ -1626,13 +1660,13 @@ int main(int argc, char* argv[])
         // Misbehaving(100) + per-peer ban comes in iteration 2 after we
         // confirm CalcHash() is bit-exact correct.
         broadcaster->set_on_mnlistdiff(
-            [sml, sml_db, quorums,
+            [sml, sml_db, quorums, quorum_db,
              cbtx_root = last_cbtx_mnlist_root,
              cbtx_height = last_cbtx_block_height, &ioc](
                 const std::string& peer_key,
                 const dash::coin::vendor::CSimplifiedMNListDiff& diff) {
                 io::post(ioc,
-                    [sml, sml_db, quorums,
+                    [sml, sml_db, quorums, quorum_db,
                      cbtx_root, cbtx_height, peer_key, diff]() {
                   try {
                     // Validate base. Cold start: base == ZERO is fine.
@@ -1702,12 +1736,25 @@ int main(int argc, char* argv[])
                     if (dash::coin::vendor::parse_quorum_tail(
                             diff.quorum_tail, qtail)) {
                         auto qr = quorums->apply(qtail);
+                        // Flush to QuorumDb on the same beat as SMLDb's
+                        // write_sml above. Keeps the two stores' BEST
+                        // sentinels aligned so the startup divergence
+                        // check stays meaningful. Failure here is
+                        // logged but non-fatal — in-memory state is
+                        // still correct for THIS session; the next
+                        // restart would just cold-start.
+                        bool persisted = false;
+                        if (quorum_db->is_open()) {
+                            persisted = quorum_db->write_state(
+                                *quorums, diff.blockHash, *cbtx_height);
+                        }
                         LOG_INFO << "[QUO] applied: +"
                                  << qr.added_or_updated << "/-"
                                  << qr.deleted
                                  << " active=" << qr.active_after
                                  << " cl_sigs=" << qr.cl_sigs_cached
-                                 << " (tail=" << diff.quorum_tail.size() << "B)";
+                                 << " (tail=" << diff.quorum_tail.size() << "B"
+                                 << " persisted=" << (persisted ? "yes" : "no") << ")";
                     } else {
                         LOG_WARNING << "[QUO] tail parse failed — "
                                        "quorum tracking skipped for this "
