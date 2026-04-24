@@ -993,6 +993,21 @@ int main(int argc, char* argv[])
     dash::DashNodeImpl node(&ioc, config.get(), testnet);
     std::cout << "[NODE] DashNodeImpl created" << std::endl;
 
+    // Phase C-INTEROP step 1: bind the sharechain P2P listener.
+    // Without this, c2pool-dash can dial OUT to peers but never
+    // accepts inbound connections — making sharechain interop with
+    // p2pool-dash impossible (p2pool dials us; we never answered).
+    // Mirrors c2pool_refactored.cpp:6902 (LTC `enhanced_node->listen`).
+    // Port is the canonical p2pool-dash sharechain port: 8999 mainnet,
+    // 18999 testnet (matches p2pool-dash --p2pool-port default).
+    try {
+        node.listen(port);
+        std::cout << "[NODE] sharechain P2P listening on 0.0.0.0:" << port << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "[NODE] failed to bind sharechain port " << port
+                  << ": " << e.what() << " — interop with p2pool-dash will be broken" << std::endl;
+    }
+
     // ── Enhanced Node (vardiff, hashrate tracking, mining interface) ──
     // Template-instantiated for Dash via impl/dash/enhanced_node.hpp.
     // Storage is null (like LTC path); chain persistence belongs to DashNodeImpl.
