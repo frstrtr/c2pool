@@ -279,4 +279,35 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     gtest_add_tests(test_compute_share_target "" AUTO)
+
+    # ── Dash unit tests (Phase C-TEMPLATE) ──
+    # Header-only modules (CreditPool, subsidy formulas, vendor structs)
+    # link against core + dash_x11. No need for the full c2pool-dash
+    # binary's deps since the tests exercise pure consensus math.
+    add_executable(test_dash_credit_pool test_dash_credit_pool.cpp)
+    # Use the same lib set as the working LTC tests so we inherit a
+    # known-good static-link order (core+ltc+ltc_coin etc resolve each
+    # other's transitive symbols correctly).
+    target_link_libraries(test_dash_credit_pool PRIVATE
+        GTest::gtest_main GTest::gtest
+        core ltc dash_x11
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_include_directories(test_dash_credit_pool PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+    )
+    gtest_add_tests(test_dash_credit_pool "" AUTO)
+
+    add_executable(test_dash_subsidy test_dash_subsidy.cpp)
+    target_link_libraries(test_dash_subsidy PRIVATE
+        GTest::gtest_main GTest::gtest
+        core ltc dash_x11
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_include_directories(test_dash_subsidy PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+    )
+    gtest_add_tests(test_dash_subsidy "" AUTO)
 endif()
