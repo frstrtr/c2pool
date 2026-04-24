@@ -144,6 +144,8 @@ struct ChainLockVerifyResult
     uint256  selected_quorum_hash;        // populated if status != NO_POOL
     uint256  sign_hash;                   // populated if status != NO_POOL
     size_t   pool_size{0};                // diagnostic: how many quorums considered
+    uint16_t quorum_nversion{0};          // diagnostic: selected quorum's nVersion
+    bool     scheme_legacy{false};        // diagnostic: which BLS scheme was used
 };
 
 // Verify a ChainLock signature end-to-end. Returns a structured result
@@ -214,13 +216,21 @@ inline ChainLockVerifyResult verify_chainlock(
     r.pool_size = candidates.size();
 
     // ── Step C: pick lowest-score quorum ────────────────────────────
+    // Score comparison MUST use memcmp (LE-byte order), NOT uint256
+    // operator< (BIG-endian-integer order). dashcore's std::sort over
+    // pair<uint256, size_t> uses uint256 operator< which is defined as
+    // Compare(other) < 0 == memcmp(...) < 0 — different from c2pool's
+    // CompareTo-based operator<. Same root cause as the SML sort fix
+    // in vendor/simplifiedmns.hpp (Bug A).
     const QuorumManager::Entry* selected = nullptr;
     uint256 best_score;
     bool first = true;
     for (const auto& c : candidates) {
         uint256 score = quorum_signing_score(
             CHAINLOCKS_LLMQ_TYPE, c.entry->key.quorumHash, request_id);
-        if (first || score < best_score) {
+        bool lower = first
+            || std::memcmp(score.data(), best_score.data(), 32) < 0;
+        if (lower) {
             first = false;
             best_score = score;
             selected = c.entry;
@@ -237,10 +247,22 @@ inline ChainLockVerifyResult verify_chainlock(
         CHAINLOCKS_LLMQ_TYPE, selected->key.quorumHash, request_id, blockHash);
 
     // ── Step E: BLS verify ───────────────────────────────────────────
-    // sign_hash is the message bytes — feed its 32 raw bytes directly.
+    // BLS scheme is per-quorum: derived from the SELECTED quorum's
+    // CFinalCommitment.nVersion (1,2 → legacy BLS; 3,4 → basic BLS).
+    // Ignoring the parameter `fLegacyScheme` if the per-quorum version
+    // is decisive — but honour the parameter when the caller wants to
+    // override (e.g. for cross-version testing).
+    using FCC = vendor::CFinalCommitment;
+    bool quorum_is_legacy =
+        (selected->commitment.nVersion == FCC::LEGACY_BLS_NON_INDEXED_QUORUM_VERSION
+      || selected->commitment.nVersion == FCC::LEGACY_BLS_INDEXED_QUORUM_VERSION);
+    bool use_legacy = fLegacyScheme || quorum_is_legacy;
+    r.scheme_legacy = use_legacy;
+    r.quorum_nversion = selected->commitment.nVersion;
+
     std::array<uint8_t, 32> msg_bytes{};
     std::memcpy(msg_bytes.data(), r.sign_hash.data(), 32);
-    bool ok = fLegacyScheme
+    bool ok = use_legacy
         ? verify_bls_legacy(selected->commitment.quorumPublicKey,
                             std::span<const uint8_t>(msg_bytes), sig)
         : verify_bls_basic(selected->commitment.quorumPublicKey,

@@ -72,6 +72,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <span>
 #include <sstream>
 #include <vector>
@@ -214,10 +215,21 @@ public:
 
     void sort()
     {
+        // CRITICAL: dashcore sorts by `proRegTxHash.Compare(other) < 0`
+        // where Compare is `std::memcmp(m_data.data(), other.data(), 32)`
+        // — i.e., LITTLE-endian-byte-order ascending (the order bytes
+        // sit in memory). c2pool's uint256 operator< uses CompareTo
+        // which iterates uint32 limbs from MSB-first → BIG-endian-
+        // INTEGER ascending. These are DIFFERENT orderings, and using
+        // the wrong one produces a different merkle leaf order →
+        // different merkle root → CBTX root mismatch on every block
+        // (Bug A surfaced live 2026-04-24 against Dash mainnet).
+        // memcmp matches dashcore's wire semantics; do NOT change.
         std::sort(mnList.begin(), mnList.end(),
             [](const CSimplifiedMNListEntry& a,
                const CSimplifiedMNListEntry& b) {
-                return a.proRegTxHash < b.proRegTxHash;
+                return std::memcmp(a.proRegTxHash.data(),
+                                   b.proRegTxHash.data(), 32) < 0;
             });
     }
 

@@ -1658,30 +1658,35 @@ int main(int argc, char* argv[])
                              << " best=" << diff.blockHash.GetHex().substr(0, 16)
                              << " peer=" << peer_key;
 
-                    // Phase C-SML step 7: verify against the most-recent
-                    // CBTX merkleRootMNList. The CBTX comes from the full
-                    // block at diff.blockHash (or close to it) — the
-                    // last_cbtx_mnlist_root captures whatever full_block
-                    // most recently arrived. There's a small race where
-                    // we apply a diff for a block that hasn't arrived as
-                    // a full_block yet — in that case cbtx_root may be
-                    // for a slightly older block; the comparison is
-                    // skipped if the block heights don't align.
+                    // Phase C-SML step 7: verify against the CBTX
+                    // EMBEDDED IN THIS DIFF. The diff carries diff.cbTx
+                    // which is the actual coinbase tx of diff.blockHash
+                    // — guaranteed to be for the same block whose SML
+                    // state we just applied. Using the cbTx from the
+                    // diff itself (rather than a cached cbtx_root from
+                    // some prior on_full_block arrival) eliminates a
+                    // state-coordination race where the cached root was
+                    // for a different height than the SML's current
+                    // best_block, producing spurious mismatches.
                     auto computed = sml->CalcMerkleRoot();
-                    if (cbtx_root->IsNull()) {
-                        LOG_DEBUG_COIND
-                            << "[SML] CBTX root not yet captured — "
-                               "verification skipped (first diff before "
-                               "first full_block)";
-                    } else if (computed == *cbtx_root) {
+                    dash::coin::vendor::CCbTx diff_cbtx;
+                    if (!dash::coin::vendor::parse_cbtx(
+                            diff.cbTx.extra_payload, diff_cbtx)) {
+                        LOG_WARNING << "[SML] could not parse CBTX from "
+                                       "mnlistdiff (CCbTx payload "
+                                       << diff.cbTx.extra_payload.size()
+                                       << " B) — root verification skipped";
+                    } else if (computed == diff_cbtx.merkleRootMNList) {
                         LOG_INFO << "[SML] root MATCH "
                                  << computed.GetHex().substr(0, 16)
-                                 << " (vs CBTX@h=" << *cbtx_height << ")";
+                                 << " (vs diff.cbTx@h=" << diff_cbtx.nHeight
+                                 << " block=" << diff.blockHash.GetHex().substr(0, 16) << ")";
                     } else {
                         LOG_WARNING << "[SML] root MISMATCH"
                                     << " computed=" << computed.GetHex().substr(0, 16)
-                                    << " cbtx="     << cbtx_root->GetHex().substr(0, 16)
-                                    << " (vs CBTX@h=" << *cbtx_height << ")"
+                                    << " cbtx="     << diff_cbtx.merkleRootMNList.GetHex().substr(0, 16)
+                                    << " (vs diff.cbTx@h=" << diff_cbtx.nHeight
+                                    << " block=" << diff.blockHash.GetHex().substr(0, 16) << ")"
                                     << " — log-only at MVP, applied anyway";
                     }
 
@@ -1748,6 +1753,8 @@ int main(int argc, char* argv[])
                                  << " block=" << bhash.GetHex().substr(0, 16)
                                  << " quorum=" << r.selected_quorum_hash.GetHex().substr(0, 16)
                                  << " pool=" << r.pool_size
+                                 << " qver=" << r.quorum_nversion
+                                 << " scheme=" << (r.scheme_legacy ? "legacy" : "basic")
                                  << " peer=" << peer_key;
                         break;
                     case S::INVALID_SIG:
@@ -1755,6 +1762,8 @@ int main(int argc, char* argv[])
                                     << " block=" << bhash.GetHex().substr(0, 16)
                                     << " selected_quorum=" << r.selected_quorum_hash.GetHex().substr(0, 16)
                                     << " pool=" << r.pool_size
+                                    << " qver=" << r.quorum_nversion
+                                    << " scheme=" << (r.scheme_legacy ? "legacy" : "basic")
                                     << " peer=" << peer_key
                                     << " — log-only at MVP, relay-trust "
                                        "record retained";
