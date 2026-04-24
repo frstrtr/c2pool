@@ -36,9 +36,19 @@ namespace p2p
 {
 
 template <typename ConfigType>
-class NodeP2P : public core::ICommunicator, public core::INetwork, public core::Factory<core::Client>
+class NodeP2P
+    : public core::ICommunicator
+    , public core::INetwork                              // already inherits enable_shared_from_this<INetwork>
+    , public core::Factory<core::Client>
+    , public std::enable_shared_from_this<NodeP2P<ConfigType>>  // own typed shared_from_this for self-capturing lambdas
 {
     using config_t = ConfigType;
+    // Disambiguate which shared_from_this() to use — both base classes
+    // provide one. We want NodeP2P-typed self in the timer lambdas so
+    // method dispatch stays in this class (no cast).
+    using self_t = NodeP2P<ConfigType>;
+    using std::enable_shared_from_this<self_t>::shared_from_this;
+    using std::enable_shared_from_this<self_t>::weak_from_this;
 
     static constexpr time_t CONNECT_TIMEOUT_SEC = 10;
     static constexpr time_t IDLE_TIMEOUT_SEC = 100;
@@ -203,10 +213,14 @@ public:
         core::Factory<core::Client>::connect(addr);
 
         m_reconnect_timer = std::make_unique<core::Timer>(m_context, true);
-        m_reconnect_timer->start(30, [this]() {
-            if (!m_peer && m_reconnect_enabled) {
-                LOG_INFO << "[DashP2P] Reconnecting to " << m_target_addr.to_string();
-                core::Factory<core::Client>::connect(m_target_addr);
+        // Bug 3 root-cause fix: capture self via shared_from_this so the
+        // timer handler keeps NodeP2P alive while it runs. Without this,
+        // a peer destroy mid-firing UAFs on m_target_addr → garbage in
+        // to_string() → boost::log codecvt crash.
+        m_reconnect_timer->start(30, [self = shared_from_this()]() {
+            if (!self->m_peer && self->m_reconnect_enabled) {
+                LOG_INFO << "[DashP2P] Reconnecting to " << self->m_target_addr.to_string();
+                self->core::Factory<core::Client>::connect(self->m_target_addr);
             }
         });
     }
@@ -219,8 +233,9 @@ public:
         LOG_INFO << "[DashP2P] Connected to " << m_target_addr.to_string();
 
         ensure_timeout_timer();
-        m_timeout_timer->start(CONNECT_TIMEOUT_SEC, [this]() {
-            timeout("handshake timeout");
+        // Bug 3 root-cause fix: self-capture so timeout() runs on a live NodeP2P.
+        m_timeout_timer->start(CONNECT_TIMEOUT_SEC, [self = shared_from_this()]() {
+            self->timeout("handshake timeout");
         });
 
         auto msg_version = message_version::make_raw(
@@ -476,7 +491,8 @@ private:
         m_timeout_timer->restart(IDLE_TIMEOUT_SEC);
 
         ensure_ping_timer();
-        m_ping_timer->start(PING_INTERVAL_SEC, [this]() { send_ping(); });
+        // Bug 3 root-cause fix: self-capture; send_ping touches m_peer + writes.
+        m_ping_timer->start(PING_INTERVAL_SEC, [self = shared_from_this()]() { self->send_ping(); });
 
         // BIP 130: request header-first announcements
         auto msg_sendheaders = message_sendheaders::make_raw();

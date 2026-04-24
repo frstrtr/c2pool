@@ -73,14 +73,21 @@ private:
 };
 
 /// One P2P connection slot: config + NodeP2P + event sink.
+///
+/// Bug 3 root-cause fix: node_p2p is now a shared_ptr (was value). NodeP2P
+/// inherits std::enable_shared_from_this so its async timer/connect/read
+/// callbacks can capture `self = shared_from_this()` and keep the node alive
+/// for the duration of the handler. shared_from_this() requires the object
+/// be MANAGED by a shared_ptr at construction time — hence the make_shared
+/// in the constructor below.
 struct DashBroadcastPeer
 {
-    std::string                                       key;        // "host:port"
-    DashBroadcasterConfig                             config;
-    dash::interfaces::Node                            coin_node;  // event sink
-    dash::coin::p2p::NodeP2P<DashBroadcasterConfig>   node_p2p;
-    bool                                              connected{false};
-    bool                                              handshake_done{false};
+    std::string                                                       key;
+    DashBroadcasterConfig                                             config;
+    dash::interfaces::Node                                            coin_node;
+    std::shared_ptr<dash::coin::p2p::NodeP2P<DashBroadcasterConfig>>  node_p2p;
+    bool                                                              connected{false};
+    bool                                                              handshake_done{false};
 
     DashBroadcastPeer(boost::asio::io_context* ioc,
                       const std::string& peer_key,
@@ -88,7 +95,8 @@ struct DashBroadcastPeer
                       const NetService& addr)
         : key(peer_key)
         , config(prefix, addr)
-        , node_p2p(ioc, &coin_node, &config)
+        , node_p2p(std::make_shared<dash::coin::p2p::NodeP2P<DashBroadcasterConfig>>(
+              ioc, &coin_node, &config))
     {
     }
 };
@@ -198,15 +206,8 @@ public:
     {
         m_running = false;
         m_maintenance_timer.cancel();
-        m_graveyard_timer.cancel();
         m_peer_manager.stop();
         std::lock_guard<std::mutex> lock(m_mutex);
-        // Move live peers into the graveyard so async callbacks still see
-        // valid m_target_addr when they unwind. The graveyard itself is
-        // drained on process exit by ~vector destruction; by that point
-        // io_context has stopped so no more callbacks can fire.
-        for (auto& [k, p] : m_peers)
-            if (p) retire_to_graveyard_locked(std::move(p));
         m_peers.clear();
     }
 
@@ -217,7 +218,7 @@ public:
         int sent = 0, failed = 0;
         for (auto& [key, peer] : m_peers) {
             try {
-                peer->node_p2p.submit_block(block);
+                peer->node_p2p->submit_block(block);
                 m_peer_manager.record_broadcast_success(key);
                 ++sent;
             } catch (const std::exception& e) {
@@ -240,7 +241,7 @@ public:
         int sent = 0, failed = 0;
         for (auto& [key, peer] : m_peers) {
             try {
-                peer->node_p2p.submit_block_raw(block_bytes);
+                peer->node_p2p->submit_block_raw(block_bytes);
                 m_peer_manager.record_broadcast_success(key);
                 ++sent;
             } catch (const std::exception& e) {
@@ -268,7 +269,7 @@ public:
         int sent = 0;
         for (auto& [key, peer] : m_peers) {
             try {
-                peer->node_p2p.send_block_inv(block_hash);
+                peer->node_p2p->send_block_inv(block_hash);
                 m_peer_manager.record_broadcast_success(key);
                 ++sent;
             } catch (...) {
@@ -301,13 +302,13 @@ public:
         for (const auto& [key, peer] : m_peers) {
             arr.push_back({
                 {"addr", key},
-                {"version", peer->node_p2p.peer_version()},
-                {"subver", peer->node_p2p.peer_subver()},
-                {"services", peer->node_p2p.peer_services()},
-                {"startingheight", peer->node_p2p.peer_start_height()},
-                {"conntime", peer->node_p2p.peer_uptime_sec()},
+                {"version", peer->node_p2p->peer_version()},
+                {"subver", peer->node_p2p->peer_subver()},
+                {"services", peer->node_p2p->peer_services()},
+                {"startingheight", peer->node_p2p->peer_start_height()},
+                {"conntime", peer->node_p2p->peer_uptime_sec()},
                 {"inbound", false},
-                {"connected", peer->node_p2p.is_handshake_complete()}
+                {"connected", peer->node_p2p->is_handshake_complete()}
             });
         }
         return arr;
@@ -337,16 +338,12 @@ public:
         LOG_WARNING << "[DASH] Disconnecting peer " << peer_key
                     << " (Misbehaving — " << reason << ")";
         try {
-            it->second->node_p2p.disconnect();
+            it->second->node_p2p->disconnect();
         } catch (const std::exception& e) {
             LOG_WARNING << "[DASH] disconnect_peer "
                         << peer_key << " threw: " << e.what();
         }
         m_peer_manager.record_broadcast_failure(peer_key);
-        // Bug 3 mitigation: defer destruction so in-flight async callbacks
-        // on this NodeP2P see m_target_addr alive when they fire. See the
-        // GRAVEYARD_TTL block at the bottom of this class.
-        retire_to_graveyard(std::move(it->second));
         m_peers.erase(it);
     }
 
@@ -360,7 +357,7 @@ public:
         int sent = 0;
         for (auto& [key, peer] : m_peers) {
             try {
-                peer->node_p2p.request_full_block(block_hash);
+                peer->node_p2p->request_full_block(block_hash);
                 ++sent;
             } catch (...) {}
         }
@@ -380,7 +377,7 @@ public:
         auto it = m_peers.begin();
         std::advance(it, peer_idx % m_peers.size());
         try {
-            it->second->node_p2p.request_full_block(block_hash);
+            it->second->node_p2p->request_full_block(block_hash);
             return true;
         } catch (...) {
             return false;
@@ -402,7 +399,7 @@ public:
         auto it = m_peers.begin();
         std::advance(it, peer_idx % m_peers.size());
         try {
-            it->second->node_p2p.request_mnlistdiff(
+            it->second->node_p2p->request_mnlistdiff(
                 base_block_hash, target_block_hash);
             return it->first;
         } catch (...) {
@@ -429,7 +426,7 @@ private:
             // discovery is enabled on this PeerManager instance.
             bool should_discover = m_peer_manager.discovery_enabled();
             if (should_discover) {
-                peer->node_p2p.set_addr_callback(
+                peer->node_p2p->set_addr_callback(
                     [this](const std::vector<NetService>& addrs) {
                         if (!m_peer_manager.discovery_enabled()) return;
                         for (auto& a : addrs)
@@ -459,21 +456,21 @@ private:
                 });
 
             if (m_on_peer_height)
-                peer->node_p2p.set_on_peer_height(
+                peer->node_p2p->set_on_peer_height(
                     [this](uint32_t h) { m_on_peer_height(h); });
 
             // Phase C-SML step 4: fan SML diffs out to broadcaster
             // consumer. Always-armed because the per-peer dispatch is
             // cheap and main_dash.cpp may register the callback after
             // some peers have already connected.
-            peer->node_p2p.set_on_mnlistdiff(
+            peer->node_p2p->set_on_mnlistdiff(
                 [this](const std::string& pk,
                        const dash::coin::vendor::CSimplifiedMNListDiff& diff) {
                     if (m_on_mnlistdiff) m_on_mnlistdiff(pk, diff);
                 });
 
             // Phase L step 3: fan ChainLock arrivals out to verifier.
-            peer->node_p2p.set_on_clsig(
+            peer->node_p2p->set_on_clsig(
                 [this](const std::string& pk,
                        int32_t h,
                        const uint256& bhash,
@@ -481,7 +478,7 @@ private:
                     if (m_on_clsig) m_on_clsig(pk, h, bhash, sig);
                 });
 
-            peer->node_p2p.connect(addr);
+            peer->node_p2p->connect(addr);
             m_peers[key] = std::move(peer);
         }
         m_peer_manager.notify_connected(key);
@@ -492,71 +489,9 @@ private:
         LOG_INFO << "[DASH] Disconnecting P2P peer: " << key;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            auto it = m_peers.find(key);
-            if (it != m_peers.end()) {
-                // Bug 3 mitigation: graveyard, not direct erase.
-                retire_to_graveyard(std::move(it->second));
-                m_peers.erase(it);
-            }
+            m_peers.erase(key);
         }
         m_peer_manager.notify_disconnected(key);
-    }
-
-    // Bug 3 mitigation: defer destruction of disconnected peers so any
-    // in-flight async callback (NodeP2P::connected, message handlers, timers)
-    // sees a valid m_target_addr when it unwinds. After GRAVEYARD_TTL seconds
-    // the io_context has no remaining handlers referencing the peer; safe
-    // to destruct.
-    //
-    // Caller MUST hold m_mutex.
-    void retire_to_graveyard_locked(std::unique_ptr<DashBroadcastPeer> peer)
-    {
-        if (!peer) return;
-        m_graveyard.push_back({std::move(peer),
-                               std::chrono::steady_clock::now() + GRAVEYARD_TTL});
-        if (m_graveyard.size() == 1)
-            schedule_graveyard_drain();
-    }
-
-    // Wrapper that locks for callers that don't already hold m_mutex.
-    void retire_to_graveyard(std::unique_ptr<DashBroadcastPeer> peer)
-    {
-        // Heuristic: callers that already hold the lock pass the unique_ptr
-        // directly; the helper above handles them. Distinct external entry
-        // point retained for clarity in disconnect_peer paths that lock
-        // around a tighter scope than the enclosing function.
-        retire_to_graveyard_locked(std::move(peer));
-    }
-
-    void schedule_graveyard_drain()
-    {
-        m_graveyard_timer.expires_after(std::chrono::seconds(5));
-        m_graveyard_timer.async_wait(
-            [this](const boost::system::error_code& ec) {
-                if (ec) return;
-                drain_graveyard();
-                std::lock_guard<std::mutex> lock(m_mutex);
-                if (!m_graveyard.empty() && m_running)
-                    schedule_graveyard_drain();
-            });
-    }
-
-    void drain_graveyard()
-    {
-        const auto now = std::chrono::steady_clock::now();
-        std::vector<std::unique_ptr<DashBroadcastPeer>> to_destroy;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            auto it = m_graveyard.begin();
-            while (it != m_graveyard.end() && it->die_at <= now) {
-                to_destroy.push_back(std::move(it->peer));
-                ++it;
-            }
-            m_graveyard.erase(m_graveyard.begin(), it);
-        }
-        // Destruction outside the mutex — peer destructor may invoke
-        // callbacks/log calls that themselves take other locks.
-        to_destroy.clear();
     }
 
     void schedule_maintenance()
@@ -629,12 +564,12 @@ private:
                 // handshake-pending case alive briefly via the NodeP2P
                 // timeout, but once peer_version() is zero AND no
                 // handshake, drop it.
-                if (!peer->node_p2p.is_handshake_complete()
-                    && peer->node_p2p.peer_uptime_sec() == 0) {
+                if (!peer->node_p2p->is_handshake_complete()
+                    && peer->node_p2p->peer_uptime_sec() == 0) {
                     // Still connecting — don't drop yet.
                     continue;
                 }
-                if (!peer->node_p2p.is_connected())
+                if (!peer->node_p2p->is_connected())
                     to_drop.push_back(key);
             }
         }
@@ -650,25 +585,6 @@ private:
     mutable std::mutex                                        m_mutex;
     std::map<std::string, std::unique_ptr<DashBroadcastPeer>> m_peers;
     bool                                                      m_running{true};
-
-    // Bug 3 mitigation (use-after-free during peer disconnect/reconnect cascade):
-    // NodeP2P doesn't inherit enable_shared_from_this and DashBroadcastPeer
-    // holds it by value. When m_peers.erase() destructs the slot, any
-    // in-flight async callback (connect/read/timer) that captured `this`
-    // UAFs on the freed m_target_addr string → garbage in to_string() →
-    // boost::log codecvt crashes on non-UTF8 bytes.
-    //
-    // Until the proper shared_from_this refactor lands, defer destruction
-    // by GRAVEYARD_TTL seconds. Callers move erased peers here and a timer
-    // pops the front when its TTL expires. By then all in-flight async
-    // ops on the dead peer have either completed or seen ec=cancelled.
-    static constexpr std::chrono::seconds GRAVEYARD_TTL{30};
-    struct DeferredPeer {
-        std::unique_ptr<DashBroadcastPeer>      peer;
-        std::chrono::steady_clock::time_point   die_at;
-    };
-    std::vector<DeferredPeer>                                 m_graveyard;
-    boost::asio::steady_timer                                 m_graveyard_timer{m_ioc};
 
     BlockCallback      m_on_new_block;
     TxCallback         m_on_new_tx;
