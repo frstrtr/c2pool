@@ -1097,13 +1097,63 @@ int main(int argc, char* argv[])
         // data.spv keys when present.
         if (web_server) {
             auto* mi3 = web_server->get_mining_interface();
-            mi3->set_spv_progress_fn([&header_chain, &coin_node]() -> nlohmann::json {
+            mi3->set_spv_progress_fn(
+                [&header_chain, &coin_node, sml, sml_db, quorums, quorum_db,
+                 chainlocked_blocks]() -> nlohmann::json {
                 nlohmann::json r;
                 r["dash_height"] = static_cast<int>(header_chain.height());
                 r["dash_tip_count"] = static_cast<int>(header_chain.size());
                 r["dash_synced"] = header_chain.is_synced();
                 // Connection status to local dashd
                 r["dashd_connected"] = coin_node && coin_node->has_p2p();
+
+                // ── Phase C-SML / C-QUO / L state for dashboard ──
+                // Three sections surface our SPV-embedded health to
+                // the dashboard's data.spv consumer:
+                //   sml      — last successful mnlistdiff state
+                //   quorums  — active LLMQ set + counts by type
+                //   chainlocks — count of verified ChainLocks recorded
+                //                  (gated on iteration-2a verify success)
+                //
+                // Per-type llmq counts use the named-LLMQ string keys
+                // dashcore exposes in its RPC, so the dashboard can
+                // render them familiarly.
+                if (sml) {
+                    nlohmann::json s;
+                    s["entries"] = static_cast<int>(sml->size());
+                    if (sml_db) {
+                        s["best_hash"]  = sml_db->get_best_hash().GetHex();
+                        s["best_height"] = static_cast<int>(sml_db->get_best_height());
+                        s["persisted"]  = sml_db->is_open();
+                    }
+                    r["dash_sml"] = std::move(s);
+                }
+                if (quorums) {
+                    nlohmann::json q;
+                    q["active"] = static_cast<int>(quorums->active_count());
+                    nlohmann::json by_type = nlohmann::json::object();
+                    using FCC = dash::coin::vendor::CFinalCommitment;
+                    for (const auto& [t, n] : quorums->active_by_type()) {
+                        const char* name =
+                            (t == FCC::LLMQ_50_60)  ? "llmq_50_60"  :
+                            (t == FCC::LLMQ_400_60) ? "llmq_400_60" :
+                            (t == FCC::LLMQ_400_85) ? "llmq_400_85" :
+                            (t == FCC::LLMQ_100_67) ? "llmq_100_67" :
+                            (t == FCC::LLMQ_60_75)  ? "llmq_60_75"  :
+                            (t == FCC::LLMQ_25_67)  ? "llmq_25_67"  :
+                            "unknown";
+                        by_type[name] = static_cast<int>(n);
+                    }
+                    q["by_type"] = std::move(by_type);
+                    if (quorum_db) {
+                        q["persisted"] = quorum_db->is_open();
+                    }
+                    r["dash_quorums"] = std::move(q);
+                }
+                if (chainlocked_blocks) {
+                    r["dash_chainlocks_verified"] =
+                        static_cast<int>(chainlocked_blocks->size());
+                }
                 return r;
             });
             // Wire the dashd P2P peers (primary + broadcaster pool) into the
