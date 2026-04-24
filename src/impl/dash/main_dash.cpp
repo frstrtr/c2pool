@@ -215,6 +215,13 @@ int main(int argc, char* argv[])
     // counts as 1; the broadcaster pool fills the other 19.
     size_t      dashd_max_peers = 20;
 
+    // LTC-parity rpcuser/rpcpassword pieces — merged into dashd_rpc_userpass
+    // after the argv loop (joined with ':' to match the existing format).
+    std::string rpc_user_piece;
+    std::string rpc_pass_piece;
+    bool        rpc_user_piece_set = false;
+    bool        rpc_pass_piece_set = false;
+
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--testnet") { testnet = true; port = 18999; dashd_port = 19999; dashd_rpc_port = 19998; }
@@ -244,28 +251,52 @@ int main(int argc, char* argv[])
                 dashd_host = addr;
             }
         }
+        // LTC-parity: --coind-address sets BOTH P2P + RPC host (typical
+        // case where both run on the same daemon process).
+        else if (arg == "--coind-address" && i + 1 < argc) {
+            dashd_host = argv[++i];
+            dashd_rpc_host = dashd_host;
+        }
+        // LTC-parity: --coind-p2p-port and --coind-rpc-port set just one.
+        else if (arg == "--coind-p2p-port" && i + 1 < argc) {
+            dashd_port = static_cast<uint16_t>(std::stoul(argv[++i]));
+        }
+        else if (arg == "--coind-rpc-port" && i + 1 < argc) {
+            dashd_rpc_port = static_cast<uint16_t>(std::stoul(argv[++i]));
+        }
         else if (arg == "--stratum-port" && i + 1 < argc) {
             stratum_port = static_cast<uint16_t>(std::stoul(argv[++i]));
         }
-        else if (arg == "--mining-address" && i + 1 < argc) {
+        // --mining-address (LTC parity: also accept --solo-address / --node-owner-address)
+        else if ((arg == "--mining-address"
+                  || arg == "--solo-address"
+                  || arg == "--node-owner-address") && i + 1 < argc) {
             mining_address = argv[++i];
         }
         else if (arg == "--share-difficulty" && i + 1 < argc) {
             share_difficulty_default = std::stod(argv[++i]);
         }
-        else if (arg == "--no-pplns") {
-            pplns_enabled = false;          // pay 100% of miner reward to --mining-address
+        // --no-pplns (LTC parity: also accept --solo, since both mean
+        // "don't split via PPLNS — pay 100% to --mining-address")
+        else if (arg == "--no-pplns" || arg == "--solo") {
+            pplns_enabled = false;
         }
-        else if (arg == "--pplns-window" && i + 1 < argc) {
+        // --pplns-window (LTC parity alias: --payout-window)
+        else if ((arg == "--pplns-window" || arg == "--payout-window")
+                 && i + 1 < argc) {
             pplns_window = static_cast<size_t>(std::stoul(argv[++i]));
         }
-        else if ((arg == "--donation-percentage" || arg == "--donation")
-                 && i + 1 < argc) {
+        // --donation / --donation-percentage (LTC parity alias: --dev-donation)
+        else if ((arg == "--donation-percentage"
+                  || arg == "--donation"
+                  || arg == "--dev-donation") && i + 1 < argc) {
             donation_percentage = std::stod(argv[++i]);
             if (donation_percentage < 0.0)   donation_percentage = 0.0;
             if (donation_percentage > 100.0) donation_percentage = 100.0;
         }
-        else if (arg == "--http-port" && i + 1 < argc) {
+        // --http-port (LTC parity alias: --web-port)
+        else if ((arg == "--http-port" || arg == "--web-port")
+                 && i + 1 < argc) {
             http_port = static_cast<uint16_t>(std::stoul(argv[++i]));
         }
         else if (arg == "--http-host" && i + 1 < argc) {
@@ -284,7 +315,12 @@ int main(int argc, char* argv[])
             explorer_enabled = true;
             explorer_url = argv[++i];
         }
-        else if (arg == "--target-peers" && i + 1 < argc) {
+        // --target-peers (LTC parity aliases: --max-conns, --outgoing-conns,
+        // --p2p-max-peers — all describe the desired/max outbound peer count)
+        else if ((arg == "--target-peers"
+                  || arg == "--max-conns"
+                  || arg == "--outgoing-conns"
+                  || arg == "--p2p-max-peers") && i + 1 < argc) {
             target_outbound_peers = static_cast<size_t>(std::stoul(argv[++i]));
         }
         else if (arg == "--ban-duration" && i + 1 < argc) {
@@ -349,6 +385,24 @@ int main(int argc, char* argv[])
         else if (arg == "--no-embedded-dash" || arg == "--standalone") {
             gbt_source = "rpc";
         }
+        // LTC-parity: --rpcuser / --rpcpassword as separate flags. Merged
+        // into dashd_rpc_userpass after the loop to match the existing
+        // "user:pass" string format that --dashd-rpc populates.
+        else if (arg == "--rpcuser" && i + 1 < argc) {
+            rpc_user_piece = argv[++i];
+            rpc_user_piece_set = true;
+        }
+        else if (arg == "--rpcpassword" && i + 1 < argc) {
+            rpc_pass_piece = argv[++i];
+            rpc_pass_piece_set = true;
+        }
+    }
+
+    // Merge --rpcuser/--rpcpassword into dashd_rpc_userpass if either was
+    // set on the CLI. If --dashd-rpc also populated dashd_rpc_userpass,
+    // the LTC-style separate flags take precedence (they're more specific).
+    if (rpc_user_piece_set || rpc_pass_piece_set) {
+        dashd_rpc_userpass = rpc_user_piece + ":" + rpc_pass_piece;
     }
 
     std::cout << "╔══════════════════════════════════════════════════════════╗" << std::endl;
