@@ -23,7 +23,12 @@ class Node : public dash::interfaces::Node
     boost::asio::io_context* m_context;
     config_t* m_config;
 
-    std::unique_ptr<NodeP2P<config_t>> m_p2p;
+    // Bug 3 root-cause fix: NodeP2P inherits enable_shared_from_this so the
+    // timer/connect/read async lambdas can capture self. shared_from_this()
+    // requires the object be MANAGED by a shared_ptr at construction —
+    // hence shared_ptr (not unique_ptr) here, and make_shared in start_p2p
+    // below.
+    std::shared_ptr<NodeP2P<config_t>> m_p2p;
 
 public:
     Node(auto* context, auto* config) : m_context(context), m_config(config) {}
@@ -31,7 +36,7 @@ public:
     void start_p2p(const NetService& addr)
     {
         LOG_INFO << "[DashCoin] Creating P2P node for " << addr.to_string();
-        m_p2p = std::make_unique<NodeP2P<config_t>>(m_context, this, m_config);
+        m_p2p = std::make_shared<NodeP2P<config_t>>(m_context, this, m_config);
         LOG_INFO << "[DashCoin] P2P node created, connecting...";
         m_p2p->connect(addr);
         LOG_INFO << "[DashCoin] P2P connecting to " << addr.to_string();
