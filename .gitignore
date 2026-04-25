@@ -88,7 +88,7 @@ doc/EMBEDDED_COIN_NODE_DESIGN.md
 
 #c2pool
 /logs
-# /data is ignored except for the in-tree DMN snapshots (Phase C-PAY
+ # /data is ignored except for the in-tree DMN snapshots (Phase C-PAY
 # step 3c). Force-add new snapshot files with `git add -f` when
 # refreshing via --dump-mn-snapshot.
 /data
@@ -166,7 +166,12 @@ test/test_*_include.cmake
 SHA256SUMS
 
 CLAUDE.md
-
+# CMake build dirs (any name with a `build` prefix or `build` exact match)
+build/
+build-*/
+# Autoconf/autoreconf backup files (e.g. external/dashbls/configure~)
+*~
+ref/
 external-logs/
 tools/
 
