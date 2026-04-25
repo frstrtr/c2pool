@@ -50,17 +50,12 @@ jobs:
         run: cmake --build build_ci --target c2pool -j$(nproc)
 
       - name: Build tests
-        # NOTE: test_multiaddress_pplns / test_pplns_stress remain excluded due
-        # to a static-link cycle introduced when core/web_server.cpp grew direct
-        # calls into ltc::coin::NodeRPC and c2pool::merged::MergedMiningManager.
-        # test_coin_broadcaster works around the cycle with --start-group/--end-group;
-        # the other two pull in a wider transitive set (pool, sharechain,
-        # c2pool_storage, c2pool_payout, c2pool_hashrate) that causes CMake to
-        # inject duplicate libcore.a/libltc_coin.a OUTSIDE the start-group, where
-        # ld can't multi-pass-resolve. Proper fix: extract the LTC/MM-specific
-        # endpoints out of core/ into their own translation unit, OR split
-        # MiningInterface into a coin-agnostic base + LTC subclass. See
-        # memory: project_dash_test_rot_2026_04_25.md for full diagnosis.
+        # All tests now build. The previously-disabled link-cycle group
+        # (test_coin_broadcaster, test_multiaddress_pplns, test_pplns_stress)
+        # is unblocked: test_coin_broadcaster via --start-group/--end-group,
+        # the other two via --whole-archive on libltc_coin.a (forces rpc.cpp.o
+        # in regardless of ld's archive-scan logic, which evidently doesn't
+        # multi-pass extract those refs even inside --start-group).
         run: |
           cmake --build build_ci \
             --target test_hardening test_share_messages \
@@ -79,7 +74,7 @@ jobs:
                     test_utxo \
                     test_dash_credit_pool test_dash_subsidy test_dash_battletest_regressions \
                     test_dash_pay_attribution \
-                    test_coin_broadcaster \
+                    test_coin_broadcaster test_multiaddress_pplns test_pplns_stress \
             -j$(nproc)
 
       - name: Run tests
