@@ -2786,14 +2786,27 @@ int main(int argc, char* argv[])
                 // UTXO rolling window. This is the missing piece for
                 // catching up MN payments accumulated between snapshot
                 // dump time and now.
+                uint32_t mn_snap_h_pre = (mn_state_db && mn_state_db->is_open())
+                    ? mn_state_db->get_best_height()
+                    : 0;
+                // Stronger trigger gate: when we have a snapshot, defer
+                // bootstrap-trigger until a block at-or-after the snapshot
+                // arrives. Otherwise a stale-peer-pushed block (e.g. h=2430000
+                // when our snapshot is at h=2460550 and the real tip is at
+                // h=2460805) would lock bootstrap into a 30000-block range
+                // entirely before our snapshot. Drain processes those, MN
+                // apply produces meaningless predictions (state is "future"
+                // relative to those heights), and the snapshot-to-tip gap
+                // never gets backfilled.
+                bool trigger_ok_for_snapshot =
+                    (mn_snap_h_pre == 0) || (height >= mn_snap_h_pre);
                 if (!dash_bootstrap_done && !dash_bs->active
                     && chain && bcaster && height > DASH_KEEP
-                    && chain->height() <= height) {
+                    && chain->height() <= height
+                    && trigger_ok_for_snapshot) {
                     dash_bootstrap_done = true;
                     uint32_t utxo_best = utxo->get_best_height();
-                    uint32_t mn_snap_h = (mn_state_db && mn_state_db->is_open())
-                        ? mn_state_db->get_best_height()
-                        : 0;
+                    uint32_t mn_snap_h = mn_snap_h_pre;
                     uint32_t start_from =
                         (utxo_best > 0 && utxo_best >= height - DASH_KEEP)
                         ? utxo_best + 1
