@@ -2774,14 +2774,39 @@ int main(int argc, char* argv[])
                 static bool dash_bootstrap_done = false;
 
                 // ── 1. Bootstrap trigger ────────────────────────────────
+                // Defer the trigger if this block is stale relative to what
+                // the header chain has already learned (a peer pushed an old
+                // block-body before the chain caught up to the real tip).
+                // Without this, bootstrap would be set up with a 30000-block
+                // gap to the actual current tip, taking ~50h via the
+                // 16-block sliding window.
+                //
+                // Also use mn_state_db.best_height as a floor so bootstrap
+                // covers the snapshot-to-tip MN state gap, not just the
+                // UTXO rolling window. This is the missing piece for
+                // catching up MN payments accumulated between snapshot
+                // dump time and now.
                 if (!dash_bootstrap_done && !dash_bs->active
-                    && chain && bcaster && height > DASH_KEEP) {
+                    && chain && bcaster && height > DASH_KEEP
+                    && chain->height() <= height) {
                     dash_bootstrap_done = true;
                     uint32_t utxo_best = utxo->get_best_height();
+                    uint32_t mn_snap_h = (mn_state_db && mn_state_db->is_open())
+                        ? mn_state_db->get_best_height()
+                        : 0;
                     uint32_t start_from =
                         (utxo_best > 0 && utxo_best >= height - DASH_KEEP)
                         ? utxo_best + 1
                         : height - DASH_KEEP;
+                    // MN state floor: if snapshot is OLDER than the UTXO
+                    // bootstrap window's start_from, lower start_from to
+                    // snapshot+1 so the drain backfills the MN gap.
+                    if (mn_snap_h > 0 && mn_snap_h + 1 < start_from) {
+                        LOG_INFO << "[EMB-DASH] Lowering bootstrap start_from "
+                                 << start_from << "→" << (mn_snap_h + 1)
+                                 << " to cover MN state snapshot gap";
+                        start_from = mn_snap_h + 1;
+                    }
 
                     if (start_from < height) {
                         dash_bs->active = true;
