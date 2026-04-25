@@ -2322,6 +2322,16 @@ int main(int argc, char* argv[])
                     return;
                 }
 
+                // Bootstrap-trigger preconditions (used both at the trigger
+                // site below AND by the MN-apply gate above the bootstrap
+                // routing — the trigger block must skip top-of-handler MN
+                // apply so drain handles it once activated).
+                constexpr uint32_t DASH_KEEP = dash::coin::DASH_MIN_BLOCKS_TO_KEEP;
+                static bool dash_bootstrap_done = false;
+                uint32_t mn_snap_h_pre = (mn_state_db && mn_state_db->is_open())
+                    ? mn_state_db->get_best_height()
+                    : 0;
+
                 // Phase C-SML step 1 smoke test: parse the coinbase's CCbTx
                 // extra payload and log a one-line summary. Every Dash
                 // block since DIP-0008 carries a type-5 coinbase with the
@@ -2514,8 +2524,22 @@ int main(int argc, char* argv[])
                         // also apply at top, the tip block's apply races
                         // with the drain's per-block apply, producing
                         // transient MISMATCH on the catch-up boundary.
+                        //
+                        // Also detect "this block will TRIGGER bootstrap"
+                        // (i.e. the FIRST at-or-past-snapshot block —
+                        // see the trigger gate below). Skip top apply for
+                        // it too; drain will pick it up after activation.
+                        // Without this, the trigger block produces a
+                        // [PAY] MISMATCH because top apply runs against
+                        // snapshot-era state before drain catches up.
+                        const bool will_trigger_bootstrap =
+                            !dash_bootstrap_done && dash_bs && !dash_bs->active
+                            && chain && bcaster && height > DASH_KEEP
+                            && chain->height() <= height
+                            && (mn_snap_h_pre == 0 || height >= mn_snap_h_pre);
                         const bool drain_will_handle =
-                            dash_bs && dash_bs->active;
+                            (dash_bs && dash_bs->active)
+                            || will_trigger_bootstrap;
                         std::optional<uint256> expected;
                         std::optional<uint256> observed;
                         dash::coin::MnStateMachine::ApplyResult r{};
@@ -2778,9 +2802,6 @@ int main(int argc, char* argv[])
                     }
                 }
 
-                constexpr uint32_t DASH_KEEP = dash::coin::DASH_MIN_BLOCKS_TO_KEEP;
-                static bool dash_bootstrap_done = false;
-
                 // ── 1. Bootstrap trigger ────────────────────────────────
                 // Defer the trigger if this block is stale relative to what
                 // the header chain has already learned (a peer pushed an old
@@ -2794,9 +2815,9 @@ int main(int argc, char* argv[])
                 // UTXO rolling window. This is the missing piece for
                 // catching up MN payments accumulated between snapshot
                 // dump time and now.
-                uint32_t mn_snap_h_pre = (mn_state_db && mn_state_db->is_open())
-                    ? mn_state_db->get_best_height()
-                    : 0;
+                //
+                // (DASH_KEEP, dash_bootstrap_done, mn_snap_h_pre are declared
+                // earlier — used by the MN-apply gate above too.)
                 // Stronger trigger gate: when we have a snapshot, defer
                 // bootstrap-trigger until a block at-or-after the snapshot
                 // arrives. Otherwise a stale-peer-pushed block (e.g. h=2430000
