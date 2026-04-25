@@ -75,7 +75,19 @@ void Socket::read_length(std::shared_ptr<Packet> packet)
                 m_node->error(ec, get_addr());
                 return;
             }
-            // std::cout << "message_length: " << packet->message_length << std::endl;
+            // DoS cap: a malicious or corrupt peer can send a huge length here
+            // and crash us with std::bad_alloc / std::length_error from the
+            // payload resize. Bitcoin Core uses MAX_PROTOCOL_MESSAGE_LENGTH=4MiB;
+            // we use 32MiB to accommodate Dash's larger mnlistdiff messages with
+            // headroom. Disconnect cleanly on cap exceedance.
+            constexpr uint32_t MAX_MESSAGE_LENGTH = 32u * 1024u * 1024u;
+            if (packet->message_length > MAX_MESSAGE_LENGTH)
+            {
+                m_node->error("message_length " + std::to_string(packet->message_length)
+                              + " exceeds cap " + std::to_string(MAX_MESSAGE_LENGTH),
+                              get_addr());
+                return;
+            }
             packet->payload.resize(packet->message_length);
             read_checksum(packet);
         }
