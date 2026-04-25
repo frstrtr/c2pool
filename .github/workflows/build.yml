@@ -50,15 +50,16 @@ jobs:
         run: cmake --build build_ci --target c2pool -j$(nproc)
 
       - name: Build tests
-        # NOTE: test_coin_broadcaster / test_multiaddress_pplns / test_pplns_stress
-        # are temporarily excluded due to a static-link cycle introduced when
-        # core/web_server.cpp grew direct calls into ltc::coin::NodeRPC and
-        # c2pool::merged::MergedMiningManager. Production binaries build fine
-        # because user code (c2pool_refactored.cpp) directly references symbols
-        # that pull the right .o files in. Tests don't, so ld single-pass leaves
-        # web_server.cpp.o's refs unresolved. Proper fix: extract the LTC/MM
-        # specific endpoints out of core/ into their own translation unit, OR
-        # split MiningInterface into a coin-agnostic base + LTC subclass. See
+        # NOTE: test_multiaddress_pplns / test_pplns_stress remain excluded due
+        # to a static-link cycle introduced when core/web_server.cpp grew direct
+        # calls into ltc::coin::NodeRPC and c2pool::merged::MergedMiningManager.
+        # test_coin_broadcaster works around the cycle with --start-group/--end-group;
+        # the other two pull in a wider transitive set (pool, sharechain,
+        # c2pool_storage, c2pool_payout, c2pool_hashrate) that causes CMake to
+        # inject duplicate libcore.a/libltc_coin.a OUTSIDE the start-group, where
+        # ld can't multi-pass-resolve. Proper fix: extract the LTC/MM-specific
+        # endpoints out of core/ into their own translation unit, OR split
+        # MiningInterface into a coin-agnostic base + LTC subclass. See
         # memory: project_dash_test_rot_2026_04_25.md for full diagnosis.
         run: |
           cmake --build build_ci \
@@ -78,6 +79,7 @@ jobs:
                     test_utxo \
                     test_dash_credit_pool test_dash_subsidy test_dash_battletest_regressions \
                     test_dash_pay_attribution \
+                    test_coin_broadcaster \
             -j$(nproc)
 
       - name: Run tests
