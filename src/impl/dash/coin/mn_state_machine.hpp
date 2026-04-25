@@ -159,11 +159,57 @@ public:
     {
         if (block.m_txs.empty()) return std::nullopt;
         for (const auto& vout : block.m_txs[0].vout) {
-            if (auto m = find_by_payout_script(vout.scriptPubKey.m_data)) {
+            // Use pick_paid_mn (lowest-h disambiguation) instead of
+            // find_by_payout_script (first-map-iteration), to mirror
+            // dashd's GetMNPayee selection when multiple MNs share a
+            // scriptPayout. MUST be called PRE-apply_block so the
+            // lowest-h MN is the one dashd actually paid; post-apply
+            // the just-paid MN has the highest h and would be missed.
+            if (auto m = pick_paid_mn(vout.scriptPubKey.m_data)) {
                 return m;
             }
         }
         return std::nullopt;
+    }
+
+    // Selection-aware payee lookup (the fix for the shared-payoutAddress
+    // attribution bug). When N MNs map to the same scriptPayout, dashd's
+    // CDeterministicMNList::GetMNPayee picks the one with the lowest
+    // CompareByLastPaid_GetHeight. Mirror that here so apply_block
+    // attributes payments to the correct MN in our state, keeping us in
+    // sync with dashd's projection.
+    std::optional<uint256> pick_paid_mn(
+        const std::vector<unsigned char>& script) const
+    {
+        if (script.empty()) return std::nullopt;
+        constexpr uint32_t SENTINEL = std::numeric_limits<uint32_t>::max();
+        auto sane = [](uint32_t v) {
+            return (v == SENTINEL) ? 0u : v;
+        };
+        std::optional<uint256> best;
+        int best_h = std::numeric_limits<int>::max();
+        for (const auto& [hash, st] : m_entries) {
+            if (!st.isValid) continue;
+            if (st.scriptPayout.m_data != script) continue;
+            uint32_t lastPaid = sane(st.nLastPaidHeight);
+            uint32_t revived  = sane(st.nPoSeRevivedHeight);
+            int h = static_cast<int>(lastPaid);
+            if (revived != 0 && static_cast<int>(revived) > h) {
+                h = static_cast<int>(revived);
+            } else if (h == 0) {
+                h = static_cast<int>(st.nRegisteredHeight);
+            }
+            bool better = !best.has_value()
+                       || h < best_h
+                       || (h == best_h
+                           && std::memcmp(hash.data(),
+                                          best->data(), 32) < 0);
+            if (better) {
+                best_h = h;
+                best   = hash;
+            }
+        }
+        return best;
     }
 
     // Phase C-PAY step 5: vendor of dashcore
@@ -190,6 +236,34 @@ public:
     // memcmp(LE-byte) — NOT c2pool's CompareTo (BE-integer). Same
     // gotcha as Bug A in vendor/simplifiedmns.hpp's sort. We use
     // std::memcmp directly to match dashcore's wire semantics.
+    // Dump a MN's projection-relevant state (one-shot diagnostic).
+    void debug_dump_mn(const uint256& hash, const char* tag) const {
+        auto it = m_entries.find(hash);
+        if (it == m_entries.end()) {
+            LOG_INFO << "[MNS-DBG " << tag << "] hash=" << hash.GetHex().substr(0,16)
+                     << " NOT IN m_entries";
+            return;
+        }
+        const auto& s = it->second;
+        // Hex-dump scriptPayout for byte-level comparison vs coinbase outputs.
+        std::string sphex;
+        sphex.reserve(s.scriptPayout.m_data.size() * 2);
+        const char* hex = "0123456789abcdef";
+        for (auto b : s.scriptPayout.m_data) {
+            sphex.push_back(hex[(b >> 4) & 0xf]);
+            sphex.push_back(hex[b & 0xf]);
+        }
+        LOG_INFO << "[MNS-DBG " << tag << "] hash=" << hash.GetHex().substr(0,16)
+                 << " isValid=" << s.isValid
+                 << " nType=" << int(s.nType)
+                 << " lastPaid=" << s.nLastPaidHeight
+                 << " registered=" << s.nRegisteredHeight
+                 << " revived=" << s.nPoSeRevivedHeight
+                 << " banHeight=" << s.nPoSeBanHeight
+                 << " revoke=" << int(s.nRevocationReason)
+                 << " scriptPayout(" << s.scriptPayout.m_data.size() << ")=" << sphex;
+    }
+
     std::optional<uint256> find_expected_payee() const
     {
         std::optional<uint256> best_hash;
@@ -387,10 +461,26 @@ public:
         }
 
         // ── Pass 3: payee resolution ──────────────────────────────
+        // BUG FIX 2026-04-25: multiple MNs can share the same payoutAddress
+        // (operators running multiple MNs to one wallet). The original
+        // find_by_payout_script returned the FIRST map-iteration match,
+        // which deterministically attributed ALL payments to whichever
+        // MN had the lowest proRegTxHash bytes. Net effect: for each
+        // shared-script payment dashd correctly attributed to one MN,
+        // we'd attribute it to the OTHER one — leaving the actual paid
+        // MN's nLastPaidHeight stale forever. Live-observed: MN
+        // 7173b6a9... and 06a9ee24... both pay address
+        // XjbaGWaGnvEtuQAUoBgDxJWe8ZNv45upG2; we kept giving 06a9ee24
+        // every payment, so 7173b6a9 stayed at lastPaid=2458528 → kept
+        // winning find_expected_payee → 100% [PAY] MISMATCH against
+        // dashd which correctly rotated the two.
+        //
+        // Fix: when multiple MNs share a script, use pick_paid_mn (defined
+        // above) which mirrors dashd's CompareByLastPaid_GetHeight ordering.
         if (!block.m_txs.empty()) {
             const auto& cb = block.m_txs[0];
             for (const auto& vout : cb.vout) {
-                auto matched = find_by_payout_script(vout.scriptPubKey.m_data);
+                auto matched = pick_paid_mn(vout.scriptPubKey.m_data);
                 if (!matched) continue;
                 auto it = m_entries.find(*matched);
                 if (it == m_entries.end()) continue;

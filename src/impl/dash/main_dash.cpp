@@ -2509,9 +2509,16 @@ int main(int argc, char* argv[])
                             mn_state_db->is_open()
                             && height <= mn_state_db->get_best_height();
                         std::optional<uint256> expected;
+                        std::optional<uint256> observed;
                         dash::coin::MnStateMachine::ApplyResult r{};
                         if (!already_in_state) {
                             expected = mn_state_machine->find_expected_payee();
+                            // pick_paid_mn (used inside find_paid_in_block_first)
+                            // does lowest-h disambiguation — MUST be called BEFORE
+                            // apply_block, otherwise the just-paid MN has the
+                            // highest h and would lose to colliding MNs that share
+                            // its scriptPayout (the bug the disambiguation fixes).
+                            observed = mn_state_machine->find_paid_in_block_first(block);
                             r = mn_state_machine->apply_block(block, height);
                         }
                         if (mn_state_db->is_open()
@@ -2534,7 +2541,6 @@ int main(int argc, char* argv[])
                         // Step 5 verification — only meaningful when state
                         // has been bootstrapped (>=100 MNs threshold).
                         if (expected && mn_state_machine->size() >= 100) {
-                            auto observed = mn_state_machine->find_paid_in_block_first(block);
                             if (observed && *observed == *expected) {
                                 LOG_INFO << "[PAY] match h=" << height
                                          << " payee=" << expected->GetHex().substr(0, 16);
@@ -2543,6 +2549,15 @@ int main(int argc, char* argv[])
                                             << " expected=" << expected->GetHex().substr(0, 16)
                                             << " observed=" << observed->GetHex().substr(0, 16)
                                             << " — log-only at MVP";
+                                // One-shot diagnostic: dump the stuck-expected MN's state
+                                // and the observed MN's state side-by-side. Throttled to
+                                // every 10th MISMATCH to avoid log spam; remove once root
+                                // cause is identified.
+                                static int mismatch_count = 0;
+                                if (++mismatch_count % 10 == 1) {
+                                    mn_state_machine->debug_dump_mn(*expected, "stuck-expected");
+                                    mn_state_machine->debug_dump_mn(*observed, "actual-paid");
+                                }
                             } else {
                                 LOG_INFO << "[PAY] no-observed h=" << height
                                          << " expected=" << expected->GetHex().substr(0, 16)
