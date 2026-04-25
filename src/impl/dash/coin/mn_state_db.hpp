@@ -203,6 +203,15 @@ public:
                    const uint256& best_hash,
                    uint32_t best_height)
     {
+        // Monotonic-advance: best_height only ever increases. Required so
+        // that bootstrap drain (replaying h=snapshot+1 .. tip in chain
+        // order, AFTER a tip block at top-of-handler may have already
+        // bumped best_height to tip-height) does not roll back the
+        // persisted high-watermark. Snapshot ENTRIES still need to be
+        // written, so we always persist `entries`; only the best_hash /
+        // best_height update is gated.
+        const bool advance = (best_height >= m_best_height);
+
         auto batch = m_store.create_batch();
 
         auto existing = m_store.list_keys(std::string(1, 'M'),
@@ -219,14 +228,19 @@ public:
             batch.put(key, data);
         }
 
-        batch.put(make_state_key(), encode_best_state(best_hash, best_height));
+        if (advance) {
+            batch.put(make_state_key(),
+                      encode_best_state(best_hash, best_height));
+        }
 
         if (!batch.commit()) {
             LOG_WARNING << "[MNS-DB] write_all batch commit failed";
             return false;
         }
-        m_best_hash = best_hash;
-        m_best_height = best_height;
+        if (advance) {
+            m_best_hash   = best_hash;
+            m_best_height = best_height;
+        }
         return true;
     }
 

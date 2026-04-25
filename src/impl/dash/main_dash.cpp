@@ -2877,6 +2877,69 @@ int main(int argc, char* argv[])
                                         << h << ": " << e.what();
                         }
 
+                        // ── Phase C-PAY backfill bootstrap (2026-04-25) ──
+                        // The drain loop processes blocks in CHAIN order,
+                        // unlike on_full_block's receive-order top-of-handler
+                        // path. The top-of-handler MN apply is gated by
+                        // mn_state_db.best_height which jumps to the tip
+                        // when the FIRST new block arrives — so backfill
+                        // blocks (snapshot+1 .. tip-1) get skipped there.
+                        // Replay them here, in chain order, so MN state
+                        // stays in sync with dashd. Without this, MN
+                        // payments in the snapshot-to-tip gap are lost,
+                        // [PAY] MISMATCH rate stays stuck on whichever MN
+                        // had the lowest snapshot-time h.
+                        //
+                        // mn_state_db.write_all is monotonic-advance so
+                        // the persisted best_height does NOT roll back
+                        // when this drain (h < tip) runs after the
+                        // top-of-handler tip apply (h = tip).
+                        try {
+                            if (mn_state_machine && credit_pool) {
+                                // Credit pool: same gap problem; drive the
+                                // state machine in chain order.
+                                if (credit_pool->initialized()) {
+                                    credit_pool->apply_block(b, h);
+                                }
+                                if (credit_pool_db && credit_pool_db->is_open()
+                                    && credit_pool->initialized()) {
+                                    credit_pool_db->write_state(
+                                        bh, h,
+                                        credit_pool->balance(),
+                                        credit_pool->initialized());
+                                }
+                                // MN state machine: project + apply + verify.
+                                auto expected = mn_state_machine->find_expected_payee();
+                                auto observed = mn_state_machine->find_paid_in_block_first(b);
+                                auto r = mn_state_machine->apply_block(b, h);
+                                if (mn_state_db && mn_state_db->is_open()
+                                    && (r.registered + r.updated + r.revoked
+                                        + r.spent + r.paid > 0)) {
+                                    mn_state_db->write_all(
+                                        mn_state_machine->snapshot(), bh, h);
+                                }
+                                if (expected && mn_state_machine->size() >= 100) {
+                                    if (observed && *observed == *expected) {
+                                        // Quiet match log during backfill —
+                                        // throttle to 1-in-50 to avoid
+                                        // flooding 200+-block bootstrap drains.
+                                        static int s_bf_match_throttle = 0;
+                                        if (++s_bf_match_throttle % 50 == 1) {
+                                            LOG_INFO << "[PAY-BF] match h=" << h
+                                                     << " payee=" << expected->GetHex().substr(0, 16);
+                                        }
+                                    } else if (observed) {
+                                        LOG_WARNING << "[PAY-BF] MISMATCH h=" << h
+                                                    << " expected=" << expected->GetHex().substr(0, 16)
+                                                    << " observed=" << observed->GetHex().substr(0, 16);
+                                    }
+                                }
+                            }
+                        } catch (const std::exception& e) {
+                            LOG_WARNING << "[EMB-DASH] backfill apply_block failed at h="
+                                        << h << ": " << e.what();
+                        }
+
                         ++dash_bs->next_height;
                         ++dash_bs->processed;
                         dash_bs->last_drain_time =
