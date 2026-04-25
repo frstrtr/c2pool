@@ -484,6 +484,12 @@ public:
                 if (!matched) continue;
                 auto it = m_entries.find(*matched);
                 if (it == m_entries.end()) continue;
+                // Idempotency safety net: never roll lastPaidHeight backwards.
+                // Defense-in-depth against any future caller bypassing the
+                // outer OOO guard (main_dash.cpp's `already_in_state` check).
+                // Without this, an out-of-order h<current re-apply would have
+                // bumped lastPaid backwards — the original 03fa0aa1 bug class.
+                if (height <= it->second.nLastPaidHeight) continue;
                 bool was_consecutive = (it->second.nLastPaidHeight == height - 1);
                 it->second.nLastPaidHeight = height;
                 if (it->second.nType == vendor::MnType::EVO) {

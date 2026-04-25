@@ -322,4 +322,18 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${CMAKE_SOURCE_DIR}/src
     )
     gtest_add_tests(test_dash_battletest_regressions "" AUTO)
+
+    # Phase C-PAY attribution regressions (mainnet shadow soak 2026-04-25):
+    # UINT32_MAX wrap, OOO-block re-apply, shared-payoutAddress.
+    add_executable(test_dash_pay_attribution test_dash_pay_attribution.cpp)
+    target_link_libraries(test_dash_pay_attribution PRIVATE
+        GTest::gtest_main GTest::gtest
+        ltc core dash_x11 c2pool_difficulty
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_include_directories(test_dash_pay_attribution PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+    )
+    gtest_add_tests(test_dash_pay_attribution "" AUTO)
 endif()
