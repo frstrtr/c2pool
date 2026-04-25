@@ -2895,19 +2895,15 @@ int main(int argc, char* argv[])
                         // when this drain (h < tip) runs after the
                         // top-of-handler tip apply (h = tip).
                         try {
-                            if (mn_state_machine && credit_pool) {
-                                // Credit pool: same gap problem; drive the
-                                // state machine in chain order.
-                                if (credit_pool->initialized()) {
-                                    credit_pool->apply_block(b, h);
-                                }
-                                if (credit_pool_db && credit_pool_db->is_open()
-                                    && credit_pool->initialized()) {
-                                    credit_pool_db->write_state(
-                                        bh, h,
-                                        credit_pool->balance(),
-                                        credit_pool->initialized());
-                                }
+                            if (mn_state_machine) {
+                                // NOTE: credit_pool intentionally NOT applied
+                                // here. credit_pool gets seeded at top-of-
+                                // handler with the TIP block's
+                                // cbtx.creditPoolBalance. Replaying h=N+1..tip
+                                // deltas on top would double-count every
+                                // backfill block's locks/unlocks. credit_pool
+                                // catch-up is a separate problem (needs
+                                // re-seed at snapshot height before drain).
                                 // MN state machine: project + apply + verify.
                                 auto expected = mn_state_machine->find_expected_payee();
                                 auto observed = mn_state_machine->find_paid_in_block_first(b);
