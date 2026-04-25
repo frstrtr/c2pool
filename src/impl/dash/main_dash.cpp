@@ -1002,10 +1002,31 @@ int main(int argc, char* argv[])
                 mn_state_db->write_all(filtered, snap.block_hash, snap.height);
             }
             mn_states_loaded = std::move(filtered);
+            // v2 snapshot trailer: if credit_pool_balance is set (>=0)
+            // and credit_pool isn't already initialized from a previous
+            // session, seed it. This lets bootstrap drain catch up
+            // credit_pool deltas h=snapshot+1..tip without double-
+            // counting (the bug fixed-by-skipping in 5efd257d).
+            if (snap.credit_pool_balance >= 0
+                && credit_pool && !credit_pool->initialized()) {
+                credit_pool->seed(
+                    static_cast<uint64_t>(snap.credit_pool_balance),
+                    snap.height);
+                if (credit_pool_db && credit_pool_db->is_open()) {
+                    credit_pool_db->write_state(
+                        snap.block_hash, snap.height,
+                        credit_pool->balance(),
+                        credit_pool->initialized());
+                }
+                LOG_INFO << "[MNS-SNAP] credit_pool seeded from v2 snapshot: "
+                         << "balance=" << snap.credit_pool_balance
+                         << " height=" << snap.height;
+            }
             LOG_INFO << "[MNS-SNAP] bootstrap applied: "
                      << mn_states_loaded.size() << " entries"
                      << " (snapshot height=" << snap.height
-                     << " block=" << snap.block_hash.GetHex().substr(0, 16) << ")";
+                     << " block=" << snap.block_hash.GetHex().substr(0, 16)
+                     << " credit_pool=" << snap.credit_pool_balance << ")";
         } else if (!dashd_rpc_host.empty()) {
             // No file-based snapshot available, but operator has a
             // dashd-RPC configured — defer to the post-RPC-connect
@@ -2386,10 +2407,23 @@ int main(int argc, char* argv[])
                                 //      WARNING (real drift signal — our
                                 //      DIP-0027 accounting disagrees
                                 //      with consensus).
+                                // Skip credit_pool apply at top-of-handler if
+                                // bootstrap drain will / is handling it.
+                                // Otherwise: apply against pre-drain state +
+                                // re-apply via drain → double-count (the
+                                // 5efd257d issue, now correctly avoided).
+                                // Trigger detection mirrors the MN gate.
+                                const bool cp_will_trigger_bs =
+                                    !dash_bootstrap_done && dash_bs && !dash_bs->active
+                                    && chain && bcaster && height > DASH_KEEP
+                                    && chain->height() <= height
+                                    && (mn_snap_h_pre == 0 || height >= mn_snap_h_pre);
+                                const bool cp_drain_handling =
+                                    (dash_bs && dash_bs->active) || cp_will_trigger_bs;
                                 if (!credit_pool->initialized()) {
                                     credit_pool->seed(
                                         cbtx.creditPoolBalance, height);
-                                } else {
+                                } else if (!cp_drain_handling) {
                                     credit_pool->apply_block(block, height);
                                     if (credit_pool->balance()
                                         != cbtx.creditPoolBalance) {
@@ -2963,14 +2997,24 @@ int main(int argc, char* argv[])
                         // top-of-handler tip apply (h = tip).
                         try {
                             if (mn_state_machine) {
-                                // NOTE: credit_pool intentionally NOT applied
-                                // here. credit_pool gets seeded at top-of-
-                                // handler with the TIP block's
-                                // cbtx.creditPoolBalance. Replaying h=N+1..tip
-                                // deltas on top would double-count every
-                                // backfill block's locks/unlocks. credit_pool
-                                // catch-up is a separate problem (needs
-                                // re-seed at snapshot height before drain).
+                                // credit_pool: now safe to apply during drain
+                                // because v2 snapshot seeded credit_pool at
+                                // snapshot_height. apply_block at h=N+1..tip
+                                // adds exactly the right deltas. Without v2
+                                // seed (older snapshot or no dashd-RPC at
+                                // dump time), credit_pool->initialized() is
+                                // false at drain time → apply_block is a
+                                // no-op until the first CCbTx-driven seed
+                                // at top-of-handler — same as before.
+                                if (credit_pool && credit_pool->initialized()) {
+                                    credit_pool->apply_block(b, h);
+                                    if (credit_pool_db && credit_pool_db->is_open()) {
+                                        credit_pool_db->write_state(
+                                            bh, h,
+                                            credit_pool->balance(),
+                                            credit_pool->initialized());
+                                    }
+                                }
                                 // MN state machine: project + apply + verify.
                                 auto expected = mn_state_machine->find_expected_payee();
                                 auto observed = mn_state_machine->find_paid_in_block_first(b);

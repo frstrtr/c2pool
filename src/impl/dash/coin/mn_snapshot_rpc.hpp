@@ -213,9 +213,32 @@ inline std::optional<DmnSnapshot> build_snapshot_via_rpc(
             ++failed;
         }
     }
+    // v2 trailer: query the snapshot block's coinbase for the
+    // creditPoolBalance — needed by the loader so the bootstrap drain
+    // can re-seed CreditPoolDb at snapshot_height and replay forward
+    // deltas without double-counting (see Bug 5 5efd257d for the
+    // double-count we're avoiding by introducing this seed).
+    snap.credit_pool_balance = -1;  // sentinel "not present"
+    try {
+        auto blk = rpc.getblock(snap.block_hash, /*verbosity=*/2);
+        if (blk.is_object() && blk.contains("tx") && blk["tx"].is_array()
+            && !blk["tx"].empty()) {
+            const auto& cb = blk["tx"][0];
+            if (cb.contains("cbTx")
+                && cb["cbTx"].contains("creditPoolBalance")) {
+                snap.credit_pool_balance =
+                    cb["cbTx"]["creditPoolBalance"].get<int64_t>();
+            }
+        }
+    } catch (const std::exception& e) {
+        LOG_WARNING << "[MNS-RPC] getblock for credit_pool_balance failed: "
+                    << e.what() << " — snapshot will lack v2 seed";
+    }
+
     LOG_INFO << "[MNS-RPC] built snapshot: " << snap.entries.size()
              << " entries (height=" << snap.height
              << " block=" << snap.block_hash.GetHex().substr(0, 16)
+             << " credit_pool=" << snap.credit_pool_balance
              << " failed=" << failed << ")";
     if (snap.entries.empty()) return std::nullopt;
     return snap;

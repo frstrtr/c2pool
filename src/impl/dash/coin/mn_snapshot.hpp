@@ -65,10 +65,15 @@ namespace coin {
 
 struct DmnSnapshot
 {
-    uint16_t version{1};
+    uint16_t version{2};  // v1: MN entries only. v2: + credit_pool_balance.
     uint32_t height{0};
     uint256  block_hash;
     std::vector<std::pair<uint256, MNState>> entries;
+    // -1 = "not present in this snapshot" (v1 files OR v2 files where the
+    // dumper couldn't query the balance). When >= 0, the loader seeds
+    // credit_pool with this value so the bootstrap drain can apply
+    // h=snapshot+1..tip deltas without double-counting.
+    int64_t  credit_pool_balance{-1};
 };
 
 /// A single in-tree snapshot entry: file path (relative to the binary
@@ -102,7 +107,12 @@ inline const std::vector<DmnSnapshotPin>& known_snapshots()
 }
 
 inline constexpr std::array<uint8_t, 4> SNAPSHOT_MAGIC{'D', 'M', 'N', 'S'};
-inline constexpr uint16_t SNAPSHOT_VERSION = 1;
+// v1: original (MN entries only).
+// v2: appends 8-byte int64 credit_pool_balance after the MN entries
+//     so bootstrap drain can re-seed CreditPoolDb at snapshot_height
+//     and replay h=snapshot+1..tip deltas without double-counting.
+inline constexpr uint16_t SNAPSHOT_VERSION_V1 = 1;
+inline constexpr uint16_t SNAPSHOT_VERSION    = 2;
 
 /// Compute SHA256d of a byte span — bit-identical to dashcore's
 /// SHA256d so the maintainer-side script can use the same algorithm.
@@ -145,6 +155,14 @@ inline std::vector<uint8_t> encode_snapshot(const DmnSnapshot& snap)
         auto stream = ::pack(state);
         auto sp = stream.get_span();
         write_bytes(reinterpret_cast<const uint8_t*>(sp.data()), sp.size());
+    }
+    // v2 trailer: 8-byte int64 credit_pool_balance (LE). -1 sentinel
+    // means "not known" (operator dumped without dashd RPC, or some
+    // failure in the cbtx parse). Loader treats -1 as "do not seed".
+    if (snap.version >= SNAPSHOT_VERSION) {
+        uint64_t u = static_cast<uint64_t>(snap.credit_pool_balance);
+        for (int i = 0; i < 8; ++i)
+            out.push_back(uint8_t((u >> (i * 8)) & 0xFF));
     }
     return out;
 }
@@ -196,9 +214,11 @@ inline bool decode_snapshot(const std::vector<uint8_t>& bytes,
         return false;
     }
     out.version = read_u16();
-    if (out.version != SNAPSHOT_VERSION) {
+    if (out.version != SNAPSHOT_VERSION_V1
+        && out.version != SNAPSHOT_VERSION) {
         LOG_WARNING << "[MNS-SNAP] unsupported version "
                     << out.version << " (expected "
+                    << SNAPSHOT_VERSION_V1 << " or "
                     << SNAPSHOT_VERSION << ")";
         return false;
     }
@@ -233,6 +253,19 @@ inline bool decode_snapshot(const std::vector<uint8_t>& bytes,
                         << " deserialize failed: " << ex.what();
             return false;
         }
+    }
+    // v2 trailer: 8-byte int64 credit_pool_balance.
+    out.credit_pool_balance = -1;  // default for v1 OR missing trailer
+    if (out.version >= SNAPSHOT_VERSION) {
+        if (off + 8 > bytes.size()) {
+            LOG_WARNING << "[MNS-SNAP] v2 file missing 8-byte credit_pool trailer";
+            return false;
+        }
+        uint64_t u = 0;
+        for (int i = 0; i < 8; ++i)
+            u |= uint64_t(bytes[off + i]) << (i * 8);
+        out.credit_pool_balance = static_cast<int64_t>(u);
+        off += 8;
     }
     if (off != bytes.size()) {
         LOG_WARNING << "[MNS-SNAP] " << (bytes.size() - off)
