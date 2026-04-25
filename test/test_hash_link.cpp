@@ -13,12 +13,21 @@
 #include <btclibs/crypto/sha256.h>
 #include <core/hash.hpp>
 #include <impl/ltc/share_check.hpp>
+#include <impl/ltc/params.hpp>
 
 #include <cstring>
 #include <numeric>
 #include <vector>
 
 namespace {
+
+// LTC mainnet CoinParams for compute_gentx_before_refhash; only the
+// share-version-keyed format constants are read, mainnet vs testnet
+// doesn't matter for hash_link round-trip equivalence.
+const core::CoinParams& test_coin_params() {
+    static const core::CoinParams p = ltc::make_coin_params(/*testnet=*/false);
+    return p;
+}
 
 // Build a byte vector of given size with sequential values
 std::vector<unsigned char> make_bytes(size_t len, unsigned char start = 0) {
@@ -152,7 +161,7 @@ TEST(HashLink, RoundTripRealisticCoinbase) {
     auto coinbase = make_bytes(250, 0x01);
 
     // compute_gentx_before_refhash would give ~83 bytes
-    auto gentx_before_refhash = ltc::compute_gentx_before_refhash(int64_t(36));
+    auto gentx_before_refhash = ltc::compute_gentx_before_refhash(int64_t(36), test_coin_params());
 
     // For the test, we must ensure the prefix ends with gentx_before_refhash.
     // Place gentx_before_refhash at the end of the prefix (before suffix).
@@ -301,7 +310,7 @@ TEST(HashLink, ProductionPathCoinbase) {
     // Donation output: value(8) + VarStr(COMBINED_DONATION_SCRIPT)
     // OP_RETURN output: value(8=0) + 0x2a + 0x6a + 0x28 + ref_hash(32) + nonce(8)
 
-    auto gentx_before_refhash = ltc::compute_gentx_before_refhash(int64_t(36));
+    auto gentx_before_refhash = ltc::compute_gentx_before_refhash(int64_t(36), test_coin_params());
     ASSERT_GT(gentx_before_refhash.size(), 0u);
 
     // Print gentx_before_refhash for debugging
