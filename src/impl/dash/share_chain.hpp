@@ -16,6 +16,23 @@
 namespace dash
 {
 
+// DoS-cap for resize() inputs read from the wire as VarInt(uint64_t), which
+// uses ReadCompactSize(false) (range_check disabled — see core/pack_types.hpp).
+// A malformed peer can send a 9-byte VarInt of UINT64_MAX, and an unguarded
+// resize() then throws std::length_error("vector::_M_default_append") and
+// kills the process via the top-level catch in main_dash.cpp:4453. Cap to
+// values comfortably above any legitimate share but well below allocator
+// max_size — exceeding the cap throws ios_base::failure, which the share
+// parser catches cleanly without process exit.
+//
+// MAX_PAYMENTS_PER_SHARE: legitimate shares carry one entry per payee in
+// the PPLNS window plus MN payouts. Real-world: ~10-50. Cap: 10000.
+//
+// MAX_TX_HASH_REF_PAIRS: one pair per non-coinbase tx in the block. A Dash
+// block holds ~few hundred tx; even worst-case dust is ~10000. Cap: 100000.
+inline constexpr uint64_t MAX_PAYMENTS_PER_SHARE   = 10000;
+inline constexpr uint64_t MAX_TX_HASH_REF_PAIRS    = 100000;
+
 // ── Formatter for v16 share serialization ────────────────────────────────────
 
 struct DashFormatter
@@ -62,6 +79,9 @@ struct DashFormatter
         {
             uint64_t count;
             ::Unserialize(is, VarInt(count));
+            if (count > MAX_PAYMENTS_PER_SHARE) {
+                throw std::ios_base::failure("packed_payments count exceeds cap");
+            }
             share->m_packed_payments.resize(count);
             for (uint64_t i = 0; i < count; ++i) {
                 BaseScript payee_bs;
@@ -79,6 +99,10 @@ struct DashFormatter
         {
             uint64_t pair_count;
             ::Unserialize(is, VarInt(pair_count));
+            if (pair_count > MAX_TX_HASH_REF_PAIRS) {
+                throw std::ios_base::failure("tx_hash_refs pair_count exceeds cap");
+            }
+            // pair_count is now <= MAX_TX_HASH_REF_PAIRS, so * 2 cannot overflow.
             share->m_transaction_hash_refs.resize(pair_count * 2);
             for (uint64_t i = 0; i < pair_count * 2; ++i) {
                 uint64_t v;

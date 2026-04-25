@@ -4450,7 +4450,16 @@ int main(int argc, char* argv[])
     try {
         ioc.run();
     } catch (const std::exception& e) {
-        std::cerr << "[ERROR] " << e.what() << std::endl;
+        // Capture exception type + backtrace so future "vector::_M_default_append"
+        // -style regressions are diagnosable without source-grepping for the
+        // resize() that broke. Mirrors the SIGSEGV handler from 2d33d09a; uses
+        // the same dash_write_crash_log() helper that drops to /tmp/c2pool_dash_crash.log.
+        std::cerr << "[ERROR] " << typeid(e).name() << ": " << e.what() << std::endl;
+        void* bt[64];
+        int n = backtrace(bt, 64);
+        backtrace_symbols_fd(bt, n, STDERR_FILENO);
+        std::string reason = std::string("uncaught ") + typeid(e).name() + ": " + e.what();
+        dash_write_crash_log(reason.c_str());
     }
 
     if (web_server) web_server->stop();
