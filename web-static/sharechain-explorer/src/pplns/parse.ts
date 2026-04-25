@@ -49,6 +49,16 @@ function num(v: unknown, fallback = 0): number {
   return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
 }
 
+// Sum a list of finite numbers, clamping to Number.MAX_VALUE if the sum
+// overflows. Individual `num()`-validated values are finite; the sum
+// can still hit Infinity when many MAX_VALUE-class values are added
+// (caught by fast-check property tests in pplns-parse-properties.test.ts).
+function finiteSum(values: number[]): number {
+  let s = 0;
+  for (const v of values) s += v;
+  return Number.isFinite(s) ? s : Number.MAX_VALUE;
+}
+
 function str(v: unknown): string | undefined {
   return typeof v === 'string' && v.length > 0 ? v : undefined;
 }
@@ -119,7 +129,7 @@ function parseNewShape(obj: Record<string, unknown>): PplnsSnapshot {
   const snap: PplnsSnapshot = {
     totalPrimary: totalPrimary > 0
       ? totalPrimary
-      : miners.reduce((s, m) => s + m.amount, 0),
+      : finiteSum(miners.map((m) => m.amount)),
     mergedChains,
     mergedTotals,
     schemaVersion: str(obj.schema_version) ?? '1.0',
@@ -258,7 +268,7 @@ function parseLegacyShape(obj: Record<string, unknown>): PplnsSnapshot {
     entries.push({ address: addr, amount, merged });
   }
 
-  const totalPrimary = entries.reduce((s, e) => s + e.amount, 0);
+  const totalPrimary = finiteSum(entries.map((e) => e.amount));
   entries.sort((a, b) => b.amount - a.amount);
 
   const miners: PplnsMiner[] = entries.map((e) => ({
