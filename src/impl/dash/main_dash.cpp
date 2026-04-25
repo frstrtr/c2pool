@@ -2508,10 +2508,18 @@ int main(int argc, char* argv[])
                         const bool already_in_state =
                             mn_state_db->is_open()
                             && height <= mn_state_db->get_best_height();
+                        // Skip top-of-handler MN apply while bootstrap is
+                        // draining — the drain loop processes each block in
+                        // chain order and runs apply_block there. If we
+                        // also apply at top, the tip block's apply races
+                        // with the drain's per-block apply, producing
+                        // transient MISMATCH on the catch-up boundary.
+                        const bool drain_will_handle =
+                            dash_bs && dash_bs->active;
                         std::optional<uint256> expected;
                         std::optional<uint256> observed;
                         dash::coin::MnStateMachine::ApplyResult r{};
-                        if (!already_in_state) {
+                        if (!already_in_state && !drain_will_handle) {
                             expected = mn_state_machine->find_expected_payee();
                             // pick_paid_mn (used inside find_paid_in_block_first)
                             // does lowest-h disambiguation — MUST be called BEFORE
