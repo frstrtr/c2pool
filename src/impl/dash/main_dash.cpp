@@ -1242,10 +1242,17 @@ int main(int argc, char* argv[])
             j["fork_count"]     = snap.fork_count;
             // §5.5 — head_count is the number of disconnected chain heads
             // currently tracked. Cheap O(heads) under shared_lock.
+            // try_to_lock per the IO-thread architectural rule (LTC
+            // node.hpp:67); on busy we already have snap.fork_count from
+            // the published snapshot which is functionally equivalent.
             {
-                std::shared_lock lock(node.tracker_mutex());
-                j["head_count"] = static_cast<int>(
-                    node.tracker().chain.get_heads().size());
+                std::shared_lock<std::shared_mutex> lock(
+                    node.tracker_mutex(), std::try_to_lock);
+                if (lock.owns_lock())
+                    j["head_count"] = static_cast<int>(
+                        node.tracker().chain.get_heads().size());
+                else
+                    j["head_count"] = snap.fork_count;
             }
             return j;
         });
@@ -1287,11 +1294,16 @@ int main(int argc, char* argv[])
         // each with the fields the dashboard JS expects (h, H, p, v, t, b,
         // a, dv, m).
         mi->set_sharechain_window_fn([&node, &params, testnet, mi_ptr = web_server->get_mining_interface()]() -> nlohmann::json {
-            // HTTP-thread callback. Hold shared_lock across the whole chain
-            // walk so writers on the main ioc thread block until we're done
-            // iterating. The walk is bounded by chain_length (4320) and
-            // returns 500 KB JSON — a few ms under lock is acceptable.
-            std::shared_lock lock(node.tracker_mutex());
+            // HTTP-thread callback. try_to_lock per the IO-thread
+            // architectural rule (LTC node.hpp:67) — never block the
+            // io_context waiting for the compute thread's exclusive lock.
+            // On busy: return empty object; the next refresh cycle picks
+            // it up.  thread_safe_wrap's CacheEntry holds the previous
+            // good value so dashboards keep rendering.
+            std::shared_lock<std::shared_mutex> lock(
+                node.tracker_mutex(), std::try_to_lock);
+            if (!lock.owns_lock())
+                return nlohmann::json::object();
             nlohmann::json result;
             auto& chain = node.tracker().chain;
             auto& verified = node.tracker().verified;
@@ -1381,11 +1393,14 @@ int main(int argc, char* argv[])
         // (web_server.hpp:112) so the cached tip can survive the JSON
         // refactor without the dashboard tripping on `.value()`.
         mi->set_sharechain_tip_fn([&node]() -> std::optional<core::SharechainTip> {
-            // HTTP-thread callback. All sharechain endpoints (tip, window,
-            // delta) agree on best-head selection by delegating to
-            // best_share_hash_nolock() — highest cumulative abswork, not
-            // arbitrary map order.
-            std::shared_lock lock(node.tracker_mutex());
+            // HTTP-thread callback. try_to_lock per the IO-thread
+            // architectural rule (LTC node.hpp:67); on busy return nullopt
+            // and the consumer renders the legacy empty-tip JSON via
+            // to_json (web_server.hpp:121).
+            std::shared_lock<std::shared_mutex> lock(
+                node.tracker_mutex(), std::try_to_lock);
+            if (!lock.owns_lock())
+                return std::nullopt;
             auto& chain = node.tracker().chain;
             uint256 best = node.best_share_hash_nolock();
             int32_t height = best.IsNull() ? 0 : chain.get_height(best);
@@ -1408,7 +1423,13 @@ int main(int argc, char* argv[])
              p2sh_ver  = (testnet ? 19 : 16),
              mi_ptr = web_server->get_mining_interface()]
             (const std::string& since_hash) -> nlohmann::json {
-                std::shared_lock lock(node.tracker_mutex());
+                // try_to_lock per the IO-thread architectural rule (LTC
+                // node.hpp:67); on busy return empty delta — consumer's
+                // RealTime polling will retry next interval.
+                std::shared_lock<std::shared_mutex> lock(
+                    node.tracker_mutex(), std::try_to_lock);
+                if (!lock.owns_lock())
+                    return nlohmann::json::object();
                 auto& chain = node.tracker().chain;
                 auto& verified = node.tracker().verified;
 
@@ -1497,7 +1518,13 @@ int main(int argc, char* argv[])
                 if (hash.IsNull())
                     return nlohmann::json{{"error", "share not found"}};
 
-                std::shared_lock lock(node.tracker_mutex());
+                // try_to_lock per the IO-thread architectural rule (LTC
+                // node.hpp:67); on busy return a transient-busy error.
+                // Consumer (share-detail page) shows a retry hint.
+                std::shared_lock<std::shared_mutex> lock(
+                    node.tracker_mutex(), std::try_to_lock);
+                if (!lock.owns_lock())
+                    return nlohmann::json{{"error", "tracker busy, retry"}};
                 auto& chain = node.tracker().chain;
                 auto& verified = node.tracker().verified;
                 if (!chain.contains(hash))
