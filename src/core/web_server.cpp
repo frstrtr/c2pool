@@ -5993,12 +5993,18 @@ nlohmann::json MiningInterface::compute_current_merged_payouts()
         auto& merged = entry["merged"];
         bool has_merged = merged.is_array() && !merged.empty();
         if (ltc_amount < 0.000001 && !has_merged) continue;
-        // Filter out overflow merged entries (< 0.01 DOGE or > 1B — clearly wrong)
+        // Filter out overflow merged entries (< 0.01 DOGE or > 1B — clearly wrong).
+        // Exempt source="donation": p2pool web.py forces donation_reward to >=1
+        // satoshi when the V36-signaling shares all set m_donation=0, so the
+        // legitimate donation entry can be 1e-8 DOGE — must not be dropped as
+        // "garbage". Matches p2pool web.py:1150 which attaches donation
+        // unconditionally regardless of amount.
         if (has_merged) {
             nlohmann::json good = nlohmann::json::array();
             for (auto& m : merged) {
                 double amt = m.value("amount", 0.0);
-                if (amt >= 0.01 && amt < 1e9)
+                bool is_donation = (m.value("source", "") == "donation");
+                if (is_donation || (amt >= 0.01 && amt < 1e9))
                     good.push_back(m);
             }
             entry["merged"] = good;

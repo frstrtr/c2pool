@@ -4088,7 +4088,9 @@
                             .style('text-align', 'right')
                             .style('color', '#6f42c1')
                             .attr('class', 'amount')
-                            .text(d3.format('.2f')(merged.amount));
+                            .text(merged.amount > 0 && merged.amount < 0.01
+                                ? d3.format('.8f')(merged.amount)
+                                : d3.format(',.2f')(merged.amount));
                     });
                 }
             });
