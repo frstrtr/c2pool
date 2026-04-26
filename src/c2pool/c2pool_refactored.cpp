@@ -4598,7 +4598,33 @@ int main(int argc, char* argv[]) {
                 }
 
                 try {
-                    auto tracker_lock = p2p_node->tracker_shared_lock();
+                    // Two bugs being fixed simultaneously:
+                    //   1. tracker_shared_lock() was BLOCKING — when the
+                    //      compute thread held the exclusive lock for a long
+                    //      think+clean cycle, this would freeze the io_context
+                    //      and trip the watchdog (same class as 2026-04-25).
+                    //   2. create_local_share() below calls tracker.add() which
+                    //      mutates m_shares + m_reverse + heads/tails — a WRITE
+                    //      under what was a SHARED lock.  Real data race
+                    //      against the compute thread which also writes during
+                    //      think (drop-tails, prune, attempt_verify).
+                    // Both fixed by taking unique_lock(try_to_lock).  On busy
+                    // we drop the share creation request — the miner will
+                    // submit again, and dropping one request is strictly
+                    // better than 30 s freeze + SIGABRT + losing all state.
+                    std::unique_lock<std::shared_mutex> tracker_lock(
+                        p2p_node->tracker_mutex(), std::try_to_lock);
+                    if (!tracker_lock.owns_lock()) {
+                        ++s_guard_blocked;
+                        static std::atomic<int64_t> s_last_drop{0};
+                        auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+                        if (now_ns - s_last_drop.load() > 10'000'000'000LL) {
+                            s_last_drop.store(now_ns);
+                            LOG_WARNING << "[Pool] create_share dropped: tracker busy"
+                                        << " (compute thread holds exclusive lock — miner will retry)";
+                        }
+                        return;
+                    }
                     if (p.prev_share_hash.IsNull()) {
                         auto chain_sz = p2p_node->tracker().chain.size();
                         // WAIT mode: block genesis (empty chain) until peers deliver shares
