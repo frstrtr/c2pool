@@ -576,9 +576,28 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
 
 std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr)
 {
-    // Shared lock: waits for think() to release exclusive lock (200-400ms max).
-    // Must respond to share requests — returning empty causes peer disconnect.
-    std::shared_lock lock(m_tracker_mutex);
+    // try_to_lock per the architectural rule (node.hpp:67) — IO thread MUST
+    // never block on m_tracker_mutex.  A blocking shared_lock here was the
+    // root cause of the periodic event-loop freeze + SIGABRT cycle on
+    // contabo (2026-04-12, -16, -19, -21, -25): when the compute thread
+    // held the exclusive lock for a long think+clean cycle on a wedged
+    // chain (~30+s), an incoming SHAREREQ on the IO thread would block
+    // here, the watchdog would fire after 30s of io_context unresponsive,
+    // and systemd would restart.
+    //
+    // Empty reply does NOT cause peer disconnect — p2pool's downloader
+    // (node.py:120) picks a random peer per request and retries; an empty
+    // hit just shifts to a different peer next iteration.
+    std::shared_lock<std::shared_mutex> lock(m_tracker_mutex, std::try_to_lock);
+    if (!lock.owns_lock())
+    {
+        static int defer_log = 0;
+        if (defer_log++ % 50 == 0)
+            LOG_INFO << "[handle_get_share] tracker busy — returning empty to "
+                     << peer_addr.to_string()
+                     << " (peer will retry against another peer)";
+        return {};
+    }
 
     parents = std::min(parents, (uint64_t)1000/hashes.size());
 	std::vector<ltc::ShareType> shares;
@@ -614,9 +633,19 @@ std::vector<ltc::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
 
 void NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hashes)
 {
-    // Shared lock: waits for think() to release (200-400ms max).
-    // Must send shares — skipping causes peer to see us as empty.
-    std::shared_lock lock(m_tracker_mutex);
+    // try_to_lock per the architectural rule (node.hpp:67) — see freeze
+    // analysis in handle_get_share above.  If we can't acquire NOW, skip
+    // this batch.  The shares are still in our chain; the next broadcast
+    // cycle (or the next think() result) picks them up.
+    std::shared_lock<std::shared_mutex> lock(m_tracker_mutex, std::try_to_lock);
+    if (!lock.owns_lock())
+    {
+        static int defer_log = 0;
+        if (defer_log++ % 50 == 0)
+            LOG_INFO << "[send_shares] tracker busy — skipping send to "
+                     << peer->addr().to_string() << " (will retry next cycle)";
+        return;
+    }
 
     // Collect shares that exist in our chain (skip rejected)
     std::vector<ShareType> shares;
@@ -714,9 +743,23 @@ void NodeImpl::send_shares(peer_ptr peer, const std::vector<uint256>& share_hash
 
 void NodeImpl::broadcast_share(const uint256& share_hash)
 {
-    // Shared lock: waits for think() to release (200-400ms max).
-    // Must broadcast — skipping causes share propagation stalls.
-    std::shared_lock lock(m_tracker_mutex);
+    // try_to_lock per the architectural rule (node.hpp:67) — see freeze
+    // analysis in handle_get_share above.  If think+clean holds the
+    // exclusive lock right now, defer this broadcast: the share is still
+    // in our chain; the next local share creation, the next think cycle,
+    // or the next peer-driven SHAREREQ will pick it up.  Blocking here
+    // was a contributing freeze trigger (called from local-share creation
+    // and from the share-add hot path).
+    std::shared_lock<std::shared_mutex> lock(m_tracker_mutex, std::try_to_lock);
+    if (!lock.owns_lock())
+    {
+        static int defer_log = 0;
+        if (defer_log++ % 50 == 0)
+            LOG_INFO << "[broadcast_share] tracker busy — deferring broadcast of "
+                     << share_hash.GetHex().substr(0, 16)
+                     << " (next cycle will pick it up)";
+        return;
+    }
 
     // Walk the chain back from share_hash, collecting un-broadcast shares
     std::vector<uint256> to_send;
