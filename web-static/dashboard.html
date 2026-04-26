@@ -2793,9 +2793,24 @@
 
             // Inject Explorer nav link when explorer is enabled
             if (info && info.explorer_enabled) {
-                // Use configured URL, or auto-detect from current host + default port
-                var explorerHref = info.explorer_url
-                    || ('http://' + window.location.hostname + ':9090');
+                // Use configured explorer_url from the YAML (preferred — explicit
+                // and survives deployment topology changes). Otherwise auto-derive
+                // from the current hostname:
+                //   - DNS hostname (e.g. voidbind.com)  → https://explorer.<hostname>
+                //   - IP literal (e.g. 192.168.86.20)  → http://<host>:9090
+                //   - localhost                         → http://localhost:9090
+                // The DNS-subdomain default matches our production layout
+                // (Caddy fronts explorer.<domain>) and works for any host
+                // following the same convention. The :9090 fallback covers
+                // LAN/dev deployments without a reverse proxy.
+                var explorerHref = info.explorer_url || (function() {
+                    var h = window.location.hostname;
+                    var isIPv4 = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+                    var isIPv6 = h.indexOf(':') !== -1;
+                    if (isIPv4 || isIPv6 || h === 'localhost')
+                        return 'http://' + h + ':9090';
+                    return window.location.protocol + '//explorer.' + h;
+                })();
                 var nav = document.querySelector('nav');
                 var _old = document.getElementById('nav-explorer'); if (_old) _old.remove();
                 if (nav) {
