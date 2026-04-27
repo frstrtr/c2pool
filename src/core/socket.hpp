@@ -7,6 +7,7 @@
 
 #include <boost/asio.hpp>
 
+#include <core/log.hpp>
 #include <core/pack.hpp>
 #include <core/pack_types.hpp>
 #include <core/message.hpp>
@@ -54,8 +55,23 @@ public:
 private:
     void read()
     {
-        auto packet = std::make_shared<Packet>(m_node->get_prefix().size());
-		read_prefix(packet);
+        // Bug 9 hardening: Packet ctor caps prefix_length to defend against
+        // a UAF on m_node where get_prefix().size() returns garbage. If the
+        // cap fires, just close the socket cleanly instead of letting the
+        // exception escape to ioc.run() and kill the process.
+        std::shared_ptr<Packet> packet;
+        try {
+            packet = std::make_shared<Packet>(m_node->get_prefix().size());
+        } catch (const std::exception& e) {
+            LOG_WARNING << "Socket::read: aborting connection (" << e.what() << ")";
+            m_status = false;
+            if (m_socket && m_socket->is_open()) {
+                boost::system::error_code ec;
+                m_socket->close(ec);
+            }
+            return;
+        }
+        read_prefix(packet);
     }
 
     void read_prefix(std::shared_ptr<Packet> packet);
