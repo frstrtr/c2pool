@@ -294,17 +294,14 @@ public:
     }
 
     /// Request a full block via getdata.
-    /// LTC: MSG_MWEB_BLOCK (0x60000002) for MWEB state extraction.
-    /// DOGE: MSG_BLOCK (0x02) — no segwit/MWEB support.
+    /// BTC: MSG_WITNESS_BLOCK (0x40000002) — BIP 144 witness-bearing block.
+    /// (LTC used MSG_MWEB_BLOCK 0x60000002 for MWEB state extraction;
+    /// bitcoind doesn't recognise that inv type and would peer-disconnect.)
     void request_full_block(const uint256& block_hash)
     {
         if (m_peer) {
-            bool is_doge = (m_chain_label == "DOGE" || m_chain_label == "doge");
-            auto inv = is_doge
-                ? inventory_type::block  // MSG_BLOCK for DOGE
-                : static_cast<inventory_type::inv_type>(0x60000002);  // MSG_MWEB_BLOCK for LTC
             auto msg = message_getdata::make_raw(
-                {inventory_type(inv, block_hash)});
+                {inventory_type(inventory_type::witness_block, block_hash)});
             m_peer->write(msg);
         }
     }
@@ -682,20 +679,16 @@ private:
         if (!vheaders.empty()) {
             m_coin->new_headers.happened(vheaders);
 
-            // BIP 130: when receiving a small headers batch (new block announcement),
-            // request the full block via getdata.
-            // LTC: MSG_MWEB_BLOCK (0x60000002) for MWEB state extraction
-            // DOGE: MSG_BLOCK (0x02) — no segwit/MWEB
-            bool is_doge_chain = (m_chain_label == "DOGE" || m_chain_label == "doge");
+            // BIP 130: when receiving a small headers batch (new block
+            // announcement), request the full block via getdata.
+            // BTC: MSG_WITNESS_BLOCK (0x40000002) — BIP 144 witness-bearing.
+            // LTC's MSG_MWEB_BLOCK (0x60000002) would be rejected by bitcoind.
             if (vheaders.size() <= 3 && m_peer) {
                 for (auto& hdr : vheaders) {
                     auto packed = pack(hdr);
                     auto bhash = Hash(packed.get_span());
-                    auto inv_type = is_doge_chain
-                        ? inventory_type::block  // MSG_BLOCK for DOGE
-                        : static_cast<inventory_type::inv_type>(0x60000002);  // MSG_MWEB_BLOCK
                     auto getdata_msg = message_getdata::make_raw(
-                        {inventory_type(inv_type, bhash)});
+                        {inventory_type(inventory_type::witness_block, bhash)});
                     m_peer->write(getdata_msg);
                     LOG_INFO << "[" << m_chain_label << "] Requesting full block "
                              << bhash.GetHex().substr(0, 16) << "...";
