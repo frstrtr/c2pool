@@ -61,6 +61,16 @@ class NodeP2P
     // Dash Core v20+ protocol version
     static constexpr uint32_t DASH_PROTOCOL_VERSION = 70230;
 
+    // Bug 9 follow-up (DashBroadcastPeer UAF on broadcaster_full.hpp:492):
+    // NodeP2P now optionally OWNS its coin and config so their lifetime is
+    // tied to NodeP2P's. When DashBroadcastPeer is erased from m_peers, the
+    // shared_ptr<NodeP2P> count drops to N (held by Socket strong_node, by
+    // pending async ops, etc.). NodeP2P stays alive past peer erase, and
+    // m_coin_owned/m_config_owned keep the dependencies alive too. Raw
+    // m_coin/m_config caches are kept for hot-path access; they alias the
+    // owned objects (or external raw pointers in the legacy LTC pattern).
+    std::unique_ptr<dash::interfaces::Node> m_coin_owned;
+    std::unique_ptr<config_t>               m_config_owned;
     dash::interfaces::Node* m_coin;
     io::io_context* m_context;
     config_t* m_config;
@@ -205,10 +215,36 @@ class NodeP2P
     }
 
 public:
+    // Legacy ctor: caller retains ownership of coin/config (raw pointers).
+    // Used by tests and any callsite where the parent guarantees lifetime.
     NodeP2P(io::io_context* context, dash::interfaces::Node* coin, config_t* config)
         : core::Factory<core::Client>(context, this, "DashP2P")
         , m_context(context), m_coin(coin), m_config(config)
     {}
+
+    // Bug 9 follow-up ctor: NodeP2P TAKES ownership of coin and config so
+    // their lifetime is tied to NodeP2P's. Required for DashBroadcastPeer
+    // safety: when m_peers.erase(key) drops the peer, NodeP2P stays alive
+    // via the Socket strong_node hold (c558fe92 fix), and m_coin/m_config
+    // stay alive too because we own them. Without this, get_prefix()
+    // returned a reference into the freed peer's config -> AsAN UAF at
+    // socket.cpp:140.
+    NodeP2P(io::io_context* context,
+            std::unique_ptr<dash::interfaces::Node> coin,
+            std::unique_ptr<config_t> config)
+        : core::Factory<core::Client>(context, this, "DashP2P")
+        , m_coin_owned(std::move(coin))
+        , m_config_owned(std::move(config))
+        , m_context(context)
+        , m_coin(m_coin_owned.get())
+        , m_config(m_config_owned.get())
+    {}
+
+    // Accessors for the owned (or aliased) dependencies. Broadcaster wires
+    // event subscriptions through coin() instead of holding its own
+    // dash::interfaces::Node by value.
+    dash::interfaces::Node* coin() { return m_coin; }
+    config_t* config() { return m_config; }
 
     void connect(NetService addr)
     {

@@ -72,19 +72,24 @@ private:
     CoinPart m_coin;
 };
 
-/// One P2P connection slot: config + NodeP2P + event sink.
+/// One P2P connection slot: NodeP2P-owned config + event sink.
 ///
-/// Bug 3 root-cause fix: node_p2p is now a shared_ptr (was value). NodeP2P
-/// inherits std::enable_shared_from_this so its async timer/connect/read
-/// callbacks can capture `self = shared_from_this()` and keep the node alive
-/// for the duration of the handler. shared_from_this() requires the object
-/// be MANAGED by a shared_ptr at construction time — hence the make_shared
-/// in the constructor below.
+/// Bug 9 follow-up (DashBroadcastPeer UAF, AsAN report 2026-04-28): config
+/// and coin_node MUST live as long as NodeP2P, otherwise the Socket async
+/// callback at socket.cpp:140 reads a freed prefix vector when m_peers.erase()
+/// drops this peer ahead of the in-flight async_read completing.
+///
+/// The fix: hand ownership of coin_node and config to NodeP2P at construction.
+/// NodeP2P is shared_ptr-managed and held alive past peer erase by Socket's
+/// strong_node (the c558fe92 weak_ptr<INetwork> mechanism). With NodeP2P-owned
+/// dependencies, get_prefix() always returns a reference into live memory.
+///
+/// Bug 3 root-cause fix (c42d0f5c): node_p2p is shared_ptr<NodeP2P>; NodeP2P
+/// inherits enable_shared_from_this so its async timer/connect/read lambdas
+/// capture `self = shared_from_this()`.
 struct DashBroadcastPeer
 {
     std::string                                                       key;
-    DashBroadcasterConfig                                             config;
-    dash::interfaces::Node                                            coin_node;
     std::shared_ptr<dash::coin::p2p::NodeP2P<DashBroadcasterConfig>>  node_p2p;
     bool                                                              connected{false};
     bool                                                              handshake_done{false};
@@ -94,9 +99,10 @@ struct DashBroadcastPeer
                       const std::vector<std::byte>& prefix,
                       const NetService& addr)
         : key(peer_key)
-        , config(prefix, addr)
         , node_p2p(std::make_shared<dash::coin::p2p::NodeP2P<DashBroadcasterConfig>>(
-              ioc, &coin_node, &config))
+              ioc,
+              std::make_unique<dash::interfaces::Node>(),
+              std::make_unique<DashBroadcasterConfig>(prefix, addr)))
     {
     }
 };
@@ -438,19 +444,20 @@ private:
             // the main_dash.cpp subscribers (header chain, chain-lock,
             // full-block logger).
             auto peer_key = key;
-            peer->coin_node.new_block.subscribe(
+            auto* coin_node = peer->node_p2p->coin();
+            coin_node->new_block.subscribe(
                 [this, peer_key](const uint256& hash) {
                     if (m_on_new_block) m_on_new_block(peer_key, hash);
                 });
-            peer->coin_node.new_tx.subscribe(
+            coin_node->new_tx.subscribe(
                 [this, peer_key](const dash::coin::Transaction& tx) {
                     if (m_on_new_tx) m_on_new_tx(peer_key, tx);
                 });
-            peer->coin_node.new_headers.subscribe(
+            coin_node->new_headers.subscribe(
                 [this, peer_key](const std::vector<dash::coin::BlockHeaderType>& hdrs) {
                     if (m_on_new_headers) m_on_new_headers(peer_key, hdrs);
                 });
-            peer->coin_node.full_block.subscribe(
+            coin_node->full_block.subscribe(
                 [this, peer_key](const dash::coin::BlockType& block) {
                     if (m_on_full_block) m_on_full_block(peer_key, block);
                 });
