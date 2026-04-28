@@ -72,8 +72,8 @@ private:
     bool m_peer_wtxidrelay{false};
     // Peer metadata from version message
     uint64_t m_peer_services{0};
-    uint32_t m_peer_version{0};          // protocol version (e.g. 70017)
-    std::string m_peer_subver;           // user agent (e.g. "/LitecoinCore:0.21.4/")
+    uint32_t m_peer_version{0};          // protocol version (e.g. 70016)
+    std::string m_peer_subver;           // user agent (e.g. "/Satoshi:28.0.0/")
     uint32_t m_peer_start_height{0};     // chain height at connect time
     std::chrono::steady_clock::time_point m_connected_at{std::chrono::steady_clock::now()};
     // BIP 35: request full mempool inventory after handshake

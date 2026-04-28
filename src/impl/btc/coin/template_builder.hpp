@@ -192,7 +192,7 @@ public:
                 next_bits = tip.header.m_bits;
             else
                 next_bits = chain.params().pow_limit.GetCompact();
-            LOG_INFO << "[EMB-LTC] TemplateBuilder: bits fallback to 0x"
+            LOG_INFO << "[EMB-BTC] TemplateBuilder: bits fallback to 0x"
                      << std::hex << next_bits << std::dec
                      << " (chain too short for retarget)";
         }
@@ -267,10 +267,10 @@ public:
                 mweb_hex = HexStr(std::span<const unsigned char>(mweb_bytes.data(), mweb_bytes.size()));
                 has_mweb = true;
 
-                LOG_INFO << "[EMB-LTC] MWEB: HogEx added as last tx, mweb_hex="
+                LOG_INFO << "[EMB-BTC] MWEB: HogEx added as last tx, mweb_hex="
                          << mweb_hex.size() / 2 << " bytes";
             } else {
-                LOG_DEBUG_COIND << "[EMB-LTC] MWEB tracker has no state yet";
+                LOG_DEBUG_COIND << "[EMB-BTC] MWEB tracker has no state yet";
             }
         }
 
@@ -294,7 +294,7 @@ public:
         data["weightlimit"]       = 4'000'000;
         data["mintime"]           = static_cast<int64_t>(tip.header.m_timestamp + 1);
 
-        LOG_INFO << "[EMB-LTC] TemplateBuilder: height=" << next_h
+        LOG_INFO << "[EMB-BTC] TemplateBuilder: height=" << next_h
                  << " version=0x" << std::hex << block_version << std::dec
                  << " prev=" << tip.block_hash.GetHex().substr(0, 16) << "..."
                  << " bits=" << bits_to_hex(next_bits)
@@ -329,18 +329,18 @@ public:
     /// Build a template from the current chain tip + mempool.
     /// Throws std::runtime_error if the chain has no genesis yet or not synced.
     rpc::WorkData getwork() override {
-        LOG_DEBUG_COIND << "[EMB-LTC] EmbeddedCoinNode::getwork() called"
+        LOG_DEBUG_COIND << "[EMB-BTC] EmbeddedCoinNode::getwork() called"
                   << " chain_height=" << m_chain.height()
                   << " mempool_size=" << m_pool.size()
                   << " synced=" << m_chain.is_synced();
         if (!m_chain.is_synced()) {
-            LOG_INFO << "[EMB-LTC] getwork() blocked: chain not synced (height="
+            LOG_INFO << "[EMB-BTC] getwork() blocked: chain not synced (height="
                      << m_chain.height() << ")";
             throw std::runtime_error("EmbeddedCoinNode::getwork: chain not synced — waiting for header sync");
         }
         auto result = TemplateBuilder::build_template(m_chain, m_pool, m_testnet, m_mweb_tracker);
         if (!result) {
-            LOG_WARNING << "[EMB-LTC] EmbeddedCoinNode::getwork() FAILED: no tip (chain empty)";
+            LOG_WARNING << "[EMB-BTC] EmbeddedCoinNode::getwork() FAILED: no tip (chain empty)";
             throw std::runtime_error("EmbeddedCoinNode::getwork: chain has no tip (not yet synced to genesis)");
         }
         return *result;
@@ -368,7 +368,7 @@ public:
             info["bestblockhash"] = std::string(64, '0');
             info["bits"]          = "00000000";
         }
-        LOG_DEBUG_COIND << "[EMB-LTC] getblockchaininfo: height=" << info["blocks"].get<int>()
+        LOG_DEBUG_COIND << "[EMB-BTC] getblockchaininfo: height=" << info["blocks"].get<int>()
                   << " synced=" << info["synced"].get<bool>()
                   << " best=" << info["bestblockhash"].get<std::string>().substr(0, 16);
         return info;
