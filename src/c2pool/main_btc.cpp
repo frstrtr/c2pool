@@ -1,52 +1,217 @@
 // c2pool-btc — Bitcoin embedded SPV p2pool node.
 //
-// PR-B0/B1/B2 SCAFFOLD: this is still a stub entry point. The real wiring —
-// arg parsing, io_context, header chain, UTXO bootstrap, mempool, template
-// builder, stratum server, web dashboard — lands in subsequent B-phases per
-// frstrtr/the/docs/c2pool-btc-embedded-impl-plan.md. The full LTC entry
-// point at src/c2pool/c2pool_refactored.cpp (~90 KB) is the porting source.
+// PR-B2-net (focused header-sync entry point).
 //
-// What's done so far:
-//   B0  scaffold src/impl/btc/ from LTC template (e107b10d)
-//   B1  constants + PoW swap to SHA256d, jtoomim/SPB v35 + protocol 3502
-//       BTC chain params (PoolConfig identifier fc70035c7a81bc6f, prefix
-//       2472ef181efcd37b, port 9333), bitcoind protocol 70016
-//   B2  header_chain.hpp: BTCChainParams with mainnet/testnet/testnet4
-//       factories, BTC genesis + DAA constants (1209600s/600s, 2016 blocks),
-//       SHA256d PoW. Log prefixes [LTC] -> [BTC].
+// Wires `btc::coin::HeaderChain` to a single `btc::coin::Node` connection
+// against a known bitcoind P2P endpoint. No sharechain, stratum, mempool,
+// template builder, broadcaster, or web dashboard — those land in B3+.
 //
-// What's still owed for a usable c2pool-btc:
-//   B2-net  smoke-test header sync against testnet4 bitcoind (port 48333,
-//           genesis 00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043)
-//   B3      mempool + template builder, surgical MWEB strip (transaction.hpp
-//           m_hogEx, block.hpp m_mweb_raw, template_builder.hpp MWEBBuilder,
-//           rpc.cpp "mweb" rule)
-//   B4      sharechain + stratum (port LTC's path; v35 share format)
-//   B5      P2P block submit + roundtrip
-//   B6      parity validation harness vs bitcoind RPC
+// This main is small on purpose: it's the smoke-test target for verifying
+// that the BTC port (jtoomim/SPB v35 + protocol 3502 + SHA256d PoW + BTC
+// genesis + DAA) actually handshakes with bitcoind, sends getheaders,
+// receives the response, and ingests headers into HeaderChain.
 //
-// Reference wiring (commented; see c2pool_refactored.cpp:1700-1800 for the
-// actual LTC equivalent that this needs to mirror):
+// Usage:
+//   c2pool-btc --bitcoind HOST:PORT [--testnet | --testnet4]
 //
-//   #include <impl/btc/coin/header_chain.hpp>
-//   #include <impl/btc/coin/node.hpp>
-//   #include <impl/btc/config_pool.hpp>
-//   #include <boost/asio.hpp>
+// Examples:
+//   c2pool-btc --testnet4 --bitcoind 127.0.0.1:48333
+//   c2pool-btc --testnet  --bitcoind 127.0.0.1:18333
+//   c2pool-btc           --bitcoind 127.0.0.1:8333
 //
-//   int main(int argc, char* argv[]) {
-//       // 1. Parse args: --testnet, --testnet4, --bootstrap host:port,
-//       //    --bitcoind-p2p host:port
-//       // 2. boost::asio::io_context ioc;
-//       // 3. Build BTCChainParams (mainnet/testnet/testnet4 factory)
-//       // 4. Construct btc::coin::HeaderChain<...>
-//       // 5. Construct btc::PoolConfig (loaded from pool.yaml)
-//       // 6. Construct btc::coin::Node<btc::PoolConfig> coin_node(&ioc, &config)
-//       // 7. coin_node.start_p2p(NetService(host, 8333|18333|48333))
-//       // 8. Wire HeaderChain to coin_node->new_headers event
-//       // 9. ioc.run()
-//   }
+// Reference port from src/c2pool/c2pool_refactored.cpp lines 1500-1900
+// (LTC's HeaderChain + EmbeddedCoinNode wiring), pruned to a single-peer
+// non-broadcaster shape suitable for B2-net smoke testing.
 
-int main(int /*argc*/, char* /*argv*/[])
+#include <impl/btc/coin/header_chain.hpp>
+#include <impl/btc/coin/node.hpp>
+#include <impl/btc/coin/node_interface.hpp>
+#include <impl/btc/config.hpp>
+
+#include <core/filesystem.hpp>
+#include <core/log.hpp>
+#include <core/netaddress.hpp>
+#include <btclibs/util/strencodings.h>
+
+#include <boost/asio.hpp>
+
+#include <atomic>
+#include <csignal>
+#include <cstdint>
+#include <filesystem>
+#include <iostream>
+#include <string>
+#include <vector>
+
+namespace io = boost::asio;
+
+static std::atomic<bool> g_should_stop{false};
+static io::io_context*   g_ioc = nullptr;
+
+static void handle_signal(int /*sig*/)
 {
+    g_should_stop.store(true);
+    if (g_ioc) g_ioc->stop();
+}
+
+static void print_usage()
+{
+    std::cerr <<
+        "Usage: c2pool-btc [--testnet | --testnet4] --bitcoind HOST:PORT\n"
+        "\n"
+        "  --testnet       BTC testnet3 chain (genesis 000000000933ea01...)\n"
+        "  --testnet4      BTC testnet4 chain (genesis 00000000da84f2ba...)\n"
+        "                  default: mainnet\n"
+        "  --bitcoind H:P  bitcoind P2P endpoint host:port\n"
+        "                  e.g. 127.0.0.1:8333  (mainnet)\n"
+        "                       127.0.0.1:18333 (testnet3)\n"
+        "                       127.0.0.1:48333 (testnet4)\n";
+}
+
+/// BTC wire-protocol magic bytes per network (pchMessageStart).
+/// Source: ref/bitcoin/src/kernel/chainparams.cpp.
+static std::vector<std::byte> btc_magic_bytes(bool testnet, bool testnet4)
+{
+    std::string hex;
+    if (testnet4)      hex = "1c163f28";   // testnet4 (line 335-338)
+    else if (testnet)  hex = "0b110907";   // testnet3 (line 235-238)
+    else               hex = "f9beb4d9";   // mainnet  (line 117-120)
+    return ParseHexBytes(hex);
+}
+
+int main(int argc, char* argv[])
+{
+    std::signal(SIGINT,  handle_signal);
+    std::signal(SIGTERM, handle_signal);
+
+    core::log::Logger::init();
+
+    bool        testnet       = false;
+    bool        testnet4      = false;
+    std::string bitcoind_host;
+    uint16_t    bitcoind_port = 0;
+
+    for (int i = 1; i < argc; ++i)
+    {
+        std::string arg = argv[i];
+        if (arg == "-h" || arg == "--help")
+        {
+            print_usage();
+            return 0;
+        }
+        else if (arg == "--testnet")
+        {
+            testnet = true;
+        }
+        else if (arg == "--testnet4")
+        {
+            testnet  = true;
+            testnet4 = true;
+        }
+        else if (arg == "--bitcoind" && i + 1 < argc)
+        {
+            std::string ep = argv[++i];
+            auto colon = ep.find(':');
+            if (colon == std::string::npos)
+            {
+                std::cerr << "--bitcoind requires HOST:PORT\n";
+                return 1;
+            }
+            bitcoind_host = ep.substr(0, colon);
+            bitcoind_port = static_cast<uint16_t>(std::stoi(ep.substr(colon + 1)));
+        }
+        else
+        {
+            std::cerr << "unknown arg: " << arg << "\n";
+            print_usage();
+            return 1;
+        }
+    }
+
+    if (bitcoind_host.empty() || bitcoind_port == 0)
+    {
+        print_usage();
+        return 1;
+    }
+
+    btc::PoolConfig::is_testnet = testnet;
+
+    auto chain_params = testnet4
+        ? btc::coin::BTCChainParams::testnet4()
+        : (testnet ? btc::coin::BTCChainParams::testnet()
+                   : btc::coin::BTCChainParams::mainnet());
+
+    const std::string net_subdir = testnet4 ? "bitcoin_testnet4"
+                                : (testnet  ? "bitcoin_testnet"
+                                            : "bitcoin");
+
+    const std::filesystem::path net_dir = core::filesystem::config_path() / net_subdir;
+    std::error_code ec;
+    std::filesystem::create_directories(net_dir, ec);  // best effort
+
+    const std::string chain_db_path = (net_dir / "embedded_headers").string();
+
+    LOG_INFO << "[BTC] c2pool-btc starting — net="
+             << (testnet4 ? "testnet4" : (testnet ? "testnet3" : "mainnet"));
+    LOG_INFO << "[BTC] HeaderChain DB: " << chain_db_path;
+    LOG_INFO << "[BTC] Genesis:        " << chain_params.genesis_hash.GetHex();
+    LOG_INFO << "[BTC] bitcoind P2P:   " << bitcoind_host << ":" << bitcoind_port;
+
+    btc::coin::HeaderChain header_chain(chain_params, chain_db_path);
+    if (!header_chain.init())
+    {
+        LOG_WARNING << "[BTC] HeaderChain init failed — running in-memory only";
+    }
+    else
+    {
+        LOG_INFO << "[BTC] HeaderChain initialized: size=" << header_chain.size()
+                 << " height=" << header_chain.height();
+    }
+
+    io::io_context ioc;
+    g_ioc = &ioc;
+
+    // btc::Config = core::Config<PoolConfig, CoinConfig> — composite holds
+    // both the c2pool sharechain identity (PoolConfig: prefix/identifier
+    // from B1) AND the bitcoind wire-protocol identity (CoinConfig::m_p2p:
+    // BTC magic bytes per network). NodeP2P reads m_config->coin()->m_p2p.prefix
+    // to frame outbound bitcoind messages — getting this wrong = peer
+    // disconnect.
+    btc::Config config(net_subdir);
+    // Skip Config::init() — it would try to load pool.yaml + coin.yaml
+    // from disk; for B2-net smoke we set fields directly from chainparams.
+    config.coin()->m_p2p.prefix  = btc_magic_bytes(testnet, testnet4);
+    config.coin()->m_p2p.address = NetService(bitcoind_host, bitcoind_port);
+    config.coin()->m_testnet     = testnet;
+    config.coin()->m_symbol      = "BTC";
+
+    btc::coin::Node<btc::Config> coin_node(&ioc, &config);
+
+    // Forward bitcoind's headers batches into HeaderChain. LTC dispatches
+    // this off-thread via a dedicated thread pool (scrypt verification is
+    // CPU-bound, ~20 ms per header). BTC's PoW is SHA256d which is fast
+    // enough to run inline for B2-net — revisit if this becomes a hot path
+    // during full mainnet IBD soak.
+    coin_node.new_headers.subscribe(
+        [&header_chain](const std::vector<btc::coin::BlockHeaderType>& headers)
+        {
+            int accepted = header_chain.add_headers(headers);
+            LOG_INFO << "[BTC] new_headers batch: received=" << headers.size()
+                     << " accepted=" << accepted
+                     << " chain_height=" << header_chain.height();
+        });
+
+    coin_node.new_block.subscribe(
+        [](const uint256& block_hash)
+        {
+            LOG_INFO << "[BTC] new_block: " << block_hash.GetHex().substr(0, 32) << "...";
+        });
+
+    LOG_INFO << "[BTC] Connecting to bitcoind...";
+    coin_node.start_p2p(NetService(bitcoind_host, bitcoind_port));
+
+    LOG_INFO << "[BTC] io_context running. Ctrl-C to stop.";
+    ioc.run();
+    LOG_INFO << "[BTC] Shutting down.";
     return 0;
 }
