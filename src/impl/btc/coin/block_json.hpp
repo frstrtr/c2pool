@@ -31,9 +31,9 @@ namespace coin {
 
 /// Chain parameters needed for address encoding.
 struct ExplorerChainParams {
-    std::string bech32_hrp;   // "ltc", "tltc", etc.
-    uint8_t p2pkh_ver;        // 0x30 (LTC mainnet), 0x6f (testnet)
-    uint8_t p2sh_ver;         // 0x32 (LTC mainnet), 0xc4 (testnet)
+    std::string bech32_hrp;   // "bc" (BTC mainnet), "tb" (testnet)
+    uint8_t p2pkh_ver;        // 0x00 (BTC mainnet), 0x6f (testnet)
+    uint8_t p2sh_ver;         // 0x05 (BTC mainnet), 0xc4 (testnet)
     std::string chain_name;   // "main", "test", etc.
 };
 

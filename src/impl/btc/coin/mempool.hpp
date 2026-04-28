@@ -208,7 +208,7 @@ public:
                     // A mempool tx spends the same output — it's now invalid
                     auto conflict_txid = it->second;
                     if (m_pool.count(conflict_txid)) {
-                        LOG_INFO << "[EMB-LTC] Mempool: removing conflict tx "
+                        LOG_INFO << "[EMB-BTC] Mempool: removing conflict tx "
                                  << conflict_txid.GetHex().substr(0, 16)
                                  << " (spends same input as confirmed tx)";
                         ++conflicts;
