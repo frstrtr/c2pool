@@ -25,8 +25,16 @@ private:
     {
         if (*m_destroyed) return;
         m_timer.expires_after(boost::asio::chrono::seconds(m_t));
+        // Bug-3-family UAF fix (paired with the Socket::m_node weak_ptr fix
+        // c558fe92): m_handler() and m_cancel() are user callbacks that can
+        // synchronously destroy *this (e.g. reply_matcher.hpp:92 erases the
+        // ResponseWrapper that owns this Timer). The lambda's `[&]` capture
+        // makes any post-callback this-relative access (m_repeat, m_cancel,
+        // restart()) a use-after-free. Capture m_repeat by value and re-check
+        // *destroyed before touching anything on this after each user callback.
         m_timer.async_wait(
-            [&, destroyed = m_destroyed](const boost::system::error_code& ec)
+            [&, destroyed = m_destroyed, repeat = m_repeat]
+            (const boost::system::error_code& ec)
             {
                 if (*destroyed)
                     return;
@@ -34,12 +42,17 @@ private:
                 if (!ec)
                 {
                     m_handler();
-                    if (m_repeat && !*destroyed)
+                    // m_handler() may have destroyed *this — re-check before
+                    // any this-relative access.
+                    if (*destroyed) return;
+                    if (repeat)
                         restart();
                 } else
                 {
-                    if (m_cancel && !*destroyed)
+                    if (m_cancel)
                         m_cancel();
+                    // m_cancel() may also destroy *this; nothing else to do
+                    // afterward, but documenting the invariant for future devs.
                 }
             }
         );
