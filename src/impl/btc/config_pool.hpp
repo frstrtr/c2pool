@@ -99,8 +99,10 @@ public:
     // Must match frstrtr/p2pool-merged-v36 p2pool/data.py exactly.
     // -----------------------------------------------------------------------
 
-    // Pre-V36 DONATION_SCRIPT (P2PK: OP_PUSHBYTES_65 <uncompressed pubkey> OP_CHECKSIG)
-    // Address: LeD2fnnDJYZuyt8zgDsZ2oBGmuVcxGKCLd (Litecoin mainnet)
+    // V35 DONATION_SCRIPT (P2PK: OP_PUSHBYTES_65 <uncompressed pubkey> OP_CHECKSIG).
+    // Same script bytes as forrestv/jtoomim BTC p2pool data.py:68 — the
+    // uncompressed pubkey is forrestv's; encoded address differs by network
+    // (1... on BTC mainnet, L... on LTC). Verified bit-identical 2026-04-28.
     static constexpr std::array<uint8_t, 67> DONATION_SCRIPT = {
         0x41, // OP_PUSHBYTES_65
         0x04, 0xff, 0xd0, 0x3d, 0xe4, 0x4a, 0x6e, 0x11,
@@ -116,8 +118,11 @@ public:
     };
 
     // V36+ COMBINED_DONATION_SCRIPT (P2SH: OP_HASH160 <hash160(redeem)> OP_EQUAL)
-    // 1-of-2 multisig: forrestv + frstrtr/c2pool dev key
-    // Address: MLhSmVQxMusLE3pjGFvp4unFckgjeD8LUA (Litecoin mainnet)
+    // 1-of-2 multisig: forrestv + frstrtr/c2pool dev key.
+    // LTC-specific (BTC stays at v35 per jtoomim — see plan v2 §3); kept
+    // here as inert byte data so get_donation_script() compiles for both
+    // BTC v35 (returns the P2PK above) and LTC v36 paths.
+    // Address: MLhSmVQxMusLE3pjGFvp4unFckgjeD8LUA (LTC mainnet P2SH).
     static constexpr std::array<uint8_t, 23> COMBINED_DONATION_SCRIPT = {
         0xa9, // OP_HASH160
         0x14, // PUSH 20 bytes
