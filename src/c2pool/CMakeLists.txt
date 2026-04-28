@@ -135,6 +135,24 @@ target_link_libraries(c2pool_enhanced
 )
 target_link_libraries(c2pool_enhanced c2pool_hashrate pool)  # OBJECT-lib SCC direct-naming (#22/#39)
 
+# c2pool-btc: BTC SPV embedded p2pool — Phase B0 scaffold (stub entry).
+# Library `btc` is a clone of `ltc` with namespace renamed and CMake targets
+# adjusted; real entry-point port is in later B-phases.
+# Links `ltc` transitively because core/web_server.cpp references LTC symbols
+# (see comment at the bottom of this file). Untangling that is out of B0 scope.
+add_executable(c2pool-btc main_btc.cpp)
+target_compile_definitions(c2pool-btc PRIVATE C2POOL_VERSION="${C2POOL_GIT_VERSION}")
+target_link_libraries(c2pool-btc
+    c2pool_node_enhanced
+    c2pool_payout
+    c2pool_merged_mining
+    core
+    ltc
+    btc
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+)
+
 # Windows: Boost.Asio requires Winsock libraries; /bigobj for large translation units
 if(WIN32)
     target_link_libraries(c2pool ws2_32 mswsock bcrypt dbghelp)
