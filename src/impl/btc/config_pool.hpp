@@ -29,34 +29,42 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // Static LTC p2pool network constants (must match frstrtr/p2pool-merged-v36)
+    // BTC p2pool network constants (jtoomim/SPB-compat — must match the live
+    // BTC p2pool sharechain at p2p-spb.xyz:9333 + jtoomim-derived peers).
+    // Source: ref/p2pool-btc + p2pool-jtoomim/p2pool/networks/bitcoin.py.
+    // Live network probe 2026-04-28: SPB cluster runs version 77.0.0 with
+    // protocol_version 3502 (one bump above jtoomim master's 3501).
     // -----------------------------------------------------------------------
-    static constexpr uint16_t P2P_PORT                  = 9326;  // must match p2pool-merged-v36
+    static constexpr uint16_t P2P_PORT                  = 9333;  // BTC p2pool sharechain port
     static constexpr uint32_t SPREAD                    = 3;       // blocks (PPLNS window)
     static constexpr uint32_t TARGET_LOOKBEHIND         = 200;
-    static constexpr uint32_t MINIMUM_PROTOCOL_VERSION  = 3301;  // accept v35 (3502) and v36 (3600) peers
-    static constexpr uint32_t ADVERTISED_PROTOCOL_VERSION = 3600; // our capability (V36 shares)
-    static constexpr uint32_t SEGWIT_ACTIVATION_VERSION = 17;
+    // MINIMUM 3500 admits jtoomim master (3501) and SPB cluster (3502).
+    // Below that lies forrestv-era v17/v32 — not interoperable with v35.
+    static constexpr uint32_t MINIMUM_PROTOCOL_VERSION  = 3500;
+    // Our capability — match SPB cluster's bump for forward-compat.
+    static constexpr uint32_t ADVERTISED_PROTOCOL_VERSION = 3502;
+    static constexpr uint32_t SEGWIT_ACTIVATION_VERSION = 33;     // jtoomim BTC bitcoin.py:35
     static constexpr uint32_t BLOCK_MAX_SIZE            = 1000000;
     static constexpr uint32_t BLOCK_MAX_WEIGHT          = 4000000;
 
-    // Mainnet constants
-    static constexpr uint32_t SHARE_PERIOD              = 15;      // seconds
+    // Mainnet constants — jtoomim BTC bitcoin.py
+    static constexpr uint32_t SHARE_PERIOD              = 30;      // seconds (BTC slower than LTC's 15)
     static constexpr uint32_t CHAIN_LENGTH              = 8640;    // 24*60*60 / 10
     static constexpr uint32_t REAL_CHAIN_LENGTH         = 8640;
 
-    // DUST_THRESHOLD: minimum payout per block to justify a share output.
-    // p2pool: PARENT.DUST_THRESHOLD (used in desired_target dust check).
-    // Mainnet: 0.03 LTC = 3000000 litoshis (litecoin/networks/litecoin.py:35)
-    // Testnet: 1.0 LTC = 100000000 litoshis (litecoin/networks/litecoin_testnet.py:33)
-    static constexpr uint64_t DUST_THRESHOLD            = 3000000;  // litoshis (mainnet)
-    static constexpr uint64_t TESTNET_DUST_THRESHOLD    = 100000000; // litoshis (testnet)
+    // DUST_THRESHOLD: minimum payout per share output.
+    // BTC mainnet: 0.001 BTC = 100000 sat (jtoomim bitcoin/networks/bitcoin.py:32).
+    // Testnet: 1.0 BTC placeholder until jtoomim BTC testnet config is consulted.
+    static constexpr uint64_t DUST_THRESHOLD            = 100000;     // satoshis (BTC mainnet)
+    static constexpr uint64_t TESTNET_DUST_THRESHOLD    = 100000000;  // satoshis placeholder
     static uint64_t dust_threshold() { return is_testnet ? TESTNET_DUST_THRESHOLD : DUST_THRESHOLD; }
 
-    // Testnet constants (selected at runtime via is_testnet)
-    static constexpr uint32_t TESTNET_SHARE_PERIOD      = 4;       // seconds
-    static constexpr uint32_t TESTNET_CHAIN_LENGTH      = 400;     // 20*60//3
-    static constexpr uint32_t TESTNET_REAL_CHAIN_LENGTH  = 400;
+    // Testnet constants (jtoomim BTC testnet bitcoin/networks/bitcoin_testnet.py
+    // not yet probed; using BTC-mainnet defaults until live testnet network is
+    // selected). Conservative copy of mainnet for now — adjust in B-testnet phase.
+    static constexpr uint32_t TESTNET_SHARE_PERIOD      = 30;
+    static constexpr uint32_t TESTNET_CHAIN_LENGTH      = 8640;
+    static constexpr uint32_t TESTNET_REAL_CHAIN_LENGTH  = 8640;
 
     // Runtime testnet flag — set once at startup
     static inline bool is_testnet = false;
@@ -66,20 +74,21 @@ public:
     static uint32_t chain_length()      { return is_testnet ? TESTNET_CHAIN_LENGTH : CHAIN_LENGTH; }
     static uint32_t real_chain_length()  { return is_testnet ? TESTNET_REAL_CHAIN_LENGTH : REAL_CHAIN_LENGTH; }
 
-    // MAX_TARGET: share difficulty floor (easiest allowed)
-    // Mainnet: 2^256 / 2^20 - 1 (≈ 2^236)
-    // Testnet: 2^256 / 20 - 1   (≈ 2^251.7)  — must match Python litecoin_testnet.py
+    // MAX_TARGET: share difficulty floor (easiest allowed share PoW).
+    // BTC mainnet: 2^256 / 2^32 - 1 (≈ 2^224, bdiff 1) — jtoomim BTC bitcoin.py:18
+    //              MAX_TARGET = 2**256//2**32 - 1
+    // Testnet: same as mainnet for now (jtoomim BTC testnet placeholder).
     static uint256 max_target()
     {
         static const uint256 MAINNET_MAX = [] {
             uint256 t;
-            t.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+            // 2^256 / 2^32 - 1 = 0x00000000ffffffff...ffffffff (224 bits set).
+            t.SetHex("00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
             return t;
         }();
         static const uint256 TESTNET_MAX = [] {
-            // 2^256 / 20 - 1
             uint256 t;
-            t.SetHex("0ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccb");
+            t.SetHex("00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
             return t;
         }();
         return is_testnet ? TESTNET_MAX : MAINNET_MAX;
@@ -128,14 +137,16 @@ public:
         return {DONATION_SCRIPT.begin(), DONATION_SCRIPT.end()};
     }
 
-    // Message framing prefix (mainnet): 72 08 c1 a5 3e f6 29 b0
-    static inline const std::string DEFAULT_PREFIX_HEX          = "7208c1a53ef629b0";
-    // Message framing prefix (testnet): ad 96 14 f6 46 6a 39 cf
-    static inline const std::string TESTNET_PREFIX_HEX          = "ad9614f6466a39cf";
-    // Network identifier (mainnet): e0 37 d5 b8 c6 92 34 10
-    static inline const std::string DEFAULT_IDENTIFIER_HEX      = "e037d5b8c6923410";
-    // Network identifier (testnet): cc a5 e2 4e c6 40 8b 1e
-    static inline const std::string TESTNET_IDENTIFIER_HEX      = "cca5e24ec6408b1e";
+    // Message framing prefix — BTC mainnet (jtoomim bitcoin.py:14):
+    //   PREFIX = '2472ef181efcd37b'
+    static inline const std::string DEFAULT_PREFIX_HEX          = "2472ef181efcd37b";
+    // Testnet placeholder until jtoomim BTC testnet prefix is probed
+    static inline const std::string TESTNET_PREFIX_HEX          = "2472ef181efcd37b";
+    // Network identifier — BTC mainnet (jtoomim bitcoin.py:13):
+    //   IDENTIFIER = 'fc70035c7a81bc6f'
+    static inline const std::string DEFAULT_IDENTIFIER_HEX      = "fc70035c7a81bc6f";
+    // Testnet placeholder
+    static inline const std::string TESTNET_IDENTIFIER_HEX      = "fc70035c7a81bc6f";
 
     // Private chain overrides — set once at startup via --network-id
     static inline std::string override_identifier_hex;
@@ -209,23 +220,28 @@ public:
         return fp;
     }
 
+    // BTC mainnet softforks per jtoomim bitcoin.py:33 + post-2021 additions.
+    // jtoomim master pre-dates Taproot activation but the bitcoind we connect
+    // to enforces it; tracking it here keeps the softfork-check pass aligned
+    // with bitcoind's getblockchaininfo.
     static inline const std::set<std::string> SOFTFORKS_REQUIRED = {
-        "bip65", "csv", "segwit", "taproot", "mweb"
+        "bip65", "csv", "segwit", "taproot"
     };
 
-    // Default bootstrap peers for the LTC p2pool mainnet
+    // Default bootstrap peers — live BTC p2pool network (probed 2026-04-28
+    // via http://p2p-spb.xyz:9334/peer_versions). Mix of the SPB-cluster
+    // 77.0.0 fork + jtoomim-master-derived peers + jtoomim BTC bitcoin.py
+    // BOOTSTRAP_ADDRS defaults.
     static inline const std::vector<std::string> DEFAULT_BOOTSTRAP_HOSTS = {
-        "ml.toom.im",
+        // SPB cluster (4 nodes RU + USA, version 77.0.0)
+        "p2p-spb.xyz",
+        "ekb.p2p-spb.xyz",
+        "rov.p2p-spb.xyz",
         "usa.p2p-spb.xyz",
-        "102.160.209.121",
-        "5.188.104.245",
-        "20.127.82.115",
-        "31.25.241.224",
-        "20.113.157.65",
-        "20.106.76.227",
-        "15.218.180.55",
-        "173.79.139.224",
-        "174.60.78.162",
+        // jtoomim-master defaults (BOOTSTRAP_ADDRS in bitcoin.py)
+        "ml.toom.im",
+        "btc-fork.coinpool.pw:9335",
+        "btc.p2pool.leblancnet.us",
     };
 
     // -----------------------------------------------------------------------

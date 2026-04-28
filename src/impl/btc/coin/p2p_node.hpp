@@ -139,25 +139,23 @@ public:
             timeout("handshake timeout");
         });
 
-        // Service flags depend on chain type:
-        // LTC: NODE_NETWORK | NODE_WITNESS | NODE_MWEB
-        // DOGE: NODE_NETWORK only (no segwit, no MWEB)
+        // BTC service flags + protocol version:
+        // BTC: NODE_NETWORK | NODE_WITNESS (no MWEB; LTC-only).
+        // Protocol 70016 = BIP 339 wtxidrelay activation point (Bitcoin Core 0.21+).
+        // (LTC-DOGE conditional removed; this is the BTC-specific module.)
         static constexpr uint64_t NODE_NETWORK = 1;
         static constexpr uint64_t NODE_WITNESS = (1 << 3);
-        static constexpr uint64_t NODE_MWEB    = (1ULL << 24);
-        bool is_doge = (m_chain_label == "DOGE" || m_chain_label == "doge");
-        uint64_t our_services = NODE_NETWORK;
-        if (!is_doge) our_services |= NODE_WITNESS | NODE_MWEB;
-        uint32_t protocol_version = is_doge ? 70015 : 70017;
+        uint64_t our_services = NODE_NETWORK | NODE_WITNESS;
+        uint32_t protocol_version = 70016;
 
         auto msg_version = message_version::make_raw(
             protocol_version,
             our_services,
             core::timestamp(),
             addr_t{our_services, m_peer->get_addr()},
-            addr_t{our_services, NetService{"192.168.0.1", 12024}},
+            addr_t{our_services, NetService{"192.168.0.1", 8333}},
             core::random::random_nonce(),
-            "c2pool",
+            "c2pool-btc",
             0
         );
 
