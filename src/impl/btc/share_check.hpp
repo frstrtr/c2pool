@@ -15,7 +15,7 @@
 #include <core/uint256.hpp>
 #include <btclibs/crypto/common.h>
 #include <btclibs/crypto/sha256.h>
-#include <btclibs/crypto/scrypt.h>
+// (LTC's btclibs/crypto/scrypt.h removed — BTC PoW is SHA256d via core/hash.hpp)
 #include <btclibs/base58.h>
 #include <btclibs/bech32.h>
 #include <core/address_utils.hpp>
@@ -291,8 +291,8 @@ inline std::string pubkey_hash_to_address(const uint160& pubkey_hash, uint8_t pu
         std::memcpy(payload.data() + 1, pubkey_hash.data(), 20);
         return EncodeBase58Check({payload.data(), payload.size()});
     } else if (pubkey_type == 1) {
-        // P2WPKH: Bech32 segwit v0
-        std::string hrp = testnet ? "tltc" : "ltc";
+        // P2WPKH: Bech32 segwit v0 — BTC mainnet "bc", testnet "tb"
+        std::string hrp = testnet ? "tb" : "bc";
         std::vector<uint8_t> prog(20);
         std::memcpy(prog.data(), pubkey_hash.data(), 20);
         return bech32::encode_segwit(hrp, 0, prog);
@@ -709,9 +709,9 @@ uint256 share_init_verify(const ShareT& share, bool check_pow = true)
         reinterpret_cast<const unsigned char*>(header_stream.data()), header_stream.size());
     uint256 share_hash = Hash(hdr_span);
 
-    // --- PoW check (scrypt) ---
-    // For Litecoin the POW_FUNC is scrypt(1024,1,1,256).
-    // Blocks are identified by SHA256d, but PoW validity uses scrypt hash.
+    // --- PoW check (SHA256d) ---
+    // For Bitcoin POW_FUNC is SHA256d, identical to the block identity hash.
+    // (LTC was scrypt(1024,1,1,256); BTC's pow_hash == share_hash via Hash(hdr_span).)
     if (check_pow)
     {
         uint256 target = chain::bits_to_target(share.m_bits);
@@ -723,12 +723,8 @@ uint256 share_init_verify(const ShareT& share, bool check_pow = true)
         if (!max_target.IsNull() && target > max_target)
             throw std::invalid_argument("share target exceeds max_target — too easy");
 
-        // Compute the scrypt hash of the 80-byte block header
-        char pow_hash_bytes[32];
-        scrypt_1024_1_1_256(reinterpret_cast<const char*>(header_stream.data()),
-                            pow_hash_bytes);
-        uint256 pow_hash;
-        memcpy(pow_hash.begin(), pow_hash_bytes, 32);
+        // BTC PoW: SHA256d(header). share_hash was already computed above.
+        uint256 pow_hash = share_hash;
         g_last_pow_hash = pow_hash;  // cache for attempt_verify merged check
 
         if (pow_hash > target)
@@ -2442,14 +2438,11 @@ uint256 create_local_share_v35(
     uint256 share_hash = Hash(hdr_span);
     share.m_hash = share_hash;
 
-    // PoW check against share target
+    // PoW check against share target — BTC pow_hash = SHA256d(header) = share_hash.
     {
         uint256 target = chain::bits_to_target(share.m_bits);
         if (!target.IsNull()) {
-            char pow_bytes[32];
-            scrypt_1024_1_1_256(reinterpret_cast<const char*>(hdr_span.data()), pow_bytes);
-            uint256 pow_hash;
-            memcpy(pow_hash.begin(), pow_bytes, 32);
+            uint256 pow_hash = share_hash;
 
             if (pow_hash > target) {
                 return uint256();  // didn't meet share target
@@ -2523,8 +2516,8 @@ uint256 create_local_share(
     const std::vector<uint256>& frozen_merkle_branches = {},
     const uint256& frozen_witness_root = uint256(),
     const std::vector<unsigned char>& frozen_merged_coinbase_info = {},
-    int64_t share_version = 36,
-    uint64_t desired_version = 36)
+    int64_t share_version = 35,
+    uint64_t desired_version = 35)
 {
     // V35 path: delegate to version-specific implementation
     if (share_version <= 35)
@@ -3091,13 +3084,11 @@ uint256 create_local_share(
     // Self-validation: PoW check against share target.
     // Also run share_init_verify to confirm peers will accept this share
     // (same check they'll run when they receive it).
+    // BTC: pow_hash = SHA256d(header) = share_hash already computed.
     {
         uint256 target = chain::bits_to_target(share.m_bits);
         if (!target.IsNull()) {
-            char pow_bytes[32];
-            scrypt_1024_1_1_256(reinterpret_cast<const char*>(hdr_span.data()), pow_bytes);
-            uint256 pow_hash;
-            memcpy(pow_hash.begin(), pow_bytes, 32);
+            uint256 pow_hash = share_hash;
 
             if (pow_hash > target) {
                 // Expected: most stratum pseudoshares don't meet share target
