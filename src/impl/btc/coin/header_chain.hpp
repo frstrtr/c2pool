@@ -1,10 +1,14 @@
 #pragma once
 
-/// LTC Header Chain — Phase 1
+/// BTC Header Chain
 ///
-/// Validated header-only chain for Litecoin, implementing headers-first
-/// sync from P2P peers. Tracks chain tip, height, and cumulative work.
-/// Persistence via LevelDB for fast restarts.
+/// Validated header-only chain for Bitcoin, implementing headers-first
+/// sync from bitcoind P2P peers. Tracks chain tip, height, and cumulative
+/// work. Persistence via LevelDB for fast restarts.
+///
+/// Adapted from src/impl/ltc/coin/header_chain.hpp — same retarget algorithm
+/// (Bitcoin's classic 2016-block window), different constants (1209600s/600s
+/// vs LTC's 302400s/150s) and PoW (SHA256d vs scrypt).
 
 #include "block.hpp"
 #include <core/coin/utxo.hpp>  // DEFAULT_MAX_TIP_AGE
@@ -15,7 +19,7 @@
 #include <core/pack.hpp>
 #include <core/hash.hpp>
 
-#include <btclibs/crypto/scrypt.h>
+// (LTC's btclibs/crypto/scrypt.h removed — BTC PoW is SHA256d via core/hash.hpp)
 
 #include <atomic>
 #include <chrono>
@@ -45,8 +49,8 @@ enum HeaderStatus : uint32_t {
 /// A validated header with chain metadata.
 struct IndexEntry {
     BlockHeaderType header;
-    uint256         hash;           // scrypt(header) for PoW check, SHA256d for identification
-    uint256         block_hash;     // SHA256d(header) — the "real" block hash used for getdata/inv
+    uint256         hash;           // SHA256d(header) — same as block_hash on BTC (LTC used scrypt here)
+    uint256         block_hash;     // SHA256d(header) — the block hash used for getdata/inv
     uint32_t        height{0};
     uint256         chain_work;     // cumulative work up to this header
     uint256         prev_hash;
@@ -77,17 +81,17 @@ struct IndexEntry {
     }
 };
 
-// ─── LTC Chain Parameters ───────────────────────────────────────────────────
+// ─── BTC Chain Parameters ───────────────────────────────────────────────────
 
-struct LTCChainParams {
-    // Mainnet
-    static constexpr int64_t MAINNET_TARGET_TIMESPAN = 302400;     // 3.5 days
-    static constexpr int64_t MAINNET_TARGET_SPACING  = 150;        // 2.5 minutes
+struct BTCChainParams {
+    // Mainnet — BTC retarget per ref/bitcoin/src/kernel/chainparams.cpp
+    static constexpr int64_t MAINNET_TARGET_TIMESPAN = 1209600;    // 2 weeks (BTC retarget window)
+    static constexpr int64_t MAINNET_TARGET_SPACING  = 600;        // 10 minutes (BTC block target)
     static constexpr bool    MAINNET_ALLOW_MIN_DIFF  = false;
 
-    // Testnet
-    static constexpr int64_t TESTNET_TARGET_TIMESPAN = 302400;     // 3.5 days
-    static constexpr int64_t TESTNET_TARGET_SPACING  = 150;        // 2.5 minutes
+    // Testnet — BTC testnet3+testnet4 use mainnet retarget window with min-diff override
+    static constexpr int64_t TESTNET_TARGET_TIMESPAN = 1209600;    // 2 weeks
+    static constexpr int64_t TESTNET_TARGET_SPACING  = 600;        // 10 minutes
     static constexpr bool    TESTNET_ALLOW_MIN_DIFF  = true;
 
     // Computed: difficulty adjustment interval = timespan / spacing
@@ -108,29 +112,45 @@ struct LTCChainParams {
     struct Checkpoint { uint32_t height{0}; uint256 hash; };
     std::optional<Checkpoint> fast_start_checkpoint;
 
-    /// Standard LTC mainnet params
-    static LTCChainParams mainnet() {
-        LTCChainParams p;
+    /// Standard BTC mainnet params (port 8333).
+    /// Genesis + powLimit per ref/bitcoin/src/kernel/chainparams.cpp.
+    static BTCChainParams mainnet() {
+        BTCChainParams p;
         p.target_timespan = MAINNET_TARGET_TIMESPAN;
         p.target_spacing  = MAINNET_TARGET_SPACING;
         p.allow_min_difficulty = MAINNET_ALLOW_MIN_DIFF;
         p.no_retargeting = false;
-        p.pow_limit.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-        p.genesis_hash.SetHex("12a765e31ffd4059bada1e25190f6e98c99d9714d334efa41a195a7e7e04bfe2");
+        // BTC mainnet powLimit (Bitcoin Core CMainParams).
+        p.pow_limit.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
+        // Genesis: ref/bitcoin/src/kernel/chainparams.cpp line 128.
+        p.genesis_hash.SetHex("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f");
         return p;
     }
 
-    /// Standard LTC testnet4 params
-    static LTCChainParams testnet() {
-        LTCChainParams p;
+    /// Standard BTC testnet3 params (port 18333).
+    /// Genesis: ref/bitcoin/src/kernel/chainparams.cpp line 246.
+    /// (For testnet4 use the testnet4() factory below — different genesis.)
+    static BTCChainParams testnet() {
+        BTCChainParams p;
         p.target_timespan = TESTNET_TARGET_TIMESPAN;
         p.target_spacing  = TESTNET_TARGET_SPACING;
         p.allow_min_difficulty = TESTNET_ALLOW_MIN_DIFF;
         p.no_retargeting = false;
-        p.pow_limit.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-        p.genesis_hash.SetHex("4966625a4b2851d9fdee139e56211a0d88575f59ed816ff5e6a63deb4e3e29a0");
-        // No hardcoded checkpoint — use --header-checkpoint CLI arg or
-        // set_dynamic_checkpoint() from RPC for any chain/network.
+        p.pow_limit.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
+        p.genesis_hash.SetHex("000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943");
+        return p;
+    }
+
+    /// BTC testnet4 params (port 48333) — preferred B2 integration target.
+    /// Genesis: ref/bitcoin/src/kernel/chainparams.cpp line 354.
+    static BTCChainParams testnet4() {
+        BTCChainParams p;
+        p.target_timespan = TESTNET_TARGET_TIMESPAN;
+        p.target_spacing  = TESTNET_TARGET_SPACING;
+        p.allow_min_difficulty = TESTNET_ALLOW_MIN_DIFF;
+        p.no_retargeting = false;
+        p.pow_limit.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
+        p.genesis_hash.SetHex("00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043");
         return p;
     }
 
@@ -141,14 +161,13 @@ struct LTCChainParams {
 
 // ─── PoW Functions ──────────────────────────────────────────────────────────
 
-/// Compute scrypt hash of an 80-byte block header (for PoW validation).
+/// Compute SHA256d hash of an 80-byte block header.
+/// On BTC the PoW hash and the block-identity hash are the same value
+/// (both SHA256d). LTC distinguishes them: scrypt for PoW, SHA256d for
+/// identity. Function name retained for callsite symmetry across coins.
 inline uint256 scrypt_hash(const BlockHeaderType& header) {
     auto packed = pack(header);
-    char pow_hash_bytes[32];
-    scrypt_1024_1_1_256(reinterpret_cast<const char*>(packed.data()), pow_hash_bytes);
-    uint256 result;
-    memcpy(result.data(), pow_hash_bytes, 32);
-    return result;
+    return Hash(packed.get_span());
 }
 
 /// Compute SHA256d hash of an 80-byte block header (block identification).
@@ -190,19 +209,19 @@ inline uint256 get_block_proof(uint32_t bits) {
     return (~target / (target + uint256::ONE)) + uint256::ONE;
 }
 
-// ─── LTC Difficulty Retarget ────────────────────────────────────────────────
-// Adapted from Litecoin Core pow.cpp (MIT license).
-// Litecoin uses Bitcoin's original 2016-block retarget with:
-//   nPowTargetTimespan = 3.5 days (302400 s)
-//   nPowTargetSpacing  = 2.5 min (150 s)
-//   DifficultyAdjustmentInterval = 302400 / 150 = 2016
+// ─── BTC Difficulty Retarget ────────────────────────────────────────────────
+// Adapted from Bitcoin Core pow.cpp (MIT license). Identical algorithm to
+// LTC — only the constants differ:
+//   nPowTargetTimespan = 2 weeks (1209600 s)
+//   nPowTargetSpacing  = 10 min  (600 s)
+//   DifficultyAdjustmentInterval = 1209600 / 600 = 2016
 
 /// Core retarget calculation: adjust difficulty based on actual vs target timespan.
 inline uint32_t calculate_next_work_required(
     uint32_t tip_bits,
     int64_t tip_time,
     int64_t first_block_time,
-    const LTCChainParams& params)
+    const BTCChainParams& params)
 {
     if (params.no_retargeting)
         return tip_bits;
@@ -248,7 +267,7 @@ inline uint32_t get_next_work_required(
     uint32_t tip_bits,
     uint32_t tip_time,
     uint32_t new_time,
-    const LTCChainParams& params)
+    const BTCChainParams& params)
 {
     uint256 pow_limit_compact;
     pow_limit_compact = params.pow_limit;
@@ -304,7 +323,7 @@ inline uint32_t get_next_work_required(
 
 class HeaderChain {
 public:
-    HeaderChain(const LTCChainParams& params, const std::string& db_path = "")
+    HeaderChain(const BTCChainParams& params, const std::string& db_path = "")
         : m_params(params)
         , m_db_path(db_path)
     {
@@ -319,7 +338,7 @@ public:
     /// Initialize: open LevelDB (if path given), load persisted state.
     /// Returns false if LevelDB open fails.
     bool init() {
-        LOG_INFO << "[EMB-LTC] HeaderChain::init() db_path=" << (m_db_path.empty() ? "(in-memory)" : m_db_path)
+        LOG_INFO << "[EMB-BTC] HeaderChain::init() db_path=" << (m_db_path.empty() ? "(in-memory)" : m_db_path)
                  << " genesis=" << m_params.genesis_hash.GetHex().substr(0, 16) << "..."
                  << " pow_limit=" << m_params.pow_limit.GetHex().substr(0, 16) << "..."
                  << " timespan=" << m_params.target_timespan << "s spacing=" << m_params.target_spacing << "s"
@@ -330,10 +349,10 @@ public:
             opts.block_cache_size = 4 * 1024 * 1024;    // 4MB
             m_db = std::make_unique<core::LevelDBStore>(m_db_path, opts);
             if (!m_db->open()) {
-                LOG_WARNING << "[EMB-LTC] HeaderChain LevelDB open FAILED at " << m_db_path;
+                LOG_WARNING << "[EMB-BTC] HeaderChain LevelDB open FAILED at " << m_db_path;
                 return false;
             }
-            LOG_INFO << "[EMB-LTC] HeaderChain LevelDB opened at " << m_db_path;
+            LOG_INFO << "[EMB-BTC] HeaderChain LevelDB opened at " << m_db_path;
             load_from_db();
         }
         // Fast-start checkpoint: if chain is empty and a checkpoint is configured,
@@ -423,7 +442,7 @@ public:
             bool ok = add_header_internal(header);
             if (ok) {
                 persist_tip();
-                LOG_INFO << "[EMB-LTC] Single header accepted: height=" << m_tip_height
+                LOG_INFO << "[EMB-BTC] Single header accepted: height=" << m_tip_height
                          << " hash=" << m_tip.GetHex().substr(0, 16) << "..."
                          << " bits=0x" << std::hex << header.m_bits << std::dec
                          << " ts=" << header.m_timestamp;
@@ -514,7 +533,7 @@ public:
                 static uint32_t s_last_logged = 0;
                 if (m_tip_height - s_last_logged >= 2000 || pct >= 99.9) {
                     s_last_logged = m_tip_height;
-                    LOG_INFO << "[LTC] Header sync: " << m_tip_height << "/" << peer_tip
+                    LOG_INFO << "[BTC] Header sync: " << m_tip_height << "/" << peer_tip
                              << " (" << std::fixed << std::setprecision(1) << pct << "%)";
                 }
             }
@@ -554,7 +573,7 @@ public:
         // Log state changes (throttled via static)
         static bool s_last_synced = false;
         if (synced != s_last_synced) {
-            LOG_INFO << "[EMB-LTC] Sync state changed: synced=" << synced
+            LOG_INFO << "[EMB-BTC] Sync state changed: synced=" << synced
                      << " tip_age=" << age << "s height=" << m_tip_height;
             s_last_synced = synced;
         }
@@ -562,7 +581,7 @@ public:
     }
 
     /// Get params (for external difficulty validation tests).
-    const LTCChainParams& params() const { return m_params; }
+    const BTCChainParams& params() const { return m_params; }
 
     /// Register a callback fired when the chain tip changes (reorg or equal-work switch).
     /// Signature: void(old_tip_hash, old_height, new_tip_hash, new_height)
@@ -582,7 +601,7 @@ private:
         // Genesis block special case: accept if it matches known genesis
         if (header.m_previous_block.IsNull()) {
             if (bhash != m_params.genesis_hash) {
-                LOG_WARNING << "[EMB-LTC] REJECT genesis: hash=" << bhash.GetHex().substr(0, 16)
+                LOG_WARNING << "[EMB-BTC] REJECT genesis: hash=" << bhash.GetHex().substr(0, 16)
                             << " expected=" << m_params.genesis_hash.GetHex().substr(0, 16);
                 return false; // wrong genesis
             }
@@ -602,7 +621,7 @@ private:
             m_tip_height = 0;
             m_best_work = entry.chain_work;
             persist_header(entry);
-            LOG_INFO << "[EMB-LTC] Genesis accepted: hash=" << bhash.GetHex()
+            LOG_INFO << "[EMB-BTC] Genesis accepted: hash=" << bhash.GetHex()
                      << " scrypt=" << entry.hash.GetHex().substr(0, 16)
                      << " bits=0x" << std::hex << header.m_bits << std::dec;
             return true;
@@ -611,7 +630,7 @@ private:
         // Must connect to an existing header
         auto prev_it = m_headers.find(header.m_previous_block);
         if (prev_it == m_headers.end()) {
-            LOG_DEBUG_COIND << "[EMB-LTC] ORPHAN header: hash=" << bhash.GetHex().substr(0, 16)
+            LOG_DEBUG_COIND << "[EMB-BTC] ORPHAN header: hash=" << bhash.GetHex().substr(0, 16)
                       << " prev=" << header.m_previous_block.GetHex().substr(0, 16)
                       << " — not connected to chain";
             return false; // orphan — not connected
@@ -634,7 +653,7 @@ private:
         if (need_scrypt) {
             pow_hash = scrypt_hash(header);
             if (!check_pow(pow_hash, header.m_bits, m_params.pow_limit)) {
-                LOG_WARNING << "[EMB-LTC] PoW FAIL at height=" << new_height
+                LOG_WARNING << "[EMB-BTC] PoW FAIL at height=" << new_height
                             << " hash=" << bhash.GetHex().substr(0, 16)
                             << " scrypt=" << pow_hash.GetHex().substr(0, 16)
                             << " bits=0x" << std::hex << header.m_bits << std::dec;
@@ -647,7 +666,7 @@ private:
 
         // Validate difficulty
         if (!validate_difficulty(header, new_height)) {
-            LOG_WARNING << "[EMB-LTC] Difficulty FAIL at height=" << new_height
+            LOG_WARNING << "[EMB-BTC] Difficulty FAIL at height=" << new_height
                         << " hash=" << bhash.GetHex().substr(0, 16)
                         << " bits=0x" << std::hex << header.m_bits << std::dec
                         << " prev_bits=0x" << prev.header.m_bits << std::dec;
@@ -698,11 +717,11 @@ private:
             } else {
                 rebuild_height_index(bhash);
                 if (equal_at_tip) {
-                    LOG_WARNING << "[EMB-LTC] EQUAL-WORK REORG at height " << new_height
+                    LOG_WARNING << "[EMB-BTC] EQUAL-WORK REORG at height " << new_height
                                 << ": old_tip=" << old_tip.GetHex().substr(0, 16)
                                 << " new_tip=" << bhash.GetHex().substr(0, 16);
                 } else if (new_height <= old_height && old_height > 0) {
-                    LOG_WARNING << "[EMB-LTC] REORG detected: old_height=" << old_height
+                    LOG_WARNING << "[EMB-BTC] REORG detected: old_height=" << old_height
                                 << " new_height=" << new_height << " hash=" << bhash.GetHex().substr(0, 16);
                 }
             }
@@ -849,9 +868,9 @@ private:
 
         if (batch.commit_sync()) {
             m_dirty_headers.clear();
-            LOG_DEBUG_COIND << "[EMB-LTC] flush_dirty: wrote " << count << " headers to LevelDB (synced)";
+            LOG_DEBUG_COIND << "[EMB-BTC] flush_dirty: wrote " << count << " headers to LevelDB (synced)";
         } else {
-            LOG_ERROR << "[EMB-LTC] flush_dirty: WriteBatch FAILED for " << count << " headers";
+            LOG_ERROR << "[EMB-BTC] flush_dirty: WriteBatch FAILED for " << count << " headers";
         }
     }
 
@@ -863,7 +882,7 @@ private:
     void load_from_db() {
         if (!m_db || !m_db->is_open()) return;
 
-        LOG_INFO << "[EMB-LTC] load_from_db: scanning LevelDB for headers...";
+        LOG_INFO << "[EMB-BTC] load_from_db: scanning LevelDB for headers...";
         auto t0 = std::chrono::steady_clock::now();
 
         // Load all headers
@@ -883,11 +902,11 @@ private:
                 ++loaded;
                 // Progress every 500k headers
                 if (loaded % 500000 == 0)
-                    LOG_INFO << "[EMB-LTC] load_from_db: " << loaded << "/" << total_keys
+                    LOG_INFO << "[EMB-BTC] load_from_db: " << loaded << "/" << total_keys
                              << " headers (" << (100 * loaded / total_keys) << "%)";
             } catch (const std::exception& e) {
                 ++corrupt;
-                LOG_WARNING << "[EMB-LTC] Corrupt header entry in DB: " << e.what();
+                LOG_WARNING << "[EMB-BTC] Corrupt header entry in DB: " << e.what();
             }
         }
 
@@ -901,14 +920,14 @@ private:
                 m_best_work = it->second.chain_work;
                 rebuild_height_index(m_tip);
             } else {
-                LOG_WARNING << "[EMB-LTC] Tip hash in DB not found among loaded headers — resetting";
+                LOG_WARNING << "[EMB-BTC] Tip hash in DB not found among loaded headers — resetting";
                 m_tip.SetNull();
             }
         }
 
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
-        LOG_INFO << "[EMB-LTC] load_from_db: loaded " << loaded << " headers"
+        LOG_INFO << "[EMB-BTC] load_from_db: loaded " << loaded << " headers"
                  << (corrupt > 0 ? ", " + std::to_string(corrupt) + " corrupt" : "")
                  << " in " << elapsed << "ms"
                  << " tip_height=" << m_tip_height
@@ -917,7 +936,7 @@ private:
 
     // ─── State ────────────────────────────────────────────────────────────
 
-    LTCChainParams m_params;
+    BTCChainParams m_params;
     std::string    m_db_path;
 
     mutable std::mutex m_mutex;

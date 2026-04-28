@@ -149,7 +149,7 @@ public:
         m_chain = &m_tracker.chain;
 
         // Open LevelDB storage and load any persisted shares
-        std::string net_name = config->m_testnet ? "litecoin_testnet" : "litecoin";
+        std::string net_name = config->m_testnet ? "bitcoin_testnet" : "bitcoin";
         m_storage = std::make_unique<c2pool::storage::SharechainStorage>(net_name);
         load_persisted_shares();
 
