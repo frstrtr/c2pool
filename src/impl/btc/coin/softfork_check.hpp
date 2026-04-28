@@ -11,8 +11,8 @@ namespace btc::coin {
  * Populate `out` with all softfork names found in a single getblockchaininfo
  * field value (either the "softforks" or "bip9_softforks" entry).
  *
- * Handles three formats produced by different litecoind / bitcoind versions:
- *   - Array of objects:  [{"id":"segwit",...}, ...]         (modern litecoind)
+ * Handles three formats produced by different bitcoind versions:
+ *   - Array of objects:  [{"id":"segwit",...}, ...]         (modern bitcoind)
  *   - Array of strings:  ["segwit", "taproot", ...]         (compact form)
  *   - Object with keys:  {"segwit":{...}, "taproot":{...}}  (BIP9 style)
  */
