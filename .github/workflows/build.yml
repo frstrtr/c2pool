@@ -106,6 +106,109 @@ jobs:
         with: { name: test-results-linux, path: build_ci/Testing/, retention-days: 7 }
 
   # ════════════════════════════════════════════════════════════════════════════
+  # Linux AddressSanitizer + UBSan (informational, not gating yet)
+  #
+  # Builds c2pool + the full test suite with -fsanitize=address,undefined and
+  # runs ctest under ASAN/UBSAN_OPTIONS. Catches use-after-free, heap overflow,
+  # uninitialized read, integer overflow, etc. at PR time instead of via 12-h
+  # soaks. Conan deps stay un-sanitized (static libs); libasan still intercepts
+  # all allocations including those from deps, so UAFs that touch our code are
+  # caught.
+  #
+  # Currently `continue-on-error: true` so reports are visible without blocking
+  # merges while we work through the audit (Phase 1 of the socket-lifecycle
+  # fundamental fix; see frstrtr/the/docs/c2pool-socket-lifecycle-fundamental-fix.md).
+  # Will flip to required once known UAFs are fixed (Phase 7).
+  # ════════════════════════════════════════════════════════════════════════════
+  linux-asan:
+    name: Linux x86_64 (AsAN+UBSan)
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            g++ cmake make libleveldb-dev libsecp256k1-dev
+
+      - uses: actions/setup-python@v6
+        with: { python-version: '3.12' }
+
+      - name: Install Conan 2
+        run: pip install "conan>=2.0,<3.0"
+
+      - name: Detect Conan profile
+        run: |
+          conan profile detect --force
+          sed -i 's/compiler.cppstd=.*/compiler.cppstd=20/' "$(conan profile path default)"
+
+      - name: Restore Conan cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.conan2
+          key: conan2-ubuntu24-gcc13-${{ hashFiles('conanfile.txt') }}
+
+      - name: Conan install
+        run: conan install . --build=missing --output-folder=build_asan --settings=build_type=Release
+
+      - name: Configure (Release + AsAN + UBSan)
+        # NOTE 1: must match the build_type passed to `conan install` (Release).
+        # Conan generates `*-Target-release.cmake` with INTERFACE_INCLUDE_DIRECTORIES
+        # wrapped in $<$<CONFIG:Release>:...>, so a mismatched cmake build type
+        # (e.g. RelWithDebInfo) silently drops every conan dep's include path.
+        # We get full optimization + debug symbols via -g in CXX_FLAGS.
+        #
+        # NOTE 2: -fno-sanitize=vptr disables the UBSan vptr check, which would
+        # require leveldb (and other foreign polymorphic types) to expose their
+        # typeinfo. leveldb is built without that, causing "undefined reference
+        # to typeinfo for leveldb::DB" link errors. All other UBSan checks
+        # remain on.
+        run: |
+          cmake -S . -B build_asan \
+            -DCMAKE_TOOLCHAIN_FILE=build_asan/conan_toolchain.cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize=vptr -fno-omit-frame-pointer -fno-sanitize-recover=undefined -g" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined -fno-sanitize=vptr" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined -fno-sanitize=vptr"
+
+      - name: Build c2pool + tests
+        run: |
+          cmake --build build_asan \
+            --target c2pool \
+                    test_hardening test_share_messages \
+                    test_redistribute_address test_redistribute test_auto_ratchet \
+                    test_stratum_extensions \
+                    core_test sharechain_test share_test \
+                    test_threading test_weights \
+                    test_header_chain test_mempool test_template_builder \
+                    test_doge_chain test_compact_blocks \
+                    test_hash_link test_decay_pplns \
+                    test_pplns_consensus \
+                    test_v36_script_sorting test_v36_cross_impl_refhash \
+                    test_phase4_embedded \
+                    test_mweb_builder \
+                    test_address_resolution test_compute_share_target \
+                    test_utxo \
+                    test_dash_credit_pool test_dash_subsidy test_dash_battletest_regressions \
+                    test_dash_pay_attribution \
+                    test_coin_broadcaster test_multiaddress_pplns test_pplns_stress \
+            -j$(nproc)
+
+      - name: Run tests under sanitizers
+        working-directory: build_asan
+        env:
+          ASAN_OPTIONS: detect_leaks=0:check_initialization_order=1:strict_string_checks=1:abort_on_error=0
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=0
+        run: ctest --output-on-failure -j$(nproc) --exclude-regex "LiveTest\."
+
+      - name: Upload sanitizer test results on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with: { name: test-results-linux-asan, path: build_asan/Testing/, retention-days: 7 }
+
+  # ════════════════════════════════════════════════════════════════════════════
   # Web-static JS verify (typecheck + build + tests + bundle-size gate)
   # Covers web-static/sharechain-explorer/: the Explorer + PPLNS View
   # bundles + Plugin SDK. Fast job (< 1 min); runs regardless of path so
