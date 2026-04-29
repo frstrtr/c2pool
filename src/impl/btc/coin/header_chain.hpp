@@ -124,6 +124,12 @@ struct BTCChainParams {
         p.pow_limit.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
         // Genesis: ref/bitcoin/src/kernel/chainparams.cpp line 128.
         p.genesis_hash.SetHex("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f");
+        // Seed genesis as the chain root (height=0). Without this, HeaderChain
+        // rejects the first headers batch because no prev_block resolves to
+        // anything in the index. fast_start_checkpoint normally points at a
+        // recent height to skip early IBD; using {0, genesis} just makes
+        // genesis itself the anchor.
+        p.fast_start_checkpoint = Checkpoint{0, p.genesis_hash};
         return p;
     }
 
@@ -138,6 +144,7 @@ struct BTCChainParams {
         p.no_retargeting = false;
         p.pow_limit.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
         p.genesis_hash.SetHex("000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943");
+        p.fast_start_checkpoint = Checkpoint{0, p.genesis_hash};
         return p;
     }
 
@@ -151,6 +158,7 @@ struct BTCChainParams {
         p.no_retargeting = false;
         p.pow_limit.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
         p.genesis_hash.SetHex("00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043");
+        p.fast_start_checkpoint = Checkpoint{0, p.genesis_hash};
         return p;
     }
 
@@ -302,11 +310,15 @@ inline uint32_t get_next_work_required(
     if (params.no_retargeting)
         return tip_bits;
 
-    // Go back the full period unless it's the first retarget after genesis.
-    // Code courtesy of Art Forz (Litecoin fix for 51% attack difficulty manipulation).
+    // Bitcoin Core always goes back `interval - 1` blocks (= 2015 for the
+    // 2016-block retarget window). The "Art Forz fix" that goes back
+    // `interval` blocks for non-first retargets is LITECOIN-SPECIFIC: LTC
+    // shipped with the off-by-one bug, then patched it via height gating
+    // because the chain had locked the buggy behavior in. BTC has no such
+    // history; always use interval - 1.
+    // Reference: ref/bitcoin/src/pow.cpp GetNextWorkRequired() →
+    //   nHeightFirst = pindexLast->nHeight - (DifficultyAdjustmentInterval()-1)
     int64_t blocks_to_go_back = interval - 1;
-    if (new_height != interval)
-        blocks_to_go_back = interval;
 
     // Get the first block of the retarget period
     uint32_t first_height = static_cast<uint32_t>(tip_height - blocks_to_go_back);
