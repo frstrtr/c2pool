@@ -26,8 +26,12 @@
 #include <impl/btc/coin/header_chain.hpp>
 #include <impl/btc/coin/node.hpp>
 #include <impl/btc/coin/node_interface.hpp>
+#include <impl/btc/coin/transaction.hpp>
 #include <impl/btc/config.hpp>
 
+#include <core/coin/utxo.hpp>
+#include <core/coin/utxo_view_cache.hpp>
+#include <core/coin/utxo_view_db.hpp>
 #include <core/filesystem.hpp>
 #include <core/log.hpp>
 #include <core/netaddress.hpp>
@@ -152,10 +156,12 @@ int main(int argc, char* argv[])
     std::filesystem::create_directories(net_dir, ec);  // best effort
 
     const std::string chain_db_path = (net_dir / "embedded_headers").string();
+    const std::string utxo_db_path  = (net_dir / "utxo_view_db").string();
 
     LOG_INFO << "[BTC] c2pool-btc starting — net="
              << (testnet4 ? "testnet4" : (testnet ? "testnet3" : "mainnet"));
     LOG_INFO << "[BTC] HeaderChain DB: " << chain_db_path;
+    LOG_INFO << "[BTC] UTXO DB:        " << utxo_db_path;
     LOG_INFO << "[BTC] Genesis:        " << chain_params.genesis_hash.GetHex();
     LOG_INFO << "[BTC] bitcoind P2P:   " << bitcoind_host << ":" << bitcoind_port;
 
@@ -169,6 +175,20 @@ int main(int argc, char* argv[])
         LOG_INFO << "[BTC] HeaderChain initialized: size=" << header_chain.size()
                  << " height=" << header_chain.height();
     }
+
+    // BTC reuses LTC_LIMITS — both chains share max_money≤2.1e15<8.4e15 (so
+    // LTC's bound never falsely rejects a BTC value) and 100-block coinbase
+    // maturity. pegout_maturity=6 is moot for BTC (no MWEB → no pegouts).
+    // KEEP_DEPTH=288 matches Bitcoin Core MIN_BLOCKS_TO_KEEP exactly.
+    core::coin::UTXOViewDB utxo_db(utxo_db_path);
+    if (!utxo_db.open())
+    {
+        LOG_WARNING << "[BTC] UTXOViewDB open failed — running without UTXO persistence";
+    }
+    core::coin::UTXOViewCache utxo_cache(&utxo_db);
+    LOG_INFO << "[BTC] UTXO loaded: best_height=" << utxo_cache.get_best_height()
+             << " best_block=" << utxo_cache.get_best_block().GetHex().substr(0, 16);
+    constexpr uint32_t BTC_KEEP_DEPTH = core::coin::LTC_MIN_BLOCKS_TO_KEEP;
 
     io::io_context ioc;
     g_ioc = &ioc;
@@ -234,6 +254,61 @@ int main(int argc, char* argv[])
         [](const uint256& block_hash)
         {
             LOG_INFO << "[BTC] new_block: " << block_hash.GetHex().substr(0, 32) << "...";
+        });
+
+    // BTC txid: SHA256d of the non-witness serialization (BIP 144). Witness
+    // bytes change wtxid only — txid stays stable. UTXO indexing must use
+    // txid since vin.prevout.hash references parents by txid.
+    auto btc_txid = [](const btc::coin::MutableTransaction& tx) {
+        auto packed = pack(btc::coin::TX_NO_WITNESS(tx));
+        return Hash(packed.get_span());
+    };
+
+    // Subscribe to full_block events to maintain UTXO. The p2p_node
+    // auto-requests every inv'd block (request_full_block uses
+    // MSG_WITNESS_BLOCK 0x40000002) so witness data arrives intact —
+    // txid (non-witness) is what UTXO keys on, but the wire path needs
+    // witness or peer drops us for advertising NODE_WITNESS yet not honoring it.
+    coin_node.full_block.subscribe(
+        [&header_chain, &utxo_cache, &utxo_db, btc_txid]
+        (const btc::coin::BlockType& block)
+        {
+            auto packed_hdr = pack(static_cast<const btc::coin::BlockHeaderType&>(block));
+            uint256 block_hash = Hash(packed_hdr.get_span());
+
+            auto entry = header_chain.get_header(block_hash);
+            if (!entry) {
+                LOG_WARNING << "[BTC] full_block: header unknown for "
+                            << block_hash.GetHex().substr(0, 16)
+                            << " — dropping (header sync lagging?)";
+                return;
+            }
+            uint32_t height = entry->height;
+
+            // Skip already-processed heights (warm restart, duplicate inv,
+            // or replayed block). UTXO is monotonic on this single-peer path.
+            if (height <= utxo_cache.get_best_height()) {
+                LOG_INFO << "[BTC] full_block: skip duplicate h=" << height
+                         << " best_height=" << utxo_cache.get_best_height();
+                return;
+            }
+
+            try {
+                auto undo = utxo_cache.connect_block(block, height, btc_txid);
+                utxo_db.put_block_undo(height, undo);
+                utxo_cache.flush(block_hash, height);
+                utxo_cache.prune_undo(height, BTC_KEEP_DEPTH);
+
+                LOG_INFO << "[BTC] UTXO connect: h=" << height
+                         << " txs=" << block.m_txs.size()
+                         << " undo_added=" << undo.added_outpoints.size()
+                         << " undo_spent=" << undo.tx_undos.size()
+                         << " best_height=" << utxo_cache.get_best_height();
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[BTC] UTXO connect_block failed h=" << height
+                            << " hash=" << block_hash.GetHex().substr(0, 16)
+                            << ": " << e.what();
+            }
         });
 
     LOG_INFO << "[BTC] Connecting to bitcoind...";
