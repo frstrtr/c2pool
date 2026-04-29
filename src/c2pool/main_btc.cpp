@@ -64,6 +64,7 @@ static void print_usage()
 {
     std::cerr <<
         "Usage: c2pool-btc [--testnet | --testnet4] --bitcoind HOST:PORT\n"
+        "                  [--p2pool HOST:PORT]\n"
         "\n"
         "  --testnet       BTC testnet3 chain (genesis 000000000933ea01...)\n"
         "  --testnet4      BTC testnet4 chain (genesis 00000000da84f2ba...)\n"
@@ -71,7 +72,10 @@ static void print_usage()
         "  --bitcoind H:P  bitcoind P2P endpoint host:port\n"
         "                  e.g. 127.0.0.1:8333  (mainnet)\n"
         "                       127.0.0.1:18333 (testnet3)\n"
-        "                       127.0.0.1:48333 (testnet4)\n";
+        "                       127.0.0.1:48333 (testnet4)\n"
+        "  --p2pool H:P    BTC p2pool peer (jtoomim/SPB v35 + protocol 3502)\n"
+        "                  e.g. p2p-spb.xyz:9333\n"
+        "                  B4 scaffold: connection deferred to B4-net.\n";
 }
 
 /// BTC wire-protocol magic bytes per network (pchMessageStart).
@@ -96,6 +100,8 @@ int main(int argc, char* argv[])
     bool        testnet4      = false;
     std::string bitcoind_host;
     uint16_t    bitcoind_port = 0;
+    std::string p2pool_host;
+    uint16_t    p2pool_port   = 0;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -125,6 +131,18 @@ int main(int argc, char* argv[])
             }
             bitcoind_host = ep.substr(0, colon);
             bitcoind_port = static_cast<uint16_t>(std::stoi(ep.substr(colon + 1)));
+        }
+        else if (arg == "--p2pool" && i + 1 < argc)
+        {
+            std::string ep = argv[++i];
+            auto colon = ep.find(':');
+            if (colon == std::string::npos)
+            {
+                std::cerr << "--p2pool requires HOST:PORT\n";
+                return 1;
+            }
+            p2pool_host = ep.substr(0, colon);
+            p2pool_port = static_cast<uint16_t>(std::stoi(ep.substr(colon + 1)));
         }
         else
         {
@@ -346,6 +364,38 @@ int main(int argc, char* argv[])
             coin_node.send_getheaders(
                 BTC_PROTOCOL_VERSION, {locator}, uint256::ZERO);
         });
+
+    // ── B4 broadcaster scaffold ─────────────────────────────────────────
+    // c2pool sharechain peer (full pool::NodeBridge<NodeImpl, Legacy, Actual>)
+    // is already cloned at src/impl/btc/node.{hpp,cpp} (2230 LOC) and uses
+    // PoolConfig::ADVERTISED_PROTOCOL_VERSION=3502 + MINIMUM_PROTOCOL_VERSION=3500
+    // (jtoomim/SPB BTC fork; share VERSION 35 PaddingBugfixShare).
+    //
+    // Wiring it requires: btc::Config(yaml) + btc::ShareChain + listener bind +
+    // accept loop + ShareTracker + outbound peer dialer. That integration is
+    // B4-net scope. For now, log the scaffold contract — verifying that the
+    // identity values we'd advertise are bit-correct against a live peer like
+    // p2p-spb.xyz:9333.
+    if (!p2pool_host.empty() && p2pool_port != 0)
+    {
+        LOG_INFO << "[BTC] B4 broadcaster scaffold:";
+        LOG_INFO << "[BTC]   --p2pool target:           " << p2pool_host << ":" << p2pool_port;
+        LOG_INFO << "[BTC]   advertised protocol:       "
+                 << btc::PoolConfig::ADVERTISED_PROTOCOL_VERSION
+                 << " (jtoomim/SPB BTC v35 wire = proto 3502)";
+        LOG_INFO << "[BTC]   minimum accepted protocol: "
+                 << btc::PoolConfig::MINIMUM_PROTOCOL_VERSION;
+        LOG_INFO << "[BTC]   share format:              VERSION " << 35
+                 << " (PaddingBugfixShare)";
+        LOG_INFO << "[BTC]   listen P2P_PORT:           "
+                 << btc::PoolConfig::P2P_PORT;
+        LOG_INFO << "[BTC]   prefix (hex):              "
+                 << btc::PoolConfig::DEFAULT_PREFIX_HEX;
+        LOG_INFO << "[BTC]   identifier (hex):          "
+                 << btc::PoolConfig::DEFAULT_IDENTIFIER_HEX;
+        LOG_INFO << "[BTC] B4 broadcaster wiring (NodeBridge instantiation, "
+                 << "ShareTracker, listener) deferred to B4-net.";
+    }
 
     LOG_INFO << "[BTC] io_context running. Ctrl-C to stop.";
     ioc.run();
