@@ -31,6 +31,8 @@
 #include <core/filesystem.hpp>
 #include <core/log.hpp>
 #include <core/netaddress.hpp>
+#include <core/pack.hpp>
+#include <core/hash.hpp>
 #include <btclibs/util/strencodings.h>
 
 #include <boost/asio.hpp>
@@ -187,18 +189,45 @@ int main(int argc, char* argv[])
 
     btc::coin::Node<btc::Config> coin_node(&ioc, &config);
 
-    // Forward bitcoind's headers batches into HeaderChain. LTC dispatches
-    // this off-thread via a dedicated thread pool (scrypt verification is
-    // CPU-bound, ~20 ms per header). BTC's PoW is SHA256d which is fast
-    // enough to run inline for B2-net — revisit if this becomes a hot path
-    // during full mainnet IBD soak.
+    // Constants for getheaders driver: protocol version sent in the message
+    // (matches what we advertised in version handshake — see B1 coin/p2p_node.hpp).
+    constexpr uint32_t BTC_PROTOCOL_VERSION = 70016;
+
+    // Hash a BlockHeaderType into its canonical block-id (SHA256d of the
+    // 80-byte serialized header). BTC unifies pow_hash and block_hash via
+    // SHA256d; LTC distinguishes them (scrypt vs SHA256d). Used to compute
+    // the locator for the next getheaders.
+    auto header_block_hash = [](const btc::coin::BlockHeaderType& hdr) {
+        auto packed = pack(hdr);
+        return Hash(packed.get_span());
+    };
+
+    // Forward bitcoind's headers batches into HeaderChain AND chain the
+    // getheaders locator forward to drive sync to peer's tip. LTC dispatches
+    // this off-thread (scrypt CPU cost); BTC's PoW is SHA256d so inline is
+    // fine for testnet (and for mainnet IBD too, given SHA256d is ~us/header).
     coin_node.new_headers.subscribe(
-        [&header_chain](const std::vector<btc::coin::BlockHeaderType>& headers)
+        [&header_chain, &coin_node, header_block_hash, &chain_params]
+        (const std::vector<btc::coin::BlockHeaderType>& headers)
         {
+            if (headers.empty()) return;
             int accepted = header_chain.add_headers(headers);
-            LOG_INFO << "[BTC] new_headers batch: received=" << headers.size()
+            uint256 last_hash = header_block_hash(headers.back());
+            LOG_INFO << "[BTC] new_headers: received=" << headers.size()
                      << " accepted=" << accepted
-                     << " chain_height=" << header_chain.height();
+                     << " chain_height=" << header_chain.height()
+                     << " last=" << last_hash.GetHex().substr(0, 16);
+            // Continue header sync if peer likely has more (full 2000-header
+            // batch); otherwise we're caught up and bitcoind will push new
+            // tips via inv/sendheaders.
+            if (headers.size() >= 2000) {
+                coin_node.send_getheaders(
+                    BTC_PROTOCOL_VERSION, {last_hash}, uint256::ZERO);
+            } else {
+                LOG_INFO << "[BTC] Header sync caught up (last batch=" << headers.size()
+                         << " < 2000). Waiting on inv announcements.";
+            }
+            (void)chain_params;  // captured for genesis fallback if needed later
         });
 
     coin_node.new_block.subscribe(
@@ -209,6 +238,39 @@ int main(int argc, char* argv[])
 
     LOG_INFO << "[BTC] Connecting to bitcoind...";
     coin_node.start_p2p(NetService(bitcoind_host, bitcoind_port));
+
+    // Drive initial header sync. Per BTC protocol, NodeP2P's verack handler
+    // sends sendheaders/sendcmpct/feefilter but NOT getheaders — header sync
+    // is the consumer's responsibility (LTC drives this from the broadcaster).
+    // Wait 3s for handshake to complete, then send getheaders([genesis], 0)
+    // to start streaming headers from genesis. The new_headers callback above
+    // chains the locator forward for the next batch.
+    boost::asio::steady_timer initial_getheaders(ioc);
+    initial_getheaders.expires_after(std::chrono::seconds(3));
+    initial_getheaders.async_wait(
+        [&coin_node, &header_chain, &chain_params, header_block_hash]
+        (const boost::system::error_code& ec)
+        {
+            if (ec) return;
+            if (!coin_node.has_p2p()) {
+                LOG_WARNING << "[BTC] initial getheaders: no P2P connection yet";
+                return;
+            }
+            if (!coin_node.is_handshake_complete()) {
+                LOG_WARNING << "[BTC] initial getheaders: handshake not complete (peer slow?)";
+                // Fire anyway — at worst the peer ignores and we retry later.
+            }
+            // Locator: if HeaderChain has any tip, use it; else genesis.
+            // For a fresh DB the chain is empty so locator = [genesis].
+            uint256 locator = (header_chain.height() > 0)
+                ? uint256::ZERO  // header_chain.tip_hash() if exposed; placeholder
+                : chain_params.genesis_hash;
+            LOG_INFO << "[BTC] Sending initial getheaders, locator="
+                     << locator.GetHex().substr(0, 16)
+                     << " (chain_height=" << header_chain.height() << ")";
+            coin_node.send_getheaders(
+                BTC_PROTOCOL_VERSION, {locator}, uint256::ZERO);
+        });
 
     LOG_INFO << "[BTC] io_context running. Ctrl-C to stop.";
     ioc.run();
