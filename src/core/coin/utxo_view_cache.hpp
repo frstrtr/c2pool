@@ -145,8 +145,12 @@ public:
             bool is_coinbase = first_tx;
             first_tx = false;
 
-            // Detect HogEx (MWEB): last tx with m_hogEx flag → outputs are pegouts
-            bool is_hogex = tx.m_hogEx;
+            // Detect HogEx (MWEB): last tx with m_hogEx flag → outputs are pegouts.
+            // BTC's MutableTransaction has no m_hogEx (no MWEB) — gate by requires.
+            bool is_hogex = false;
+            if constexpr (requires { tx.m_hogEx; }) {
+                is_hogex = tx.m_hogEx;
+            }
 
             if (!is_coinbase) {
                 // Spend inputs — save spent coins for undo

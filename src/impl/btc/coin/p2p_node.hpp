@@ -581,8 +581,11 @@ private:
                 break;
             case inventory_type::block:
                 m_coin->new_block.happened(inv.m_hash);
-                // Request full block for MWEB state extraction
-                vinv.push_back(inv);
+                // BTC advertises NODE_WITNESS — getdata for blocks must use
+                // MSG_WITNESS_BLOCK (0x40000002) per BIP 144, otherwise the
+                // peer drops witness data on the wire.
+                vinv.push_back(inventory_type(
+                    inventory_type::witness_block, inv.m_hash));
                 break;
             case inventory_type::filtered_block:
             case inventory_type::cmpct_block:
@@ -631,14 +634,12 @@ private:
         auto blockhash = Hash(packed_header.get_span());
         // ReplyMatcher may throw if nobody registered a pending request for
         // this block (e.g., unsolicited block or getdata-triggered response).
-        // Catch to ensure full_block event always fires for MWEB extraction.
+        // Catch to ensure full_block event always fires.
         try { m_peer->get_block(blockhash, block); } catch (...) {}
         try { m_peer->get_header(blockhash, header); } catch (...) {}
         LOG_INFO << "[" << m_chain_label << "] Full block received: "
                  << blockhash.GetHex().substr(0, 16) << "..."
-                 << " txs=" << block.m_txs.size()
-                 << " mweb_raw=" << block.m_mweb_raw.size() << " bytes";
-        // Fire full block event (carries MWEB data for state extraction)
+                 << " txs=" << block.m_txs.size();
         m_coin->full_block.happened(block);
     }
 
@@ -810,13 +811,11 @@ private:
         if (result.complete) {
             LOG_INFO << "[" << m_chain_label << "] Compact block reconstructed: "
                      << blockhash.GetHex()
-                     << " txs=" << result.block.m_txs.size()
-                     << " mweb_raw=" << result.block.m_mweb_raw.size() << " bytes";
+                     << " txs=" << result.block.m_txs.size();
             // Deliver as a full block
             m_peer->get_block(blockhash, result.block);
             auto header = static_cast<BlockHeaderType>(result.block);
             m_peer->get_header(blockhash, header);
-            // Fire full block event (carries MWEB data for state extraction)
             m_coin->full_block.happened(result.block);
         } else {
             LOG_INFO << "[" << m_chain_label << "] Compact block incomplete, "

@@ -239,7 +239,7 @@ bool NodeRPC::check()
 	{
 		try
 		{
-			auto gbt = getblocktemplate({"segwit", "mweb"});
+			auto gbt = getblocktemplate({"segwit"});
 			if (gbt.contains("rules") && gbt["rules"].is_array())
 			{
 				for (const auto& rule : gbt["rules"])
@@ -295,7 +295,7 @@ bool NodeRPC::check_blockheader(uint256 header)
 rpc::WorkData NodeRPC::getwork()
 {
 	auto start = core::timestamp();
-	auto work = getblocktemplate({"segwit", "mweb"}); // mweb for ltc
+	auto work = getblocktemplate({"segwit"});
 	auto end = core::timestamp();
 
 	if (!m_coin->txidcache.is_started())
@@ -374,24 +374,14 @@ rpc::WorkData NodeRPC::getwork()
     return rpc::WorkData{work, unpacked_transactions, txhashes, end - start};
 }
 
-void NodeRPC::submit_block(BlockType& block, std::string mweb, bool ignore_failure)
+void NodeRPC::submit_block(BlockType& block, bool ignore_failure)
 {
-	// Determine whether segwit is active (required for full-block vs stripped packing).
-	bool segwit_activated = false;
-	auto work = *m_coin->work;
-	if (work.m_data.contains("rules"))
-	// if (  m_coin->work->m_data.contains("rules"))
-	{
-		std::vector<std::string> rules = work.m_data["rules"].get<std::vector<std::string>>();
-    	segwit_activated += std::any_of(rules.begin(), rules.end(), [](const auto &v){ return v == "segwit";});
-    	segwit_activated += std::any_of(rules.begin(), rules.end(), [](const auto &v){ return v == "!segwit";});
-	}
-	
-	// Since taproot+segwit are required forks, stripped-block packing is not needed.
+	// BTC: segwit + taproot are required forks; full-block packing always
+	// includes witness data. No MWEB tail to append.
 	PackStream packed_block = pack<btc::coin::BlockType>(block);
-	auto result = m_client.CallMethod<nlohmann::json>(ID, "submitblock", {HexStr(packed_block.get_span()) + mweb});
+	auto result = m_client.CallMethod<nlohmann::json>(ID, "submitblock", {HexStr(packed_block.get_span())});
 	bool success = result.is_null();
-	
+
 	auto block_header = pack<btc::coin::BlockHeaderType>(block); // cast to header?
 	// We always expect the submit to succeed (non-null result means rejection).
 	auto success_expected = true;
@@ -400,9 +390,9 @@ void NodeRPC::submit_block(BlockType& block, std::string mweb, bool ignore_failu
     	LOG_ERROR << "Block submittal result: " << success << "(" << result.dump() << ") Expected: " << success_expected;
 }
 
-bool NodeRPC::submit_block_hex(const std::string& block_hex, const std::string& mweb, bool ignore_failure)
+bool NodeRPC::submit_block_hex(const std::string& block_hex, bool ignore_failure)
 {
-	auto result = m_client.CallMethod<nlohmann::json>(ID, "submitblock", {block_hex + mweb});
+	auto result = m_client.CallMethod<nlohmann::json>(ID, "submitblock", {block_hex});
 	bool success = result.is_null();
 	if (!success && !ignore_failure)
 		LOG_ERROR << "submit_block_hex result: " << result.dump();
