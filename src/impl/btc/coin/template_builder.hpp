@@ -15,7 +15,6 @@
 #include <functional>
 #include "header_chain.hpp"
 #include "mempool.hpp"
-#include "mweb_builder.hpp"
 #include "rpc_data.hpp"
 #include "transaction.hpp"
 #include "block.hpp"
@@ -136,9 +135,8 @@ inline std::string bits_to_hex(uint32_t bits) {
 ///   curtime           — current wall-clock timestamp
 ///   coinbasevalue     — miner subsidy in satoshis (no fees — no UTXO set)
 ///   transactions      — array with "data" (hex) and "txid" per tx
-///   rules             — ["csv", "!segwit", "taproot", "mweb"]
+///   rules             — ["segwit"]
 ///   coinbaseflags     — "" (empty)
-///   mweb              — serialized mw::Block hex (empty MWEB block with carry-forward roots)
 ///   sigoplimit        — 80000
 ///   sizelimit         — 4000000
 ///   weightlimit       — 4000000
@@ -148,20 +146,17 @@ public:
     // BIP9 base version — all modern blocks use 0x20000000 as the base with
     // optional version-bit signaling.  We derive the actual version from the
     // chain tip so we automatically mirror whatever signaling bits the network
-    // is using (e.g. MWEB, Taproot, future soft-forks).
+    // is using (e.g. Taproot, future soft-forks).
     static constexpr uint32_t BIP9_BASE_VERSION = 0x20000000u;
     static constexpr uint32_t MAX_BLOCK_WEIGHT  = 4'000'000u;
     static constexpr uint32_t COINBASE_RESERVE  = 2'000u;   // weight reserved for coinbase tx
 
     /// Build a WorkData template from the current chain tip + mempool.
-    /// When mweb_tracker is provided and has state, the template includes
-    /// a HogEx transaction (last tx) and MWEB block data.
     /// Returns std::nullopt if the chain has no tip yet (not synced to genesis).
     static std::optional<rpc::WorkData> build_template(
         const HeaderChain& chain,
         const Mempool&     pool,
-        bool               is_testnet = false,
-        const MWEBTracker* mweb_tracker = nullptr)
+        bool               is_testnet = false)
     {
         (void)is_testnet;  // reserved for future per-network rules
         auto t0 = std::chrono::steady_clock::now();
@@ -242,39 +237,6 @@ public:
             tx_hashes.push_back(txid);
         }
 
-        // ── MWEB: HogEx transaction + empty MWEB block ────────────────────
-        std::string mweb_hex;
-        bool has_mweb = false;
-
-        if (mweb_tracker) {
-            auto mweb_state = mweb_tracker->get_state();
-            if (mweb_state) {
-                // Build HogEx transaction (last tx in block)
-                auto hogex = MWEBBuilder::build_hogex(*mweb_state, next_h);
-                std::string hogex_hex = MWEBBuilder::serialize_hogex_hex(hogex);
-                uint256 hogex_txid = MWEBBuilder::compute_hogex_txid(hogex);
-
-                nlohmann::json hogex_entry;
-                hogex_entry["data"] = hogex_hex;
-                hogex_entry["txid"] = hogex_txid.GetHex();
-                hogex_entry["hash"] = hogex_txid.GetHex();  // HogEx: wtxid == txid (no witness)
-                tx_array.push_back(std::move(hogex_entry));
-
-                tx_objects.push_back(Transaction(hogex));
-                tx_hashes.push_back(hogex_txid);
-
-                // Build empty MWEB block (carry-forward roots)
-                auto mweb_bytes = MWEBBuilder::build_empty_mweb_block(*mweb_state, next_h);
-                mweb_hex = HexStr(std::span<const unsigned char>(mweb_bytes.data(), mweb_bytes.size()));
-                has_mweb = true;
-
-                LOG_INFO << "[EMB-BTC] MWEB: HogEx added as last tx, mweb_hex="
-                         << mweb_hex.size() / 2 << " bytes";
-            } else {
-                LOG_DEBUG_COIND << "[EMB-BTC] MWEB tracker has no state yet";
-            }
-        }
-
         // ── Build GBT-compatible JSON ──────────────────────────────────────
         nlohmann::json data;
         data["version"]           = static_cast<int>(block_version);
@@ -284,12 +246,9 @@ public:
         data["curtime"]           = static_cast<int64_t>(now_ts);
         data["coinbasevalue"]     = static_cast<int64_t>(coinbasevalue);
         data["transactions"]      = std::move(tx_array);
-        // Match litecoind GBT rules exactly
-        data["rules"]             = has_mweb
-            ? nlohmann::json::array({"csv", "!segwit", "taproot", "mweb"})
-            : nlohmann::json::array({"segwit"});
+        // Bitcoin rules: BTC has only segwit (no MWEB).
+        data["rules"]             = nlohmann::json::array({"segwit"});
         data["coinbaseflags"]     = "";
-        data["mweb"]              = mweb_hex;
         data["sigoplimit"]        = 80000;
         data["sizelimit"]         = 4'000'000;
         data["weightlimit"]       = 4'000'000;
@@ -302,7 +261,6 @@ public:
                  << " subsidy=" << subsidy << " fees=" << total_fees
                  << " coinbasevalue=" << coinbasevalue << " sat"
                  << " txs=" << data["transactions"].size()
-                 << " mweb=" << (has_mweb ? "yes" : "no")
                  << " tip_ts=" << tip.header.m_timestamp
                  << " now=" << now_ts
                  << " synced=" << chain.is_synced();
@@ -319,12 +277,10 @@ public:
 /// Calls TemplateBuilder::build_template() for getwork().
 class EmbeddedCoinNode : public CoinNodeInterface {
 public:
-    EmbeddedCoinNode(HeaderChain& chain, Mempool& pool, bool testnet = false,
-                     MWEBTracker* mweb_tracker = nullptr)
+    EmbeddedCoinNode(HeaderChain& chain, Mempool& pool, bool testnet = false)
         : m_chain(chain)
         , m_pool(pool)
         , m_testnet(testnet)
-        , m_mweb_tracker(mweb_tracker)
     {}
 
     /// Build a template from the current chain tip + mempool.
@@ -339,7 +295,7 @@ public:
                      << m_chain.height() << ")";
             throw std::runtime_error("EmbeddedCoinNode::getwork: chain not synced — waiting for header sync");
         }
-        auto result = TemplateBuilder::build_template(m_chain, m_pool, m_testnet, m_mweb_tracker);
+        auto result = TemplateBuilder::build_template(m_chain, m_pool, m_testnet);
         if (!result) {
             LOG_WARNING << "[EMB-BTC] EmbeddedCoinNode::getwork() FAILED: no tip (chain empty)";
             throw std::runtime_error("EmbeddedCoinNode::getwork: chain has no tip (not yet synced to genesis)");
@@ -390,7 +346,6 @@ private:
     Mempool&     m_pool;
     std::function<bool()> m_utxo_ready;  // coinbase maturity gate
     bool         m_testnet;
-    MWEBTracker* m_mweb_tracker{nullptr};
 };
 
 } // namespace coin
