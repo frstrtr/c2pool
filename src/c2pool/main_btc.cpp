@@ -28,6 +28,7 @@
 #include <impl/btc/coin/node_interface.hpp>
 #include <impl/btc/coin/transaction.hpp>
 #include <impl/btc/config.hpp>
+#include <impl/btc/node.hpp>
 
 #include <core/coin/utxo.hpp>
 #include <core/coin/utxo_view_cache.hpp>
@@ -353,11 +354,13 @@ int main(int argc, char* argv[])
                 LOG_WARNING << "[BTC] initial getheaders: handshake not complete (peer slow?)";
                 // Fire anyway — at worst the peer ignores and we retry later.
             }
-            // Locator: if HeaderChain has any tip, use it; else genesis.
+            // Locator: if HeaderChain has any tip, use its hash; else genesis.
             // For a fresh DB the chain is empty so locator = [genesis].
-            uint256 locator = (header_chain.height() > 0)
-                ? uint256::ZERO  // header_chain.tip_hash() if exposed; placeholder
-                : chain_params.genesis_hash;
+            uint256 locator;
+            if (auto tip = header_chain.tip(); tip)
+                locator = tip->block_hash;
+            else
+                locator = chain_params.genesis_hash;
             LOG_INFO << "[BTC] Sending initial getheaders, locator="
                      << locator.GetHex().substr(0, 16)
                      << " (chain_height=" << header_chain.height() << ")";
@@ -365,37 +368,50 @@ int main(int argc, char* argv[])
                 BTC_PROTOCOL_VERSION, {locator}, uint256::ZERO);
         });
 
-    // ── B4 broadcaster scaffold ─────────────────────────────────────────
-    // c2pool sharechain peer (full pool::NodeBridge<NodeImpl, Legacy, Actual>)
-    // is already cloned at src/impl/btc/node.{hpp,cpp} (2230 LOC) and uses
-    // PoolConfig::ADVERTISED_PROTOCOL_VERSION=3502 + MINIMUM_PROTOCOL_VERSION=3500
-    // (jtoomim/SPB BTC fork; share VERSION 35 PaddingBugfixShare).
-    //
-    // Wiring it requires: btc::Config(yaml) + btc::ShareChain + listener bind +
-    // accept loop + ShareTracker + outbound peer dialer. That integration is
-    // B4-net scope. For now, log the scaffold contract — verifying that the
-    // identity values we'd advertise are bit-correct against a live peer like
-    // p2p-spb.xyz:9333.
+    // ── B4-net: c2pool sharechain peer ───────────────────────────────────
+    // pool::NodeBridge<NodeImpl, Legacy, Actual> from src/impl/btc/node.{hpp,cpp}.
+    // Speaks the jtoomim/SPB BTC p2pool wire protocol (proto 3502, share v35
+    // PaddingBugfixShare). NodeImpl ctor opens ~/.c2pool/<net>/sharechain_leveldb
+    // for share persistence and seeds the addr store from m_bootstrap_addrs;
+    // we set those + m_prefix BEFORE constructing the node.
+    config.pool()->m_prefix = ParseHexBytes(btc::PoolConfig::prefix_hex());
+    config.m_testnet        = testnet;
+
     if (!p2pool_host.empty() && p2pool_port != 0)
     {
-        LOG_INFO << "[BTC] B4 broadcaster scaffold:";
-        LOG_INFO << "[BTC]   --p2pool target:           " << p2pool_host << ":" << p2pool_port;
-        LOG_INFO << "[BTC]   advertised protocol:       "
-                 << btc::PoolConfig::ADVERTISED_PROTOCOL_VERSION
-                 << " (jtoomim/SPB BTC v35 wire = proto 3502)";
-        LOG_INFO << "[BTC]   minimum accepted protocol: "
-                 << btc::PoolConfig::MINIMUM_PROTOCOL_VERSION;
-        LOG_INFO << "[BTC]   share format:              VERSION " << 35
-                 << " (PaddingBugfixShare)";
-        LOG_INFO << "[BTC]   listen P2P_PORT:           "
-                 << btc::PoolConfig::P2P_PORT;
-        LOG_INFO << "[BTC]   prefix (hex):              "
-                 << btc::PoolConfig::DEFAULT_PREFIX_HEX;
-        LOG_INFO << "[BTC]   identifier (hex):          "
-                 << btc::PoolConfig::DEFAULT_IDENTIFIER_HEX;
-        LOG_INFO << "[BTC] B4 broadcaster wiring (NodeBridge instantiation, "
-                 << "ShareTracker, listener) deferred to B4-net.";
+        // Single explicit target — clear defaults so we dial only the named peer.
+        config.pool()->m_bootstrap_addrs.clear();
+        config.pool()->m_bootstrap_addrs.emplace_back(p2pool_host, p2pool_port);
+        LOG_INFO << "[BTC] Sharechain bootstrap: explicit --p2pool "
+                 << p2pool_host << ":" << p2pool_port;
     }
+    else
+    {
+        // Default seed list (PoolConfig::DEFAULT_BOOTSTRAP_HOSTS, port 9333).
+        for (const auto& host : btc::PoolConfig::DEFAULT_BOOTSTRAP_HOSTS)
+        {
+            // Some entries already include ":port" — preserve, else append.
+            std::string addr = host.find(':') == std::string::npos
+                ? host + ":" + std::to_string(btc::PoolConfig::P2P_PORT)
+                : host;
+            config.pool()->m_bootstrap_addrs.emplace_back(addr);
+        }
+        LOG_INFO << "[BTC] Sharechain bootstrap: "
+                 << config.pool()->m_bootstrap_addrs.size()
+                 << " default seeds";
+    }
+
+    auto p2p_node = std::make_unique<btc::Node>(&ioc, &config);
+    p2p_node->set_target_outbound_peers(p2pool_host.empty() ? 4 : 1);
+    p2p_node->core::Server::listen(btc::PoolConfig::P2P_PORT);
+    LOG_INFO << "[BTC] Sharechain peer listening on port "
+             << btc::PoolConfig::P2P_PORT
+             << " — proto adv=" << btc::PoolConfig::ADVERTISED_PROTOCOL_VERSION
+             << " min=" << btc::PoolConfig::MINIMUM_PROTOCOL_VERSION
+             << " share=v35 prefix=" << btc::PoolConfig::prefix_hex();
+    p2p_node->start_outbound_connections();
+    LOG_INFO << "[BTC] Outbound peer dialing started ("
+             << config.pool()->m_bootstrap_addrs.size() << " bootstrap addrs)";
 
     LOG_INFO << "[BTC] io_context running. Ctrl-C to stop.";
     ioc.run();
