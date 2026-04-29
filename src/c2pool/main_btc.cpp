@@ -382,8 +382,19 @@ int main(int argc, char* argv[])
         // Single explicit target — clear defaults so we dial only the named peer.
         config.pool()->m_bootstrap_addrs.clear();
         config.pool()->m_bootstrap_addrs.emplace_back(p2pool_host, p2pool_port);
+
+        // AddrStore ctor reads addrs.json from disk if present, MERGING any
+        // saved-from-prior-runs peers with our bootstrap_addrs. Saved peers
+        // can outrank our just-added explicit target (get_good_peers scores
+        // by first_seen/last_seen). When --p2pool is given the user has
+        // explicitly chosen this peer — reset addr store so it actually wins.
+        const auto addrs_path = net_dir / "addrs.json";
+        std::error_code rm_ec;
+        std::filesystem::remove(addrs_path, rm_ec);  // best-effort
+
         LOG_INFO << "[BTC] Sharechain bootstrap: explicit --p2pool "
-                 << p2pool_host << ":" << p2pool_port;
+                 << p2pool_host << ":" << p2pool_port
+                 << " (addrs.json reset to enforce exclusive target)";
     }
     else
     {
