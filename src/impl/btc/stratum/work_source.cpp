@@ -452,21 +452,32 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
         return a.first  < b.first;
     });
 
-    // ── ref_hash computation ──
-    uint256 ref_hash;
-    uint64_t ref_nonce = 0;
+    // ── ref_hash + chain-walked frozen_ref values (Phase 12) ──
+    // The ref_hash_fn lambda walks the share tracker for the actual
+    // network share target (bits/max_bits) plus the chain-position
+    // fields (absheight/abswork/far_share_hash) and the clipped
+    // timestamp. We update the share_bits_/share_max_bits_ atomics so
+    // stratum_server's pool_difficulty gate sees the live network share
+    // difficulty (was forever 0 before Phase 12 → mining_submit was
+    // never called for ordinary pseudoshares → chain-share creation
+    // never triggered).
+    core::stratum::RefHashResult rh_result;
     if (ref_hash_fn) {
         try {
-            auto [rh, nn] = ref_hash_fn(prev_share_hash, scriptsig, payout_script,
-                                        coinbasevalue, block_bits, curtime);
-            ref_hash  = rh;
-            ref_nonce = nn;
+            rh_result = ref_hash_fn(prev_share_hash, scriptsig, payout_script,
+                                    coinbasevalue, block_bits, curtime);
+            if (rh_result.bits != 0) {
+                share_bits_.store(rh_result.bits, std::memory_order_relaxed);
+                share_max_bits_.store(rh_result.max_bits, std::memory_order_relaxed);
+            }
         } catch (const std::exception& e) {
             LOG_WARNING << "[BTC-STRATUM] ref_hash_fn threw: " << e.what()
                         << " — coinbase will lack OP_RETURN commitment";
         }
     }
-    const bool emit_op_return = ref_hash_fn && !ref_hash.IsNull();
+    const uint256&  ref_hash      = rh_result.ref_hash;
+    const uint64_t  ref_nonce     = rh_result.last_txout_nonce;
+    const bool      emit_op_return = ref_hash_fn && !ref_hash.IsNull();
 
     // ── BIP 141 witness commitment (Output 0 if segwit active) ──
     //
@@ -590,9 +601,22 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
     }
     snap.frozen_ref.share_version   = 35;        // jtoomim BTC v35
     snap.frozen_ref.desired_version = 35;
-    snap.frozen_ref.bits            = share_bits_.load();
-    snap.frozen_ref.max_bits        = share_max_bits_.load();
-    snap.frozen_ref.timestamp       = curtime;
+    // Phase 12: source bits/max_bits/absheight/abswork/far_share_hash
+    // from the ref_hash_fn result (which already walked the tracker for
+    // the same values to feed compute_ref_hash_for_work). With these
+    // populated, has_frozen=true in the create_share lambda properly
+    // overrides create_local_share_v35's in-function tracker walk —
+    // the override values are now correct (matching peers), instead of
+    // forcing absheight=0 + share.m_bits=hardcoded-diff-1.
+    snap.frozen_ref.bits            = rh_result.bits ? rh_result.bits
+                                                      : share_bits_.load();
+    snap.frozen_ref.max_bits        = rh_result.max_bits ? rh_result.max_bits
+                                                          : share_max_bits_.load();
+    snap.frozen_ref.timestamp       = rh_result.timestamp ? rh_result.timestamp
+                                                           : curtime;
+    snap.frozen_ref.absheight       = rh_result.absheight;
+    snap.frozen_ref.abswork         = rh_result.abswork;
+    snap.frozen_ref.far_share_hash  = rh_result.far_share_hash;
     snap.frozen_ref.ref_hash        = ref_hash;
     snap.frozen_ref.last_txout_nonce = ref_nonce;
 
