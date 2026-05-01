@@ -26,6 +26,7 @@
 #include <core/mining_node_interface.hpp>
 #include <core/address_validator.hpp>
 #include <core/hashrate_ring.hpp>
+#include <core/stratum_types.hpp>
 #include <c2pool/payout/payout_manager.hpp>
 #include <c2pool/hashrate/tracker.hpp>
 #include <core/address_utils.hpp>
@@ -130,13 +131,9 @@ inline nlohmann::json to_json(const std::optional<SharechainTip>& tip)
 }
 
 /// Stratum mining configuration — tuneable from CLI, YAML, or API.
-struct StratumConfig {
-    double min_difficulty       = 0.0005;   // floor for per-connection vardiff
-    double max_difficulty       = 65536.0;  // ceiling for per-connection vardiff
-    double target_time          = 3.0;      // seconds between pseudoshares (p2pool default: 3)
-    bool   vardiff_enabled      = true;     // auto-adjust per-connection difficulty
-    size_t max_coinbase_outputs = 4000;     // Python p2pool's [-4000:] cap; no consensus limit
-};
+// Hoisted to core::stratum (see core/stratum_types.hpp). Alias kept here
+// so existing references to `core::StratumConfig` resolve transparently.
+using StratumConfig = core::stratum::StratumConfig;
 
 /// Mining interface that provides RPC methods for miners
 class MiningInterface : public jsonrpccxx::JsonRpc2Server
@@ -293,52 +290,12 @@ public:
                             double pool_hashrate = 0,
                             uint64_t subsidy = 0);
     
-    // Frozen share fields returned by ref_hash_fn — must be defined before JobSnapshot.
-    struct RefHashResult {
-        uint256  ref_hash;
-        uint64_t last_txout_nonce{0};
-        uint32_t absheight{0};
-        uint128  abswork;
-        uint256  far_share_hash;
-        uint32_t max_bits{0};
-        uint32_t bits{0};
-        uint32_t timestamp{0};
-        uint256  merged_payout_hash;
-        int64_t  share_version{36};     // AutoRatchet: V35 or V36
-        uint64_t desired_version{36};   // Version vote (always target version)
-        // Frozen mm_commitment — cached from rebuild_cached_blocks().
-        // Empty if no merged mining.
-        std::vector<uint8_t> frozen_mm_commitment;
-        // Frozen segwit data — merkle branches and witness root change between
-        // GBT updates, but the ref_hash was computed with the values at template time.
-        std::vector<uint256> frozen_merkle_branches;
-        uint256  frozen_witness_root;
-        // V36: frozen merged coinbase info (pre-serialized vector<MergedCoinbaseEntry>)
-        // Contains DOGE block header + merkle proof for consensus verification.
-        std::vector<unsigned char> frozen_merged_coinbase_info;
-    };
-
-    // Stratum-style methods (for advanced miners)
-    // Job snapshot: holds all template data frozen at the time a mining job was sent.
-    struct JobSnapshot {
-        std::string coinb1, coinb2;
-        std::string gbt_prevhash;      // BE display hex
-        std::string nbits;             // BE hex e.g. "1e0fffff" (share target bits for header)
-        uint32_t    version{0};
-        std::vector<std::string> merkle_branches;
-        std::vector<std::string> tx_data;   // raw tx hex from GBT
-        std::string mweb;
-        bool        segwit_active{false};
-        uint256     prev_share_hash;  // share chain tip when this job was built
-        uint64_t    subsidy{0};       // coinbasevalue frozen at job creation
-        std::string witness_commitment_hex;  // P2Pool witness commitment frozen at job creation
-        uint256     witness_root;            // raw wtxid merkle root frozen at job creation
-        uint32_t    share_bits{0};    // share target bits from compute_share_target()
-        uint32_t    share_max_bits{0}; // share max_bits from compute_share_target()
-        std::string block_nbits;      // original GBT block bits (for block target check)
-        RefHashResult frozen_ref;     // frozen share fields from template time
-        int stale_info{0};            // 0=none, 253=orphan (stale block template)
-    };
+    // Boundary types hoisted to core::stratum (see core/stratum_types.hpp).
+    // Aliases kept here so existing references like `MiningInterface::JobSnapshot`
+    // continue to resolve. Not needed for IWorkSource extraction itself —
+    // these are convenience aliases for the existing call sites.
+    using RefHashResult = core::stratum::RefHashResult;
+    using JobSnapshot   = core::stratum::JobSnapshot;
     nlohmann::json mining_subscribe(const std::string& user_agent = "", const std::string& request_id = "");
     nlohmann::json mining_authorize(const std::string& username, const std::string& password, const std::string& request_id = "");
     nlohmann::json mining_submit(const std::string& username, const std::string& job_id, const std::string& extranonce1, const std::string& extranonce2, const std::string& ntime, const std::string& nonce, const std::string& request_id = "",
@@ -420,30 +377,15 @@ public:
 
     // Atomically snapshot work-related fields under m_work_mutex.
     // Used by StratumSession to freeze consistent state matching the coinbase.
-    struct WorkSnapshot {
-        bool segwit_active{false};
-        std::string mweb;
-        uint64_t subsidy{0};
-        std::string witness_commitment_hex;
-        uint256 witness_root;
-        // Frozen share fields from ref_hash_fn
-        RefHashResult frozen_ref;
-        // Block body data — must be captured atomically with witness_commitment
-        // to prevent merkle root mismatch when refresh_work() updates the template.
-        std::vector<std::string> tx_data;              // raw tx hex from template
-        std::vector<std::string> merkle_branches;      // stratum merkle branches
-    };
+    // (Hoisted to core::stratum::WorkSnapshot — see core/stratum_types.hpp.)
+    using WorkSnapshot = core::stratum::WorkSnapshot;
 
     // Build per-connection coinbase parts: computes ref_hash using the ref_hash callback,
     // then generates coinb1/coinb2 with full output set including OP_RETURN.
     // prev_share_hash is frozen at the caller and passed in to avoid race conditions.
     // Also returns work snapshot atomically (under same lock) to prevent race with refresh_work.
     // Returns (coinb1, coinb2) or empty strings if not possible.
-    struct CoinbaseResult {
-        std::string coinb1;
-        std::string coinb2;
-        WorkSnapshot snapshot;
-    };
+    using CoinbaseResult = core::stratum::CoinbaseResult;
     CoinbaseResult build_connection_coinbase(
         const uint256& prev_share_hash,
         const std::string& extranonce1_hex,
@@ -1472,18 +1414,7 @@ private:
 
     // ── Stratum worker session tracking ──────────────────────────────────
 public:
-    struct WorkerInfo {
-        std::string username;      // miner address (after parsing)
-        std::string worker_name;   // worker suffix from "ADDRESS.worker" (e.g. "alpha")
-        double hashrate{0.0};      // measured H/s from HashrateTracker
-        double dead_hashrate{0.0}; // DOA H/s
-        double difficulty{1.0};    // current vardiff difficulty
-        uint64_t accepted{0};
-        uint64_t rejected{0};
-        uint64_t stale{0};
-        std::chrono::steady_clock::time_point connected_at;
-        std::string remote_endpoint;  // "ip:port"
-    };
+    using WorkerInfo = core::stratum::WorkerInfo;
 
     void register_stratum_worker(const std::string& session_id, const WorkerInfo& info);
     void unregister_stratum_worker(const std::string& session_id);
