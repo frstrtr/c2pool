@@ -531,4 +531,22 @@ void BTCWorkSource::set_best_share_hash_fn(std::function<uint256()> fn)
     best_share_hash_fn_ = std::move(fn);
 }
 
+void BTCWorkSource::set_pplns_fn(PplnsFn fn)
+{
+    std::lock_guard<std::mutex> lk(callback_mutex_);
+    pplns_fn_ = std::move(fn);
+}
+
+void BTCWorkSource::set_ref_hash_fn(RefHashFn fn)
+{
+    std::lock_guard<std::mutex> lk(callback_mutex_);
+    ref_hash_fn_ = std::move(fn);
+}
+
+void BTCWorkSource::set_donation_script(std::vector<unsigned char> script)
+{
+    std::lock_guard<std::mutex> lk(callback_mutex_);
+    donation_script_ = std::move(script);
+}
+
 }  // namespace btc::stratum
