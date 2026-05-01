@@ -264,87 +264,198 @@ std::pair<std::string, std::string> BTCWorkSource::get_coinbase_parts() const
 }
 
 core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
-    const uint256& /*prev_share_hash*/,
+    const uint256& prev_share_hash,
     const std::string& /*extranonce1_hex*/,
     const std::vector<unsigned char>& payout_script,
     const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& /*merged_addrs*/) const
 {
-    // SOPHISTICATED STUB (B7-stratum-4c-iii). Produces a stratum-compatible
-    // coinbase split with the miner's payout receiving the FULL subsidy
-    // + fees. This is enough for end-to-end stratum-protocol testing and
-    // mainnet PoW classification, but does NOT yet include the c2pool
-    // sharechain payout outputs (PPLNS to other miners) or the p2pool
-    // ref_hash extension. Shares submitted against this coinbase are
-    // technically valid BTC blocks at PoW-target difficulty but won't
-    // earn c2pool sharechain credit — the v35 share format coinbase
-    // layout (jtoomim/SPB lineage) needs careful adaptation, which
-    // belongs to a follow-up phase.
+    // c2pool BTC v35 coinbase layout (Phase 8b — full PPLNS + ref_hash).
     //
-    // TODO(B-future): add c2pool extra outputs:
-    //   - Replace single full-payout output with PPLNS distribution
-    //     among recent sharechain participants
-    //   - Add c2pool donation output
-    //   - Add OP_RETURN with c2pool protocol metadata (see
-    //     core/coinbase_builder.hpp::C2POOL_PROTOCOL_VERSION)
-    //   - Compute p2pool ref_hash via ShareTracker callback, populate
-    //     CoinbaseResult.snapshot.frozen_ref accordingly
-    //   - Handle segwit witness commitment OP_RETURN
+    // Reference: core/web_server.cpp::MiningInterface::build_coinbase_parts
+    // (lines 1576-1735). We port that algorithm with BTC v35 simplifications
+    // (no DOGE merged-mining, no state_root V37 prep, no MWEB):
+    //
+    //   ScriptSig (no extranonce — c2pool puts it in OP_RETURN nonce instead):
+    //     [BIP 34 height push — incl. opcode prefix]
+    //     [/c2pool-btc/ tag with 1-byte push opcode prefix]
+    //
+    //   Outputs:
+    //     ── (segwit witness commitment FIRST if active — TODO 8c)
+    //     ── PPLNS payouts (sorted asc by amount, asc by script)
+    //        + finder fee subsidy/200 added to miner, deducted from donation
+    //     ── OP_RETURN: 0 sats, script = 6a 28 [ref_hash 32B] [nonce 8B-slot]
+    //        The 8-byte nonce slot is filled at submit time by
+    //        extranonce1(4) || extranonce2(4) — see c2pool's hash_link
+    //        deterministic-coinbase scheme.
+    //
+    //   coinb1 = entire coinbase tx UP TO AND INCLUDING ref_hash (NOT the
+    //            8B nonce slot)
+    //   coinb2 = "00000000" (just locktime)
+    //
+    // If pplns_fn_ or ref_hash_fn_ are unset (cold start, ShareTracker not
+    // ready) the coinbase degrades gracefully: single-output paying full
+    // subsidy to the miner, no OP_RETURN. Valid BTC block but no c2pool
+    // sharechain credit.
 
     auto wd = btc::coin::TemplateBuilder::build_template(chain_, mempool_, is_testnet_);
     if (!wd) return {};
 
-    uint32_t height        = wd->m_data.value("height", 0u);
-    uint64_t coinbasevalue = wd->m_data.value("coinbasevalue", uint64_t{0});
+    const uint32_t height        = wd->m_data.value("height", 0u);
+    const uint64_t coinbasevalue = wd->m_data.value("coinbasevalue", uint64_t{0});
 
+    // GBT block-target bits (NOT the share-target bits — that's in nbits).
+    uint32_t block_bits = 0;
+    if (auto it = wd->m_data.find("bits"); it != wd->m_data.end() && it->is_string())
+        block_bits = parse_be_hex_u32(it->get<std::string>());
+    const uint32_t curtime = wd->m_data.value("curtime", uint32_t{0});
+
+    // Snapshot callbacks under the lock (invoke them unlocked).
+    PplnsFn pplns_fn;
+    RefHashFn ref_hash_fn;
+    std::vector<unsigned char> donation_script;
+    {
+        std::lock_guard<std::mutex> lk(callback_mutex_);
+        pplns_fn        = pplns_fn_;
+        ref_hash_fn     = ref_hash_fn_;
+        donation_script = donation_script_;
+    }
+
+    // ── ScriptSig assembly (always the same — coinbase deterministic) ──
     auto bip34 = bip34_height_push(height);
-    constexpr size_t EXTRANONCE_SIZE = 8;  // 4 (extranonce1) + 4 (extranonce2)
     static const std::string POOL_TAG = "/c2pool-btc/";
-    std::vector<uint8_t> tag_bytes(POOL_TAG.begin(), POOL_TAG.end());
 
-    const size_t scriptsig_len = bip34.size() + EXTRANONCE_SIZE + tag_bytes.size();
+    std::vector<uint8_t> scriptsig;
+    scriptsig.insert(scriptsig.end(), bip34.begin(), bip34.end());
+    if (!POOL_TAG.empty() && POOL_TAG.size() < 76) {
+        // Push opcode: for 1-75 bytes, the opcode IS the length.
+        scriptsig.push_back(static_cast<uint8_t>(POOL_TAG.size()));
+        scriptsig.insert(scriptsig.end(), POOL_TAG.begin(), POOL_TAG.end());
+    }
 
-    // ── coinb1: tx prefix up to (but not including) the extranonce slot ──
+    // ── PPLNS payouts ──
+    std::map<std::vector<unsigned char>, double> payouts;
+    if (pplns_fn) {
+        uint256 block_target;
+        if (block_bits != 0) block_target.SetCompact(block_bits);
+        try {
+            payouts = pplns_fn(prev_share_hash, block_target, coinbasevalue, donation_script);
+        } catch (const std::exception& e) {
+            LOG_WARNING << "[BTC-STRATUM] pplns_fn threw: " << e.what()
+                        << " — falling back to single-output coinbase";
+            payouts.clear();
+        }
+    }
+
+    // v35 finder fee: 0.5% of subsidy goes to the share-finder (this miner),
+    // deducted from donation. Reference: c2pool_refactored.cpp wiring +
+    // share_tracker.hpp v35 PPLNS docs ("amounts WITHOUT finder fee — caller
+    // adds subsidy/200 to the share creator's script").
+    if (!payouts.empty() && coinbasevalue > 0) {
+        const double finder_fee = static_cast<double>(coinbasevalue) / 200.0;
+        payouts[payout_script] += finder_fee;
+        if (!donation_script.empty()) {
+            auto it = payouts.find(donation_script);
+            if (it != payouts.end()) {
+                it->second = std::max(0.0, it->second - finder_fee);
+            }
+        }
+    }
+
+    // Degraded fallback: full subsidy → miner.
+    if (payouts.empty()) {
+        payouts[payout_script] = static_cast<double>(coinbasevalue);
+    }
+
+    // ── Sort outputs: by amount asc, then by script asc (matches LTC) ──
+    std::vector<std::pair<std::vector<unsigned char>, uint64_t>> outputs;
+    outputs.reserve(payouts.size());
+    for (const auto& [script, amount_d] : payouts) {
+        // Round to satoshi. Anything < 1 sat is dust — drop it (matches
+        // Bitcoin Core dust-out-policy + LTC payout manager behaviour).
+        const uint64_t amount = static_cast<uint64_t>(amount_d);
+        if (amount > 0)
+            outputs.emplace_back(script, amount);
+    }
+    std::sort(outputs.begin(), outputs.end(), [](const auto& a, const auto& b) {
+        if (a.second != b.second) return a.second < b.second;
+        return a.first  < b.first;
+    });
+
+    // ── ref_hash computation ──
+    uint256 ref_hash;
+    uint64_t ref_nonce = 0;
+    if (ref_hash_fn) {
+        try {
+            auto [rh, nn] = ref_hash_fn(prev_share_hash, scriptsig, payout_script,
+                                        coinbasevalue, block_bits, curtime);
+            ref_hash  = rh;
+            ref_nonce = nn;
+        } catch (const std::exception& e) {
+            LOG_WARNING << "[BTC-STRATUM] ref_hash_fn threw: " << e.what()
+                        << " — coinbase will lack OP_RETURN commitment";
+        }
+    }
+    const bool emit_op_return = ref_hash_fn && !ref_hash.IsNull();
+
+    // ── Assemble coinb1: full tx up to (and including) ref_hash ──
+    const size_t output_count = outputs.size() + (emit_op_return ? 1 : 0);
+
     std::vector<uint8_t> coinb1;
-    push_u32_le(coinb1, /*tx version*/ 2);
-    coinb1.push_back(0x01);                                     // vin_count = 1
-    coinb1.insert(coinb1.end(), 32, 0x00);                       // prev_hash = 32 zero bytes
-    push_u32_le(coinb1, 0xFFFFFFFFu);                            // prev_vout = 0xFFFFFFFF
-    push_varint(coinb1, scriptsig_len);                          // scriptSig length
-    coinb1.insert(coinb1.end(), bip34.begin(), bip34.end());     // BIP 34 height push
+    push_u32_le(coinb1, /*tx version*/ 1);  // c2pool reference uses version 1
+    coinb1.push_back(0x01);                  // vin_count = 1
+    coinb1.insert(coinb1.end(), 32, 0x00);   // prev_hash = 32 zero bytes
+    push_u32_le(coinb1, 0xFFFFFFFFu);        // prev_vout
+    push_varint(coinb1, scriptsig.size());
+    coinb1.insert(coinb1.end(), scriptsig.begin(), scriptsig.end());
+    push_u32_le(coinb1, 0xFFFFFFFFu);        // sequence
+    push_varint(coinb1, output_count);
 
-    // ── coinb2: scriptSig tail + sequence + outputs + locktime ──
+    // PPLNS / payout outputs (already sorted)
+    for (const auto& [script, amount] : outputs) {
+        push_u64_le(coinb1, amount);
+        push_varint(coinb1, script.size());
+        coinb1.insert(coinb1.end(), script.begin(), script.end());
+    }
+
+    // OP_RETURN: 0 sats, script = 6a (OP_RETURN) 28 (PUSH_40)
+    //                            ref_hash(32) + [8B nonce slot — filled by en1+en2]
+    // We emit ONLY the ref_hash here; the 8B nonce comes from the miner's
+    // extranonce1+extranonce2 inserted between coinb1 and coinb2.
+    if (emit_op_return) {
+        push_u64_le(coinb1, /*sats*/ 0);
+        coinb1.push_back(0x2a);   // script_len = 42 (OP_RETURN[1] + PUSH_40[1] + ref_hash[32] + nonce[8])
+        coinb1.push_back(0x6a);   // OP_RETURN
+        coinb1.push_back(0x28);   // PUSH_40
+        coinb1.insert(coinb1.end(), ref_hash.data(), ref_hash.data() + 32);
+        // [8B nonce slot — coinb1 ends here; en1+en2 fills it]
+    }
+
+    // ── coinb2: locktime only ──
     std::vector<uint8_t> coinb2;
-    coinb2.insert(coinb2.end(), tag_bytes.begin(), tag_bytes.end());  // /c2pool-btc/
-    push_u32_le(coinb2, 0xFFFFFFFFu);                            // sequence
-    coinb2.push_back(0x01);                                      // vout_count = 1
-    push_u64_le(coinb2, coinbasevalue);                          // value (subsidy + fees)
-    push_varint(coinb2, payout_script.size());
-    coinb2.insert(coinb2.end(), payout_script.begin(), payout_script.end());
-    push_u32_le(coinb2, 0);                                      // locktime
+    push_u32_le(coinb2, 0u);  // locktime = 0
 
     core::stratum::CoinbaseResult result;
     result.coinb1 = HexStr(std::span<const uint8_t>(coinb1.data(), coinb1.size()));
     result.coinb2 = HexStr(std::span<const uint8_t>(coinb2.data(), coinb2.size()));
 
-    // Snapshot — frozen state matching this coinbase. Stratum sessions
-    // store this in their JobEntry and pass it to mining_submit later.
+    // ── Snapshot — frozen state matching this coinbase ──
     auto& snap = result.snapshot;
-    snap.subsidy            = coinbasevalue;
-    snap.segwit_active      = false;  // TODO: detect from wd->m_data["rules"]
-    snap.witness_root       = uint256::ZERO;  // TODO: when segwit
-    snap.frozen_ref.share_version  = 35;      // jtoomim BTC v35
+    snap.subsidy                    = coinbasevalue;
+    snap.segwit_active              = false;     // TODO 8c: detect from wd rules
+    snap.witness_root               = uint256::ZERO;
+    snap.frozen_ref.share_version   = 35;        // jtoomim BTC v35
     snap.frozen_ref.desired_version = 35;
-    snap.frozen_ref.bits           = share_bits_.load();
-    snap.frozen_ref.max_bits       = share_max_bits_.load();
-    // frozen_merkle_branches mirrors public branches for now
+    snap.frozen_ref.bits            = share_bits_.load();
+    snap.frozen_ref.max_bits        = share_max_bits_.load();
+    snap.frozen_ref.timestamp       = curtime;
+    snap.frozen_ref.ref_hash        = ref_hash;
+    snap.frozen_ref.last_txout_nonce = ref_nonce;
+
     auto branches = get_stratum_merkle_branches();
     for (const auto& h : branches) {
-        uint256 b;
-        b.SetHex(h.c_str());
+        uint256 b; b.SetHex(h.c_str());
         snap.frozen_ref.frozen_merkle_branches.push_back(b);
     }
-    // Capture raw tx hex from template (excludes coinbase — sessions reconstruct
-    // the coinbase from coinb1+extranonces+coinb2)
     auto txs_field = wd->m_data.find("transactions");
     if (txs_field != wd->m_data.end() && txs_field->is_array()) {
         for (const auto& t : *txs_field) {
@@ -419,15 +530,11 @@ nlohmann::json BTCWorkSource::mining_submit(
     auto prevhash_be = ParseHex(job->gbt_prevhash);
     std::vector<uint8_t> prevhash_le(prevhash_be.rbegin(), prevhash_be.rend());
 
+    // 80-byte block header. version comes from the JobSnapshot as a uint32
+    // (decimal). TODO(version-rolling): when BIP 310 is wired, the miner's
+    // submitted version may differ from job->version within POOL_VERSION_MASK
+    // — accept and use the miner's version then.
     std::vector<uint8_t> header;
-    header.reserve(80);
-    push_u32_le(header, parse_be_hex_u32(std::to_string(job->version) /*decimal!*/));
-    // ↑ subtle: version arrives as a decimal int in JobSnapshot, not BE hex.
-    // The miner sends it in mining.submit ALSO as BE hex — we'd want that one,
-    // but the miner can override for ASICBoost. For the stub we use the job's
-    // version directly. (TODO: respect submitted version when version-rolling
-    // is enabled and within POOL_VERSION_MASK.)
-    header.clear();
     header.reserve(80);
     push_u32_le(header, job->version);
     header.insert(header.end(), prevhash_le.begin(), prevhash_le.end());
