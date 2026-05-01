@@ -91,6 +91,31 @@ public:
         const std::vector<unsigned char>& payout_script,
         uint64_t subsidy, uint32_t bits, uint32_t timestamp)>;
 
+    /// Sharechain WRITE path. Called from mining_submit when a share's
+    /// SHA256d PoW meets sharechain (not block) target. main_btc.cpp wires
+    /// this to a lambda that:
+    ///   1. Acquires `unique_lock(p2p_node->tracker_mutex(), try_to_lock)`
+    ///      — non-blocking; returns uint256::ZERO if compute thread busy
+    ///   2. Calls btc::create_local_share() (templated on TrackerT) which
+    ///      builds a v35 PaddingBugfixShare and tracker.add()s it
+    ///   3. On non-zero return, calls p2p_node->broadcast_share(hash)
+    ///      to announce to peers + notify_local_share(hash) to bump
+    ///      local best so miners get fresh work tied to our new tip
+    ///
+    /// Returns the share hash on success, uint256::ZERO on failure
+    /// (tracker busy, PoW recheck failed, prev_share unknown, etc.).
+    /// mining_submit reports either share-accepted with the hash or
+    /// share-deferred to the miner.
+    ///
+    /// The full_coinbase is the reconstructed coinb1||en1||en2||coinb2
+    /// (non-witness form — txid math). The header_80b is the 80-byte
+    /// block header bytes from mining_submit's classification step.
+    using CreateShareFn = std::function<uint256(
+        const std::vector<unsigned char>& full_coinbase,
+        const std::vector<uint8_t>&        header_80b,
+        const core::stratum::JobSnapshot&  job,
+        const std::vector<unsigned char>& payout_script)>;
+
     BTCWorkSource(btc::coin::HeaderChain&       chain,
                   btc::coin::Mempool&           mempool,
                   bool                          is_testnet,
@@ -172,6 +197,12 @@ public:
     /// mode, but coinbase still valid for BTC).
     void set_ref_hash_fn(RefHashFn fn);
 
+    /// Wire the share-create callback (sharechain WRITE path). Called once
+    /// at startup. May be left unset — mining_submit then logs accepted
+    /// shares but doesn't add them to the tracker, leaving c2pool-btc as
+    /// a stratum proxy without sharechain participation.
+    void set_create_share_fn(CreateShareFn fn);
+
     /// Set the donation script (bytes of the c2pool donation
     /// scriptPubKey — typically a P2PKH or P2WPKH for the c2pool donation
     /// address). Used by build_connection_coinbase as the residual
@@ -204,10 +235,11 @@ private:
     mutable std::mutex          best_share_mutex_;
     std::function<uint256()>    best_share_hash_fn_;
 
-    // PPLNS + ref_hash callbacks (from ShareTracker via main_btc.cpp)
+    // PPLNS + ref_hash + share-create callbacks (from ShareTracker via main_btc.cpp)
     mutable std::mutex          callback_mutex_;
     PplnsFn                     pplns_fn_;
     RefHashFn                   ref_hash_fn_;
+    CreateShareFn               create_share_fn_;
     std::vector<unsigned char>  donation_script_;
 
     // Template cache (filled lazily; invalidated when work_generation_ bumps)

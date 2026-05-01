@@ -17,6 +17,7 @@
 #include <impl/btc/coin/template_builder.hpp>  // build_template + merkle_hash_pair
 #include <impl/btc/coin/transaction.hpp>
 
+#include <core/address_utils.hpp>               // address_to_script (for share write path)
 #include <core/hash.hpp>
 #include <core/log.hpp>
 #include <btclibs/util/strencodings.h>          // HexStr, ParseHex
@@ -762,15 +763,56 @@ nlohmann::json BTCWorkSource::mining_submit(
     }
 
     if (!(pow_hash > share_target)) {
-        // pow_hash <= share_target → share accepted.
-        // TODO(B-future): record share in btc::ShareTracker (PPLNS state update).
-        // For the stub, we accept the share but don't yet propagate to the
-        // sharechain peer. The miner will see "share accepted" stratum responses
-        // but the c2pool dashboard / payouts will be empty until ShareTracker
-        // wiring lands.
-        LOG_INFO << "[BTC-STRATUM-SHARE] accepted user=" << username
-                 << " pow_hash=" << pow_hex_short
-                 << " job=" << job_id;
+        // pow_hash <= share_target → share meets sharechain target.
+        // Phase 11: dispatch to create_share_fn_ which builds a v35
+        // PaddingBugfixShare, adds it to btc::ShareTracker, broadcasts
+        // to peers, and bumps the local best. If the callback is unset
+        // (degraded mode) we just log the acceptance — miner gets a
+        // success reply but the share doesn't earn sharechain credit.
+
+        CreateShareFn create_fn;
+        {
+            std::lock_guard<std::mutex> lk(callback_mutex_);
+            create_fn = create_share_fn_;
+        }
+
+        uint256 share_hash;
+        if (create_fn) {
+            // Reconstruct the miner's payout_script from the username.
+            // address_to_script handles bech32 (P2WPKH/P2WSH) + base58
+            // (P2PKH/P2SH). Empty script (unsupported address format)
+            // means the share can still be ADDED locally but won't carry
+            // a payout — peers will reject it on consensus check, which
+            // we tolerate during dev.
+            auto payout_script = core::address_to_script(username);
+
+            try {
+                share_hash = create_fn(coinbase, header, *job, payout_script);
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[BTC-STRATUM-SHARE] create_share_fn threw: "
+                            << e.what() << " — share not added";
+            }
+        }
+
+        if (!share_hash.IsNull()) {
+            LOG_INFO << "[BTC-STRATUM-SHARE] ACCEPTED + ADDED user=" << username
+                     << " share_hash=" << share_hash.GetHex().substr(0, 16)
+                     << " pow_hash="   << pow_hex_short
+                     << " job=" << job_id;
+        } else if (create_fn) {
+            // Callback was wired but couldn't add (tracker busy, prev_share
+            // unknown, PoW recheck failed inside create_local_share, etc.).
+            // Miner still gets a success reply since their PoW was valid.
+            LOG_INFO << "[BTC-STRATUM-SHARE] accepted (deferred) user=" << username
+                     << " pow_hash=" << pow_hex_short
+                     << " job=" << job_id;
+        } else {
+            // No callback wired — degraded mode (proxy without sharechain).
+            LOG_INFO << "[BTC-STRATUM-SHARE] accepted (no-tracker) user=" << username
+                     << " pow_hash=" << pow_hex_short
+                     << " job=" << job_id;
+        }
+
         {
             std::lock_guard<std::mutex> lk(workers_mutex_);
             for (auto& [_, w] : workers_) {
@@ -810,6 +852,12 @@ void BTCWorkSource::set_ref_hash_fn(RefHashFn fn)
 {
     std::lock_guard<std::mutex> lk(callback_mutex_);
     ref_hash_fn_ = std::move(fn);
+}
+
+void BTCWorkSource::set_create_share_fn(CreateShareFn fn)
+{
+    std::lock_guard<std::mutex> lk(callback_mutex_);
+    create_share_fn_ = std::move(fn);
 }
 
 void BTCWorkSource::set_donation_script(std::vector<unsigned char> script)
