@@ -29,7 +29,10 @@
 #include <impl/btc/coin/node_interface.hpp>
 #include <impl/btc/coin/transaction.hpp>
 #include <impl/btc/config.hpp>
+#include <impl/btc/config_pool.hpp>
 #include <impl/btc/node.hpp>
+#include <impl/btc/share_check.hpp>      // RefHashParams + compute_ref_hash_for_work
+#include <impl/btc/share_tracker.hpp>    // get_v35_expected_payouts
 #include <impl/btc/stratum/work_source.hpp>
 
 #include <core/coin/utxo.hpp>
@@ -642,6 +645,103 @@ int main(int argc, char* argv[])
     auto work_source = std::make_shared<btc::stratum::BTCWorkSource>(
         header_chain, mempool, testnet, std::move(stratum_submit_fn));
     work_source_for_shutdown = work_source;  // expose to signal handler
+
+    // ── PPLNS + ref_hash callbacks (Phase 8d) ────────────────────────────
+    //
+    // These wire the BTCWorkSource's coinbase builder to the live BTC
+    // sharechain via btc::ShareTracker. The pplns lambda is the real
+    // deal — calls get_v35_expected_payouts under read_tracker() guard.
+    // The ref_hash lambda is a SOPHISTICATED STUB: it calls
+    // compute_ref_hash_for_work with sane defaults for tracker-derived
+    // fields (absheight, abswork, far_share_hash). Until those are
+    // properly walked from the tracker, the resulting ref_hash will not
+    // match what live SPB peers expect — c2pool-btc-built shares get
+    // produced locally but won't be accepted by the wider sharechain.
+    // That's the next concrete TODO; the wiring + payouts are now real.
+
+    auto* p2p_node_raw = p2p_node.get();  // captured by reference into lambdas
+
+    work_source->set_donation_script(
+        btc::PoolConfig::get_donation_script(/*share_version*/ 35));
+
+    work_source->set_pplns_fn(
+        [p2p_node_raw](const uint256& best_share_hash,
+                       const uint256& block_target,
+                       uint64_t subsidy,
+                       const std::vector<unsigned char>& donation_script)
+        -> std::map<std::vector<unsigned char>, double>
+        {
+            if (!p2p_node_raw) return {};
+            auto guard = p2p_node_raw->read_tracker();
+            if (!guard) {
+                // Tracker busy with compute thread — return empty so the
+                // coinbase falls back to single-output mode for THIS work
+                // refresh. Next refresh will likely succeed.
+                return {};
+            }
+            try {
+                return guard->get_v35_expected_payouts(
+                    best_share_hash, block_target, subsidy, donation_script);
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[BTC-STRATUM] get_v35_expected_payouts threw: " << e.what();
+                return {};
+            }
+        });
+
+    work_source->set_ref_hash_fn(
+        [p2p_node_raw](const uint256& prev_share_hash,
+                       const std::vector<unsigned char>& scriptSig,
+                       const std::vector<unsigned char>& payout_script,
+                       uint64_t subsidy, uint32_t bits, uint32_t timestamp)
+        -> std::pair<uint256, uint64_t>
+        {
+            // Build RefHashParams for v35. SOPHISTICATED STUB: tracker-walked
+            // fields (absheight, abswork, far_share_hash, share_nonce) get
+            // placeholder values. These need to be derived by walking back
+            // from prev_share_hash in the share tracker — TODO Phase 8d+.
+            btc::RefHashParams p;
+            p.share_version       = 35;
+            p.prev_share          = prev_share_hash;
+            p.coinbase_scriptSig  = scriptSig;
+            p.share_nonce         = 0;
+            p.subsidy             = subsidy;
+            p.donation            = 50;            // 0.5% (matches finder fee)
+            p.stale_info          = 0;
+            p.desired_version     = 35;
+            p.has_segwit          = false;
+            p.bits                = bits;
+            p.timestamp           = timestamp;
+            p.max_bits            = bits;          // SIMPLIFIED — same as bits for now
+            p.absheight           = 0;             // TODO: walk tracker from prev_share
+            p.abswork             = uint128(0);    // TODO: walk tracker
+            p.far_share_hash      = prev_share_hash;  // TODO: ~99 shares back
+
+            // Heuristic v35 pubkey extract: P2PK is 0x41 + 65B pubkey + 0xac;
+            // P2PKH is 0x76 0xa9 0x14 + 20B hash + 0x88 0xac. Try P2PKH first.
+            if (payout_script.size() == 25 && payout_script[0] == 0x76 &&
+                payout_script[1] == 0xa9 && payout_script[2] == 0x14 &&
+                payout_script[23] == 0x88 && payout_script[24] == 0xac)
+            {
+                std::memcpy(p.pubkey_hash.begin(), payout_script.data() + 3, 20);
+                p.pubkey_type = 0;
+            }
+            // Else leave pubkey_hash zeroed — v35 may use the address string.
+
+            // Touch p2p_node_raw to keep capture from being optimized away
+            // when we wire real tracker walks here.
+            (void)p2p_node_raw;
+
+            try {
+                return btc::compute_ref_hash_for_work(p);
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[BTC-STRATUM] compute_ref_hash_for_work threw: " << e.what();
+                return { uint256::ZERO, 0 };
+            }
+        });
+
+    LOG_INFO << "[BTC-STRATUM] PPLNS + ref_hash callbacks wired"
+             << " (donation_script=" << btc::PoolConfig::get_donation_script(35).size()
+             << "B P2PK; ref_hash uses sophisticated-stub for tracker-walked fields)";
 
     // Bump work-generation counter on every chain tip change. The stratum
     // server uses this to detect stale work between job-push timer firings
