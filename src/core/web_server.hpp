@@ -27,6 +27,7 @@
 #include <core/address_validator.hpp>
 #include <core/hashrate_ring.hpp>
 #include <core/stratum_types.hpp>
+#include <core/stratum_work_source.hpp>
 #include <c2pool/payout/payout_manager.hpp>
 #include <c2pool/hashrate/tracker.hpp>
 #include <core/address_utils.hpp>
@@ -135,8 +136,14 @@ inline nlohmann::json to_json(const std::optional<SharechainTip>& tip)
 // so existing references to `core::StratumConfig` resolve transparently.
 using StratumConfig = core::stratum::StratumConfig;
 
-/// Mining interface that provides RPC methods for miners
-class MiningInterface : public jsonrpccxx::JsonRpc2Server
+/// Mining interface that provides RPC methods for miners.
+///
+/// Implements `core::stratum::IWorkSource` so the same `core::StratumServer`
+/// can drive both LTC's `MiningInterface` and BTC's `btc::stratum::
+/// BTCWorkSource`. The IWorkSource methods on this class are annotated
+/// `override`. See `core/stratum_work_source.hpp` for the contract.
+class MiningInterface : public jsonrpccxx::JsonRpc2Server,
+                        public core::stratum::IWorkSource
 {
 public:
     MiningInterface(bool testnet = false, std::shared_ptr<IMiningNode> node = nullptr, Blockchain blockchain = Blockchain::LITECOIN);
@@ -300,7 +307,7 @@ public:
     nlohmann::json mining_authorize(const std::string& username, const std::string& password, const std::string& request_id = "");
     nlohmann::json mining_submit(const std::string& username, const std::string& job_id, const std::string& extranonce1, const std::string& extranonce2, const std::string& ntime, const std::string& nonce, const std::string& request_id = "",
         const std::map<uint32_t, std::vector<unsigned char>>& merged_addresses = {},
-        const JobSnapshot* job = nullptr);
+        const JobSnapshot* job = nullptr) override;
 
     // Enhanced coinbase and validation methods
     nlohmann::json validate_address(const std::string& address);
@@ -345,7 +352,7 @@ public:
 
     // Hook: returns the best share hash from the share tracker (for prev_hash wiring)
     void set_best_share_hash_fn(std::function<uint256()> fn) { m_best_share_hash_fn = thread_safe_wrap(std::move(fn)); }
-    std::function<uint256()> get_best_share_hash_fn() const { return m_best_share_hash_fn; }
+    std::function<uint256()> get_best_share_hash_fn() const override { return m_best_share_hash_fn; }
 
     // Hook: walk back from best_share to find nearest peer share for work template.
     // Ensures c2pool shares extend the main chain, not local forks.
@@ -390,7 +397,7 @@ public:
         const uint256& prev_share_hash,
         const std::string& extranonce1_hex,
         const std::vector<unsigned char>& payout_script,
-        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const;
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const override;
 
     // Hook: called by mining_submit() pool path to create a share in the tracker.
     // All block template data needed by create_local_share() is passed through.
@@ -634,11 +641,11 @@ public:
     // Fetch a fresh block template from the coin daemon and cache it
     void refresh_work();
     // Return the most recently cached block template (empty json if unavailable)
-    nlohmann::json get_current_work_template() const;
+    nlohmann::json get_current_work_template() const override;
     // Return Stratum-ready merkle branch hashes
-    std::vector<std::string> get_stratum_merkle_branches() const;
+    std::vector<std::string> get_stratum_merkle_branches() const override;
     // Return coinb1 and coinb2 (coinbase parts split around extranonce)
-    std::pair<std::string, std::string> get_coinbase_parts() const;
+    std::pair<std::string, std::string> get_coinbase_parts() const override;
 
     // Return whether segwit is active in the current template
     bool get_segwit_active() const;
@@ -652,7 +659,7 @@ public:
     WorkSnapshot get_work_snapshot() const;
 
     // Returns current GBT previousblockhash (for stale block template detection)
-    std::string get_current_gbt_prevhash() const;
+    std::string get_current_gbt_prevhash() const override;
 
     // Found block status and record (Layer +2 — blockchain-accepted blocks)
     enum class BlockStatus : uint8_t {
@@ -879,7 +886,7 @@ public:
     void set_address_fallback_fn(address_fallback_fn_t fn) { m_address_fallback_fn = std::move(fn); }
 
     // Return true if the merged-mining manager has a configured chain with chain_id.
-    bool has_merged_chain(uint32_t chain_id) const;
+    bool has_merged_chain(uint32_t chain_id) const override;
 
     // Extract the 40-char hex hash160 from the node fee scriptPubKey (P2PKH bytes 3-22).
     // Returns "" if the fee script is not a 25-byte P2PKH.
@@ -962,7 +969,12 @@ private:
 public:
     // Monotonically increasing counter — incremented on each refresh_work().
     // Used by per-miner safety timer to avoid pushing unchanged work.
-    uint64_t get_work_generation() const { return m_work_generation.load(); }
+    uint64_t get_work_generation() const override { return m_work_generation.load(); }
+
+    // IWorkSource atomic-state getters — replace direct m_share_bits.load()
+    // member access from stratum_server (post-extraction).
+    uint32_t get_share_bits() const override { return m_share_bits.load(); }
+    uint32_t get_share_max_bits() const override { return m_share_max_bits.load(); }
 
     // Share target from compute_share_target() — set by ref_hash_fn, used by
     // mining.notify (nbits) and share creation (params.bits).
@@ -1157,7 +1169,7 @@ private:
     std::string m_auth_token;   // auth token for sensitive endpoints; empty = no auth
 public:
     void set_stratum_config(const StratumConfig& cfg) { m_stratum_config = cfg; }
-    const StratumConfig& get_stratum_config() const { return m_stratum_config; }
+    const StratumConfig& get_stratum_config() const override { return m_stratum_config; }
     void set_cors_origin(const std::string& origin) { m_cors_origin = origin; }
     const std::string& get_cors_origin() const { return m_cors_origin; }
 
@@ -1416,11 +1428,11 @@ private:
 public:
     using WorkerInfo = core::stratum::WorkerInfo;
 
-    void register_stratum_worker(const std::string& session_id, const WorkerInfo& info);
-    void unregister_stratum_worker(const std::string& session_id);
+    void register_stratum_worker(const std::string& session_id, const WorkerInfo& info) override;
+    void unregister_stratum_worker(const std::string& session_id) override;
     void update_stratum_worker(const std::string& session_id,
                                double hashrate, double dead_hashrate, double difficulty,
-                               uint64_t accepted, uint64_t rejected, uint64_t stale);
+                               uint64_t accepted, uint64_t rejected, uint64_t stale) override;
     std::map<std::string, WorkerInfo> get_stratum_workers() const;
 
 private:
