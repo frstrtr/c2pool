@@ -88,6 +88,17 @@ inline uint32_t parse_be_hex_u32(const std::string& s) {
     return v;
 }
 
+// BIP 141 witness reserved value: 32 zero bytes embedded as the only
+// stack item in the coinbase witness. The witness commitment in the
+// coinbase OP_RETURN is computed against this exact value.
+constexpr std::array<uint8_t, 32> WITNESS_RESERVED_VALUE{};  // all zeros
+
+// BIP 141 witness commitment magic: OP_RETURN OP_PUSHBYTES_36 + "aa21a9ed".
+// Followed by 32 bytes of commitment hash for total OP_RETURN script of 38 bytes.
+constexpr std::array<uint8_t, 6> WITNESS_COMMIT_HEADER = {
+    0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed
+};
+
 }  // anonymous namespace
 
 namespace btc::stratum {
@@ -309,6 +320,22 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
         block_bits = parse_be_hex_u32(it->get<std::string>());
     const uint32_t curtime = wd->m_data.value("curtime", uint32_t{0});
 
+    // Detect segwit activation. GBT exposes this in two redundant ways:
+    // a "rules" array containing "!segwit" or "segwit", or the presence of
+    // a non-empty "default_witness_commitment" (which TemplateBuilder doesn't
+    // currently emit, so we go off "rules"). For BTC mainnet segwit has been
+    // active since 2017, so for our purposes this is effectively always true
+    // post-IBD. We still gate on it to remain correct for testnet edges and
+    // synthetic test fixtures.
+    bool segwit_active = false;
+    if (auto it = wd->m_data.find("rules"); it != wd->m_data.end() && it->is_array()) {
+        for (const auto& r : *it) {
+            if (!r.is_string()) continue;
+            auto s = r.get<std::string>();
+            if (s == "segwit" || s == "!segwit") { segwit_active = true; break; }
+        }
+    }
+
     // Snapshot callbacks under the lock (invoke them unlocked).
     PplnsFn pplns_fn;
     RefHashFn ref_hash_fn;
@@ -432,8 +459,69 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
     }
     const bool emit_op_return = ref_hash_fn && !ref_hash.IsNull();
 
+    // ── BIP 141 witness commitment (Output 0 if segwit active) ──
+    //
+    // Required for mainnet block acceptance since segwit activation
+    // (2017-08). bitcoind validates: SHA256d(witness_root || reserved_value)
+    // == commitment_hash present in coinbase OP_RETURN with magic aa21a9ed.
+    //
+    // witness_root is the merkle root of WTXIDs of all txs in the block.
+    // The coinbase WTXID is conventionally 32 zero bytes (BIP 141), so it
+    // takes the leftmost slot. Other txs' wtxids come from the GBT
+    // template's "hash" field (TemplateBuilder line 226 emits this).
+    //
+    // For coinbase-only templates (no other txs) the witness root is just
+    // the coinbase wtxid (zero), so commitment = SHA256d(zero32 || zero32).
+    std::vector<uint8_t> witness_commitment_script;  // empty if segwit not active
+    uint256 witness_root_uint;
+    if (segwit_active) {
+        std::vector<uint256> wtxids;
+        wtxids.reserve(1 + (wd->m_txs.size()));
+        wtxids.push_back(uint256::ZERO);  // coinbase wtxid placeholder
+        if (auto txs_field = wd->m_data.find("transactions");
+            txs_field != wd->m_data.end() && txs_field->is_array())
+        {
+            for (const auto& t : *txs_field) {
+                if (!t.is_object()) continue;
+                if (auto h = t.find("hash"); h != t.end() && h->is_string()) {
+                    uint256 wt; wt.SetHex(h->get<std::string>().c_str());
+                    wtxids.push_back(wt);
+                }
+            }
+        }
+        // Bitcoin Core merkle: pad odd levels by duplicating last.
+        std::vector<uint256> level = std::move(wtxids);
+        while (level.size() > 1) {
+            std::vector<uint256> next;
+            next.reserve((level.size() + 1) / 2);
+            for (size_t i = 0; i < level.size(); i += 2) {
+                const uint256& l = level[i];
+                const uint256& r = (i + 1 < level.size()) ? level[i + 1] : level[i];
+                next.push_back(btc::coin::merkle_hash_pair(l, r));
+            }
+            level = std::move(next);
+        }
+        witness_root_uint = level.empty() ? uint256::ZERO : level[0];
+
+        // commitment_hash = SHA256d(witness_root || witness_reserved_value)
+        std::array<uint8_t, 64> commit_in;
+        std::memcpy(commit_in.data(),      witness_root_uint.data(),    32);
+        std::memcpy(commit_in.data() + 32, WITNESS_RESERVED_VALUE.data(), 32);
+        uint256 commit_hash = Hash(std::span<const uint8_t>(commit_in.data(), 64));
+
+        // Build OP_RETURN script: 0x6a 0x24 [aa21a9ed] [commit 32B] = 38 bytes total
+        witness_commitment_script.reserve(38);
+        witness_commitment_script.insert(witness_commitment_script.end(),
+            WITNESS_COMMIT_HEADER.begin(), WITNESS_COMMIT_HEADER.end());
+        witness_commitment_script.insert(witness_commitment_script.end(),
+            commit_hash.data(), commit_hash.data() + 32);
+    }
+
     // ── Assemble coinb1: full tx up to (and including) ref_hash ──
-    const size_t output_count = outputs.size() + (emit_op_return ? 1 : 0);
+    // Output count = [witness commitment if segwit] + [PPLNS outputs] + [OP_RETURN ref_hash if any]
+    const size_t output_count = (segwit_active ? 1 : 0)
+                              + outputs.size()
+                              + (emit_op_return ? 1 : 0);
 
     std::vector<uint8_t> coinb1;
     push_u32_le(coinb1, /*tx version*/ 1);  // c2pool reference uses version 1
@@ -445,6 +533,16 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
     push_u32_le(coinb1, 0xFFFFFFFFu);        // sequence
     push_varint(coinb1, output_count);
 
+    // Output 0: BIP 141 witness commitment (FIRST so it's stable across
+    // PPLNS reordering — bitcoind scans for the LAST aa21a9ed commitment
+    // but stable position helps reproducibility).
+    if (segwit_active) {
+        push_u64_le(coinb1, /*sats*/ 0);
+        push_varint(coinb1, witness_commitment_script.size());
+        coinb1.insert(coinb1.end(),
+            witness_commitment_script.begin(), witness_commitment_script.end());
+    }
+
     // PPLNS / payout outputs (already sorted)
     for (const auto& [script, amount] : outputs) {
         push_u64_le(coinb1, amount);
@@ -452,13 +550,12 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
         coinb1.insert(coinb1.end(), script.begin(), script.end());
     }
 
-    // OP_RETURN: 0 sats, script = 6a (OP_RETURN) 28 (PUSH_40)
-    //                            ref_hash(32) + [8B nonce slot — filled by en1+en2]
-    // We emit ONLY the ref_hash here; the 8B nonce comes from the miner's
-    // extranonce1+extranonce2 inserted between coinb1 and coinb2.
+    // Output last: OP_RETURN with c2pool ref_hash + 8B nonce slot.
+    // Script: 6a (OP_RETURN) 28 (PUSH_40) ref_hash(32) nonce(8) — total 42 bytes.
+    // The 8B nonce comes from extranonce1+extranonce2 between coinb1 and coinb2.
     if (emit_op_return) {
         push_u64_le(coinb1, /*sats*/ 0);
-        coinb1.push_back(0x2a);   // script_len = 42 (OP_RETURN[1] + PUSH_40[1] + ref_hash[32] + nonce[8])
+        coinb1.push_back(0x2a);   // script_len = 42
         coinb1.push_back(0x6a);   // OP_RETURN
         coinb1.push_back(0x28);   // PUSH_40
         coinb1.insert(coinb1.end(), ref_hash.data(), ref_hash.data() + 32);
@@ -476,8 +573,12 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
     // ── Snapshot — frozen state matching this coinbase ──
     auto& snap = result.snapshot;
     snap.subsidy                    = coinbasevalue;
-    snap.segwit_active              = false;     // TODO 8c: detect from wd rules
-    snap.witness_root               = uint256::ZERO;
+    snap.segwit_active              = segwit_active;
+    snap.witness_root               = witness_root_uint;
+    if (!witness_commitment_script.empty()) {
+        snap.witness_commitment_hex = HexStr(std::span<const uint8_t>(
+            witness_commitment_script.data(), witness_commitment_script.size()));
+    }
     snap.frozen_ref.share_version   = 35;        // jtoomim BTC v35
     snap.frozen_ref.desired_version = 35;
     snap.frozen_ref.bits            = share_bits_.load();
@@ -603,12 +704,38 @@ nlohmann::json BTCWorkSource::mining_submit(
                     << " job=" << job_id;
 
         // Build the full serialized block: header ‖ tx_count ‖ coinbase ‖ other_txs.
+        // For segwit-active templates the coinbase MUST be serialized in BIP 144
+        // form with the 32-byte witness reserved value as its single witness
+        // stack item — bitcoind validates the OP_RETURN aa21a9ed commitment by
+        // hashing (witness_root || reserved_value), and a missing witness here
+        // makes that hash mismatch → block rejected as bad-witness-merkle-match.
+        //
+        // BIP 144 witness format inserts a marker(0x00) + flag(0x01) right
+        // after the 4-byte version, and witness data right before the
+        // 4-byte locktime. Coinbase witness = 1 stack item, 32 zero bytes.
+        std::vector<uint8_t> coinbase_serialized = coinbase;
+        if (job->segwit_active) {
+            // Insert marker+flag after version (offset 4)
+            const std::array<uint8_t, 2> marker_flag = {0x00, 0x01};
+            coinbase_serialized.insert(coinbase_serialized.begin() + 4,
+                marker_flag.begin(), marker_flag.end());
+            // Append witness BEFORE locktime (last 4 bytes):
+            //   [stack_count = 1][item_len = 0x20][32 zero bytes]
+            std::array<uint8_t, 34> witness_bytes{};
+            witness_bytes[0] = 0x01;  // stack_count
+            witness_bytes[1] = 0x20;  // item_len = 32
+            // bytes [2..33] already zero from default-init = WITNESS_RESERVED_VALUE
+            coinbase_serialized.insert(coinbase_serialized.end() - 4,
+                witness_bytes.begin(), witness_bytes.end());
+        }
+
         std::vector<uint8_t> block_bytes;
-        block_bytes.reserve(80 + 9 + coinbase.size() + job->tx_data.size() * 256);
+        block_bytes.reserve(80 + 9 + coinbase_serialized.size() + job->tx_data.size() * 256);
         block_bytes.insert(block_bytes.end(), header.begin(), header.end());
 
         push_varint(block_bytes, 1 + job->tx_data.size());  // total tx count
-        block_bytes.insert(block_bytes.end(), coinbase.begin(), coinbase.end());
+        block_bytes.insert(block_bytes.end(),
+            coinbase_serialized.begin(), coinbase_serialized.end());
         for (const auto& tx_hex : job->tx_data) {
             auto tx_bytes = ParseHex(tx_hex);
             block_bytes.insert(block_bytes.end(), tx_bytes.begin(), tx_bytes.end());
