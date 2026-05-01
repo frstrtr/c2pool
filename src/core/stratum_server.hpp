@@ -209,6 +209,13 @@ public:
     // best_share_hash_fn() live. This prevents PPLNS recomputation race when
     // best_share changes mid-iteration in notify_all().
     void send_notify_work(bool force_clean = false, const uint256* frozen_best_share = nullptr);
+
+    // Graceful shutdown: cancel timers + close socket. The pending async_read
+    // fails with operation_aborted, the read handler runs the standard
+    // disconnect path (cancel_timers, unregister_stratum_worker, log). Idempotent.
+    // Called by StratumServer::stop() during process shutdown so no queued
+    // async handlers reference half-destroyed state when the io_context dies.
+    void shutdown() { cancel_timers(); }
 private:
     void start_periodic_work_push();
     void schedule_work_push_timer();

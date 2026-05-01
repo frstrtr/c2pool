@@ -102,14 +102,41 @@ bool StratumServer::start()
 
 void StratumServer::stop()
 {
-    if (running_) {
-        try {
-            acceptor_.close();
-            running_ = false;
-            LOG_INFO << "StratumServer stopped";
-        } catch (const std::exception& e) {
-            LOG_ERROR << "Error stopping StratumServer: " << e.what();
+    if (!running_) return;
+
+    try {
+        // Stop accepting new connections first — no more sessions can spawn
+        // after this point, so the snapshot below is exhaustive.
+        boost::system::error_code ec;
+        acceptor_.cancel(ec);
+        acceptor_.close(ec);
+        running_ = false;
+
+        // Snapshot + clear the live-sessions set under the mutex, then close
+        // each one OUTSIDE the lock. cancel_timers() does asio operations
+        // (timer.cancel + socket.close) that should not run with our
+        // sessions_mutex_ held — the read-error handler will fire on the
+        // io_context thread and try to acquire sessions_mutex_ via
+        // unregister_session.
+        std::set<std::shared_ptr<StratumSession>> snapshot;
+        {
+            std::lock_guard<std::mutex> lk(sessions_mutex_);
+            snapshot = std::move(sessions_);
+            sessions_.clear();
         }
+
+        for (auto& session : snapshot) {
+            try {
+                session->shutdown();
+            } catch (const std::exception& e) {
+                LOG_WARNING << "StratumSession shutdown threw: " << e.what();
+            }
+        }
+
+        LOG_INFO << "StratumServer stopped (closed " << snapshot.size()
+                 << " active session" << (snapshot.size() == 1 ? "" : "s") << ")";
+    } catch (const std::exception& e) {
+        LOG_ERROR << "Error stopping StratumServer: " << e.what();
     }
 }
 
