@@ -78,18 +78,28 @@ public:
         uint64_t subsidy,
         const std::vector<unsigned char>& donation_script)>;
 
-    /// p2pool ref_hash computation: takes the share's identity fields and
-    /// produces (ref_hash, last_txout_nonce). The ref_hash is embedded in
-    /// the coinbase OP_RETURN; the nonce is REPLACED by the miner's
-    /// extranonce1+extranonce2 (8 bytes total) at submit time, so the
-    /// returned nonce is just a placeholder for hash_link prefix
-    /// computation. main_btc.cpp wires this to a lambda calling
-    /// btc::compute_ref_hash_for_work.
-    using RefHashFn = std::function<std::pair<uint256, uint64_t>(
+    /// Computes the ref_hash AND walks the share tracker for all
+    /// chain-derived values needed to populate snap.frozen_ref. Phase 12:
+    /// returns the full `core::stratum::RefHashResult` (already used by
+    /// LTC for the same purpose) instead of just (ref_hash, nonce). The
+    /// extra fields (bits, max_bits, absheight, abswork, far_share_hash,
+    /// timestamp) are fed straight into snap.frozen_ref so create_local
+    /// _share_v35 can override its in-function compute_share_target
+    /// safely (has_frozen=true again) — and the work source updates its
+    /// share_bits_/share_max_bits_ atomics so stratum_server's
+    /// pool_difficulty gate becomes non-zero, finally letting
+    /// mining_submit be called for ordinary pseudoshares.
+    ///
+    /// Inputs: `block_bits` is the BTC mainnet GBT block target (passed
+    /// to compute_share_target as desired_target). `timestamp` is the
+    /// candidate share timestamp; the lambda may clip it forward to
+    /// `prev->m_timestamp + 1` and report the clipped value back via
+    /// the result's `timestamp` field.
+    using RefHashFn = std::function<core::stratum::RefHashResult(
         const uint256& prev_share_hash,
         const std::vector<unsigned char>& coinbase_scriptSig,
         const std::vector<unsigned char>& payout_script,
-        uint64_t subsidy, uint32_t bits, uint32_t timestamp)>;
+        uint64_t subsidy, uint32_t block_bits, uint32_t timestamp)>;
 
     /// Sharechain WRITE path. Called from mining_submit when a share's
     /// SHA256d PoW meets sharechain (not block) target. main_btc.cpp wires
@@ -233,8 +243,10 @@ private:
 
     // Atomic state
     std::atomic<uint64_t>       work_generation_{0};
-    std::atomic<uint32_t>       share_bits_{0};
-    std::atomic<uint32_t>       share_max_bits_{0};
+    // mutable so build_connection_coinbase (const) can refresh them from
+    // ref_hash_fn's tracker.compute_share_target result (Phase 12).
+    mutable std::atomic<uint32_t>       share_bits_{0};
+    mutable std::atomic<uint32_t>       share_max_bits_{0};
 
     // Worker registry (per-connection metadata)
     mutable std::mutex          workers_mutex_;
