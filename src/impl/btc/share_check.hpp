@@ -2445,6 +2445,21 @@ uint256 create_local_share_v35(
             uint256 pow_hash = share_hash;
 
             if (pow_hash > target) {
+                // Diagnostic so the silent-ZERO return path is visible.
+                // Bitaxe-class miners @ ~1.7 TH/s hit this on virtually
+                // every submission against BTC mainnet sharechain
+                // difficulty (~2e8), so without a log it looks like
+                // create_local_share is "broken" when in fact the share
+                // simply doesn't clear the actual share target.
+                static std::atomic<int> miss_diag{0};
+                if (miss_diag.fetch_add(1) < 20) {
+                    LOG_INFO << "[V35-SHARE-MISS] pow=" << pow_hash.GetHex().substr(0, 16)
+                             << " target=" << target.GetHex().substr(0, 16)
+                             << " bits=0x" << std::hex << share.m_bits << std::dec
+                             << " diff_share=" << chain::target_to_difficulty(target)
+                             << " diff_pow=" << chain::target_to_difficulty(pow_hash)
+                             << " absheight=" << share.m_absheight;
+                }
                 return uint256();  // didn't meet share target
             }
             LOG_INFO << "[Pool] V35 SHARE CREATED! pow=" << pow_hash.GetHex().substr(0, 16)
