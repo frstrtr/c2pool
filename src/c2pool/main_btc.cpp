@@ -43,10 +43,15 @@
 #include <boost/asio.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <iostream>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -241,12 +246,55 @@ int main(int argc, char* argv[])
         return Hash(packed.get_span());
     };
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // B5: P2P submit + roundtrip tracking infrastructure.
+    //
+    // submit_block() is the public entry point for future found-block
+    // producers (stratum, debug hook, etc.). It broadcasts the block to
+    // bitcoind via MSG_BLOCK and records the hash in pending_submits.
+    //
+    // Confirmation strategy: bitcoind does NOT echo MSG_BLOCK back to its
+    // sender (it tracks per-peer m_inv_known_blocks), so on_full_block won't
+    // fire for our own submission. Instead we observe arrival in HeaderChain
+    // via new_headers — bitcoind announces the new tip via headers relay,
+    // which our locator-driven getheaders captures naturally. A 30s scan
+    // timer warns on submits unconfirmed for >60s — typically a sign of
+    // bitcoind rejecting (consensus failure) or mempool/network hiccup.
+    //
+    // shared_ptr captures: pending state outlives any single callback; the
+    // new_headers subscriber, the warn timer, and submit_block all need it.
+    // ─────────────────────────────────────────────────────────────────────────
+    struct PendingSubmit {
+        std::chrono::steady_clock::time_point submitted_at;
+        uint32_t height;
+    };
+    auto pending_mu      = std::make_shared<std::mutex>();
+    // std::map (not unordered_map): uint256 has operator< from base_uint::CompareTo
+    // but no std::hash<uint256> specialization in this codebase.
+    auto pending_submits = std::make_shared<std::map<uint256, PendingSubmit>>();
+
+    [[maybe_unused]]
+    auto submit_block = [&coin_node, pending_mu, pending_submits]
+        (btc::coin::BlockType& block, uint32_t height)
+    {
+        auto packed_hdr = pack(static_cast<const btc::coin::BlockHeaderType&>(block));
+        uint256 block_hash = Hash(packed_hdr.get_span());
+        {
+            std::lock_guard<std::mutex> lk(*pending_mu);
+            (*pending_submits)[block_hash] = { std::chrono::steady_clock::now(), height };
+        }
+        LOG_INFO << "[BTC-SUBMIT] sending block " << block_hash.GetHex().substr(0, 16)
+                 << " height=" << height;
+        coin_node.submit_block_p2p(block);
+    };
+
     // Forward bitcoind's headers batches into HeaderChain AND chain the
     // getheaders locator forward to drive sync to peer's tip. LTC dispatches
     // this off-thread (scrypt CPU cost); BTC's PoW is SHA256d so inline is
     // fine for testnet (and for mainnet IBD too, given SHA256d is ~us/header).
     coin_node.new_headers.subscribe(
-        [&header_chain, &coin_node, header_block_hash, &chain_params]
+        [&header_chain, &coin_node, header_block_hash, &chain_params,
+         pending_mu, pending_submits]
         (const std::vector<btc::coin::BlockHeaderType>& headers)
         {
             if (headers.empty()) return;
@@ -256,6 +304,26 @@ int main(int argc, char* argv[])
                      << " accepted=" << accepted
                      << " chain_height=" << header_chain.height()
                      << " last=" << last_hash.GetHex().substr(0, 16);
+
+            // B5 roundtrip detection: any header in this batch matching a
+            // pending submit means bitcoind accepted our block and built on it.
+            if (!pending_submits->empty()) {
+                std::lock_guard<std::mutex> lk(*pending_mu);
+                for (const auto& hdr : headers) {
+                    uint256 h = header_block_hash(hdr);
+                    auto it = pending_submits->find(h);
+                    if (it != pending_submits->end()) {
+                        auto age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - it->second.submitted_at).count();
+                        LOG_INFO << "[BTC-SUBMIT] roundtrip CONFIRMED: block "
+                                 << h.GetHex().substr(0, 16)
+                                 << " height=" << it->second.height
+                                 << " latency=" << age_ms << "ms";
+                        pending_submits->erase(it);
+                    }
+                }
+            }
+
             // Continue header sync if peer likely has more (full 2000-header
             // batch); otherwise we're caught up and bitcoind will push new
             // tips via inv/sendheaders.
@@ -367,6 +435,43 @@ int main(int argc, char* argv[])
             coin_node.send_getheaders(
                 BTC_PROTOCOL_VERSION, {locator}, uint256::ZERO);
         });
+
+    // B5: stale-submit warning timer. Every 30s, scan pending_submits for
+    // entries older than 60s and log [BTC-SUBMIT] STALE — typically means
+    // bitcoind rejected the block (consensus failure / dup hash / wrong
+    // chain) since an accepted submission should appear in HeaderChain
+    // within seconds. The recursive scheduler uses weak_ptr to itself to
+    // avoid a self-referencing shared_ptr cycle.
+    auto warn_timer    = std::make_shared<boost::asio::steady_timer>(ioc);
+    auto schedule_warn = std::make_shared<std::function<void()>>();
+    std::weak_ptr<std::function<void()>> weak_warn = schedule_warn;
+    *schedule_warn = [warn_timer, pending_mu, pending_submits, weak_warn]() {
+        warn_timer->expires_after(std::chrono::seconds(30));
+        warn_timer->async_wait([warn_timer, pending_mu, pending_submits, weak_warn]
+                               (const boost::system::error_code& ec) {
+            if (ec) return;
+            {
+                std::lock_guard<std::mutex> lk(*pending_mu);
+                auto now = std::chrono::steady_clock::now();
+                for (auto it = pending_submits->begin(); it != pending_submits->end(); ) {
+                    auto age_s = std::chrono::duration_cast<std::chrono::seconds>(
+                        now - it->second.submitted_at).count();
+                    if (age_s >= 60) {
+                        LOG_WARNING << "[BTC-SUBMIT] STALE: block "
+                                    << it->first.GetHex().substr(0, 16)
+                                    << " height=" << it->second.height
+                                    << " pending " << age_s
+                                    << "s — bitcoind likely rejected";
+                        it = pending_submits->erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+            if (auto self = weak_warn.lock()) (*self)();
+        });
+    };
+    (*schedule_warn)();
 
     // ── B4-net: c2pool sharechain peer ───────────────────────────────────
     // pool::NodeBridge<NodeImpl, Legacy, Actual> from src/impl/btc/node.{hpp,cpp}.
