@@ -48,7 +48,6 @@
 namespace btc::coin {
 class HeaderChain;
 class Mempool;
-struct BlockType;
 }  // namespace btc::coin
 
 namespace btc::stratum {
@@ -58,9 +57,11 @@ class BTCWorkSource : public core::stratum::IWorkSource
 public:
     /// Callback invoked when `mining_submit` validates a submission whose
     /// SHA256d PoW meets BTC mainnet difficulty. main_btc.cpp wires this
-    /// to the B5 submit_block lambda (which adds to pending_submits map +
-    /// calls coin_node.submit_block_p2p).
-    using SubmitBlockFn = std::function<void(btc::coin::BlockType&, uint32_t height)>;
+    /// to a lambda that calls `coin_node.get_p2p()->submit_block_raw(bytes)`
+    /// + adds to the B5 pending_submits map. Raw-bytes form keeps
+    /// BTCWorkSource decoupled from the BlockType serialization details.
+    using SubmitBlockFn = std::function<void(const std::vector<unsigned char>& block_bytes,
+                                             uint32_t height)>;
 
     BTCWorkSource(btc::coin::HeaderChain&       chain,
                   btc::coin::Mempool&           mempool,
