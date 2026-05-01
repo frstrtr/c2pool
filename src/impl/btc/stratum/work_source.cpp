@@ -14,9 +14,12 @@
 
 #include <impl/btc/coin/header_chain.hpp>
 #include <impl/btc/coin/mempool.hpp>
-#include <impl/btc/coin/transaction.hpp>  // for BlockType (the SubmitBlockFn arg)
+#include <impl/btc/coin/template_builder.hpp>  // build_template + merkle_hash_pair
+#include <impl/btc/coin/transaction.hpp>       // BlockType (the SubmitBlockFn arg)
 
 #include <core/log.hpp>
+
+#include <utility>
 
 namespace btc::stratum {
 
@@ -58,8 +61,15 @@ std::function<uint256()> BTCWorkSource::get_best_share_hash_fn() const
 
 std::string BTCWorkSource::get_current_gbt_prevhash() const
 {
-    // Stage 4b: read chain_.tip() and return BE-display-hex form.
-    return {};
+    // BE display-hex of the current bitcoind chain tip. Stratum sessions
+    // use this both as the `prevhash` field in mining.notify and as the
+    // dedup key for `clean_jobs` detection (when prevhash changes, all
+    // outstanding jobs are invalidated and miners reset).
+    //
+    // Empty string if HeaderChain has no tip yet (uninitialized / pre-IBD).
+    auto tip = chain_.tip();
+    if (!tip) return {};
+    return tip->block_hash.GetHex();
 }
 
 uint64_t BTCWorkSource::get_work_generation() const
@@ -124,17 +134,55 @@ void BTCWorkSource::update_stratum_worker(const std::string& session_id,
 
 nlohmann::json BTCWorkSource::get_current_work_template() const
 {
-    // Stage 4c: call TemplateBuilder::build_template(chain_, mempool_, is_testnet_)
-    // and shape its WorkData into the GBT-style JSON the stratum session
-    // expects (previousblockhash, bits, version, curtime, mintime, height,
-    // coinbasevalue, transactions[]).
-    return nlohmann::json::object();
+    // TemplateBuilder::build_template already shapes the result as a
+    // GBT-style nlohmann::json in WorkData::m_data — exactly what stratum
+    // sessions expect (previousblockhash, bits, version, curtime, mintime,
+    // height, coinbasevalue, transactions[]). Return that directly.
+    //
+    // Returns an empty object if HeaderChain isn't past genesis yet — the
+    // session will skip work-push and retry on next poll.
+    auto wd = btc::coin::TemplateBuilder::build_template(chain_, mempool_, is_testnet_);
+    if (!wd) return nlohmann::json::object();
+    return wd->m_data;
 }
 
 std::vector<std::string> BTCWorkSource::get_stratum_merkle_branches() const
 {
-    // Stage 4c: return cached branches from last template build.
-    return {};
+    // Stratum merkle branches: at each level, the SIBLING of the left-most
+    // node (the one that descends from the coinbase). The miner reconstructs
+    // the merkle root by:
+    //     hash_0 = SHA256d(coinbase_txid || branch[0])
+    //     hash_1 = SHA256d(hash_0       || branch[1])
+    //     ...continue until single hash → merkle_root
+    //
+    // Algorithm matches Bitcoin Core's merkle.cpp: at every level, if the
+    // count is odd, duplicate the last element. The branches list is
+    // typically log2(N) entries for N transactions.
+    auto wd = btc::coin::TemplateBuilder::build_template(chain_, mempool_, is_testnet_);
+    if (!wd || wd->m_hashes.empty()) return {};
+
+    // wd->m_hashes[0] is the coinbase placeholder — the actual coinbase
+    // hash doesn't matter for branch computation since the miner provides
+    // their own coinbase. We only need the structure.
+    std::vector<uint256> level = wd->m_hashes;
+    std::vector<std::string> branches;
+    while (level.size() > 1) {
+        // Right-sibling of the left-most node = level[1].
+        branches.push_back(level[1].GetHex());
+
+        // Ascend: place a placeholder for the next-level coinbase combo,
+        // then hash subsequent pairs (duplicate last on odd count).
+        std::vector<uint256> next;
+        next.reserve((level.size() + 2) / 2);
+        next.push_back(uint256::ZERO);  // placeholder for combo of (cb, level[1])
+        for (size_t i = 2; i < level.size(); i += 2) {
+            const uint256& l = level[i];
+            const uint256& r = (i + 1 < level.size()) ? level[i + 1] : level[i];
+            next.push_back(btc::coin::merkle_hash_pair(l, r));
+        }
+        level = std::move(next);
+    }
+    return branches;
 }
 
 std::pair<std::string, std::string> BTCWorkSource::get_coinbase_parts() const
