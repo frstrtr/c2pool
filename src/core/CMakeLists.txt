@@ -30,6 +30,7 @@ set(source
     addr_store.hpp addr_store.cpp
     web_server.hpp web_server.cpp
     stratum_server.hpp stratum_server.cpp
+    stratum_types.hpp
     address_utils.hpp address_utils.cpp
     leveldb_store.hpp leveldb_store.cpp
     address_validator.hpp address_validator.cpp
