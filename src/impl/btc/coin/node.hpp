@@ -87,6 +87,16 @@ public:
             m_p2p->submit_block(block);
     }
 
+    /// Submit a pre-serialized block via P2P. Used by the stratum work
+    /// source which already has the full block bytes assembled from
+    /// (header || tx_count || coinbase || tx_data) and doesn't need to
+    /// round-trip through BlockType deserialization.
+    void submit_block_p2p_raw(const std::vector<unsigned char>& block_bytes)
+    {
+        if (m_p2p)
+            m_p2p->submit_block_raw(block_bytes);
+    }
+
     bool has_p2p() const { return m_p2p != nullptr; }
 
     /// Send getheaders to drive header sync (BIP 31).

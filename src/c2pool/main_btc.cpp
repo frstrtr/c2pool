@@ -24,11 +24,13 @@
 // non-broadcaster shape suitable for B2-net smoke testing.
 
 #include <impl/btc/coin/header_chain.hpp>
+#include <impl/btc/coin/mempool.hpp>
 #include <impl/btc/coin/node.hpp>
 #include <impl/btc/coin/node_interface.hpp>
 #include <impl/btc/coin/transaction.hpp>
 #include <impl/btc/config.hpp>
 #include <impl/btc/node.hpp>
+#include <impl/btc/stratum/work_source.hpp>
 
 #include <core/coin/utxo.hpp>
 #include <core/coin/utxo_view_cache.hpp>
@@ -38,6 +40,7 @@
 #include <core/netaddress.hpp>
 #include <core/pack.hpp>
 #include <core/hash.hpp>
+#include <core/stratum_server.hpp>
 #include <btclibs/util/strencodings.h>
 
 #include <boost/asio.hpp>
@@ -81,7 +84,10 @@ static void print_usage()
         "                       127.0.0.1:48333 (testnet4)\n"
         "  --p2pool H:P    BTC p2pool peer (jtoomim/SPB v35 + protocol 3502)\n"
         "                  e.g. p2p-spb.xyz:9333\n"
-        "                  B4 scaffold: connection deferred to B4-net.\n";
+        "  --stratum [H:]P stratum TCP listener for miners (B4-stratum)\n"
+        "                  e.g. --stratum 9332           (binds 0.0.0.0:9332)\n"
+        "                       --stratum 127.0.0.1:9332 (loopback only)\n"
+        "                  Omit to disable stratum listener.\n";
 }
 
 /// BTC wire-protocol magic bytes per network (pchMessageStart).
@@ -108,6 +114,8 @@ int main(int argc, char* argv[])
     uint16_t    bitcoind_port = 0;
     std::string p2pool_host;
     uint16_t    p2pool_port   = 0;
+    std::string stratum_addr  = "0.0.0.0";  // listen all interfaces by default
+    uint16_t    stratum_port  = 0;          // 0 disables stratum; --stratum sets it
 
     for (int i = 1; i < argc; ++i)
     {
@@ -149,6 +157,20 @@ int main(int argc, char* argv[])
             }
             p2pool_host = ep.substr(0, colon);
             p2pool_port = static_cast<uint16_t>(std::stoi(ep.substr(colon + 1)));
+        }
+        else if (arg == "--stratum" && i + 1 < argc)
+        {
+            // --stratum [HOST:]PORT — bind a stratum TCP listener for miners.
+            // HOST defaults to 0.0.0.0 (all interfaces). When omitted entirely,
+            // stratum is disabled.
+            std::string ep = argv[++i];
+            auto colon = ep.find(':');
+            if (colon == std::string::npos) {
+                stratum_port = static_cast<uint16_t>(std::stoi(ep));
+            } else {
+                stratum_addr = ep.substr(0, colon);
+                stratum_port = static_cast<uint16_t>(std::stoi(ep.substr(colon + 1)));
+            }
         }
         else
         {
@@ -528,6 +550,74 @@ int main(int argc, char* argv[])
     p2p_node->start_outbound_connections();
     LOG_INFO << "[BTC] Outbound peer dialing started ("
              << config.pool()->m_bootstrap_addrs.size() << " bootstrap addrs)";
+
+    // ── B7-stratum: stratum server + BTCWorkSource (miner-facing TCP) ────
+    //
+    // Mempool is constructed unwired for the MVP — TemplateBuilder still
+    // produces valid coinbase-only templates from chain_.tip() + subsidy.
+    // Wiring bitcoind P2P inv_tx → mempool.add_tx is a follow-up phase
+    // (current LTC integration uses RPC getrawmempool which we deliberately
+    // don't have in embedded mode).
+    btc::coin::Mempool mempool;
+    mempool.set_utxo(&utxo_cache);
+
+    // submit_block_fn: bridges BTCWorkSource → coin_node.submit_block_p2p_raw
+    // + adds to B5's pending_submits map for roundtrip tracking. Lambda
+    // captures by reference so it reuses the existing B5 infrastructure
+    // instead of duplicating it.
+    auto stratum_submit_fn = [&coin_node, pending_mu, pending_submits]
+        (const std::vector<unsigned char>& block_bytes, uint32_t height)
+    {
+        // Compute block_hash for pending_submits tracking. BTC block_hash =
+        // SHA256d of the first 80 bytes (the header).
+        if (block_bytes.size() < 80) {
+            LOG_WARNING << "[BTC-STRATUM-BLOCK] block bytes too short ("
+                        << block_bytes.size() << " < 80) — not submitting";
+            return;
+        }
+        uint256 block_hash = Hash(std::span<const unsigned char>(block_bytes.data(), 80));
+        {
+            std::lock_guard<std::mutex> lk(*pending_mu);
+            (*pending_submits)[block_hash] = {
+                std::chrono::steady_clock::now(), height
+            };
+        }
+        LOG_INFO << "[BTC-SUBMIT] sending block " << block_hash.GetHex().substr(0, 16)
+                 << " height=" << height << " (via stratum)";
+        coin_node.submit_block_p2p_raw(block_bytes);
+    };
+
+    // Construct the work source. Holds non-owning refs to chain + mempool;
+    // both outlive it (stack-scoped main() lifetime).
+    auto work_source = std::make_shared<btc::stratum::BTCWorkSource>(
+        header_chain, mempool, testnet, std::move(stratum_submit_fn));
+
+    // Bump work-generation counter on every chain tip change. The stratum
+    // server uses this to detect stale work between job-push timer firings
+    // without snapshotting full template state.
+    coin_node.new_headers.subscribe(
+        [work_source](const std::vector<btc::coin::BlockHeaderType>&)
+        { work_source->bump_work_generation(); });
+    coin_node.full_block.subscribe(
+        [work_source](const btc::coin::BlockType&)
+        { work_source->bump_work_generation(); });
+
+    std::unique_ptr<core::StratumServer> stratum_server;
+    if (stratum_port != 0) {
+        stratum_server = std::make_unique<core::StratumServer>(
+            ioc, stratum_addr, stratum_port, work_source);
+        if (stratum_server->start()) {
+            LOG_INFO << "[BTC-STRATUM] listening on " << stratum_addr << ":" << stratum_port
+                     << " (work source: BTCWorkSource, share v35, MVP — c2pool"
+                     << " sharechain payouts deferred)";
+        } else {
+            LOG_WARNING << "[BTC-STRATUM] failed to bind " << stratum_addr << ":" << stratum_port
+                        << " — stratum disabled";
+            stratum_server.reset();
+        }
+    } else {
+        LOG_INFO << "[BTC-STRATUM] disabled (no --stratum flag)";
+    }
 
     LOG_INFO << "[BTC] io_context running. Ctrl-C to stop.";
     ioc.run();
