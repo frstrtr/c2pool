@@ -111,6 +111,7 @@ target_link_libraries(c2pool-btc
     core
     ltc
     btc
+    btc_stratum
     nlohmann_json::nlohmann_json
     ${Boost_LIBRARIES}
 )
