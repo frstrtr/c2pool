@@ -661,6 +661,17 @@ int main(int argc, char* argv[])
 
     auto* p2p_node_raw = p2p_node.get();  // captured by reference into lambdas
 
+    // Wire best-share lookup: BTCWorkSource asks via this fn to determine
+    // prev_share_hash for new jobs. Returns the sharechain tip the local
+    // node has built up to. Empty (uint256::ZERO) on cold start; the
+    // ref_hash callback then falls into its genesis branch — that ref_hash
+    // won't match peers, but it's the right answer pre-bootstrap.
+    work_source->set_best_share_hash_fn(
+        [p2p_node_raw]() -> uint256 {
+            if (!p2p_node_raw) return uint256::ZERO;
+            return p2p_node_raw->best_share_hash();
+        });
+
     work_source->set_donation_script(
         btc::PoolConfig::get_donation_script(/*share_version*/ 35));
 
@@ -695,29 +706,26 @@ int main(int argc, char* argv[])
                        uint64_t subsidy, uint32_t bits, uint32_t timestamp)
         -> std::pair<uint256, uint64_t>
         {
-            // Build RefHashParams for v35. SOPHISTICATED STUB: tracker-walked
-            // fields (absheight, abswork, far_share_hash, share_nonce) get
-            // placeholder values. These need to be derived by walking back
-            // from prev_share_hash in the share tracker — TODO Phase 8d+.
+            // RefHashParams for v35 with tracker-walked share-chain fields.
+            // Mirrors LTC's c2pool_refactored.cpp:4460-4520 logic, simplified
+            // for v35 (no merged_addresses / merged_payout_hash / desired
+            // _target vardiff dance — we use the bits passed in by the work
+            // source which derives them from the GBT template).
             btc::RefHashParams p;
             p.share_version       = 35;
             p.prev_share          = prev_share_hash;
             p.coinbase_scriptSig  = scriptSig;
-            p.share_nonce         = 0;
+            p.share_nonce         = 0;             // matches LTC line 4281
             p.subsidy             = subsidy;
             p.donation            = 50;            // 0.5% (matches finder fee)
             p.stale_info          = 0;
             p.desired_version     = 35;
-            p.has_segwit          = false;
+            p.has_segwit          = false;         // TODO Phase 8c+: detect from rules
             p.bits                = bits;
             p.timestamp           = timestamp;
-            p.max_bits            = bits;          // SIMPLIFIED — same as bits for now
-            p.absheight           = 0;             // TODO: walk tracker from prev_share
-            p.abswork             = uint128(0);    // TODO: walk tracker
-            p.far_share_hash      = prev_share_hash;  // TODO: ~99 shares back
+            p.max_bits            = bits;          // v35 stub: same as bits
 
-            // Heuristic v35 pubkey extract: P2PK is 0x41 + 65B pubkey + 0xac;
-            // P2PKH is 0x76 0xa9 0x14 + 20B hash + 0x88 0xac. Try P2PKH first.
+            // Heuristic v35 pubkey extract: P2PKH is 0x76 0xa9 0x14 + 20B + 0x88 0xac.
             if (payout_script.size() == 25 && payout_script[0] == 0x76 &&
                 payout_script[1] == 0xa9 && payout_script[2] == 0x14 &&
                 payout_script[23] == 0x88 && payout_script[24] == 0xac)
@@ -725,11 +733,68 @@ int main(int argc, char* argv[])
                 std::memcpy(p.pubkey_hash.begin(), payout_script.data() + 3, 20);
                 p.pubkey_type = 0;
             }
-            // Else leave pubkey_hash zeroed — v35 may use the address string.
+            // Bech32 P2WSH/P2WPKH: leave pubkey_hash zeroed for now (TODO).
 
-            // Touch p2p_node_raw to keep capture from being optimized away
-            // when we wire real tracker walks here.
-            (void)p2p_node_raw;
+            // ── Walk the share tracker for chain-position fields ──────────
+            //
+            // This is the critical path from "ref_hash never matches network
+            // expectations" → "ref_hash matches IF prev_share is one our peers
+            // also have". The 4 fields below (timestamp clip, absheight,
+            // abswork, far_share_hash) are deterministically derived from the
+            // chain — every node walking the same share chain MUST produce
+            // the same values, otherwise their ref_hash diverges and shares
+            // get rejected as invalid.
+            if (p2p_node_raw && !prev_share_hash.IsNull()) {
+                auto guard = p2p_node_raw->read_tracker();
+                if (guard && guard->chain.contains(prev_share_hash)) {
+                    auto& tracker = *guard;
+
+                    // 1. absheight + timestamp clip (must be > prev's timestamp)
+                    tracker.chain.get(prev_share_hash).share.invoke([&](auto* prev) {
+                        p.absheight = prev->m_absheight + 1;
+                        if (p.timestamp <= prev->m_timestamp)
+                            p.timestamp = prev->m_timestamp + 1;
+                    });
+
+                    // 2. abswork = prev_abswork + work-of-this-share-at-bits
+                    tracker.chain.get(prev_share_hash).share.invoke([&](auto* prev) {
+                        auto attempts = chain::target_to_average_attempts(
+                            chain::bits_to_target(p.bits));
+                        p.abswork = prev->m_abswork + uint128(attempts.GetLow64());
+                    });
+
+                    // 3. far_share_hash = 99th ancestor of prev_share (matches
+                    //    p2pool data.py get_nth_parent_hash(prev, 99))
+                    auto [prev_height, _last] = tracker.chain.get_height_and_last(prev_share_hash);
+                    if (prev_height >= 99) {
+                        try {
+                            p.far_share_hash = tracker.chain.get_nth_parent_key(prev_share_hash, 99);
+                        } catch (const std::exception&) {
+                            p.far_share_hash = uint256::ZERO;
+                        }
+                    } else {
+                        // Chain too short (cold-start, fragmented) — no 99th ancestor.
+                        // Matches LTC reference at c2pool_refactored.cpp:4498.
+                        p.far_share_hash = uint256::ZERO;
+                    }
+                } else {
+                    // Tracker busy OR prev_share unknown to us — we'll still
+                    // compute a ref_hash, but it'll be a "genesis-like" walk
+                    // that almost certainly won't match peers. The work source
+                    // logs this separately; here we just fall through with
+                    // genesis defaults below.
+                    p.absheight       = 1;
+                    p.abswork         = uint128(chain::target_to_average_attempts(
+                        chain::bits_to_target(p.bits)).GetLow64());
+                    p.far_share_hash  = uint256::ZERO;
+                }
+            } else {
+                // No prev_share (genesis case) — matches LTC line 4516-4519.
+                p.absheight       = 1;
+                p.abswork         = uint128(chain::target_to_average_attempts(
+                    chain::bits_to_target(p.bits)).GetLow64());
+                p.far_share_hash  = uint256::ZERO;
+            }
 
             try {
                 return btc::compute_ref_hash_for_work(p);
@@ -741,7 +806,7 @@ int main(int argc, char* argv[])
 
     LOG_INFO << "[BTC-STRATUM] PPLNS + ref_hash callbacks wired"
              << " (donation_script=" << btc::PoolConfig::get_donation_script(35).size()
-             << "B P2PK; ref_hash uses sophisticated-stub for tracker-walked fields)";
+             << "B P2PK; ref_hash walks share tracker for absheight/abswork/far_share)";
 
     // Bump work-generation counter on every chain tip change. The stratum
     // server uses this to detect stale work between job-push timer firings
