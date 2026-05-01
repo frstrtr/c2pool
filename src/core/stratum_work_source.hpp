@@ -61,9 +61,11 @@ public:
     virtual std::function<uint256()> get_best_share_hash_fn() const = 0;
 
     /// Current GBT-format previousblockhash (the BTC/LTC tip the pool is
-    /// mining on top of). Used as a fallback when the best-share fn is
-    /// unset and as the basis for `clean_jobs` detection.
-    virtual uint256 get_current_gbt_prevhash() const = 0;
+    /// mining on top of), in BE display-hex form (matches what miners
+    /// receive in `mining.notify`'s prevhash field). Used as a fallback
+    /// when the best-share fn is unset and as the basis for `clean_jobs`
+    /// detection.
+    virtual std::string get_current_gbt_prevhash() const = 0;
 
     /// Monotonic counter that bumps on every template refresh. The server
     /// uses it to detect stale work between job-push timer firings without
