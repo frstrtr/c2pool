@@ -346,23 +346,56 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
         }
     }
 
-    // v35 finder fee: 0.5% of subsidy goes to the share-finder (this miner),
-    // deducted from donation. Reference: c2pool_refactored.cpp wiring +
-    // share_tracker.hpp v35 PPLNS docs ("amounts WITHOUT finder fee — caller
-    // adds subsidy/200 to the share creator's script").
-    if (!payouts.empty() && coinbasevalue > 0) {
-        const double finder_fee = static_cast<double>(coinbasevalue) / 200.0;
-        payouts[payout_script] += finder_fee;
-        if (!donation_script.empty()) {
-            auto it = payouts.find(donation_script);
-            if (it != payouts.end()) {
-                it->second = std::max(0.0, it->second - finder_fee);
+    // Drop any empty-script entries from the PPLNS map BEFORE applying the
+    // finder fee. Empty payout_script means the share's miner had an
+    // unrecognized/unsupported address (e.g. bech32 P2WSH that the stratum
+    // address validator couldn't decode). Their sats would otherwise become
+    // an unspendable 0-script output in the coinbase. Drop them — the value
+    // flows back to the donation residual via the post-PPLNS rebalance below.
+    {
+        size_t dropped_n = 0;
+        uint64_t dropped_value = 0;
+        for (auto it = payouts.begin(); it != payouts.end(); ) {
+            if (it->first.empty()) {
+                dropped_n++;
+                dropped_value += static_cast<uint64_t>(it->second);
+                it = payouts.erase(it);
+            } else {
+                ++it;
             }
+        }
+        if (dropped_n > 0) {
+            LOG_INFO << "[BTC-STRATUM] PPLNS: dropped " << dropped_n
+                     << " empty-script entries (" << dropped_value
+                     << " sats reabsorbed to donation)";
+            // Reabsorb the dropped value into donation so total payouts == subsidy.
+            if (!donation_script.empty())
+                payouts[donation_script] += static_cast<double>(dropped_value);
         }
     }
 
-    // Degraded fallback: full subsidy → miner.
-    if (payouts.empty()) {
+    // v35 finder fee: 0.5% of subsidy goes to the share-finder (this miner),
+    // deducted from donation. Reference: c2pool_refactored.cpp wiring +
+    // share_tracker.hpp v35 PPLNS docs ("amounts WITHOUT finder fee — caller
+    // adds subsidy/200 to the share creator's script"). Conditional on having
+    // a non-empty payout_script — otherwise we'd reintroduce the empty-output
+    // bug we just filtered. And the deduction-from-donation must succeed
+    // (donation must hold ≥ finder_fee), else we'd inflate total > subsidy.
+    if (!payouts.empty() && coinbasevalue > 0 && !payout_script.empty()) {
+        const double finder_fee = static_cast<double>(coinbasevalue) / 200.0;
+        if (!donation_script.empty()) {
+            auto it = payouts.find(donation_script);
+            if (it != payouts.end() && it->second >= finder_fee) {
+                it->second   -= finder_fee;
+                payouts[payout_script] += finder_fee;
+            }
+            // else: donation can't cover the fee — skip silently. Total stays
+            // at subsidy (per get_v35_expected_payouts post-condition).
+        }
+    }
+
+    // Degraded fallback: full subsidy → miner (only if miner address is OK).
+    if (payouts.empty() && !payout_script.empty()) {
         payouts[payout_script] = static_cast<double>(coinbasevalue);
     }
 
@@ -372,6 +405,8 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
     for (const auto& [script, amount_d] : payouts) {
         // Round to satoshi. Anything < 1 sat is dust — drop it (matches
         // Bitcoin Core dust-out-policy + LTC payout manager behaviour).
+        // Empty scripts already filtered above but defense-in-depth.
+        if (script.empty()) continue;
         const uint64_t amount = static_cast<uint64_t>(amount_d);
         if (amount > 0)
             outputs.emplace_back(script, amount);
