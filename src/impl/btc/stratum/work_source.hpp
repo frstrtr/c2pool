@@ -164,6 +164,15 @@ public:
     uint32_t get_share_bits() const override     { return share_bits_.load(); }
     uint32_t get_share_max_bits() const override { return share_max_bits_.load(); }
 
+    // ── IWorkSource: per-coin PoW (BTC = SHA256d) ────────────────────────
+    double compute_share_difficulty(
+        const std::string& coinb1, const std::string& coinb2,
+        const std::string& extranonce1, const std::string& extranonce2,
+        const std::string& ntime, const std::string& nonce,
+        uint32_t version, const std::string& prevhash_hex,
+        const std::string& nbits_hex,
+        const std::vector<std::string>& merkle_branches) const override;
+
     // ── BTC-specific control surface (called from main_btc.cpp) ──────────
 
     /// Increment work_generation. Called when the bitcoind tip moves

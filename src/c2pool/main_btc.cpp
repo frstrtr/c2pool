@@ -969,6 +969,17 @@ int main(int argc, char* argv[])
     LOG_INFO << "[BTC-STRATUM] sharechain write path wired (mining_submit"
              << " → create_local_share → broadcast_share + notify_local_share)";
 
+    // Initial share-target: 0x1d00ffff = "diff 1" (smallest difficulty
+    // bitcoin allows in compact form). At ~1.7 TH/s of bitaxe SHA256d
+    // hashrate, that's ~400 shares/second across the fleet — plenty for
+    // exercising the create_share path. The c2pool sharechain's actual
+    // target floats with chain difficulty, but for first-light testing
+    // a fixed low diff is the simplest path. TODO Phase 12: drive
+    // set_share_target from compute_share_target on each new tip.
+    work_source->set_share_target(/*bits*/ 0x1d00ffff, /*max_bits*/ 0x1f0fffff);
+    LOG_INFO << "[BTC-STRATUM] initial share target: bits=0x1d00ffff (diff 1)"
+             << " max_bits=0x1f0fffff — fixed for first-light bitaxe testing";
+
     // Bump work-generation counter on every chain tip change. The stratum
     // server uses this to detect stale work between job-push timer firings
     // without snapshotting full template state.
