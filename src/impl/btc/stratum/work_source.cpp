@@ -20,6 +20,7 @@
 #include <core/address_utils.hpp>               // address_to_script (for share write path)
 #include <core/hash.hpp>
 #include <core/log.hpp>
+#include <core/target_utils.hpp>                // chain::target_to_difficulty
 #include <btclibs/util/strencodings.h>          // HexStr, ParseHex
 
 #include <cstdio>
@@ -249,7 +250,14 @@ std::vector<std::string> BTCWorkSource::get_stratum_merkle_branches() const
     std::vector<std::string> branches;
     while (level.size() > 1) {
         // Right-sibling of the left-most node = level[1].
-        branches.push_back(level[1].GetHex());
+        // Wire encoding: hex of LE-internal bytes (NOT GetHex() which is
+        // BE display). Matches cgminer convention + LTC's working
+        // compute_merkle_branches (web_server.cpp:1299). The miner does
+        // hex2bin on this string and uses bytes directly in SHA256d, so
+        // the bytes on the wire MUST be the same LE-internal bytes the
+        // pool used to build the merkle tree. GetHex() reverses them and
+        // produces a totally different merkle root in the miner's view.
+        branches.push_back(HexStr(std::span<const unsigned char>(level[1].data(), 32)));
 
         // Ascend: place a placeholder for the next-level coinbase combo,
         // then hash subsequent pairs (duplicate last on odd count).
@@ -590,7 +598,9 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
 
     auto branches = get_stratum_merkle_branches();
     for (const auto& h : branches) {
-        uint256 b; b.SetHex(h.c_str());
+        uint256 b;
+        auto bb = ParseHex(h);
+        if (bb.size() == 32) std::memcpy(b.begin(), bb.data(), 32);
         snap.frozen_ref.frozen_merkle_branches.push_back(b);
     }
     auto txs_field = wd->m_data.find("transactions");
@@ -654,11 +664,14 @@ nlohmann::json BTCWorkSource::mining_submit(
 
     uint256 coinbase_txid = Hash(std::span<const uint8_t>(coinbase.data(), coinbase.size()));
 
-    // Ascend the stratum merkle branches.
+    // Ascend the stratum merkle branches. Branches are wire-formatted as
+    // LE-internal bytes (see get_stratum_merkle_branches comment) — must
+    // be parsed with ParseHex+memcpy, NOT SetHex (which reverses bytes).
     uint256 merkle_root = coinbase_txid;
     for (const auto& branch_hex : job->merkle_branches) {
         uint256 b;
-        b.SetHex(branch_hex.c_str());
+        auto bb = ParseHex(branch_hex);
+        if (bb.size() == 32) std::memcpy(b.begin(), bb.data(), 32);
         merkle_root = btc::coin::merkle_hash_pair(merkle_root, b);
     }
 
@@ -682,9 +695,21 @@ nlohmann::json BTCWorkSource::mining_submit(
 
     uint256 pow_hash = Hash(std::span<const uint8_t>(header.data(), header.size()));
 
-    // Decode share target (compact bits in header) and block target.
+    // Decode share target (separate from block target — pre-this-fix we
+    // were comparing pow_hash against block target which is network
+    // difficulty, so every share got rejected as low-diff. The miner
+    // submits when their hash beats the per-session set_difficulty
+    // target; we validate against the per-job share_bits (compact form
+    // set by IWorkSource via get_share_bits()).
     uint256 share_target;
-    share_target.SetCompact(parse_be_hex_u32(job->nbits));
+    if (job->share_bits != 0) {
+        share_target.SetCompact(job->share_bits);
+    } else {
+        // Fallback for jobs frozen before share_bits was set — be
+        // permissive: use the loosest possible target so PoW classifier
+        // doesn't silently reject everything.
+        share_target.SetCompact(/*diff 1*/ 0x1d00ffff);
+    }
 
     uint256 block_target;
     block_target.SetCompact(parse_be_hex_u32(
@@ -858,6 +883,110 @@ void BTCWorkSource::set_create_share_fn(CreateShareFn fn)
 {
     std::lock_guard<std::mutex> lk(callback_mutex_);
     create_share_fn_ = std::move(fn);
+}
+
+double BTCWorkSource::compute_share_difficulty(
+    const std::string& coinb1, const std::string& coinb2,
+    const std::string& extranonce1, const std::string& extranonce2,
+    const std::string& ntime, const std::string& nonce,
+    uint32_t version, const std::string& prevhash_hex,
+    const std::string& nbits_hex,
+    const std::vector<std::string>& merkle_branches) const
+{
+    // Mirror of MiningInterface::calculate_share_difficulty (web_server.cpp)
+    // but with SHA256d instead of scrypt for the PoW step. This is the
+    // function whose return value gates pseudoshare acceptance in
+    // stratum_server.cpp's handle_submit — getting this wrong (falling
+    // back to LTC's scrypt) makes EVERY BTC submission look like garbage
+    // diff and reject at the vardiff gate. Bitaxe testing 2026-05-01.
+
+    // Reconstruct full coinbase: coinb1 || en1 || en2 || coinb2
+    auto coinb1_bytes = ParseHex(coinb1);
+    auto en1_bytes    = ParseHex(extranonce1);
+    auto en2_bytes    = ParseHex(extranonce2);
+    auto coinb2_bytes = ParseHex(coinb2);
+    std::vector<uint8_t> coinbase;
+    coinbase.reserve(coinb1_bytes.size() + en1_bytes.size()
+                   + en2_bytes.size() + coinb2_bytes.size());
+    coinbase.insert(coinbase.end(), coinb1_bytes.begin(), coinb1_bytes.end());
+    coinbase.insert(coinbase.end(), en1_bytes.begin(),    en1_bytes.end());
+    coinbase.insert(coinbase.end(), en2_bytes.begin(),    en2_bytes.end());
+    coinbase.insert(coinbase.end(), coinb2_bytes.begin(), coinb2_bytes.end());
+    uint256 coinbase_txid = Hash(std::span<const uint8_t>(coinbase.data(), coinbase.size()));
+
+    // Ascend stratum merkle branches. Branches are wire-formatted as LE
+    // internal byte order (despite looking like BE display hex) — the
+    // miner does `hex2bin` and feeds bytes directly into SHA256d.  Match
+    // LTC's reconstruct_merkle_root (web_server.cpp:1330) which parses
+    // via ParseHex + memcpy, NOT SetHex (which would reverse bytes and
+    // produce a totally different merkle root than the miner computed).
+    uint256 merkle_root = coinbase_txid;
+    for (const auto& bhex : merkle_branches) {
+        uint256 b;
+        auto bb = ParseHex(bhex);
+        if (bb.size() == 32) std::memcpy(b.begin(), bb.data(), 32);
+        merkle_root = btc::coin::merkle_hash_pair(merkle_root, b);
+    }
+
+    // Build 80-byte header. prevhash arrives as BE display hex; reverse
+    // to LE for header bytes.
+    auto prevhash_be = ParseHex(prevhash_hex);
+    std::vector<uint8_t> prevhash_le(prevhash_be.rbegin(), prevhash_be.rend());
+
+    std::vector<uint8_t> header;
+    header.reserve(80);
+    push_u32_le(header, version);
+    header.insert(header.end(), prevhash_le.begin(), prevhash_le.end());
+    header.insert(header.end(), merkle_root.data(), merkle_root.data() + 32);
+    push_u32_le(header, parse_be_hex_u32(ntime));
+    push_u32_le(header, parse_be_hex_u32(nbits_hex));
+    push_u32_le(header, parse_be_hex_u32(nonce));
+    if (header.size() != 80) return 0.0;
+
+    // SHA256d the header → pow_hash
+    uint256 pow_hash = Hash(std::span<const uint8_t>(header.data(), header.size()));
+
+    // diff = max_target / pow_hash (max_target = bitcoin diff-1 target)
+    if (pow_hash.IsNull()) return 0.0;
+    double diff = chain::target_to_difficulty(pow_hash);
+
+    // Diagnostic — only first 5 to avoid spam. Detailed dump so we can
+    // reproduce the bitaxe's expected hash off-line and pinpoint the
+    // header-reconstruction bug (coinbase txid? merkle ascent? prevhash
+    // byte-order? version-rolling convention?).
+    {
+        static std::atomic<int> diag{0};
+        if (diag.fetch_add(1) < 5) {
+            static const char* HX = "0123456789abcdef";
+            auto to_hex = [&](const std::vector<uint8_t>& v) {
+                std::string s; s.reserve(v.size()*2);
+                for (auto b : v) { s += HX[b>>4]; s += HX[b&0xf]; }
+                return s;
+            };
+            std::string hdr_hex; for (auto b : header) { hdr_hex += HX[b>>4]; hdr_hex += HX[b&0xf]; }
+            LOG_INFO << "[BTC-DIFF] hdr=" << hdr_hex
+                     << " pow=" << pow_hash.GetHex().substr(0,16)
+                     << " diff=" << diff
+                     << " ver=" << version << " ntime=" << ntime
+                     << " nbits=" << nbits_hex << " nonce=" << nonce
+                     << " en2=" << extranonce2;
+            LOG_INFO << "[BTC-DIFF-CB] coinb1=" << coinb1
+                     << " en1=" << extranonce1
+                     << " en2=" << extranonce2
+                     << " coinb2=" << coinb2;
+            LOG_INFO << "[BTC-DIFF-CB] coinbase_full=" << to_hex(coinbase)
+                     << " coinbase_txid_LE=" << HexStr(std::span<const uint8_t>(coinbase_txid.data(), 32))
+                     << " coinbase_txid_BE=" << coinbase_txid.GetHex();
+            for (size_t i = 0; i < merkle_branches.size(); ++i) {
+                LOG_INFO << "[BTC-DIFF-MR] step=" << i
+                         << " branch=" << merkle_branches[i];
+            }
+            LOG_INFO << "[BTC-DIFF-MR] merkle_root_LE="
+                     << HexStr(std::span<const uint8_t>(merkle_root.data(), 32))
+                     << " prevhash_in=" << prevhash_hex;
+        }
+    }
+    return diff;
 }
 
 void BTCWorkSource::set_donation_script(std::vector<unsigned char> script)

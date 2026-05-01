@@ -157,6 +157,25 @@ public:
     /// at the moment. Used to validate stale jobs and detect retarget
     /// transitions.
     virtual uint32_t get_share_max_bits() const = 0;
+
+    /// Compute the share difficulty for a stratum submission. The
+    /// per-coin PoW hash function (scrypt for LTC, SHA256d for BTC,
+    /// X11/Quark/etc. for future ports) is encapsulated here — the
+    /// stratum server invokes this rather than calling a hardcoded
+    /// scrypt function. The returned difficulty is "diff 1 / pow_hash"
+    /// in standard Bitcoin convention. Returns 0.0 on parse error.
+    ///
+    /// Without this, a coin-agnostic stratum server can't validate
+    /// pseudoshares from miners using a different PoW than the
+    /// implementor's default — every submission gets garbage diff and
+    /// rejects at the vardiff gate.
+    virtual double compute_share_difficulty(
+        const std::string& coinb1, const std::string& coinb2,
+        const std::string& extranonce1, const std::string& extranonce2,
+        const std::string& ntime, const std::string& nonce,
+        uint32_t version, const std::string& prevhash_hex,
+        const std::string& nbits_hex,
+        const std::vector<std::string>& merkle_branches) const = 0;
 };
 
 }  // namespace core::stratum

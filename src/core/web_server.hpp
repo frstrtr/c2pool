@@ -350,6 +350,22 @@ public:
         const std::string& nbits_hex,
         const std::vector<std::string>& merkle_branches);
 
+    /// IWorkSource virtual override: LTC uses scrypt, so delegate to the
+    /// existing scrypt-based static `calculate_share_difficulty` directly.
+    /// (BTC's BTCWorkSource overrides with a SHA256d implementation.)
+    double compute_share_difficulty(
+        const std::string& coinb1, const std::string& coinb2,
+        const std::string& extranonce1, const std::string& extranonce2,
+        const std::string& ntime, const std::string& nonce,
+        uint32_t version, const std::string& prevhash_hex,
+        const std::string& nbits_hex,
+        const std::vector<std::string>& merkle_branches) const override
+    {
+        return calculate_share_difficulty(coinb1, coinb2, extranonce1, extranonce2,
+                                          ntime, nonce, version, prevhash_hex,
+                                          nbits_hex, merkle_branches);
+    }
+
     // Hook: returns the best share hash from the share tracker (for prev_hash wiring)
     void set_best_share_hash_fn(std::function<uint256()> fn) { m_best_share_hash_fn = thread_safe_wrap(std::move(fn)); }
     std::function<uint256()> get_best_share_hash_fn() const override { return m_best_share_hash_fn; }

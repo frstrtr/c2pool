@@ -944,8 +944,20 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
                 response["error"] = nlohmann::json::array({20, "Invalid version mask", nullptr});
                 return response;
             }
-            // Apply: keep non-rolling bits from job, take rolling bits from miner
-            effective_version = (job.version & ~version_rolling_mask_) | (miner_version_bits & version_rolling_mask_);
+            // BIP 320: version_bits is the XOR-difference between the miner's
+            // rolled version and the job version (per spec: "bits set by miner
+            // to be different from version field given by mining.notify").
+            // Recovery: effective = job ^ version_bits.  ESP-Miner / bitaxe
+            // firmware sends version_bits this way (asic_result_task.c:60:
+            // `version_bits = rolled_version ^ active_job->version`). Earlier
+            // mask check ensures version_bits flips only mask-bits, so XOR
+            // only modifies the negotiated bits.
+            //
+            // Old REPLACE convention `(job & ~mask) | (bits & mask)` silently
+            // zeroed any job-version bits in the mask region (e.g. BIP 9
+            // signal bits) before OR'ing — produced a header version that
+            // bitaxe never hashed, every share rejected at vardiff gate.
+            effective_version = job.version ^ miner_version_bits;
         } catch (...) {
             LOG_WARNING << "[Stratum] Invalid version_bits hex from " << username_ << ": " << version_bits;
         }
@@ -953,7 +965,12 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
 
     // Use gbt_prevhash (BE display hex) — SetHex converts to LE internal,
     // matching build_block_from_stratum which the daemon accepts.
-    double share_difficulty = MiningInterface::calculate_share_difficulty(
+    // Per-coin PoW dispatch via IWorkSource virtual: LTC delegates to the
+    // existing static scrypt-based calculate_share_difficulty; BTC's
+    // BTCWorkSource implements this with SHA256d. Without this dispatch
+    // every BTC stratum submission gets a garbage scrypt-based diff and
+    // rejects at the vardiff gate.
+    double share_difficulty = mining_interface_->compute_share_difficulty(
         job.coinb1, job.coinb2,
         extranonce1_, extranonce2, ntime, nonce,
         effective_version, job.gbt_prevhash, job.nbits, job.merkle_branches);
