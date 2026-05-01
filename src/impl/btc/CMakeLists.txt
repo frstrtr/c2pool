@@ -1,4 +1,5 @@
 add_subdirectory(coin)
+add_subdirectory(stratum)
 
 add_library(btc
     config_coin.hpp config_coin.cpp config_pool.hpp config_pool.cpp config.hpp
