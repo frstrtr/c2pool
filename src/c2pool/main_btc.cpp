@@ -895,10 +895,16 @@ int main(int argc, char* argv[])
             BaseScript coinbase_bs(std::vector<unsigned char>(
                 full_coinbase.begin(), full_coinbase.end()));
 
+            // Wire format for stratum branches is hex of LE-internal bytes
+            // (see get_stratum_merkle_branches).  Parse via ParseHex+memcpy
+            // — SetHex would reverse, producing uint256s that don't match
+            // the bytes the miner already used to build their merkle root.
             std::vector<uint256> merkle_branches;
             merkle_branches.reserve(job.merkle_branches.size());
             for (const auto& bhex : job.merkle_branches) {
-                uint256 b; b.SetHex(bhex.c_str());
+                uint256 b;
+                auto bb = ParseHex(bhex);
+                if (bb.size() == 32) std::memcpy(b.begin(), bb.data(), 32);
                 merkle_branches.push_back(b);
             }
 
