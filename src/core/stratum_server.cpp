@@ -62,7 +62,7 @@ RateMonitor::get_datums_in_last(double dt) const {
 /// Static member definition
 std::atomic<uint64_t> StratumSession::job_counter_{0};
 
-StratumServer::StratumServer(net::io_context& ioc, const std::string& address, uint16_t port, std::shared_ptr<MiningInterface> mining_interface)
+StratumServer::StratumServer(net::io_context& ioc, const std::string& address, uint16_t port, std::shared_ptr<IWorkSource> mining_interface)
     : ioc_(ioc)
     , acceptor_(ioc)
     , mining_interface_(mining_interface)
@@ -275,7 +275,7 @@ void StratumServer::notify_all()
 }
 
 /// StratumSession Implementation
-StratumSession::StratumSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface,
+StratumSession::StratumSession(tcp::socket socket, std::shared_ptr<IWorkSource> mining_interface,
                                StratumServer* server)
     : socket_(std::move(socket))
     , mining_interface_(mining_interface)
@@ -937,7 +937,7 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
 
     // Pool share difficulty (for P2P share creation threshold)
     double pool_difficulty = 0.0;
-    uint32_t sb = mining_interface_->m_share_bits.load();
+    uint32_t sb = mining_interface_->get_share_bits();
     if (sb != 0)
         pool_difficulty = chain::target_to_difficulty(chain::bits_to_target(sb));
 
@@ -975,8 +975,8 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     snapshot.subsidy         = job.subsidy;
     snapshot.witness_commitment_hex = job.witness_commitment_hex;
     snapshot.witness_root            = job.witness_root;
-    snapshot.share_bits      = mining_interface_->m_share_bits.load();
-    snapshot.share_max_bits  = mining_interface_->m_share_max_bits.load();
+    snapshot.share_bits      = mining_interface_->get_share_bits();
+    snapshot.share_max_bits  = mining_interface_->get_share_max_bits();
     // Pass frozen share fields through to ShareCreationParams
     snapshot.frozen_ref.absheight = job.frozen_absheight;
     snapshot.frozen_ref.abswork = job.frozen_abswork;

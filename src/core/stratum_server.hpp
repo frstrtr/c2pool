@@ -20,6 +20,7 @@
 
 #include <core/log.hpp>
 #include <core/uint256.hpp>
+#include <core/stratum_work_source.hpp>
 #include <c2pool/hashrate/tracker.hpp>
 
 namespace core {
@@ -27,8 +28,10 @@ namespace core {
 namespace net = boost::asio;
 using tcp = net::ip::tcp;
 
-// Forward declaration — defined in web_server.hpp
-class MiningInterface;
+// IWorkSource is the abstract interface stratum_server holds (defined in
+// core/stratum_work_source.hpp). LTC's MiningInterface and BTC's
+// btc::stratum::BTCWorkSource both implement it.
+using IWorkSource = core::stratum::IWorkSource;
 
 /// Sliding-window rate monitor matching p2pool's util.math.RateMonitor.
 /// Records timestamped work datums for smooth hashrate estimation.
@@ -89,7 +92,7 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
     boost::asio::streambuf buffer_;
     std::deque<std::string> write_queue_;  // async write queue (non-blocking)
     bool writing_ = false;                 // true while an async_write is in flight
-    std::shared_ptr<MiningInterface> mining_interface_;
+    std::shared_ptr<IWorkSource> mining_interface_;
     StratumServer* server_ = nullptr;  // back-pointer for RateMonitor recording
     std::string subscription_id_;
     std::string extranonce1_;
@@ -173,7 +176,7 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
     boost::asio::steady_timer work_push_timer_;
 
 public:
-    explicit StratumSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface,
+    explicit StratumSession(tcp::socket socket, std::shared_ptr<IWorkSource> mining_interface,
                             StratumServer* server = nullptr);
     void start();
 
@@ -220,7 +223,7 @@ class StratumServer
 {
     net::io_context& ioc_;
     tcp::acceptor acceptor_;
-    std::shared_ptr<MiningInterface> mining_interface_;
+    std::shared_ptr<IWorkSource> mining_interface_;
     std::string bind_address_;
     uint16_t port_;
     bool running_;
@@ -243,7 +246,7 @@ class StratumServer
     mutable std::mutex cache_mutex_;
 
 public:
-    StratumServer(net::io_context& ioc, const std::string& address, uint16_t port, std::shared_ptr<MiningInterface> mining_interface);
+    StratumServer(net::io_context& ioc, const std::string& address, uint16_t port, std::shared_ptr<IWorkSource> mining_interface);
     ~StratumServer();
 
     bool start();
