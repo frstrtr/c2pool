@@ -47,7 +47,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <csignal>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -59,15 +58,6 @@
 #include <vector>
 
 namespace io = boost::asio;
-
-static std::atomic<bool> g_should_stop{false};
-static io::io_context*   g_ioc = nullptr;
-
-static void handle_signal(int /*sig*/)
-{
-    g_should_stop.store(true);
-    if (g_ioc) g_ioc->stop();
-}
 
 static void print_usage()
 {
@@ -103,9 +93,6 @@ static std::vector<std::byte> btc_magic_bytes(bool testnet, bool testnet4)
 
 int main(int argc, char* argv[])
 {
-    std::signal(SIGINT,  handle_signal);
-    std::signal(SIGTERM, handle_signal);
-
     core::log::Logger::init();
 
     bool        testnet       = false;
@@ -237,7 +224,70 @@ int main(int argc, char* argv[])
     constexpr uint32_t BTC_KEEP_DEPTH = core::coin::LTC_MIN_BLOCKS_TO_KEEP;
 
     io::io_context ioc;
-    g_ioc = &ioc;
+
+    // ── Graceful shutdown via boost::asio::signal_set ─────────────────────
+    //
+    // Why not std::signal? Two reasons:
+    //   1. std::signal handlers run in the signal-delivery context, which
+    //      is async-signal-safe-only. boost::asio::io_context::stop is
+    //      thread-safe but not documented as signal-safe — calling it from
+    //      a signal handler is undefined-behaviour-adjacent.
+    //   2. Even if we get past UB, the queued asio handlers (pending reads,
+    //      timer callbacks) hold shared_ptrs to sessions; stopping ioc
+    //      drops the queue but leaves those captures alive until ioc itself
+    //      is destroyed — by which time other subsystems have started their
+    //      own RAII teardown, producing destruction-order races.
+    //
+    // signal_set runs its handler on the io_context thread, in an ordinary
+    // async callback. We use it to drive an EXPLICIT graceful shutdown:
+    // stop the stratum acceptor + close every active session FIRST (so
+    // their pending async ops are cancelled cleanly via cancel_timers),
+    // THEN call ioc.stop() to drain the rest. By the time ioc is destroyed
+    // at end-of-main, all async operations have completed via cancellation
+    // and there are no stale captures referencing torn-down state.
+    //
+    // The shutdown lambda captures by reference variables that are
+    // declared further down in this function (stratum_server, work_source,
+    // etc.) — those references resolve at *invocation* time (i.e., when
+    // SIGINT/SIGTERM arrives), by which point the variables exist. If a
+    // signal arrives before the variables are constructed (e.g., during
+    // HeaderChain::init), the signal handler will see them as nullptr/
+    // empty and the `if` guards below short-circuit safely.
+    std::shared_ptr<btc::stratum::BTCWorkSource> work_source_for_shutdown;  // populated later
+    std::unique_ptr<core::StratumServer>         stratum_server_for_shutdown;  // populated later
+    bool                                         shutdown_initiated = false;
+
+    io::signal_set signals(ioc, SIGINT, SIGTERM);
+    signals.async_wait(
+        [&ioc, &stratum_server_for_shutdown, &shutdown_initiated]
+        (const boost::system::error_code& ec, int signo) {
+            if (ec) return;
+            if (shutdown_initiated) return;
+            shutdown_initiated = true;
+
+            LOG_INFO << "[BTC] received signal " << signo
+                     << " — initiating graceful shutdown";
+
+            // 1) Stop stratum BEFORE ioc.stop() so sessions close cleanly:
+            //    StratumServer::stop() cancels the acceptor + iterates
+            //    session set, calling shutdown() on each (cancels the
+            //    work_push_timer + closes the socket). The pending
+            //    async_read_some on each session then fails with
+            //    operation_aborted, the read-error path runs, the session
+            //    self-removes from the workers map. By the time we call
+            //    ioc.stop(), no session-bound async op is left.
+            if (stratum_server_for_shutdown) {
+                stratum_server_for_shutdown->stop();
+            }
+
+            // 2) Stop the io_context. Other subsystems (sharechain peer
+            //    btc::Node, bitcoind P2P btc::coin::Node) handle their own
+            //    teardown via RAII when main() exits. They don't have
+            //    queued state that depends on this ioc (their timers/
+            //    sockets are owned by THEIR objects, destroyed in reverse
+            //    construction order before ioc itself).
+            ioc.stop();
+        });
 
     // btc::Config = core::Config<PoolConfig, CoinConfig> — composite holds
     // both the c2pool sharechain identity (PoolConfig: prefix/identifier
@@ -591,6 +641,7 @@ int main(int argc, char* argv[])
     // both outlive it (stack-scoped main() lifetime).
     auto work_source = std::make_shared<btc::stratum::BTCWorkSource>(
         header_chain, mempool, testnet, std::move(stratum_submit_fn));
+    work_source_for_shutdown = work_source;  // expose to signal handler
 
     // Bump work-generation counter on every chain tip change. The stratum
     // server uses this to detect stale work between job-push timer firings
@@ -618,9 +669,41 @@ int main(int argc, char* argv[])
     } else {
         LOG_INFO << "[BTC-STRATUM] disabled (no --stratum flag)";
     }
+    // Expose to the signal handler for graceful shutdown. Note: signal_set
+    // can fire as soon as we registered the async_wait, which means
+    // theoretically the handler could see an empty stratum_server_for_shutdown
+    // if a signal arrived during early init. That's fine — the `if` guard in
+    // the lambda handles it.
+    stratum_server_for_shutdown = std::move(stratum_server);
 
     LOG_INFO << "[BTC] io_context running. Ctrl-C to stop.";
     ioc.run();
-    LOG_INFO << "[BTC] Shutting down.";
+
+    // ── Graceful shutdown — explicit teardown order ──────────────────────
+    //
+    // ioc.run() returned because the signal handler called ioc.stop(). Now
+    // we tear down in a controlled order BEFORE letting RAII at end-of-main
+    // do the rest:
+    //
+    //   1. StratumServer is already stopped by the signal handler — sessions
+    //      cancelled, acceptor closed. Reset the unique_ptr to invoke the
+    //      destructor early so its sessions_ set is freed before anything
+    //      else runs.
+    //   2. work_source: drop our ref via the expose-shutdown variable. The
+    //      coin_node subscribers still hold shared_ptrs to it, so it stays
+    //      alive until coin_node's destructors clear those subscribers
+    //      (which happens automatically at end-of-scope below). Important
+    //      that work_source outlives any in-flight stratum-handler that
+    //      might call into it.
+    //   3. p2p_node (sharechain peer): explicit reset so its NodeP2P
+    //      destructor closes peer connections before coin_node tears down
+    //      its subordinate state.
+    //   4. coin_node (bitcoind P2P) + ioc + the rest: regular RAII at end
+    //      of scope.
+    LOG_INFO << "[BTC] Shutting down...";
+    stratum_server_for_shutdown.reset();
+    work_source_for_shutdown.reset();
+    p2p_node.reset();
+    LOG_INFO << "[BTC] Shutdown complete.";
     return 0;
 }
