@@ -15,11 +15,80 @@
 #include <impl/btc/coin/header_chain.hpp>
 #include <impl/btc/coin/mempool.hpp>
 #include <impl/btc/coin/template_builder.hpp>  // build_template + merkle_hash_pair
-#include <impl/btc/coin/transaction.hpp>       // BlockType (the SubmitBlockFn arg)
+#include <impl/btc/coin/transaction.hpp>
 
+#include <core/hash.hpp>
 #include <core/log.hpp>
+#include <btclibs/util/strencodings.h>          // HexStr, ParseHex
 
+#include <cstdio>
+#include <cstring>
 #include <utility>
+
+namespace {
+
+// ── Byte-stream helpers used by coinbase + header construction ──────────────
+// All encodings are little-endian (Bitcoin wire format). Push helpers append
+// to a std::vector<uint8_t> for incremental building; the result becomes the
+// raw serialized form ready for HexStr() conversion.
+
+inline void push_u32_le(std::vector<uint8_t>& v, uint32_t x) {
+    v.push_back(static_cast<uint8_t>(x       & 0xff));
+    v.push_back(static_cast<uint8_t>((x >>  8) & 0xff));
+    v.push_back(static_cast<uint8_t>((x >> 16) & 0xff));
+    v.push_back(static_cast<uint8_t>((x >> 24) & 0xff));
+}
+
+inline void push_u64_le(std::vector<uint8_t>& v, uint64_t x) {
+    for (int i = 0; i < 8; ++i)
+        v.push_back(static_cast<uint8_t>((x >> (i * 8)) & 0xff));
+}
+
+inline void push_varint(std::vector<uint8_t>& v, uint64_t n) {
+    if (n < 0xfd) {
+        v.push_back(static_cast<uint8_t>(n));
+    } else if (n <= 0xffff) {
+        v.push_back(0xfd);
+        v.push_back(static_cast<uint8_t>(n & 0xff));
+        v.push_back(static_cast<uint8_t>((n >> 8) & 0xff));
+    } else if (n <= 0xffffffff) {
+        v.push_back(0xfe);
+        push_u32_le(v, static_cast<uint32_t>(n));
+    } else {
+        v.push_back(0xff);
+        push_u64_le(v, n);
+    }
+}
+
+// BIP 34 minimally-encoded height push for the coinbase scriptSig.
+// Returns: [opcode_pushbytes_n][n bytes height_LE], where n is the smallest
+// number of bytes needed to encode the height with the high bit clear (script
+// integer convention — sign-bit safety prevents the value from being parsed
+// as negative).
+inline std::vector<uint8_t> bip34_height_push(uint32_t h) {
+    std::vector<uint8_t> enc;
+    uint32_t tmp = h;
+    while (tmp) {
+        enc.push_back(static_cast<uint8_t>(tmp & 0xff));
+        tmp >>= 8;
+    }
+    if (enc.empty()) enc.push_back(0);
+    if (enc.back() & 0x80) enc.push_back(0);
+    std::vector<uint8_t> out;
+    out.push_back(static_cast<uint8_t>(enc.size()));   // OP_PUSHBYTES_n
+    out.insert(out.end(), enc.begin(), enc.end());
+    return out;
+}
+
+// Parse a BE hex string into a uint32_t. Stratum sends ntime/nonce/version
+// as 8-char BE hex; sscanf(%x) is enough.
+inline uint32_t parse_be_hex_u32(const std::string& s) {
+    uint32_t v = 0;
+    std::sscanf(s.c_str(), "%x", &v);
+    return v;
+}
+
+}  // anonymous namespace
 
 namespace btc::stratum {
 
@@ -187,21 +256,105 @@ std::vector<std::string> BTCWorkSource::get_stratum_merkle_branches() const
 
 std::pair<std::string, std::string> BTCWorkSource::get_coinbase_parts() const
 {
-    // Stage 4c: return cached coinb1/coinb2 (extranonce slot between them).
+    // Fallback coinbase split with no payout output (the per-connection
+    // builder produces the real one). Used only when stratum sessions
+    // ask for default parts before authorize completes — they then skip
+    // mining.notify until build_connection_coinbase becomes available.
     return { {}, {} };
 }
 
 core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
     const uint256& /*prev_share_hash*/,
     const std::string& /*extranonce1_hex*/,
-    const std::vector<unsigned char>& /*payout_script*/,
+    const std::vector<unsigned char>& payout_script,
     const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& /*merged_addrs*/) const
 {
-    // Stage 4c: build per-connection coinbase using TemplateBuilder helpers
-    // + ShareTracker ref_hash. For now return an empty result; sessions
-    // calling this will get an empty job and skip pushing work, which is
-    // safe but non-functional.
-    return {};
+    // SOPHISTICATED STUB (B7-stratum-4c-iii). Produces a stratum-compatible
+    // coinbase split with the miner's payout receiving the FULL subsidy
+    // + fees. This is enough for end-to-end stratum-protocol testing and
+    // mainnet PoW classification, but does NOT yet include the c2pool
+    // sharechain payout outputs (PPLNS to other miners) or the p2pool
+    // ref_hash extension. Shares submitted against this coinbase are
+    // technically valid BTC blocks at PoW-target difficulty but won't
+    // earn c2pool sharechain credit — the v35 share format coinbase
+    // layout (jtoomim/SPB lineage) needs careful adaptation, which
+    // belongs to a follow-up phase.
+    //
+    // TODO(B-future): add c2pool extra outputs:
+    //   - Replace single full-payout output with PPLNS distribution
+    //     among recent sharechain participants
+    //   - Add c2pool donation output
+    //   - Add OP_RETURN with c2pool protocol metadata (see
+    //     core/coinbase_builder.hpp::C2POOL_PROTOCOL_VERSION)
+    //   - Compute p2pool ref_hash via ShareTracker callback, populate
+    //     CoinbaseResult.snapshot.frozen_ref accordingly
+    //   - Handle segwit witness commitment OP_RETURN
+
+    auto wd = btc::coin::TemplateBuilder::build_template(chain_, mempool_, is_testnet_);
+    if (!wd) return {};
+
+    uint32_t height        = wd->m_data.value("height", 0u);
+    uint64_t coinbasevalue = wd->m_data.value("coinbasevalue", uint64_t{0});
+
+    auto bip34 = bip34_height_push(height);
+    constexpr size_t EXTRANONCE_SIZE = 8;  // 4 (extranonce1) + 4 (extranonce2)
+    static const std::string POOL_TAG = "/c2pool-btc/";
+    std::vector<uint8_t> tag_bytes(POOL_TAG.begin(), POOL_TAG.end());
+
+    const size_t scriptsig_len = bip34.size() + EXTRANONCE_SIZE + tag_bytes.size();
+
+    // ── coinb1: tx prefix up to (but not including) the extranonce slot ──
+    std::vector<uint8_t> coinb1;
+    push_u32_le(coinb1, /*tx version*/ 2);
+    coinb1.push_back(0x01);                                     // vin_count = 1
+    coinb1.insert(coinb1.end(), 32, 0x00);                       // prev_hash = 32 zero bytes
+    push_u32_le(coinb1, 0xFFFFFFFFu);                            // prev_vout = 0xFFFFFFFF
+    push_varint(coinb1, scriptsig_len);                          // scriptSig length
+    coinb1.insert(coinb1.end(), bip34.begin(), bip34.end());     // BIP 34 height push
+
+    // ── coinb2: scriptSig tail + sequence + outputs + locktime ──
+    std::vector<uint8_t> coinb2;
+    coinb2.insert(coinb2.end(), tag_bytes.begin(), tag_bytes.end());  // /c2pool-btc/
+    push_u32_le(coinb2, 0xFFFFFFFFu);                            // sequence
+    coinb2.push_back(0x01);                                      // vout_count = 1
+    push_u64_le(coinb2, coinbasevalue);                          // value (subsidy + fees)
+    push_varint(coinb2, payout_script.size());
+    coinb2.insert(coinb2.end(), payout_script.begin(), payout_script.end());
+    push_u32_le(coinb2, 0);                                      // locktime
+
+    core::stratum::CoinbaseResult result;
+    result.coinb1 = HexStr(std::span<const uint8_t>(coinb1.data(), coinb1.size()));
+    result.coinb2 = HexStr(std::span<const uint8_t>(coinb2.data(), coinb2.size()));
+
+    // Snapshot — frozen state matching this coinbase. Stratum sessions
+    // store this in their JobEntry and pass it to mining_submit later.
+    auto& snap = result.snapshot;
+    snap.subsidy            = coinbasevalue;
+    snap.segwit_active      = false;  // TODO: detect from wd->m_data["rules"]
+    snap.witness_root       = uint256::ZERO;  // TODO: when segwit
+    snap.frozen_ref.share_version  = 35;      // jtoomim BTC v35
+    snap.frozen_ref.desired_version = 35;
+    snap.frozen_ref.bits           = share_bits_.load();
+    snap.frozen_ref.max_bits       = share_max_bits_.load();
+    // frozen_merkle_branches mirrors public branches for now
+    auto branches = get_stratum_merkle_branches();
+    for (const auto& h : branches) {
+        uint256 b;
+        b.SetHex(h.c_str());
+        snap.frozen_ref.frozen_merkle_branches.push_back(b);
+    }
+    // Capture raw tx hex from template (excludes coinbase — sessions reconstruct
+    // the coinbase from coinb1+extranonces+coinb2)
+    auto txs_field = wd->m_data.find("transactions");
+    if (txs_field != wd->m_data.end() && txs_field->is_array()) {
+        for (const auto& t : *txs_field) {
+            if (t.is_object() && t.contains("data") && t["data"].is_string())
+                snap.tx_data.push_back(t["data"].get<std::string>());
+        }
+    }
+    snap.merkle_branches = std::move(branches);
+
+    return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -210,33 +363,162 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
 
 nlohmann::json BTCWorkSource::mining_submit(
     const std::string& username, const std::string& job_id,
-    const std::string& /*extranonce1*/, const std::string& /*extranonce2*/,
-    const std::string& /*ntime*/, const std::string& /*nonce*/,
+    const std::string& extranonce1, const std::string& extranonce2,
+    const std::string& ntime, const std::string& nonce,
     const std::string& /*request_id*/,
     const std::map<uint32_t, std::vector<unsigned char>>& /*merged_addresses*/,
-    const core::stratum::JobSnapshot* /*job*/)
+    const core::stratum::JobSnapshot* job)
 {
-    // Stage 4d will:
-    //   1. Reconstruct the 80-byte block header from JobSnapshot + miner inputs
-    //   2. SHA256d the header → pow_hash
-    //   3. Decode share target from job->share_bits (compact)
-    //   4. Decode block target from job->block_nbits (compact)
-    //   5. Classify:
-    //        pow_hash <= block target → submit_block_fn_(full_block, height)
-    //        pow_hash <= share target → record share in tracker (sharechain accept)
-    //        otherwise                → reject as low-difficulty
-    //   6. Update worker stats accordingly
-    //
-    // For now: log + reject everything as low-difficulty. Miners will see
-    // stratum errors but the binary won't crash.
-    LOG_WARNING << "[BTC-STRATUM] mining_submit not implemented (stage 4d): "
-                << "user=" << username << " job=" << job_id
-                << " — submission rejected as low-difficulty";
+    // Stratum-style JSON-RPC error payload (false + [code, message, null]).
+    auto reject = [](int code, const char* msg) {
+        return nlohmann::json::array({
+            false, nlohmann::json::array({code, msg, nullptr})
+        });
+    };
 
-    return nlohmann::json::array({
-        false,
-        nlohmann::json::array({23, "Low difficulty share (stratum stub: stage 4d not implemented)", nullptr})
-    });
+    if (!job) {
+        LOG_WARNING << "[BTC-STRATUM] submit reject (no JobSnapshot): user=" << username
+                    << " job=" << job_id;
+        return reject(21, "Job not found");
+    }
+
+    // ── Reconstruct full 80-byte block header from JobSnapshot + miner inputs ──
+    //
+    // 1. Coinbase = coinb1 ‖ extranonce1 ‖ extranonce2 ‖ coinb2
+    // 2. coinbase_txid = SHA256d(coinbase) — non-witness for this stub
+    // 3. merkle_root = ascend through frozen merkle branches starting from txid
+    // 4. header = version(LE) ‖ prev_hash(LE) ‖ merkle_root ‖ ntime(LE)
+    //             ‖ nbits(LE) ‖ nonce(LE)         (80 bytes total)
+    // 5. pow_hash = SHA256d(header)
+    // 6. Compare to block target + share target → classify
+
+    auto coinb1_bytes = ParseHex(job->coinb1);
+    auto en1_bytes    = ParseHex(extranonce1);
+    auto en2_bytes    = ParseHex(extranonce2);
+    auto coinb2_bytes = ParseHex(job->coinb2);
+
+    std::vector<uint8_t> coinbase;
+    coinbase.reserve(coinb1_bytes.size() + en1_bytes.size() + en2_bytes.size() + coinb2_bytes.size());
+    coinbase.insert(coinbase.end(), coinb1_bytes.begin(), coinb1_bytes.end());
+    coinbase.insert(coinbase.end(), en1_bytes.begin(),    en1_bytes.end());
+    coinbase.insert(coinbase.end(), en2_bytes.begin(),    en2_bytes.end());
+    coinbase.insert(coinbase.end(), coinb2_bytes.begin(), coinb2_bytes.end());
+
+    uint256 coinbase_txid = Hash(std::span<const uint8_t>(coinbase.data(), coinbase.size()));
+
+    // Ascend the stratum merkle branches.
+    uint256 merkle_root = coinbase_txid;
+    for (const auto& branch_hex : job->merkle_branches) {
+        uint256 b;
+        b.SetHex(branch_hex.c_str());
+        merkle_root = btc::coin::merkle_hash_pair(merkle_root, b);
+    }
+
+    // Build the 80-byte header (all little-endian little-endian).
+    // prev_hash arrives in BE display-hex; reverse to internal byte order.
+    auto prevhash_be = ParseHex(job->gbt_prevhash);
+    std::vector<uint8_t> prevhash_le(prevhash_be.rbegin(), prevhash_be.rend());
+
+    std::vector<uint8_t> header;
+    header.reserve(80);
+    push_u32_le(header, parse_be_hex_u32(std::to_string(job->version) /*decimal!*/));
+    // ↑ subtle: version arrives as a decimal int in JobSnapshot, not BE hex.
+    // The miner sends it in mining.submit ALSO as BE hex — we'd want that one,
+    // but the miner can override for ASICBoost. For the stub we use the job's
+    // version directly. (TODO: respect submitted version when version-rolling
+    // is enabled and within POOL_VERSION_MASK.)
+    header.clear();
+    header.reserve(80);
+    push_u32_le(header, job->version);
+    header.insert(header.end(), prevhash_le.begin(), prevhash_le.end());
+    header.insert(header.end(), merkle_root.data(), merkle_root.data() + 32);
+    push_u32_le(header, parse_be_hex_u32(ntime));
+    push_u32_le(header, parse_be_hex_u32(job->nbits));      // share-target bits in header
+    push_u32_le(header, parse_be_hex_u32(nonce));
+
+    uint256 pow_hash = Hash(std::span<const uint8_t>(header.data(), header.size()));
+
+    // Decode share target (compact bits in header) and block target.
+    uint256 share_target;
+    share_target.SetCompact(parse_be_hex_u32(job->nbits));
+
+    uint256 block_target;
+    block_target.SetCompact(parse_be_hex_u32(
+        job->block_nbits.empty() ? job->nbits : job->block_nbits));
+
+    auto pow_hex_short = pow_hash.GetHex().substr(0, 16);
+
+    // ── Classify ──────────────────────────────────────────────────────────
+
+    if (!(pow_hash > block_target)) {
+        // pow_hash <= block_target → BLOCK FOUND.
+        uint32_t height = 0;
+        if (auto tip = chain_.tip(); tip) height = tip->height + 1;
+
+        LOG_WARNING << "[BTC-STRATUM-BLOCK] *** BLOCK FOUND *** user=" << username
+                    << " height~=" << height
+                    << " pow_hash=" << pow_hex_short
+                    << " job=" << job_id;
+
+        // Build the full serialized block: header ‖ tx_count ‖ coinbase ‖ other_txs.
+        std::vector<uint8_t> block_bytes;
+        block_bytes.reserve(80 + 9 + coinbase.size() + job->tx_data.size() * 256);
+        block_bytes.insert(block_bytes.end(), header.begin(), header.end());
+
+        push_varint(block_bytes, 1 + job->tx_data.size());  // total tx count
+        block_bytes.insert(block_bytes.end(), coinbase.begin(), coinbase.end());
+        for (const auto& tx_hex : job->tx_data) {
+            auto tx_bytes = ParseHex(tx_hex);
+            block_bytes.insert(block_bytes.end(), tx_bytes.begin(), tx_bytes.end());
+        }
+
+        if (submit_block_fn_) {
+            try {
+                submit_block_fn_(block_bytes, height);
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[BTC-STRATUM-BLOCK] submit_block_fn threw: " << e.what();
+            }
+        } else {
+            LOG_WARNING << "[BTC-STRATUM-BLOCK] no submit_block_fn wired — block not broadcast";
+        }
+
+        // Update worker stats (block-find counts as accepted)
+        {
+            std::lock_guard<std::mutex> lk(workers_mutex_);
+            for (auto& [_, w] : workers_) {
+                if (w.username == username) { w.accepted++; break; }
+            }
+        }
+        return nlohmann::json(true);
+    }
+
+    if (!(pow_hash > share_target)) {
+        // pow_hash <= share_target → share accepted.
+        // TODO(B-future): record share in btc::ShareTracker (PPLNS state update).
+        // For the stub, we accept the share but don't yet propagate to the
+        // sharechain peer. The miner will see "share accepted" stratum responses
+        // but the c2pool dashboard / payouts will be empty until ShareTracker
+        // wiring lands.
+        LOG_INFO << "[BTC-STRATUM-SHARE] accepted user=" << username
+                 << " pow_hash=" << pow_hex_short
+                 << " job=" << job_id;
+        {
+            std::lock_guard<std::mutex> lk(workers_mutex_);
+            for (auto& [_, w] : workers_) {
+                if (w.username == username) { w.accepted++; break; }
+            }
+        }
+        return nlohmann::json(true);
+    }
+
+    // pow_hash > share_target → low-difficulty rejection.
+    {
+        std::lock_guard<std::mutex> lk(workers_mutex_);
+        for (auto& [_, w] : workers_) {
+            if (w.username == username) { w.rejected++; break; }
+        }
+    }
+    return reject(23, "Low difficulty share");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
