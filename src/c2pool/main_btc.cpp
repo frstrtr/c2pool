@@ -614,6 +614,37 @@ int main(int argc, char* argv[])
     btc::coin::Mempool mempool;
     mempool.set_utxo(&utxo_cache);
 
+    // ── Mempool wiring (Phase 10c) ────────────────────────────────────────
+    //
+    // Feed the local mempool from bitcoind's P2P inv stream so TemplateBuilder
+    // produces real fee-bearing templates instead of coinbase-only ones.
+    // bitcoind announces new mempool txs via `inv` of MSG_TX, NodeP2P
+    // requests them via getdata, and on receipt fires coin_node.new_tx with
+    // the parsed Transaction. We add to mempool; a later [BTC] full_block
+    // subscriber removes confirmed txs.
+    //
+    // Mempool::add_tx without UTXO context cannot compute the fee — fees
+    // start at sentinel UNKNOWN and Mempool::recompute_unknown_fees fills
+    // them in lazily as the UTXO catches up. For now we don't drive that
+    // recomputation; templates produced before fees are known fall back to
+    // base-subsidy behavior. TODO: periodic call to recompute_unknown_fees.
+    coin_node.new_tx.subscribe(
+        [&mempool, &utxo_cache](const btc::coin::Transaction& tx) {
+            // The Transaction → MutableTransaction round-trip is required
+            // because Mempool::add_tx takes the mutable variant (matches the
+            // pattern used by btc::coin::TemplateBuilder).
+            btc::coin::MutableTransaction mtx(tx);
+            (void)mempool.add_tx(mtx, &utxo_cache);
+        });
+
+    // remove_for_block on every full block we receive — connecting txs are
+    // no longer mempool-eligible. Keeps the mempool honest after each new
+    // tip without us having to track individual confirmations.
+    coin_node.full_block.subscribe(
+        [&mempool](const btc::coin::BlockType& block) {
+            mempool.remove_for_block(block);
+        });
+
     // submit_block_fn: bridges BTCWorkSource → coin_node.submit_block_p2p_raw
     // + adds to B5's pending_submits map for roundtrip tracking. Lambda
     // captures by reference so it reuses the existing B5 infrastructure
