@@ -63,6 +63,34 @@ public:
     using SubmitBlockFn = std::function<void(const std::vector<unsigned char>& block_bytes,
                                              uint32_t height)>;
 
+    /// PPLNS payout query: walks back N shares from prev_share_hash and
+    /// returns {payout_script_bytes → satoshi_amount}. main_btc.cpp wires
+    /// this to a lambda that calls
+    /// `p2p_node->tracker().get_v35_expected_payouts(...)` under a
+    /// TrackerReadGuard. Caller responsibility: apply finder fee
+    /// (subsidy/200 to the miner's payout, deducted from donation).
+    /// Returning an empty map means the share tracker isn't ready yet
+    /// (cold start, no chain) — we then fall back to a single-output
+    /// coinbase (full subsidy → miner) and skip the OP_RETURN.
+    using PplnsFn = std::function<std::map<std::vector<unsigned char>, double>(
+        const uint256& best_share_hash,
+        const uint256& block_target,
+        uint64_t subsidy,
+        const std::vector<unsigned char>& donation_script)>;
+
+    /// p2pool ref_hash computation: takes the share's identity fields and
+    /// produces (ref_hash, last_txout_nonce). The ref_hash is embedded in
+    /// the coinbase OP_RETURN; the nonce is REPLACED by the miner's
+    /// extranonce1+extranonce2 (8 bytes total) at submit time, so the
+    /// returned nonce is just a placeholder for hash_link prefix
+    /// computation. main_btc.cpp wires this to a lambda calling
+    /// btc::compute_ref_hash_for_work.
+    using RefHashFn = std::function<std::pair<uint256, uint64_t>(
+        const uint256& prev_share_hash,
+        const std::vector<unsigned char>& coinbase_scriptSig,
+        const std::vector<unsigned char>& payout_script,
+        uint64_t subsidy, uint32_t bits, uint32_t timestamp)>;
+
     BTCWorkSource(btc::coin::HeaderChain&       chain,
                   btc::coin::Mempool&           mempool,
                   bool                          is_testnet,
@@ -132,6 +160,25 @@ public:
     /// is constructed.
     void set_best_share_hash_fn(std::function<uint256()> fn);
 
+    /// Wire the PPLNS payout-map producer. Called once at startup. May be
+    /// left unset, in which case build_connection_coinbase falls back to
+    /// a single-output coinbase paying the full subsidy to the miner
+    /// (degraded mode — no c2pool sharechain participation but valid BTC
+    /// blocks still produced).
+    void set_pplns_fn(PplnsFn fn);
+
+    /// Wire the ref_hash producer. Called once at startup. May be left
+    /// unset; in that case the coinbase OP_RETURN is omitted (degraded
+    /// mode, but coinbase still valid for BTC).
+    void set_ref_hash_fn(RefHashFn fn);
+
+    /// Set the donation script (bytes of the c2pool donation
+    /// scriptPubKey — typically a P2PKH or P2WPKH for the c2pool donation
+    /// address). Used by build_connection_coinbase as the residual
+    /// recipient of any payout-rounding remainder, plus added to the
+    /// PPLNS map so it always appears as an output.
+    void set_donation_script(std::vector<unsigned char> script);
+
 private:
     // External dependencies (non-owning references)
     btc::coin::HeaderChain&     chain_;
@@ -156,6 +203,12 @@ private:
     // Best-share callback (from ShareTracker)
     mutable std::mutex          best_share_mutex_;
     std::function<uint256()>    best_share_hash_fn_;
+
+    // PPLNS + ref_hash callbacks (from ShareTracker via main_btc.cpp)
+    mutable std::mutex          callback_mutex_;
+    PplnsFn                     pplns_fn_;
+    RefHashFn                   ref_hash_fn_;
+    std::vector<unsigned char>  donation_script_;
 
     // Template cache (filled lazily; invalidated when work_generation_ bumps)
     // Stage 4c populates these.
