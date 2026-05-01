@@ -946,7 +946,15 @@ int main(int argc, char* argv[])
                     /* frozen_far_share_hash */ job.frozen_ref.far_share_hash,
                     /* frozen_timestamp */      job.frozen_ref.timestamp,
                     /* frozen_merged_payout */  job.frozen_ref.merged_payout_hash,
-                    /* has_frozen */            true,
+                    // has_frozen=false: snap.frozen_ref.{absheight,abswork,
+                    // far_share_hash,timestamp} are NOT populated by
+                    // build_connection_coinbase (only ref_hash_fn computes
+                    // them, into a local RefHashParams). With has_frozen=true
+                    // they'd override the live-walked values with 0 — produces
+                    // shares with absheight=0 that peers reject + RST us.
+                    // We hold tracker_mutex unique here, so the in-function
+                    // walks (lines 2127-2208 of share_check.hpp) are safe.
+                    /* has_frozen */            false,
                     /* frozen_merkle_branches*/ job.frozen_ref.frozen_merkle_branches,
                     /* frozen_witness_root */   job.frozen_ref.frozen_witness_root,
                     /* frozen_merged_cb_info */ job.frozen_ref.frozen_merged_coinbase_info,
@@ -975,16 +983,21 @@ int main(int argc, char* argv[])
     LOG_INFO << "[BTC-STRATUM] sharechain write path wired (mining_submit"
              << " → create_local_share → broadcast_share + notify_local_share)";
 
-    // Initial share-target: 0x1d00ffff = "diff 1" (smallest difficulty
-    // bitcoin allows in compact form). At ~1.7 TH/s of bitaxe SHA256d
-    // hashrate, that's ~400 shares/second across the fleet — plenty for
-    // exercising the create_share path. The c2pool sharechain's actual
-    // target floats with chain difficulty, but for first-light testing
-    // a fixed low diff is the simplest path. TODO Phase 12: drive
-    // set_share_target from compute_share_target on each new tip.
-    work_source->set_share_target(/*bits*/ 0x1d00ffff, /*max_bits*/ 0x1f0fffff);
-    LOG_INFO << "[BTC-STRATUM] initial share target: bits=0x1d00ffff (diff 1)"
-             << " max_bits=0x1f0fffff — fixed for first-light bitaxe testing";
+    // Share-target: leave at 0 → frozen_ref.bits=0 / frozen_ref.max_bits=0
+    // → override_bits=0 in create_local_share_v35 → share.m_bits is taken
+    // from tracker.compute_share_target(prev_share, ...), the REAL network
+    // sharechain target. Without this, a hardcoded diff-1 trivially passes
+    // the internal PoW check, we add+broadcast invalid shares, and peers
+    // promptly RST/ban us (verified empirically 2026-05-02 on .122 oracle:
+    // disconnect 14ms after first broadcast).
+    //
+    // Stratum-side mining_submit's share_target check falls back to diff-1
+    // when share_bits==0 (work_source.cpp:711), so pseudoshares are still
+    // accepted for PPLNS bookkeeping. The chain WRITE path is reached only
+    // when a bitaxe genuinely finds a hash meeting network sharechain
+    // difficulty (~2e8) — that's the correct gate.
+    LOG_INFO << "[BTC-STRATUM] share target left at 0 — create_local_share_v35"
+             << " will use tracker.compute_share_target (real network target)";
 
     // Bump work-generation counter on every chain tip change. The stratum
     // server uses this to detect stale work between job-push timer firings
