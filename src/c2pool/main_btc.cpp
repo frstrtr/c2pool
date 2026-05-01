@@ -839,6 +839,136 @@ int main(int argc, char* argv[])
              << " (donation_script=" << btc::PoolConfig::get_donation_script(35).size()
              << "B P2PK; ref_hash walks share tracker for absheight/abswork/far_share)";
 
+    // ── Sharechain WRITE path (Phase 11) ──────────────────────────────────
+    //
+    // mining_submit calls this when a stratum submission's PoW meets the
+    // sharechain target. The lambda:
+    //   1. Parses 80-byte header → SmallBlockHeaderType (the v35 share's
+    //      "min_header" field — a trimmed block header that omits the
+    //      merkle_root since that's reconstructible from the share's
+    //      coinbase + frozen branches).
+    //   2. Wraps full_coinbase in a BaseScript.
+    //   3. Converts string-hex merkle_branches → vector<uint256>.
+    //   4. Acquires EXCLUSIVE tracker lock via try_to_lock — non-blocking;
+    //      defer to next miner submission if compute thread is mid-think.
+    //   5. Calls btc::create_local_share<TrackerT>(...) which builds a
+    //      v35 PaddingBugfixShare, runs PoW recheck, and tracker.add()s
+    //      it. Returns share_hash on success, uint256::ZERO on failure.
+    //   6. On success: broadcast_share + notify_local_share so peers learn
+    //      our new tip and miners get fresh work.
+    //
+    // create_local_share INTERNAL behavior (relevant to debug):
+    //   - validates PoW against bits-derived target
+    //   - reconstructs ref_hash from frozen fields and verifies it matches
+    //     what the coinbase OP_RETURN claims
+    //   - calls tracker.add(share) — attempt_verify runs later in think()
+    work_source->set_create_share_fn(
+        [p2p_node_raw](const std::vector<unsigned char>& full_coinbase,
+                       const std::vector<uint8_t>&        header_80b,
+                       const core::stratum::JobSnapshot&  job,
+                       const std::vector<unsigned char>& payout_script)
+        -> uint256
+        {
+            if (!p2p_node_raw || header_80b.size() != 80) {
+                LOG_WARNING << "[BTC-CREATE-SHARE] precondition fail: p2p_node="
+                            << (p2p_node_raw ? "ok" : "null")
+                            << " header_size=" << header_80b.size();
+                return uint256::ZERO;
+            }
+
+            // ── Parse 80B BTC block header ──
+            auto read_le32 = [](const uint8_t* p) -> uint32_t {
+                return uint32_t(p[0]) | (uint32_t(p[1]) << 8)
+                     | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
+            };
+
+            btc::coin::SmallBlockHeaderType min_header;
+            min_header.m_version   = read_le32(header_80b.data() + 0);
+            std::memcpy(min_header.m_previous_block.data(),
+                        header_80b.data() + 4, 32);
+            // bytes 36..67 are merkle_root — not stored in min_header
+            min_header.m_timestamp = read_le32(header_80b.data() + 68);
+            min_header.m_bits      = read_le32(header_80b.data() + 72);
+            min_header.m_nonce     = read_le32(header_80b.data() + 76);
+
+            // ── Wrap coinbase + convert merkle branches ──
+            BaseScript coinbase_bs(std::vector<unsigned char>(
+                full_coinbase.begin(), full_coinbase.end()));
+
+            std::vector<uint256> merkle_branches;
+            merkle_branches.reserve(job.merkle_branches.size());
+            for (const auto& bhex : job.merkle_branches) {
+                uint256 b; b.SetHex(bhex.c_str());
+                merkle_branches.push_back(b);
+            }
+
+            // ── Acquire EXCLUSIVE tracker lock (try, non-blocking) ──
+            std::unique_lock<std::shared_mutex> lk(
+                p2p_node_raw->tracker_mutex(), std::try_to_lock);
+            if (!lk.owns_lock()) {
+                LOG_INFO << "[BTC-CREATE-SHARE] tracker busy — share deferred";
+                return uint256::ZERO;
+            }
+
+            // ── Call into btc::create_local_share ──
+            // v35 path: dispatches internally based on share_version arg.
+            // No merged_addrs (BTC v35 has no merged mining).
+            uint256 share_hash;
+            try {
+                share_hash = btc::create_local_share(
+                    p2p_node_raw->tracker(),
+                    min_header,
+                    coinbase_bs,
+                    /* subsidy */               job.subsidy,
+                    /* prev_share */            job.prev_share_hash,
+                    merkle_branches,
+                    payout_script,
+                    /* donation */              50,         // 0.5%
+                    /* merged_addrs */          {},
+                    /* stale_info */            btc::StaleInfo::none,
+                    /* segwit_active */         job.segwit_active,
+                    /* witness_commitment */    job.witness_commitment_hex,
+                    /* message_data */          {},
+                    /* actual_coinbase_bytes */ std::vector<unsigned char>(
+                                                    full_coinbase.begin(),
+                                                    full_coinbase.end()),
+                    /* witness_root */          job.witness_root,
+                    /* override_max_bits */     job.frozen_ref.max_bits,
+                    /* override_bits */         job.frozen_ref.bits,
+                    /* frozen_absheight */      job.frozen_ref.absheight,
+                    /* frozen_abswork */        job.frozen_ref.abswork,
+                    /* frozen_far_share_hash */ job.frozen_ref.far_share_hash,
+                    /* frozen_timestamp */      job.frozen_ref.timestamp,
+                    /* frozen_merged_payout */  job.frozen_ref.merged_payout_hash,
+                    /* has_frozen */            true,
+                    /* frozen_merkle_branches*/ job.frozen_ref.frozen_merkle_branches,
+                    /* frozen_witness_root */   job.frozen_ref.frozen_witness_root,
+                    /* frozen_merged_cb_info */ job.frozen_ref.frozen_merged_coinbase_info,
+                    /* share_version */         35,
+                    /* desired_version */       35);
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[BTC-CREATE-SHARE] threw: " << e.what();
+                return uint256::ZERO;
+            }
+
+            // Lock release order: drop the unique_lock BEFORE calling
+            // broadcast_share / notify_local_share — those acquire their
+            // own locks (or post to io_context) and we don't want to hold
+            // exclusive while they run.
+            lk.unlock();
+
+            if (!share_hash.IsNull()) {
+                p2p_node_raw->broadcast_share(share_hash);
+                p2p_node_raw->notify_local_share(share_hash);
+                LOG_INFO << "[BTC-CREATE-SHARE] OK + broadcast: hash="
+                         << share_hash.GetHex().substr(0, 16);
+            }
+            return share_hash;
+        });
+
+    LOG_INFO << "[BTC-STRATUM] sharechain write path wired (mining_submit"
+             << " → create_local_share → broadcast_share + notify_local_share)";
+
     // Bump work-generation counter on every chain tip change. The stratum
     // server uses this to detect stale work between job-push timer firings
     // without snapshotting full template state.
@@ -855,8 +985,8 @@ int main(int argc, char* argv[])
             ioc, stratum_addr, stratum_port, work_source);
         if (stratum_server->start()) {
             LOG_INFO << "[BTC-STRATUM] listening on " << stratum_addr << ":" << stratum_port
-                     << " (work source: BTCWorkSource, share v35, MVP — c2pool"
-                     << " sharechain payouts deferred)";
+                     << " (work source: BTCWorkSource, share v35, full c2pool stack:"
+                     << " PPLNS + ref_hash + segwit_commit + sharechain write)";
         } else {
             LOG_WARNING << "[BTC-STRATUM] failed to bind " << stratum_addr << ":" << stratum_port
                         << " — stratum disabled";
