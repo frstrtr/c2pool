@@ -141,7 +141,19 @@ struct CProRegTx
     static constexpr uint16_t SPECIALTX_TYPE = 1;
 
     uint16_t                           nVersion{ProTxVersion::BASIC_BLS};
-    uint8_t                            nType{MnType::REGULAR};
+    // dashcore wire format has nType as uint16_t (LE), NOT uint8_t. The
+    // narrower read silently shifted every subsequent field by 1 byte,
+    // which:
+    //   - For REGULAR (nType=0): coincidentally aligned because the 0x00
+    //     high byte of nType and the 0x00 low byte of nMode both happen
+    //     to be zero, so nType+nMode read the right values — BUT
+    //     collateralOutpoint then started 1 byte early and was garbage.
+    //     Effect: registered EVO MNs got wrong collateralOutpoint →
+    //     m_collateral_index entries point at non-existent outpoints,
+    //     so collateral-spend detection misses them.
+    //   - For EVO (nType=1): same shift, garbage collateral.
+    // Bug 13 root cause when paired with the same fix on CProUpServTx.
+    uint16_t                           nType{MnType::REGULAR};
     uint16_t                           nMode{0};
     bitcoin_family::coin::TxPrevOut    collateralOutpoint;
     LegacyNetService                   netInfo;
@@ -204,7 +216,16 @@ struct CProUpServTx
     static constexpr uint16_t SPECIALTX_TYPE = 2;
 
     uint16_t              nVersion{ProTxVersion::BASIC_BLS};
-    uint8_t               nType{MnType::REGULAR};
+    // dashcore wire format has nType as uint16_t (LE), NOT uint8_t.
+    // The narrower read shifted proTxHash + every subsequent field by
+    // 1 byte for v2+ (BASIC_BLS) ProUpServTxs. Effect: parse_protx_payload
+    // failed (read past end of payload) for EVO updates AND parsed
+    // garbage proTxHash for REGULAR updates. Live-observed via 6+
+    // [MNS-SM] CProUpServTx parse failed warnings 2026-04-26..05-03,
+    // including h=2462994 — the missed PoSe revival of MN
+    // 788707b3...80f4 that produced 1858 [PAY] MISMATCH events
+    // before Bug 12's SML sync masked the symptom. Bug 13 root cause.
+    uint16_t              nType{MnType::REGULAR};
     uint256               proTxHash;
     LegacyNetService      netInfo;
     OPScript              scriptOperatorPayout;

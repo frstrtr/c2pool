@@ -20,8 +20,10 @@
 #include <impl/dash/coin/mn_state_machine.hpp>
 #include <impl/dash/coin/block.hpp>
 #include <impl/dash/coin/transaction.hpp>
+#include <impl/dash/coin/vendor/providertx.hpp>
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>
 #include <core/uint256.hpp>
+#include <util/strencodings.h>
 
 #include <vector>
 #include <utility>
@@ -367,6 +369,64 @@ TEST(DashPayAttribution, Bug12_SyncFromSml_SmlOnlyIsNoOp)
     EXPECT_EQ(sr.flipped_to_valid,   0u);
     EXPECT_EQ(m.size(), 0u)
         << "sync must not insert MNs; that's apply_block's job.";
+}
+
+// ─── Bug 13: CProUpServTx nType width regression ──────────────────────
+//
+// dashcore wire format encodes nType as uint16_t (LE). c2pool's vendor
+// struct had it as uint8_t which silently shifted every subsequent field
+// by 1 byte for v2+ ProUpServTx payloads. Effect: parse_protx_payload
+// failed for EVO-type updates (read past end of payload) AND parsed a
+// garbage proTxHash for REGULAR updates. Live-observed via 6+
+// "[MNS-SM] CProUpServTx parse failed" warnings 2026-04-26..05-03 on
+// the Dash mainnet shadow soak, including h=2462994 — the missed
+// PoSe revival of MN 788707b3...80f4 that produced 1858 [PAY] MISMATCH
+// events before Bug 12's SML sync masked the symptom.
+//
+// This test parses the actual on-the-wire extraPayload bytes from
+// block 2462994 and verifies the post-fix parser produces the correct
+// proTxHash + netInfo + EVO platform fields.
+
+TEST(DashPayAttribution, Bug13_CProUpServTx_v2_EVO_RealPayload_Parses)
+{
+    // The exact 207-byte extraPayload from Dash mainnet block 2462994's
+    // tx[17] (txid 1b942a809dc16da2...). nVersion=2 (BASIC_BLS),
+    // nType=1 (EVO), proTxHash=788707b373dab06acf...80f4.
+    const std::string ep_hex =
+        "02000100"  // nVersion=2 LE, nType=1 LE (uint16_t)
+        "f4804ebdec582b7362646ee0fdab70634881ecb0948154cf6ab0da73b3078778"  // proTxHash LE
+        "00000000000000000000ffff416d54cc"  // netInfo IPv6 (IPv4-mapped 65.109.84.204)
+        "270f"                              // netInfo port BE = 9999
+        "00"                                // scriptOperatorPayout varint len=0
+        "94333438ff7bee3af289faf952eb1b9807f01a0730f9a09c53a3fbeba86ff7de" // inputsHash
+        "6c63e53baaf8e32d90d08171ce28e66924847e1a"  // platformNodeID (uint160)
+        "2068"                                       // platformP2PPort BE = 8296
+        "bb01"                                       // platformHTTPPort BE = 47873
+        // 96-byte BLS sig (no need to verify content, just that it consumes)
+        "afd50d34db71cf453c6b6943360045883befbceb80a7b62cfcab6433ebbdd8a5"
+        "c9c135d9a8806c628bcbca6fcc63d92f01c9f6fce815a22bd6998e90417f3c15"
+        "2b4956e03d91aecbab6708248157c92dddb77b2db381175ef1b817812c9aae0a";
+
+    auto bytes = ParseHex(ep_hex);
+    ASSERT_EQ(bytes.size(), 207u) << "test payload size sanity";
+
+    dash::coin::vendor::CProUpServTx ptx;
+    ASSERT_TRUE(dash::coin::vendor::parse_protx_payload(bytes, ptx))
+        << "Bug 13 regression: CProUpServTx parser fails on v2 EVO real-world "
+           "payload because nType was uint8_t instead of uint16_t — every "
+           "subsequent field shifted by 1 byte.";
+
+    EXPECT_EQ(ptx.nVersion, 2u);
+    EXPECT_EQ(ptx.nType, 1u) << "EVO type must round-trip cleanly through uint16_t";
+
+    // Hex of the proTxHash, BE (display) form.
+    EXPECT_EQ(ptx.proTxHash.GetHex(),
+              "788707b373dab06acf548194b0ec81486370abfde06e6462732b58ecbd4e80f4")
+        << "proTxHash misread (the diagnostic symptom that masked Bug 13 for days)";
+
+    // EVO platform fields (nVersion < EXT_ADDR=3 so they're inline).
+    EXPECT_EQ(ptx.platformP2PPort,  8296u);
+    EXPECT_EQ(ptx.platformHTTPPort, 47873u);
 }
 
 TEST(DashPayAttribution, Bug12_SyncFromSml_OnlyTouchesIsValid)
