@@ -1059,6 +1059,24 @@ int main(int argc, char* argv[])
               << " best_hash=" << mn_state_db->get_best_hash().GetHex().substr(0, 16)
               << std::endl;
 
+    // Phase C-PAY Bug 12 fix — startup reconciliation. If the persisted
+    // MnStateDb predates this fix (or was written between PoSe bans and
+    // a clean restart), m_entries[h].isValid for some MNs may disagree
+    // with the SML we just loaded above. Apply one upfront sync so the
+    // first find_expected_payee call after boot already reflects SML
+    // truth, instead of waiting for the next mnlistdiff to arrive over
+    // the network. See mn_state_machine.hpp::sync_validity_from_sml.
+    if (sml && !sml->mnList.empty()) {
+        auto sr = mn_state_machine->sync_validity_from_sml(*sml);
+        std::cout << "[MNS-SYNC] startup reconcile from SML: "
+                  << "matched=" << sr.matched
+                  << " banned="  << sr.flipped_to_invalid
+                  << " revived=" << sr.flipped_to_valid
+                  << " sml_only=" << sr.sml_only
+                  << " (sml=" << sr.scanned << ", mns=" << mn_state_machine->size() << ")"
+                  << std::endl;
+    }
+
     // ── Phase C-MEMPOOL step 1: in-memory tx pool ──
     // Wires up new_tx events from broadcaster fan-out (any peer) into
     // an in-memory store with optional UTXO-based fee computation.
@@ -3339,14 +3357,14 @@ int main(int argc, char* argv[])
         // Misbehaving(100) + per-peer ban comes in iteration 2 after we
         // confirm CalcHash() is bit-exact correct.
         broadcaster->set_on_mnlistdiff(
-            [sml, sml_db, quorums, quorum_db,
+            [sml, sml_db, quorums, quorum_db, mn_state_machine,
              cbtx_root = last_cbtx_mnlist_root,
              cbtx_height = last_cbtx_block_height,
              bcaster = broadcaster.get(), &ioc](
                 const std::string& peer_key,
                 const dash::coin::vendor::CSimplifiedMNListDiff& diff) {
                 io::post(ioc,
-                    [sml, sml_db, quorums, quorum_db,
+                    [sml, sml_db, quorums, quorum_db, mn_state_machine,
                      cbtx_root, cbtx_height, bcaster, peer_key, diff]() {
                   try {
                     // Validate base. Cold start: base == ZERO is fine.
@@ -3425,6 +3443,28 @@ int main(int argc, char* argv[])
                                  << computed.GetHex().substr(0, 16)
                                  << " (vs diff.cbTx@h=" << diff_cbtx.nHeight
                                  << " block=" << diff.blockHash.GetHex().substr(0, 16) << ")";
+
+                        // ── Phase C-PAY Bug 12 fix ──
+                        // Project SML's authoritative isValid onto
+                        // MnStateMachine. PoSe bans aren't tx-driven
+                        // so apply_block can never observe them; SML
+                        // (mnlistdiff, just root-verified bit-exact
+                        // against the coinbase commitment above) is
+                        // the only correct source. Without this sync
+                        // find_expected_payee deterministically picks
+                        // PoSe-banned MNs forever — see
+                        // mn_state_machine.hpp::sync_validity_from_sml
+                        // and project_dash_phase_c_pay_pathA.md Bug 12.
+                        if (mn_state_machine) {
+                            auto sr = mn_state_machine->sync_validity_from_sml(*sml);
+                            if (sr.flipped_to_invalid + sr.flipped_to_valid > 0) {
+                                LOG_INFO << "[MNS-SYNC] from SML root MATCH: "
+                                         << "matched=" << sr.matched
+                                         << " banned="  << sr.flipped_to_invalid
+                                         << " revived=" << sr.flipped_to_valid
+                                         << " sml_only=" << sr.sml_only;
+                            }
+                        }
                     }
 
                     // ── Phase C-QUO step 3: structured tail → quorums ─

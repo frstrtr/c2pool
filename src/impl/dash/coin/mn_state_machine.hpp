@@ -69,6 +69,7 @@
 #include <impl/dash/coin/block.hpp>
 #include <impl/dash/coin/mn_state_db.hpp>
 #include <impl/dash/coin/vendor/providertx.hpp>
+#include <impl/dash/coin/vendor/simplifiedmns.hpp>
 #include <impl/bitcoin_family/coin/base_transaction.hpp>
 
 #include <core/hash.hpp>
@@ -314,6 +315,79 @@ public:
             out.emplace_back(h, st);
         }
         return out;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // sync_validity_from_sml — reconcile per-MN liveness from the SML
+    // ─────────────────────────────────────────────────────────────────
+    //
+    // Phase C-PAY Bug 12 fix (2026-05-03).
+    //
+    // **Problem.** PoSe bans aren't tx-driven. Dash Core applies them
+    // via consensus rules (CDeterministicMNManager triggers a ban when
+    // an MN crosses MAX_PoSe_PENALTY from missed quorums). They never
+    // appear as a special tx in any block. So apply_block(), which
+    // walks special txs, can never observe them — the MN stays
+    // isValid=true in MnStateMachine forever after a real-world ban.
+    // find_expected_payee() then deterministically picks that phantom-
+    // eligible MN until manually re-snapshotted from RPC. Live-observed
+    // 2026-04-30..05-03: 1858 [PAY] MISMATCH all with the same
+    // expected=7a9b3753... after dashd PoSe-banned it at h=2463018.
+    //
+    // **Fix.** The SML feed (Phase C-SML, mnlistdiff p2p messages,
+    // root-verified bit-exact against the coinbase's
+    // merkleRootMNList) carries the authoritative
+    // CSimplifiedMNListEntry::isValid for every active MN. After each
+    // successful root MATCH we project that view onto our m_entries
+    // so find_expected_payee's `if (!st.isValid) continue;` filter
+    // becomes consistent with dashd.
+    //
+    // **Field-ownership contract** (post-this-sync):
+    //   - SML owns:  isValid (banned / revived state)
+    //   - this owns: nLastPaidHeight, nRegisteredHeight,
+    //                nPoSeRevivedHeight, nPoSeBanHeight, scriptPayout,
+    //                collateralOutpoint, nType (timing + identity facets
+    //                that are tx-driven and reach us via apply_block)
+    //
+    // Idempotent: safe to call after every SML root MATCH (live diff)
+    // and once at startup post-load_sml + post-load_into (catches any
+    // persisted divergence). O(|SML|) — ~3700 entries on Dash mainnet,
+    // microseconds.
+    //
+    // Does NOT touch nPoSeBanHeight directly because the SML wire
+    // entry doesn't carry the ban height — only the boolean. If you
+    // need the height for diagnostics, get it from RPC; for payee
+    // selection only the boolean matters.
+    struct SyncFromSmlResult {
+        size_t scanned{0};            // SML entries iterated
+        size_t matched{0};            // also present in m_entries
+        size_t flipped_to_invalid{0}; // m_entries[h].isValid: true → false
+        size_t flipped_to_valid{0};   // m_entries[h].isValid: false → true
+        size_t sml_only{0};           // SML had it, m_entries didn't —
+                                      // a no-op; apply_block will
+                                      // register on the next ProRegTx
+                                      // for this MN (or the next
+                                      // load() reseed from snapshot)
+    };
+    SyncFromSmlResult sync_validity_from_sml(
+        const vendor::CSimplifiedMNList& sml)
+    {
+        SyncFromSmlResult r;
+        for (const auto& sml_entry : sml.mnList) {
+            ++r.scanned;
+            auto it = m_entries.find(sml_entry.proRegTxHash);
+            if (it == m_entries.end()) {
+                ++r.sml_only;
+                continue;
+            }
+            ++r.matched;
+            if (it->second.isValid != sml_entry.isValid) {
+                if (sml_entry.isValid) ++r.flipped_to_valid;
+                else                   ++r.flipped_to_invalid;
+                it->second.isValid = sml_entry.isValid;
+            }
+        }
+        return r;
     }
 
     // Process a single block. Mutates state per dashcore's

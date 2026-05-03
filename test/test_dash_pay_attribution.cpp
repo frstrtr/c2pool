@@ -4,18 +4,23 @@
 /// but each had a distinct root cause; the tests below pin each fix
 /// independently so a future refactor can't silently regress one.
 ///
-/// Bug 1 (`e4c7c108`)  — UINT32_MAX wrap from JSON int(-1) sentinel
-/// Bug 2 (`03fa0aa1`)  — OOO bootstrap blocks re-applied, rolling
-///                       nLastPaidHeight backwards (defense-in-depth
-///                       Pass-3 idempotency in `8d809ea6`)
-/// Bug 3 (`8d809ea6`)  — multiple MNs sharing the same payoutAddress;
-///                       find_by_payout_script picked the wrong one
+/// Bug 1  (`e4c7c108`)  — UINT32_MAX wrap from JSON int(-1) sentinel
+/// Bug 2  (`03fa0aa1`)  — OOO bootstrap blocks re-applied, rolling
+///                        nLastPaidHeight backwards (defense-in-depth
+///                        Pass-3 idempotency in `8d809ea6`)
+/// Bug 3  (`8d809ea6`)  — multiple MNs sharing the same payoutAddress;
+///                        find_by_payout_script picked the wrong one
+/// Bug 12 (this file)   — apply_block can't see PoSe bans (consensus-
+///                        rule, not tx-driven); SML carries the truth
+///                        via mnlistdiff. Tests below pin the
+///                        sync_validity_from_sml contract.
 
 #include <gtest/gtest.h>
 
 #include <impl/dash/coin/mn_state_machine.hpp>
 #include <impl/dash/coin/block.hpp>
 #include <impl/dash/coin/transaction.hpp>
+#include <impl/dash/coin/vendor/simplifiedmns.hpp>
 #include <core/uint256.hpp>
 
 #include <vector>
@@ -23,6 +28,8 @@
 
 using dash::coin::MnStateMachine;
 using dash::coin::MNState;
+using dash::coin::vendor::CSimplifiedMNList;
+using dash::coin::vendor::CSimplifiedMNListEntry;
 
 namespace {
 
@@ -235,4 +242,155 @@ TEST(DashPayAttribution, Bug2_Pass3_NeverRollsLastPaidBackwards)
         << "Pass-3 idempotency safety net broken — a re-applied OOO "
            "block bumped lastPaid backwards. The original Bug 2 (03fa0aa1) "
            "would re-introduce the constant-expected projection bug.";
+}
+
+// ─── Bug 12: apply_block doesn't see PoSe bans → SML must reconcile ──
+//
+// Live observed 2026-04-30..05-03: MN 7a9b3753... was PoSe-banned by
+// Dash Core at h=2463018 (consensus rule, no special tx). c2pool's
+// apply_block walks special txs and never observed the ban — the MN
+// stayed isValid=true in MnStateMachine forever, and find_expected_payee
+// deterministically picked it 1858 times in a row. The SML feed
+// (mnlistdiff p2p, root-verified bit-exact) carries the authoritative
+// CSimplifiedMNListEntry::isValid — these tests pin the new
+// sync_validity_from_sml() that projects SML truth onto m_entries.
+
+namespace {
+// Build a minimal SML with a few entries; only proRegTxHash + isValid
+// matter for these tests (the rest of CSimplifiedMNListEntry is wire
+// scaffolding).
+CSimplifiedMNListEntry mk_sml_entry(uint256 protx, bool valid)
+{
+    CSimplifiedMNListEntry e;
+    e.proRegTxHash = protx;
+    e.isValid      = valid;
+    // nVersion + zero-init for the rest is fine — we don't serialize.
+    return e;
+}
+} // namespace
+
+TEST(DashPayAttribution, Bug12_SyncFromSml_FlipsBannedToInvalid)
+{
+    // The exact failure mode: MN was paid + revived previously, then
+    // PoSe-banned by dashd between blocks. apply_block didn't see the
+    // ban (it's not a tx). MnStateMachine's m_entries[h].isValid is
+    // STILL true. find_expected_payee picks this MN forever.
+    auto h = mk_hash(0x7a);
+    MnStateMachine m;
+    m.load({{h, mk_mn(mk_p2pkh_script(0x57), /*lastPaid=*/2461646,
+                      /*registered=*/2163364, /*revived=*/2434048)}});
+    ASSERT_TRUE(m.entries().at(h).isValid)
+        << "Precondition: pre-sync, ban-oblivious m_entries thinks it's valid.";
+
+    // SML carries the authoritative ban (isValid=false).
+    CSimplifiedMNList sml;
+    sml.mnList.push_back(mk_sml_entry(h, /*valid=*/false));
+
+    auto sr = m.sync_validity_from_sml(sml);
+
+    EXPECT_EQ(sr.scanned, 1u);
+    EXPECT_EQ(sr.matched, 1u);
+    EXPECT_EQ(sr.flipped_to_invalid, 1u);
+    EXPECT_EQ(sr.flipped_to_valid, 0u);
+    EXPECT_EQ(sr.sml_only, 0u);
+    EXPECT_FALSE(m.entries().at(h).isValid)
+        << "sync_validity_from_sml must project SML's ban onto m_entries.";
+
+    // The downstream effect: find_expected_payee must now skip it.
+    auto expected = m.find_expected_payee();
+    EXPECT_FALSE(expected.has_value())
+        << "After SML ban-sync, the only MN is invalid; "
+           "find_expected_payee must return nullopt, not the banned MN.";
+}
+
+TEST(DashPayAttribution, Bug12_SyncFromSml_FlipsRevivedBackToValid)
+{
+    // Symmetric: a previously-banned MN that gets revived in dashd
+    // (PoSeBanHeight cleared, isValid back to true in SML) must also
+    // be reflected. apply_block CAN catch some revivals via ProUpServTx
+    // but the SML-driven path is the safety net.
+    auto h = mk_hash(0xab);
+    MnStateMachine m;
+    auto state = mk_mn(mk_p2pkh_script(0xcd), /*lastPaid=*/2461000);
+    state.isValid = false;  // currently locally believed banned
+    m.load({{h, state}});
+
+    CSimplifiedMNList sml;
+    sml.mnList.push_back(mk_sml_entry(h, /*valid=*/true));  // dashd revived it
+
+    auto sr = m.sync_validity_from_sml(sml);
+
+    EXPECT_EQ(sr.flipped_to_valid, 1u);
+    EXPECT_EQ(sr.flipped_to_invalid, 0u);
+    EXPECT_TRUE(m.entries().at(h).isValid);
+}
+
+TEST(DashPayAttribution, Bug12_SyncFromSml_Idempotent)
+{
+    // Calling repeatedly with the same SML must produce zero deltas
+    // after the first call — required so we can call after EVERY
+    // mnlistdiff without log spam or wasted work.
+    auto h = mk_hash(0x42);
+    MnStateMachine m;
+    m.load({{h, mk_mn(mk_p2pkh_script(0x99), 1000)}});
+
+    CSimplifiedMNList sml;
+    sml.mnList.push_back(mk_sml_entry(h, /*valid=*/false));
+
+    auto first  = m.sync_validity_from_sml(sml);
+    auto second = m.sync_validity_from_sml(sml);
+    auto third  = m.sync_validity_from_sml(sml);
+
+    EXPECT_EQ(first.flipped_to_invalid, 1u);
+    EXPECT_EQ(second.flipped_to_invalid, 0u)
+        << "Second call must be a no-op — already in SML state.";
+    EXPECT_EQ(third.flipped_to_invalid, 0u);
+}
+
+TEST(DashPayAttribution, Bug12_SyncFromSml_SmlOnlyIsNoOp)
+{
+    // SML may contain MNs that aren't yet in MnStateMachine
+    // (registration tx hasn't been processed by apply_block yet, or
+    // we just loaded a stale snapshot). These must be counted but
+    // NOT inserted — apply_block owns the registration path.
+    MnStateMachine m;  // empty
+    CSimplifiedMNList sml;
+    sml.mnList.push_back(mk_sml_entry(mk_hash(0x01), true));
+    sml.mnList.push_back(mk_sml_entry(mk_hash(0x02), false));
+
+    auto sr = m.sync_validity_from_sml(sml);
+
+    EXPECT_EQ(sr.scanned,  2u);
+    EXPECT_EQ(sr.matched,  0u);
+    EXPECT_EQ(sr.sml_only, 2u);
+    EXPECT_EQ(sr.flipped_to_invalid, 0u);
+    EXPECT_EQ(sr.flipped_to_valid,   0u);
+    EXPECT_EQ(m.size(), 0u)
+        << "sync must not insert MNs; that's apply_block's job.";
+}
+
+TEST(DashPayAttribution, Bug12_SyncFromSml_OnlyTouchesIsValid)
+{
+    // Field-ownership contract: SML owns isValid; MnStateMachine owns
+    // nLastPaidHeight, nRegisteredHeight, scriptPayout, etc. The sync
+    // must NOT write any of MnStateMachine's owned fields even if
+    // SML has them.
+    auto h = mk_hash(0x55);
+    MnStateMachine m;
+    auto state = mk_mn(mk_p2pkh_script(0x33),
+                       /*lastPaid=*/12345, /*registered=*/1000,
+                       /*revived=*/5000);
+    m.load({{h, state}});
+
+    CSimplifiedMNList sml;
+    sml.mnList.push_back(mk_sml_entry(h, /*valid=*/false));
+
+    m.sync_validity_from_sml(sml);
+
+    const auto& after = m.entries().at(h);
+    EXPECT_FALSE(after.isValid);
+    EXPECT_EQ(after.nLastPaidHeight,    12345u);
+    EXPECT_EQ(after.nRegisteredHeight,  1000u);
+    EXPECT_EQ(after.nPoSeRevivedHeight, 5000u);
+    EXPECT_EQ(after.scriptPayout.m_data, mk_p2pkh_script(0x33));
 }
