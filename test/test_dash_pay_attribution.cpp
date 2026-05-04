@@ -288,7 +288,7 @@ TEST(DashPayAttribution, Bug12_SyncFromSml_FlipsBannedToInvalid)
     CSimplifiedMNList sml;
     sml.mnList.push_back(mk_sml_entry(h, /*valid=*/false));
 
-    auto sr = m.sync_validity_from_sml(sml);
+    auto sr = m.sync_validity_from_sml(sml, /*current_height=*/2465500);
 
     EXPECT_EQ(sr.scanned, 1u);
     EXPECT_EQ(sr.matched, 1u);
@@ -320,7 +320,7 @@ TEST(DashPayAttribution, Bug12_SyncFromSml_FlipsRevivedBackToValid)
     CSimplifiedMNList sml;
     sml.mnList.push_back(mk_sml_entry(h, /*valid=*/true));  // dashd revived it
 
-    auto sr = m.sync_validity_from_sml(sml);
+    auto sr = m.sync_validity_from_sml(sml, /*current_height=*/2465500);
 
     EXPECT_EQ(sr.flipped_to_valid, 1u);
     EXPECT_EQ(sr.flipped_to_invalid, 0u);
@@ -339,14 +339,17 @@ TEST(DashPayAttribution, Bug12_SyncFromSml_Idempotent)
     CSimplifiedMNList sml;
     sml.mnList.push_back(mk_sml_entry(h, /*valid=*/false));
 
-    auto first  = m.sync_validity_from_sml(sml);
-    auto second = m.sync_validity_from_sml(sml);
-    auto third  = m.sync_validity_from_sml(sml);
+    auto first  = m.sync_validity_from_sml(sml, /*current_height=*/2000);
+    auto second = m.sync_validity_from_sml(sml, /*current_height=*/2001);
+    auto third  = m.sync_validity_from_sml(sml, /*current_height=*/2002);
 
     EXPECT_EQ(first.flipped_to_invalid, 1u);
     EXPECT_EQ(second.flipped_to_invalid, 0u)
         << "Second call must be a no-op — already in SML state.";
     EXPECT_EQ(third.flipped_to_invalid, 0u);
+    EXPECT_EQ(second.ban_height_set, 0u)
+        << "No flip → no Bug-14 banHeight write either.";
+    EXPECT_EQ(third.ban_height_set,  0u);
 }
 
 TEST(DashPayAttribution, Bug12_SyncFromSml_SmlOnlyIsNoOp)
@@ -360,7 +363,7 @@ TEST(DashPayAttribution, Bug12_SyncFromSml_SmlOnlyIsNoOp)
     sml.mnList.push_back(mk_sml_entry(mk_hash(0x01), true));
     sml.mnList.push_back(mk_sml_entry(mk_hash(0x02), false));
 
-    auto sr = m.sync_validity_from_sml(sml);
+    auto sr = m.sync_validity_from_sml(sml, /*current_height=*/2465500);
 
     EXPECT_EQ(sr.scanned,  2u);
     EXPECT_EQ(sr.matched,  0u);
@@ -429,12 +432,13 @@ TEST(DashPayAttribution, Bug13_CProUpServTx_v2_EVO_RealPayload_Parses)
     EXPECT_EQ(ptx.platformHTTPPort, 47873u);
 }
 
-TEST(DashPayAttribution, Bug12_SyncFromSml_OnlyTouchesIsValid)
+TEST(DashPayAttribution, Bug12_SyncFromSml_OnlyTouchesOwnedFields)
 {
-    // Field-ownership contract: SML owns isValid; MnStateMachine owns
-    // nLastPaidHeight, nRegisteredHeight, scriptPayout, etc. The sync
-    // must NOT write any of MnStateMachine's owned fields even if
-    // SML has them.
+    // Field-ownership contract (post-Bug-14): SML owns the triple
+    // (isValid, nPoSeBanHeight, nPoSeRevivedHeight); MnStateMachine
+    // owns nLastPaidHeight, nRegisteredHeight, scriptPayout, etc. On
+    // a flip-to-invalid, sync must NOT write any of the MnStateMachine-
+    // owned fields, even if SML carries them.
     auto h = mk_hash(0x55);
     MnStateMachine m;
     auto state = mk_mn(mk_p2pkh_script(0x33),
@@ -445,12 +449,195 @@ TEST(DashPayAttribution, Bug12_SyncFromSml_OnlyTouchesIsValid)
     CSimplifiedMNList sml;
     sml.mnList.push_back(mk_sml_entry(h, /*valid=*/false));
 
-    m.sync_validity_from_sml(sml);
+    m.sync_validity_from_sml(sml, /*current_height=*/15000);
 
     const auto& after = m.entries().at(h);
-    EXPECT_FALSE(after.isValid);
+    EXPECT_FALSE(after.isValid)
+        << "SML-owned: must flip.";
+    // SML-owned fields: banHeight gets set (Bug 14, was 0).
+    // revivedHeight is preserved on flip-to-invalid (only updated
+    // on flip-to-valid).
+    EXPECT_EQ(after.nPoSeBanHeight, 15000u)
+        << "Bug 14: SML owns banHeight; current_height is the upper-bound "
+           "estimate when no precise tx-driven value exists.";
+    EXPECT_EQ(after.nPoSeRevivedHeight, 5000u)
+        << "SML-owned but only written on flip-to-valid; preserved here.";
+    // MnStateMachine-owned fields: untouched.
     EXPECT_EQ(after.nLastPaidHeight,    12345u);
     EXPECT_EQ(after.nRegisteredHeight,  1000u);
-    EXPECT_EQ(after.nPoSeRevivedHeight, 5000u);
     EXPECT_EQ(after.scriptPayout.m_data, mk_p2pkh_script(0x33));
+}
+
+// ─── Bug 14: implicit-PoSe-revive class — closes the apply_block gate hole ──
+//
+// Live observed 2026-05-04: MN 13dcc4eb...4e8c, dashd PoSeRevivedHeight=2465346,
+// our state nPoSeRevivedHeight=2396789. Chain implicitly PoSe-banned the MN
+// (no tx; consensus-rule trigger from PoSePenalty), so we never set banHeight
+// in apply_block. Bug 12's SML sync correctly flipped isValid back to true
+// when the chain revived, but didn't update banHeight or revivedHeight. When
+// ProUpServTx arrived at h=2465346 (Bug 13 parser fix held → tx parsed
+// cleanly), apply_block's revival branch `if (banHeight != 0)` failed —
+// banHeight was 0 because we never observed the implicit ban — so
+// nPoSeRevivedHeight stayed at the old 2396789. find_expected_payee uses
+// max(lastPaid, revivedHeight) for queue position, so the MN remained
+// "oldest unpaid" → 57+ [PAY] MISMATCH over ~6 hours all expecting the
+// same MN. Bug 14 extends Bug 12's contract to the full
+// (isValid, banHeight, revivedHeight) triple, atomic on every flip.
+
+TEST(DashPayAttribution, Bug14_FlipToValid_BumpsRevivedHeightFromCurrent)
+{
+    // The exact scenario: MN was banned implicitly (we missed the ban,
+    // banHeight stayed 0). SML now reports it valid again. Without
+    // Bug 14, revivedHeight stays at the OLD value and the MN keeps
+    // winning find_expected_payee.
+    auto h = mk_hash(0x13);
+    MnStateMachine m;
+    auto state = mk_mn(mk_p2pkh_script(0x38),
+                       /*lastPaid=*/2463761,
+                       /*registered=*/2114996,
+                       /*revived=*/2396789);  // OLD revive (the stuck value)
+    state.isValid = false;     // SML had previously synced isValid=false
+    state.nPoSeBanHeight = 0;  // but apply_block never observed the ban
+    m.load({{h, state}});
+
+    CSimplifiedMNList sml;
+    sml.mnList.push_back(mk_sml_entry(h, /*valid=*/true));  // dashd revived
+
+    auto sr = m.sync_validity_from_sml(sml, /*current_height=*/2465346);
+
+    EXPECT_EQ(sr.flipped_to_valid, 1u);
+    EXPECT_EQ(sr.revived_height_set, 1u)
+        << "Bug 14: flip-to-valid must bump revivedHeight when current_height "
+           "exceeds the stale persisted value.";
+    EXPECT_EQ(m.entries().at(h).nPoSeRevivedHeight, 2465346u)
+        << "Bug 14: revivedHeight must equal current_height after the bump.";
+    EXPECT_EQ(m.entries().at(h).nPoSeBanHeight, 0u)
+        << "Bug 14: flip-to-valid clears banHeight unconditionally — MN is "
+           "back, no banned epoch is in flight.";
+    EXPECT_TRUE(m.entries().at(h).isValid);
+}
+
+TEST(DashPayAttribution, Bug14_FlipToValid_RevivedHeightMonotonic)
+{
+    // Conservative invariant: never roll revivedHeight backward. If
+    // apply_block already set a higher revived (e.g. from a future
+    // ProUpServTx replayed during reorg recovery), SML's sync must
+    // not clobber it down to its lower current_height bound.
+    auto h = mk_hash(0x14);
+    MnStateMachine m;
+    auto state = mk_mn(mk_p2pkh_script(0x77),
+                       /*lastPaid=*/2400000,
+                       /*registered=*/2100000,
+                       /*revived=*/2465500);  // already known-precise
+    state.isValid = false;
+    m.load({{h, state}});
+
+    CSimplifiedMNList sml;
+    sml.mnList.push_back(mk_sml_entry(h, /*valid=*/true));
+
+    // current_height LESS than the existing revivedHeight.
+    auto sr = m.sync_validity_from_sml(sml, /*current_height=*/2465300);
+
+    EXPECT_EQ(sr.flipped_to_valid, 1u);
+    EXPECT_EQ(sr.revived_height_set, 0u)
+        << "Bug 14: monotonic — no bump when current_height ≤ existing.";
+    EXPECT_EQ(m.entries().at(h).nPoSeRevivedHeight, 2465500u)
+        << "Existing precise revivedHeight must be preserved.";
+}
+
+TEST(DashPayAttribution, Bug14_FlipToInvalid_SetsBanHeightWhenZero)
+{
+    // Symmetric: SML reports newly-banned MN. We didn't see the ban tx
+    // (it's the implicit class). Set banHeight = current_height.
+    auto h = mk_hash(0x15);
+    MnStateMachine m;
+    auto state = mk_mn(mk_p2pkh_script(0xaa), /*lastPaid=*/2460000);
+    state.isValid = true;
+    state.nPoSeBanHeight = 0;
+    m.load({{h, state}});
+
+    CSimplifiedMNList sml;
+    sml.mnList.push_back(mk_sml_entry(h, /*valid=*/false));
+
+    auto sr = m.sync_validity_from_sml(sml, /*current_height=*/2465400);
+
+    EXPECT_EQ(sr.flipped_to_invalid, 1u);
+    EXPECT_EQ(sr.ban_height_set, 1u)
+        << "Bug 14: flip-to-invalid must set banHeight when previously 0.";
+    EXPECT_EQ(m.entries().at(h).nPoSeBanHeight, 2465400u);
+}
+
+TEST(DashPayAttribution, Bug14_FlipToInvalid_PreservesPreciseBanHeight)
+{
+    // If apply_block already recorded a precise banHeight (via
+    // ProUpRevTx or ProUpRegTx-key-change), SML's sync must not
+    // overwrite it with its current_height upper bound. apply_block's
+    // value is exact; SML's is approximate.
+    auto h = mk_hash(0x16);
+    MnStateMachine m;
+    auto state = mk_mn(mk_p2pkh_script(0xbb), /*lastPaid=*/2460000);
+    state.isValid = true;
+    state.nPoSeBanHeight = 2461234;  // precise — apply_block set this
+    m.load({{h, state}});
+
+    CSimplifiedMNList sml;
+    sml.mnList.push_back(mk_sml_entry(h, /*valid=*/false));
+
+    auto sr = m.sync_validity_from_sml(sml, /*current_height=*/2465400);
+
+    EXPECT_EQ(sr.flipped_to_invalid, 1u);
+    EXPECT_EQ(sr.ban_height_set, 0u)
+        << "Bug 14: must NOT touch banHeight when already non-zero.";
+    EXPECT_EQ(m.entries().at(h).nPoSeBanHeight, 2461234u)
+        << "Precise banHeight from apply_block must be preserved.";
+}
+
+TEST(DashPayAttribution, Bug14_RegressionScenario_ClearsStuckQueue)
+{
+    // End-to-end reproduction of the live 13dcc4eb...4e8c scenario:
+    // MN_stuck has lastPaid=2463761, revived=2396789, isValid=false
+    // (SML had already synced the implicit ban; banHeight=0 because
+    // apply_block missed it). Other MNs have lastPaid > stuck's
+    // effective max(lastPaid, revived)=2463761.
+    //
+    // Pre-Bug-14: SML revives MN_stuck via a flip-to-valid; only
+    // isValid changes; revived stays at 2396789. find_expected_payee
+    // computes max(2463761, 2396789)=2463761 — the OLDEST in the
+    // pool — and picks MN_stuck. Stuck queue.
+    //
+    // Post-Bug-14: revived gets bumped to current_height=2465346,
+    // pushing MN_stuck to the back of the queue. find_expected_payee
+    // picks MN_other (lastPaid=2464000 < 2465346).
+    auto h_stuck = mk_hash(0x13);
+    auto h_other = mk_hash(0xa9);
+    MnStateMachine m;
+
+    auto stuck = mk_mn(mk_p2pkh_script(0x38),
+                       /*lastPaid=*/2463761,
+                       /*registered=*/2114996,
+                       /*revived=*/2396789);
+    stuck.isValid = false;
+    stuck.nPoSeBanHeight = 0;  // Bug 12 territory: implicit ban
+
+    auto other = mk_mn(mk_p2pkh_script(0xee),
+                       /*lastPaid=*/2464000,
+                       /*registered=*/2200000,
+                       /*revived=*/0);
+
+    m.load({{h_stuck, stuck}, {h_other, other}});
+
+    // SML revives the stuck MN.
+    CSimplifiedMNList sml;
+    sml.mnList.push_back(mk_sml_entry(h_stuck, /*valid=*/true));
+    sml.mnList.push_back(mk_sml_entry(h_other, /*valid=*/true));
+
+    m.sync_validity_from_sml(sml, /*current_height=*/2465346);
+
+    auto expected = m.find_expected_payee();
+    ASSERT_TRUE(expected.has_value());
+    EXPECT_EQ(*expected, h_other)
+        << "Bug 14 regression: pre-fix would pick h_stuck because revived "
+           "stayed at 2396789, making max(lastPaid, revived)=2463761 the "
+           "lowest effective height. Post-fix bumps revived to 2465346, "
+           "pushing h_stuck behind h_other (lastPaid=2464000).";
 }

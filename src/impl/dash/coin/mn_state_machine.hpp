@@ -321,48 +321,81 @@ public:
     // sync_validity_from_sml — reconcile per-MN liveness from the SML
     // ─────────────────────────────────────────────────────────────────
     //
-    // Phase C-PAY Bug 12 fix (2026-05-03).
+    // Phase C-PAY Bug 12 fix (2026-05-03), extended by Bug 14 (2026-05-04).
     //
-    // **Problem.** PoSe bans aren't tx-driven. Dash Core applies them
-    // via consensus rules (CDeterministicMNManager triggers a ban when
-    // an MN crosses MAX_PoSe_PENALTY from missed quorums). They never
-    // appear as a special tx in any block. So apply_block(), which
+    // **Problem (Bug 12).** PoSe bans aren't tx-driven. Dash Core applies
+    // them via consensus rules (CDeterministicMNManager triggers a ban
+    // when an MN crosses MAX_PoSe_PENALTY from missed quorums). They
+    // never appear as a special tx in any block. So apply_block(), which
     // walks special txs, can never observe them — the MN stays
     // isValid=true in MnStateMachine forever after a real-world ban.
     // find_expected_payee() then deterministically picks that phantom-
-    // eligible MN until manually re-snapshotted from RPC. Live-observed
-    // 2026-04-30..05-03: 1858 [PAY] MISMATCH all with the same
-    // expected=7a9b3753... after dashd PoSe-banned it at h=2463018.
+    // eligible MN until manually re-snapshotted from RPC.
+    //
+    // **Problem (Bug 14).** The mirror class on the revive side: when an
+    // implicitly-banned MN is later revived by a ProUpServTx, the apply
+    // path's revival branch is gated on `nPoSeBanHeight != 0` (mirroring
+    // dashcore specialtxman.cpp:361-370). If we never observed the ban
+    // (Bug 12 territory), banHeight stays 0 and the gate fails — so
+    // nPoSeRevivedHeight stays at its OLD value. find_expected_payee
+    // uses max(nLastPaidHeight, nPoSeRevivedHeight) for queue position,
+    // so the MN keeps winning as oldest-unpaid until manually reseeded.
+    // Live-observed 2026-05-04: MN 13dcc4eb...4e8c, dashd
+    // PoSeRevivedHeight=2465346, our state revived=2396789 → 57+ [PAY]
+    // MISMATCH all with the same expected= over ~6 hours.
     //
     // **Fix.** The SML feed (Phase C-SML, mnlistdiff p2p messages,
     // root-verified bit-exact against the coinbase's
     // merkleRootMNList) carries the authoritative
     // CSimplifiedMNListEntry::isValid for every active MN. After each
-    // successful root MATCH we project that view onto our m_entries
-    // so find_expected_payee's `if (!st.isValid) continue;` filter
-    // becomes consistent with dashd.
+    // successful root MATCH we project that view onto our m_entries.
+    // Bug 12 synced isValid alone; Bug 14 extends the contract to the
+    // full causally-coupled triple — see "Field-ownership contract"
+    // below.
     //
-    // **Field-ownership contract** (post-this-sync):
-    //   - SML owns:  isValid (banned / revived state)
-    //   - this owns: nLastPaidHeight, nRegisteredHeight,
-    //                nPoSeRevivedHeight, nPoSeBanHeight, scriptPayout,
+    // **Field-ownership contract** (post-Bug-14):
+    //   - SML owns the triple (isValid, nPoSeBanHeight, nPoSeRevivedHeight)
+    //     — they're causally one piece of state. SML's isValid is the
+    //     boolean projection of dashd's authoritative ban/revive epoch;
+    //     when SML flips it we update banHeight + revivedHeight
+    //     consistently using current_height as a conservative bound.
+    //   - this owns: nLastPaidHeight, nRegisteredHeight, scriptPayout,
     //                collateralOutpoint, nType (timing + identity facets
     //                that are tx-driven and reach us via apply_block)
+    //
+    // **Sync semantics** (per flip direction):
+    //   - false→true (revive): set nPoSeRevivedHeight = max(existing,
+    //     current_height) — monotonic, never rolls back; clear
+    //     nPoSeBanHeight = 0. After this, apply_block's ProUpServTx
+    //     revival branch becomes consistent: the next explicit ProUpServTx
+    //     (if any) is a no-op on these fields, not a stale-state trap.
+    //   - true→false (ban): set nPoSeBanHeight = current_height ONLY if
+    //     not already set (preserve apply_block's exact ban height when
+    //     known via tx; SML's view is approximate by ≤ diff cadence).
+    //
+    // **Why current_height is a safe bound.** SML diffs lag the chain
+    // tip by ≤ a small number of blocks (<= the diff request cadence).
+    // The actual ban/revive height ≤ current_height always. For the
+    // scheduler this means: revivedHeight may be slightly later than
+    // chain (worst case: MN gets pushed slightly further back in queue
+    // than dashd would — a transient under-payment of 1-2 blocks);
+    // banHeight may be slightly later (banned-window length metric is
+    // truncated, but ban itself is correctly observed). Both directions
+    // are strictly better than the pre-fix behavior of a stuck queue.
     //
     // Idempotent: safe to call after every SML root MATCH (live diff)
     // and once at startup post-load_sml + post-load_into (catches any
     // persisted divergence). O(|SML|) — ~3700 entries on Dash mainnet,
     // microseconds.
-    //
-    // Does NOT touch nPoSeBanHeight directly because the SML wire
-    // entry doesn't carry the ban height — only the boolean. If you
-    // need the height for diagnostics, get it from RPC; for payee
-    // selection only the boolean matters.
     struct SyncFromSmlResult {
         size_t scanned{0};            // SML entries iterated
         size_t matched{0};            // also present in m_entries
         size_t flipped_to_invalid{0}; // m_entries[h].isValid: true → false
         size_t flipped_to_valid{0};   // m_entries[h].isValid: false → true
+        size_t revived_height_set{0}; // Bug 14: nPoSeRevivedHeight
+                                      // bumped on a flip-to-valid
+        size_t ban_height_set{0};     // Bug 14: nPoSeBanHeight set
+                                      // on a flip-to-invalid (was 0)
         size_t sml_only{0};           // SML had it, m_entries didn't —
                                       // a no-op; apply_block will
                                       // register on the next ProRegTx
@@ -370,7 +403,8 @@ public:
                                       // load() reseed from snapshot)
     };
     SyncFromSmlResult sync_validity_from_sml(
-        const vendor::CSimplifiedMNList& sml)
+        const vendor::CSimplifiedMNList& sml,
+        uint32_t current_height)
     {
         SyncFromSmlResult r;
         for (const auto& sml_entry : sml.mnList) {
@@ -381,11 +415,40 @@ public:
                 continue;
             }
             ++r.matched;
-            if (it->second.isValid != sml_entry.isValid) {
-                if (sml_entry.isValid) ++r.flipped_to_valid;
-                else                   ++r.flipped_to_invalid;
-                it->second.isValid = sml_entry.isValid;
+            if (it->second.isValid == sml_entry.isValid) continue;
+
+            // Flip detected — apply the (isValid, banHeight,
+            // revivedHeight) triple update atomically.
+            if (sml_entry.isValid) {
+                // false→true (revive): clear ban, bump revivedHeight
+                // monotonically. Whether the original ban was tx-driven
+                // (we observed it via apply_block's ProUpRevTx /
+                // ProUpRegTx-key-change branches) or implicit (Bug 12
+                // class — dashd's PoSePenalty consensus rule), the SML
+                // flipping back to valid is the authoritative signal
+                // that the MN is back. Setting revivedHeight here
+                // closes the apply_block-revival-gate hole (Bug 14
+                // class) for implicit revivals.
+                ++r.flipped_to_valid;
+                if (current_height > it->second.nPoSeRevivedHeight) {
+                    it->second.nPoSeRevivedHeight = current_height;
+                    ++r.revived_height_set;
+                }
+                it->second.nPoSeBanHeight = 0;
+            } else {
+                // true→false (ban): record banHeight only if we don't
+                // already have one. apply_block sets it precisely when
+                // the ban is tx-driven (ProUpRevTx, key-change in
+                // ProUpRegTx); SML's current_height is an upper bound
+                // for the implicit case. Don't clobber a precise
+                // height with our approximation.
+                ++r.flipped_to_invalid;
+                if (it->second.nPoSeBanHeight == 0) {
+                    it->second.nPoSeBanHeight = current_height;
+                    ++r.ban_height_set;
+                }
             }
+            it->second.isValid = sml_entry.isValid;
         }
         return r;
     }

@@ -1067,11 +1067,19 @@ int main(int argc, char* argv[])
     // truth, instead of waiting for the next mnlistdiff to arrive over
     // the network. See mn_state_machine.hpp::sync_validity_from_sml.
     if (sml && !sml->mnList.empty()) {
-        auto sr = mn_state_machine->sync_validity_from_sml(*sml);
+        // Bug 14: pass sml_db's best_height as the conservative
+        // current_height bound for implicit ban/revive height
+        // assignment. At startup this is the highest block whose SML
+        // diff we've persisted — every flipped entry was banned/revived
+        // at-or-before this height.
+        auto sr = mn_state_machine->sync_validity_from_sml(
+            *sml, static_cast<uint32_t>(sml_db->get_best_height()));
         std::cout << "[MNS-SYNC] startup reconcile from SML: "
                   << "matched=" << sr.matched
                   << " banned="  << sr.flipped_to_invalid
                   << " revived=" << sr.flipped_to_valid
+                  << " banH_set=" << sr.ban_height_set
+                  << " revH_set=" << sr.revived_height_set
                   << " sml_only=" << sr.sml_only
                   << " (sml=" << sr.scanned << ", mns=" << mn_state_machine->size() << ")"
                   << std::endl;
@@ -3456,12 +3464,20 @@ int main(int argc, char* argv[])
                         // mn_state_machine.hpp::sync_validity_from_sml
                         // and project_dash_phase_c_pay_pathA.md Bug 12.
                         if (mn_state_machine) {
-                            auto sr = mn_state_machine->sync_validity_from_sml(*sml);
+                            // Bug 14: diff_cbtx.nHeight is the
+                            // root-verified SML diff height — every
+                            // ban/revive carried in this diff happened
+                            // at-or-before this height.
+                            auto sr = mn_state_machine->sync_validity_from_sml(
+                                *sml,
+                                static_cast<uint32_t>(diff_cbtx.nHeight));
                             if (sr.flipped_to_invalid + sr.flipped_to_valid > 0) {
                                 LOG_INFO << "[MNS-SYNC] from SML root MATCH: "
                                          << "matched=" << sr.matched
                                          << " banned="  << sr.flipped_to_invalid
                                          << " revived=" << sr.flipped_to_valid
+                                         << " banH_set=" << sr.ban_height_set
+                                         << " revH_set=" << sr.revived_height_set
                                          << " sml_only=" << sr.sml_only;
                             }
                         }
