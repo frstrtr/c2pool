@@ -53,28 +53,26 @@ echo "  → $UNI_BIN"
 echo "  → $(file "$UNI_BIN" | head -1)"
 echo "  → SHA256: $(shasum -a 256 "$UNI_BIN" | cut -d' ' -f1)"
 
-# If both secp dylibs were provided, lipo them too — overrides the
-# search-and-bundle logic in create-dmg.sh by pre-staging the universal
-# dylib at the path create-dmg.sh expects from `otool -L`.
+# If both secp dylibs were provided, lipo them and stage the universal
+# dylib at a stable absolute path that create-dmg.sh's `otool -L` →
+# `cp` flow will see and bundle. The universal binary's install_name
+# is patched to point at that staged path so `otool -L` reports it.
 if [ -n "$X86_SECP" ] && [ -f "$X86_SECP" ] && [ -n "$ARM_SECP" ] && [ -f "$ARM_SECP" ]; then
-    UNI_SECP="$TMP/libsecp256k1.6.dylib"
+    UNI_SECP_TMP="$TMP/libsecp256k1.6.dylib"
+    UNI_SECP_STAGED="$TMP/staged-libsecp256k1.6.dylib"
     echo
     echo "Combining libsecp256k1 dylibs"
-    lipo -create "$X86_SECP" "$ARM_SECP" -output "$UNI_SECP"
-    echo "  → $UNI_SECP ($(file "$UNI_SECP" | head -1))"
-    # Patch the universal binary's secp256k1 install_name to a stable
-    # path the universal dylib will sit at after create-dmg.sh stages it.
-    # (create-dmg.sh's otool-driven detection will find the existing
-    # install_name and re-point it to @executable_path; pre-pointing it
-    # here ensures the universal dylib is the one packaged.)
-    UNI_LIB_DIR="$(dirname "$X86_SECP")"
-    install_name_tool -change "$X86_SECP" "$UNI_LIB_DIR/libsecp256k1.6.dylib" "$UNI_BIN" 2>/dev/null || true
-    install_name_tool -change "$ARM_SECP" "$UNI_LIB_DIR/libsecp256k1.6.dylib" "$UNI_BIN" 2>/dev/null || true
-    # Stage the universal dylib at the install_name path so create-dmg.sh's
-    # `cp "$LINKED_SECP"` picks it up. (sudo not required if path is in
-    # /opt/homebrew/Cellar, but we use a tmp staging dir to avoid
-    # mutating Homebrew's tree.)
-    cp "$UNI_SECP" "$UNI_LIB_DIR/libsecp256k1.6.dylib.universal" 2>/dev/null || true
+    lipo -create "$X86_SECP" "$ARM_SECP" -output "$UNI_SECP_TMP"
+    echo "  → $UNI_SECP_TMP ($(file "$UNI_SECP_TMP" | head -1))"
+
+    # Stage the universal dylib at a path create-dmg.sh will find via
+    # otool -L. Use an absolute path under $TMP so we don't pollute
+    # Homebrew's Cellar or /usr/local; install_name_tool both binary's
+    # current secp256k1 references to point at this staging path.
+    cp "$UNI_SECP_TMP" "$UNI_SECP_STAGED"
+    install_name_tool -change "$X86_SECP" "$UNI_SECP_STAGED" "$UNI_BIN" 2>/dev/null || true
+    install_name_tool -change "$ARM_SECP" "$UNI_SECP_STAGED" "$UNI_BIN" 2>/dev/null || true
+    echo "  → $UNI_BIN install_name patched to $UNI_SECP_STAGED"
 fi
 
 echo
