@@ -27,6 +27,51 @@ These should be audited and guarded with `shared_lock(try_to_lock)` as well.
 
 ---
 
+## SIGSEGV during sharechain pruning (drop_tails iterator/race) — open
+
+**Severity**: Medium  
+**First reported**: 2026-05-06 (krizis, pre-v0.1.2-alpha binary)  
+**Risk**: Process crash; auto-restarts cover it but state momentarily lost.
+
+Reported crash signature on a long-running pre-v0.1.2-alpha node:
+
+```
+[drop-tails-QUALIFY] tail=e1add697515ef9f1 min_height=17521 threshold=17290 n_heads=5 chain_size=18705
+[drop-tails-PRE] iter=0 drop_idx=0/1 aftertail=65ba9088c660768a chain_size=18705
+[drop-tails-PRE] iter=1 drop_idx=0/1 aftertail=b3ff057b0c294850 chain_size=18704
+=== CRASH (signal 11) ===
+./c2pool(+0x47919) ...
+/lib/x86_64-linux-gnu/libc.so.6(+0x45330) ...
+```
+
+SIGSEGV inside `drop_tails` on the second pruning iteration of a large
+sharechain (18,705 entries, 5 disconnected heads). **Not** the same class
+as v0.1.2-alpha's Bug 9 fix (wire-side `vector::resize` / `Packet::read`
+length_error) or Bug 3 fix (Factory async-lambda UAF on disconnect-reconnect)
+— the crash site is in sharechain mutation, not network IO.
+
+The most plausible cause is the residual tracker-race class above: an HTTP
+request walking the chain (e.g. `/sharechain/share/:hash` via
+`share_lookup_fn`) racing with `drop_tails` mutating the chain mid-iteration.
+The reporter's binary was discarded before symbols could be resolved, so the
+exact fault address is undetermined; symptoms are consistent with this class.
+
+**Status**: open. Triggered repro requires a long-running node + heavy
+HTTP traffic on `/sharechain/*` endpoints during pruning.
+
+**Mitigation today**: enable `Restart=always` in the systemd unit so the
+auto-restart absorbs the crash; rely on persistent sharechain on disk to
+resume cleanly. v0.1.1-alpha's external watchdog thread + `LimitCORE=infinity`
+will also capture a core dump for future analysis if it recurs on a
+v0.1.2-alpha+ binary (where addr2line will resolve symbols against a
+distributed binary's BuildID).
+
+**Fix path**: extend the `shared_lock(try_to_lock)` guard to the remaining
+HTTP callbacks listed above. Tracked in the tracker-callbacks audit item
+that v0.1.1-alpha started.
+
+---
+
 ## `m_found_blocks` grows without bound
 
 **Severity**: Low (very slow growth)  
