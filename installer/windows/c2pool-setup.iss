@@ -19,7 +19,7 @@
 
 ; ── App metadata ────────────────────────────────────────────────────────────
 #define MyAppName "c2pool"
-#define MyAppVersion "0.1.1-alpha"
+#define MyAppVersion "0.1.2-alpha"
 #define MyAppPublisher "frstrtr"
 #define MyAppURL "https://github.com/frstrtr/c2pool"
 #define MyAppExeName "c2pool.exe"

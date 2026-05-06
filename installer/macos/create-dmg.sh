@@ -15,7 +15,7 @@ set -e
 
 BINARY="$1"
 ARCH="${2:-$(uname -m)}"
-VERSION="0.1.1-alpha"
+VERSION="0.1.2-alpha"
 VOLNAME="c2pool-${VERSION}"
 DMG_NAME="c2pool-${VERSION}-macos-${ARCH}.dmg"
 
@@ -26,10 +26,24 @@ if [ -z "$BINARY" ] || [ ! -f "$BINARY" ]; then
 fi
 
 # Verify binary architecture
-ACTUAL_ARCH=$(file "$BINARY" | grep -o 'x86_64\|arm64' | head -1)
-if [ "$ACTUAL_ARCH" != "$ARCH" ]; then
-    echo "ERROR: binary is $ACTUAL_ARCH but arch=$ARCH specified"
-    exit 1
+if [ "$ARCH" = "universal" ]; then
+    # Universal binary contains both architectures (lipo -create combined)
+    if ! file "$BINARY" | grep -q 'universal binary with 2 architectures'; then
+        echo "ERROR: arch=universal requires a universal binary (lipo -create x86_64-bin arm64-bin)"
+        file "$BINARY"
+        exit 1
+    fi
+    if ! file "$BINARY" | grep -q 'arm64' || ! file "$BINARY" | grep -q 'x86_64'; then
+        echo "ERROR: universal binary must contain both arm64 + x86_64 slices"
+        file "$BINARY"
+        exit 1
+    fi
+else
+    ACTUAL_ARCH=$(file "$BINARY" | grep -o 'x86_64\|arm64' | head -1)
+    if [ "$ACTUAL_ARCH" != "$ARCH" ]; then
+        echo "ERROR: binary is $ACTUAL_ARCH but arch=$ARCH specified"
+        exit 1
+    fi
 fi
 
 # Find repo root (script is in installer/macos/)

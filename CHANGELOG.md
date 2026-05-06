@@ -1,5 +1,76 @@
 # Changelog
 
+## [0.1.2-alpha] - 2026-05-06
+
+### Stability (Critical) — UAF + length_error class permanently closed
+
+This release backports the LTC/DOGE-applicable subset of the Bug 9 + Bug 3
+fixes that were proven on the Dash mainnet shadow soak (8d 1h 40m
+continuous uptime through 2026-05-06 with `NRestarts=0` and zero new
+crash-log entries — see the postmortem archive for the verdict). The
+crashes these fixes prevent had not yet been observed on LTC/DOGE in
+the wild, but the affected code paths (`core/socket.cpp`, `core/factory.hpp`,
+`core/packet.hpp`, `core/timer.hpp`) are shared, so the same UAF /
+unbounded-resize footguns existed dormant on every multi-coin canary.
+
+- **Fix unbounded `vector::resize()` from wire** — Packet read paths
+  could call `resize()` with attacker-controlled lengths up to 4 GiB,
+  hitting `std::length_error` (the original `vector::_M_default_append`
+  signature) and aborting the process. Caps now enforced at multiple
+  layers: `Packet::read()` rejects prefix lengths > 16 bytes;
+  `Socket::read()` catches and logs instead of letting `length_error`
+  escape; share/header/peer wire structs gate `resize()` inputs against
+  documented protocol bounds before allocating.
+- **Fix Socket use-after-free during peer disconnect-reconnect cascade**
+  — `Socket::m_node` was a raw pointer that could outlive the network
+  node it referenced. Replaced with `std::weak_ptr<core::INetwork>`;
+  the read path now `acquire_node()`s before touching `m_node->get_prefix()`,
+  so a freed node returns null instead of garbage. Includes an AsAN CI
+  job (Linux + Ubuntu 24.04 + GCC 13) that re-runs the unit tests under
+  ASan/UBSan to catch regressions of this class on every push.
+- **Fix Timer use-after-free** — `Timer::cancel()` could be called on a
+  destroyed `Timer` via a still-pending async lambda; the lambda now
+  captures `weak_from_this()` and bails when `lock()` returns null.
+  Surfaced by the AsAN job once it was wired up; same lifetime pattern
+  as Socket's fix.
+- **Fix Factory async-lambda UAF (Bug 3 root cause)** — `Factory<Client>`
+  / `Factory<Server>`'s acceptor/connector callbacks captured the raw
+  `m_node` pointer; if the node disconnected mid-handshake, the next
+  `connected()` callback fired on freed memory. Lambdas now capture
+  `m_node->weak_from_this()` and check liveness on entry. The fix
+  also requires nodes to inherit from the new `core::INetwork` mix-in
+  (extracted to its own header for Apple clang 21 / Apple Silicon
+  template-instantiation strictness — see the build-macos guide for
+  the universal-arch build flow this enables).
+
+### Build infrastructure
+
+- **macOS universal binary support** — the v0.1.1-alpha release shipped
+  separate `macos-arm64` and `macos-x86_64` `.dmg`s. v0.1.2-alpha now
+  ships a single `macos-universal.dmg` whose `c2pool` binary contains
+  both architectures (combined via `lipo -create`); it runs natively
+  on Apple Silicon (M1/M2/M3/M4) AND Intel Macs from the same package.
+  The per-arch `.dmg` and `.zip` artifacts are still produced for users
+  who need single-arch downloads.
+- **Apple clang 21 compatibility** — `core::INetwork` extracted from
+  `core/factory.hpp` to its own `core/inetwork.hpp`. Apple clang 21's
+  two-phase template lookup is strict about non-dependent member
+  access into incomplete types, which broke the make_socket template
+  on macOS Tahoe / cmd-line-tools 21. GCC 13 / earlier clang were
+  lenient. No behavior change.
+
+### Validation
+
+- 89 unit tests pass on Linux x86_64 (`test_share_messages`,
+  `test_hardening`, `test_utxo`, `test_decay_pplns`, `test_doge_chain`,
+  `test_redistribute_address`).
+- 8d 1h 40m clean Dash mainnet shadow soak with the same core-code fixes
+  (sister branch `dash-spv-embedded`) — Bug 3 verdict declared at
+  2026-05-06 17:12 UTC.
+- Pre-release smoke soak on PVE VM 213 (LTC mainnet sharechain peer-only
+  observer with stratum locked to localhost) — running clean against
+  20+ peers since 2026-05-06 18:24 UTC.
+
 ## [0.1.1-alpha] - 2026-04-13
 
 ### Stability (Critical)
