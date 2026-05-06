@@ -22,9 +22,9 @@ Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 | OS | Version | Compiler | Boost | Arch | Status |
 |----|---------|----------|-------|------|--------|
 | Ubuntu | 24.04.4 LTS | GCC 13.3 | 1.90 (Conan) | x86_64 | Working |
-| macOS | 26.3.1 (Tahoe) | Apple Clang 21.0 | 1.90 (Homebrew) | x86_64 Intel | Working |
-| macOS | — | Apple Clang | 1.90 (Homebrew) | arm64 (M-series) | Supported, untested |
-| Windows | 11 (26100) | MSVC 2022 | 1.90 (Conan) | x86_64 | Working |
+| macOS | 26.4.1 (Tahoe) | Apple Clang 21.0 | 1.90 (Homebrew) | x86_64 Intel | Working |
+| macOS | 26.4.1 (Tahoe) | Apple Clang 21.0 | 1.90 (Homebrew) | arm64 (M4) | Working |
+| Windows | 11 Pro (26100) | MSVC 19.44 (VS 2022) | 1.90 (Conan) | x86_64 | Working (Win10 minimum) |
 
 ---
 
@@ -35,9 +35,8 @@ Pre-built binaries are available on the [Releases page](https://github.com/frstr
 | Platform | Package | Notes |
 |----------|---------|-------|
 | Linux x86_64 | `.tar.gz` | Extract and run `./start.sh` |
-| macOS Intel | `.zip` | Bundled dylibs, no Homebrew needed |
-| macOS Apple Silicon | `.zip` | Native arm64 binary |
-| Windows x86_64 | `.zip` or `setup.exe` | Installer bundles VC++ Runtime + firewall rules |
+| macOS Universal | `.dmg` | Single download — runs natively on Apple Silicon AND Intel (lipo'd Mach-O, bundled libsecp256k1). Recommended starting v0.1.2-alpha. |
+| Windows x86_64 | `.zip` or `setup.exe` | Installer bundles VC++ Runtime + firewall rules. Windows 10 minimum. |
 
 ### Verify downloads
 
@@ -56,7 +55,7 @@ Get-FileHash c2pool-*-setup.exe -Algorithm SHA256
 
 All release binaries are built from the tagged git commit. To verify a binary matches the source:
 
-1. Check the git tag: `git log v0.1.1-alpha --oneline -1`
+1. Check the git tag: `git log v0.1.2-alpha --oneline -1`
 2. Build from that tag following the platform-specific guide
 3. Compare the SHA256 of your binary with the release `SHA256SUMS`
 

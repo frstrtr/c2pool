@@ -80,6 +80,10 @@ xattr -dr com.apple.quarantine ~/c2pool
 
 ### macOS arm64 cross-compile
 
-Homebrew's secp256k1 is native-only (x86_64 on Intel Macs). To build
-an arm64 binary, cross-compile secp256k1 from source into a persistent
-directory (not `/tmp/` which gets cleaned). See `doc/build-macos.md`.
+Homebrew's secp256k1 is native-only (x86_64 on Intel Macs / arm64 on
+Apple Silicon). The official macOS distribution since v0.1.2-alpha is
+a single Universal DMG built by combining per-arch binaries (one
+built on each Mac) via `lipo -create` — see
+`installer/macos/create-universal-dmg.sh`. If you need to cross-compile
+a single-arch binary on a single Mac, see the cross-compile section in
+`doc/build-macos.md`.
