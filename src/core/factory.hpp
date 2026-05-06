@@ -2,6 +2,7 @@
 #include <boost/asio.hpp>
 
 #include <core/log.hpp>
+#include <core/inetwork.hpp>
 #include <core/socket.hpp>
 #include <core/addr_store.hpp>
 #include <core/node_interface.hpp>
@@ -10,25 +11,10 @@ namespace io = boost::asio;
 
 namespace core
 {
-// Bug 3 root-cause fix: INetwork inherits enable_shared_from_this so
-// Factory::Client / Factory::Server can capture weak_from_this() into
-// their async lambdas instead of raw `this`. When the derived node
-// (e.g. dash::coin::p2p::NodeP2P) is owned by a shared_ptr, the captured
-// weak_ptr keeps it alive across the async callback's execution, fixing
-// the use-after-free that produced the 19:23:15 UTC SIGSEGV in
-// codecvt::do_length called from the boost::log formatter inside
-// NodeP2P::connected on a freed m_target_addr.
-//
-// For derived nodes NOT owned by shared_ptr (current LTC/DOGE pattern),
-// weak_from_this() returns an empty weak_ptr; Factory falls back to the
-// raw m_node pointer (preserves prior behavior — LTC/DOGE haven't been
-// observed to crash, the disconnect-reconnect cascade is Dash-specific).
-struct INetwork : public std::enable_shared_from_this<INetwork>
-{
-    virtual ~INetwork() = default;
-    virtual void connected(std::shared_ptr<core::Socket> socket) = 0;
-    virtual void disconnect() = 0;
-};
+// INetwork moved to core/inetwork.hpp 2026-05-06 (extracted to break
+// circular with socket.hpp's make_socket template — Apple clang 21
+// needs the complete type at the template's point of definition).
+// See its header comment for the Bug 3 root-cause-fix rationale.
 
 class Server
 {

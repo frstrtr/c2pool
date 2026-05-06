@@ -16,14 +16,15 @@
 #include <core/hash.hpp>
 #include <core/netaddress.hpp>
 #include <core/packet.hpp>
+#include <core/inetwork.hpp>
 
 namespace core
 {
 
-// Forward-declared to avoid circular include with factory.hpp (which includes
-// socket.hpp). Socket needs INetwork only for weak_ptr<INetwork> liveness
-// tracking; full definition is needed in socket.cpp via factory.hpp.
-struct INetwork;
+// INetwork's full definition lives in inetwork.hpp (extracted from
+// factory.hpp 2026-05-06 to break the circular include — Apple clang
+// 21 needs the complete type at the point of make_socket's template
+// definition for the network->weak_from_this() member access).
 
 enum connection_type
 {
