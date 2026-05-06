@@ -175,6 +175,14 @@ jobs:
 
       - name: Build c2pool + tests
         run: |
+          # NOTE: Dash-specific test targets (test_dash_credit_pool,
+          # test_dash_subsidy, test_dash_battletest_regressions,
+          # test_dash_pay_attribution) live on dash-spv-embedded only —
+          # they're built from src/impl/dash which isn't part of master /
+          # RC branches. The cherry-picked Bug 9 fundamental fix
+          # (c558fe92) imported this workflow file from dash-spv-embedded
+          # which had those targets in scope; trimming them here so the
+          # AsAN job builds clean on master + RC branches.
           cmake --build build_asan \
             --target c2pool \
                     test_hardening test_share_messages \
@@ -191,8 +199,6 @@ jobs:
                     test_mweb_builder \
                     test_address_resolution test_compute_share_target \
                     test_utxo \
-                    test_dash_credit_pool test_dash_subsidy test_dash_battletest_regressions \
-                    test_dash_pay_attribution \
                     test_coin_broadcaster test_multiaddress_pplns test_pplns_stress \
             -j$(nproc)
 
