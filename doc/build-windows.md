@@ -45,11 +45,21 @@ Get-FileHash c2pool-*-windows-*.exe -Algorithm SHA256
 
 | Component | Version |
 |-----------|---------|
-| Windows | 11 (Build 26100) |
+| Windows | 11 Pro (Build 26100) — **Windows 10 minimum** |
 | Visual Studio | 2022 Community (MSVC 19.44) |
 | CMake | 3.28+ |
-| Conan | 2.27 |
+| Conan | 2.28+ |
+| Boost | 1.90.0 (via Conan) |
 | Architecture | x86_64 |
+
+> **Windows 10 minimum**: c2pool's CMake sets `_WIN32_WINNT=0x0A00`
+> for MSVC builds because Boost 1.90's `boost/atomic/detail/wait_ops_windows.hpp`
+> uses `WaitOnAddress` / `WakeByAddressAll` (Windows 8+ Synchronization API).
+> Pinning to Windows 10 is the simplest way to satisfy that AND the
+> Microsoft toolchain assumptions; older Windows versions are
+> untested. The CMakeLists adds `Synchronization.lib` to the link
+> for these symbols. v0.1.1-alpha used Boost 1.78.0 which didn't
+> need this.
 
 ### Prerequisites
 

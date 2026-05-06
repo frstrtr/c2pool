@@ -46,4 +46,10 @@ target_link_libraries(core Boost::headers Boost::exception Boost::log Boost::log
 # Add LevelDB include directories
 target_include_directories(core PUBLIC ${LEVELDB_INCLUDE_DIRS})
 
+# Windows: web_server.cpp grew past MSVC's default object section limit
+# (error C1128). /bigobj raises the limit to ~4G sections.
+if(MSVC)
+    target_compile_options(core PRIVATE /bigobj)
+endif()
+
 add_subdirectory(test)

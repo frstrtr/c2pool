@@ -6,27 +6,35 @@ This guide covers building c2pool from source on macOS.
 
 | Component | Version |
 |-----------|---------|
-| macOS | 26.3.1 (Tahoe) |
+| macOS | 26.4.1 (Tahoe) — both Intel + Apple Silicon |
 | Xcode / Apple Clang | 21.0.0 |
-| CMake | 4.3.1 |
+| CMake | 4.3.2 |
+| Conan | 2.28.1 (used for cross-arch builds; native builds can use Homebrew only) |
 | Boost | 1.90.0 |
 | LevelDB | 1.23 |
 | libsecp256k1 | 0.7.1 |
-| Architecture | x86_64 (Intel Mac Pro) |
+| Architectures | x86_64 (Intel Mac Pro) + arm64 (Mac mini M4) |
 
-> Other macOS versions may work but are untested. Boost API changes between
-> major versions are the most common source of build failures on untested
-> configurations.
+> Apple Clang 21+ enforces strict two-phase template lookup: the
+> `make_socket` template in `core/socket.hpp` requires `core::INetwork`'s
+> full definition at the point of declaration, not just at instantiation.
+> v0.1.2-alpha extracted `INetwork` to its own header
+> (`src/core/inetwork.hpp`) to satisfy this; older clang versions / GCC
+> were lenient about it. If you build on an older Xcode you may not
+> have surfaced the issue, but the extract is now permanent.
 
 ## Option 1: Pre-built DMG (recommended)
 
 Download from the [Releases page](https://github.com/frstrtr/c2pool/releases):
-- **Intel Mac**: `c2pool-VERSION-macos-x86_64.dmg`
-- **Apple Silicon (M1/M2/M3/M4)**: `c2pool-VERSION-macos-arm64.dmg`
+
+- **`c2pool-VERSION-macos-universal.dmg`** — Recommended. Single
+  download containing both x86_64 + arm64 slices (combined via
+  `lipo -create`). Runs natively on Apple Silicon (M1/M2/M3/M4) AND
+  Intel Macs.
 
 ```bash
 # Mount the DMG
-hdiutil attach c2pool-*-macos-*.dmg
+hdiutil attach c2pool-*-macos-universal.dmg
 
 # Copy to your preferred location
 cp -R /Volumes/c2pool-*/  ~/c2pool
@@ -38,6 +46,11 @@ hdiutil detach /Volumes/c2pool-*
 cd ~/c2pool
 ./start.sh
 ```
+
+> **Pre-v0.1.2 releases** shipped two separate per-arch DMGs
+> (`-macos-arm64.dmg` and `-macos-x86_64.dmg`). v0.1.2-alpha+ supersedes
+> that with the single universal DMG; pick whichever your release page
+> offers.
 
 Dashboard: `http://localhost:8080` — Stratum: `stratum+tcp://YOUR_IP:9327`
 
@@ -241,8 +254,8 @@ bash installer/macos/create-dmg.sh build-arm64/src/c2pool/c2pool arm64
 
 ## Building a DMG package
 
-The `installer/macos/create-dmg.sh` script packages a binary with all
-required assets into a distributable `.dmg` file:
+The `installer/macos/create-dmg.sh` script packages a single-arch
+binary with all required assets into a distributable `.dmg` file:
 
 ```bash
 # Native architecture
@@ -251,10 +264,65 @@ bash installer/macos/create-dmg.sh build/src/c2pool/c2pool
 # Specific architecture
 bash installer/macos/create-dmg.sh build/src/c2pool/c2pool x86_64
 bash installer/macos/create-dmg.sh build-arm64/src/c2pool/c2pool arm64
+
+# Universal binary (after lipo-combining; see next section)
+bash installer/macos/create-dmg.sh path/to/universal-c2pool universal
 ```
 
 The DMG includes: binary, `libsecp256k1.6.dylib` (with `install_name_tool`
-fixup for `@executable_path`), web-static, explorer, config, start.sh, README.
+fixup for `@executable_path`), web-static, explorer, config, start.sh,
+README.
+
+### Building a universal DMG (Intel + Apple Silicon in one .dmg)
+
+`installer/macos/create-universal-dmg.sh` is a wrapper that takes both
+per-arch binaries (built on their respective Macs and scp'd to a
+single host) plus their per-arch `libsecp256k1.6.dylib` files, runs
+`lipo -create` on each, then delegates to `create-dmg.sh` with
+`arch=universal`. Run it on the host that has lipo + a working
+`create-dmg.sh` flow (any modern macOS).
+
+```bash
+# Prereq: built c2pool on both Macs
+#   Intel Mac:        ~/c2pool/build/src/c2pool/c2pool   (x86_64)
+#   Apple Silicon:    ~/c2pool/build/src/c2pool/c2pool   (arm64)
+
+# Stage Intel artifacts on the Apple Silicon host (or vice-versa)
+scp user0@intel-mac:~/c2pool/build/src/c2pool/c2pool ./c2pool-x86_64
+scp user0@intel-mac:/usr/local/opt/secp256k1/lib/libsecp256k1.6.dylib ./libsecp256k1-intel.dylib
+
+# Run the wrapper on the Apple Silicon host
+bash installer/macos/create-universal-dmg.sh \
+    ./c2pool-x86_64 \
+    ~/c2pool/build/src/c2pool/c2pool \
+    ./libsecp256k1-intel.dylib \
+    /opt/homebrew/opt/secp256k1/lib/libsecp256k1.6.dylib
+```
+
+The wrapper:
+
+1. Reads each per-arch binary's libsecp256k1 install_name via `otool -L`
+   (the install_name is baked at link time on each Mac and may differ
+   from the dylib FILE PATH on the lipo host — Intel uses
+   `/usr/local/opt/...`, Apple Silicon uses `/opt/homebrew/opt/...`).
+2. `lipo -create`s the two binaries into a universal Mach-O (verified
+   `Mach-O universal binary with 2 architectures: [x86_64] [arm64]`).
+3. `lipo -create`s the two dylibs into a universal libsecp256k1.
+4. Patches each slice's install_name to point at a stable staging path
+   so `create-dmg.sh`'s `otool -L → cp` flow finds and bundles the
+   universal dylib, then re-points it at `@executable_path/lib/...`
+   in the final DMG.
+
+Output: `c2pool-VERSION-macos-universal.dmg`. Verify with:
+
+```bash
+hdiutil attach c2pool-*-macos-universal.dmg
+lipo -info /Volumes/c2pool-*/c2pool          # should list both archs
+lipo -info /Volumes/c2pool-*/lib/libsecp256k1.6.dylib   # also both archs
+arch -arm64 /Volumes/c2pool-*/c2pool --help  # arm64 native
+arch -x86_64 /Volumes/c2pool-*/c2pool --help # x86_64 via Rosetta-2
+hdiutil detach /Volumes/c2pool-*
+```
 
 ---
 

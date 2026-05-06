@@ -6,7 +6,7 @@ Download `c2pool-VERSION-linux-x86_64.tar.gz` from the
 [Releases page](https://github.com/frstrtr/c2pool/releases).
 
 ```bash
-VERSION="0.1.1-alpha"
+VERSION="0.1.2-alpha"
 wget https://github.com/frstrtr/c2pool/releases/download/v${VERSION}/c2pool-${VERSION}-linux-x86_64.tar.gz
 tar xzf c2pool-${VERSION}-linux-x86_64.tar.gz
 cd c2pool-${VERSION}-linux-x86_64
