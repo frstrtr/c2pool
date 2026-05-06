@@ -99,7 +99,9 @@ fi
 # Copy secp256k1 dylib and fix load path
 # Detect the actual linked path from the binary (Homebrew may use Cellar paths
 # like /usr/local/opt/secp256k1/lib/ instead of /usr/local/lib/)
-LINKED_SECP=$(otool -L "$APP_DIR/c2pool" | grep secp256k1 | awk '{print $1}')
+# For universal binaries, otool emits one secp256k1 line per slice
+# (typically the same install_name on both); take only the first.
+LINKED_SECP=$(otool -L "$APP_DIR/c2pool" | grep secp256k1 | head -1 | awk '{print $1}')
 if [ -n "$LINKED_SECP" ] && [ -f "$LINKED_SECP" ]; then
     SECP_REAL=$(realpath "$LINKED_SECP")
     cp "$SECP_REAL" "$APP_DIR/lib/libsecp256k1.6.dylib"
