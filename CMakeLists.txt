@@ -10,6 +10,14 @@ endif()
 if(MSVC)
     # Suppress common MSVC warnings for POSIX names and unsafe CRT functions
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS _WINSOCK_DEPRECATED_NO_WARNINGS)
+    # Boost 1.90's wait_ops_windows.hpp uses WaitOnAddress/WakeByAddressAll
+    # (Windows 8+ Synchronization API). Without _WIN32_WINNT set high enough,
+    # boost::winapi doesn't expose the symbols and the build fails with
+    # "WakeByAddressAll: is not a member of boost::winapi". Pin to 0x0A00
+    # (Windows 10) since that's the minimum we support; also link
+    # Synchronization.lib at link time below.
+    add_compile_definitions(_WIN32_WINNT=0x0A00 WINVER=0x0A00)
+    link_libraries(Synchronization)
 endif()
 
 # Handle CMake 3.30+ policy for FindBoost removal
