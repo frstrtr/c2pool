@@ -624,10 +624,9 @@ int main(int argc, char* argv[])
     // subscriber removes confirmed txs.
     //
     // Mempool::add_tx without UTXO context cannot compute the fee — fees
-    // start at sentinel UNKNOWN and Mempool::recompute_unknown_fees fills
-    // them in lazily as the UTXO catches up. For now we don't drive that
-    // recomputation; templates produced before fees are known fall back to
-    // base-subsidy behavior. TODO: periodic call to recompute_unknown_fees.
+    // start at sentinel UNKNOWN.  Subsequent block connects bring new
+    // UTXOs into view, so fees of previously-unknown txs become resolvable.
+    // The full_block hook below drives this revalidation each tip change.
     coin_node.new_tx.subscribe(
         [&mempool, &utxo_cache](const btc::coin::Transaction& tx) {
             // The Transaction → MutableTransaction round-trip is required
@@ -640,9 +639,31 @@ int main(int argc, char* argv[])
     // remove_for_block on every full block we receive — connecting txs are
     // no longer mempool-eligible. Keeps the mempool honest after each new
     // tip without us having to track individual confirmations.
+    //
+    // After remove, also drive two UTXO-dependent maintenance passes:
+    //   1. revalidate_inputs: evict txs whose inputs the new block spent
+    //      out from under us (catches the case where remove_for_block's
+    //      conflict detection didn't see the spend — e.g., the spending
+    //      tx wasn't tracked in m_spent_outputs, parent-of-CPFP, etc).
+    //   2. recompute_unknown_fees: re-attempt fee computation for txs
+    //      that came in via new_tx before their inputs were visible.
+    //      Without this, txs with unresolved inputs stay fee=? forever
+    //      and are skipped by TemplateBuilder's fee-sorted include path
+    //      → blocks miss legitimate fees that were just one tip behind.
+    //
+    // Subscriber-call order: this lambda registers AFTER the UTXO
+    // connect_block subscriber at line 434, so by the time we run the
+    // UTXO has the new block already applied. revalidate_inputs and
+    // recompute_unknown_fees both operate on the post-connect snapshot.
     coin_node.full_block.subscribe(
-        [&mempool](const btc::coin::BlockType& block) {
+        [&mempool, &utxo_cache](const btc::coin::BlockType& block) {
             mempool.remove_for_block(block);
+            int evicted   = mempool.revalidate_inputs(&utxo_cache);
+            int resolved  = mempool.recompute_unknown_fees(&utxo_cache);
+            if (evicted > 0 || resolved > 0) {
+                LOG_INFO << "[EMB] post-tip mempool maintenance: evicted="
+                         << evicted << " resolved_fees=" << resolved;
+            }
         });
 
     // submit_block_fn: bridges BTCWorkSource → coin_node.submit_block_p2p_raw
