@@ -7058,13 +7058,28 @@ int main(int argc, char* argv[]) {
             stats_timer->expires_after(std::chrono::seconds(100));
             stats_timer->async_wait(*stats_fn);
 
-            // Run until shutdown
+            // Run until shutdown.
+            // Diagnostic [IOC-LAT]: when a single run_for slice takes far longer
+            // than its 100ms target, log it loud — boost::asio doesn't preempt
+            // handlers so any handler blocking for N seconds shows up here.
+            // This is the freeze-detection signal one rung below the existing
+            // watchdog: the watchdog tells you the io_context wedged for >30s,
+            // [IOC-LAT] tells you which slice (and rough wall-time) had the
+            // blocking handler in real time, well before the watchdog fires.
             while (!g_shutdown_requested) {
                 ioc.restart();
+                auto loop_t0 = std::chrono::steady_clock::now();
                 try {
                     ioc.run_for(std::chrono::milliseconds(100));
                 } catch (const std::exception& e) {
                     LOG_ERROR << "ioc handler exception (non-fatal): " << e.what();
+                }
+                auto loop_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - loop_t0).count();
+                if (loop_ms > 2000) {
+                    LOG_WARNING << "[IOC-LAT] iteration took " << loop_ms
+                                << "ms (target 100ms; pulse_age_ms="
+                                << (now_ms() - hb_ioc->load()) << ")";
                 }
             }
             work_guard.reset();
