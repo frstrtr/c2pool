@@ -1107,7 +1107,31 @@ int main(int argc, char* argv[])
     stratum_server_for_shutdown = std::move(stratum_server);
 
     LOG_INFO << "[BTC] io_context running. Ctrl-C to stop.";
-    ioc.run();
+
+    // Diagnostic [IOC-LAT]: when a single run_for slice takes far longer
+    // than its 100ms target, log it loud — boost::asio doesn't preempt
+    // handlers so any handler blocking for N seconds shows up here. Same
+    // signal as LTC's c2pool freeze-diag instrumentation
+    // (c2pool_refactored.cpp:7065). The original blocking ioc.run() can't
+    // emit per-slice diagnostics; switching to a 100ms-slice loop with
+    // the signal-set handler still calling ioc.stop() preserves graceful
+    // shutdown — once stop() is requested, run_for returns promptly and
+    // g_shutdown_requested terminates the loop.
+    while (!shutdown_initiated) {
+        ioc.restart();
+        auto loop_t0 = std::chrono::steady_clock::now();
+        try {
+            ioc.run_for(std::chrono::milliseconds(100));
+        } catch (const std::exception& e) {
+            LOG_ERROR << "ioc handler exception (non-fatal): " << e.what();
+        }
+        auto loop_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - loop_t0).count();
+        if (loop_ms > 2000) {
+            LOG_WARNING << "[IOC-LAT] iteration took " << loop_ms
+                        << "ms (target 100ms)";
+        }
+    }
 
     // ── Graceful shutdown — explicit teardown order ──────────────────────
     //
