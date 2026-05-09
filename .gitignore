@@ -212,3 +212,6 @@ external/**/relic_conf.h.in
 external/**/relic_conf.h.old
 # Doxygen output (e.g. external/dashbls/depends/mimalloc/docs/)
 external/**/depends/**/docs/
+
+# Release artifact staging area (built binaries, not source)
+release-staging/
