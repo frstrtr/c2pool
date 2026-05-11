@@ -51,6 +51,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>           // [MEM] periodic logger reads /proc/self/status
 #include <filesystem>
 #include <functional>
 #include <iostream>
@@ -547,6 +548,41 @@ int main(int argc, char* argv[])
         });
     };
     (*schedule_warn)();
+
+    // [MEM] periodic memory logger: every 60s, log VmRSS / VmSize from
+    // /proc/self/status. Catches slow leaks invisible from in-process
+    // state alone — boost::asio handler queues, leveldb caches, fragmented
+    // allocator pools, etc. Lightweight (~50µs per fire). Pair with a
+    // MemoryMax cgroup cap so any runaway is caught at the systemd layer.
+    // Other component sizes (mempool, chain) are already logged elsewhere
+    // by their own subsystems; this timer adds the OS-level RSS/VSZ that
+    // was previously visible only via external `ps` polling.
+    auto mem_timer    = std::make_shared<boost::asio::steady_timer>(ioc);
+    auto schedule_mem = std::make_shared<std::function<void()>>();
+    std::weak_ptr<std::function<void()>> weak_mem = schedule_mem;
+    *schedule_mem = [mem_timer, weak_mem]() {
+        mem_timer->expires_after(std::chrono::seconds(60));
+        mem_timer->async_wait([mem_timer, weak_mem]
+                               (const boost::system::error_code& ec) {
+            if (ec) return;
+            long vm_rss_kb = 0, vm_size_kb = 0, vm_data_kb = 0;
+            if (FILE* f = std::fopen("/proc/self/status", "r")) {
+                char line[256];
+                while (std::fgets(line, sizeof(line), f)) {
+                    long v;
+                    if (std::sscanf(line, "VmRSS: %ld kB",  &v) == 1) { vm_rss_kb  = v; continue; }
+                    if (std::sscanf(line, "VmSize: %ld kB", &v) == 1) { vm_size_kb = v; continue; }
+                    if (std::sscanf(line, "VmData: %ld kB", &v) == 1) { vm_data_kb = v; continue; }
+                }
+                std::fclose(f);
+            }
+            LOG_INFO << "[MEM] vmrss=" << vm_rss_kb << "kB"
+                     << " vmsize=" << vm_size_kb << "kB"
+                     << " vmdata=" << vm_data_kb << "kB";
+            if (auto self = weak_mem.lock()) (*self)();
+        });
+    };
+    (*schedule_mem)();
 
     // ── B4-net: c2pool sharechain peer ───────────────────────────────────
     // pool::NodeBridge<NodeImpl, Legacy, Actual> from src/impl/btc/node.{hpp,cpp}.
