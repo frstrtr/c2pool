@@ -76,8 +76,9 @@ inline DashWorkData build_embedded_workdata(
     constexpr uint32_t MAX_BLOCK_BYTES = 1'990'000;  // leave headroom for cb
     auto [selected, total_fees] =
         mempool.get_sorted_txs_with_fees(MAX_BLOCK_BYTES);
-    int64_t block_value = reward + total_fees;
-    int64_t mn_payment  = compute_dash_mn_payment_post_v20(block_value);
+    int64_t block_value      = reward + total_fees;
+    int64_t platform_reward  = compute_dash_platform_reward_post_v20_mn_rr(w.m_height);
+    int64_t mn_payment       = compute_dash_mn_payment_post_v20(block_value) - platform_reward;
 
     w.m_coinbase_value  = static_cast<uint64_t>(block_value);
     w.m_payment_amount  = static_cast<uint64_t>(mn_payment);
@@ -91,6 +92,16 @@ inline DashWorkData build_embedded_workdata(
         w.m_txs.emplace_back(s.tx);
         w.m_tx_hashes.push_back(dash::coin::dash_txid(s.tx));
         w.m_tx_fees.push_back(s.fee);
+    }
+
+    // Platform Credit Pool burn (DIP-0027): emit OP_RETURN payment
+    // FIRST (matches dashcore GetBlockTxOuts ordering at payments.cpp:55).
+    // Payee uses the "!hex" raw-script convention; OP_RETURN single byte = 0x6a.
+    if (platform_reward > 0) {
+        PackedPayment burn;
+        burn.payee  = "!6a";
+        burn.amount = static_cast<uint64_t>(platform_reward);
+        w.m_packed_payments.push_back(std::move(burn));
     }
 
     // MN payee → packed_payment. dashcore GBT returns "payee" as a

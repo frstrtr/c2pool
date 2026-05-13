@@ -2779,22 +2779,25 @@ int main(int argc, char* argv[])
                                     auto fees_opt = dash::coin::computed_block_fees(
                                         block, utxo);
                                     if (fees_opt.has_value()) {
+                                        int64_t platform =
+                                            dash::coin::compute_dash_platform_reward_post_v20_mn_rr(
+                                                height);
                                         int64_t expected_mn =
                                             dash::coin::compute_dash_mn_payment_post_v20(
-                                                reward + *fees_opt);
+                                                reward + *fees_opt) - platform;
                                         if (observed_mn_amount == expected_mn) {
                                             LOG_INFO << "[MN-PAY] match h=" << height
                                                      << " mn_payment=" << observed_mn_amount
                                                      << " (reward=" << reward
                                                      << " + fees=" << *fees_opt
-                                                     << " ×3/4)";
+                                                     << " ×3/4 - platform=" << platform << ")";
                                         } else {
                                             LOG_WARNING << "[MN-PAY] MISMATCH h=" << height
                                                         << " observed=" << observed_mn_amount
                                                         << " expected=" << expected_mn
                                                         << " (reward=" << reward
                                                         << " + fees=" << *fees_opt
-                                                        << " ×3/4)"
+                                                        << " ×3/4 - platform=" << platform << ")"
                                                         << " diff=" << (observed_mn_amount - expected_mn)
                                                         << " — log-only at MVP";
                                         }

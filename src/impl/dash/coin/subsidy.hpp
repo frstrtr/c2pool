@@ -43,6 +43,7 @@ inline constexpr int64_t COIN_SAT = 100'000'000LL;
 inline constexpr int DASH_SUBSIDY_HALVING_INTERVAL = 210240;
 inline constexpr int DASH_V20_HEIGHT_MAINNET       = 1'987'776;
 inline constexpr int DASH_BRR_HEIGHT_MAINNET       = 1'374'912;
+inline constexpr int DASH_MN_RR_HEIGHT_MAINNET     = 2'128'896;
 inline constexpr int DASH_SUPERBLOCK_CYCLE_MAINNET = 16616;
 
 /// Returns the BLOCK reward (excluding tx fees) for a block at height
@@ -72,6 +73,21 @@ inline int64_t compute_dash_block_reward_post_v20(uint32_t height)
 inline int64_t compute_dash_mn_payment_post_v20(int64_t block_value)
 {
     return block_value * 3 / 4;
+}
+
+/// Platform Credit Pool burn (DIP-0027 / Asset Lock) per-block share.
+/// Activates when both V20 AND MN_RR are deployed (mainnet h>=MN_RR=2,128,896,
+/// our checkpoint h=2.4M is always past). Mirror of dashcore PlatformShare()
+/// at masternode/payments.cpp: PlatformShare(GetMasternodePayment(h, subsidy, true))
+/// = (subsidy * 3/4) * 375/1000. Integer-arithmetic order matters: dashcore
+/// truncates between the two divisions, so we replicate that order exactly.
+/// The result is added as an OP_RETURN coinbase output and DEDUCTED from the
+/// MN's portion (miner share is unaffected).
+inline int64_t compute_dash_platform_reward_post_v20_mn_rr(uint32_t height)
+{
+    if (static_cast<int>(height) < DASH_MN_RR_HEIGHT_MAINNET) return 0;
+    int64_t mn_subsidy_share = compute_dash_block_reward_post_v20(height) * 3 / 4;
+    return mn_subsidy_share * 375 / 1000;
 }
 
 /// True if `height` is a superblock height (treasury budget payout).

@@ -33,6 +33,7 @@
 
 using dash::coin::compute_dash_block_reward_post_v20;
 using dash::coin::compute_dash_mn_payment_post_v20;
+using dash::coin::compute_dash_platform_reward_post_v20_mn_rr;
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
@@ -83,4 +84,52 @@ TEST(DashSubsidy, SuperblockHeightDetectionMainnet)
     EXPECT_TRUE(dash::coin::is_superblock_height(16616 * 2, 16616));
     EXPECT_FALSE(dash::coin::is_superblock_height(16615, 16616));
     EXPECT_FALSE(dash::coin::is_superblock_height(16617, 16616));
+}
+
+TEST(DashSubsidy, PlatformRewardZeroBeforeMN_RR)
+{
+    // MN_RR mainnet activation = h=2,128,896. Before that, platform_reward
+    // must be zero (pre-DIP-0027 split with no asset-lock burn output).
+    EXPECT_EQ(compute_dash_platform_reward_post_v20_mn_rr(2'128'895), 0);
+    EXPECT_EQ(compute_dash_platform_reward_post_v20_mn_rr(1'987'776), 0);
+    EXPECT_EQ(compute_dash_platform_reward_post_v20_mn_rr(0), 0);
+}
+
+TEST(DashSubsidy, PlatformRewardMatchesMainnetH2470904)
+{
+    // Live-validated against Dash mainnet block 2470904 (2026-05-13):
+    //   coinbase vout[0] value=0.49787579 DASH = 49,787,579 sat (OP_RETURN burn)
+    //   coinbase vout[1] value=0.83056309 DASH = 83,056,309 sat (MN payee)
+    //   coinbase vout[2] value=0.44281297 DASH = 44,281,297 sat (miner)
+    //   block reward = 177,022,505 sat (this height has 11 halvings applied)
+    //   fees         = 102,680 sat (computed from in-block tx fees)
+    //
+    // Formula (dashcore masternode/payments.cpp:28-58):
+    //   mn_subsidy_share = block_reward × 3/4 = 132,766,878 (floored)
+    //   platform_reward  = mn_subsidy_share × 375/1000 = 49,787,579 (floored)
+    constexpr uint32_t H = 2'470'904;
+    EXPECT_EQ(compute_dash_block_reward_post_v20(H), 177'022'505LL);
+    EXPECT_EQ(compute_dash_platform_reward_post_v20_mn_rr(H), 49'787'579LL);
+
+    // expected_mn (for [MN-PAY] shadow check) = (subsidy+fees) × 3/4 - platform
+    int64_t reward       = compute_dash_block_reward_post_v20(H);
+    int64_t fees         = 102'680LL;
+    int64_t platform     = compute_dash_platform_reward_post_v20_mn_rr(H);
+    int64_t expected_mn  = compute_dash_mn_payment_post_v20(reward + fees) - platform;
+    EXPECT_EQ(expected_mn, 83'056'309LL)
+        << "must match observed MN coinbase output at h=2,470,904";
+}
+
+TEST(DashSubsidy, PlatformReward28125PercentOfBlockReward)
+{
+    // Per dashcore: platform = (block_reward × 3/4) × 375/1000.
+    // For any block_reward where the math is exact (no truncation),
+    // platform = block_reward × 9/32 = 28.125%. At h=2,400,000 (post-MN_RR)
+    // the live values produce small truncation noise but the proportion
+    // should hold within 1 sat.
+    int64_t r = compute_dash_block_reward_post_v20(2'400'000);
+    int64_t p = compute_dash_platform_reward_post_v20_mn_rr(2'400'000);
+    int64_t expected_exact = (r * 9) / 32;
+    EXPECT_LE(std::abs(p - expected_exact), 1LL)
+        << "platform should match 9/32 of block_reward within int-truncation";
 }
