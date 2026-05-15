@@ -23,18 +23,24 @@
 
 #include <atomic>
 #include <chrono>
-#include <map>
 #include <mutex>
 #include <optional>
-#include <set>
 #include <thread>
 #include <functional>
 #include <iomanip>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace btc {
 namespace coin {
+
+// uint256 hasher for unordered containers (low-64 bits is already a uniform
+// distribution over a cryptographic hash, no further mixing needed).
+struct Uint256Hasher {
+    size_t operator()(const uint256& h) const { return h.GetLow64(); }
+};
 
 // ─── Index Entry ────────────────────────────────────────────────────────────
 
@@ -901,6 +907,8 @@ private:
         auto keys = m_db->list_keys("h", 10000000);
         int loaded = 0, corrupt = 0;
         int total_keys = static_cast<int>(keys.size());
+        m_headers.reserve(static_cast<size_t>(total_keys));
+        m_height_index.reserve(static_cast<size_t>(total_keys));
         for (auto& key : keys) {
             if (key.size() != 33) continue; // 'h' + 32-byte hash
             std::vector<uint8_t> data;
@@ -953,8 +961,8 @@ private:
 
     mutable std::mutex m_mutex;
 
-    std::map<uint256, IndexEntry>  m_headers;       // block_hash → entry
-    std::map<uint32_t, uint256>    m_height_index;  // height → block_hash (best chain only)
+    std::unordered_map<uint256, IndexEntry, Uint256Hasher>  m_headers;       // block_hash → entry
+    std::unordered_map<uint32_t, uint256>                   m_height_index;  // height → block_hash (best chain only)
 
     uint256    m_tip;                                // best chain tip hash
     uint32_t   m_tip_height{0};
@@ -967,7 +975,7 @@ private:
     std::unique_ptr<core::LevelDBStore> m_db;
 
     /// Dirty set: headers modified since last flush (write-back model).
-    std::set<uint256> m_dirty_headers;
+    std::unordered_set<uint256, Uint256Hasher> m_dirty_headers;
 
     /// Callback fired on tip change (reorg / equal-work switch).
     TipChangedCallback m_on_tip_changed;
