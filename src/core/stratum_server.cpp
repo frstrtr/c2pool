@@ -1361,7 +1361,7 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
     // coinbase/tx_data consistency. Overriding them caused GENTX validation
     // failures on p2pool nodes (absheight, bits mismatch).
     if (!cbr.snapshot.merkle_branches.empty()) {
-        merkle_branches_vec = cbr.snapshot.merkle_branches;
+        merkle_branches_vec = std::move(cbr.snapshot.merkle_branches);
         merkle_branches = nlohmann::json::array();
         for (const auto& h : merkle_branches_vec)
             merkle_branches.push_back(h);
@@ -1384,7 +1384,7 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         je.coinb1 = coinb1;
         je.coinb2 = coinb2;
         je.version = version_u32;
-        je.merkle_branches = merkle_branches_vec;
+        je.merkle_branches = std::move(merkle_branches_vec);
         je.gbt_block_nbits = gbt_block_nbits;
         active_jobs_[job_id] = std::move(je);
     }
@@ -1423,7 +1423,10 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         // Use tx_data from the atomic snapshot — NOT from the potentially stale
         // tmpl fetched at the top of send_notify_work(). This ensures the block
         // body transactions match the witness commitment and merkle branches.
-        je.tx_data = cbr.snapshot.tx_data;
+        // std::move because cbr is a local of this function and snapshot.tx_data
+        // is not referenced again after this assignment — saves a deep copy of
+        // the per-tx hex string vector on every notify (Option 2 fix).
+        je.tx_data = std::move(cbr.snapshot.tx_data);
     }
 
     // VARDIFF: do NOT override per-connection difficulty with pool share_bits.
