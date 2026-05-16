@@ -52,17 +52,36 @@ enum HeaderStatus : uint32_t {
     HEADER_VALID_CHAIN    = 3,  // Difficulty validated
 };
 
-/// A validated header with chain metadata.
+/// A validated header with chain metadata (in-memory representation).
+///
+/// On BTC, two fields that the on-disk layout carries are computable from
+/// the rest and are not stored in RAM:
+///   - "PoW hash" is identical to block_hash (both SHA256d(header)).
+///   - "prev_hash" is always header.m_previous_block.
+/// Dropping them saves 64 B/entry × ~1M headers = ~60 MB peak heap.
+///
+/// On-disk format is unchanged — see IndexEntryDiskV1 below.
 struct IndexEntry {
     BlockHeaderType header;
-    uint256         hash;           // SHA256d(header) — same as block_hash on BTC (LTC used scrypt here)
     uint256         block_hash;     // SHA256d(header) — the block hash used for getdata/inv
     uint32_t        height{0};
     uint256         chain_work;     // cumulative work up to this header
-    uint256         prev_hash;
+    HeaderStatus    status{HEADER_VALID_UNKNOWN};
+};
+
+/// Legacy 6-field on-disk layout. Kept verbatim for backward read compat AND
+/// forward write compat (so a roll-back to a pre-Phase-1B binary can still
+/// parse what we wrote). The duplicate `hash` and `prev_hash` fields are
+/// derived from the slim IndexEntry at write time.
+struct IndexEntryDiskV1 {
+    BlockHeaderType header;
+    uint256         hash;           // SHA256d(header) — same as block_hash on BTC
+    uint256         block_hash;     // SHA256d(header) — the block hash used for getdata/inv
+    uint32_t        height{0};
+    uint256         chain_work;     // cumulative work up to this header
+    uint256         prev_hash;      // == header.m_previous_block on BTC
     HeaderStatus    status{HEADER_VALID_UNKNOWN};
 
-    // Serialization for LevelDB persistence
     template<typename Stream>
     void Serialize(Stream& s) const {
         ::Serialize(s, header);
@@ -84,6 +103,30 @@ struct IndexEntry {
         uint32_t st;
         ::Unserialize(s, st);
         status = static_cast<HeaderStatus>(st);
+    }
+
+    /// Materialize the slim in-memory form (drops the duplicate fields).
+    IndexEntry to_entry() const {
+        IndexEntry e;
+        e.header     = header;
+        e.block_hash = block_hash;
+        e.height     = height;
+        e.chain_work = chain_work;
+        e.status     = status;
+        return e;
+    }
+
+    /// Build the legacy on-disk form from a slim entry (computes duplicates).
+    static IndexEntryDiskV1 from_entry(const IndexEntry& e) {
+        IndexEntryDiskV1 d;
+        d.header     = e.header;
+        d.hash       = e.block_hash;
+        d.block_hash = e.block_hash;
+        d.height     = e.height;
+        d.chain_work = e.chain_work;
+        d.prev_hash  = e.header.m_previous_block;
+        d.status     = e.status;
+        return d;
     }
 };
 
@@ -382,10 +425,11 @@ public:
             entry.block_hash = cp.hash;
             entry.height = cp.height;
             entry.chain_work = uint256::ONE;  // minimal non-zero work
-            entry.prev_hash = uint256::ZERO;  // no parent (checkpoint is trusted root)
             entry.status = HEADER_VALID_CHAIN;
             // Minimal header — we don't have the actual header data, but we
-            // have the hash.  Peers will send headers AFTER this point.
+            // have the hash. Peers will send headers AFTER this point. The
+            // null prev_block doubles as the "trusted root" marker for the
+            // chain walk in get_header_by_height_internal().
             entry.header.m_previous_block.SetNull();
 
             m_headers[cp.hash] = entry;
@@ -492,7 +536,6 @@ public:
             entry.block_hash = hash;
             entry.height = height;
             entry.chain_work = uint256::ONE;
-            entry.prev_hash = uint256::ZERO;
             entry.status = HEADER_VALID_CHAIN;
             entry.header.m_previous_block.SetNull();
             m_headers[hash] = entry;
@@ -627,10 +670,8 @@ private:
             IndexEntry entry;
             entry.header = header;
             entry.block_hash = bhash;
-            entry.hash = scrypt_hash(header);
             entry.height = 0;
             entry.chain_work = get_block_proof(header.m_bits);
-            entry.prev_hash = uint256::ZERO;
             entry.status = HEADER_VALID_CHAIN;
 
             m_headers[bhash] = entry;
@@ -640,7 +681,6 @@ private:
             m_best_work = entry.chain_work;
             persist_header(entry);
             LOG_INFO << "[EMB-BTC] Genesis accepted: hash=" << bhash.GetHex()
-                     << " scrypt=" << entry.hash.GetHex().substr(0, 16)
                      << " bits=0x" << std::hex << header.m_bits << std::dec;
             return true;
         }
@@ -695,11 +735,10 @@ private:
         IndexEntry entry;
         entry.header = header;
         entry.block_hash = bhash;
-        entry.hash = pow_hash;
         entry.height = new_height;
         entry.chain_work = prev.chain_work + get_block_proof(header.m_bits);
-        entry.prev_hash = header.m_previous_block;
         entry.status = HEADER_VALID_CHAIN;
+        (void)pow_hash; // PoW already checked above; not stored on BTC since == block_hash
 
         m_headers[bhash] = entry;
         persist_header(entry);
@@ -730,7 +769,7 @@ private:
             // Incremental height index update: if this header extends the
             // previous tip (common case during sync), just add one entry.
             // Only do a full rebuild on reorgs (tip changed branch).
-            if (new_height == old_height + 1 && entry.prev_hash == m_height_index[old_height]) {
+            if (new_height == old_height + 1 && entry.header.m_previous_block == m_height_index[old_height]) {
                 m_height_index[new_height] = bhash;
             } else {
                 rebuild_height_index(bhash);
@@ -807,7 +846,7 @@ private:
             auto it = m_headers.find(current);
             if (it == m_headers.end()) break;
             m_height_index[it->second.height] = current;
-            current = it->second.prev_hash;
+            current = it->second.header.m_previous_block;
         }
     }
 
@@ -859,7 +898,10 @@ private:
             auto it = m_headers.find(hash);
             if (it == m_headers.end()) continue;
 
-            auto packed = pack(it->second);
+            // Serialize as legacy V1 layout (with hash + prev_hash duplicates)
+            // so a pre-Phase-1B binary can still read what we write.
+            auto disk = IndexEntryDiskV1::from_entry(it->second);
+            auto packed = pack(disk);
             std::vector<uint8_t> data(
                 reinterpret_cast<const uint8_t*>(packed.data()),
                 reinterpret_cast<const uint8_t*>(packed.data()) + packed.size());
@@ -916,9 +958,10 @@ private:
 
             try {
                 PackStream ps(data);
-                IndexEntry entry;
-                ps >> entry;
-                m_headers[entry.block_hash] = entry;
+                IndexEntryDiskV1 disk;
+                ps >> disk;
+                auto entry = disk.to_entry();
+                m_headers[entry.block_hash] = std::move(entry);
                 ++loaded;
                 // Progress every 500k headers
                 if (loaded % 500000 == 0)
