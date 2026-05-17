@@ -311,6 +311,25 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     gtest_add_tests(test_dash_subsidy "" AUTO)
 
+    # Block-replay harness — loads test/fixtures/dash_blocks/*.json and
+    # asserts c2pool's Dash consensus formulas bit-exact against on-chain
+    # ground truth from getblock verbosity=2. Day 2 of the harness;
+    # design doc: frstrtr/the/docs/c2pool-dash-block-replay-test-harness.md
+    add_executable(test_dash_block_replay test_dash_block_replay.cpp)
+    target_link_libraries(test_dash_block_replay PRIVATE
+        GTest::gtest_main GTest::gtest
+        ltc core dash_x11
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_include_directories(test_dash_block_replay PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+    )
+    target_compile_definitions(test_dash_block_replay PRIVATE
+        TEST_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/test/fixtures/dash_blocks"
+    )
+    gtest_add_tests(test_dash_block_replay "" AUTO)
+
     add_executable(test_dash_battletest_regressions test_dash_battletest_regressions.cpp)
     target_link_libraries(test_dash_battletest_regressions PRIVATE
         GTest::gtest_main GTest::gtest
