@@ -33,6 +33,7 @@
 #include <impl/dash/coin/mn_state_db.hpp>
 #include <impl/dash/coin/mn_snapshot.hpp>
 #include <impl/dash/coin/mn_snapshot_rpc.hpp>
+#include <impl/dash/coin/block_dumper.hpp>
 #include <impl/dash/coin/mn_state_machine.hpp>
 #include <impl/dash/coin/mempool.hpp>
 #include <impl/dash/coin/subsidy.hpp>
@@ -190,6 +191,8 @@ int main(int argc, char* argv[])
     std::string gbt_source = "auto";
     std::string dash_mn_snapshot_path;     // --dash-mn-snapshot operator override
     std::string dump_mn_snapshot_output;   // --dump-mn-snapshot one-shot dumper
+    std::string dump_blocks_out_dir;       // --dump-blocks one-shot fixture dump
+    std::string dump_blocks_heights;       // optional CSV; empty → canonical 100
     uint16_t    stratum_port   = 0;       // 0 = disabled; canonical Dash p2pool stratum port is 7903
     std::string mining_address;           // required when stratum+rpc are wired
     double      share_difficulty_default = 0.001;  // vardiff lands later
@@ -240,6 +243,12 @@ int main(int argc, char* argv[])
         }
         else if (arg == "--dump-mn-snapshot" && i + 1 < argc) {
             dump_mn_snapshot_output = argv[++i];
+        }
+        else if (arg == "--dump-blocks" && i + 1 < argc) {
+            dump_blocks_out_dir = argv[++i];
+        }
+        else if (arg == "--dump-blocks-heights" && i + 1 < argc) {
+            dump_blocks_heights = argv[++i];
         }
         else if (arg == "--dashd" && i + 1 < argc) {
             std::string addr = argv[++i];
@@ -467,6 +476,85 @@ int main(int argc, char* argv[])
             } else {
                 std::cout << "[--dump-mn-snapshot] OK — file written + pin printed above" << std::endl;
             }
+            dump_ioc.stop();
+        });
+        dump_ioc.run();
+        return exit_code;
+    }
+
+    // ── --dump-blocks one-shot path (block-replay test harness, Phase 1) ──
+    // Walks N heights via dashd RPC, writes one JSON fixture per block to
+    // out_dir. Heights either explicit via --dump-blocks-heights "H1,H2,..."
+    // or the canonical 100-block selection from block_dumper.hpp.
+    //
+    // Usage:
+    //   c2pool-dash --dump-blocks test/fixtures/dash_blocks/ \
+    //               --dashd-rpc HOST:PORT:USER:PASS
+    //   c2pool-dash --dump-blocks test/fixtures/dash_blocks/ \
+    //               --dump-blocks-heights 2470904,2470905 \
+    //               --dashd-rpc HOST:PORT:USER:PASS
+    //
+    // Design doc: frstrtr/the/docs/c2pool-dash-block-replay-test-harness.md
+    if (!dump_blocks_out_dir.empty()) {
+        if (dashd_rpc_host.empty()) {
+            std::cerr << "[--dump-blocks] requires --dashd-rpc to be set"
+                      << std::endl;
+            return 1;
+        }
+        boost::asio::io_context dump_ioc;
+        dash::interfaces::Node dump_iface;
+        auto dump_rpc = std::make_unique<dash::coin::NodeRPC>(
+            &dump_ioc, &dump_iface, testnet);
+        boost::asio::post(dump_ioc, [&]() {
+            NetService rpc_addr(dashd_rpc_host + ":" + std::to_string(dashd_rpc_port));
+            dump_rpc->connect(rpc_addr, dashd_rpc_userpass);
+        });
+        int exit_code = 0;
+        auto dump_timer = std::make_shared<boost::asio::steady_timer>(
+            dump_ioc, std::chrono::seconds(5));
+        dump_timer->async_wait(
+            [&, dump_timer](const boost::system::error_code& ec) {
+            if (ec) return;
+            if (!dump_rpc || !dump_rpc->is_connected()) {
+                std::cerr << "[--dump-blocks] RPC not connected after 5s — aborting"
+                          << std::endl;
+                exit_code = 2;
+                dump_ioc.stop();
+                return;
+            }
+
+            // Build heights list
+            std::vector<int> heights;
+            if (!dump_blocks_heights.empty()) {
+                std::string s = dump_blocks_heights;
+                size_t pos = 0;
+                while (pos < s.size()) {
+                    size_t comma = s.find(',', pos);
+                    std::string tok = s.substr(pos, comma - pos);
+                    if (!tok.empty()) heights.push_back(std::stoi(tok));
+                    if (comma == std::string::npos) break;
+                    pos = comma + 1;
+                }
+            } else {
+                int tip = 0;
+                try {
+                    auto info = dump_rpc->getblockchaininfo();
+                    tip = info.value("blocks", 0);
+                } catch (...) {
+                    std::cerr << "[--dump-blocks] getblockchaininfo failed" << std::endl;
+                    exit_code = 3;
+                    dump_ioc.stop();
+                    return;
+                }
+                heights = dash::coin::canonical_fixture_heights(tip);
+                std::cout << "[--dump-blocks] using canonical fixture set: "
+                          << heights.size() << " heights, tip=" << tip << std::endl;
+            }
+
+            dash::coin::BlockDumper dumper{*dump_rpc, dump_blocks_out_dir, std::move(heights)};
+            int written = dumper.run();
+            std::cout << "[--dump-blocks] OK — wrote " << written
+                      << " new fixture(s) to " << dump_blocks_out_dir << std::endl;
             dump_ioc.stop();
         });
         dump_ioc.run();

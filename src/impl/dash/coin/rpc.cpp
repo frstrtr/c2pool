@@ -220,6 +220,11 @@ nlohmann::json NodeRPC::getblock(const uint256& blockhash, int verbosity)
     return call_method("getblock", {blockhash, verbosity});
 }
 
+nlohmann::json NodeRPC::getblockhash(int height)
+{
+    return call_method("getblockhash", {height});
+}
+
 // ── Dash GBT parsing ─────────────────────────────────────────────────────────
 
 void NodeRPC::parse_payments(const nlohmann::json& gbt, DashWorkData& out)

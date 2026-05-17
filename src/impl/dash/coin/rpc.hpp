@@ -60,6 +60,8 @@ public:
     nlohmann::json getmininginfo();
     nlohmann::json getblockheader(const uint256& header, bool verbose = true);
     nlohmann::json getblock(const uint256& blockhash, int verbosity = 1);
+    // Maps height → block hash. Used by block_dumper for the replay harness.
+    nlohmann::json getblockhash(int height);
 
     // Fetch + parse GBT → DashWorkData (Dash-specific field extraction).
     DashWorkData getwork();
