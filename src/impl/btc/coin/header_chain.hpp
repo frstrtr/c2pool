@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <list>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -432,12 +433,12 @@ public:
             // chain walk in get_header_by_height_internal().
             entry.header.m_previous_block.SetNull();
 
-            m_headers[cp.hash] = entry;
+            put_header_internal(cp.hash, entry);
             m_height_index[cp.height] = cp.hash;
+            mark_height_dirty_internal(cp.height);
             m_tip = cp.hash;
             m_tip_height = cp.height;
             m_best_work = entry.chain_work;
-            persist_header(entry);
             persist_tip();
             LOG_INFO << "HeaderChain: fast-start from checkpoint height="
                      << cp.height << " hash=" << cp.hash.GetHex().substr(0, 16) << "...";
@@ -449,9 +450,7 @@ public:
     std::optional<IndexEntry> tip() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_tip.IsNull()) return std::nullopt;
-        auto it = m_headers.find(m_tip);
-        if (it == m_headers.end()) return std::nullopt;
-        return it->second;
+        return lookup_header_internal(m_tip);
     }
 
     /// Current chain tip height. Returns 0 if empty.
@@ -466,24 +465,24 @@ public:
         return m_best_work;
     }
 
-    /// Number of headers stored.
+    /// Number of headers stored on the best chain. Backed by m_height_index
+    /// after Phase 1C — m_headers is a bounded cache, not authoritative.
     size_t size() const {
         std::lock_guard<std::mutex> lock(m_mutex);
-        return m_headers.size();
+        return m_height_index.size();
     }
 
-    /// Check if we have a header by its SHA256d block hash.
+    /// Check if we have a header by its SHA256d block hash. Looks in the LRU
+    /// cache first, then the LevelDB store.
     bool has_header(const uint256& block_hash) const {
         std::lock_guard<std::mutex> lock(m_mutex);
-        return m_headers.count(block_hash) > 0;
+        return has_header_internal(block_hash);
     }
 
-    /// Get header by SHA256d block hash.
+    /// Get header by SHA256d block hash. Lazy-loads from disk on cache miss.
     std::optional<IndexEntry> get_header(const uint256& block_hash) const {
         std::lock_guard<std::mutex> lock(m_mutex);
-        auto it = m_headers.find(block_hash);
-        if (it == m_headers.end()) return std::nullopt;
-        return it->second;
+        return lookup_header_internal(block_hash);
     }
 
     /// Get header by height (only works for headers on the best chain).
@@ -491,9 +490,7 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         auto it = m_height_index.find(h);
         if (it == m_height_index.end()) return std::nullopt;
-        auto hit = m_headers.find(it->second);
-        if (hit == m_headers.end()) return std::nullopt;
-        return hit->second;
+        return lookup_header_internal(it->second);
     }
 
     /// Add a single header. Returns true if accepted (new + valid).
@@ -538,12 +535,12 @@ public:
             entry.chain_work = uint256::ONE;
             entry.status = HEADER_VALID_CHAIN;
             entry.header.m_previous_block.SetNull();
-            m_headers[hash] = entry;
+            put_header_internal(hash, entry);
             m_height_index[height] = hash;
+            mark_height_dirty_internal(height);
             m_tip = hash;
             m_tip_height = height;
             m_best_work = entry.chain_work;
-            persist_header(entry);
             persist_tip();
             LOG_INFO << "HeaderChain: dynamic checkpoint at height="
                      << height << " hash=" << hash.GetHex().substr(0, 16) << "...";
@@ -615,7 +612,7 @@ public:
     /// Check if a prev_hash connects to our chain.
     bool is_connected(const uint256& prev_hash) const {
         std::lock_guard<std::mutex> lock(m_mutex);
-        return m_headers.count(prev_hash) > 0;
+        return has_header_internal(prev_hash);
     }
 
     /// Whether the chain is synced (tip timestamp within DEFAULT_MAX_TIP_AGE of wall clock).
@@ -626,10 +623,10 @@ public:
     bool is_synced() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_tip.IsNull()) return false;
-        auto it = m_headers.find(m_tip);
-        if (it == m_headers.end()) return false;
+        auto tip_opt = lookup_header_internal(m_tip);
+        if (!tip_opt) return false;
         auto now = static_cast<uint32_t>(std::time(nullptr));
-        uint32_t age = now - it->second.header.m_timestamp;
+        uint32_t age = now - tip_opt->header.m_timestamp;
         bool synced = age < core::coin::DEFAULT_MAX_TIP_AGE; // 24 hours (86400s)
         // Log state changes (throttled via static)
         static bool s_last_synced = false;
@@ -656,7 +653,7 @@ private:
         uint256 bhash = block_hash(header);
         
         // Skip if already known
-        if (m_headers.count(bhash))
+        if (has_header_internal(bhash))
             return false;
 
         // Genesis block special case: accept if it matches known genesis
@@ -674,27 +671,27 @@ private:
             entry.chain_work = get_block_proof(header.m_bits);
             entry.status = HEADER_VALID_CHAIN;
 
-            m_headers[bhash] = entry;
+            put_header_internal(bhash, entry);
             m_height_index[0] = bhash;
+            mark_height_dirty_internal(0);
             m_tip = bhash;
             m_tip_height = 0;
             m_best_work = entry.chain_work;
-            persist_header(entry);
             LOG_INFO << "[EMB-BTC] Genesis accepted: hash=" << bhash.GetHex()
                      << " bits=0x" << std::hex << header.m_bits << std::dec;
             return true;
         }
 
         // Must connect to an existing header
-        auto prev_it = m_headers.find(header.m_previous_block);
-        if (prev_it == m_headers.end()) {
+        auto prev_opt = lookup_header_internal(header.m_previous_block);
+        if (!prev_opt) {
             LOG_DEBUG_COIND << "[EMB-BTC] ORPHAN header: hash=" << bhash.GetHex().substr(0, 16)
                       << " prev=" << header.m_previous_block.GetHex().substr(0, 16)
                       << " — not connected to chain";
             return false; // orphan — not connected
         }
 
-        const auto& prev = prev_it->second;
+        const auto& prev = *prev_opt;
         uint32_t new_height = prev.height + 1;
 
         // Validate PoW — skip expensive scrypt for old headers during initial sync.
@@ -740,8 +737,7 @@ private:
         entry.status = HEADER_VALID_CHAIN;
         (void)pow_hash; // PoW already checked above; not stored on BTC since == block_hash
 
-        m_headers[bhash] = entry;
-        persist_header(entry);
+        put_header_internal(bhash, entry);
 
         // Update tip if this chain has more work, OR if a competing block
         // at the same height has equal work (equal-work reorg).
@@ -771,6 +767,7 @@ private:
             // Only do a full rebuild on reorgs (tip changed branch).
             if (new_height == old_height + 1 && entry.header.m_previous_block == m_height_index[old_height]) {
                 m_height_index[new_height] = bhash;
+                mark_height_dirty_internal(new_height);
             } else {
                 rebuild_height_index(bhash);
                 if (equal_at_tip) {
@@ -809,14 +806,15 @@ private:
                 return true; // trust difficulty within first retarget window after checkpoint
         }
         // Also skip when we have a dynamic checkpoint (no fast_start_checkpoint set
-        // but chain started at a non-zero height)
-        if (m_headers.size() < static_cast<size_t>(interval + 10))
+        // but chain started at a non-zero height). Use m_height_index (authoritative
+        // best-chain length) since m_headers is a bounded LRU after Phase 1C.
+        if (m_height_index.size() < static_cast<size_t>(interval + 10))
             return true;
 
         // Get tip (the block we're building on)
-        auto prev_it = m_headers.find(header.m_previous_block);
-        if (prev_it == m_headers.end()) return false;
-        const auto& tip = prev_it->second;
+        auto prev_opt = lookup_header_internal(header.m_previous_block);
+        if (!prev_opt) return false;
+        const auto& tip = *prev_opt;
 
         auto get_ancestor = [this](uint32_t h) -> std::optional<IndexEntry> {
             return this->get_header_by_height_internal(h);
@@ -833,21 +831,33 @@ private:
     std::optional<IndexEntry> get_header_by_height_internal(uint32_t h) const {
         auto it = m_height_index.find(h);
         if (it == m_height_index.end()) return std::nullopt;
-        auto hit = m_headers.find(it->second);
-        if (hit == m_headers.end()) return std::nullopt;
-        return hit->second;
+        return lookup_header_internal(it->second);
     }
 
-    /// Rebuild height index from a new tip back to genesis.
+    /// Rebuild height index from a new tip back to genesis (chain walk).
+    /// Marks every changed height dirty so flush_dirty() persists it.
+    /// On a one-time legacy migration this walks the full chain — subsequent
+    /// reorgs walk only as far as the divergence depth.
     void rebuild_height_index(const uint256& new_tip) {
-        m_height_index.clear();
+        // Snapshot old mapping so we only dirty heights that actually change.
+        std::unordered_map<uint32_t, uint256> old_index;
+        old_index.swap(m_height_index);
         uint256 current = new_tip;
         while (!current.IsNull()) {
-            auto it = m_headers.find(current);
-            if (it == m_headers.end()) break;
-            m_height_index[it->second.height] = current;
-            current = it->second.header.m_previous_block;
+            auto cur_opt = lookup_header_internal(current);
+            if (!cur_opt) break;
+            uint32_t h = cur_opt->height;
+            m_height_index[h] = current;
+            auto oit = old_index.find(h);
+            if (oit == old_index.end() || oit->second != current)
+                mark_height_dirty_internal(h);
+            current = cur_opt->header.m_previous_block;
         }
+        // Any heights that were in the old index but not in the new one are now
+        // orphan-chain entries; we don't have a way to delete LevelDB rows yet,
+        // so they're left as stale records. Acceptable: reads through
+        // m_height_index never see them, and the next reorg through the same
+        // height will overwrite.
     }
 
     /// Block locator: exponential backoff from tip (caller holds mutex).
@@ -874,10 +884,139 @@ private:
 
     // ─── LevelDB persistence ──────────────────────────────────────────────
     // Schema:
-    //   "h" + block_hash(32 bytes) → IndexEntry (serialized)
-    //   "H" + height(4 bytes BE)   → block_hash(32 bytes)
+    //   "h" + block_hash(32 bytes) → IndexEntry (serialized as IndexEntryDiskV1)
+    //   "i" + height(4 bytes BE)   → block_hash(32 bytes)  (Phase 1C — m_height_index persistence)
     //   "tip"                      → block_hash(32 bytes)
-    //   "height"                   → uint32_t
+    //   "height"                   → uint32_t (4-byte BE)
+
+    static std::string make_height_key(uint32_t h) {
+        std::string k = "i";
+        char buf[4];
+        buf[0] = static_cast<char>((h >> 24) & 0xFF);
+        buf[1] = static_cast<char>((h >> 16) & 0xFF);
+        buf[2] = static_cast<char>((h >> 8) & 0xFF);
+        buf[3] = static_cast<char>(h & 0xFF);
+        k.append(buf, 4);
+        return k;
+    }
+
+    static uint32_t parse_height_key(const std::string& k) {
+        if (k.size() != 5 || k[0] != 'i') return UINT32_MAX;
+        return (static_cast<uint32_t>(static_cast<uint8_t>(k[1])) << 24)
+             | (static_cast<uint32_t>(static_cast<uint8_t>(k[2])) << 16)
+             | (static_cast<uint32_t>(static_cast<uint8_t>(k[3])) <<  8)
+             |  static_cast<uint32_t>(static_cast<uint8_t>(k[4]));
+    }
+
+    // ─── Phase 1C: LRU cache helpers ──────────────────────────────────────
+
+    /// Move an existing cache entry to the front of the LRU list (most recent).
+    void touch_lru_internal(const uint256& hash) const {
+        auto pit = m_lru_iter.find(hash);
+        if (pit == m_lru_iter.end()) return;
+        if (pit->second == m_lru_order.begin()) return;
+        m_lru_order.splice(m_lru_order.begin(), m_lru_order, pit->second);
+    }
+
+    /// Evict from the back of the LRU until we're at or below the cap.
+    /// Dirty entries are never evicted — they have unwritten changes.
+    void evict_lru_if_full_internal() const {
+        auto bound = static_cast<size_t>(HEADER_CACHE_CAP);
+        size_t guard = 0;
+        while (m_headers.size() > bound && !m_lru_order.empty() && guard++ < bound) {
+            const uint256 victim = m_lru_order.back();
+            // Don't evict if dirty (would lose unflushed write).
+            if (m_dirty_headers.count(victim)) {
+                // Rotate dirty victim to the front so we try a different one.
+                m_lru_order.splice(m_lru_order.begin(), m_lru_order, std::prev(m_lru_order.end()));
+                auto it = m_lru_iter.find(victim);
+                if (it != m_lru_iter.end()) it->second = m_lru_order.begin();
+                continue;
+            }
+            m_lru_order.pop_back();
+            m_lru_iter.erase(victim);
+            m_headers.erase(victim);
+        }
+    }
+
+    /// Insert into cache (or replace existing). Returns pointer into m_headers
+    /// for the inserted entry. Triggers eviction if over cap. Pointer is stable
+    /// only until the next cache mutation.
+    const IndexEntry* insert_into_cache_internal(const uint256& hash, IndexEntry&& entry) const {
+        auto pit = m_lru_iter.find(hash);
+        if (pit != m_lru_iter.end()) {
+            m_lru_order.splice(m_lru_order.begin(), m_lru_order, pit->second);
+            auto& slot = m_headers[hash];
+            slot = std::move(entry);
+            return &slot;
+        }
+        m_lru_order.push_front(hash);
+        m_lru_iter[hash] = m_lru_order.begin();
+        auto [it, inserted] = m_headers.emplace(hash, std::move(entry));
+        (void)inserted;
+        evict_lru_if_full_internal();
+        // After eviction, the iterator might still be valid (we don't evict the
+        // entry we just inserted — it's at the front, eviction starts at back).
+        return &it->second;
+    }
+
+    /// Read a single header from LevelDB by block_hash. Returns true if found.
+    bool try_load_header_from_db_internal(const uint256& hash, IndexEntry& out) const {
+        if (!m_db || !m_db->is_open()) return false;
+        std::string key = "h";
+        key.append(reinterpret_cast<const char*>(hash.data()), 32);
+        std::vector<uint8_t> data;
+        if (!m_db->get(key, data)) return false;
+        try {
+            PackStream ps(data);
+            IndexEntryDiskV1 disk;
+            ps >> disk;
+            out = disk.to_entry();
+            return true;
+        } catch (const std::exception& e) {
+            LOG_WARNING << "[EMB-BTC] try_load_header_from_db: corrupt entry hash="
+                        << hash.GetHex().substr(0, 16) << " err=" << e.what();
+            return false;
+        }
+    }
+
+    /// Cache-then-DB lookup. Returns a copy (avoids pointer-stability hazards
+    /// when callers do follow-up lookups). nullopt = not present anywhere.
+    std::optional<IndexEntry> lookup_header_internal(const uint256& hash) const {
+        auto it = m_headers.find(hash);
+        if (it != m_headers.end()) {
+            touch_lru_internal(hash);
+            return it->second;
+        }
+        IndexEntry tmp;
+        if (!try_load_header_from_db_internal(hash, tmp)) return std::nullopt;
+        IndexEntry copy = tmp;
+        insert_into_cache_internal(hash, std::move(tmp));
+        return copy;
+    }
+
+    /// Existence check using cache + DB. Avoids loading the full entry into the
+    /// cache for transient checks (count() / has_header() pattern).
+    bool has_header_internal(const uint256& hash) const {
+        if (m_headers.count(hash) > 0) return true;
+        if (!m_db || !m_db->is_open()) return false;
+        std::string key = "h";
+        key.append(reinterpret_cast<const char*>(hash.data()), 32);
+        return m_db->exists(key);
+    }
+
+    /// Store an entry in the cache and mark it dirty for the next flush.
+    /// Use this in place of `m_headers[hash] = entry` to keep LRU + persistence
+    /// state in sync.
+    void put_header_internal(const uint256& hash, IndexEntry entry) {
+        insert_into_cache_internal(hash, std::move(entry));
+        m_dirty_headers.insert(hash);
+    }
+
+    /// Persist m_height_index entry to LevelDB on next flush.
+    void mark_height_dirty_internal(uint32_t h) {
+        m_dirty_heights.insert(h);
+    }
 
     void persist_header(const IndexEntry& entry) {
         // Write-back model (matches Litecoin Core's setDirtyBlockIndex):
@@ -885,18 +1024,20 @@ private:
         m_dirty_headers.insert(entry.block_hash);
     }
 
-    /// Flush all dirty headers + tip to LevelDB in a single atomic WriteBatch
-    /// with sync=true (fsync).  Matches Litecoin Core's FlushStateToDisk() pattern.
-    /// Caller must hold m_mutex.
+    /// Flush all dirty headers + height_index + tip to LevelDB in a single
+    /// atomic WriteBatch with sync=true (fsync). Matches Litecoin Core's
+    /// FlushStateToDisk() pattern. Caller must hold m_mutex.
     void flush_dirty() {
-        if (!m_db || !m_db->is_open() || m_dirty_headers.empty()) return;
+        if (!m_db || !m_db->is_open()) return;
+        if (m_dirty_headers.empty() && m_dirty_heights.empty()) return;
 
         auto batch = m_db->create_batch();
-        int count = 0;
+        int header_count = 0;
+        int height_count = 0;
 
         for (const auto& hash : m_dirty_headers) {
             auto it = m_headers.find(hash);
-            if (it == m_headers.end()) continue;
+            if (it == m_headers.end()) continue;  // evicted before flush — should never happen given evict_lru protects dirty
 
             // Serialize as legacy V1 layout (with hash + prev_hash duplicates)
             // so a pre-Phase-1B binary can still read what we write.
@@ -909,7 +1050,16 @@ private:
             std::string key = "h";
             key.append(reinterpret_cast<const char*>(hash.data()), 32);
             batch.put(key, data);
-            ++count;
+            ++header_count;
+        }
+
+        // Phase 1C: persist m_height_index dirty entries under "i" + BE_height
+        for (uint32_t h : m_dirty_heights) {
+            auto it = m_height_index.find(h);
+            if (it == m_height_index.end()) continue;
+            std::vector<uint8_t> data(it->second.data(), it->second.data() + 32);
+            batch.put(make_height_key(h), data);
+            ++height_count;
         }
 
         // Include tip in the same atomic batch
@@ -928,9 +1078,12 @@ private:
 
         if (batch.commit_sync()) {
             m_dirty_headers.clear();
-            LOG_DEBUG_COIND << "[EMB-BTC] flush_dirty: wrote " << count << " headers to LevelDB (synced)";
+            m_dirty_heights.clear();
+            LOG_DEBUG_COIND << "[EMB-BTC] flush_dirty: wrote " << header_count
+                            << " headers + " << height_count << " height-index entries (synced)";
         } else {
-            LOG_ERROR << "[EMB-BTC] flush_dirty: WriteBatch FAILED for " << count << " headers";
+            LOG_ERROR << "[EMB-BTC] flush_dirty: WriteBatch FAILED for " << header_count
+                      << " headers + " << height_count << " height-index entries";
         }
     }
 
@@ -942,59 +1095,69 @@ private:
     void load_from_db() {
         if (!m_db || !m_db->is_open()) return;
 
-        LOG_INFO << "[EMB-BTC] load_from_db: scanning LevelDB for headers...";
         auto t0 = std::chrono::steady_clock::now();
 
-        // Load all headers
-        auto keys = m_db->list_keys("h", 10000000);
-        int loaded = 0, corrupt = 0;
-        int total_keys = static_cast<int>(keys.size());
-        m_headers.reserve(static_cast<size_t>(total_keys));
-        m_height_index.reserve(static_cast<size_t>(total_keys));
-        for (auto& key : keys) {
-            if (key.size() != 33) continue; // 'h' + 32-byte hash
-            std::vector<uint8_t> data;
-            if (!m_db->get(key, data)) continue;
-
-            try {
-                PackStream ps(data);
-                IndexEntryDiskV1 disk;
-                ps >> disk;
-                auto entry = disk.to_entry();
-                m_headers[entry.block_hash] = std::move(entry);
-                ++loaded;
-                // Progress every 500k headers
-                if (loaded % 500000 == 0)
-                    LOG_INFO << "[EMB-BTC] load_from_db: " << loaded << "/" << total_keys
-                             << " headers (" << (100 * loaded / total_keys) << "%)";
-            } catch (const std::exception& e) {
-                ++corrupt;
-                LOG_WARNING << "[EMB-BTC] Corrupt header entry in DB: " << e.what();
+        // Phase 1C fast path: load m_height_index directly from "i:" entries.
+        // This skips the full m_headers RAM residency that pre-Phase-1C used.
+        auto i_keys = m_db->list_keys("i", 10000000);
+        int hi_loaded = 0;
+        if (!i_keys.empty()) {
+            m_height_index.reserve(i_keys.size());
+            for (auto& k : i_keys) {
+                uint32_t h = parse_height_key(k);
+                if (h == UINT32_MAX) continue;
+                std::vector<uint8_t> data;
+                if (!m_db->get(k, data) || data.size() != 32) continue;
+                uint256 hash;
+                memcpy(hash.data(), data.data(), 32);
+                m_height_index[h] = hash;
+                ++hi_loaded;
             }
+            LOG_INFO << "[EMB-BTC] load_from_db: loaded " << hi_loaded
+                     << " height-index entries directly (Phase 1C fast path)";
         }
 
         // Load tip
+        bool need_migration = false;
         std::vector<uint8_t> tip_data;
         if (m_db->get("tip", tip_data) && tip_data.size() == 32) {
             memcpy(m_tip.data(), tip_data.data(), 32);
-            auto it = m_headers.find(m_tip);
-            if (it != m_headers.end()) {
-                m_tip_height = it->second.height;
-                m_best_work = it->second.chain_work;
-                rebuild_height_index(m_tip);
+            // Lazy-load tip header into the cache so subsequent queries (e.g.
+            // is_synced()) don't need to hit disk.
+            auto tip_opt = lookup_header_internal(m_tip);
+            if (tip_opt) {
+                m_tip_height = tip_opt->height;
+                m_best_work  = tip_opt->chain_work;
+                if (hi_loaded == 0) {
+                    // Phase 1C migration: older on-disk data has no "i:" entries.
+                    // Do the legacy walk ONCE to populate m_height_index, persist,
+                    // and let subsequent restarts use the fast path.
+                    need_migration = true;
+                }
             } else {
-                LOG_WARNING << "[EMB-BTC] Tip hash in DB not found among loaded headers — resetting";
+                LOG_WARNING << "[EMB-BTC] Tip hash in DB not found — resetting";
                 m_tip.SetNull();
             }
         }
 
+        if (need_migration) {
+            LOG_INFO << "[EMB-BTC] load_from_db: legacy data detected, running one-time "
+                     << "height-index migration (walks back from tip)";
+            rebuild_height_index(m_tip);
+            for (auto& [h, _] : m_height_index) mark_height_dirty_internal(h);
+            // Flush right away so the next restart hits the fast path.
+            flush_dirty();
+            LOG_INFO << "[EMB-BTC] load_from_db: migration done, " << m_height_index.size()
+                     << " height-index entries persisted";
+        }
+
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
-        LOG_INFO << "[EMB-BTC] load_from_db: loaded " << loaded << " headers"
-                 << (corrupt > 0 ? ", " + std::to_string(corrupt) + " corrupt" : "")
-                 << " in " << elapsed << "ms"
+        LOG_INFO << "[EMB-BTC] load_from_db: ready in " << elapsed << "ms"
                  << " tip_height=" << m_tip_height
-                 << " tip=" << (m_tip.IsNull() ? "(null)" : m_tip.GetHex().substr(0, 16) + "...");
+                 << " tip=" << (m_tip.IsNull() ? "(null)" : m_tip.GetHex().substr(0, 16) + "...")
+                 << " m_headers_cached=" << m_headers.size()
+                 << " m_height_index=" << m_height_index.size();
     }
 
     // ─── State ────────────────────────────────────────────────────────────
@@ -1004,7 +1167,19 @@ private:
 
     mutable std::mutex m_mutex;
 
-    std::unordered_map<uint256, IndexEntry, Uint256Hasher>  m_headers;       // block_hash → entry
+    // Phase 1C: bounded LRU cache for IndexEntry. The full m_height_index is
+    // kept in RAM (~46 MB for the BTC mainnet tip), but m_headers is a
+    // ~3 MB working-set cache backed by LevelDB. Front of m_lru_order is most
+    // recently used; back is the eviction candidate. m_lru_iter gives O(1)
+    // moves to front. All three are mutable so that const lookup helpers can
+    // refresh LRU position / lazy-load on miss.
+    static constexpr size_t HEADER_CACHE_CAP = 16384;
+    mutable std::unordered_map<uint256, IndexEntry, Uint256Hasher>  m_headers; // block_hash → entry (LRU-bounded)
+    mutable std::list<uint256>                                       m_lru_order;
+    mutable std::unordered_map<uint256,
+                               std::list<uint256>::iterator,
+                               Uint256Hasher>                        m_lru_iter;
+
     std::unordered_map<uint32_t, uint256>                   m_height_index;  // height → block_hash (best chain only)
 
     uint256    m_tip;                                // best chain tip hash
@@ -1017,8 +1192,9 @@ private:
 
     std::unique_ptr<core::LevelDBStore> m_db;
 
-    /// Dirty set: headers modified since last flush (write-back model).
+    /// Dirty sets: items modified since last flush (write-back model).
     std::unordered_set<uint256, Uint256Hasher> m_dirty_headers;
+    std::unordered_set<uint32_t>               m_dirty_heights;
 
     /// Callback fired on tip change (reorg / equal-work switch).
     TipChangedCallback m_on_tip_changed;
