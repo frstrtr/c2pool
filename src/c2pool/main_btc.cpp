@@ -52,6 +52,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>           // [MEM] periodic logger reads /proc/self/status
+#include <malloc.h>         // [MEM] periodic malloc_trim(0) bounds glibc pool fragmentation
 #include <filesystem>
 #include <functional>
 #include <iostream>
@@ -576,9 +577,17 @@ int main(int argc, char* argv[])
                 }
                 std::fclose(f);
             }
+            // Hand glibc-resident-but-freed pages back to the kernel. Heaptrack
+            // v4 (post Phase 1A+1B+1C) showed peak heap at 182 MB but RSS still
+            // grew ~140 MB/h — confirmed glibc malloc-pool fragmentation, not a
+            // true heap leak. malloc_trim(0) walks the top chunk of every arena
+            // and madvise(MADV_DONTNEED)s pages that are free. Cheap (~ms) on
+            // typical heap sizes, returns 1 if it actually released memory.
+            int trimmed = ::malloc_trim(0);
             LOG_INFO << "[MEM] vmrss=" << vm_rss_kb << "kB"
                      << " vmsize=" << vm_size_kb << "kB"
-                     << " vmdata=" << vm_data_kb << "kB";
+                     << " vmdata=" << vm_data_kb << "kB"
+                     << " malloc_trim=" << trimmed;
             if (auto self = weak_mem.lock()) (*self)();
         });
     };
