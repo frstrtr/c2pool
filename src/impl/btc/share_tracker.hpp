@@ -1011,7 +1011,14 @@ public:
                     if (!was_already_verified) {
                         --budget_remaining;
                     }
-                    if (p2_verified_count % 50 == 0)
+                    // Throttled progress log: contabo freeze-diag (2026-05-24) caught
+                    // this loop wedging the io_context for 2-7.5s at a time when emit
+                    // was every 50 entries (173 lines per think cycle on an 8639-share
+                    // chain). Boost::log internal mutex starves the io_context handler
+                    // that runs the same think cycle. Bumped to every 1000 (~9 lines/
+                    // cycle); the loop runs at >1 verify/ms so a line/sec cadence is
+                    // plenty for diagnostics.
+                    if (p2_verified_count % 1000 == 0)
                         LOG_INFO << "[think-P2] verifying: " << p2_verified_count << "/" << to_get
                                  << " new=" << (was_already_verified ? "no" : "yes")
                                  << " budget=" << budget_remaining
