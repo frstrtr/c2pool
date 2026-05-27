@@ -11,6 +11,39 @@
 ///   MWEBBuilder     — constructs empty mw::Block bytes + HogEx tx
 ///
 /// The MWEB block hash uses blake3 (matching Litecoin Core's libmw).
+///
+/// ════════════════════════════════════════════════════════════════════════
+/// ⚠ INCLUDE-ORDER INVARIANT ⚠
+/// ────────────────────────────────────────────────────────────────────────
+/// This file pulls in <btclibs/serialize.h>, a Bitcoin-Core-derived
+/// serialization framework that `#undef`s and redefines the global
+/// `SERIALIZE_METHODS` and `READWRITE` macros to its own two-argument
+/// form. c2pool's native framework in <core/pack.hpp> defines the same
+/// macros with a one-argument signature. The two can coexist within a
+/// single translation unit ONLY if:
+///
+///   1. Every pack.hpp-style `BEGIN_MESSAGE` / `SERIALIZE_METHODS(TYPE)`
+///      header is included FIRST, so its macros expand against pack.hpp's
+///      definitions before btclibs swaps them out.
+///   2. mweb_builder.hpp (this file) comes AFTER those includes.
+///
+/// In c2pool_refactored.cpp today: pack.hpp lands at line 24, every LTC
+/// message header expands BEGIN_MESSAGE against pack.hpp between there
+/// and line 265, and mweb_builder.hpp itself is included at line 266.
+/// That order is load-bearing — breaking it causes silent macro-binding
+/// errors where later `SERIALIZE_METHODS(TYPE)` calls resolve against
+/// btclibs's two-argument macro and fail to compile, or worse bind to
+/// btclibs's read/write dispatch and silently corrupt wire format.
+///
+/// If you need to add a new pack.hpp consumer to a TU that already
+/// includes this file, move the new include to BEFORE this one.
+///
+/// See `frstrtr/the/docs/c2pool-dash-self-sufficient-spv-plan.md`
+/// Phase S2 §vendor/shim.hpp for the analysis, and c2pool's
+/// `src/impl/dash/coin/vendor/shim.hpp` for the other pattern we use
+/// (pack.hpp-native reimplementation of btclibs formatters, isolating
+/// the btclibs include to a single TU entirely).
+/// ════════════════════════════════════════════════════════════════════════
 
 #include "transaction.hpp"
 #include "block.hpp"
