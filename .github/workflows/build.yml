@@ -2,10 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [master, windows-build, service-update]
+    branches: [master, btc-embedded, dash-spv-embedded, windows-build, service-update]
     tags: ['v*']
   pull_request:
-    branches: [master]
+    branches: [master, btc-embedded, dash-spv-embedded]
 
 jobs:
   # ════════════════════════════════════════════════════════════════════════════
@@ -163,24 +163,27 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   # c2pool-qt leak-regression harness (Qt hybrid step 14, delta v1 §E.2)
   # Builds ui/c2pool-qt/ with C2POOL_QT_BUILD_TESTS=ON and runs the
-  # mount/destroy × 100 harness under xvfb, asserting no orphan
-  # QtWebEngineProcess helpers remain.
+  # mount/destroy × 100 harness under xvfb.
   #
-  # DISABLED by default. QtWebEngine 6.4.2 (Ubuntu 24.04 apt package)
-  # segfaults inside Chromium's child-process init on GitHub's
-  # GPU-less runners regardless of software-GL / headless / sandbox
-  # flags — we tried LIBGL_ALWAYS_SOFTWARE, QT_OPENGL=software,
-  # --use-gl=swiftshader, --disable-gpu, --headless=new, xvfb-run
-  # with GLX, QTWEBENGINE_DISABLE_SANDBOX. All produced the same
-  # 2-second-after-banner SIGSEGV. This is an environment issue,
-  # not a harness bug — the lifecycle logic is code-verified against
-  # PageEmbedded::destroyView + Qt parent/child semantics. The
-  # harness compiles cleanly and is expected to pass on any
-  # non-Wayland dev box or a self-hosted CI runner with working
-  # QtWebEngine headless support.
+  # PARTIAL COVERAGE. Configure + build are gating: API breakage in
+  # PageEmbedded::destroyView or its Qt dependencies will fail compile
+  # and block merge. That alone catches the most common class of
+  # regression (a refactor renaming/removing a destroyView hook).
   #
-  # To re-enable, flip `if: false` → `if: true` (or remove the
-  # guard) once one of:
+  # The runtime mount/destroy × 100 step is `continue-on-error: true`
+  # because QtWebEngine 6.4.2 (Ubuntu 24.04 apt package) segfaults
+  # inside Chromium's child-process init on GitHub's GPU-less runners
+  # regardless of software-GL / headless / sandbox flags — tried
+  # LIBGL_ALWAYS_SOFTWARE, QT_OPENGL=software, --use-gl=swiftshader,
+  # --disable-gpu, --headless=new, xvfb-run with GLX,
+  # QTWEBENGINE_DISABLE_SANDBOX. All produce the same 2-second-after-
+  # banner SIGSEGV. The lifecycle logic is code-verified against
+  # PageEmbedded::destroyView + Qt parent/child semantics; the harness
+  # is expected to pass on any non-Wayland dev box or a self-hosted CI
+  # runner with working QtWebEngine headless support.
+  #
+  # To flip the runtime step back to gating, remove `continue-on-error: true`
+  # once one of:
   #   - Ubuntu PPA ships QtWebEngine ≥ 6.6 with better headless
   #   - Self-hosted runner with a working Qt6 WebEngine is available
   #   - Alternative harness drops QWebEngineView mount (mocks the
@@ -188,7 +191,6 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   qt-webengine:
     name: Qt WebEngine leak gate
-    if: false
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
@@ -213,6 +215,7 @@ jobs:
         run: cmake --build build-qt --target c2pool-qt_test_embedded_leak -j$(nproc)
 
       - name: Run leak harness under xvfb
+        continue-on-error: true
         env:
           QTWEBENGINE_DISABLE_SANDBOX: '1'
           # Force software GL throughout — the GitHub Ubuntu runner
@@ -235,6 +238,78 @@ jobs:
         run: |
           xvfb-run -a --server-args="-screen 0 1280x800x24 +extension GLX +render -noreset" \
             timeout 180 ./build-qt/c2pool-qt_test_embedded_leak
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # BTC embedded smoke (c2pool-btc target)
+  #
+  # Gated to runs where the btc-embedded branch is involved — pushes to
+  # btc-embedded, or PRs whose head or base is btc-embedded. On master
+  # itself the BTC sources don't yet exist (src/c2pool/main_btc.cpp,
+  # src/impl/btc/) so this job is intentionally a no-op there; it
+  # activates as soon as this workflow lands on btc-embedded via merge.
+  #
+  # Coverage: cmake --build --target c2pool-btc catches any link/compile
+  # breakage in the embedded BTC SPV binary (main_btc.cpp + btc module +
+  # btc_stratum + transitive ltc dependency). Until this CI job existed,
+  # BTC had ZERO automated coverage on any commit.
+  #
+  # Deferred to a follow-up PR landing on btc-embedded directly:
+  #   - src/impl/btc/test/share_test.cpp: `add_subdirectory(test)` is
+  #     commented out in src/impl/btc/CMakeLists.txt because the test
+  #     still references LTC types. Revival is owned by the btc-heap-opt
+  #     arc.
+  #   - src/impl/btc/test/template_parity_test.cpp: standalone consensus
+  #     oracle harness; the file header claims it builds with a bare g++
+  #     invocation but its transitive includes pull in nlohmann_json,
+  #     leveldb_store, core/log — needs proper CMake target wiring to be
+  #     reliable in CI.
+  # ════════════════════════════════════════════════════════════════════════════
+  btc-linux:
+    name: BTC embedded smoke (Linux x86_64)
+    if: |
+      github.ref == 'refs/heads/btc-embedded' ||
+      github.head_ref == 'btc-embedded' ||
+      github.base_ref == 'btc-embedded'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            g++ cmake make libleveldb-dev libsecp256k1-dev
+
+      - uses: actions/setup-python@v6
+        with: { python-version: '3.12' }
+
+      - name: Install Conan 2
+        run: pip install "conan>=2.0,<3.0"
+
+      - name: Detect Conan profile
+        run: |
+          conan profile detect --force
+          sed -i 's/compiler.cppstd=.*/compiler.cppstd=20/' "$(conan profile path default)"
+
+      - name: Restore Conan cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.conan2
+          key: conan2-ubuntu24-gcc13-${{ hashFiles('conanfile.txt') }}
+
+      - name: Conan install
+        run: conan install . --build=missing --output-folder=build_btc --settings=build_type=Release
+
+      - name: Configure
+        run: cmake -S . -B build_btc -DCMAKE_TOOLCHAIN_FILE=build_btc/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build c2pool-btc
+        run: cmake --build build_btc --target c2pool-btc -j$(nproc)
+
+      - name: Verify binary
+        run: |
+          file build_btc/src/c2pool/c2pool-btc
+          build_btc/src/c2pool/c2pool-btc --help 2>&1 | head -3 || true
 
   # ════════════════════════════════════════════════════════════════════════════
   # macOS (Apple Silicon arm64 — GitHub only provides ARM runners now)

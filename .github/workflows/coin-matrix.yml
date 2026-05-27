@@ -1,0 +1,108 @@
+name: Coin matrix
+
+# Per the multi-coin landing strategy (2026-05-24): every PR builds AND
+# smoke-tests every coin binary that exists on the branch. A core change
+# that regresses any coin fails at PR review time, not weeks later at
+# merge. This is what makes single-master safe — human cross-coin review
+# does not scale.
+#
+# Forward-compatible: each coin's job activates when src/c2pool/main_<coin>.cpp
+# + src/impl/<coin>/ are present. On master today only `btc` will run
+# (when this lands on master via Bucket-B's CMake glue + main_<coin>.cpp
+# split, the other coins activate automatically without YAML changes).
+
+on:
+  push:
+    branches: [master, btc-embedded, dash-spv-embedded, windows-build, service-update]
+  pull_request:
+    branches: [master, btc-embedded, dash-spv-embedded]
+
+jobs:
+  coin:
+    name: ${{ matrix.coin }} smoke (Linux x86_64)
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        coin: [ltc, doge, dash, btc]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check source presence
+        id: presence
+        run: |
+          if [ -f "src/c2pool/main_${{ matrix.coin }}.cpp" ] && [ -d "src/impl/${{ matrix.coin }}" ]; then
+            echo "exists=1" >> "$GITHUB_OUTPUT"
+            echo "::notice::c2pool-${{ matrix.coin }} source present — building."
+          else
+            echo "exists=0" >> "$GITHUB_OUTPUT"
+            echo "::notice::c2pool-${{ matrix.coin }} source not on this branch — skipping (expected until that coin's split lands)."
+          fi
+
+      - name: Install system dependencies
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            g++ cmake make libleveldb-dev libsecp256k1-dev
+
+      - uses: actions/setup-python@v6
+        if: steps.presence.outputs.exists == '1'
+        with: { python-version: '3.12' }
+
+      - name: Install Conan 2
+        if: steps.presence.outputs.exists == '1'
+        run: pip install "conan>=2.0,<3.0"
+
+      - name: Detect Conan profile
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          conan profile detect --force
+          sed -i 's/compiler.cppstd=.*/compiler.cppstd=20/' "$(conan profile path default)"
+
+      - name: Restore Conan cache
+        if: steps.presence.outputs.exists == '1'
+        uses: actions/cache@v5
+        with:
+          path: ~/.conan2
+          key: conan2-ubuntu24-gcc13-${{ matrix.coin }}-${{ hashFiles('conanfile.txt') }}
+          restore-keys: |
+            conan2-ubuntu24-gcc13-${{ matrix.coin }}-
+            conan2-ubuntu24-gcc13-
+
+      - name: Conan install
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          conan install . \
+            --build=missing \
+            --output-folder=build_${{ matrix.coin }} \
+            --settings=build_type=Release
+
+      - name: Configure
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          cmake -S . -B build_${{ matrix.coin }} \
+            -DCMAKE_TOOLCHAIN_FILE=build_${{ matrix.coin }}/conan_toolchain.cmake \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build c2pool-${{ matrix.coin }}
+        if: steps.presence.outputs.exists == '1'
+        run: cmake --build build_${{ matrix.coin }} --target c2pool-${{ matrix.coin }} -j$(nproc)
+
+      - name: Smoke test (--help)
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          BIN=build_${{ matrix.coin }}/src/c2pool/c2pool-${{ matrix.coin }}
+          file "$BIN"
+          "$BIN" --help 2>&1 | head -5 || true
+
+      - name: Upload build artifacts on failure
+        if: failure() && steps.presence.outputs.exists == '1'
+        uses: actions/upload-artifact@v7
+        with:
+          name: coin-matrix-${{ matrix.coin }}-fail
+          path: |
+            build_${{ matrix.coin }}/CMakeFiles/CMakeOutput.log
+            build_${{ matrix.coin }}/CMakeFiles/CMakeError.log
+          retention-days: 7
+          if-no-files-found: ignore
