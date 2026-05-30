@@ -44,6 +44,17 @@ public:
     // read
     Packet(size_t prefix_length)
     {
+        // Bug 9 hardening: prefix_length comes from m_node->get_prefix().size()
+        // in Socket::init(). If m_node has been destroyed mid-handshake (UAF
+        // from rapid disconnect-reconnect — Bug-3-family), the vector's size
+        // field reads garbage and resize() throws std::length_error
+        // ("vector::_M_default_append") which kills the process. All known
+        // protocols have a 4-byte magic prefix; cap at 16 to reject UAF
+        // garbage cleanly and let the connection fail without crashing.
+        constexpr size_t MAX_PREFIX_LENGTH = 16;
+        if (prefix_length > MAX_PREFIX_LENGTH) {
+            throw std::ios_base::failure("Packet prefix_length exceeds cap (likely UAF on m_node)");
+        }
         prefix.resize(prefix_length);
     }
 
