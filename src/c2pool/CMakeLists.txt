@@ -44,13 +44,12 @@ target_link_libraries(c2pool_merged_mining
     ${Boost_LIBRARIES}
 )
 
-# Enhanced Node Library
-add_library(c2pool_node_enhanced
-    node/enhanced_node.cpp
-)
-target_include_directories(c2pool_node_enhanced PUBLIC .)
-target_link_libraries(c2pool_node_enhanced 
-    ltc
+# Enhanced Node Library (header-only template after M6 decoupling).
+# Coin-agnostic; callers that use the LTC alias (enhanced_node.hpp) must link
+# `ltc` themselves. Dash callers include impl/dash/enhanced_node.hpp.
+add_library(c2pool_node_enhanced INTERFACE)
+target_include_directories(c2pool_node_enhanced INTERFACE .)
+target_link_libraries(c2pool_node_enhanced INTERFACE
     core
     c2pool_hashrate
     c2pool_difficulty
