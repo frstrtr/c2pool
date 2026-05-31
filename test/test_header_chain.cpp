@@ -220,7 +220,7 @@ TEST(DifficultyRetargetTest, RetargetFasterThanExpected) {
     // Difficulty should increase (lower target)
     uint32_t actual_timespan = params.target_timespan / 4;
 
-    uint32_t result = calculate_next_work_required(
+    uint32_t result = ltc::coin::calculate_next_work_required(
         tip_bits, actual_timespan, 0, params);
 
     // Since actual = target/4 (minimum clamp), target stays same
@@ -246,7 +246,7 @@ TEST(DifficultyRetargetTest, RetargetSlowerThanExpected) {
     // If blocks arrived 4x slower, actual timespan = target*4
     uint32_t actual_timespan = params.target_timespan * 4;
 
-    uint32_t result = calculate_next_work_required(
+    uint32_t result = ltc::coin::calculate_next_work_required(
         tip_bits, actual_timespan, 0, params);
 
     uint256 old_target = target_from_bits(tip_bits);
@@ -260,7 +260,7 @@ TEST(DifficultyRetargetTest, NoRetargetingFlag) {
     params.no_retargeting = true;
 
     uint32_t tip_bits = 0x1e0ffff0;
-    uint32_t result = calculate_next_work_required(tip_bits, 999999, 0, params);
+    uint32_t result = ltc::coin::calculate_next_work_required(tip_bits, 999999, 0, params);
 
     EXPECT_EQ(result, tip_bits)
         << "With no_retargeting=true, difficulty should never change";
