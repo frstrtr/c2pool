@@ -1,0 +1,46 @@
+name: PPLNS parse seed-pin guard
+
+# Permanent regression guard for the PPLNS parse property suite.
+#
+# The random-seeded web-static job (build.yml) can pass even when a specific
+# fast-check sequence still reproduces a bug, because it never replays that
+# sequence. This job pins seed -1679627146 — the counterexample that found
+# the non-finite legacy bare-number regression (input [Infinity] ->
+# totalPrimary Infinity, fixed in PR #51) — so the exact failing path is
+# re-exercised deterministically on every change to the parser or its tests.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "web-static/sharechain-explorer/**"
+      - ".github/workflows/pplns-parse-seedpin.yml"
+  pull_request:
+    branches: [master]
+    paths:
+      - "web-static/sharechain-explorer/**"
+      - ".github/workflows/pplns-parse-seedpin.yml"
+
+jobs:
+  seedpin:
+    name: PPLNS parse seed-pin replay
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: web-static/sharechain-explorer
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web-static/sharechain-explorer/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Replay pinned seed -1679627146 against PPLNS parse property suite
+        run: |
+          node --import tsx --import ./.ci-seed-pin.mjs \
+            --test "tests/unit/pplns-parse-properties.test.ts"
