@@ -274,3 +274,52 @@ test('parseMinerDetail: well-formed input produces typed output', () => {
     }
   }), { numRuns: 300 });
 });
+
+// ── Regression: non-finite numbers (Infinity / -Infinity / NaN) ──────
+// Pinned counterexamples for the fast-check flake on PRs #49/#50
+// (seed -1679627146, shrunk input [Infinity]). A bare Infinity in the
+// legacy flat-map shape was assigned to amount without finite filtering,
+// so it survived the amount > 0 guard and poisoned totalPrimary. These
+// explicit cases lock the three non-finite shapes regardless of seed.
+
+test('parseSnapshot: non-finite amounts are dropped, total stays finite', () => {
+  // Array shape: Object.entries([x]) -> ["0", x], hits the legacy
+  // bare-number branch — the exact path the property test shrank to.
+  for (const raw of [[Infinity], [-Infinity], [NaN]]) {
+    const snap = parseSnapshot(raw);
+    assert.ok(Number.isFinite(snap.totalPrimary),
+      `totalPrimary not finite for ${String(raw[0])}`);
+    assert.equal(snap.totalPrimary, 0);
+    assert.equal(snap.miners.length, 0);
+    // Required-keys contract (mirrors the property assertions at L107-112).
+    assert.equal(typeof snap.totalPrimary, 'number');
+    assert.ok(Array.isArray(snap.mergedChains));
+    assert.ok(snap.mergedTotals !== null && typeof snap.mergedTotals === 'object');
+    assert.equal(typeof snap.schemaVersion, 'string');
+    assert.ok(Array.isArray(snap.miners));
+  }
+});
+
+test('parseSnapshot: non-finite legacy-object amounts are dropped', () => {
+  // Legacy { addr: { amount } } shape with a non-finite amount field.
+  for (const bad of [Infinity, -Infinity, NaN]) {
+    const snap = parseSnapshot({ miner1: { amount: bad } });
+    assert.ok(Number.isFinite(snap.totalPrimary));
+    assert.equal(snap.totalPrimary, 0);
+    assert.equal(snap.miners.length, 0);
+  }
+});
+
+test('parseSnapshot: non-finite new-shape miner amounts are dropped', () => {
+  // New shape: a miner row whose amount is non-finite must not appear
+  // and must not poison the totalPrimary fallback sum.
+  for (const bad of [Infinity, -Infinity, NaN]) {
+    const snap = parseSnapshot({
+      total_primary: 0,
+      miners: [{ address: 'a', amount: bad, pct: 0 }],
+    });
+    assert.ok(Number.isFinite(snap.totalPrimary));
+    assert.equal(snap.totalPrimary, 0);
+    assert.equal(snap.miners.length, 0);
+  }
+});

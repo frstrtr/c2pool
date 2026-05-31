@@ -222,7 +222,11 @@ function parseLegacyShape(obj: Record<string, unknown>): PplnsSnapshot {
     let amount: number;
     let mergedRaw: unknown[] = [];
     if (typeof v === 'number') {
-      amount = v;
+      // Drop non-finite values (Infinity, -Infinity, NaN); num() clamps
+      // them to 0 so the !(amount > 0) guard below discards the row. A
+      // raw Infinity here would otherwise poison totalPrimary. Regression:
+      // tests/unit/pplns-parse-properties.test.ts non-finite cases.
+      amount = num(v);
     } else if (v !== null && typeof v === 'object') {
       const o = v as Record<string, unknown>;
       amount = num(o.amount);
