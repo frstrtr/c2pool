@@ -191,7 +191,7 @@ TEST_F(Phase1LiveTest, HeaderChainSyncsFromDaemon)
 
     BroadcastPeer peer(&ioc, key, LTC_TESTNET_PREFIX, addr);
 
-    auto params = LTCChainParams::testnet();
+    auto params = make_ltc_chain_params_testnet();
     HeaderChain chain(params);
     ASSERT_TRUE(chain.init());
 
@@ -280,7 +280,7 @@ TEST_F(Phase1LiveTest, BroadcasterFeedsHeaderChain)
                                 "/tmp/c2pool_phase1_test_pm",
                                 PeerManagerConfig{});
 
-    auto params = LTCChainParams::testnet();
+    auto params = make_ltc_chain_params_testnet();
     HeaderChain chain(params);
     ASSERT_TRUE(chain.init());
 

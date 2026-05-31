@@ -55,7 +55,7 @@ static BlockHeaderType ltc_testnet_genesis() {
 }
 
 static std::unique_ptr<HeaderChain> make_chain_with_genesis(bool testnet = true) {
-    LTCChainParams p = testnet ? LTCChainParams::testnet() : LTCChainParams::mainnet();
+    LTCChainParams p = testnet ? make_ltc_chain_params_testnet() : make_ltc_chain_params_mainnet();
     auto chain = std::make_unique<HeaderChain>(p);
     EXPECT_TRUE(chain->init());
     EXPECT_TRUE(chain->add_header(ltc_testnet_genesis()));
@@ -65,7 +65,7 @@ static std::unique_ptr<HeaderChain> make_chain_with_genesis(bool testnet = true)
 /// Create a chain with a "synced" fake header (recent timestamp) for WorkData tests.
 /// The sync gate requires tip timestamp within 2 hours of wall clock.
 static std::unique_ptr<HeaderChain> make_synced_chain() {
-    LTCChainParams p = LTCChainParams::testnet();
+    LTCChainParams p = make_ltc_chain_params_testnet();
     auto chain = std::make_unique<HeaderChain>(p);
     EXPECT_TRUE(chain->init());
 
@@ -154,7 +154,7 @@ TEST(Phase4EmbeddedNodeTest, IsPolymorphic) {
 }
 
 TEST(Phase4EmbeddedNodeTest, GetworkThrowsWithNoGenesis) {
-    LTCChainParams p = LTCChainParams::testnet();
+    LTCChainParams p = make_ltc_chain_params_testnet();
     HeaderChain chain(p);
     chain.init();
     Mempool pool;
@@ -196,7 +196,7 @@ TEST(Phase4EmbeddedNodeTest, GetblockchaininfoChainIsTestForTestnet) {
 
 TEST(Phase4EmbeddedNodeTest, GetblockchaininfoChainIsMainForMainnet) {
     // Use testnet genesis but testnet=false — chain field should reflect node config
-    LTCChainParams p = LTCChainParams::testnet();
+    LTCChainParams p = make_ltc_chain_params_testnet();
     auto chain = std::make_unique<HeaderChain>(p);
     chain->init();
     chain->add_header(ltc_testnet_genesis());

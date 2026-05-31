@@ -55,7 +55,7 @@ static BlockHeaderType make_mainnet_genesis() {
 // ─── Chain Params Tests ─────────────────────────────────────────────────────
 
 TEST(LTCChainParamsTest, MainnetDefaults) {
-    auto p = LTCChainParams::mainnet();
+    auto p = make_ltc_chain_params_mainnet();
     EXPECT_EQ(p.target_timespan, 302400);
     EXPECT_EQ(p.target_spacing, 150);
     EXPECT_FALSE(p.allow_min_difficulty);
@@ -69,7 +69,7 @@ TEST(LTCChainParamsTest, MainnetDefaults) {
 }
 
 TEST(LTCChainParamsTest, TestnetDefaults) {
-    auto p = LTCChainParams::testnet();
+    auto p = make_ltc_chain_params_testnet();
     EXPECT_EQ(p.target_timespan, 302400);
     EXPECT_EQ(p.target_spacing, 150);
     EXPECT_TRUE(p.allow_min_difficulty);
@@ -163,7 +163,7 @@ TEST(PoWFunctionsTest, GetBlockProofInvalid) {
 
 TEST(DifficultyRetargetTest, NoChangeWithinInterval) {
     // At heights that are NOT multiples of 2016, difficulty should stay the same
-    auto params = LTCChainParams::testnet();
+    auto params = make_ltc_chain_params_testnet();
     // Disable min-diff for this test to get deterministic behavior
     params.allow_min_difficulty = false;
 
@@ -184,7 +184,7 @@ TEST(DifficultyRetargetTest, NoChangeWithinInterval) {
 TEST(DifficultyRetargetTest, RetargetAtInterval) {
     // At a retarget boundary (multiple of 2016), difficulty should change
     // based on actual vs target timespan
-    auto params = LTCChainParams::testnet();
+    auto params = make_ltc_chain_params_testnet();
     params.allow_min_difficulty = false;
 
     uint32_t tip_bits = 0x1e0ffff0;
@@ -212,7 +212,7 @@ TEST(DifficultyRetargetTest, RetargetAtInterval) {
 }
 
 TEST(DifficultyRetargetTest, RetargetFasterThanExpected) {
-    auto params = LTCChainParams::testnet();
+    auto params = make_ltc_chain_params_testnet();
     params.allow_min_difficulty = false;
 
     uint32_t tip_bits = 0x1e0ffff0;
@@ -220,7 +220,7 @@ TEST(DifficultyRetargetTest, RetargetFasterThanExpected) {
     // Difficulty should increase (lower target)
     uint32_t actual_timespan = params.target_timespan / 4;
 
-    uint32_t result = calculate_next_work_required(
+    uint32_t result = ltc::coin::calculate_next_work_required(
         tip_bits, actual_timespan, 0, params);
 
     // Since actual = target/4 (minimum clamp), target stays same
@@ -239,14 +239,14 @@ TEST(DifficultyRetargetTest, RetargetFasterThanExpected) {
 }
 
 TEST(DifficultyRetargetTest, RetargetSlowerThanExpected) {
-    auto params = LTCChainParams::testnet();
+    auto params = make_ltc_chain_params_testnet();
     params.allow_min_difficulty = false;
 
     uint32_t tip_bits = 0x1e0ffff0;
     // If blocks arrived 4x slower, actual timespan = target*4
     uint32_t actual_timespan = params.target_timespan * 4;
 
-    uint32_t result = calculate_next_work_required(
+    uint32_t result = ltc::coin::calculate_next_work_required(
         tip_bits, actual_timespan, 0, params);
 
     uint256 old_target = target_from_bits(tip_bits);
@@ -256,11 +256,11 @@ TEST(DifficultyRetargetTest, RetargetSlowerThanExpected) {
 }
 
 TEST(DifficultyRetargetTest, NoRetargetingFlag) {
-    auto params = LTCChainParams::testnet();
+    auto params = make_ltc_chain_params_testnet();
     params.no_retargeting = true;
 
     uint32_t tip_bits = 0x1e0ffff0;
-    uint32_t result = calculate_next_work_required(tip_bits, 999999, 0, params);
+    uint32_t result = ltc::coin::calculate_next_work_required(tip_bits, 999999, 0, params);
 
     EXPECT_EQ(result, tip_bits)
         << "With no_retargeting=true, difficulty should never change";
@@ -268,7 +268,7 @@ TEST(DifficultyRetargetTest, NoRetargetingFlag) {
 
 TEST(DifficultyRetargetTest, TestnetMinDiffRule) {
     // Testnet rule: if >2x target spacing since last block, allow min-diff
-    auto params = LTCChainParams::testnet();
+    auto params = make_ltc_chain_params_testnet();
     ASSERT_TRUE(params.allow_min_difficulty);
 
     uint256 pow_limit = params.pow_limit;
@@ -294,7 +294,7 @@ TEST(DifficultyRetargetTest, TestnetMinDiffRule) {
 
 class HeaderChainTest : public ::testing::Test {
 protected:
-    LTCChainParams params = LTCChainParams::testnet();
+    LTCChainParams params = make_ltc_chain_params_testnet();
 
     void SetUp() override {}
 };
@@ -478,7 +478,7 @@ protected:
 };
 
 TEST_F(HeaderChainPersistenceTest, PersistAndReload) {
-    auto params = LTCChainParams::testnet();
+    auto params = make_ltc_chain_params_testnet();
 
     // Write genesis to DB
     {
@@ -518,7 +518,7 @@ TEST_F(HeaderChainPersistenceTest, PersistAndReload) {
 }
 
 TEST_F(HeaderChainPersistenceTest, EmptyDBLoadsClean) {
-    auto params = LTCChainParams::testnet();
+    auto params = make_ltc_chain_params_testnet();
 
     HeaderChain chain(params, db_path);
     ASSERT_TRUE(chain.init());

@@ -232,7 +232,7 @@ TEST_F(Phase2LiveTest, MempoolPrunedOnBlockAdvance)
 
     BroadcastPeer peer(&ioc, key, LTC_TESTNET_PREFIX, addr);
 
-    auto params = LTCChainParams::testnet();
+    auto params = make_ltc_chain_params_testnet();
     HeaderChain chain(params);
     ASSERT_TRUE(chain.init());
 

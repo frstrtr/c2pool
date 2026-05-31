@@ -42,15 +42,21 @@ namespace coin {
 
 // ─── LTC Subsidy ─────────────────────────────────────────────────────────────
 
-/// LTC block subsidy (miner reward) in satoshis at a given block height.
-/// Initial subsidy: 50 LTC = 5,000,000,000 satoshis.
-/// Halving: every 840,000 blocks (LTC halving schedule, 4× faster than BTC).
-/// Subsidy drops to 0 after 64 halvings (never in practice).
-inline uint64_t get_block_subsidy(uint32_t height) {
-    static constexpr uint64_t COIN            = 100'000'000ULL;   // satoshis per LTC
-    static constexpr uint64_t INITIAL_SUBSIDY = 50ULL * COIN;     // 50 LTC
-    static constexpr uint32_t HALVING_INTERVAL = 840'000u;
+/// Generic block subsidy using ChainParams halving_interval and initial_subsidy.
+/// Works for any coin with Bitcoin-style halvings (LTC, BTC).
+/// Coins without halvings (DOGE, Dash) should use CoinParams.subsidy_func instead.
+inline uint64_t get_block_subsidy(uint32_t height, const bitcoin_family::coin::ChainParams& params) {
+    if (params.halving_interval == 0) return params.initial_subsidy; // no halving
+    int halvings = static_cast<int>(height / params.halving_interval);
+    if (halvings >= 64) return 0;
+    return params.initial_subsidy >> halvings;
+}
 
+/// Legacy LTC-specific overload (for code that doesn't have ChainParams yet).
+inline uint64_t get_block_subsidy(uint32_t height) {
+    static constexpr uint64_t COIN            = 100'000'000ULL;
+    static constexpr uint64_t INITIAL_SUBSIDY = 50ULL * COIN;
+    static constexpr uint32_t HALVING_INTERVAL = 840'000u;
     int halvings = static_cast<int>(height / HALVING_INTERVAL);
     if (halvings >= 64) return 0;
     return INITIAL_SUBSIDY >> halvings;

@@ -7,6 +7,7 @@
 /// Persistence via LevelDB for fast restarts.
 
 #include "block.hpp"
+#include <impl/bitcoin_family/coin/chain_params.hpp>
 #include <core/coin/utxo.hpp>  // DEFAULT_MAX_TIP_AGE
 
 #include <core/uint256.hpp>
@@ -14,8 +15,7 @@
 #include <core/log.hpp>
 #include <core/pack.hpp>
 #include <core/hash.hpp>
-
-#include <btclibs/crypto/scrypt.h>
+#include <core/pow.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -79,82 +79,63 @@ struct IndexEntry {
 
 // ─── LTC Chain Parameters ───────────────────────────────────────────────────
 
-struct LTCChainParams {
-    // Mainnet
-    static constexpr int64_t MAINNET_TARGET_TIMESPAN = 302400;     // 3.5 days
-    static constexpr int64_t MAINNET_TARGET_SPACING  = 150;        // 2.5 minutes
-    static constexpr bool    MAINNET_ALLOW_MIN_DIFF  = false;
+// LTCChainParams is now an alias for the generic bitcoin_family::coin::ChainParams.
+// The PoW function, block hash function, and all constants are injected at construction.
+using LTCChainParams = bitcoin_family::coin::ChainParams;
 
-    // Testnet
-    static constexpr int64_t TESTNET_TARGET_TIMESPAN = 302400;     // 3.5 days
-    static constexpr int64_t TESTNET_TARGET_SPACING  = 150;        // 2.5 minutes
-    static constexpr bool    TESTNET_ALLOW_MIN_DIFF  = true;
+// LTC-specific factory functions for creating ChainParams with scrypt PoW.
+inline LTCChainParams make_ltc_chain_params_mainnet() {
+    LTCChainParams p;
+    p.target_timespan = 302400;     // 3.5 days
+    p.target_spacing  = 150;        // 2.5 minutes
+    p.allow_min_difficulty = false;
+    p.no_retargeting = false;
+    p.pow_limit.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    p.genesis_hash.SetHex("12a765e31ffd4059bada1e25190f6e98c99d9714d334efa41a195a7e7e04bfe2");
+    p.halving_interval = 840000;
+    p.initial_subsidy = 5000000000ULL;
+    p.pow_func = core::pow::scrypt;
+    p.block_hash_func = core::pow::sha256d;
+    return p;
+}
 
-    // Computed: difficulty adjustment interval = timespan / spacing
-    static constexpr int64_t difficulty_adjustment_interval(int64_t timespan, int64_t spacing) {
-        return timespan / spacing;
-    }
-
-    int64_t target_timespan;
-    int64_t target_spacing;
-    bool    allow_min_difficulty;
-    bool    no_retargeting{false};
-    uint256 pow_limit;
-    uint256 genesis_hash;      // SHA256d genesis block hash (for identification)
-
-    // Fast-start checkpoint: skip syncing from genesis, start from a recent height.
-    // The header chain seeds this checkpoint as if it were the genesis block.
-    // All headers before this height are implicitly trusted.
-    struct Checkpoint { uint32_t height{0}; uint256 hash; };
-    std::optional<Checkpoint> fast_start_checkpoint;
-
-    /// Standard LTC mainnet params
-    static LTCChainParams mainnet() {
-        LTCChainParams p;
-        p.target_timespan = MAINNET_TARGET_TIMESPAN;
-        p.target_spacing  = MAINNET_TARGET_SPACING;
-        p.allow_min_difficulty = MAINNET_ALLOW_MIN_DIFF;
-        p.no_retargeting = false;
-        p.pow_limit.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-        p.genesis_hash.SetHex("12a765e31ffd4059bada1e25190f6e98c99d9714d334efa41a195a7e7e04bfe2");
-        return p;
-    }
-
-    /// Standard LTC testnet4 params
-    static LTCChainParams testnet() {
-        LTCChainParams p;
-        p.target_timespan = TESTNET_TARGET_TIMESPAN;
-        p.target_spacing  = TESTNET_TARGET_SPACING;
-        p.allow_min_difficulty = TESTNET_ALLOW_MIN_DIFF;
-        p.no_retargeting = false;
-        p.pow_limit.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-        p.genesis_hash.SetHex("4966625a4b2851d9fdee139e56211a0d88575f59ed816ff5e6a63deb4e3e29a0");
-        // No hardcoded checkpoint — use --header-checkpoint CLI arg or
-        // set_dynamic_checkpoint() from RPC for any chain/network.
-        return p;
-    }
-
-    int64_t difficulty_adjustment_interval() const {
-        return target_timespan / target_spacing;
-    }
-};
+inline LTCChainParams make_ltc_chain_params_testnet() {
+    LTCChainParams p;
+    p.target_timespan = 302400;
+    p.target_spacing  = 150;
+    p.allow_min_difficulty = true;
+    p.no_retargeting = false;
+    p.pow_limit.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    p.genesis_hash.SetHex("4966625a4b2851d9fdee139e56211a0d88575f59ed816ff5e6a63deb4e3e29a0");
+    p.halving_interval = 840000;
+    p.initial_subsidy = 5000000000ULL;
+    p.pow_func = core::pow::scrypt;
+    p.block_hash_func = core::pow::sha256d;
+    return p;
+}
 
 // ─── PoW Functions ──────────────────────────────────────────────────────────
 
-/// Compute scrypt hash of an 80-byte block header (for PoW validation).
-inline uint256 scrypt_hash(const BlockHeaderType& header) {
+/// Compute PoW hash of an 80-byte block header using the coin's PoW function.
+/// For LTC: scrypt, for Dash: X11, for BTC: SHA256d.
+inline uint256 pow_hash(const BlockHeaderType& header, const core::PowFunc& pow_func) {
     auto packed = pack(header);
-    char pow_hash_bytes[32];
-    scrypt_1024_1_1_256(reinterpret_cast<const char*>(packed.data()), pow_hash_bytes);
-    uint256 result;
-    memcpy(result.data(), pow_hash_bytes, 32);
-    return result;
+    auto sp = std::span<const unsigned char>(
+        reinterpret_cast<const unsigned char*>(packed.data()), packed.size());
+    return pow_func(sp);
 }
 
 /// Compute SHA256d hash of an 80-byte block header (block identification).
+/// This is the "real" block hash used for getdata/inv/prev_block references.
+/// Same for all Bitcoin-family coins.
 inline uint256 block_hash(const BlockHeaderType& header) {
     auto packed = pack(header);
     return Hash(packed.get_span());
+}
+
+// Legacy alias — callers that used scrypt_hash() now use pow_hash() with scrypt func.
+inline uint256 scrypt_hash(const BlockHeaderType& header) {
+    return pow_hash(header, core::pow::scrypt);
 }
 
 /// Compute the target from compact nBits representation.
@@ -202,7 +183,7 @@ inline uint32_t calculate_next_work_required(
     uint32_t tip_bits,
     int64_t tip_time,
     int64_t first_block_time,
-    const LTCChainParams& params)
+    const bitcoin_family::coin::ChainParams& params)
 {
     if (params.no_retargeting)
         return tip_bits;
@@ -248,7 +229,7 @@ inline uint32_t get_next_work_required(
     uint32_t tip_bits,
     uint32_t tip_time,
     uint32_t new_time,
-    const LTCChainParams& params)
+    const bitcoin_family::coin::ChainParams& params)
 {
     uint256 pow_limit_compact;
     pow_limit_compact = params.pow_limit;
@@ -297,7 +278,7 @@ inline uint32_t get_next_work_required(
 
     int64_t first_time = first_entry->header.m_timestamp;
 
-    return calculate_next_work_required(tip_bits, tip_time, first_time, params);
+    return ltc::coin::calculate_next_work_required(tip_bits, tip_time, first_time, params);
 }
 
 // ─── HeaderChain ────────────────────────────────────────────────────────────
@@ -590,7 +571,7 @@ private:
             IndexEntry entry;
             entry.header = header;
             entry.block_hash = bhash;
-            entry.hash = scrypt_hash(header);
+            entry.hash = pow_hash(header, m_params.pow_func);
             entry.height = 0;
             entry.chain_work = get_block_proof(header.m_bits);
             entry.prev_hash = uint256::ZERO;
@@ -630,19 +611,19 @@ private:
         uint32_t peer_tip = m_peer_tip_height.load(std::memory_order_relaxed);
         bool need_scrypt = (peer_tip == 0) // unknown tip → validate everything
                         || (new_height + SCRYPT_VALIDATION_DEPTH >= peer_tip);
-        uint256 pow_hash;
+        uint256 pow_hash_val;
         if (need_scrypt) {
-            pow_hash = scrypt_hash(header);
-            if (!check_pow(pow_hash, header.m_bits, m_params.pow_limit)) {
+            pow_hash_val = pow_hash(header, m_params.pow_func);
+            if (!check_pow(pow_hash_val, header.m_bits, m_params.pow_limit)) {
                 LOG_WARNING << "[EMB-LTC] PoW FAIL at height=" << new_height
                             << " hash=" << bhash.GetHex().substr(0, 16)
-                            << " scrypt=" << pow_hash.GetHex().substr(0, 16)
+                            << " pow=" << pow_hash_val.GetHex().substr(0, 16)
                             << " bits=0x" << std::hex << header.m_bits << std::dec;
                 return false;
             }
         } else {
             // Structural-only: trust PoW, store zero hash (not needed for old blocks)
-            pow_hash = block_hash(header); // SHA256d, not scrypt — cheap placeholder
+            pow_hash_val = block_hash(header); // SHA256d — cheap placeholder for fast-sync
         }
 
         // Validate difficulty
@@ -658,7 +639,7 @@ private:
         IndexEntry entry;
         entry.header = header;
         entry.block_hash = bhash;
-        entry.hash = pow_hash;
+        entry.hash = pow_hash_val;
         entry.height = new_height;
         entry.chain_work = prev.chain_work + get_block_proof(header.m_bits);
         entry.prev_hash = header.m_previous_block;

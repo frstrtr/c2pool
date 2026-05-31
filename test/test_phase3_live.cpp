@@ -124,7 +124,7 @@ TEST_F(Phase3LiveTest, GetworkAfterHeaderSync)
 
     BroadcastPeer peer(&ioc, key, LTC_TESTNET_PREFIX, addr);
 
-    auto params = LTCChainParams::testnet();
+    auto params = make_ltc_chain_params_testnet();
     HeaderChain chain(params);
     ASSERT_TRUE(chain.init());
     ASSERT_TRUE(chain.add_header(ltc_testnet_genesis()));
@@ -231,7 +231,7 @@ TEST_F(Phase3LiveTest, TemplateTxsAreFromMempool)
 
     BroadcastPeer peer(&ioc, key, LTC_TESTNET_PREFIX, addr);
 
-    auto params = LTCChainParams::testnet();
+    auto params = make_ltc_chain_params_testnet();
     HeaderChain chain(params);
     ASSERT_TRUE(chain.init());
     ASSERT_TRUE(chain.add_header(ltc_testnet_genesis()));
@@ -311,7 +311,7 @@ TEST_F(Phase3LiveTest, BroadcasterDrivenTemplate)
                                  "/tmp/c2pool_phase3_test_pm",
                                  PeerManagerConfig{});
 
-    auto params = LTCChainParams::testnet();
+    auto params = make_ltc_chain_params_testnet();
     HeaderChain chain(params);
     ASSERT_TRUE(chain.init());
     ASSERT_TRUE(chain.add_header(ltc_testnet_genesis()));
@@ -385,7 +385,7 @@ TEST_F(Phase3LiveTest, SubsidyAtSyncedHeight)
 
     BroadcastPeer peer(&ioc, key, LTC_TESTNET_PREFIX, addr);
 
-    auto params = LTCChainParams::testnet();
+    auto params = make_ltc_chain_params_testnet();
     HeaderChain chain(params);
     ASSERT_TRUE(chain.init());
     ASSERT_TRUE(chain.add_header(ltc_testnet_genesis()));

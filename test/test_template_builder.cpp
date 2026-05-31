@@ -82,7 +82,7 @@ static MutableTransaction make_tx(uint32_t nonce = 0) {
 
 /// Create a chain with genesis already added (returned as unique_ptr — HeaderChain is non-copyable).
 static std::unique_ptr<HeaderChain> make_chain_with_genesis(bool testnet = true) {
-    LTCChainParams p = testnet ? LTCChainParams::testnet() : LTCChainParams::mainnet();
+    LTCChainParams p = testnet ? make_ltc_chain_params_testnet() : make_ltc_chain_params_mainnet();
     auto chain = std::make_unique<HeaderChain>(p);
     EXPECT_TRUE(chain->init());
     EXPECT_TRUE(chain->add_header(ltc_testnet_genesis()));
@@ -193,7 +193,7 @@ TEST(MerkleTest, Deterministic) {
 // ─── Test 6: TemplateBuilder — no genesis ────────────────────────────────────
 
 TEST(TemplateBuilderTest, NoGenesisReturnsNullopt) {
-    LTCChainParams p = LTCChainParams::testnet();
+    LTCChainParams p = make_ltc_chain_params_testnet();
     HeaderChain chain(p);
     ASSERT_TRUE(chain.init());
 
@@ -419,7 +419,7 @@ TEST(TemplateBuilderTest, WeightlimitIs4000000) {
 // ─── EmbeddedCoinNode tests ───────────────────────────────────────────────────
 
 TEST(EmbeddedCoinNodeTest, GetworkThrowsWithNoGenesis) {
-    LTCChainParams p = LTCChainParams::testnet();
+    LTCChainParams p = make_ltc_chain_params_testnet();
     HeaderChain chain(p);
     ASSERT_TRUE(chain.init());
     Mempool pool;
@@ -452,7 +452,7 @@ TEST(EmbeddedCoinNodeTest, GetblockchainInfoFields) {
 
 TEST(EmbeddedCoinNodeTest, GetblockchainInfoMainnet) {
     // Mainnet EmbeddedCoinNode reports "main"
-    LTCChainParams p = LTCChainParams::mainnet();
+    LTCChainParams p = make_ltc_chain_params_mainnet();
     HeaderChain chain(p);
     ASSERT_TRUE(chain.init());
     Mempool pool;
