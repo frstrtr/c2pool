@@ -6,6 +6,8 @@
 #include <iomanip>
 #include <functional>
 
+#include <core/core_util.hpp>
+
 namespace core
 {
 
@@ -47,6 +49,7 @@ struct debug_timestamp
     }
 };
 
-uint32_t timestamp();
+// core::timestamp() is declared in <core/core_util.hpp> (included above),
+// the dependency-free leaf that breaks the core<->{pool,ltc,c2pool} cycle.
 
 } // namespace core
