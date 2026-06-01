@@ -111,7 +111,7 @@ endif()
 
 # Test applications
 add_executable(test_ltc_node test_ltc_node.cpp)
-target_link_libraries(test_ltc_node core btclibs pool ltc)
+target_link_libraries(test_ltc_node $<LINK_GROUP:RESCAN,core,sharechain,btclibs,pool,ltc,ltc_coin,c2pool_storage,c2pool_payout,c2pool_hashrate,c2pool_merged_mining>)
 target_link_libraries(test_ltc_node nlohmann_json::nlohmann_json)
 
 # Legacy applications have been archived to ../../archive/
