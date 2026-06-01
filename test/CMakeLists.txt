@@ -2,8 +2,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     add_executable(test_coin_broadcaster test_coin_broadcaster.cpp)
     target_link_libraries(test_coin_broadcaster PRIVATE
         GTest::gtest_main GTest::gtest
-        c2pool_merged_mining
-        core ltc
+        $<LINK_GROUP:RESCAN,core,sharechain,pool,ltc,btclibs,ltc_coin,c2pool_storage,c2pool_payout,c2pool_hashrate,c2pool_merged_mining>
         nlohmann_json::nlohmann_json
         ${Boost_LIBRARIES}
     )
@@ -45,8 +44,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     add_executable(test_phase0_live test_phase0_live.cpp)
     target_link_libraries(test_phase0_live PRIVATE
         GTest::gtest_main GTest::gtest
-        c2pool_merged_mining
-        core ltc
+        $<LINK_GROUP:RESCAN,core,sharechain,pool,ltc,btclibs,ltc_coin,c2pool_storage,c2pool_payout,c2pool_hashrate,c2pool_merged_mining>
         nlohmann_json::nlohmann_json
         ${Boost_LIBRARIES}
     )
@@ -62,8 +60,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     add_executable(test_phase1_live test_phase1_live.cpp)
     target_link_libraries(test_phase1_live PRIVATE
         GTest::gtest_main GTest::gtest
-        c2pool_merged_mining
-        core ltc
+        $<LINK_GROUP:RESCAN,core,sharechain,pool,ltc,btclibs,ltc_coin,c2pool_storage,c2pool_payout,c2pool_hashrate,c2pool_merged_mining>
         nlohmann_json::nlohmann_json
         ${Boost_LIBRARIES}
     )
@@ -79,8 +76,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     add_executable(test_phase2_live test_phase2_live.cpp)
     target_link_libraries(test_phase2_live PRIVATE
         GTest::gtest_main GTest::gtest
-        c2pool_merged_mining
-        core ltc
+        $<LINK_GROUP:RESCAN,core,sharechain,pool,ltc,btclibs,ltc_coin,c2pool_storage,c2pool_payout,c2pool_hashrate,c2pool_merged_mining>
         nlohmann_json::nlohmann_json
         ${Boost_LIBRARIES}
     )
@@ -96,8 +92,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     add_executable(test_phase3_live test_phase3_live.cpp)
     target_link_libraries(test_phase3_live PRIVATE
         GTest::gtest_main GTest::gtest
-        c2pool_merged_mining
-        core ltc
+        $<LINK_GROUP:RESCAN,core,sharechain,pool,ltc,btclibs,ltc_coin,c2pool_storage,c2pool_payout,c2pool_hashrate,c2pool_merged_mining>
         nlohmann_json::nlohmann_json
         ${Boost_LIBRARIES}
     )
