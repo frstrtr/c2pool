@@ -10,8 +10,22 @@ namespace io = boost::asio;
 
 namespace core
 {
-struct INetwork
+// Bug 3 root-cause fix: INetwork inherits enable_shared_from_this so
+// Factory::Client / Factory::Server can capture weak_from_this() into
+// their async lambdas instead of raw `this`. When the derived node
+// (e.g. dash::coin::p2p::NodeP2P) is owned by a shared_ptr, the captured
+// weak_ptr keeps it alive across the async callback's execution, fixing
+// the use-after-free that produced the 19:23:15 UTC SIGSEGV in
+// codecvt::do_length called from the boost::log formatter inside
+// NodeP2P::connected on a freed m_target_addr.
+//
+// For derived nodes NOT owned by shared_ptr (current LTC/DOGE pattern),
+// weak_from_this() returns an empty weak_ptr; Factory falls back to the
+// raw m_node pointer (preserves prior behavior — LTC/DOGE haven't been
+// observed to crash, the disconnect-reconnect cascade is Dash-specific).
+struct INetwork : public std::enable_shared_from_this<INetwork>
 {
+    virtual ~INetwork() = default;
     virtual void connected(std::shared_ptr<core::Socket> socket) = 0;
     virtual void disconnect() = 0;
 };
@@ -25,30 +39,32 @@ private:
 protected:
 	void accept()
     {
+        // Bug 3 root-cause fix: capture m_node->weak_from_this() so the async
+        // callback keeps the node alive while it dispatches connected().
+        // Empty weak_ptr (LTC/DOGE pattern, node not shared_ptr-managed) →
+        // fall back to raw m_node (preserves prior behavior).
+        auto weak_node = m_node->weak_from_this();
+        bool was_managed = weak_node.lock() != nullptr;
         m_acceptor.async_accept(
-			[this](boost::system::error_code ec, io::ip::tcp::socket io_socket)
+			[this, weak_node, was_managed](boost::system::error_code ec, io::ip::tcp::socket io_socket)
 			{
 				if (ec)
 				{
 					LOG_ERROR << "listen error: " << ec.what();
 					return;
-					// if (ec != boost::system::errc::operation_canceled)
-					// 	error(libp2p::ASIO_ERROR, "PoolListener::async_loop: " + ec.message(), NetAddress{socket_.remote_endpoint()});
-					// else
-					// 	LOG_DEBUG_POOL << "PoolListener::async_loop canceled";
-					// return;
 				}
+
+				std::shared_ptr<INetwork> strong_node = weak_node.lock();
+				if (was_managed && !strong_node) return;  // node destroyed mid-flight
+				INetwork* node_ptr = strong_node ? strong_node.get() : m_node;
 
 				auto tcp_socket = std::make_unique<io::ip::tcp::socket>(std::move(io_socket));
-				auto socket = core::make_socket(std::move(tcp_socket), core::connection_type::incoming, m_node);
+				auto socket = core::make_socket(std::move(tcp_socket), core::connection_type::incoming, node_ptr);
 				socket->init();
-				// Guard: if init() closed the socket (peer disconnected immediately),
-				// skip connected() to avoid storing a dead socket in m_connections.
 				if (socket->status()) {
-					m_node->connected(socket);
+					node_ptr->connected(socket);
 				}
 
-				// continue accept connections
 				accept();
 			}
 		);
@@ -88,9 +104,16 @@ private:
 	{
 		auto tcp_socket = std::make_unique<io::ip::tcp::socket>(*m_context);
 		auto socket = core::make_socket(std::move(tcp_socket), core::connection_type::outgoing, m_node);
-		
-		io::async_connect(*socket->raw(), endpoints, 
-			[&, socket = socket]
+
+		// Bug 3 root-cause fix: weak_from_this() into the async lambda so the
+		// async_connect callback keeps the node alive across the in-flight
+		// connect() → connected() handoff. Without this, the lambda's bare `&`
+		// (this) capture meant connected() could fire on a freed NodeP2P,
+		// reading garbage m_target_addr and crashing in boost::log codecvt.
+		auto weak_node = m_node->weak_from_this();
+		bool was_managed = weak_node.lock() != nullptr;
+		io::async_connect(*socket->raw(), endpoints,
+			[this, weak_node, was_managed, socket = socket]
 			(const auto& ec, boost::asio::ip::tcp::endpoint ep)
 			{
 				if (ec)
@@ -102,28 +125,48 @@ private:
 					return;
 				}
 
+				// Lock once; the strong_node also keeps the INetwork alive
+				// for the duration of the connected() dispatch below.
+				std::shared_ptr<INetwork> strong_node = weak_node.lock();
+				if (was_managed && !strong_node) return;  // node destroyed mid-flight
+				INetwork* node_ptr = strong_node ? strong_node.get() : m_node;
+
 				LOG_TRACE << "[" << m_label << "] Handshake with " << ep.address() << ":" << ep.port();
 				socket->init();
 
-				m_node->connected(socket);
+				node_ptr->connected(socket);
 			}
 		);
 	}
 
 	void resolve(const NetService& addr)
 	{
-		m_resolver.async_resolve(addr.address(), addr.port_str(), 
-			[&, addr = addr](const auto& ec, auto endpoints)
+		// Same lifetime extension as connect_socket — weak_from_this() rides
+		// the async_resolve handler so the chained connect_socket() sees a
+		// live node.
+		auto weak_node = m_node->weak_from_this();
+		// std::weak_ptr::expired() is true both for default-constructed weak
+		// (LTC/DOGE pattern, never associated) and for expired-after-managed
+		// (Dash pattern, node freed). Distinguish them at registration so we
+		// only enforce the alive check when there WAS a shared owner to
+		// begin with.
+		bool was_managed = weak_node.lock() != nullptr;
+		m_resolver.async_resolve(addr.address(), addr.port_str(),
+			[this, weak_node, was_managed, addr = addr](const auto& ec, auto endpoints)
 			{
 				if (ec)
 				{
-					
 					if (ec != boost::system::errc::operation_canceled)
 						LOG_TRACE << "[" << m_label << "] DNS resolve failed: " << ec.message();
 					else
 						LOG_DEBUG_OTHER << "Factory::Client::resolve canceled";
 					return;
 				}
+
+				// If the node WAS managed at registration but is now expired,
+				// it has been destroyed — skip the connect to avoid the UAF
+				// on m_node->connected(socket) inside connect_socket().
+				if (was_managed && weak_node.expired()) return;
 
 				connect_socket(endpoints);
 			}
