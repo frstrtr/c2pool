@@ -308,9 +308,40 @@ std::vector<uint8_t> build_extended_header(
 doge::coin::CAuxPow make_sample_auxpow()
 {
     doge::coin::CAuxPow aux;
+
+    // Parent-chain (LTC) coinbase == the pool's own gentx, carried in the proof
+    // witness-stripped via tx_id_type (auxpow.hpp §12-Q1). Give it a realistic
+    // coinbase shape — null prevout, 0xffffffff index, a scriptSig and an
+    // output — so the variable-length tx body is genuinely round-tripped rather
+    // than left default-empty.
+    ltc::coin::MutableTransaction& cb = aux.m_merkle_tx.m_tx;
+    cb.version = 1;
+    cb.locktime = 0;
+    ltc::coin::TxIn cb_in;
+    cb_in.prevout.hash.SetNull();          // coinbase has a null prevout...
+    cb_in.prevout.index = 0xffffffff;      // ...and the 0xffffffff sentinel index
+    cb_in.scriptSig.m_data = {0x03, 0x99, 0x96, 0x06, 0x04, 0xde, 0xad, 0xbe, 0xef};
+    cb_in.sequence = 0xffffffff;
+    cb.vin.push_back(cb_in);
+    ltc::coin::TxOut cb_out;
+    cb_out.value = 5000000000LL;           // 50.00000000
+    cb_out.scriptPubKey.m_data = {
+        0x76, 0xa9, 0x14,                  // OP_DUP OP_HASH160 PUSH(20)
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa,
+        0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44,
+        0x88, 0xac};                       // OP_EQUALVERIFY OP_CHECKSIG
+    cb.vout.push_back(cb_out);
+
     aux.m_merkle_tx.m_block_hash.SetHex(
         "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899");
-    aux.m_merkle_tx.m_merkle_link.m_index = 0;
+    // Coinbase merkle branch: the path from the coinbase (leaf 0) up to the
+    // parent block's merkle root. Populate it (was empty) so the second
+    // variable-length proof component is exercised on the round-trip.
+    uint256 cb_b0; cb_b0.SetHex("00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff");
+    uint256 cb_b1; cb_b1.SetHex("123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0");
+    aux.m_merkle_tx.m_merkle_link.m_branch = {cb_b0, cb_b1};
+    aux.m_merkle_tx.m_merkle_link.m_index = 0;  // coinbase is always leaf 0
+
     uint256 b0; b0.SetHex("01");
     uint256 b1; b1.SetHex("02");
     aux.m_chain_merkle_link.m_branch = {b0, b1};
@@ -373,6 +404,22 @@ TEST(AuxPowStructuredTest, ParseAuxPowHeaderRoundTripsProof) {
     EXPECT_EQ(out.m_chain_merkle_link.m_branch[1], aux.m_chain_merkle_link.m_branch[1]);
     EXPECT_EQ(out.m_chain_merkle_link.m_index, 3u);
     EXPECT_EQ(out.m_parent_block_header.m_nonce, 0x0000c0deu);
+
+    // The two most variable-length parts of the proof — the parent coinbase tx
+    // body and the coinbase merkle branch — must round-trip WITH content, so a
+    // wrong-length read in either path is caught (not masked by empty defaults).
+    ASSERT_EQ(out.m_merkle_tx.m_tx.vin.size(), 1u);
+    EXPECT_EQ(out.m_merkle_tx.m_tx.vin[0].prevout.index, 0xffffffffu);
+    EXPECT_EQ(out.m_merkle_tx.m_tx.vin[0].scriptSig.m_data,
+              aux.m_merkle_tx.m_tx.vin[0].scriptSig.m_data);
+    ASSERT_EQ(out.m_merkle_tx.m_tx.vout.size(), 1u);
+    EXPECT_EQ(out.m_merkle_tx.m_tx.vout[0].value, 5000000000LL);
+    EXPECT_EQ(out.m_merkle_tx.m_tx.vout[0].scriptPubKey.m_data,
+              aux.m_merkle_tx.m_tx.vout[0].scriptPubKey.m_data);
+    ASSERT_EQ(out.m_merkle_tx.m_merkle_link.m_branch.size(), 2u);
+    EXPECT_EQ(out.m_merkle_tx.m_merkle_link.m_branch[0], aux.m_merkle_tx.m_merkle_link.m_branch[0]);
+    EXPECT_EQ(out.m_merkle_tx.m_merkle_link.m_branch[1], aux.m_merkle_tx.m_merkle_link.m_branch[1]);
+    EXPECT_EQ(out.m_merkle_tx.m_merkle_link.m_index, 0u);
 }
 
 TEST(AuxPowStructuredTest, HasAuxFalseForPlainHeader) {
