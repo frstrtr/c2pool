@@ -52,7 +52,17 @@ struct CMerkleLink
     std::vector<uint256> m_branch;
     uint32_t             m_index{0};
 
-    SERIALIZE_METHODS(CMerkleLink) { READWRITE(obj.m_branch, obj.m_index); }
+    // Hand-written to stay independent of which SERIALIZE_METHODS macro is
+    // active in the TU: core/pack.hpp defines a 1-arg form, btclibs/serialize.h
+    // a 2-arg one, and CMerkleTx::m_tx pulls btclibs into this header's TUs.
+    template <typename Stream> void Serialize(Stream& s) const {
+        ::Serialize(s, m_branch);
+        ::Serialize(s, m_index);
+    }
+    template <typename Stream> void Unserialize(Stream& s) {
+        ::Unserialize(s, m_branch);
+        ::Unserialize(s, m_index);
+    }
 
     void SetNull() { m_branch.clear(); m_index = 0; }
     bool IsNull() const { return m_branch.empty() && m_index == 0; }
@@ -68,9 +78,16 @@ struct CMerkleTx
     uint256                       m_block_hash;
     CMerkleLink                   m_merkle_link;
 
-    SERIALIZE_METHODS(CMerkleTx) {
-        // tx_id_type == witness-stripped tx serialization (data.py:232)
-        READWRITE(TX_NO_WITNESS(obj.m_tx), obj.m_block_hash, obj.m_merkle_link);
+    // tx_id_type == witness-stripped tx serialization (data.py:232).
+    template <typename Stream> void Serialize(Stream& s) const {
+        ::Serialize(s, bitcoin_family::coin::TX_NO_WITNESS(m_tx));
+        ::Serialize(s, m_block_hash);
+        ::Serialize(s, m_merkle_link);
+    }
+    template <typename Stream> void Unserialize(Stream& s) {
+        ::Unserialize(s, bitcoin_family::coin::TX_NO_WITNESS(m_tx));
+        ::Unserialize(s, m_block_hash);
+        ::Unserialize(s, m_merkle_link);
     }
 
     void SetNull() {
@@ -90,8 +107,15 @@ struct CAuxPow
     CMerkleLink      m_chain_merkle_link;    // aux/chain merkle branch + slot index
     CPureBlockHeader m_parent_block_header;  // parent (LTC) 80-byte header
 
-    SERIALIZE_METHODS(CAuxPow) {
-        READWRITE(obj.m_merkle_tx, obj.m_chain_merkle_link, obj.m_parent_block_header);
+    template <typename Stream> void Serialize(Stream& s) const {
+        ::Serialize(s, m_merkle_tx);
+        ::Serialize(s, m_chain_merkle_link);
+        ::Serialize(s, m_parent_block_header);
+    }
+    template <typename Stream> void Unserialize(Stream& s) {
+        ::Unserialize(s, m_merkle_tx);
+        ::Unserialize(s, m_chain_merkle_link);
+        ::Unserialize(s, m_parent_block_header);
     }
 
     void SetNull() {
@@ -113,10 +137,26 @@ inline bool is_auxpow_version(int32_t version) { return (version & 0x100) != 0; 
 
 /// M3: structured parse of a (possibly AuxPoW-extended) DOGE header from `s`.
 ///   - reads CPureBlockHeader (80B)
-///   - if is_auxpow_version(version): reads CAuxPow into `out_aux`, sets has_aux
-/// Supersedes the skip-only parser in auxpow_header.hpp. Declared here; M3 impl.
+///   - if is_auxpow_version(version): deserializes CAuxPow into `out_aux`, has_aux=true
+///   - else: clears `out_aux`, has_aux=false
+/// Supersedes the byte-skip parser in auxpow_header.hpp: the AuxPoW proof is now
+/// deserialized into the CAuxPow/CMerkleTx/CMerkleLink hierarchy via the standard
+/// pack.hpp surface, not merely skipped. The 80-byte base header is what
+/// HeaderChain consumes; `out_aux` carries the proof for validation
+/// (CAuxPow::check_proof, future milestone). Throws on truncation/parse failure.
 template <typename Stream>
-CPureBlockHeader parse_aux_header(Stream& s, CAuxPow& out_aux, bool& has_aux);
+CPureBlockHeader parse_aux_header(Stream& s, CAuxPow& out_aux, bool& has_aux)
+{
+    CPureBlockHeader hdr;
+    ::Unserialize(s, hdr);                                  // 80-byte base header
+    has_aux = is_auxpow_version(static_cast<int32_t>(hdr.m_version));
+    if (has_aux) {
+        ::Unserialize(s, out_aux);                          // structured CAuxPow proof
+    } else {
+        out_aux.SetNull();
+    }
+    return hdr;
+}
 
 } // namespace coin
 } // namespace doge

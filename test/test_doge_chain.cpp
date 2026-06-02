@@ -286,6 +286,147 @@ TEST(AuxPowParserTest, SingleNonAuxPowMessage) {
     EXPECT_EQ(result[0].m_version, 4);
 }
 
+// ─── AuxPoW Structured Parser Tests (M3) ─────────────────────────────────────
+
+namespace {
+// Build a raw extended-header blob: 80-byte base header + (optional) CAuxPow
+// proof + tx_count(CompactSize). Mirrors the DOGE 'headers'-message wire layout.
+std::vector<uint8_t> build_extended_header(
+    const bitcoin_family::coin::BlockHeaderType& base,
+    const doge::coin::CAuxPow* aux)
+{
+    PackStream ps;
+    ::Serialize(ps, base);
+    if (aux)
+        ::Serialize(ps, *aux);
+    WriteCompactSize(ps, 0); // tx_count — always 0 in a 'headers' message
+    auto sp = ps.get_span();
+    auto* b = reinterpret_cast<const uint8_t*>(sp.data());
+    return std::vector<uint8_t>(b, b + sp.size());
+}
+
+doge::coin::CAuxPow make_sample_auxpow()
+{
+    doge::coin::CAuxPow aux;
+    aux.m_merkle_tx.m_block_hash.SetHex(
+        "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899");
+    aux.m_merkle_tx.m_merkle_link.m_index = 0;
+    uint256 b0; b0.SetHex("01");
+    uint256 b1; b1.SetHex("02");
+    aux.m_chain_merkle_link.m_branch = {b0, b1};
+    aux.m_chain_merkle_link.m_index = 3;
+    aux.m_parent_block_header.m_version = 2;
+    aux.m_parent_block_header.m_timestamp = 0x499602d2;
+    aux.m_parent_block_header.m_bits = 0x1e0ffff0;
+    aux.m_parent_block_header.m_nonce = 0x0000c0de;
+    return aux;
+}
+} // namespace
+
+TEST(AuxPowStructuredTest, ParseAuxPowHeaderConsumesProof) {
+    bitcoin_family::coin::BlockHeaderType base;
+    base.m_version = 0x00620102;  // chain_id=98, AuxPoW bit set, version 2
+    base.m_previous_block.SetHex("1111111111111111111111111111111111111111111111111111111111111111");
+    base.m_merkle_root.SetHex("2222222222222222222222222222222222222222222222222222222222222222");
+    base.m_timestamp = 0x5a5a5a5a;
+    base.m_bits = 0x1e0ffff0;
+    base.m_nonce = 0x12345678;
+
+    auto aux = make_sample_auxpow();
+    auto blob = build_extended_header(base, &aux);
+
+    const uint8_t* pos = blob.data();
+    const uint8_t* end = blob.data() + blob.size();
+    auto hdr = doge::coin::parse_doge_header(pos, end);
+
+    // Base header is recovered intact past the variable-length AuxPoW proof.
+    EXPECT_EQ(hdr.m_version, 0x00620102u);
+    EXPECT_EQ(hdr.m_timestamp, 0x5a5a5a5au);
+    EXPECT_EQ(hdr.m_bits, 0x1e0ffff0u);
+    EXPECT_EQ(hdr.m_nonce, 0x12345678u);
+    EXPECT_EQ(hdr.m_previous_block, base.m_previous_block);
+    EXPECT_EQ(hdr.m_merkle_root, base.m_merkle_root);
+    EXPECT_EQ(pos, end) << "Structured parser must consume the full AuxPoW header";
+}
+
+TEST(AuxPowStructuredTest, ParseAuxPowHeaderRoundTripsProof) {
+    // Verify parse_aux_header deserializes the proof structurally (not skipped):
+    // the CAuxPow read back must equal the one we serialized.
+    bitcoin_family::coin::BlockHeaderType base;
+    base.m_version = 0x00620104;  // AuxPoW bit set
+    base.m_bits = 0x1e0ffff0;
+
+    auto aux = make_sample_auxpow();
+    auto blob = build_extended_header(base, &aux);
+
+    PackStream ps(std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(blob.data()), blob.size()));
+    doge::coin::CAuxPow out;
+    bool has_aux = false;
+    auto hdr = doge::coin::parse_aux_header(ps, out, has_aux);
+
+    EXPECT_TRUE(has_aux);
+    EXPECT_EQ(hdr.m_version, 0x00620104u);
+    EXPECT_EQ(out.m_merkle_tx.m_block_hash, aux.m_merkle_tx.m_block_hash);
+    ASSERT_EQ(out.m_chain_merkle_link.m_branch.size(), 2u);
+    EXPECT_EQ(out.m_chain_merkle_link.m_branch[0], aux.m_chain_merkle_link.m_branch[0]);
+    EXPECT_EQ(out.m_chain_merkle_link.m_branch[1], aux.m_chain_merkle_link.m_branch[1]);
+    EXPECT_EQ(out.m_chain_merkle_link.m_index, 3u);
+    EXPECT_EQ(out.m_parent_block_header.m_nonce, 0x0000c0deu);
+}
+
+TEST(AuxPowStructuredTest, HasAuxFalseForPlainHeader) {
+    bitcoin_family::coin::BlockHeaderType base;
+    base.m_version = 4;  // no AuxPoW bit
+    base.m_bits = 0x1e0ffff0;
+    auto blob = build_extended_header(base, nullptr);
+
+    PackStream ps(std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(blob.data()), blob.size()));
+    doge::coin::CAuxPow out;
+    bool has_aux = true;
+    auto hdr = doge::coin::parse_aux_header(ps, out, has_aux);
+    EXPECT_FALSE(has_aux);
+    EXPECT_EQ(hdr.m_version, 4u);
+}
+
+TEST(AuxPowStructuredTest, BatchParsesAuxPowHeader) {
+    // count=1 followed by a single AuxPoW-extended header.
+    bitcoin_family::coin::BlockHeaderType base;
+    base.m_version = 0x00620102;
+    base.m_bits = 0x1e0ffff0;
+    base.m_nonce = 0xdeadbeef;
+    auto aux = make_sample_auxpow();
+
+    std::vector<uint8_t> msg;
+    msg.push_back(0x01); // CompactSize count = 1
+    auto hdr_blob = build_extended_header(base, &aux);
+    msg.insert(msg.end(), hdr_blob.begin(), hdr_blob.end());
+
+    auto result = doge::coin::parse_doge_headers_message(msg.data(), msg.size());
+    ASSERT_EQ(result.size(), 1u);
+    EXPECT_EQ(result[0].m_version, 0x00620102u);
+    EXPECT_EQ(result[0].m_nonce, 0xdeadbeefu);
+}
+
+TEST(AuxPowStructuredTest, BatchStopsAtTruncatedHeader) {
+    // count=2, but only the first header is complete; second is truncated.
+    bitcoin_family::coin::BlockHeaderType base;
+    base.m_version = 0x00620102;
+    base.m_bits = 0x1e0ffff0;
+    auto aux = make_sample_auxpow();
+
+    std::vector<uint8_t> msg;
+    msg.push_back(0x02); // claims 2 headers
+    auto hdr_blob = build_extended_header(base, &aux);
+    msg.insert(msg.end(), hdr_blob.begin(), hdr_blob.end());
+    // Append a truncated second header (only 10 bytes of the 80-byte base).
+    msg.insert(msg.end(), 10, 0x00);
+
+    auto result = doge::coin::parse_doge_headers_message(msg.data(), msg.size());
+    EXPECT_EQ(result.size(), 1u) << "Truncated tail header must be dropped, first kept";
+}
+
 // ─── Mersenne Twister Uniform Int Tests ─────────────────────────────────────
 
 TEST(MersenneTwisterTest, BoostCompatibleOutput) {
