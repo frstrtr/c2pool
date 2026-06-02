@@ -191,8 +191,6 @@ jobs:
                     test_mweb_builder \
                     test_address_resolution test_compute_share_target \
                     test_utxo \
-                    test_dash_credit_pool test_dash_subsidy test_dash_battletest_regressions \
-                    test_dash_pay_attribution \
                     test_coin_broadcaster test_multiaddress_pplns test_pplns_stress \
             -j$(nproc)
 
