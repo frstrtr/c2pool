@@ -1,48 +1,50 @@
 # Enhanced C2Pool Components
 
 # Hashrate Tracker Library
-add_library(c2pool_hashrate
+add_library(c2pool_hashrate OBJECT
     hashrate/tracker.cpp
 )
 target_include_directories(c2pool_hashrate PUBLIC .)
-target_link_libraries(c2pool_hashrate 
+target_link_libraries(c2pool_hashrate
     btclibs
-    core
     nlohmann_json::nlohmann_json
 )
+target_include_directories(c2pool_hashrate PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 # Difficulty Adjustment Engine Library  
 add_library(c2pool_difficulty
     difficulty/adjustment_engine.cpp
 )
 target_include_directories(c2pool_difficulty PUBLIC .)
-target_link_libraries(c2pool_difficulty 
+target_link_libraries(c2pool_difficulty
     btclibs
-    core
     nlohmann_json::nlohmann_json
 )
+# Stays STATIC (one-way into core, outside the SCC); drop the core link edge so its
+# archive does not absorb core OBJECT files (would duplicate at the final link).
+target_include_directories(c2pool_difficulty PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 # Storage Manager Library
-add_library(c2pool_storage
+add_library(c2pool_storage OBJECT
     storage/sharechain_storage.cpp
 )
 target_include_directories(c2pool_storage PUBLIC .)
-target_link_libraries(c2pool_storage 
-    core
+target_link_libraries(c2pool_storage
     btclibs
 )
+target_include_directories(c2pool_storage PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 # Merged Mining Manager Library (integrated mm-adapter)
-add_library(c2pool_merged_mining
+add_library(c2pool_merged_mining OBJECT
     merged/merged_mining.cpp
 )
 target_include_directories(c2pool_merged_mining PUBLIC .)
 target_link_libraries(c2pool_merged_mining
-    core
     btclibs
     nlohmann_json::nlohmann_json
     ${Boost_LIBRARIES}
 )
+target_include_directories(c2pool_merged_mining PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 # Enhanced Node Library (header-only template after M6 decoupling).
 # Coin-agnostic; callers that use the LTC alias (enhanced_node.hpp) must link
@@ -111,7 +113,7 @@ endif()
 
 # Test applications
 add_executable(test_ltc_node test_ltc_node.cpp)
-target_link_libraries(test_ltc_node $<LINK_GROUP:RESCAN,core,sharechain,btclibs,pool,ltc,ltc_coin,c2pool_storage,c2pool_payout,c2pool_hashrate,c2pool_merged_mining>)
+target_link_libraries(test_ltc_node core ltc)
 target_link_libraries(test_ltc_node nlohmann_json::nlohmann_json)
 
 # Legacy applications have been archived to ../../archive/
@@ -122,8 +124,12 @@ target_link_libraries(test_ltc_node nlohmann_json::nlohmann_json)
 add_subdirectory(ltc)
 add_subdirectory(payout)
 
-# core's web_server.cpp references symbols from c2pool_payout, c2pool_hashrate,
-# and secp256k1, so expose them transitively so any target linking core also
-# picks them up (fixes link ordering for test executables).
-# NOTE: uses plain signature to match core/CMakeLists.txt's style.
-target_link_libraries(core c2pool_payout c2pool_hashrate c2pool_merged_mining ltc ${SECP256K1_LIBRARIES})
+# core/web_server.cpp references symbols from c2pool_payout, c2pool_hashrate and
+# c2pool_merged_mining. With OBJECT libraries every consumer pools ALL of core's
+# objects (including web_server.o), so those symbols must reach every core consumer.
+# Propagate them as INTERFACE deps (consumers pool their objects) with NO back-edge
+# into core: the payout/hashrate/merged OBJECT libs no longer link core (header-only
+# access via the global src/ include path), keeping the target graph ACYCLIC so CMake
+# accepts the non-STATIC SCC. secp256k1 (external) likewise propagated via INTERFACE.
+# Source-level dissolution of these core->c2pool deps is deferred to V37.
+target_link_libraries(core INTERFACE c2pool_payout c2pool_hashrate c2pool_merged_mining ${SECP256K1_LIBRARIES})

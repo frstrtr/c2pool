@@ -4,5 +4,5 @@ set(pool_source
     protocol.hpp
 )
 
-add_library(pool STATIC ${pool_source})
+add_library(pool OBJECT ${pool_source})
 target_link_libraries(pool core)
