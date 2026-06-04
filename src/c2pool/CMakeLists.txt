@@ -40,6 +40,12 @@ target_link_libraries(c2pool_storage
     # only via the leveldb::leveldb imported target; without this, Windows fails
     # C1083 leveldb/db.h (Linux happens to find it on the default system path).
     ${LEVELDB_LIBRARIES}
+    # sharechain_storage.cpp uses <core/log.hpp> (LOG_* -> Boost.Log trivial). OBJECT
+    # lib does not link core (SCC break); carry Boost.Log explicitly so ld64 resolves
+    # it on AppleClang arm64 (same carry pattern as c2pool_payout/c2pool_merged_mining,
+    # #22/#39).
+    Boost::log
+    Boost::log_setup
 )
 target_include_directories(c2pool_storage PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
