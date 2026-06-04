@@ -4379,7 +4379,7 @@ nlohmann::json MiningInterface::rest_local_stats()
     double fee_ratio = m_pool_fee_percent / 100.0;
     double miner_subsidy = std::max(0.0, block_value - payment_amount);
     result["block_value_miner"] = miner_subsidy * (1.0 - fee_ratio);
-    result["block_value_payments"] = payment_amount;
+    result["block_value_payments"] = (m_blockchain == Blockchain::DASH) ? payment_amount : block_value;
 
     // Node fee amounts per block: fee% × (local_hashrate / pool_hashrate) × block_value
     // Matches p2pool: operator gets fee% of THIS node's contribution, not the whole block.
@@ -5445,10 +5445,10 @@ nlohmann::json MiningInterface::rest_miner_payouts(const std::string& address)
 
 nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cached_sc)
 {
-    // V35→V36 transition tracking is LTC-specific. Other blockchains
-    // (e.g. Dash v16) don't have a pending transition, so return an
-    // empty object to keep the dashboard's transition banners hidden.
-    if (m_blockchain != Blockchain::LITECOIN)
+    // V35→V36 transition tracking applies to the v36 coins (LTC and DOGE).
+    // Other blockchains (e.g. Dash v16) don't have a pending transition, so
+    // return an empty object to keep the dashboard's transition banners hidden.
+    if (m_blockchain != Blockchain::LITECOIN && m_blockchain != Blockchain::DOGECOIN)
         return nlohmann::json::object();
 
     // Matches p2pool's get_version_signaling() — all fields the dashboard JS expects.
@@ -6995,7 +6995,7 @@ void MiningInterface::update_stat_log()
         {
             switch (m_blockchain) {
             case Blockchain::LITECOIN:
-                return m_testnet ? std::make_tuple<uint8_t, uint8_t, std::string>(0x6f, 0x3a, "tltc")
+                return m_testnet ? std::make_tuple<uint8_t, uint8_t, std::string>(0x6f, 0xc4, "tltc")
                                  : std::make_tuple<uint8_t, uint8_t, std::string>(0x30, 0x32, "ltc");
             case Blockchain::DASH:
                 return m_testnet ? std::make_tuple<uint8_t, uint8_t, std::string>(140, 19, "")
