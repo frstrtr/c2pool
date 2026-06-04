@@ -11,6 +11,7 @@
 // implementing the substantive logic.
 
 #include <impl/btc/stratum/work_source.hpp>
+#include <memory>
 
 #include <impl/btc/coin/header_chain.hpp>
 #include <impl/btc/coin/mempool.hpp>
@@ -629,10 +630,16 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
     }
     auto txs_field = wd->m_data.find("transactions");
     if (txs_field != wd->m_data.end() && txs_field->is_array()) {
+        // a1 (shared_ptr + lazy materialize): build the per-tx hex vector ONCE
+        // and hand the snapshot a shared_ptr to it, so the copies made along
+        // CoinbaseResult -> JobSnapshot -> JobEntry become refcount bumps, not
+        // deep copies of the full mempool tx hex (the H5 churn site).
+        auto txd = std::make_shared<std::vector<std::string>>();
         for (const auto& t : *txs_field) {
             if (t.is_object() && t.contains("data") && t["data"].is_string())
-                snap.tx_data.push_back(t["data"].get<std::string>());
+                txd->push_back(t["data"].get<std::string>());
         }
+        snap.tx_data = std::move(txd);
     }
     snap.merkle_branches = std::move(branches);
 
@@ -779,14 +786,19 @@ nlohmann::json BTCWorkSource::mining_submit(
                 witness_bytes.begin(), witness_bytes.end());
         }
 
+        // a1: lazy materialize the tx hex at submit time (the only reader).
+        static const std::vector<std::string> kEmptyTxData;
+        const std::vector<std::string>& txs =
+            job->tx_data ? *job->tx_data : kEmptyTxData;
+
         std::vector<uint8_t> block_bytes;
-        block_bytes.reserve(80 + 9 + coinbase_serialized.size() + job->tx_data.size() * 256);
+        block_bytes.reserve(80 + 9 + coinbase_serialized.size() + txs.size() * 256);
         block_bytes.insert(block_bytes.end(), header.begin(), header.end());
 
-        push_varint(block_bytes, 1 + job->tx_data.size());  // total tx count
+        push_varint(block_bytes, 1 + txs.size());  // total tx count
         block_bytes.insert(block_bytes.end(),
             coinbase_serialized.begin(), coinbase_serialized.end());
-        for (const auto& tx_hex : job->tx_data) {
+        for (const auto& tx_hex : txs) {
             auto tx_bytes = ParseHex(tx_hex);
             block_bytes.insert(block_bytes.end(), tx_bytes.begin(), tx_bytes.end());
         }

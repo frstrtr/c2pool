@@ -120,7 +120,7 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
         std::string coinb2;
         uint32_t    version{};
         std::vector<std::string> merkle_branches;
-        std::vector<std::string> tx_data;     // raw tx hex from GBT template
+        std::shared_ptr<const std::vector<std::string>> tx_data;     // raw tx hex from GBT template (a1: shared/lazy)
         std::string mweb;                      // MWEB extension data
         bool        segwit_active{false};
         uint256     prev_share_hash;  // share chain tip when this job was built

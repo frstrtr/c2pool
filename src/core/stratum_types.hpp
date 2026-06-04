@@ -20,6 +20,7 @@
 // and non-LTC paths without divergence.
 
 #include <core/uint256.hpp>
+#include <memory>
 
 #include <chrono>
 #include <cstdint>
@@ -78,7 +79,7 @@ struct JobSnapshot {
     std::string nbits;             // BE hex e.g. "1e0fffff" (share target bits for header)
     uint32_t    version{0};
     std::vector<std::string> merkle_branches;
-    std::vector<std::string> tx_data;   // raw tx hex from GBT
+    std::shared_ptr<const std::vector<std::string>> tx_data;   // raw tx hex from GBT (a1: shared/lazy)
     std::string mweb;                    // empty for non-MWEB coins
     bool        segwit_active{false};
     uint256     prev_share_hash;  // share chain tip when this job was built
@@ -104,7 +105,7 @@ struct WorkSnapshot {
     RefHashResult frozen_ref;
     // Block body data — captured atomically with witness_commitment to
     // prevent merkle root mismatch when refresh_work() updates the template.
-    std::vector<std::string> tx_data;          // raw tx hex from template
+    std::shared_ptr<const std::vector<std::string>> tx_data;          // raw tx hex from template (a1: shared/lazy)
     std::vector<std::string> merkle_branches;  // stratum merkle branches
 };
 

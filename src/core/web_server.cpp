@@ -1,5 +1,6 @@
 #include "web_server.hpp"
 #include "stratum_server.hpp"
+#include <memory>
 #include "address_utils.hpp"
 #include "socket.hpp"
 
@@ -1413,7 +1414,7 @@ MiningInterface::build_block_from_stratum(const std::string& extranonce1,
     block << HexStr(std::span<const unsigned char>(nonce_bytes.data(), nonce_bytes.size()));
 
     // Transaction count (varint) + coinbase + rest of transactions
-    const auto& tx_list = job ? job->tx_data : std::vector<std::string>{};
+    const std::vector<std::string> tx_list = (job && job->tx_data) ? *job->tx_data : std::vector<std::string>{};
     // If no job snapshot, collect tx data from the live template
     std::vector<std::string> live_tx_data;
     if (!job && m_cached_template.contains("transactions")) {
@@ -2139,9 +2140,11 @@ MiningInterface::build_connection_coinbase(
     // when refresh_work() updates the template between separate reads.
     snap.merkle_branches = ws.merkle_branches;
     if (ws.tmpl.contains("transactions")) {
+        auto txd = std::make_shared<std::vector<std::string>>();
         for (const auto& tx : ws.tmpl["transactions"])
             if (tx.contains("data"))
-                snap.tx_data.push_back(tx["data"].get<std::string>());
+                txd->push_back(tx["data"].get<std::string>());
+        snap.tx_data = std::move(txd);
     }
     return {std::move(cb1), std::move(cb2), std::move(snap)};
 }
@@ -7666,7 +7669,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                     // means the root was computed and should be used as-is.
                     // Only recompute when witness_commitment is empty but segwit active.
                     if (params.witness_commitment_hex.empty() && params.segwit_active) {
-                        const auto& txd = job ? job->tx_data : std::vector<std::string>{};
+                        const std::vector<std::string> txd = (job && job->tx_data) ? *job->tx_data : std::vector<std::string>{};
                         if (!txd.empty()) {
                             std::vector<uint256> wtxids;
                             wtxids.push_back(uint256());  // coinbase wtxid = 0
