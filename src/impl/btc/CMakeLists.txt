@@ -10,6 +10,6 @@ add_library(btc
     share_types.hpp share.hpp
 )
 
-target_link_libraries(btc core pool sharechain btc_coin btclibs c2pool_storage ${SECP256K1_LIBRARIES})
+target_link_libraries(btc core pool sharechain btc_coin btclibs c2pool_storage c2pool_hashrate ${SECP256K1_LIBRARIES})  # OBJECT-lib SCC direct-naming (#22/#39) — vardiff/HashrateTracker link fix
 
 # add_subdirectory(test)  # B0: disabled — share_test.cpp references LTC types, restore in later phase
