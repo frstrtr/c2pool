@@ -6,6 +6,7 @@ add_library(c2pool_hashrate OBJECT
 )
 target_include_directories(c2pool_hashrate PUBLIC .)
 target_link_libraries(c2pool_hashrate
+    yaml-cpp::yaml-cpp
     btclibs
     nlohmann_json::nlohmann_json
 )
@@ -17,6 +18,7 @@ add_library(c2pool_difficulty
 )
 target_include_directories(c2pool_difficulty PUBLIC .)
 target_link_libraries(c2pool_difficulty
+    yaml-cpp::yaml-cpp
     btclibs
     nlohmann_json::nlohmann_json
 )
@@ -30,6 +32,7 @@ add_library(c2pool_storage OBJECT
 )
 target_include_directories(c2pool_storage PUBLIC .)
 target_link_libraries(c2pool_storage
+    yaml-cpp::yaml-cpp
     btclibs
 )
 target_include_directories(c2pool_storage PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -40,6 +43,7 @@ add_library(c2pool_merged_mining OBJECT
 )
 target_include_directories(c2pool_merged_mining PUBLIC .)
 target_link_libraries(c2pool_merged_mining
+    yaml-cpp::yaml-cpp
     btclibs
     nlohmann_json::nlohmann_json
     ${Boost_LIBRARIES}
@@ -82,9 +86,14 @@ target_link_libraries(c2pool
     c2pool_merged_mining
     core
     ltc
+    # OBJECT sets reachable only transitively via ltc (itself OBJECT) do not
+    # propagate their objects into the exe link; name them directly (#22/#39).
+    c2pool_storage
+    ltc_coin
     nlohmann_json::nlohmann_json
     ${Boost_LIBRARIES}
 )
+target_link_libraries(c2pool c2pool_hashrate pool)  # OBJECT-lib SCC direct-naming (#22/#39)
 
 # Enhanced version with explicit name (for backward compatibility)
 add_executable(c2pool_enhanced c2pool_refactored.cpp)
@@ -94,9 +103,12 @@ target_link_libraries(c2pool_enhanced
     c2pool_merged_mining
     core
     ltc
+    c2pool_storage
+    ltc_coin
     nlohmann_json::nlohmann_json
     ${Boost_LIBRARIES}
 )
+target_link_libraries(c2pool_enhanced c2pool_hashrate pool)  # OBJECT-lib SCC direct-naming (#22/#39)
 
 # Windows: Boost.Asio requires Winsock libraries; /bigobj for large translation units
 if(WIN32)
@@ -114,6 +126,7 @@ endif()
 # Test applications
 add_executable(test_ltc_node test_ltc_node.cpp)
 target_link_libraries(test_ltc_node core ltc)
+target_link_libraries(test_ltc_node c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage ltc_coin pool)  # OBJECT-lib SCC direct-naming (#22/#39)
 target_link_libraries(test_ltc_node nlohmann_json::nlohmann_json)
 
 # Legacy applications have been archived to ../../archive/

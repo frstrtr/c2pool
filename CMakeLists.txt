@@ -26,6 +26,7 @@ find_package(Boost REQUIRED COMPONENTS log log_setup thread filesystem exception
 find_package(Boost QUIET OPTIONAL_COMPONENTS system)
 
 find_package(nlohmann_json REQUIRED)
+find_package(yaml-cpp REQUIRED)  # hoisted to root so yaml-cpp::yaml-cpp is visible to src/c2pool OBJECT libs (sibling of src/core)
 
 # Threading (needed by LevelDB on some platforms)
 find_package(Threads REQUIRED)

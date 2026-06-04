@@ -10,6 +10,7 @@ target_include_directories(c2pool_payout PUBLIC
 )
 
 target_link_libraries(c2pool_payout
+    yaml-cpp::yaml-cpp
     nlohmann_json::nlohmann_json
     ${Boost_LIBRARIES}
     btclibs
