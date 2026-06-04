@@ -62,7 +62,7 @@ RateMonitor::get_datums_in_last(double dt) const {
 /// Static member definition
 std::atomic<uint64_t> StratumSession::job_counter_{0};
 
-StratumServer::StratumServer(net::io_context& ioc, const std::string& address, uint16_t port, std::shared_ptr<MiningInterface> mining_interface)
+StratumServer::StratumServer(net::io_context& ioc, const std::string& address, uint16_t port, std::shared_ptr<IWorkSource> mining_interface)
     : ioc_(ioc)
     , acceptor_(ioc)
     , mining_interface_(mining_interface)
@@ -102,14 +102,41 @@ bool StratumServer::start()
 
 void StratumServer::stop()
 {
-    if (running_) {
-        try {
-            acceptor_.close();
-            running_ = false;
-            LOG_INFO << "StratumServer stopped";
-        } catch (const std::exception& e) {
-            LOG_ERROR << "Error stopping StratumServer: " << e.what();
+    if (!running_) return;
+
+    try {
+        // Stop accepting new connections first — no more sessions can spawn
+        // after this point, so the snapshot below is exhaustive.
+        boost::system::error_code ec;
+        acceptor_.cancel(ec);
+        acceptor_.close(ec);
+        running_ = false;
+
+        // Snapshot + clear the live-sessions set under the mutex, then close
+        // each one OUTSIDE the lock. cancel_timers() does asio operations
+        // (timer.cancel + socket.close) that should not run with our
+        // sessions_mutex_ held — the read-error handler will fire on the
+        // io_context thread and try to acquire sessions_mutex_ via
+        // unregister_session.
+        std::set<std::shared_ptr<StratumSession>> snapshot;
+        {
+            std::lock_guard<std::mutex> lk(sessions_mutex_);
+            snapshot = std::move(sessions_);
+            sessions_.clear();
         }
+
+        for (auto& session : snapshot) {
+            try {
+                session->shutdown();
+            } catch (const std::exception& e) {
+                LOG_WARNING << "StratumSession shutdown threw: " << e.what();
+            }
+        }
+
+        LOG_INFO << "StratumServer stopped (closed " << snapshot.size()
+                 << " active session" << (snapshot.size() == 1 ? "" : "s") << ")";
+    } catch (const std::exception& e) {
+        LOG_ERROR << "Error stopping StratumServer: " << e.what();
     }
 }
 
@@ -275,7 +302,7 @@ void StratumServer::notify_all()
 }
 
 /// StratumSession Implementation
-StratumSession::StratumSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface,
+StratumSession::StratumSession(tcp::socket socket, std::shared_ptr<IWorkSource> mining_interface,
                                StratumServer* server)
     : socket_(std::move(socket))
     , mining_interface_(mining_interface)
@@ -917,8 +944,20 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
                 response["error"] = nlohmann::json::array({20, "Invalid version mask", nullptr});
                 return response;
             }
-            // Apply: keep non-rolling bits from job, take rolling bits from miner
-            effective_version = (job.version & ~version_rolling_mask_) | (miner_version_bits & version_rolling_mask_);
+            // BIP 320: version_bits is the XOR-difference between the miner's
+            // rolled version and the job version (per spec: "bits set by miner
+            // to be different from version field given by mining.notify").
+            // Recovery: effective = job ^ version_bits.  ESP-Miner / bitaxe
+            // firmware sends version_bits this way (asic_result_task.c:60:
+            // `version_bits = rolled_version ^ active_job->version`). Earlier
+            // mask check ensures version_bits flips only mask-bits, so XOR
+            // only modifies the negotiated bits.
+            //
+            // Old REPLACE convention `(job & ~mask) | (bits & mask)` silently
+            // zeroed any job-version bits in the mask region (e.g. BIP 9
+            // signal bits) before OR'ing — produced a header version that
+            // bitaxe never hashed, every share rejected at vardiff gate.
+            effective_version = job.version ^ miner_version_bits;
         } catch (...) {
             LOG_WARNING << "[Stratum] Invalid version_bits hex from " << username_ << ": " << version_bits;
         }
@@ -926,7 +965,12 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
 
     // Use gbt_prevhash (BE display hex) — SetHex converts to LE internal,
     // matching build_block_from_stratum which the daemon accepts.
-    double share_difficulty = MiningInterface::calculate_share_difficulty(
+    // Per-coin PoW dispatch via IWorkSource virtual: LTC delegates to the
+    // existing static scrypt-based calculate_share_difficulty; BTC's
+    // BTCWorkSource implements this with SHA256d. Without this dispatch
+    // every BTC stratum submission gets a garbage scrypt-based diff and
+    // rejects at the vardiff gate.
+    double share_difficulty = mining_interface_->compute_share_difficulty(
         job.coinb1, job.coinb2,
         extranonce1_, extranonce2, ntime, nonce,
         effective_version, job.gbt_prevhash, job.nbits, job.merkle_branches);
@@ -937,7 +981,7 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
 
     // Pool share difficulty (for P2P share creation threshold)
     double pool_difficulty = 0.0;
-    uint32_t sb = mining_interface_->m_share_bits.load();
+    uint32_t sb = mining_interface_->get_share_bits();
     if (sb != 0)
         pool_difficulty = chain::target_to_difficulty(chain::bits_to_target(sb));
 
@@ -975,8 +1019,8 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     snapshot.subsidy         = job.subsidy;
     snapshot.witness_commitment_hex = job.witness_commitment_hex;
     snapshot.witness_root            = job.witness_root;
-    snapshot.share_bits      = mining_interface_->m_share_bits.load();
-    snapshot.share_max_bits  = mining_interface_->m_share_max_bits.load();
+    snapshot.share_bits      = mining_interface_->get_share_bits();
+    snapshot.share_max_bits  = mining_interface_->get_share_max_bits();
     // Pass frozen share fields through to ShareCreationParams
     snapshot.frozen_ref.absheight = job.frozen_absheight;
     snapshot.frozen_ref.abswork = job.frozen_abswork;
@@ -1317,7 +1361,7 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
     // coinbase/tx_data consistency. Overriding them caused GENTX validation
     // failures on p2pool nodes (absheight, bits mismatch).
     if (!cbr.snapshot.merkle_branches.empty()) {
-        merkle_branches_vec = cbr.snapshot.merkle_branches;
+        merkle_branches_vec = std::move(cbr.snapshot.merkle_branches);
         merkle_branches = nlohmann::json::array();
         for (const auto& h : merkle_branches_vec)
             merkle_branches.push_back(h);
@@ -1340,7 +1384,7 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         je.coinb1 = coinb1;
         je.coinb2 = coinb2;
         je.version = version_u32;
-        je.merkle_branches = merkle_branches_vec;
+        je.merkle_branches = std::move(merkle_branches_vec);
         je.gbt_block_nbits = gbt_block_nbits;
         active_jobs_[job_id] = std::move(je);
     }
@@ -1379,7 +1423,10 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         // Use tx_data from the atomic snapshot — NOT from the potentially stale
         // tmpl fetched at the top of send_notify_work(). This ensures the block
         // body transactions match the witness commitment and merkle branches.
-        je.tx_data = cbr.snapshot.tx_data;
+        // std::move because cbr is a local of this function and snapshot.tx_data
+        // is not referenced again after this assignment — saves a deep copy of
+        // the per-tx hex string vector on every notify (Option 2 fix).
+        je.tx_data = std::move(cbr.snapshot.tx_data);
     }
 
     // VARDIFF: do NOT override per-connection difficulty with pool share_bits.

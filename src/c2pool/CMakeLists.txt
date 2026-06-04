@@ -44,12 +44,13 @@ target_link_libraries(c2pool_merged_mining
     ${Boost_LIBRARIES}
 )
 
-# Enhanced Node Library (header-only template after M6 decoupling).
-# Coin-agnostic; callers that use the LTC alias (enhanced_node.hpp) must link
-# `ltc` themselves. Dash callers include impl/dash/enhanced_node.hpp.
-add_library(c2pool_node_enhanced INTERFACE)
-target_include_directories(c2pool_node_enhanced INTERFACE .)
-target_link_libraries(c2pool_node_enhanced INTERFACE
+# Enhanced Node Library
+add_library(c2pool_node_enhanced
+    node/enhanced_node.cpp
+)
+target_include_directories(c2pool_node_enhanced PUBLIC .)
+target_link_libraries(c2pool_node_enhanced 
+    ltc
     core
     c2pool_hashrate
     c2pool_difficulty
@@ -96,6 +97,25 @@ target_link_libraries(c2pool_enhanced
     ${Boost_LIBRARIES}
 )
 
+# c2pool-btc: BTC SPV embedded p2pool — Phase B0 scaffold (stub entry).
+# Library `btc` is a clone of `ltc` with namespace renamed and CMake targets
+# adjusted; real entry-point port is in later B-phases.
+# Links `ltc` transitively because core/web_server.cpp references LTC symbols
+# (see comment at the bottom of this file). Untangling that is out of B0 scope.
+add_executable(c2pool-btc main_btc.cpp)
+target_compile_definitions(c2pool-btc PRIVATE C2POOL_VERSION="${C2POOL_GIT_VERSION}")
+target_link_libraries(c2pool-btc
+    c2pool_node_enhanced
+    c2pool_payout
+    c2pool_merged_mining
+    core
+    ltc
+    btc
+    btc_stratum
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+)
+
 # Windows: Boost.Asio requires Winsock libraries; /bigobj for large translation units
 if(WIN32)
     target_link_libraries(c2pool ws2_32 mswsock bcrypt dbghelp)
@@ -111,7 +131,7 @@ endif()
 
 # Test applications
 add_executable(test_ltc_node test_ltc_node.cpp)
-target_link_libraries(test_ltc_node $<LINK_GROUP:RESCAN,core,sharechain,btclibs,pool,ltc,ltc_coin,c2pool_storage,c2pool_payout,c2pool_hashrate,c2pool_merged_mining>)
+target_link_libraries(test_ltc_node core btclibs pool ltc)
 target_link_libraries(test_ltc_node nlohmann_json::nlohmann_json)
 
 # Legacy applications have been archived to ../../archive/

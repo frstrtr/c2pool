@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "agenticmail": {
+      "command": "/usr/bin/npx",
+      "args": ["-y", "@agenticmail/mcp@latest"],
+      "env": {
+        "AGENTICMAIL_API_KEY": "ak_6239e8b5bb4bc5dbc7fb8bfd9e7182c7b8829daf89b9a1b4",
+        "AGENTICMAIL_API_URL": "https://mail.morisguide.com"
+      }
+    }
+  }
+}

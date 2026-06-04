@@ -1,0 +1,687 @@
+/* depends/relic/include/relic_conf.h.in.  Generated from configure.ac by autoheader.  */
+
+#ifndef RLC_CONF_H
+
+#define RLC_CONF_H
+
+/* Byte boundary to align digit vectors. */
+#undef ALIGN
+
+/* Chosen memory allocation policy. */
+#undef ALLOC
+
+/* Almost inverse algorithm. */
+#undef ALMOS
+
+/* ANSI-compatible timer. */
+#undef ANSI
+
+/* Architecture. */
+#undef ARCH
+
+/* Define if C-only backend is requested. */
+#undef ARITH
+
+/* ARM 32-bit architecture. */
+#undef ARM
+
+/* Automatic memory allocation. */
+#undef AUTO
+
+/* Atmel AVR ATMega128 8-bit architecture. */
+#undef AVR
+
+/* BLAKE2s-160 hash function. */
+#undef B2S160
+
+/* BLAKE2s-256 hash function. */
+#undef B2S256
+
+/* Basic method. */
+#undef BASIC
+
+/* Define this symbol if big-endian support is enabled */
+#undef BIGED
+
+/* Binary inversion. */
+#undef BINAR
+
+/* Chosen multiple precision greatest common divisor method. */
+#undef BN_GCD
+
+/* Chosen prime generation algorithm. */
+#undef BN_GEN
+
+/* Number of Karatsuba steps. */
+#undef BN_KARAT
+
+/* Effective size of a multiple precision integer. */
+#undef BN_MAGNI
+
+/* Multiple precision arithmetic method. */
+#undef BN_METHD
+
+/* Chosen multiple precision modular reduction method. */
+#undef BN_MOD
+
+/* Chosen multiple precision multiplication method. */
+#undef BN_MUL
+
+/* Chosen multiple precision modular exponentiation method. */
+#undef BN_MXP
+
+/* Required precision in bits. */
+#undef BN_PRECI
+
+/* Chosen multiple precision multiplication method. */
+#undef BN_SQR
+
+/* Hardware-friendly inversion by Brunner-Curiger-Hofstetter. */
+#undef BRUCH
+
+/* Override library generator with the callback. */
+#undef CALL
+
+/* A multiple precision integer can store the result of an addition. */
+#undef CARRY
+
+/* Binary curves. */
+#undef CHAR2
+
+/* Define this symbol if error-checking support is enabled */
+#undef CHECK
+
+/* Define this symbol if colored output is enabled */
+#undef COLOR
+
+/* Comba method. */
+#undef COMBA
+
+/* Double-table comb method. */
+#undef COMBD
+
+/* Single-table comb method. */
+#undef COMBS
+
+/* Support for faster CRT-based exponentiation in factoring-based
+   cryptosystems. */
+#undef CP_CRT
+
+/* Chosen RSA padding method. */
+#undef CP_RSAPD
+
+/* Constant-time version of almost inverse. */
+#undef CTAIA
+
+/* Cycle-counting timer. */
+#undef CYCLE
+
+/* Define this symbol if debugging support is enabled */
+#undef DEBUG
+
+/* Constant-time inversion by Bernstein-Yang division steps. */
+#undef DIVST
+
+/* A multiple precision integer can store the result of a multiplication. */
+#undef DOUBLE
+
+/* Android operating system. */
+#undef DROID
+
+/* Arduino platform. */
+#undef DUINO
+
+/* Dynamic memory allocation. */
+#undef DYNAMIC
+
+/* Easy C-only backend. */
+#undef EASY
+
+/* Chosen binary elliptic curve coordinate method. */
+#undef EB_ADD
+
+/* Width of precomputation table for fixed point methods. */
+#undef EB_DEPTH
+
+/* Chosen binary elliptic curve point multiplication method. */
+#undef EB_FIX
+
+/* Support for Koblitz anomalous binary curves. */
+#undef EB_KBLTZ
+
+/* Binary elliptic curve arithmetic method. */
+#undef EB_METHD
+
+/* Use mixed coordinates. */
+#undef EB_MIXED
+
+/* Chosen binary elliptic curve point multiplication method. */
+#undef EB_MUL
+
+/* Support for ordinary curves without endormorphisms. */
+#undef EB_PLAIN
+
+/* Build precomputation table for generator. */
+#undef EB_PRECO
+
+/* Chosen binary elliptic curve simulteanous point multiplication method. */
+#undef EB_SIM
+
+/* Width of window processing for unknown point methods. */
+#undef EB_WIDTH
+
+/* Chosen elliptic curve type. */
+#undef EC_CUR
+
+/* Chosen elliptic curve cryptography method. */
+#undef EC_METHD
+
+/* Edwards curves. */
+#undef EDDIE
+
+/* Chosen binary elliptic curve coordinate method. */
+#undef ED_ADD
+
+/* Width of precomputation table for fixed point methods. */
+#undef ED_DEPTH
+
+/* Chosen prime elliptic twisted Edwards curve point multiplication method. */
+#undef ED_FIX
+
+/* Edwards elliptic curve arithmetic method. */
+#undef ED_METHD
+
+/* Chosen prime elliptic twisted Edwards curve point multiplication method. */
+#undef ED_MUL
+
+/* Build precomputation table for generator. */
+#undef ED_PRECO
+
+/* Chosen prime elliptic curve simulteanous point multiplication method. */
+#undef ED_SIM
+
+/* Width of window processing for unknown point methods. */
+#undef ED_WIDTH
+
+/* Chosen prime elliptic curve coordinate method. */
+#undef EP_ADD
+
+/* Enable isogeny map for SSWU map-to-curve. */
+#undef EP_CTMAP
+
+/* Width of precomputation table for fixed point methods. */
+#undef EP_DEPTH
+
+/* Support for prime curves with efficient endormorphisms. */
+#undef EP_ENDOM
+
+/* Chosen prime elliptic curve point multiplication method. */
+#undef EP_FIX
+
+/* Prime elliptic curve arithmetic method. */
+#undef EP_METHD
+
+/* Use mixed coordinates. */
+#undef EP_MIXED
+
+/* Chosen prime elliptic curve point multiplication method. */
+#undef EP_MUL
+
+/* Build precomputation table for generator. */
+#undef EP_PRECO
+
+/* Chosen prime elliptic curve simulteanous point multiplication method. */
+#undef EP_SIM
+
+/* Width of window processing for unknown point methods. */
+#undef EP_WIDTH
+
+/* Extended Euclidean algorithm. */
+#undef EXGCD
+
+/* Extended projective twisted Edwards coordinates. */
+#undef EXTND
+
+/* Chosen multiple precision modular exponentiation method. */
+#undef FB_EXP
+
+/* Chosen binary field inversion method. */
+#undef FB_INV
+
+/* Chosen method to solve a quadratic equation. */
+#undef FB_ITR
+
+/* Number of Karatsuba levels. */
+#undef FB_KARAT
+
+/* Binary field arithmetic method */
+#undef FB_METHD
+
+/* Chosen binary field multiplication method. */
+#undef FB_MUL
+
+/* Irreducible polynomial size in bits. */
+#undef FB_POLYN
+
+/* Precompute multiplication table for sqrt(z). */
+#undef FB_PRECO
+
+/* Chosen binary field modular reduction method. */
+#undef FB_RDC
+
+/* Chosen method to solve a quadratic equation. */
+#undef FB_SLV
+
+/* Chosen binary field squaring method. */
+#undef FB_SQR
+
+/* Chosen binary field modular reduction method. */
+#undef FB_SRT
+
+/* Chosen trace computation method. */
+#undef FB_TRC
+
+/* Prefer trinomials over pentanomials. */
+#undef FB_TRINO
+
+/* Width of window processing for exponentiation methods. */
+#undef FB_WIDTH
+
+/* Chosen extension field arithmetic method. */
+#undef FPX_CBC
+
+/* Prime extension field arithmetic method. */
+#undef FPX_METHD
+
+/* Chosen extension field arithmetic method. */
+#undef FPX_QDR
+
+/* Chosen extension field arithmetic method. */
+#undef FPX_RDC
+
+/* Chosen prime field multiplication method. */
+#undef FP_ADD
+
+/* Chosen multiple precision modular exponentiation method. */
+#undef FP_EXP
+
+/* Chosen prime field inversion method. */
+#undef FP_INV
+
+/* Number of Karatsuba steps. */
+#undef FP_KARAT
+
+/* Prime field arithmetic method. */
+#undef FP_METHD
+
+/* Chosen prime field multiplication method. */
+#undef FP_MUL
+
+/* Prime field size in bits. */
+#undef FP_PRIME
+
+/* Use -1 as quadratic non-residue. */
+#undef FP_QNRES
+
+/* Chosen prime field reduction method. */
+#undef FP_RDC
+
+/* Chosen prime field multiplication method. */
+#undef FP_SQR
+
+/* Width of window processing for exponentiation methods. */
+#undef FP_WIDTH
+
+/* FreeBSD operating system. */
+#undef FREEBSD
+
+/* Backend based on GNU Multiple Precision library. */
+#undef GMP
+
+/* Backend based on GNU Multiple Precision library, but using constant-time
+   code. */
+#undef GMP_SEC
+
+/* Halving. */
+#undef HALVE
+
+/* NIST HASH-DRBG generator. */
+#undef HASHD
+
+/* define if the compiler supports basic C++14 syntax */
+#undef HAVE_CXX14
+
+/* Define to 1 if you have the <dlfcn.h> header file. */
+#undef HAVE_DLFCN_H
+
+/* Define to 1 if you have the <inttypes.h> header file. */
+#undef HAVE_INTTYPES_H
+
+/* Define to 1 if you have the `advapi32' library (-ladvapi32). */
+#undef HAVE_LIBADVAPI32
+
+/* Define to 1 if you have the `bcrypt' library (-lbcrypt). */
+#undef HAVE_LIBBCRYPT
+
+/* Define to 1 if you have the `gmp' library (-lgmp). */
+#undef HAVE_LIBGMP
+
+/* Define to 1 if you have the `psapi' library (-lpsapi). */
+#undef HAVE_LIBPSAPI
+
+/* Define to 1 if you have the `shell32' library (-lshell32). */
+#undef HAVE_LIBSHELL32
+
+/* Define to 1 if you have the `user32' library (-luser32). */
+#undef HAVE_LIBUSER32
+
+/* Define if you have POSIX threads libraries and header files. */
+#undef HAVE_PTHREAD
+
+/* Have PTHREAD_PRIO_INHERIT. */
+#undef HAVE_PTHREAD_PRIO_INHERIT
+
+/* Define to 1 if you have the <stdint.h> header file. */
+#undef HAVE_STDINT_H
+
+/* Define to 1 if you have the <stdio.h> header file. */
+#undef HAVE_STDIO_H
+
+/* Define to 1 if you have the <stdlib.h> header file. */
+#undef HAVE_STDLIB_H
+
+/* Define to 1 if you have the <strings.h> header file. */
+#undef HAVE_STRINGS_H
+
+/* Define to 1 if you have the <string.h> header file. */
+#undef HAVE_STRING_H
+
+/* Define to 1 if you have the <sys/stat.h> header file. */
+#undef HAVE_SYS_STAT_H
+
+/* Define to 1 if you have the <sys/types.h> header file. */
+#undef HAVE_SYS_TYPES_H
+
+/* Define to 1 if you have the <unistd.h> header file. */
+#undef HAVE_UNISTD_H
+
+/* Per-process high-resolution timer. */
+#undef HPROC
+
+/* Per-process high-resolution timer. */
+#undef HREAL
+
+/* Per-thread high-resolution timer. */
+#undef HTHRD
+
+/* Integrated modular addtion. */
+#undef INTEG
+
+/* Interleaving of w-(T)NAFs. */
+#undef INTER
+
+/* Itoh-Tsuji inversion. */
+#undef ITOHT
+
+/* Jacobian coordinates. */
+#undef JACOB
+
+/* Joint sparse form. */
+#undef JOINT
+
+/* Lazy-reduced extension field arithmetic. */
+#undef LAZYR
+
+/* Lehmer's fast GCD Algorithm. */
+#undef LEHME
+
+/* Standard C library generator. */
+#undef LIBC
+
+/* GNU/Linux operating system. */
+#undef LINUX
+
+/* Lopez-Dahab multiplication. */
+#undef LODAH
+
+/* Use implementation provided by the lower layer. */
+#undef LOWER
+
+/* Define to the sub-directory where libtool stores uninstalled libraries. */
+#undef LT_OBJDIR
+
+/* Left-to-right Width-w NAF. */
+#undef LWNAF
+
+/* Left-to-right Width-w NAF. */
+#undef LWREG
+
+/* MacOS operating system. */
+#undef MACOSX
+
+/* Chosen hash function. */
+#undef MD_MAP
+
+/* Choice of hash function. */
+#undef MD_METHD
+
+/* Montgomery method. */
+#undef MONTY
+
+/* MSP430 16-bit architecture. */
+#undef MSP
+
+/* Chosen multithreading API. */
+#undef MULTI
+
+/* Reuse multiplication for squaring. */
+#undef MULTP
+
+/* Optimal ate pairing. */
+#undef OATEP
+
+/* OpenMP multithreading support. */
+#undef OPENMP
+
+/* Detected operation system. */
+#undef OPSYS
+
+/* Define this symbol if overhead estimation is enabled */
+#undef OVERH
+
+/* Define to the address where bug reports for this package should be sent. */
+#undef PACKAGE_BUGREPORT
+
+/* Define to the full name of this package. */
+#undef PACKAGE_NAME
+
+/* Define to the full name and version of this package. */
+#undef PACKAGE_STRING
+
+/* Define to the one symbol short name of this package. */
+#undef PACKAGE_TARNAME
+
+/* Define to the home page for this package. */
+#undef PACKAGE_URL
+
+/* Define to the version of this package. */
+#undef PACKAGE_VERSION
+
+/* Performance monitoring framework. */
+#undef PERF
+
+/* RSA PKCS#1 v1.5 padding. */
+#undef PKCS1
+
+/* RSA PKCS#1 v2.1 padding. */
+#undef PKCS2
+
+/* Pseudo-Mersenne method. */
+#undef PMERS
+
+/* POSIX-compatible timer. */
+#undef POSIX
+
+/* Chosen extension field arithmetic method. */
+#undef PP_EXT
+
+/* Chosen pairing method over prime elliptic curves. */
+#undef PP_MAP
+
+/* Bilinear pairing method. */
+#undef PP_METHD
+
+/* Prime curves. */
+#undef PRIME
+
+/* Define this symbol if profiling support is enabled */
+#undef PROFL
+
+/* Projective coordinates. */
+#undef PROJC
+
+/* POSIX multithreading support. */
+#undef PTHREAD
+
+/* Define to necessary symbol if this constant uses a non-standard name on
+   your system. */
+#undef PTHREAD_CREATE_JOINABLE
+
+/* Fast reduction modulo special form prime. */
+#undef QUICK
+
+/* Define this symbol if printing is disabled */
+#undef QUIET
+
+/* Chosen random generator. */
+#undef RAND
+
+/* Intel RdRand instruction. */
+#undef RDRND
+
+/* Unknown or unrecognized parameter. */
+#undef RELIC_NONE
+
+/* Relic Version */
+#undef RLC_VERSION
+
+/* Safe prime generation. */
+#undef SAFEP
+
+/* Chosen random generator seeder. */
+#undef SEED
+
+/* SHA-224 hash function. */
+#undef SH224
+
+/* SHA-256 hash function. */
+#undef SH256
+
+/* SHA-384 hash function. */
+#undef SH384
+
+/* SHA-512 hash function. */
+#undef SH512
+
+/* A multiple precision integer can store w words. */
+#undef SINGLE
+
+/* Sliding window modular exponentiation. */
+#undef SLIDE
+
+/* Define to 1 if all of the C90 standard headers exist (not just the ones
+   required in a freestanding environment). This macro is provided for
+   backward compatibility; new code need not use it. */
+#undef STDC_HEADERS
+
+/* Stein's binary GCD Algorithm. */
+#undef STEIN
+
+/* Strong prime generation. */
+#undef STRON
+
+/* Tate pairing. */
+#undef TATEP
+
+/* Chosen timer. */
+#undef TIMER
+
+/* Shamir's trick. */
+#undef TRICK
+
+/* Operating system underlying generator. */
+#undef UDEV
+
+/* Define this symbol if detailed error messages are enabled */
+#undef VERBS
+
+/* Use Windows' CryptGenRandom. */
+#undef WCGR
+
+/* Weil pairing. */
+#undef WEILP
+
+/* Windows operating system. */
+#undef WINDOWS
+
+/* Build block ciphers. */
+#undef WITH_BC
+
+/* Build multiple precision integer module. */
+#undef WITH_BN
+
+/* Build cryptographic protocols. */
+#undef WITH_CP
+
+/* Temporary double-precision digit vectors. */
+#undef WITH_DV
+
+/* Build binary elliptic curve module. */
+#undef WITH_EB
+
+/* Build elliptic curve cryptography module. */
+#undef WITH_EC
+
+/* Build elliptic Edwards curve module. */
+#undef WITH_ED
+
+/* Build prime elliptic curve module. */
+#undef WITH_EP
+
+/* Build prime field extension elliptic curve module. */
+#undef WITH_EPX
+
+/* Build binary field module. */
+#undef WITH_FB
+
+/* Build binary field extension module. */
+#undef WITH_FBX
+
+/* Build prime field module. */
+#undef WITH_FP
+
+/* Build prime field extension module. */
+#undef WITH_FPX
+
+/* Build hash functions. */
+#undef WITH_MD
+
+/* Build Multi-party computation primitives. */
+#undef WITH_MPC
+
+/* Build pairing-based cryptography module. */
+#undef WITH_PC
+
+/* Build pairings over prime curves module. */
+#undef WITH_PP
+
+/* Size of word in this architecture. */
+#undef WSIZE
+
+/* AMD64-compatible 64-bit architecture. */
+#undef X64
+
+/* Intel x86-compatible 32-bit architecture. */
+#undef X86
+
+#endif /*RLC_CONF_H*/

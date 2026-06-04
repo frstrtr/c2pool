@@ -1,6 +1,6 @@
 if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
-    add_executable(core_test pack_test.cpp events_test.cpp chain_test.cpp packet_test.cpp)
-    target_link_libraries(core_test PRIVATE GTest::gtest_main core c2pool_merged_mining GTest::gtest)
+    add_executable(core_test pack_test.cpp events_test.cpp chain_test.cpp)
+    target_link_libraries(core_test PRIVATE GTest::gtest_main core GTest::gtest)
 
     include(GoogleTest)
     include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})

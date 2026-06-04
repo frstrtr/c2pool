@@ -30,6 +30,8 @@ set(source
     addr_store.hpp addr_store.cpp
     web_server.hpp web_server.cpp
     stratum_server.hpp stratum_server.cpp
+    stratum_types.hpp
+    stratum_work_source.hpp
     address_utils.hpp address_utils.cpp
     leveldb_store.hpp leveldb_store.cpp
     address_validator.hpp address_validator.cpp
@@ -38,13 +40,8 @@ set(source
 
 find_package(yaml-cpp REQUIRED)
 
-# core_util: dependency-free leaf carrying core::timestamp(), split out to
-# break the core <-> {pool,ltc,c2pool} static-link SCC (V36 gate). Source
-# half landed in 07165699; this wires the leaf library into the build.
-add_library(core_util STATIC core_util.cpp)
-
 add_library(core STATIC ${source})
-target_link_libraries(core core_util btclibs)
+target_link_libraries(core btclibs)
 
 target_link_libraries(core Boost::headers Boost::exception Boost::log Boost::log_setup Boost::thread Boost::filesystem yaml-cpp nlohmann_json::nlohmann_json ${LEVELDB_LIBRARIES})
 
