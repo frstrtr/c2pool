@@ -43,10 +43,10 @@ find_package(yaml-cpp REQUIRED)
 # half landed in 07165699; this wires the leaf library into the build.
 add_library(core_util STATIC core_util.cpp)
 
-add_library(core STATIC ${source})
-target_link_libraries(core core_util btclibs)
+add_library(core OBJECT ${source})
+target_link_libraries(core PUBLIC core_util btclibs)
 
-target_link_libraries(core Boost::headers Boost::exception Boost::log Boost::log_setup Boost::thread Boost::filesystem yaml-cpp nlohmann_json::nlohmann_json ${LEVELDB_LIBRARIES})
+target_link_libraries(core PUBLIC Boost::headers Boost::exception Boost::log Boost::log_setup Boost::thread Boost::filesystem yaml-cpp nlohmann_json::nlohmann_json ${LEVELDB_LIBRARIES})
 
 # Add LevelDB include directories
 target_include_directories(core PUBLIC ${LEVELDB_INCLUDE_DIRS})

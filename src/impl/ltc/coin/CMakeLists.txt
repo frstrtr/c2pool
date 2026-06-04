@@ -19,6 +19,6 @@ set(ltc_coin_interface
 )
 
 
-add_library(ltc_coin ${ltc_coin_interface} ${ltc_coin_impl})
+add_library(ltc_coin OBJECT ${ltc_coin_interface} ${ltc_coin_impl})
 
 target_link_libraries(ltc_coin core nlohmann_json::nlohmann_json)

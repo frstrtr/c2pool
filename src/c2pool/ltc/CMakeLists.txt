@@ -1,7 +1,9 @@
 add_executable(ltc_pool_test ltc_pool_test.cpp)
 target_link_libraries(ltc_pool_test core btclibs ltc)
+target_link_libraries(ltc_pool_test c2pool_payout c2pool_hashrate ltc_coin c2pool_storage c2pool_merged_mining pool)  # OBJECT-lib SCC direct-naming (#22/#39)
 target_link_libraries(ltc_pool_test nlohmann_json::nlohmann_json)
 
 add_executable(ltc_coin_test ltc_coin_test.cpp)
 target_link_libraries(ltc_coin_test core btclibs pool ltc ltc_coin)
+target_link_libraries(ltc_coin_test c2pool_payout c2pool_hashrate c2pool_storage c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
 target_link_libraries(ltc_coin_test nlohmann_json::nlohmann_json)
