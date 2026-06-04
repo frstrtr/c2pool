@@ -9,6 +9,10 @@ target_link_libraries(c2pool_hashrate
     yaml-cpp::yaml-cpp
     btclibs
     nlohmann_json::nlohmann_json
+    # lib does not link core (SCC break); carry Boost.Log explicitly so ld64 resolves
+    # it on AppleClang arm64 (same carry pattern as c2pool_storage/c2pool_payout, #22/#39).
+    Boost::log
+    Boost::log_setup
 )
 target_include_directories(c2pool_hashrate PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
@@ -21,6 +25,10 @@ target_link_libraries(c2pool_difficulty
     yaml-cpp::yaml-cpp
     btclibs
     nlohmann_json::nlohmann_json
+    # lib does not link core (SCC break); carry Boost.Log explicitly so ld64 resolves
+    # it on AppleClang arm64 (same carry pattern as c2pool_storage/c2pool_payout, #22/#39).
+    Boost::log
+    Boost::log_setup
 )
 # Stays STATIC (one-way into core, outside the SCC); drop the core link edge so its
 # archive does not absorb core OBJECT files (would duplicate at the final link).
