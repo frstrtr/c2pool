@@ -53,6 +53,11 @@ target_link_libraries(c2pool_merged_mining
     btclibs
     nlohmann_json::nlohmann_json
     ${Boost_LIBRARIES}
+    # merged_mining.cpp uses <core/log.hpp> (LOG_* -> Boost.Log trivial). OBJECT lib
+    # does not link core (SCC break); carry Boost.Log explicitly so ld64 resolves it
+    # on AppleClang arm64 (same fix class as c2pool_storage/leveldb, #22/#39).
+    Boost::log
+    Boost::log_setup
 )
 target_include_directories(c2pool_merged_mining PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
