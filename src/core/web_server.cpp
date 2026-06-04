@@ -776,7 +776,7 @@ void HttpSession::process_request()
                         std::string ext = resolved.extension().string();
                         std::string mime = "application/octet-stream";
                         if (ext == ".html" || ext == ".htm") mime = "text/html; charset=utf-8";
-                        else if (ext == ".js")   mime = "application/javascript; charset=utf-8";
+                        else if (ext == ".js" || ext == ".mjs") mime = "application/javascript; charset=utf-8";
                         else if (ext == ".css")  mime = "text/css; charset=utf-8";
                         else if (ext == ".json") mime = "application/json; charset=utf-8";
                         else if (ext == ".ico")  mime = "image/x-icon";
@@ -3071,6 +3071,17 @@ nlohmann::json MiningInterface::rest_current_payouts()
     nlohmann::json result = nlohmann::json::object();
     bool is_ltc = (m_blockchain == Blockchain::LITECOIN);
 
+    // Script-to-address resolver — picks chain-specific version bytes so
+    // Dash payouts render as 'X...' not Bitcoin '1...'.
+    auto resolve_addr = [this, is_ltc](const std::vector<unsigned char>& s) -> std::string {
+        if (m_blockchain == Blockchain::DASH) {
+            uint8_t p2pkh = m_testnet ? 140 : 76;   // Dash: 'y' / 'X'
+            uint8_t p2sh  = m_testnet ?  19 : 16;   // Dash: '7'
+            return core::script_to_address(s, "", p2pkh, p2sh);
+        }
+        return core::script_to_address(s, is_ltc, m_testnet);
+    };
+
     // Primary source: cached PPLNS outputs from the coinbase builder.
     // These are always up-to-date with the latest share template and subsidy.
     auto cached = get_cached_pplns_outputs();
@@ -3085,7 +3096,7 @@ nlohmann::json MiningInterface::rest_current_payouts()
 
             // script_hex is a hex-encoded scriptPubKey — decode to bytes, then to address
             auto script_bytes = ParseHex(script_hex);
-            std::string addr = core::script_to_address(script_bytes, is_ltc, m_testnet);
+            std::string addr = resolve_addr(script_bytes);
             if (addr.empty() && script_bytes.size() > 33 && script_bytes.back() == 0xac) {
                 // P2PK: PUSH<len> <pubkey> OP_CHECKSIG → hash pubkey → P2PKH address
                 size_t pk_len = script_bytes[0];
@@ -3098,7 +3109,7 @@ nlohmann::json MiningInterface::rest_current_payouts()
                     p2pkh.insert(p2pkh.end(), rip, rip + 20);
                     p2pkh.push_back(0x88);
                     p2pkh.push_back(0xac);
-                    addr = core::script_to_address(p2pkh, is_ltc, m_testnet);
+                    addr = resolve_addr(p2pkh);
                 }
             }
             if (addr.empty())
@@ -3754,12 +3765,13 @@ void MiningInterface::cache_pplns_at_tip()
     std::lock_guard<std::mutex> lock(m_pplns_cache_mutex);
     m_pplns_per_tip[tip] = std::move(pplns);
 
-    // Evict old entries to prevent unbounded growth.
-    // Keep at most 100 entries (~50 minutes of tips at 30s intervals).
-    constexpr size_t MAX_PPLNS_CACHE = 100;
+    // Evict old entries to prevent unbounded growth. Cap at 5000 so Dash's
+    // chain_length=4320 precompute + live tip churn both fit. LTC's older
+    // 100-entry comment was sized for live tips only; precompute now stores
+    // one entry per share in the window, so the cap has to be larger than
+    // the biggest window we serve.
+    constexpr size_t MAX_PPLNS_CACHE = 5000;
     if (m_pplns_per_tip.size() > MAX_PPLNS_CACHE * 2) {
-        // Bulk clear — cheaper than selective eviction on unordered_map
-        // Keep only the current tip entry
         auto current = std::move(m_pplns_per_tip[tip]);
         m_pplns_per_tip.clear();
         m_pplns_per_tip[tip] = std::move(current);
@@ -4350,17 +4362,24 @@ nlohmann::json MiningInterface::rest_local_stats()
 
     // block_value in coins (not satoshis)
     double block_value = 0.0;
+    double payment_amount = 0.0;
     {
         std::lock_guard<std::mutex> lock(m_work_mutex);
-        if (!m_cached_template.is_null())
+        if (!m_cached_template.is_null()) {
             block_value = m_cached_template.value("coinbasevalue", uint64_t(0)) / 1e8;
+            // Dash: payment_amount = masternode + superblock + platform payments
+            // These are deducted from miner payout before PPLNS distribution
+            payment_amount = m_cached_template.value("payment_amount", uint64_t(0)) / 1e8;
+        }
     }
     result["block_value"] = block_value;
-    // Deduct total fee (node fee + dev donation) from miner portion
-    // donation_proportion already represents the combined fee ratio
+    // Miner portion: subsidy minus protocol payments (masternode/superblock) minus node fee
+    // For LTC/DOGE: payment_amount=0, so block_value_miner = block_value * (1 - fee)
+    // For Dash: block_value_miner = (subsidy - payment_amount) * (1 - fee)
     double fee_ratio = m_pool_fee_percent / 100.0;
-    result["block_value_miner"] = block_value * (1.0 - fee_ratio);
-    result["block_value_payments"] = block_value;  // total including fees
+    double miner_subsidy = std::max(0.0, block_value - payment_amount);
+    result["block_value_miner"] = miner_subsidy * (1.0 - fee_ratio);
+    result["block_value_payments"] = (m_blockchain == Blockchain::DASH) ? payment_amount : block_value;
 
     // Node fee amounts per block: fee% × (local_hashrate / pool_hashrate) × block_value
     // Matches p2pool: operator gets fee% of THIS node's contribution, not the whole block.
@@ -4368,7 +4387,17 @@ nlohmann::json MiningInterface::rest_local_stats()
         double local_hr = m_stratum_hashrate_fn ? m_stratum_hashrate_fn() : 0.0;
         double pool_hr = m_pool_hashrate_fn ? m_pool_hashrate_fn() : 0.0;
         double node_share = (pool_hr > 0 && local_hr > 0) ? local_hr / pool_hr : 0.0;
-        result["node_fee_ltc"] = block_value * fee_ratio * node_share;
+        // Use blockchain-appropriate key for backward compatibility
+        double primary_fee = miner_subsidy * fee_ratio * node_share;
+        switch (m_blockchain) {
+        case Blockchain::DASH:
+            result["node_fee_dash"] = primary_fee; break;
+        case Blockchain::DOGECOIN:
+            result["node_fee_doge"] = primary_fee;
+            result["node_fee_ltc"] = primary_fee; break;  // compat
+        default:
+            result["node_fee_ltc"] = primary_fee; break;
+        }
         if (m_mm_manager) {
             auto chain_infos = m_mm_manager->get_chain_infos();
             for (const auto& ci : chain_infos) {
@@ -4396,7 +4425,10 @@ nlohmann::json MiningInterface::rest_local_stats()
         }
 
         // 2. No work template yet
-        {
+        // Coin targets that drive their own work pipeline (c2pool-dash)
+        // don't populate m_cached_template; suppress this warning when
+        // the dashboard-always-ready flag is set.
+        if (!m_dashboard_always_ready.load(std::memory_order_relaxed)) {
             std::lock_guard<std::mutex> lock(m_work_mutex);
             if (!m_work_valid)
                 warnings.push_back("No block template received yet — waiting for daemon connection");
@@ -4528,7 +4560,7 @@ nlohmann::json MiningInterface::rest_local_stats()
 
     // p2pool-compat: version and protocol_version
     result["version"] = m_pool_version;
-    result["protocol_version"] = 3600;  // V36 share format
+    result["protocol_version"] = m_protocol_version.load(std::memory_order_relaxed);
 
     return result;
 }
@@ -4636,6 +4668,20 @@ nlohmann::json MiningInterface::rest_web_currency_info()
             result["tx_explorer_url_prefix"]      = "https://blockchair.com/dogecoin/transaction/";
         }
         break;
+    case Blockchain::DASH:
+        result["symbol"] = "DASH";
+        result["name"] = "Dash";
+        result["block_period"] = 150;  // 2.5 min average
+        if (!m_custom_address_explorer.empty()) {
+            result["address_explorer_url_prefix"] = m_custom_address_explorer;
+            result["block_explorer_url_prefix"]   = m_custom_block_explorer;
+            result["tx_explorer_url_prefix"]      = m_custom_tx_explorer;
+        } else {
+            result["address_explorer_url_prefix"] = "https://blockchair.com/dash/address/";
+            result["block_explorer_url_prefix"]   = "https://blockchair.com/dash/block/";
+            result["tx_explorer_url_prefix"]      = "https://blockchair.com/dash/transaction/";
+        }
+        break;
     }
 
     // Expose explorer state so dashboard JS can link to internal explorer
@@ -4646,6 +4692,17 @@ nlohmann::json MiningInterface::rest_web_currency_info()
     // Mode indicators for conditional UI
     result["embedded"] = (m_embedded_node != nullptr);
     result["has_rpc"]  = (m_coin_rpc != nullptr);
+
+    // p2pool share version for the current coin — consumed by the
+    // bundled @c2pool/sharechain-explorer to classify share cells.
+    // Dash = v16, LTC/DOGE/BTC = v36.
+    switch (m_blockchain) {
+    case Blockchain::DASH:     result["share_version"] = 16; break;
+    case Blockchain::LITECOIN:
+    case Blockchain::BITCOIN:
+    case Blockchain::DOGECOIN:
+    default:                   result["share_version"] = 36; break;
+    }
 
     return result;
 }
@@ -4702,7 +4759,11 @@ nlohmann::json MiningInterface::rest_sync_status()
     // The placeholder template has height=1 and coinbasevalue=5000000000 —
     // reject it by requiring height > 100.
     bool has_work = false;
-    {
+    if (m_dashboard_always_ready.load(std::memory_order_relaxed)) {
+        // Coin-driven work pipelines (c2pool-dash) manage their own work;
+        // report has_work=true so the loading gate doesn't stall.
+        has_work = true;
+    } else {
         std::lock_guard<std::mutex> lock(m_work_mutex);
         has_work = !m_cached_template.is_null()
             && m_cached_template.value("coinbasevalue", uint64_t(0)) > 0
@@ -4734,6 +4795,12 @@ nlohmann::json MiningInterface::rest_sync_status()
 
 bool MiningInterface::is_node_ready()
 {
+    // Coin targets that drive their own work pipeline (c2pool-dash) can
+    // bypass the internal readiness gate — their dashboard is ready as
+    // soon as the HTTP server is up.
+    if (m_dashboard_always_ready.load(std::memory_order_relaxed))
+        return true;
+
     // Check sharechain has verified shares
     if (m_sharechain_stats_fn) {
         auto sc = m_sharechain_stats_fn();
@@ -5024,6 +5091,10 @@ nlohmann::json MiningInterface::rest_node_info()
     case Blockchain::DOGECOIN:
         result["network"] = m_testnet ? "dogecoin_testnet" : "dogecoin";
         result["symbol"] = "DOGE";
+        break;
+    case Blockchain::DASH:
+        result["network"] = m_testnet ? "dash_testnet" : "dash";
+        result["symbol"] = "DASH";
         break;
     }
     return result;
@@ -5374,6 +5445,12 @@ nlohmann::json MiningInterface::rest_miner_payouts(const std::string& address)
 
 nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cached_sc)
 {
+    // V35→V36 transition tracking applies to the v36 coins (LTC and DOGE).
+    // Other blockchains (e.g. Dash v16) don't have a pending transition, so
+    // return an empty object to keep the dashboard's transition banners hidden.
+    if (m_blockchain != Blockchain::LITECOIN && m_blockchain != Blockchain::DOGECOIN)
+        return nlohmann::json::object();
+
     // Matches p2pool's get_version_signaling() — all fields the dashboard JS expects.
     constexpr int TARGET_VERSION = 36;
     const std::map<int, std::string> share_type_names = {
@@ -6421,18 +6498,38 @@ nlohmann::json MiningInterface::rest_discovered_merged_blocks()
 nlohmann::json MiningInterface::rest_broadcaster_status()
 {
     nlohmann::json result = nlohmann::json::object();
-    if (!m_mm_manager || !m_mm_manager->has_chains()) {
-        result["running"] = false;
-        result["last_broadcast"] = nullptr;
+
+    // LTC / merged-mining path: broadcaster is driven by MM manager.
+    if (m_mm_manager && m_mm_manager->has_chains()) {
+        result["running"] = true;
+        result["enabled"] = true;
+        result["chains"] = m_mm_manager->chain_count();
+        result["total_blocks_found"] = m_mm_manager->get_total_blocks();
+        if (m_ltc_peer_info_fn)
+            result["peers"] = m_ltc_peer_info_fn();
         return result;
     }
-    result["running"] = true;
-    result["enabled"] = true;
-    result["chains"] = m_mm_manager->chain_count();
-    result["total_blocks_found"] = m_mm_manager->get_total_blocks();
-    // LTC P2P peer info
-    if (m_ltc_peer_info_fn)
-        result["peers"] = m_ltc_peer_info_fn();
+
+    // Non-merged path (e.g. Dash SPV): coin_peer_info_fn provides the
+    // daemon P2P peer list so the dashboard's "Parent Chain Peers" panel
+    // can render dashd connections. Runs true iff the callback is wired
+    // AND at least one peer is connected.
+    if (m_coin_peer_info_fn) {
+        auto peers = m_coin_peer_info_fn();
+        bool any_connected = false;
+        if (peers.is_array()) {
+            for (const auto& p : peers)
+                if (p.value("connected", false)) { any_connected = true; break; }
+        }
+        result["running"] = any_connected;
+        result["enabled"] = true;
+        result["peers"] = std::move(peers);
+        result["total_blocks_found"] = 0;  // no coin-side found-block counter yet
+        return result;
+    }
+
+    result["running"] = false;
+    result["last_broadcast"] = nullptr;
     return result;
 }
 
@@ -6888,10 +6985,30 @@ void MiningInterface::update_stat_log()
     entry.current_payouts = nlohmann::json::object();
     {
         auto cached = get_cached_pplns_outputs();
-        bool is_ltc = (m_blockchain == Blockchain::LITECOIN);
+        // Chain-aware address encoding. The legacy is_ltc bool overload
+        // only covers LTC/BTC version bytes; Dash needs 76/16 mainnet,
+        // 140/19 testnet. Pick the right pair per blockchain so graph_db
+        // samples carry human-readable addresses (not Bitcoin fallback
+        // encodings). Parity-audit D-tier followup shipped alongside C2.
+        auto [p2pkh_ver, p2sh_ver, hrp] = [&]()
+            -> std::tuple<uint8_t, uint8_t, std::string>
+        {
+            switch (m_blockchain) {
+            case Blockchain::LITECOIN:
+                return m_testnet ? std::make_tuple<uint8_t, uint8_t, std::string>(0x6f, 0xc4, "tltc")
+                                 : std::make_tuple<uint8_t, uint8_t, std::string>(0x30, 0x32, "ltc");
+            case Blockchain::DASH:
+                return m_testnet ? std::make_tuple<uint8_t, uint8_t, std::string>(140, 19, "")
+                                 : std::make_tuple<uint8_t, uint8_t, std::string>(76, 16, "");
+            case Blockchain::BITCOIN:
+            default:
+                return m_testnet ? std::make_tuple<uint8_t, uint8_t, std::string>(0x6f, 0xc4, "tb")
+                                 : std::make_tuple<uint8_t, uint8_t, std::string>(0x00, 0x05, "bc");
+            }
+        }();
         for (const auto& [script_hex, amount] : cached) {
             auto script_bytes = ParseHex(script_hex);
-            std::string addr = core::script_to_address(script_bytes, is_ltc, m_testnet);
+            std::string addr = core::script_to_address(script_bytes, hrp, p2pkh_ver, p2sh_ver);
             if (addr.empty()) addr = script_hex;
             double coin_amt = static_cast<double>(amount) / 1e8;
             if (entry.current_payouts.contains(addr))

@@ -607,6 +607,19 @@ public:
 
     // Pool hashrate (H/s) — from P2P node's get_pool_attempts_per_second
     void set_pool_hashrate_fn(std::function<double()> fn) { m_pool_hashrate_fn = thread_safe_wrap(std::move(fn)); }
+
+    // Bypass the is_node_ready() + has_work gating. Used by coin targets
+    // (e.g. c2pool-dash) that drive their own work pipeline and don't rely
+    // on WebServer's internal refresh_work()/m_cached_template. When true,
+    // is_node_ready() returns true immediately and sync_status reports
+    // has_work=true regardless of the cached template.
+    void set_dashboard_always_ready(bool v) { m_dashboard_always_ready.store(v, std::memory_order_relaxed); }
+    bool is_dashboard_always_ready() const { return m_dashboard_always_ready.load(std::memory_order_relaxed); }
+
+    // Override the p2pool-compat protocol_version reported by /local_stats.
+    // Default 3600 matches LTC/V36; Dash uses 1700.
+    void set_protocol_version(int v) { m_protocol_version.store(v, std::memory_order_relaxed); }
+    int  get_protocol_version() const { return m_protocol_version.load(std::memory_order_relaxed); }
     double get_pool_hashrate() const { return m_pool_hashrate_fn ? m_pool_hashrate_fn() : 0.0; }
 
     // Rate monitor stats for p2pool-style status (DOA%, time window)
@@ -620,9 +633,41 @@ public:
     RateStats get_stratum_rate_stats() const { return m_stratum_rate_stats_fn ? m_stratum_rate_stats_fn() : RateStats{}; }
 
     // Current PPLNS outputs for payout display
+    // Coin targets (c2pool-dash) that compute PPLNS outside the
+    // refresh_work() path can push the current distribution here so
+    // /current_payouts reflects the live sharechain.
+    void set_cached_pplns_outputs(std::vector<std::pair<std::string, uint64_t>> v) {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        m_cached_pplns_outputs = std::move(v);
+    }
+
     std::vector<std::pair<std::string, uint64_t>> get_cached_pplns_outputs() const {
         std::lock_guard<std::mutex> l(m_work_mutex);
         return m_cached_pplns_outputs;
+    }
+
+    // Exact-match lookup (no fallback). Returns empty object if missing.
+    // Used by coins that want to know "did we actually cache PPLNS for this
+    // share?" rather than always falling back to an arbitrary entry.
+    nlohmann::json get_pplns_for_tip_exact(const std::string& tip_key) {
+        std::lock_guard<std::mutex> lock(m_pplns_cache_mutex);
+        auto it = m_pplns_per_tip.find(tip_key);
+        return (it != m_pplns_per_tip.end()) ? it->second : nlohmann::json::object();
+    }
+
+    // Store a per-share PPLNS snapshot under the given key (full or short
+    // share hash — the sharechain_window_fn must look up by the same form).
+    // Used by coins that drive their own PPLNS precomputation loop instead of
+    // going through start_pplns_precompute / refresh_work.
+    void store_pplns_for_tip(const std::string& tip_key, nlohmann::json pplns) {
+        std::lock_guard<std::mutex> lock(m_pplns_cache_mutex);
+        m_pplns_per_tip[tip_key] = std::move(pplns);
+        constexpr size_t MAX_PPLNS_CACHE = 5000;
+        if (m_pplns_per_tip.size() > MAX_PPLNS_CACHE * 2) {
+            auto keep = std::move(m_pplns_per_tip[tip_key]);
+            m_pplns_per_tip.clear();
+            m_pplns_per_tip[tip_key] = std::move(keep);
+        }
     }
     // THE state root for sharechain anchoring (used by merged coinbase too)
     uint256 get_the_state_root() const { std::lock_guard<std::mutex> l(m_work_mutex); return m_cached_the_state_root; }
@@ -870,6 +915,12 @@ public:
     using coin_peer_info_fn = std::function<nlohmann::json()>;
     void set_ltc_peer_info_fn(coin_peer_info_fn fn) { m_ltc_peer_info_fn = thread_safe_wrap(std::move(fn)); }
     void set_doge_peer_info_fn(coin_peer_info_fn fn) { m_doge_peer_info_fn = thread_safe_wrap(std::move(fn)); }
+    // Generic coin peer-info for non-LTC paths (e.g. Dash SPV). Consumed by
+    // rest_broadcaster_status when m_mm_manager is null (no merged mining).
+    // The dashboard's "Parent Chain Peers" panel expects an array of
+    // {addr, subver, startingheight, conntime, connected} objects plus a
+    // running=true top-level flag.
+    void set_coin_peer_info_fn(coin_peer_info_fn fn) { m_coin_peer_info_fn = thread_safe_wrap(std::move(fn)); }
 
     // Callback fired whenever a block submission is attempted.
     // Arguments: header hex (first 80 bytes), stale_info (none=accepted, orphan=stale prev, doa=daemon rejected).
@@ -1105,6 +1156,8 @@ private:
     uint16_t m_cached_miner_count{0};
     double m_cached_pool_hashrate{0};
     std::function<double()> m_pool_hashrate_fn;
+    std::atomic<bool> m_dashboard_always_ready{false};
+    std::atomic<int> m_protocol_version{3600};
 
     // THE checkpoint callbacks (set by node layer)
     checkpoint_store_fn_t m_checkpoint_latest_fn;
@@ -1148,6 +1201,7 @@ private:
     std::shared_ptr<void> m_merged_block_store;  // MergedBlockStore (opaque)
     coin_peer_info_fn m_ltc_peer_info_fn;
     coin_peer_info_fn m_doge_peer_info_fn;
+    coin_peer_info_fn m_coin_peer_info_fn;
     block_verify_fn_t m_block_verify_fn;  // default (parent chain)
     std::map<std::string, block_verify_fn_t> m_chain_verify_fns; // per-chain
     void verify_found_block(size_t index);
