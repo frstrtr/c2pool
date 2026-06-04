@@ -13,6 +13,7 @@
 #include <core/pack_types.hpp>
 #include <core/message.hpp>
 #include <core/node_interface.hpp>
+#include <core/inetwork.hpp>
 #include <core/hash.hpp>
 #include <core/netaddress.hpp>
 #include <core/packet.hpp>
@@ -20,10 +21,8 @@
 namespace core
 {
 
-// Forward-declared to avoid circular include with factory.hpp (which includes
-// socket.hpp). Socket needs INetwork only for weak_ptr<INetwork> liveness
-// tracking; full definition is needed in socket.cpp via factory.hpp.
-struct INetwork;
+// INetwork is defined in core/inetwork.hpp (included above) so the make_socket
+// template below sees its complete type for the dynamic_cast + weak_from_this().
 
 enum connection_type
 {
