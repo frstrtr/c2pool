@@ -30,7 +30,7 @@ public:
     uint256 hash;
     uint32_t index;
 
-    SERIALIZE_METHODS(TxPrevOut) { READWRITE(obj.hash, obj.index); }
+    C2POOL_SERIALIZE_METHODS(TxPrevOut) { READWRITE(obj.hash, obj.index); }
 };
 
 class TxIn
@@ -41,7 +41,7 @@ public:
     uint32_t sequence;
     OPScriptWitness scriptWitness; //!< Only serialized through Transaction
 
-    SERIALIZE_METHODS(TxIn) { READWRITE(obj.prevout, obj.scriptSig, obj.sequence); }
+    C2POOL_SERIALIZE_METHODS(TxIn) { READWRITE(obj.prevout, obj.scriptSig, obj.sequence); }
 };
 
 class TxOut
@@ -50,7 +50,7 @@ public:
     int64_t value;
     OPScript scriptPubKey;
 
-    SERIALIZE_METHODS(TxOut) { READWRITE(obj.value, obj.scriptPubKey); }
+    C2POOL_SERIALIZE_METHODS(TxOut) { READWRITE(obj.value, obj.scriptPubKey); }
 };
 
 } // namespace coin

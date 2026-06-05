@@ -80,7 +80,7 @@ struct custom
         return !(*this == c);
     }
 
-    SERIALIZE_METHODS(custom) { READWRITE(obj.m_i, obj.m_str, obj.m_h); }
+    C2POOL_SERIALIZE_METHODS(custom) { READWRITE(obj.m_i, obj.m_str, obj.m_h); }
 };
 
 TEST(Pack, CUSTOM_TYPE)
@@ -341,7 +341,7 @@ struct opt_custom
         return !(*this == c);
     }
 
-    SERIALIZE_METHODS(opt_custom) 
+    C2POOL_SERIALIZE_METHODS(opt_custom) 
     { READWRITE(Optional(obj.m_c, DefaultCustom)); }
     // { formatter.action(stream, Using<OptionalType<DefaultCustom>>(obj.m_c)); }
     // { formatter.action(stream, *obj.m_c); }

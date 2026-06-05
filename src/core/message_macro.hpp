@@ -52,7 +52,7 @@
         stream >> *result;\
         return result;\
     }\
-    SERIALIZE_METHODS(message_type)
+    C2POOL_SERIALIZE_METHODS(message_type)
     
 #define WITHOUT_MESSAGE_FIELDS()\
     static PackStream make()\
@@ -72,7 +72,7 @@
         auto result = std::make_unique<message_type>();\
         return result;\
     }\
-    SERIALIZE_METHODS(message_type)
+    C2POOL_SERIALIZE_METHODS(message_type)
 
 
 #define END_MESSAGE() };

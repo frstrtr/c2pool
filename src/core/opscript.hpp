@@ -15,7 +15,7 @@ public:
     friend bool operator==(const OPScript& l, const OPScript& r) { return l.m_data == r.m_data; }
     friend bool operator!=(const OPScript& l, const OPScript& r) { return !(l==r); }
 
-    SERIALIZE_METHODS(OPScript) { READWRITE(AsBase<BaseScript>(obj)); }
+    C2POOL_SERIALIZE_METHODS(OPScript) { READWRITE(AsBase<BaseScript>(obj)); }
 };
 
 struct OPScriptWitness

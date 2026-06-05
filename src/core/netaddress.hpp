@@ -135,7 +135,7 @@ public:
     std::string port_str() const { return std::to_string(m_port); }
     std::string to_string() const { return m_ip + ":" + port_str(); }
 
-    SERIALIZE_METHODS(NetService) { READWRITE(AsBase<NetAddress>(obj), Using<IntType<16, true>>(obj.m_port)); }
+    C2POOL_SERIALIZE_METHODS(NetService) { READWRITE(AsBase<NetAddress>(obj), Using<IntType<16, true>>(obj.m_port)); }
 
     friend bool operator==(const NetService& l, const NetService& r)
     { return (l.m_type == r.m_type) && (l.m_ip == r.m_ip) && (l.m_port == r.m_port); }
@@ -184,7 +184,7 @@ struct addr_t
     addr_t() { }
     addr_t(uint64_t services, NetService endpoint) : m_services(services), m_endpoint(endpoint) { }
 
-    SERIALIZE_METHODS(addr_t) { READWRITE(obj.m_services, obj.m_endpoint); }
+    C2POOL_SERIALIZE_METHODS(addr_t) { READWRITE(obj.m_services, obj.m_endpoint); }
 };
 
 struct addr_record_t : addr_t
@@ -195,7 +195,7 @@ struct addr_record_t : addr_t
     addr_record_t(addr_t addr, uint64_t timestamp) : addr_t(addr), m_timestamp(timestamp) { }
     addr_record_t(uint64_t services, NetService endpoint, uint64_t timestamp) : addr_t(services, endpoint), m_timestamp(timestamp) {}
 
-    SERIALIZE_METHODS(addr_record_t) { READWRITE(obj.m_timestamp, AsBase<addr_t>(obj)); }
+    C2POOL_SERIALIZE_METHODS(addr_record_t) { READWRITE(obj.m_timestamp, AsBase<addr_t>(obj)); }
 };
 
 
