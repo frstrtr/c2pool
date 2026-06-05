@@ -391,21 +391,22 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
     // Non-blocking mutex: if think() holds the exclusive lock on the compute
     // thread, queue this batch for processing after think() releases. The IO
     // thread never blocks — keepalive timers and network I/O continue.
-    {
-        std::unique_lock lock(m_tracker_mutex, std::try_to_lock);
-        if (!lock.owns_lock()) {
-            LOG_INFO << "[ASYNC-DEFER] processing_shares_phase2: mutex busy, queuing "
-                     << data.m_items.size() << " shares from " << addr.to_string()
-                     << " (pending=" << m_pending_adds.size() + 1 << ")";
-            m_pending_adds.push_back(PendingShareBatch{
-                std::make_unique<HandleSharesData>(std::move(data)), addr});
-            return;
-        }
+    // Acquire the tracker lock and HOLD it across the entire mutation body below.
+    // try_to_lock keeps the IO thread non-blocking — if think()/clean holds the
+    // exclusive lock we queue the batch and return. Once acquired we must NOT
+    // release until all m_tracker.chain mutations are done: the prior code
+    // released here and ran the body lock-free, letting the compute-thread
+    // clean_tracker() exclusive prune (drop_tails) free chain nodes mid-mutation
+    // → SIGSEGV (kr1z1s LTC/DGB). Released just before run_think() below.
+    std::unique_lock lock(m_tracker_mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        LOG_INFO << "[ASYNC-DEFER] processing_shares_phase2: mutex busy, queuing "
+                 << data.m_items.size() << " shares from " << addr.to_string()
+                 << " (pending=" << m_pending_adds.size() + 1 << ")";
+        m_pending_adds.push_back(PendingShareBatch{
+            std::make_unique<HandleSharesData>(std::move(data)), addr});
+        return;
     }
-    // Lock released — proceed with normal processing.
-    // No lock needed for the rest: we only enter here when think() is NOT
-    // running (m_tracker_mutex was available), and ASIO single-thread
-    // guarantees no other IO handler overlaps.
 
     // Step 1: collect verified shares (skip any that failed verification, hash still null)
     std::vector<ShareType> valid_shares;
@@ -565,6 +566,11 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
                  << source << "... (dup=" << dup_count
                  << " chain=" << m_tracker.chain.size() << ")";
     }
+
+    // Release the tracker lock before triggering think(): run_think() posts the
+    // think+prune job to the compute thread, which needs the exclusive lock. All
+    // chain mutations above are complete at this point.
+    lock.unlock();
 
     // Trigger think() after every share batch (p2pool: set_best_share after handle_shares).
     // p2pool calls set_best_share() after EVERY batch with new_count > 0 — no size gate.
@@ -790,14 +796,18 @@ void NodeImpl::notify_local_share(const uint256& share_hash)
 {
     // p2pool: set_best_share() → think() synchronously on the reactor thread.
     // Use think() for ALL best_share decisions, matching p2pool exactly.
-    if (share_hash.IsNull() || !m_tracker.chain.contains(share_hash))
+    if (share_hash.IsNull())
         return;
 
-    // Try inline verify — if think() holds the mutex, defer to next think() cycle.
-    // The share is already in the chain; think() will verify + score it.
+    // Both the chain.contains() read AND attempt_verify() run UNDER the tracker
+    // lock. A bare m_tracker.chain.contains() here (the prior code) raced the
+    // compute-thread clean_tracker() exclusive prune freeing chain nodes →
+    // SIGSEGV (kr1z1s LTC/DGB). try_to_lock keeps the IO thread non-blocking; if
+    // think()/clean holds the lock we skip the inline verify — the share is
+    // already in-chain and run_think() below will score it next cycle.
     {
         std::unique_lock lock(m_tracker_mutex, std::try_to_lock);
-        if (lock.owns_lock())
+        if (lock.owns_lock() && m_tracker.chain.contains(share_hash))
             m_tracker.attempt_verify(share_hash);
     }
 
