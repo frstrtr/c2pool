@@ -2,7 +2,8 @@ name: SAFE-COSMETIC auto-merge
 
 # Operator-sanctioned exception to the per-push approval rule
 # (operator pick 2026-06-06 13:52 +04, relayed by integrator). Auto-merges a PR
-# carrying the `SAFE-COSMETIC` label once ALL required Linux green contexts pass.
+# carrying the `SAFE-COSMETIC` label once ALL required Linux green contexts pass
+# AND a head-SHA-bound HMAC authorization from the integrator is present.
 # Intended scope: comment / whitespace / doc-only cosmetic changes.
 #
 # SAFETY CONTROLS (all must hold to merge):
@@ -11,6 +12,8 @@ name: SAFE-COSMETIC auto-merge
 #   3. PR base branch == master                       (stated merge target)
 #   4. PR open, not draft
 #   5. Every context in REQUIRED below == success
+#   6. A valid HMAC-SHA256 authorization comment bound to the CURRENT head SHA
+#      (operator-ratified 2026-06-06; see HMAC GATE below). Fail-closed.
 #
 # CHECK-RUN NAME MATCHING — DO NOT "FIX" TO THE UI FORM:
 #   The check-runs REST API returns the BARE job `name:` ("Linux x86_64"), NOT
@@ -19,6 +22,17 @@ name: SAFE-COSMETIC auto-merge
 #   literally "(AsAN+UBSan)" (sic). Both verified against live check-run data on
 #   PR #68 on 2026-06-06. The legacy "BTC embedded smoke (Linux x86_64)" job is
 #   deliberately NOT required here (coin-matrix "btc smoke" is the live gate).
+#
+# HMAC GATE — why head-SHA binding matters:
+#   The integrator posts a PR comment of the EXACT shape:
+#     SAFE-COSMETIC-AUTH: <hmac> head=<head-sha>
+#   where <hmac> = HMAC-SHA256(INTEGRATOR_LABEL_KEY, "<repo>:<pr>:<head-sha>")
+#   as lowercase hex. The workflow recomputes the expected value over the PR's
+#   CURRENT head SHA and only merges if a matching comment exists. Any new push
+#   changes the head SHA and silently invalidates every prior signature, so an
+#   authorization can never be replayed across PRs or across SHAs. The signing
+#   key lives only as the INTEGRATOR_LABEL_KEY Actions secret; this workflow
+#   never emits it.
 
 on:
   check_suite:
@@ -39,11 +53,12 @@ jobs:
   evaluate:
     runs-on: ubuntu-24.04
     steps:
-      - name: Evaluate gate and merge if all required contexts are green
+      - name: Evaluate gate and merge if green and authorized
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           ENABLED: ${{ vars.SAFE_COSMETIC_ENABLED }}
+          INTEGRATOR_LABEL_KEY: ${{ secrets.INTEGRATOR_LABEL_KEY }}
         run: |
           set -euo pipefail
 
@@ -95,11 +110,40 @@ jobs:
               [ "$concl" = "success" ] || ok=0
             done
 
-            if [ "$ok" = "1" ]; then
-              echo "All required contexts green on PR #$PR — merging into $BASE_REQUIRED."
-              gh pr merge "$PR" --repo "$REPO" --merge --delete-branch=false
-            else
-              echo "Gate NOT satisfied for PR #$PR — not merging."
+            if [ "$ok" != "1" ]; then
+              echo "Required contexts not all green for PR #$PR — not merging (waiting)."
+              echo "::endgroup::"
+              continue
             fi
+
+            # --- HMAC authorization gate (operator-ratified 2026-06-06) ---
+            # Only enforced once the PR is otherwise mergeable, so an in-flight
+            # (not-yet-green) PR is never punished for a missing signature. When a
+            # PR IS green but lacks valid authorization bound to the current head,
+            # fail closed: strip the label, post a refusal, and fail the job.
+            if [ -z "${INTEGRATOR_LABEL_KEY:-}" ]; then
+              echo "INTEGRATOR_LABEL_KEY secret unavailable — cannot verify authorization. Fail-closed."
+              exit 1
+            fi
+
+            MSG="$REPO:$PR:$SHA"
+            EXPECTED=$(printf '%s' "$MSG" | openssl dgst -sha256 -hmac "$INTEGRATOR_LABEL_KEY" | awk '{print $NF}')
+            WANT="SAFE-COSMETIC-AUTH: $EXPECTED head=$SHA"
+            echo "  Authorization required for head $SHA (HMAC over \"$MSG\")."
+
+            if gh api "repos/$REPO/issues/$PR/comments" --paginate --jq '.[].body' \
+                 | tr -d '\r' | grep -Fqx "$WANT"; then
+              echo "  Valid SAFE-COSMETIC authorization found for head $SHA — proceeding."
+            else
+              echo "  NO valid authorization comment bound to head $SHA — fail-closed."
+              gh api -X DELETE "repos/$REPO/issues/$PR/labels/$LABEL" >/dev/null 2>&1 || true
+              gh pr comment "$PR" --repo "$REPO" --body \
+                "SAFE-COSMETIC auto-merge refused: no valid integrator authorization bound to head \`$SHA\`. The \`$LABEL\` label has been removed. Re-apply it after the integrator posts a fresh \`SAFE-COSMETIC-AUTH:\` signature for this exact head SHA." || true
+              exit 1
+            fi
+            # --- end HMAC gate ---
+
+            echo "All required contexts green AND authorization valid on PR #$PR — merging into $BASE_REQUIRED."
+            gh pr merge "$PR" --repo "$REPO" --merge --delete-branch=false
             echo "::endgroup::"
           done
