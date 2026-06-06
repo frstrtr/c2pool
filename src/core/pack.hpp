@@ -253,7 +253,7 @@ const Out& AsBase(const In& x)
         Read(is, *this);\
     }
 
-#define SERIALIZE_METHODS(TYPE)\
+#define C2POOL_SERIALIZE_METHODS(TYPE)\
     BASE_SERIALIZE_METHODS(TYPE)\
     FORMAT_METHODS(TYPE)
 

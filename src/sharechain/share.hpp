@@ -19,7 +19,7 @@ struct RawShare
     RawShare(uint64_t version, BaseScript script) : type(version), contents(script) { }
     RawShare(uint64_t version, PackStream stream) : type(version), contents(stream) { }
 
-    SERIALIZE_METHODS(RawShare) { READWRITE(VarInt(obj.type), obj.contents); }
+    C2POOL_SERIALIZE_METHODS(RawShare) { READWRITE(VarInt(obj.type), obj.contents); }
 };
 
 template <typename HashType, int64_t Version>

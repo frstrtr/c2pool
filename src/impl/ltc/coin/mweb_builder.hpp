@@ -22,7 +22,7 @@
 /// macros with a one-argument signature. The two can coexist within a
 /// single translation unit ONLY if:
 ///
-///   1. Every pack.hpp-style `BEGIN_MESSAGE` / `SERIALIZE_METHODS(TYPE)`
+///   1. Every pack.hpp-style `BEGIN_MESSAGE` / `C2POOL_SERIALIZE_METHODS(TYPE)`
 ///      header is included FIRST, so its macros expand against pack.hpp's
 ///      definitions before btclibs swaps them out.
 ///   2. mweb_builder.hpp (this file) comes AFTER those includes.
@@ -31,7 +31,7 @@
 /// message header expands BEGIN_MESSAGE against pack.hpp between there
 /// and line 265, and mweb_builder.hpp itself is included at line 266.
 /// That order is load-bearing — breaking it causes silent macro-binding
-/// errors where later `SERIALIZE_METHODS(TYPE)` calls resolve against
+/// errors where later `C2POOL_SERIALIZE_METHODS(TYPE)` calls resolve against
 /// btclibs's two-argument macro and fail to compile, or worse bind to
 /// btclibs's read/write dispatch and silently corrupt wire format.
 ///

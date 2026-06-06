@@ -26,7 +26,7 @@ struct SmallBlockHeaderType
     uint32_t m_bits{};
     uint32_t m_nonce{};
 
-    SERIALIZE_METHODS(SmallBlockHeaderType) { READWRITE(VarInt(obj.m_version), obj.m_previous_block, obj.m_timestamp, obj.m_bits, obj.m_nonce); }
+    C2POOL_SERIALIZE_METHODS(SmallBlockHeaderType) { READWRITE(VarInt(obj.m_version), obj.m_previous_block, obj.m_timestamp, obj.m_bits, obj.m_nonce); }
 
     SmallBlockHeaderType() {}
 

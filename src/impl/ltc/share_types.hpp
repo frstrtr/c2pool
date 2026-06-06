@@ -75,7 +75,7 @@ struct SegwitData
     SegwitData() {}
     SegwitData(MerkleLink txid_merkle_link, uint256 wtxid) : m_txid_merkle_link(txid_merkle_link), m_wtxid_merkle_root(wtxid) { }
 
-    SERIALIZE_METHODS(SegwitData) { READWRITE(MERKLE_LINK_SMALL(obj.m_txid_merkle_link), obj.m_wtxid_merkle_root); }
+    C2POOL_SERIALIZE_METHODS(SegwitData) { READWRITE(MERKLE_LINK_SMALL(obj.m_txid_merkle_link), obj.m_wtxid_merkle_root); }
 };
 
 struct SegwitDataDefault
@@ -98,7 +98,7 @@ struct TxHashRefs
     TxHashRefs() = default;
     TxHashRefs(uint64_t share, uint64_t tx) : m_share_count(share), m_tx_count(tx) {}
 
-    SERIALIZE_METHODS(TxHashRefs) { READWRITE(VarInt(obj.m_share_count), VarInt(obj.m_tx_count)); }
+    C2POOL_SERIALIZE_METHODS(TxHashRefs) { READWRITE(VarInt(obj.m_share_count), VarInt(obj.m_tx_count)); }
 };
 
 struct ShareTxInfo
@@ -111,7 +111,7 @@ struct ShareTxInfo
     ShareTxInfo(const auto& new_tx_hashes, const auto& tx_hash_refs) 
         : m_new_transaction_hashes(new_tx_hashes), m_transaction_hash_refs(tx_hash_refs) { }
 
-    SERIALIZE_METHODS(ShareTxInfo) { READWRITE(obj.m_new_transaction_hashes, obj.m_transaction_hash_refs); }
+    C2POOL_SERIALIZE_METHODS(ShareTxInfo) { READWRITE(obj.m_new_transaction_hashes, obj.m_transaction_hash_refs); }
 };
 
 struct HashLinkType
@@ -120,7 +120,7 @@ struct HashLinkType
     // FixedStrType<0> m_extra_data; //pack.FixedStrType(0) # bit of a hack, but since the donation script is at the end, const_ending is long enough to always make this empty
     uint64_t m_length;        //pack.VarIntType()
 
-    SERIALIZE_METHODS(HashLinkType) { READWRITE(obj.m_state, /*obj.m_extra_data,*/ VarInt(obj.m_length)); }
+    C2POOL_SERIALIZE_METHODS(HashLinkType) { READWRITE(obj.m_state, /*obj.m_extra_data,*/ VarInt(obj.m_length)); }
 };
 
 // V36 hash link — extra_data becomes VarStr (was FixedStr(0) pre-V36)
@@ -130,7 +130,7 @@ struct V36HashLinkType
     BaseScript m_extra_data;     // VarStr in V36
     uint64_t m_length;
 
-    SERIALIZE_METHODS(V36HashLinkType) { READWRITE(obj.m_state, obj.m_extra_data, VarInt(obj.m_length)); }
+    C2POOL_SERIALIZE_METHODS(V36HashLinkType) { READWRITE(obj.m_state, obj.m_extra_data, VarInt(obj.m_length)); }
 };
 
 // V36 merged mining: per-chain address entry
@@ -139,7 +139,7 @@ struct MergedAddressEntry
     uint32_t m_chain_id;
     BaseScript m_script;
 
-    SERIALIZE_METHODS(MergedAddressEntry) { READWRITE(obj.m_chain_id, obj.m_script); }
+    C2POOL_SERIALIZE_METHODS(MergedAddressEntry) { READWRITE(obj.m_chain_id, obj.m_script); }
 };
 
 // V36 merged mining: per-chain coinbase verification entry

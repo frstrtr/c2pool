@@ -224,7 +224,7 @@ struct BaseScript
     friend bool operator==(const BaseScript& l, const BaseScript& r) { return l.m_data == r.m_data; }
     friend bool operator!=(const BaseScript& l, const BaseScript& r) { return !(l==r); }
 
-    SERIALIZE_METHODS(BaseScript) { READWRITE(obj.m_data); }
+    C2POOL_SERIALIZE_METHODS(BaseScript) { READWRITE(obj.m_data); }
 };
 
 template <size_t Size>
