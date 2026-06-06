@@ -520,3 +520,5 @@ cd build && ctest --output-on-failure -j$(nproc)
 - [Windows](doc/build-windows.md)
 
 See [deploy/DEPLOY.md](deploy/DEPLOY.md) for HiveOS/MinerStat/RaveOS setup.
+
+<!-- safe-cosmetic auto-merge dry-run 2026-06-06 -->
