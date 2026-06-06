@@ -1,0 +1,105 @@
+name: SAFE-COSMETIC auto-merge
+
+# Operator-sanctioned exception to the per-push approval rule
+# (operator pick 2026-06-06 13:52 +04, relayed by integrator). Auto-merges a PR
+# carrying the `SAFE-COSMETIC` label once ALL required Linux green contexts pass.
+# Intended scope: comment / whitespace / doc-only cosmetic changes.
+#
+# SAFETY CONTROLS (all must hold to merge):
+#   1. Repo variable SAFE_COSMETIC_ENABLED == "true"  (operator kill-switch; fail-closed)
+#   2. PR carries the `SAFE-COSMETIC` label           (applied by integrator only)
+#   3. PR base branch == master                       (stated merge target)
+#   4. PR open, not draft
+#   5. Every context in REQUIRED below == success
+#
+# CHECK-RUN NAME MATCHING — DO NOT "FIX" TO THE UI FORM:
+#   The check-runs REST API returns the BARE job `name:` ("Linux x86_64"), NOT
+#   the "Workflow / Job" form shown in the PR UI ("CI / Linux x86_64"). Matching
+#   the prefixed strings makes the gate silently never fire. The ASan job name is
+#   literally "(AsAN+UBSan)" (sic). Both verified against live check-run data on
+#   PR #68 on 2026-06-06. The legacy "BTC embedded smoke (Linux x86_64)" job is
+#   deliberately NOT required here (coin-matrix "btc smoke" is the live gate).
+
+on:
+  check_suite:
+    types: [completed]
+  pull_request_target:
+    types: [labeled, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+concurrency:
+  group: safe-cosmetic-automerge-${{ github.event.pull_request.number || github.event.check_suite.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Evaluate gate and merge if all required contexts are green
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          ENABLED: ${{ vars.SAFE_COSMETIC_ENABLED }}
+        run: |
+          set -euo pipefail
+
+          if [ "${ENABLED:-}" != "true" ]; then
+            echo "SAFE_COSMETIC_ENABLED != true (kill-switch off) — auto-merge disabled. Exiting."
+            exit 0
+          fi
+
+          LABEL="SAFE-COSMETIC"
+          BASE_REQUIRED="master"
+          REQUIRED=(
+            "Linux x86_64"
+            "Linux x86_64 (AsAN+UBSan)"
+            "ltc smoke (Linux x86_64)"
+            "doge smoke (Linux x86_64)"
+            "dash smoke (Linux x86_64)"
+            "btc smoke (Linux x86_64)"
+          )
+
+          # Candidate PR numbers from whichever event fired.
+          PRS=$(jq -r '[ .pull_request.number, (.check_suite.pull_requests[]?.number) ] | map(select(. != null)) | unique | .[]' "$GITHUB_EVENT_PATH")
+          if [ -z "${PRS:-}" ]; then
+            echo "No candidate PRs in event payload — nothing to do."
+            exit 0
+          fi
+
+          for PR in $PRS; do
+            echo "::group::Evaluating PR #$PR"
+            META=$(gh api "repos/$REPO/pulls/$PR" --jq '{state:.state, draft:.draft, base:.base.ref, sha:.head.sha, labels:[.labels[].name]}')
+            STATE=$(jq -r '.state' <<<"$META")
+            DRAFT=$(jq -r '.draft' <<<"$META")
+            BASE=$(jq  -r '.base'  <<<"$META")
+            SHA=$(jq   -r '.sha'   <<<"$META")
+            HAS_LABEL=$(jq -r --arg L "$LABEL" 'any(.labels[]; . == $L)' <<<"$META")
+
+            [ "$STATE" = "open" ]          || { echo "PR not open — skip.";                echo "::endgroup::"; continue; }
+            [ "$DRAFT" = "false" ]         || { echo "PR is draft — skip.";                echo "::endgroup::"; continue; }
+            [ "$HAS_LABEL" = "true" ]      || { echo "No $LABEL label — skip.";            echo "::endgroup::"; continue; }
+            [ "$BASE" = "$BASE_REQUIRED" ] || { echo "Base $BASE != $BASE_REQUIRED — out of scope, skip."; echo "::endgroup::"; continue; }
+
+            RUNS=$(gh api "repos/$REPO/commits/$SHA/check-runs" --paginate \
+                   --jq '.check_runs[] | "\(.name)\t\(.conclusion)"')
+
+            ok=1
+            for ctx in "${REQUIRED[@]}"; do
+              concl=$(awk -F'\t' -v c="$ctx" '$1==c {print $2; exit}' <<<"$RUNS" || true)
+              if [ -z "$concl" ]; then echo "  MISSING required context: $ctx"; ok=0; continue; fi
+              echo "  $ctx => $concl"
+              [ "$concl" = "success" ] || ok=0
+            done
+
+            if [ "$ok" = "1" ]; then
+              echo "All required contexts green on PR #$PR — merging into $BASE_REQUIRED."
+              gh pr merge "$PR" --repo "$REPO" --merge --delete-branch=false
+            else
+              echo "Gate NOT satisfied for PR #$PR — not merging."
+            fi
+            echo "::endgroup::"
+          done
