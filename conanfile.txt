@@ -7,6 +7,7 @@ leveldb/1.23
 
 [options]
 boost/*:without_exception=False
+boost/*:without_cobalt=True
 
 [generators]
 CMakeDeps
