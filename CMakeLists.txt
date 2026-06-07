@@ -154,6 +154,28 @@ set_target_properties(dashbls PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/external/dashbls/include;${CMAKE_SOURCE_DIR}/external/dashbls/depends/relic/include"
 )
 
+# --- Portable circular-archive link group (RESCAN) -------------------------
+# The core<->coin static archives form a dependency cycle. GNU ld and LLD (ELF)
+# resolve it with the RESCAN link feature ($<LINK_GROUP:RESCAN,...> expands to
+# --start-group/--end-group with a repeated scan). ld64 (macOS) and
+# lld-link/link.exe (MSVC) do not implement RESCAN, and emitting that generator
+# expression there is a hard generation-time error -- so gate on the linker's
+# actual capability (CMAKE_LINK_GROUP_USING_RESCAN_SUPPORTED), not the platform.
+# Where RESCAN is unsupported we link the same archives as a plain list; once
+# master's #63 OBJECT-lib SCC break flows down the cycle is gone and the group
+# is a harmless no-op on every linker.
+set(C2POOL_RESCAN_LIBS
+    core sharechain pool ltc btclibs ltc_coin
+    c2pool_storage c2pool_payout c2pool_hashrate c2pool_merged_mining)
+if(CMAKE_LINK_GROUP_USING_RESCAN_SUPPORTED)
+    list(JOIN C2POOL_RESCAN_LIBS "," _c2pool_rescan_csv)
+    set(C2POOL_RESCAN_GROUP "$<LINK_GROUP:RESCAN,${_c2pool_rescan_csv}>")
+    unset(_c2pool_rescan_csv)
+else()
+    set(C2POOL_RESCAN_GROUP ${C2POOL_RESCAN_LIBS})
+endif()
+# ---------------------------------------------------------------------------
+
 add_subdirectory(src)
 add_subdirectory(test)
 # add_subdirectory(benchmark)
