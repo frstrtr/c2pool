@@ -1310,10 +1310,10 @@ int main(int argc, char* argv[])
 
     // ── Web dashboard (optional; enabled when --http-port > 0) ──────────
     // Coin-agnostic path: constructor takes IMiningNode (our EnhancedNode)
-    // and Blockchain::DASH. We do NOT call set_coin_rpc() — that signature
-    // is hardcoded to ltc::coin::NodeRPC* and would require ICoinRPC
-    // extraction. Our GBT/submitblock path stays in the existing stratum
-    // handler. The dashboard serves mining stats via IMiningNode only.
+    // and Blockchain::DASH. We deliberately leave the WebServer coin-node
+    // seam unset (no set_coin_node; nullptr by design): dash owns its
+    // own GBT/submitblock pipeline via the stratum handler, so the
+    // dashboard serves mining stats via IMiningNode only.
     // set_stratum_port(0) prevents WebServer from launching its own
     // StratumServer (we run dash::stratum::Server ourselves).
     std::unique_ptr<core::WebServer> web_server;
