@@ -157,8 +157,21 @@ public:
 // pattern after c42d0f5c), or stores an empty weak_ptr + was_managed=false
 // for legacy unmanaged nodes (LTC/DOGE pool today).
 //
-// Defined inline as a template so the caller's full INetwork type is
-// available for the dynamic_cast + weak_from_this() call.
+// Out-of-line, non-template helper: the INetwork cross-cast +
+// weak_from_this() liveness probe need INetwork complete, so this lives in
+// socket.cpp (which includes factory.hpp). Keeping the INetwork dependency
+// out of the header lets the inline template below require only ICommunicator
+// (complete here), which fixes the Apple Clang "incomplete type INetwork"
+// error when ltc_coin instantiates make_socket, while preserving the
+// factory.hpp<->socket.hpp include-cycle break.
+std::shared_ptr<core::Socket> make_socket_for_communicator(
+    std::unique_ptr<boost::asio::ip::tcp::socket> tcp_socket,
+    core::connection_type type,
+    core::ICommunicator* communicator);
+
+// Thin inline template: only the ICommunicator down-cast is type-dependent and
+// ICommunicator is complete here; the INetwork-dependent work is delegated
+// out-of-line so no compiler needs INetwork complete at the instantiation site.
 template <typename CommunicatorNode>
 std::shared_ptr<core::Socket> make_socket(
     std::unique_ptr<boost::asio::ip::tcp::socket> tcp_socket,
@@ -167,16 +180,8 @@ std::shared_ptr<core::Socket> make_socket(
 {
     auto communicator = dynamic_cast<core::ICommunicator*>(node);
     assert(communicator && "node can't be cast to ICommunicator!");
-    auto network = dynamic_cast<core::INetwork*>(node);
-    std::weak_ptr<core::INetwork> weak_node;
-    bool was_managed = false;
-    if (network) {
-        weak_node = network->weak_from_this();
-        was_managed = (weak_node.lock() != nullptr);
-    }
-    return std::make_shared<core::Socket>(
-        std::move(tcp_socket), type, communicator,
-        std::move(weak_node), was_managed);
+    return make_socket_for_communicator(
+        std::move(tcp_socket), type, communicator);
 }
 
 } // namespace core

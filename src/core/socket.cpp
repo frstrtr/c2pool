@@ -247,4 +247,27 @@ void Socket::message_processing(std::shared_ptr<Packet> packet)
 }
 
 
+// Out-of-line companion to the inline make_socket template (socket.hpp).
+// INetwork is complete here via factory.hpp, so the cross-cast and the
+// weak_from_this() liveness probe compile on every toolchain (incl. Apple
+// Clang). Cross-casting the already-resolved ICommunicator* is equivalent to
+// the previous dynamic_cast<INetwork*>(node): same dynamic object, RTTI yields
+// the INetwork subobject when present, nullptr for legacy unmanaged nodes.
+std::shared_ptr<core::Socket> make_socket_for_communicator(
+    std::unique_ptr<boost::asio::ip::tcp::socket> tcp_socket,
+    core::connection_type type,
+    core::ICommunicator* communicator)
+{
+    auto network = dynamic_cast<core::INetwork*>(communicator);
+    std::weak_ptr<core::INetwork> weak_node;
+    bool was_managed = false;
+    if (network) {
+        weak_node = network->weak_from_this();
+        was_managed = (weak_node.lock() != nullptr);
+    }
+    return std::make_shared<core::Socket>(
+        std::move(tcp_socket), type, communicator,
+        std::move(weak_node), was_managed);
+}
+
 } // namespace core
