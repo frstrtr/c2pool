@@ -40,7 +40,7 @@ inline uint64_t mul128_shift(uint64_t a, uint64_t b, unsigned shift) {
 #include <set>
 #include <vector>
 
-namespace ltc
+namespace btc
 {
 
 struct StaleCounts
@@ -2827,4 +2827,4 @@ private:
     CumulativeWeights m_decayed_cache_result;
 };
 
-} // namespace ltc
+} // namespace btc

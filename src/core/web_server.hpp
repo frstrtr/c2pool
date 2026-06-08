@@ -26,6 +26,8 @@
 #include <core/mining_node_interface.hpp>
 #include <core/address_validator.hpp>
 #include <core/hashrate_ring.hpp>
+#include <core/stratum_types.hpp>
+#include <core/stratum_work_source.hpp>
 #include <c2pool/payout/payout_manager.hpp>
 #include <c2pool/hashrate/tracker.hpp>
 #include <core/address_utils.hpp>
@@ -130,16 +132,18 @@ inline nlohmann::json to_json(const std::optional<SharechainTip>& tip)
 }
 
 /// Stratum mining configuration — tuneable from CLI, YAML, or API.
-struct StratumConfig {
-    double min_difficulty       = 0.0005;   // floor for per-connection vardiff
-    double max_difficulty       = 65536.0;  // ceiling for per-connection vardiff
-    double target_time          = 3.0;      // seconds between pseudoshares (p2pool default: 3)
-    bool   vardiff_enabled      = true;     // auto-adjust per-connection difficulty
-    size_t max_coinbase_outputs = 4000;     // Python p2pool's [-4000:] cap; no consensus limit
-};
+// Hoisted to core::stratum (see core/stratum_types.hpp). Alias kept here
+// so existing references to `core::StratumConfig` resolve transparently.
+using StratumConfig = core::stratum::StratumConfig;
 
-/// Mining interface that provides RPC methods for miners
-class MiningInterface : public jsonrpccxx::JsonRpc2Server
+/// Mining interface that provides RPC methods for miners.
+///
+/// Implements `core::stratum::IWorkSource` so the same `core::StratumServer`
+/// can drive both LTC's `MiningInterface` and BTC's `btc::stratum::
+/// BTCWorkSource`. The IWorkSource methods on this class are annotated
+/// `override`. See `core/stratum_work_source.hpp` for the contract.
+class MiningInterface : public jsonrpccxx::JsonRpc2Server,
+                        public core::stratum::IWorkSource
 {
 public:
     MiningInterface(bool testnet = false, std::shared_ptr<IMiningNode> node = nullptr, Blockchain blockchain = Blockchain::LITECOIN);
@@ -293,57 +297,17 @@ public:
                             double pool_hashrate = 0,
                             uint64_t subsidy = 0);
     
-    // Frozen share fields returned by ref_hash_fn — must be defined before JobSnapshot.
-    struct RefHashResult {
-        uint256  ref_hash;
-        uint64_t last_txout_nonce{0};
-        uint32_t absheight{0};
-        uint128  abswork;
-        uint256  far_share_hash;
-        uint32_t max_bits{0};
-        uint32_t bits{0};
-        uint32_t timestamp{0};
-        uint256  merged_payout_hash;
-        int64_t  share_version{36};     // AutoRatchet: V35 or V36
-        uint64_t desired_version{36};   // Version vote (always target version)
-        // Frozen mm_commitment — cached from rebuild_cached_blocks().
-        // Empty if no merged mining.
-        std::vector<uint8_t> frozen_mm_commitment;
-        // Frozen segwit data — merkle branches and witness root change between
-        // GBT updates, but the ref_hash was computed with the values at template time.
-        std::vector<uint256> frozen_merkle_branches;
-        uint256  frozen_witness_root;
-        // V36: frozen merged coinbase info (pre-serialized vector<MergedCoinbaseEntry>)
-        // Contains DOGE block header + merkle proof for consensus verification.
-        std::vector<unsigned char> frozen_merged_coinbase_info;
-    };
-
-    // Stratum-style methods (for advanced miners)
-    // Job snapshot: holds all template data frozen at the time a mining job was sent.
-    struct JobSnapshot {
-        std::string coinb1, coinb2;
-        std::string gbt_prevhash;      // BE display hex
-        std::string nbits;             // BE hex e.g. "1e0fffff" (share target bits for header)
-        uint32_t    version{0};
-        std::vector<std::string> merkle_branches;
-        std::vector<std::string> tx_data;   // raw tx hex from GBT
-        std::string mweb;
-        bool        segwit_active{false};
-        uint256     prev_share_hash;  // share chain tip when this job was built
-        uint64_t    subsidy{0};       // coinbasevalue frozen at job creation
-        std::string witness_commitment_hex;  // P2Pool witness commitment frozen at job creation
-        uint256     witness_root;            // raw wtxid merkle root frozen at job creation
-        uint32_t    share_bits{0};    // share target bits from compute_share_target()
-        uint32_t    share_max_bits{0}; // share max_bits from compute_share_target()
-        std::string block_nbits;      // original GBT block bits (for block target check)
-        RefHashResult frozen_ref;     // frozen share fields from template time
-        int stale_info{0};            // 0=none, 253=orphan (stale block template)
-    };
+    // Boundary types hoisted to core::stratum (see core/stratum_types.hpp).
+    // Aliases kept here so existing references like `MiningInterface::JobSnapshot`
+    // continue to resolve. Not needed for IWorkSource extraction itself —
+    // these are convenience aliases for the existing call sites.
+    using RefHashResult = core::stratum::RefHashResult;
+    using JobSnapshot   = core::stratum::JobSnapshot;
     nlohmann::json mining_subscribe(const std::string& user_agent = "", const std::string& request_id = "");
     nlohmann::json mining_authorize(const std::string& username, const std::string& password, const std::string& request_id = "");
     nlohmann::json mining_submit(const std::string& username, const std::string& job_id, const std::string& extranonce1, const std::string& extranonce2, const std::string& ntime, const std::string& nonce, const std::string& request_id = "",
         const std::map<uint32_t, std::vector<unsigned char>>& merged_addresses = {},
-        const JobSnapshot* job = nullptr);
+        const JobSnapshot* job = nullptr) override;
 
     // Enhanced coinbase and validation methods
     nlohmann::json validate_address(const std::string& address);
@@ -386,9 +350,25 @@ public:
         const std::string& nbits_hex,
         const std::vector<std::string>& merkle_branches);
 
+    /// IWorkSource virtual override: LTC uses scrypt, so delegate to the
+    /// existing scrypt-based static `calculate_share_difficulty` directly.
+    /// (BTC's BTCWorkSource overrides with a SHA256d implementation.)
+    double compute_share_difficulty(
+        const std::string& coinb1, const std::string& coinb2,
+        const std::string& extranonce1, const std::string& extranonce2,
+        const std::string& ntime, const std::string& nonce,
+        uint32_t version, const std::string& prevhash_hex,
+        const std::string& nbits_hex,
+        const std::vector<std::string>& merkle_branches) const override
+    {
+        return calculate_share_difficulty(coinb1, coinb2, extranonce1, extranonce2,
+                                          ntime, nonce, version, prevhash_hex,
+                                          nbits_hex, merkle_branches);
+    }
+
     // Hook: returns the best share hash from the share tracker (for prev_hash wiring)
     void set_best_share_hash_fn(std::function<uint256()> fn) { m_best_share_hash_fn = thread_safe_wrap(std::move(fn)); }
-    std::function<uint256()> get_best_share_hash_fn() const { return m_best_share_hash_fn; }
+    std::function<uint256()> get_best_share_hash_fn() const override { return m_best_share_hash_fn; }
 
     // Hook: walk back from best_share to find nearest peer share for work template.
     // Ensures c2pool shares extend the main chain, not local forks.
@@ -420,35 +400,20 @@ public:
 
     // Atomically snapshot work-related fields under m_work_mutex.
     // Used by StratumSession to freeze consistent state matching the coinbase.
-    struct WorkSnapshot {
-        bool segwit_active{false};
-        std::string mweb;
-        uint64_t subsidy{0};
-        std::string witness_commitment_hex;
-        uint256 witness_root;
-        // Frozen share fields from ref_hash_fn
-        RefHashResult frozen_ref;
-        // Block body data — must be captured atomically with witness_commitment
-        // to prevent merkle root mismatch when refresh_work() updates the template.
-        std::vector<std::string> tx_data;              // raw tx hex from template
-        std::vector<std::string> merkle_branches;      // stratum merkle branches
-    };
+    // (Hoisted to core::stratum::WorkSnapshot — see core/stratum_types.hpp.)
+    using WorkSnapshot = core::stratum::WorkSnapshot;
 
     // Build per-connection coinbase parts: computes ref_hash using the ref_hash callback,
     // then generates coinb1/coinb2 with full output set including OP_RETURN.
     // prev_share_hash is frozen at the caller and passed in to avoid race conditions.
     // Also returns work snapshot atomically (under same lock) to prevent race with refresh_work.
     // Returns (coinb1, coinb2) or empty strings if not possible.
-    struct CoinbaseResult {
-        std::string coinb1;
-        std::string coinb2;
-        WorkSnapshot snapshot;
-    };
+    using CoinbaseResult = core::stratum::CoinbaseResult;
     CoinbaseResult build_connection_coinbase(
         const uint256& prev_share_hash,
         const std::string& extranonce1_hex,
         const std::vector<unsigned char>& payout_script,
-        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const;
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const override;
 
     // Hook: called by mining_submit() pool path to create a share in the tracker.
     // All block template data needed by create_local_share() is passed through.
@@ -692,11 +657,11 @@ public:
     // Fetch a fresh block template from the coin daemon and cache it
     void refresh_work();
     // Return the most recently cached block template (empty json if unavailable)
-    nlohmann::json get_current_work_template() const;
+    nlohmann::json get_current_work_template() const override;
     // Return Stratum-ready merkle branch hashes
-    std::vector<std::string> get_stratum_merkle_branches() const;
+    std::vector<std::string> get_stratum_merkle_branches() const override;
     // Return coinb1 and coinb2 (coinbase parts split around extranonce)
-    std::pair<std::string, std::string> get_coinbase_parts() const;
+    std::pair<std::string, std::string> get_coinbase_parts() const override;
 
     // Return whether segwit is active in the current template
     bool get_segwit_active() const;
@@ -710,7 +675,7 @@ public:
     WorkSnapshot get_work_snapshot() const;
 
     // Returns current GBT previousblockhash (for stale block template detection)
-    std::string get_current_gbt_prevhash() const;
+    std::string get_current_gbt_prevhash() const override;
 
     // Found block status and record (Layer +2 — blockchain-accepted blocks)
     enum class BlockStatus : uint8_t {
@@ -937,7 +902,7 @@ public:
     void set_address_fallback_fn(address_fallback_fn_t fn) { m_address_fallback_fn = std::move(fn); }
 
     // Return true if the merged-mining manager has a configured chain with chain_id.
-    bool has_merged_chain(uint32_t chain_id) const;
+    bool has_merged_chain(uint32_t chain_id) const override;
 
     // Extract the 40-char hex hash160 from the node fee scriptPubKey (P2PKH bytes 3-22).
     // Returns "" if the fee script is not a 25-byte P2PKH.
@@ -1020,7 +985,12 @@ private:
 public:
     // Monotonically increasing counter — incremented on each refresh_work().
     // Used by per-miner safety timer to avoid pushing unchanged work.
-    uint64_t get_work_generation() const { return m_work_generation.load(); }
+    uint64_t get_work_generation() const override { return m_work_generation.load(); }
+
+    // IWorkSource atomic-state getters — replace direct m_share_bits.load()
+    // member access from stratum_server (post-extraction).
+    uint32_t get_share_bits() const override { return m_share_bits.load(); }
+    uint32_t get_share_max_bits() const override { return m_share_max_bits.load(); }
 
     // Share target from compute_share_target() — set by ref_hash_fn, used by
     // mining.notify (nbits) and share creation (params.bits).
@@ -1215,7 +1185,7 @@ private:
     std::string m_auth_token;   // auth token for sensitive endpoints; empty = no auth
 public:
     void set_stratum_config(const StratumConfig& cfg) { m_stratum_config = cfg; }
-    const StratumConfig& get_stratum_config() const { return m_stratum_config; }
+    const StratumConfig& get_stratum_config() const override { return m_stratum_config; }
     void set_cors_origin(const std::string& origin) { m_cors_origin = origin; }
     const std::string& get_cors_origin() const { return m_cors_origin; }
 
@@ -1472,24 +1442,13 @@ private:
 
     // ── Stratum worker session tracking ──────────────────────────────────
 public:
-    struct WorkerInfo {
-        std::string username;      // miner address (after parsing)
-        std::string worker_name;   // worker suffix from "ADDRESS.worker" (e.g. "alpha")
-        double hashrate{0.0};      // measured H/s from HashrateTracker
-        double dead_hashrate{0.0}; // DOA H/s
-        double difficulty{1.0};    // current vardiff difficulty
-        uint64_t accepted{0};
-        uint64_t rejected{0};
-        uint64_t stale{0};
-        std::chrono::steady_clock::time_point connected_at;
-        std::string remote_endpoint;  // "ip:port"
-    };
+    using WorkerInfo = core::stratum::WorkerInfo;
 
-    void register_stratum_worker(const std::string& session_id, const WorkerInfo& info);
-    void unregister_stratum_worker(const std::string& session_id);
+    void register_stratum_worker(const std::string& session_id, const WorkerInfo& info) override;
+    void unregister_stratum_worker(const std::string& session_id) override;
     void update_stratum_worker(const std::string& session_id,
                                double hashrate, double dead_hashrate, double difficulty,
-                               uint64_t accepted, uint64_t rejected, uint64_t stale);
+                               uint64_t accepted, uint64_t rejected, uint64_t stale) override;
     std::map<std::string, WorkerInfo> get_stratum_workers() const;
 
 private:
