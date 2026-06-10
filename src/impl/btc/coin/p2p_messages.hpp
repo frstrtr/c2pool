@@ -27,7 +27,7 @@ struct btc_addr_record_t : addr_t
 
     btc_addr_record_t() : addr_t() {}
 
-    SERIALIZE_METHODS(btc_addr_record_t) { READWRITE(obj.m_timestamp, AsBase<addr_t>(obj)); }
+    C2POOL_SERIALIZE_METHODS(btc_addr_record_t) { READWRITE(obj.m_timestamp, AsBase<addr_t>(obj)); }
 };
 //[+] void handle_message_tx(std::shared_ptr<coind::messages::message_tx> msg, CoindProtocol* protocol); //
 //[+] void handle_message_block(std::shared_ptr<coind::messages::message_block> msg, CoindProtocol* protocol); //
@@ -118,7 +118,7 @@ struct inventory_type
         return (static_cast<uint32_t>(m_type) & MSG_WITNESS_FLAG) != 0;
     }
 
-    SERIALIZE_METHODS(inventory_type) {READWRITE(Using<EnumType<IntType<32>>>(obj.m_type), obj.m_hash);}
+    C2POOL_SERIALIZE_METHODS(inventory_type) {READWRITE(Using<EnumType<IntType<32>>>(obj.m_type), obj.m_hash);}
 };
 
 BEGIN_MESSAGE(inv)
