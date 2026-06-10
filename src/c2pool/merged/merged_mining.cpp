@@ -304,7 +304,10 @@ bool AuxChainRPC::connect()
 std::string AuxChainRPC::Send(const std::string& request)
 {
     if (!m_connected) {
-        throw std::runtime_error("AuxChainRPC not connected");
+        // Lazy (re)connect: fallback backends are registered unconnected, and
+        // the daemon closes idle keep-alive connections (-rpcservertimeout).
+        if (!connect())
+            throw std::runtime_error("AuxChainRPC not connected");
     }
 
     m_http_request.body() = request;
@@ -577,9 +580,12 @@ void MergedMiningManager::start()
 {
     if (m_running) return;
 
-    // Connect all RPC clients
+    // Connect all RPC clients (fallback backends too, so the jumpstart
+    // path is usable when the primary embedded chain is not synced)
     for (auto& chain : m_chains) {
         chain.rpc->connect();
+        if (chain.fallback)
+            chain.fallback->connect();
     }
 
     m_running = true;
