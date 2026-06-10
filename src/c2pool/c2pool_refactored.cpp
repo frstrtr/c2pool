@@ -44,9 +44,14 @@
 #include <impl/ltc/auto_ratchet.hpp>
 #include <impl/ltc/share_messages.hpp>
 #include <impl/ltc/coin/block.hpp>
-#include <impl/ltc/coin/coin_node.hpp>
 #include <impl/ltc/node.hpp>
 #include <impl/ltc/messages.hpp>
+// NOTE: must follow node.hpp/messages.hpp. coin_node.hpp pulls in
+// btclibs/serialize.h, which #undefs READWRITE and redefines it to the
+// (s, ser_action, ...) form. Included earlier, the MESSAGE_FIELDS macros in
+// messages.hpp expand against that wrong READWRITE and fail to compile under
+// AppleClang/arm64 ("use of undeclared identifier s / ser_action").
+#include <impl/ltc/coin/coin_node.hpp>
 #include <impl/ltc/config.hpp>
 
 // Chain seed discovery
