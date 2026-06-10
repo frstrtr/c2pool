@@ -1,0 +1,397 @@
+name: Release matrix
+
+# V36 ship packaging (integrator dispatch 2026-06-10): one workflow builds
+# every coin binary on every platform at tag time and emits a single
+# SHA256SUMS, matching the v0.1.x-alpha release shape
+# (c2pool-<coin>-<version>-<platform>.{tar.gz,zip} + SHA256SUMS).
+#
+# Coins: btc, ltc (carries doge merged-mining aux — no separate doge
+# binary), dgb, dash, bch. Each coin×platform cell gates on source
+# presence (same entrypoint gate as coin-matrix.yml: the real entrypoint
+# src/c2pool/main_<coin>.cpp, not src/impl/<coin>/main — see PR #66) and
+# every matrix is fail-fast:false, so one red coin never blocks the other
+# coins' packages. This implements the ship decouple: a red btc cell
+# still lets ltc/dash/doge/dgb/bch package.
+#
+# macOS: v1 ships arm64 (the proven brew path from build.yml — GitHub
+# only provides ARM runners). The universal (arm64+x86_64 lipo) artifact
+# needs x86_64 deps on the arm64 runner — dual Conan profile cross-build
+# planned as a follow-up iteration on this workflow before tag time.
+#
+# Triggers: tags only, plus workflow_dispatch for a full-matrix dry run
+# from any ref. PR-time per-coin coverage stays in coin-matrix.yml; this
+# workflow is intentionally NOT wired to pull_request (15 cells).
+#
+# Publishing: the checksums job assembles all packages and, on tags,
+# creates a DRAFT GitHub release. Publishing the draft is a manual
+# operator action — CI never publishes.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════════
+  # Linux x86_64 (Ubuntu 24.04, GCC 13, Conan) — one cell per coin
+  # ════════════════════════════════════════════════════════════════════════════
+  linux:
+    name: ${{ matrix.coin }} package (Linux x86_64)
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        coin: [btc, ltc, dgb, dash, bch]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check source presence
+        id: presence
+        run: |
+          if [ -f "src/c2pool/main_${{ matrix.coin }}.cpp" ] && [ -d "src/impl/${{ matrix.coin }}" ]; then
+            echo "exists=1" >> "$GITHUB_OUTPUT"
+            echo "::notice::c2pool-${{ matrix.coin }} source present — packaging."
+          else
+            echo "exists=0" >> "$GITHUB_OUTPUT"
+            echo "::warning::c2pool-${{ matrix.coin }} source not on this ref — no ${{ matrix.coin }} Linux package will be produced."
+          fi
+
+      - name: Install system dependencies
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            g++ cmake make libleveldb-dev libsecp256k1-dev
+
+      - uses: actions/setup-python@v6
+        if: steps.presence.outputs.exists == '1'
+        with: { python-version: '3.12' }
+
+      - name: Install Conan 2
+        if: steps.presence.outputs.exists == '1'
+        run: pip install "conan>=2.0,<3.0"
+
+      - name: Detect Conan profile
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          conan profile detect --force
+          sed -i 's/compiler.cppstd=.*/compiler.cppstd=20/' "$(conan profile path default)"
+
+      - name: Restore Conan cache
+        if: steps.presence.outputs.exists == '1'
+        uses: actions/cache@v5
+        with:
+          path: ~/.conan2
+          key: conan2-ubuntu24-gcc13-${{ matrix.coin }}-${{ hashFiles('conanfile.txt') }}
+          restore-keys: |
+            conan2-ubuntu24-gcc13-${{ matrix.coin }}-
+            conan2-ubuntu24-gcc13-
+
+      - name: Conan install
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          conan install . \
+            --build=missing \
+            --output-folder=build_${{ matrix.coin }} \
+            --settings=build_type=Release
+
+      - name: Configure
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          cmake -S . -B build_${{ matrix.coin }} \
+            -DCMAKE_TOOLCHAIN_FILE=build_${{ matrix.coin }}/conan_toolchain.cmake \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build c2pool-${{ matrix.coin }}
+        if: steps.presence.outputs.exists == '1'
+        run: cmake --build build_${{ matrix.coin }} --target c2pool-${{ matrix.coin }} -j$(nproc)
+
+      - name: Smoke test (--help)
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          BIN=build_${{ matrix.coin }}/src/c2pool/c2pool-${{ matrix.coin }}
+          file "$BIN"
+          "$BIN" --help 2>&1 | head -5 || true
+
+      - name: Package
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          COIN="${{ matrix.coin }}"
+          PKG="c2pool-${COIN}-${VERSION}-linux-x86_64"
+          mkdir -p "${PKG}/lib" "${PKG}/config" "${PKG}/web-static" "${PKG}/explorer"
+          cp "build_${COIN}/src/c2pool/c2pool-${COIN}" "${PKG}/"
+          strip "${PKG}/c2pool-${COIN}"
+          for lib in libleveldb.so.1 libsecp256k1.so.2 libsnappy.so.1; do
+            found=$(find /usr/lib -name "${lib}*" -type f 2>/dev/null | head -1)
+            [ -n "$found" ] && cp "$found" "${PKG}/lib/"
+          done
+          cp start.sh "${PKG}/" && chmod +x "${PKG}/start.sh"
+          cp config/c2pool_mainnet.yaml "${PKG}/config/c2pool_mainnet.yaml.example" || true
+          cp config/c2pool_testnet.yaml "${PKG}/config/" || true
+          cp -r web-static/* "${PKG}/web-static/"
+          cp explorer/explorer.py "${PKG}/explorer/"
+          tar czf "${PKG}.tar.gz" "${PKG}/"
+
+      - name: Upload package
+        if: steps.presence.outputs.exists == '1'
+        uses: actions/upload-artifact@v7
+        with:
+          name: pkg-linux-${{ matrix.coin }}
+          path: c2pool-*-linux-x86_64.tar.gz
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # macOS arm64 (Apple Silicon; universal lipo is a follow-up — see header)
+  # ════════════════════════════════════════════════════════════════════════════
+  macos:
+    name: ${{ matrix.coin }} package (macOS arm64)
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        coin: [btc, ltc, dgb, dash, bch]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check source presence
+        id: presence
+        run: |
+          if [ -f "src/c2pool/main_${{ matrix.coin }}.cpp" ] && [ -d "src/impl/${{ matrix.coin }}" ]; then
+            echo "exists=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=0" >> "$GITHUB_OUTPUT"
+            echo "::warning::c2pool-${{ matrix.coin }} source not on this ref — no ${{ matrix.coin }} macOS package will be produced."
+          fi
+
+      - name: Install dependencies
+        if: steps.presence.outputs.exists == '1'
+        run: brew install cmake boost leveldb secp256k1 nlohmann-json yaml-cpp
+
+      - name: Configure
+        if: steps.presence.outputs.exists == '1'
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build c2pool-${{ matrix.coin }}
+        if: steps.presence.outputs.exists == '1'
+        run: cmake --build build --target c2pool-${{ matrix.coin }} -j$(sysctl -n hw.ncpu)
+
+      - name: Smoke test (--help)
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          BIN=build/src/c2pool/c2pool-${{ matrix.coin }}
+          file "$BIN"
+          "$BIN" --help 2>&1 | head -5 || true
+
+      - name: Package
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          COIN="${{ matrix.coin }}"
+          PKG="c2pool-${COIN}-${VERSION}-macos-arm64"
+          mkdir -p "${PKG}/lib" "${PKG}/config" "${PKG}/web-static" "${PKG}/explorer"
+          cp "build/src/c2pool/c2pool-${COIN}" "${PKG}/"
+          strip "${PKG}/c2pool-${COIN}"
+          for dylib in $(otool -L "${PKG}/c2pool-${COIN}" | grep "/opt/homebrew" | awk '{print $1}'); do
+            base=$(basename "$dylib")
+            cp "$dylib" "${PKG}/lib/${base}"
+            install_name_tool -change "$dylib" "@executable_path/lib/${base}" "${PKG}/c2pool-${COIN}"
+          done
+          for lib in "${PKG}"/lib/*.dylib; do
+            for ref in $(otool -L "$lib" | grep "/opt/homebrew" | awk '{print $1}'); do
+              base=$(basename "$ref")
+              [ -f "${PKG}/lib/${base}" ] && install_name_tool -change "$ref" "@executable_path/lib/${base}" "$lib"
+            done
+            install_name_tool -id "@executable_path/lib/$(basename $lib)" "$lib"
+          done
+          cp start.sh "${PKG}/" && chmod +x "${PKG}/start.sh"
+          cp config/c2pool_mainnet.yaml "${PKG}/config/c2pool_mainnet.yaml.example" || true
+          cp -r web-static/* "${PKG}/web-static/"
+          cp explorer/explorer.py "${PKG}/explorer/"
+          zip -r "${PKG}.zip" "${PKG}/"
+
+      - name: Upload package
+        if: steps.presence.outputs.exists == '1'
+        uses: actions/upload-artifact@v7
+        with:
+          name: pkg-macos-${{ matrix.coin }}
+          path: c2pool-*-macos-arm64.zip
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Windows x86_64 (MSVC 2022, Conan)
+  # ════════════════════════════════════════════════════════════════════════════
+  windows:
+    name: ${{ matrix.coin }} package (Windows x86_64)
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        coin: [btc, ltc, dgb, dash, bch]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check source presence
+        id: presence
+        shell: bash
+        run: |
+          if [ -f "src/c2pool/main_${{ matrix.coin }}.cpp" ] && [ -d "src/impl/${{ matrix.coin }}" ]; then
+            echo "exists=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=0" >> "$GITHUB_OUTPUT"
+            echo "::warning::c2pool-${{ matrix.coin }} source not on this ref — no ${{ matrix.coin }} Windows package will be produced."
+          fi
+
+      - uses: actions/setup-python@v6
+        if: steps.presence.outputs.exists == '1'
+        with: { python-version: '3.12' }
+
+      - name: Install Conan 2
+        if: steps.presence.outputs.exists == '1'
+        run: pip install "conan>=2.0,<3.0"
+
+      - name: Detect Conan profile
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          conan profile detect --force
+          $profile = conan profile path default
+          (Get-Content $profile) -replace 'compiler.cppstd=14','compiler.cppstd=20' | Set-Content $profile
+
+      - name: Restore Conan cache
+        if: steps.presence.outputs.exists == '1'
+        uses: actions/cache@v5
+        with:
+          path: ~/.conan2
+          key: conan2-windows-msvc194-${{ hashFiles('conanfile.txt') }}
+
+      - name: Conan install
+        if: steps.presence.outputs.exists == '1'
+        run: conan install . --build=missing --output-folder=build_ci
+
+      - name: Build secp256k1
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          git clone https://github.com/bitcoin-core/secp256k1 secp256k1-src
+          cmake -B secp256k1-src/build -S secp256k1-src -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="${env:GITHUB_WORKSPACE}/secp256k1" -DSECP256K1_BUILD_TESTS=OFF -DSECP256K1_BUILD_EXHAUSTIVE_TESTS=OFF -DSECP256K1_BUILD_BENCHMARK=OFF -DSECP256K1_BUILD_EXAMPLES=OFF
+          cmake --build secp256k1-src/build --config Release
+          cmake --install secp256k1-src/build --config Release
+
+      - name: Configure
+        if: steps.presence.outputs.exists == '1'
+        shell: cmd
+        run: cmake -S . -B build_ci -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake -DCMAKE_PREFIX_PATH="%GITHUB_WORKSPACE%/secp256k1" -DCMAKE_CXX_FLAGS="/D_WIN32_WINNT=0x0A00"
+
+      - name: Build c2pool-${{ matrix.coin }}
+        if: steps.presence.outputs.exists == '1'
+        shell: cmd
+        run: cmake --build build_ci --target c2pool-${{ matrix.coin }} --config Release -j %NUMBER_OF_PROCESSORS%
+
+      - name: Smoke test (--help)
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-6.dll" build_ci/src/c2pool/Release/
+          build_ci/src/c2pool/Release/c2pool-${{ matrix.coin }}.exe --help 2>&1 | Select-Object -First 5
+
+      - name: Package
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          $VERSION = "${{ steps.ver.outputs.version }}"
+          $COIN = "${{ matrix.coin }}"
+          $PKG = "c2pool-${COIN}-${VERSION}-windows-x86_64"
+          New-Item -ItemType Directory -Path "${PKG}/lib","${PKG}/config","${PKG}/web-static","${PKG}/explorer" -Force
+          Copy-Item "build_ci/src/c2pool/Release/c2pool-${COIN}.exe" "${PKG}/"
+          # DLL must be next to exe for Windows DLL search path (portable ZIP)
+          # Also copy to lib/ for Inno Setup installer compatibility
+          Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-6.dll" "${PKG}/"
+          Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-6.dll" "${PKG}/lib/"
+          Copy-Item start.bat "${PKG}/"
+          Copy-Item -Recurse web-static/* "${PKG}/web-static/"
+          Copy-Item explorer/explorer.py "${PKG}/explorer/"
+          Copy-Item config/c2pool_mainnet.yaml "${PKG}/config/c2pool_mainnet.yaml.example"
+          Copy-Item config/c2pool_testnet.yaml "${PKG}/config/" -ErrorAction SilentlyContinue
+          Compress-Archive -Path "${PKG}" -DestinationPath "${PKG}.zip"
+
+      - name: Upload package
+        if: steps.presence.outputs.exists == '1'
+        uses: actions/upload-artifact@v7
+        with:
+          name: pkg-windows-${{ matrix.coin }}
+          path: c2pool-*-windows-x86_64.zip
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Aggregate: single SHA256SUMS over every produced package; on tags,
+  # attach everything to a DRAFT release (operator publishes manually).
+  # if: always() — runs even when some coin cells are red or skipped, so a
+  # red btc never blocks the other coins' packages from shipping.
+  # ════════════════════════════════════════════════════════════════════════════
+  checksums:
+    name: SHA256SUMS + draft release
+    runs-on: ubuntu-24.04
+    needs: [linux, macos, windows]
+    if: always()
+    permissions:
+      contents: write
+    steps:
+      - name: Download all packages
+        uses: actions/download-artifact@v7
+        with:
+          pattern: pkg-*
+          merge-multiple: true
+          path: dist
+
+      - name: Generate SHA256SUMS
+        working-directory: dist
+        run: |
+          ls -l
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload SHA256SUMS
+        uses: actions/upload-artifact@v7
+        with:
+          name: SHA256SUMS
+          path: dist/SHA256SUMS
+
+      - name: Create draft release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --draft \
+            --title "c2pool ${GITHUB_REF_NAME}" \
+            --notes "Draft assembled by release.yml — operator reviews and publishes manually." \
+            dist/*
