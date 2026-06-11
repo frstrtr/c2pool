@@ -600,8 +600,8 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
         snap.witness_commitment_hex = HexStr(std::span<const uint8_t>(
             witness_commitment_script.data(), witness_commitment_script.size()));
     }
-    snap.frozen_ref.share_version   = 35;        // jtoomim BTC v35
-    snap.frozen_ref.desired_version = 35;
+    snap.frozen_ref.share_version   = rh_result.share_version;   // Pillar 1: AutoRatchet-voted
+    snap.frozen_ref.desired_version = rh_result.desired_version;
     // Phase 12: source bits/max_bits/absheight/abswork/far_share_hash
     // from the ref_hash_fn result (which already walked the tracker for
     // the same values to feed compute_ref_hash_for_work). With these
