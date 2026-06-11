@@ -21,6 +21,7 @@
 #include <impl/ltc/coin/header_chain.hpp>
 #include <impl/ltc/coin/mempool.hpp>
 #include <impl/ltc/coin/template_builder.hpp>
+#include <impl/ltc/coin/coin_node.hpp>
 #include <c2pool/merged/coin_broadcaster.hpp>
 #include <core/web_server.hpp>
 #include <core/address_validator.hpp>
@@ -239,7 +240,8 @@ TEST_F(Phase4LiveTest, MiningInterfaceRefreshWorkWithEmbeddedNode)
     // Wire embedded node into MiningInterface
     EmbeddedCoinNode embedded(chain, pool, true);
     core::MiningInterface mi(/*testnet=*/true, nullptr, c2pool::address::Blockchain::LITECOIN);
-    mi.set_embedded_node(&embedded);
+    ltc::coin::CoinNode coin_iface(&embedded, /*rpc=*/nullptr);
+    mi.set_coin_node(&coin_iface);
 
     EXPECT_NO_THROW(mi.refresh_work());
 
