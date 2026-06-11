@@ -4,9 +4,10 @@
 #include "address_utils.hpp"
 #include "socket.hpp"
 
-// Real coin daemon RPC (optional - only linked when set_coin_rpc() is called)
+// Real coin daemon access (optional - only active when set_coin_node() is called)
 #include <impl/ltc/coin/rpc.hpp>
 #include <impl/ltc/coin/node_interface.hpp>
+#include <core/coin/node_iface.hpp>
 // Phase 4: embedded coin node interface
 #include <impl/ltc/coin/template_builder.hpp>
 #include <impl/ltc/share_messages.hpp>
@@ -1139,17 +1140,10 @@ std::vector<unsigned char> MiningInterface::get_operator_message_blob() const
 
 // ─── Live coin-daemon integration ────────────────────────────────────────────
 
-void MiningInterface::set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Node* coin)
+void MiningInterface::set_coin_node(core::coin::ICoinNode* node)
 {
-    m_coin_rpc  = rpc;
-    m_coin_node = coin;
-    LOG_INFO << "MiningInterface: coin RPC " << (rpc ? "connected" : "disconnected");
-}
-
-void MiningInterface::set_embedded_node(ltc::coin::CoinNodeInterface* node)
-{
-    m_embedded_node = node;
-    LOG_INFO << "MiningInterface: embedded coin node " << (node ? "connected" : "disconnected");
+    m_coin_node = node;
+    LOG_INFO << "MiningInterface: coin node " << (node ? "attached" : "detached");
 }
 
 void MiningInterface::set_on_block_submitted(std::function<void(const std::string&, int)> fn)
@@ -2153,7 +2147,7 @@ MiningInterface::build_connection_coinbase(
 
 void MiningInterface::refresh_work()
 {
-    if (!m_coin_rpc && !m_embedded_node) return;
+    if (!m_coin_node) return;
 
     // Serialize refresh_work calls — two concurrent threads (e.g. embedded LTC
     // header callback + stratum submit) hitting build_coinbase_parts() in parallel
@@ -2163,13 +2157,10 @@ void MiningInterface::refresh_work()
     if (!refresh_lock.owns_lock()) return;  // another refresh in progress, skip
 
     try {
-        // Phase 4: prefer embedded node; fall back to RPC (HybridCoinNode pattern)
-        auto wd = m_embedded_node ? m_embedded_node->getwork()
-                                  : m_coin_rpc->getwork();
-
-        // Update the coin node's Variable<WorkData> so submit_block() can read it
-        if (m_coin_node)
-            m_coin_node->work.set(wd);
+        // P2 WorkView seam: the concrete coin node makes the embedded-vs-RPC
+        // decision internally, retains the full per-coin WorkData coin-side
+        // (work.set), and returns only the agnostic slice (m_data/m_hashes/m_latency).
+        auto wd = m_coin_node->get_work_view();
 
         // Collect tx hashes from WorkData
         std::vector<std::string> tx_hashes_hex;
@@ -2725,9 +2716,9 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
         }
     }
 
-    if (m_coin_rpc) {
+    if (m_coin_node && m_coin_node->has_rpc()) {
         try {
-            bool accepted = m_coin_rpc->submit_block_hex(hex_data, "", false);
+            bool accepted = m_coin_node->submit_block_hex(hex_data, false);
             LOG_INFO << "Block forwarded to coin daemon";
             if (accepted) {
                 // Notify P2P layer with stale_info=0 (none — accepted)
@@ -2747,7 +2738,7 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
             }
             return {{"error", std::string(e.what())}};
         }
-    } else if (m_embedded_node) {
+    } else if (m_coin_node && m_coin_node->is_embedded()) {
         // Phase 4 embedded mode: no daemon — relay the block directly via P2P.
         // on_block_relay is wired to CoinBroadcaster::submit_block_raw().
         size_t block_size = hex_data.size() / 2;
@@ -4420,10 +4411,10 @@ nlohmann::json MiningInterface::rest_local_stats()
         auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
         if (m_last_work_update_time > 0 && now_s - m_last_work_update_time > 60) {
-            std::string src = m_embedded_node ? "EMBEDDED LTC NODE" : "LTC DAEMON";
+            std::string src = (m_coin_node && m_coin_node->is_embedded()) ? "EMBEDDED LTC NODE" : "LTC DAEMON";
             warnings.push_back("LOST CONTACT WITH " + src + " for "
                 + std::to_string(now_s - m_last_work_update_time) + "s! "
-                + (m_embedded_node ? "No new blocks received from P2P peers."
+                + ((m_coin_node && m_coin_node->is_embedded()) ? "No new blocks received from P2P peers."
                                    : "Check that it isn't frozen or dead!"));
         }
 
@@ -4445,10 +4436,10 @@ nlohmann::json MiningInterface::rest_local_stats()
             for (const auto& ci : chain_infos) {
                 int64_t threshold = 180; // 3 minutes default (covers DOGE 1min blocks)
                 if (ci.last_update_age_s > threshold) {
-                    std::string src = m_embedded_node ? " EMBEDDED NODE" : " DAEMON";
+                    std::string src = (m_coin_node && m_coin_node->is_embedded()) ? " EMBEDDED NODE" : " DAEMON";
                     warnings.push_back("LOST CONTACT WITH " + ci.symbol + src + " for "
                         + std::to_string(ci.last_update_age_s) + "s!"
-                        + (m_embedded_node ? " No new blocks from P2P peers." : ""));
+                        + ((m_coin_node && m_coin_node->is_embedded()) ? " No new blocks from P2P peers." : ""));
                 }
             }
         }
@@ -4693,8 +4684,8 @@ nlohmann::json MiningInterface::rest_web_currency_info()
         result["explorer_url"] = m_explorer_url;
 
     // Mode indicators for conditional UI
-    result["embedded"] = (m_embedded_node != nullptr);
-    result["has_rpc"]  = (m_coin_rpc != nullptr);
+    result["embedded"] = (m_coin_node && m_coin_node->is_embedded());
+    result["has_rpc"]  = (m_coin_node && m_coin_node->has_rpc());
 
     // p2pool share version for the current coin — consumed by the
     // bundled @c2pool/sharechain-explorer to classify share cells.
@@ -7349,7 +7340,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         LOG_INFO << "Solo mining share accepted - primary payout address: " << payout_address;
         
         // Check if share meets network difficulty and attempt block submission
-        if ((m_coin_rpc || m_embedded_node) && !extranonce1.empty()) {
+        if (m_coin_node && !extranonce1.empty()) {
             std::string block_hex = build_block_from_stratum(extranonce1, extranonce2, ntime, nonce, job);
             if (!block_hex.empty()) {
                 // Check merged mining targets for every share (aux targets are lower)
@@ -7740,7 +7731,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         }
         
         // Attempt block construction + submission only when PoW meets blockchain target.
-        if ((m_coin_rpc || m_embedded_node) && !extranonce1.empty()) {
+        if (m_coin_node && !extranonce1.empty()) {
             std::string block_hex = build_block_from_stratum(extranonce1, extranonce2, ntime, nonce, job);
             if (!block_hex.empty()) {
                 // Check merged mining targets for every share (aux targets are lower)
@@ -8044,7 +8035,7 @@ bool WebServer::start()
         // One-shot initial template fetch: populate the cache before any events fire.
         // After this, all template updates are event-driven (bestblock, best_share_changed).
         // p2pool has no recurring refresh timer — Twisted reactor events handle everything.
-        if (m_coin_rpc_) {
+        if (m_coin_node_ && m_coin_node_->has_rpc()) {
             auto timer = std::make_shared<net::steady_timer>(ioc_);
             timer->expires_after(std::chrono::milliseconds(500));
             timer->async_wait([this, timer](beast::error_code ec) {
@@ -8152,18 +8143,11 @@ void WebServer::trigger_work_refresh_debounced()
     }
 }
 
-void WebServer::set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Node* coin)
+void WebServer::set_coin_node(core::coin::ICoinNode* node)
 {
-    m_coin_rpc_  = rpc;
-    m_coin_node_ = coin;
-    mining_interface_->set_coin_rpc(rpc, coin);
-    LOG_INFO << "WebServer: coin RPC " << (rpc ? "attached" : "detached");
-}
-
-void WebServer::set_embedded_node(ltc::coin::CoinNodeInterface* node)
-{
-    mining_interface_->set_embedded_node(node);
-    LOG_INFO << "WebServer: embedded coin node " << (node ? "attached" : "detached");
+    m_coin_node_ = node;
+    mining_interface_->set_coin_node(node);
+    LOG_INFO << "WebServer: coin node " << (node ? "attached" : "detached");
 }
 
 void WebServer::set_best_share_hash_fn(std::function<uint256()> fn)
