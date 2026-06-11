@@ -31,6 +31,7 @@
 #include <impl/btc/config.hpp>
 #include <impl/btc/config_pool.hpp>
 #include <impl/btc/node.hpp>
+#include <impl/btc/auto_ratchet.hpp>     // AutoRatchet V35->V36 forward-version-voting
 #include <impl/btc/share_check.hpp>      // RefHashParams + compute_ref_hash_for_work
 #include <impl/btc/share_tracker.hpp>    // get_v35_expected_payouts
 #include <impl/btc/stratum/work_source.hpp>
@@ -758,6 +759,16 @@ int main(int argc, char* argv[])
 
     auto* p2p_node_raw = p2p_node.get();  // captured by reference into lambdas
 
+    // Pillar 1 (forward-version-voting): AutoRatchet drives btc's autonomous
+    // V35->V36 share-version transition for its OWN modern sharechain.
+    // target_version=36 — votes toward + activates V36; the machine is
+    // v37-generic (bump target later). State persists under the net dir.
+    const std::string ratchet_path = (net_dir / "v36_ratchet.json").string();
+    auto auto_ratchet = std::make_shared<btc::AutoRatchet>(ratchet_path, /*target_version=*/36);
+    LOG_INFO << "[AutoRatchet] Initialized: state="
+             << btc::ratchet_state_str(auto_ratchet->state())
+             << " target=V36 file=" << ratchet_path;
+
     // Wire best-share lookup: BTCWorkSource asks via this fn to determine
     // prev_share_hash for new jobs. Returns the sharechain tip the local
     // node has built up to. Empty (uint256::ZERO) on cold start; the
@@ -769,14 +780,28 @@ int main(int argc, char* argv[])
             return p2p_node_raw->best_share_hash();
         });
 
-    work_source->set_donation_script(
-        btc::PoolConfig::get_donation_script(/*share_version*/ 35));
+    {
+        // Initial donation script must match the genesis share's version
+        // (created before the first PPLNS-hook refresh). AutoRatchet bootstrap
+        // returns V35 until the chain votes in V36, so P2PK DONATION_SCRIPT is
+        // used pre-transition and COMBINED P2SH after — matching gentx.
+        int64_t initial_ver = 35;
+        if (p2p_node_raw) {
+            auto [iv, idv] = auto_ratchet->get_share_version(
+                p2p_node_raw->tracker(), uint256::ZERO);
+            initial_ver = iv;
+        }
+        work_source->set_donation_script(
+            btc::PoolConfig::get_donation_script(initial_ver));
+        LOG_INFO << "[AutoRatchet] initial donation script V" << initial_ver;
+    }
 
     work_source->set_pplns_fn(
-        [p2p_node_raw](const uint256& best_share_hash,
+        [p2p_node_raw, auto_ratchet, ws = work_source.get()](
+                       const uint256& best_share_hash,
                        const uint256& block_target,
                        uint64_t subsidy,
-                       const std::vector<unsigned char>& donation_script)
+                       const std::vector<unsigned char>& /*donation_script*/)
         -> std::map<std::vector<unsigned char>, double>
         {
             if (!p2p_node_raw) return {};
@@ -787,17 +812,27 @@ int main(int argc, char* argv[])
                 // refresh. Next refresh will likely succeed.
                 return {};
             }
+            // Pillar 1: AutoRatchet picks the live share version from chain
+            // vote state. Donation script + PPLNS formula must BOTH match it
+            // (v35 flat PPLNS + P2PK donation, v36 decayed PPLNS + P2SH).
+            auto [share_version, desired_ver] =
+                auto_ratchet->get_share_version(*guard, best_share_hash);
+            auto correct_donation = btc::PoolConfig::get_donation_script(share_version);
+            ws->set_donation_script(correct_donation);
             try {
-                return guard->get_v35_expected_payouts(
-                    best_share_hash, block_target, subsidy, donation_script);
+                if (share_version < 36)
+                    return guard->get_v35_expected_payouts(
+                        best_share_hash, block_target, subsidy, correct_donation);
+                return guard->get_expected_payouts(
+                    best_share_hash, block_target, subsidy, correct_donation);
             } catch (const std::exception& e) {
-                LOG_WARNING << "[BTC-STRATUM] get_v35_expected_payouts threw: " << e.what();
+                LOG_WARNING << "[BTC-STRATUM] get_expected_payouts threw: " << e.what();
                 return {};
             }
         });
 
     work_source->set_ref_hash_fn(
-        [p2p_node_raw](const uint256& prev_share_hash,
+        [p2p_node_raw, auto_ratchet](const uint256& prev_share_hash,
                        const std::vector<unsigned char>& scriptSig,
                        const std::vector<unsigned char>& payout_script,
                        uint64_t subsidy, uint32_t block_bits, uint32_t timestamp)
@@ -862,6 +897,19 @@ int main(int argc, char* argv[])
                 auto guard = p2p_node_raw->read_tracker();
                 if (guard) {
                     auto& tracker = *guard;
+
+                    // Pillar 1: AutoRatchet sets the live share version from
+                    // network vote state, overriding the V35 genesis defaults
+                    // above once a chain exists. Done before compute_share
+                    // _target so p.share_version is consistent with the rest.
+                    {
+                        auto [sv, dv] = auto_ratchet->get_share_version(
+                            tracker, prev_share_hash);
+                        result.share_version   = sv;
+                        result.desired_version = dv;
+                        p.share_version        = sv;
+                        p.desired_version      = dv;
+                    }
 
                     // Step 1 (must run before compute_share_target): clip
                     // timestamp + walk for absheight + far_share_hash.
@@ -982,7 +1030,7 @@ int main(int argc, char* argv[])
     //     what the coinbase OP_RETURN claims
     //   - calls tracker.add(share) — attempt_verify runs later in think()
     work_source->set_create_share_fn(
-        [p2p_node_raw](const std::vector<unsigned char>& full_coinbase,
+        [p2p_node_raw, auto_ratchet](const std::vector<unsigned char>& full_coinbase,
                        const std::vector<uint8_t>&        header_80b,
                        const core::stratum::JobSnapshot&  job,
                        const std::vector<unsigned char>& payout_script)
@@ -1038,6 +1086,14 @@ int main(int argc, char* argv[])
             // ── Call into btc::create_local_share ──
             // v35 path: dispatches internally based on share_version arg.
             // No merged_addrs (BTC v35 has no merged mining).
+            // Pillar 1: live share version from AutoRatchet (the EXCLUSIVE
+            // tracker lock is already held above). create_local_share
+            // dispatches on this: <=35 -> V35 gentx path, >=36 -> V36 path
+            // (P2SH donation + decayed PPLNS). This is how v36_active reaches
+            // generate_share_transaction for locally created shares.
+            auto [voted_ver, voted_desired] = auto_ratchet->get_share_version(
+                p2p_node_raw->tracker(), job.prev_share_hash);
+
             uint256 share_hash;
             try {
                 share_hash = btc::create_local_share(
@@ -1077,8 +1133,8 @@ int main(int argc, char* argv[])
                     /* frozen_merkle_branches*/ job.frozen_ref.frozen_merkle_branches,
                     /* frozen_witness_root */   job.frozen_ref.frozen_witness_root,
                     /* frozen_merged_cb_info */ job.frozen_ref.frozen_merged_coinbase_info,
-                    /* share_version */         35,
-                    /* desired_version */       35);
+                    /* share_version */         voted_ver,
+                    /* desired_version */       voted_desired);
             } catch (const std::exception& e) {
                 LOG_WARNING << "[BTC-CREATE-SHARE] threw: " << e.what();
                 return uint256::ZERO;
