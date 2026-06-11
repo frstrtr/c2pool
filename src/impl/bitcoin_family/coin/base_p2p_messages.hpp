@@ -19,6 +19,19 @@
 #include <core/message.hpp>
 #include <core/message_macro.hpp>
 
+// READWRITE collision guard.
+// The C2POOL_SERIALIZE_METHODS bodies below rely on core/pack.hpp's READWRITE
+// contract (formatter.action(stream, ...)). btclibs/serialize.h, pulled
+// transitively into some translation units, re-#defines READWRITE to the legacy
+// (s, ser_action) contract and can win by include order, breaking every body here
+// ("use of undeclared identifier 's' / 'ser_action'" on macOS arm64 / Linux).
+// Re-assert the core contract so this header is include-order-independent; mirrors
+// btc/coin/p2p_messages.hpp, whose include chain keeps the core macro active.
+#ifdef READWRITE
+#  undef READWRITE
+#endif
+#define READWRITE(...) formatter.action(stream, __VA_ARGS__)
+
 namespace bitcoin_family
 {
 namespace coin
