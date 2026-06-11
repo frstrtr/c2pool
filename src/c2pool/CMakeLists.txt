@@ -148,6 +148,7 @@ target_link_libraries(c2pool-btc
     c2pool_merged_mining
     core
     ltc
+    ltc_coin  # ltc OBJECT lib pulls in protocol handlers needing ltc::coin::{Mutable,}Transaction ctors
     btc
     btc_stratum
     nlohmann_json::nlohmann_json

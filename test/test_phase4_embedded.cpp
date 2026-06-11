@@ -20,7 +20,7 @@
 /// 15.  HeaderChain::get_header returns correct entry for tip
 /// 16.  block_rel_height via HeaderChain: genesis depth = 1
 /// 17.  block_rel_height via HeaderChain: unknown hash → 0
-/// 18.  MiningInterface::set_embedded_node accepts CoinNodeInterface*
+/// 18.  MiningInterface::set_coin_node accepts core::coin::ICoinNode*
 /// 19.  refresh_work with embedded node populates cached template
 /// 20.  refresh_work falls back to RPC when embedded node is null
 
@@ -31,6 +31,7 @@
 #include <impl/ltc/coin/mempool.hpp>
 #include <impl/ltc/coin/transaction.hpp>
 #include <core/web_server.hpp>
+#include <impl/ltc/coin/coin_node.hpp>
 #include <core/address_validator.hpp>
 
 #include <string>
@@ -312,19 +313,21 @@ TEST(Phase4ChainDepthTest, UnknownHashReturnsNoEntry) {
 
 TEST(Phase4MiningInterfaceTest, SetEmbeddedNodeAcceptsNull) {
     core::MiningInterface mi(/*testnet=*/false, nullptr, c2pool::address::Blockchain::LITECOIN);
-    EXPECT_NO_THROW(mi.set_embedded_node(nullptr));
+    EXPECT_NO_THROW(mi.set_coin_node(nullptr));
 }
 
 TEST(Phase4MiningInterfaceTest, SetEmbeddedNodeAcceptsMock) {
     core::MiningInterface mi(false, nullptr, c2pool::address::Blockchain::LITECOIN);
     MockCoinNode mock;
-    EXPECT_NO_THROW(mi.set_embedded_node(&mock));
+    ltc::coin::CoinNode node(&mock, /*rpc=*/nullptr);
+    EXPECT_NO_THROW(mi.set_coin_node(&node));
 }
 
 TEST(Phase4MiningInterfaceTest, RefreshWorkWithEmbeddedNodePopulatesTemplate) {
     core::MiningInterface mi(false, nullptr, c2pool::address::Blockchain::LITECOIN);
     MockCoinNode mock;
-    mi.set_embedded_node(&mock);
+    ltc::coin::CoinNode node(&mock, /*rpc=*/nullptr);
+    mi.set_coin_node(&node);
 
     EXPECT_NO_THROW(mi.refresh_work());
 

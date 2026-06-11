@@ -42,9 +42,7 @@ using AddressValidationResult = c2pool::address::AddressValidationResult;
 using BlockchainAddressValidator = c2pool::address::BlockchainAddressValidator;
 
 // Forward declarations for optional coin daemon integration (avoid layering violation)
-namespace ltc { namespace coin { class NodeRPC; } }
-namespace ltc { namespace coin { class CoinNodeInterface; } }
-namespace ltc { namespace interfaces { struct Node; } }
+namespace core { namespace coin { struct ICoinNode; } }
 
 namespace core {
 
@@ -649,11 +647,9 @@ public:
     void set_payout_manager(c2pool::payout::PayoutManager* manager) { m_payout_manager_ptr = manager; }
     c2pool::payout::PayoutManager* get_payout_manager_ptr() const { return m_payout_manager_ptr; }
 
-    // Wire a live coin-daemon RPC connection so getblocktemplate/submitblock use real data
-    void set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Node* coin = nullptr);
-    // Wire an embedded coin node (Phase 4) — used instead of RPC when set.
-    // refresh_work() will call node->getwork(); block submissions relay via on_block_relay.
-    void set_embedded_node(ltc::coin::CoinNodeInterface* node);
+    // Wire the per-coin node (embedded and/or RPC) behind the agnostic seam.
+    // refresh_work() calls get_work_view(); submissions go via submit_block_hex().
+    void set_coin_node(core::coin::ICoinNode* node);
     // Fetch a fresh block template from the coin daemon and cache it
     void refresh_work();
     // Return the most recently cached block template (empty json if unavailable)
@@ -965,11 +961,8 @@ private:
     // Payout system integration
     c2pool::payout::PayoutManager* m_payout_manager_ptr = nullptr;
 
-    // Real coin daemon connection (replaces mock LitecoinRpcClient)
-    ltc::coin::NodeRPC*          m_coin_rpc       = nullptr;
-    ltc::interfaces::Node*       m_coin_node      = nullptr;
-    // Phase 4: embedded coin node (preferred over RPC when set)
-    ltc::coin::CoinNodeInterface* m_embedded_node = nullptr;
+    // Per-coin node behind the agnostic seam (embedded and/or RPC, decided coin-side)
+    core::coin::ICoinNode*       m_coin_node      = nullptr;
     // io_context for scheduling async verification timers
     boost::asio::io_context*     m_context        = nullptr;
     std::thread::id              m_main_thread_id;          // set by set_io_context()
@@ -1485,9 +1478,8 @@ class WebServer
     // Payout system integration
     c2pool::payout::PayoutManager* payout_manager_ptr_ = nullptr;
 
-    // Optional coin daemon RPC (enables real getblocktemplate + submitblock)
-    ltc::coin::NodeRPC*    m_coin_rpc_  = nullptr;
-    ltc::interfaces::Node* m_coin_node_ = nullptr;
+    // Per-coin node behind the agnostic seam (enables getblocktemplate + submitblock)
+    core::coin::ICoinNode* m_coin_node_ = nullptr;
     
 public:
     WebServer(net::io_context& ioc, const std::string& address, uint16_t port, bool testnet = false);
@@ -1530,10 +1522,8 @@ public:
     void set_explorer_enabled(bool enabled);
     void set_explorer_url(const std::string& url);
 
-    // Wire a live coin-daemon RPC connection for block template generation
-    void set_coin_rpc(ltc::coin::NodeRPC* rpc, ltc::interfaces::Node* coin = nullptr);
-    // Wire an embedded coin node (Phase 4 — preferred over RPC when set)
-    void set_embedded_node(ltc::coin::CoinNodeInterface* node);
+    // Wire the per-coin node (embedded and/or RPC) behind the agnostic seam
+    void set_coin_node(core::coin::ICoinNode* node);
     // Forward block-found callback to the underlying MiningInterface
     void set_on_block_submitted(std::function<void(const std::string&, int)> fn);
     // Forward P2P block relay callback to the underlying MiningInterface
