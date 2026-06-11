@@ -24,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        coin: [ltc, doge, dash, btc]
+        coin: [ltc, doge, dash, btc, dgb, bch]
     steps:
       - uses: actions/checkout@v6
 
