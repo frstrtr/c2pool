@@ -46,12 +46,6 @@
 #include <impl/ltc/coin/block.hpp>
 #include <impl/ltc/node.hpp>
 #include <impl/ltc/messages.hpp>
-// NOTE: must follow node.hpp/messages.hpp. coin_node.hpp pulls in
-// btclibs/serialize.h, which #undefs READWRITE and redefines it to the
-// (s, ser_action, ...) form. Included earlier, the MESSAGE_FIELDS macros in
-// messages.hpp expand against that wrong READWRITE and fail to compile under
-// AppleClang/arm64 ("use of undeclared identifier s / ser_action").
-#include <impl/ltc/coin/coin_node.hpp>
 #include <impl/ltc/config.hpp>
 
 // Chain seed discovery
@@ -1508,10 +1502,6 @@ int main(int argc, char* argv[]) {
             // ── Coin node: embedded (Phase 4) or RPC (legacy) ─────────────────
             ltc::interfaces::Node  coin_node;
             std::unique_ptr<ltc::coin::NodeRPC> node_rpc;
-            // P2 WorkView seam: web_server holds a core::coin::ICoinNode*; the
-            // concrete ltc::coin::CoinNode owns the embedded/rpc decision + the
-            // full WorkData coin-side. Declared before web_server so it outlives it.
-            std::unique_ptr<ltc::coin::CoinNode> coin_iface;
 
             // Phase 4 embedded objects (alive for the duration of integrated mode)
             std::unique_ptr<ltc::coin::HeaderChain>     embedded_chain;
@@ -1981,14 +1971,10 @@ int main(int argc, char* argv[]) {
 
             // Wire live coin-daemon RPC so getblocktemplate/submitblock use real data
             if (!embedded_ltc) {
-                coin_iface = std::make_unique<ltc::coin::CoinNode>(
-                    /*embedded*/nullptr, /*rpc*/node_rpc.get());
-                web_server.set_coin_node(coin_iface.get());
+                web_server.set_coin_rpc(node_rpc.get(), &coin_node);
             } else if (embedded_broadcaster && embedded_chain) {
                 // Wire embedded node + header-sync callback (now that web_server is alive)
-                coin_iface = std::make_unique<ltc::coin::CoinNode>(
-                    /*embedded*/embedded_node.get(), /*rpc*/node_rpc.get());
-                web_server.set_coin_node(coin_iface.get());
+                web_server.set_embedded_node(embedded_node.get());
 
                 // Wire block verification for embedded mode
                 auto* mi = web_server.get_mining_interface();
@@ -7164,16 +7150,12 @@ int main(int argc, char* argv[]) {
             solo_node_rpc->connect(NetService(rpc_host, static_cast<uint16_t>(rpc_port)),
                                    rpc_user + ":" + rpc_pass);
 
-            // P2 WorkView seam: own the CoinNode before solo_server so it outlives it.
-            auto solo_coin_iface = std::make_unique<ltc::coin::CoinNode>(
-                /*embedded*/nullptr, /*rpc*/solo_node_rpc.get());
-
             // Create a minimal web server for solo mining (Stratum only)
             core::WebServer solo_server(ioc, http_host, 8083,
                                        settings->m_testnet, nullptr, blockchain);
 
             // Wire coin daemon so solo Stratum gets live GBT + submitblock
-            solo_server.set_coin_node(solo_coin_iface.get());
+            solo_server.set_coin_rpc(solo_node_rpc.get(), &solo_coin_node);
 
             // Configure payout system for solo server
             solo_server.set_payout_manager(payout_manager.get());
