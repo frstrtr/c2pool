@@ -145,7 +145,7 @@ struct PPLNSEntry {
     std::vector<unsigned char> script;      // payout script (variable-length)
 };
 
-class DensePPLNSRing {
+class DensePPLNSWindow {
 public:
     static constexpr uint64_t DECAY_PRECISION = 40;
     static constexpr uint64_t DECAY_SCALE = uint64_t(1) << DECAY_PRECISION;
@@ -244,7 +244,7 @@ public:
 };
 
 // ── Head-Level Incremental PPLNS ─────────────────────────────────────────
-// Maintains a DensePPLNSRing + cached CumulativeWeights per active head.
+// Maintains a DensePPLNSWindow + cached CumulativeWeights per active head.
 // When verifying consecutive shares along a chain:
 //   1. rebuild() at first share's parent: O(chain_len) — one hash map walk
 //   2. extend() for each subsequent share: O(1) ring push + O(chain_len) dense recompute
@@ -252,7 +252,7 @@ public:
 // vs current: O(N × chain_len) random hash map ops — ~10x faster per op.
 
 class HeadPPLNS {
-    DensePPLNSRing m_ring;
+    DensePPLNSWindow m_ring;
     CumulativeWeights m_cached;
     bool m_dirty{true};
 
@@ -306,7 +306,7 @@ public:
 
     bool valid() const { return !m_ring.empty(); }
     int32_t window_size() const { return m_ring.size(); }
-    const DensePPLNSRing& ring() const { return m_ring; }
+    const DensePPLNSWindow& ring() const { return m_ring; }
 };
 
 // --- ShareTracker ---
