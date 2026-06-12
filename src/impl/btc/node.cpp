@@ -12,10 +12,10 @@
 #include <iomanip>
 #include <random>
 
-// Static members for DensePPLNSRing precomputed decay table
-std::vector<uint64_t> btc::DensePPLNSRing::s_decay_table;
-uint64_t btc::DensePPLNSRing::s_decay_per = 0;
-bool btc::DensePPLNSRing::s_table_initialized = false;
+// Static members for DensePPLNSWindow precomputed decay table
+std::vector<uint64_t> btc::DensePPLNSWindow::s_decay_table;
+uint64_t btc::DensePPLNSWindow::s_decay_per = 0;
+bool btc::DensePPLNSWindow::s_table_initialized = false;
 
 // Helper: read current RSS from /proc/self/status (Linux only)
 static long get_rss_mb() {
