@@ -1,5 +1,25 @@
 # V37 MRR Roundabout Round-Buffer — implementation notes (WIP for review)
 
+## ARCHIVE LANES (AR-OQ1..5 resolved) — EXECUTED 2026-06-12
+
+Lane classes per c2pool-v37-archive-pyramid.md v1.0: half_life=0 is the
+lambda=1 archive sentinel (all factors exactly Q_ONE, scaled==raw, headroom
+guard inapplicable); window_bins=0 is the infinite-window sentinel (never
+evict; mirrored in ReferenceLane). DecayTables::shift_at(age) extends the
+epoch-shift table on demand by the same iterated truncating multiply —
+deterministic — covering unbounded bucket ages in no-evict lanes; all three
+shift sites (rebuild/cascade/evict) route through it. The L>=3 cascade now
+has its gated debut: the archive test runs L=3 through the FULL every-push
+reference gate (cascade residual is exactly zero at lambda=1), asserts
+raw_total == sum(pushed) forever, acc_total == raw_total << FRAC_BITS, and
+digest/proofs unchanged; a reputation-lane test (decaying, infinite window,
+L=2) exercises deep-age shift extension under the gate. Debug note: the
+first archive gate failure was a REFERENCE bug (ReferenceLane lacked the
+no-evict guard and silently dropped folded buckets) — production code was
+exact against raw truth throughout. Suite: 1,629,525 checks, 0 failures
+(-O2 and ASan/UBSan). Hierarchical digest hook (AR-OQ2 nested roots) and
+cold tier (AR-OQ4) are integration wiring.
+
 ## ORIGIN-BIN REWORK (T-OQ1) — EXECUTED 2026-06-12
 
 The ratified origin-bin temporal model is now THE implementation on this

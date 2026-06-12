@@ -135,7 +135,7 @@ struct ReferenceLane {
             for (u64 i = 0; i < p.rollup && !levels[k].empty(); ++i) {
                 Bucket c = levels[k].front();
                 levels[k].pop_front();
-                u64 f = tab.epoch_shift[(B - c.epoch_tag) / p.epoch_bins];
+                u64 f = tab.shift_at((B - c.epoch_tag) / p.epoch_bins);
                 if (i == 0) b.bin_lo = c.bin_lo;
                 b.bin_hi = c.bin_hi;
                 b.scaled_sum += c.scaled_sum.mul_q(f);
@@ -153,6 +153,7 @@ struct ReferenceLane {
     }
 
     void evict_old() {
+        if (p.window_bins == 0) return;   // infinite window (archive) — mirror
         for (;;) {
             std::size_t best = SIZE_MAX;
             for (std::size_t k = 0; k < levels.size(); ++k) {
@@ -174,7 +175,7 @@ struct ReferenceLane {
                 out[s.miner] += U256::from_u128(s.w_scaled);
         for (const auto& lvl : levels)
             for (const auto& bkt : lvl) {
-                u64 f = tab.epoch_shift[(B - bkt.epoch_tag) / p.epoch_bins];
+                u64 f = tab.shift_at((B - bkt.epoch_tag) / p.epoch_bins);
                 for (const auto& e : bkt.comp)
                     out[e.miner] += e.scaled.mul_q(f);
             }
@@ -702,6 +703,98 @@ static void test_vesting() {
     CHECK(!(c.digest(test_key) == d.digest(test_key)));
 }
 
+// AR-OQ1: archive lanes (lambda = 1, infinite window, L >= 3) and
+// reputation lanes (decaying, infinite window, unbounded bucket ages).
+static void test_archive_lanes() {
+    // ARCHIVE: no decay, never evict, three levels — the L>=3 cascade
+    // debuts here, where its re-framing residual is exactly zero, so the
+    // full every-push reference gate applies.
+    LaneParams a;
+    a.window_bins = 0;        // infinite
+    a.half_life = 0;          // lambda = 1
+    a.fine_bins = 8;
+    a.rollup = 4;
+    a.level_caps = {8, 12};   // L = 3
+    a.epoch_bins = 32;
+    a.n_ctx = 2;
+    a.journal_depth = 16;
+    a.vest_threshold_shares = 0;
+    Lane lane(a);
+    ReferenceLane ref(a);
+    Driver drv(2718);
+    u128 pushed = 0;
+    bool cascaded = false;
+    for (int i = 0; i < 6000; ++i) {
+        MinerId m; u64 w, b;
+        drv.step(a, m, w, b);
+        lane.push(m, w, 0, b);
+        ref.push(m, w, 0, b);
+        pushed += w;
+        if (lane.acc() != ref.scan_acc()) {
+            ++g_failures;
+            std::printf("FAIL archive: acc != reference at push %d\n", i);
+            auto sc = ref.scan_acc();
+            for (const auto& [mm, av] : lane.acc()) {
+                U256 rv = sc.count(mm) ? sc[mm] : U256();
+                if (!(av == rv))
+                    std::printf("  miner %u lane=%s ref=%s\n", mm,
+                                av.hex().c_str(), rv.hex().c_str());
+            }
+            std::printf("  lane: open=%zu l0=%zu l1=%zu | ref: open=%zu l0=%zu l1=%zu\n",
+                        lane.open_bins().size(), lane.levels()[0].size(),
+                        lane.levels()[1].size(), ref.open.size(),
+                        ref.levels[0].size(), ref.levels[1].size());
+            return;
+        }
+        ++g_checks;
+        if (!lane.levels()[1].empty()) cascaded = true;
+    }
+    CHECK(cascaded);                          // L2 actually exercised
+    CHECK(lane.raw_total() == pushed);        // never evicts: exact forever
+    // lambda = 1 exactness: scaled state IS raw state (<< FRAC_BITS)
+    CHECK(lane.acc_total() == U256::from_u128(lane.raw_total()).shl(FRAC_BITS));
+    CHECK(lane.decayed_total() == lane.acc_total());  // head factor = 1.0
+    // digest + proofs work unchanged on archive lanes
+    bytes32 root = lane.digest(test_key);
+    MinerId m0 = lane.acc().begin()->first;
+    bytes32 leaf; Lane::MerkleProof proof;
+    CHECK(lane.acc_proof(m0, test_key, leaf, proof));
+    CHECK(Lane::verify_proof(root, leaf, proof));
+
+    // REPUTATION: decaying, infinite window, single bucket level — bucket
+    // ages grow past the initial epoch_shift table and exercise the
+    // deterministic on-demand extension; gate holds every push at L = 2.
+    LaneParams r;
+    r.window_bins = 0;
+    r.half_life = 8;
+    r.fine_bins = 4;
+    r.rollup = 4;
+    r.level_caps = {100000};   // outermost cap is not load-bearing
+    r.epoch_bins = 16;
+    r.n_ctx = 2;
+    r.journal_depth = 8;
+    r.vest_threshold_shares = 0;
+    Lane rl(r);
+    ReferenceLane rr(r);
+    XorShift64 rng(31415);
+    u64 bin = 100;
+    for (int i = 0; i < 3000; ++i) {
+        if (rng.range(1, 3) == 1) bin += 1;   // fast clock: deep ages
+        MinerId m = static_cast<MinerId>(rng.range(0, 4));
+        u64 w = rng.range(1, 1000000);
+        rl.push(m, w, 0, bin);
+        rr.push(m, w, 0, bin);
+        if (rl.acc() != rr.scan_acc()) {
+            ++g_failures;
+            std::printf("FAIL reputation: acc != reference at push %d\n", i);
+            return;
+        }
+        ++g_checks;
+    }
+    // ages reached: (bin-100)/E epochs >> initial max_epochs(=4)
+    CHECK((bin - 100) / r.epoch_bins > 8);
+}
+
 int main() {
     test_sha256();
     test_fixed_point();
@@ -721,6 +814,7 @@ int main() {
     test_digest_canonical_identity();
     test_merkle_proofs();
     test_vesting();
+    test_archive_lanes();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

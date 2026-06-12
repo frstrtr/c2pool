@@ -155,13 +155,36 @@ struct DecayTables {
 
     std::vector<u64> decay;     // decay[d]   = lambda^d,    Q62, d in [0, span]
     std::vector<u64> inv_decay; // inv_decay[j] = lambda^-j, Q62, j in [0, E)
-    std::vector<u64> epoch_shift; // epoch_shift[i] = lambda^(E*i), Q62
+    mutable std::vector<u64> epoch_shift; // lambda^(E*i), Q62 — extendable
+
+    // Bucket ages are unbounded for no-evict (archive/reputation) lanes:
+    // extend the epoch-shift table on demand by the same iterated truncating
+    // multiplication that built it — deterministic on every node (§8.2).
+    u64 shift_at(u64 age) const {
+        if (half_life == 0) return Q_ONE;            // archive: lambda = 1
+        while (age >= epoch_shift.size())
+            epoch_shift.push_back(
+                mul_q64(epoch_shift.back(), decay[epoch_len]));
+        return epoch_shift[age];
+    }
 
     void init(u64 half_life_, u64 epoch_len_, u64 max_depth, u64 max_epochs) {
-        if (half_life_ == 0 || epoch_len_ == 0)
-            throw std::invalid_argument("v37: zero decay parameter");
+        if (epoch_len_ == 0)
+            throw std::invalid_argument("v37: zero epoch length");
         half_life = half_life_;
         epoch_len = epoch_len_;
+
+        // half_life == 0 is the ARCHIVE sentinel (AR-OQ1): lambda = 1, no
+        // decay. All factors are exactly 1.0; scaled == raw; headroom guard
+        // does not apply (the sequence is constant by definition).
+        if (half_life == 0) {
+            decay_per = Q_ONE;
+            inv_per = Q_ONE;
+            decay.assign(max_depth + 1, Q_ONE);
+            inv_decay.assign(epoch_len, Q_ONE);
+            epoch_shift.assign(max_epochs + 1, Q_ONE);
+            return;
+        }
 
         // V36-lineage per-step factor at Q62:
         //   decay_per = 1.0 - ln2/half_life  (first-order, exactly as V36's

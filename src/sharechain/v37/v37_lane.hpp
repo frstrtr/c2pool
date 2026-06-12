@@ -31,11 +31,12 @@ namespace v37 {
 using MinerId = std::uint32_t;
 
 struct LaneParams {
-    u64 window_bins = 576;       // W: ~24 h at LTC 2.5-min bins (T-OQ3 default)
+    u64 window_bins = 576;       // W (~24 h LTC); 0 = INFINITE (archive/
+                                 // reputation lanes, AR-OQ1: never evict)
     u64 fine_bins = 64;          // open-bin horizon (Present); must exceed n_ctx
     u64 rollup = 8;              // bins per level-1 bucket (band-aligned)
     std::vector<u64> level_caps = {80};  // bucket counts for levels >= 1
-    u64 half_life = 144;         // bins (= W/4 default)
+    u64 half_life = 144;         // bins (= W/4); 0 = NO DECAY (archive)
     u64 epoch_bins = 256;        // E (needs lambda^-(E-1) < 4: E <~ 2*HL)
     u64 n_ctx = 2;               // receipt context window, bins (RDWR N_CTX)
     u64 journal_depth = 64;      // D (OQ-7)
@@ -88,7 +89,7 @@ public:
             throw std::invalid_argument(
                 "v37: fine horizon must exceed the receipt context window "
                 "(receipts must always land in open bins)");
-        if (p.window_bins < p.fine_bins + p.rollup)
+        if (p.window_bins != 0 && p.window_bins < p.fine_bins + p.rollup)
             throw std::invalid_argument("v37: window must exceed fine+rollup");
         if (p.level_caps.empty())
             throw std::invalid_argument("v37: at least one bucket level");
@@ -99,7 +100,7 @@ public:
         // decay[] covers query depths [0,E) and rebuild/insert depths up to
         // E + fine + n_ctx; epoch_shift[] covers the max bucket age.
         u64 max_depth = p.epoch_bins + p.fine_bins + p.n_ctx + 2;
-        u64 max_epochs = p.window_bins / p.epoch_bins + 4;
+        u64 max_epochs = p.window_bins / p.epoch_bins + 4;  // shift_at extends
         m_tab.init(p.half_life, p.epoch_bins, max_depth, max_epochs);
         m_levels.resize(p.level_caps.size());
     }
@@ -306,8 +307,7 @@ public:
         }
         for (const auto& lvl : m_levels) {
             for (const auto& bkt : lvl) {
-                u64 age = (B_new - bkt.epoch_tag) / m_p.epoch_bins;
-                u64 f = m_tab.epoch_shift[age];
+                u64 f = m_tab.shift_at((B_new - bkt.epoch_tag) / m_p.epoch_bins);
                 for (const auto& e : bkt.comp) {
                     U256 c = e.scaled.mul_q(f);
                     m_acc[e.miner] += c;
@@ -401,8 +401,7 @@ private:
             for (u64 i = 0; i < m_p.rollup && !m_levels[k].empty(); ++i) {
                 Bucket child = m_levels[k].front();
                 m_levels[k].pop_front();
-                u64 age = (m_B - child.epoch_tag) / m_p.epoch_bins;
-                u64 f = m_tab.epoch_shift[age];
+                u64 f = m_tab.shift_at((m_B - child.epoch_tag) / m_p.epoch_bins);
                 if (i == 0) b.bin_lo = child.bin_lo;
                 b.bin_hi = child.bin_hi;
                 b.scaled_sum += child.scaled_sum.mul_q(f);
@@ -422,8 +421,10 @@ private:
         }
     }
 
-    // (3) evict whole buckets fully older than the window (time-true OQ-1)
+    // (3) evict whole buckets fully older than the window (time-true OQ-1);
+    // window_bins == 0 => infinite window: archive lanes never evict.
     void evict_old() {
+        if (m_p.window_bins == 0) return;
         for (;;) {
             std::size_t best = SIZE_MAX;
             for (std::size_t k = 0; k < m_levels.size(); ++k) {
@@ -437,8 +438,7 @@ private:
                 return;                            // still inside the window
             Bucket b = m_levels[best].front();
             m_levels[best].pop_front();
-            u64 age = (m_B - b.epoch_tag) / m_p.epoch_bins;
-            u64 f = m_tab.epoch_shift[age];
+            u64 f = m_tab.shift_at((m_B - b.epoch_tag) / m_p.epoch_bins);
             Op op; op.type = Op::Type::Evict; op.level_index = best;
             for (const auto& e : b.comp) {
                 U256 sub = e.scaled.mul_q(f);
