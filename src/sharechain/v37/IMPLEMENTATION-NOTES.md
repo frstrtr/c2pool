@@ -1,6 +1,164 @@
 # V37 MRR Roundabout Round-Buffer — implementation notes (WIP for review)
 
-Branch: `v37/mrr-roundabout-buffer`. Spec: `c2pool-v37-mrr-roundabout-buffer.md` v1.0
+## Merkle digest (2026-06-12, OQ-M5 resolved) — lite-client proofs
+
+The lane digest is now the root of a domain-separated Merkle tree over the
+same canonical leaves (leaf = sha256d(0x00||payload), interior =
+sha256d(0x01||L||R), odd promoted; fixed order: header leaf with geometry/
+position/counts/L0 sums, acc leaves in canonical-identity order, bucket
+leaves level-by-level oldest-first). `Lane::acc_proof()` produces a log-size
+inclusion proof for one miner's accumulator; static `Lane::verify_proof()`
+is the stateless lite-client verifier (kilobytes end-to-end via parent-chain
+SPV -> OP_RETURN -> THE root -> lane root -> leaf). Same mechanism makes
+per-band bucket raw_work individually provable for market settlement.
+Tested: proof round-trip for every miner, tamper/index/root-freshness
+rejection. Suite: 100,509 checks, 0 failures (-O2 and ASan/UBSan).
+
+## Formal review pass (2026-06-12, fourth commit) — 7-angle review, 8 fixes
+
+A structured multi-angle review (line-scan, replaced-behavior audit vs V36,
+contract tracing, reuse/simplification/efficiency, altitude) confirmed the
+three earlier fixes and surfaced new defects. Fixed in this commit:
+
+1. **Rewind over a rebuild boundary** (consensus split, confirmed by
+   experiment): rewinding onto the rebuild-triggering push succeeded without
+   undoing the rebuild — restored state was in the new frame while honest
+   peers that never saw the orphan stayed in the old frame. Fix: a
+   RebuildBoundary sentinel journaled at every rebuild; rewind refuses to
+   land on the rebuild-triggering push (caller takes the full-rebuild path);
+   journal trim preserves an adjacent sentinel.
+2. **kind-255 raw_script unbound to identity**: `valid()` now requires
+   `canonicalize_script(raw_script) == pay` for RAW (enforces the hash
+   binding AND the one-canon rule — template scripts smuggled under kind 255
+   fail), rejects raw_script on template kinds, and validates payload widths
+   (20/32) for every ScriptRef incl. attribution and aux.
+3. **Geometry validation gaps**: constructor now refuses window < C0
+   (previously: deterministic mid-push crash), empty level_caps, and inner
+   level caps < R (previously: empty-deque UB on cascade).
+4. **add_lane exception safety**: Lane constructed before directory insert —
+   a geometry throw no longer bricks the chain id with a null entry.
+5. **Public epoch_rebuild() misuse**: throws off the positional boundary
+   (previously: B > next_pos, u64 underflow, OOB table reads).
+6. **Zero-work shares rejected**: push(w_raw=0) created a zero acc entry the
+   digest committed but undo_push erased — rewind was not bit-exact.
+7. **aux count bound**: valid() caps aux at 0xffff so the canonical u16
+   count field can never contradict the serialized entries.
+8. **Lane geometry digest-committed**: W/C0/R/half_life/level_caps are now
+   part of the digest preimage — parameter mismatch between nodes surfaces
+   as an immediate attributable digest difference. Dead consensus surface
+   removed (unused append_u32, free mul_q, U256::lo128).
+
+Post-fix: **100,464 checks, 0 failures** (-O2 and ASan/UBSan), including
+regressions for every fix above.
+
+### Review findings deferred to integration (not fixed here)
+
+- **Donation split (IMPORTANT)**: V36 splits each share's weight via the
+  65535-donation scheme; v37 has no equivalent. The integration adapter MUST
+  define donation handling — e.g. split w_raw at the adapter into a miner
+  push and a donation-descriptor push (integer rule to be specified as
+  consensus), or carry donation in the descriptor. Unresolved = donation
+  outputs silently unpaid after migration.
+- **Backward slide / multi-head**: V36 `slide_backward`/per-head `HeadPPLNS`
+  have no direct v37 API. Multi-head = one Lane instance per competing head
+  (~130 KiB each at default geometry); deep verification needs a
+  rebuild-from-tracker constructor (O(W) push replay — same cost class as
+  V36 `rebuild()`). Needs caller-shaped API at integration.
+- **att (uint288) -> w_raw (u64) adapter** must assert/clamp (already
+  flagged; review re-confirmed nothing in-module guards it).
+- **Authority share messaging (V36 carry-forward, IMPORTANT)**: V36 embeds
+  authority messages in shares' message_data — consensus-carried
+  (ref_hash/PoW-protected), validated in share_check (bad envelope = share
+  REJECTED), typed (incl. EMERGENCY and TRANSITION_SIGNAL — the channel a
+  V37 activation itself would ride). See src/impl/<coin>/share_messages.hpp.
+  This module reflects only PRESENCE at the lowest temporal level (L0 flag
+  bit L0F_AUTHORITY_MSG, annotation-only, set by the adapter after
+  share_check validation); payloads stay in the share store and join by
+  pos. OQ-10 resolved (2026-06-12): the V36 authority key set
+  (DONATION_AUTHORITY_PUBKEYS) carries forward UNCHANGED for V37.0 —
+  share_check reuses the existing envelope validation verbatim; rotation is
+  a V37.x validity-rule change. OQ-11 resolved (2026-06-12): fold-bounded
+  visibility accepted — FLAG_PERSISTENT imposes no buffer/consensus
+  obligation; pinning is an optional view-layer feature. No open design
+  questions remain anywhere in the V37 corpus.
+- **Efficiency backlog** (semantics-neutral): journal push-count counter
+  instead of per-push O(|journal|) scans; drop dead Bucket copies in fold
+  journal ops (only Evict undo reads op.bucket); payout_map emplace_hint or
+  vector return (documented O(n) is currently O(n log n)); digest streaming
+  into the incremental SHA ctx + per-call id_key memoization;
+  raw_work_in_span lower_bound on ordered deques. Also consider deriving
+  m_cover / m_acc_total / m_l0 sums instead of hand-maintaining (drift-proof
+  by construction; the L0 sums are digest leaves, so derivation in digest()
+  is the safer shape).
+- **raw_work_in_span semantics**: buckets straddling the span edge are
+  excluded (bucket-granular by design) and L0-vs-folded timing changes
+  answers for unaligned bands — settlement bands MUST align to bucket/epoch
+  boundaries (the market doc already assumes epoch-aligned bands); API doc
+  updated, consider an aligned-band-only API at integration.
+- **Reuse divergence risks for CI**: this module is the 3rd script-template
+  classifier (vs core/address_utils.cpp x2), the 7th copy of the LN2_MICRO
+  decay derivation, and a 2nd big-int (U256 vs base_uint). Integration
+  should add cross-implementation agreement tests (same inputs -> same
+  outputs) and a digest byte-layout golden test pinning the serialization
+  independently of these helpers before any swap to core/pack.hpp idioms.
+
+## Full reassessment pass 2 (2026-06-12, third commit) — C-1, consensus-critical
+
+**C-1: lane digest keyed by node-local intern ids.** `MinerIntern` assigns
+dense u32 ids at first *global* sighting; with multiple lanes the cross-lane
+interleaving of first sightings is node-local (wall-clock dependent), so two
+honest nodes assign different ids to the same miners. `digest()` serialized
+acc in id order with raw id values (and `comp_hash` embedded ids), so two
+honest nodes produced different digests for identical lane state — a chain
+split under the consensus-committed digest (OQ-4). Payouts were never
+affected (ids resolve to descriptors); only digest bytes.
+
+Root cause is the SPEC: §8.5 says "acc in miner-id order". Erratum filed in
+the design doc (v1.1): consensus serialization must be in **canonical
+payout-descriptor identity order** with the 32-byte identity key (S-3) as
+the serialized name — intern ids must never appear in consensus bytes.
+
+Fix: `Lane::digest(resolver)` + `comp_hash(bucket, resolver)` sort and
+serialize by `MinerIntern::key(id)` (identity_key, SHA256d of the identity
+preimage); `Roundabout::lane_digest(chain)` is the production entry point.
+Regression: two Roundabouts fed identical per-lane sequences under different
+cross-lane interleavings — intern ids diverge, lane digests must not.
+Post-fix: **100,448 checks, 0 failures** (-O2 and ASan/UBSan).
+
+Docs re-verified in the same pass (geometry sums, half-life coverage, epoch
+growth, tail-density claims all check out); doc errata E-1..E-5 listed in
+the design doc v1.1 revision note.
+
+## Reassessment pass (2026-06-12, second commit)
+
+A full fresh-eyes re-audit of the consensus paths (re-deriving every range
+bound rather than trusting comments) found and fixed two real defects that
+the original 100k-check run could not see because both were self-consistent
+between the fast path and the reference:
+
+1. **Unguarded u64 wrap in `inv_decay` generation.** The inverse table
+   requires `lambda^-(E-1) < 4.0` (roughly `E <= 2*half_life`); geometries
+   violating it silently wrapped — lane and reference shared the wrapped
+   table, so the bit-exact gate passed on a mathematically wrong curve. The
+   generator now throws on any non-increase (wrap detection); two test
+   geometries violated the ratio and were corrected; a regression test pins
+   the throw. The ratified default geometry (E/HL = 1.896) was never
+   affected.
+2. **`rewind()` left the landing push's folds applied.** One push() call
+   journals `[Folds][Push][Evicts]`; the undo loop stopped at the d-th Push
+   without popping its own preceding folds, so a rewind landing exactly on a
+   fold-triggering share restored "after the fold" instead of "before the
+   share". The original digest test passed only by alignment luck. Fixed in
+   `rewind()` and in the journal trim (which now keeps the kept-oldest
+   push's folds); regression-tested by forcing a fold at the rewind boundary
+   plus a 50-round randomized snapshot/push-k/rewind-k digest sweep.
+
+Post-fix: **100,444 checks, 0 failures** (-O2 and ASan/UBSan). Lesson
+folded into the suite: the reference-equality gate proves fast==reference,
+not fast==intended-math — table generation and rewind now have their own
+direct oracles (monotonicity/throw, digest-restore sweeps).
+
+Branch: `fable/v37-mrr-buffer`. Spec: `c2pool-v37-mrr-roundabout-buffer.md` v1.0
 (all OQ/S decisions resolved). Module: `src/sharechain/v37/`, header-only,
 `namespace v37`, stdlib-only — compiles and tests standalone with
 `g++ -std=c++20`, no conan/boost/btclibs dependency.
