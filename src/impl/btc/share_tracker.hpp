@@ -2726,10 +2726,15 @@ private:
                                         tier_name = "T1.5:retro";
                                     }
                                 }
-                                // Tier 2: normalize P2WPKH→P2PKH for merged
-                                // chain compatibility. P2TR/P2WSH → empty → skipped.
+                                // F1 (Option A; mirror of ltc 8ca17954): default
+                                // merged-weight emission key = RAW parent script
+                                // (== p2pool address_key == share.new_script), matching
+                                // the payout key. normalize_script_for_merged stays the
+                                // Tier-1.5 lookup PROBE only (above); keying emission by
+                                // the normalized P2WPKH->P2PKH form was the merged-payout
+                                // accounting divergence.
                                 if (weight_key.empty())
-                                    weight_key = normalize_script_for_merged(parent_script);
+                                    weight_key = parent_script;
                             }
                         }
                         else
