@@ -226,57 +226,78 @@ public:
         return true;
     }
 
-    // ── digest (§8.5, OQ-4) — canonical, consensus-committed ──────────────
+    // ── digest (§8.5, OQ-4 + OQ-M5) — Merkle root, consensus-committed ────
     // CONSENSUS: intern ids are NODE-LOCAL (assigned at first global
     // sighting, which interleaves differently across lanes on different
-    // nodes). The digest therefore serializes miners by their CANONICAL
-    // identity key (PayoutDescriptor identity, 32 bytes), supplied by the
-    // resolver, and sorts by those bytes — never by raw intern id. The
-    // spec's "acc in miner-id order" wording is corrected by erratum to
-    // "canonical payout-descriptor order".
+    // nodes). All consensus bytes use the CANONICAL identity key
+    // (PayoutDescriptor identity, 32 bytes) supplied by the resolver, sorted
+    // by those bytes — never raw intern ids.
+    //
+    // OQ-M5 (resolved): the digest is the root of a Merkle tree over the
+    // canonical leaves, so lite clients can verify one accumulator entry
+    // (message-TTL budget) or one bucket's raw work (market settlement band)
+    // with a log-size proof against the on-chain commitment. Tree rule:
+    //   leaf node     = sha256d(0x00 || leaf payload)
+    //   interior node = sha256d(0x01 || left || right)   (domain-separated)
+    //   odd node      = promoted unchanged (no duplication ambiguity)
+    // Leaf order (fixed): [0] header leaf (geometry, B, next_pos, counts,
+    // L0 sums); then acc leaves in canonical-identity order; then bucket
+    // leaves level-by-level, oldest -> newest.
     template <typename Resolver>  // bytes32 resolver(MinerId)
     bytes32 digest(Resolver&& id_key) const {
-        std::vector<std::uint8_t> buf;
-        append_bytes(buf, "V37L", 4);
-        // Lane geometry is consensus state: committing it makes a parameter
-        // mismatch (e.g. divergent half_life) an immediate, attributable
-        // digest difference instead of unexplained weight drift.
-        append_u64(buf, m_p.window);
-        append_u64(buf, m_p.c0);
-        append_u64(buf, m_p.rollup);
-        append_u64(buf, m_p.half_life);
-        append_u64(buf, static_cast<u64>(m_p.level_caps.size()));
-        for (u64 c : m_p.level_caps) append_u64(buf, c);
-        append_u64(buf, m_B);
-        append_u64(buf, m_next_pos);
-        append_u64(buf, static_cast<u64>(m_acc.size()));
-        {
-            std::vector<std::pair<bytes32, const U256*>> rows;
-            rows.reserve(m_acc.size());
-            for (const auto& [m, a] : m_acc) rows.emplace_back(id_key(m), &a);
-            std::sort(rows.begin(), rows.end(),
-                      [](const auto& a, const auto& b) { return a.first < b.first; });
-            for (const auto& [k, a] : rows) {
-                buf.insert(buf.end(), k.begin(), k.end());
-                append_u256(buf, *a);
+        return merkle_root(build_leaves(id_key));
+    }
+
+    // Inclusion proof for one miner's accumulator leaf (lite-client TTL
+    // verification). Returns false if the miner has no acc entry.
+    struct MerkleProof {
+        u64 leaf_count = 0;
+        u64 index = 0;
+        std::vector<bytes32> path;  // siblings bottom-up; promote-odd levels
+                                    // contribute no entry (structure is
+                                    // derivable from leaf_count + index)
+    };
+    template <typename Resolver>
+    bool acc_proof(MinerId m, Resolver&& id_key, bytes32& leaf_out,
+                   MerkleProof& proof_out) const {
+        if (!m_acc.count(m)) return false;
+        auto leaves = build_leaves(id_key);
+        // locate the miner's acc leaf: header is leaf 0; acc leaves follow
+        // in canonical order — recompute its leaf hash and find it.
+        bytes32 key = id_key(m);
+        std::vector<std::uint8_t> payload;
+        append_bytes(payload, "V37A", 4);
+        payload.insert(payload.end(), key.begin(), key.end());
+        append_u256(payload, m_acc.at(m));
+        bytes32 target = leaf_hash(payload);
+        u64 idx = 0;
+        for (; idx < leaves.size(); ++idx)
+            if (leaves[idx] == target) break;
+        if (idx == leaves.size()) return false;
+        leaf_out = target;
+        proof_out = make_proof(leaves, idx);
+        return true;
+    }
+
+    // Stateless verifier (what a lite client runs against the committed
+    // root): recomputes the path using only leaf_count/index for structure.
+    static bool verify_proof(const bytes32& root, const bytes32& leaf,
+                             const MerkleProof& p) {
+        bytes32 h = leaf;
+        u64 idx = p.index, size = p.leaf_count;
+        std::size_t used = 0;
+        if (idx >= size || size == 0) return false;
+        while (size > 1) {
+            bool odd_last = (size & 1) && idx == size - 1;
+            if (!odd_last) {
+                if (used >= p.path.size()) return false;
+                const bytes32& sib = p.path[used++];
+                h = (idx & 1) ? interior_hash(sib, h) : interior_hash(h, sib);
             }
+            idx /= 2;
+            size = (size + 1) / 2;
         }
-        // level-ring headers incl. per-ring raw_sum (F-1 leaves)
-        append_u64(buf, static_cast<u64>(m_l0.size()));
-        append_u256(buf, m_l0_scaled_sum);
-        append_u128(buf, m_l0_raw_sum);
-        for (const auto& lvl : m_levels) {
-            append_u64(buf, static_cast<u64>(lvl.size()));
-            for (const auto& b : lvl) {       // per-bucket leaves
-                append_u64(buf, b.pos_lo);
-                append_u64(buf, b.pos_hi);
-                append_u128(buf, b.raw_work);
-                append_u64(buf, b.epoch_tag);
-                auto ch = comp_hash(b, id_key);
-                buf.insert(buf.end(), ch.begin(), ch.end());
-            }
-        }
-        return sha256d(buf);
+        return used == p.path.size() && h == root;
     }
 
     // ── OQ-2 exact epoch rebuild, exposed for tests/reference checks ──────
@@ -512,6 +533,115 @@ private:
     static void append_u256(std::vector<std::uint8_t>& b, const U256& x) {
         for (int i = 0; i < 4; ++i) append_u64(b, x.v[i]);
     }
+    // ── Merkle digest machinery (OQ-M5) ───────────────────────────────────
+    static bytes32 leaf_hash(const std::vector<std::uint8_t>& payload) {
+        std::vector<std::uint8_t> b;
+        b.reserve(payload.size() + 1);
+        b.push_back(0x00);
+        b.insert(b.end(), payload.begin(), payload.end());
+        return sha256d(b);
+    }
+    static bytes32 interior_hash(const bytes32& l, const bytes32& r) {
+        std::uint8_t b[65];
+        b[0] = 0x01;
+        std::copy(l.begin(), l.end(), b + 1);
+        std::copy(r.begin(), r.end(), b + 33);
+        return sha256d(b, 65);
+    }
+    static bytes32 merkle_root(std::vector<bytes32> level) {
+        // never empty: build_leaves always emits the header leaf
+        while (level.size() > 1) {
+            std::vector<bytes32> next;
+            next.reserve((level.size() + 1) / 2);
+            std::size_t i = 0;
+            for (; i + 1 < level.size(); i += 2)
+                next.push_back(interior_hash(level[i], level[i + 1]));
+            if (i < level.size()) next.push_back(level[i]);  // promote odd
+            level = std::move(next);
+        }
+        return level[0];
+    }
+    static MerkleProof make_proof(const std::vector<bytes32>& leaves, u64 idx) {
+        MerkleProof p;
+        p.leaf_count = static_cast<u64>(leaves.size());
+        p.index = idx;
+        std::vector<bytes32> level = leaves;
+        while (level.size() > 1) {
+            bool odd_last = (level.size() & 1) && idx == level.size() - 1;
+            if (!odd_last) p.path.push_back(level[idx ^ 1]);
+            std::vector<bytes32> next;
+            next.reserve((level.size() + 1) / 2);
+            std::size_t i = 0;
+            for (; i + 1 < level.size(); i += 2)
+                next.push_back(interior_hash(level[i], level[i + 1]));
+            if (i < level.size()) next.push_back(level[i]);
+            level = std::move(next);
+            idx /= 2;
+        }
+        return p;
+    }
+
+    // Canonical leaf list — the fixed order every conforming node produces.
+    template <typename Resolver>
+    std::vector<bytes32> build_leaves(Resolver&& id_key) const {
+        std::vector<bytes32> leaves;
+        u64 bucket_total = 0;
+        for (const auto& lvl : m_levels) bucket_total += lvl.size();
+        leaves.reserve(1 + m_acc.size() + bucket_total);
+        {   // [0] header leaf: geometry (consensus parameters — a mismatch
+            // becomes an attributable digest difference), position state,
+            // counts, and the L0 ring sums (F-1 leaves).
+            std::vector<std::uint8_t> h;
+            append_bytes(h, "V37H", 4);
+            append_u64(h, m_p.window);
+            append_u64(h, m_p.c0);
+            append_u64(h, m_p.rollup);
+            append_u64(h, m_p.half_life);
+            append_u64(h, static_cast<u64>(m_p.level_caps.size()));
+            for (u64 c : m_p.level_caps) append_u64(h, c);
+            append_u64(h, m_B);
+            append_u64(h, m_next_pos);
+            append_u64(h, static_cast<u64>(m_acc.size()));
+            append_u64(h, static_cast<u64>(m_l0.size()));
+            append_u256(h, m_l0_scaled_sum);
+            append_u128(h, m_l0_raw_sum);
+            for (const auto& lvl : m_levels)
+                append_u64(h, static_cast<u64>(lvl.size()));
+            leaves.push_back(leaf_hash(h));
+        }
+        {   // acc leaves, canonical-identity order
+            std::vector<std::pair<bytes32, const U256*>> rows;
+            rows.reserve(m_acc.size());
+            for (const auto& [m, a] : m_acc) rows.emplace_back(id_key(m), &a);
+            std::sort(rows.begin(), rows.end(),
+                      [](const auto& a, const auto& b) { return a.first < b.first; });
+            for (const auto& [k, a] : rows) {
+                std::vector<std::uint8_t> b;
+                append_bytes(b, "V37A", 4);
+                b.insert(b.end(), k.begin(), k.end());
+                append_u256(b, *a);
+                leaves.push_back(leaf_hash(b));
+            }
+        }
+        // bucket leaves, level-by-level, oldest -> newest (F-1 settlement
+        // bands provable individually)
+        for (std::size_t k = 0; k < m_levels.size(); ++k) {
+            for (const auto& bkt : m_levels[k]) {
+                std::vector<std::uint8_t> b;
+                append_bytes(b, "V37B", 4);
+                append_u64(b, static_cast<u64>(k));
+                append_u64(b, bkt.pos_lo);
+                append_u64(b, bkt.pos_hi);
+                append_u128(b, bkt.raw_work);
+                append_u64(b, bkt.epoch_tag);
+                auto ch = comp_hash(bkt, id_key);
+                b.insert(b.end(), ch.begin(), ch.end());
+                leaves.push_back(leaf_hash(b));
+            }
+        }
+        return leaves;
+    }
+
     // Composition hash, also in canonical-identity order (see digest()).
     template <typename Resolver>
     static bytes32 comp_hash(const Bucket& b, Resolver&& id_key) {

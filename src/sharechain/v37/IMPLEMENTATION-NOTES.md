@@ -1,5 +1,19 @@
 # V37 MRR Roundabout Round-Buffer — implementation notes (WIP for review)
 
+## Merkle digest (2026-06-12, OQ-M5 resolved) — lite-client proofs
+
+The lane digest is now the root of a domain-separated Merkle tree over the
+same canonical leaves (leaf = sha256d(0x00||payload), interior =
+sha256d(0x01||L||R), odd promoted; fixed order: header leaf with geometry/
+position/counts/L0 sums, acc leaves in canonical-identity order, bucket
+leaves level-by-level oldest-first). `Lane::acc_proof()` produces a log-size
+inclusion proof for one miner's accumulator; static `Lane::verify_proof()`
+is the stateless lite-client verifier (kilobytes end-to-end via parent-chain
+SPV -> OP_RETURN -> THE root -> lane root -> leaf). Same mechanism makes
+per-band bucket raw_work individually provable for market settlement.
+Tested: proof round-trip for every miner, tamper/index/root-freshness
+rejection. Suite: 100,509 checks, 0 failures (-O2 and ASan/UBSan).
+
 ## Formal review pass (2026-06-12, fourth commit) — 7-angle review, 8 fixes
 
 A structured multi-angle review (line-scan, replaced-behavior audit vs V36,

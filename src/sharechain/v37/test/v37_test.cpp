@@ -624,6 +624,46 @@ static void test_review_guards() {
     }
 }
 
+// OQ-M5: Merkle digest — inclusion proofs verify against the root; any
+// tamper (leaf, index, root) fails verification.
+static void test_merkle_proofs() {
+    LaneParams p = small_params();
+    Lane l(p);
+    XorShift64 r(77);
+    for (int i = 0; i < 400; ++i)
+        l.push(static_cast<MinerId>(r.range(0, 9)), r.range(1, 1000000), 0);
+    bytes32 root = l.digest(test_key);
+    int proved = 0;
+    for (const auto& [m, a] : l.acc()) {
+        bytes32 leaf;
+        Lane::MerkleProof proof;
+        CHECK(l.acc_proof(m, test_key, leaf, proof));
+        CHECK(Lane::verify_proof(root, leaf, proof));
+        // tampered leaf fails
+        bytes32 bad = leaf; bad[0] ^= 1;
+        CHECK(!Lane::verify_proof(root, bad, proof));
+        // wrong index fails
+        Lane::MerkleProof p2 = proof;
+        p2.index = (p2.index + 1) % p2.leaf_count;
+        CHECK(!Lane::verify_proof(root, leaf, p2));
+        ++proved;
+    }
+    CHECK(proved >= 5);
+    // proofs remain valid only against the matching root: push one share,
+    // old proofs must fail against the new root
+    bytes32 leaf;
+    Lane::MerkleProof proof;
+    MinerId m0 = l.acc().begin()->first;
+    CHECK(l.acc_proof(m0, test_key, leaf, proof));
+    l.push(m0, 12345, 0);
+    bytes32 root2 = l.digest(test_key);
+    CHECK(!(root2 == root));
+    CHECK(!Lane::verify_proof(root2, leaf, proof));
+    // missing miner: no proof
+    Lane::MerkleProof p3; bytes32 lf3;
+    CHECK(!l.acc_proof(4040404u, test_key, lf3, p3));
+}
+
 int main() {
     test_sha256();
     test_fixed_point();
@@ -640,6 +680,7 @@ int main() {
     test_roundabout();
     test_digest_canonical_identity();
     test_review_guards();
+    test_merkle_proofs();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
