@@ -1,5 +1,32 @@
 # V37 MRR Roundabout Round-Buffer — implementation notes (WIP for review)
 
+## ORIGIN-BIN REWORK (T-OQ1 RATIFIED 2026-06-12) — queued, next sitting
+
+The operator ratified the origin-bin temporal model as THE V37 spec
+(c2pool-v37-the-temporal-levels.md v1.0, normative). The code on this
+branch implements the pre-ratification position-decay model and remains
+the working reference for the shared machinery. Re-indexing checklist:
+
+1. push() gains `bin` (origin mainchain height, committed bytes); validate
+   current-N_CTX <= bin <= current.
+2. Decay index: InvD[bin - B] (B in bin units); head factor lambda^(t-B)
+   with t = current bin. Epoch boundary at t - B == E_bins.
+3. Fold bin-aligned: fine level retains F newest bins; fold bands of R
+   bins (variable event counts; compositions as today).
+4. Window in bins (W_bins); evict whole outermost bin-buckets.
+5. Digest: header gains bin params; bucket leaves carry bin spans (true
+   time bands — market settlement synergy).
+6. Journal/rewind: entries carry bin; rebuild-boundary semantics in bin
+   units; receipts-to-past-open-bin undo is an ordinary delta.
+7. ReferenceLane mirrored; reference gate re-run at full strength; new
+   tests: same-bin-equal-decay, receipt-to-past-bin credit, bin-window
+   eviction, geometry re-derivation (W_bins ~ 576 @ LTC 2.5min/24h,
+   HL_bins = W_bins/4 = 144, E_bins = 256 — proposed, T-OQ3 pending).
+8. Vesting/EMA inputs re-derived (raw_total/cover in bin terms).
+
+Until executed, consumers MUST treat position-decay code as reference-
+only; the spec of record is the ratified doc.
+
 > Naming: the V36 type this module replaces was renamed DensePPLNSRing ->
 > DensePPLNSWindow on master (c2pool PR #87, 98fdacf) — upstream adoption of
 > this design's misnomer call-out. References below use the new name; older
