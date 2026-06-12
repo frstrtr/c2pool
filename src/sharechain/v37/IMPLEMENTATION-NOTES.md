@@ -1,5 +1,34 @@
 # V37 MRR Roundabout Round-Buffer — implementation notes (WIP for review)
 
+## Reassessment pass (2026-06-12, second commit)
+
+A full fresh-eyes re-audit of the consensus paths (re-deriving every range
+bound rather than trusting comments) found and fixed two real defects that
+the original 100k-check run could not see because both were self-consistent
+between the fast path and the reference:
+
+1. **Unguarded u64 wrap in `inv_decay` generation.** The inverse table
+   requires `lambda^-(E-1) < 4.0` (roughly `E <= 2*half_life`); geometries
+   violating it silently wrapped — lane and reference shared the wrapped
+   table, so the bit-exact gate passed on a mathematically wrong curve. The
+   generator now throws on any non-increase (wrap detection); two test
+   geometries violated the ratio and were corrected; a regression test pins
+   the throw. The ratified default geometry (E/HL = 1.896) was never
+   affected.
+2. **`rewind()` left the landing push's folds applied.** One push() call
+   journals `[Folds][Push][Evicts]`; the undo loop stopped at the d-th Push
+   without popping its own preceding folds, so a rewind landing exactly on a
+   fold-triggering share restored "after the fold" instead of "before the
+   share". The original digest test passed only by alignment luck. Fixed in
+   `rewind()` and in the journal trim (which now keeps the kept-oldest
+   push's folds); regression-tested by forcing a fold at the rewind boundary
+   plus a 50-round randomized snapshot/push-k/rewind-k digest sweep.
+
+Post-fix: **100,444 checks, 0 failures** (-O2 and ASan/UBSan). Lesson
+folded into the suite: the reference-equality gate proves fast==reference,
+not fast==intended-math — table generation and rewind now have their own
+direct oracles (monotonicity/throw, digest-restore sweeps).
+
 Branch: `fable/v37-mrr-buffer`. Spec: `c2pool-v37-mrr-roundabout-buffer.md` v1.0
 (all OQ/S decisions resolved). Module: `src/sharechain/v37/`, header-only,
 `namespace v37`, stdlib-only — compiles and tests standalone with

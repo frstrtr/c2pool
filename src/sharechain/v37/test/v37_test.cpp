@@ -227,16 +227,32 @@ static void test_fixed_point() {
 }
 
 // Small geometry exercising every mechanism quickly:
-// W=216 = C0(128) + 11 buckets x 8; E=128; HL=54; D=16.
+// W=256 = C0(128) + 16 buckets x 8; E=128; HL=64 (=W/4); D=16.
+// NOTE: E/HL must keep lambda^-(E-1) < 4.0 (inverse-decay u64 headroom) —
+// the table generator now enforces this (see test_headroom_guard).
 static LaneParams small_params() {
     LaneParams p;
-    p.window = 216;
+    p.window = 256;
     p.c0 = 128;
     p.rollup = 8;
-    p.level_caps = {11};
-    p.half_life = 54;
+    p.level_caps = {16};
+    p.half_life = 64;
     p.journal_depth = 16;
     return p;
+}
+
+static void test_headroom_guard() {
+    // E/HL = 128/54 = 2.37: lambda^-(127) ~ 2^2.35 > 4.0 -> must throw,
+    // never silently wrap the inverse table.
+    LaneParams bad = small_params();
+    bad.half_life = 54;
+    bool threw = false;
+    try { Lane l(bad); } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw);
+    // Ratified default geometry (4096/2160 = 1.896) constructs fine.
+    LaneParams def;
+    Lane ok(def);
+    CHECK(ok.tables().inv_decay.size() == def.epoch_len());
 }
 
 static void test_lane_vs_reference(const LaneParams& p, u64 pushes, u64 seed,
@@ -332,6 +348,52 @@ static void test_digest_and_rewind() {
     for (u64 i = 0; i < p.epoch_len() + 4; ++i) f.push(0, 10, 0);
     CHECK(!f.rewind(8));   // boundary at E crossed 4 pushes ago, only 4 journaled
     CHECK(f.rewind(2));    // shallow rewind still fine
+
+    // Regression: rewind landing exactly on a push that triggered a fold
+    // must undo that fold too (state = before the share arrived).
+    Lane g(p);
+    XorShift64 r5(21);
+    for (int i = 0; i < 200; ++i)
+        g.push(static_cast<MinerId>(r5.range(0, 5)), r5.range(1, 1000000), 0);
+    // Drive L0 to exactly full so the NEXT push folds, staying mid-epoch.
+    while (g.l0().size() != p.c0 ||
+           (g.next_pos() - g.epoch_base()) >= p.epoch_len() - 4)
+        g.push(0, 7, 0);
+    auto snap_fold = g.digest();
+    std::size_t buckets_before = g.levels()[0].size();
+    g.push(1, 99, 0);                       // folds 8 slots, then inserts
+    CHECK(g.levels()[0].size() == buckets_before + 1);
+    CHECK(g.rewind(1));
+    CHECK(g.digest() == snap_fold);          // fold undone with its push
+    CHECK(g.levels()[0].size() == buckets_before);
+
+    // Randomized rewind sweep: snapshot / push k <= D / rewind k must be a
+    // bit-exact no-op wherever it lands in the fold/evict cycle (mid-epoch).
+    Lane h(p);
+    XorShift64 r6(31);
+    for (int i = 0; i < 150; ++i)
+        h.push(static_cast<MinerId>(r6.range(0, 5)), r6.range(1, 1000000), 0);
+    for (int round = 0; round < 50; ++round) {
+        // keep the span clear of the epoch boundary (journal is cleared there)
+        while ((h.next_pos() - h.epoch_base()) >= p.epoch_len() - (p.journal_depth + 2) ||
+               (h.next_pos() - h.epoch_base()) < p.journal_depth)
+            h.push(0, 3, 0);
+        u64 k = r6.range(1, p.journal_depth);
+        auto snap = h.digest();
+        for (u64 i = 0; i < k; ++i)
+            h.push(static_cast<MinerId>(r6.range(0, 5)), r6.range(1, 1000000), 0);
+        CHECK(h.rewind(k));
+        if (!(h.digest() == snap)) {
+            ++g_failures;
+            std::printf("FAIL rewind sweep round %d (k=%llu)\n", round,
+                        (unsigned long long)k);
+            return;
+        }
+        ++g_checks;
+        // replay so rounds keep advancing through fold/evict alignments
+        for (u64 i = 0; i < k; ++i)
+            h.push(static_cast<MinerId>(r6.range(0, 7)), r6.range(1, 1000000), 0);
+    }
 }
 
 static void test_descriptor() {
@@ -403,7 +465,7 @@ static void test_roundabout() {
     Roundabout rb;
     rb.add_lane(1, small_params());
     LaneParams p2 = small_params();
-    p2.window = 108; p2.c0 = 64; p2.level_caps = {6}; p2.half_life = 27;
+    p2.window = 112; p2.c0 = 64; p2.level_caps = {6}; p2.half_life = 32;
     rb.add_lane(2, p2);   // runtime add, different geometry (per-lane params)
     CHECK(rb.lane_count() == 2);
 
@@ -432,6 +494,7 @@ static void test_roundabout() {
 int main() {
     test_sha256();
     test_fixed_point();
+    test_headroom_guard();
     // small geometry: 5+ epochs, constant folding + eviction churn
     test_lane_vs_reference(small_params(), 1500, 1234, "small");
     // default OQ-5 geometry: cross two epoch rebuilds (>8192 pushes)

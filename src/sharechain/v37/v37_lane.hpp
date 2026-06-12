@@ -165,6 +165,20 @@ public:
             case Op::Type::Evict: undo_evict(op); break;
             }
         }
+        // One push() call journals [Folds][Push][Evicts]. The loop above
+        // stops at the d-th Push; any folds IMMEDIATELY preceding it were
+        // triggered by that same share's arrival and must be undone too —
+        // the restored state is "before the share arrived", not "after its
+        // folds". Trailing folds are unambiguous: nothing else sits between
+        // a push's folds and its Push record.
+        while (!m_journal.empty() &&
+               (m_journal.back().type == Op::Type::FoldL0 ||
+                m_journal.back().type == Op::Type::FoldLevel)) {
+            Op op = m_journal.back();
+            m_journal.pop_back();
+            if (op.type == Op::Type::FoldL0) undo_fold_l0(op);
+            else undo_fold_level(op);
+        }
         return true;
     }
 
@@ -255,7 +269,9 @@ private:
 
     void journal_push(Op op) {
         m_journal.push_back(std::move(op));
-        // Trim: keep ops back to (and including) the D-th most recent push.
+        // Trim: keep ops back to (and including) the D-th most recent push,
+        // PLUS that push's immediately preceding folds — rewind(D) must be
+        // able to undo the full push() call it lands on.
         u64 pushes = 0;
         std::size_t keep_from = 0;
         for (std::size_t i = m_journal.size(); i-- > 0;) {
@@ -263,7 +279,12 @@ private:
                 if (++pushes == m_p.journal_depth) { keep_from = i; break; }
             }
         }
-        if (pushes >= m_p.journal_depth && keep_from > 0)
+        if (pushes < m_p.journal_depth || keep_from == 0) return;
+        while (keep_from > 0 &&
+               (m_journal[keep_from - 1].type == Op::Type::FoldL0 ||
+                m_journal[keep_from - 1].type == Op::Type::FoldLevel))
+            --keep_from;
+        if (keep_from > 0)
             m_journal.erase(m_journal.begin(),
                             m_journal.begin() + static_cast<long>(keep_from));
     }

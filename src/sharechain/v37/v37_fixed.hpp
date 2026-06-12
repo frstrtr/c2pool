@@ -161,8 +161,18 @@ struct DecayTables {
 
         inv_decay.assign(epoch_len, 0);
         inv_decay[0] = Q_ONE;
-        for (u64 j = 1; j < epoch_len; ++j)
+        for (u64 j = 1; j < epoch_len; ++j) {
             inv_decay[j] = mul_q64(inv_decay[j - 1], inv_per);
+            // Headroom guard: the true sequence is strictly increasing
+            // (every entry >= 1.0 and inv_per > 1.0), so any non-increase
+            // is a u64 wrap — the lane geometry violates the inverse-decay
+            // headroom (requires lambda^-(E-1) < 4.0, i.e. roughly
+            // epoch_len <= 2 * half_life). Refuse rather than corrupt.
+            if (inv_decay[j] <= inv_decay[j - 1])
+                throw std::invalid_argument(
+                    "v37: epoch_len/half_life ratio overflows inverse-decay "
+                    "headroom (need lambda^-(E-1) < 4.0)");
+        }
 
         if (max_depth < epoch_len)
             throw std::invalid_argument("v37: decay table shorter than epoch");
