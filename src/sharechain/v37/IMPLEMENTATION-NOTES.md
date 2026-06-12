@@ -8,9 +8,11 @@ with T = vest_threshold_shares x (raw_total/cover), Q62 via `U256::ratio_q`
 payout-construction input; `vest_threshold_shares` (default W/2 = 4320,
 0 = disabled) is a LaneParams consensus parameter, digest-committed in the
 header leaf. This realizes POOL_HOPPING 7.3.4 on the lane accumulator —
-the separate IncrementalVestingCache plan is retired. Flag V-1: absolute
-threshold (anti-placeholder by design; small miners vest slowly — V37.x
-hashrate-neutral variant if telemetry warrants). Suite: 100,567 checks.
+the separate IncrementalVestingCache plan is retired. V-1 resolved (operator,
+2026-06-12): absolute threshold KEPT for V37.0 (anti-placeholder by
+design; small-miner slow-vesting is the accepted launch trade);
+hashrate-neutral variant deferred to V37.x behind telemetry. Suite:
+100,567 checks.
 
 ## Merkle digest (2026-06-12, OQ-M5 resolved) — lite-client proofs
 
