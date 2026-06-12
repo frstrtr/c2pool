@@ -2293,11 +2293,12 @@ public:
             }
         }
 
-        // Default key: parent script normalized for merged-chain compatibility.
-        // (F1 will change this to the RAW parent script to match p2pool's
-        //  address_key = share.new_script; normalize stays the Tier-1.5 probe only.)
+        // Default key: RAW parent script, matching p2pool's
+        // address_key = share.new_script.  normalize_script_for_merged stays a
+        // Tier-1.5 lookup PROBE only (above); keying emission by the normalized
+        // P2PKH form was the merged-payout accounting divergence (F1, Option A).
         if (weight_key.empty())
-            weight_key = normalize_script_for_merged(parent_script);
+            weight_key = parent_script;
         if (weight_key.empty())
             return delta;
 
