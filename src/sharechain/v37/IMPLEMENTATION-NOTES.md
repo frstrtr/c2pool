@@ -1,5 +1,10 @@
 # V37 MRR Roundabout Round-Buffer — implementation notes (WIP for review)
 
+> Naming: the V36 type this module replaces was renamed DensePPLNSRing ->
+> DensePPLNSWindow on master (c2pool PR #87, 98fdacf) — upstream adoption of
+> this design's misnomer call-out. References below use the new name; older
+> commit messages on this branch predate the rename.
+
 ## Vesting wired (2026-06-12, operator-resolved)
 
 V37.0 payouts use vested weights: `vesting_factor()` = min(1, decayed/T)
@@ -266,6 +271,6 @@ runtime lane add/remove, cross-lane identity intern.
 4. **gtest port**: the suite uses a standalone CHECK harness so it runs
    without GTest; trivially portable to the repo's gtest idiom if preferred.
 5. **Caller migration**: `HeadPPLNS`/`think()` integration (replacing
-   `DensePPLNSRing` per the spec's "subsumes" map) is intentionally not
+   `DensePPLNSWindow` per the spec's "subsumes" map) is intentionally not
    started — the module is per-coin-agnostic and caller-shaped for it
    (push/rewind/payout_map mirror slide/rebuild/compute_v36_weights).
