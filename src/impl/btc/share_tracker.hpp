@@ -2255,11 +2255,13 @@ public:
                     delta.total_donation_weight = att * static_cast<uint32_t>(obj->m_donation);
                     auto raw_script = get_share_script(obj);
                     if (raw_script.empty()) return;
-                    // Normalize P2WPKH→P2PKH for merged chain compatibility.
-                    // P2TR/P2WSH → empty → skipped (unconvertible).
-                    auto script = normalize_script_for_merged(raw_script);
-                    if (script.empty()) return;
-                    delta.weights[script] = att * static_cast<uint32_t>(65535 - obj->m_donation);
+                    // F1 (Option A; mirror of ltc 8ca17954): key merged weight by the
+                    // RAW parent script (== p2pool address_key == share.new_script),
+                    // matching the payout key. p2pool credits raw weight to every V36
+                    // share regardless of script type (data.py compute_merged_payout_hash);
+                    // keying by the normalized P2WPKH->P2PKH form (and skipping
+                    // unconvertible P2TR/P2WSH) was the merged-payout key/pay divergence.
+                    delta.weights[raw_script] = att * static_cast<uint32_t>(65535 - obj->m_donation);
                 });
                 return delta;
             },
@@ -2649,15 +2651,17 @@ private:
                     auto att = chain::target_to_average_attempts(target);
                     auto raw_script = get_share_script(obj);
                     if (raw_script.empty()) return;
-                    // Normalize P2WPKH→P2PKH for merged chain compatibility.
-                    // P2TR/P2WSH → empty → skipped (unconvertible).
-                    auto script = normalize_script_for_merged(raw_script);
-                    if (script.empty()) return;
-                    // Only set total_weight/donation for convertible scripts
-                    // (matching p2pool: unconvertible → (1, {}, 0, 0))
+                    // F1 (Option A; mirror of ltc 8ca17954): key merged weight by the
+                    // RAW parent script (== p2pool address_key == share.new_script),
+                    // matching the payout key and compute_merged_payout_hash. p2pool
+                    // credits raw weight + full total to every V36 share regardless of
+                    // script type (data.py get_v36_merged_weights:2756 -- if address_key
+                    // is None: address_key = share.new_script). Keying by the normalized
+                    // P2WPKH->P2PKH form and skipping unconvertible P2TR/P2WSH was the
+                    // key/pay divergence F1 removes.
                     delta.total_weight = att * 65535;
                     delta.total_donation_weight = att * static_cast<uint32_t>(obj->m_donation);
-                    delta.weights[script] = att * static_cast<uint32_t>(65535 - obj->m_donation);
+                    delta.weights[raw_script] = att * static_cast<uint32_t>(65535 - obj->m_donation);
                 });
                 return delta;
             },
@@ -2726,10 +2730,15 @@ private:
                                         tier_name = "T1.5:retro";
                                     }
                                 }
-                                // Tier 2: normalize P2WPKH→P2PKH for merged
-                                // chain compatibility. P2TR/P2WSH → empty → skipped.
+                                // F1 (Option A; mirror of ltc 8ca17954): default
+                                // merged-weight emission key = RAW parent script
+                                // (== p2pool address_key == share.new_script), matching
+                                // the payout key. normalize_script_for_merged stays the
+                                // Tier-1.5 lookup PROBE only (above); keying emission by
+                                // the normalized P2WPKH->P2PKH form was the merged-payout
+                                // accounting divergence.
                                 if (weight_key.empty())
-                                    weight_key = normalize_script_for_merged(parent_script);
+                                    weight_key = parent_script;
                             }
                         }
                         else
