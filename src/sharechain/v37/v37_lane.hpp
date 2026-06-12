@@ -61,6 +61,9 @@ constexpr std::uint32_t L0F_LATE          = 0x20;  // entropy-licensed late
 // licensed depth committed in share bytes)
 constexpr std::uint32_t L0F_UNCLE         = 0x40;  // reserved: uncle-DAG
 // fallback path (same accounting shape, discounted push)
+constexpr std::uint32_t L0F_RECEIPT       = 0x80;  // real-difficulty work
+// receipt (c2pool-v37-work-receipts.md: stale work self-carried by the
+// miner's next share as a PoW certificate — THE Layer -1, primary path)
 constexpr std::uint32_t L0F_MINER_MSG     = 0x10;  // permissionless miner
 // message present (c2pool-v37-miner-messages.md v1.1: plaintext envelope,
 // derived signing key announced in the share binds to the payout identity
