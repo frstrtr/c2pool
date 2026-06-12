@@ -12,3 +12,4 @@ add_library(sharechain OBJECT ${SHARECHAIN_SOURCE})
 target_link_libraries(sharechain core)
 
 add_subdirectory(test)
+add_subdirectory(v37/test)

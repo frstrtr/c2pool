@@ -119,7 +119,10 @@ function parseNewShape(obj: Record<string, unknown>): PplnsSnapshot {
   const snap: PplnsSnapshot = {
     totalPrimary: totalPrimary > 0
       ? totalPrimary
-      : miners.reduce((s, m) => s + m.amount, 0),
+      // Clamp the fallback sum: amounts are individually finite, but a
+      // sum of values near Number.MAX_VALUE overflows to Infinity, which
+      // breaks the "totalPrimary is finite" invariant (parse-properties #204).
+      : num(miners.reduce((s, m) => s + m.amount, 0)),
     mergedChains,
     mergedTotals,
     schemaVersion: str(obj.schema_version) ?? '1.0',
@@ -258,7 +261,9 @@ function parseLegacyShape(obj: Record<string, unknown>): PplnsSnapshot {
     entries.push({ address: addr, amount, merged });
   }
 
-  const totalPrimary = entries.reduce((s, e) => s + e.amount, 0);
+  // num() clamps an overflowed sum (values near Number.MAX_VALUE) back to a
+  // finite 0 rather than Infinity; see parse-properties #204.
+  const totalPrimary = num(entries.reduce((s, e) => s + e.amount, 0));
   entries.sort((a, b) => b.amount - a.amount);
 
   const miners: PplnsMiner[] = entries.map((e) => ({
