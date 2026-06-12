@@ -77,9 +77,10 @@ regressions for every fix above.
   pos. OQ-10 resolved (2026-06-12): the V36 authority key set
   (DONATION_AUTHORITY_PUBKEYS) carries forward UNCHANGED for V37.0 —
   share_check reuses the existing envelope validation verbatim; rotation is
-  a V37.x validity-rule change. Still open: OQ-11 — FLAG_PERSISTENT
-  semantics vs the roll-up pyramid (display-layer; decide at view
-  implementation).
+  a V37.x validity-rule change. OQ-11 resolved (2026-06-12): fold-bounded
+  visibility accepted — FLAG_PERSISTENT imposes no buffer/consensus
+  obligation; pinning is an optional view-layer feature. No open design
+  questions remain anywhere in the V37 corpus.
 - **Efficiency backlog** (semantics-neutral): journal push-count counter
   instead of per-push O(|journal|) scans; drop dead Bucket copies in fold
   journal ops (only Evict undo reads op.bucket); payout_map emplace_hint or
