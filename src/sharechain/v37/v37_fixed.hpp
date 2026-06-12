@@ -96,6 +96,39 @@ struct U256 {
         return out;
     }
 
+    // General left shift (k < 256); callers guarantee no overflow.
+    U256 shl(unsigned k) const {
+        U256 r;
+        unsigned limb = k / 64, bits = k % 64;
+        for (int i = 3; i >= 0; --i) {
+            u64 v_ = 0;
+            int src = i - static_cast<int>(limb);
+            if (src >= 0) {
+                v_ = v[src] << bits;
+                if (bits && src > 0) v_ |= v[src - 1] >> (64 - bits);
+            }
+            r.v[i] = v_;
+        }
+        return r;
+    }
+
+    // floor(num * 2^FRAC_BITS / den) clamped to Q_ONE — the Q62 ratio used
+    // by vesting (§4.3). Deterministic: restoring binary division, truncating
+    // (integer division is already part of the §8.2 consensus toolbox).
+    static u64 ratio_q(const U256& num, const U256& den) {
+        if (den.is_zero() || !(num < den)) return Q_ONE;
+        U256 n = num.shl(FRAC_BITS);   // num < den <= 2^194 head-room safe
+        u64 q = 0;
+        for (int i = static_cast<int>(FRAC_BITS) - 1; i >= 0; --i) {
+            U256 d = den.shl(static_cast<unsigned>(i));
+            if (!(n < d)) {
+                n -= d;
+                q |= u64(1) << i;
+            }
+        }
+        return q;
+    }
+
     std::string hex() const {
         static const char* d = "0123456789abcdef";
         std::string s;

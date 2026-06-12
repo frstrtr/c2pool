@@ -664,6 +664,65 @@ static void test_merkle_proofs() {
     CHECK(!l.acc_proof(4040404u, test_key, lf3, p3));
 }
 
+// Vesting (base doc 4.3): factor in [0, Q_ONE], deterministic, monotone in
+// accumulated work; disabled when vest_threshold_shares == 0; digest commits
+// the parameter.
+static void test_vesting() {
+    // ratio_q unit behavior
+    CHECK(U256::ratio_q(U256(5), U256(10)) == Q_ONE / 2);
+    CHECK(U256::ratio_q(U256(10), U256(10)) == Q_ONE);
+    CHECK(U256::ratio_q(U256(11), U256(10)) == Q_ONE);
+    CHECK(U256::ratio_q(U256(0), U256(10)) == 0);
+    CHECK(U256::ratio_q(U256(1), U256()) == Q_ONE);  // zero den guard
+    CHECK(U256::ratio_q(U256(1), U256(3)) == (u64)((u128(1) << 62) / 3));
+
+    LaneParams p = small_params();
+    p.vest_threshold_shares = 64;     // W/4 of the small geometry
+    Lane l(p);
+    // Miner 1 mines steadily; miner 2 appears late with one share.
+    XorShift64 r(5);
+    for (int i = 0; i < 200; ++i) l.push(1, 1000, 0);
+    l.push(2, 1000, 0);
+    u64 v1 = l.vesting_factor(1), v2 = l.vesting_factor(2);
+    CHECK(v1 == Q_ONE);               // steady miner fully vested
+    CHECK(v2 < Q_ONE / 16);           // newcomer barely vested
+    // vested map <= unvested map, equality for fully-vested
+    auto pm = l.payout_map();
+    auto vm = l.vested_payout_map();
+    CHECK(vm[1] == pm[1].mul_q(Q_ONE));
+    CHECK(vm[2] < pm[2]);
+    // factor grows monotonically as the newcomer keeps mining
+    u64 prev = v2;
+    for (int i = 0; i < 40; ++i) {
+        l.push(2, 1000, 0);
+        u64 now = l.vesting_factor(2);
+        CHECK(now >= prev);
+        prev = now;
+    }
+    // disabled vesting -> identity
+    LaneParams p0 = small_params();
+    p0.vest_threshold_shares = 0;
+    Lane l0(p0);
+    l0.push(7, 123, 0);
+    CHECK(l0.vesting_factor(7) == Q_ONE);
+    CHECK(l0.vested_payout_map()[7] == l0.payout_map()[7].mul_q(Q_ONE));
+    // determinism across nodes: identical sequences -> identical factors
+    Lane a(p), b(p);
+    XorShift64 r1(9), r2(9);
+    for (int i = 0; i < 300; ++i) {
+        a.push(static_cast<MinerId>(r1.range(0, 4)), r1.range(1, 99999), 0);
+        b.push(static_cast<MinerId>(r2.range(0, 4)), r2.range(1, 99999), 0);
+    }
+    for (MinerId m = 0; m <= 4; ++m)
+        CHECK(a.vesting_factor(m) == b.vesting_factor(m));
+    // digest commits the vesting parameter
+    LaneParams pv = small_params();
+    pv.vest_threshold_shares = 128;
+    Lane c(small_params()), d(pv);
+    c.push(1, 100, 0); d.push(1, 100, 0);
+    CHECK(!(c.digest(test_key) == d.digest(test_key)));
+}
+
 int main() {
     test_sha256();
     test_fixed_point();
@@ -681,6 +740,7 @@ int main() {
     test_digest_canonical_identity();
     test_review_guards();
     test_merkle_proofs();
+    test_vesting();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

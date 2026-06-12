@@ -34,6 +34,11 @@ struct LaneParams {
     std::vector<u64> level_caps = {568};  // slot counts for levels >= 1
     u64 half_life = 2160;       // W/4 (OQ-5)
     u64 journal_depth = 64;     // D   (OQ-7)
+    // Vesting (base doc §4.3, wired into V37.0 payouts): a miner's payout
+    // weight is decayed_weight x min(1, decayed_weight / threshold) where
+    // threshold = vest_threshold_shares x (window EMA of share work).
+    // 0 disables vesting (factor 1.0). Consensus parameter: digest-committed.
+    u64 vest_threshold_shares = 4320;  // W/2 default (POOL_HOPPING 7.3.4)
 
     u64 epoch_len() const { return c0; }
     std::size_t levels() const { return 1 + level_caps.size(); }
@@ -162,6 +167,39 @@ public:
         std::map<MinerId, U256> out;
         u64 f = head_decay();
         for (const auto& [m, a] : m_acc) out[m] = a.mul_q(f);
+        return out;
+    }
+
+    // ── vesting (§4.3 — POOL_HOPPING 7.3.4 wired onto the accumulator) ────
+    // factor = min(1.0, decayed_weight / (vest_threshold_shares x EMA share
+    // work)), Q62. The EMA is raw_total / cover — both consensus-maintained
+    // integers, truncating division per §8.2. Hashrate note: the threshold
+    // is ABSOLUTE work by design (defeats placeholder/tenure farming);
+    // see base doc V-1 for the small-miner discussion.
+    u64 vesting_factor(MinerId m) const {
+        if (m_p.vest_threshold_shares == 0 || m_cover == 0) return Q_ONE;
+        u64 ema = static_cast<u64>(m_raw_total / m_cover);
+        if (ema == 0) return Q_ONE;
+        U256 threshold = U256(ema);
+        // ema x vest_shares <= 2^64 x 2^~13: compute via mul_q-free path
+        u64 vs = m_p.vest_threshold_shares;
+        u128 tw = u128(ema) * vs;                  // <= 2^77, exact
+        threshold = U256::from_u128(tw).shl(FRAC_BITS);  // Q62 work units
+        return U256::ratio_q(decayed_weight(m), threshold);
+    }
+
+    // Vested payout map: weight_m = decayed_weight_m x vesting_factor_m.
+    // Normalization at payout construction redistributes non-vested weight
+    // to vested miners automatically (the --redistribute spirit).
+    std::map<MinerId, U256> vested_payout_map() const {
+        std::map<MinerId, U256> out;
+        u64 f = head_decay();
+        for (const auto& [m, a] : m_acc) {
+            U256 dw = a.mul_q(f);
+            u64 vf = (m_p.vest_threshold_shares == 0)
+                         ? Q_ONE : vesting_factor(m);
+            out[m] = dw.mul_q(vf);
+        }
         return out;
     }
 
@@ -598,6 +636,7 @@ private:
             append_u64(h, m_p.c0);
             append_u64(h, m_p.rollup);
             append_u64(h, m_p.half_life);
+            append_u64(h, m_p.vest_threshold_shares);  // §4.3, consensus
             append_u64(h, static_cast<u64>(m_p.level_caps.size()));
             for (u64 c : m_p.level_caps) append_u64(h, c);
             append_u64(h, m_B);

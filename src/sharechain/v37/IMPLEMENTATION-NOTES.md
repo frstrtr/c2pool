@@ -1,5 +1,17 @@
 # V37 MRR Roundabout Round-Buffer — implementation notes (WIP for review)
 
+## Vesting wired (2026-06-12, operator-resolved)
+
+V37.0 payouts use vested weights: `vesting_factor()` = min(1, decayed/T)
+with T = vest_threshold_shares x (raw_total/cover), Q62 via `U256::ratio_q`
+(restoring binary division, truncating). `vested_payout_map()` is the
+payout-construction input; `vest_threshold_shares` (default W/2 = 4320,
+0 = disabled) is a LaneParams consensus parameter, digest-committed in the
+header leaf. This realizes POOL_HOPPING 7.3.4 on the lane accumulator —
+the separate IncrementalVestingCache plan is retired. Flag V-1: absolute
+threshold (anti-placeholder by design; small miners vest slowly — V37.x
+hashrate-neutral variant if telemetry warrants). Suite: 100,567 checks.
+
 ## Merkle digest (2026-06-12, OQ-M5 resolved) — lite-client proofs
 
 The lane digest is now the root of a domain-separated Merkle tree over the
