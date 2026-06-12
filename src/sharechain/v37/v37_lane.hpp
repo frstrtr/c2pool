@@ -50,6 +50,10 @@ struct LaneParams {
 constexpr std::uint32_t L0F_FEE_SHARE     = 0x01;
 constexpr std::uint32_t L0F_STALE_DOA     = 0x02;
 constexpr std::uint32_t L0F_AUTHORITY_MSG = 0x08;
+constexpr std::uint32_t L0F_MINER_MSG     = 0x10;  // permissionless miner
+// message present (c2pool-v37-miner-messages.md: plaintext envelope, sig
+// bound to the payout identity, TTL funded by decayed_weight() — the lane
+// is the budget ledger; the live-message index is view-layer, not here)
 
 // Level-0 slot (SoA in the production layout; AoS here for clarity — the
 // arrays are contiguous std::vector rings either way).
