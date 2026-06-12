@@ -4698,6 +4698,17 @@ nlohmann::json MiningInterface::rest_web_currency_info()
     default:                   result["share_version"] = 36; break;
     }
 
+    // p2pool share version for the current coin — consumed by the
+    // bundled @c2pool/sharechain-explorer to classify share cells.
+    // Dash = v16, LTC/DOGE/BTC = v36.
+    switch (m_blockchain) {
+    case Blockchain::DASH:     result["share_version"] = 16; break;
+    case Blockchain::LITECOIN:
+    case Blockchain::BITCOIN:
+    case Blockchain::DOGECOIN:
+    default:                   result["share_version"] = 36; break;
+    }
+
     return result;
 }
 
