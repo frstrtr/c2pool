@@ -55,6 +55,12 @@ struct LaneParams {
 constexpr std::uint32_t L0F_FEE_SHARE     = 0x01;
 constexpr std::uint32_t L0F_STALE_DOA     = 0x02;
 constexpr std::uint32_t L0F_AUTHORITY_MSG = 0x08;
+constexpr std::uint32_t L0F_LATE          = 0x20;  // entropy-licensed late
+// share (c2pool-v37-ell-late-shares.md: stale work re-entering the linear
+// sequence under a real-difficulty license — THE Layer -1; full credit,
+// licensed depth committed in share bytes)
+constexpr std::uint32_t L0F_UNCLE         = 0x40;  // reserved: uncle-DAG
+// fallback path (same accounting shape, discounted push)
 constexpr std::uint32_t L0F_MINER_MSG     = 0x10;  // permissionless miner
 // message present (c2pool-v37-miner-messages.md v1.1: plaintext envelope,
 // derived signing key announced in the share binds to the payout identity
