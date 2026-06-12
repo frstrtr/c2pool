@@ -1120,8 +1120,23 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
     auto gst_t2 = std::chrono::steady_clock::now(); // after amounts
     // Python: sorted(dests, key=lambda a: (amounts[a], a))[-4000:]
     // = ascending by (amount, script), keep last 4000 (highest amounts)
-    std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs(
-        amounts.begin(), amounts.end());
+    // F11: canonical exclude-then-append donation handling (p2pool data.py
+    // generate_transaction). The per-miner dests list excludes BOTH donation
+    // scripts; a COMBINED_DONATION_SCRIPT-keyed weight folds into the single
+    // donation-last output, and any DONATION_SCRIPT-keyed weight is dropped.
+    const std::vector<unsigned char> combined_donation_script(
+        PoolConfig::COMBINED_DONATION_SCRIPT.begin(), PoolConfig::COMBINED_DONATION_SCRIPT.end());
+    const std::vector<unsigned char> p2pk_donation_script(
+        PoolConfig::DONATION_SCRIPT.begin(), PoolConfig::DONATION_SCRIPT.end());
+    if (auto _dit = amounts.find(combined_donation_script); _dit != amounts.end())
+        donation_amount += _dit->second;
+    std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs;
+    payout_outputs.reserve(amounts.size());
+    for (auto& _kv : amounts) {
+        if (_kv.first == combined_donation_script || _kv.first == p2pk_donation_script)
+            continue;
+        payout_outputs.emplace_back(_kv.first, _kv.second);
+    }
     std::sort(payout_outputs.begin(), payout_outputs.end(),
         [](const auto& a, const auto& b) {
             if (a.second != b.second) return a.second < b.second; // asc by amount
@@ -1704,31 +1719,70 @@ bool share_check(const ShareT& share,
     if (share.m_timestamp > now + 600)
         throw std::invalid_argument("share timestamp is too far in the future");
 
-    // 2. Version counting — AutoRatchet upgrade enforcement
-    // p2pool data.py:1400-1414: version switch validation only at BOUNDARIES
-    // (when share.VERSION != parent.VERSION). Shares that match their parent's
-    // version are always valid — they were correct when created.
-    // Previous code rejected ALL v35 shares retroactively after 95% activation.
+    // 2. Version switch enforcement — canonical 60% weighted switch rule.
+    // p2pool data.py check() (lines 1396-1414): a version BOUNDARY
+    // (share.version != parent.version) is only valid when, in the sampling
+    // window [CHAIN_LENGTH*9/10, CHAIN_LENGTH] behind the PARENT, the new
+    // version holds >= 60% of the PPLNS-WEIGHTED desired-version counts.
+    // The weight is target_to_average_attempts per share — get_desired_version_weights,
+    // matching canonical get_desired_version_counts (data.py:2651) — NOT a flat count.
+    // F10/(b): the prior non-canonical 95%-obsolescence punish is removed; the
+    // canonical 60% switch rule is now the ONLY version gate. AutoRatchet stays
+    // count-based and does not gate peer shares here.
     {
-        auto lookbehind = static_cast<int32_t>(PoolConfig::chain_length());
-        if (tracker.chain.contains(share.m_hash) &&
-            !share.m_prev_hash.IsNull() && tracker.chain.contains(share.m_prev_hash))
+        auto chain_length = static_cast<int32_t>(PoolConfig::chain_length());
+        if (!share.m_prev_hash.IsNull() && tracker.chain.contains(share.m_prev_hash))
         {
-            // Get parent's share version
+            // Parent's share version (the type the incoming share must legally follow)
             int64_t parent_version = 0;
             tracker.chain.get_share(share.m_prev_hash).invoke([&](auto* obj) {
                 parent_version = std::remove_pointer_t<decltype(obj)>::version;
             });
+            int64_t share_ver = share.version;
 
-            // Only enforce version obsolescence at version BOUNDARIES
-            if (share.version != parent_version)
+            auto prev_height = tracker.chain.get_height(share.m_prev_hash);
+            if (prev_height >= chain_length)
             {
-                auto height = tracker.chain.get_height(share.m_hash);
-                if (height >= lookbehind)
+                if (share_ver == parent_version)
                 {
-                    if (tracker.should_punish_version(share.m_hash, share.version, lookbehind))
-                        throw std::invalid_argument("share version too old — newer version has 95%+ activation");
+                    // same version — always valid (correct when created)
                 }
+                else if (share_ver == parent_version + 1)
+                {
+                    // Upgrade by one version: requires >= 60% weighted support in
+                    // window [CHAIN_LENGTH*9/10, CHAIN_LENGTH] behind the parent.
+                    uint32_t window_start = (static_cast<uint32_t>(chain_length) * 9) / 10;
+                    uint32_t window_size  = static_cast<uint32_t>(chain_length) / 10;
+                    auto ancestor = tracker.chain.get_nth_parent_key(share.m_prev_hash, window_start);
+                    auto weights = tracker.get_desired_version_weights(
+                        ancestor, static_cast<int32_t>(window_size));
+
+                    uint288 new_ver_weight;   // weight of shares desiring exactly share_ver
+                    uint288 total_weight;
+                    for (auto& [ver, w] : weights)
+                    {
+                        total_weight = total_weight + w;
+                        if (static_cast<int64_t>(ver) == share_ver)
+                            new_ver_weight = new_ver_weight + w;
+                    }
+                    // Canonical: counts.get(self.VERSION,0) < sum(counts)*60//100
+                    if (new_ver_weight * uint32_t(100) < total_weight * uint32_t(60))
+                        throw std::invalid_argument("switch without enough hash power upgraded");
+                }
+                else if (parent_version == share_ver + 1)
+                {
+                    // Downgrade by one (AutoRatchet deactivation: V35 may follow V36)
+                }
+                else
+                {
+                    throw std::invalid_argument("invalid version jump from "
+                        + std::to_string(parent_version) + " to " + std::to_string(share_ver));
+                }
+            }
+            else if (share_ver == parent_version + 1)
+            {
+                // Not enough history for an upgrade boundary
+                throw std::invalid_argument("switch without enough history");
             }
         }
     }
@@ -2352,8 +2406,23 @@ uint256 create_local_share_v35(
         // V35: no minimum donation enforcement (unlike v36)
         uint64_t donation_amount = (subsidy > sum_amounts) ? (subsidy - sum_amounts) : 0;
 
-        std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs(
-            amounts.begin(), amounts.end());
+        // F11: canonical exclude-then-append donation handling (p2pool data.py
+        // generate_transaction). The per-miner dests list excludes BOTH donation
+        // scripts; a COMBINED_DONATION_SCRIPT-keyed weight folds into the single
+        // donation-last output, and any DONATION_SCRIPT-keyed weight is dropped.
+        const std::vector<unsigned char> combined_donation_script(
+            PoolConfig::COMBINED_DONATION_SCRIPT.begin(), PoolConfig::COMBINED_DONATION_SCRIPT.end());
+        const std::vector<unsigned char> p2pk_donation_script(
+            PoolConfig::DONATION_SCRIPT.begin(), PoolConfig::DONATION_SCRIPT.end());
+        if (auto _dit = amounts.find(combined_donation_script); _dit != amounts.end())
+            donation_amount += _dit->second;
+        std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs;
+        payout_outputs.reserve(amounts.size());
+        for (auto& _kv : amounts) {
+            if (_kv.first == combined_donation_script || _kv.first == p2pk_donation_script)
+                continue;
+            payout_outputs.emplace_back(_kv.first, _kv.second);
+        }
         std::sort(payout_outputs.begin(), payout_outputs.end(),
             [](const auto& a, const auto& b) {
                 if (a.second != b.second) return a.second < b.second;
@@ -2894,8 +2963,23 @@ uint256 create_local_share(
             }
         }
 
-        std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs(
-            amounts.begin(), amounts.end());
+        // F11: canonical exclude-then-append donation handling (p2pool data.py
+        // generate_transaction). The per-miner dests list excludes BOTH donation
+        // scripts; a COMBINED_DONATION_SCRIPT-keyed weight folds into the single
+        // donation-last output, and any DONATION_SCRIPT-keyed weight is dropped.
+        const std::vector<unsigned char> combined_donation_script(
+            PoolConfig::COMBINED_DONATION_SCRIPT.begin(), PoolConfig::COMBINED_DONATION_SCRIPT.end());
+        const std::vector<unsigned char> p2pk_donation_script(
+            PoolConfig::DONATION_SCRIPT.begin(), PoolConfig::DONATION_SCRIPT.end());
+        if (auto _dit = amounts.find(combined_donation_script); _dit != amounts.end())
+            donation_amount += _dit->second;
+        std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs;
+        payout_outputs.reserve(amounts.size());
+        for (auto& _kv : amounts) {
+            if (_kv.first == combined_donation_script || _kv.first == p2pk_donation_script)
+                continue;
+            payout_outputs.emplace_back(_kv.first, _kv.second);
+        }
         std::sort(payout_outputs.begin(), payout_outputs.end(),
             [](const auto& a, const auto& b) {
                 if (a.second != b.second) return a.second < b.second;

@@ -1140,16 +1140,16 @@ public:
                     if (!head_idx) continue;
                     int64_t ts = head_idx->time_seen;
 
-                    // Punish heads: version obsolescence OR naughty (invalid block)
+                    // Punish heads: naughty (invalid block) only.
+                    // F10/(b): the non-canonical 95%-version-obsolescence punish
+                    // is dropped — canonical Phase-4 head-scoring punishes only
+                    // naughty heads. The version gate is the check() 60% weighted
+                    // switch rule (share_check), not head-scoring.
                     int32_t reason = 0;
                     {
-                        auto share_version = chain.get_share(hh).version();
-                        auto lookbehind = static_cast<int32_t>(PoolConfig::chain_length());
-                        if (should_punish_version(hh, share_version, lookbehind))
-                            reason = 1;
                         auto* idx = chain.get_index(hh);
                         if (idx && idx->naughty > 0)
-                            reason = std::max(reason, idx->naughty);
+                            reason = idx->naughty;
                     }
 
                     // p2pool: sort key = (work - min(punish,1)*ata(target), -reason, -time_seen)
@@ -2109,6 +2109,36 @@ public:
         return counts;
     }
 
+    // -- PPLNS-weighted version counting for the consensus 60% switch rule --
+    // Canonical p2pool get_desired_version_counts (data.py:2651) weights each
+    // share by target_to_average_attempts(share.target) — NOT a flat count.
+    // The check()-phase 60% switch rule (share_check step 2) is a consensus gate
+    // and MUST use these weights to stay byte-identical with p2pool. AutoRatchet
+    // and its tail guard deliberately keep the FLAT-COUNT variant above
+    // (count-based per F10 finding #1 — weighting them would shift activation
+    // timing across the soak). Weight = ShareIndex::work (share.hpp).
+    std::map<uint64_t, uint288> get_desired_version_weights(const uint256& share_hash, int32_t lookbehind)
+    {
+        std::map<uint64_t, uint288> weights;
+        if (!chain.contains(share_hash))
+            return weights;
+        auto height = chain.get_height(share_hash);
+        auto actual = std::min(lookbehind, height);
+        if (actual <= 0)
+            return weights;
+
+        auto view = chain.get_chain(share_hash, actual);
+        for (auto [hash, data] : view)
+        {
+            uint64_t dv = 0;
+            data.share.invoke([&](auto* obj) { dv = obj->m_desired_version; });
+            auto* idx = chain.get_index(hash);
+            if (idx)
+                weights[dv] = weights[dv] + idx->work;
+        }
+        return weights;
+    }
+
     // -- Merged mining: per-chain PPLNS weights --
     // For a specific aux chain_id, walk the share chain and accumulate PPLNS
     // weights for V36-signaling shares.  Uses O(log n) skip list.
@@ -2197,6 +2227,100 @@ public:
         return {std::move(result.weights), result.total_weight, result.total_donation_weight};
     }
 
+    // -- merged_weights_delta (F2: single source of truth) --
+    // Unified per-share merged-mining PPLNS weight delta.  Replaces the three
+    // formerly-divergent variants (the compute_merged_payout_hash inline walk,
+    // ensure_v36_skiplist, and per-chain ensure_merged_skiplist).  Mirrors
+    // p2pool MergedWeightsSkipList.get_delta (data.py:1864).
+    //
+    //   chain_id == nullopt : hash / v36 path — no merged-address resolution.
+    //   chain_id has value  : per-chain path — Tier 1 explicit merged_addresses,
+    //                         Tier 1.5 retroactive miner→merged lookup (normalize
+    //                         used only as a lookup PROBE), else the default key.
+    //
+    // Pre-V36 shares count toward window sizing but contribute zero weight
+    // (p2pool returns (1, {}, 0, 0)); total_weight/donation are only set once a
+    // weight key resolves, so unconvertible scripts never inflate the denominator.
+    template <class ShareT>
+    chain::WeightsDelta merged_weights_delta(ShareT* obj, std::optional<uint32_t> chain_id)
+    {
+        chain::WeightsDelta delta;
+        delta.share_count = 1;
+        if (obj->m_desired_version < 36)
+            return delta;
+
+        auto target = chain::bits_to_target(obj->m_bits);
+        auto att = chain::target_to_average_attempts(target);
+        auto parent_script = get_share_script(obj);
+        if (parent_script.empty())
+            return delta;
+
+        std::vector<unsigned char> weight_key;
+        // Tier 1 / 1.5 merged-address resolution — only for chain-keyed skiplists
+        // whose share type carries explicit merged_addresses.
+        if (chain_id.has_value())
+        {
+            if constexpr (requires { obj->m_merged_addresses; })
+            {
+                // Tier 1: explicit merged_addresses for this chain.
+                for (const auto& entry : obj->m_merged_addresses)
+                {
+                    if (entry.m_chain_id == *chain_id)
+                    {
+                        weight_key = make_merged_key(entry.m_script.m_data);
+                        break;
+                    }
+                }
+                // Tier 1.5: retroactive lookup of the same miner's explicit merged
+                // address from their other shares.  Try the raw parent script, then
+                // its normalized P2PKH form (normalize is a lookup PROBE only here).
+                if (weight_key.empty())
+                {
+                    auto table_it = m_miner_merged_addr.find(*chain_id);
+                    if (table_it != m_miner_merged_addr.end())
+                    {
+                        auto miner_it = table_it->second.find(parent_script);
+                        if (miner_it == table_it->second.end())
+                        {
+                            auto norm = normalize_script_for_merged(parent_script);
+                            if (!norm.empty() && norm != parent_script)
+                                miner_it = table_it->second.find(norm);
+                        }
+                        if (miner_it != table_it->second.end())
+                            weight_key = make_merged_key(miner_it->second);
+                    }
+                }
+            }
+        }
+
+        // Default key: RAW parent script, matching p2pool's
+        // address_key = share.new_script.  normalize_script_for_merged stays a
+        // Tier-1.5 lookup PROBE only (above); keying emission by the normalized
+        // P2PKH form was the merged-payout accounting divergence (F1, Option A).
+        if (weight_key.empty())
+            weight_key = parent_script;
+        if (weight_key.empty())
+            return delta;
+
+        delta.total_weight = att * 65535;
+        delta.total_donation_weight = att * static_cast<uint32_t>(obj->m_donation);
+        delta.weights[weight_key] = att * static_cast<uint32_t>(65535 - obj->m_donation);
+        return delta;
+    }
+
+    // Per-hash wrapper: the boilerplate shared by every merged-weight skiplist
+    // lambda — bounds-check the raw chain, then dispatch to merged_weights_delta.
+    chain::WeightsDelta merged_weights_delta_for_hash(
+        const uint256& hash, std::optional<uint32_t> chain_id)
+    {
+        chain::WeightsDelta delta;
+        if (!chain.contains(hash)) return delta;
+        chain.get_share(hash).invoke([&](auto* obj) {
+            delta = merged_weights_delta(obj, chain_id);
+        });
+        return delta;
+    }
+
     // -- compute_merged_payout_hash --
     // Deterministic hash of V36-only PPLNS weight distribution.
     // Committed into V36 shares so peers can verify that the share creator's
@@ -2244,24 +2368,8 @@ public:
         };
         chain::WeightsSkipList raw_sl(
             [this](const uint256& hash) -> chain::WeightsDelta {
-                chain::WeightsDelta delta;
-                if (!chain.contains(hash)) return delta;
-                delta.share_count = 1;
-                chain.get_share(hash).invoke([&](auto* obj) {
-                    if (obj->m_desired_version < 36) return;
-                    auto target = chain::bits_to_target(obj->m_bits);
-                    auto att = chain::target_to_average_attempts(target);
-                    delta.total_weight = att * 65535;
-                    delta.total_donation_weight = att * static_cast<uint32_t>(obj->m_donation);
-                    auto raw_script = get_share_script(obj);
-                    if (raw_script.empty()) return;
-                    // Normalize P2WPKH→P2PKH for merged chain compatibility.
-                    // P2TR/P2WSH → empty → skipped (unconvertible).
-                    auto script = normalize_script_for_merged(raw_script);
-                    if (script.empty()) return;
-                    delta.weights[script] = att * static_cast<uint32_t>(65535 - obj->m_donation);
-                });
-                return delta;
+                // F2: unified merged-weight delta, hash/v36 path (no chain_id).
+                return merged_weights_delta_for_hash(hash, std::nullopt);
             },
             std::move(raw_prev_fn)
         );
@@ -2500,30 +2608,12 @@ public:
         return result;
     }
 
-    // Returns true if shares at `share_version` should be punished because
-    // a newer version has reached the 95% activation threshold.
-    // Python ref: share.check() version_after_check logic
-    bool should_punish_version(const uint256& share_hash, int64_t share_version, int32_t lookbehind)
-    {
-        if (!chain.contains(share_hash))
-            return false;
-        auto counts = get_desired_version_counts(share_hash, lookbehind);
-        auto height = chain.get_height(share_hash);
-        auto actual = std::min(lookbehind, height);
-        if (actual <= 0)
-            return false;
-
-        // Check if any version higher than share_version has >= 95% support
-        for (auto& [ver, count] : counts)
-        {
-            if (static_cast<int64_t>(ver) > share_version)
-            {
-                if (count * 100 >= actual * 95) // 95% threshold
-                    return true;
-            }
-        }
-        return false;
-    }
+    // F10/(b): should_punish_version (the 95%-obsolescence punish) was removed.
+    // It was non-canonical — canonical p2pool check() has no 95% obsolescence
+    // rule; the count-based AutoRatchet plus the 60% weighted switch rule
+    // (share_check step 2) are the only version gates. Keeping it would
+    // punish/score-down shares canonical accepts, breaking the #81 zero-
+    // divergence gate. Head-scoring (Phase 4) now punishes only naughty heads.
 
 private:
     std::vector<stale_callback_t> m_stale_callbacks;
@@ -2640,26 +2730,8 @@ private:
             return;
         m_v36_weights_skiplist.emplace(
             [this](const uint256& hash) -> chain::WeightsDelta {
-                chain::WeightsDelta delta;
-                if (!chain.contains(hash)) return delta;
-                delta.share_count = 1;
-                chain.get_share(hash).invoke([&](auto* obj) {
-                    if (obj->m_desired_version < 36) return;
-                    auto target = chain::bits_to_target(obj->m_bits);
-                    auto att = chain::target_to_average_attempts(target);
-                    auto raw_script = get_share_script(obj);
-                    if (raw_script.empty()) return;
-                    // Normalize P2WPKH→P2PKH for merged chain compatibility.
-                    // P2TR/P2WSH → empty → skipped (unconvertible).
-                    auto script = normalize_script_for_merged(raw_script);
-                    if (script.empty()) return;
-                    // Only set total_weight/donation for convertible scripts
-                    // (matching p2pool: unconvertible → (1, {}, 0, 0))
-                    delta.total_weight = att * 65535;
-                    delta.total_donation_weight = att * static_cast<uint32_t>(obj->m_donation);
-                    delta.weights[script] = att * static_cast<uint32_t>(65535 - obj->m_donation);
-                });
-                return delta;
+                // F2: unified merged-weight delta, hash/v36 path (no chain_id).
+                return merged_weights_delta_for_hash(hash, std::nullopt);
             },
             make_previous_fn()
         );
@@ -2675,112 +2747,8 @@ private:
             chain_id,
             chain::WeightsSkipList(
                 [this, chain_id](const uint256& hash) -> chain::WeightsDelta {
-                    chain::WeightsDelta delta;
-                    if (!chain.contains(hash)) return delta;
-                    delta.share_count = 1;
-                    chain.get_share(hash).invoke([&](auto* obj) {
-                        if (obj->m_desired_version < 36) return;
-                        auto target = chain::bits_to_target(obj->m_bits);
-                        auto att = chain::target_to_average_attempts(target);
-                        // NOTE: total_weight and donation_weight are set AFTER
-                        // convertibility check below.  p2pool returns (1, {}, 0, 0)
-                        // for unconvertible scripts — zero total, zero donation.
-                        // Setting them here would inflate the denominator.
-
-                        std::vector<unsigned char> weight_key;
-                        const char* tier_name = "raw:v35";
-                        // p2pool gates Tier 1 + 1.5 on share.VERSION >= 36.
-                        // V35-format shares always use raw parent script as key,
-                        // even if desired_version >= 36.  This keeps V35 and V36
-                        // weight entries separate per miner during the mixed window.
-                        if constexpr (requires { obj->m_merged_addresses; })
-                        {
-                            tier_name = "T3:skip";
-                            // Tier 1: explicit merged_addresses for this chain
-                            for (const auto& entry : obj->m_merged_addresses)
-                            {
-                                if (entry.m_chain_id == chain_id)
-                                {
-                                    weight_key = make_merged_key(entry.m_script.m_data);
-                                    tier_name = "T1:explicit";
-                                    break;
-                                }
-                            }
-                            // Tier 1.5: retroactive lookup — same miner's
-                            // explicit merged address from their other shares.
-                            // p2pool v0.14.5: try raw, then normalized P2PKH form.
-                            if (weight_key.empty())
-                            {
-                                auto parent_script = get_share_script(obj);
-                                auto table_it = m_miner_merged_addr.find(chain_id);
-                                if (table_it != m_miner_merged_addr.end())
-                                {
-                                    auto miner_it = table_it->second.find(parent_script);
-                                    if (miner_it == table_it->second.end()) {
-                                        auto norm = normalize_script_for_merged(parent_script);
-                                        if (!norm.empty() && norm != parent_script)
-                                            miner_it = table_it->second.find(norm);
-                                    }
-                                    if (miner_it != table_it->second.end()) {
-                                        weight_key = make_merged_key(miner_it->second);
-                                        tier_name = "T1.5:retro";
-                                    }
-                                }
-                                // Tier 2: normalize P2WPKH→P2PKH for merged
-                                // chain compatibility. P2TR/P2WSH → empty → skipped.
-                                if (weight_key.empty())
-                                    weight_key = normalize_script_for_merged(parent_script);
-                            }
-                        }
-                        else
-                        {
-                            // V35-format share: normalize P2WPKH→P2PKH for merged
-                            // chain compatibility. P2TR/P2WSH → empty → skipped.
-                            weight_key = normalize_script_for_merged(get_share_script(obj));
-                        }
-                        // Per-share tier diagnostic
-                        // Log every T1/T1.5/MERGED hit and every 200th otherwise
-                        {
-                            static int s_tier_log_ctr = 0;
-                            bool is_merged = is_merged_key(weight_key);
-                            bool is_p2wpkh = !is_merged && weight_key.size() == 22 &&
-                                             weight_key[0] == 0x00 && weight_key[1] == 0x14;
-                            if (is_merged || is_p2wpkh || s_tier_log_ctr++ % 200 == 0) {
-                                auto to_hex_short = [](const std::vector<unsigned char>& s, size_t n = 20) {
-                                    static const char* H = "0123456789abcdef";
-                                    std::string r; for (size_t i = 0; i < std::min(s.size(), n); ++i) { r += H[s[i]>>4]; r += H[s[i]&0xf]; }
-                                    return r;
-                                };
-                                auto parent_script = get_share_script(obj);
-                                LOG_INFO << "[DOGE-TIER] " << tier_name
-                                         << " chain_id=" << chain_id
-                                         << " ver=" << obj->version
-                                         << " dv=" << obj->m_desired_version
-                                         << " parent=" << to_hex_short(parent_script)
-                                         << " key=" << to_hex_short(weight_key)
-                                         << " bits=0x" << std::hex << obj->m_bits << std::dec;
-                                // For V36 shares, log merged_addresses status
-                                if constexpr (requires { obj->m_merged_addresses; }) {
-                                    LOG_INFO << "[DOGE-TIER]   merged_addrs=" << obj->m_merged_addresses.size()
-                                             << " ver=" << obj->version;
-                                    for (const auto& entry : obj->m_merged_addresses) {
-                                        LOG_INFO << "[DOGE-TIER]   chain_id=" << entry.m_chain_id
-                                                 << " script_len=" << entry.m_script.m_data.size()
-                                                 << " script=" << to_hex_short(entry.m_script.m_data);
-                                    }
-                                }
-                            }
-                        }
-                        // Tier 3: unconvertible — skip, weight redistributed
-                        // p2pool: return (1, {}, 0, 0) — share counts but zero weight
-                        if (weight_key.empty()) return;
-                        // Only set total_weight/donation for convertible scripts
-                        // (matching p2pool MergedWeightsSkipList.get_delta)
-                        delta.total_weight = att * 65535;
-                        delta.total_donation_weight = att * static_cast<uint32_t>(obj->m_donation);
-                        delta.weights[weight_key] = att * static_cast<uint32_t>(65535 - obj->m_donation);
-                    });
-                    return delta;
+                    // F2: unified merged-weight delta, per-chain path.
+                    return merged_weights_delta_for_hash(hash, chain_id);
                 },
                 make_previous_fn()
             )
