@@ -203,8 +203,6 @@ static void test_fixed_point() {
     U256 big = U256::from_u128((u128(0x0123456789abcdefULL) << 64) | 0xfedcba9876543210ULL);
     big += big;  // ensure multi-limb
     CHECK(big.mul_q(Q_ONE) == big);
-    u128 x = (u128(7) << 100) + 12345;
-    CHECK(mul_q(x, Q_ONE) == x);
     CHECK(mul_q64(Q_ONE, Q_ONE) == Q_ONE);
 
     // Table generation: deterministic, monotonic, V36-lineage formula
@@ -357,6 +355,9 @@ static void test_digest_and_rewind() {
     Lane f(p);
     for (u64 i = 0; i < p.epoch_len() + 4; ++i) f.push(0, 10, 0);
     CHECK(!f.rewind(8));   // boundary at E crossed 4 pushes ago, only 4 journaled
+    // REVIEW REGRESSION: rewind landing exactly on the rebuild-triggering
+    // push must refuse — the journal cannot restore the pre-rebuild frame.
+    CHECK(!f.rewind(4));   // d == pushes-since-rebuild, sentinel present
     CHECK(f.rewind(2));    // shallow rewind still fine
 
     // Regression: rewind landing exactly on a push that triggered a fold
@@ -386,7 +387,7 @@ static void test_digest_and_rewind() {
     for (int round = 0; round < 50; ++round) {
         // keep the span clear of the epoch boundary (journal is cleared there)
         while ((h.next_pos() - h.epoch_base()) >= p.epoch_len() - (p.journal_depth + 2) ||
-               (h.next_pos() - h.epoch_base()) < p.journal_depth)
+               (h.next_pos() - h.epoch_base()) < p.journal_depth + 2)
             h.push(0, 3, 0);
         u64 k = r6.range(1, p.journal_depth);
         auto snap = h.digest(test_key);
@@ -452,6 +453,23 @@ static void test_descriptor() {
     CHECK(!d3.valid());
     d3.raw_script = exotic;
     CHECK(d3.valid());
+    // REVIEW REGRESSIONS: raw_script must BIND to the identity payload
+    d3.raw_script.push_back(0x00);          // different script, same payload
+    CHECK(!d3.valid());
+    d3.raw_script = exotic;
+    PayoutDescriptor d3b; d3b.pay = r3; d3b.raw_script = p2pkh;
+    CHECK(!d3b.valid());                    // wrong script entirely
+    PayoutDescriptor d3c;                   // template smuggled under kind 255
+    d3c.pay.kind = ScriptKind::RAW;
+    auto th = sha256d(p2pkh);
+    d3c.pay.payload.assign(th.begin(), th.end());
+    d3c.raw_script = p2pkh;                 // canonicalizes to P2PKH, not RAW
+    CHECK(!d3c.valid());
+    PayoutDescriptor d3d; d3d.pay = r1; d3d.raw_script = p2pkh;
+    CHECK(!d3d.valid());                    // template kinds carry no script
+    PayoutDescriptor d3e; d3e.pay = r1;
+    d3e.pay.payload.resize(5);              // bad payload width
+    CHECK(!d3e.valid());
     // Attribution MUST be absent under V37.0 rules; OK when rule flipped
     PayoutDescriptor d4; d4.pay = r1; d4.attribution = r2;
     CHECK(!d4.valid(false));
@@ -537,6 +555,75 @@ static void test_digest_canonical_identity() {
     CHECK(!(rb1.lane_digest(1) == rb1.lane_digest(2)));
 }
 
+// Guards added by the formal review pass: geometry validation, zero-work
+// rejection, public epoch_rebuild misuse, add_lane exception safety, aux
+// count bound, geometry committed in the digest.
+static void test_review_guards() {
+    LaneParams p = small_params();
+    {   // window < C0: refused at construction, not a mid-push logic_error
+        LaneParams bad = p; bad.window = 64;
+        bool threw = false;
+        try { Lane l(bad); } catch (const std::invalid_argument&) { threw = true; }
+        CHECK(threw);
+    }
+    {   // inner level cap below the roll-up factor: refused
+        LaneParams bad = p; bad.level_caps = {4, 568};
+        bool threw = false;
+        try { Lane l(bad); } catch (const std::invalid_argument&) { threw = true; }
+        CHECK(threw);
+    }
+    {   // no bucket levels at all: refused (eviction needs buckets)
+        LaneParams bad = p; bad.level_caps = {};
+        bool threw = false;
+        try { Lane l(bad); } catch (const std::invalid_argument&) { threw = true; }
+        CHECK(threw);
+    }
+    {   // zero-work share: refused (digest/rewind exactness)
+        Lane l(p);
+        bool threw = false;
+        try { l.push(0, 0, 0); } catch (const std::invalid_argument&) { threw = true; }
+        CHECK(threw);
+    }
+    {   // public epoch_rebuild() off the positional boundary: refused
+        Lane l(p);
+        l.push(0, 5, 0);
+        bool threw = false;
+        try { l.epoch_rebuild(); } catch (const std::logic_error&) { threw = true; }
+        CHECK(threw);
+    }
+    {   // add_lane exception safety: failed construction leaves no entry
+        Roundabout rb;
+        LaneParams bad = p; bad.window = 1;
+        bool threw = false;
+        try { rb.add_lane(5, bad); } catch (const std::invalid_argument&) { threw = true; }
+        CHECK(threw);
+        CHECK(rb.lane_count() == 0 && rb.lane(5) == nullptr);
+        rb.add_lane(5, p);              // chain id is NOT bricked
+        CHECK(rb.lane(5) != nullptr);
+    }
+    {   // aux count beyond the canonical u16 field: invalid
+        std::vector<std::uint8_t> s = {0x76, 0xa9, 0x14};
+        for (int i = 0; i < 20; ++i) s.push_back(1);
+        s.push_back(0x88); s.push_back(0xac);
+        PayoutDescriptor d; d.pay = canonicalize_script(s);
+        d.aux.resize(0x10000);
+        for (std::size_t i = 0; i < d.aux.size(); ++i) {
+            d.aux[i].chain_id = static_cast<std::uint32_t>(i);
+            d.aux[i].ref = d.pay;
+        }
+        CHECK(!d.valid());
+        d.aux.resize(0xffff);
+        CHECK(d.valid());
+    }
+    {   // lane geometry is digest-committed: same pushes, different
+        // half_life -> different digests (attributable parameter mismatch)
+        LaneParams p2 = p; p2.half_life = 96;
+        Lane a(p), b(p2);
+        for (int i = 0; i < 50; ++i) { a.push(1, 100, 0); b.push(1, 100, 0); }
+        CHECK(!(a.digest(test_key) == b.digest(test_key)));
+    }
+}
+
 int main() {
     test_sha256();
     test_fixed_point();
@@ -552,6 +639,7 @@ int main() {
     test_descriptor();
     test_roundabout();
     test_digest_canonical_identity();
+    test_review_guards();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

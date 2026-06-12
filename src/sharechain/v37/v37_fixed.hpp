@@ -45,8 +45,6 @@ struct U256 {
         r.v[1] = static_cast<u64>(x >> 64);
         return r;
     }
-    u128 lo128() const { return (u128(v[1]) << 64) | v[0]; }
-
     bool is_zero() const { return !(v[0] | v[1] | v[2] | v[3]); }
 
     U256& operator+=(const U256& o) {
@@ -107,18 +105,6 @@ struct U256 {
         return s;
     }
 };
-
-// (a * b) >> FRAC_BITS for u128 a (a Q62 scaled value) and u64 b (a Q62
-// factor), truncating. 128 x 64 -> 192-bit intermediate via limbs.
-inline u128 mul_q(u128 a, u64 b) {
-    u64 a0 = static_cast<u64>(a);
-    u64 a1 = static_cast<u64>(a >> 64);
-    u128 lo = u128(a0) * b;            // bits   0..127
-    u128 hi = u128(a1) * b;            // bits  64..191
-    constexpr unsigned s = FRAC_BITS;
-    u128 r = (lo >> s) + (hi << (64 - s));
-    return r;  // < 2^128 under range pinning
-}
 
 // (a * b) >> FRAC_BITS for two u64 Q62 factors (both values < 4.0).
 inline u64 mul_q64(u64 a, u64 b) {

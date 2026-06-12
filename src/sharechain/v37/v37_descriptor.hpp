@@ -104,13 +104,44 @@ struct PayoutDescriptor {
     // whole of V37.0; flipping it is the V37.x validity-rule change.
     bool valid(bool allow_attribution = false) const {
         if (attribution.has_value() && !allow_attribution) return false;
+        if (attribution.has_value() && !ref_well_formed(*attribution))
+            return false;
+        if (aux.size() > 0xffff)
+            return false;  // canonical u16 count field must not truncate
         for (std::size_t i = 0; i < aux.size(); ++i) {
             if (i > 0 && !(aux[i - 1].chain_id < aux[i].chain_id))
                 return false;  // unsorted or duplicate chain_id: malformed
+            if (!ref_well_formed(aux[i].ref)) return false;
         }
-        if (pay.kind == ScriptKind::RAW && raw_script.empty())
-            return false;  // kind 255 must carry the script for payment
+        if (!ref_well_formed(pay)) return false;
+        if (pay.kind == ScriptKind::RAW) {
+            // The carried script must BIND to the identity: re-canonicalize
+            // and require exact equality. This enforces both the hash
+            // binding (payload == sha256d(raw_script)) and the one-canon
+            // rule (a template script smuggled under kind 255 canonicalizes
+            // to its template kind and fails the comparison).
+            if (raw_script.empty()) return false;
+            if (!(canonicalize_script(raw_script) == pay)) return false;
+        } else {
+            // Template kinds derive their script from (kind, payload); a
+            // carried raw_script has no meaning and is rejected as malformed.
+            if (!raw_script.empty()) return false;
+        }
         return true;
+    }
+
+    // Payload widths are part of the canon: 20 bytes for hash160 kinds,
+    // 32 for sha256/x-only/raw-hash kinds.
+    static bool ref_well_formed(const ScriptRef& r) {
+        switch (r.kind) {
+        case ScriptKind::P2PKH:
+        case ScriptKind::P2SH:
+        case ScriptKind::P2WPKH: return r.payload.size() == 20;
+        case ScriptKind::P2WSH:
+        case ScriptKind::P2TR:
+        case ScriptKind::RAW:    return r.payload.size() == 32;
+        }
+        return false;  // unknown kind byte
     }
 
     // Canonical serialization (§6.3 rule 6): the identity preimage.

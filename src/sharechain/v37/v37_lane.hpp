@@ -70,6 +70,17 @@ public:
             throw std::invalid_argument("v37: C0 must be a power of two");
         if (p.rollup == 0 || p.c0 % p.rollup != 0)
             throw std::invalid_argument("v37: R must divide C0");
+        if (p.window < p.c0)
+            throw std::invalid_argument("v37: window must be >= C0 "
+                                        "(eviction needs whole buckets)");
+        if (p.level_caps.empty())
+            throw std::invalid_argument("v37: at least one bucket level");
+        // Inner bucket levels must hold at least one roll-up group; the
+        // outermost level never folds, so its cap is not load-bearing.
+        for (std::size_t k = 0; k + 1 < p.level_caps.size(); ++k)
+            if (p.level_caps[k] < p.rollup)
+                throw std::invalid_argument(
+                    "v37: inner level cap smaller than roll-up factor");
         // decay[] must cover query depths [0,E) and rebuild depths [1,E];
         // epoch_shift[] must cover the max bucket age in epochs.
         u64 max_epochs = (p.window / p.epoch_len()) + 4;
@@ -92,6 +103,10 @@ public:
 
     // ── push: O(1) amortized (§7) ─────────────────────────────────────────
     void push(MinerId miner, u64 w_raw, std::uint32_t flags) {
+        if (w_raw == 0)
+            throw std::invalid_argument("v37: zero-work share");
+            // (a zero-weight acc entry would be committed by the digest but
+            //  erased by undo_push — rewind would not be bit-exact)
         if (m_next_pos - m_B == m_p.epoch_len())
             epoch_rebuild();                              // (1) — clears journal
 
@@ -152,9 +167,18 @@ public:
     // the full lane rebuild from the tracker (the >D path).
     bool rewind(u64 d) {
         u64 pushes = 0;
-        for (const auto& op : m_journal)
+        bool boundary = false;
+        for (const auto& op : m_journal) {
             if (op.type == Op::Type::Push) ++pushes;
+            else if (op.type == Op::Type::RebuildBoundary) boundary = true;
+        }
         if (d > pushes) return false;
+        // The push that TRIGGERED an epoch rebuild cannot be undone without
+        // undoing the rebuild itself (the canonical pre-share state is the
+        // pre-rebuild frame, which the journal cannot restore). When the
+        // boundary sentinel is in the journal, the rebuild-triggering push
+        // is the oldest journaled push — refuse to land on it.
+        if (boundary && d == pushes) return false;
         u64 undone = 0;
         while (undone < d) {
             Op op = m_journal.back();
@@ -164,6 +188,9 @@ public:
             case Op::Type::FoldL0: undo_fold_l0(op); break;
             case Op::Type::FoldLevel: undo_fold_level(op); break;
             case Op::Type::Evict: undo_evict(op); break;
+            case Op::Type::RebuildBoundary:
+                throw std::logic_error("v37: rewind crossed rebuild sentinel"
+                                       " (guarded above — unreachable)");
             }
         }
         // One push() call journals [Folds][Push][Evicts]. The loop above
@@ -195,6 +222,15 @@ public:
     bytes32 digest(Resolver&& id_key) const {
         std::vector<std::uint8_t> buf;
         append_bytes(buf, "V37L", 4);
+        // Lane geometry is consensus state: committing it makes a parameter
+        // mismatch (e.g. divergent half_life) an immediate, attributable
+        // digest difference instead of unexplained weight drift.
+        append_u64(buf, m_p.window);
+        append_u64(buf, m_p.c0);
+        append_u64(buf, m_p.rollup);
+        append_u64(buf, m_p.half_life);
+        append_u64(buf, static_cast<u64>(m_p.level_caps.size()));
+        for (u64 c : m_p.level_caps) append_u64(buf, c);
         append_u64(buf, m_B);
         append_u64(buf, m_next_pos);
         append_u64(buf, static_cast<u64>(m_acc.size()));
@@ -232,6 +268,9 @@ public:
     // L0; immutable bucket records with the epoch-shift rule). This IS the
     // reference function the fast path re-converges to (§8.4).
     void epoch_rebuild() {
+        if (m_next_pos - m_B != m_p.epoch_len())
+            throw std::logic_error("v37: epoch_rebuild outside the epoch "
+                                   "boundary (positionally defined, §8.3)");
         u64 B_new = m_B + m_p.epoch_len();
         m_acc.clear();
         m_acc_total = U256();
@@ -258,12 +297,14 @@ public:
         }
         m_B = B_new;
         m_journal.clear();   // rewind cannot cross a rebuild (see notes)
+        Op b2; b2.type = Op::Type::RebuildBoundary;
+        m_journal.push_back(std::move(b2));  // sentinel: see rewind()
     }
 
 private:
     // ── journal ───────────────────────────────────────────────────────────
     struct Op {
-        enum class Type { Push, FoldL0, FoldLevel, Evict };
+        enum class Type { Push, FoldL0, FoldLevel, Evict, RebuildBoundary };
         Type type;
         // Push
         L0Slot slot;
@@ -298,8 +339,11 @@ private:
         if (pushes < m_p.journal_depth || keep_from == 0) return;
         while (keep_from > 0 &&
                (m_journal[keep_from - 1].type == Op::Type::FoldL0 ||
-                m_journal[keep_from - 1].type == Op::Type::FoldLevel))
+                m_journal[keep_from - 1].type == Op::Type::FoldLevel ||
+                m_journal[keep_from - 1].type == Op::Type::RebuildBoundary))
             --keep_from;
+            // the boundary sentinel is kept when adjacent: rewind() must
+            // still see it to refuse landing on the rebuild-triggering push
         if (keep_from > 0)
             m_journal.erase(m_journal.begin(),
                             m_journal.begin() + static_cast<long>(keep_from));
@@ -441,9 +485,6 @@ private:
     // ── digest serialization helpers (fixed-width LE, §8.3) ───────────────
     static void append_bytes(std::vector<std::uint8_t>& b, const char* p, std::size_t n) {
         b.insert(b.end(), p, p + n);
-    }
-    static void append_u32(std::vector<std::uint8_t>& b, std::uint32_t x) {
-        for (int i = 0; i < 4; ++i) b.push_back(static_cast<std::uint8_t>(x >> (8 * i)));
     }
     static void append_u64(std::vector<std::uint8_t>& b, u64 x) {
         for (int i = 0; i < 8; ++i) b.push_back(static_cast<std::uint8_t>(x >> (8 * i)));

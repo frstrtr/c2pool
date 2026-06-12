@@ -46,10 +46,15 @@ private:
 class Roundabout {
 public:
     // O(1) directory append; no other lane is touched (§7).
+    // Exception-safe: the Lane is constructed BEFORE the directory entry is
+    // created, so a geometry-validation throw leaves the directory unchanged
+    // (no null entry, the chain id stays usable).
     Lane& add_lane(ChainId chain, const LaneParams& p) {
-        auto [it, fresh] = m_lanes.emplace(chain, nullptr);
-        if (!fresh) throw std::invalid_argument("v37: lane already exists");
-        it->second = std::make_unique<Lane>(p);
+        if (m_lanes.count(chain))
+            throw std::invalid_argument("v37: lane already exists");
+        auto lane = std::make_unique<Lane>(p);
+        auto [it, fresh] = m_lanes.emplace(chain, std::move(lane));
+        (void)fresh;
         return *it->second;
     }
     void remove_lane(ChainId chain) { m_lanes.erase(chain); }

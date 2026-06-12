@@ -1,5 +1,78 @@
 # V37 MRR Roundabout Round-Buffer — implementation notes (WIP for review)
 
+## Formal review pass (2026-06-12, fourth commit) — 7-angle review, 8 fixes
+
+A structured multi-angle review (line-scan, replaced-behavior audit vs V36,
+contract tracing, reuse/simplification/efficiency, altitude) confirmed the
+three earlier fixes and surfaced new defects. Fixed in this commit:
+
+1. **Rewind over a rebuild boundary** (consensus split, confirmed by
+   experiment): rewinding onto the rebuild-triggering push succeeded without
+   undoing the rebuild — restored state was in the new frame while honest
+   peers that never saw the orphan stayed in the old frame. Fix: a
+   RebuildBoundary sentinel journaled at every rebuild; rewind refuses to
+   land on the rebuild-triggering push (caller takes the full-rebuild path);
+   journal trim preserves an adjacent sentinel.
+2. **kind-255 raw_script unbound to identity**: `valid()` now requires
+   `canonicalize_script(raw_script) == pay` for RAW (enforces the hash
+   binding AND the one-canon rule — template scripts smuggled under kind 255
+   fail), rejects raw_script on template kinds, and validates payload widths
+   (20/32) for every ScriptRef incl. attribution and aux.
+3. **Geometry validation gaps**: constructor now refuses window < C0
+   (previously: deterministic mid-push crash), empty level_caps, and inner
+   level caps < R (previously: empty-deque UB on cascade).
+4. **add_lane exception safety**: Lane constructed before directory insert —
+   a geometry throw no longer bricks the chain id with a null entry.
+5. **Public epoch_rebuild() misuse**: throws off the positional boundary
+   (previously: B > next_pos, u64 underflow, OOB table reads).
+6. **Zero-work shares rejected**: push(w_raw=0) created a zero acc entry the
+   digest committed but undo_push erased — rewind was not bit-exact.
+7. **aux count bound**: valid() caps aux at 0xffff so the canonical u16
+   count field can never contradict the serialized entries.
+8. **Lane geometry digest-committed**: W/C0/R/half_life/level_caps are now
+   part of the digest preimage — parameter mismatch between nodes surfaces
+   as an immediate attributable digest difference. Dead consensus surface
+   removed (unused append_u32, free mul_q, U256::lo128).
+
+Post-fix: **100,464 checks, 0 failures** (-O2 and ASan/UBSan), including
+regressions for every fix above.
+
+### Review findings deferred to integration (not fixed here)
+
+- **Donation split (IMPORTANT)**: V36 splits each share's weight via the
+  65535-donation scheme; v37 has no equivalent. The integration adapter MUST
+  define donation handling — e.g. split w_raw at the adapter into a miner
+  push and a donation-descriptor push (integer rule to be specified as
+  consensus), or carry donation in the descriptor. Unresolved = donation
+  outputs silently unpaid after migration.
+- **Backward slide / multi-head**: V36 `slide_backward`/per-head `HeadPPLNS`
+  have no direct v37 API. Multi-head = one Lane instance per competing head
+  (~130 KiB each at default geometry); deep verification needs a
+  rebuild-from-tracker constructor (O(W) push replay — same cost class as
+  V36 `rebuild()`). Needs caller-shaped API at integration.
+- **att (uint288) -> w_raw (u64) adapter** must assert/clamp (already
+  flagged; review re-confirmed nothing in-module guards it).
+- **Efficiency backlog** (semantics-neutral): journal push-count counter
+  instead of per-push O(|journal|) scans; drop dead Bucket copies in fold
+  journal ops (only Evict undo reads op.bucket); payout_map emplace_hint or
+  vector return (documented O(n) is currently O(n log n)); digest streaming
+  into the incremental SHA ctx + per-call id_key memoization;
+  raw_work_in_span lower_bound on ordered deques. Also consider deriving
+  m_cover / m_acc_total / m_l0 sums instead of hand-maintaining (drift-proof
+  by construction; the L0 sums are digest leaves, so derivation in digest()
+  is the safer shape).
+- **raw_work_in_span semantics**: buckets straddling the span edge are
+  excluded (bucket-granular by design) and L0-vs-folded timing changes
+  answers for unaligned bands — settlement bands MUST align to bucket/epoch
+  boundaries (the market doc already assumes epoch-aligned bands); API doc
+  updated, consider an aligned-band-only API at integration.
+- **Reuse divergence risks for CI**: this module is the 3rd script-template
+  classifier (vs core/address_utils.cpp x2), the 7th copy of the LN2_MICRO
+  decay derivation, and a 2nd big-int (U256 vs base_uint). Integration
+  should add cross-implementation agreement tests (same inputs -> same
+  outputs) and a digest byte-layout golden test pinning the serialization
+  independently of these helpers before any swap to core/pack.hpp idioms.
+
 ## Full reassessment pass 2 (2026-06-12, third commit) — C-1, consensus-critical
 
 **C-1: lane digest keyed by node-local intern ids.** `MinerIntern` assigns
