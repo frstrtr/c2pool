@@ -74,11 +74,12 @@ regressions for every fix above.
   This module reflects only PRESENCE at the lowest temporal level (L0 flag
   bit L0F_AUTHORITY_MSG, annotation-only, set by the adapter after
   share_check validation); payloads stay in the share store and join by
-  pos. Open for operator/integrator: the V37 authority key set (V36 keys
-  are baked-in donation-authority keys; new net needs an explicit decision
-  + rotation policy) and FLAG_PERSISTENT semantics vs the roll-up pyramid
-  (persistent messages lose L0 visibility at fold — re-broadcast, pin, or
-  accept). Both filed as open questions in the design doc v1.2.
+  pos. OQ-10 resolved (2026-06-12): the V36 authority key set
+  (DONATION_AUTHORITY_PUBKEYS) carries forward UNCHANGED for V37.0 —
+  share_check reuses the existing envelope validation verbatim; rotation is
+  a V37.x validity-rule change. Still open: OQ-11 — FLAG_PERSISTENT
+  semantics vs the roll-up pyramid (display-layer; decide at view
+  implementation).
 - **Efficiency backlog** (semantics-neutral): journal push-count counter
   instead of per-push O(|journal|) scans; drop dead Bucket copies in fold
   journal ops (only Evict undo reads op.bucket); payout_map emplace_hint or
