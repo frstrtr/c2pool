@@ -39,6 +39,18 @@ struct LaneParams {
     std::size_t levels() const { return 1 + level_caps.size(); }
 };
 
+// L0 slot flag bits. Annotation-only: flags are NOT digest leaves and never
+// affect weights. Bit 0x08 mirrors V36 share_messages FLAG_PROTOCOL_AUTHORITY
+// for operator familiarity: it marks shares whose message_data carried
+// validated authority messages (V36 share_messages.hpp — envelope under the
+// authority pubkeys, ECDSA-signed, ref_hash/PoW-protected; validation happens
+// in share_check BEFORE push, payloads stay in the share store). Views join
+// message payloads by `pos`; messages age out of visibility at fold, which
+// matches their per-share nature (FLAG_PERSISTENT semantics: operator OQ).
+constexpr std::uint32_t L0F_FEE_SHARE     = 0x01;
+constexpr std::uint32_t L0F_STALE_DOA     = 0x02;
+constexpr std::uint32_t L0F_AUTHORITY_MSG = 0x08;
+
 // Level-0 slot (SoA in the production layout; AoS here for clarity — the
 // arrays are contiguous std::vector rings either way).
 struct L0Slot {
@@ -46,7 +58,7 @@ struct L0Slot {
     u64 w_raw = 0;       // work(target), verbatim (F-1; feeds epoch rebuild)
     u128 w_scaled = 0;   // w_raw x InvD[pos - B] at insert, Q62
     MinerId miner = 0;
-    std::uint32_t flags = 0;
+    std::uint32_t flags = 0;   // L0F_* bits above
 };
 
 struct CompEntry {              // (miner, w_scaled, w_raw) triple, F-1

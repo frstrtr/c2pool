@@ -52,6 +52,19 @@ regressions for every fix above.
   V36 `rebuild()`). Needs caller-shaped API at integration.
 - **att (uint288) -> w_raw (u64) adapter** must assert/clamp (already
   flagged; review re-confirmed nothing in-module guards it).
+- **Authority share messaging (V36 carry-forward, IMPORTANT)**: V36 embeds
+  authority messages in shares' message_data — consensus-carried
+  (ref_hash/PoW-protected), validated in share_check (bad envelope = share
+  REJECTED), typed (incl. EMERGENCY and TRANSITION_SIGNAL — the channel a
+  V37 activation itself would ride). See src/impl/<coin>/share_messages.hpp.
+  This module reflects only PRESENCE at the lowest temporal level (L0 flag
+  bit L0F_AUTHORITY_MSG, annotation-only, set by the adapter after
+  share_check validation); payloads stay in the share store and join by
+  pos. Open for operator/integrator: the V37 authority key set (V36 keys
+  are baked-in donation-authority keys; new net needs an explicit decision
+  + rotation policy) and FLAG_PERSISTENT semantics vs the roll-up pyramid
+  (persistent messages lose L0 visibility at fold — re-broadcast, pin, or
+  accept). Both filed as open questions in the design doc v1.2.
 - **Efficiency backlog** (semantics-neutral): journal push-count counter
   instead of per-push O(|journal|) scans; drop dead Bucket copies in fold
   journal ops (only Evict undo reads op.bucket); payout_map emplace_hint or
