@@ -165,6 +165,16 @@ struct ReferenceLane {
     }
 };
 
+// Injective deterministic id -> key map for single-node lane tests (real
+// deployments resolve through MinerIntern::key — see the canonical-identity
+// regression test below).
+static bytes32 test_key(MinerId m) {
+    std::uint8_t b[4] = {
+        static_cast<std::uint8_t>(m), static_cast<std::uint8_t>(m >> 8),
+        static_cast<std::uint8_t>(m >> 16), static_cast<std::uint8_t>(m >> 24)};
+    return sha256d(b, 4);
+}
+
 // ── tests ──────────────────────────────────────────────────────────────────
 
 static void test_sha256() {
@@ -319,12 +329,12 @@ static void test_digest_and_rewind() {
         a.push(static_cast<MinerId>(r1.range(0, 5)), r1.range(1, 1000000), 0);
         b.push(static_cast<MinerId>(r2.range(0, 5)), r2.range(1, 1000000), 0);
     }
-    CHECK(a.digest() == b.digest());
+    CHECK(a.digest(test_key) == b.digest(test_key));
     // Sensitivity: different order -> different digest
     Lane c(p), d(p);
     c.push(1, 100, 0); c.push(2, 200, 0);
     d.push(2, 200, 0); d.push(1, 100, 0);
-    CHECK(!(c.digest() == d.digest()));
+    CHECK(!(c.digest(test_key) == d.digest(test_key)));
 
     // Rewind: bit-exact state restoration (OQ-7), within one epoch
     Lane e(p);
@@ -336,12 +346,12 @@ static void test_digest_and_rewind() {
            (e.next_pos() - e.epoch_base()) < 16) {
         e.push(0, 1, 0);
     }
-    auto snap = e.digest();
+    auto snap = e.digest(test_key);
     XorShift64 r4(11);
     for (int i = 0; i < 10; ++i)
         e.push(static_cast<MinerId>(r4.range(0, 5)), r4.range(1, 1000000), 0);
     CHECK(e.rewind(10));
-    CHECK(e.digest() == snap);
+    CHECK(e.digest(test_key) == snap);
 
     // Rewind across an epoch rebuild must refuse (journal cleared)
     Lane f(p);
@@ -359,12 +369,12 @@ static void test_digest_and_rewind() {
     while (g.l0().size() != p.c0 ||
            (g.next_pos() - g.epoch_base()) >= p.epoch_len() - 4)
         g.push(0, 7, 0);
-    auto snap_fold = g.digest();
+    auto snap_fold = g.digest(test_key);
     std::size_t buckets_before = g.levels()[0].size();
     g.push(1, 99, 0);                       // folds 8 slots, then inserts
     CHECK(g.levels()[0].size() == buckets_before + 1);
     CHECK(g.rewind(1));
-    CHECK(g.digest() == snap_fold);          // fold undone with its push
+    CHECK(g.digest(test_key) == snap_fold);          // fold undone with its push
     CHECK(g.levels()[0].size() == buckets_before);
 
     // Randomized rewind sweep: snapshot / push k <= D / rewind k must be a
@@ -379,11 +389,11 @@ static void test_digest_and_rewind() {
                (h.next_pos() - h.epoch_base()) < p.journal_depth)
             h.push(0, 3, 0);
         u64 k = r6.range(1, p.journal_depth);
-        auto snap = h.digest();
+        auto snap = h.digest(test_key);
         for (u64 i = 0; i < k; ++i)
             h.push(static_cast<MinerId>(r6.range(0, 5)), r6.range(1, 1000000), 0);
         CHECK(h.rewind(k));
-        if (!(h.digest() == snap)) {
+        if (!(h.digest(test_key) == snap)) {
             ++g_failures;
             std::printf("FAIL rewind sweep round %d (k=%llu)\n", round,
                         (unsigned long long)k);
@@ -491,6 +501,42 @@ static void test_roundabout() {
     CHECK(rb.lane_count() == 1 && rb.lane(2) == nullptr);
 }
 
+// CONSENSUS REGRESSION (C-1): intern ids are node-local — two nodes seeing
+// the same per-lane share sequences but a different cross-lane interleaving
+// assign different ids to the same miners. The lane digest must be identical
+// anyway, because it serializes canonical identity keys, never intern ids.
+static void test_digest_canonical_identity() {
+    auto mk_desc = [](std::uint8_t fill) {
+        std::vector<std::uint8_t> s = {0x76, 0xa9, 0x14};
+        for (int i = 0; i < 20; ++i) s.push_back(fill);
+        s.push_back(0x88); s.push_back(0xac);
+        PayoutDescriptor d; d.pay = canonicalize_script(s);
+        return d;
+    };
+    PayoutDescriptor dx = mk_desc(0xaa), dy = mk_desc(0xbb);
+
+    LaneParams p = small_params();
+    Roundabout rb1, rb2;
+    rb1.add_lane(1, p); rb1.add_lane(2, p);
+    rb2.add_lane(1, p); rb2.add_lane(2, p);
+
+    // Node 1 sees lane 1 first; node 2 sees lane 2 first. Per-lane order is
+    // identical (consensus order): lane1 = [dx, dy], lane2 = [dy, dx].
+    rb1.push(1, dx, 100, 0); rb1.push(2, dy, 300, 0);
+    rb1.push(1, dy, 200, 0); rb1.push(2, dx, 400, 0);
+
+    rb2.push(2, dy, 300, 0); rb2.push(2, dx, 400, 0);
+    rb2.push(1, dx, 100, 0); rb2.push(1, dy, 200, 0);
+
+    // Intern ids genuinely diverge between the nodes...
+    CHECK(rb1.miners().intern(dx) != rb2.miners().intern(dx));
+    // ...but the consensus digests must not.
+    CHECK(rb1.lane_digest(1) == rb2.lane_digest(1));
+    CHECK(rb1.lane_digest(2) == rb2.lane_digest(2));
+    // Sanity: digests still distinguish different lane contents.
+    CHECK(!(rb1.lane_digest(1) == rb1.lane_digest(2)));
+}
+
 int main() {
     test_sha256();
     test_fixed_point();
@@ -505,6 +551,7 @@ int main() {
     test_digest_and_rewind();
     test_descriptor();
     test_roundabout();
+    test_digest_canonical_identity();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

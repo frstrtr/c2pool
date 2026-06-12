@@ -1,5 +1,32 @@
 # V37 MRR Roundabout Round-Buffer — implementation notes (WIP for review)
 
+## Full reassessment pass 2 (2026-06-12, third commit) — C-1, consensus-critical
+
+**C-1: lane digest keyed by node-local intern ids.** `MinerIntern` assigns
+dense u32 ids at first *global* sighting; with multiple lanes the cross-lane
+interleaving of first sightings is node-local (wall-clock dependent), so two
+honest nodes assign different ids to the same miners. `digest()` serialized
+acc in id order with raw id values (and `comp_hash` embedded ids), so two
+honest nodes produced different digests for identical lane state — a chain
+split under the consensus-committed digest (OQ-4). Payouts were never
+affected (ids resolve to descriptors); only digest bytes.
+
+Root cause is the SPEC: §8.5 says "acc in miner-id order". Erratum filed in
+the design doc (v1.1): consensus serialization must be in **canonical
+payout-descriptor identity order** with the 32-byte identity key (S-3) as
+the serialized name — intern ids must never appear in consensus bytes.
+
+Fix: `Lane::digest(resolver)` + `comp_hash(bucket, resolver)` sort and
+serialize by `MinerIntern::key(id)` (identity_key, SHA256d of the identity
+preimage); `Roundabout::lane_digest(chain)` is the production entry point.
+Regression: two Roundabouts fed identical per-lane sequences under different
+cross-lane interleavings — intern ids diverge, lane digests must not.
+Post-fix: **100,448 checks, 0 failures** (-O2 and ASan/UBSan).
+
+Docs re-verified in the same pass (geometry sums, half-life coverage, epoch
+growth, tail-density claims all check out); doc errata E-1..E-5 listed in
+the design doc v1.1 revision note.
+
 ## Reassessment pass (2026-06-12, second commit)
 
 A full fresh-eyes re-audit of the consensus paths (re-deriving every range

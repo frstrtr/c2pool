@@ -13,6 +13,7 @@
 // All folds/evicts/rebuilds happen at positionally defined points; no input
 // to the sequence is node-local.
 
+#include <algorithm>
 #include <cstdint>
 #include <deque>
 #include <map>
@@ -183,15 +184,30 @@ public:
     }
 
     // ── digest (§8.5, OQ-4) — canonical, consensus-committed ──────────────
-    bytes32 digest() const {
+    // CONSENSUS: intern ids are NODE-LOCAL (assigned at first global
+    // sighting, which interleaves differently across lanes on different
+    // nodes). The digest therefore serializes miners by their CANONICAL
+    // identity key (PayoutDescriptor identity, 32 bytes), supplied by the
+    // resolver, and sorts by those bytes — never by raw intern id. The
+    // spec's "acc in miner-id order" wording is corrected by erratum to
+    // "canonical payout-descriptor order".
+    template <typename Resolver>  // bytes32 resolver(MinerId)
+    bytes32 digest(Resolver&& id_key) const {
         std::vector<std::uint8_t> buf;
         append_bytes(buf, "V37L", 4);
         append_u64(buf, m_B);
         append_u64(buf, m_next_pos);
         append_u64(buf, static_cast<u64>(m_acc.size()));
-        for (const auto& [m, a] : m_acc) {   // std::map: miner-id order
-            append_u32(buf, m);
-            append_u256(buf, a);
+        {
+            std::vector<std::pair<bytes32, const U256*>> rows;
+            rows.reserve(m_acc.size());
+            for (const auto& [m, a] : m_acc) rows.emplace_back(id_key(m), &a);
+            std::sort(rows.begin(), rows.end(),
+                      [](const auto& a, const auto& b) { return a.first < b.first; });
+            for (const auto& [k, a] : rows) {
+                buf.insert(buf.end(), k.begin(), k.end());
+                append_u256(buf, *a);
+            }
         }
         // level-ring headers incl. per-ring raw_sum (F-1 leaves)
         append_u64(buf, static_cast<u64>(m_l0.size()));
@@ -204,7 +220,7 @@ public:
                 append_u64(buf, b.pos_hi);
                 append_u128(buf, b.raw_work);
                 append_u64(buf, b.epoch_tag);
-                auto ch = comp_hash(b);
+                auto ch = comp_hash(b, id_key);
                 buf.insert(buf.end(), ch.begin(), ch.end());
             }
         }
@@ -439,12 +455,19 @@ private:
     static void append_u256(std::vector<std::uint8_t>& b, const U256& x) {
         for (int i = 0; i < 4; ++i) append_u64(b, x.v[i]);
     }
-    static bytes32 comp_hash(const Bucket& b) {
+    // Composition hash, also in canonical-identity order (see digest()).
+    template <typename Resolver>
+    static bytes32 comp_hash(const Bucket& b, Resolver&& id_key) {
+        std::vector<std::pair<bytes32, const CompEntry*>> rows;
+        rows.reserve(b.comp.size());
+        for (const auto& e : b.comp) rows.emplace_back(id_key(e.miner), &e);
+        std::sort(rows.begin(), rows.end(),
+                  [](const auto& a, const auto& c) { return a.first < c.first; });
         std::vector<std::uint8_t> buf;
-        for (const auto& e : b.comp) {
-            append_u32(buf, e.miner);
-            append_u256(buf, e.scaled);
-            append_u128(buf, e.raw);
+        for (const auto& [k, e] : rows) {
+            buf.insert(buf.end(), k.begin(), k.end());
+            append_u256(buf, e->scaled);
+            append_u128(buf, e->raw);
         }
         return sha256d(buf);
     }
