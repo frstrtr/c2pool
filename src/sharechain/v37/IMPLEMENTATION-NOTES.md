@@ -1,11 +1,29 @@
 # V37 MRR Roundabout Round-Buffer — implementation notes (WIP for review)
 
-## ORIGIN-BIN REWORK (T-OQ1 RATIFIED 2026-06-12) — queued, next sitting
+## ORIGIN-BIN REWORK (T-OQ1) — EXECUTED 2026-06-12
 
-The operator ratified the origin-bin temporal model as THE V37 spec
-(c2pool-v37-the-temporal-levels.md v1.0, normative). The code on this
-branch implements the pre-ratification position-decay model and remains
-the working reference for the shared machinery. Re-indexing checklist:
+The ratified origin-bin temporal model is now THE implementation on this
+branch. v37_lane.hpp was rewritten to the normative spec
+(c2pool-v37-the-temporal-levels.md v1.0): the consensus clock is the
+committed mainchain bin; push(miner, w_raw, flags, BIN); decay/vesting/
+window/folds/epochs are bin-indexed; receipts credit past open bins
+(scaled_for handles both InvD[bin-B] and decay[B-bin] directions);
+structure events fire only on clock advance in fixed order (rebuild ->
+band folds -> time eviction); folds are band-aligned (rollup bins per
+bucket, empty bins skipped); the window is time-denominated; the digest
+header commits the full bin geometry + clock, bucket leaves carry bin
+spans (true time bands). Journal records carry (bin, prev_t,
+prev_started); rewind restores the clock and refuses rebuild crossings as
+before. ReferenceLane mirrored to the bin model; the gate now compares
+incremental vs full-scan EVERY push with receipts in the driver mix.
+
+VERIFIED: 1,620,518 checks, 0 failures (g++13.3 -O2 and ASan/UBSan),
+incl. the THE-fairness headline test: same origin bin -> identical
+decayed weight whether accounted on time or carried late (and surviving
+an epoch rebuild). NOTE the semantics change the suite encodes: within-
+bin arrival order between miners carries no consensus meaning (identical
+end state -> identical digest, asserted); digests differ on actual state
+(bins/weights/geometry). Original checklist (executed):
 
 1. push() gains `bin` (origin mainchain height, committed bytes); validate
    current-N_CTX <= bin <= current.

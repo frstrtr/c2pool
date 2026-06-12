@@ -1,17 +1,20 @@
 #pragma once
-// V37 MRR roundabout — one sharechain lane.
-// Spec: docs/c2pool-v37-mrr-roundabout-buffer.md §3 (data model), §4.1
-// (roll-up pyramid), §4.2 (epoch-scaled incremental decay + OQ-2 exact
-// rebuild), §6.1 (quantized window, OQ-1), §6.2 (reorg journal, OQ-7).
+// V37 MRR roundabout — one sharechain lane, ORIGIN-BIN temporal model.
+// Spec: c2pool-v37-the-temporal-levels.md v1.0 (NORMATIVE, T-OQ1 ratified) +
+// docs/c2pool-v37-mrr-roundabout-buffer.md v3.0 (§4.2 machinery, §8 rules).
 //
-// CONSENSUS-DETERMINISM (§8.3): the operation order inside push() is fixed —
-//   (1) epoch rebuild when next_pos - B == E,
-//   (2) L0 fold when L0 is full,
-//   (3) level-k fold cascade when a level ring is full,
-//   (4) insert,
-//   (5) whole-bucket eviction while cover > W.
-// All folds/evicts/rebuilds happen at positionally defined points; no input
-// to the sequence is node-local.
+// The consensus clock is the mainchain block height committed in every
+// share/receipt ("bin"). Decay, vesting, the window, folds and epochs are
+// all indexed by origin bin — work decays by the time it was PERFORMED,
+// not the time it was accounted (RDWR receipts credit their origin bin).
+//
+// CONSENSUS-DETERMINISM (§8.3): structure events fire only on clock
+// advance (a push whose bin exceeds the current clock), in fixed order:
+//   (1) epoch rebuild while t - B >= E      (B advances by E; journal seals)
+//   (2) fold of bin bands older than the fine horizon (band-aligned)
+//   (3) eviction of whole buckets older than the window
+// then the insert itself. Non-advancing pushes (same-bin work, receipts)
+// only insert. Every input is committed share/receipt bytes.
 
 #include <algorithm>
 #include <cstdint>
@@ -28,142 +31,125 @@ namespace v37 {
 using MinerId = std::uint32_t;
 
 struct LaneParams {
-    u64 window = 8640;          // W   (OQ-5 default)
-    u64 c0 = 4096;              // C0, power of two; also E (epoch length)
-    u64 rollup = 8;             // R
-    std::vector<u64> level_caps = {568};  // slot counts for levels >= 1
-    u64 half_life = 2160;       // W/4 (OQ-5)
-    u64 journal_depth = 64;     // D   (OQ-7)
-    // Vesting (base doc §4.3, wired into V37.0 payouts): a miner's payout
-    // weight is decayed_weight x min(1, decayed_weight / threshold) where
-    // threshold = vest_threshold_shares x (window EMA of share work).
-    // 0 disables vesting (factor 1.0). Consensus parameter: digest-committed.
-    u64 vest_threshold_shares = 4320;  // W/2 default (POOL_HOPPING 7.3.4)
+    u64 window_bins = 576;       // W: ~24 h at LTC 2.5-min bins (T-OQ3 default)
+    u64 fine_bins = 64;          // open-bin horizon (Present); must exceed n_ctx
+    u64 rollup = 8;              // bins per level-1 bucket (band-aligned)
+    std::vector<u64> level_caps = {80};  // bucket counts for levels >= 1
+    u64 half_life = 144;         // bins (= W/4 default)
+    u64 epoch_bins = 256;        // E (needs lambda^-(E-1) < 4: E <~ 2*HL)
+    u64 n_ctx = 2;               // receipt context window, bins (RDWR N_CTX)
+    u64 journal_depth = 64;      // D (OQ-7)
+    u64 vest_threshold_shares = 4320;  // §4.2a (0 disables)
 
-    u64 epoch_len() const { return c0; }
     std::size_t levels() const { return 1 + level_caps.size(); }
 };
 
-// L0 slot flag bits. Annotation-only: flags are NOT digest leaves and never
-// affect weights. Bit 0x08 mirrors V36 share_messages FLAG_PROTOCOL_AUTHORITY
-// for operator familiarity: it marks shares whose message_data carried
-// validated authority messages (V36 share_messages.hpp — envelope under the
-// authority pubkeys, ECDSA-signed, ref_hash/PoW-protected; validation happens
-// in share_check BEFORE push, payloads stay in the share store). Views join
-// message payloads by `pos`; messages age out of visibility at fold, which
-// matches their per-share nature (FLAG_PERSISTENT semantics: operator OQ).
+// L0 slot flag bits — annotation-only, never digest leaves, never weights.
 constexpr std::uint32_t L0F_FEE_SHARE     = 0x01;
 constexpr std::uint32_t L0F_STALE_DOA     = 0x02;
-constexpr std::uint32_t L0F_AUTHORITY_MSG = 0x08;
-constexpr std::uint32_t L0F_LATE          = 0x20;  // entropy-licensed late
-// share (c2pool-v37-ell-late-shares.md: stale work re-entering the linear
-// sequence under a real-difficulty license — THE Layer -1; full credit,
-// licensed depth committed in share bytes)
-constexpr std::uint32_t L0F_UNCLE         = 0x40;  // reserved: uncle-DAG
-// fallback path (same accounting shape, discounted push)
-constexpr std::uint32_t L0F_RECEIPT       = 0x80;  // real-difficulty work
-// receipt (c2pool-v37-work-receipts.md: stale work self-carried by the
-// miner's next share as a PoW certificate — THE Layer -1, primary path)
-constexpr std::uint32_t L0F_MINER_MSG     = 0x10;  // permissionless miner
-// message present (c2pool-v37-miner-messages.md v1.1: plaintext envelope,
-// derived signing key announced in the share binds to the payout identity
-// (A-1), TTL funded by decayed_weight() with share-sacrifice premium lane
-// (A-2) — the lane is the budget ledger; message index is view-layer)
+constexpr std::uint32_t L0F_AUTHORITY_MSG = 0x08;  // V36-compatible bit
+constexpr std::uint32_t L0F_MINER_MSG     = 0x10;  // miner-messages doc v1.1
+constexpr std::uint32_t L0F_LATE          = 0x20;  // ELL alternative (reserved)
+constexpr std::uint32_t L0F_UNCLE         = 0x40;  // uncle-DAG fallback (reserved)
+constexpr std::uint32_t L0F_RECEIPT       = 0x80;  // RDWR work receipt (primary)
 
-// Level-0 slot (SoA in the production layout; AoS here for clarity — the
-// arrays are contiguous std::vector rings either way).
 struct L0Slot {
-    u64 pos = 0;
-    u64 w_raw = 0;       // work(target), verbatim (F-1; feeds epoch rebuild)
-    u128 w_scaled = 0;   // w_raw x InvD[pos - B] at insert, Q62
+    u64 w_raw = 0;       // work(T_origin), verbatim (F-1; feeds epoch rebuild)
+    u128 w_scaled = 0;   // origin-bin scaled contribution, Q62 (see scaled_for)
     MinerId miner = 0;
-    std::uint32_t flags = 0;   // L0F_* bits above
+    std::uint32_t flags = 0;
 };
 
-struct CompEntry {              // (miner, w_scaled, w_raw) triple, F-1
+struct OpenBin {                 // the Present: one origin bin, still writable
+    u64 bin = 0;
+    std::vector<L0Slot> entries; // arrival (= consensus push) order
+};
+
+struct CompEntry {               // (miner, w_scaled, w_raw) triple, F-1
     MinerId miner = 0;
-    U256 scaled;                // stored in the bucket's epoch frame
+    U256 scaled;                 // in the bucket's epoch frame
     u128 raw = 0;
 };
 
-struct Bucket {                 // immutable after close (§4.1)
-    u64 pos_lo = 0, pos_hi = 0;
-    u64 epoch_tag = 0;          // B at close; shift applied at read/evict
+struct Bucket {                  // settled bin band (the Past) — immutable
+    u64 bin_lo = 0, bin_hi = 0;  // band-aligned origin-bin span
+    u64 epoch_tag = 0;           // B at close; shift applied at read/evict
     U256 scaled_sum;
-    u128 raw_work = 0;          // F-1: per-band settlement leaf
-    std::vector<CompEntry> comp;  // sorted by miner id (deterministic)
+    u128 raw_work = 0;           // F-1: per-time-band settlement leaf
+    std::vector<CompEntry> comp; // miner-id order (deterministic)
 };
 
 class Lane {
 public:
     explicit Lane(const LaneParams& p) : m_p(p) {
-        if (p.c0 == 0 || (p.c0 & (p.c0 - 1)) != 0)
-            throw std::invalid_argument("v37: C0 must be a power of two");
-        if (p.rollup == 0 || p.c0 % p.rollup != 0)
-            throw std::invalid_argument("v37: R must divide C0");
-        if (p.window < p.c0)
-            throw std::invalid_argument("v37: window must be >= C0 "
-                                        "(eviction needs whole buckets)");
+        if (p.rollup == 0) throw std::invalid_argument("v37: zero rollup");
+        if (p.n_ctx == 0) throw std::invalid_argument("v37: zero n_ctx");
+        if (p.fine_bins <= p.n_ctx)
+            throw std::invalid_argument(
+                "v37: fine horizon must exceed the receipt context window "
+                "(receipts must always land in open bins)");
+        if (p.window_bins < p.fine_bins + p.rollup)
+            throw std::invalid_argument("v37: window must exceed fine+rollup");
         if (p.level_caps.empty())
             throw std::invalid_argument("v37: at least one bucket level");
-        // Inner bucket levels must hold at least one roll-up group; the
-        // outermost level never folds, so its cap is not load-bearing.
         for (std::size_t k = 0; k + 1 < p.level_caps.size(); ++k)
             if (p.level_caps[k] < p.rollup)
                 throw std::invalid_argument(
                     "v37: inner level cap smaller than roll-up factor");
-        // decay[] must cover query depths [0,E) and rebuild depths [1,E];
-        // epoch_shift[] must cover the max bucket age in epochs.
-        u64 max_epochs = (p.window / p.epoch_len()) + 4;
-        m_tab.init(p.half_life, p.epoch_len(), p.epoch_len() + p.c0, max_epochs);
+        // decay[] covers query depths [0,E) and rebuild/insert depths up to
+        // E + fine + n_ctx; epoch_shift[] covers the max bucket age.
+        u64 max_depth = p.epoch_bins + p.fine_bins + p.n_ctx + 2;
+        u64 max_epochs = p.window_bins / p.epoch_bins + 4;
+        m_tab.init(p.half_life, p.epoch_bins, max_depth, max_epochs);
         m_levels.resize(p.level_caps.size());
     }
 
     const LaneParams& params() const { return m_p; }
     const DecayTables& tables() const { return m_tab; }
-    u64 next_pos() const { return m_next_pos; }
+    bool started() const { return m_started; }
+    u64 clock() const { return m_t; }            // current bin (mainchain ht)
     u64 epoch_base() const { return m_B; }
-    u64 cover() const { return m_cover; }
+    u64 event_count() const { return m_events; }
     const U256& acc_total() const { return m_acc_total; }
     u128 raw_total() const { return m_raw_total; }
     const std::map<MinerId, U256>& acc() const { return m_acc; }
-    const std::deque<L0Slot>& l0() const { return m_l0; }
+    const std::map<u64, OpenBin>& open_bins() const { return m_open; }
     const std::vector<std::deque<Bucket>>& levels() const { return m_levels; }
-    const U256& l0_scaled_sum() const { return m_l0_scaled_sum; }
-    u128 l0_raw_sum() const { return m_l0_raw_sum; }
+    const U256& open_scaled_sum() const { return m_open_scaled_sum; }
+    u128 open_raw_sum() const { return m_open_raw_sum; }
 
-    // ── push: O(1) amortized (§7) ─────────────────────────────────────────
-    void push(MinerId miner, u64 w_raw, std::uint32_t flags) {
+    // ── push: O(1) amortized; structure events only on clock advance ──────
+    void push(MinerId miner, u64 w_raw, std::uint32_t flags, u64 bin) {
         if (w_raw == 0)
             throw std::invalid_argument("v37: zero-work share");
-            // (a zero-weight acc entry would be committed by the digest but
-            //  erased by undo_push — rewind would not be bit-exact)
-        if (m_next_pos - m_B == m_p.epoch_len())
-            epoch_rebuild();                              // (1) — clears journal
-
-        if (m_l0.size() == m_p.c0)
-            fold_l0();                                    // (2)
-        cascade_folds();                                  // (3)
-
-        u64 p = m_next_pos++;
-        u64 j = p - m_B;                                  // in [0, E)
-        u128 w_scaled = u128(w_raw) * m_tab.inv_decay[j]; // Q62, fits u128
-        L0Slot s{p, w_raw, w_scaled, miner, flags};
-        m_l0.push_back(s);                                // (4)
+        u64 prev_t = m_t;
+        bool prev_started = m_started;
+        if (!m_started) {
+            m_started = true;
+            m_t = bin;
+            m_B = bin;
+        } else if (bin > m_t) {
+            advance_clock(bin);                    // (1)(2)(3)
+        } else if (m_t - bin > m_p.n_ctx) {
+            throw std::invalid_argument(
+                "v37: origin bin beyond the receipt context window");
+        }
+        u128 w_scaled = scaled_for(w_raw, bin);    // insert
+        L0Slot s{w_raw, w_scaled, miner, flags};
+        m_open[bin].bin = bin;
+        m_open[bin].entries.push_back(s);
         m_acc[miner] += U256::from_u128(w_scaled);
         m_acc_total += U256::from_u128(w_scaled);
         m_raw_total += w_raw;
-        m_l0_scaled_sum += U256::from_u128(w_scaled);
-        m_l0_raw_sum += w_raw;
-        m_cover += 1;
-        journal_push(Op::push(s));
-
-        while (m_cover > m_p.window)                      // (5) OQ-1
-            evict_oldest_bucket();
+        m_open_scaled_sum += U256::from_u128(w_scaled);
+        m_open_raw_sum += w_raw;
+        m_events += 1;
+        Op op; op.type = Op::Type::Push; op.slot = s; op.bin = bin;
+        op.prev_t = prev_t; op.prev_started = prev_started;
+        journal_push(std::move(op));
     }
 
-    // ── queries ───────────────────────────────────────────────────────────
-    // Decayed weight of one miner at the current head (O(1) + map lookup).
+    // ── queries (head factor = lambda^(t - B), Q62) ───────────────────────
     U256 decayed_weight(MinerId m) const {
         auto it = m_acc.find(m);
         if (it == m_acc.end()) return U256();
@@ -171,7 +157,6 @@ public:
     }
     U256 decayed_total() const { return m_acc_total.mul_q(head_decay()); }
 
-    // Full payout map: O(active miners) (§7).
     std::map<MinerId, U256> payout_map() const {
         std::map<MinerId, U256> out;
         u64 f = head_decay();
@@ -179,56 +164,42 @@ public:
         return out;
     }
 
-    // ── vesting (§4.3 — POOL_HOPPING 7.3.4 wired onto the accumulator) ────
-    // factor = min(1.0, decayed_weight / (vest_threshold_shares x EMA share
-    // work)), Q62. The EMA is raw_total / cover — both consensus-maintained
-    // integers, truncating division per §8.2. Hashrate note: the threshold
-    // is ABSOLUTE work by design (defeats placeholder/tenure farming);
-    // see base doc V-1 for the small-miner discussion.
+    // Vesting (§4.2a): threshold in event-EMA share-work units.
     u64 vesting_factor(MinerId m) const {
-        if (m_p.vest_threshold_shares == 0 || m_cover == 0) return Q_ONE;
-        u64 ema = static_cast<u64>(m_raw_total / m_cover);
+        if (m_p.vest_threshold_shares == 0 || m_events == 0) return Q_ONE;
+        u64 ema = static_cast<u64>(m_raw_total / m_events);
         if (ema == 0) return Q_ONE;
-        U256 threshold = U256(ema);
-        // ema x vest_shares <= 2^64 x 2^~13: compute via mul_q-free path
-        u64 vs = m_p.vest_threshold_shares;
-        u128 tw = u128(ema) * vs;                  // <= 2^77, exact
-        threshold = U256::from_u128(tw).shl(FRAC_BITS);  // Q62 work units
+        u128 tw = u128(ema) * m_p.vest_threshold_shares;
+        U256 threshold = U256::from_u128(tw).shl(FRAC_BITS);
         return U256::ratio_q(decayed_weight(m), threshold);
     }
-
-    // Vested payout map: weight_m = decayed_weight_m x vesting_factor_m.
-    // Normalization at payout construction redistributes non-vested weight
-    // to vested miners automatically (the --redistribute spirit).
     std::map<MinerId, U256> vested_payout_map() const {
         std::map<MinerId, U256> out;
         u64 f = head_decay();
         for (const auto& [m, a] : m_acc) {
             U256 dw = a.mul_q(f);
-            u64 vf = (m_p.vest_threshold_shares == 0)
-                         ? Q_ONE : vesting_factor(m);
+            u64 vf = (m_p.vest_threshold_shares == 0) ? Q_ONE
+                                                      : vesting_factor(m);
             out[m] = dw.mul_q(vf);
         }
         return out;
     }
 
-    // Per-band raw delivered work over [lo, hi] positions, bucket-granular
-    // at coarse levels (settlement-grade reading, F-1 / market §4.1).
+    // Per-time-band raw delivered work over origin bins [lo, hi]: open bins
+    // individually, settled bands when fully inside (F-1 reading; settlement
+    // bands MUST align to band boundaries).
     u128 raw_work_in_span(u64 lo, u64 hi) const {
         u128 sum = 0;
-        for (const auto& s : m_l0)
-            if (s.pos >= lo && s.pos <= hi) sum += s.w_raw;
+        for (const auto& [b, ob] : m_open)
+            if (b >= lo && b <= hi)
+                for (const auto& e : ob.entries) sum += e.w_raw;
         for (const auto& lvl : m_levels)
-            for (const auto& b : lvl)
-                if (b.pos_lo >= lo && b.pos_hi <= hi) sum += b.raw_work;
+            for (const auto& bkt : lvl)
+                if (bkt.bin_lo >= lo && bkt.bin_hi <= hi) sum += bkt.raw_work;
         return sum;
     }
 
-    // ── reorg rewind (§6.2, OQ-7) ─────────────────────────────────────────
-    // Rewind the last d pushes. Returns false when the journal cannot serve
-    // the request (d > recorded pushes, or the span crosses an epoch-rebuild
-    // boundary — the journal is cleared at rebuilds); the caller then does
-    // the full lane rebuild from the tracker (the >D path).
+    // ── reorg rewind (§6.2, OQ-7): unchanged semantics, bin-aware undo ────
     bool rewind(u64 d) {
         u64 pushes = 0;
         bool boundary = false;
@@ -237,12 +208,7 @@ public:
             else if (op.type == Op::Type::RebuildBoundary) boundary = true;
         }
         if (d > pushes) return false;
-        // The push that TRIGGERED an epoch rebuild cannot be undone without
-        // undoing the rebuild itself (the canonical pre-share state is the
-        // pre-rebuild frame, which the journal cannot restore). When the
-        // boundary sentinel is in the journal, the rebuild-triggering push
-        // is the oldest journaled push — refuse to land on it.
-        if (boundary && d == pushes) return false;
+        if (boundary && d == pushes) return false;  // can't undo the rebuild
         u64 undone = 0;
         while (undone < d) {
             Op op = m_journal.back();
@@ -253,65 +219,39 @@ public:
             case Op::Type::FoldLevel: undo_fold_level(op); break;
             case Op::Type::Evict: undo_evict(op); break;
             case Op::Type::RebuildBoundary:
-                throw std::logic_error("v37: rewind crossed rebuild sentinel"
-                                       " (guarded above — unreachable)");
+                throw std::logic_error("v37: rewind crossed rebuild sentinel");
             }
         }
-        // One push() call journals [Folds][Push][Evicts]. The loop above
-        // stops at the d-th Push; any folds IMMEDIATELY preceding it were
-        // triggered by that same share's arrival and must be undone too —
-        // the restored state is "before the share arrived", not "after its
-        // folds". Trailing folds are unambiguous: nothing else sits between
-        // a push's folds and its Push record.
+        // trailing folds/evicts belong to the landing push's clock advance
+        // and must be undone with it (state = before the share arrived)
         while (!m_journal.empty() &&
                (m_journal.back().type == Op::Type::FoldL0 ||
-                m_journal.back().type == Op::Type::FoldLevel)) {
+                m_journal.back().type == Op::Type::FoldLevel ||
+                m_journal.back().type == Op::Type::Evict)) {
             Op op = m_journal.back();
             m_journal.pop_back();
             if (op.type == Op::Type::FoldL0) undo_fold_l0(op);
-            else undo_fold_level(op);
+            else if (op.type == Op::Type::FoldLevel) undo_fold_level(op);
+            else undo_evict(op);
         }
         return true;
     }
 
-    // ── digest (§8.5, OQ-4 + OQ-M5) — Merkle root, consensus-committed ────
-    // CONSENSUS: intern ids are NODE-LOCAL (assigned at first global
-    // sighting, which interleaves differently across lanes on different
-    // nodes). All consensus bytes use the CANONICAL identity key
-    // (PayoutDescriptor identity, 32 bytes) supplied by the resolver, sorted
-    // by those bytes — never raw intern ids.
-    //
-    // OQ-M5 (resolved): the digest is the root of a Merkle tree over the
-    // canonical leaves, so lite clients can verify one accumulator entry
-    // (message-TTL budget) or one bucket's raw work (market settlement band)
-    // with a log-size proof against the on-chain commitment. Tree rule:
-    //   leaf node     = sha256d(0x00 || leaf payload)
-    //   interior node = sha256d(0x01 || left || right)   (domain-separated)
-    //   odd node      = promoted unchanged (no duplication ambiguity)
-    // Leaf order (fixed): [0] header leaf (geometry, B, next_pos, counts,
-    // L0 sums); then acc leaves in canonical-identity order; then bucket
-    // leaves level-by-level, oldest -> newest.
-    template <typename Resolver>  // bytes32 resolver(MinerId)
-    bytes32 digest(Resolver&& id_key) const {
-        return merkle_root(build_leaves(id_key));
-    }
-
-    // Inclusion proof for one miner's accumulator leaf (lite-client TTL
-    // verification). Returns false if the miner has no acc entry.
+    // ── Merkle digest (§8.5, OQ-4 + OQ-M5) over the origin-bin state ──────
     struct MerkleProof {
         u64 leaf_count = 0;
         u64 index = 0;
-        std::vector<bytes32> path;  // siblings bottom-up; promote-odd levels
-                                    // contribute no entry (structure is
-                                    // derivable from leaf_count + index)
+        std::vector<bytes32> path;
     };
+    template <typename Resolver>
+    bytes32 digest(Resolver&& id_key) const {
+        return merkle_root(build_leaves(id_key));
+    }
     template <typename Resolver>
     bool acc_proof(MinerId m, Resolver&& id_key, bytes32& leaf_out,
                    MerkleProof& proof_out) const {
         if (!m_acc.count(m)) return false;
         auto leaves = build_leaves(id_key);
-        // locate the miner's acc leaf: header is leaf 0; acc leaves follow
-        // in canonical order — recompute its leaf hash and find it.
         bytes32 key = id_key(m);
         std::vector<std::uint8_t> payload;
         append_bytes(payload, "V37A", 4);
@@ -326,9 +266,6 @@ public:
         proof_out = make_proof(leaves, idx);
         return true;
     }
-
-    // Stateless verifier (what a lite client runs against the committed
-    // root): recomputes the path using only leaf_count/index for structure.
     static bool verify_proof(const bytes32& root, const bytes32& leaf,
                              const MerkleProof& p) {
         bytes32 h = leaf;
@@ -348,32 +285,30 @@ public:
         return used == p.path.size() && h == root;
     }
 
-    // ── OQ-2 exact epoch rebuild, exposed for tests/reference checks ──────
-    // Re-derives every scaled quantity from durable records (w_raw + pos for
-    // L0; immutable bucket records with the epoch-shift rule). This IS the
-    // reference function the fast path re-converges to (§8.4).
+    // ── OQ-2 exact rebuild from durable records (origin-bin indexed) ──────
+    // Public for tests; refuses off the positional boundary.
     void epoch_rebuild() {
-        if (m_next_pos - m_B != m_p.epoch_len())
-            throw std::logic_error("v37: epoch_rebuild outside the epoch "
-                                   "boundary (positionally defined, §8.3)");
-        u64 B_new = m_B + m_p.epoch_len();
+        if (!m_started || m_t - m_B < m_p.epoch_bins)
+            throw std::logic_error("v37: epoch_rebuild before the boundary");
+        u64 B_new = m_B + m_p.epoch_bins;
         m_acc.clear();
         m_acc_total = U256();
-        m_l0_scaled_sum = U256();
-        // L0: recompute from primary inputs, oldest -> newest.
-        for (auto& s : m_l0) {
-            u64 depth = B_new - s.pos;          // in [1, E] (E == C0)
-            s.w_scaled = u128(s.w_raw) * m_tab.decay[depth];
-            m_acc[s.miner] += U256::from_u128(s.w_scaled);
-            m_acc_total += U256::from_u128(s.w_scaled);
-            m_l0_scaled_sum += U256::from_u128(s.w_scaled);
+        m_open_scaled_sum = U256();
+        for (auto& [b, ob] : m_open) {
+            for (auto& s : ob.entries) {
+                s.w_scaled = (b >= B_new)
+                                 ? u128(s.w_raw) * m_tab.inv_decay[b - B_new]
+                                 : u128(s.w_raw) * m_tab.decay[B_new - b];
+                m_acc[s.miner] += U256::from_u128(s.w_scaled);
+                m_acc_total += U256::from_u128(s.w_scaled);
+                m_open_scaled_sum += U256::from_u128(s.w_scaled);
+            }
         }
-        // Buckets: immutable; shifted by lambda^(E*age) at read.
         for (const auto& lvl : m_levels) {
-            for (const auto& b : lvl) {
-                u64 age = (B_new - b.epoch_tag) / m_p.epoch_len();
+            for (const auto& bkt : lvl) {
+                u64 age = (B_new - bkt.epoch_tag) / m_p.epoch_bins;
                 u64 f = m_tab.epoch_shift[age];
-                for (const auto& e : b.comp) {
+                for (const auto& e : bkt.comp) {
                     U256 c = e.scaled.mul_q(f);
                     m_acc[e.miner] += c;
                     m_acc_total += c;
@@ -381,88 +316,81 @@ public:
             }
         }
         m_B = B_new;
-        m_journal.clear();   // rewind cannot cross a rebuild (see notes)
+        m_journal.clear();
         Op b2; b2.type = Op::Type::RebuildBoundary;
-        m_journal.push_back(std::move(b2));  // sentinel: see rewind()
+        m_journal.push_back(std::move(b2));
     }
 
 private:
-    // ── journal ───────────────────────────────────────────────────────────
     struct Op {
         enum class Type { Push, FoldL0, FoldLevel, Evict, RebuildBoundary };
-        Type type;
-        // Push
-        L0Slot slot;
-        // FoldL0 / FoldLevel / Evict
-        Bucket bucket;                 // created (folds) or removed (evict)
-        std::vector<L0Slot> folded_slots;     // FoldL0: removed L0 slots
-        std::vector<Bucket> folded_children;  // FoldLevel: removed buckets
-        std::size_t level_index = 0;          // FoldLevel/Evict: which level
-        std::vector<std::pair<MinerId, U256>> subtracted;  // Evict: exact subs
-
-        static Op push(const L0Slot& s) { Op o; o.type = Type::Push; o.slot = s; return o; }
+        Type type = Type::Push;
+        L0Slot slot;                 // Push
+        u64 bin = 0;                 // Push: origin bin
+        u64 prev_t = 0;              // Push: clock before this push
+        bool prev_started = false;   // Push: lane started before this push
+        Bucket bucket;               // fold result / evicted bucket
+        std::vector<OpenBin> folded_bins;     // FoldL0: removed open bins
+        std::vector<Bucket> folded_children;  // FoldLevel
+        std::size_t level_index = 0;
+        std::vector<std::pair<MinerId, U256>> subtracted;  // Evict
     };
 
     u64 head_decay() const {
-        // factor lambda^(H - B) with H = next_pos - 1; H - B in [0, E).
-        if (m_next_pos == m_B) return Q_ONE;
-        return m_tab.decay[(m_next_pos - 1) - m_B];
+        if (!m_started) return Q_ONE;
+        return m_tab.decay[m_t - m_B];   // t - B in [0, E)
     }
 
-    void journal_push(Op op) {
-        m_journal.push_back(std::move(op));
-        // Trim: keep ops back to (and including) the D-th most recent push,
-        // PLUS that push's immediately preceding folds — rewind(D) must be
-        // able to undo the full push() call it lands on.
-        u64 pushes = 0;
-        std::size_t keep_from = 0;
-        for (std::size_t i = m_journal.size(); i-- > 0;) {
-            if (m_journal[i].type == Op::Type::Push) {
-                if (++pushes == m_p.journal_depth) { keep_from = i; break; }
+    u128 scaled_for(u64 w_raw, u64 bin) const {
+        return (bin >= m_B) ? u128(w_raw) * m_tab.inv_decay[bin - m_B]
+                            : u128(w_raw) * m_tab.decay[m_B - bin];
+    }
+
+    void advance_clock(u64 new_t) {
+        m_t = new_t;
+        while (m_t - m_B >= m_p.epoch_bins) epoch_rebuild();   // (1)
+        fold_ready();                                          // (2)
+        evict_old();                                           // (3)
+    }
+
+    // (2) fold band-aligned bin bands fully older than the fine horizon
+    void fold_ready() {
+        while (!m_open.empty()) {
+            u64 oldest = m_open.begin()->first;
+            u64 band = oldest / m_p.rollup;
+            u64 band_lo = band * m_p.rollup;
+            u64 band_hi = band_lo + m_p.rollup - 1;
+            if (band_hi + m_p.fine_bins >= m_t) break;  // still the Present
+            Bucket b;
+            b.bin_lo = band_lo;
+            b.bin_hi = band_hi;
+            b.epoch_tag = m_B;
+            std::map<MinerId, CompEntry> agg;
+            Op op; op.type = Op::Type::FoldL0; op.level_index = 0;
+            for (u64 bi = band_lo; bi <= band_hi; ++bi) {
+                auto it = m_open.find(bi);
+                if (it == m_open.end()) continue;  // empty bin in the band
+                for (const auto& s : it->second.entries) {
+                    b.scaled_sum += U256::from_u128(s.w_scaled);
+                    b.raw_work += s.w_raw;
+                    auto& e = agg[s.miner];
+                    e.miner = s.miner;
+                    e.scaled += U256::from_u128(s.w_scaled);
+                    e.raw += s.w_raw;
+                    m_open_scaled_sum -= U256::from_u128(s.w_scaled);
+                    m_open_raw_sum -= s.w_raw;
+                }
+                op.folded_bins.push_back(std::move(it->second));
+                m_open.erase(it);
             }
+            for (auto& [m, e] : agg) b.comp.push_back(e);
+            op.bucket = b;
+            m_levels[0].push_back(std::move(b));
+            m_journal.push_back(std::move(op));
+            cascade_folds();
         }
-        if (pushes < m_p.journal_depth || keep_from == 0) return;
-        while (keep_from > 0 &&
-               (m_journal[keep_from - 1].type == Op::Type::FoldL0 ||
-                m_journal[keep_from - 1].type == Op::Type::FoldLevel ||
-                m_journal[keep_from - 1].type == Op::Type::RebuildBoundary))
-            --keep_from;
-            // the boundary sentinel is kept when adjacent: rewind() must
-            // still see it to refuse landing on the rebuild-triggering push
-        if (keep_from > 0)
-            m_journal.erase(m_journal.begin(),
-                            m_journal.begin() + static_cast<long>(keep_from));
     }
 
-    // ── fold: L0 -> level 1 (§4.1) ────────────────────────────────────────
-    void fold_l0() {
-        Bucket b;
-        b.epoch_tag = m_B;
-        std::map<MinerId, CompEntry> agg;
-        Op op; op.type = Op::Type::FoldL0; op.level_index = 0;
-        for (u64 i = 0; i < m_p.rollup; ++i) {
-            const L0Slot& s = m_l0.front();
-            if (i == 0) b.pos_lo = s.pos;
-            b.pos_hi = s.pos;
-            b.scaled_sum += U256::from_u128(s.w_scaled);
-            b.raw_work += s.w_raw;
-            auto& e = agg[s.miner];
-            e.miner = s.miner;
-            e.scaled += U256::from_u128(s.w_scaled);
-            e.raw += s.w_raw;
-            m_l0_scaled_sum -= U256::from_u128(s.w_scaled);
-            m_l0_raw_sum -= s.w_raw;
-            op.folded_slots.push_back(s);
-            m_l0.pop_front();
-        }
-        for (auto& [m, e] : agg) b.comp.push_back(e);  // miner-id order
-        op.bucket = b;
-        m_levels[0].push_back(std::move(b));
-        m_journal.push_back(std::move(op));
-        // acc is untouched: fold relocates scaled value, it does not change it.
-    }
-
-    // ── fold cascade: level k -> k+1 when ring k is full ──────────────────
     void cascade_folds() {
         for (std::size_t k = 0; k + 1 < m_levels.size(); ++k) {
             if (m_levels[k].size() < m_p.level_caps[k]) continue;
@@ -470,13 +398,13 @@ private:
             b.epoch_tag = m_B;
             std::map<MinerId, CompEntry> agg;
             Op op; op.type = Op::Type::FoldLevel; op.level_index = k;
-            for (u64 i = 0; i < m_p.rollup; ++i) {
+            for (u64 i = 0; i < m_p.rollup && !m_levels[k].empty(); ++i) {
                 Bucket child = m_levels[k].front();
                 m_levels[k].pop_front();
-                u64 age = (m_B - child.epoch_tag) / m_p.epoch_len();
+                u64 age = (m_B - child.epoch_tag) / m_p.epoch_bins;
                 u64 f = m_tab.epoch_shift[age];
-                if (i == 0) b.pos_lo = child.pos_lo;
-                b.pos_hi = child.pos_hi;
+                if (i == 0) b.bin_lo = child.bin_lo;
+                b.bin_hi = child.bin_hi;
                 b.scaled_sum += child.scaled_sum.mul_q(f);
                 b.raw_work += child.raw_work;
                 for (const auto& e : child.comp) {
@@ -491,64 +419,85 @@ private:
             op.bucket = b;
             m_levels[k + 1].push_back(std::move(b));
             m_journal.push_back(std::move(op));
-            // NOTE: shifting children to the current frame at fold changes
-            // their stored frame; acc tracked them in their OLD frame, so a
-            // truncation residual is created here. It is deterministic and
-            // flushed at the next epoch rebuild (§4.2 determinism note) —
-            // and with default L = 2 this path never runs.
         }
     }
 
-    // ── eviction: whole outermost buckets (OQ-1) ──────────────────────────
-    void evict_oldest_bucket() {
-        // Globally oldest bucket = the one with the smallest pos_lo across
-        // all bucket levels (data is strictly ordered through the pyramid).
-        std::size_t best = SIZE_MAX;
-        for (std::size_t k = 0; k < m_levels.size(); ++k) {
-            if (m_levels[k].empty()) continue;
-            if (best == SIZE_MAX ||
-                m_levels[k].front().pos_lo < m_levels[best].front().pos_lo)
-                best = k;
+    // (3) evict whole buckets fully older than the window (time-true OQ-1)
+    void evict_old() {
+        for (;;) {
+            std::size_t best = SIZE_MAX;
+            for (std::size_t k = 0; k < m_levels.size(); ++k) {
+                if (m_levels[k].empty()) continue;
+                if (best == SIZE_MAX ||
+                    m_levels[k].front().bin_lo < m_levels[best].front().bin_lo)
+                    best = k;
+            }
+            if (best == SIZE_MAX) return;
+            if (m_levels[best].front().bin_hi + m_p.window_bins >= m_t)
+                return;                            // still inside the window
+            Bucket b = m_levels[best].front();
+            m_levels[best].pop_front();
+            u64 age = (m_B - b.epoch_tag) / m_p.epoch_bins;
+            u64 f = m_tab.epoch_shift[age];
+            Op op; op.type = Op::Type::Evict; op.level_index = best;
+            for (const auto& e : b.comp) {
+                U256 sub = e.scaled.mul_q(f);
+                m_acc[e.miner] -= sub;
+                m_acc_total -= sub;
+                if (m_acc[e.miner].is_zero()) m_acc.erase(e.miner);
+                op.subtracted.emplace_back(e.miner, sub);
+            }
+            m_raw_total -= b.raw_work;
+            op.bucket = std::move(b);
+            m_journal.push_back(std::move(op));
         }
-        if (best == SIZE_MAX)
-            throw std::logic_error("v37: cover > W with no buckets");
-        Bucket b = m_levels[best].front();
-        m_levels[best].pop_front();
-        u64 age = (m_B - b.epoch_tag) / m_p.epoch_len();
-        u64 f = m_tab.epoch_shift[age];
-        Op op; op.type = Op::Type::Evict; op.level_index = best;
-        for (const auto& e : b.comp) {
-            U256 sub = e.scaled.mul_q(f);
-            m_acc[e.miner] -= sub;
-            m_acc_total -= sub;
-            if (m_acc[e.miner].is_zero()) m_acc.erase(e.miner);
-            op.subtracted.emplace_back(e.miner, sub);
-        }
-        m_raw_total -= b.raw_work;
-        m_cover -= (b.pos_hi - b.pos_lo + 1);
-        op.bucket = std::move(b);
+    }
+
+    void journal_push(Op op) {
         m_journal.push_back(std::move(op));
+        u64 pushes = 0;
+        std::size_t keep_from = 0;
+        for (std::size_t i = m_journal.size(); i-- > 0;) {
+            if (m_journal[i].type == Op::Type::Push) {
+                if (++pushes == m_p.journal_depth) { keep_from = i; break; }
+            }
+        }
+        if (pushes < m_p.journal_depth || keep_from == 0) return;
+        // keep everything attached to the kept-oldest push (its preceding
+        // ops are only ever this call's folds/evicts or the sentinel —
+        // structure ops follow clock advances, which precede the insert)
+        while (keep_from > 0 &&
+               m_journal[keep_from - 1].type != Op::Type::Push)
+            --keep_from;
+        if (keep_from > 0)
+            m_journal.erase(m_journal.begin(),
+                            m_journal.begin() + static_cast<long>(keep_from));
     }
 
-    // ── undo ops (exact bit-restoration; no rebuild in between by rule) ───
     void undo_push(const Op& op) {
+        auto it = m_open.find(op.bin);
+        it->second.entries.pop_back();
+        if (it->second.entries.empty()) m_open.erase(it);
         const L0Slot& s = op.slot;
-        m_l0.pop_back();
         m_acc[s.miner] -= U256::from_u128(s.w_scaled);
         if (m_acc[s.miner].is_zero()) m_acc.erase(s.miner);
         m_acc_total -= U256::from_u128(s.w_scaled);
         m_raw_total -= s.w_raw;
-        m_l0_scaled_sum -= U256::from_u128(s.w_scaled);
-        m_l0_raw_sum -= s.w_raw;
-        m_cover -= 1;
-        m_next_pos -= 1;
+        m_open_scaled_sum -= U256::from_u128(s.w_scaled);
+        m_open_raw_sum -= s.w_raw;
+        m_events -= 1;
+        m_t = op.prev_t;
+        m_started = op.prev_started;
     }
     void undo_fold_l0(const Op& op) {
         m_levels[0].pop_back();
-        for (auto it = op.folded_slots.rbegin(); it != op.folded_slots.rend(); ++it) {
-            m_l0.push_front(*it);
-            m_l0_scaled_sum += U256::from_u128(it->w_scaled);
-            m_l0_raw_sum += it->w_raw;
+        for (auto it = op.folded_bins.rbegin(); it != op.folded_bins.rend();
+             ++it) {
+            for (const auto& s : it->entries) {
+                m_open_scaled_sum += U256::from_u128(s.w_scaled);
+                m_open_raw_sum += s.w_raw;
+            }
+            m_open[it->bin] = *it;
         }
     }
     void undo_fold_level(const Op& op) {
@@ -564,24 +513,9 @@ private:
             m_acc_total += sub;
         }
         m_raw_total += op.bucket.raw_work;
-        m_cover += (op.bucket.pos_hi - op.bucket.pos_lo + 1);
     }
 
-    // ── digest serialization helpers (fixed-width LE, §8.3) ───────────────
-    static void append_bytes(std::vector<std::uint8_t>& b, const char* p, std::size_t n) {
-        b.insert(b.end(), p, p + n);
-    }
-    static void append_u64(std::vector<std::uint8_t>& b, u64 x) {
-        for (int i = 0; i < 8; ++i) b.push_back(static_cast<std::uint8_t>(x >> (8 * i)));
-    }
-    static void append_u128(std::vector<std::uint8_t>& b, u128 x) {
-        append_u64(b, static_cast<u64>(x));
-        append_u64(b, static_cast<u64>(x >> 64));
-    }
-    static void append_u256(std::vector<std::uint8_t>& b, const U256& x) {
-        for (int i = 0; i < 4; ++i) append_u64(b, x.v[i]);
-    }
-    // ── Merkle digest machinery (OQ-M5) ───────────────────────────────────
+    // ── Merkle machinery (unchanged rules; origin-bin leaves) ─────────────
     static bytes32 leaf_hash(const std::vector<std::uint8_t>& payload) {
         std::vector<std::uint8_t> b;
         b.reserve(payload.size() + 1);
@@ -597,14 +531,13 @@ private:
         return sha256d(b, 65);
     }
     static bytes32 merkle_root(std::vector<bytes32> level) {
-        // never empty: build_leaves always emits the header leaf
         while (level.size() > 1) {
             std::vector<bytes32> next;
             next.reserve((level.size() + 1) / 2);
             std::size_t i = 0;
             for (; i + 1 < level.size(); i += 2)
                 next.push_back(interior_hash(level[i], level[i + 1]));
-            if (i < level.size()) next.push_back(level[i]);  // promote odd
+            if (i < level.size()) next.push_back(level[i]);
             level = std::move(next);
         }
         return level[0];
@@ -629,36 +562,38 @@ private:
         return p;
     }
 
-    // Canonical leaf list — the fixed order every conforming node produces.
     template <typename Resolver>
     std::vector<bytes32> build_leaves(Resolver&& id_key) const {
         std::vector<bytes32> leaves;
         u64 bucket_total = 0;
         for (const auto& lvl : m_levels) bucket_total += lvl.size();
         leaves.reserve(1 + m_acc.size() + bucket_total);
-        {   // [0] header leaf: geometry (consensus parameters — a mismatch
-            // becomes an attributable digest difference), position state,
-            // counts, and the L0 ring sums (F-1 leaves).
+        {   // header leaf: geometry (consensus params), clock state, counts,
+            // open (Present) sums — T-OQ4: open partial state is committed
             std::vector<std::uint8_t> h;
             append_bytes(h, "V37H", 4);
-            append_u64(h, m_p.window);
-            append_u64(h, m_p.c0);
+            append_u64(h, m_p.window_bins);
+            append_u64(h, m_p.fine_bins);
             append_u64(h, m_p.rollup);
             append_u64(h, m_p.half_life);
-            append_u64(h, m_p.vest_threshold_shares);  // §4.3, consensus
+            append_u64(h, m_p.epoch_bins);
+            append_u64(h, m_p.n_ctx);
+            append_u64(h, m_p.vest_threshold_shares);
             append_u64(h, static_cast<u64>(m_p.level_caps.size()));
             for (u64 c : m_p.level_caps) append_u64(h, c);
             append_u64(h, m_B);
-            append_u64(h, m_next_pos);
+            append_u64(h, m_t);
+            append_u64(h, m_started ? 1 : 0);
             append_u64(h, static_cast<u64>(m_acc.size()));
-            append_u64(h, static_cast<u64>(m_l0.size()));
-            append_u256(h, m_l0_scaled_sum);
-            append_u128(h, m_l0_raw_sum);
+            append_u64(h, m_events);
+            append_u64(h, static_cast<u64>(m_open.size()));
+            append_u256(h, m_open_scaled_sum);
+            append_u128(h, m_open_raw_sum);
             for (const auto& lvl : m_levels)
                 append_u64(h, static_cast<u64>(lvl.size()));
             leaves.push_back(leaf_hash(h));
         }
-        {   // acc leaves, canonical-identity order
+        {
             std::vector<std::pair<bytes32, const U256*>> rows;
             rows.reserve(m_acc.size());
             for (const auto& [m, a] : m_acc) rows.emplace_back(id_key(m), &a);
@@ -672,15 +607,13 @@ private:
                 leaves.push_back(leaf_hash(b));
             }
         }
-        // bucket leaves, level-by-level, oldest -> newest (F-1 settlement
-        // bands provable individually)
         for (std::size_t k = 0; k < m_levels.size(); ++k) {
             for (const auto& bkt : m_levels[k]) {
                 std::vector<std::uint8_t> b;
                 append_bytes(b, "V37B", 4);
                 append_u64(b, static_cast<u64>(k));
-                append_u64(b, bkt.pos_lo);
-                append_u64(b, bkt.pos_hi);
+                append_u64(b, bkt.bin_lo);
+                append_u64(b, bkt.bin_hi);
                 append_u128(b, bkt.raw_work);
                 append_u64(b, bkt.epoch_tag);
                 auto ch = comp_hash(bkt, id_key);
@@ -691,7 +624,6 @@ private:
         return leaves;
     }
 
-    // Composition hash, also in canonical-identity order (see digest()).
     template <typename Resolver>
     static bytes32 comp_hash(const Bucket& b, Resolver&& id_key) {
         std::vector<std::pair<bytes32, const CompEntry*>> rows;
@@ -708,18 +640,35 @@ private:
         return sha256d(buf);
     }
 
+    static void append_bytes(std::vector<std::uint8_t>& b, const char* p,
+                             std::size_t n) {
+        b.insert(b.end(), p, p + n);
+    }
+    static void append_u64(std::vector<std::uint8_t>& b, u64 x) {
+        for (int i = 0; i < 8; ++i)
+            b.push_back(static_cast<std::uint8_t>(x >> (8 * i)));
+    }
+    static void append_u128(std::vector<std::uint8_t>& b, u128 x) {
+        append_u64(b, static_cast<u64>(x));
+        append_u64(b, static_cast<u64>(x >> 64));
+    }
+    static void append_u256(std::vector<std::uint8_t>& b, const U256& x) {
+        for (int i = 0; i < 4; ++i) append_u64(b, x.v[i]);
+    }
+
     LaneParams m_p;
     DecayTables m_tab;
-    u64 m_next_pos = 0;
-    u64 m_B = 0;
-    u64 m_cover = 0;
-    std::deque<L0Slot> m_l0;
-    std::vector<std::deque<Bucket>> m_levels;
-    std::map<MinerId, U256> m_acc;           // ordered: digest determinism
+    bool m_started = false;
+    u64 m_t = 0;                 // consensus clock: latest origin bin seen
+    u64 m_B = 0;                 // epoch base, bin units
+    u64 m_events = 0;            // accounting events (EMA denominator)
+    std::map<u64, OpenBin> m_open;             // the Present, by origin bin
+    std::vector<std::deque<Bucket>> m_levels;  // the Past, settling coarser
+    std::map<MinerId, U256> m_acc;
     U256 m_acc_total;
     u128 m_raw_total = 0;
-    U256 m_l0_scaled_sum;
-    u128 m_l0_raw_sum = 0;
+    U256 m_open_scaled_sum;
+    u128 m_open_raw_sum = 0;
     std::deque<Op> m_journal;
 };
 

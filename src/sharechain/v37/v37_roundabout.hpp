@@ -72,13 +72,13 @@ public:
     // Push a share: validates the descriptor under V37.0 rules (attribution
     // MUST be absent), interns identity, forwards to the lane.
     MinerId push(ChainId chain, const PayoutDescriptor& d, u64 w_raw,
-                 std::uint32_t flags) {
+                 std::uint32_t flags, u64 bin) {
         if (!d.valid(false))
             throw std::invalid_argument("v37: invalid descriptor (V37.0 rules)");
         Lane* l = lane(chain);
         if (!l) throw std::invalid_argument("v37: unknown chain");
         MinerId id = m_miners.intern(d);
-        l->push(id, w_raw, flags);
+        l->push(id, w_raw, flags, bin);   // bin = committed mainchain height
         return id;
     }
 
