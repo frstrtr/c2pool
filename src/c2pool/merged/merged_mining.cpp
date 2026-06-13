@@ -1272,6 +1272,11 @@ void MergedMiningManager::set_block_relay_fn(BlockRelayFn fn)
 
 // ─── Shared helpers ──────────────────────────────────────────────────────────
 
+// [v36-audit C4] Output ordering here is NODE-LOCAL and NOT consensus-bearing:
+// the assembled DOGE coinbase is submitted only to dogecoind, which accepts any
+// valid ordering. The sharechain commits to merged work via the AuxPoW merkle
+// proof, not by re-deriving these outputs across peers. Donation split + dust
+// tiebreak below are deterministic purely for stable local block assembly.
 /*static*/ std::string MergedMiningManager::build_pplns_coinbase_hex(
     int height,
     const std::vector<std::pair<std::vector<unsigned char>, uint64_t>>& payouts,

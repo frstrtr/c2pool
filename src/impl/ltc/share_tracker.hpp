@@ -2304,6 +2304,10 @@ public:
 
         delta.total_weight = att * 65535;
         delta.total_donation_weight = att * static_cast<uint32_t>(obj->m_donation);
+        // [v36-audit C2] INTENTIONAL DIVERGENCE: merged-chain weights are FLAT
+        // (att-weighted, no time-decay). Only the parent/LTC chain applies decay.
+        // Mirrors p2pool get_v36_merged_weights (flat + cap, data.py:2657) vs the
+        // parent decayed-cumulative skiplist. Verified intentional, not a bug.
         delta.weights[weight_key] = att * static_cast<uint32_t>(65535 - obj->m_donation);
         return delta;
     }
@@ -2512,6 +2516,12 @@ public:
     //   per_miner = miners_reward * w // accepted_total
     //   rounding_remainder = miners_reward - sum(per_miner)
     //   final_donation = donation_amount + rounding_remainder
+    // [v36-audit C4] NODE-LOCAL / NON-CONSENSUS. Despite the name, this derives
+    // THIS node's intended DOGE aux-coinbase payout split from PPLNS weights to
+    // build the block submitted to dogecoind. Sole caller = the MM payout_provider
+    // (c2pool_refactored.cpp); never invoked from share verification. Peers validate
+    // the merged commitment via the AuxPoW merkle proof, NOT by re-deriving these
+    // outputs, so output ordering is node-local (dogecoind accepts any valid order).
     std::map<std::vector<unsigned char>, uint64_t>
     get_merged_expected_payouts(const uint256& best_share_hash,
                                 const uint256& block_target,
