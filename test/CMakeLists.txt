@@ -34,7 +34,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_utxo PRIVATE c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage ltc_coin pool)  # OBJECT-lib SCC direct-naming (#22/#39)
-    gtest_discover_tests(test_utxo)
+    gtest_discover_tests(test_utxo DISCOVERY_MODE PRE_TEST)  # defer discovery to ctest runtime; fixes -j(nproc) build-time discovery race vs v37_test (PR #84)
 
     add_executable(test_redistribute_address test_redistribute_address.cpp)
     target_link_libraries(test_redistribute_address PRIVATE
