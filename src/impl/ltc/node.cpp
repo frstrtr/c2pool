@@ -247,10 +247,10 @@ int NodeImpl::get_verified_count() const { return get_tracker_snapshot().verifie
 void NodeImpl::send_version(peer_ptr peer)
 {
     auto rmsg = ltc::message_version::make_raw(
-        ltc::PoolConfig::ADVERTISED_PROTOCOL_VERSION,
+        m_tracker.m_params->minimum_protocol_version,
         1,                                    // services
         addr_t{1, peer->addr()},              // addr_to (the remote)
-        addr_t{1, NetService{"0.0.0.0", ltc::PoolConfig::P2P_PORT}}, // addr_from (us)
+        addr_t{1, NetService{"0.0.0.0", m_tracker.m_params->p2p_port}}, // addr_from (us)
         m_nonce,
         m_software_version,
         1,                                    // mode (always 1 for legacy compat)
@@ -304,11 +304,11 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
         }
 
         // Reject peers running too-old protocol
-        if (msg->m_version < ltc::PoolConfig::MINIMUM_PROTOCOL_VERSION)
+        if (msg->m_version < m_tracker.m_params->minimum_protocol_version)
         {
             LOG_WARNING << "Peer " << msg->m_addr_from.m_endpoint.to_string()
                         << " protocol " << msg->m_version
-                        << " < minimum " << ltc::PoolConfig::MINIMUM_PROTOCOL_VERSION
+                        << " < minimum " << m_tracker.m_params->minimum_protocol_version
                         << ", disconnecting";
             throw std::runtime_error("peer protocol too old");
         }
@@ -362,7 +362,7 @@ void NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
                     try
                     {
                         share.ACTION({
-                            obj->m_hash = share_init_verify(*obj, true);
+                            obj->m_hash = share_init_verify(*obj, *m_tracker.m_params, true);
                         });
                     }
                     catch (const std::exception&)
@@ -391,22 +391,21 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
     // Non-blocking mutex: if think() holds the exclusive lock on the compute
     // thread, queue this batch for processing after think() releases. The IO
     // thread never blocks — keepalive timers and network I/O continue.
-    // Acquire the tracker lock and HOLD it across the entire mutation body below.
-    // try_to_lock keeps the IO thread non-blocking — if think()/clean holds the
-    // exclusive lock we queue the batch and return. Once acquired we must NOT
-    // release until all m_tracker.chain mutations are done: the prior code
-    // released here and ran the body lock-free, letting the compute-thread
-    // clean_tracker() exclusive prune (drop_tails) free chain nodes mid-mutation
-    // → SIGSEGV (kr1z1s LTC/DGB). Released just before run_think() below.
-    std::unique_lock lock(m_tracker_mutex, std::try_to_lock);
-    if (!lock.owns_lock()) {
-        LOG_INFO << "[ASYNC-DEFER] processing_shares_phase2: mutex busy, queuing "
-                 << data.m_items.size() << " shares from " << addr.to_string()
-                 << " (pending=" << m_pending_adds.size() + 1 << ")";
-        m_pending_adds.push_back(PendingShareBatch{
-            std::make_unique<HandleSharesData>(std::move(data)), addr});
-        return;
+    {
+        std::unique_lock lock(m_tracker_mutex, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            LOG_INFO << "[ASYNC-DEFER] processing_shares_phase2: mutex busy, queuing "
+                     << data.m_items.size() << " shares from " << addr.to_string()
+                     << " (pending=" << m_pending_adds.size() + 1 << ")";
+            m_pending_adds.push_back(PendingShareBatch{
+                std::make_unique<HandleSharesData>(std::move(data)), addr});
+            return;
+        }
     }
+    // Lock released — proceed with normal processing.
+    // No lock needed for the rest: we only enter here when think() is NOT
+    // running (m_tracker_mutex was available), and ASIO single-thread
+    // guarantees no other IO handler overlaps.
 
     // Step 1: collect verified shares (skip any that failed verification, hash still null)
     std::vector<ShareType> valid_shares;
@@ -566,11 +565,6 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
                  << source << "... (dup=" << dup_count
                  << " chain=" << m_tracker.chain.size() << ")";
     }
-
-    // Release the tracker lock before triggering think(): run_think() posts the
-    // think+prune job to the compute thread, which needs the exclusive lock. All
-    // chain mutations above are complete at this point.
-    lock.unlock();
 
     // Trigger think() after every share batch (p2pool: set_best_share after handle_shares).
     // p2pool calls set_best_share() after EVERY batch with new_count > 0 — no size gate.
@@ -796,18 +790,14 @@ void NodeImpl::notify_local_share(const uint256& share_hash)
 {
     // p2pool: set_best_share() → think() synchronously on the reactor thread.
     // Use think() for ALL best_share decisions, matching p2pool exactly.
-    if (share_hash.IsNull())
+    if (share_hash.IsNull() || !m_tracker.chain.contains(share_hash))
         return;
 
-    // Both the chain.contains() read AND attempt_verify() run UNDER the tracker
-    // lock. A bare m_tracker.chain.contains() here (the prior code) raced the
-    // compute-thread clean_tracker() exclusive prune freeing chain nodes →
-    // SIGSEGV (kr1z1s LTC/DGB). try_to_lock keeps the IO thread non-blocking; if
-    // think()/clean holds the lock we skip the inline verify — the share is
-    // already in-chain and run_think() below will score it next cycle.
+    // Try inline verify — if think() holds the mutex, defer to next think() cycle.
+    // The share is already in the chain; think() will verify + score it.
     {
         std::unique_lock lock(m_tracker_mutex, std::try_to_lock);
-        if (lock.owns_lock() && m_tracker.chain.contains(share_hash))
+        if (lock.owns_lock())
             m_tracker.attempt_verify(share_hash);
     }
 
@@ -1059,7 +1049,7 @@ void NodeImpl::load_persisted_shares()
         return;
     }
 
-    const size_t keep_per_head = PoolConfig::chain_length() * 2 + 10;
+    const size_t keep_per_head = m_tracker.m_params->chain_length * 2 + 10;
     const size_t total_in_db = all_hashes.size();
 
     // Only load the most recent shares (highest height = end of vector)
@@ -1121,7 +1111,7 @@ void NodeImpl::load_persisted_shares()
                                 g_last_pow_hash = uint256();
                                 g_last_init_is_block = false;
                                 uint256 computed_hash;
-                                share.ACTION({ computed_hash = share_init_verify(*obj, true); });
+                                share.ACTION({ computed_hash = share_init_verify(*obj, *m_tracker.m_params, true); });
                                 if (!g_last_pow_hash.IsNull())
                                     idx->pow_hash = g_last_pow_hash;
                                 if (!computed_hash.IsNull() && computed_hash != hash) {
@@ -1264,7 +1254,7 @@ void NodeImpl::prune_shares(const uint256& /*best_share*/)
     // - Remove ONE child of qualifying tail per iteration
     // - Loop up to 1000 times (gradual, not bulk)
     // - Also cascade removal to verified
-    const auto CL = static_cast<int32_t>(PoolConfig::chain_length());
+    const auto CL = static_cast<int32_t>(m_tracker.m_params->chain_length);
     const int32_t min_depth = 2 * CL + 10;
 
     for (int iter = 0; iter < 1000; ++iter)
@@ -1603,7 +1593,7 @@ void NodeImpl::heartbeat_log()
     }
     if (!walk_start.IsNull() && m_tracker.chain.contains(walk_start)) {
         int window = std::min(height, static_cast<int>(
-            std::min(size_t(3600) / PoolConfig::share_period(), size_t(height))));
+            std::min(size_t(3600) / m_tracker.m_params->share_period, size_t(height))));
         if (window > 0) {
             auto walkable = m_tracker.chain.get_height(walk_start);
             auto walk_n = std::min(window, walkable);
@@ -1663,7 +1653,7 @@ void NodeImpl::heartbeat_log()
         try {
             auto aps = m_tracker.get_pool_attempts_per_second(
                 m_best_share_hash,
-                std::min(height - 1, static_cast<int>(PoolConfig::TARGET_LOOKBEHIND)),
+                std::min(height - 1, static_cast<int>(m_tracker.m_params->target_lookbehind)),
                 /*min_work=*/false);
             double pool_hs = static_cast<double>(aps.GetLow64());
             double real_pool_hs = (stale_prop < 0.999 && pool_hs > 0)
@@ -1751,7 +1741,7 @@ void NodeImpl::clean_tracker()
 
         // Steps 2-3: Prune (still holding exclusive lock)
         auto now_sec = static_cast<int64_t>(std::time(nullptr));
-        auto CL = static_cast<int32_t>(ltc::PoolConfig::chain_length());
+        auto CL = static_cast<int32_t>(m_tracker.m_params->chain_length);
 
     // Step 2: Eat stale heads (p2pool node.py:358-378)
     // Three guards protect useful heads:

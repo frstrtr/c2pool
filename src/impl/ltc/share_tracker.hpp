@@ -23,6 +23,7 @@ inline uint64_t mul128_shift(uint64_t a, uint64_t b, unsigned shift) {
 #include "config_pool.hpp"
 
 #include <core/target_utils.hpp>
+#include <core/coin_params.hpp>
 #include <core/uint256.hpp>
 #include <core/netaddress.hpp>
 #include <sharechain/weights_skiplist.hpp>
@@ -317,6 +318,11 @@ public:
     ShareChain chain;
     ShareChain verified;
 
+    // Coin parameters (non-owning). Set by the owning ltc::NodeImpl right
+    // after construction (m_tracker.m_params = &m_coin_params). Drives the
+    // parameterized verify_share() and protocol-version lookups (PR-0 S1).
+    const core::CoinParams* m_params = nullptr;
+
 
     // Set by think() Phase 2 when verification budget is exhausted.
     // Checked by run_think() to schedule a deferred continuation.
@@ -472,7 +478,7 @@ public:
             auto t0 = std::chrono::steady_clock::now();
             auto& share_var = chain.get_share(share_hash);
             share_var.ACTION({
-                auto computed_hash = verify_share(*obj, *this);
+                auto computed_hash = verify_share(*obj, *this, *m_params);
                 (void)computed_hash;
             });
             {
