@@ -18,7 +18,7 @@
 # follows the OBJECT-lib convention PR; held ~2-3 heartbeats, not raced here.
 if(COIN_DGB)
   message(STATUS "c2pool: DGB Scrypt-only coin module enabled (skeleton)")
-  # add_subdirectory(coin)
+  add_subdirectory(coin)
   # add_subdirectory(daemon)
   # add_subdirectory(test)
 endif()
