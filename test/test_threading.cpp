@@ -47,6 +47,7 @@
 
 #include <impl/ltc/share.hpp>
 #include <impl/ltc/share_check.hpp>
+#include <impl/ltc/params.hpp>
 #include <sharechain/sharechain.hpp>
 #include <core/pack.hpp>
 #include <btclibs/crypto/scrypt.h>
@@ -90,6 +91,11 @@ static ltc::ShareType load_test_share()
     return ltc::load_share(rshare, NetService{"0.0.0.0", 0});
 }
 
+// LTC testnet CoinParams for the share-verify path (the loaded share is a
+// real V36 *testnet* share). const + namespace-scope so the threaded test
+// below reads it concurrently without capturing it per-lambda.
+static const core::CoinParams g_test_params = ltc::make_coin_params(/*testnet=*/true);
+
 // ─── Test 1: scrypt is controlled by check_pow flag ──────────────────────────
 
 TEST(VerifyShareThreading, ScryptControlledByCheckPowFlag)
@@ -116,7 +122,7 @@ TEST(VerifyShareThreading, ScryptControlledByCheckPowFlag)
     auto t_fast_start = std::chrono::steady_clock::now();
     for (int i = 0; i < SCRYPT_REPS; i++)
     {
-        share.ACTION({ ltc::share_init_verify(*obj, false); });
+        share.ACTION({ ltc::share_init_verify(*obj, g_test_params, false); });
     }
     auto t_fast_us = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - t_fast_start).count();
@@ -145,7 +151,7 @@ TEST(VerifyShareThreading, VerifyShareUsesPresetHashToSkipScrypt)
     bool phase1_ok = true;
     try {
         share.ACTION({
-            obj->m_hash = ltc::share_init_verify(*obj, true);
+            obj->m_hash = ltc::share_init_verify(*obj, g_test_params, true);
             phase1_hash = obj->m_hash;
         });
     } catch (const std::exception& e) {
@@ -153,7 +159,7 @@ TEST(VerifyShareThreading, VerifyShareUsesPresetHashToSkipScrypt)
         // stricter than the hex data meets.  Fall back to check_pow=false.
         phase1_ok = false;
         share.ACTION({
-            obj->m_hash = ltc::share_init_verify(*obj, false);
+            obj->m_hash = ltc::share_init_verify(*obj, g_test_params, false);
             phase1_hash = obj->m_hash;
         });
     }
@@ -172,7 +178,7 @@ TEST(VerifyShareThreading, VerifyShareUsesPresetHashToSkipScrypt)
     // Result must equal the stored hash (SHA256d is deterministic).
     uint256 verify_hash;
     share.ACTION({
-        verify_hash = ltc::share_init_verify(*obj, obj->m_hash.IsNull());
+        verify_hash = ltc::share_init_verify(*obj, g_test_params, obj->m_hash.IsNull());
     });
 
     EXPECT_EQ(verify_hash, phase1_hash)
@@ -193,7 +199,7 @@ TEST(VerifyShareThreading, VerifyShareUsesPresetHashToSkipScrypt)
     for (int i = 0; i < N; i++)
     {
         share.ACTION({
-            ltc::share_init_verify(*obj, obj->m_hash.IsNull()); // check_pow=false
+            ltc::share_init_verify(*obj, g_test_params, obj->m_hash.IsNull()); // check_pow=false
         });
     }
     auto fast_us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -342,7 +348,7 @@ TEST(VerifyShareThreading, ParallelShareInitVerifyDeterministic)
         {
             shares[i].ACTION({
                 // Use check_pow=false to avoid PoW target mismatch on testnet data
-                results[i] = ltc::share_init_verify(*obj, false);
+                results[i] = ltc::share_init_verify(*obj, g_test_params, false);
             });
         });
     }

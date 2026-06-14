@@ -8,9 +8,11 @@
 #include "share_messages.hpp"
 #include "share_types.hpp"
 
+#include <core/coin_params.hpp>
 #include <core/hash.hpp>
 #include <core/pack.hpp>
 #include <core/pack_types.hpp>
+#include <core/pow.hpp>
 #include <core/target_utils.hpp>
 #include <core/uint256.hpp>
 #include <btclibs/crypto/common.h>
@@ -223,12 +225,13 @@ inline uint256 check_merkle_link(const uint256& tip_hash, const MerkleLink& link
 // Legacy: networks/network.cpp  "init gentx_before_refhash"
 // Formula: VarStr(DONATION_SCRIPT) + int64(0) + VarStr(0x6a28 + int256(0) + int64(0))[:3]
 // ============================================================================
-inline std::vector<unsigned char> compute_gentx_before_refhash(int64_t share_version)
+inline std::vector<unsigned char> compute_gentx_before_refhash(int64_t share_version,
+                                                              const core::CoinParams& params)
 {
     std::vector<unsigned char> result;
 
     // 1. VarStr(DONATION_SCRIPT)
-    auto donation_script = PoolConfig::get_donation_script(share_version);
+    auto donation_script = params.donation_script_func(share_version);
     {
         PackStream s;
         BaseScript bs;
@@ -280,34 +283,30 @@ inline std::vector<unsigned char> compute_gentx_before_refhash(int64_t share_ver
 // Used for V35 share_data.address field (VarStr).
 // pubkey_type: 0=P2PKH, 1=P2WPKH, 2=P2SH (same as V36 encoding)
 // ============================================================================
-inline std::string pubkey_hash_to_address(const uint160& pubkey_hash, uint8_t pubkey_type)
+inline std::string pubkey_hash_to_address(const uint160& pubkey_hash, uint8_t pubkey_type,
+                                          const core::CoinParams& params)
 {
-    bool testnet = PoolConfig::is_testnet;
     if (pubkey_type == 0) {
         // P2PKH: Base58Check with version byte
-        uint8_t ver = testnet ? 0x6f : 0x30;
         std::vector<unsigned char> payload(21);
-        payload[0] = ver;
+        payload[0] = params.address_version;
         std::memcpy(payload.data() + 1, pubkey_hash.data(), 20);
         return EncodeBase58Check({payload.data(), payload.size()});
     } else if (pubkey_type == 1) {
         // P2WPKH: Bech32 segwit v0
-        std::string hrp = testnet ? "tltc" : "ltc";
         std::vector<uint8_t> prog(20);
         std::memcpy(prog.data(), pubkey_hash.data(), 20);
-        return bech32::encode_segwit(hrp, 0, prog);
+        return bech32::encode_segwit(params.bech32_hrp, 0, prog);
     } else if (pubkey_type == 2) {
         // P2SH: Base58Check with version byte
-        uint8_t ver = testnet ? 0xc4 : 0x32;
         std::vector<unsigned char> payload(21);
-        payload[0] = ver;
+        payload[0] = params.address_p2sh_version;
         std::memcpy(payload.data() + 1, pubkey_hash.data(), 20);
         return EncodeBase58Check({payload.data(), payload.size()});
     }
     // Fallback: P2PKH
-    uint8_t ver = testnet ? 0x6f : 0x30;
     std::vector<unsigned char> payload(21);
-    payload[0] = ver;
+    payload[0] = params.address_version;
     std::memcpy(payload.data() + 1, pubkey_hash.data(), 20);
     return EncodeBase58Check({payload.data(), payload.size()});
 }
@@ -348,13 +347,14 @@ struct RefHashParams {
     BaseScript message_data;              // V36 PossiblyNoneType(b'', VarStrType())
 };
 
-inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParams& p)
+inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParams& p,
+                                                              const core::CoinParams& params)
 {
     PackStream ref_stream;
 
     // IDENTIFIER
     {
-        auto hex = PoolConfig::identifier_hex();
+        auto hex = params.active_identifier_hex();
         for (size_t i = 0; i + 1 < hex.size(); i += 2) {
             unsigned char byte = static_cast<unsigned char>(
                 std::stoul(hex.substr(i, 2), nullptr, 16));
@@ -474,7 +474,7 @@ inline thread_local uint256 g_last_pow_hash;  // scrypt hash of the share header
 // verification path from legacy Share::init().
 // ============================================================================
 template <typename ShareT>
-uint256 share_init_verify(const ShareT& share, bool check_pow = true)
+uint256 share_init_verify(const ShareT& share, const core::CoinParams& params, bool check_pow = true)
 {
     // --- Basic validation ---
     if (share.m_coinbase.size() < 2 || share.m_coinbase.size() > 100)
@@ -507,7 +507,7 @@ uint256 share_init_verify(const ShareT& share, bool check_pow = true)
 
     // IDENTIFIER bytes (8 bytes from IDENTIFIER_HEX)
     {
-        auto hex = PoolConfig::identifier_hex();
+        auto hex = params.active_identifier_hex();
         for (size_t i = 0; i + 1 < hex.size(); i += 2)
         {
             unsigned char byte = static_cast<unsigned char>(
@@ -652,7 +652,7 @@ uint256 share_init_verify(const ShareT& share, bool check_pow = true)
         hash_link_data.insert(hash_link_data.end(), p, p + 4);
     }
 
-    auto gentx_before_refhash = compute_gentx_before_refhash(ver);
+    auto gentx_before_refhash = compute_gentx_before_refhash(ver, params);
 
     // --- check_hash_link → gentx_hash ---
     uint256 gentx_hash = check_hash_link(share.m_hash_link, hash_link_data, gentx_before_refhash);
@@ -717,18 +717,16 @@ uint256 share_init_verify(const ShareT& share, bool check_pow = true)
         uint256 target = chain::bits_to_target(share.m_bits);
         if (target.IsNull())
             throw std::invalid_argument("share target is zero");
-        if (target > PoolConfig::max_target())
+        if (target > params.max_target)
             throw std::invalid_argument("share target exceeds MAX_TARGET");
         auto max_target = chain::bits_to_target(share.m_max_bits);
         if (!max_target.IsNull() && target > max_target)
             throw std::invalid_argument("share target exceeds max_target — too easy");
 
-        // Compute the scrypt hash of the 80-byte block header
-        char pow_hash_bytes[32];
-        scrypt_1024_1_1_256(reinterpret_cast<const char*>(header_stream.data()),
-                            pow_hash_bytes);
-        uint256 pow_hash;
-        memcpy(pow_hash.begin(), pow_hash_bytes, 32);
+        // Compute PoW hash using coin-specific function (scrypt for LTC, x11 for Dash, etc.)
+        auto hdr_pow_span = std::span<const unsigned char>(
+            reinterpret_cast<const unsigned char*>(header_stream.data()), header_stream.size());
+        uint256 pow_hash = params.pow_func(hdr_pow_span);
         g_last_pow_hash = pow_hash;  // cache for attempt_verify merged check
 
         if (pow_hash > target)
@@ -932,7 +930,7 @@ inline std::vector<unsigned char> get_share_script(const auto* obj)
 // Reference: frstrtr/p2pool-merged-v36  p2pool/data.py  generate_transaction()
 // ============================================================================
 template <typename ShareT, typename TrackerT>
-uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool dump_diag = false, bool v36_active = false)
+uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, const core::CoinParams& params, bool dump_diag = false, bool v36_active = false)
 {
     auto gst_t0 = std::chrono::steady_clock::now();
     constexpr int64_t ver = ShareT::version;
@@ -971,7 +969,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
         // Without this guard, attempt_verify() (which allows CHAIN_LENGTH+1) can
         // trigger a PPLNS walk that terminates early, producing wrong coinbase
         // amounts and causing persistent GENTX-MISMATCH during bootstrap.
-        auto chain_len = static_cast<int32_t>(PoolConfig::real_chain_length());
+        auto chain_len = static_cast<int32_t>(params.real_chain_length);
         {
             auto pplns_height = tracker.chain.get_height(prev_hash);
             auto pplns_last = tracker.chain.get_last(prev_hash);
@@ -985,7 +983,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
         // block_target from block header bits (matches Python: self.header['bits'].target)
         auto block_target = chain::bits_to_target(share.m_min_header.m_bits);
         auto max_weight = chain::target_to_average_attempts(block_target)
-                          * PoolConfig::SPREAD * 65535;
+                          * params.spread * 65535;
 
         // PPLNS formula selected by runtime v36_active (AutoRatchet state),
         // not compile-time share version. Ref: p2pool data.py:879, work.py:759.
@@ -1120,23 +1118,8 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
     auto gst_t2 = std::chrono::steady_clock::now(); // after amounts
     // Python: sorted(dests, key=lambda a: (amounts[a], a))[-4000:]
     // = ascending by (amount, script), keep last 4000 (highest amounts)
-    // F11: canonical exclude-then-append donation handling (p2pool data.py
-    // generate_transaction). The per-miner dests list excludes BOTH donation
-    // scripts; a COMBINED_DONATION_SCRIPT-keyed weight folds into the single
-    // donation-last output, and any DONATION_SCRIPT-keyed weight is dropped.
-    const std::vector<unsigned char> combined_donation_script(
-        PoolConfig::COMBINED_DONATION_SCRIPT.begin(), PoolConfig::COMBINED_DONATION_SCRIPT.end());
-    const std::vector<unsigned char> p2pk_donation_script(
-        PoolConfig::DONATION_SCRIPT.begin(), PoolConfig::DONATION_SCRIPT.end());
-    if (auto _dit = amounts.find(combined_donation_script); _dit != amounts.end())
-        donation_amount += _dit->second;
-    std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs;
-    payout_outputs.reserve(amounts.size());
-    for (auto& _kv : amounts) {
-        if (_kv.first == combined_donation_script || _kv.first == p2pk_donation_script)
-            continue;
-        payout_outputs.emplace_back(_kv.first, _kv.second);
-    }
+    std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs(
+        amounts.begin(), amounts.end());
     std::sort(payout_outputs.begin(), payout_outputs.end(),
         [](const auto& a, const auto& b) {
             if (a.second != b.second) return a.second < b.second; // asc by amount
@@ -1251,7 +1234,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
     // Donation output — V35 shares always use P2PK DONATION_SCRIPT,
     // V36 shares always use P2SH COMBINED_DONATION_SCRIPT.
     // Each share was created with the donation script matching its version.
-    auto donation_script = PoolConfig::get_donation_script(ver);
+    auto donation_script = params.donation_script_func(ver);
     write_txout(donation_amount, donation_script);
 
     // OP_RETURN commitment: value=0, script = 0x6a28 + ref_hash(32) + last_txout_nonce(8)
@@ -1261,7 +1244,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
 
         // IDENTIFIER bytes
         {
-            auto hex = PoolConfig::identifier_hex();
+            auto hex = params.active_identifier_hex();
             for (size_t i = 0; i + 1 < hex.size(); i += 2)
             {
                 unsigned char byte = static_cast<unsigned char>(
@@ -1396,7 +1379,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
     {
         if constexpr (requires { share.m_hash_link.m_extra_data; })
         {
-            auto gbr = compute_gentx_before_refhash(ver);
+            auto gbr = compute_gentx_before_refhash(ver, params);
             // prefix = full coinbase minus last 44 bytes (ref_hash 32 + nonce 8 + locktime 4)
             size_t prefix_len = tx.size() - 44;
             std::vector<unsigned char> prefix(
@@ -1480,7 +1463,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
         // First 5 + last 5 shares in PPLNS walk (for cross-impl comparison)
         if (!share.m_prev_hash.IsNull() && tracker.chain.contains(share.m_prev_hash)) {
             auto cl = std::min(tracker.chain.get_height(share.m_prev_hash),
-                               static_cast<int32_t>(PoolConfig::real_chain_length()));
+                               static_cast<int32_t>(params.real_chain_length));
             LOG_WARNING << "[GENTX-DIAG] PPLNS walk_count=" << cl
                         << " total_weight=" << total_weight.GetHex()
                         << " total_don_weight=" << total_donation_weight.GetHex()
@@ -1561,7 +1544,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
 // ============================================================================
 template <typename ShareT, typename TrackerT>
 std::string verify_merged_coinbase_commitment(
-    const ShareT& share, TrackerT& tracker)
+    const ShareT& share, TrackerT& tracker, const core::CoinParams& params)
 {
     if constexpr (ShareT::version < 36)
         return {};
@@ -1576,14 +1559,14 @@ std::string verify_merged_coinbase_commitment(
     if (share.m_prev_hash.IsNull() || !tracker.chain.contains(share.m_prev_hash))
         return {};
     auto height = tracker.chain.get_height(share.m_prev_hash);
-    if (height < static_cast<int32_t>(PoolConfig::real_chain_length()))
+    if (height < static_cast<int32_t>(params.real_chain_length))
         return {};  // Insufficient depth — skip (match Python behavior)
 
     auto block_target = chain::bits_to_target(share.m_bits);
     auto max_weight = chain::target_to_average_attempts(block_target)
-                    * 65535 * PoolConfig::SPREAD;
+                    * 65535 * params.spread;
     int32_t chain_len = std::min(height,
-        static_cast<int32_t>(PoolConfig::real_chain_length()));
+        static_cast<int32_t>(params.real_chain_length));
 
     // Parse mm_data from LTC coinbase scriptSig
     const auto& coinbase = share.m_coinbase.m_data;
@@ -1627,7 +1610,7 @@ std::string verify_merged_coinbase_commitment(
             continue;  // No V36 shares → can't verify
 
         // Build payout list (same logic as payout_provider)
-        auto donation_script = PoolConfig::get_donation_script(36);
+        auto donation_script = params.donation_script_func(36);
         uint64_t coinbase_value = info.m_coinbase_value;
 
         // Convert weights to integer payouts
@@ -1710,7 +1693,8 @@ template <typename ShareT, typename TrackerT>
 bool share_check(const ShareT& share,
                  const uint256& share_hash,
                  const uint256& gentx_hash,
-                 TrackerT& tracker)
+                 TrackerT& tracker,
+                 const core::CoinParams& params)
 {
     // 1. Timestamp check — must not be more than 600s in the future
     auto now = static_cast<uint32_t>(
@@ -1730,7 +1714,7 @@ bool share_check(const ShareT& share,
     // canonical 60% switch rule is now the ONLY version gate. AutoRatchet stays
     // count-based and does not gate peer shares here.
     {
-        auto chain_length = static_cast<int32_t>(PoolConfig::chain_length());
+        auto chain_length = static_cast<int32_t>(params.chain_length);
         if (!share.m_prev_hash.IsNull() && tracker.chain.contains(share.m_prev_hash))
         {
             // Parent's share version (the type the incoming share must legally follow)
@@ -1798,7 +1782,7 @@ bool share_check(const ShareT& share,
     bool v36_active = (share_ver >= 36);
     if (!share.m_prev_hash.IsNull() && tracker.chain.contains(share.m_prev_hash))
     {
-        uint256 expected_gentx = generate_share_transaction(share, tracker, false, v36_active);
+        uint256 expected_gentx = generate_share_transaction(share, tracker, params, false, v36_active);
         if (expected_gentx != gentx_hash)
         {
             LOG_WARNING << "GENTX-MISMATCH detail:"
@@ -1812,7 +1796,7 @@ bool share_check(const ShareT& share,
 
             auto chain_len = std::min(
                 tracker.chain.get_height(share.m_prev_hash),
-                static_cast<int32_t>(PoolConfig::real_chain_length()));
+                static_cast<int32_t>(params.real_chain_length));
             // V35: log grandparent + height-1 window info
             uint256 gp_hash;
             if (tracker.chain.contains(share.m_prev_hash))
@@ -1822,7 +1806,7 @@ bool share_check(const ShareT& share,
                         << " v35_walk=" << v35_walk
                         << " grandparent=" << (gp_hash.IsNull() ? "null" : gp_hash.GetHex().substr(0,16))
                         << " prev_height=" << tracker.chain.get_height(share.m_prev_hash)
-                        << " real_chain_length=" << PoolConfig::real_chain_length();
+                        << " real_chain_length=" << params.real_chain_length;
 
             // Compare share target: what c2pool computes vs what the share has
             {
@@ -1831,7 +1815,7 @@ bool share_check(const ShareT& share,
                     auto [cst_max_bits, cst_bits] = tracker.compute_share_target(
                         share.m_prev_hash, share.m_timestamp, uint256());
                     auto share_aps = tracker.get_pool_attempts_per_second(
-                        share.m_prev_hash, PoolConfig::TARGET_LOOKBEHIND, true);
+                        share.m_prev_hash, params.target_lookbehind, true);
                     LOG_WARNING << "[GENTX-TARGET] share_bits=0x" << std::hex << share.m_bits
                                 << " share_max_bits=0x" << share.m_max_bits
                                 << " c2pool_bits=0x" << cst_bits
@@ -1840,7 +1824,7 @@ bool share_check(const ShareT& share,
                                 << " prev=" << share.m_prev_hash.GetHex().substr(0,16);
 
                     // APS walk component dump for cross-impl comparison
-                    int32_t dist = PoolConfig::TARGET_LOOKBEHIND;
+                    int32_t dist = params.target_lookbehind;
                     auto near_hash = share.m_prev_hash;
                     auto far_hash = near_hash;
                     int32_t actual_dist = 0;
@@ -1898,12 +1882,12 @@ bool share_check(const ShareT& share,
             if (s_diag_count++ < 5)
             {
                 LOG_WARNING << "[GENTX-DIAG] Re-running generate_share_transaction with full dump (v36_active=" << v36_active << "):";
-                generate_share_transaction(share, tracker, true, v36_active);
+                generate_share_transaction(share, tracker, params, true, v36_active);
 
                 // Per-share PPLNS walk dump — compare with p2pool's [PARENT-PPLNS] output.
                 // Uses same parameters as generate_share_transaction's V36 path.
                 if (v36_active && !share.m_prev_hash.IsNull()) {
-                    auto diag_chain_len = static_cast<int32_t>(PoolConfig::real_chain_length());
+                    auto diag_chain_len = static_cast<int32_t>(params.real_chain_length);
                     LOG_WARNING << "[GENTX-DIAG] Per-share V36 PPLNS walk from prev="
                                 << share.m_prev_hash.GetHex().substr(0, 16) << ":";
                     tracker.dump_v36_pplns_walk(share.m_prev_hash, diag_chain_len);
@@ -1949,7 +1933,7 @@ bool share_check(const ShareT& share,
     // Verifies the actual merged coinbase matches canonical PPLNS construction.
     if constexpr (ShareT::version >= 36)
     {
-        auto mcv_err = verify_merged_coinbase_commitment(share, tracker);
+        auto mcv_err = verify_merged_coinbase_commitment(share, tracker, params);
         if (!mcv_err.empty())
             throw std::invalid_argument("merged coinbase verification: " + mcv_err);
     }
@@ -1964,14 +1948,14 @@ bool share_check(const ShareT& share,
 // Returns the computed share hash.
 // ============================================================================
 template <typename ShareT, typename TrackerT>
-uint256 verify_share(const ShareT& share, TrackerT& tracker)
+uint256 verify_share(const ShareT& share, TrackerT& tracker, const core::CoinParams& params)
 {
     auto vt0 = std::chrono::steady_clock::now();
     // share_init_verify computes gentx_hash along the way — we need it
     // for the GenerateShareTransaction comparison in share_check.
     // Skip scrypt PoW re-check when hash was already computed in Phase 1
     // (processing_shares offloads scrypt to m_verify_pool; no need to repeat).
-    uint256 hash = share_init_verify(share, share.m_hash.IsNull());
+    uint256 hash = share_init_verify(share, params, share.m_hash.IsNull());
     auto vt1 = std::chrono::steady_clock::now();
 
     // Verify recomputed hash matches stored hash (informational).
@@ -1988,12 +1972,12 @@ uint256 verify_share(const ShareT& share, TrackerT& tracker)
 
     // Re-derive gentx_hash for the check phase
     constexpr int64_t ver = ShareT::version;
-    auto gentx_before_refhash = compute_gentx_before_refhash(ver);
+    auto gentx_before_refhash = compute_gentx_before_refhash(ver, params);
 
     // Rebuild ref_hash + hash_link_data the same way init does
     PackStream ref_stream;
     {
-        auto hex = PoolConfig::identifier_hex();
+        auto hex = params.active_identifier_hex();
         for (size_t i = 0; i + 1 < hex.size(); i += 2)
         {
             unsigned char byte = static_cast<unsigned char>(
@@ -2118,7 +2102,7 @@ uint256 verify_share(const ShareT& share, TrackerT& tracker)
         }
     }
 
-    share_check(share, hash, gentx_hash, tracker);
+    share_check(share, hash, gentx_hash, tracker, params);
     {
         auto vt2 = std::chrono::steady_clock::now();
         auto init_us = std::chrono::duration_cast<std::chrono::microseconds>(vt1 - vt0).count();
@@ -2148,6 +2132,7 @@ uint256 verify_share(const ShareT& share, TrackerT& tracker)
 template <typename TrackerT>
 uint256 create_local_share_v35(
     TrackerT& tracker,
+    const core::CoinParams& params,
     const coin::SmallBlockHeaderType& min_header,
     const BaseScript& coinbase,
     uint64_t subsidy,
@@ -2215,7 +2200,7 @@ uint256 create_local_share_v35(
         } else if (payout_script.size() >= 20) {
             std::memcpy(pubkey_hash.data(), payout_script.data(), 20);
         }
-        std::string addr_str = pubkey_hash_to_address(pubkey_hash, pubkey_type);
+        std::string addr_str = pubkey_hash_to_address(pubkey_hash, pubkey_type, params);
         share.m_address.m_data.assign(addr_str.begin(), addr_str.end());
         {
             auto roundtrip = core::address_to_script(addr_str);
@@ -2304,7 +2289,7 @@ uint256 create_local_share_v35(
     // --- Compute ref_hash (V35 format) ---
     PackStream ref_stream;
     {
-        auto hex = PoolConfig::identifier_hex();
+        auto hex = params.active_identifier_hex();
         for (size_t i = 0; i + 1 < hex.size(); i += 2) {
             unsigned char byte = static_cast<unsigned char>(
                 std::stoul(hex.substr(i, 2), nullptr, 16));
@@ -2355,7 +2340,7 @@ uint256 create_local_share_v35(
     }
 
     // --- Derive hash_link (V35: HashLinkType, no extra_data) ---
-    auto gentx_before_refhash = compute_gentx_before_refhash(int64_t(35));
+    auto gentx_before_refhash = compute_gentx_before_refhash(int64_t(35), params);
 
     std::vector<unsigned char> coinbase_bytes_for_hashlink;
     if (!actual_coinbase_bytes.empty()) {
@@ -2378,10 +2363,10 @@ uint256 create_local_share_v35(
             if (!pplns_start.IsNull()) {
                 auto height = tracker.chain.get_height(prev_share);
                 int32_t max_shares = std::max(0, std::min(height,
-                    static_cast<int32_t>(PoolConfig::real_chain_length())) - 1);
+                    static_cast<int32_t>(params.real_chain_length)) - 1);
                 auto block_target = chain::bits_to_target(share.m_min_header.m_bits);
                 auto desired_weight = chain::target_to_average_attempts(block_target)
-                                      * uint288(PoolConfig::SPREAD) * uint288(65535);
+                                      * uint288(params.spread) * uint288(65535);
                 // Flat weight accumulation (not decayed)
                 auto result = tracker.get_cumulative_weights(pplns_start, max_shares, desired_weight);
                 weights = std::move(result.weights);
@@ -2406,23 +2391,8 @@ uint256 create_local_share_v35(
         // V35: no minimum donation enforcement (unlike v36)
         uint64_t donation_amount = (subsidy > sum_amounts) ? (subsidy - sum_amounts) : 0;
 
-        // F11: canonical exclude-then-append donation handling (p2pool data.py
-        // generate_transaction). The per-miner dests list excludes BOTH donation
-        // scripts; a COMBINED_DONATION_SCRIPT-keyed weight folds into the single
-        // donation-last output, and any DONATION_SCRIPT-keyed weight is dropped.
-        const std::vector<unsigned char> combined_donation_script(
-            PoolConfig::COMBINED_DONATION_SCRIPT.begin(), PoolConfig::COMBINED_DONATION_SCRIPT.end());
-        const std::vector<unsigned char> p2pk_donation_script(
-            PoolConfig::DONATION_SCRIPT.begin(), PoolConfig::DONATION_SCRIPT.end());
-        if (auto _dit = amounts.find(combined_donation_script); _dit != amounts.end())
-            donation_amount += _dit->second;
-        std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs;
-        payout_outputs.reserve(amounts.size());
-        for (auto& _kv : amounts) {
-            if (_kv.first == combined_donation_script || _kv.first == p2pk_donation_script)
-                continue;
-            payout_outputs.emplace_back(_kv.first, _kv.second);
-        }
+        std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs(
+            amounts.begin(), amounts.end());
         std::sort(payout_outputs.begin(), payout_outputs.end(),
             [](const auto& a, const auto& b) {
                 if (a.second != b.second) return a.second < b.second;
@@ -2457,7 +2427,7 @@ uint256 create_local_share_v35(
         }
         for (auto& [script, amount] : payout_outputs) write_txout(amount, script);
         // V35: use pre-V36 DONATION_SCRIPT
-        write_txout(donation_amount, PoolConfig::get_donation_script(int64_t(35)));
+        write_txout(donation_amount, params.donation_script_func(int64_t(35)));
         { std::vector<unsigned char> op; op.push_back(0x6a); op.push_back(0x28);
           op.insert(op.end(), ref_hash.data(), ref_hash.data() + 32);
           uint64_t n = share.m_last_txout_nonce; auto* p = reinterpret_cast<const unsigned char*>(&n);
@@ -2515,10 +2485,7 @@ uint256 create_local_share_v35(
     {
         uint256 target = chain::bits_to_target(share.m_bits);
         if (!target.IsNull()) {
-            char pow_bytes[32];
-            scrypt_1024_1_1_256(reinterpret_cast<const char*>(hdr_span.data()), pow_bytes);
-            uint256 pow_hash;
-            memcpy(pow_hash.begin(), pow_bytes, 32);
+            uint256 pow_hash = params.pow_func(hdr_span);
 
             if (pow_hash > target) {
                 return uint256();  // didn't meet share target
@@ -2565,6 +2532,7 @@ uint256 create_local_share_v35(
 template <typename TrackerT>
 uint256 create_local_share(
     TrackerT& tracker,
+    const core::CoinParams& params,
     const coin::SmallBlockHeaderType& min_header,
     const BaseScript& coinbase,
     uint64_t subsidy,
@@ -2598,7 +2566,7 @@ uint256 create_local_share(
     // V35 path: delegate to version-specific implementation
     if (share_version <= 35)
         return create_local_share_v35(
-            tracker, min_header, coinbase, subsidy, prev_share, merkle_branches,
+            tracker, params, min_header, coinbase, subsidy, prev_share, merkle_branches,
             payout_script, donation, stale_info, segwit_active, witness_commitment_hex,
             actual_coinbase_bytes, witness_root, override_max_bits, override_bits,
             frozen_absheight, frozen_abswork, frozen_far_share_hash, frozen_timestamp,
@@ -2814,7 +2782,7 @@ uint256 create_local_share(
     // --- Compute the ref_hash ---
     PackStream ref_stream;
     {
-        auto hex = PoolConfig::identifier_hex();
+        auto hex = params.active_identifier_hex();
         for (size_t i = 0; i + 1 < hex.size(); i += 2) {
             unsigned char byte = static_cast<unsigned char>(
                 std::stoul(hex.substr(i, 2), nullptr, 16));
@@ -2914,7 +2882,7 @@ uint256 create_local_share(
     // directly.  This eliminates the race where the share chain changes between
     // template creation and share submission, which caused GENTX mismatches
     // and p2pool peer bans.
-    auto gentx_before_refhash = compute_gentx_before_refhash(int64_t(36));
+    auto gentx_before_refhash = compute_gentx_before_refhash(int64_t(36), params);
 
     std::vector<unsigned char> coinbase_bytes_for_hashlink;
     if (!actual_coinbase_bytes.empty()) {
@@ -2930,10 +2898,10 @@ uint256 create_local_share(
         if (!prev_share.IsNull() && tracker.chain.contains(prev_share))
         {
             // Pass REAL_CHAIN_LENGTH — walk naturally stops at chain end.
-            auto chain_len = static_cast<int32_t>(PoolConfig::real_chain_length());
+            auto chain_len = static_cast<int32_t>(params.real_chain_length);
             auto block_target = chain::bits_to_target(share.m_min_header.m_bits);
             auto max_weight = chain::target_to_average_attempts(block_target)
-                              * PoolConfig::SPREAD * 65535;
+                              * params.spread * 65535;
             auto result = tracker.get_v36_decayed_cumulative_weights(prev_share, chain_len, max_weight);
             weights = std::move(result.weights);
             total_weight = result.total_weight;
@@ -2963,23 +2931,8 @@ uint256 create_local_share(
             }
         }
 
-        // F11: canonical exclude-then-append donation handling (p2pool data.py
-        // generate_transaction). The per-miner dests list excludes BOTH donation
-        // scripts; a COMBINED_DONATION_SCRIPT-keyed weight folds into the single
-        // donation-last output, and any DONATION_SCRIPT-keyed weight is dropped.
-        const std::vector<unsigned char> combined_donation_script(
-            PoolConfig::COMBINED_DONATION_SCRIPT.begin(), PoolConfig::COMBINED_DONATION_SCRIPT.end());
-        const std::vector<unsigned char> p2pk_donation_script(
-            PoolConfig::DONATION_SCRIPT.begin(), PoolConfig::DONATION_SCRIPT.end());
-        if (auto _dit = amounts.find(combined_donation_script); _dit != amounts.end())
-            donation_amount += _dit->second;
-        std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs;
-        payout_outputs.reserve(amounts.size());
-        for (auto& _kv : amounts) {
-            if (_kv.first == combined_donation_script || _kv.first == p2pk_donation_script)
-                continue;
-            payout_outputs.emplace_back(_kv.first, _kv.second);
-        }
+        std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs(
+            amounts.begin(), amounts.end());
         std::sort(payout_outputs.begin(), payout_outputs.end(),
             [](const auto& a, const auto& b) {
                 if (a.second != b.second) return a.second < b.second;
@@ -3013,7 +2966,7 @@ uint256 create_local_share(
             write_txout(0, wscript);
         }
         for (auto& [script, amount] : payout_outputs) write_txout(amount, script);
-        write_txout(donation_amount, PoolConfig::get_donation_script(int64_t(36)));
+        write_txout(donation_amount, params.donation_script_func(int64_t(36)));
         { std::vector<unsigned char> op; op.push_back(0x6a); op.push_back(0x28);
           op.insert(op.end(), ref_hash.data(), ref_hash.data() + 32);
           uint64_t n = share.m_last_txout_nonce; auto* p = reinterpret_cast<const unsigned char*>(&n);
@@ -3178,10 +3131,7 @@ uint256 create_local_share(
     {
         uint256 target = chain::bits_to_target(share.m_bits);
         if (!target.IsNull()) {
-            char pow_bytes[32];
-            scrypt_1024_1_1_256(reinterpret_cast<const char*>(hdr_span.data()), pow_bytes);
-            uint256 pow_hash;
-            memcpy(pow_hash.begin(), pow_bytes, 32);
+            uint256 pow_hash = params.pow_func(hdr_span);
 
             if (pow_hash > target) {
                 // Expected: most stratum pseudoshares don't meet share target
@@ -3226,7 +3176,7 @@ uint256 create_local_share(
             // with this ref_hash produces the same gentx_hash as direct Hash(coinbase),
             // peers will accept the share.
             {
-                auto gentx_before_refhash_xc = compute_gentx_before_refhash(int64_t(36));
+                auto gentx_before_refhash_xc = compute_gentx_before_refhash(int64_t(36), params);
 
                 // Use the ref_hash from the coinbase (same as what hash_link was built with)
                 std::vector<unsigned char> xc_data;
@@ -3330,7 +3280,7 @@ uint256 create_local_share(
     {
         static int xcheck_count = 0;
         if (true) { // Always cross-check (was: xcheck_count < 5)
-            uint256 verify_hash = generate_share_transaction<MergedMiningShare>(*heap_share, tracker, true, (MergedMiningShare::version >= 36));
+            uint256 verify_hash = generate_share_transaction<MergedMiningShare>(*heap_share, tracker, params, true, (MergedMiningShare::version >= 36));
             bool xcheck_ok = (verify_hash == gentx_hash_for_header);
             if (xcheck_ok) {
                 LOG_INFO << "[Pool] Cross-check PASSED";
