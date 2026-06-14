@@ -16,6 +16,16 @@
 # link bitcoin_family/Scrypt shared base, wire embedded DigiByte Core daemon
 # slice under daemon/. Top-level add_subdirectory(src/impl/dgb) registration
 # follows the OBJECT-lib convention PR; held ~2-3 heartbeats, not raced here.
+# TODO(Phase B): pool/share-layer OBJECT lib. Scaffolding stubs landed on
+# branch dgb/pool-pillars-port (ported from src/impl/ltc, Scrypt-only):
+#   share_types.hpp share.hpp share_tracker.hpp share_check.hpp
+#   redistribute.hpp peer.hpp messages.hpp
+#   auto_ratchet.hpp        -- PILLAR 1, GATED on F10 fence (version-acceptance)
+#   donation_consensus.hpp  -- PILLAR 4, GATED on farsider350-vs-LTC reconcile
+#   config_pool.cpp node.cpp protocol_actual.cpp protocol_legacy.cpp (TBD)
+# Files are listed for tracking but NOT yet compiled -- the add_library(impl_dgb
+# ...) OBJECT-lib registration follows the same ci-steward convention PR as the
+# coin lib (held, not raced). Pillars 1 and 4 stay stubbed behind their gates.
 if(COIN_DGB)
   message(STATUS "c2pool: DGB Scrypt-only coin module enabled (skeleton)")
   add_subdirectory(coin)
