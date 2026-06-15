@@ -67,6 +67,7 @@ jobs:
                     test_mweb_builder \
                     test_address_resolution test_compute_share_target \
                     test_utxo \
+                    v37_test \
             -j$(nproc)
 
       - name: Run tests
@@ -192,6 +193,7 @@ jobs:
                     test_address_resolution test_compute_share_target \
                     test_utxo \
                     test_coin_broadcaster test_multiaddress_pplns test_pplns_stress \
+                    v37_test \
             -j$(nproc)
 
       - name: Run tests under sanitizers
