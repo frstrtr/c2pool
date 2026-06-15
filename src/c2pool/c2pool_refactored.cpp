@@ -442,6 +442,10 @@ void print_help() {
     std::cout << "                            Nonzero: creates a private sharechain. P2P prefix\n";
     std::cout << "                            and THE metadata will carry this ID on the blockchain.\n";
     std::cout << "                            Genesis shares are created automatically when chain is empty.\n";
+    std::cout << "                            Full 8 bytes (up to 16 hex chars) are used, not truncated.\n";
+    std::cout << "  --prefix HEX              Explicit P2P transport-framing prefix (hex, up to 8 bytes).\n";
+    std::cout << "                            Independent of --network-id; defaults to the compiled\n";
+    std::cout << "                            per-network constant. Must match across all peers.\n";
     std::cout << "  --startup-mode MODE       Sharechain startup behavior:\n";
     std::cout << "                              auto    — wait for peers (60s), then genesis if none (default)\n";
     std::cout << "                              genesis — create new chain immediately, don't wait for peers\n";
@@ -642,7 +646,8 @@ int main(int argc, char* argv[]) {
     std::string coinbase_text;  // --coinbase-text (replaces /c2pool/ tag)
 
     // Private sharechain
-    uint32_t network_id = 0;        // 0 = public p2pool network, nonzero = private
+    uint64_t network_id = 0;        // 0 = public p2pool network, nonzero = private (full 8 bytes)
+    std::string prefix_override_hex; // explicit --prefix; empty = compiled per-network default
 
     // Startup mode: wait (default, p2pool persist=true), genesis, auto
     enum class StartupMode { AUTO, GENESIS, WAIT };
@@ -960,8 +965,13 @@ int main(int argc, char* argv[]) {
             cli_explicit.insert("coinbase_text");
         }
         else if ((arg == "--network-id" || arg == "--chain-id") && i + 1 < argc) {
-            network_id = static_cast<uint32_t>(std::stoul(argv[++i], nullptr, 16));
+            // Full 8-byte identifier: parse as 64-bit, never truncate to 32 bits
+            network_id = std::stoull(argv[++i], nullptr, 16);
             cli_explicit.insert("network_id");
+        }
+        else if (arg == "--prefix" && i + 1 < argc) {
+            prefix_override_hex = argv[++i];
+            cli_explicit.insert("prefix");
         }
         else if (arg == "--startup-mode" && i + 1 < argc) {
             std::string mode = argv[++i];
@@ -2530,11 +2540,14 @@ int main(int argc, char* argv[]) {
             // Private chain: override IDENTIFIER and PREFIX before any P2P or share ops
             if (network_id != 0) {
                 std::ostringstream hex;
-                hex << std::hex << std::setfill('0') << std::setw(8) << network_id;
-                // Pad to 16 hex chars (8 bytes) for full IDENTIFIER
+                hex << std::hex << std::setfill('0') << std::setw(16) << network_id;  // full 8-byte IDENTIFIER, no truncation
+                // setw(16) already produced the full 8-byte IDENTIFIER
                 std::string id_hex = hex.str();
-                while (id_hex.size() < 16) id_hex += "00";
                 ltc::PoolConfig::set_network_id(id_hex);
+                // PREFIX is independent: compiled per-network default unless
+                // explicitly overridden via --prefix (never derived from the ID)
+                if (!prefix_override_hex.empty())
+                    ltc::PoolConfig::set_prefix(prefix_override_hex);
                 LOG_INFO << "[Private] Network ID: " << ltc::PoolConfig::identifier_hex()
                          << " (PREFIX: " << ltc::PoolConfig::prefix_hex() << ")";
             }
