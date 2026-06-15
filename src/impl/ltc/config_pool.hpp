@@ -142,7 +142,7 @@ public:
     static inline std::string override_prefix_hex;
 
     /// Set private network identity. IDENTIFIER is the consensus secret
-    /// (hashed into ref_hash). PREFIX is derived from it for transport framing.
+    /// (hashed into ref_hash). PREFIX is NOT derived from it (see set_prefix).
     /// Call once at startup before any P2P or share operations.
     static void set_network_id(const std::string& network_id_hex) {
         if (network_id_hex.empty() || network_id_hex == "0" || network_id_hex == "00000000")
@@ -154,20 +154,18 @@ public:
         if (padded.size() > 16) padded = padded.substr(0, 16);
 
         override_identifier_hex = padded;
+    }
 
-        // Derive PREFIX from IDENTIFIER using simple XOR mixing
-        // PREFIX = IDENTIFIER bytes XOR-rotated (fast, deterministic, non-reversible enough
-        // for transport framing — the real security is in IDENTIFIER via ref_hash)
-        auto id_bytes = ParseHex(padded);
-        static const char* HEX = "0123456789abcdef";
-        override_prefix_hex.clear();
-        override_prefix_hex.reserve(16);
-        for (size_t i = 0; i < 8 && i < id_bytes.size(); ++i) {
-            // XOR with rotated byte + constant to ensure PREFIX != IDENTIFIER
-            uint8_t b = id_bytes[i] ^ id_bytes[(i + 3) % id_bytes.size()] ^ 0x5A;
-            override_prefix_hex += HEX[b >> 4];
-            override_prefix_hex += HEX[b & 0x0f];
-        }
+    /// Set an explicit transport-framing PREFIX for a private chain (--prefix).
+    /// Independent of IDENTIFIER; when unset, prefix_hex() falls back to the
+    /// compiled per-network constant. All peers on the chain must agree on it.
+    static void set_prefix(const std::string& prefix_hex_in) {
+        if (prefix_hex_in.empty() || prefix_hex_in == "0")
+            return;
+        std::string padded = prefix_hex_in;
+        while (padded.size() < 16) padded = "0" + padded;
+        if (padded.size() > 16) padded = padded.substr(padded.size() - 16);
+        override_prefix_hex = padded;
     }
 
     static const std::string& identifier_hex() {
@@ -191,7 +189,7 @@ public:
         if (override_identifier_hex.empty())
             return 0;  // public network
 
-        auto pfx_bytes = ParseHex(override_prefix_hex);
+        auto pfx_bytes = ParseHex(prefix_hex());  // effective prefix (override or compiled default)
         auto id_bytes = ParseHex(override_identifier_hex);
         std::vector<unsigned char> preimage;
         preimage.reserve(pfx_bytes.size() + id_bytes.size());
