@@ -231,8 +231,7 @@ public:
             if (on_compute) {
                 ok_ = true;   // exclusive lock already held by caller
             } else {
-                lock_.try_lock();
-                ok_ = lock_.owns_lock();
+                ok_ = lock_.try_lock();
             }
         }
         TrackerReadGuard(TrackerReadGuard&&) = default;
