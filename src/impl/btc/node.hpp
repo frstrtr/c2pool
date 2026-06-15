@@ -13,6 +13,8 @@
 #include <sharechain/prepared_list.hpp>
 #include <c2pool/storage/sharechain_storage.hpp>
 
+#include <boost/asio/steady_timer.hpp>
+
 #include <atomic>
 #include <chrono>
 #include <mutex>
@@ -112,6 +114,30 @@ protected:
         NetService addr;
     };
     std::vector<PendingShareBatch> m_pending_adds;
+
+    // ── think() watchdog + backpressure (V36 livelock defense-in-depth) ──
+    // If a think() cycle exceeds THINK_WATCHDOG_SECONDS the watchdog logs the
+    // compute-thread state (timing + backtrace dump), flags the cycle, and
+    // resets m_think_running so the pipeline recovers instead of wedging.
+    // Implemented as an atomic deadline checked by an IO-thread steady_timer:
+    // the watchdog NEVER touches m_tracker_mutex (would itself block on the
+    // stuck compute thread). MAX_PENDING_ADDS caps the deferred queue so a
+    // stuck/slow think() cannot grow memory without bound — over the cap new
+    // batches are dropped with a LOG_WARNING backpressure message.
+    static constexpr int THINK_WATCHDOG_SECONDS = 30;
+    static constexpr size_t MAX_PENDING_ADDS = 256;
+    // Steady-clock time-point (ns since epoch) by which the in-flight think()
+    // cycle must complete. 0 == no cycle armed. Set on dispatch, cleared on
+    // completion; read by the watchdog timer on the IO thread.
+    std::atomic<int64_t> m_think_deadline_ns{0};
+    // Generation counter: bumped each dispatch so a fired watchdog only acts
+    // on the cycle it was armed for (guards against late/duplicate fires).
+    std::atomic<uint64_t> m_think_generation{0};
+    // IO-thread timer that polls the deadline. Armed on run_think() dispatch.
+    std::unique_ptr<boost::asio::steady_timer> m_watchdog_timer;
+    // Arm/disarm helpers (defined in node.cpp).
+    void arm_think_watchdog();
+    void disarm_think_watchdog();
 
     // Top-5 scored heads from last think() — used by clean_tracker()
     // to protect the best chains from head pruning (p2pool node.py:363).

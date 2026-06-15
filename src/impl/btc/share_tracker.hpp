@@ -322,6 +322,16 @@ public:
     // Checked by run_think() to schedule a deferred continuation.
     bool m_think_needs_continue{false};
 
+    // V36 livelock mirror (lock-yield): set by think() when the long
+    // decayed-cumulative-weight + PPLNS scoring walk exhausts its
+    // cooperative-yield budget (THINK_WALK_YIELD_BUDGET). It reuses the
+    // SAME run_think() continuation path as m_think_needs_continue so the
+    // compute thread RELEASES m_tracker_mutex, drain_pending_adds() runs,
+    // and a continuation is re-posted — breaking IO-thread starvation when
+    // the scoring window is pathologically large. On healthy windows the
+    // budget never trips (semantics unchanged).
+    bool m_think_walk_needs_continue{false};
+
 private:
     // Retry counter for log throttling only — p2pool retries every think()
     // with no limit.  Counter is cleared on successful verification or
@@ -854,6 +864,23 @@ public:
         constexpr int THINK_VERIFY_BUDGET = 100;
         int budget_remaining = bootstrap_mode ? INT_MAX : THINK_VERIFY_BUDGET;
         m_think_needs_continue = false;
+
+        // ── V36 livelock mirror: cooperative-yield budget for the scoring walk ──
+        // The Phase 3/4 scoring step walks the decayed-cumulative-weight + PPLNS
+        // window per scored head while holding m_tracker_mutex.  On a healthy
+        // chain this is cheap, but a pathologically large/forked window can pin
+        // the lock long enough to starve the IO thread (the livelock).  We reuse
+        // the existing needs_continue continuation mechanism: when this budget is
+        // exhausted we stop scoring, release the lock (run_think() does this),
+        // let drain_pending_adds() run, and re-post a continuation.
+        //
+        // The budget is sized FAR above a normal full-window scoring pass so it
+        // NEVER trips on healthy load — behaviour and scoring results are
+        // unchanged for normal-size windows.  It is purely a starvation circuit
+        // breaker for the degenerate case.
+        constexpr int THINK_WALK_YIELD_BUDGET = 1000000;
+        int walk_budget_remaining = bootstrap_mode ? INT_MAX : THINK_WALK_YIELD_BUDGET;
+        m_think_walk_needs_continue = false;
         {
             static int p2_skip_log = 0;
             if (p2_skip_log++ % 20 == 0)
@@ -1063,6 +1090,20 @@ public:
         std::vector<DecoratedData<TailScore>> decorated_tails;
         for (auto& [tail_hash, head_hashes] : verified.get_tails())
         {
+            // ── V36 livelock mirror: COARSE walk-yield boundary ──────────────
+            // Conservative boundary: checked once per scored head, NOT inside the
+            // innermost decay iteration (that exact intra-walk yield point is the
+            // marked TODO below, pending ltc-doge PIE symbolization).  When the
+            // scoring walk has consumed its (generous) budget, defer the remaining
+            // tails to a re-posted continuation so the lock is released and
+            // drain_pending_adds() can run.  Trips only on a degenerate window.
+            if (walk_budget_remaining <= 0) {
+                m_think_walk_needs_continue = true;
+                LOG_WARNING << "[think-WALK-YIELD] scoring-walk budget exhausted; "
+                               "deferring remaining tails to continuation";
+                break;
+            }
+
             // p2pool: max(verified.tails[tail_hash], key=verified.get_work)
             uint256 best_head;
             uint288 best_work;
@@ -1085,6 +1126,12 @@ public:
                     auto s = score(best_head, block_rel_height_func);
                     s.best_head_work = best_work;  // tiebreak by total work
                     decorated_tails.push_back({s, tail_hash});
+                    // Charge the (coarse) cost of one scored head against the
+                    // walk-yield budget.  score() walks up to CHAIN_LENGTH/16
+                    // window entries; charging the chain_len keeps the accounting
+                    // proportional to real lock-hold time without descending into
+                    // the inner decay loop (see TODO marker there).
+                    walk_budget_remaining -= std::max(s.chain_len, 1);
                 } catch (const std::exception&) {
                     // Chain was concurrently modified (trim removed an
                     // ancestor).  Skip this tail — will be scored next cycle.
@@ -1713,6 +1760,16 @@ public:
 
         // Single-pass walk matching p2pool's while loop in
         // get_decayed_cumulative_weights. No pre-collection needed.
+        //
+        // TODO(ltc-doge): pin exact intra-walk yield boundary + optional
+        // zero-divisor guard (degenerate target_ratio==0). This inner decay
+        // iteration is the candidate finest-grained yield point for the V36
+        // livelock lock-yield mechanism; the cooperative budget is currently
+        // enforced at the COARSE per-scored-head boundary in think() Phase 3
+        // (THINK_WALK_YIELD_BUDGET). Once PIE core symbolization pins the true
+        // hot site, move/refine the budget check here. The zero-divisor guard
+        // referenced is the `!this_total.IsNull()` proration guard just below
+        // (remaining / this_total) — confirm it covers the degenerate case.
         auto cur = start;
         while (!cur.IsNull() && chain.contains(cur) && share_count < max_shares)
         {
