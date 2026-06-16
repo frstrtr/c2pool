@@ -19,9 +19,11 @@
 // the next M4 slice in the work-source path, NOT here.
 //
 // PIN / VERIFY (vs VM300 bchn-bch + p2pool-merged-v36 python ref, staged next):
-//   * block-size budget is sourced via abla.hpp (CHIP-2023-01) at the
-//     activation/floor limit (32 MB); per-tip ABLA state replay through the
-//     header chain raises it dynamically -- next size-slice (header ABLA col).
+//   * block-size budget is sourced via abla.hpp (CHIP-2023-01): a caller-
+//     supplied per-tip ABLA State (abla::replay over full-block sizes) raises
+//     it dynamically, else the safe activation/floor limit (32 MB). The size
+//     feed is a full-block/daemon-layer concern (M5+) -- the headers-only SPV
+//     chain does not carry block sizes.
 //   * `rules` array contents -- confirm against BCHN getblocktemplate output.
 
 #include "header_chain.hpp"
@@ -146,15 +148,22 @@ public:
     static std::optional<rpc::WorkData> build_template(
         const HeaderChain& chain,
         const Mempool&     pool,
-        bool               is_testnet = false)
+        bool               is_testnet = false,
+        const abla::State* tip_state  = nullptr)
     {
         auto t0 = std::chrono::steady_clock::now();
 
         // Block-size byte budget. ABLA (CHIP-2023-01) makes the consensus
-        // limit dynamic; until per-tip ABLA state is replayed through the
-        // header chain we use the activation/floor limit, which ABLA only
-        // ever raises -- a safe LOCAL build cap (see abla.hpp head).
-        const uint64_t max_block_bytes = abla::floor_block_size_limit(is_testnet);
+        // limit dynamic. When the caller supplies a per-tip ABLA State
+        // (replayed via abla::replay from a BCHN-pinned anchor over full-block
+        // sizes -- a full-block/daemon-layer feed, NOT the headers-only SPV
+        // chain) we build to that dynamic limit; otherwise we fall back to the
+        // activation/floor limit, which ABLA only ever raises -- always a safe
+        // LOCAL build cap (see abla.hpp head). Either way this is a build-time
+        // byte budget only: zero p2pool-merged-v36 surface.
+        const uint64_t max_block_bytes = tip_state
+            ? tip_state->GetBlockSizeLimit()
+            : abla::floor_block_size_limit(is_testnet);
 
         auto tip_opt = chain.tip();
         if (!tip_opt)

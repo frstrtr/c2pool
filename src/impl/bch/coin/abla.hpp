@@ -178,11 +178,32 @@ public:
 inline Config mainnet_config()  { return Config::MakeDefault(DEFAULT_CONSENSUS_BLOCK_SIZE, /*fixedSize=*/false); }
 inline Config testnet_config()  { return Config::MakeDefault(DEFAULT_CONSENSUS_BLOCK_SIZE, /*fixedSize=*/true);  }
 
+// Replay ABLA forward from a known-good anchor State over a contiguous run of
+// block sizes (oldest-first), returning the State *after the last size supplied*
+// -- i.e. the State whose GetBlockSizeLimit() governs the block we are about to
+// build. 1:1 BCHN: repeated State::NextBlockState. The anchor MUST be the ABLA
+// State of the block immediately preceding sizes[0].
+//
+// NOTE on the size feed: ABLA is driven by each block's *actual serialized
+// size*, which the headers-only SPV header_chain structurally does not carry.
+// The natural anchor on BCH is therefore a BCHN-pinned {height,State}; the live
+// per-block sizes enter at the full-block / embedded-daemon layer (M5+), not
+// here. Until that feed exists the template builder stays on the safe floor
+// (see floor_block_size_limit / template_builder build budget).
+inline State replay(State anchor, const Config& config,
+                    const uint64_t* sizes, size_t n) {
+    State s = anchor;
+    for (size_t i = 0; i < n; ++i)
+        s = s.NextBlockState(config, sizes[i]);
+    return s;
+}
+
 // Conservative LOCAL build budget for the template builder when per-tip ABLA
 // state is not yet replayed through the header chain: the activation/floor
 // state. ABLA only ever raises the limit above this floor, so building to the
-// floor can never exceed the live consensus limit. Replacing this with the
-// tip's replayed State is the next size-slice (needs header_chain ABLA column).
+// floor can never exceed the live consensus limit. The dynamic path is
+// abla::replay (above) fed a BCHN-pinned anchor + full-block sizes; that feed
+// lives at the full-block/daemon layer, not the headers-only SPV chain.
 inline uint64_t floor_block_size_limit(bool is_testnet) {
     const Config cfg = is_testnet ? testnet_config() : mainnet_config();
     return State(cfg, 0).GetBlockSizeLimit();
