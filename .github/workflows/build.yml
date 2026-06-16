@@ -5,7 +5,7 @@ on:
     branches: [master, btc-embedded, dash-spv-embedded, windows-build, service-update]
     tags: ['v*']
   pull_request:
-    branches: [master, btc-embedded, dash-spv-embedded]
+    branches: [master, btc-embedded, dash-spv-embedded, dgb/pool-pillars-port]
 
 jobs:
   # ════════════════════════════════════════════════════════════════════════════
