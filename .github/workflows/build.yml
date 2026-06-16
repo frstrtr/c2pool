@@ -58,7 +58,7 @@ jobs:
                     core_test sharechain_test share_test \
                     test_threading test_weights \
                     test_header_chain test_mempool test_template_builder \
-                    test_doge_chain test_compact_blocks \
+                    test_doge_chain test_compact_blocks test_dash_x11_kat \
                     test_multiaddress_pplns test_pplns_stress \
                     test_hash_link test_decay_pplns \
                     test_pplns_consensus \
@@ -184,7 +184,7 @@ jobs:
                     core_test sharechain_test share_test \
                     test_threading test_weights \
                     test_header_chain test_mempool test_template_builder \
-                    test_doge_chain test_compact_blocks \
+                    test_doge_chain test_compact_blocks test_dash_x11_kat \
                     test_hash_link test_decay_pplns \
                     test_pplns_consensus \
                     test_v36_script_sorting test_v36_cross_impl_refhash \
