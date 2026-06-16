@@ -31,6 +31,8 @@
 // Reference: frstrtr/p2pool-merged-v36 p2pool/data.py
 //   (get_expected_payouts, get_decayed_cumulative_weights).
 
+#include <cstdint>   // mul128_shift below uses uint64_t before the include block
+
 // Portable 128-bit multiply-shift: (a * b) >> shift
 // GCC/Clang have __uint128_t; MSVC uses _umul128 intrinsic.
 // shift must be in [1, 63] to avoid undefined behavior from 64-bit shifts.
