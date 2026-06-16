@@ -517,6 +517,7 @@ protected:
     size_t m_max_peers = 30;
     size_t m_target_outbound_peers = DEFAULT_TARGET_OUTBOUND_PEERS;
     std::unique_ptr<core::Timer> m_connect_timer;
+    std::unique_ptr<core::Timer> m_readvert_timer; // one-shot ROOT-2 re-advert
     std::set<NetService> m_pending_outbound;   // addresses currently being dialed
     std::set<NetService> m_outbound_addrs;     // successfully connected outbound peers
 
@@ -552,6 +553,10 @@ protected:
     // Cached best share hash from the most recent think() cycle
     uint256 m_best_share_hash;
 
+    // ROOT-2: fire exactly one delayed re-advert when the verified chain
+    // first transitions from empty to non-empty (peers that handshook
+    // during the empty window otherwise never see a best-change event).
+    bool m_verified_was_empty = true;
 
     // Cache of original raw serialized bytes keyed by share hash.
     // Used for relay so we send the exact bytes we received, avoiding

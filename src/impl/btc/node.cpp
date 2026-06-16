@@ -1624,6 +1624,21 @@ void NodeImpl::run_think()
                             << " verified_heads=" << m_tracker.verified.get_heads().size();
             }
 
+            // ROOT-2: fire ONE think-independent delayed re-advert when the
+            // verified chain first becomes non-empty.  Covers peers that
+            // handshook during the empty window and so never see a best-change
+            // event.  The one-shot timer runs on the IO thread, so it still
+            // fires even if a later think() cycle wedges (composes with the
+            // #97 think-watchdog).  Pure reads; broadcast stays try_to_lock.
+            if (m_verified_was_empty && m_tracker.verified.size() > 0) {
+                m_verified_was_empty = false;
+                if (!m_readvert_timer)
+                    m_readvert_timer = std::make_unique<core::Timer>(m_context, false);
+                m_readvert_timer->start(10, [this]() { readvertise_best(); });
+                LOG_INFO << "[readvertise] verified chain populated — scheduled "
+                            "10s re-advert (ROOT-2)";
+            }
+
             // Drain share batches queued while think() held the mutex
             LOG_INFO << "[ASYNC-THINK] IO-phase: draining " << m_pending_adds.size()
                      << " pending batches, peers=" << m_peers.size();
