@@ -13,9 +13,9 @@ name: Coin matrix
 
 on:
   push:
-    branches: [master, btc-embedded, dash-spv-embedded, windows-build, service-update]
+    branches: [master, btc-embedded, dash-spv-embedded, dgb/pool-pillars-port, windows-build, service-update]
   pull_request:
-    branches: [master, btc-embedded, dash-spv-embedded]
+    branches: [master, btc-embedded, dash-spv-embedded, dgb/pool-pillars-port]
 
 jobs:
   coin:
