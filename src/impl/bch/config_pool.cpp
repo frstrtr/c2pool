@@ -1,0 +1,48 @@
+#include "config_pool.hpp"
+
+#include <btclibs/util/strencodings.h>
+#include <yaml-cpp/yaml.h>
+
+// bch::PoolConfig load/default -- ported from src/impl/btc/config_pool.cpp.
+// Coin-agnostic in shape; the BCH-specific values live in config_pool.hpp.
+
+namespace bch
+{
+
+std::ofstream& PoolConfig::get_default(std::ofstream& file)
+{
+    YAML::Node out;
+
+    out["prefix"] = m_prefix.empty() ? prefix_hex() : HexStr(m_prefix);
+    out["worker"] = m_worker;
+
+    YAML::Node addrs_node;
+    for (const auto& host : DEFAULT_BOOTSTRAP_HOSTS)
+        addrs_node.push_back(host + ":" + std::to_string(P2P_PORT));
+    out["bootstrap_addrs"] = addrs_node;
+
+    file << out;
+    return file;
+}
+
+void PoolConfig::load()
+{
+    YAML::Node node = YAML::LoadFile(m_filepath.string());
+
+    m_prefix = ParseHexBytes(node["prefix"].as<std::string>());
+
+    PARSE_CONFIG(node, worker, std::string);
+
+    if (node["bootstrap_addrs"] && node["bootstrap_addrs"].IsSequence())
+    {
+        for (const auto& item : node["bootstrap_addrs"])
+            m_bootstrap_addrs.emplace_back(item.as<std::string>());
+    }
+    else
+    {
+        for (const auto& host : DEFAULT_BOOTSTRAP_HOSTS)
+            m_bootstrap_addrs.emplace_back(host + ":" + std::to_string(P2P_PORT));
+    }
+}
+
+} // namespace bch
