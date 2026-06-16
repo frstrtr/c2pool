@@ -19,8 +19,9 @@
 // the next M4 slice in the work-source path, NOT here.
 //
 // PIN / VERIFY (vs VM300 bchn-bch + p2pool-merged-v36 python ref, staged next):
-//   * block-size budget is the pre-ABLA 32 MB EB here; ABLA (CHIP-2023-01)
-//     dynamic limit must be sourced from chain state -- TODO(M4 size-slice).
+//   * block-size budget is sourced via abla.hpp (CHIP-2023-01) at the
+//     activation/floor limit (32 MB); per-tip ABLA state replay through the
+//     header chain raises it dynamically -- next size-slice (header ABLA col).
 //   * `rules` array contents -- confirm against BCHN getblocktemplate output.
 
 #include "header_chain.hpp"
@@ -29,6 +30,7 @@
 #include "block.hpp"
 #include "rpc_data.hpp"
 #include "../coinbase_commitment.hpp"   // s19 seam (commitment built downstream)
+#include "abla.hpp"                       // s2: ABLA block-size limit (CHIP-2023-01)
 
 #include <core/hash.hpp>
 #include <core/pack.hpp>
@@ -137,19 +139,22 @@ inline std::string bits_to_hex(uint32_t bits) {
 /// (share creation, Stratum) consumes, so p2pool-merged-v36 interop is held.
 class TemplateBuilder {
 public:
-    // BCH has no SegWit weight accounting -- the budget is a flat byte size.
-    // Pre-ABLA excessive-blocksize (EB) = 32 MB. ABLA (CHIP-2023-01) makes this
-    // dynamic from chain state; sourcing it is a later M4 slice (see file head).
-    static constexpr uint32_t DEFAULT_MAX_BLOCK_BYTES = 32'000'000u;
-    static constexpr uint32_t COINBASE_RESERVE        = 1'000u;  // bytes for coinbase
+    // BCH has no SegWit weight accounting -- the budget is a flat byte size,
+    // sourced per-network from abla.hpp (see build_template / file head).
+    static constexpr uint32_t COINBASE_RESERVE = 1'000u;  // bytes for coinbase
 
     static std::optional<rpc::WorkData> build_template(
         const HeaderChain& chain,
         const Mempool&     pool,
         bool               is_testnet = false)
     {
-        (void)is_testnet;
         auto t0 = std::chrono::steady_clock::now();
+
+        // Block-size byte budget. ABLA (CHIP-2023-01) makes the consensus
+        // limit dynamic; until per-tip ABLA state is replayed through the
+        // header chain we use the activation/floor limit, which ABLA only
+        // ever raises -- a safe LOCAL build cap (see abla.hpp head).
+        const uint64_t max_block_bytes = abla::floor_block_size_limit(is_testnet);
 
         auto tip_opt = chain.tip();
         if (!tip_opt)
@@ -190,7 +195,7 @@ public:
 
         // ── Mempool selection (fee-sorted) ─────────────────────────────────
         auto [selected_txs, total_fees] =
-            pool.get_sorted_txs_with_fees(DEFAULT_MAX_BLOCK_BYTES - COINBASE_RESERVE);
+            pool.get_sorted_txs_with_fees(max_block_bytes - COINBASE_RESERVE);
 
         // ── CTOR re-sort (CHIP-2018-11) ────────────────────────────────────
         // After fee selection, the block body must be in canonical order:
@@ -240,7 +245,7 @@ public:
         // BCH: no segwit. ABLA/active-fork rules to be confirmed vs BCHN GBT.
         data["rules"]             = nlohmann::json::array();
         data["coinbaseflags"]     = "";
-        data["sizelimit"]         = static_cast<int64_t>(DEFAULT_MAX_BLOCK_BYTES);
+        data["sizelimit"]         = static_cast<int64_t>(max_block_bytes);
         data["mintime"]           = static_cast<int64_t>(tip.header.m_timestamp + 1);
 
         LOG_INFO << "[EMB-BCH] TemplateBuilder: height=" << next_h
