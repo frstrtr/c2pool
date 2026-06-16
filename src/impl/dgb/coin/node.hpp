@@ -30,11 +30,32 @@
 #include "node_interface.hpp"
 #include "rpc.hpp"
 
+#ifdef AUX_DOGE
+// DOGE merged-mining aux module (STRETCH; -DAUX_DOGE=ON only). dgb CONSUMES the
+// shared aux types; ltc-doge owns and is the sole modifier of src/impl/doge/coin/aux_*.
+// Forward declaration only at slice #3 -- the real
+// <impl/doge/coin/aux_chain_embedded.hpp> include lands with the
+// bind_aux_doge_parsers() body at M3.
+namespace doge { namespace coin { class AuxChainEmbedded; } }
+#endif
+
 namespace dgb
 {
 
 namespace coin
 {
+
+#ifdef AUX_DOGE
+// ---------------------------------------------------------------------------
+// DOGE merged-mining aux seam -- header-only type alias (slice #3, option b per
+// integrator UID-904). Names the shared src/impl/doge aux-module backend that
+// bind_aux_doge_parsers() wires onto the (M3) coin P2P layer. No new TU; no
+// effect on the default Scrypt-only standalone build (which never defines
+// AUX_DOGE). The structured parsers consumed at M3 bind time are the free
+// functions doge::coin::parse_doge_header / parse_doge_headers_message /
+// parse_doge_block (auxpow_header.hpp). Parity: p2pool-merged-v36.
+using AuxChainBackend = ::doge::coin::AuxChainEmbedded;   // IAuxChainBackend impl
+#endif
 
 template <typename ConfigType>
 class Node : public dgb::interfaces::Node
