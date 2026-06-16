@@ -1,29 +1,25 @@
 #pragma once
 
-/// PILLAR 4 (donation gate) — Phase B scaffolding STUB, GATED.
+/// PILLAR 4 (donation gate) — Phase B scaffolding STUB.
 ///
-/// GATE: donation reconcile (ltc-doge + operator). DGB pre-v36 donation is
-/// farsider350 2-of-3 P2MS (105 bytes), NOT LTC 67B P2PK — verified ground
-/// truth (see [[dgb-canonical-base-and-donation]]). The version-gate itself
-/// already LANDED in config_pool.hpp::get_donation_script (PR #82, 46fbdd18):
-/// farsider350-2of3 for version < 36, COMBINED_DONATION_SCRIPT for >= 36.
+/// RESOLVED (integrator 06-16, independently verified against merged-v36 @ 42ccca53):
+/// DGB donation is the GLOBAL p2pool script, NOT a per-network value. DGB's
+/// networks/digibyte.py defines no donation, so DGB inherits data.py:118 (pre-V36
+/// P2PK, forrestv) / data.py:131 (V36+ COMBINED P2SH 1-of-2) identically to LTC/DOGE.
+/// The legacy farsider350 p2pool-dgb-scrypt-350 2-of-3 P2MS is the standalone-network
+/// donation and is SUPERSEDED for the v36 compat target (using it would break gentx
+/// parity). config_pool.hpp::get_donation_script + params.hpp::make_coin_params now
+/// both carry the global bytes with the same >=36 gate.
 ///
-/// This module ports ltc::donation_consensus (per-share donation accounting /
-/// consensus enforcement) on TOP of that already-landed script selection.
-/// It stays a STUB until integrator routes the farsider350-vs-LTC reconcile
-/// with ltc-doge + operator at Phase B start (per integrator 06-11 18:29).
-///
-/// COMPAT: donation consensus math is shared base — must match
-/// p2pool-merged-v36. Divergence => [decision-needed].
+/// COMPAT: donation consensus math is shared base — must match p2pool-merged-v36.
+/// Divergence => [decision-needed].
 
 #include "config_pool.hpp"
 
 namespace dgb
 {
 
-// TODO(Phase B, reconcile-gated): port ltc/donation_consensus.hpp.
-// config_pool::get_donation_script(version) is ALREADY version-gated; this
-// module enforces the per-share donation against that selection. Folds the
-// landed pillar-4 gate, no re-port (integrator confirmed #82 stays).
+// TODO(Phase B): port ltc/donation_consensus.hpp per-share donation accounting /
+// consensus enforcement on top of the (now resolved) global script selection.
 
 } // namespace dgb
