@@ -9,18 +9,21 @@
 // have (see bch/coin/transaction.hpp banner).
 //
 // The BIP-152 compact-block carrier messages (cmpctblock / getblocktxn /
-// blocktxn) are intentionally NOT defined here: they depend on the
+// blocktxn) are wired below (M3 slice 10, cmpct-wireback). They wrap the
 // CompactBlock / BlockTransactions{Request,Response} types from
-// compact_blocks.hpp, which lands in a later slice. The sendcmpct
-// negotiation message has no such dependency and is kept -- BCHN speaks
-// BIP-152. When compact_blocks.hpp is ported, the three carrier messages
-// are added here and into Handler.
+// compact_blocks.hpp (slice 9). The BCH divergences -- no-witness tx
+// bodies, short IDs over txid (compute_txid), and no CTOR re-sort -- live
+// in those wrapped types, so the carrier wiring here is structurally the
+// same as btc. The sendcmpct negotiation message has no CompactBlock
+// dependency and has been present since slice 7 -- BCHN speaks BIP-152.
+// Unlike btc there is NO wtxidrelay carrier: BCH has no wtxid.
 //
 // Source refs: bitcoin-cash-node/src/protocol.{h,cpp} (GetDataMsg enum,
 // NetMsgType command strings) and src/net_processing.cpp.
 
 #include "transaction.hpp"
 #include "block.hpp"
+#include "compact_blocks.hpp"
 
 #include <vector>
 
@@ -276,6 +279,89 @@ BEGIN_MESSAGE(sendcmpct)
     }
 END_MESSAGE()
 
+// BIP 152 — cmpctblock (HeaderAndShortIDs). Wraps CompactBlock from
+// compact_blocks.hpp: legacy (no-witness) tx bodies, short IDs over txid.
+class message_cmpctblock : public Message {
+private:
+    using message_type = message_cmpctblock;
+public:
+    message_cmpctblock() : Message("cmpctblock") {}
+
+    CompactBlock m_compact_block;
+
+    static std::unique_ptr<RawMessage> make_raw(const CompactBlock& cb) {
+        auto temp = std::make_unique<message_type>();
+        temp->m_compact_block = cb;
+        auto result = std::make_unique<RawMessage>(temp->m_command, pack(*temp));
+        return result;
+    }
+    static std::unique_ptr<RawMessage> make_raw() {
+        return std::make_unique<RawMessage>("cmpctblock", PackStream{});
+    }
+    static std::unique_ptr<message_type> make(PackStream& stream) {
+        auto result = std::make_unique<message_type>();
+        stream >> *result;
+        return result;
+    }
+    template<typename Stream> void Serialize(Stream& s) const { m_compact_block.Serialize(s); }
+    template<typename Stream> void Unserialize(Stream& s) { m_compact_block.Unserialize(s); }
+};
+
+// BIP 152 — getblocktxn (request missing transactions)
+class message_getblocktxn : public Message {
+private:
+    using message_type = message_getblocktxn;
+public:
+    message_getblocktxn() : Message("getblocktxn") {}
+
+    BlockTransactionsRequest m_request;
+
+    static std::unique_ptr<RawMessage> make_raw(const BlockTransactionsRequest& req) {
+        auto temp = std::make_unique<message_type>();
+        temp->m_request = req;
+        auto result = std::make_unique<RawMessage>(temp->m_command, pack(*temp));
+        return result;
+    }
+    static std::unique_ptr<RawMessage> make_raw() {
+        return std::make_unique<RawMessage>("getblocktxn", PackStream{});
+    }
+    static std::unique_ptr<message_type> make(PackStream& stream) {
+        auto result = std::make_unique<message_type>();
+        stream >> *result;
+        return result;
+    }
+    template<typename Stream> void Serialize(Stream& s) const { m_request.Serialize(s); }
+    template<typename Stream> void Unserialize(Stream& s) { m_request.Unserialize(s); }
+};
+
+// BIP 152 — blocktxn (missing transactions response). Tx bodies are legacy
+// (no-witness) per BlockTransactionsResponse in compact_blocks.hpp.
+class message_blocktxn : public Message {
+private:
+    using message_type = message_blocktxn;
+public:
+    message_blocktxn() : Message("blocktxn") {}
+
+    BlockTransactionsResponse m_response;
+
+    static std::unique_ptr<RawMessage> make_raw(const BlockTransactionsResponse& resp) {
+        auto temp = std::make_unique<message_type>();
+        temp->m_response = resp;
+        auto result = std::make_unique<RawMessage>(temp->m_command, pack(*temp));
+        return result;
+    }
+    static std::unique_ptr<RawMessage> make_raw() {
+        return std::make_unique<RawMessage>("blocktxn", PackStream{});
+    }
+    static std::unique_ptr<message_type> make(PackStream& stream) {
+        auto result = std::make_unique<message_type>();
+        stream >> *result;
+        return result;
+    }
+    template<typename Stream> void Serialize(Stream& s) const { m_response.Serialize(s); }
+    template<typename Stream> void Unserialize(Stream& s) { m_response.Unserialize(s); }
+};
+
 // BIP 155 — sendaddrv2 (empty, signals addrv2 support; sent before verack)
 BEGIN_MESSAGE(sendaddrv2)
     WITHOUT_MESSAGE_FIELDS() { }
@@ -302,6 +388,9 @@ using Handler = MessageHandler<
     message_feefilter,
     message_mempool,
     message_sendcmpct,
+    message_cmpctblock,
+    message_getblocktxn,
+    message_blocktxn,
     message_sendaddrv2
 >;
 
