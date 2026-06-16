@@ -1,23 +1,109 @@
 #pragma once
-// c2pool-bch :: BCH coin parameters (V36)
-// Skeleton per c2pool-bch-embedded-impl-plan.md (frstrtr/the docs/v36) §3.
-// Embedded daemon forked from Bitcoin Cash Node (BCHN). SHA256d family.
+// bch::CoinConfig -- BCH coin parameters (V36). Ported from
+// src/impl/btc/config_coin.hpp (M3 slice 14). Namespace bch (was the M2
+// skeleton's c2pool::bch CoinParams -- reconciled to bch::CoinConfig here so
+// config.hpp's core::Config<PoolConfig, CoinConfig> resolves; see the M3
+// slice-1 namespace note).
 //
-// SCOPE NOTE (M1 §4.2): HogEx is a SmartBCH sidechain construct, NOT BCH
-// mainchain. It is explicitly OUT OF SCOPE for this template/coin module.
-// Do not add HogEx commitment handling here. See feedback: hogex-not-bch.
+// SCOPE NOTE (M1 4.2): HogEx is a SmartBCH sidechain construct, NOT BCH
+// mainchain. It is explicitly OUT OF SCOPE for this coin module. Do not add
+// HogEx commitment handling here. See feedback: hogex-not-bch.
 //
 // CashAddr scaffolding: BCH address encoding diverges from BTC base58/bech32.
-// TODO(M3): port CashAddr (prefix "bitcoincash:") encode/decode at vendoring.
+// TODO(M4): port CashAddr (prefix "bitcoincash:") encode/decode at the
+// template/address layer -- the wire/config shape below is coin-agnostic and
+// matches the btc reference 1:1 (P2P prefix + NetService + RPC userpass).
 
-namespace c2pool::bch {
+#include <core/config.hpp>
+#include <core/fileconfig.hpp>
+#include <core/netaddress.hpp>
 
-struct CoinParams {
-    // TODO(M3): fill from BCHN chainparams at vendoring (confirm commit/tag).
-    static constexpr const char* ticker      = "BCH";
-    static constexpr const char* cashaddr_hrp = "bitcoincash";
-    // ASERT DAA (May 2020) anchor — see coin/header_chain.hpp insertion point.
-    // CTOR (Nov 2018) canonical tx ordering — see coin/template_builder.hpp.
+#include <yaml-cpp/yaml.h>
+
+namespace bch
+{
+namespace config
+{
+    struct P2PData
+    {
+        std::vector<std::byte> prefix;
+        NetService address;
+    };
+
+    struct RPCData
+    {
+        NetService address;
+        std::string userpass;
+    };
+
+} // config
+} // namespace bch
+
+namespace YAML
+{
+template<> struct convert<bch::config::P2PData>
+{
+    static Node encode(const bch::config::P2PData& rhs)
+    {
+        Node node;
+        node["prefix"] = HexStr(rhs.prefix);
+        node["address"] = rhs.address;
+        return node;
+    }
+
+    static bool decode(const Node& node, bch::config::P2PData& rhs)
+    {
+        // prefix
+        rhs.prefix = ParseHexBytes(node["prefix"].as<std::string>());
+        // address
+        rhs.address = node["address"].as<NetService>();
+        return true;
+    }
 };
 
-} // namespace c2pool::bch
+template<> struct convert<bch::config::RPCData>
+{
+    static Node encode(const bch::config::RPCData& rhs)
+    {
+        Node node;
+        node["address"] = rhs.address;
+        node["userpass"] = rhs.userpass;
+        return node;
+    }
+
+    static bool decode(const Node& node, bch::config::RPCData& rhs)
+    {
+        rhs.address = node["address"].as<NetService>();
+        rhs.userpass = node["userpass"].as<std::string>();
+        return true;
+    }
+};
+}
+
+namespace bch
+{
+
+class CoinConfig : protected core::Fileconfig
+{
+
+protected:
+    std::ofstream& get_default(std::ofstream& file) override;
+    void load() override;
+
+public:
+    CoinConfig(const std::filesystem::path& path) : core::Fileconfig(path)
+    {
+
+    }
+
+public:
+
+    config::P2PData m_p2p;
+    config::RPCData m_rpc;
+
+    std::string m_symbol;
+    int m_share_period{};
+    bool m_testnet {false};
+};
+
+} // namespace bch
