@@ -157,33 +157,35 @@ public:
     static inline std::string override_identifier_hex;
     static inline std::string override_prefix_hex;
 
-    /// Set private network identity. IDENTIFIER is the consensus secret
-    /// (hashed into ref_hash). PREFIX is derived from it for transport framing.
-    /// Call once at startup before any P2P or share operations.
-    static void set_network_id(const std::string& network_id_hex) {
+    /// Set private network identity. IDENTIFIER and PREFIX are TWO INDEPENDENT
+    /// per-network constants (p2pool model) — there is NO algebraic relationship
+    /// between them, so PREFIX is never derived from IDENTIFIER. To join a custom
+    /// p2pool sharechain, supply BOTH the network id and its prefix (each a
+    /// separate per-network constant). If the prefix override is omitted, the
+    /// compiled network-default prefix is used. Call once at startup before any
+    /// P2P or share operations.
+    static void set_network_id(const std::string& network_id_hex,
+                               const std::string& prefix_hex_override = "") {
         if (network_id_hex.empty() || network_id_hex == "0" || network_id_hex == "00000000")
             return;  // public network, use defaults
 
-        // Pad to 16 hex chars (8 bytes) if shorter
-        std::string padded = network_id_hex;
-        while (padded.size() < 16) padded = "0" + padded;
-        if (padded.size() > 16) padded = padded.substr(0, 16);
+        // Normalize a hex string to exactly 16 hex chars (8 bytes).
+        auto to8 = [](std::string h) {
+            while (h.size() < 16) h = "0" + h;
+            if (h.size() > 16) h = h.substr(0, 16);
+            return h;
+        };
 
-        override_identifier_hex = padded;
+        override_identifier_hex = to8(network_id_hex);
 
-        // Derive PREFIX from IDENTIFIER using simple XOR mixing
-        // PREFIX = IDENTIFIER bytes XOR-rotated (fast, deterministic, non-reversible enough
-        // for transport framing — the real security is in IDENTIFIER via ref_hash)
-        auto id_bytes = ParseHex(padded);
-        static const char* HEX = "0123456789abcdef";
-        override_prefix_hex.clear();
-        override_prefix_hex.reserve(16);
-        for (size_t i = 0; i < 8 && i < id_bytes.size(); ++i) {
-            // XOR with rotated byte + constant to ensure PREFIX != IDENTIFIER
-            uint8_t b = id_bytes[i] ^ id_bytes[(i + 3) % id_bytes.size()] ^ 0x5A;
-            override_prefix_hex += HEX[b >> 4];
-            override_prefix_hex += HEX[b & 0x0f];
-        }
+        // PREFIX is an INDEPENDENT transport constant — set it directly from the
+        // override and NEVER derive it from IDENTIFIER. The old XOR-rotate
+        // derivation has no p2pool analog and structurally prevented c2pool from
+        // joining any p2pool custom network (derived prefix != p2pool prefix).
+        // When no prefix override is given, leave override_prefix_hex empty so
+        // prefix_hex() falls back to the compiled network default.
+        if (!prefix_hex_override.empty())
+            override_prefix_hex = to8(prefix_hex_override);
     }
 
     static const std::string& identifier_hex() {
@@ -207,8 +209,8 @@ public:
         if (override_identifier_hex.empty())
             return 0;  // public network
 
-        auto pfx_bytes = ParseHex(override_prefix_hex);
-        auto id_bytes = ParseHex(override_identifier_hex);
+        auto pfx_bytes = ParseHex(prefix_hex());
+        auto id_bytes = ParseHex(identifier_hex());
         std::vector<unsigned char> preimage;
         preimage.reserve(pfx_bytes.size() + id_bytes.size());
         preimage.insert(preimage.end(), pfx_bytes.begin(), pfx_bytes.end());

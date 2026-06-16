@@ -85,7 +85,13 @@ static void print_usage()
         "  --stratum [H:]P stratum TCP listener for miners (B4-stratum)\n"
         "                  e.g. --stratum 9332           (binds 0.0.0.0:9332)\n"
         "                       --stratum 127.0.0.1:9332 (loopback only)\n"
-        "                  Omit to disable stratum listener.\n";
+        "                  Omit to disable stratum listener.\n"
+        "  --network-id ID c2pool sharechain IDENTIFIER (hex, <=8 bytes) for a\n"
+        "                  private/custom p2pool network. Omit for public BTC.\n"
+        "  --prefix HEX    c2pool sharechain PREFIX (hex, <=8 bytes), an\n"
+        "                  INDEPENDENT per-network constant (no algebraic tie to\n"
+        "                  IDENTIFIER). Supply with --network-id to join a custom\n"
+        "                  p2pool chain; omit to use the compiled default prefix.\n";
 }
 
 /// BTC wire-protocol magic bytes per network (pchMessageStart).
@@ -111,6 +117,8 @@ int main(int argc, char* argv[])
     uint16_t    p2pool_port   = 0;
     std::string stratum_addr  = "0.0.0.0";  // listen all interfaces by default
     uint16_t    stratum_port  = 0;          // 0 disables stratum; --stratum sets it
+    std::string network_id_hex;             // --network-id: c2pool IDENTIFIER override (empty = public net)
+    std::string prefix_hex;                 // --prefix: c2pool PREFIX override (empty = compiled default)
 
     for (int i = 1; i < argc; ++i)
     {
@@ -167,6 +175,14 @@ int main(int argc, char* argv[])
                 stratum_port = static_cast<uint16_t>(std::stoi(ep.substr(colon + 1)));
             }
         }
+        else if (arg == "--network-id" && i + 1 < argc)
+        {
+            network_id_hex = argv[++i];
+        }
+        else if (arg == "--prefix" && i + 1 < argc)
+        {
+            prefix_hex = argv[++i];
+        }
         else
         {
             std::cerr << "unknown arg: " << arg << "\n";
@@ -182,6 +198,14 @@ int main(int argc, char* argv[])
     }
 
     btc::PoolConfig::is_testnet = testnet;
+
+    // B2-net: apply optional private-chain overrides. IDENTIFIER and PREFIX are
+    // two INDEPENDENT per-network constants — set_network_id never derives one
+    // from the other (commit 9034b59d). A bare --network-id keeps the compiled
+    // network-default prefix; supply --prefix to join a custom p2pool chain.
+    if (!prefix_hex.empty() && network_id_hex.empty())
+        std::cerr << "[BTC] warning: --prefix ignored without --network-id\n";
+    btc::PoolConfig::set_network_id(network_id_hex, prefix_hex);
 
     auto chain_params = testnet4
         ? btc::coin::BTCChainParams::testnet4()
