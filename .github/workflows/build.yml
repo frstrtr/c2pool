@@ -433,6 +433,22 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Set up Homebrew PATH
+        # Self-hosted Intel runner (macpro-intel-204) launches the Actions
+        # service from launchd, whose PATH omits Homebrew's /usr/local/bin
+        # (#100: brew exit 127). GitHub-hosted arm64 keeps /opt/homebrew on PATH.
+        # Append whichever prefix actually has brew so every later step
+        # (cmake, brew --prefix) inherits it via $GITHUB_PATH.
+        run: |
+          if [ -x /opt/homebrew/bin/brew ]; then
+            echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+          elif [ -x /usr/local/bin/brew ]; then
+            echo "/usr/local/bin" >> "$GITHUB_PATH"
+          else
+            echo "::error::Homebrew not found at /opt/homebrew or /usr/local on ${RUNNER_NAME:-runner}" >&2
+            exit 1
+          fi
+
       - name: Install dependencies
         run: brew install cmake boost leveldb secp256k1 nlohmann-json yaml-cpp
 
