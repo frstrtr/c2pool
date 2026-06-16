@@ -68,7 +68,7 @@ struct CAssetLockPayload
     uint8_t                nVersion{CURRENT_VERSION};
     std::vector<TxOut>     creditOutputs;
 
-    SERIALIZE_METHODS(CAssetLockPayload)
+    C2POOL_SERIALIZE_METHODS(CAssetLockPayload)
     {
         READWRITE(obj.nVersion, obj.creditOutputs);
     }
@@ -94,7 +94,7 @@ struct CAssetUnlockPayload
     uint256                            quorumHash;
     std::array<uint8_t, BLS_SIG_SIZE>  quorumSig{};
 
-    SERIALIZE_METHODS(CAssetUnlockPayload)
+    C2POOL_SERIALIZE_METHODS(CAssetUnlockPayload)
     {
         READWRITE(obj.nVersion, obj.index, obj.fee, obj.requestedHeight,
                   obj.quorumHash,

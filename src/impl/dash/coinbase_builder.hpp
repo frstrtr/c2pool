@@ -49,6 +49,7 @@
 #include <core/uint256.hpp>
 #include <core/hash.hpp>
 #include <core/coin_params.hpp>
+#include <core/log.hpp>
 #include <btclibs/util/strencodings.h>
 
 namespace dash {

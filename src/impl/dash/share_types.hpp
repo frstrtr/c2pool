@@ -23,7 +23,7 @@ struct MerkleLink
     std::vector<uint256> m_branch;
     uint32_t m_index{0};
 
-    SERIALIZE_METHODS(MerkleLink) { READWRITE(obj.m_branch); /* index always 0, not serialized */ }
+    C2POOL_SERIALIZE_METHODS(MerkleLink) { READWRITE(obj.m_branch); /* index always 0, not serialized */ }
 };
 
 // Hash link (same structure as LTC)
@@ -33,7 +33,7 @@ struct HashLinkType
     BaseScript m_extra_data;  // VarStr
     uint64_t m_length;
 
-    SERIALIZE_METHODS(HashLinkType) { READWRITE(obj.m_state, obj.m_extra_data, VarInt(obj.m_length)); }
+    C2POOL_SERIALIZE_METHODS(HashLinkType) { READWRITE(obj.m_state, obj.m_extra_data, VarInt(obj.m_length)); }
 };
 
 // Packed payment entry (masternode/superblock/platform)

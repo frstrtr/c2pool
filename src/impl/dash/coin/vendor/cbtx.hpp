@@ -56,7 +56,7 @@ struct CCbTx
     std::array<uint8_t, BLS_SIG_SIZE> bestCLSignature{};
     int64_t                           creditPoolBalance{0};
 
-    SERIALIZE_METHODS(CCbTx)
+    C2POOL_SERIALIZE_METHODS(CCbTx)
     {
         READWRITE(obj.nVersion, obj.nHeight, obj.merkleRootMNList);
         if (obj.nVersion >= VERSION_MERKLE_ROOT_QUORUMS) {
