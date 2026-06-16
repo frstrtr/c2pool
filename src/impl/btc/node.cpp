@@ -1400,8 +1400,7 @@ void NodeImpl::disarm_think_watchdog()
     // no-op, and cancels the pending timer.
     m_think_deadline_ns.store(0, std::memory_order_relaxed);
     if (m_watchdog_timer) {
-        boost::system::error_code ec;
-        m_watchdog_timer->cancel(ec);
+        m_watchdog_timer->cancel();
     }
 }
 
