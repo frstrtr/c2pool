@@ -254,7 +254,7 @@ void NodeImpl::send_version(peer_ptr peer)
         m_nonce,
         m_software_version,
         1,                                    // mode (always 1 for legacy compat)
-        best_share_hash()                     // advertise our tallest chain head
+        advertised_best_share()               // verified head, or raw head pre-sync (ROOT-2)
     );
     peer->write(std::move(rmsg));
 }
@@ -886,6 +886,81 @@ uint256 NodeImpl::best_share_hash()
     return best;
 }
 
+uint256 NodeImpl::advertised_best_share()
+{
+    // Peer-facing advertisement ONLY (version handshake + timer re-announce).
+    // NEVER used for work/share creation — best_share_hash() owns that and
+    // deliberately returns a VERIFIED head (or NULL) so we never build local
+    // work on an unagreed chain.  For ADVERTISEMENT the opposite is right: a
+    // peer must learn our tallest head to call download_shares() and pull our
+    // chain.  ROOT-2 (Option-A net-id soak): a --genesis node whose verified
+    // chain is still empty at handshake advertises NULL via best_share_hash();
+    // the peer never downloads and broadcast can't backfill (head shares are
+    // already de-dup-marked).  Advertising the raw head breaks that deadlock
+    // without touching work creation.
+    uint256 v = best_share_hash();
+    if (!v.IsNull())
+        return v;
+
+    // Verified chain still empty — advertise our tallest RAW head instead.
+    if (m_chain && m_chain->size() > 0) {
+        uint256 best;
+        int32_t best_height = -1;
+        for (const auto& [head_hash, tail_hash] : m_chain->get_heads()) {
+            auto h = m_chain->get_height(head_hash);
+            if (h > best_height) {
+                best = head_hash;
+                best_height = h;
+            }
+        }
+        return best;
+    }
+    return uint256::ZERO;
+}
+
+void NodeImpl::readvertise_best_share()
+{
+    // ROOT-2 re-advertisement.  A peer that finished its version handshake
+    // while our verified chain was empty got a NULL best_share and never
+    // called download_shares(); broadcast_share() can't wake it either because
+    // our head shares are already in m_shared_share_hashes (de-dup-marked at
+    // creation) so its walk breaks immediately.  Here we re-push the tip walk
+    // to every peer WITHOUT consulting the de-dup set.  Advertise-only: never
+    // affects local work creation.
+    uint256 head = advertised_best_share();
+    if (head.IsNull())
+        return;
+
+    // Same try_to_lock discipline as broadcast_share (node.hpp:67): never block
+    // the IO thread on the tracker mutex.  If think() holds it now, the next
+    // trigger (best-change or the timer) retries.
+    std::shared_lock<std::shared_mutex> lock(m_tracker_mutex, std::try_to_lock);
+    if (!lock.owns_lock())
+        return;
+
+    if (!m_chain->contains(head))
+        return;
+
+    std::vector<uint256> to_send;
+    int32_t height = m_chain->get_height(head);
+    int32_t walk = std::min(height, 5);
+    for (auto [hash, data] : m_chain->get_chain(head, walk)) {
+        if (m_rejected_share_hashes.count(hash))
+            continue; // never re-broadcast peer-rejected shares
+        to_send.push_back(hash);
+    }
+    if (to_send.empty())
+        return;
+
+    auto now = std::chrono::steady_clock::now();
+    for (auto& [nonce, peer] : m_peers) {
+        send_shares(peer, to_send);
+        m_last_broadcast_to[peer->addr()] = {to_send, now};
+    }
+    LOG_INFO << "[readvertise] re-pushed " << to_send.size()
+             << " head share(s) to " << m_peers.size() << " peer(s) (ROOT-2)";
+}
+
 void NodeImpl::download_shares(peer_ptr /*unused_peer*/, const uint256& target_hash)
 {
     // p2pool node.py:108-141 download_shares() — exact translation.
@@ -1475,6 +1550,23 @@ void NodeImpl::run_think()
                 LOG_WARNING << "[ASYNC-THINK] IO-phase: result.best is NULL — verified_tails="
                             << m_tracker.verified.get_tails().size()
                             << " verified_heads=" << m_tracker.verified.get_heads().size();
+            }
+
+            // ROOT-2: re-advertise our head so a peer that handshook while our
+            // verified chain was empty can finally download it.  On best-change
+            // push immediately; additionally fire ONE delayed re-advert when the
+            // verified chain first becomes non-empty (covers peers that connected
+            // during the empty window and never see a best-change event).
+            if (best_changed && !m_peers.empty()) {
+                readvertise_best_share();
+            }
+            if (m_verified_was_empty && m_tracker.verified.size() > 0) {
+                m_verified_was_empty = false;
+                if (!m_readvert_timer)
+                    m_readvert_timer = std::make_unique<core::Timer>(m_context, false);
+                m_readvert_timer->start(10, [this]() { readvertise_best_share(); });
+                LOG_INFO << "[readvertise] verified chain populated — scheduled "
+                            "10s re-advert (ROOT-2)";
             }
 
             // Drain share batches queued while think() held the mutex
