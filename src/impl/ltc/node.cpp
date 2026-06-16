@@ -254,7 +254,7 @@ void NodeImpl::send_version(peer_ptr peer)
         m_nonce,
         m_software_version,
         1,                                    // mode (always 1 for legacy compat)
-        best_share_hash()                     // advertise our tallest chain head
+        advertised_best_share()               // raw head: peers always learn+pull our chain (root-2)
     );
     peer->write(std::move(rmsg));
 }
@@ -886,6 +886,49 @@ uint256 NodeImpl::best_share_hash()
     return best;
 }
 
+// Head advertised to peers in the version handshake and re-advertisement ONLY.
+// Unlike best_share_hash() -- which is verified-only and collapses to ZERO once
+// peers exist so work/template never builds on a MAX_TARGET head -- this returns
+// our tallest RAW chain head.  Root-2: on a fresh (--genesis) node the verified
+// set is empty at handshake, so best_share_hash() advertised ZERO and the peer
+// never issued download_shares() for our shares.  Advertising the raw head makes
+// a connecting peer always learn we have a chain and pull it, while work/template
+// stays on the verified head via best_share_hash().
+uint256 NodeImpl::advertised_best_share()
+{
+    // Prefer think()s current best (verified or not) -- our canonical head.
+    if (!m_best_share_hash.IsNull())
+        return m_best_share_hash;
+
+    // Otherwise the tallest raw chain head (mirrors the genesis fallback above).
+    if (m_chain && m_chain->size() > 0) {
+        uint256 best;
+        int32_t best_height = -1;
+        for (const auto& [head_hash, tail_hash] : m_chain->get_heads()) {
+            auto h = m_chain->get_height(head_hash);
+            if (h > best_height) {
+                best = head_hash;
+                best_height = h;
+            }
+        }
+        if (!best.IsNull())
+            return best;
+    }
+
+    // True genesis: no shares at all yet -- advertise ZERO exactly as before.
+    return uint256::ZERO;
+}
+
+void NodeImpl::readvertise_best()
+{
+    if (m_peers.empty())
+        return;
+    uint256 adv = advertised_best_share();
+    if (adv.IsNull() || adv == uint256::ZERO)
+        return;
+    broadcast_share(adv);
+}
+
 void NodeImpl::download_shares(peer_ptr /*unused_peer*/, const uint256& target_hash)
 {
     // p2pool node.py:108-141 download_shares() — exact translation.
@@ -1471,6 +1514,10 @@ void NodeImpl::run_think()
                 auto wr_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - wr_t0).count();
                 LOG_INFO << "[ASYNC-THINK] IO-phase: work refresh done in " << wr_ms << "ms";
+                // Root-2: re-advertise our new head.  A peer that handshook
+                // before we had a chain saw a ZERO advert and never issued
+                // download_shares -- re-announce so it pulls our shares now.
+                readvertise_best();
             } else if (result.best.IsNull()) {
                 LOG_WARNING << "[ASYNC-THINK] IO-phase: result.best is NULL — verified_tails="
                             << m_tracker.verified.get_tails().size()
@@ -1974,6 +2021,7 @@ void NodeImpl::clean_tracker()
         if (clean_best_changed && m_on_best_share_changed) {
             LOG_INFO << "[CLEAN] IO-phase: work refresh (best changed)";
             m_on_best_share_changed();
+            readvertise_best();   // root-2: re-announce new head to peers
         }
         drain_pending_adds();
         m_think_running.store(false);

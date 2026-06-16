@@ -308,12 +308,27 @@ public:
     /// Broadcast a locally-generated (or newly-received) share to all peers.
     void broadcast_share(const uint256& share_hash);
 
+    /// Re-announce our current advertised head (advertised_best_share()) to all
+    /// connected peers.  Invoked when think()/clean updates the best share so a
+    /// peer that completed the version handshake before we had any shares (when
+    /// our advert was ZERO) still learns our head and pulls via download_shares.
+    void readvertise_best();
+
     /// Start downloading shares from a peer, beginning at `target_hash`.
     /// Recursively fetches parents until the chain is connected or CHAIN_LENGTH reached.
     void download_shares(peer_ptr peer, const uint256& target_hash);
 
-    /// Return the hash of our tallest chain head, or uint256::ZERO if empty.
+    /// Return the best VERIFIED share head for work/template selection, or
+    /// uint256::ZERO when no verified chain exists yet and peers are connected
+    /// (so work never builds on a MAX_TARGET head).  NOT for the wire advert —
+    /// use advertised_best_share() there.
     uint256 best_share_hash();
+
+    /// Head advertised to peers (version handshake + re-advertisement ONLY).
+    /// Returns our tallest RAW chain head so a connecting peer always learns we
+    /// have a chain and pulls it; unlike best_share_hash() it does not collapse
+    /// to ZERO once peers exist.  Root-2 genesis-null-advert fix.
+    uint256 advertised_best_share();
 
     /// Load persisted shares from LevelDB storage into the tracker.
     void load_persisted_shares();
