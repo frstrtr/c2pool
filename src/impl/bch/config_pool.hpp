@@ -30,10 +30,13 @@
 //    reference value. "WEIGHT" is a p2pool bookkeeping field (4x size); BCH has
 //    no witness weight.
 //  - SHARE_PERIOD 60s (BTC 30s, LTC 15s); CHAIN_LENGTH 3*24*60 shares (3 days).
-//  - Donation: BCH uses the SINGLE static forrestv P2PK script for ALL share
-//    versions -- NO V36 COMBINED/P2SH ratchet. Verified first-hand against
-//    p2poolBCH @6603b79 (see memory donation-verification-closed). This is a
-//    deliberate, closed divergence from the LTC/DOGE V36 donation transition.
+//  - Donation: VERSION-GATED (operator ruling 2026-06-16, V36 master-compat).
+//    share_version <  36 -> BCH-native forrestv P2PK (static), byte-for-byte
+//    from p2poolBCH @6603b79 (memory donation-verification-closed).
+//    share_version >= 36 -> COMBINED_DONATION_SCRIPT (1-of-2 P2MS->P2SH
+//    transition + AutoRatchet 95%/50% + tail-guard), byte-identical to the
+//    BTC/LTC merged-path combined script -- merged-path is always COMBINED for
+//    cross-coin V36 parity (project_v36_donation_transition_mechanism).
 // ---------------------------------------------------------------------------
 
 namespace bch
@@ -110,10 +113,12 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // Consensus-critical donation script -- BCH uses the SINGLE static forrestv
-    // P2PK for ALL share versions (NO V36 COMBINED ratchet). Bytes are
-    // forrestv's uncompressed pubkey, bit-identical to the BTC/LTC pre-V36 P2PK.
-    // Verified first-hand vs p2poolBCH @6603b79 (memory: donation-verification-closed).
+    // Consensus-critical donation scripts -- VERSION-GATED per operator ruling
+    // 2026-06-16 (V36 master-compat with p2pool-merged-v36).
+    //
+    // Pre-V36 (share_version < 36): BCH-native forrestv P2PK (static). Bytes are
+    // forrestv's uncompressed pubkey, bit-identical to the BTC/LTC pre-V36 P2PK,
+    // verified first-hand vs p2poolBCH @6603b79 (memory donation-verification-closed).
     // -----------------------------------------------------------------------
     static constexpr std::array<uint8_t, 67> DONATION_SCRIPT = {
         0x41, // OP_PUSHBYTES_65
@@ -129,9 +134,27 @@ public:
         0xac  // OP_CHECKSIG
     };
 
-    // BCH returns the P2PK donation regardless of share_version -- no ratchet.
-    static std::vector<unsigned char> get_donation_script(int64_t /*share_version*/)
+    // V36+ (share_version >= 36): COMBINED_DONATION_SCRIPT -- P2SH wrapping the
+    // 1-of-2 P2MS (forrestv + maintainer) transition redeem; AutoRatchet 95%/50%
+    // + tail-guard semantics are carried in the redeem script. Byte-identical to
+    // the BTC/LTC merged-path combined script (coin-independent hash160) --
+    // merged-path is always COMBINED for cross-coin V36 parity.
+    static constexpr std::array<uint8_t, 23> COMBINED_DONATION_SCRIPT = {
+        0xa9, // OP_HASH160
+        0x14, // PUSH 20 bytes
+        0x8c, 0x62, 0x72, 0x62, 0x1d, 0x89, 0xe8, 0xfa,
+        0x52, 0x6d, 0xd8, 0x6a, 0xcf, 0xf6, 0x0c, 0x71,
+        0x36, 0xbe, 0x8e, 0x85,
+        0x87  // OP_EQUAL
+    };
+
+    // Returns the correct donation script for a share version (operator ruling
+    // 2026-06-16). Pre-V36 shares use the BCH-native forrestv P2PK; V36+ shares
+    // use the combined P2SH 1-of-2 multisig script. Same shape as BTC/LTC.
+    static std::vector<unsigned char> get_donation_script(int64_t share_version)
     {
+        if (share_version >= 36)
+            return {COMBINED_DONATION_SCRIPT.begin(), COMBINED_DONATION_SCRIPT.end()};
         return {DONATION_SCRIPT.begin(), DONATION_SCRIPT.end()};
     }
 
