@@ -1,26 +1,53 @@
 #pragma once
-// BCH block-template builder. Mirrors src/impl/btc/coin/template_builder.hpp.
+// BCH block-template builder. Mirrors src/impl/btc/coin/template_builder.hpp,
+// diverging where BCH consensus requires (M1 §4):
+//   * No SegWit / witness commitment  -- txs serialize as a single canonical
+//     form; txid == "hash" (no wtxid distinction). `rules` carries no segwit.
+//   * CTOR (CHIP-2018-11)             -- block body txs are re-sorted into
+//     canonical (ascending txid) order AFTER fee selection, coinbase excluded.
+//   * ASERT (aserti3-2d, CHIP-2020-05)-- next-block bits come from the ASERT
+//     DAA (asert.hpp), not BTC's 2016-block retarget.
+//   * CashTokens (May 2023)           -- token-prefixed outputs are carried
+//     transparently: they live in the tx bytes and round-trip unchanged.
+//   * HogEx                           -- NOT applicable (SmartBCH; struck §4.2).
 //
-// >>> CTOR INSERTION POINT (M1 4.3) <<<
-// BCH requires CTOR: canonical (lexicographic txid) ordering of mempool txs
-// in the block body, coinbase first. Net-new c2pool code (second BCH slice).
-// TODO(M3/M4): CTOR re-sort pass over selected txs before template assembly.
+// Coinbase: like the BTC builder, this body does NOT assemble the coinbase tx
+// itself -- it emits `coinbasevalue` + `height` and downstream share/work code
+// builds the coinbase. The BCH coinbase scriptSig commitment (BIP34 height +
+// "/c2pool/" + 32B state_root) is produced by bch::consensus (see
+// ../coinbase_commitment.hpp, M3 s19); binding it into the coinbase builder is
+// the next M4 slice in the work-source path, NOT here.
 //
-// CashTokens (May 2023) awareness: token-bearing outputs must round-trip
-// intact through template assembly. TODO(M3/M4): preserve token prefix bytes.
-// HogEx: NOT applicable (see config_coin.hpp scope note).
-//
-// M3 slice 3: CoinNodeInterface (the abstract work-source/submit seam) is
-// ported here -- mirroring the BTC source, which co-locates it with the
-// builder. It is independent of TemplateBuilder (depends only on rpc::WorkData
-// + BlockType) and is the base inherited by bch::coin::CoinNode. The concrete
-// TemplateBuilder body (merkle helpers + GBT assembly + CTOR re-sort) remains
-// the M4 deliverable below.
+// PIN / VERIFY (vs VM300 bchn-bch + p2pool-merged-v36 python ref, staged next):
+//   * block-size budget is the pre-ABLA 32 MB EB here; ABLA (CHIP-2023-01)
+//     dynamic limit must be sourced from chain state -- TODO(M4 size-slice).
+//   * `rules` array contents -- confirm against BCHN getblocktemplate output.
 
+#include "header_chain.hpp"
+#include "mempool.hpp"
+#include "transaction.hpp"
 #include "block.hpp"
 #include "rpc_data.hpp"
+#include "../coinbase_commitment.hpp"   // s19 seam (commitment built downstream)
+
+#include <core/hash.hpp>
+#include <core/pack.hpp>
+#include <core/log.hpp>
+
+#include <btclibs/util/strencodings.h>
 
 #include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <ctime>
+#include <functional>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace bch
 {
@@ -54,10 +81,246 @@ public:
     virtual bool is_synced() const { return false; }
 };
 
-// TODO(M4): class TemplateBuilder -- GBT assembly from HeaderChain + Mempool
-// with CTOR re-sort and CashTokens-transparent tx carry. (was: namespace
-// c2pool::bch TemplateBuilder stub)
+// ─── BCH Subsidy ─────────────────────────────────────────────────────────────
+
+/// BCH block subsidy in satoshis at a given height. BCH inherited Bitcoin's
+/// emission verbatim: 50 BCH initial, halving every 210,000 blocks. Identical
+/// to the BTC schedule (BCH forked at height 478,558 with the same curve).
+/// Reference: BCHN src/validation.cpp GetBlockSubsidy().
+inline uint64_t get_block_subsidy(uint32_t height) {
+    static constexpr uint64_t COIN             = 100'000'000ULL;  // satoshis per BCH
+    static constexpr uint64_t INITIAL_SUBSIDY  = 50ULL * COIN;    // 50 BCH
+    static constexpr uint32_t HALVING_INTERVAL = 210'000u;
+
+    int halvings = static_cast<int>(height / HALVING_INTERVAL);
+    if (halvings >= 64) return 0;
+    return INITIAL_SUBSIDY >> halvings;
+}
+
+// ─── Merkle Tree (SHA256d, BCH == BTC) ───────────────────────────────────────
+
+inline uint256 merkle_hash_pair(const uint256& left, const uint256& right) {
+    auto sl = std::span<const uint8_t>(left.data(),  32);
+    auto sr = std::span<const uint8_t>(right.data(), 32);
+    return Hash(sl, sr);
+}
+
+/// Merkle root over txids (SHA256d pairwise, last element duplicated for odd
+/// counts). Identical algorithm to BTC -- BCH did not change the merkle rule.
+inline uint256 compute_merkle_root(std::vector<uint256> hashes) {
+    if (hashes.empty()) return uint256::ZERO;
+    while (hashes.size() > 1) {
+        if (hashes.size() & 1u)
+            hashes.push_back(hashes.back());
+        std::vector<uint256> next;
+        next.reserve(hashes.size() / 2);
+        for (size_t i = 0; i < hashes.size(); i += 2)
+            next.push_back(merkle_hash_pair(hashes[i], hashes[i + 1]));
+        hashes = std::move(next);
+    }
+    return hashes[0];
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Compact bits as 8-char lowercase hex, matching bchn getblocktemplate.
+inline std::string bits_to_hex(uint32_t bits) {
+    char buf[9];
+    std::snprintf(buf, sizeof(buf), "%08x", bits);
+    return std::string(buf);
+}
+
+// ─── TemplateBuilder ─────────────────────────────────────────────────────────
+
+/// Builds a BCH block template (WorkData) from a validated HeaderChain and
+/// Mempool. WorkData stays layout-compatible with the GBT JSON downstream code
+/// (share creation, Stratum) consumes, so p2pool-merged-v36 interop is held.
+class TemplateBuilder {
+public:
+    // BCH has no SegWit weight accounting -- the budget is a flat byte size.
+    // Pre-ABLA excessive-blocksize (EB) = 32 MB. ABLA (CHIP-2023-01) makes this
+    // dynamic from chain state; sourcing it is a later M4 slice (see file head).
+    static constexpr uint32_t DEFAULT_MAX_BLOCK_BYTES = 32'000'000u;
+    static constexpr uint32_t COINBASE_RESERVE        = 1'000u;  // bytes for coinbase
+
+    static std::optional<rpc::WorkData> build_template(
+        const HeaderChain& chain,
+        const Mempool&     pool,
+        bool               is_testnet = false)
+    {
+        (void)is_testnet;
+        auto t0 = std::chrono::steady_clock::now();
+
+        auto tip_opt = chain.tip();
+        if (!tip_opt)
+            return std::nullopt;  // chain has no genesis yet
+
+        const IndexEntry& tip    = *tip_opt;
+        uint32_t          next_h  = tip.height + 1;
+        uint32_t          now_ts  = static_cast<uint32_t>(std::time(nullptr));
+
+        // ── Next difficulty via ASERT (aserti3-2d) ─────────────────────────
+        const BCHChainParams& params = chain.params();
+        uint32_t next_bits;
+        if (static_cast<int64_t>(tip.height) >= params.asert.anchor.height) {
+            next_bits = get_next_work_required_asert(
+                tip.height,
+                static_cast<int64_t>(tip.header.m_timestamp),
+                static_cast<int64_t>(now_ts),
+                params.asert);
+        } else {
+            // Chain shorter than the ASERT anchor (post-checkpoint cold start):
+            // fall back to the tip's bits, else pow_limit.
+            next_bits = (tip.header.m_bits != 0)
+                            ? tip.header.m_bits
+                            : params.pow_limit.GetCompact();
+            LOG_INFO << "[EMB-BCH] TemplateBuilder: bits fallback to 0x"
+                     << std::hex << next_bits << std::dec
+                     << " (tip below ASERT anchor)";
+        }
+
+        // ── Block version ──────────────────────────────────────────────────
+        // BCH blocks use version 4 (no BIP9 version-bit signaling -- BCH does
+        // not soft-fork via version bits). Mirror the tip; floor at 4.
+        uint32_t block_version = static_cast<uint32_t>(tip.header.m_version);
+        if (block_version < 4u) block_version = 4u;
+
+        // ── Subsidy ────────────────────────────────────────────────────────
+        uint64_t subsidy = get_block_subsidy(next_h);
+
+        // ── Mempool selection (fee-sorted) ─────────────────────────────────
+        auto [selected_txs, total_fees] =
+            pool.get_sorted_txs_with_fees(DEFAULT_MAX_BLOCK_BYTES - COINBASE_RESERVE);
+
+        // ── CTOR re-sort (CHIP-2018-11) ────────────────────────────────────
+        // After fee selection, the block body must be in canonical order:
+        // ascending txid, coinbase excluded (it is prepended downstream). This
+        // is consensus-critical on BCH -- a non-CTOR body is rejected.
+        std::sort(selected_txs.begin(), selected_txs.end(),
+                  [](const Mempool::SelectedTx& a, const Mempool::SelectedTx& b) {
+                      return compute_txid(a.tx) < compute_txid(b.tx);
+                  });
+
+        uint64_t coinbasevalue = subsidy + total_fees;
+
+        nlohmann::json           tx_array = nlohmann::json::array();
+        std::vector<Transaction> tx_objects;
+        std::vector<uint256>     tx_hashes;
+
+        for (const auto& stx : selected_txs) {
+            uint256     txid     = compute_txid(stx.tx);
+            auto        packed   = pack(stx.tx);          // single canonical form
+            std::string hex_data = HexStr(packed.get_span());
+
+            nlohmann::json entry;
+            entry["data"] = hex_data;
+            entry["txid"] = txid.GetHex();
+            entry["hash"] = txid.GetHex();   // BCH: no wtxid; hash == txid
+            // Per-tx fee -- p2pool adjusts subsidy when txs are excluded from a
+            // share (helper.py / data.py). null => python uses base subsidy.
+            if (stx.fee_known)
+                entry["fee"] = static_cast<int64_t>(stx.fee);
+            else
+                entry["fee"] = nullptr;
+            tx_array.push_back(std::move(entry));
+
+            tx_objects.push_back(Transaction(stx.tx));
+            tx_hashes.push_back(txid);
+        }
+
+        // ── GBT-compatible JSON ────────────────────────────────────────────
+        nlohmann::json data;
+        data["version"]           = static_cast<int>(block_version);
+        data["previousblockhash"] = tip.block_hash.GetHex();
+        data["bits"]              = bits_to_hex(next_bits);
+        data["height"]            = static_cast<int>(next_h);
+        data["curtime"]           = static_cast<int64_t>(now_ts);
+        data["coinbasevalue"]     = static_cast<int64_t>(coinbasevalue);
+        data["transactions"]      = std::move(tx_array);
+        // BCH: no segwit. ABLA/active-fork rules to be confirmed vs BCHN GBT.
+        data["rules"]             = nlohmann::json::array();
+        data["coinbaseflags"]     = "";
+        data["sizelimit"]         = static_cast<int64_t>(DEFAULT_MAX_BLOCK_BYTES);
+        data["mintime"]           = static_cast<int64_t>(tip.header.m_timestamp + 1);
+
+        LOG_INFO << "[EMB-BCH] TemplateBuilder: height=" << next_h
+                 << " version=" << block_version
+                 << " prev=" << tip.block_hash.GetHex().substr(0, 16) << "..."
+                 << " bits=" << bits_to_hex(next_bits)
+                 << " subsidy=" << subsidy << " fees=" << total_fees
+                 << " coinbasevalue=" << coinbasevalue << " sat"
+                 << " txs=" << data["transactions"].size()
+                 << " (CTOR-sorted) tip_ts=" << tip.header.m_timestamp
+                 << " now=" << now_ts << " synced=" << chain.is_synced();
+
+        auto t1 = std::chrono::steady_clock::now();
+        auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        return rpc::WorkData{std::move(data), std::move(tx_objects), std::move(tx_hashes), latency_ms};
+    }
+};
+
+// ─── EmbeddedCoinNode ─────────────────────────────────────────────────────────
+
+/// Concrete CoinNodeInterface backed by a HeaderChain and Mempool.
+class EmbeddedCoinNode : public CoinNodeInterface {
+public:
+    EmbeddedCoinNode(HeaderChain& chain, Mempool& pool, bool testnet = false)
+        : m_chain(chain), m_pool(pool), m_testnet(testnet) {}
+
+    rpc::WorkData getwork() override {
+        LOG_DEBUG_COIND << "[EMB-BCH] EmbeddedCoinNode::getwork()"
+                  << " chain_height=" << m_chain.height()
+                  << " mempool_size=" << m_pool.size()
+                  << " synced=" << m_chain.is_synced();
+        if (!m_chain.is_synced()) {
+            LOG_INFO << "[EMB-BCH] getwork() blocked: chain not synced (height="
+                     << m_chain.height() << ")";
+            throw std::runtime_error("EmbeddedCoinNode::getwork: chain not synced — waiting for header sync");
+        }
+        auto result = TemplateBuilder::build_template(m_chain, m_pool, m_testnet);
+        if (!result) {
+            LOG_WARNING << "[EMB-BCH] getwork() FAILED: no tip (chain empty)";
+            throw std::runtime_error("EmbeddedCoinNode::getwork: chain has no tip (not yet synced to genesis)");
+        }
+        return *result;
+    }
+
+    /// Block relay in embedded mode is handled by CoinBroadcaster, not here.
+    void submit_block(BlockType& /*block*/) override { }
+
+    nlohmann::json getblockchaininfo() override {
+        nlohmann::json info;
+        info["chain"]   = m_testnet ? "test" : "main";
+        info["blocks"]  = static_cast<int>(m_chain.height());
+        info["headers"] = static_cast<int>(m_chain.height());
+        info["synced"]  = m_chain.is_synced();
+
+        auto tip = m_chain.tip();
+        if (tip) {
+            info["bestblockhash"] = tip->block_hash.GetHex();
+            info["bits"]          = bits_to_hex(tip->header.m_bits);
+        } else {
+            info["bestblockhash"] = std::string(64, '0');
+            info["bits"]          = "00000000";
+        }
+        return info;
+    }
+
+    /// UTXO-readiness gate (coinbase maturity = 100 blocks on BCH).
+    void set_utxo_ready_fn(std::function<bool()> fn) { m_utxo_ready = std::move(fn); }
+
+    bool is_synced() const override {
+        if (!m_chain.is_synced()) return false;
+        if (m_utxo_ready && !m_utxo_ready()) return false;
+        return true;
+    }
+
+private:
+    HeaderChain&          m_chain;
+    Mempool&              m_pool;
+    std::function<bool()> m_utxo_ready;
+    bool                  m_testnet;
+};
 
 } // namespace coin
-
 } // namespace bch
