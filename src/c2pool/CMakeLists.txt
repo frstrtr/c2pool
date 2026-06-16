@@ -155,6 +155,26 @@ target_link_libraries(c2pool-btc
     ${Boost_LIBRARIES}
 )
 
+# c2pool-dgb: DigiByte Scrypt-only (V36) — slice #4 minimal COMPILING SKELETON.
+# Mirrors the c2pool-btc add_executable shape, pruned to a stub entry. The body
+# (embedded daemon + pool pillars) is M3/Phase B; this target only proves the
+# binary builds + links off master. It compiles impl/dgb/node.cpp directly
+# rather than linking a dgb / dgb_coin / impl_dgb lib on purpose: the top-level
+# OBJECT-lib registration of src/impl/dgb is ci-steward's convention PR and is
+# intentionally NOT raced here. The skeleton references NO core/coin/pool/ltc
+# symbols (only std + the header-only dgb config), so it needs no coin lib and
+# sidesteps the core/web_server self-link tangle that forces c2pool-btc to drag
+# in ltc/payout/merged. Link deps stay at json + Boost until Phase B.
+add_executable(c2pool-dgb
+    main_dgb.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/dgb/node.cpp
+)
+target_compile_definitions(c2pool-dgb PRIVATE C2POOL_VERSION="${C2POOL_GIT_VERSION}")
+target_link_libraries(c2pool-dgb
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+)
+
 # Windows: Boost.Asio requires Winsock libraries; /bigobj for large translation units
 if(WIN32)
     target_link_libraries(c2pool ws2_32 mswsock bcrypt dbghelp)
