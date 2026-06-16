@@ -15,7 +15,7 @@ on:
   push:
     branches: [master, btc-embedded, dash-spv-embedded, windows-build, service-update]
   pull_request:
-    branches: [master, btc-embedded, dash-spv-embedded]
+    branches: [master, btc-embedded, dash-spv-embedded, dgb/slice4-skeleton]
 
 jobs:
   coin:
