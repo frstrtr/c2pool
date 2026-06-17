@@ -15,6 +15,8 @@
 #include "config_pool.hpp"
 #include "config_coin.hpp"
 
+#include <string>
+
 // DGB Scrypt shares use the same format as LTC shares.
 // The share type, validation logic, tracker, and protocol are shared.
 // Only config_pool and config_coin differ between LTC and DGB networks.
@@ -26,5 +28,18 @@ namespace dgb
 // These will be used when instantiating the node template
 using PoolConfigType = dgb::PoolConfig;
 using CoinParamsType = dgb::CoinParams;
+
+// ---------------------------------------------------------------------------
+// Skeleton entry points (slice #4, Option B). Defined in node.cpp.
+// COMPILING SKELETON ONLY — the real node run-loop is M3 / Phase B.
+// ---------------------------------------------------------------------------
+
+// One-line summary of the DGB-Scrypt network from the header-only config
+// constants (no Fileconfig instantiation).
+std::string network_summary();
+
+// Skeleton run entry. Returns a process exit code. Phase B replaces this with
+// the embedded-daemon + pool/sharechain run-loop.
+int run_skeleton();
 
 } // namespace dgb

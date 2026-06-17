@@ -155,6 +155,33 @@ target_link_libraries(c2pool-btc
     ${Boost_LIBRARIES}
 )
 
+# c2pool-dgb: DigiByte Scrypt-only (V36) — slice #4 minimal COMPILING SKELETON.
+# Mirrors the c2pool-btc add_executable shape, pruned to a stub entry. The body
+# (embedded daemon + pool pillars) is M3/Phase B; this target only proves the
+# binary builds + links off master. It compiles impl/dgb/node.cpp directly
+# rather than linking a dgb / dgb_coin / impl_dgb lib on purpose: the top-level
+# OBJECT-lib registration of src/impl/dgb is ci-steward's convention PR and is
+# intentionally NOT raced here. The skeleton reads only header constexpr
+# constants from impl/dgb/config_{coin,pool}.hpp; those headers #include
+# core/netaddress.hpp, which #includes <yaml-cpp/yaml.h>. So the target needs
+# yaml-cpp's INCLUDE DIR to compile — but NOT core's symbols: it never
+# instantiates the Fileconfig-derived configs nor calls any core function.
+# Linking the `core` library instead would drag in core/web_server.o +
+# stratum_server.o, which reference merged/payout/hashrate/ltc symbols (the
+# self-link tangle that forces c2pool-btc to drag in ltc/payout/merged) and
+# would pull Phase B forward. We therefore add ONLY yaml-cpp (header path).
+# Link deps stay at yaml-cpp + json + Boost until Phase B.
+add_executable(c2pool-dgb
+    main_dgb.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/dgb/node.cpp
+)
+target_compile_definitions(c2pool-dgb PRIVATE C2POOL_VERSION="${C2POOL_GIT_VERSION}")
+target_link_libraries(c2pool-dgb
+    yaml-cpp::yaml-cpp  # include dir only: config_{coin,pool}.hpp -> core/netaddress.hpp -> <yaml-cpp/yaml.h>
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+)
+
 # Windows: Boost.Asio requires Winsock libraries; /bigobj for large translation units
 if(WIN32)
     target_link_libraries(c2pool ws2_32 mswsock bcrypt dbghelp)
