@@ -14,7 +14,9 @@ namespace dgb
 {
 
 /// DigiByte Scrypt P2Pool network configuration.
-/// Constants match frstrtr/p2pool-merged-v36 p2pool/networks/digibyte.py
+/// Source of truth: the p2pool-dgb-scrypt oracle network (operator ruling
+/// 2026-06-17, "switch-oracle" / Option B). The V36-master byte-compat
+/// constraint with p2pool-merged-v36 is FORMALLY WAIVED for DGB by that ruling.
 class PoolConfig : protected core::Fileconfig
 {
 protected:
@@ -31,7 +33,8 @@ public:
     static constexpr uint16_t P2P_PORT                  = 5024;
     static constexpr uint32_t SPREAD                    = 30;
     static constexpr uint32_t TARGET_LOOKBEHIND         = 200;
-    static constexpr uint32_t MINIMUM_PROTOCOL_VERSION  = 3600;
+    static constexpr uint32_t MINIMUM_PROTOCOL_VERSION    = 1700;  // floor (p2pool-dgb-scrypt digibyte.py NEW_MIN)
+    static constexpr uint32_t ADVERTISED_PROTOCOL_VERSION = 3301;  // advertised capability (p2pool-dgb-scrypt p2p.py VERSION)
     static constexpr uint32_t SEGWIT_ACTIVATION_VERSION = 17;
     static constexpr uint32_t BLOCK_MAX_SIZE            = 1000000;
     static constexpr uint32_t BLOCK_MAX_WEIGHT          = 4000000;
@@ -70,26 +73,28 @@ public:
 
     // -----------------------------------------------------------------------
     // Donation scripts — version-gated migration (pillar 4)
-    //   pre-V36 : farsider350 2-of-3 bare multisig (DGB v35 canonical donation)
-    //   V36+    : shared COMBINED P2SH 1-of-2 (byte-identical to LTC network)
-    // get_donation_script(version) selects per share version, matching the
-    // donation transition in p2pool-merged-v36. Source of truth for the v35
-    // bytes: farsider350 p2pool-dgb-scrypt-350 p2pool/data.py:66 DONATION_SCRIPT.
+    //   pre-V36 : original P2Pool DONATION_SCRIPT (P2PK, author forrestv)
+    //   V36+    : COMBINED P2SH 1-of-2 (forrestv + maintainer)
+    // get_donation_script(version) selects per share version. Source of truth:
+    // p2pool-dgb-scrypt oracle (operator ruling 2026-06-17, "switch-oracle").
+    // This REVERSES the 2026-06-16 farsider350 2-of-3 P2MS overrule for DGB; the
+    // oracle inherits the global forrestv P2PK v35 donation (byte-identical to LTC).
     // -----------------------------------------------------------------------
 
-    // Pre-V36 DONATION_SCRIPT (OP_2 <3x33B pubkey> OP_3 OP_CHECKMULTISIG)
-    static constexpr std::array<uint8_t, 105> DONATION_SCRIPT = {
-        0x52,                                   // OP_2
-        0x21, 0x02, 0xd9, 0x22, 0x34, 0x77, 0x7b, 0x63,  // push33 pubkey 1
-              0xf6, 0xdb, 0xc0, 0xa0, 0x38, 0x2b, 0xbc, 0xb5, 0x4e, 0x0b, 0xef, 0xb0, 0x1f, 0x6a, 0x4b, 0x06,
-              0x21, 0x22, 0xfa, 0xda, 0xb0, 0x44, 0xaf, 0x6c, 0x06, 0x88,
-        0x21, 0x03, 0xb2, 0x7b, 0xbc, 0x50, 0x19, 0xd3,  // push33 pubkey 2
-              0x54, 0x35, 0x86, 0x48, 0x2a, 0x99, 0x5e, 0x8f, 0x57, 0xc6, 0xad, 0x50, 0x6a, 0x4d, 0xaf, 0xa6,
-              0xbf, 0x7c, 0xc8, 0x95, 0x33, 0xb8, 0xdc, 0xb2, 0xdf, 0x1b,
-        0x21, 0x02, 0x91, 0x1f, 0xf8, 0x7e, 0x79, 0x2e,  // push33 pubkey 3
-              0xc7, 0x5b, 0x3a, 0x30, 0xdc, 0x11, 0x5d, 0xfd, 0x06, 0xec, 0x27, 0xc9, 0x3b, 0x27, 0x03, 0x4a,
-              0xa8, 0xe7, 0xce, 0xfb, 0xee, 0x64, 0x77, 0xe5, 0xd0, 0x34,
-        0x53, 0xae                              // OP_3 OP_CHECKMULTISIG
+    // Pre-V36 DONATION_SCRIPT (P2PK: OP_PUSHBYTES_65 <uncompressed pubkey> OP_CHECKSIG)
+    // Original P2Pool donation key (author forrestv); byte-identical to LTC/global.
+    static constexpr std::array<uint8_t, 67> DONATION_SCRIPT = {
+        0x41,                                   // OP_PUSHBYTES_65
+        0x04, 0xff, 0xd0, 0x3d, 0xe4, 0x4a, 0x6e, 0x11,
+        0xb9, 0x91, 0x7f, 0x3a, 0x29, 0xf9, 0x44, 0x32,
+        0x83, 0xd9, 0x87, 0x1c, 0x9d, 0x74, 0x3e, 0xf3,
+        0x0d, 0x5e, 0xdd, 0xcd, 0x37, 0x09, 0x4b, 0x64,
+        0xd1, 0xb3, 0xd8, 0x09, 0x04, 0x96, 0xb5, 0x32,
+        0x56, 0x78, 0x6b, 0xf5, 0xc8, 0x29, 0x32, 0xec,
+        0x23, 0xc3, 0xb7, 0x4d, 0x9f, 0x05, 0xa6, 0xf9,
+        0x5a, 0x8b, 0x55, 0x29, 0x35, 0x26, 0x56, 0x66,
+        0x4b,
+        0xac                                    // OP_CHECKSIG
     };
 
     // V36+ combined donation (P2SH 1-of-2 multisig, same as LTC network)
@@ -108,11 +113,11 @@ public:
         return {DONATION_SCRIPT.begin(), DONATION_SCRIPT.end()};
     }
 
-    // P2Pool network framing (from p2pool-merged-v36/p2pool/networks/digibyte.py)
-    static inline const std::string DEFAULT_PREFIX_HEX     = "1bfe01eff652e4b7";
-    static inline const std::string TESTNET_PREFIX_HEX     = "1bfe01eff652e4b7";  // same for testnet
-    static inline const std::string IDENTIFIER_HEX         = "1bfe01eff5ba4e38";
-    static inline const std::string TESTNET_IDENTIFIER_HEX = "1bfe01eff5ba4e38";
+    // P2Pool network framing (p2pool-dgb-scrypt oracle; operator ruling 2026-06-17)
+    static inline const std::string DEFAULT_PREFIX_HEX     = "1c0553f23ebfcffe";
+    static inline const std::string TESTNET_PREFIX_HEX     = "1c0553f23ebfcffe";  // same for testnet
+    static inline const std::string IDENTIFIER_HEX         = "4b62545b1a631afe";
+    static inline const std::string TESTNET_IDENTIFIER_HEX = "4b62545b1a631afe";
 
     static const std::string& identifier_hex() {
         return is_testnet ? TESTNET_IDENTIFIER_HEX : IDENTIFIER_HEX;
