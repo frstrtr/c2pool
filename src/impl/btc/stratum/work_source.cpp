@@ -11,6 +11,7 @@
 // implementing the substantive logic.
 
 #include <impl/btc/stratum/work_source.hpp>
+#include <impl/btc/stratum/tx_data_memo.hpp>   // H5 tx_data memo seam (work_source.cpp:634 churn fix)
 #include <memory>
 
 #include <impl/btc/coin/header_chain.hpp>
@@ -630,44 +631,20 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
     }
     auto txs_field = wd->m_data.find("transactions");
     if (txs_field != wd->m_data.end() && txs_field->is_array()) {
-        // a1 (shared_ptr + lazy materialize): build the per-tx hex vector ONCE
-        // and hand the snapshot a shared_ptr to it, so the copies made along
-        // CoinbaseResult -> JobSnapshot -> JobEntry become refcount bumps, not
-        // deep copies of the full mempool tx hex.
-        //
-        // H5 (memoize across calls): a1 collapsed the per-job copies, but the
-        // vector itself was still rebuilt from scratch on every call to this
-        // method even when the mempool tx set had not changed -- the dominant
-        // leak/churn site (work_source.cpp:634, 768MB / 1.2M calls). Fingerprint
-        // the template tx set over wd->m_hashes (the merkle leaf set, in
-        // merkle-leaf order) and reuse the memoized shared_ptr on a match.
-        // The fingerprint keys on the SAME leaves that built this job's merkle,
-        // so a hit is atomic with the witness_commitment/merkle captured for
-        // the job (no stale-tx-vs-fresh-merkle mismatch on submit). Single slot
-        // -> bounded memory (one tx set retained), self-evicting on tx-set roll.
-        CHash256 fp_hasher;
-        for (const auto& h : wd->m_hashes)
-            fp_hasher.Write(std::span<const unsigned char>(h.data(), 32));
-        uint256 fp;
-        fp_hasher.Finalize(std::span<unsigned char>(fp.data(), 32));
-
-        std::shared_ptr<std::vector<std::string>> txd;
-        {
-            std::lock_guard<std::mutex> lk(template_mutex_);
-            if (tx_data_memo_ && tx_data_fp_ == fp) {
-                txd = tx_data_memo_;  // unchanged tx set -> refcount bump, no rebuild
-            } else {
-                txd = std::make_shared<std::vector<std::string>>();
-                txd->reserve(txs_field->size());
-                for (const auto& t : *txs_field) {
-                    if (t.is_object() && t.contains("data") && t["data"].is_string())
-                        txd->push_back(t["data"].get<std::string>());
-                }
-                tx_data_fp_   = fp;    // single slot: overwrite, prior set refcount drops
-                tx_data_memo_ = txd;
-            }
-        }
-        snap.tx_data = std::move(txd);
+        // a1 + H5 memo: build the per-tx hex vector ONCE and hand the snapshot a
+        // shared_ptr to it (copies along CoinbaseResult -> JobSnapshot -> JobEntry
+        // become refcount bumps, not deep copies of the full mempool tx hex).
+        // The memo seam goes one further: it keys a single-slot cache to a
+        // fingerprint over the merkle leaf set (wd->m_hashes), so a repeat call
+        // against an UNCHANGED tx set reuses the cached shared_ptr instead of
+        // re-serializing the whole mempool -- the dominant churn site in the
+        // 2026-06-02 heaptrack (768MB / 1.2M calls). The key is the exact leaf
+        // set that built this job merkle, so a hit is atomic-with-merkle by
+        // construction. The seam does no locking; build_connection_coinbase runs
+        // on connection threads, so guard the memo members with template_mutex_.
+        std::lock_guard<std::mutex> lk(template_mutex_);
+        snap.tx_data = btc::stratum::detail::tx_data_memo_get_or_build(
+            wd->m_hashes, *txs_field, tx_data_fp_, tx_data_memo_);
     }
     snap.merkle_branches = std::move(branches);
 
