@@ -190,3 +190,72 @@ TEST(DashConformancePayoutScript, DonationScriptIsP2PKHOverDonationHash) {
     EXPECT_EQ(dash::pubkey_hash_to_script2(h160(DONATION_H160)),
               dash::DONATION_SCRIPT);
 }
+
+// ── Masternode-payment-packing conformance (S6 slice 3) ──────────────────────
+// Dash's PPLNS payout set carries DASH-SPECIFIC entries BTC p2pool has no
+// analogue for: masternode / superblock / platform payments, each packed as
+// PackedPayment{ payee (PossiblyNone VarStr), amount (LE uint64) }. Before a
+// full payout SET can be conformance-checked against frstrtr/p2pool-dash
+// (data.py packed_payments), the single-entry and vector wire framing must
+// match byte-for-byte: a CompactSize-prefixed payee string + 8-byte LE amount,
+// and a CompactSize-prefixed vector count. These KATs are computed OUT-OF-BAND
+// with CPython (CompactSize + struct "<Q"), so they are NOT circular with the
+// C++ Serialize path. The round-trip case proves Unserialize is its inverse.
+namespace {
+std::string ps_hex(const PackStream& ps) {
+    auto& m = const_cast<PackStream&>(ps);
+    return HexStr(std::span<const unsigned char>(reinterpret_cast<const unsigned char*>(m.data()), m.size()));
+}
+
+dash::PackedPayment payment(const std::string& payee, uint64_t amount) {
+    dash::PackedPayment pp;
+    pp.m_payee = payee;
+    pp.m_amount = amount;
+    return pp;
+}
+
+}  // namespace
+
+// Single PackedPayment: CompactSize(len) + payee bytes + LE64 amount. The empty
+// payee is PossiblyNone(None) -> a single 0x00 length, NOT a sentinel.
+TEST(DashConformancePayment, SingleEntryMatchesOutOfBandKat) {
+    struct PayKat { const char* payee; uint64_t amount; const char* hex; };
+    const PayKat kats[] = {
+        {"", 0, "000000000000000000"},
+        {"XyPmasternodePayeeAddr00", 200000000,
+         "185879506d61737465726e6f6465506179656541646472303000c2eb0b00000000"},
+        {"!76a91420cb5c22b1e4d5947e5c112c7696b51ad9af3c6188ac", 500000000,
+         "332137366139313432306362356332326231653464353934376535633131326337"
+         "363936623531616439616633633631383861630065cd1d00000000"},
+    };
+    for (const auto& k : kats) {
+        PackStream ps;
+        ::Serialize(ps, payment(k.payee, k.amount));
+        EXPECT_EQ(ps_hex(ps), std::string(k.hex))
+            << "payee=\"" << k.payee << "\" amount=" << k.amount;
+    }
+}
+
+// std::vector<PackedPayment> prefixes a CompactSize count, then each entry.
+TEST(DashConformancePayment, VectorFramingMatchesOutOfBandKat) {
+    std::vector<dash::PackedPayment> v{
+        payment("XyPmasternodePayeeAddr00", 200000000),
+        payment("", 0),
+    };
+    PackStream ps;
+    ::Serialize(ps, v);
+    EXPECT_EQ(ps_hex(ps),
+        std::string("02185879506d61737465726e6f6465506179656541646472303000c2eb0b"
+                    "00000000000000000000000000"));
+}
+
+// Unserialize is the exact inverse of Serialize (payee + amount recovered).
+TEST(DashConformancePayment, RoundTripRecoversFields) {
+    const auto orig = payment("XyPmasternodePayeeAddr00", 200000000);
+    PackStream ps;
+    ::Serialize(ps, orig);
+    dash::PackedPayment back;
+    ::Unserialize(ps, back);
+    EXPECT_EQ(back.m_payee, orig.m_payee);
+    EXPECT_EQ(back.m_amount, orig.m_amount);
+}
