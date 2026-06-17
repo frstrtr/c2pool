@@ -30,12 +30,15 @@
 #include <impl/dash/coinbase_builder.hpp>   // dash::coinbase::merkle_branches_raw, HexStr
 #include <impl/dash/share_check.hpp>        // dash::check_merkle_link
 #include <impl/dash/share_types.hpp>        // dash::MerkleLink
+#include <impl/dash/pplns.hpp>           // dash::pplns::compute_payouts, dash::ShareChain, DashShare
 #include <impl/bitcoin_family/coin/base_block.hpp>  // bitcoin_family::coin::SmallBlockHeaderType
 
 #include <core/hash.hpp>                     // Hash (sha256d)
 #include <core/uint256.hpp>
 
 #include <cstdint>
+#include <map>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -359,4 +362,174 @@ TEST(DashConformanceDifficulty, BitsToDifficultyMatchesP2poolDash) {
         const double got = dash::coinbase::bits_to_difficulty(k.nbits);
         EXPECT_NEAR(got, k.diff, k.diff * 1e-12 + 1e-18) << "nbits=" << k.nbits;
     }
+}
+
+// ── PPLNS payout-SET equality conformance (S6 slice 6) ───────────────────────
+// The miner-facing output of the whole sharechain is the PPLNS payout SET:
+// the {scriptPubKey -> amount} map a coinbase pays. For DASH to be value-
+// equivalent to its own older oracle (frstrtr/p2pool-dash data.py
+// get_expected_payouts) every recipient AND every satoshi must agree. This
+// slice pins that floored-proportional split — per-share weight = difficulty
+// (bits_to_difficulty), worker/donation split by m_donation/65535, dust drop,
+// and the ALWAYS-emitted donation residue line — against OUT-OF-BAND CPython
+// KAT vectors (no node dependency, not circular with the C++ doubles).
+//
+// The synthetic ShareChain is test-local scaffolding: minimal back-linked
+// DashShares carrying only the fields compute_payouts() reads. bits is fixed
+// to 0x1d00ffff, whose difficulty is EXACTLY 1.0 (difficulty_1 == target), so
+// every weight is the integer 1.0 and the running sums are bit-exact in any
+// order — the only floating ops left are the split fractions (e.g. 2.0/3.0),
+// which IEEE-double C++ and CPython evaluate identically. That removes the
+// summation-order fragility that would otherwise make the KAT non-reproducible.
+namespace {
+
+// Compact bits whose Dash share difficulty is exactly 1.0 (see slice 5 KAT).
+constexpr uint32_t BITS_DIFF1 = 0x1d00ffffu;
+
+uint256 pplns_share_hash(uint8_t tag) {
+    std::vector<unsigned char> v(32, 0x00);
+    v[0]  = tag;
+    v[31] = 0xa5;  // keep non-null independent of tag
+    return uint256(v);
+}
+
+uint160 miner_h160(uint8_t tag) {
+    std::vector<unsigned char> v(20, 0x00);
+    v[0] = tag;
+    return uint160(v);
+}
+
+// Owns a set of synthetic shares and the chain that indexes them. Shares are
+// added tip-last; each links to `prev` via m_prev_hash. Only m_hash /
+// m_prev_hash / m_bits / m_max_bits / m_donation / m_pubkey_hash are set.
+struct SyntheticChain {
+    dash::ShareChain chain;
+    std::vector<dash::DashShare*> pool;  // chain (ShareVariants::destroy) owns the shares; raw avoids double-free
+
+    uint256 add(uint8_t tag, const uint256& prev, uint16_t donation,
+                const uint160& pkh) {
+        auto* s = new dash::DashShare();
+        s->m_hash        = pplns_share_hash(tag);
+        s->m_prev_hash   = prev;
+        s->m_bits        = BITS_DIFF1;
+        s->m_max_bits    = BITS_DIFF1;  // ShareIndex ctor reads m_max_bits
+        s->m_donation    = donation;
+        s->m_pubkey_hash = pkh;
+        const uint256 h  = s->m_hash;
+        chain.add(s);
+        pool.push_back(s);
+        return h;
+    }
+};
+
+// Flatten a payout result into {script_hex -> amount} for set comparison, and
+// separately assert the outputs are sorted ascending by script bytes (the
+// deterministic coinbase-output order compute_payouts() guarantees).
+std::map<std::string, uint64_t> payout_set(const dash::pplns::Result& r) {
+    std::map<std::string, uint64_t> out;
+    for (const auto& p : r.payouts)
+        out[HexStr(std::span<const unsigned char>(p.script.data(), p.script.size()))]
+            = p.amount;
+    return out;
+}
+
+std::string script_hex(const std::vector<unsigned char>& v) {
+    return HexStr(std::span<const unsigned char>(v.data(), v.size()));
+}
+
+}  // namespace
+
+// Two miners, A with two shares and B with one (all weight 1.0), V = 1 DASH.
+// p2pool floored split: A = floor(2/3 * 1e8) = 66666666, B = floor(1/3 * 1e8)
+// = 33333333, donation residue = 1. Outputs sorted by script bytes (A < B <
+// donation). KAT amounts computed OUT-OF-BAND in CPython.
+TEST(DashConformancePplns, ProportionalSplitMatchesOutOfBandKat) {
+    SyntheticChain sc;
+    const uint160 A = miner_h160(0x01), B = miner_h160(0x02);
+    uint256 g   = sc.add(0x10, uint256(), 0, B);  // genesis: miner B
+    uint256 s1  = sc.add(0x11, g,         0, A);  // miner A
+    uint256 tip = sc.add(0x12, s1,        0, A);  // tip: miner A
+
+    const uint64_t V = 100000000;  // 1 DASH
+    auto fallback = dash::pubkey_hash_to_script2(miner_h160(0xee));
+    auto r = dash::pplns::compute_payouts(sc.chain, tip, /*window*/ 10, V,
+                                          fallback, /*min_shares*/ 2);
+
+    ASSERT_FALSE(r.used_fallback);
+    EXPECT_EQ(r.shares_used, 3u);
+
+    const std::string a_hex = script_hex(dash::pubkey_hash_to_script2(A));
+    const std::string b_hex = script_hex(dash::pubkey_hash_to_script2(B));
+    const std::string d_hex = script_hex(dash::DONATION_SCRIPT);
+
+    const std::map<std::string, uint64_t> expected = {
+        {a_hex, 66666666u},
+        {b_hex, 33333333u},
+        {d_hex, 1u},
+    };
+    EXPECT_EQ(payout_set(r), expected);
+
+    // Conservation: every satoshi of miner_value is accounted for.
+    uint64_t sum = 0;
+    for (const auto& p : r.payouts) sum += p.amount;
+    EXPECT_EQ(sum, V);
+
+    // Deterministic order: outputs sorted ascending by script bytes.
+    for (size_t i = 1; i < r.payouts.size(); ++i)
+        EXPECT_TRUE(r.payouts[i - 1].script < r.payouts[i].script)
+            << "payout outputs not in canonical script order at index " << i;
+}
+
+// A single miner share with a ~10% donation (m_donation = 6553/65535). The
+// worker keeps frac = 1 - 6553/65535 of the value; the unallocated remainder
+// (donation portion + rounding) flows to the always-emitted donation line.
+// CPython KAT: A = floor((1 - 6553/65535) * 1e8) = 90000762, donation = 9999238.
+TEST(DashConformancePplns, DonationWeightSplitMatchesOutOfBandKat) {
+    SyntheticChain sc;
+    const uint160 A = miner_h160(0x01);
+    uint256 tip = sc.add(0x20, uint256(), /*donation bps*/ 6553, A);
+
+    const uint64_t V = 100000000;
+    auto fallback = dash::pubkey_hash_to_script2(miner_h160(0xee));
+    // min_shares = 1 so a single-share chain takes the PPLNS path, not fallback.
+    auto r = dash::pplns::compute_payouts(sc.chain, tip, /*window*/ 10, V,
+                                          fallback, /*min_shares*/ 1);
+
+    ASSERT_FALSE(r.used_fallback);
+    const std::map<std::string, uint64_t> expected = {
+        {script_hex(dash::pubkey_hash_to_script2(A)), 90000762u},
+        {script_hex(dash::DONATION_SCRIPT),            9999238u},
+    };
+    EXPECT_EQ(payout_set(r), expected);
+
+    uint64_t sum = 0;
+    for (const auto& p : r.payouts) sum += p.amount;
+    EXPECT_EQ(sum, V);
+}
+
+// Cold / insufficient chain: when fewer than min_shares ancestors are
+// reachable, p2pool mines solo — a single payout of the full value to the
+// caller's fallback script. Tip absent from the chain hits the same path.
+TEST(DashConformancePplns, ColdChainFallsBackToSingleRecipient) {
+    SyntheticChain sc;
+    const uint160 A = miner_h160(0x01);
+    uint256 tip = sc.add(0x30, uint256(), 0, A);  // only one share
+
+    const uint64_t V = 100000000;
+    auto fallback = dash::pubkey_hash_to_script2(miner_h160(0xee));
+
+    // Default min_shares (20) is unmet by a 1-share chain -> fallback.
+    auto r = dash::pplns::compute_payouts(sc.chain, tip, /*window*/ 10, V,
+                                          fallback);
+    ASSERT_TRUE(r.used_fallback);
+    ASSERT_EQ(r.payouts.size(), 1u);
+    EXPECT_EQ(r.payouts[0].script, fallback);
+    EXPECT_EQ(r.payouts[0].amount, V);
+
+    // A tip that isn't in the chain at all also falls back.
+    auto r2 = dash::pplns::compute_payouts(sc.chain, pplns_share_hash(0x7f),
+                                           10, V, fallback, 1);
+    ASSERT_TRUE(r2.used_fallback);
+    ASSERT_EQ(r2.payouts.size(), 1u);
+    EXPECT_EQ(r2.payouts[0].amount, V);
 }
