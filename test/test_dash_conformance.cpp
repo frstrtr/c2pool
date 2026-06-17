@@ -30,6 +30,7 @@
 #include <impl/dash/coinbase_builder.hpp>   // dash::coinbase::merkle_branches_raw, HexStr
 #include <impl/dash/share_check.hpp>        // dash::check_merkle_link
 #include <impl/dash/share_types.hpp>        // dash::MerkleLink
+#include <impl/bitcoin_family/coin/base_block.hpp>  // bitcoin_family::coin::SmallBlockHeaderType
 
 #include <core/hash.hpp>                     // Hash (sha256d)
 #include <core/uint256.hpp>
@@ -258,4 +259,73 @@ TEST(DashConformancePayment, RoundTripRecoversFields) {
     ::Unserialize(ps, back);
     EXPECT_EQ(back.m_payee, orig.m_payee);
     EXPECT_EQ(back.m_amount, orig.m_amount);
+}
+
+// ── Share-header wire-equality conformance (S6 slice 4) ──────────────────────
+// A DASH share embeds a compact min_header (bitcoin_family::coin::
+// SmallBlockHeaderType): CompactSize(version) + prev_block(32, internal order)
+// + LE32 timestamp + LE32 bits + LE32 nonce. The VarInt(version) is c2pool's
+// CompactFormat == Bitcoin CompactSize (0xfd/0xfe prefixes), the SAME encoding
+// frstrtr/p2pool-dash's small_block_header_type uses for 'version'. Before a
+// share header can be conformance-checked against that older-than-v35 oracle,
+// this framing must match byte-for-byte. KATs are computed OUT-OF-BAND with
+// CPython (CompactSize + struct "<I" + sha256d), so they are NOT circular with
+// the C++ Serialize path. prev_block = sha256d(byte) reuses slice-1's
+// unambiguous byte-order convention (raw digest == uint256 internal order ==
+// serialized bytes, no reversal).
+namespace {
+bitcoin_family::coin::SmallBlockHeaderType
+small_header(uint64_t version, uint8_t prev_seed, uint32_t ts, uint32_t bits, uint32_t nonce) {
+    bitcoin_family::coin::SmallBlockHeaderType h;
+    h.m_version = version;
+    h.m_previous_block = leaf(prev_seed);   // Hash(single byte): internal order, no reversal
+    h.m_timestamp = ts;
+    h.m_bits = bits;
+    h.m_nonce = nonce;
+    return h;
+}
+}  // namespace
+
+TEST(DashConformanceShareHeader, SmallHeaderMatchesOutOfBandKat) {
+    struct HdrKat { uint64_t version; uint8_t prev; uint32_t ts, bits, nonce; const char* hex; };
+    const HdrKat kats[] = {
+        {1,     0, 0x00000000u, 0x00000000u, 0x00000000u,
+         "011406e05881e299367766d313e26c05564ec91bf721d31726bd6e46e60689539a000000000000000000000000"},
+        {20,    1, 0x5f5e1000u, 0x1e0ffff0u, 0xdeadbeefu,
+         "149c12cfdc04c74584d787ac3d23772132c18524bc7ab28dec4219b8fc5b425f7000105e5ff0ff0f1eefbeadde"},
+        {253,   2, 0x12345678u, 0x207fffffu, 0x00000001u,
+         "fdfd001cc3adea40ebfd94433ac004777d68150cce9db4c771bc7de1b297a7b795bbba78563412ffff7f2001000000"},
+        {70221, 3, 0x499602d2u, 0x1b0404cbu, 0xfeedfaceu,
+         "fe4d120100c942a06c127c2c18022677e888020afb174208d299354f3ecfedb124a1f3fa45d2029649cb04041bcefaedfe"},
+    };
+    for (const auto& k : kats) {
+        PackStream ps;
+        ::Serialize(ps, small_header(k.version, k.prev, k.ts, k.bits, k.nonce));
+        EXPECT_EQ(ps_hex(ps), std::string(k.hex))
+            << "version=" << k.version << " bits=" << k.bits;
+    }
+}
+
+// The CompactSize(version) byte is the conformance-critical boundary: a 1-byte
+// encoding below 0xfd, a 0xfd + u16-LE at/above it. Pin both so a regression to
+// a fixed-width version field (or to base-128 VarInt) is caught immediately.
+TEST(DashConformanceShareHeader, VersionCompactSizeBoundary) {
+    PackStream a; ::Serialize(a, small_header(252, 0, 0, 0, 0));
+    EXPECT_EQ(ps_hex(a).substr(0, 2), std::string("fc"));     // 252 -> single byte
+    PackStream b; ::Serialize(b, small_header(253, 0, 0, 0, 0));
+    EXPECT_EQ(ps_hex(b).substr(0, 6), std::string("fdfd00"));  // 253 -> 0xfd + u16 LE
+}
+
+// Unserialize is the exact inverse of Serialize (all five fields recovered).
+TEST(DashConformanceShareHeader, RoundTripRecoversFields) {
+    const auto orig = small_header(70221, 3, 0x499602d2u, 0x1b0404cbu, 0xfeedfaceu);
+    PackStream ps;
+    ::Serialize(ps, orig);
+    bitcoin_family::coin::SmallBlockHeaderType back;
+    ::Unserialize(ps, back);
+    EXPECT_EQ(back.m_version, orig.m_version);
+    EXPECT_EQ(back.m_previous_block, orig.m_previous_block);
+    EXPECT_EQ(back.m_timestamp, orig.m_timestamp);
+    EXPECT_EQ(back.m_bits, orig.m_bits);
+    EXPECT_EQ(back.m_nonce, orig.m_nonce);
 }
