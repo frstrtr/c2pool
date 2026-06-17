@@ -909,6 +909,15 @@ private:
         LOG_INFO << "[" << m_chain_label << "] Compact block completed via blocktxn: "
                  << blockhash.GetHex();
 
+        // Emit the reconstructed block on full_block, exactly as the direct
+        // `block` handler and the complete-path `cmpctblock` handler do. Without
+        // this, a block delivered via the compact + getblocktxn round-trip (the
+        // common case when the mempool is missing some txns) never reaches the
+        // ABLA size feed: AblaBlockFeed would see a height discontinuity and the
+        // template budget would drop to the 32 MB safe floor. Producer-side
+        // completion of the embedded-daemon block-connect -> full_block path.
+        m_coin->full_block.happened(block);
+
         m_pending_cmpct.reset();
         m_pending_missing_indexes.clear();
     }
