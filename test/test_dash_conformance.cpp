@@ -31,6 +31,7 @@
 #include <impl/dash/share_check.hpp>        // dash::check_merkle_link
 #include <impl/dash/share_types.hpp>        // dash::MerkleLink
 #include <impl/dash/pplns.hpp>           // dash::pplns::compute_payouts, dash::ShareChain, DashShare
+#include <impl/dash/version_negotiation.hpp> // dash::version_negotiation::get_desired_version_counts/weights
 #include <impl/bitcoin_family/coin/base_block.hpp>  // bitcoin_family::coin::SmallBlockHeaderType
 
 #include <core/hash.hpp>                     // Hash (sha256d)
@@ -532,4 +533,115 @@ TEST(DashConformancePplns, ColdChainFallsBackToSingleRecipient) {
     ASSERT_TRUE(r2.used_fallback);
     ASSERT_EQ(r2.payouts.size(), 1u);
     EXPECT_EQ(r2.payouts[0].amount, V);
+}
+
+// ── S6 conformance: share-version transition negotiation vs frstrtr/p2pool-dash ──
+//
+// The older-than-v35 -> v36 handshake. Two tallies are kept deliberately apart
+// (the F10 version-gate trap): a PLAIN per-share vote count drives the
+// SUCCESSOR confirmed-state guard / AutoRatchet, while a SEPARATE work-WEIGHTED
+// tally drives the v36 activation gate. Mixing them is the exact divergence the
+// fleet is converging on for V36.
+//
+// Reference: p2pool-dash data.py Share.check (60% SUCCESSOR guard, plain
+// get_desired_version_counts) and p2pool-merged-v36 work.py (v36_active =
+// weight[36]/Sum >= 0.95). All thresholds and weights below are KAT vectors
+// computed OUT-OF-BAND in CPython from the exact integer formulas
+//   target_to_average_attempts = 2**256 // (target + 1)
+//   tail-guard  : count >= (total*60)//100      (floor)
+//   v36 gate    : w36*100 >= total*95           (exact rational)
+// so the pins are not circular with the C++ path.
+
+// Out-of-band CPython: diff-1 (0x1d00ffff) work = 2**256//(target+1).
+static constexpr uint64_t W_DIFF1 = 4295032833ULL;   // 0x100010001
+// Heavier share, bits 0x1c7fff00 (target = 0x7fff00 << (8*25)): work doubles+.
+static constexpr uint32_t BITS_HEAVY = 0x1c7fff00u;
+static constexpr uint64_t W_HEAVY  = 8590196744ULL;  // 0x200040008
+
+namespace {
+// Append a share with an explicit desired_version and bits. SyntheticChain's
+// ShareIndex caches work from m_bits at add() time; version_negotiation reads
+// obj->m_bits live, so post-add patching is what the production walk observes.
+uint256 add_versioned(SyntheticChain& sc, uint8_t tag, const uint256& prev,
+                      uint64_t version, uint32_t bits, const uint160& pkh) {
+    uint256 h = sc.add(tag, prev, /*donation*/ 0, pkh);
+    auto* s = sc.pool.back();
+    s->m_desired_version = version;
+    s->m_bits = bits;
+    return h;
+}
+}  // namespace
+
+// Production plain count and work-weighted tally over the same window must equal
+// the out-of-band CPython KATs: a 3x-v36(diff1) + 1x-v16(heavy) chain.
+TEST(DashConformanceVersionNeg, PlainCountAndWeightVsOutOfBandKat) {
+    SyntheticChain sc;
+    const uint160 A = miner_h160(0x01);
+    uint256 g   = add_versioned(sc, 0x40, uint256(), 16, BITS_HEAVY, A); // old, heavy
+    uint256 s1  = add_versioned(sc, 0x41, g,         36, BITS_DIFF1,  A);
+    uint256 s2  = add_versioned(sc, 0x42, s1,        36, BITS_DIFF1,  A);
+    uint256 tip = add_versioned(sc, 0x43, s2,        36, BITS_DIFF1,  A);
+
+    auto plain = dash::version_negotiation::get_desired_version_counts(sc.chain, tip, 4);
+    const std::map<uint64_t, uint64_t> plain_expected = {{16u, 1u}, {36u, 3u}};
+    EXPECT_EQ(plain, plain_expected) << "plain vote count != CPython KAT";
+
+    auto weights = dash::version_negotiation::get_desired_version_weights(sc.chain, tip, 4);
+    ASSERT_TRUE(weights.contains(16u) && weights.contains(36u));
+    EXPECT_TRUE(weights[16u] == uint288(W_HEAVY))
+        << "v16 weight != CPython KAT (heavy share work)";
+    EXPECT_TRUE(weights[36u] == uint288(3ULL * W_DIFF1))
+        << "v36 weight != CPython KAT (3x diff1 work)";
+}
+
+// 60% SUCCESSOR tail-guard, floor semantics. KAT booleans from CPython
+// count >= (total*60)//100. The 4/7 case (57% but thr=floor(4.2)=4) and 3/7
+// case lock the floor exactly as the oracle's `sum*60//100`.
+TEST(DashConformanceVersionNeg, SuccessorGuard60PercentFloorKat) {
+    using dash::version_negotiation::successor_switch_allowed;
+    EXPECT_TRUE (successor_switch_allowed({{36u, 6u}, {16u, 4u}}, 36u));   // 60%
+    EXPECT_FALSE(successor_switch_allowed({{36u, 5u}, {16u, 5u}}, 36u));   // 50%
+    EXPECT_TRUE (successor_switch_allowed({{36u, 60u}, {16u, 40u}}, 36u)); // 60%
+    EXPECT_FALSE(successor_switch_allowed({{36u, 59u}, {16u, 41u}}, 36u)); // 59%
+    EXPECT_TRUE (successor_switch_allowed({{36u, 4u}, {16u, 3u}}, 36u));   // 4/7, thr=4
+    EXPECT_FALSE(successor_switch_allowed({{36u, 3u}, {16u, 4u}}, 36u));   // 3/7, thr=4
+    EXPECT_FALSE(successor_switch_allowed({}, 36u));                       // empty
+}
+
+// v36 activation gate, exact-rational 95% on the work-weighted tally. KAT
+// booleans from CPython w36*100 >= total*95.
+TEST(DashConformanceVersionNeg, V36GateWeighted95PercentKat) {
+    using dash::version_negotiation::v36_active;
+    EXPECT_TRUE (v36_active({{36u, uint288(95u)}, {16u, uint288(5u)}}));  // exactly 95%
+    EXPECT_FALSE(v36_active({{36u, uint288(94u)}, {16u, uint288(6u)}}));  // 94%
+    EXPECT_TRUE (v36_active({{36u, uint288(19u)}, {16u, uint288(1u)}}));  // 19/20 = 95%
+    EXPECT_FALSE(v36_active({{36u, uint288(18u)}, {16u, uint288(2u)}}));  // 18/20 = 90%
+    EXPECT_FALSE(v36_active({{16u, uint288(100u)}}));                     // no v36 vote
+
+    // Wide-value boundary: exercises the uint288 path at scale (no overflow,
+    // exactly 95%). big = 2^240.
+    uint288 big(1u); big <<= 240;
+    EXPECT_TRUE (v36_active({{36u, big * uint288(95u)}, {16u, big * uint288(5u)}}));
+    EXPECT_FALSE(v36_active({{36u, big * uint288(94u)}, {16u, big * uint288(6u)}}));
+}
+
+// The two tallies must diverge: on the 3x-v36(diff1)+1x-v16(heavy) chain the
+// PLAIN guard clears (v36 holds 3/4 of votes >= 60%) but the WEIGHTED gate
+// denies (v36 holds only ~60% of work < 95%). Proves the gate consumes the
+// weighted variant, not the plain count (F10 separation).
+TEST(DashConformanceVersionNeg, GateUsesWeightNotPlainCount) {
+    SyntheticChain sc;
+    const uint160 A = miner_h160(0x02);
+    uint256 g   = add_versioned(sc, 0x50, uint256(), 16, BITS_HEAVY, A);
+    uint256 s1  = add_versioned(sc, 0x51, g,         36, BITS_DIFF1,  A);
+    uint256 s2  = add_versioned(sc, 0x52, s1,        36, BITS_DIFF1,  A);
+    uint256 tip = add_versioned(sc, 0x53, s2,        36, BITS_DIFF1,  A);
+
+    auto plain   = dash::version_negotiation::get_desired_version_counts(sc.chain, tip, 4);
+    auto weights = dash::version_negotiation::get_desired_version_weights(sc.chain, tip, 4);
+
+    // Plain: v36 = 3/4 of votes -> SUCCESSOR switch permitted.
+    EXPECT_TRUE(dash::version_negotiation::successor_switch_allowed(plain, 36u));
+    // Weighted: v36 work share ~60% (3*W_DIFF1 / (3*W_DIFF1 + W_HEAVY)) < 95%.
+    EXPECT_FALSE(dash::version_negotiation::v36_active(weights));
 }
