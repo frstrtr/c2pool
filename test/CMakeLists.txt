@@ -1,4 +1,16 @@
 if (BUILD_TESTING AND GTest_FOUND)
+    # DGB block subsidy oracle-conformance (card #156). config_coin.hpp
+    # subsidy() is header-only/static; no dgb runtime link required.
+    add_executable(test_dgb_subsidy test_dgb_subsidy.cpp)
+    target_link_libraries(test_dgb_subsidy PRIVATE
+        GTest::gtest_main GTest::gtest
+        btclibs
+        yaml-cpp::yaml-cpp
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    gtest_discover_tests(test_dgb_subsidy DISCOVERY_MODE PRE_TEST)
+
     add_executable(test_coin_broadcaster test_coin_broadcaster.cpp)
     target_link_libraries(test_coin_broadcaster PRIVATE
         GTest::gtest_main GTest::gtest
