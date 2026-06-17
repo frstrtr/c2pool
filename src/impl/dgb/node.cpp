@@ -1474,6 +1474,16 @@ void NodeImpl::run_think()
             m_whale_departure.detect(m_tracker, m_best_share_hash),
             std::memory_order_relaxed);
 
+        // Phase 3L: log-based pool monitor on a ~30s cadence (same exclusive
+        // tracker lock). Consensus-neutral — emits [MONITOR-*] lines only.
+        {
+            auto mon_now = static_cast<uint32_t>(std::time(nullptr));
+            if (mon_now - m_last_monitor_ts >= MONITOR_INTERVAL_S) {
+                m_last_monitor_ts = mon_now;
+                m_pool_monitor.run_cycle(m_tracker, m_best_share_hash);
+            }
+        }
+
         // Publish lock-free snapshot for all IO-thread consumers
         publish_snapshot();
 
