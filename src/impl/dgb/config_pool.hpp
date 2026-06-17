@@ -35,7 +35,7 @@ public:
     static constexpr uint32_t TARGET_LOOKBEHIND         = 100;
     static constexpr uint32_t MINIMUM_PROTOCOL_VERSION    = 1700;  // floor (p2pool-dgb-scrypt digibyte.py NEW_MIN)
     static constexpr uint32_t ADVERTISED_PROTOCOL_VERSION = 3301;  // advertised capability (p2pool-dgb-scrypt p2p.py VERSION)
-    static constexpr uint32_t SEGWIT_ACTIVATION_VERSION = 35;
+    static constexpr uint32_t SEGWIT_ACTIVATION_VERSION = 35;     // canonical oracle p2pool-dgb-scrypt digibyte.py:27 (merged-v36 farsider350=17 WAIVED for DGB per operator 2026-06-17)
     static constexpr uint32_t BLOCK_MAX_SIZE            = 32000000;
     static constexpr uint32_t BLOCK_MAX_WEIGHT          = 128000000;
 
