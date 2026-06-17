@@ -6,6 +6,7 @@
 #include <btclibs/util/strencodings.h>
 #include <btclibs/crypto/sha256.h>
 #include <core/uint256.hpp>
+#include <core/donation.hpp>
 
 #include <array>
 #include <cstdint>
@@ -99,55 +100,15 @@ public:
     // Must match frstrtr/p2pool-merged-v36 p2pool/data.py exactly.
     // -----------------------------------------------------------------------
 
-    // V35 DONATION_SCRIPT (P2PK: OP_PUSHBYTES_65 <uncompressed pubkey> OP_CHECKSIG).
-    // Same script bytes as forrestv/jtoomim BTC p2pool data.py:68 — the
-    // uncompressed pubkey is forrestv's; encoded address differs by network
-    // (1... on BTC mainnet, L... on LTC). Verified bit-identical 2026-04-28.
-    static constexpr std::array<uint8_t, 67> DONATION_SCRIPT = {
-        0x41, // OP_PUSHBYTES_65
-        0x04, 0xff, 0xd0, 0x3d, 0xe4, 0x4a, 0x6e, 0x11,
-        0xb9, 0x91, 0x7f, 0x3a, 0x29, 0xf9, 0x44, 0x32,
-        0x83, 0xd9, 0x87, 0x1c, 0x9d, 0x74, 0x3e, 0xf3,
-        0x0d, 0x5e, 0xdd, 0xcd, 0x37, 0x09, 0x4b, 0x64,
-        0xd1, 0xb3, 0xd8, 0x09, 0x04, 0x96, 0xb5, 0x32,
-        0x56, 0x78, 0x6b, 0xf5, 0xc8, 0x29, 0x32, 0xec,
-        0x23, 0xc3, 0xb7, 0x4d, 0x9f, 0x05, 0xa6, 0xf9,
-        0x5a, 0x8b, 0x55, 0x29, 0x35, 0x26, 0x56, 0x66,
-        0x4b,
-        0xac  // OP_CHECKSIG
-    };
-
-    // V36+ COMBINED_DONATION_SCRIPT (P2SH: OP_HASH160 <hash160(redeem)> OP_EQUAL)
-    // 1-of-2 multisig redeem: forrestv + frstrtr/c2pool dev key.
-    //
-    // INTENTIONAL unified cross-coin v36 donation target. This is NOT inert and
-    // NOT LTC-only: BTC v36 coinbases deliberately pay this combined P2SH. The
-    // identical 20-byte hash160 (8c627262..8e85) is emitted by EVERY coin's v36
-    // gentx (btc/ltc/bch/dgb) via PoolConfig::get_donation_script(>=36). Per-coin
-    // baseline conformance (vs each coin's own p2pool source) still governs every
-    // OTHER consensus aspect; the v36 donation target is the one deliberate
-    // cross-coin exception (operator FLAG6 ruling 2026-06-17, option-b).
-    //
-    // The hash160 renders as MLhSmVQxMusLE3pjGFvp4unFckgjeD8LUA under the LTC
-    // mainnet P2SH prefix; the same hash160 is the shared target on all coins
-    // (only the base58 rendering differs per coin prefix, the redeem does not).
-    static constexpr std::array<uint8_t, 23> COMBINED_DONATION_SCRIPT = {
-        0xa9, // OP_HASH160
-        0x14, // PUSH 20 bytes
-        0x8c, 0x62, 0x72, 0x62, 0x1d, 0x89, 0xe8, 0xfa,
-        0x52, 0x6d, 0xd8, 0x6a, 0xcf, 0xf6, 0x0c, 0x71,
-        0x36, 0xbe, 0x8e, 0x85,
-        0x87  // OP_EQUAL
-    };
-
-    // Returns the correct donation script based on share version.
-    // Pre-V36 shares use the original P2PK donation script.
-    // V36+ shares use the combined P2SH 1-of-2 multisig script.
+    // Donation script — delegated to the chain-agnostic single source of
+    // truth in core::donation. The bytes are coin-invariant (no network
+    // version byte; uniform v36 redeem hash160), so they are no longer
+    // duplicated per-coin. See core/donation.hpp for provenance (forrestv
+    // P2PK pre-v36; combined P2SH 1-of-2 v36+, operator FLAG6 ruling
+    // 2026-06-17 option-b; bitcoin-agnostic re-scope 2026-06-17).
     static std::vector<unsigned char> get_donation_script(int64_t share_version)
     {
-        if (share_version >= 36)
-            return {COMBINED_DONATION_SCRIPT.begin(), COMBINED_DONATION_SCRIPT.end()};
-        return {DONATION_SCRIPT.begin(), DONATION_SCRIPT.end()};
+        return core::donation::get_donation_script(share_version);
     }
 
     // Message framing prefix — BTC mainnet (jtoomim bitcoin.py:14):
