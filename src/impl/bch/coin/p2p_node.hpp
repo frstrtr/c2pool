@@ -20,6 +20,23 @@
 //    headers/blocks are the standard SHA256d serialization.
 //  * doublespendproof (DSPROOF, 0x94a0) inv is recognized but not requested.
 //
+// >>> BLOCK-ARRIVAL EMIT CONFORMANCE (vs frstrtr/p2poolBCH @6603b79) <<<
+// The Python baseline delivers block arrivals through exactly two events in
+// p2pool/bitcoin/p2p.py:
+//   - handle_inv  -> factory.new_block.happened(inv['hash'])  (announcement)
+//   - handle_block -> get_block.got_response(hash, block)  (full block,
+//     matched to an explicit get_block ReplyMatcher request; single path,
+//     no broadcast event, no compact-block handling at all).
+// We mirror both: new_block.happened(hash) on the block inv, and the direct
+// `block` handler calls m_peer->get_block(hash, block) (the same ReplyMatcher
+// surface) before firing full_block. The two compact-block delivery paths
+// (cmpctblock-complete and cmpctblock+blocktxn) have NO Python analog -- they
+// are strictly additive embedded-daemon coverage that funnels reconstructed
+// blocks into the same full_block sink. full_block itself is internal ABLA /
+// mempool plumbing with zero p2pool-merged-v36 surface (Python reads block
+// size from the daemon, not from a broadcast event). Emit-completeness across
+// all three delivery paths therefore conforms to the baseline and is additive.
+//
 // This class is templated on ConfigType and touches the per-coin config only
 // through `m_config->coin()->m_p2p.prefix`. It carries NO concrete dependency
 // on bch's config.hpp -- the config binding is deferred to the
