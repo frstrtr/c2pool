@@ -123,3 +123,70 @@ TEST(DashConformanceMerkle, SingleTxRootIsGentx) {
     EXPECT_TRUE(dash::coinbase::merkle_branches_raw(txs).empty());
     EXPECT_EQ(production_root(txs), txs[0]);
 }
+
+// ── Payout-script-encoding conformance (S6 slice 2) ──────────────────────────
+// Before any PPLNS payout SET can be conformance-checked against DASH's own
+// older oracle (frstrtr/p2pool-dash data.py), each recipient's scriptPubKey
+// must encode byte-identically. Dash payouts are ALWAYS P2PKH (no segwit):
+//     OP_DUP OP_HASH160 <0x14> <20-byte hash160> OP_EQUALVERIFY OP_CHECKSIG
+// i.e. 76 a9 14 <hash> 88 ac, total 25 bytes, with the hash emitted in uint160
+// internal (GetChars) order and NO reversal. These KATs pin that encoding with
+// no node dependency; the donation cross-check proves two independent
+// representations of the same recipient agree.
+namespace {
+
+uint160 h160(const std::vector<unsigned char>& v) { return uint160(v); }
+
+std::string hex_bytes(const std::vector<unsigned char>& v) {
+    return HexStr(std::span<const unsigned char>(v.data(), v.size()));
+}
+
+// p2pool-dash DONATION_SCRIPT hash160 (data.py) — the 20 bytes between the
+// 76 a9 14 prefix and the 88 ac suffix of dash::DONATION_SCRIPT.
+const std::vector<unsigned char> DONATION_H160 = {
+    0x20, 0xcb, 0x5c, 0x22, 0xb1, 0xe4, 0xd5, 0x94,
+    0x7e, 0x5c, 0x11, 0x2c, 0x76, 0x96, 0xb5, 0x1a,
+    0xd9, 0xaf, 0x3c, 0x61
+};
+
+struct ScriptKat { std::vector<unsigned char> h160; const char* script_hex; };
+
+}  // namespace
+
+// Canonical P2PKH shape for arbitrary hash160s, hash bytes in GetChars order.
+TEST(DashConformancePayoutScript, CanonicalP2PKHStructure) {
+    const std::vector<std::vector<unsigned char>> hashes = {
+        std::vector<unsigned char>(20, 0x00),
+        std::vector<unsigned char>(20, 0xff),
+        DONATION_H160,
+    };
+    for (const auto& hv : hashes) {
+        auto s = dash::pubkey_hash_to_script2(h160(hv));
+        ASSERT_EQ(s.size(), 25u);
+        EXPECT_EQ(s[0], 0x76); EXPECT_EQ(s[1], 0xa9); EXPECT_EQ(s[2], 0x14);
+        EXPECT_EQ(s[23], 0x88); EXPECT_EQ(s[24], 0xac);
+        for (size_t i = 0; i < 20; ++i)
+            EXPECT_EQ(s[3 + i], hv[i]) << "hash byte " << i << " not in GetChars order";
+    }
+}
+
+// Out-of-band KAT: full 25-byte P2PKH script hex for fixed hash160s.
+TEST(DashConformancePayoutScript, MatchesOutOfBandKat) {
+    const ScriptKat kats[] = {
+        { std::vector<unsigned char>(20, 0x00),
+          "76a914000000000000000000000000000000000000000088ac" },
+        { DONATION_H160,
+          "76a91420cb5c22b1e4d5947e5c112c7696b51ad9af3c6188ac" },
+    };
+    for (const auto& k : kats)
+        EXPECT_EQ(hex_bytes(dash::pubkey_hash_to_script2(h160(k.h160))),
+                  std::string(k.script_hex));
+}
+
+// Two independent representations of the donation recipient agree: the literal
+// DONATION_SCRIPT array (data.py copy) equals the script-builder over the
+// donation hash160. Catches an accidental edit to either path.
+TEST(DashConformancePayoutScript, DonationScriptIsP2PKHOverDonationHash) {
+    EXPECT_EQ(dash::pubkey_hash_to_script2(h160(DONATION_H160)),
+              dash::DONATION_SCRIPT);
+}
