@@ -50,11 +50,13 @@
 // ---------------------------------------------------------------------------
 
 #include <cstdint>
+#include <memory>
 
 #include "header_chain.hpp"     // HeaderChain
 #include "mempool.hpp"          // Mempool
 #include "template_builder.hpp" // EmbeddedCoinNode
 #include "node.hpp"             // coin::Node<Config> (interfaces::Node source)
+#include "coin_node.hpp"        // CoinNode (core::coin::ICoinNode seam)
 #include "abla_runtime.hpp"     // AblaRuntime (owns tracker + feed)
 
 #include <core/log.hpp>
@@ -90,6 +92,10 @@ public:
     void run() {
         m_node.run();                 // init_rpc(): external BCHN-RPC fallback retained
         m_abla.wire(m_node, m_embedded);
+        // Build the CoinNode seam NOW (not in the ctor): m_node.rpc() is only
+        // live after run()/init_rpc(). Embedded work source = primary, the
+        // external BCHN-RPC = retained fallback (v36 external_fallback law).
+        m_coin_node = std::make_unique<CoinNode>(&m_embedded, m_node.rpc());
         LOG_INFO << "[EMB-BCH] embedded daemon up: embedded-primary work source,"
                  << " external BCHN-RPC fallback retained, ABLA loop closed"
                  << " (cold-start floor anchor; VM300 pin pending operator).";
@@ -106,6 +112,11 @@ public:
     // and for tests; the daemon retains ownership.
     EmbeddedCoinNode&   embedded()       { return m_embedded; }
     Node<config_t>&     node()           { return m_node; }
+    /// The CoinNode seam handed to the pool/web_server (core::coin::ICoinNode).
+    /// Valid only after run() has built it. Embedded-primary + external-RPC
+    /// fallback; the daemon owns it for its whole run.
+    CoinNode&           coin_node()      { return *m_coin_node; }
+    bool                seam_ready() const { return m_coin_node != nullptr; }
     AblaRuntime&        abla()           { return m_abla; }
     HeaderChain&        chain()          { return m_chain; }
     Mempool&            mempool()        { return m_pool; }
@@ -118,6 +129,9 @@ private:
     EmbeddedCoinNode m_embedded; // in-process work source
     Node<config_t>   m_node;     // P2P + external-RPC fallback; full_block source
     AblaRuntime      m_abla;     // owns tracker + feed; wired in run()
+    // Built in run() once m_node.rpc() is live; binds raw ptrs to m_embedded
+    // (primary) + m_node's NodeRPC (fallback), both outlive it (daemon-owned).
+    std::unique_ptr<CoinNode> m_coin_node;
 };
 
 } // namespace coin
