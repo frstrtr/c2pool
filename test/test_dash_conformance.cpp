@@ -33,6 +33,7 @@
 #include <impl/dash/pplns.hpp>           // dash::pplns::compute_payouts, dash::ShareChain, DashShare
 #include <impl/dash/version_negotiation.hpp> // dash::version_negotiation::get_desired_version_counts/weights
 #include <impl/dash/coin/vendor/cbtx.hpp> // dash::coin::vendor::CCbTx, parse_cbtx
+#include <impl/dash/coin/vendor/assetlock.hpp> // dash::coin::vendor::CAssetLockPayload/CAssetUnlockPayload, parse_assetlock_payload, parse_assetunlock_payload
 #include <impl/bitcoin_family/coin/base_block.hpp>  // bitcoin_family::coin::SmallBlockHeaderType
 
 #include <core/hash.hpp>                     // Hash (sha256d)
@@ -741,4 +742,147 @@ TEST(DashConformanceCbtx, ParseCbtxIsExactInverseOfKat) {
     dash::coin::vendor::CCbTx tx2;
     EXPECT_FALSE(dash::coin::vendor::parse_cbtx(bytes, tx2))
         << "parse_cbtx accepted trailing garbage (wire-drift guard defeated)";
+}
+
+
+// -- DIP-0027 asset-lock special-tx payload (CAssetLock / CAssetUnlock) wire --
+// conformance (S6 slice). DASH credit-pool accounting reads two DIP-0027
+// special-tx payloads off the wire: TRANSACTION_ASSET_LOCK (type 8) carries a
+// vector<TxOut> of credit outputs whose values sum into the pool; ASSET_UNLOCK
+// (type 9) carries a fixed-layout treasury spend (index/fee/requestedHeight +
+// quorumHash + 96B BLS sig). Before the balance scanner can be conformance-
+// checked against frstrtr/p2pool-dash, this payload framing must match dashcore
+// (evo/assetlocktx.h) byte-for-byte. KATs are computed OUT-OF-BAND with CPython
+// (u8 + CompactSize-framed vector<TxOut> = LE64 value + CompactSize script;
+// LE u64/u32 scalars; raw uint256 + raw 96B sig), so the pins are NOT circular
+// with the C++ ::Serialize path. The parse cases prove parse_assetlock_payload
+// / parse_assetunlock_payload are the exact inverse and reject trailing garbage
+// (the wire-drift guard).
+namespace {
+using ::bitcoin_family::coin::TxOut;
+
+// P2PKH script (OP_DUP OP_HASH160 <20:b> OP_EQUALVERIFY OP_CHECKSIG) over a
+// hash160 of repeated byte b -- deterministic, three-line-reproducible.
+OPScript p2pkh_script(unsigned char b) {
+    std::vector<unsigned char> v{0x76, 0xa9, 0x14};
+    v.insert(v.end(), 20, b);
+    v.push_back(0x88);
+    v.push_back(0xac);
+    return OPScript(v.data(), v.data() + v.size());
+}
+
+TxOut credit_out(int64_t value, unsigned char b) {
+    TxOut o;
+    o.value = value;
+    o.scriptPubKey = p2pkh_script(b);
+    return o;
+}
+}  // namespace
+
+// CAssetLockPayload: nVersion(u8) + CompactSize(count) + each TxOut
+// (LE64 value + CompactSize(len) scriptPubKey). Single credit output.
+TEST(DashConformanceAssetLock, SingleCreditOutputMatchesOutOfBandKat) {
+    dash::coin::vendor::CAssetLockPayload pl;
+    pl.nVersion = 1;
+    pl.creditOutputs = { credit_out(100000000, 0x11) };
+
+    PackStream ps; ::Serialize(ps, pl);
+    EXPECT_EQ(ps_hex(ps),
+        "01" "01"
+        "00e1f50500000000"
+        "19" "76a914" "1111111111111111111111111111111111111111" "88ac")
+        << "asset-lock single-output wire != CPython KAT (TxOut/script framing drift)";
+}
+
+// Two credit outputs; total_credit() sums the payload values (the credit-pool
+// delta the balance scanner accumulates).
+TEST(DashConformanceAssetLock, TwoCreditOutputsAndTotalMatchKat) {
+    dash::coin::vendor::CAssetLockPayload pl;
+    pl.nVersion = 1;
+    pl.creditOutputs = { credit_out(100000000, 0x11), credit_out(250000000, 0x22) };
+
+    PackStream ps; ::Serialize(ps, pl);
+    EXPECT_EQ(ps_hex(ps),
+        "01" "02"
+        "00e1f50500000000" "19" "76a914" "1111111111111111111111111111111111111111" "88ac"
+        "80b2e60e00000000" "19" "76a914" "2222222222222222222222222222222222222222" "88ac")
+        << "asset-lock two-output wire != CPython KAT";
+    EXPECT_EQ(pl.total_credit(), 350000000);
+}
+
+// Empty creditOutputs vector -> CompactSize(0) == single 0x00, zero credit.
+TEST(DashConformanceAssetLock, EmptyCreditOutputsMatchKat) {
+    dash::coin::vendor::CAssetLockPayload pl;
+    pl.nVersion = 1;
+    PackStream ps; ::Serialize(ps, pl);
+    EXPECT_EQ(ps_hex(ps), "0100");
+    EXPECT_EQ(pl.total_credit(), 0);
+}
+
+// parse_assetlock_payload is the exact inverse on the out-of-band bytes, and
+// rejects trailing garbage (the wire-drift guard).
+TEST(DashConformanceAssetLock, ParseIsExactInverseOfKat) {
+    const std::string kat =
+        "010100e1f50500000000"
+        "1976a914111111111111111111111111111111111111111188ac";
+    dash::coin::vendor::CAssetLockPayload pl;
+    ASSERT_TRUE(dash::coin::vendor::parse_assetlock_payload(unhex(kat), pl))
+        << "parse_assetlock_payload rejected a valid out-of-band payload";
+    EXPECT_EQ(pl.nVersion, 1);
+    ASSERT_EQ(pl.creditOutputs.size(), 1u);
+    EXPECT_EQ(pl.creditOutputs[0].value, 100000000);
+    EXPECT_EQ(pl.total_credit(), 100000000);
+
+    auto bytes = unhex(kat); bytes.push_back(0x00);  // one trailing byte
+    dash::coin::vendor::CAssetLockPayload pl2;
+    EXPECT_FALSE(dash::coin::vendor::parse_assetlock_payload(bytes, pl2))
+        << "parse_assetlock_payload accepted trailing garbage (wire-drift guard defeated)";
+}
+
+// CAssetUnlockPayload: nVersion(u8) + index(LE64) + fee(LE32) +
+// requestedHeight(LE32) + quorumHash(32, internal order) + quorumSig(96 raw).
+TEST(DashConformanceAssetUnlock, FixedLayoutMatchesOutOfBandKat) {
+    dash::coin::vendor::CAssetUnlockPayload pl;
+    pl.nVersion        = 1;
+    pl.index           = 42;
+    pl.fee             = 1000;
+    pl.requestedHeight = 500000;
+    pl.quorumHash      = leaf(0x07);
+    pl.quorumSig.fill(0xCD);
+
+    PackStream ps; ::Serialize(ps, pl);
+    EXPECT_EQ(ps_hex(ps),
+        "01"
+        "2a00000000000000"
+        "e8030000"
+        "20a10700"
+        "b6d58dfa6547c1eb7f0d4ffd3e3bd6452213210ea51baa70b97c31f011187215"
+        "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd")
+        << "asset-unlock wire != CPython KAT (scalar LE / uint256 / BLS-sig framing drift)";
+}
+
+// parse_assetunlock_payload is the exact inverse on the out-of-band bytes, and
+// rejects trailing garbage.
+TEST(DashConformanceAssetUnlock, ParseIsExactInverseOfKat) {
+    const std::string kat =
+        "012a00000000000000e803000020a10700"
+        "b6d58dfa6547c1eb7f0d4ffd3e3bd6452213210ea51baa70b97c31f011187215"
+        "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+    dash::coin::vendor::CAssetUnlockPayload pl;
+    ASSERT_TRUE(dash::coin::vendor::parse_assetunlock_payload(unhex(kat), pl))
+        << "parse_assetunlock_payload rejected a valid out-of-band payload";
+    EXPECT_EQ(pl.nVersion, 1);
+    EXPECT_EQ(pl.index, 42u);
+    EXPECT_EQ(pl.fee, 1000u);
+    EXPECT_EQ(pl.requestedHeight, 500000u);
+    EXPECT_TRUE(pl.quorumHash == leaf(0x07));
+    EXPECT_EQ(pl.quorumSig[0], 0xCD);
+    EXPECT_EQ(pl.quorumSig[95], 0xCD);
+
+    auto bytes = unhex(kat); bytes.push_back(0x00);  // one trailing byte
+    dash::coin::vendor::CAssetUnlockPayload pl2;
+    EXPECT_FALSE(dash::coin::vendor::parse_assetunlock_payload(bytes, pl2))
+        << "parse_assetunlock_payload accepted trailing garbage (wire-drift guard defeated)";
 }
