@@ -7,11 +7,20 @@
 namespace bch
 {
 
-const uint64_t SEGWIT_ACTIVATION_VERSION = 17;
+// BCH has NO SegWit (rejected at the 2017 fork). The p2poolBCH oracle
+// (p2pool/data.py:63-66) derives is_segwit_activated from
+// getattr(net, \"SEGWIT_ACTIVATION_VERSION\", 0); the bitcoincash[_testnet].py
+// network configs define NO SEGWIT_ACTIVATION_VERSION, so the default 0 makes it
+// return False for EVERY share version -- segwit_data is never present in a BCH
+// share. A disabled (== 0) sentinel here reproduces that exactly, keeping the
+// share wire-format + ref_hash byte-conformant with p2poolBCH (was 17, a stray
+// BTC/LTC port that forced segwit_data on for all v17..v35 -> sharechain fork).
+const uint64_t SEGWIT_ACTIVATION_VERSION = 0;
 
 constexpr bool is_segwit_activated(uint64_t version)
 {
-    return version >= SEGWIT_ACTIVATION_VERSION;
+    // Mirror the oracle guard: disabled when the sentinel is 0.
+    return SEGWIT_ACTIVATION_VERSION != 0 && version >= SEGWIT_ACTIVATION_VERSION;
 }
 
 enum StaleInfo
