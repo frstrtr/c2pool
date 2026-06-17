@@ -67,7 +67,7 @@ jobs:
                     test_phase4_embedded \
                     test_mweb_builder \
                     test_address_resolution test_compute_share_target \
-                    test_utxo \
+                    test_utxo test_dgb_subsidy \
                     v37_test \
             -j$(nproc)
 
@@ -193,7 +193,7 @@ jobs:
                     test_phase4_embedded \
                     test_mweb_builder \
                     test_address_resolution test_compute_share_target \
-                    test_utxo \
+                    test_utxo test_dgb_subsidy \
                     test_coin_broadcaster test_multiaddress_pplns test_pplns_stress \
                     v37_test \
             -j$(nproc)
