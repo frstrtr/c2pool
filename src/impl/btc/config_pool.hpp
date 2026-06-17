@@ -118,13 +118,19 @@ public:
     };
 
     // V36+ COMBINED_DONATION_SCRIPT (P2SH: OP_HASH160 <hash160(redeem)> OP_EQUAL)
-    // 1-of-2 multisig: forrestv + frstrtr/c2pool dev key.
-    // LTC P2SH donation target. BTC now runs v36-active shares, but its
-    // donation leg intentionally stays the V35 P2PK above (forrestv
-    // canonical BTC-mainnet donation); this COMBINED P2SH is LTC-only,
-    // kept here as inert byte data so get_donation_script() compiles for
-    // both the BTC (P2PK) and LTC v36 (P2SH) paths.
-    // Address: MLhSmVQxMusLE3pjGFvp4unFckgjeD8LUA (LTC mainnet P2SH).
+    // 1-of-2 multisig redeem: forrestv + frstrtr/c2pool dev key.
+    //
+    // INTENTIONAL unified cross-coin v36 donation target. This is NOT inert and
+    // NOT LTC-only: BTC v36 coinbases deliberately pay this combined P2SH. The
+    // identical 20-byte hash160 (8c627262..8e85) is emitted by EVERY coin's v36
+    // gentx (btc/ltc/bch/dgb) via PoolConfig::get_donation_script(>=36). Per-coin
+    // baseline conformance (vs each coin's own p2pool source) still governs every
+    // OTHER consensus aspect; the v36 donation target is the one deliberate
+    // cross-coin exception (operator FLAG6 ruling 2026-06-17, option-b).
+    //
+    // The hash160 renders as MLhSmVQxMusLE3pjGFvp4unFckgjeD8LUA under the LTC
+    // mainnet P2SH prefix; the same hash160 is the shared target on all coins
+    // (only the base58 rendering differs per coin prefix, the redeem does not).
     static constexpr std::array<uint8_t, 23> COMBINED_DONATION_SCRIPT = {
         0xa9, // OP_HASH160
         0x14, // PUSH 20 bytes
