@@ -28,21 +28,21 @@ public:
 
     // -----------------------------------------------------------------------
     // Static DGB Scrypt p2pool network constants
-    // Source: p2pool-merged-v36/p2pool/networks/digibyte.py
+    // Source of truth: p2pool-dgb-scrypt oracle networks/digibyte.py
     // -----------------------------------------------------------------------
     static constexpr uint16_t P2P_PORT                  = 5024;
-    static constexpr uint32_t SPREAD                    = 30;
-    static constexpr uint32_t TARGET_LOOKBEHIND         = 200;
+    static constexpr uint32_t SPREAD                    = 24;
+    static constexpr uint32_t TARGET_LOOKBEHIND         = 100;
     static constexpr uint32_t MINIMUM_PROTOCOL_VERSION    = 1700;  // floor (p2pool-dgb-scrypt digibyte.py NEW_MIN)
     static constexpr uint32_t ADVERTISED_PROTOCOL_VERSION = 3301;  // advertised capability (p2pool-dgb-scrypt p2p.py VERSION)
-    static constexpr uint32_t SEGWIT_ACTIVATION_VERSION = 17;
-    static constexpr uint32_t BLOCK_MAX_SIZE            = 1000000;
-    static constexpr uint32_t BLOCK_MAX_WEIGHT          = 4000000;
+    static constexpr uint32_t SEGWIT_ACTIVATION_VERSION = 35;
+    static constexpr uint32_t BLOCK_MAX_SIZE            = 32000000;
+    static constexpr uint32_t BLOCK_MAX_WEIGHT          = 128000000;
 
     // Mainnet constants
-    static constexpr uint32_t SHARE_PERIOD              = 25;      // seconds
-    static constexpr uint32_t CHAIN_LENGTH              = 8640;    // ~24 hours at 25s
-    static constexpr uint32_t REAL_CHAIN_LENGTH         = 8640;
+    static constexpr uint32_t SHARE_PERIOD              = 15;      // seconds (oracle SHARE_PERIOD)
+    static constexpr uint32_t CHAIN_LENGTH              = 2880;    // 12*60*60//15 — ~12h at 15s
+    static constexpr uint32_t REAL_CHAIN_LENGTH         = 2880;
 
     // Testnet constants
     static constexpr uint32_t TESTNET_SHARE_PERIOD      = 4;
@@ -124,7 +124,7 @@ public:
     }
 
     static inline const std::set<std::string> SOFTFORKS_REQUIRED = {
-        "csv", "segwit"
+        "nversionbips", "csv", "segwit", "reservealgo", "odo", "taproot"
     };
 
     // Bootstrap peers for the DGB Scrypt p2pool network
