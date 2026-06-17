@@ -549,7 +549,7 @@ TEST(DashConformancePplns, ColdChainFallsBackToSingleRecipient) {
 // weight[36]/Sum >= 0.95). All thresholds and weights below are KAT vectors
 // computed OUT-OF-BAND in CPython from the exact integer formulas
 //   target_to_average_attempts = 2**256 // (target + 1)
-//   tail-guard  : count >= (total*60)//100      (floor)
+//   switch gate : have_w*100 >= total_w*60      (weighted, exact rational)
 //   v36 gate    : w36*100 >= total*95           (exact rational)
 // so the pins are not circular with the C++ path.
 
@@ -595,18 +595,19 @@ TEST(DashConformanceVersionNeg, PlainCountAndWeightVsOutOfBandKat) {
         << "v36 weight != CPython KAT (3x diff1 work)";
 }
 
-// 60% SUCCESSOR tail-guard, floor semantics. KAT booleans from CPython
-// count >= (total*60)//100. The 4/7 case (57% but thr=floor(4.2)=4) and 3/7
-// case lock the floor exactly as the oracle's `sum*60//100`.
-TEST(DashConformanceVersionNeg, SuccessorGuard60PercentFloorKat) {
+// 60% SUCCESSOR switch gate, PPLNS-WEIGHTED exact-rational semantics (D1 /
+// F10 685669e9). KAT booleans from CPython have_w*100 >= total_w*60 (no floor).
+// The 4/7 case now REJECTS (400 < 420) where the prior plain-floor gate cleared
+// it (thr=floor(4.2)=4) -- the exact divergence D1 standardizes away.
+TEST(DashConformanceVersionNeg, SuccessorGuard60PercentWeightedKat) {
     using dash::version_negotiation::successor_switch_allowed;
-    EXPECT_TRUE (successor_switch_allowed({{36u, 6u}, {16u, 4u}}, 36u));   // 60%
-    EXPECT_FALSE(successor_switch_allowed({{36u, 5u}, {16u, 5u}}, 36u));   // 50%
-    EXPECT_TRUE (successor_switch_allowed({{36u, 60u}, {16u, 40u}}, 36u)); // 60%
-    EXPECT_FALSE(successor_switch_allowed({{36u, 59u}, {16u, 41u}}, 36u)); // 59%
-    EXPECT_TRUE (successor_switch_allowed({{36u, 4u}, {16u, 3u}}, 36u));   // 4/7, thr=4
-    EXPECT_FALSE(successor_switch_allowed({{36u, 3u}, {16u, 4u}}, 36u));   // 3/7, thr=4
-    EXPECT_FALSE(successor_switch_allowed({}, 36u));                       // empty
+    EXPECT_TRUE (successor_switch_allowed({{36u, uint288(6u)},  {16u, uint288(4u)}},  36u)); // 6/10 = 60%
+    EXPECT_FALSE(successor_switch_allowed({{36u, uint288(5u)},  {16u, uint288(5u)}},  36u)); // 5/10 = 50%
+    EXPECT_TRUE (successor_switch_allowed({{36u, uint288(60u)}, {16u, uint288(40u)}}, 36u)); // 60/100 = 60%
+    EXPECT_FALSE(successor_switch_allowed({{36u, uint288(59u)}, {16u, uint288(41u)}}, 36u)); // 59/100 = 59%
+    EXPECT_FALSE(successor_switch_allowed({{36u, uint288(4u)},  {16u, uint288(3u)}},  36u)); // 4/7: 400 < 420 -> reject
+    EXPECT_FALSE(successor_switch_allowed({{36u, uint288(3u)},  {16u, uint288(4u)}},  36u)); // 3/7: 300 < 420 -> reject
+    EXPECT_FALSE(successor_switch_allowed({}, 36u));                                          // empty
 }
 
 // v36 activation gate, exact-rational 95% on the work-weighted tally. KAT
@@ -626,10 +627,11 @@ TEST(DashConformanceVersionNeg, V36GateWeighted95PercentKat) {
     EXPECT_FALSE(v36_active({{36u, big * uint288(94u)}, {16u, big * uint288(6u)}}));
 }
 
-// The two tallies must diverge: on the 3x-v36(diff1)+1x-v16(heavy) chain the
-// PLAIN guard clears (v36 holds 3/4 of votes >= 60%) but the WEIGHTED gate
-// denies (v36 holds only ~60% of work < 95%). Proves the gate consumes the
-// weighted variant, not the plain count (F10 separation).
+// D1 + F10 separation: the 60% SUCCESSOR gate consumes the WEIGHTED tally, not
+// the plain count. On the 3x-v36(diff1)+1x-v16(heavy) chain the two disagree at
+// the 60% boundary: plain v36 = 3/4 = 75% (a plain-count gate WOULD clear), but
+// weighted v36 = 3*W_DIFF1 / (3*W_DIFF1 + W_HEAVY) = 59.9996% < 60%, so the
+// canonical weighted gate DENIES. The 95% activation gate likewise denies.
 TEST(DashConformanceVersionNeg, GateUsesWeightNotPlainCount) {
     SyntheticChain sc;
     const uint160 A = miner_h160(0x02);
@@ -641,9 +643,12 @@ TEST(DashConformanceVersionNeg, GateUsesWeightNotPlainCount) {
     auto plain   = dash::version_negotiation::get_desired_version_counts(sc.chain, tip, 4);
     auto weights = dash::version_negotiation::get_desired_version_weights(sc.chain, tip, 4);
 
-    // Plain: v36 = 3/4 of votes -> SUCCESSOR switch permitted.
-    EXPECT_TRUE(dash::version_negotiation::successor_switch_allowed(plain, 36u));
-    // Weighted: v36 work share ~60% (3*W_DIFF1 / (3*W_DIFF1 + W_HEAVY)) < 95%.
+    // Plain count: v36 holds 3/4 = 75% of votes -- a plain-count 60% gate WOULD clear.
+    const std::map<uint64_t, uint64_t> plain_expected = {{16u, 1u}, {36u, 3u}};
+    EXPECT_EQ(plain, plain_expected);
+    // Weighted 60% SUCCESSOR gate (D1): v36 work ~59.9996% < 60% -> DENY.
+    EXPECT_FALSE(dash::version_negotiation::successor_switch_allowed(weights, 36u));
+    // Weighted 95% activation gate: v36 work ~60% < 95% -> not active.
     EXPECT_FALSE(dash::version_negotiation::v36_active(weights));
 }
 

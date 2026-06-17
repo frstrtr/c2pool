@@ -8,17 +8,19 @@
 //
 //   * get_desired_version_counts() — a PLAIN tally (one vote per share) over a
 //     chain window. Reference: p2pool-dash data.py get_desired_version_counts
-//     as consumed by Share.check()'s confirmed-state guard and by the
-//     AutoRatchet desired-version selection. It is NOT weighted in place.
+//     as consumed by the AutoRatchet desired-version selection and the VOTING
+//     tail guard (F10 keeps these count-based). It is NOT weighted in place.
 //
 //   * get_desired_version_weights() — the SEPARATE WEIGHTED variant
-//     (weight = target_to_average_attempts(target), i.e. expected hashes) the
-//     v36 activation gate consumes. Reference: p2pool-merged-v36 work.py
-//     v36_active = weight[36] / Sum(weight) >= 0.95.
+//     (weight = target_to_average_attempts(target), i.e. expected hashes) that
+//     BOTH consensus gates consume: the 60% SUCCESSOR switch gate (D1) and the
+//     95% v36 activation gate. Reference: p2pool data.py:1396-1414 (60% switch,
+//     PPLNS-weighted) + p2pool-merged-v36 work.py v36_active = weight[36] /
+//     Sum(weight) >= 0.95.
 //
 // The confirmed-state guard (Share.check): a SUCCESSOR-version share may follow
-// its predecessor only if the new version already holds >= 60% of the PLAIN
-// votes in the [9/10 .. 10/10] tail of the CHAIN_LENGTH window; a switch with
+// its predecessor only if the new version already holds >= 60% of the WEIGHTED
+// desired-version tally in the [9/10 .. 10/10] tail of the CHAIN_LENGTH window; a switch with
 // fewer than CHAIN_LENGTH ancestors is rejected ("without enough history").
 
 #include "share_chain.hpp"   // dash::ShareChain, dash::DashShare
@@ -81,21 +83,25 @@ get_desired_version_weights(ShareChain& chain, const uint256& start_hash, uint64
     return res;
 }
 
-// 60% confirmed-state guard (p2pool-dash data.py Share.check). A SUCCESSOR
-// share is accepted only when its PLAIN vote count reaches floor(total*60/100).
-// The floor matches the oracle's integer `sum*60//100` exactly (e.g. 4/7 votes
-// clears thr=4, 3/7 does not).
+// 60% switch gate (canonical v36-native -- F10 685669e9 share_check.hpp step 2;
+// p2pool data.py:1396-1414). A SUCCESSOR-version share is accepted only when the
+// new version holds >= 60% of the PPLNS-WEIGHTED desired-version tally (weight =
+// target_to_average_attempts per share), via the exact rational
+// new_ver_weight*100 >= total_weight*60 -- integer uint288, no IEEE-double and no
+// floor. D1 standardization: the weighted tally (get_desired_version_weights)
+// feeds this consensus gate; the PLAIN count (get_desired_version_counts) is
+// retained for AutoRatchet + the VOTING tail guard only (D4). F10 deleted the
+// old flat-count validate_version_switch precisely because flat-count diverges.
 inline bool
-successor_switch_allowed(const std::map<uint64_t, uint64_t>& plain_counts,
+successor_switch_allowed(const std::map<uint64_t, uint288>& weights,
                          uint64_t successor_version)
 {
-    uint64_t total = 0;
-    for (const auto& [v, c] : plain_counts) total += c;
-    if (total == 0) return false;
-    const uint64_t threshold = (total * 60) / 100;  // floor, as in the oracle
-    auto it = plain_counts.find(successor_version);
-    const uint64_t have = (it == plain_counts.end()) ? 0 : it->second;
-    return have >= threshold;
+    uint288 total(0);
+    for (const auto& [v, w] : weights) total += w;
+    if (total == uint288(0)) return false;
+    auto it = weights.find(successor_version);
+    const uint288 have = (it == weights.end()) ? uint288(0) : it->second;
+    return have * uint288(100) >= total * uint288(60);
 }
 
 // v36 activation gate (p2pool-merged-v36 work.py): v36 is active once its
