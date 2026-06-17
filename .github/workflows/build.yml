@@ -417,14 +417,39 @@ jobs:
           build_btc/src/c2pool/c2pool-btc --help 2>&1 | head -3 || true
 
   # ════════════════════════════════════════════════════════════════════════════
-  # macOS (Apple Silicon arm64 — GitHub only provides ARM runners now)
-  # Intel x86_64 macOS binary is built locally; see doc/build-macos.md
+  # macOS (matrix: arm64 on GitHub-hosted macos-14, x86_64 on the self-hosted
+  # Intel runner labeled c2pool-mac-intel). The self-hosted lane resolves the
+  # macOS x86_64 CI starvation (#42) — macpro-intel-204 standup 2026-06-16.
   # ════════════════════════════════════════════════════════════════════════════
   macos:
-    name: macOS arm64
-    runs-on: macos-14
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
+          - arch: x86_64
+            runner: [self-hosted, macOS, X64, c2pool-mac-intel]
     steps:
       - uses: actions/checkout@v6
+
+      - name: Set up Homebrew PATH
+        # Self-hosted Intel runner (macpro-intel-204) launches the Actions
+        # service from launchd, whose PATH omits Homebrew's /usr/local/bin
+        # (#100: brew exit 127). GitHub-hosted arm64 keeps /opt/homebrew on PATH.
+        # Append whichever prefix actually has brew so every later step
+        # (cmake, brew --prefix) inherits it via $GITHUB_PATH.
+        run: |
+          if [ -x /opt/homebrew/bin/brew ]; then
+            echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+          elif [ -x /usr/local/bin/brew ]; then
+            echo "/usr/local/bin" >> "$GITHUB_PATH"
+          else
+            echo "::error::Homebrew not found at /opt/homebrew or /usr/local on ${RUNNER_NAME:-runner}" >&2
+            exit 1
+          fi
 
       - name: Install dependencies
         run: brew install cmake boost leveldb secp256k1 nlohmann-json yaml-cpp
@@ -442,17 +467,18 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          PKG="c2pool-${VERSION}-macos-arm64"
+          PKG="c2pool-${VERSION}-macos-${{ matrix.arch }}"
+          BREW="$(brew --prefix)"
           mkdir -p "${PKG}/lib" "${PKG}/config" "${PKG}/web-static" "${PKG}/explorer"
           cp build/src/c2pool/c2pool "${PKG}/"
           strip "${PKG}/c2pool"
-          for dylib in $(otool -L "${PKG}/c2pool" | grep "/opt/homebrew" | awk '{print $1}'); do
+          for dylib in $(otool -L "${PKG}/c2pool" | grep "${BREW}" | awk '{print $1}'); do
             base=$(basename "$dylib")
             cp "$dylib" "${PKG}/lib/${base}"
             install_name_tool -change "$dylib" "@executable_path/lib/${base}" "${PKG}/c2pool"
           done
           for lib in "${PKG}"/lib/*.dylib; do
-            for ref in $(otool -L "$lib" | grep "/opt/homebrew" | awk '{print $1}'); do
+            for ref in $(otool -L "$lib" | grep "${BREW}" | awk '{print $1}'); do
               base=$(basename "$ref")
               [ -f "${PKG}/lib/${base}" ] && install_name_tool -change "$ref" "@executable_path/lib/${base}" "$lib"
             done
@@ -469,8 +495,8 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v7
         with:
-          name: macos-arm64
-          path: c2pool-*-macos-arm64.zip*
+          name: macos-${{ matrix.arch }}
+          path: c2pool-*-macos-${{ matrix.arch }}.zip*
 
   # ════════════════════════════════════════════════════════════════════════════
   # Windows (MSVC 2022, Conan)
