@@ -33,6 +33,7 @@
 #include "rpc_data.hpp"
 #include "../coinbase_commitment.hpp"   // s19 seam (commitment built downstream)
 #include "abla.hpp"                       // s2: ABLA block-size limit (CHIP-2023-01)
+#include "abla_tracker.hpp"               // sC: live full-block size feed -> ABLA state
 
 #include <core/hash.hpp>
 #include <core/pack.hpp>
@@ -291,7 +292,19 @@ public:
                      << m_chain.height() << ")";
             throw std::runtime_error("EmbeddedCoinNode::getwork: chain not synced — waiting for header sync");
         }
-        auto result = TemplateBuilder::build_template(m_chain, m_pool, m_testnet);
+        // Dynamic ABLA budget: when an AblaTracker is wired (the full-block /
+        // daemon layer feeding live per-block sizes) and its running state sits
+        // exactly at our tip, hand build_template that per-tip State so the
+        // budget tracks the live consensus limit. Otherwise pass nullptr and
+        // build_template falls back to the 32 MB activation/floor -- the hard,
+        // never-undercut fallback for an absent or stale (gapped) feed.
+        const abla::State* tip_state = nullptr;
+        if (m_abla) {
+            auto tip = m_chain.tip();
+            if (tip)
+                tip_state = m_abla->state_for_tip(tip->height);
+        }
+        auto result = TemplateBuilder::build_template(m_chain, m_pool, m_testnet, tip_state);
         if (!result) {
             LOG_WARNING << "[EMB-BCH] getwork() FAILED: no tip (chain empty)";
             throw std::runtime_error("EmbeddedCoinNode::getwork: chain has no tip (not yet synced to genesis)");
@@ -323,6 +336,11 @@ public:
     /// UTXO-readiness gate (coinbase maturity = 100 blocks on BCH).
     void set_utxo_ready_fn(std::function<bool()> fn) { m_utxo_ready = std::move(fn); }
 
+    /// Wire the live ABLA size feed (full-block/daemon layer). Optional: when
+    /// unset the template builder uses the 32 MB floor budget. The tracker is
+    /// owned by the daemon layer and must outlive this node.
+    void set_abla_tracker(AblaTracker* abla) { m_abla = abla; }
+
     bool is_synced() const override {
         if (!m_chain.is_synced()) return false;
         if (m_utxo_ready && !m_utxo_ready()) return false;
@@ -334,6 +352,7 @@ private:
     Mempool&              m_pool;
     std::function<bool()> m_utxo_ready;
     bool                  m_testnet;
+    AblaTracker*          m_abla = nullptr;   // sC: live size feed (daemon-owned, optional)
 };
 
 } // namespace coin
