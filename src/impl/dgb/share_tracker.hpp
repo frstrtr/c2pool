@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 // Portable 128-bit multiply-shift: (a * b) >> shift
 // GCC/Clang have __uint128_t; MSVC uses _umul128 intrinsic.
 // shift must be in [1, 63] to avoid undefined behavior from 64-bit shifts.
