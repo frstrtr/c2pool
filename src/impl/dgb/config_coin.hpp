@@ -4,6 +4,9 @@
 #include <core/fileconfig.hpp>
 #include <core/netaddress.hpp>
 
+#include <yaml-cpp/yaml.h>
+#include <btclibs/util/strencodings.h>
+
 #include <cstdint>
 #include <algorithm>
 
@@ -25,6 +28,49 @@ namespace config
     };
 
 } // config
+} // namespace dgb
+
+namespace YAML
+{
+template<> struct convert<dgb::config::P2PData>
+{
+    static Node encode(const dgb::config::P2PData& rhs)
+    {
+        Node node;
+        node["prefix"] = HexStr(rhs.prefix);
+        node["address"] = rhs.address;
+        return node;
+    }
+
+    static bool decode(const Node& node, dgb::config::P2PData& rhs)
+    {
+        rhs.prefix = ParseHexBytes(node["prefix"].as<std::string>());
+        rhs.address = node["address"].as<NetService>();
+        return true;
+    }
+};
+
+template<> struct convert<dgb::config::RPCData>
+{
+    static Node encode(const dgb::config::RPCData& rhs)
+    {
+        Node node;
+        node["address"] = rhs.address;
+        node["userpass"] = rhs.userpass;
+        return node;
+    }
+
+    static bool decode(const Node& node, dgb::config::RPCData& rhs)
+    {
+        rhs.address = node["address"].as<NetService>();
+        rhs.userpass = node["userpass"].as<std::string>();
+        return true;
+    }
+};
+}
+
+namespace dgb
+{
 
 /// DigiByte Scrypt coin parameters.
 /// Source of truth: p2pool-dgb-scrypt oracle bitcoin/networks/digibyte.py
