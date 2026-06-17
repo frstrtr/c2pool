@@ -32,6 +32,7 @@
 #include <impl/dash/share_types.hpp>        // dash::MerkleLink
 #include <impl/dash/pplns.hpp>           // dash::pplns::compute_payouts, dash::ShareChain, DashShare
 #include <impl/dash/version_negotiation.hpp> // dash::version_negotiation::get_desired_version_counts/weights
+#include <impl/dash/coin/vendor/cbtx.hpp> // dash::coin::vendor::CCbTx, parse_cbtx
 #include <impl/bitcoin_family/coin/base_block.hpp>  // bitcoin_family::coin::SmallBlockHeaderType
 
 #include <core/hash.hpp>                     // Hash (sha256d)
@@ -644,4 +645,100 @@ TEST(DashConformanceVersionNeg, GateUsesWeightNotPlainCount) {
     EXPECT_TRUE(dash::version_negotiation::successor_switch_allowed(plain, 36u));
     // Weighted: v36 work share ~60% (3*W_DIFF1 / (3*W_DIFF1 + W_HEAVY)) < 95%.
     EXPECT_FALSE(dash::version_negotiation::v36_active(weights));
+}
+
+// ── DIP4 special-tx coinbase payload (CCbTx) wire-encoding conformance ──────
+// DASH coinbase transactions carry a DIP-0004 "special transaction" extra
+// payload: the CCbTx. Its merkleRootMNList / merkleRootQuorums fields are what
+// every downstream SML / quorum conformance check reads, so the wire framing
+// must match dashcore (evo/cbtx.h) byte-for-byte. These KATs are computed
+// OUT-OF-BAND with CPython (LE struct pack + Bitcoin base-128 VarInt + raw
+// sha256d digest bytes for the uint256 fields), so the pins are NOT circular
+// with the C++ ::Serialize path. The decode case proves parse_cbtx is the
+// exact inverse on the very same bytes.
+namespace {
+// Self-contained hex -> bytes. Feeding the out-of-band hex straight into the
+// C++ parser keeps the decode KAT non-circular (no Serialize round-trip).
+std::vector<unsigned char> unhex(const std::string& h) {
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        return c - 'A' + 10;
+    };
+    std::vector<unsigned char> out;
+    out.reserve(h.size() / 2);
+    for (size_t i = 0; i + 1 < h.size(); i += 2)
+        out.push_back(static_cast<unsigned char>((nib(h[i]) << 4) | nib(h[i + 1])));
+    return out;
+}
+}  // namespace
+
+// v=2 (MERKLE_ROOT_QUORUMS): nVersion(LE16) nHeight(LE32) mnlist(32) quorums(32).
+TEST(DashConformanceCbtx, V2QuorumsMatchesOutOfBandKat) {
+    dash::coin::vendor::CCbTx tx;
+    tx.nVersion          = dash::coin::vendor::CCbTx::VERSION_MERKLE_ROOT_QUORUMS;
+    tx.nHeight           = 1000000;
+    tx.merkleRootMNList  = leaf(0x01);
+    tx.merkleRootQuorums = leaf(0x02);
+
+    PackStream ps; ::Serialize(ps, tx);
+    EXPECT_EQ(ps_hex(ps),
+        "020040420f00"
+        "9c12cfdc04c74584d787ac3d23772132c18524bc7ab28dec4219b8fc5b425f70"
+        "1cc3adea40ebfd94433ac004777d68150cce9db4c771bc7de1b297a7b795bbba")
+        << "v2 CCbTx wire != CPython KAT (DIP4 special-tx payload framing drift)";
+}
+
+// v=3 (CLSIG_AND_BALANCE): v2 prefix + VarInt(clHeightDiff) + 96B BLS sig +
+// LE64 signed creditPoolBalance.
+TEST(DashConformanceCbtx, V3ClsigBalanceMatchesOutOfBandKat) {
+    dash::coin::vendor::CCbTx tx;
+    tx.nVersion          = dash::coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+    tx.nHeight           = 2000000;
+    tx.merkleRootMNList  = leaf(0x03);
+    tx.merkleRootQuorums = leaf(0x04);
+    tx.bestCLHeightDiff  = 24;                       // single-byte base-128 VarInt 0x18
+    tx.bestCLSignature.fill(0xAB);
+    tx.creditPoolBalance = 123456789;
+
+    PackStream ps; ::Serialize(ps, tx);
+    EXPECT_EQ(ps_hex(ps),
+        "030080841e00"
+        "c942a06c127c2c18022677e888020afb174208d299354f3ecfedb124a1f3fa45"
+        "214e63bf41490e67d34476778f6707aa6c8d2c8dccdf78ae11e40ee9f91e89a7"
+        "18"
+        "abababababababababababababababababababababababababababababababab"
+        "abababababababababababababababababababababababababababababababab"
+        "abababababababababababababababababababababababababababababababab"
+        "15cd5b0700000000")
+        << "v3 CCbTx wire != CPython KAT (VarInt / BLS-sig / creditPool framing drift)";
+}
+
+// Decode path: parse_cbtx must be the exact inverse on the out-of-band bytes,
+// and must reject trailing garbage (the wire-drift guard).
+TEST(DashConformanceCbtx, ParseCbtxIsExactInverseOfKat) {
+    const std::string kat_v3 =
+        "030080841e00"
+        "c942a06c127c2c18022677e888020afb174208d299354f3ecfedb124a1f3fa45"
+        "214e63bf41490e67d34476778f6707aa6c8d2c8dccdf78ae11e40ee9f91e89a7"
+        "18"
+        "abababababababababababababababababababababababababababababababab"
+        "abababababababababababababababababababababababababababababababab"
+        "abababababababababababababababababababababababababababababababab"
+        "15cd5b0700000000";
+    dash::coin::vendor::CCbTx tx;
+    ASSERT_TRUE(dash::coin::vendor::parse_cbtx(unhex(kat_v3), tx))
+        << "parse_cbtx rejected a valid out-of-band v3 payload";
+    EXPECT_EQ(tx.nVersion, dash::coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE);
+    EXPECT_EQ(tx.nHeight, 2000000);
+    EXPECT_TRUE(tx.merkleRootMNList  == leaf(0x03));
+    EXPECT_TRUE(tx.merkleRootQuorums == leaf(0x04));
+    EXPECT_EQ(tx.bestCLHeightDiff, 24u);
+    EXPECT_TRUE(tx.has_best_cl_signature());
+    EXPECT_EQ(tx.creditPoolBalance, 123456789);
+
+    auto bytes = unhex(kat_v3); bytes.push_back(0x00);  // one trailing byte
+    dash::coin::vendor::CCbTx tx2;
+    EXPECT_FALSE(dash::coin::vendor::parse_cbtx(bytes, tx2))
+        << "parse_cbtx accepted trailing garbage (wire-drift guard defeated)";
 }
