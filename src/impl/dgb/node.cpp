@@ -1466,6 +1466,14 @@ void NodeImpl::run_think()
             m_best_share_hash = result.best;
         }
 
+        // Phase 1c: drive the whale-departure detector with the fresh best
+        // share while we still hold the tracker lock exclusively (race-free).
+        // detect() emits [WHALE-DEPARTURE]/[WHALE-RECOVERY] log lines itself;
+        // we publish its verdict for the local work path (local_desired_target).
+        m_whale_departure_active.store(
+            m_whale_departure.detect(m_tracker, m_best_share_hash),
+            std::memory_order_relaxed);
+
         // Publish lock-free snapshot for all IO-thread consumers
         publish_snapshot();
 

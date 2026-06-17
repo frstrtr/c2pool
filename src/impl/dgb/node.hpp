@@ -57,8 +57,11 @@ protected:
     share_getter_t m_share_getter;
     ShareTracker m_tracker;
     // Phase 1c non-consensus local heuristic; compiled into the real node TU.
-    // detect() wiring into the desired-target override path is the next slice.
+    // Driven from run_think() under the exclusive tracker lock; the result is
+    // published into m_whale_departure_active for the IO/work threads to read.
     WhaleDepartureDetector m_whale_departure;
+    // Lock-free publication of the detector verdict (see local_desired_target).
+    std::atomic<bool> m_whale_departure_active{false};
     std::unique_ptr<c2pool::storage::SharechainStorage> m_storage;
 
     // Global pool of known transactions, populated by remember_tx and coin daemon.
@@ -327,6 +330,22 @@ public:
 
     /// Return the hash of our tallest chain head, or uint256::ZERO if empty.
     uint256 best_share_hash();
+
+    /// Phase 1c: whale-departure recovery state, published by run_think()'s
+    /// detect() call under the tracker lock. Non-consensus -- only affects what
+    /// THIS node mines, never share verification.
+    bool whale_departure_active() const {
+        return m_whale_departure_active.load(std::memory_order_relaxed);
+    }
+
+    /// Local mining target after whale-departure override: when recovery is
+    /// active the desired share target is eased to pre_target3 (== MAX_TARGET,
+    /// the easiest consensus-allowed difficulty); otherwise the caller's normal
+    /// desired target passes through unchanged. Consumed by the local work path.
+    uint256 local_desired_target(const uint256& normal_desired) const {
+        return m_whale_departure_active.load(std::memory_order_relaxed)
+            ? PoolConfig::max_target() : normal_desired;
+    }
 
     /// Peer-facing advertisement of our head (version handshake + timer
     /// re-announce ONLY — never work creation).  Returns the verified head
