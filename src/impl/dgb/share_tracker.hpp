@@ -635,14 +635,16 @@ public:
         // oscillation where short chains beat long chains simply because the
         // long chain's old blocks are unresolvable.
         if (!block_height.has_value() || block_height.value() <= 0)
-            block_height = 1000000;  // ~1M confirmations → time_span ≈ 150M seconds
+            block_height = 1000000;  // ~1M confirmations → time_span ≈ 75M seconds
 
         // p2pool: self.verified.get_delta(share_hash, end_point).work
         auto total_work = verified.get_delta_work(share_hash, end_point);
 
         // p2pool: (0 - block_height + 1) * BLOCK_PERIOD
-        // c2pool confirmations: 1=tip → 150s, 4 → 600s (matches p2pool).
-        auto time_span = block_height.value() * 15;  // DGB BLOCK_PERIOD = 15s (farsider350 digibyte.py:21)
+        // c2pool confirmations: 1=tip → 75s, 4 → 300s (matches p2pool).
+        // BLOCK_PERIOD sourced from the make_coin_params-populated CoinParams
+        // (oracle PARENT.BLOCK_PERIOD, config_coin.hpp = 75s) — no hardcoded holdover.
+        auto time_span = block_height.value() * static_cast<int32_t>(m_params->block_period);
         if (time_span <= 0)
             time_span = 1;
 
