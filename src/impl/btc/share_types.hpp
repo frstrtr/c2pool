@@ -3,15 +3,15 @@
 #include <core/uint256.hpp>
 #include <core/pack_types.hpp>
 #include <core/pack.hpp>
+#include "config_pool.hpp"   // SSOT: PoolConfig::SEGWIT_ACTIVATION_VERSION
 
 namespace btc
 {
 
-const uint64_t SEGWIT_ACTIVATION_VERSION = 17;
 
 constexpr bool is_segwit_activated(uint64_t version)
 {
-    return version >= SEGWIT_ACTIVATION_VERSION;
+    return version >= PoolConfig::SEGWIT_ACTIVATION_VERSION;
 }
 
 enum StaleInfo

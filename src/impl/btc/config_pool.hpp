@@ -119,9 +119,11 @@ public:
 
     // V36+ COMBINED_DONATION_SCRIPT (P2SH: OP_HASH160 <hash160(redeem)> OP_EQUAL)
     // 1-of-2 multisig: forrestv + frstrtr/c2pool dev key.
-    // LTC-specific (BTC stays at v35 per jtoomim — see plan v2 §3); kept
-    // here as inert byte data so get_donation_script() compiles for both
-    // BTC v35 (returns the P2PK above) and LTC v36 paths.
+    // LTC P2SH donation target. BTC now runs v36-active shares, but its
+    // donation leg intentionally stays the V35 P2PK above (forrestv
+    // canonical BTC-mainnet donation); this COMBINED P2SH is LTC-only,
+    // kept here as inert byte data so get_donation_script() compiles for
+    // both the BTC (P2PK) and LTC v36 (P2SH) paths.
     // Address: MLhSmVQxMusLE3pjGFvp4unFckgjeD8LUA (LTC mainnet P2SH).
     static constexpr std::array<uint8_t, 23> COMBINED_DONATION_SCRIPT = {
         0xa9, // OP_HASH160
