@@ -278,6 +278,22 @@ class ShareTracker
 public:
     ShareChain chain;
 
+    // Verified best-chain mirror (p2pool known_verified pattern): shares that
+    // have passed full PoW + context verification.  Work/template selection and
+    // block scanning run against this sub-chain, never the raw "chain" buffer.
+    ShareChain verified;
+
+    // -- Node-layer callback hooks (wired by the pool node in node.hpp) --
+    // BCH is a SHA256d standalone-parent chain: NO merged-mining / AuxPoW, so
+    // there is no m_on_merged_block_check (present in btc for the DOGE aux leg).
+    // Fired when a share passes verification (LevelDB known_verified persistence).
+    std::function<void(const uint256&)> m_on_share_verified;
+    // Fired when a verified share meets the BCH block target (found block).
+    std::function<void(const uint256&)> m_on_block_found;
+    // Fired for every verified share with its difficulty + miner script
+    // (best-share difficulty tracking for the dashboard).
+    std::function<void(double difficulty, const std::string& miner)> m_on_share_difficulty;
+
     // -- PPLNS cumulative weights computation (O(log n) via skip list) --
     CumulativeWeights get_cumulative_weights(const uint256& start, int32_t max_shares, const uint288& desired_weight)
     {
@@ -580,6 +596,61 @@ private:
     int32_t m_decayed_cache_shares{0};
     uint288 m_decayed_cache_desired;
     CumulativeWeights m_decayed_cache_result;
+
+public:
+    // -- Pool hashrate estimation --
+    /// Pool hashrate estimation -- matches p2pool get_pool_attempts_per_second exactly.
+    /// Uses skip list O(log n) for ancestor lookup + TrackerView delta cache O(1) for work sum.
+    /// BCH-faithful: SHA256d work/target math, identical to the shared p2pool formula
+    /// (no scrypt, no merged-mining divergence -- coin-independent).
+    ///
+    /// p2pool (data.py:2489-2499):
+    ///   near = tracker.items[previous_share_hash]
+    ///   far  = tracker.items[tracker.get_nth_parent_hash(previous_share_hash, dist - 1)]
+    ///   attempts = tracker.get_delta(near.hash, far.hash).min_work   (if min_work)
+    ///            = tracker.get_delta(near.hash, far.hash).work        (otherwise)
+    ///   time = near.timestamp - far.timestamp
+    ///   return attempts // time   (integer=True in generate_transaction)
+    uint288 get_pool_attempts_per_second(const uint256& share_hash, int32_t dist, bool use_min_work = false)
+    {
+        if (dist < 2 || !chain.contains(share_hash))
+            return uint288(0);
+
+        // p2pool: far = tracker.items[tracker.get_nth_parent_hash(share_hash, dist - 1)]
+        auto far_hash = chain.get_nth_parent_via_skip(share_hash, dist - 1);
+        if (far_hash.IsNull() || !chain.contains(far_hash))
+            return uint288(0);
+
+        // Verify skip list vs naive walk (periodic -- detect stale pointers)
+        {
+            static int skip_verify = 0;
+            if (skip_verify++ % 100 == 0) {
+                try {
+                    auto naive_far = chain.get_nth_parent_key(share_hash, dist - 1);
+                    if (naive_far != far_hash) {
+                        LOG_ERROR << "[SKIP-MISMATCH] dist=" << dist
+                                  << " skip=" << far_hash.GetHex().substr(0,16)
+                                  << " naive=" << naive_far.GetHex().substr(0,16)
+                                  << " near=" << share_hash.GetHex().substr(0,16);
+                    }
+                } catch (...) {}
+            }
+        }
+
+        // p2pool: tracker.get_delta(near.hash, far.hash)  -- O(1) via TrackerView
+        auto delta = chain.get_delta(share_hash, far_hash);
+        uint288 attempts = use_min_work ? delta.min_work : delta.work;
+
+        // p2pool: time = near.timestamp - far.timestamp; if time <= 0: time = 1
+        uint32_t near_ts = 0, far_ts = 0;
+        chain.get_share(share_hash).invoke([&](auto* obj) { near_ts = obj->m_timestamp; });
+        chain.get_share(far_hash).invoke([&](auto* obj) { far_ts = obj->m_timestamp; });
+
+        int32_t time_span = static_cast<int32_t>(near_ts) - static_cast<int32_t>(far_ts);
+        if (time_span <= 0) time_span = 1;
+
+        return attempts / uint288(time_span);
+    }
 };
 
 } // namespace bch
