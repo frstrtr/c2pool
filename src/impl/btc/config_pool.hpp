@@ -134,13 +134,14 @@ public:
         0x87  // OP_EQUAL
     };
 
-    // Returns the correct donation script based on share version.
-    // Pre-V36 shares use the original P2PK donation script.
-    // V36+ shares use the combined P2SH 1-of-2 multisig script.
-    static std::vector<unsigned char> get_donation_script(int64_t share_version)
+    // BTC donation leg is forrestv's canonical P2PK on ALL share versions,
+    // including v36+ (FLAG6 conformance vs BTC's own jtoomim/forrestv baseline).
+    // The COMBINED P2SH script above is the LTC v36 donation target and is
+    // NEVER selected for BTC: returning it from a BTC gentx would pay the LTC
+    // dev-fund P2SH instead of forrestv's BTC-mainnet P2PK. The version arg is
+    // retained for signature parity with the LTC config but is ignored here.
+    static std::vector<unsigned char> get_donation_script(int64_t /*share_version*/)
     {
-        if (share_version >= 36)
-            return {COMBINED_DONATION_SCRIPT.begin(), COMBINED_DONATION_SCRIPT.end()};
         return {DONATION_SCRIPT.begin(), DONATION_SCRIPT.end()};
     }
 
