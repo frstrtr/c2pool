@@ -266,20 +266,12 @@ private:
     // Template cache (filled lazily; invalidated when work_generation_ bumps)
     // Stage 4c populates these.
     mutable std::mutex          template_mutex_;
-    // H5 fix: single-slot tx_data memo. build_connection_coinbase rebuilt
-    // the per-tx hex vector on every call; for an unchanged mempool tx set
-    // that is pure churn (768MB / 1.2M calls in the 2026-06-02 trace, ~78%
-    // of total leaked bytes). Memoize the shared_ptr keyed to a fingerprint
-    // over wd->m_hashes (the merkle leaf set, in merkle-leaf order) so a
-    // repeat call against the same tx set returns a refcount bump instead
-    // of a fresh deep copy. Single slot: only the latest tx set is ever
-    // needed, so the memo is O(1) and self-evicting (a new fingerprint
-    // overwrites the prior entry, dropping its refcount). Guarded by
-    // template_mutex_. Atomic-with-merkle by construction: the key is the
-    // exact leaf set that produced this job, so a memo hit implies an
-    // identical merkle (no stale-tx-vs-fresh-merkle submit mismatch).
-    mutable uint256                                   tx_data_fp_;
-    mutable std::shared_ptr<std::vector<std::string>> tx_data_memo_;
+    // H5 tx_data memo (single slot, guarded by template_mutex_): the per-job
+    // tx-hex vector and a fingerprint over its merkle leaf set, so repeat
+    // build_connection_coinbase calls against an unchanged tx set reuse the
+    // shared_ptr instead of re-serializing the mempool. See tx_data_memo.hpp.
+    mutable uint256                                     tx_data_fp_;
+    mutable std::shared_ptr<std::vector<std::string>>   tx_data_memo_;
 };
 
 }  // namespace btc::stratum
