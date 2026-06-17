@@ -485,7 +485,7 @@ uint256 share_init_verify(const ShareT& share, bool check_pow = true)
 
     constexpr int64_t ver = ShareT::version;
 
-    if constexpr (ver >= btc::SEGWIT_ACTIVATION_VERSION)
+    if constexpr (ver >= btc::PoolConfig::SEGWIT_ACTIVATION_VERSION)
     {
         if constexpr (requires { share.m_segwit_data; })
         {
@@ -563,7 +563,7 @@ uint256 share_init_verify(const ShareT& share, bool check_pow = true)
         // segwit_data (optional)
         if constexpr (requires { share.m_segwit_data; })
         {
-            if constexpr (ver >= btc::SEGWIT_ACTIVATION_VERSION)
+            if constexpr (ver >= btc::PoolConfig::SEGWIT_ACTIVATION_VERSION)
             {
                 // PossiblyNoneType: ALWAYS serialize (p2pool writes default when None)
                 if (share.m_segwit_data.has_value()) {
@@ -671,7 +671,7 @@ uint256 share_init_verify(const ShareT& share, bool check_pow = true)
     // --- Merkle root ---
     // For segwit-activated shares, use segwit_data.txid_merkle_link; otherwise merkle_link
     uint256 merkle_root;
-    if constexpr (ver >= btc::SEGWIT_ACTIVATION_VERSION)
+    if constexpr (ver >= btc::PoolConfig::SEGWIT_ACTIVATION_VERSION)
     {
         if constexpr (requires { share.m_segwit_data; })
         {
@@ -1163,7 +1163,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
     size_t n_outs = payout_outputs.size() + 1 /* donation */ + 1 /* OP_RETURN commitment */;
     // Segwit commitment output (if applicable)
     bool has_segwit = false;
-    if constexpr (ver >= btc::SEGWIT_ACTIVATION_VERSION)
+    if constexpr (ver >= btc::PoolConfig::SEGWIT_ACTIVATION_VERSION)
     {
         if constexpr (requires { share.m_segwit_data; })
         {
@@ -1282,7 +1282,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
 
             if constexpr (requires { share.m_segwit_data; })
             {
-                if constexpr (ver >= btc::SEGWIT_ACTIVATION_VERSION)
+                if constexpr (ver >= btc::PoolConfig::SEGWIT_ACTIVATION_VERSION)
                 {
                     // PossiblyNoneType: ALWAYS serialize (p2pool writes default when None).
                     // Must match share_init_verify — both paths must produce identical ref_hash.
@@ -1973,7 +1973,7 @@ uint256 verify_share(const ShareT& share, TrackerT& tracker)
 
         if constexpr (requires { share.m_segwit_data; })
         {
-            if constexpr (ver >= btc::SEGWIT_ACTIVATION_VERSION)
+            if constexpr (ver >= btc::PoolConfig::SEGWIT_ACTIVATION_VERSION)
             {
                 // PossiblyNoneType: ALWAYS serialize (p2pool writes default when None)
                 if (share.m_segwit_data.has_value()) {
