@@ -633,11 +633,39 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
         // a1 (shared_ptr + lazy materialize): build the per-tx hex vector ONCE
         // and hand the snapshot a shared_ptr to it, so the copies made along
         // CoinbaseResult -> JobSnapshot -> JobEntry become refcount bumps, not
-        // deep copies of the full mempool tx hex (the H5 churn site).
-        auto txd = std::make_shared<std::vector<std::string>>();
-        for (const auto& t : *txs_field) {
-            if (t.is_object() && t.contains("data") && t["data"].is_string())
-                txd->push_back(t["data"].get<std::string>());
+        // deep copies of the full mempool tx hex.
+        //
+        // H5 (memoize across calls): a1 collapsed the per-job copies, but the
+        // vector itself was still rebuilt from scratch on every call to this
+        // method even when the mempool tx set had not changed -- the dominant
+        // leak/churn site (work_source.cpp:634, 768MB / 1.2M calls). Fingerprint
+        // the template tx set over wd->m_hashes (the merkle leaf set, in
+        // merkle-leaf order) and reuse the memoized shared_ptr on a match.
+        // The fingerprint keys on the SAME leaves that built this job's merkle,
+        // so a hit is atomic with the witness_commitment/merkle captured for
+        // the job (no stale-tx-vs-fresh-merkle mismatch on submit). Single slot
+        // -> bounded memory (one tx set retained), self-evicting on tx-set roll.
+        CHash256 fp_hasher;
+        for (const auto& h : wd->m_hashes)
+            fp_hasher.Write(std::span<const unsigned char>(h.data(), 32));
+        uint256 fp;
+        fp_hasher.Finalize(std::span<unsigned char>(fp.data(), 32));
+
+        std::shared_ptr<std::vector<std::string>> txd;
+        {
+            std::lock_guard<std::mutex> lk(template_mutex_);
+            if (tx_data_memo_ && tx_data_fp_ == fp) {
+                txd = tx_data_memo_;  // unchanged tx set -> refcount bump, no rebuild
+            } else {
+                txd = std::make_shared<std::vector<std::string>>();
+                txd->reserve(txs_field->size());
+                for (const auto& t : *txs_field) {
+                    if (t.is_object() && t.contains("data") && t["data"].is_string())
+                        txd->push_back(t["data"].get<std::string>());
+                }
+                tx_data_fp_   = fp;    // single slot: overwrite, prior set refcount drops
+                tx_data_memo_ = txd;
+            }
         }
         snap.tx_data = std::move(txd);
     }
