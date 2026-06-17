@@ -213,6 +213,20 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_block_replay PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
     gtest_add_tests(test_dash_block_replay "" AUTO)
 
+    # DASH V36 conformance -- merkle-root-equality precondition (S6 slice).
+    # share_check.hpp (check_merkle_link) + coinbase_builder.hpp
+    # (merkle_branches_raw) are header-only over the dash_x11 + core link set;
+    # no ltc/pool SCC dependency. Mirrors the test_dash_header_chain link set.
+    add_executable(test_dash_conformance test_dash_conformance.cpp)
+    target_link_libraries(test_dash_conformance PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_conformance PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
+    gtest_add_tests(test_dash_conformance "" AUTO)
+
     add_executable(test_compact_blocks test_compact_blocks.cpp)
     target_link_libraries(test_compact_blocks PRIVATE
         GTest::gtest_main GTest::gtest
