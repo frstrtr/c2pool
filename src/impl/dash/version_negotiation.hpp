@@ -71,13 +71,16 @@ get_desired_version_weights(ShareChain& chain, const uint256& start_hash, uint64
         static_cast<uint64_t>(chain.get_height(start_hash)));
     for (auto&& [h, data] : chain.get_chain(start_hash, n)) {
         (void)h;
+        // D5: consume the cached per-share work (ShareIndex::work, set at add()
+        // to target_to_average_attempts(bits_to_target(m_bits)) -- share_chain.hpp:227)
+        // instead of recomputing it live. The two are equal by construction; sourcing
+        // the cached accessor removes recompute-drift risk and standardizes on the
+        // shared F10 work metric (divergence-map row D5).
+        const uint288 w = data.index->work;
         data.share.invoke([&](auto* obj) {
             using S = std::remove_pointer_t<decltype(obj)>;
-            if constexpr (std::is_same_v<S, dash::DashShare>) {
-                uint288 w = chain::target_to_average_attempts(
-                    chain::bits_to_target(obj->m_bits));
+            if constexpr (std::is_same_v<S, dash::DashShare>)
                 res[obj->m_desired_version] += w;
-            }
         });
     }
     return res;

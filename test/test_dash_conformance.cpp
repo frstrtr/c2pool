@@ -409,12 +409,18 @@ struct SyntheticChain {
     std::vector<dash::DashShare*> pool;  // chain (ShareVariants::destroy) owns the shares; raw avoids double-free
 
     uint256 add(uint8_t tag, const uint256& prev, uint16_t donation,
-                const uint160& pkh) {
+                const uint160& pkh,
+                uint32_t bits = BITS_DIFF1, uint64_t version = 0) {
         auto* s = new dash::DashShare();
         s->m_hash        = pplns_share_hash(tag);
         s->m_prev_hash   = prev;
-        s->m_bits        = BITS_DIFF1;
-        s->m_max_bits    = BITS_DIFF1;  // ShareIndex ctor reads m_max_bits
+        // Final fields set BEFORE chain.add(): ShareIndex caches
+        // work=target_to_average_attempts(bits_to_target(m_bits)) at insertion,
+        // and a production share has immutable bits once it enters the chain.
+        // (m_max_bits stays at diff1 -- min_work basis unchanged.)
+        s->m_bits            = bits;
+        s->m_max_bits        = BITS_DIFF1;
+        s->m_desired_version = version;
         s->m_donation    = donation;
         s->m_pubkey_hash = pkh;
         const uint256 h  = s->m_hash;
@@ -565,11 +571,8 @@ namespace {
 // obj->m_bits live, so post-add patching is what the production walk observes.
 uint256 add_versioned(SyntheticChain& sc, uint8_t tag, const uint256& prev,
                       uint64_t version, uint32_t bits, const uint160& pkh) {
-    uint256 h = sc.add(tag, prev, /*donation*/ 0, pkh);
-    auto* s = sc.pool.back();
-    s->m_desired_version = version;
-    s->m_bits = bits;
-    return h;
+    // Bits/version set pre-insertion so the cached ShareIndex::work matches.
+    return sc.add(tag, prev, /*donation*/ 0, pkh, bits, version);
 }
 }  // namespace
 
