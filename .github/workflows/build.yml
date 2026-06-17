@@ -345,76 +345,19 @@ jobs:
             timeout 180 ./build-qt/c2pool-qt_test_embedded_leak
 
   # ════════════════════════════════════════════════════════════════════════════
-  # BTC embedded smoke (c2pool-btc target)
+  # BTC embedded smoke — RETIRED 2026-06-17 (ci-steward/retire-btc-linux).
+  # Superseded by the coin-matrix.yml `btc` cell ("btc smoke (Linux x86_64)",
+  # a required check on master). The old btc-linux job was gated solely to
+  # btc-embedded branch involvement and never fired on master, so removing it
+  # changes no live coverage.
   #
-  # Gated to runs where the btc-embedded branch is involved — pushes to
-  # btc-embedded, or PRs whose head or base is btc-embedded. On master
-  # itself the BTC sources don't yet exist (src/c2pool/main_btc.cpp,
-  # src/impl/btc/) so this job is intentionally a no-op there; it
-  # activates as soon as this workflow lands on btc-embedded via merge.
-  #
-  # Coverage: cmake --build --target c2pool-btc catches any link/compile
-  # breakage in the embedded BTC SPV binary (main_btc.cpp + btc module +
-  # btc_stratum + transitive ltc dependency). Until this CI job existed,
-  # BTC had ZERO automated coverage on any commit.
-  #
-  # Deferred to a follow-up PR landing on btc-embedded directly:
-  #   - src/impl/btc/test/share_test.cpp: `add_subdirectory(test)` is
-  #     commented out in src/impl/btc/CMakeLists.txt because the test
-  #     still references LTC types. Revival is owned by the btc-heap-opt
-  #     arc.
-  #   - src/impl/btc/test/template_parity_test.cpp: standalone consensus
-  #     oracle harness; the file header claims it builds with a bare g++
-  #     invocation but its transitive includes pull in nlohmann_json,
-  #     leveldb_store, core/log — needs proper CMake target wiring to be
-  #     reliable in CI.
+  # Deferred btc test wiring (unchanged, owned by the btc-heap-opt arc):
+  #   - src/impl/btc/test/share_test.cpp — add_subdirectory(test) disabled in
+  #     src/impl/btc/CMakeLists.txt (still references LTC types).
+  #   - src/impl/btc/test/template_parity_test.cpp — standalone consensus
+  #     oracle harness; needs proper CMake target wiring (nlohmann_json,
+  #     leveldb_store, core/log) to be CI-reliable.
   # ════════════════════════════════════════════════════════════════════════════
-  btc-linux:
-    name: BTC embedded smoke (Linux x86_64)
-    if: |
-      github.ref == 'refs/heads/btc-embedded' ||
-      github.head_ref == 'btc-embedded' ||
-      github.base_ref == 'btc-embedded'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            g++ cmake make libleveldb-dev libsecp256k1-dev
-
-      - uses: actions/setup-python@v6
-        with: { python-version: '3.12' }
-
-      - name: Install Conan 2
-        run: pip install "conan>=2.0,<3.0"
-
-      - name: Detect Conan profile
-        run: |
-          conan profile detect --force
-          sed -i 's/compiler.cppstd=.*/compiler.cppstd=20/' "$(conan profile path default)"
-
-      - name: Restore Conan cache
-        uses: actions/cache@v5
-        with:
-          path: ~/.conan2
-          key: conan2-ubuntu24-gcc13-${{ hashFiles('conanfile.txt') }}
-
-      - name: Conan install
-        run: conan install . --build=missing --output-folder=build_btc --settings=build_type=Release
-
-      - name: Configure
-        run: cmake -S . -B build_btc -DCMAKE_TOOLCHAIN_FILE=build_btc/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release
-
-      - name: Build c2pool-btc
-        run: cmake --build build_btc --target c2pool-btc -j$(nproc)
-
-      - name: Verify binary
-        run: |
-          file build_btc/src/c2pool/c2pool-btc
-          build_btc/src/c2pool/c2pool-btc --help 2>&1 | head -3 || true
 
   # ════════════════════════════════════════════════════════════════════════════
   # macOS (matrix: arm64 on GitHub-hosted macos-14, x86_64 on the self-hosted
