@@ -8,6 +8,7 @@
 #include "share.hpp"
 #include "share_tracker.hpp"
 #include "whale_departure.hpp"
+#include "pool_monitor.hpp"
 #include "peer.hpp"
 #include "messages.hpp"
 
@@ -62,6 +63,12 @@ protected:
     WhaleDepartureDetector m_whale_departure;
     // Lock-free publication of the detector verdict (see local_desired_target).
     std::atomic<bool> m_whale_departure_active{false};
+    // Phase 3L non-consensus log-based pool monitor (attack/anomaly detection).
+    // Driven from run_think() under the exclusive tracker lock on a ~30s cadence;
+    // emits [MONITOR-*] log lines only — no consensus / sharechain effect.
+    PoolMonitor m_pool_monitor;
+    uint32_t m_last_monitor_ts{0};
+    static constexpr uint32_t MONITOR_INTERVAL_S = 30;
     std::unique_ptr<c2pool::storage::SharechainStorage> m_storage;
 
     // Global pool of known transactions, populated by remember_tx and coin daemon.
