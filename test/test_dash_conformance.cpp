@@ -652,6 +652,47 @@ TEST(DashConformanceVersionNeg, GateUsesWeightNotPlainCount) {
     EXPECT_FALSE(dash::version_negotiation::v36_active(weights));
 }
 
+// D2: unified 5-case version-switch classifier (F10 share_check.hpp step 2).
+// Pins classify_switch() over every transition shape and the switch_accepted()
+// decision table, then cross-checks the SuccessorGated body against the live D1
+// 60% weighted gate so the classifier can never diverge from successor_switch_allowed.
+TEST(DashConformanceVersionNeg, SwitchClassifier5CaseKat) {
+    using namespace dash::version_negotiation;
+    using C = dash::version_negotiation::SwitchClass;
+
+    // classify_switch: structural transition classification (prev, desired, has_history).
+    EXPECT_EQ(classify_switch(36u, 36u, true),  C::Same);                // continuation
+    EXPECT_EQ(classify_switch(36u, 36u, false), C::Same);                // history irrelevant
+    EXPECT_EQ(classify_switch(35u, 34u, true),  C::PredecessorAllowed);  // downgrade-by-one
+    EXPECT_EQ(classify_switch(35u, 34u, false), C::PredecessorAllowed);  // needs no window
+    EXPECT_EQ(classify_switch(35u, 36u, true),  C::SuccessorGated);      // +1 with support window
+    EXPECT_EQ(classify_switch(35u, 36u, false), C::NoHistory);           // +1, window absent
+    EXPECT_EQ(classify_switch(35u, 37u, true),  C::InvalidJump);         // +2 skip
+    EXPECT_EQ(classify_switch(35u, 33u, true),  C::InvalidJump);         // -2 skip
+    EXPECT_EQ(classify_switch(35u, 40u, false), C::InvalidJump);         // +5, structural reject
+
+    // switch_accepted: final verdict. SuccessorGated defers to the 60% gate;
+    // every other case is decided structurally (gate_cleared is then ignored).
+    EXPECT_TRUE (switch_accepted(C::Same,               false));  // continuation always ok
+    EXPECT_TRUE (switch_accepted(C::PredecessorAllowed, false));  // rollback always ok
+    EXPECT_TRUE (switch_accepted(C::SuccessorGated,     true));   // +1, gate cleared
+    EXPECT_FALSE(switch_accepted(C::SuccessorGated,     false));  // +1, gate denied
+    EXPECT_FALSE(switch_accepted(C::InvalidJump,        true));   // skip never ok
+    EXPECT_FALSE(switch_accepted(C::NoHistory,          true));   // no support window
+
+    // Cross-check the gated body against the live D1 weighted gate: a +1 switch
+    // to v36 with history is accepted exactly when successor_switch_allowed clears.
+    const std::map<uint64_t, uint288> clears  = {{36u, uint288(6u)}, {16u, uint288(4u)}};  // 60%
+    const std::map<uint64_t, uint288> denies  = {{36u, uint288(5u)}, {16u, uint288(5u)}};  // 50%
+    EXPECT_TRUE (switch_accepted(classify_switch(35u, 36u, true),
+                                 successor_switch_allowed(clears, 36u)));
+    EXPECT_FALSE(switch_accepted(classify_switch(35u, 36u, true),
+                                 successor_switch_allowed(denies, 36u)));
+    // Same chain, but window absent -> NoHistory short-circuits the gate entirely.
+    EXPECT_FALSE(switch_accepted(classify_switch(35u, 36u, false),
+                                 successor_switch_allowed(clears, 36u)));
+}
+
 // ── DIP4 special-tx coinbase payload (CCbTx) wire-encoding conformance ──────
 // DASH coinbase transactions carry a DIP-0004 "special transaction" extra
 // payload: the CCbTx. Its merkleRootMNList / merkleRootQuorums fields are what

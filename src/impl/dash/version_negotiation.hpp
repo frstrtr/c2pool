@@ -133,4 +133,63 @@ negotiation_window(ShareChain& chain, const uint256& prev_hash, uint64_t chain_l
     return Window{start, dist};
 }
 
+// ── D2: unified 5-case version-switch classifier (F10 share_check.hpp step 2) ─
+// successor_switch_allowed() answers ONLY the 60% upgrade threshold. The
+// canonical v36-native shape (F10 share_check step 2; p2pool-dash data.py
+// Share.check) classifies a proposed predecessor->desired version transition
+// into five cases -- the threshold gate is just the body of ONE of them:
+//
+//   Same                desired == prev          -> always allowed (continuation)
+//   SuccessorGated      desired == prev + 1      -> allowed IFF the 60% weighted
+//                                                   gate (successor_switch_allowed)
+//                                                   clears over the window
+//   PredecessorAllowed  desired == prev - 1      -> always allowed (downgrade-by-one
+//                                                   rollback; needs no support window)
+//   InvalidJump         |desired - prev| > 1     -> rejected (no version skipping)
+//   NoHistory           a +1 switch is proposed  -> rejected ("switch without enough
+//                       with < CHAIN_LENGTH         history"): the support window
+//                       ancestors                   cannot be evaluated
+//
+// no-history applies ONLY to the +1 successor case -- it is the one transition
+// that needs the support window; Same/Predecessor need no window, an InvalidJump
+// is rejected on structure regardless of history. DASH previously expressed only
+// negotiation_window() + the threshold; this folds them into the canonical shape.
+// Pure + scaffolding-only (no live share_check caller) -- zero consensus risk.
+enum class SwitchClass : uint8_t {
+    Same               = 0,  // desired == prev               -- allow
+    SuccessorGated     = 1,  // desired == prev + 1           -- allow iff 60% gate clears
+    PredecessorAllowed = 2,  // desired == prev - 1           -- allow (rollback)
+    InvalidJump        = 3,  // |desired - prev| > 1          -- reject
+    NoHistory          = 4,  // +1 switch, < CHAIN_LENGTH anc -- reject (no support window)
+};
+
+// Classify the predecessor->desired transition. `has_history` is whether the
+// support window exists (>= CHAIN_LENGTH ancestors), i.e. negotiation_window()
+// returned a value; it only changes the verdict for the +1 successor case.
+inline SwitchClass
+classify_switch(uint64_t prev_version, uint64_t desired_version, bool has_history)
+{
+    if (desired_version == prev_version)     return SwitchClass::Same;
+    if (desired_version == prev_version - 1) return SwitchClass::PredecessorAllowed;
+    if (desired_version == prev_version + 1)
+        return has_history ? SwitchClass::SuccessorGated : SwitchClass::NoHistory;
+    return SwitchClass::InvalidJump;  // |delta| > 1
+}
+
+// Final accept decision for a classified transition. SuccessorGated defers to the
+// 60% weighted gate result (`gate_cleared` = successor_switch_allowed over the
+// window); every other case is decided structurally. Mirrors F10 step 2 exactly.
+inline bool
+switch_accepted(SwitchClass cls, bool gate_cleared)
+{
+    switch (cls) {
+        case SwitchClass::Same:
+        case SwitchClass::PredecessorAllowed: return true;
+        case SwitchClass::SuccessorGated:     return gate_cleared;
+        case SwitchClass::InvalidJump:
+        case SwitchClass::NoHistory:          return false;
+    }
+    return false;
+}
+
 } // namespace dash::version_negotiation
