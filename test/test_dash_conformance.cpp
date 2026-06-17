@@ -329,3 +329,34 @@ TEST(DashConformanceShareHeader, RoundTripRecoversFields) {
     EXPECT_EQ(back.m_bits, orig.m_bits);
     EXPECT_EQ(back.m_nonce, orig.m_nonce);
 }
+
+// ── S6 conformance: nbits -> share difficulty equality vs frstrtr/p2pool-dash ──
+//
+// dash::coinbase::bits_to_difficulty() is the share-difficulty convention the
+// pool advertises and that p2pool-dash peers expect. It must equal p2pool-dash
+// bitcoin_data.target_to_difficulty(target):
+//
+//     difficulty_1 = 0xffff * 2**208 ;  difficulty = difficulty_1 / target
+//
+// Expected values are KAT vectors computed OUT-OF-BAND in CPython from that
+// exact rational (big-int target via a re-implemented compact decode, then the
+// p2pool ratio) — NOT from the C++ path — so the pins are not circular. The
+// production path takes the top-64 target bits (target >> 192) and divides
+// 0xffff0000 by them; for these vectors (compact size 0x1b..0x20) the targets
+// significant bits never fall below bit 192, so that truncation is lossless and
+// the two agree to the last ULP across diff 4.7e-10 .. 1.6e4.
+TEST(DashConformanceDifficulty, BitsToDifficultyMatchesP2poolDash) {
+    struct DiffKat { uint32_t nbits; double diff; };
+    const DiffKat kats[] = {
+        {0x1b104c8bu, 4020.7998157598363},
+        {0x1e0ffff0u, 0.000244140625},
+        {0x1d00ffffu, 1.0},
+        {0x1b0404cbu, 16307.420938523983},
+        {0x1c0fffffu, 15.999771117945784},
+        {0x207fffffu, 4.6565423739069247e-10},
+    };
+    for (const auto& k : kats) {
+        const double got = dash::coinbase::bits_to_difficulty(k.nbits);
+        EXPECT_NEAR(got, k.diff, k.diff * 1e-12 + 1e-18) << "nbits=" << k.nbits;
+    }
+}
