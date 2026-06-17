@@ -7,6 +7,7 @@
 #include "params.hpp"
 #include "share.hpp"
 #include "share_tracker.hpp"
+#include "whale_departure.hpp"
 #include "peer.hpp"
 #include "messages.hpp"
 
@@ -55,6 +56,9 @@ protected:
     dgb::Handler m_handler;
     share_getter_t m_share_getter;
     ShareTracker m_tracker;
+    // Phase 1c non-consensus local heuristic; compiled into the real node TU.
+    // detect() wiring into the desired-target override path is the next slice.
+    WhaleDepartureDetector m_whale_departure;
     std::unique_ptr<c2pool::storage::SharechainStorage> m_storage;
 
     // Global pool of known transactions, populated by remember_tx and coin daemon.
