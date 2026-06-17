@@ -27,7 +27,7 @@ namespace config
 } // config
 
 /// DigiByte Scrypt coin parameters.
-/// Source: p2pool-merged-v36/p2pool/bitcoin/networks/digibyte.py
+/// Source of truth: p2pool-dgb-scrypt oracle bitcoin/networks/digibyte.py
 ///
 /// DGB uses 5 algorithms rotating every 15 seconds. Scrypt is one of them.
 /// When running as a P2Pool parent chain, we request getblocktemplate with
@@ -49,8 +49,10 @@ public:
     static constexpr uint16_t MAINNET_RPC_PORT = 14024;
     static constexpr uint16_t TESTNET_RPC_PORT = 14025;
 
-    // Block timing: 75s total / 5 algos = 15s per algo
-    static constexpr uint32_t BLOCK_PERIOD     = 15;   // seconds (Scrypt algo rotation)
+    // Block timing: Scrypt-only parent block period (oracle PARENT.BLOCK_PERIOD).
+    // DGB mints a block ~every 15s across 5 rotating algos; one algo (Scrypt)
+    // lands ~every 75s, which is the period a Scrypt-only parent observes.
+    static constexpr uint32_t BLOCK_PERIOD     = 75;   // seconds (Scrypt algo period)
 
     // -----------------------------------------------------------------------
     // Address encoding
@@ -71,7 +73,7 @@ public:
 
     // -----------------------------------------------------------------------
     // DGB subsidy schedule (3-phase decay)
-    // Source: p2pool-merged-v36/p2pool/bitcoin/networks/digibyte.py
+    // Source: p2pool-dgb-scrypt oracle bitcoin/networks/digibyte.py
     // -----------------------------------------------------------------------
     static uint64_t subsidy(uint32_t height)
     {

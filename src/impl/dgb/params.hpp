@@ -30,7 +30,7 @@ inline core::CoinParams make_coin_params(bool testnet)
 
     // ===== Coin-level (net.PARENT) — from dgb::CoinParams (config_coin.hpp) =====
     p.symbol       = "DGB";
-    p.block_period = CoinParams::BLOCK_PERIOD;  // 15s (Scrypt algo rotation slot)
+    p.block_period = CoinParams::BLOCK_PERIOD;  // 75s (Scrypt-only parent period, oracle PARENT.BLOCK_PERIOD)
 
     // Address encoding
     if (testnet) {
@@ -42,8 +42,10 @@ inline core::CoinParams make_coin_params(bool testnet)
         p.address_p2sh_version = CoinParams::ADDRESS_P2SH_VERSION;     // 63 (S...)
         p.bech32_hrp           = CoinParams::BECH32_HRP;               // "dgb"
     }
-    // address_p2sh_version2: DGB legacy P2SH prefix (5). Affects address-parse
-    // leniency only, NOT block/share validation. [confirm-vs-oracle]
+    // address_p2sh_version2: secondary P2SH prefix for parse leniency only, NOT
+    // block/share validation. The oracle defines a SINGLE P2SH version (63); it
+    // is silent on a second prefix, so 5 (DGB legacy) is NOT oracle-sourced.
+    // [confirm-vs-oracle] kept open — see oracle-conformance report.
     p.address_p2sh_version2 = testnet ? 0 : 5;
 
     // PoW: Scrypt work, SHA256d block identity (same shape as LTC)
@@ -55,17 +57,18 @@ inline core::CoinParams make_coin_params(bool testnet)
         return CoinParams::subsidy(height);
     };
 
-    // Dust threshold: 0.001 DGB. Local relay policy, not consensus. [confirm-vs-oracle]
+    // Dust threshold: 0.001 DGB = 100000 sat. Confirmed vs oracle DUST_THRESHOLD
+    // (0.001e8). Local relay policy, not consensus.
     p.dust_threshold = 100000;
 
-    // Softforks — from PoolConfig SSOT (DGB oracle: csv + segwit)
+    // Softforks — from PoolConfig SSOT (oracle: nversionbips,csv,segwit,reservealgo,odo,taproot)
     p.softforks_required        = PoolConfig::SOFTFORKS_REQUIRED;
-    p.segwit_activation_version = PoolConfig::SEGWIT_ACTIVATION_VERSION;  // 17
+    p.segwit_activation_version = PoolConfig::SEGWIT_ACTIVATION_VERSION;  // 35
 
     // ===== Pool-level (net) — from dgb::PoolConfig (config_pool.hpp) =====
     p.p2p_port    = PoolConfig::P2P_PORT;  // 5024 (DGB sharechain P2P)
-    // worker_port: DGB Stratum port. Operator-overridable via pool.yaml; the
-    // default below is provisional pending oracle confirmation. [confirm-vs-oracle]
+    // worker_port: DGB Stratum port. Confirmed vs oracle WORKER_PORT = 5025.
+    // Operator-overridable via pool.yaml.
     p.worker_port = 5025;
 
     if (testnet) {
@@ -73,13 +76,13 @@ inline core::CoinParams make_coin_params(bool testnet)
         p.chain_length     = PoolConfig::TESTNET_CHAIN_LENGTH;       // 400
         p.real_chain_length = PoolConfig::TESTNET_REAL_CHAIN_LENGTH;  // 400
     } else {
-        p.share_period     = PoolConfig::SHARE_PERIOD;              // 25
-        p.chain_length     = PoolConfig::CHAIN_LENGTH;             // 8640
-        p.real_chain_length = PoolConfig::REAL_CHAIN_LENGTH;        // 8640
+        p.share_period     = PoolConfig::SHARE_PERIOD;              // 15
+        p.chain_length     = PoolConfig::CHAIN_LENGTH;             // 2880
+        p.real_chain_length = PoolConfig::REAL_CHAIN_LENGTH;        // 2880
     }
 
-    p.target_lookbehind        = PoolConfig::TARGET_LOOKBEHIND;          // 200
-    p.spread                   = PoolConfig::SPREAD;                     // 30
+    p.target_lookbehind        = PoolConfig::TARGET_LOOKBEHIND;          // 100
+    p.spread                   = PoolConfig::SPREAD;                     // 24
     p.minimum_protocol_version = PoolConfig::MINIMUM_PROTOCOL_VERSION;   // 1700 floor
     p.block_max_size           = PoolConfig::BLOCK_MAX_SIZE;
     p.block_max_weight         = PoolConfig::BLOCK_MAX_WEIGHT;
