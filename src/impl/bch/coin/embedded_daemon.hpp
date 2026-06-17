@@ -58,6 +58,7 @@
 #include "node.hpp"             // coin::Node<Config> (interfaces::Node source)
 #include "coin_node.hpp"        // CoinNode (core::coin::ICoinNode seam)
 #include "abla_runtime.hpp"     // AblaRuntime (owns tracker + feed)
+#include "bchn_anchor_record.hpp" // BchnAnchorRecord (cold-start anchor)
 
 #include <core/log.hpp>
 
@@ -106,6 +107,39 @@ public:
     /// approved; until then the floor anchor is correct and never-undercut.
     void apply_bchn_anchor(uint32_t height, abla::State state) {
         m_abla.reanchor(height, state);
+    }
+
+    /// DRY RUN of the cold-start reanchor: read the STATIC VM300 anchor record
+    /// (BchnAnchorRecord -- captured once, read-only; the live VM is never
+    /// touched here) and LOG exactly what apply_bchn_anchor() WOULD pin, with
+    /// no mutation of the running ABLA state. This is the cold-start path
+    /// wiring: origin is the recorded {height,hash,chainwork,time} anchor, NOT
+    /// genesis; the AblaRuntime replay stays pinned to the 32 MB safe floor
+    /// whenever the recorded control state is still at floor (the 955700
+    /// capture is). The real reanchor stays operator-gated -- this only proves
+    /// the wiring and surfaces a non-floor budget the moment a capture shows one.
+    void dry_run_bchn_anchor() const {
+        using Rec = BchnAnchorRecord;
+        const abla::State rec_state = Rec::state(m_config->m_testnet);
+        const uint64_t rec_limit = rec_state.GetBlockSizeLimit();
+        LOG_INFO << "[EMB-BCH] cold-start anchor DRY RUN (record-only, VM300 untouched):"
+                 << " height=" << Rec::height
+                 << " hash=" << Rec::hash
+                 << " chainwork=" << Rec::chainwork
+                 << " time=" << Rec::time
+                 << " -> ABLA limit=" << rec_limit
+                 << " (control=" << rec_state.GetControlBlockSize()
+                 << " elastic=" << rec_state.GetElasticBufferSize() << ").";
+        if (Rec::is_floor()) {
+            LOG_INFO << "[EMB-BCH] recorded ABLA control state == 32 MB floor;"
+                     << " pinning is a no-op vs cold-start floor (provenance only)."
+                     << " apply_bchn_anchor() remains operator-gated.";
+        } else {
+            LOG_WARNING << "[EMB-BCH] recorded ABLA control state is ABOVE floor"
+                        << " (limit=" << rec_limit << "); apply_bchn_anchor("
+                        << Rec::height << ", state) would RAISE the cold-start"
+                        << " budget. Operator gate required before pinning.";
+        }
     }
 
     // Accessors for the CoinNode seam cluster (embedded-primary + RPC fallback)
