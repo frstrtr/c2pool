@@ -30,6 +30,7 @@
 #include "mempool.hpp"
 #include "transaction.hpp"
 #include "block.hpp"
+#include "merkle.hpp"               // shared SHA256d tx-merkle (also used by p2p_node full-block accept)
 #include "rpc_data.hpp"
 #include "../coinbase_commitment.hpp"   // s19 seam (commitment built downstream)
 #include "abla.hpp"                       // s2: ABLA block-size limit (CHIP-2023-01)
@@ -102,29 +103,7 @@ inline uint64_t get_block_subsidy(uint32_t height) {
     return INITIAL_SUBSIDY >> halvings;
 }
 
-// ─── Merkle Tree (SHA256d, BCH == BTC) ───────────────────────────────────────
-
-inline uint256 merkle_hash_pair(const uint256& left, const uint256& right) {
-    auto sl = std::span<const uint8_t>(left.data(),  32);
-    auto sr = std::span<const uint8_t>(right.data(), 32);
-    return Hash(sl, sr);
-}
-
-/// Merkle root over txids (SHA256d pairwise, last element duplicated for odd
-/// counts). Identical algorithm to BTC -- BCH did not change the merkle rule.
-inline uint256 compute_merkle_root(std::vector<uint256> hashes) {
-    if (hashes.empty()) return uint256::ZERO;
-    while (hashes.size() > 1) {
-        if (hashes.size() & 1u)
-            hashes.push_back(hashes.back());
-        std::vector<uint256> next;
-        next.reserve(hashes.size() / 2);
-        for (size_t i = 0; i < hashes.size(); i += 2)
-            next.push_back(merkle_hash_pair(hashes[i], hashes[i + 1]));
-        hashes = std::move(next);
-    }
-    return hashes[0];
-}
+// ─── Merkle Tree → moved to merkle.hpp (shared producer/consumer) ──────────
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
