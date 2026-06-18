@@ -237,3 +237,96 @@ TEST(HeaderChainValidate, IngestGateEnforcesDigiShieldNextTarget)
     EXPECT_EQ(hc.validate_and_append({SHA256D, 1090, 1}),
               IngestResult::ACCEPTED_CONTINUITY);
 }
+
+
+// ---------------------------------------------------------------------------
+// 256-BIT BOUNDARY (M3 §7b — arith_uint256 swap). Proves, not assumes, that
+// the DigiShield damped multiply runs at TRUE 256-bit width: a uint64/__int128
+// proxy and the full-width path DIVERGE once avg_target leaves the 64-bit range
+// or the product overflows 256 bits near pow_limit. mul_div_u256 reproduces
+// arith_uint256 multiply-then-divide with 256-bit overflow truncation, which is
+// CONSENSUS behaviour in DigiByte Core CalculateNextWorkRequired.
+// ---------------------------------------------------------------------------
+#include <impl/dgb/coin/dgb_arith256.hpp>
+using dgb::coin::u256;
+using dgb::coin::mul_div_u256;
+
+static constexpr uint64_t BIT63 = 0x8000000000000000ull; // 2^63
+
+TEST(DigiShield256, Uint64RangeIsBitIdenticalToProxy)
+{
+    // For every avg in 64-bit range the 256-bit path equals the old __int128
+    // proxy (a*m)/d exactly — this is the no-regression guard for the swap.
+    const uint64_t cases[][3] = {
+        {1000, 60,  60},   // nominal     -> 1000
+        {1000, 90,  60},   // ceiling rail-> 1500
+        {1000, 45,  60},   // floor rail  -> 750
+        {4096, 70,  80},   // window-1 7/8-> 3584
+        {999999999ull, 90, 60},
+    };
+    for (auto& c : cases) {
+        const u256 r = mul_div_u256(u256::from_u64(c[0]), c[1], c[2]);
+        ASSERT_TRUE(r.fits_u64());
+        const unsigned __int128 proxy =
+            ((unsigned __int128)c[0] * c[1]) / c[2];
+        EXPECT_EQ(r.low64(), (uint64_t)proxy);
+    }
+}
+
+TEST(DigiShield256, FullWidthAvgDivergesFromUint64Proxy)
+{
+    // avg_target = 2^64 (limb[1]=1, limb[0]=0): a value the uint64 proxy CANNOT
+    // hold — it sees only low64()==0. Full width: 2^64 * 3/2 = 3*2^63.
+    u256 avg; avg.limb[1] = 1; avg.limb[0] = 0;        // == 2^64
+    const u256 full = mul_div_u256(avg, 3, 2);
+
+    // Full-width result carries the high limb: 3*2^63 = 2^64 + 2^63.
+    EXPECT_EQ(full.limb[1], 1u);
+    EXPECT_EQ(full.limb[0], BIT63);
+    EXPECT_FALSE(full.fits_u64());
+
+    // The proxy, fed the truncated low64()==0, would compute 0 -> divergence.
+    const u256 proxy = mul_div_u256(u256::from_u64(avg.low64()), 3, 2);
+    EXPECT_TRUE(proxy.is_zero());
+    EXPECT_FALSE(full == proxy);
+}
+
+TEST(DigiShield256, MultiplyTruncatesAt256BitsLikeArithUint256)
+{
+    // avg = 2^255 (top bit of the top limb). *4 = 2^257 -> wraps to 0 mod 2^256.
+    // A wider/overflow-safe intermediate would yield 2^257 (non-zero); the
+    // 256-bit consensus path MUST truncate to 0.
+    u256 avg; avg.limb[3] = BIT63;                      // == 2^255
+    EXPECT_TRUE(mul_div_u256(avg, 4, 1).is_zero());
+
+    // *3 = 2^256 + 2^255 -> truncates back to 2^255.
+    const u256 wrap = mul_div_u256(avg, 3, 1);
+    EXPECT_EQ(wrap.limb[3], BIT63);
+    EXPECT_EQ(wrap.limb[0], 0u);
+    EXPECT_EQ(wrap.limb[1], 0u);
+    EXPECT_EQ(wrap.limb[2], 0u);
+}
+
+TEST(DigiShield256, NearPowLimitCeilingRailRetargetsAtFullWidth)
+{
+    // A near-pow_limit avg at the ceiling rail (damped 90, nominal 60 -> *3/2).
+    // avg = 2^224 (representative DGB Scrypt pow_limit magnitude); *3/2 stays in
+    // range here (no wrap) but lives ENTIRELY in the high limbs the proxy drops.
+    u256 avg; avg.limb[3] = 0x0000000100000000ull;     // 2^224
+    const u256 full = mul_div_u256(avg, 90, 60);        // *3/2
+    // 2^224 * 3/2 = 3 * 2^223 = 2^224 + 2^223; high limb 0x0000000180000000.
+    EXPECT_EQ(full.limb[3], 0x0000000180000000ull);
+    EXPECT_FALSE(full.fits_u64());
+    // Proxy on low64()==0 collapses to 0 — the rail would be computed wrong.
+    EXPECT_TRUE(mul_div_u256(u256::from_u64(avg.low64()), 90, 60).is_zero());
+}
+
+TEST(DigiShield256, ComparePicksTheLargerFullWidthValue)
+{
+    // pow_limit cap uses u256 compare; verify ordering across the limb boundary.
+    u256 big;   big.limb[3] = 1;                         // 2^192
+    u256 small = u256::from_u64(UINT64_MAX);             // 2^64 - 1
+    EXPECT_TRUE(small < big);
+    EXPECT_TRUE(big > small);
+    EXPECT_FALSE(big < small);
+}

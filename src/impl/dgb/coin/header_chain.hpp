@@ -44,6 +44,7 @@
 #include <functional>
 #include <vector>
 
+#include <impl/dgb/coin/dgb_arith256.hpp>
 #include <impl/dgb/coin/dgb_block_algo.hpp>
 #include <impl/dgb/coin/dgb_digishield.hpp>
 
@@ -54,7 +55,9 @@ using ::dgb::coin::HeaderDisposition;
 using ::dgb::coin::dgb_header_disposition;
 using ::dgb::coin::header_credits_work;
 using ::dgb::coin::is_scrypt_header;
+using ::dgb::coin::mul_div_u256;
 using ::dgb::coin::scrypt_window_ancestors;
+using ::dgb::coin::u256;
 
 // Minimal header sample the Scrypt-only retarget body consumes. The embedded
 // DigiByte Core port (M3+) carries the full CBlockHeader; the validate() +
@@ -114,10 +117,15 @@ struct DigiShieldParams {
 // actual_timespan goes sharply negative (out-of-order block times); the upper
 // rail trips once actual_timespan exceeds ~5x nominal.
 //
-// `target` here is the fixed-width uint64 proxy the standalone CI guard uses;
-// the embedded-daemon port swaps arith_uint256 in with the SAME field shape, so
-// this multiply/clamp shape is unchanged when the real 256-bit width lands. The
-// intermediate uses __int128 so avg_target * damped cannot overflow the proxy.
+// The damped-multiply intermediate runs at TRUE 256-bit width via mul_div_u256
+// (coin/dgb_arith256.hpp): arith_uint256 multiply-then-divide with 256-bit
+// overflow truncation -- the consensus behaviour DigiByte Core exhibits near
+// pow_limit, which an __int128 proxy could NOT reproduce (it would compute a
+// wider, divergent next target). `target` here is still the uint64 field proxy
+// the standalone CI guard uses; for any uint64-range avg_target the 256-bit path
+// is bit-identical to the prior intermediate, so existing vectors are unchanged.
+// The embedded-daemon port swaps real arith_uint256 into the field shape with
+// this exact multiply/clamp ordering.
 //
 // Returns 0 when the window carries no Scrypt samples -- the caller MUST keep
 // the prior target rather than retarget off an empty window (early/genesis).
@@ -138,19 +146,22 @@ inline uint64_t digishield_next_target(const RetargetWindow& rw,
     if (damped < floor_ts) damped = floor_ts;
     if (damped > ceil_ts)  damped = ceil_ts;
 
-    // bnNew = avg_target * damped / nominal, __int128 to avoid proxy overflow.
-    // damped is strictly positive after the clamp (floor_ts > 0 for nominal>0).
-    unsigned __int128 bn_new =
-        (static_cast<unsigned __int128>(rw.avg_target) *
-         static_cast<unsigned __int128>(static_cast<uint64_t>(damped)))
-        / static_cast<unsigned __int128>(static_cast<uint64_t>(nominal));
+    // bnNew = avg_target * damped / nominal at full 256-bit width. damped is
+    // strictly positive after the clamp (floor_ts > 0 for nominal > 0). The
+    // multiply truncates at 256 bits exactly as arith_uint256 does, so a target
+    // near pow_limit retargets to the SAME value DigiByte Core computes.
+    const u256 bn_new = mul_div_u256(u256::from_u64(rw.avg_target),
+                                     static_cast<uint64_t>(damped),
+                                     static_cast<uint64_t>(nominal));
 
     // Difficulty floor: never relax past the network's easiest target.
     if (params.pow_limit != 0 &&
-        bn_new > static_cast<unsigned __int128>(params.pow_limit))
+        bn_new > u256::from_u64(params.pow_limit))
         return params.pow_limit;
 
-    return static_cast<uint64_t>(bn_new);
+    // uint64 field proxy: a uint64-range avg keeps bn_new within 64 bits, so
+    // low64() is exact (the embedded port returns the full arith_uint256).
+    return bn_new.low64();
 }
 
 // Work-neutral header chain with a Scrypt-only DigiShield retarget body.
