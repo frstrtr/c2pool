@@ -125,6 +125,8 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   linux-asan:
     name: Linux x86_64 (AsAN+UBSan)
+    # dash bring-up slices may opt out of sanitizers via dash-skip-sanitizers; KEEP for consensus/payout slices (default = on)
+    if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-skip-sanitizers')) }}
     runs-on: ubuntu-24.04
     continue-on-error: true
     steps:
@@ -369,6 +371,8 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   macos:
     name: macOS ${{ matrix.arch }}
+    # dash-slice campaign: skip macOS for PRs carrying the dash-linux-only label (re-enabled at block-viable gate, ~07-01)
+    if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-linux-only')) }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -449,6 +453,8 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   windows:
     name: Windows x86_64
+    # dash-slice campaign: skip Windows for PRs carrying the dash-linux-only label (re-enabled at block-viable gate, ~07-01)
+    if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-linux-only')) }}
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v6
