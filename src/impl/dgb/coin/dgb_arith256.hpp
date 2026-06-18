@@ -45,6 +45,26 @@ struct u256 {
 
     static u256 from_u64(uint64_t v) { u256 r; r.limb[0] = v; return r; }
 
+    // Construct from a 32-byte little-endian digest (the scrypt_1024_1_1_256
+    // PoW output): limb[0] holds the least-significant 8 bytes. Mirrors bitcoin
+    // UintToArith256 -- the Scrypt PoW hash is read little-endian for the
+    // hash <= target comparison, so the digest the embedded DigiByte Core port
+    // produces drops straight into HeaderSample::pow_hash at the ingest boundary
+    // in the SAME byte order the 256-bit satisfaction gate already compares.
+    // Depends only on <cstdint> / builtin unsigned char, so the standalone
+    // header guard keeps linking with NO btclibs scrypt dependency; the scrypt
+    // CALL itself lands at the ingest boundary in a following slice.
+    static u256 from_le_bytes(const unsigned char b[32]) {
+        u256 r;
+        for (int i = 0; i < 4; ++i) {
+            uint64_t v = 0;
+            for (int j = 0; j < 8; ++j)
+                v |= (uint64_t)b[i * 8 + j] << (8 * j);
+            r.limb[i] = v;
+        }
+        return r;
+    }
+
     bool     fits_u64() const { return limb[1] == 0 && limb[2] == 0 && limb[3] == 0; }
     bool     is_zero()  const { return limb[0] == 0 && limb[1] == 0 && limb[2] == 0 && limb[3] == 0; }
     uint64_t low64()    const { return limb[0]; }
