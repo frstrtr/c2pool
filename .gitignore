@@ -215,3 +215,4 @@ external/**/depends/**/docs/
 
 # Release artifact staging area (built binaries, not source)
 release-staging/
+/.c2pool-bch-regtest/
