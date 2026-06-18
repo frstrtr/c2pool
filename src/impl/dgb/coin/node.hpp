@@ -64,18 +64,25 @@ class Node : public dgb::interfaces::Node
 
     config_t* m_config = nullptr;
 
+    // Real io_context for the M3 NodeRPC transport (mirrors btc node.hpp).
+    // rpc.hpp brings boost::asio in transitively; no extra include needed.
+    boost::asio::io_context* m_context = nullptr;
+
     std::unique_ptr<NodeRPC> m_rpc;
 
 public:
-    Node(auto* /*context*/, auto* config) : m_config(config)
+    Node(auto* context, auto* config) : m_config(config), m_context(context)
     {
     }
 
     void run()
     {
-        // Stub NodeRPC: constructed so has-rpc presence wiring can be
-        // exercised, but no transport connect until M3.
-        m_rpc = std::make_unique<NodeRPC>(this);
+        // M3: real NodeRPC transport (external-daemon FALLBACK path that V36
+        // mandates persist alongside the embedded daemon). Mirrors btc
+        // node.hpp; testnet drives the chain-identity genesis probe in
+        // NodeRPC::check(). connect() (transport bring-up) is driven by the
+        // pool-layer seam once an RPC endpoint is configured.
+        m_rpc = std::make_unique<NodeRPC>(m_context, this, m_config->m_testnet);
     }
 
     NodeRPC* rpc() { return m_rpc.get(); }
