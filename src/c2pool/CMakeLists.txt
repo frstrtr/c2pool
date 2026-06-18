@@ -206,7 +206,19 @@ target_link_libraries(c2pool-dgb
 # P2P IBD run-loop (coin/p2p_node.cpp read-only sync vs VM300 .110:8333) and its
 # live numbers are the NEXT --ibd slice; kept separate so this lands additive.
 # Per-coin isolation held: src/impl/bch only, no shared-base/core edits.
-add_executable(c2pool-bch main_bch.cpp)
+add_executable(c2pool-bch
+    main_bch.cpp
+    # BCH coin impl TUs (M3 deferred impl_bch reg, now forced by --ibd harness
+    # needing to LINK bch:: symbols). Compiled directly into the target, exactly
+    # as the bch tests add coin/transaction.cpp; per-coin isolation holds.
+    ${CMAKE_SOURCE_DIR}/src/impl/bch/config_coin.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bch/config_pool.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/transaction.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/p2p_connection.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/p2p_node.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/coin_node.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/rpc.cpp
+)
 target_compile_definitions(c2pool-bch PRIVATE C2POOL_VERSION="${C2POOL_GIT_VERSION}")
 # --ibd RUN-LOOP slice (integrator 2026-06-18): the read-only headers-first IBD
 # harness stands up EmbeddedDaemon over its P2P front-end (NodeP2P/HeaderChain/
@@ -218,7 +230,13 @@ target_compile_definitions(c2pool-bch PRIVATE C2POOL_VERSION="${C2POOL_GIT_VERSI
 # so it links all its objects (incl. web_server/stratum) — those symbols already
 # resolve in the full c2pool target; we depend on the same set here.
 target_link_libraries(c2pool-bch
-    core
+    # OBJECT-lib SCC direct-naming (#22/#39): core is monolithic; its stratum_server/
+    # web_server objects reference the whole pool/payout/merged/hashrate/storage/
+    # difficulty SCC, so every core consumer names the full set. Identical to the
+    # bch test link set; merged is the shared core SCC (BCH never invokes it), NOT
+    # BCH-specific merged-mining logic -> per-coin isolation holds.
+    core pool sharechain
+    c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage c2pool_difficulty
     btclibs
     yaml-cpp::yaml-cpp
     nlohmann_json::nlohmann_json

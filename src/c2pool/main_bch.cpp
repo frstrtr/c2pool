@@ -41,6 +41,7 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <vector>
 
 #ifndef C2POOL_VERSION
 #define C2POOL_VERSION "dev"
@@ -123,6 +124,15 @@ int run_ibd(const std::string& host, uint16_t port, bool testnet, uint32_t max_s
     cfg.m_testnet = testnet;
     const NetService peer(host, port);
     cfg.coin()->m_p2p.address = peer;
+    // BCH P2P network magic (pchMessageStart). The harness builds config WITHOUT
+    // a YAML load, so m_p2p.prefix is empty by default -> core::Socket frames the
+    // version message with a zero-length magic and BCHN drops the peer with EOF
+    // right after connect (handshake never completes). Set it by hand, the only
+    // other field the IBD harness touches beyond address. Values per BCHN
+    // chainparams.cpp: mainnet e3e1f3e8, testnet3 f4e5f3f4.
+    cfg.coin()->m_p2p.prefix = testnet
+        ? std::vector<std::byte>{ std::byte{0xf4}, std::byte{0xe5}, std::byte{0xf3}, std::byte{0xf4} }
+        : std::vector<std::byte>{ std::byte{0xe3}, std::byte{0xe1}, std::byte{0xf3}, std::byte{0xe8} };
 
     EmbeddedDaemon<bch::Config> daemon(&ctx, &cfg, /*anchor_height=*/0);
     daemon.start_ibd(peer);
