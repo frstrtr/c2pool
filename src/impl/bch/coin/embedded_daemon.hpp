@@ -103,6 +103,40 @@ public:
                  << " (cold-start anchor pinned @" << BchnAnchorRecord::height << ").";
     }
 
+    /// READ-ONLY IBD evidence harness entry (drives the --ibd run-loop in
+    /// main_bch.cpp). Brings up ONLY the network-free chain + the P2P front-end
+    /// pointed at a single BCHN peer (VM300 bchn-bch .110:8333), with the
+    /// headers-first ingest subscription (wire_chain_ingest) live, so a REAL
+    /// sync advances m_chain past its init() checkpoint and the block-download
+    /// window accrues the in_flight / reissue / false_evict counters the harness
+    /// reports. Deliberately does NOT call init_rpc(): this is a read-only
+    /// header/block pull for evidence, NOT the production daemon -- run() still
+    /// owns the external BCHN-RPC fallback (external_fallback invariant intact).
+    /// A P2P peer connection issues NO qm/control op, so VM300 stays read-only.
+    /// p2pool-merged-v36 surface: NONE (local SPV header state only).
+    void start_ibd(const NetService& peer) {
+        m_chain.init();               // genesis/checkpoint origin (network-free)
+        assemble();                   // ABLA loop + CoinNode seam (network-free)
+        wire_chain_ingest();          // new_headers --> HeaderChain (height advance)
+        pin_cold_start_anchor();      // operator-approved floor-equivalent anchor
+        m_node.start_p2p(peer);       // read-only P2P connect to the BCHN peer
+    }
+
+    /// True once the BCHN peer handshake (version/verack) has completed, so the
+    /// first locator-anchored getheaders can be issued.
+    bool ibd_handshake_ready() {
+        return m_node.has_p2p() && m_node.p2p()->is_handshake_complete();
+    }
+
+    /// Kick the first headers-first getheaders from our current locator
+    /// (genesis/checkpoint). The peer streams its chain forward and the
+    /// p2p_node ContinueSync follow-up self-drives the rest of IBD; block
+    /// bodies backfill through the bounded download window. Caller issues this
+    /// once, after ibd_handshake_ready() turns true.
+    void ibd_kick_sync() {
+        m_node.send_getheaders(70016, m_chain.get_locator(), uint256::ZERO);
+    }
+
     /// NETWORK-FREE assembly of the in-process daemon graph: close the ABLA
     /// size loop (full_block --> feed --> tracker --> EmbeddedCoinNode budget)
     /// and build the CoinNode seam (core::coin::ICoinNode) embedded-primary.

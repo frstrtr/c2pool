@@ -208,6 +208,22 @@ target_link_libraries(c2pool-dgb
 # Per-coin isolation held: src/impl/bch only, no shared-base/core edits.
 add_executable(c2pool-bch main_bch.cpp)
 target_compile_definitions(c2pool-bch PRIVATE C2POOL_VERSION="${C2POOL_GIT_VERSION}")
+# --ibd RUN-LOOP slice (integrator 2026-06-18): the read-only headers-first IBD
+# harness stands up EmbeddedDaemon over its P2P front-end (NodeP2P/HeaderChain/
+# Timer), which pulls the core OBJECT-lib + Boost.Asio. Adding ONLY these link
+# deps (core + btclibs + yaml-cpp + json + Boost), matching the c2pool-dgb tier,
+# is SAFE-ADDITIVE on this target (integrator explicitly cleared it): no shared-
+# base/core SOURCE edit, src/impl/bch headers only, per-coin isolation held. The
+# --selftest path remains the std-only ABLA budget driver. core is an OBJECT lib
+# so it links all its objects (incl. web_server/stratum) — those symbols already
+# resolve in the full c2pool target; we depend on the same set here.
+target_link_libraries(c2pool-bch
+    core
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+)
 
 # Windows: Boost.Asio requires Winsock libraries; /bigobj for large translation units
 if(WIN32)
