@@ -141,6 +141,11 @@ public:
         // Re-queue the stalled hashes ahead of not-yet-requested ones so a stuck
         // block is retried before fresh tip blocks.
         for (const auto& h : evicted) m_queue.push_front(h);
+        // Cumulative re-issue tally: every evicted hash is requeued and
+        // re-issued by the next drain, so eviction count == re-issue count.
+        // Surfaced for the read-only IBD writeup (real re-issue metric, not
+        // inferred) and for peer-demotion heuristics on a noisy single peer.
+        m_reissue_count += evicted.size();
         return evicted;
     }
 
@@ -151,12 +156,16 @@ public:
     bool has_capacity() const { return m_in_flight.size() < m_max_in_flight && !m_queue.empty(); }
     /// True when nothing is queued and nothing is outstanding (IBD drained).
     bool idle() const { return m_queue.empty() && m_in_flight.empty(); }
+    /// Cumulative count of stalled in-flight requests re-issued over the
+    /// window lifetime (== total expire() evictions). Read-only IBD evidence.
+    std::size_t reissue_count() const { return m_reissue_count; }
 
 private:
     std::size_t m_max_in_flight;
     std::deque<uint256> m_queue;                            // pending, chain order
     std::unordered_map<uint256, uint64_t, HashHasher> m_in_flight; // hash -> tick getdata issued
     std::unordered_set<uint256, HashHasher> m_known;        // queued ∪ inflight ∪ received
+    std::size_t m_reissue_count = 0;                       // lifetime re-issues (stall-driven)
 };
 
 } // namespace bch::coin::block_download

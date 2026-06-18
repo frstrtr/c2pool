@@ -147,6 +147,7 @@ int main()
         // window freed, and they go back to the FRONT of the queue.
         auto evicted = w.expire(/*now=*/110, /*timeout=*/10);
         assert(evicted.size() == 2);
+        assert(w.reissue_count() == 2); // both stalls counted as re-issues
         assert(w.in_flight() == 0);
         assert(w.queued() == 4);                    // H0,H1 re-queued ahead of H2,H3
 
@@ -195,6 +196,9 @@ int main()
         // proving the issue tick was refreshed rather than carried over.
         assert(w.expire(/*now=*/77, /*timeout=*/60).empty());
         assert(w.in_flight() == 1);
+        // The one stall produced exactly one re-issue; a non-expiring tick
+        // does not inflate the tally (this is the IBD writeup re-issue metric).
+        assert(w.reissue_count() == 1);
     }
 
     std::cout << "bch block_download window: ALL PASS\n";
