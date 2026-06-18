@@ -14,6 +14,7 @@ if(BUILD_TESTING)
         abla_block_feed_test
         abla_block_feed_gap_test
         header_sync_test          # M5: headers-first IBD continuation policy (pure)
+        header_sync_progress_test # M5: sync-to-peer-tip convergence + steady-state-follow soak (pure)
         block_download_test       # M5: windowed headers-first block download (pure)
         genesis_conformance_test  # M5: genesis-hash pin vs BCHN v29.0.0 chainparams (pure)
         abla_growth_soak_test     # M5: dynamic ABLA budget-GROWTH proof above 32 MB floor (pure)
