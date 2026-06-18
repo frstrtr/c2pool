@@ -13,6 +13,7 @@ if(BUILD_TESTING)
         abla_floor_invariant_test
         abla_block_feed_test
         abla_block_feed_gap_test
+        header_sync_test          # M5: headers-first IBD continuation policy (pure)
     )
     foreach(t IN LISTS BCH_ABLA_TESTS)
         add_executable(bch_${t} ${t}.cpp)

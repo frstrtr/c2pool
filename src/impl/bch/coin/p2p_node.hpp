@@ -49,6 +49,7 @@
 #include "compact_blocks.hpp"
 #include "mempool.hpp"
 #include "merkle.hpp"
+#include "header_sync.hpp"
 
 #include <memory>
 
@@ -699,19 +700,43 @@ private:
         if (!vheaders.empty()) {
             m_coin->new_headers.happened(vheaders);
 
-            // BIP 130: when receiving a small headers batch (new block
-            // announcement), request the full block via getdata.
-            // BCH: plain MSG_BLOCK (0x02) — no witness-bearing block inv.
-            if (vheaders.size() <= 3 && m_peer) {
-                for (auto& hdr : vheaders) {
-                    auto packed = pack(hdr);
-                    auto bhash = Hash(packed.get_span());
-                    auto getdata_msg = message_getdata::make_raw(
-                        {inventory_type(inventory_type::block, bhash)});
-                    m_peer->write(getdata_msg);
-                    LOG_INFO << "[" << m_chain_label << "] Requesting full block "
-                             << bhash.GetHex().substr(0, 16) << "...";
+            // Headers-first follow-up policy (header_sync.hpp, PURE + tested):
+            //   ContinueSync  -- maximal IBD batch, peer has more -> getheaders
+            //   RequestBlocks -- BIP130 tip announce (small batch)  -> getdata
+            //   Idle          -- caught up / nothing to do
+            using header_sync::Followup;
+            switch (header_sync::classify_headers_batch(vheaders.size())) {
+            case Followup::ContinueSync:
+                if (m_peer) {
+                    // Anchor the next locator at the last header we just learned
+                    // so the peer streams the next batch forward to its tip.
+                    auto last_packed = pack(vheaders.back());
+                    auto last_hash = Hash(last_packed.get_span());
+                    send_getheaders(m_peer_version ? m_peer_version : 1,
+                                    {last_hash}, uint256::ZERO);
+                    LOG_INFO << "[" << m_chain_label << "] IBD: got "
+                             << vheaders.size() << " headers, continuing from "
+                             << last_hash.GetHex().substr(0, 16) << "...";
                 }
+                break;
+            case Followup::RequestBlocks:
+                // BIP 130 header-first block announcement: request the full
+                // block(s) via getdata. BCH: plain MSG_BLOCK (0x02) -- no
+                // witness-bearing block inv.
+                if (m_peer) {
+                    for (auto& hdr : vheaders) {
+                        auto packed = pack(hdr);
+                        auto bhash = Hash(packed.get_span());
+                        auto getdata_msg = message_getdata::make_raw(
+                            {inventory_type(inventory_type::block, bhash)});
+                        m_peer->write(getdata_msg);
+                        LOG_INFO << "[" << m_chain_label << "] Requesting full block "
+                                 << bhash.GetHex().substr(0, 16) << "...";
+                    }
+                }
+                break;
+            case Followup::Idle:
+                break;
             }
         }
     }
