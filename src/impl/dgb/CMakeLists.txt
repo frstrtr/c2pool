@@ -17,8 +17,23 @@
 # slice under daemon/. Top-level add_subdirectory(src/impl/dgb) registration
 # follows the OBJECT-lib convention PR; held ~2-3 heartbeats, not raced here.
 if(COIN_DGB)
-  message(STATUS "c2pool: DGB Scrypt-only coin module enabled (skeleton)")
+  message(STATUS "c2pool: DGB Scrypt-only coin module enabled")
   add_subdirectory(coin)
   # add_subdirectory(daemon)
-  # add_subdirectory(test)
+  add_subdirectory(test)
+
+  # dgb -- DGB Scrypt pool-layer OBJECT lib. Mirrors the ltc OBJECT lib
+  # (src/impl/ltc/CMakeLists.txt): compiles the real NodeImpl translation unit
+  # (node.cpp + protocol handlers) so share_tracker.hpp / share_check.hpp are
+  # pulled into a compiled TU. Links the shared core / pool / sharechain base
+  # plus dgb_coin (embedded P2P+mempool) and c2pool_storage (LevelDB sharechain).
+  add_library(dgb OBJECT
+      config_coin.hpp config_coin.cpp config_pool.hpp config_pool.cpp
+      node.hpp node.cpp
+      peer.hpp
+      protocol_actual.cpp protocol_legacy.cpp
+      messages.hpp
+      share_types.hpp share.hpp
+  )
+  target_link_libraries(dgb core pool sharechain dgb_coin btclibs c2pool_storage ${SECP256K1_LIBRARIES})
 endif()
