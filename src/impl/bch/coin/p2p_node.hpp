@@ -50,6 +50,7 @@
 #include "mempool.hpp"
 #include "merkle.hpp"
 #include "header_sync.hpp"
+#include "block_download.hpp"
 
 #include <memory>
 
@@ -129,6 +130,10 @@ private:
     uint256   m_sent_cmpct_hash;
     // External mempool for compact block tx matching
     Mempool* m_mempool{nullptr};
+    // Headers-first windowed block download (cold-start IBD). Bounds outstanding
+    // getdata(MSG_BLOCK) so the synced header stream is pulled as block bodies at
+    // the peer's pace instead of stalling after header sync. See block_download.hpp.
+    block_download::BlockDownloadWindow m_block_dl;
 
     // Callbacks for broadcaster integration
     using AddrCallback = std::function<void(const std::vector<NetService>&)>;
@@ -345,6 +350,24 @@ public:
             auto msg = message_getdata::make_raw(
                 {inventory_type(inventory_type::block, block_hash)});
             m_peer->write(msg);
+        }
+    }
+
+    /// Drain the IBD block-download window: issue getdata(MSG_BLOCK) for every
+    /// hash the window releases (bounded by MAX_BLOCKS_IN_FLIGHT). Called after
+    /// enqueuing a synced headers batch and again on each block arrival to top
+    /// the window back up. No-op when the window is full or the queue is empty.
+    void drain_block_window()
+    {
+        if (!m_peer) return;
+        for (const auto& bhash : m_block_dl.next_requests()) {
+            auto getdata_msg = message_getdata::make_raw(
+                {inventory_type(inventory_type::block, bhash)});
+            m_peer->write(getdata_msg);
+            LOG_DEBUG_COIND << "[" << m_chain_label << "] IBD getdata block "
+                            << bhash.GetHex().substr(0, 16) << "... (in flight "
+                            << m_block_dl.in_flight() << ", queued "
+                            << m_block_dl.queued() << ")";
         }
     }
 
@@ -678,6 +701,11 @@ private:
                  << blockhash.GetHex().substr(0, 16) << "..."
                  << " txs=" << block.m_txs.size();
         emit_full_block(block, blockhash);
+
+        // IBD window: this block freed a slot (if it was one we requested) --
+        // top the window back up so the next queued block bodies stream in.
+        m_block_dl.on_block_received(blockhash);
+        drain_block_window();
     }
 
     ADD_P2P_HANDLER(headers)
@@ -717,6 +745,20 @@ private:
                     LOG_INFO << "[" << m_chain_label << "] IBD: got "
                              << vheaders.size() << " headers, continuing from "
                              << last_hash.GetHex().substr(0, 16) << "...";
+
+                    // Headers-first BLOCK download: queue this batch's blocks and
+                    // pull them through the bounded in-flight window. Without this
+                    // IBD walked the header chain to the tip but never downloaded
+                    // a single block body (ABLA size feed / block-connector need
+                    // real block data). block_download.hpp dedupes + bounds.
+                    std::vector<uint256> batch_hashes;
+                    batch_hashes.reserve(vheaders.size());
+                    for (auto& hdr : vheaders) {
+                        auto p = pack(hdr);
+                        batch_hashes.push_back(Hash(p.get_span()));
+                    }
+                    m_block_dl.enqueue(batch_hashes);
+                    drain_block_window();
                 }
                 break;
             case Followup::RequestBlocks:
