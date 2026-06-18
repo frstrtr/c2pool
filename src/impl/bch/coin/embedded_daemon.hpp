@@ -77,7 +77,8 @@ public:
     /// daemon (owned by the binary entrypoint, same contract as coin::Node).
     EmbeddedDaemon(auto* context, config_t* config, uint32_t anchor_height)
         : m_config(config),
-          m_chain(),
+          m_chain(config->m_testnet ? BCHChainParams::testnet()
+                                    : BCHChainParams::mainnet()),
           m_pool(),
           m_embedded(m_chain, m_pool, config->m_testnet),
           m_node(context, config),
@@ -91,15 +92,34 @@ public:
     /// flow node --> feed --> tracker --> EmbeddedCoinNode dynamic budget, and
     /// EmbeddedCoinNode::getwork() is the live in-process work source.
     void run() {
+        m_chain.init();               // load genesis / fast-start checkpoint (network-free)
         m_node.run();                 // init_rpc(): external BCHN-RPC fallback retained
-        m_abla.wire(m_node, m_embedded);
-        // Build the CoinNode seam NOW (not in the ctor): m_node.rpc() is only
-        // live after run()/init_rpc(). Embedded work source = primary, the
-        // external BCHN-RPC = retained fallback (v36 external_fallback law).
-        m_coin_node = std::make_unique<CoinNode>(&m_embedded, m_node.rpc());
+        assemble();                   // network-free seam + ABLA wiring (see below)
         LOG_INFO << "[EMB-BCH] embedded daemon up: embedded-primary work source,"
                  << " external BCHN-RPC fallback retained, ABLA loop closed"
                  << " (cold-start floor anchor; VM300 pin pending operator).";
+    }
+
+    /// NETWORK-FREE assembly of the in-process daemon graph: close the ABLA
+    /// size loop (full_block --> feed --> tracker --> EmbeddedCoinNode budget)
+    /// and build the CoinNode seam (core::coin::ICoinNode) embedded-primary.
+    /// Split out of run() so the embedded cluster can be assembled and verified
+    /// against the REAL EmbeddedCoinNode without bringing up the external
+    /// BCHN-RPC / P2P front-end (run() = m_node.run() THEN assemble()).
+    ///
+    /// The seam binds &m_embedded (always-live, primary) + m_node.rpc() (the
+    /// external FALLBACK sink). When assemble() runs BEFORE run(), m_node.rpc()
+    /// is still null -> the seam is embedded-primary with the fallback absent,
+    /// which is the correct offline contract; run() calls assemble() AFTER
+    /// init_rpc() so production binds the live RPC fallback. Idempotent: guarded
+    /// on m_coin_node so a second call (e.g. assemble()-then-run()) is a no-op.
+    /// p2pool-merged-v36 surface: NONE -- pure local wiring, no PoW/share/
+    /// coinbase/PPLNS/WorkData-shape change.
+    void assemble() {
+        if (m_coin_node)
+            return;                   // already assembled; idempotent no-op
+        m_abla.wire(m_node, m_embedded);
+        m_coin_node = std::make_unique<CoinNode>(&m_embedded, m_node.rpc());
     }
 
     /// Apply a BCHN-pinned {height, State} captured from VM300 bchn-bch. This
