@@ -199,3 +199,41 @@ TEST(DigiShieldRetarget, ConsumesLiveScryptOnlyWindow)
     ASSERT_TRUE(rw.sufficient);
     EXPECT_EQ(digishield_next_target(rw, DigiShieldParams{225, 0}), 100u);
 }
+
+// ---------------------------------------------------------------------------
+// Ingest-path retarget gate: validate_and_append must demand the declared
+// Scrypt target EQUAL the DigiShield next-target computed over the Scrypt-only
+// window ending at the current tip (nBits-style exact consensus match). A
+// default-constructed chain leaves the gate unconfigured (target_timespan 0 ->
+// expected 0), so every test above runs unconstrained; this one configures it.
+//
+//   window depth 1, nominal 80. Window(1) over a lone Scrypt tip has
+//   actual_timespan 0 (front == back) -> damped = 80 + (0-80)/8 = 70, above the
+//   floor rail 60 -> next target = avg * 70/80 = avg * 7/8, deterministically.
+// ---------------------------------------------------------------------------
+TEST(HeaderChainValidate, IngestGateEnforcesDigiShieldNextTarget)
+{
+    HeaderChain hc(DigiShieldParams{80, 0}, /*retarget_window=*/1);
+
+    // Seed: empty window -> gate no-op, any non-zero target seeds the chain.
+    ASSERT_EQ(hc.validate_and_append({SCRYPT, 1000, 4096}),
+              IngestResult::VALIDATED_SCRYPT);
+
+    // Required next target = 4096 * 7/8 = 3584. A mismatch is consensus-invalid
+    // and must REJECT without mutating the chain (size + work unchanged).
+    const std::size_t size_before = hc.size();
+    const uint64_t    work_before = hc.cumulative_work();
+    EXPECT_EQ(hc.validate_and_append({SCRYPT, 1080, 4096}),
+              IngestResult::REJECTED);
+    EXPECT_EQ(hc.size(),            size_before);
+    EXPECT_EQ(hc.cumulative_work(), work_before);
+
+    // The exact DigiShield target is accepted and credits work.
+    EXPECT_EQ(hc.validate_and_append({SCRYPT, 1080, 3584}),
+              IngestResult::VALIDATED_SCRYPT);
+    EXPECT_GT(hc.cumulative_work(), work_before);
+
+    // Continuity headers bypass the retarget gate (work-neutral, no nBits).
+    EXPECT_EQ(hc.validate_and_append({SHA256D, 1090, 1}),
+              IngestResult::ACCEPTED_CONTINUITY);
+}

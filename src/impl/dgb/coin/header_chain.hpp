@@ -157,6 +157,17 @@ inline uint64_t digishield_next_target(const RetargetWindow& rw,
 // Append order is oldest..newest; the retarget walk reads nearest-first.
 class HeaderChain {
 public:
+    HeaderChain() = default;
+
+    // Configure the consensus retarget gate: the DigiShield params + the
+    // Scrypt-only window depth validate_and_append enforces declared targets
+    // against. Default-constructed chains leave target_timespan == 0, which
+    // makes digishield_next_target() return 0 and the gate a no-op -- the
+    // retarget-window/work-accounting tests run unconstrained, exactly as
+    // before this slice.
+    HeaderChain(DigiShieldParams ds, std::size_t retarget_window)
+        : m_ds_params(ds), m_retarget_window(retarget_window) {}
+
     // Validate one header and, unless rejected, append it to the chain.
     // Work-neutrality SSOT: cumulative work advances iff header_credits_work()
     // — the SAME predicate scrypt_window_ancestors() consults for the retarget
@@ -171,15 +182,32 @@ public:
             return IngestResult::REJECTED;
 
         case HeaderDisposition::VALIDATE_SCRYPT:
+        {
             // PoW validate path. A zero target is not a validatable Scrypt
             // header (the embedded daemon's full scrypt(header) <= target
             // check lands with the daemon port; the structural guard here is
             // that a malformed target never credits work).
             if (h.target == 0)
                 return IngestResult::REJECTED;
+
+            // Consensus retarget gate: the declared target must equal the
+            // DigiShield next-target computed over the Scrypt-only window
+            // ending at the CURRENT tip (assembled BEFORE h is appended).
+            // expected == 0 means no Scrypt ancestor is in range yet
+            // (genesis/bootstrap) or the gate is unconfigured -- no retarget
+            // constraint is enforceable, so the header passes on its
+            // structural (non-zero) target alone. nBits-style exact match
+            // mirrors Bitcoin/DigiByte consensus: the header carries the
+            // required next-work value, not merely a target it satisfies.
+            const RetargetWindow rw = next_retarget_window(m_retarget_window);
+            const uint64_t expected = digishield_next_target(rw, m_ds_params);
+            if (expected != 0 && h.target != expected)
+                return IngestResult::REJECTED;
+
             m_chain.push_back(h);
             m_cumulative_work += work_from_target(h.target);  // credited
             return IngestResult::VALIDATED_SCRYPT;
+        }
 
         case HeaderDisposition::ACCEPT_BY_CONTINUITY:
         default:
@@ -237,6 +265,8 @@ private:
         return target == 0 ? 0 : (UINT64_MAX / target);
     }
 
+    DigiShieldParams          m_ds_params{};        // retarget gate params
+    std::size_t               m_retarget_window = 0; // Scrypt window depth
     std::vector<HeaderSample> m_chain;          // oldest .. newest
     uint64_t                  m_cumulative_work = 0;
 };
