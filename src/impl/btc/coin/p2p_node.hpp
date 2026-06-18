@@ -345,9 +345,9 @@ public:
     /// Relay a pre-serialized block via P2P.
     /// Uses compact block format (BIP 152 v2) for peers that support it,
     /// falling back to full block otherwise.
-    void submit_block_raw(const std::vector<unsigned char>& block_bytes)
+    bool submit_block_raw(const std::vector<unsigned char>& block_bytes)
     {
-        if (!m_peer) return;
+        if (!m_peer) return false;
 
         if (m_peer_supports_cmpct && m_peer_cmpct_version >= 2) {
             // Deserialize the block to build a compact representation
@@ -371,7 +371,7 @@ public:
                          << blockhash.GetHex()
                          << " (" << cb.short_ids.size() << " short IDs, "
                          << cb.prefilled_txns.size() << " prefilled)";
-                return;
+                return true;
             } catch (const std::exception& e) {
                 LOG_WARNING << "[" << m_chain_label
                             << "] Compact block build failed (block_size=" << block_bytes.size()
@@ -385,18 +385,20 @@ public:
         }
 
         // Fallback: send full block
-        submit_block_full(block_bytes);
+        return submit_block_full(block_bytes);
     }
 
-    /// Send a full block message (legacy relay).
-    void submit_block_full(const std::vector<unsigned char>& block_bytes)
+    /// Send a full block message (legacy relay). Returns true iff a peer
+    /// was connected and the block bytes were written to it.
+    bool submit_block_full(const std::vector<unsigned char>& block_bytes)
     {
-        if (!m_peer) return;
+        if (!m_peer) return false;
         PackStream ps(block_bytes);
         auto rmsg = std::make_unique<RawMessage>("block", std::move(ps));
         m_peer->write(rmsg);
         LOG_INFO << "[" << m_chain_label << "] Sent full block message ("
                  << block_bytes.size() << " bytes) to " << m_target_addr.to_string();
+        return true;
     }
 
     //[x][x][x] void handle_message_version(std::shared_ptr<coind::messages::message_version> msg, CoindProtocol* protocol); //

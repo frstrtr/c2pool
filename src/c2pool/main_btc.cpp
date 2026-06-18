@@ -747,14 +747,14 @@ int main(int argc, char* argv[])
     // captures by reference so it reuses the existing B5 infrastructure
     // instead of duplicating it.
     auto stratum_submit_fn = [&coin_node, pending_mu, pending_submits]
-        (const std::vector<unsigned char>& block_bytes, uint32_t height)
+        (const std::vector<unsigned char>& block_bytes, uint32_t height) -> bool
     {
         // Compute block_hash for pending_submits tracking. BTC block_hash =
         // SHA256d of the first 80 bytes (the header).
         if (block_bytes.size() < 80) {
             LOG_WARNING << "[BTC-STRATUM-BLOCK] block bytes too short ("
                         << block_bytes.size() << " < 80) — not submitting";
-            return;
+            return false;
         }
         uint256 block_hash = Hash(std::span<const unsigned char>(block_bytes.data(), 80));
         {
@@ -765,7 +765,8 @@ int main(int argc, char* argv[])
         }
         LOG_INFO << "[BTC-SUBMIT] sending block " << block_hash.GetHex().substr(0, 16)
                  << " height=" << height << " (via stratum)";
-        coin_node.submit_block_p2p_raw(block_bytes);
+        // FALLBACK: P2P relay primary, submitblock RPC if P2P unavailable/failed.
+        return coin_node.submit_block_with_fallback(block_bytes);
     };
 
     // Construct the work source. Holds non-owning refs to chain + mempool;
