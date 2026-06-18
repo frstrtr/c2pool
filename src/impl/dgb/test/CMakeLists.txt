@@ -25,7 +25,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     # transport rpc.cpp wiring is deferred (Option-B scope). Each MUST appear
     # in BOTH this ctest registration AND the build.yml --target allowlist,
     # or it becomes a #143-style NOT_BUILT sentinel that reds master.
-    foreach(dgb_guard rpc_request_test softfork_check_test genesis_check_test algo_select_test)
+    foreach(dgb_guard rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test header_chain_test)
         add_executable(${dgb_guard} ${dgb_guard}.cpp)
         target_link_libraries(${dgb_guard} PRIVATE
             GTest::gtest_main GTest::gtest nlohmann_json::nlohmann_json)
