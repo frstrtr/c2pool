@@ -31,6 +31,7 @@
 #include <impl/dgb/share_check.hpp>
 #include <impl/dgb/params.hpp>
 #include <impl/dgb/coin/gentx_coinbase.hpp>
+#include <impl/dgb/coin/transaction.hpp>
 
 #include <core/pack.hpp>
 #include <core/hash.hpp>
@@ -259,6 +260,49 @@ TEST(DgbGentxSharePath, CoinbaseInputsAreLoadBearing)
     bumped_cb.m_coinbase.m_data.push_back(0x99);
     uint256 h2 = dgb::generate_share_transaction(bumped_cb, tracker, params, false, true);
     EXPECT_NE(h0, h2) << "coinbase script did not reach the gentx vin";
+}
+
+// --- Test 4: SSOT gentx bytes are exposed for won-block reconstruction (#82) ---
+// reconstruct_won_block needs the EXACT coinbase bytes whose txid is the merkle
+// leaf -- not just the hash. The out_gentx param surfaces them straight from the
+// SSOT assembler; they must (a) hash to the returned gentx_hash and (b)
+// deserialize into the coinbase MutableTransaction that assemble_won_block frames
+// as block tx[0], round-tripping byte-identically.
+TEST(DgbGentxSharePath, SsotGentxBytesExposedForReconstruct)
+{
+    auto params = dgb::make_coin_params(false);
+    dgb::ShareTracker tracker;
+    auto share = make_v36_share();
+
+    dgb::coin::GentxCoinbase gc;
+    uint256 gentx_hash = dgb::generate_share_transaction(
+        share, tracker, params, /*dump_diag=*/false, /*v36_active=*/true, &gc);
+
+    ASSERT_FALSE(gc.bytes.empty()) << "out_gentx not populated";
+    EXPECT_EQ(gc.txid, gentx_hash)
+        << "exposed gentx bytes do not match the returned gentx_hash";
+    auto sp = std::span<const unsigned char>(gc.bytes.data(), gc.bytes.size());
+    EXPECT_EQ(Hash(sp), gentx_hash)
+        << "double-SHA(exposed bytes) != gentx_hash (merkle leaf would mismatch)";
+
+    // Deserialize into the coinbase tx that assemble_won_block consumes.
+    dgb::coin::MutableTransaction gentx;
+    {
+        PackStream ps(gc.bytes);
+        dgb::coin::UnserializeTransaction(gentx, ps, dgb::coin::TX_NO_WITNESS);
+    }
+    // Coinbase shape: single input spending the null outpoint at 0xffffffff.
+    ASSERT_EQ(gentx.vin.size(), 1u);
+    EXPECT_TRUE(gentx.vin[0].prevout.hash.IsNull());
+    EXPECT_EQ(gentx.vin[0].prevout.index, 0xffffffffu);
+
+    // Re-serialize non-witness => byte-identical to the SSOT bytes, so the
+    // reconstructed block tx[0] is faithful and the daemon-side block hashes.
+    auto repacked = pack(dgb::coin::TX_NO_WITNESS(gentx));
+    std::vector<unsigned char> rebytes(
+        reinterpret_cast<const unsigned char*>(repacked.data()),
+        reinterpret_cast<const unsigned char*>(repacked.data()) + repacked.size());
+    EXPECT_EQ(rebytes, gc.bytes) << "coinbase tx does not round-trip the SSOT bytes";
 }
 
 } // namespace

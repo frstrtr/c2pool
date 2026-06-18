@@ -933,7 +933,7 @@ inline std::vector<unsigned char> get_share_script(const auto* obj)
 // Reference: frstrtr/p2pool-merged-v36  p2pool/data.py  generate_transaction()
 // ============================================================================
 template <typename ShareT, typename TrackerT>
-uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, const core::CoinParams& params, bool dump_diag = false, bool v36_active = false)
+uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, const core::CoinParams& params, bool dump_diag = false, bool v36_active = false, dgb::coin::GentxCoinbase* out_gentx = nullptr)
 {
     auto gst_t0 = std::chrono::steady_clock::now();
     constexpr int64_t ver = ShareT::version;
@@ -1309,6 +1309,11 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, const
     tx.write(std::span<const std::byte>(
         reinterpret_cast<const std::byte*>(_gc.bytes.data()), _gc.bytes.size()));
     auto txid = _gc.txid;
+
+    // Expose the SSOT gentx (non-witness bytes + txid) for the won-block
+    // reconstructor (#82): block tx[0] is this coinbase and gentx_hash is
+    // its merkle leaf. Default nullptr => zero change for verification callers.
+    if (out_gentx) *out_gentx = _gc;
 
     // V36 hash_link cross-check: compute prefix hash_link from our coinbase
     // and compare with the share's stored hash_link. If states differ,
