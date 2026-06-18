@@ -201,40 +201,54 @@ TEST(DigiShieldRetarget, ConsumesLiveScryptOnlyWindow)
 }
 
 // ---------------------------------------------------------------------------
-// Ingest-path retarget gate: validate_and_append must demand the declared
-// Scrypt target EQUAL the DigiShield next-target computed over the Scrypt-only
-// window ending at the current tip (nBits-style exact consensus match). A
-// default-constructed chain leaves the gate unconfigured (target_timespan 0 ->
-// expected 0), so every test above runs unconstrained; this one configures it.
+// Parent-difficulty retarget gate DEMOTED to a no-op for V36 (integrator
+// decision 2026-06-18, operator FYI'd). p2pool-merged-v36 never re-derives
+// parent difficulty -- it trusts the declared nBits and checks PoW against it.
+// DGB's live retarget is MultiShield V4 (a GLOBAL cross-algo averaging window),
+// which a Scrypt-only walk cannot reproduce -> full recompute is V37 5-algo
+// scope. So a declared Scrypt target that does NOT equal the single-algo
+// DigiShield next-target is NO LONGER rejected by the ingest path; it is
+// accepted on the daemon-independent CheckProofOfWork halves alone (pow_limit
+// floor + scrypt(header) <= target). digishield_next_target() survives as test
+// scaffolding / a reference for the V37 embedded-daemon port.
 //
 //   window depth 1, nominal 80. Window(1) over a lone Scrypt tip has
 //   actual_timespan 0 (front == back) -> damped = 80 + (0-80)/8 = 70, above the
-//   floor rail 60 -> next target = avg * 70/80 = avg * 7/8, deterministically.
+//   floor rail 60 -> reference next target = avg * 70/80 = avg * 7/8.
 // ---------------------------------------------------------------------------
-TEST(HeaderChainValidate, IngestGateEnforcesDigiShieldNextTarget)
+TEST(HeaderChainValidate, IngestRetargetGateDemotedToNoOpForV36)
 {
     HeaderChain hc(DigiShieldParams{80, 0}, /*retarget_window=*/1);
 
-    // Seed: empty window -> gate no-op, any non-zero target seeds the chain.
+    // Seed a lone Scrypt tip.
     ASSERT_EQ(hc.validate_and_append({SCRYPT, 1000, 4096}),
               IngestResult::VALIDATED_SCRYPT);
 
-    // Required next target = 4096 * 7/8 = 3584. A mismatch is consensus-invalid
-    // and must REJECT without mutating the chain (size + work unchanged).
-    const std::size_t size_before = hc.size();
-    const uint64_t    work_before = hc.cumulative_work();
-    EXPECT_EQ(hc.validate_and_append({SCRYPT, 1080, 4096}),
-              IngestResult::REJECTED);
-    EXPECT_EQ(hc.size(),            size_before);
-    EXPECT_EQ(hc.cumulative_work(), work_before);
+    // The single-algo DigiShield reference next-target over window(1) is
+    // 4096 * 7/8 = 3584 -- still computable as V37 embedded-port scaffolding,
+    // even though the ingest path no longer enforces it.
+    const RetargetWindow rw = hc.next_retarget_window(1);
+    EXPECT_EQ(digishield_next_target(rw, DigiShieldParams{80, 0}), 3584u);
 
-    // The exact DigiShield target is accepted and credits work.
-    EXPECT_EQ(hc.validate_and_append({SCRYPT, 1080, 3584}),
+    // A header whose declared target does NOT equal that reference (4096 != 3584)
+    // is ACCEPTED and credits work: V36 trusts the declared nBits rather than
+    // re-deriving and demanding an exact match.
+    const uint64_t work_before = hc.cumulative_work();
+    EXPECT_EQ(hc.validate_and_append({SCRYPT, 1080, 4096}),
               IngestResult::VALIDATED_SCRYPT);
     EXPECT_GT(hc.cumulative_work(), work_before);
 
-    // Continuity headers bypass the retarget gate (work-neutral, no nBits).
-    EXPECT_EQ(hc.validate_and_append({SHA256D, 1090, 1}),
+    // The PoW satisfaction half still fires independent of the demoted gate: a
+    // header whose scrypt(header) digest exceeds its declared target is rejected
+    // without mutating the chain.
+    HeaderSample weak{SCRYPT, 1090, 4096};
+    weak.pow_hash = 4097;
+    const std::size_t size_before = hc.size();
+    EXPECT_EQ(hc.validate_and_append(weak), IngestResult::REJECTED);
+    EXPECT_EQ(hc.size(), size_before);
+
+    // Continuity headers remain work-neutral and bypass every PoW gate.
+    EXPECT_EQ(hc.validate_and_append({SHA256D, 1100, 1}),
               IngestResult::ACCEPTED_CONTINUITY);
 }
 
@@ -256,8 +270,8 @@ TEST(HeaderChainValidate, IngestGateRejectsTargetAbovePowLimit)
               IngestResult::VALIDATED_SCRYPT);
 
     // A target ABOVE pow_limit (easier than the network minimum) must REJECT
-    // without mutating the chain -- and it must do so on the ceiling alone,
-    // before the retarget-equality gate (which here would demand 4096*7/8=3584).
+    // without mutating the chain -- the ceiling is the sole rejecter here (the
+    // single-algo retarget-equality gate is demoted to a no-op in V36).
     const std::size_t size_before = hc.size();
     const uint64_t    work_before = hc.cumulative_work();
     EXPECT_EQ(hc.validate_and_append({SCRYPT, 1080, 4097}),

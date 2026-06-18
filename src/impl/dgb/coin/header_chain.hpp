@@ -232,19 +232,26 @@ public:
             if (h.pow_hash > h.target)
                 return IngestResult::REJECTED;
 
-            // Consensus retarget gate: the declared target must equal the
-            // DigiShield next-target computed over the Scrypt-only window
-            // ending at the CURRENT tip (assembled BEFORE h is appended).
-            // expected == 0 means no Scrypt ancestor is in range yet
-            // (genesis/bootstrap) or the gate is unconfigured -- no retarget
-            // constraint is enforceable, so the header passes on its
-            // structural (non-zero) target alone. nBits-style exact match
-            // mirrors Bitcoin/DigiByte consensus: the header carries the
-            // required next-work value, not merely a target it satisfies.
-            const RetargetWindow rw = next_retarget_window(m_retarget_window);
-            const u256 expected = digishield_next_target(rw, m_ds_params);
-            if (!expected.is_zero() && !(h.target == expected))
-                return IngestResult::REJECTED;
+            // Parent-difficulty retarget gate: DEMOTED to a no-op for V36
+            // (integrator decision 2026-06-18, operator FYI'd). V36's defining
+            // constraint is p2pool-merged-v36 compatibility, and that reference
+            // NEVER re-derives parent difficulty -- it trusts the parent
+            // header's declared nBits and checks PoW against it. The two
+            // daemon-independent CheckProofOfWork halves above (pow_limit floor +
+            // scrypt(header) <= target) ARE the correct, complete V36
+            // parent-difficulty validation.
+            //
+            // Re-derivation is also structurally impossible here: DigiByte's
+            // live retarget is MultiShield V4, whose averaging window is GLOBAL
+            // across all 5 algos (Scrypt/SHA256d/Skein/Qubit/Odocrypt) with
+            // per-algo adjust + MedianTimePast deltas + /4 damping. A Scrypt-only
+            // header walk cannot reconstruct that window without full multi-algo
+            // header tracking == V37 (5-algo validation) by definition.
+            // digishield_next_target() / next_retarget_window() are retained as
+            // test scaffolding and a reference for the V37 embedded-daemon port;
+            // the ingest path deliberately does NOT call them here (an nBits-exact
+            // gate would only deepen the wrong single-algo retarget model). See
+            // V37 backlog: full V4 MultiShield recompute.
 
             m_chain.push_back(h);
             m_cumulative_work += work_from_target(h.target);  // credited
