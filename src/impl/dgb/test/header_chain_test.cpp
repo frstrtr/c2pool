@@ -440,3 +440,49 @@ TEST(HeaderChainValidate, IngestPoWSatisfactionRunsAtFullWidth)
     EXPECT_EQ(hc.validate_and_append(weak), IngestResult::REJECTED);
     EXPECT_EQ(hc.size(), 1u);             // unchanged
 }
+
+// ---------------------------------------------------------------------------
+// 256-BIT DIGEST INGEST (M3 7b) -- bytes -> field conversion. The embedded
+// DigiByte Core port produces the Scrypt PoW hash as a 32-byte little-endian
+// digest (scrypt_1024_1_1_256 output). u256::from_le_bytes is the bytes->field
+// half of dropping that digest into HeaderSample::pow_hash; the scrypt CALL
+// itself (btclibs) lands at the ingest boundary in a following slice. Pins the
+// little-endian limb mapping (limb[0] = least-significant 8 bytes, matching
+// bitcoin UintToArith256) and proves a converted digest feeds the existing
+// full-width satisfaction gate with the SAME ordering -- no low64 proxy.
+// ---------------------------------------------------------------------------
+TEST(HeaderChainValidate, ScryptDigestLittleEndianConversion)
+{
+    // Byte i = i+1, so each limb is a distinct, easily-checked LE word.
+    unsigned char d[32];
+    for (int i = 0; i < 32; ++i) d[i] = (unsigned char)(i + 1);
+    u256 h = u256::from_le_bytes(d);
+    EXPECT_EQ(h.limb[0], 0x0807060504030201ULL);
+    EXPECT_EQ(h.limb[1], 0x100f0e0d0c0b0a09ULL);
+    EXPECT_EQ(h.limb[2], 0x1817161514131211ULL);
+    EXPECT_EQ(h.limb[3], 0x201f1e1d1c1b1a19ULL);
+
+    // All-zero digest -> 0 (trivially satisfies any non-zero target).
+    unsigned char zero[32] = {0};
+    EXPECT_TRUE(u256::from_le_bytes(zero).is_zero());
+
+    // All-0xff digest -> MAX 256-bit value (every limb saturated), exceeding
+    // any real Scrypt target -> would NOT satisfy PoW.
+    unsigned char ones[32];
+    for (int i = 0; i < 32; ++i) ones[i] = 0xff;
+    u256 maxv = u256::from_le_bytes(ones);
+    for (int i = 0; i < 4; ++i) EXPECT_EQ(maxv.limb[i], 0xffffffffffffffffULL);
+
+    // Feed a converted digest through the live satisfaction gate: digest 9
+    // (low byte) vs target 2^192 + 5 -> 9 <= 2^192+5 at full width -> VALIDATED.
+    // Proves the converted value flows the SAME full-width path the field-shape
+    // swap widened, not a low64 proxy.
+    HeaderChain hc;
+    u256 target; target.limb[3] = 1; target.limb[0] = 5;
+    unsigned char nine[32] = {0}; nine[0] = 9;
+    HeaderSample s{SCRYPT, 1000};
+    s.target   = target;
+    s.pow_hash = u256::from_le_bytes(nine);
+    EXPECT_EQ(hc.validate_and_append(s), IngestResult::VALIDATED_SCRYPT);
+    EXPECT_EQ(hc.size(), 1u);
+}
