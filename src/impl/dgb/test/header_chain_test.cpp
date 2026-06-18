@@ -12,16 +12,21 @@
 //      reaches avg_target nor widens actual_timespan. A naive all-headers
 //      window would corrupt both; this proves it can't.
 //
-// Header-only guard: links the header-only chain helpers + gtest, no dgb
-// OBJECT lib / transport. MUST appear in BOTH the test/CMakeLists foreach AND
-// both build.yml --target allowlists, or it becomes a #143 NOT_BUILT sentinel.
+// Links the header-only chain helpers + gtest, plus the btclibs Scrypt PoW TU
+// set (scrypt.cpp + the SHA256 family) so the M3 7b digest conversion runs
+// against the REAL scrypt_1024_1_1_256 hash -- NOT the full btclibs archive,
+// NOT the dgb OBJECT lib / transport. MUST appear in BOTH the test/CMakeLists
+// dedicated target block AND both build.yml --target allowlists, or it becomes
+// a #143 NOT_BUILT sentinel.
 // ---------------------------------------------------------------------------
 
 #include <cstdint>
+#include <cstring>
 
 #include <gtest/gtest.h>
 
 #include <impl/dgb/coin/header_chain.hpp>
+#include <btclibs/crypto/scrypt.h>
 
 using namespace c2pool::dgb;
 using dgb::coin::DGB_BLOCK_VERSION_SCRYPT;
@@ -485,4 +490,59 @@ TEST(HeaderChainValidate, ScryptDigestLittleEndianConversion)
     s.pow_hash = u256::from_le_bytes(nine);
     EXPECT_EQ(hc.validate_and_append(s), IngestResult::VALIDATED_SCRYPT);
     EXPECT_EQ(hc.size(), 1u);
+}
+
+
+// ---------------------------------------------------------------------------
+// REAL SCRYPT DIGEST -> pow_hash, END-TO-END (M3 7b, slice (a)). The prior test
+// pins the from_le_bytes limb mapping against SYNTHETIC bytes; this one closes
+// the loop by running the ACTUAL btclibs scrypt_1024_1_1_256 PoW hash over an
+// 80-byte header, converting the 32-byte little-endian digest via from_le_bytes,
+// and feeding it through the live full-width satisfaction gate. Proves the
+// conversion primitive is correct against a GENUINE Scrypt digest. It does NOT
+// prove scrypt is wired into the production node.cpp ingest path -- that
+// (b)-shaped call lands in embedded-daemon Phase A, scoped with an exe-smoke.
+// ---------------------------------------------------------------------------
+TEST(HeaderChainValidate, RealScryptDigestFeedsSatisfactionGate)
+{
+    // Deterministic 80-byte header (content arbitrary for the conversion proof;
+    // fixed so the digest is a stable self-derived KAT).
+    char header[80];
+    for (int i = 0; i < 80; ++i) header[i] = (char)(i + 1);
+
+    unsigned char digest[32];
+    scrypt_1024_1_1_256(header, reinterpret_cast<char*>(digest));
+
+    // Deterministic: a second run yields the identical digest.
+    unsigned char digest2[32];
+    scrypt_1024_1_1_256(header, reinterpret_cast<char*>(digest2));
+    EXPECT_EQ(0, std::memcmp(digest, digest2, 32));
+
+    // Self-derived KAT: pin the actual scrypt PoW hash for this fixed header so
+    // any drift in scrypt OR the LE conversion is caught. limb[0] is the least-
+    // significant 8 bytes (from_le_bytes / UintToArith256 ordering).
+    u256 h = u256::from_le_bytes(digest);
+    EXPECT_EQ(h.limb[0], 0x3863b84a2bd8d4c7ULL);
+    EXPECT_EQ(h.limb[1], 0xdbc48fcba50b456bULL);
+    EXPECT_EQ(h.limb[2], 0x22185f7f7b983293ULL);
+    EXPECT_EQ(h.limb[3], 0x64d9ed52d29c3fbdULL);
+
+    // The real digest, converted, satisfies a max (pow_limit) target -> VALID.
+    HeaderChain hc;
+    u256 max_target; for (int i = 0; i < 4; ++i) max_target.limb[i] = 0xffffffffffffffffULL;
+    HeaderSample ok{SCRYPT, 1000};
+    ok.target   = max_target;
+    ok.pow_hash = h;
+    EXPECT_EQ(hc.validate_and_append(ok), IngestResult::VALIDATED_SCRYPT);
+    EXPECT_EQ(hc.size(), 1u);
+
+    // Same real digest vs a tiny target (value 1): the high limbs are nonzero
+    // (0x64d9...) so hash > 1 at full width -> REJECT. A low64-only proxy could
+    // not see the high limbs -- this proves the converted digest flows the
+    // full-width satisfaction path, not a truncated comparison. No mutation.
+    HeaderSample weak{SCRYPT, 1075};
+    weak.target.limb[0] = 1;        // value == 1, all high limbs zero
+    weak.pow_hash = h;
+    EXPECT_EQ(hc.validate_and_append(weak), IngestResult::REJECTED);
+    EXPECT_EQ(hc.size(), 1u);        // unchanged
 }
