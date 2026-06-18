@@ -54,6 +54,20 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_gentx_coinbase_test "" AUTO)
 
+    # --- #172 share-path gentx KAT (collapse consumption proof) ------------
+    # Proves generate_share_transaction (the verification SSOT call site #172
+    # rewired) EMITS assemble_gentx_coinbase framing for a real v36 share, via
+    # a round-trip equivalence (the op_return ref_hash is share-derived, so it
+    # cannot be pinned to a fixed oracle vector). Links the dgb OBJECT lib like
+    # dgb_share_test. MUST also be in the build.yml --target allowlist (#143).
+    add_executable(dgb_gentx_share_path_test gentx_share_path_test.cpp)
+    target_link_libraries(dgb_gentx_share_path_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_gentx_share_path_test "" AUTO)
+
     foreach(dgb_guard rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test header_chain_test)
         add_executable(${dgb_guard} ${dgb_guard}.cpp)
         target_link_libraries(${dgb_guard} PRIVATE
