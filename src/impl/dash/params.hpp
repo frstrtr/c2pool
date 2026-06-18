@@ -83,7 +83,10 @@ inline core::CoinParams make_coin_params(bool testnet, const PoolOverrides& over
         return subsidy;
     };
 
-    p.dust_threshold = 5460;  // [confirm-vs-oracle] legacy DASH dust floor (relay policy, not consensus)
+    // Dust: payout-dust floor from the SSOT (config_pool.hpp). Was 5460 (dashd
+    // relay-policy floor, wrong semantic for the PPLNS payout path) -- reconciled
+    // to the oracle payout-dust value 100000 per V36 Option-A conform-to-p2pool.
+    p.dust_threshold = PoolConfig::dust_threshold();
 
     // Softforks: DASH older baseline has NO segwit (segwit_activation_version=0).
     p.softforks_required        = {};
