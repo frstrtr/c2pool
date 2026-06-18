@@ -40,6 +40,7 @@
 #include <shared_mutex>
 #include <random>
 #include <thread>
+#include <optional>
 
 namespace bch
 {
@@ -69,6 +70,18 @@ protected:
     // Global pool of known transactions, populated by remember_tx and coin daemon.
     // Protocol handlers look up tx hashes here when processing shares.
     std::map<uint256, coin::Transaction> m_known_txs;
+
+    // -- Won-block broadcaster sink (broadcaster-gate A+B in-operation fire) --
+    // The pool node stays coin-daemon-agnostic: the binary entrypoint wires this
+    // to bch::coin::EmbeddedDaemon::broadcast_won_block (dual path: embedded P2P
+    // PRIMARY + external BCHN submitblock FALLBACK). m_on_block_found fires it
+    // the instant a verified share meets the BCH block target -- the live sink
+    // the dispatcher (90a35536) was waiting on. No p2pool-v36 surface (block
+    // dispatch, not share/PPLNS/coinbase bytes).
+    using BlockBroadcastFn =
+        std::function<void(const std::vector<unsigned char>& /*block_bytes*/,
+                           const std::string& /*block_hex*/)>;
+    BlockBroadcastFn m_block_broadcaster;
 
     // Thread pool for parallel share_init_verify (SHA256d CPU work).
     // Keeps expensive crypto off the io_context thread.
@@ -173,6 +186,57 @@ public:
         : m_share_getter(nullptr,
             [](uint256, peer_ptr, std::vector<uint256>, uint64_t, std::vector<uint256>){}) {}
 
+    // Reconstruct the full BCH block (header + [coinbase] + other_txs) for
+    // a won share -- p2pool data.py as_block(tracker, known_txs). Declared
+    // before the ctor so the m_on_block_found lambda can call it. Gathers
+    // other_txs from m_known_txs via the share transaction_hash_refs over
+    // parent shares (data.py get_other_tx_hashes / _get_other_txs); returns
+    // nullopt when not all parent txs are present (== as_block None).
+    // NOTE: coinbase (gentx) full-body reconstruction (GenerateShareTransaction,
+    // share_check.hpp:472) is the remaining dependency before this emits a
+    // complete block; until it lands this returns nullopt -- no partial/
+    // invalid block is ever broadcast. The other_tx gather seam is here.
+    std::optional<std::pair<std::vector<unsigned char>, std::string>>
+        reconstruct_won_block(const uint256& share_hash)
+    {
+        // p2pool data.py Share.as_block(tracker, known_txs): a won block =
+        // header + [gentx] + other_txs, where other_txs resolve from known_txs
+        // and gentx (coinbase) is the reconstructed GenerateShareTransaction.
+        auto& chain = m_tracker.chain;
+        if (!chain.contains(share_hash)) {
+            LOG_WARNING << "[BCH-POOL] reconstruct: won share "
+                        << share_hash.GetHex().substr(0, 16)
+                        << " absent from sharechain -- cannot build block";
+            return std::nullopt;
+        }
+
+        // other-tx readiness probe: resolve the share's own new_transaction_hashes
+        // against m_known_txs (the protocol-handler tx cache). ref-chain entries
+        // (transaction_hash_refs into ancestor shares) are counted but the full
+        // ancestor walk + gentx body are the remaining work below.
+        std::size_t direct = 0, resolved = 0, refchain = 0;
+        chain.get_share(share_hash).invoke([&](auto* s) {
+            if constexpr (requires { s->m_tx_info; }) {
+                for (const auto& h : s->m_tx_info.m_new_transaction_hashes) {
+                    ++direct;
+                    if (m_known_txs.count(h)) ++resolved;
+                }
+                refchain = s->m_tx_info.m_transaction_hash_refs.size();
+            }
+        });
+
+        // Coinbase (gentx) full-body reconstruction is the remaining dependency
+        // (GenerateShareTransaction, share_check.hpp:472); the block merkle_root
+        // derives from it, so no valid block can be serialized until it lands.
+        // Return nullopt -- the dual-path broadcaster stays wired + fires the
+        // instant this can yield a complete block; we NEVER relay a partial one.
+        LOG_INFO << "[BCH-POOL] reconstruct: share "
+                 << share_hash.GetHex().substr(0, 16)
+                 << " other_tx direct " << resolved << "/" << direct
+                 << " known, " << refchain << " ref-chain; gentx body pending -> nullopt";
+        return std::nullopt;
+    }
+
     NodeImpl(boost::asio::io_context* ctx, config_t* config)
         : base_t(ctx, config),
           m_share_getter(ctx,
@@ -211,6 +275,31 @@ public:
         m_tracker.chain.on_removed([this](const uint256& hash) {
             m_removal_flush_buf.push_back(hash);
         });
+
+        // Wire the in-operation won-block fire path (broadcaster-gate A+B).
+        // A verified share that meets the BCH block target -> reconstruct the
+        // full block -> fire BOTH broadcast paths via the entrypoint-supplied
+        // sink. Mirrors the m_on_share_verified wiring above; the sink itself
+        // is set by the binary entrypoint via set_block_broadcaster().
+        m_tracker.m_on_block_found = [this](const uint256& share_hash) {
+            if (!m_block_broadcaster) {
+                LOG_WARNING << "[BCH-POOL] won block on share "
+                            << share_hash.GetHex().substr(0, 16)
+                            << " but NO broadcaster sink wired -- block NOT relayed";
+                return;
+            }
+            auto blk = reconstruct_won_block(share_hash);
+            if (!blk) {
+                LOG_WARNING << "[BCH-POOL] won block on share "
+                            << share_hash.GetHex().substr(0, 16)
+                            << " not yet broadcastable (full block not reconstructable)";
+                return;
+            }
+            LOG_INFO << "[BCH-POOL] won block on share "
+                     << share_hash.GetHex().substr(0, 16)
+                     << " -- firing dual-path broadcast (" << blk->first.size() << " bytes)";
+            m_block_broadcaster(blk->first, blk->second);
+        };
     }
 
     // INetwork: Pool node does not initiate disconnect — peer connections
@@ -234,6 +323,13 @@ public:
     /// or startup code (before compute thread exists).
     /// IO-thread code MUST use read_tracker() instead.
     ShareTracker& tracker() { return m_tracker; }
+
+    /// Wire the won-block broadcaster sink (binary entrypoint ->
+    /// EmbeddedDaemon::broadcast_won_block). Call once at startup before
+    /// run(); idempotent replace. Pool-entrypoint leg of broadcaster-gate
+    /// criterion C: gives tracker().m_on_block_found a live sink so an
+    /// in-operation win emits down both paths (P2P + external submitblock).
+    void set_block_broadcaster(BlockBroadcastFn fn) { m_block_broadcaster = std::move(fn); }
 
     /// RAII guard for IO-thread tracker reads.
     /// - IO thread: acquires shared_lock(try_to_lock). Returns falsy if busy.
