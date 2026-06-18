@@ -33,6 +33,7 @@
 #include <impl/dash/pplns.hpp>           // dash::pplns::compute_payouts, dash::ShareChain, DashShare
 #include <impl/dash/version_negotiation.hpp> // dash::version_negotiation::get_desired_version_counts/weights
 #include <impl/dash/coin/vendor/cbtx.hpp> // dash::coin::vendor::CCbTx, parse_cbtx
+#include <impl/dash/config_pool.hpp>     // dash::PoolConfig (sharechain SSOT)
 #include <impl/bitcoin_family/coin/base_block.hpp>  // bitcoin_family::coin::SmallBlockHeaderType
 
 #include <core/hash.hpp>                     // Hash (sha256d)
@@ -790,4 +791,163 @@ TEST(DashConformanceCbtx, ParseCbtxIsExactInverseOfKat) {
     dash::coin::vendor::CCbTx tx2;
     EXPECT_FALSE(dash::coin::vendor::parse_cbtx(bytes, tx2))
         << "parse_cbtx accepted trailing garbage (wire-drift guard defeated)";
+}
+
+
+// -- Sharechain network-params conformance (S6 slice 3) -----------------------
+// Pin DASH's p2pool sharechain framing constants against its OWN older-than-v35
+// oracle (frstrtr/p2pool-dash networks/dash.py + dash_testnet.py). The expected
+// values below are an INDEPENDENT transcription of the oracle, NOT a re-export of
+// dash::PoolConfig, so the assertions catch a drift in either copy -- the same
+// anti-circularity design used by the merkle/payout KATs above.
+//
+// PREFIX/IDENTIFIER are isolation primitives: pinned per-coin here, never to be
+// unified cross-coin (operator v36_standardization_goal 2026-06-17).
+TEST(DashConformanceNetworkParams, MainnetMatchesP2poolDashOracle) {
+    dash::PoolConfig::is_testnet = false;
+    EXPECT_EQ(dash::PoolConfig::p2p_port(), 8999);
+    EXPECT_EQ(dash::PoolConfig::worker_port(), 7903);
+    EXPECT_EQ(dash::PoolConfig::share_period(), 20u);
+    EXPECT_EQ(dash::PoolConfig::chain_length(), 4320u);       // 24*60*60//20
+    EXPECT_EQ(dash::PoolConfig::real_chain_length(), 4320u);
+    EXPECT_EQ(dash::PoolConfig::TARGET_LOOKBEHIND, 100u);
+    EXPECT_EQ(dash::PoolConfig::SPREAD, 10u);
+    EXPECT_EQ(dash::PoolConfig::MINIMUM_PROTOCOL_VERSION, 1700u);
+    EXPECT_EQ(dash::PoolConfig::identifier_hex(), std::string("7242ef345e1bed6b"));
+    EXPECT_EQ(dash::PoolConfig::prefix_hex(),     std::string("3b3e1286f446b891"));
+    uint256 expect_max;
+    expect_max.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
+    EXPECT_EQ(dash::PoolConfig::max_target(), expect_max);    // 0xFFFF * 2**208
+}
+
+TEST(DashConformanceNetworkParams, TestnetMatchesP2poolDashOracle) {
+    dash::PoolConfig::is_testnet = true;
+    EXPECT_EQ(dash::PoolConfig::p2p_port(), 18999);
+    EXPECT_EQ(dash::PoolConfig::worker_port(), 17903);
+    EXPECT_EQ(dash::PoolConfig::share_period(), 20u);
+    EXPECT_EQ(dash::PoolConfig::chain_length(), 4320u);
+    EXPECT_EQ(dash::PoolConfig::identifier_hex(), std::string("b6deb1e543fe2427"));
+    EXPECT_EQ(dash::PoolConfig::prefix_hex(),     std::string("198b644f6821e3b3"));
+    uint256 expect_max;
+    expect_max.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    EXPECT_EQ(dash::PoolConfig::max_target(), expect_max);    // 2**256 // 2**20 - 1
+    dash::PoolConfig::is_testnet = false;  // restore global for any later tests
+}
+
+// ── Factory↔SSOT conformance (S6 slice: make_coin_params wiring) ─────────────
+// The dash::make_coin_params factory MUST populate core::CoinParams pool-level
+// fields from the dash::PoolConfig SSOT (config_pool.hpp) and the coin-level
+// fields from the DASH oracle, so share_check/coinbase_builder — which consume a
+// const core::CoinParams& — never run on an unpopulated or drifted struct. This
+// pins the factory output WITHOUT a node dependency: it is the node-free half of
+// S6, complementary to the real-node KAT capture.
+#include <impl/dash/params.hpp>  // dash::make_coin_params
+
+TEST(DashConformanceFactory, PoolFieldsSourcedFromSSOT) {
+    for (bool testnet : {false, true}) {
+        dash::PoolConfig::is_testnet = testnet;
+        auto p = dash::make_coin_params(testnet);
+        EXPECT_EQ(p.p2p_port,                 dash::PoolConfig::p2p_port());
+        EXPECT_EQ(p.worker_port,              dash::PoolConfig::worker_port());
+        EXPECT_EQ(p.share_period,             dash::PoolConfig::share_period());
+        EXPECT_EQ(p.chain_length,             dash::PoolConfig::chain_length());
+        EXPECT_EQ(p.real_chain_length,        dash::PoolConfig::real_chain_length());
+        EXPECT_EQ(p.target_lookbehind,        dash::PoolConfig::TARGET_LOOKBEHIND);
+        EXPECT_EQ(p.spread,                   dash::PoolConfig::SPREAD);
+        EXPECT_EQ(p.minimum_protocol_version, dash::PoolConfig::MINIMUM_PROTOCOL_VERSION);
+        EXPECT_EQ(p.identifier_hex,           dash::PoolConfig::IDENTIFIER_HEX);
+        EXPECT_EQ(p.prefix_hex,               dash::PoolConfig::PREFIX_HEX);
+        EXPECT_EQ(p.testnet_identifier_hex,   dash::PoolConfig::TESTNET_IDENTIFIER_HEX);
+        EXPECT_EQ(p.testnet_prefix_hex,       dash::PoolConfig::TESTNET_PREFIX_HEX);
+        dash::PoolConfig::is_testnet = testnet;
+        EXPECT_EQ(p.max_target,               dash::PoolConfig::max_target());
+        EXPECT_EQ(p.is_testnet,               testnet);
+    }
+}
+
+TEST(DashConformanceFactory, CoinFieldsMatchDashOracle) {
+    auto mn = dash::make_coin_params(/*testnet=*/false);
+    EXPECT_EQ(mn.symbol, "DASH");
+    EXPECT_EQ(mn.block_period, 150u);
+    EXPECT_EQ(mn.address_version, 76);        // X...
+    EXPECT_EQ(mn.address_p2sh_version, 16);   // 7...
+    EXPECT_EQ(mn.address_p2sh_version2, 0);   // no secondary P2SH
+    EXPECT_EQ(mn.segwit_activation_version, 0u);  // DASH: no segwit
+    EXPECT_EQ(mn.current_share_version, 16u);     // older-than-v35 baseline
+
+    auto tn = dash::make_coin_params(/*testnet=*/true);
+    EXPECT_EQ(tn.address_version, 140);       // y...
+    EXPECT_EQ(tn.address_p2sh_version, 19);
+}
+
+// The factory donation script is byte-identical to the DONATION_SCRIPT SSOT for
+// every share version (DASH is always P2PKH; no v36 combined-P2SH switch).
+TEST(DashConformanceFactory, DonationScriptIsSSOTForAllVersions) {
+    auto p = dash::make_coin_params(/*testnet=*/false);
+    for (int64_t v : {0, 15, 16, 35, 36}) {
+        EXPECT_EQ(p.donation_script_func(v), dash::DONATION_SCRIPT)
+            << "donation script diverged at share_version=" << v;
+    }
+}
+
+// PoW and block-identity hashes are BOTH X11 (DASH identifies blocks by X11,
+// not SHA256d) — guard against an accidental copy of the LTC sha256d shape.
+TEST(DashConformanceFactory, PowAndBlockHashAreBothX11) {
+    auto p = dash::make_coin_params(/*testnet=*/false);
+    ASSERT_TRUE(p.pow_func);
+    ASSERT_TRUE(p.block_hash_func);
+    std::vector<unsigned char> sample(80, 0xab);
+    std::span<const unsigned char> s(sample.data(), sample.size());
+    uint256 expect = dash::crypto::hash_x11(s);
+    EXPECT_EQ(p.pow_func(s), expect);
+    EXPECT_EQ(p.block_hash_func(s), expect);
+}
+
+// ── pool.yaml runtime-override seam (S6 slice: make_coin_params overrides) ────
+// The override overload lets an operator pool.yaml retune ONLY non-consensus,
+// non-isolation pool fields (ports, bootstrap peers). With no overrides the
+// factory output is byte-identical to the pure-SSOT overload; consensus-critical
+// and isolation fields are NEVER reachable from PoolOverrides (compile-time:
+// the struct has no field for them) and stay pinned to the SSOT even when the
+// tunable fields are overridden. Node-free — pins the seam pool.yaml populates.
+TEST(DashConformanceFactory, NoOverridesEqualsSSOTOverload) {
+    for (bool testnet : {false, true}) {
+        auto base = dash::make_coin_params(testnet);
+        auto ovr  = dash::make_coin_params(testnet, dash::PoolOverrides{});
+        EXPECT_EQ(ovr.p2p_port,        base.p2p_port);
+        EXPECT_EQ(ovr.worker_port,     base.worker_port);
+        EXPECT_EQ(ovr.bootstrap_addrs, base.bootstrap_addrs);
+    }
+}
+
+TEST(DashConformanceFactory, OverridesApplyToTunableFields) {
+    dash::PoolOverrides ov;
+    ov.p2p_port        = 19000;
+    ov.worker_port     = 19001;
+    ov.bootstrap_addrs = std::vector<std::string>{"seed.example:8999", "node2.example:8999"};
+    auto p = dash::make_coin_params(/*testnet=*/false, ov);
+    EXPECT_EQ(p.p2p_port,    19000);
+    EXPECT_EQ(p.worker_port, 19001);
+    ASSERT_EQ(p.bootstrap_addrs.size(), 2u);
+    EXPECT_EQ(p.bootstrap_addrs[0], "seed.example:8999");
+    EXPECT_EQ(p.bootstrap_addrs[1], "node2.example:8999");
+}
+
+// Even with tunable overrides set, consensus + isolation fields MUST equal the
+// SSOT/oracle values — a mis-edited pool.yaml can never fork the sharechain.
+TEST(DashConformanceFactory, OverridesNeverTouchConsensusOrIsolation) {
+    dash::PoolOverrides ov;
+    ov.p2p_port    = 19000;
+    ov.worker_port = 19001;
+    auto ssot = dash::make_coin_params(/*testnet=*/false);
+    auto p    = dash::make_coin_params(/*testnet=*/false, ov);
+    EXPECT_EQ(p.identifier_hex,         ssot.identifier_hex);
+    EXPECT_EQ(p.prefix_hex,             ssot.prefix_hex);
+    EXPECT_EQ(p.testnet_identifier_hex, ssot.testnet_identifier_hex);
+    EXPECT_EQ(p.testnet_prefix_hex,     ssot.testnet_prefix_hex);
+    EXPECT_EQ(p.max_target,             ssot.max_target);
+    EXPECT_EQ(p.current_share_version,  ssot.current_share_version);
+    EXPECT_EQ(p.minimum_protocol_version, ssot.minimum_protocol_version);
+    for (int64_t v : {0, 16, 35, 36})
+        EXPECT_EQ(p.donation_script_func(v), dash::DONATION_SCRIPT);
 }
