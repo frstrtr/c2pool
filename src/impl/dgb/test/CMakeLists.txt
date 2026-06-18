@@ -148,4 +148,16 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_coin_node_seam_test "" AUTO)
 
+    # --- #82 dual-path won-block broadcaster contract ----------------------
+    # Header-only contract test for coin/block_broadcast.hpp (the dispatcher the
+    # run-loop wires tracker().m_on_block_found to). Links core for the ICoinNode
+    # seam + LOG_* symbols; needs no dgb OBJECT lib (uses a fake ICoinNode).
+    add_executable(dgb_block_broadcast_test block_broadcast_test.cpp)
+    target_link_libraries(dgb_block_broadcast_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_block_broadcast_test "" AUTO)
+
 endif()
