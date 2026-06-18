@@ -194,6 +194,20 @@ target_link_libraries(c2pool-dgb
     nlohmann_json::nlohmann_json
     ${Boost_LIBRARIES}
 )
+# c2pool-bch: Bitcoin Cash (SHA256d standalone parent, V36) — EXE-WIRE slice.
+# Closes the "no runnable c2pool-bch entrypoint" gap (integrator 2026-06-18):
+# the M5 lane was pure state-machine + ctest with no main_bch.cpp. Mirrors the
+# c2pool-dgb add_executable shape but is even leaner: main_bch.cpp drives the
+# LIVE header-only ABLA template-budget path (impl/bch/coin/abla.hpp, 1:1 BCHN
+# consensus/abla.cpp port). abla.hpp is std-only (no core/yaml/uint256/leveldb),
+# so this target links NOTHING beyond the standard runtime — it never drags in
+# the core OBJECT-lib web_server/stratum tangle that forces c2pool-btc to pull
+# ltc/payout/merged. The global src/ include path resolves <impl/bch/...>. The
+# P2P IBD run-loop (coin/p2p_node.cpp read-only sync vs VM300 .110:8333) and its
+# live numbers are the NEXT --ibd slice; kept separate so this lands additive.
+# Per-coin isolation held: src/impl/bch only, no shared-base/core edits.
+add_executable(c2pool-bch main_bch.cpp)
+target_compile_definitions(c2pool-bch PRIVATE C2POOL_VERSION="${C2POOL_GIT_VERSION}")
 
 # Windows: Boost.Asio requires Winsock libraries; /bigobj for large translation units
 if(WIN32)
