@@ -928,7 +928,8 @@ inline std::vector<unsigned char> get_share_script(const auto* obj)
 // Reference: frstrtr/p2pool-merged-v36  p2pool/data.py  generate_transaction()
 // ============================================================================
 template <typename ShareT, typename TrackerT>
-uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool dump_diag = false, bool v36_active = false)
+uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool dump_diag = false, bool v36_active = false,
+                                  std::vector<unsigned char>* out_gentx_bytes = nullptr)
 {
     auto gst_t0 = std::chrono::steady_clock::now();
     constexpr int64_t ver = ShareT::version;
@@ -1377,6 +1378,18 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
     auto tx_span = std::span<const unsigned char>(
         reinterpret_cast<const unsigned char*>(tx.data()), tx.size());
     auto txid = Hash(tx_span);
+
+    // Expose the exact serialized coinbase (gentx) bytes the txid was hashed
+    // from. This is the SAME byte buffer that produced the txid -- reusing it
+    // (rather than re-deriving in a second codepath) guarantees the won-block
+    // reconstruction emits a coinbase byte-identical to the one consensus and
+    // the sharechain validated. Coinbase byte-layout conformance vs p2poolBCH
+    // already adjudicated (no re-derivation = no divergence risk).
+    if (out_gentx_bytes) {
+        const unsigned char* p =
+            reinterpret_cast<const unsigned char*>(tx.data());
+        out_gentx_bytes->assign(p, p + tx.size());
+    }
 
     // V36 hash_link cross-check: compute prefix hash_link from our coinbase
     // and compare with the share's stored hash_link. If states differ,
