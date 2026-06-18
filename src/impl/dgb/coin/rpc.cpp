@@ -12,15 +12,10 @@ namespace dgb
 namespace coin
 {
 
-// DGB chain-identity probe: the DigiByte genesis hash (DigiByte Core v8.26.2
-// kernel/chainparams.cpp). A real digibyted answers getblockheader(genesis);
-// a wrong-coin daemon does not. mainnet/testnet selected by IS_TESTNET.
-static const char* DGB_GENESIS_MAIN =
-    "7497ea1b465eb39f1c8f507bc877078fe016d6fcb6dfad3a64c98dcc6e1e8496";
-static const char* DGB_GENESIS_TEST =
-    "308ea0711d5763be2995670dd9ca9872753561285a84da1d58be58acaa822252";
-
-// DGB_MIN_DAEMON_VERSION / make_gbt_request: see impl/dgb/coin/rpc_request.hpp (oracle SSOT).
+// DGB chain-identity genesis hashes, DGB_MIN_DAEMON_VERSION and
+// make_gbt_request: see impl/dgb/coin/rpc_request.hpp (oracle/identity SSOT).
+// check() probes getblockheader(dgb_genesis_hash(IS_TESTNET)) to confirm the
+// daemon is a real digibyted on the selected network.
 
 NodeRPC::NodeRPC(io::io_context* context, dgb::interfaces::Node* coin, bool testnet)
     : m_context(context), IS_TESTNET(testnet), m_resolver(*context), m_stream(*context),
@@ -205,7 +200,7 @@ nlohmann::json NodeRPC::CallAPIMethod(const std::string& method, const jsonrpccx
 
 bool NodeRPC::check()
 {
-	uint256 genesis = uint256S(IS_TESTNET ? DGB_GENESIS_TEST : DGB_GENESIS_MAIN);
+	uint256 genesis = uint256S(dgb_genesis_hash(IS_TESTNET));
 	bool has_block = check_blockheader(genesis);
 	bool is_main_chain = getblockchaininfo()["chain"].get<std::string>() == "main";
 	nlohmann::json blockchaininfo;

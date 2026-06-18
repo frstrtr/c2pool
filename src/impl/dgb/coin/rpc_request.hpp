@@ -49,6 +49,23 @@ inline nlohmann::json make_gbt_request(const std::vector<std::string>& rules)
     return nlohmann::json::object({{"rules", rules}, {"algo", "scrypt"}});
 }
 
+// DGB chain-identity genesis hashes (DigiByte Core kernel/chainparams.cpp).
+// NodeRPC::check() probes getblockheader(genesis) to confirm it is talking to
+// a real digibyted (a wrong-coin daemon does not answer). These are a bucket-1
+// ISOLATION PRIMITIVE -- KEEP per-coin in v36 AND v37, never standardize; they
+// are pinned in this SSOT only so a standalone TU can guard against accidental
+// drift WITHOUT linking the boost::beast transport.
+inline constexpr const char* DGB_GENESIS_MAIN =
+    "7497ea1b465eb39f1c8f507bc877078fe016d6fcb6dfad3a64c98dcc6e1e8496";
+inline constexpr const char* DGB_GENESIS_TEST =
+    "308ea0711d5763be2995670dd9ca9872753561285a84da1d58be58acaa822252";
+
+// The genesis hash NodeRPC::check() probes for the selected network.
+inline const char* dgb_genesis_hash(bool testnet)
+{
+    return testnet ? DGB_GENESIS_TEST : DGB_GENESIS_MAIN;
+}
+
 } // namespace coin
 
 } // namespace dgb
