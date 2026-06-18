@@ -40,6 +40,20 @@ if (BUILD_TESTING AND GTest_FOUND)
     # transport rpc.cpp wiring is deferred (Option-B scope). Each MUST appear
     # in BOTH this ctest registration AND the build.yml --target allowlist,
     # or it becomes a #143-style NOT_BUILT sentinel that reds master.
+
+    # --- #82 SSOT gentx coinbase assembler KAT ----------------------------
+    # coin/gentx_coinbase.hpp uses core primitives (PackStream/BaseScript/Hash/
+    # uint256), so it links the same proven set as dgb_share_test rather than
+    # the header-only guard foreach above. Oracle ground-truth vectors. MUST
+    # also be in the build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_gentx_coinbase_test gentx_coinbase_test.cpp)
+    target_link_libraries(dgb_gentx_coinbase_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_gentx_coinbase_test "" AUTO)
+
     foreach(dgb_guard rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test header_chain_test)
         add_executable(${dgb_guard} ${dgb_guard}.cpp)
         target_link_libraries(${dgb_guard} PRIVATE
