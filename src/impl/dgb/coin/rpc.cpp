@@ -19,10 +19,12 @@ static const char* DGB_GENESIS_MAIN =
 static const char* DGB_GENESIS_TEST =
     "308ea0711d5763be2995670dd9ca9872753561285a84da1d58be58acaa822252";
 
-// Minimum acceptable digibyted CLIENT_VERSION int (10000*major+100*minor+build).
-// 71700 == DigiByte Core 7.17.0, the segwit+taproot baseline; 8.26.2 == 82602.
-// [confirm-vs-oracle] frstrtr/p2pool-dgb-scrypt digibyte.py for an exact floor.
-static constexpr int DGB_MIN_DAEMON_VERSION = 71700;
+// Minimum acceptable digibyted getnetworkinfo[\"version\"] int.
+// Floor conformed to oracle frstrtr/p2pool-dgb-scrypt networks/digibyte.py:
+//   VERSION_CHECK = lambda v: None if 82202 <= v else \"...Upgrade to 7.17.2 or newer!\"
+// i.e. DigiByte Core 7.17.2 (oracle HEAD 22761e7). Same getnetworkinfo version field
+// the oracle gates on, so the comparison below is byte-for-byte oracle-equivalent.
+static constexpr int DGB_MIN_DAEMON_VERSION = 82202;
 
 NodeRPC::NodeRPC(io::io_context* context, dgb::interfaces::Node* coin, bool testnet)
     : m_context(context), IS_TESTNET(testnet), m_resolver(*context), m_stream(*context),
