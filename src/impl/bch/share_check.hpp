@@ -7,6 +7,7 @@
 #include "share.hpp"
 #include "share_messages.hpp"
 #include "share_types.hpp"
+#include <core/version_gate.hpp>   // SSOT: core::version_gate::is_v36_active
 
 #include <core/hash.hpp>
 #include <core/pack.hpp>
@@ -374,7 +375,7 @@ inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParam
 
     ref_stream << p.share_nonce;
 
-    if (p.share_version >= 36) {
+    if (core::version_gate::is_v36_active(p.share_version)) {
         // V36: pubkey_hash (uint160) + pubkey_type (uint8)
         ref_stream << p.pubkey_hash;
         ref_stream << p.pubkey_type;
@@ -399,7 +400,7 @@ inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParam
         ref_stream << p.segwit_data;
 
     // V36: merged_addresses (after segwit_data, before far_share_hash)
-    if (p.share_version >= 36)
+    if (core::version_gate::is_v36_active(p.share_version))
         ref_stream << p.merged_addresses;
 
     ref_stream << p.far_share_hash;
@@ -408,7 +409,7 @@ inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParam
     ref_stream << p.timestamp;
     ref_stream << p.absheight;
 
-    if (p.share_version >= 36) {
+    if (core::version_gate::is_v36_active(p.share_version)) {
         ::Serialize(ref_stream, Using<AbsworkV36Format>(p.abswork));
         ref_stream << p.merged_coinbase_info;
         ref_stream << p.merged_payout_hash;
@@ -426,10 +427,10 @@ inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParam
     {
         static int rfn_log = 0;
         static int rfn_v36_log = 0;
-        bool should_log = (rfn_log < 3) || (p.share_version >= 36 && rfn_v36_log < 5);
+        bool should_log = (rfn_log < 3) || (core::version_gate::is_v36_active(p.share_version) && rfn_v36_log < 5);
         if (should_log) {
             rfn_log++;
-            if (p.share_version >= 36) rfn_v36_log++;
+            if (core::version_gate::is_v36_active(p.share_version)) rfn_v36_log++;
             static const char* HX = "0123456789abcdef";
             std::string hex;
             auto* rd = reinterpret_cast<const unsigned char*>(ref_stream.data());
@@ -543,7 +544,7 @@ uint256 share_init_verify(const ShareT& share, bool check_pow = true)
             ref_stream << share.m_pubkey_hash;
 
         // subsidy: VarInt for V36+, raw uint64_t LE for older
-        if constexpr (ver >= 36)
+        if constexpr (core::version_gate::is_v36_active(ver))
             ::Serialize(ref_stream, VarInt(share.m_subsidy));
         else
             ref_stream << share.m_subsidy;
@@ -578,7 +579,7 @@ uint256 share_init_verify(const ShareT& share, bool check_pow = true)
         }
 
         // merged_addresses (V36+)
-        if constexpr (ver >= 36)
+        if constexpr (core::version_gate::is_v36_active(ver))
         {
             if constexpr (requires { share.m_merged_addresses; })
                 ref_stream << share.m_merged_addresses;
@@ -599,7 +600,7 @@ uint256 share_init_verify(const ShareT& share, bool check_pow = true)
         ref_stream << share.m_absheight;
 
         // abswork: AbsworkV36Format for V36+, raw uint128 LE for older
-        if constexpr (ver >= 36)
+        if constexpr (core::version_gate::is_v36_active(ver))
         {
             if constexpr (requires { share.m_abswork; })
                 ::Serialize(ref_stream, Using<AbsworkV36Format>(share.m_abswork));
@@ -610,7 +611,7 @@ uint256 share_init_verify(const ShareT& share, bool check_pow = true)
         }
 
         // V36+ merged mining commitment fields
-        if constexpr (ver >= 36)
+        if constexpr (core::version_gate::is_v36_active(ver))
         {
             if constexpr (requires { share.m_merged_coinbase_info; })
                 ref_stream << share.m_merged_coinbase_info;
@@ -621,7 +622,7 @@ uint256 share_init_verify(const ShareT& share, bool check_pow = true)
 
     // V36 ref_type includes message_data as PossiblyNoneType(b'', VarStrType())
     // When m_message_data is empty, BaseScript serialises as varint(0) = 0x00.
-    if constexpr (ver >= 36)
+    if constexpr (core::version_gate::is_v36_active(ver))
     {
         if constexpr (requires { share.m_message_data; })
             ref_stream << share.m_message_data;
@@ -935,7 +936,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
     // p2pool selects PPLNS formula by runtime AutoRatchet state, not compile-time
     // share version. When v36_active is true (AutoRatchet ACTIVATED/CONFIRMED),
     // use v36 PPLNS even for v35 shares. Ref: p2pool data.py:879, work.py:759.
-    const bool use_v36_pplns = v36_active || (ver >= 36);
+    const bool use_v36_pplns = v36_active || (core::version_gate::is_v36_active(ver));
     const uint64_t subsidy = share.m_subsidy;
     const uint16_t donation = share.m_donation;
 
@@ -1268,7 +1269,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
             else
                 ref_stream << share.m_pubkey_hash;
 
-            if constexpr (ver >= 36)
+            if constexpr (core::version_gate::is_v36_active(ver))
                 ::Serialize(ref_stream, VarInt(share.m_subsidy));
             else
                 ref_stream << share.m_subsidy;
@@ -1297,7 +1298,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
                 }
             }
 
-            if constexpr (ver >= 36)
+            if constexpr (core::version_gate::is_v36_active(ver))
             {
                 if constexpr (requires { share.m_merged_addresses; })
                     ref_stream << share.m_merged_addresses;
@@ -1315,7 +1316,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
             ref_stream << share.m_timestamp;
             ref_stream << share.m_absheight;
 
-            if constexpr (ver >= 36)
+            if constexpr (core::version_gate::is_v36_active(ver))
             {
                 if constexpr (requires { share.m_abswork; })
                     ::Serialize(ref_stream, Using<AbsworkV36Format>(share.m_abswork));
@@ -1325,7 +1326,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
                 ref_stream << share.m_abswork;
             }
 
-            if constexpr (ver >= 36)
+            if constexpr (core::version_gate::is_v36_active(ver))
             {
                 if constexpr (requires { share.m_merged_coinbase_info; })
                     ref_stream << share.m_merged_coinbase_info;
@@ -1335,7 +1336,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
         }
 
         // V36 ref_type includes message_data (must match verify_share)
-        if constexpr (ver >= 36)
+        if constexpr (core::version_gate::is_v36_active(ver))
         {
             if constexpr (requires { share.m_message_data; })
                 ref_stream << share.m_message_data;
@@ -1737,7 +1738,7 @@ bool share_check(const ShareT& share,
     // This ensures V35 shares always verify with V35 PPLNS formula, even after
     // the AutoRatchet transitions to ACTIVATED.
     constexpr int64_t share_ver = ShareT::version;
-    bool v36_active = (share_ver >= 36);
+    bool v36_active = (core::version_gate::is_v36_active(share_ver));
     if (!share.m_prev_hash.IsNull() && tracker.chain.contains(share.m_prev_hash))
     {
         uint256 expected_gentx = generate_share_transaction(share, tracker, false, v36_active);
@@ -1861,7 +1862,7 @@ bool share_check(const ShareT& share,
     // independently compute from the share chain. Without this, a malicious
     // node could steal all merged chain (DOGE) rewards while appearing honest
     // on the parent chain (LTC payouts are consensus-enforced via gentx above).
-    if constexpr (ShareT::version >= 36)
+    if constexpr (core::version_gate::is_v36_active(ShareT::version))
     {
         if constexpr (requires { share.m_merged_payout_hash; })
         {
@@ -1889,7 +1890,7 @@ bool share_check(const ShareT& share,
 
     // 5. V36+ merged coinbase commitment verification (7-step chain)
     // Verifies the actual merged coinbase matches canonical PPLNS construction.
-    if constexpr (ShareT::version >= 36)
+    if constexpr (core::version_gate::is_v36_active(ShareT::version))
     {
         auto mcv_err = verify_merged_coinbase_commitment(share, tracker);
         if (!mcv_err.empty())
@@ -1959,7 +1960,7 @@ uint256 verify_share(const ShareT& share, TrackerT& tracker)
         else
             ref_stream << share.m_pubkey_hash;
 
-        if constexpr (ver >= 36)
+        if constexpr (core::version_gate::is_v36_active(ver))
             ::Serialize(ref_stream, VarInt(share.m_subsidy));
         else
             ref_stream << share.m_subsidy;
@@ -1987,7 +1988,7 @@ uint256 verify_share(const ShareT& share, TrackerT& tracker)
             }
         }
 
-        if constexpr (ver >= 36)
+        if constexpr (core::version_gate::is_v36_active(ver))
         {
             if constexpr (requires { share.m_merged_addresses; })
                 ref_stream << share.m_merged_addresses;
@@ -2005,7 +2006,7 @@ uint256 verify_share(const ShareT& share, TrackerT& tracker)
         ref_stream << share.m_timestamp;
         ref_stream << share.m_absheight;
 
-        if constexpr (ver >= 36)
+        if constexpr (core::version_gate::is_v36_active(ver))
         {
             if constexpr (requires { share.m_abswork; })
                 ::Serialize(ref_stream, Using<AbsworkV36Format>(share.m_abswork));
@@ -2015,7 +2016,7 @@ uint256 verify_share(const ShareT& share, TrackerT& tracker)
             ref_stream << share.m_abswork;
         }
 
-        if constexpr (ver >= 36)
+        if constexpr (core::version_gate::is_v36_active(ver))
         {
             if constexpr (requires { share.m_merged_coinbase_info; })
                 ref_stream << share.m_merged_coinbase_info;
@@ -2025,7 +2026,7 @@ uint256 verify_share(const ShareT& share, TrackerT& tracker)
     }
 
     // V36 ref_type includes message_data
-    if constexpr (ver >= 36)
+    if constexpr (core::version_gate::is_v36_active(ver))
     {
         if constexpr (requires { share.m_message_data; })
             ref_stream << share.m_message_data;
@@ -2050,7 +2051,7 @@ uint256 verify_share(const ShareT& share, TrackerT& tracker)
     uint256 gentx_hash = check_hash_link(share.m_hash_link, hash_link_data, gentx_before_refhash);
 
     // V36+: Validate message_data (reject shares with invalid encrypted messages)
-    if constexpr (ver >= 36)
+    if constexpr (core::version_gate::is_v36_active(ver))
     {
         if constexpr (requires { share.m_message_data; })
         {
@@ -3252,7 +3253,7 @@ uint256 create_local_share(
     {
         static int xcheck_count = 0;
         if (true) { // Always cross-check (was: xcheck_count < 5)
-            uint256 verify_hash = generate_share_transaction<MergedMiningShare>(*heap_share, tracker, true, (MergedMiningShare::version >= 36));
+            uint256 verify_hash = generate_share_transaction<MergedMiningShare>(*heap_share, tracker, true, (core::version_gate::is_v36_active(MergedMiningShare::version)));
             bool xcheck_ok = (verify_hash == gentx_hash_for_header);
             if (xcheck_ok) {
                 LOG_INFO << "[Pool] Cross-check PASSED";
