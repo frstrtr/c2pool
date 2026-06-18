@@ -50,4 +50,22 @@ if(BUILD_TESTING)
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage c2pool_difficulty
         btclibs)
     add_test(NAME bch_block_ordering_test COMMAND bch_block_ordering_test)
+
+    # embedded_daemon_assembly_test: network-free assembly of the full
+    # EmbeddedDaemon graph (Node + EmbeddedCoinNode + AblaRuntime + CoinNode
+    # seam) plus the operator-approved cold-start anchor LIVE PIN (floor-
+    # equivalent). Same link set + transaction.cpp TU as the connector tests.
+    add_executable(bch_embedded_daemon_assembly_test
+        embedded_daemon_assembly_test.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/transaction.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/coin_node.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/p2p_connection.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/p2p_node.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/rpc.cpp)
+    target_include_directories(bch_embedded_daemon_assembly_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(bch_embedded_daemon_assembly_test PRIVATE
+        core pool sharechain
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage c2pool_difficulty
+        btclibs)
+    add_test(NAME bch_embedded_daemon_assembly_test COMMAND bch_embedded_daemon_assembly_test)
 endif()

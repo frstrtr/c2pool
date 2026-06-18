@@ -98,6 +98,17 @@ int main() {
     daemon.dry_run_bchn_anchor();
     CHECK(daemon.is_wired());                      // unchanged by the dry run
 
+    // 6) Cold-start anchor LIVE PIN (operator-approved, decisions@ 2026-06-18,
+    //    dry-run -> live flip). The recorded @955700 control state is at the
+    //    32 MB floor, so the pin is floor-equivalent: it reanchors but the ABLA
+    //    budget stays exactly the 32 MB consensus floor (never undercuts).
+    using Rec = bch::coin::BchnAnchorRecord;
+    daemon.pin_cold_start_anchor();
+    CHECK(daemon.is_wired());                      // still wired after the pin
+    CHECK(Rec::is_floor());                        // record provenance: at floor
+    CHECK(daemon.abla().tracker().budget_for_tip(Rec::height)
+          == Rec::abla_blocksizelimit);          // floor-equivalent: 32 MB
+
     if (failures == 0) {
         std::cout << "embedded_daemon_assembly_test: ALL PASS\n";
         return 0;

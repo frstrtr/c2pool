@@ -95,9 +95,10 @@ public:
         m_chain.init();               // load genesis / fast-start checkpoint (network-free)
         m_node.run();                 // init_rpc(): external BCHN-RPC fallback retained
         assemble();                   // network-free seam + ABLA wiring (see below)
+        pin_cold_start_anchor();      // operator-APPROVED VM300 anchor (decisions@ 2026-06-18); floor-equivalent
         LOG_INFO << "[EMB-BCH] embedded daemon up: embedded-primary work source,"
                  << " external BCHN-RPC fallback retained, ABLA loop closed"
-                 << " (cold-start floor anchor; VM300 pin pending operator).";
+                 << " (cold-start anchor pinned @" << BchnAnchorRecord::height << ").";
     }
 
     /// NETWORK-FREE assembly of the in-process daemon graph: close the ABLA
@@ -127,6 +128,28 @@ public:
     /// approved; until then the floor anchor is correct and never-undercut.
     void apply_bchn_anchor(uint32_t height, abla::State state) {
         m_abla.reanchor(height, state);
+    }
+
+    /// Pin the operator-APPROVED VM300 BCHN cold-start anchor. decisions@
+    /// 2026-06-18 flipped this dry-run -> live (floor-equivalent): the recorded
+    /// control state @955700 is still at the 32 MB floor, so pinning changes NO
+    /// ABLA budget vs the cold-start floor -- it only fixes the height/chainwork
+    /// origin so a future SPV cold-start can trust the recorded header instead
+    /// of climbing from genesis. The moment a future capture is ABOVE floor this
+    /// path RAISES the budget to the real recorded limit (never undercuts). The
+    /// static record is read here; VM300 stays read-only (no qm op). Zero
+    /// p2pool-merged-v36 surface (ABLA is BCH embedded-internal).
+    void pin_cold_start_anchor() {
+        using Rec = BchnAnchorRecord;
+        apply_bchn_anchor(Rec::height, Rec::state(m_config->m_testnet));
+        const uint64_t pinned = m_abla.tracker().budget_for_tip(Rec::height);
+        if (Rec::is_floor())
+            LOG_INFO << "[EMB-BCH] cold-start anchor PINNED (operator-approved):"
+                     << " height=" << Rec::height << " budget=" << pinned
+                     << " (32 MB floor-equivalent; provenance hash=" << Rec::hash << ").";
+        else
+            LOG_WARNING << "[EMB-BCH] cold-start anchor PINNED above floor:"
+                        << " height=" << Rec::height << " budget=" << pinned << ".";
     }
 
     /// DRY RUN of the cold-start reanchor: read the STATIC VM300 anchor record
