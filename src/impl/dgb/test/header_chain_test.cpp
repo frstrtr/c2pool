@@ -18,6 +18,7 @@
 // ---------------------------------------------------------------------------
 
 #include <cstdint>
+#include <limits>
 
 #include <gtest/gtest.h>
 
@@ -453,4 +454,90 @@ TEST(HeaderChainValidate, IngestPoWSatisfactionRunsAtFullWidth)
     weak.pow_hash.limb[3] = 2;            // 2^193, low64 == 0
     EXPECT_EQ(hc.validate_and_append(weak), IngestResult::REJECTED);
     EXPECT_EQ(hc.size(), 1u);             // unchanged
+}
+
+
+// ---------------------------------------------------------------------------
+// MTP MONOTONICITY INGEST GUARD (M3 7b -- ContextualCheckBlockHeader
+// "time-too-old"). A Scrypt header's nTime must be STRICTLY GREATER than the
+// median timestamp of the tip and its (up to) 10 nearest ancestors. This is the
+// daemon-independent, Scrypt-only-walk-safe half of header time validation: it
+// reads only timestamps already in the local header chain, no difficulty
+// re-derivation (the demoted V4-MultiShield recompute). Every appended header of
+// EVERY algo contributes to the median exactly as DGB Core's block index does,
+// but only the Scrypt-validated path is rejected on it -- continuity headers are
+// accept-by-continuity and bypass the gate.
+// ---------------------------------------------------------------------------
+TEST(HeaderChainMtp, GenesisIsUnconstrained)
+{
+    // Empty chain -> median_time_past() == INT64_MIN -> any nTime accepted.
+    HeaderChain hc;
+    EXPECT_EQ(hc.median_time_past(), std::numeric_limits<int64_t>::min());
+    EXPECT_EQ(hc.validate_and_append({SCRYPT, 1, 100}),
+              IngestResult::VALIDATED_SCRYPT);
+    EXPECT_EQ(hc.size(), 1u);
+}
+
+TEST(HeaderChainMtp, RejectsTimeNotStrictlyAboveMedian)
+{
+    // Seed 5 monotone Scrypt headers; MTP over the last 5 is sorted[2] == 1200.
+    HeaderChain hc;
+    for (int64_t t : {1000, 1100, 1200, 1300, 1400})
+        ASSERT_EQ(hc.validate_and_append({SCRYPT, t, 100}),
+                  IngestResult::VALIDATED_SCRYPT);
+    EXPECT_EQ(hc.median_time_past(), 1200);
+
+    const std::size_t size_before = hc.size();
+    const uint64_t    work_before = hc.cumulative_work();
+
+    // nTime == median: NOT strictly greater -> reject, no mutation.
+    EXPECT_EQ(hc.validate_and_append({SCRYPT, 1200, 100}),
+              IngestResult::REJECTED);
+    // nTime below median -> reject.
+    EXPECT_EQ(hc.validate_and_append({SCRYPT, 1150, 100}),
+              IngestResult::REJECTED);
+    EXPECT_EQ(hc.size(),            size_before);
+    EXPECT_EQ(hc.cumulative_work(), work_before);
+
+    // nTime strictly above median -> accepted.
+    EXPECT_EQ(hc.validate_and_append({SCRYPT, 1500, 100}),
+              IngestResult::VALIDATED_SCRYPT);
+    EXPECT_EQ(hc.size(), size_before + 1);
+}
+
+TEST(HeaderChainMtp, ContinuityTimestampsContributeToMedian)
+{
+    // A continuity header is NOT MTP-checked (accept-by-continuity), but its
+    // timestamp DOES enter the median window -- DGB Core's GetMedianTimePast
+    // walks every block of every algo.
+    HeaderChain hc;
+    ASSERT_EQ(hc.validate_and_append({SCRYPT,  1000, 100}),
+              IngestResult::VALIDATED_SCRYPT);
+    // Continuity header far in the future: accepted, bypasses MTP.
+    ASSERT_EQ(hc.validate_and_append({SHA256D, 5000, 100}),
+              IngestResult::ACCEPTED_CONTINUITY);
+
+    // Median over the last 2 headers (1000, 5000) is sorted[1] == 5000. A Scrypt
+    // header at 4000 is ABOVE the prior Scrypt time yet <= the continuity-lifted
+    // median, so it is rejected -- proving the continuity timestamp feeds it.
+    EXPECT_EQ(hc.median_time_past(), 5000);
+    EXPECT_EQ(hc.validate_and_append({SCRYPT, 4000, 100}),
+              IngestResult::REJECTED);
+    // Strictly above the continuity-lifted median -> accepted.
+    EXPECT_EQ(hc.validate_and_append({SCRYPT, 6000, 100}),
+              IngestResult::VALIDATED_SCRYPT);
+}
+
+TEST(HeaderChainMtp, ContinuityHeaderItselfBypassesMtp)
+{
+    // A continuity header with a time AT or BELOW the median is still accepted:
+    // the gate is Scrypt-path only.
+    HeaderChain hc;
+    ASSERT_EQ(hc.validate_and_append({SCRYPT, 2000, 100}),
+              IngestResult::VALIDATED_SCRYPT);
+    EXPECT_EQ(hc.median_time_past(), 2000);
+    // A continuity header at 1500 (below the median) is NOT rejected.
+    EXPECT_EQ(hc.validate_and_append({SKEIN, 1500, 100}),
+              IngestResult::ACCEPTED_CONTINUITY);
+    EXPECT_EQ(hc.size(), 2u);
 }
