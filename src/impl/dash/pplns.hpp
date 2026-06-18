@@ -24,6 +24,7 @@
 #include "share_chain.hpp"                 // dash::ShareChain, DashShare
 #include "share_check.hpp"                 // dash::pubkey_hash_to_script2
 #include "coinbase_builder.hpp"            // dash::coinbase::bits_to_difficulty
+#include "config_pool.hpp"               // dash::PoolConfig::dust_threshold (payout-dust SSOT)
 
 #include <algorithm>
 #include <map>
@@ -56,7 +57,7 @@ inline Result compute_payouts(
     uint64_t miner_value,
     const std::vector<unsigned char>& fallback_script,
     size_t   min_shares_for_pplns = 20,
-    uint64_t dust_threshold       = 54600)   // Dash dust sat
+    uint64_t dust_threshold       = dash::PoolConfig::dust_threshold())  // payout-dust SSOT (config_pool.hpp)
 {
     Result r;
     if (miner_value == 0 || fallback_script.empty()) return r;
