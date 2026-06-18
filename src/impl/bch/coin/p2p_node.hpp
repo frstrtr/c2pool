@@ -786,10 +786,36 @@ private:
         if (!vheaders.empty()) {
             m_coin->new_headers.happened(vheaders);
 
-            // Headers-first follow-up policy (header_sync.hpp, PURE + tested):
+            // Headers-first BLOCK download is INDEPENDENT of the getheaders
+            // follow-up policy: EVERY header batch we learn -- a maximal IBD
+            // batch, a BIP130 tip announce, OR a non-maximal partial batch (the
+            // --near-tip anchor->tip span is ~100 headers) -- must have its
+            // block BODIES pulled, or the ABLA size feed / block-connector
+            // starve: the header chain advances to the peer tip but
+            // AblaTracker's cursor never moves (pinned at the 32 MB floor). The
+            // old code queued bodies ONLY inside the ContinueSync branch, so the
+            // near-tip span classified Idle and downloaded NOTHING -- exactly
+            // the pinned-cursor symptom. Queue this batch's hashes through the
+            // bounded, deduping, reissue-accounted window for ALL batch shapes;
+            // block_download.hpp dedupes overlap and bounds in_flight while
+            // accounting reissue/false_evict.
+            std::vector<uint256> batch_hashes;
+            batch_hashes.reserve(vheaders.size());
+            for (auto& hdr : vheaders) {
+                auto p = pack(hdr);
+                batch_hashes.push_back(Hash(p.get_span()));
+            }
+            m_block_dl.enqueue(batch_hashes);
+            drain_block_window();
+
+            // getheaders follow-up policy (header_sync.hpp, PURE + tested).
+            // Block bodies for ALL batch shapes were already queued above; here
+            // we only decide whether to re-issue getheaders for the NEXT header
+            // batch:
             //   ContinueSync  -- maximal IBD batch, peer has more -> getheaders
-            //   RequestBlocks -- BIP130 tip announce (small batch)  -> getdata
-            //   Idle          -- caught up / nothing to do
+            //   RequestBlocks -- BIP130 tip announce / partial batch -> bodies
+            //                    only (already queued); no further header sync
+            //   Idle          -- caught up; nothing further to fetch
             using header_sync::Followup;
             switch (header_sync::classify_headers_batch(vheaders.size())) {
             case Followup::ContinueSync:
@@ -803,38 +829,9 @@ private:
                     LOG_INFO << "[" << m_chain_label << "] IBD: got "
                              << vheaders.size() << " headers, continuing from "
                              << last_hash.GetHex().substr(0, 16) << "...";
-
-                    // Headers-first BLOCK download: queue this batch's blocks and
-                    // pull them through the bounded in-flight window. Without this
-                    // IBD walked the header chain to the tip but never downloaded
-                    // a single block body (ABLA size feed / block-connector need
-                    // real block data). block_download.hpp dedupes + bounds.
-                    std::vector<uint256> batch_hashes;
-                    batch_hashes.reserve(vheaders.size());
-                    for (auto& hdr : vheaders) {
-                        auto p = pack(hdr);
-                        batch_hashes.push_back(Hash(p.get_span()));
-                    }
-                    m_block_dl.enqueue(batch_hashes);
-                    drain_block_window();
                 }
                 break;
             case Followup::RequestBlocks:
-                // BIP 130 header-first block announcement: request the full
-                // block(s) via getdata. BCH: plain MSG_BLOCK (0x02) -- no
-                // witness-bearing block inv.
-                if (m_peer) {
-                    for (auto& hdr : vheaders) {
-                        auto packed = pack(hdr);
-                        auto bhash = Hash(packed.get_span());
-                        auto getdata_msg = message_getdata::make_raw(
-                            {inventory_type(inventory_type::block, bhash)});
-                        m_peer->write(getdata_msg);
-                        LOG_INFO << "[" << m_chain_label << "] Requesting full block "
-                                 << bhash.GetHex().substr(0, 16) << "...";
-                    }
-                }
-                break;
             case Followup::Idle:
                 break;
             }
