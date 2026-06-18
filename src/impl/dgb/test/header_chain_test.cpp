@@ -123,3 +123,79 @@ TEST(HeaderChainValidate, EmptyChainAndZeroWindowAreSafe)
     EXPECT_FALSE(rw.sufficient);
     EXPECT_EQ(rw.scrypt_samples, 0u);
 }
+
+
+// ---------------------------------------------------------------------------
+// DigiShield/MultiShield damped retarget multiply (digishield_next_target).
+// Exercises the amplitude filter + clamp at BOTH rails plus the nominal case,
+// and the pow_limit difficulty floor. Inputs are hand-built RetargetWindows so
+// the multiply is pinned independently of the (already-tested) Scrypt-only
+// window assembly above.
+//
+//   nominal target_timespan = 60  ->  floor = 60 - 60/4 = 45,
+//                                      ceil  = 60 + 60/2 = 90.
+// ---------------------------------------------------------------------------
+static RetargetWindow make_window(uint64_t avg_target, int64_t actual_timespan)
+{
+    RetargetWindow rw;
+    rw.scrypt_samples  = 3;
+    rw.avg_target      = avg_target;
+    rw.actual_timespan = actual_timespan;
+    rw.sufficient      = true;
+    return rw;
+}
+
+TEST(DigiShieldRetarget, NominalTimespanLeavesTargetUnchanged)
+{
+    // actual == nominal -> damped == nominal -> bnNew == avg_target.
+    const DigiShieldParams p{60, 0};
+    EXPECT_EQ(digishield_next_target(make_window(1000, 60), p), 1000u);
+}
+
+TEST(DigiShieldRetarget, CeilingRailCapsTheEasing)
+{
+    // actual far above nominal: damped = 60 + (1000-60)/8 = 177 -> clamps to 90.
+    // bnNew = 1000 * 90 / 60 = 1500 (target relaxes by exactly the 3/2 rail).
+    const DigiShieldParams p{60, 0};
+    EXPECT_EQ(digishield_next_target(make_window(1000, 1000), p), 1500u);
+}
+
+TEST(DigiShieldRetarget, FloorRailCapsTheTightening)
+{
+    // Sharply negative timespan (out-of-order block times): damped goes well
+    // below floor -> clamps to 45. bnNew = 1000 * 45 / 60 = 750 (3/4 rail).
+    const DigiShieldParams p{60, 0};
+    EXPECT_EQ(digishield_next_target(make_window(1000, -1000), p), 750u);
+}
+
+TEST(DigiShieldRetarget, PowLimitFloorsTheTarget)
+{
+    // Ceiling rail would yield 1500, but pow_limit (easiest target) caps it.
+    const DigiShieldParams p{60, 1200};
+    EXPECT_EQ(digishield_next_target(make_window(1000, 1000), p), 1200u);
+}
+
+TEST(DigiShieldRetarget, EmptyWindowKeepsPriorTarget)
+{
+    // No Scrypt samples -> 0 sentinel: caller keeps the prior target.
+    RetargetWindow rw;            // scrypt_samples == 0
+    const DigiShieldParams p{60, 0};
+    EXPECT_EQ(digishield_next_target(rw, p), 0u);
+    // Degenerate nominal is also rejected (no divide-by-zero).
+    EXPECT_EQ(digishield_next_target(make_window(1000, 60), DigiShieldParams{0, 0}), 0u);
+}
+
+TEST(DigiShieldRetarget, ConsumesLiveScryptOnlyWindow)
+{
+    // End-to-end: the same continuity-skipped window the validate() path builds
+    // (avg 100, timespan 225 over 3 Scrypt samples) feeds the multiply. With
+    // nominal 225 the damped value is exactly nominal -> target unchanged at 100.
+    HeaderChain hc;
+    hc.validate_and_append({SCRYPT,  1000, 100});
+    hc.validate_and_append({SHA256D, 1075, 999999});   // continuity, skipped
+    hc.validate_and_append({SCRYPT,  1150, 100});
+    hc.validate_and_append({SCRYPT,  1225, 100});
+    const RetargetWindow rw = hc.next_retarget_window(3);
+    ASSERT_TRUE(rw.sufficient);
+    EXPECT_EQ(digishield_next_target(rw, DigiShieldParams{225, 0}), 100u);
+}

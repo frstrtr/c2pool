@@ -87,6 +87,72 @@ struct RetargetWindow {
     bool        sufficient      = false; // true iff the full window was found
 };
 
+// DigiShield/MultiShield retarget parameters (per-algo). `target_timespan` is
+// the nominal per-block Scrypt solve time the damped filter pulls toward;
+// `pow_limit` is the easiest (largest) admissible target -- bnNew is capped to
+// it so a long stall can never relax difficulty past the network minimum.
+struct DigiShieldParams {
+    int64_t  target_timespan = 0;   // nominal solve time the filter centers on
+    uint64_t pow_limit       = 0;   // max (easiest) target; result never exceeds
+};
+
+// Per-algo DigiShield/MultiShield damped retarget multiply (M3 7b).
+//
+// Consumes the Scrypt-only RetargetWindow (averaged target + actual timespan,
+// both assembled over SCRYPT ancestors EXCLUSIVELY in next_retarget_window) and
+// produces the next block's expanded target. Pins DigiByte Core's DigiShield v3
+// amplitude filter:
+//
+//   damped = target_timespan + (actual_timespan - target_timespan) / 8
+//   clamp damped into [target_timespan*3/4, target_timespan*3/2]
+//   bnNew  = avg_target * damped / target_timespan
+//   bnNew  = min(bnNew, pow_limit)
+//
+// The /8 filter damps a single block's deviation; the clamp rails bound the
+// per-step move so a manipulated (or non-monotonic) timestamp run cannot swing
+// difficulty arbitrarily in one retarget. The lower rail is reachable only when
+// actual_timespan goes sharply negative (out-of-order block times); the upper
+// rail trips once actual_timespan exceeds ~5x nominal.
+//
+// `target` here is the fixed-width uint64 proxy the standalone CI guard uses;
+// the embedded-daemon port swaps arith_uint256 in with the SAME field shape, so
+// this multiply/clamp shape is unchanged when the real 256-bit width lands. The
+// intermediate uses __int128 so avg_target * damped cannot overflow the proxy.
+//
+// Returns 0 when the window carries no Scrypt samples -- the caller MUST keep
+// the prior target rather than retarget off an empty window (early/genesis).
+inline uint64_t digishield_next_target(const RetargetWindow& rw,
+                                       const DigiShieldParams& params)
+{
+    if (rw.scrypt_samples == 0 || params.target_timespan <= 0)
+        return 0;
+
+    const int64_t nominal = params.target_timespan;
+
+    // Amplitude filter: pull the observed timespan 1/8 of the way off nominal.
+    int64_t damped = nominal + (rw.actual_timespan - nominal) / 8;
+
+    // Per-step clamp rails: [3/4 nominal, 3/2 nominal].
+    const int64_t floor_ts = nominal - nominal / 4;
+    const int64_t ceil_ts  = nominal + nominal / 2;
+    if (damped < floor_ts) damped = floor_ts;
+    if (damped > ceil_ts)  damped = ceil_ts;
+
+    // bnNew = avg_target * damped / nominal, __int128 to avoid proxy overflow.
+    // damped is strictly positive after the clamp (floor_ts > 0 for nominal>0).
+    unsigned __int128 bn_new =
+        (static_cast<unsigned __int128>(rw.avg_target) *
+         static_cast<unsigned __int128>(static_cast<uint64_t>(damped)))
+        / static_cast<unsigned __int128>(static_cast<uint64_t>(nominal));
+
+    // Difficulty floor: never relax past the network's easiest target.
+    if (params.pow_limit != 0 &&
+        bn_new > static_cast<unsigned __int128>(params.pow_limit))
+        return params.pow_limit;
+
+    return static_cast<uint64_t>(bn_new);
+}
+
 // Work-neutral header chain with a Scrypt-only DigiShield retarget body.
 // Append order is oldest..newest; the retarget walk reads nearest-first.
 class HeaderChain {
