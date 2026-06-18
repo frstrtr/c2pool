@@ -20,7 +20,7 @@ if(COIN_DGB)
   message(STATUS "c2pool: DGB Scrypt-only coin module enabled")
   add_subdirectory(coin)
   # add_subdirectory(daemon)
-  # add_subdirectory(test)
+  add_subdirectory(test)
 
   # dgb -- DGB Scrypt pool-layer OBJECT lib. Mirrors the ltc OBJECT lib
   # (src/impl/ltc/CMakeLists.txt): compiles the real NodeImpl translation unit
