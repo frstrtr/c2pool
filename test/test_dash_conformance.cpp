@@ -853,3 +853,52 @@ TEST(DashConformanceFactory, PowAndBlockHashAreBothX11) {
     EXPECT_EQ(p.pow_func(s), expect);
     EXPECT_EQ(p.block_hash_func(s), expect);
 }
+
+// ── pool.yaml runtime-override seam (S6 slice: make_coin_params overrides) ────
+// The override overload lets an operator pool.yaml retune ONLY non-consensus,
+// non-isolation pool fields (ports, bootstrap peers). With no overrides the
+// factory output is byte-identical to the pure-SSOT overload; consensus-critical
+// and isolation fields are NEVER reachable from PoolOverrides (compile-time:
+// the struct has no field for them) and stay pinned to the SSOT even when the
+// tunable fields are overridden. Node-free — pins the seam pool.yaml populates.
+TEST(DashConformanceFactory, NoOverridesEqualsSSOTOverload) {
+    for (bool testnet : {false, true}) {
+        auto base = dash::make_coin_params(testnet);
+        auto ovr  = dash::make_coin_params(testnet, dash::PoolOverrides{});
+        EXPECT_EQ(ovr.p2p_port,        base.p2p_port);
+        EXPECT_EQ(ovr.worker_port,     base.worker_port);
+        EXPECT_EQ(ovr.bootstrap_addrs, base.bootstrap_addrs);
+    }
+}
+
+TEST(DashConformanceFactory, OverridesApplyToTunableFields) {
+    dash::PoolOverrides ov;
+    ov.p2p_port        = 19000;
+    ov.worker_port     = 19001;
+    ov.bootstrap_addrs = std::vector<std::string>{"seed.example:8999", "node2.example:8999"};
+    auto p = dash::make_coin_params(/*testnet=*/false, ov);
+    EXPECT_EQ(p.p2p_port,    19000);
+    EXPECT_EQ(p.worker_port, 19001);
+    ASSERT_EQ(p.bootstrap_addrs.size(), 2u);
+    EXPECT_EQ(p.bootstrap_addrs[0], "seed.example:8999");
+    EXPECT_EQ(p.bootstrap_addrs[1], "node2.example:8999");
+}
+
+// Even with tunable overrides set, consensus + isolation fields MUST equal the
+// SSOT/oracle values — a mis-edited pool.yaml can never fork the sharechain.
+TEST(DashConformanceFactory, OverridesNeverTouchConsensusOrIsolation) {
+    dash::PoolOverrides ov;
+    ov.p2p_port    = 19000;
+    ov.worker_port = 19001;
+    auto ssot = dash::make_coin_params(/*testnet=*/false);
+    auto p    = dash::make_coin_params(/*testnet=*/false, ov);
+    EXPECT_EQ(p.identifier_hex,         ssot.identifier_hex);
+    EXPECT_EQ(p.prefix_hex,             ssot.prefix_hex);
+    EXPECT_EQ(p.testnet_identifier_hex, ssot.testnet_identifier_hex);
+    EXPECT_EQ(p.testnet_prefix_hex,     ssot.testnet_prefix_hex);
+    EXPECT_EQ(p.max_target,             ssot.max_target);
+    EXPECT_EQ(p.current_share_version,  ssot.current_share_version);
+    EXPECT_EQ(p.minimum_protocol_version, ssot.minimum_protocol_version);
+    for (int64_t v : {0, 16, 35, 36})
+        EXPECT_EQ(p.donation_script_func(v), dash::DONATION_SCRIPT);
+}

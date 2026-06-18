@@ -23,10 +23,31 @@
 #include <core/coin_params.hpp>
 #include <core/pow.hpp>
 
+#include <optional>
+#include <string>
+#include <vector>
+
 namespace dash
 {
 
-inline core::CoinParams make_coin_params(bool testnet)
+// Runtime override seam for pool.yaml (Fileconfig consume-side, S6 follow-on).
+// ONLY operationally-tunable, NON-consensus, NON-isolation pool fields may be
+// overridden by an operator pool.yaml. Consensus-critical fields (share version,
+// max_target, donation script, X11 pow/block identity) and the network ISOLATION
+// PRIMITIVES (prefix/identifier) are deliberately ABSENT from this struct and are
+// therefore NEVER overridable: they stay pinned to the dash::PoolConfig SSOT
+// regardless of any override file, so a mis-edited pool.yaml can retune
+// ports/peers but can NEVER fork the sharechain off its oracle-conformant
+// identity. The YAML file-load half lands when DASH gains its config_pool.cpp
+// Fileconfig (mirrors dgb/btc); this header carries no file IO.
+struct PoolOverrides
+{
+    std::optional<uint16_t>                 p2p_port;
+    std::optional<uint16_t>                 worker_port;
+    std::optional<std::vector<std::string>> bootstrap_addrs;
+};
+
+inline core::CoinParams make_coin_params(bool testnet, const PoolOverrides& overrides)
 {
     core::CoinParams p;
 
@@ -100,7 +121,18 @@ inline core::CoinParams make_coin_params(bool testnet)
     p.current_share_version = 16;  // DASH older-than-v35 baseline (m_desired_version{16})
     p.is_testnet            = testnet;
 
+    // ----- pool.yaml runtime overrides (tunable, non-consensus only) -----
+    if (overrides.p2p_port)        p.p2p_port        = *overrides.p2p_port;
+    if (overrides.worker_port)     p.worker_port     = *overrides.worker_port;
+    if (overrides.bootstrap_addrs) p.bootstrap_addrs = *overrides.bootstrap_addrs;
+
     return p;
+}
+
+// Convenience overload: no operator overrides -> pure SSOT/oracle CoinParams.
+inline core::CoinParams make_coin_params(bool testnet)
+{
+    return make_coin_params(testnet, PoolOverrides{});
 }
 
 } // namespace dash
