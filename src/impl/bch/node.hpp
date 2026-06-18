@@ -210,31 +210,131 @@ public:
             return std::nullopt;
         }
 
-        // other-tx readiness probe: resolve the share's own new_transaction_hashes
-        // against m_known_txs (the protocol-handler tx cache). ref-chain entries
-        // (transaction_hash_refs into ancestor shares) are counted but the full
-        // ancestor walk + gentx body are the remaining work below.
-        std::size_t direct = 0, resolved = 0, refchain = 0;
+        // --- other_txs (p2pool data.py get_other_tx_hashes / _get_other_txs) ---
+        // The won block's "other txs" are the FULL ordered list named by this
+        // share's transaction_hash_refs: each (share_count, tx_count) indexes
+        // new_transaction_hashes[tx_count] of the ancestor share_count steps back
+        // (0 == this share). We resolve every ref to a tx hash, then every hash to
+        // a full tx in m_known_txs. If ANY ancestor share or tx body is absent we
+        // return nullopt (== as_block None) and NEVER relay a partial block.
+        // Strict equality vs the oracle ref-chain walk -- no best-effort assembly.
+        std::vector<bch::TxHashRefs> refs;
         chain.get_share(share_hash).invoke([&](auto* s) {
-            if constexpr (requires { s->m_tx_info; }) {
-                for (const auto& h : s->m_tx_info.m_new_transaction_hashes) {
-                    ++direct;
-                    if (m_known_txs.count(h)) ++resolved;
-                }
-                refchain = s->m_tx_info.m_transaction_hash_refs.size();
-            }
+            if constexpr (requires { s->m_tx_info; })
+                refs = s->m_tx_info.m_transaction_hash_refs;
         });
 
-        // Coinbase (gentx) full-body reconstruction is the remaining dependency
-        // (GenerateShareTransaction, share_check.hpp:472); the block merkle_root
-        // derives from it, so no valid block can be serialized until it lands.
-        // Return nullopt -- the dual-path broadcaster stays wired + fires the
-        // instant this can yield a complete block; we NEVER relay a partial one.
+        // Walk the ancestor chain (via index->tail) to the deepest referenced
+        // share_count. contains() guards every hop so get_index() never throws.
+        uint64_t max_back = 0;
+        for (const auto& r : refs)
+            max_back = std::max<uint64_t>(max_back, r.m_share_count);
+        std::vector<uint256> chain_hashes;
+        chain_hashes.reserve(max_back + 1);
+        {
+            uint256 cur = share_hash;
+            for (uint64_t i = 0; i <= max_back; ++i) {
+                if (cur.IsNull() || !chain.contains(cur)) break;
+                chain_hashes.push_back(cur);
+                auto* idx = chain.get_index(cur);
+                cur = idx ? idx->tail : uint256();
+            }
+        }
+        if (chain_hashes.size() <= max_back) {
+            LOG_INFO << "[BCH-POOL] reconstruct: share "
+                     << share_hash.GetHex().substr(0, 16)
+                     << " ancestor depth " << chain_hashes.size() << "/"
+                     << (max_back + 1)
+                     << " not present -> as_block None (nullopt)";
+            return std::nullopt;
+        }
+
+        // Resolve each ref -> tx hash -> full tx body.
+        std::vector<const coin::Transaction*> other_txs;
+        other_txs.reserve(refs.size());
+        for (const auto& r : refs) {
+            uint256 th;
+            bool got = false;
+            chain.get_share(chain_hashes[r.m_share_count]).invoke([&](auto* s) {
+                if constexpr (requires { s->m_tx_info; }) {
+                    const auto& nh = s->m_tx_info.m_new_transaction_hashes;
+                    if (r.m_tx_count < nh.size()) { th = nh[r.m_tx_count]; got = true; }
+                }
+            });
+            if (!got) {
+                LOG_WARNING << "[BCH-POOL] reconstruct: tx_hash_ref ("
+                            << r.m_share_count << "," << r.m_tx_count
+                            << ") out of range -> nullopt";
+                return std::nullopt;
+            }
+            auto it = m_known_txs.find(th);
+            if (it == m_known_txs.end()) {
+                LOG_INFO << "[BCH-POOL] reconstruct: other tx "
+                         << th.GetHex().substr(0, 16)
+                         << " not yet known -> as_block None (nullopt)";
+                return std::nullopt;
+            }
+            other_txs.push_back(&it->second);
+        }
+
+        // --- coinbase (gentx) body + 80-byte header ---
+        // Reuse the EXACT serialized coinbase buffer the txid was hashed from
+        // (out_gentx_bytes), so the relayed coinbase is byte-identical to what
+        // consensus + the sharechain validated -- no second derivation path, no
+        // divergence risk. merkle_root via check_merkle_link (BCH has no segwit,
+        // so always the coinbase txid merkle link). Header layout mirrors
+        // share_check.hpp:695-705 exactly.
+        std::vector<unsigned char> gentx_bytes;
+        PackStream header_stream;
+        bool built = false;
+        chain.get_share(share_hash).invoke([&](auto* s) {
+            using ST = std::remove_pointer_t<decltype(s)>;
+            constexpr int64_t ver = ST::version;
+            const bool v36 = (ver >= 36);
+            const uint256 gentx_hash =
+                generate_share_transaction(*s, m_tracker, false, v36, &gentx_bytes);
+            const uint256 merkle_root =
+                check_merkle_link(gentx_hash, s->m_merkle_link);
+            uint32_t hdr_version = static_cast<uint32_t>(s->m_min_header.m_version);
+            header_stream << hdr_version;
+            header_stream << s->m_min_header.m_previous_block;
+            header_stream << merkle_root;
+            header_stream << s->m_min_header.m_timestamp;
+            header_stream << s->m_min_header.m_bits;
+            header_stream << s->m_min_header.m_nonce;
+            built = true;
+        });
+        if (!built || gentx_bytes.empty() || header_stream.size() != 80) {
+            LOG_WARNING << "[BCH-POOL] reconstruct: gentx/header build failed (built="
+                        << built << " gentx=" << gentx_bytes.size()
+                        << " hdr=" << header_stream.size() << ") -> nullopt";
+            return std::nullopt;
+        }
+
+        // --- serialize full block (Bitcoin wire) ---
+        // header || CompactSize(1 + other_txs) || coinbase_bytes || other txs.
+        PackStream block_stream;
+        block_stream.write(header_stream.get_span());
+        WriteCompactSize(block_stream,
+                         static_cast<uint64_t>(1 + other_txs.size()));
+        block_stream.write(std::as_bytes(std::span<const unsigned char>(
+            gentx_bytes.data(), gentx_bytes.size())));
+        for (const auto* tx : other_txs)
+            block_stream << *tx;
+
+        auto block_span = block_stream.get_span();
+        std::vector<unsigned char> block_bytes(
+            reinterpret_cast<const unsigned char*>(block_span.data()),
+            reinterpret_cast<const unsigned char*>(block_span.data())
+                + block_span.size());
+        std::string block_hex = HexStr(block_span);
+
         LOG_INFO << "[BCH-POOL] reconstruct: share "
                  << share_hash.GetHex().substr(0, 16)
-                 << " other_tx direct " << resolved << "/" << direct
-                 << " known, " << refchain << " ref-chain; gentx body pending -> nullopt";
-        return std::nullopt;
+                 << " -> full block " << block_bytes.size() << " bytes, "
+                 << (1 + other_txs.size()) << " txs (1 coinbase + "
+                 << other_txs.size() << " other)";
+        return std::make_pair(std::move(block_bytes), std::move(block_hex));
     }
 
     NodeImpl(boost::asio::io_context* ctx, config_t* config)
