@@ -135,4 +135,17 @@ if (BUILD_TESTING AND GTest_FOUND)
             GTest::gtest_main GTest::gtest nlohmann_json::nlohmann_json)
         gtest_add_tests(${dgb_guard} "" AUTO)
     endforeach()
+    # --- #82 broadcaster-gate: CoinNode submit/seam contract -----------------
+    # Links the dgb OBJECT lib (coin_node.cpp) like dgb_share_test so the live
+    # CoinNode::submit_block_hex !m_rpc guard + embedded WorkView slice are
+    # build- and run-verified. Pins the external-digibyted RPC fallback half of
+    # the won-block dispatch (web_server -> ICoinNode::submit_block_hex).
+    add_executable(dgb_coin_node_seam_test coin_node_seam_test.cpp)
+    target_link_libraries(dgb_coin_node_seam_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_coin_node_seam_test "" AUTO)
+
 endif()
