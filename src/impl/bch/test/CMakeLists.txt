@@ -66,6 +66,36 @@ if(BUILD_TESTING)
         btclibs)
     add_test(NAME bch_utxo_connect_test COMMAND bch_utxo_connect_test)
 
+    # reorg_connect_test: M5 reorg/disconnect leg -- retained BlockUndo + a
+    # best-chain branch switch. Disconnects the orphaned branch (restore spent
+    # inputs, remove created outputs, return its txs to the mempool) and re-applies
+    # the new branch from the remembered-block ring. Same link set as the other
+    # connector tests; no impl_bch coin lib -> per-coin isolation holds.
+    add_executable(bch_reorg_connect_test
+        reorg_connect_test.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/transaction.cpp)
+    target_include_directories(bch_reorg_connect_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(bch_reorg_connect_test PRIVATE
+        core pool sharechain
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage c2pool_difficulty
+        btclibs)
+    add_test(NAME bch_reorg_connect_test COMMAND bch_reorg_connect_test)
+
+    # compact_block_connector_test: M5 (b) -- BIP152 compact-block depth on the
+    # connector seam. on_compact_block reconstructs from prefilled + mempool; a
+    # missing tx drives a getblocktxn round that on_block_txn closes out before
+    # the normal block-connect/mempool reconciliation. Uses btclibs for SipHash;
+    # same link set + transaction.cpp TU; no impl_bch coin lib -> isolation holds.
+    add_executable(bch_compact_block_connector_test
+        compact_block_connector_test.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/transaction.cpp)
+    target_include_directories(bch_compact_block_connector_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(bch_compact_block_connector_test PRIVATE
+        core pool sharechain
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage c2pool_difficulty
+        btclibs)
+    add_test(NAME bch_compact_block_connector_test COMMAND bch_compact_block_connector_test)
+
     # embedded_daemon_assembly_test: network-free assembly of the full
     # EmbeddedDaemon graph (Node + EmbeddedCoinNode + AblaRuntime + CoinNode
     # seam) plus the operator-approved cold-start anchor LIVE PIN (floor-
