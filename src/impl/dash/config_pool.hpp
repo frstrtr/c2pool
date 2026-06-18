@@ -63,6 +63,17 @@ struct PoolConfig
     static const std::string& identifier_hex() { return is_testnet ? TESTNET_IDENTIFIER_HEX : IDENTIFIER_HEX; }
     static const std::string& prefix_hex()     { return is_testnet ? TESTNET_PREFIX_HEX     : PREFIX_HEX; }
 
+    // ---- Dust threshold (payout-dust semantic) -----------------------------
+    // DUST_THRESHOLD: minimum per-recipient payout to justify a coinbase output.
+    // SOURCE: p2pool-dash oracle DUST_THRESHOLD = 0.001e8 = 100000 satoshi
+    // (PARENT.DUST_THRESHOLD). This is the PAYOUT-dust floor, NOT the dashd relay
+    // policy floor (5460/54600) which is wrong-semantic for the PPLNS path.
+    // V36 Option-A conform-to-p2pool: 100000 is the V36-correct value, matching
+    // the BTC/BCH/DGB sibling payout-dust semantic.
+    static constexpr uint64_t DUST_THRESHOLD         = 100000;  // satoshi (mainnet)
+    static constexpr uint64_t TESTNET_DUST_THRESHOLD = 100000;  // satoshi (testnet: oracle carries no separate floor)
+    static uint64_t dust_threshold() { return is_testnet ? TESTNET_DUST_THRESHOLD : DUST_THRESHOLD; }
+
     // MAX_TARGET: easiest allowed share difficulty (share-diff floor).
     //   mainnet : 0xFFFF * 2**208      (standard bdiff difficulty-1 target)
     //   testnet : 2**256 // 2**20 - 1
