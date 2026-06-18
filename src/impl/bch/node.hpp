@@ -431,6 +431,12 @@ public:
     /// in-operation win emits down both paths (P2P + external submitblock).
     void set_block_broadcaster(BlockBroadcastFn fn) { m_block_broadcaster = std::move(fn); }
 
+    /// True once a won-block sink is wired (set_block_broadcaster called). Lets
+    /// the binary entrypoint assert the broadcaster-gate criterion-C sink is
+    /// LIVE at standup before the run-loop, and is the structural half of the
+    /// dual-path evidence (the live VM300 e2e is the behavioural half).
+    bool has_block_broadcaster() const { return static_cast<bool>(m_block_broadcaster); }
+
     /// RAII guard for IO-thread tracker reads.
     /// - IO thread: acquires shared_lock(try_to_lock). Returns falsy if busy.
     /// - Compute thread: skips locking (exclusive already held). Always truthy.
