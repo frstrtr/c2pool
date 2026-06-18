@@ -201,6 +201,18 @@ public:
             if (h.target == 0)
                 return IngestResult::REJECTED;
 
+            // Minimum-difficulty ceiling (DigiByte Core CheckProofOfWork
+            // rejects when bnTarget > bnPowLimit). A declared Scrypt target
+            // EASIER (numerically larger) than the network minimum is
+            // consensus-invalid REGARDLESS of the retarget window -- this
+            // guards the bootstrap/empty-window path (expected == 0) where
+            // the nBits-style equality below cannot fire yet, so a stall
+            // could not otherwise reject a sub-minimum-difficulty header.
+            // pow_limit == 0 leaves the gate unconfigured (legacy
+            // default-ctor chains stay unconstrained, exactly as before).
+            if (m_ds_params.pow_limit != 0 && h.target > m_ds_params.pow_limit)
+                return IngestResult::REJECTED;
+
             // Consensus retarget gate: the declared target must equal the
             // DigiShield next-target computed over the Scrypt-only window
             // ending at the CURRENT tip (assembled BEFORE h is appended).

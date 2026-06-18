@@ -239,6 +239,39 @@ TEST(HeaderChainValidate, IngestGateEnforcesDigiShieldNextTarget)
 }
 
 
+// Ingest-path minimum-difficulty ceiling: a Scrypt header declaring a target
+// EASIER than pow_limit (numerically larger) is consensus-invalid REGARDLESS of
+// the retarget window -- it must be rejected even on the bootstrap/empty-window
+// path where the nBits-style equality gate is a no-op (expected == 0). Mirrors
+// DigiByte Core CheckProofOfWork rejecting when bnTarget > bnPowLimit.
+TEST(HeaderChainValidate, IngestGateRejectsTargetAbovePowLimit)
+{
+    // pow_limit configured, retarget_window 1. Seed empty -> equality gate is a
+    // no-op, so only the ceiling can reject this first header.
+    HeaderChain hc(DigiShieldParams{80, /*pow_limit=*/4096}, /*window=*/1);
+
+    // target == pow_limit is the easiest ADMISSIBLE target (strict > reject):
+    // accepted and credits work, seeding the chain.
+    ASSERT_EQ(hc.validate_and_append({SCRYPT, 1000, 4096}),
+              IngestResult::VALIDATED_SCRYPT);
+
+    // A target ABOVE pow_limit (easier than the network minimum) must REJECT
+    // without mutating the chain -- and it must do so on the ceiling alone,
+    // before the retarget-equality gate (which here would demand 4096*7/8=3584).
+    const std::size_t size_before = hc.size();
+    const uint64_t    work_before = hc.cumulative_work();
+    EXPECT_EQ(hc.validate_and_append({SCRYPT, 1080, 4097}),
+              IngestResult::REJECTED);
+    EXPECT_EQ(hc.size(),            size_before);
+    EXPECT_EQ(hc.cumulative_work(), work_before);
+
+    // pow_limit == 0 leaves the ceiling unconfigured: an enormous target is not
+    // rejected by THIS gate (legacy default-ctor behaviour preserved).
+    HeaderChain unconfigured;  // target_timespan 0, pow_limit 0
+    EXPECT_EQ(unconfigured.validate_and_append({SCRYPT, 1000, UINT64_MAX}),
+              IngestResult::VALIDATED_SCRYPT);
+}
+
 // ---------------------------------------------------------------------------
 // 256-BIT BOUNDARY (M3 §7b — arith_uint256 swap). Proves, not assumes, that
 // the DigiShield damped multiply runs at TRUE 256-bit width: a uint64/__int128
