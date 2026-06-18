@@ -33,6 +33,7 @@
 #include <impl/dash/pplns.hpp>           // dash::pplns::compute_payouts, dash::ShareChain, DashShare
 #include <impl/dash/version_negotiation.hpp> // dash::version_negotiation::get_desired_version_counts/weights
 #include <impl/dash/coin/vendor/cbtx.hpp> // dash::coin::vendor::CCbTx, parse_cbtx
+#include <impl/dash/config_pool.hpp>     // dash::PoolConfig (sharechain SSOT)
 #include <impl/bitcoin_family/coin/base_block.hpp>  // bitcoin_family::coin::SmallBlockHeaderType
 
 #include <core/hash.hpp>                     // Hash (sha256d)
@@ -409,12 +410,18 @@ struct SyntheticChain {
     std::vector<dash::DashShare*> pool;  // chain (ShareVariants::destroy) owns the shares; raw avoids double-free
 
     uint256 add(uint8_t tag, const uint256& prev, uint16_t donation,
-                const uint160& pkh) {
+                const uint160& pkh,
+                uint32_t bits = BITS_DIFF1, uint64_t version = 0) {
         auto* s = new dash::DashShare();
         s->m_hash        = pplns_share_hash(tag);
         s->m_prev_hash   = prev;
-        s->m_bits        = BITS_DIFF1;
-        s->m_max_bits    = BITS_DIFF1;  // ShareIndex ctor reads m_max_bits
+        // Final fields set BEFORE chain.add(): ShareIndex caches
+        // work=target_to_average_attempts(bits_to_target(m_bits)) at insertion,
+        // and a production share has immutable bits once it enters the chain.
+        // (m_max_bits stays at diff1 -- min_work basis unchanged.)
+        s->m_bits            = bits;
+        s->m_max_bits        = BITS_DIFF1;
+        s->m_desired_version = version;
         s->m_donation    = donation;
         s->m_pubkey_hash = pkh;
         const uint256 h  = s->m_hash;
@@ -549,7 +556,7 @@ TEST(DashConformancePplns, ColdChainFallsBackToSingleRecipient) {
 // weight[36]/Sum >= 0.95). All thresholds and weights below are KAT vectors
 // computed OUT-OF-BAND in CPython from the exact integer formulas
 //   target_to_average_attempts = 2**256 // (target + 1)
-//   tail-guard  : count >= (total*60)//100      (floor)
+//   switch gate : have_w*100 >= total_w*60      (weighted, exact rational)
 //   v36 gate    : w36*100 >= total*95           (exact rational)
 // so the pins are not circular with the C++ path.
 
@@ -565,11 +572,8 @@ namespace {
 // obj->m_bits live, so post-add patching is what the production walk observes.
 uint256 add_versioned(SyntheticChain& sc, uint8_t tag, const uint256& prev,
                       uint64_t version, uint32_t bits, const uint160& pkh) {
-    uint256 h = sc.add(tag, prev, /*donation*/ 0, pkh);
-    auto* s = sc.pool.back();
-    s->m_desired_version = version;
-    s->m_bits = bits;
-    return h;
+    // Bits/version set pre-insertion so the cached ShareIndex::work matches.
+    return sc.add(tag, prev, /*donation*/ 0, pkh, bits, version);
 }
 }  // namespace
 
@@ -595,18 +599,19 @@ TEST(DashConformanceVersionNeg, PlainCountAndWeightVsOutOfBandKat) {
         << "v36 weight != CPython KAT (3x diff1 work)";
 }
 
-// 60% SUCCESSOR tail-guard, floor semantics. KAT booleans from CPython
-// count >= (total*60)//100. The 4/7 case (57% but thr=floor(4.2)=4) and 3/7
-// case lock the floor exactly as the oracle's `sum*60//100`.
-TEST(DashConformanceVersionNeg, SuccessorGuard60PercentFloorKat) {
+// 60% SUCCESSOR switch gate, PPLNS-WEIGHTED exact-rational semantics (D1 /
+// F10 685669e9). KAT booleans from CPython have_w*100 >= total_w*60 (no floor).
+// The 4/7 case now REJECTS (400 < 420) where the prior plain-floor gate cleared
+// it (thr=floor(4.2)=4) -- the exact divergence D1 standardizes away.
+TEST(DashConformanceVersionNeg, SuccessorGuard60PercentWeightedKat) {
     using dash::version_negotiation::successor_switch_allowed;
-    EXPECT_TRUE (successor_switch_allowed({{36u, 6u}, {16u, 4u}}, 36u));   // 60%
-    EXPECT_FALSE(successor_switch_allowed({{36u, 5u}, {16u, 5u}}, 36u));   // 50%
-    EXPECT_TRUE (successor_switch_allowed({{36u, 60u}, {16u, 40u}}, 36u)); // 60%
-    EXPECT_FALSE(successor_switch_allowed({{36u, 59u}, {16u, 41u}}, 36u)); // 59%
-    EXPECT_TRUE (successor_switch_allowed({{36u, 4u}, {16u, 3u}}, 36u));   // 4/7, thr=4
-    EXPECT_FALSE(successor_switch_allowed({{36u, 3u}, {16u, 4u}}, 36u));   // 3/7, thr=4
-    EXPECT_FALSE(successor_switch_allowed({}, 36u));                       // empty
+    EXPECT_TRUE (successor_switch_allowed({{36u, uint288(6u)},  {16u, uint288(4u)}},  36u)); // 6/10 = 60%
+    EXPECT_FALSE(successor_switch_allowed({{36u, uint288(5u)},  {16u, uint288(5u)}},  36u)); // 5/10 = 50%
+    EXPECT_TRUE (successor_switch_allowed({{36u, uint288(60u)}, {16u, uint288(40u)}}, 36u)); // 60/100 = 60%
+    EXPECT_FALSE(successor_switch_allowed({{36u, uint288(59u)}, {16u, uint288(41u)}}, 36u)); // 59/100 = 59%
+    EXPECT_FALSE(successor_switch_allowed({{36u, uint288(4u)},  {16u, uint288(3u)}},  36u)); // 4/7: 400 < 420 -> reject
+    EXPECT_FALSE(successor_switch_allowed({{36u, uint288(3u)},  {16u, uint288(4u)}},  36u)); // 3/7: 300 < 420 -> reject
+    EXPECT_FALSE(successor_switch_allowed({}, 36u));                                          // empty
 }
 
 // v36 activation gate, exact-rational 95% on the work-weighted tally. KAT
@@ -626,10 +631,11 @@ TEST(DashConformanceVersionNeg, V36GateWeighted95PercentKat) {
     EXPECT_FALSE(v36_active({{36u, big * uint288(94u)}, {16u, big * uint288(6u)}}));
 }
 
-// The two tallies must diverge: on the 3x-v36(diff1)+1x-v16(heavy) chain the
-// PLAIN guard clears (v36 holds 3/4 of votes >= 60%) but the WEIGHTED gate
-// denies (v36 holds only ~60% of work < 95%). Proves the gate consumes the
-// weighted variant, not the plain count (F10 separation).
+// D1 + F10 separation: the 60% SUCCESSOR gate consumes the WEIGHTED tally, not
+// the plain count. On the 3x-v36(diff1)+1x-v16(heavy) chain the two disagree at
+// the 60% boundary: plain v36 = 3/4 = 75% (a plain-count gate WOULD clear), but
+// weighted v36 = 3*W_DIFF1 / (3*W_DIFF1 + W_HEAVY) = 59.9996% < 60%, so the
+// canonical weighted gate DENIES. The 95% activation gate likewise denies.
 TEST(DashConformanceVersionNeg, GateUsesWeightNotPlainCount) {
     SyntheticChain sc;
     const uint160 A = miner_h160(0x02);
@@ -641,10 +647,54 @@ TEST(DashConformanceVersionNeg, GateUsesWeightNotPlainCount) {
     auto plain   = dash::version_negotiation::get_desired_version_counts(sc.chain, tip, 4);
     auto weights = dash::version_negotiation::get_desired_version_weights(sc.chain, tip, 4);
 
-    // Plain: v36 = 3/4 of votes -> SUCCESSOR switch permitted.
-    EXPECT_TRUE(dash::version_negotiation::successor_switch_allowed(plain, 36u));
-    // Weighted: v36 work share ~60% (3*W_DIFF1 / (3*W_DIFF1 + W_HEAVY)) < 95%.
+    // Plain count: v36 holds 3/4 = 75% of votes -- a plain-count 60% gate WOULD clear.
+    const std::map<uint64_t, uint64_t> plain_expected = {{16u, 1u}, {36u, 3u}};
+    EXPECT_EQ(plain, plain_expected);
+    // Weighted 60% SUCCESSOR gate (D1): v36 work ~59.9996% < 60% -> DENY.
+    EXPECT_FALSE(dash::version_negotiation::successor_switch_allowed(weights, 36u));
+    // Weighted 95% activation gate: v36 work ~60% < 95% -> not active.
     EXPECT_FALSE(dash::version_negotiation::v36_active(weights));
+}
+
+// D2: unified 5-case version-switch classifier (F10 share_check.hpp step 2).
+// Pins classify_switch() over every transition shape and the switch_accepted()
+// decision table, then cross-checks the SuccessorGated body against the live D1
+// 60% weighted gate so the classifier can never diverge from successor_switch_allowed.
+TEST(DashConformanceVersionNeg, SwitchClassifier5CaseKat) {
+    using namespace dash::version_negotiation;
+    using C = dash::version_negotiation::SwitchClass;
+
+    // classify_switch: structural transition classification (prev, desired, has_history).
+    EXPECT_EQ(classify_switch(36u, 36u, true),  C::Same);                // continuation
+    EXPECT_EQ(classify_switch(36u, 36u, false), C::Same);                // history irrelevant
+    EXPECT_EQ(classify_switch(35u, 34u, true),  C::PredecessorAllowed);  // downgrade-by-one
+    EXPECT_EQ(classify_switch(35u, 34u, false), C::PredecessorAllowed);  // needs no window
+    EXPECT_EQ(classify_switch(35u, 36u, true),  C::SuccessorGated);      // +1 with support window
+    EXPECT_EQ(classify_switch(35u, 36u, false), C::NoHistory);           // +1, window absent
+    EXPECT_EQ(classify_switch(35u, 37u, true),  C::InvalidJump);         // +2 skip
+    EXPECT_EQ(classify_switch(35u, 33u, true),  C::InvalidJump);         // -2 skip
+    EXPECT_EQ(classify_switch(35u, 40u, false), C::InvalidJump);         // +5, structural reject
+
+    // switch_accepted: final verdict. SuccessorGated defers to the 60% gate;
+    // every other case is decided structurally (gate_cleared is then ignored).
+    EXPECT_TRUE (switch_accepted(C::Same,               false));  // continuation always ok
+    EXPECT_TRUE (switch_accepted(C::PredecessorAllowed, false));  // rollback always ok
+    EXPECT_TRUE (switch_accepted(C::SuccessorGated,     true));   // +1, gate cleared
+    EXPECT_FALSE(switch_accepted(C::SuccessorGated,     false));  // +1, gate denied
+    EXPECT_FALSE(switch_accepted(C::InvalidJump,        true));   // skip never ok
+    EXPECT_FALSE(switch_accepted(C::NoHistory,          true));   // no support window
+
+    // Cross-check the gated body against the live D1 weighted gate: a +1 switch
+    // to v36 with history is accepted exactly when successor_switch_allowed clears.
+    const std::map<uint64_t, uint288> clears  = {{36u, uint288(6u)}, {16u, uint288(4u)}};  // 60%
+    const std::map<uint64_t, uint288> denies  = {{36u, uint288(5u)}, {16u, uint288(5u)}};  // 50%
+    EXPECT_TRUE (switch_accepted(classify_switch(35u, 36u, true),
+                                 successor_switch_allowed(clears, 36u)));
+    EXPECT_FALSE(switch_accepted(classify_switch(35u, 36u, true),
+                                 successor_switch_allowed(denies, 36u)));
+    // Same chain, but window absent -> NoHistory short-circuits the gate entirely.
+    EXPECT_FALSE(switch_accepted(classify_switch(35u, 36u, false),
+                                 successor_switch_allowed(clears, 36u)));
 }
 
 // ── DIP4 special-tx coinbase payload (CCbTx) wire-encoding conformance ──────
@@ -741,4 +791,163 @@ TEST(DashConformanceCbtx, ParseCbtxIsExactInverseOfKat) {
     dash::coin::vendor::CCbTx tx2;
     EXPECT_FALSE(dash::coin::vendor::parse_cbtx(bytes, tx2))
         << "parse_cbtx accepted trailing garbage (wire-drift guard defeated)";
+}
+
+
+// -- Sharechain network-params conformance (S6 slice 3) -----------------------
+// Pin DASH's p2pool sharechain framing constants against its OWN older-than-v35
+// oracle (frstrtr/p2pool-dash networks/dash.py + dash_testnet.py). The expected
+// values below are an INDEPENDENT transcription of the oracle, NOT a re-export of
+// dash::PoolConfig, so the assertions catch a drift in either copy -- the same
+// anti-circularity design used by the merkle/payout KATs above.
+//
+// PREFIX/IDENTIFIER are isolation primitives: pinned per-coin here, never to be
+// unified cross-coin (operator v36_standardization_goal 2026-06-17).
+TEST(DashConformanceNetworkParams, MainnetMatchesP2poolDashOracle) {
+    dash::PoolConfig::is_testnet = false;
+    EXPECT_EQ(dash::PoolConfig::p2p_port(), 8999);
+    EXPECT_EQ(dash::PoolConfig::worker_port(), 7903);
+    EXPECT_EQ(dash::PoolConfig::share_period(), 20u);
+    EXPECT_EQ(dash::PoolConfig::chain_length(), 4320u);       // 24*60*60//20
+    EXPECT_EQ(dash::PoolConfig::real_chain_length(), 4320u);
+    EXPECT_EQ(dash::PoolConfig::TARGET_LOOKBEHIND, 100u);
+    EXPECT_EQ(dash::PoolConfig::SPREAD, 10u);
+    EXPECT_EQ(dash::PoolConfig::MINIMUM_PROTOCOL_VERSION, 1700u);
+    EXPECT_EQ(dash::PoolConfig::identifier_hex(), std::string("7242ef345e1bed6b"));
+    EXPECT_EQ(dash::PoolConfig::prefix_hex(),     std::string("3b3e1286f446b891"));
+    uint256 expect_max;
+    expect_max.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
+    EXPECT_EQ(dash::PoolConfig::max_target(), expect_max);    // 0xFFFF * 2**208
+}
+
+TEST(DashConformanceNetworkParams, TestnetMatchesP2poolDashOracle) {
+    dash::PoolConfig::is_testnet = true;
+    EXPECT_EQ(dash::PoolConfig::p2p_port(), 18999);
+    EXPECT_EQ(dash::PoolConfig::worker_port(), 17903);
+    EXPECT_EQ(dash::PoolConfig::share_period(), 20u);
+    EXPECT_EQ(dash::PoolConfig::chain_length(), 4320u);
+    EXPECT_EQ(dash::PoolConfig::identifier_hex(), std::string("b6deb1e543fe2427"));
+    EXPECT_EQ(dash::PoolConfig::prefix_hex(),     std::string("198b644f6821e3b3"));
+    uint256 expect_max;
+    expect_max.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    EXPECT_EQ(dash::PoolConfig::max_target(), expect_max);    // 2**256 // 2**20 - 1
+    dash::PoolConfig::is_testnet = false;  // restore global for any later tests
+}
+
+// ── Factory↔SSOT conformance (S6 slice: make_coin_params wiring) ─────────────
+// The dash::make_coin_params factory MUST populate core::CoinParams pool-level
+// fields from the dash::PoolConfig SSOT (config_pool.hpp) and the coin-level
+// fields from the DASH oracle, so share_check/coinbase_builder — which consume a
+// const core::CoinParams& — never run on an unpopulated or drifted struct. This
+// pins the factory output WITHOUT a node dependency: it is the node-free half of
+// S6, complementary to the real-node KAT capture.
+#include <impl/dash/params.hpp>  // dash::make_coin_params
+
+TEST(DashConformanceFactory, PoolFieldsSourcedFromSSOT) {
+    for (bool testnet : {false, true}) {
+        dash::PoolConfig::is_testnet = testnet;
+        auto p = dash::make_coin_params(testnet);
+        EXPECT_EQ(p.p2p_port,                 dash::PoolConfig::p2p_port());
+        EXPECT_EQ(p.worker_port,              dash::PoolConfig::worker_port());
+        EXPECT_EQ(p.share_period,             dash::PoolConfig::share_period());
+        EXPECT_EQ(p.chain_length,             dash::PoolConfig::chain_length());
+        EXPECT_EQ(p.real_chain_length,        dash::PoolConfig::real_chain_length());
+        EXPECT_EQ(p.target_lookbehind,        dash::PoolConfig::TARGET_LOOKBEHIND);
+        EXPECT_EQ(p.spread,                   dash::PoolConfig::SPREAD);
+        EXPECT_EQ(p.minimum_protocol_version, dash::PoolConfig::MINIMUM_PROTOCOL_VERSION);
+        EXPECT_EQ(p.identifier_hex,           dash::PoolConfig::IDENTIFIER_HEX);
+        EXPECT_EQ(p.prefix_hex,               dash::PoolConfig::PREFIX_HEX);
+        EXPECT_EQ(p.testnet_identifier_hex,   dash::PoolConfig::TESTNET_IDENTIFIER_HEX);
+        EXPECT_EQ(p.testnet_prefix_hex,       dash::PoolConfig::TESTNET_PREFIX_HEX);
+        dash::PoolConfig::is_testnet = testnet;
+        EXPECT_EQ(p.max_target,               dash::PoolConfig::max_target());
+        EXPECT_EQ(p.is_testnet,               testnet);
+    }
+}
+
+TEST(DashConformanceFactory, CoinFieldsMatchDashOracle) {
+    auto mn = dash::make_coin_params(/*testnet=*/false);
+    EXPECT_EQ(mn.symbol, "DASH");
+    EXPECT_EQ(mn.block_period, 150u);
+    EXPECT_EQ(mn.address_version, 76);        // X...
+    EXPECT_EQ(mn.address_p2sh_version, 16);   // 7...
+    EXPECT_EQ(mn.address_p2sh_version2, 0);   // no secondary P2SH
+    EXPECT_EQ(mn.segwit_activation_version, 0u);  // DASH: no segwit
+    EXPECT_EQ(mn.current_share_version, 16u);     // older-than-v35 baseline
+
+    auto tn = dash::make_coin_params(/*testnet=*/true);
+    EXPECT_EQ(tn.address_version, 140);       // y...
+    EXPECT_EQ(tn.address_p2sh_version, 19);
+}
+
+// The factory donation script is byte-identical to the DONATION_SCRIPT SSOT for
+// every share version (DASH is always P2PKH; no v36 combined-P2SH switch).
+TEST(DashConformanceFactory, DonationScriptIsSSOTForAllVersions) {
+    auto p = dash::make_coin_params(/*testnet=*/false);
+    for (int64_t v : {0, 15, 16, 35, 36}) {
+        EXPECT_EQ(p.donation_script_func(v), dash::DONATION_SCRIPT)
+            << "donation script diverged at share_version=" << v;
+    }
+}
+
+// PoW and block-identity hashes are BOTH X11 (DASH identifies blocks by X11,
+// not SHA256d) — guard against an accidental copy of the LTC sha256d shape.
+TEST(DashConformanceFactory, PowAndBlockHashAreBothX11) {
+    auto p = dash::make_coin_params(/*testnet=*/false);
+    ASSERT_TRUE(p.pow_func);
+    ASSERT_TRUE(p.block_hash_func);
+    std::vector<unsigned char> sample(80, 0xab);
+    std::span<const unsigned char> s(sample.data(), sample.size());
+    uint256 expect = dash::crypto::hash_x11(s);
+    EXPECT_EQ(p.pow_func(s), expect);
+    EXPECT_EQ(p.block_hash_func(s), expect);
+}
+
+// ── pool.yaml runtime-override seam (S6 slice: make_coin_params overrides) ────
+// The override overload lets an operator pool.yaml retune ONLY non-consensus,
+// non-isolation pool fields (ports, bootstrap peers). With no overrides the
+// factory output is byte-identical to the pure-SSOT overload; consensus-critical
+// and isolation fields are NEVER reachable from PoolOverrides (compile-time:
+// the struct has no field for them) and stay pinned to the SSOT even when the
+// tunable fields are overridden. Node-free — pins the seam pool.yaml populates.
+TEST(DashConformanceFactory, NoOverridesEqualsSSOTOverload) {
+    for (bool testnet : {false, true}) {
+        auto base = dash::make_coin_params(testnet);
+        auto ovr  = dash::make_coin_params(testnet, dash::PoolOverrides{});
+        EXPECT_EQ(ovr.p2p_port,        base.p2p_port);
+        EXPECT_EQ(ovr.worker_port,     base.worker_port);
+        EXPECT_EQ(ovr.bootstrap_addrs, base.bootstrap_addrs);
+    }
+}
+
+TEST(DashConformanceFactory, OverridesApplyToTunableFields) {
+    dash::PoolOverrides ov;
+    ov.p2p_port        = 19000;
+    ov.worker_port     = 19001;
+    ov.bootstrap_addrs = std::vector<std::string>{"seed.example:8999", "node2.example:8999"};
+    auto p = dash::make_coin_params(/*testnet=*/false, ov);
+    EXPECT_EQ(p.p2p_port,    19000);
+    EXPECT_EQ(p.worker_port, 19001);
+    ASSERT_EQ(p.bootstrap_addrs.size(), 2u);
+    EXPECT_EQ(p.bootstrap_addrs[0], "seed.example:8999");
+    EXPECT_EQ(p.bootstrap_addrs[1], "node2.example:8999");
+}
+
+// Even with tunable overrides set, consensus + isolation fields MUST equal the
+// SSOT/oracle values — a mis-edited pool.yaml can never fork the sharechain.
+TEST(DashConformanceFactory, OverridesNeverTouchConsensusOrIsolation) {
+    dash::PoolOverrides ov;
+    ov.p2p_port    = 19000;
+    ov.worker_port = 19001;
+    auto ssot = dash::make_coin_params(/*testnet=*/false);
+    auto p    = dash::make_coin_params(/*testnet=*/false, ov);
+    EXPECT_EQ(p.identifier_hex,         ssot.identifier_hex);
+    EXPECT_EQ(p.prefix_hex,             ssot.prefix_hex);
+    EXPECT_EQ(p.testnet_identifier_hex, ssot.testnet_identifier_hex);
+    EXPECT_EQ(p.testnet_prefix_hex,     ssot.testnet_prefix_hex);
+    EXPECT_EQ(p.max_target,             ssot.max_target);
+    EXPECT_EQ(p.current_share_version,  ssot.current_share_version);
+    EXPECT_EQ(p.minimum_protocol_version, ssot.minimum_protocol_version);
+    for (int64_t v : {0, 16, 35, 36})
+        EXPECT_EQ(p.donation_script_func(v), dash::DONATION_SCRIPT);
 }
