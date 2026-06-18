@@ -61,6 +61,7 @@
 #include "bchn_anchor_record.hpp" // BchnAnchorRecord (cold-start anchor)
 
 #include <core/log.hpp>
+#include <core/events.hpp>   // EventDisposable (new_headers subscription handle)
 
 namespace bch {
 namespace coin {
@@ -95,6 +96,7 @@ public:
         m_chain.init();               // load genesis / fast-start checkpoint (network-free)
         m_node.run();                 // init_rpc(): external BCHN-RPC fallback retained
         assemble();                   // network-free seam + ABLA wiring (see below)
+        wire_chain_ingest();          // new_headers --> HeaderChain (advances synced height)
         pin_cold_start_anchor();      // operator-APPROVED VM300 anchor (decisions@ 2026-06-18); floor-equivalent
         LOG_INFO << "[EMB-BCH] embedded daemon up: embedded-primary work source,"
                  << " external BCHN-RPC fallback retained, ABLA loop closed"
@@ -121,6 +123,48 @@ public:
             return;                   // already assembled; idempotent no-op
         m_abla.wire(m_node, m_embedded);
         m_coin_node = std::make_unique<CoinNode>(&m_embedded, m_node.rpc());
+    }
+
+    /// Drive the authoritative HeaderChain from the live P2P header stream.
+    /// The P2P front-end (NodeP2P) parses `headers` messages and fires
+    /// new_headers; until this subscription existed NOTHING advanced m_chain
+    /// during a sync (the handler only queued block-body downloads), so the
+    /// synced height stayed pinned at the init() checkpoint. Here we feed every
+    /// received batch into m_chain.add_headers() -- headers-first IBD: the tip
+    /// tracks the peer as batches stream, block bodies backfill via the
+    /// block-download window. The peer's advertised tip is propagated first so
+    /// add_headers() picks its fast-sync batch size. Idempotent (guarded).
+    /// p2pool-merged-v36 surface: NONE -- local SPV header state only (no
+    /// PoW/share/coinbase/PPLNS/WorkData-shape change).
+    void wire_chain_ingest() {
+        if (m_headers_sub)
+            return;                   // already wired; idempotent no-op
+        m_headers_sub = m_node.new_headers.subscribe(
+            [this](const std::vector<BlockHeaderType>& headers) {
+                if (auto* p2p = m_node.p2p()) {
+                    const uint32_t peer_tip = p2p->peer_start_height();
+                    if (peer_tip > 0)
+                        m_chain.set_peer_tip_height(peer_tip);
+                }
+                m_chain.add_headers(headers);
+            });
+    }
+
+    // Read-only IBD evidence for the --ibd run-loop: synced height vs the peer's
+    // advertised tip, plus the block-download window stall counters. All derived
+    // from live members; valid once run()/start_p2p() has connected a peer.
+    uint32_t ibd_synced_height() { return m_chain.height(); }
+    uint32_t ibd_peer_tip() {
+        return m_node.has_p2p() ? m_node.p2p()->peer_start_height() : 0;
+    }
+    std::size_t ibd_reissue_count() {
+        return m_node.has_p2p() ? m_node.p2p()->ibd_reissue_count() : 0;
+    }
+    std::size_t ibd_false_evict_count() {
+        return m_node.has_p2p() ? m_node.p2p()->ibd_false_evict_count() : 0;
+    }
+    std::size_t ibd_in_flight() {
+        return m_node.has_p2p() ? m_node.p2p()->ibd_in_flight() : 0;
     }
 
     /// Apply a BCHN-pinned {height, State} captured from VM300 bchn-bch. This
@@ -206,6 +250,8 @@ private:
     EmbeddedCoinNode m_embedded; // in-process work source
     Node<config_t>   m_node;     // P2P + external-RPC fallback; full_block source
     AblaRuntime      m_abla;     // owns tracker + feed; wired in run()
+    // new_headers -> m_chain.add_headers() subscription (headers-first IBD).
+    std::shared_ptr<EventDisposable> m_headers_sub;
     // Built in run() once m_node.rpc() is live; binds raw ptrs to m_embedded
     // (primary) + m_node's NodeRPC (fallback), both outlive it (daemon-owned).
     std::unique_ptr<CoinNode> m_coin_node;

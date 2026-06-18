@@ -105,6 +105,11 @@ public:
     /// unsolicited / already-handled block).
     bool on_block_received(const uint256& h)
     {
+        // False-eviction accounting: a hash we previously expired() now arrived.
+        // On a healthy peer with a generous timeout NOTHING expires, so this
+        // stays 0 -- a non-zero value means the BLOCK_DL_TIMEOUT_SEC fired on a
+        // request the peer was merely slow to answer, not genuinely stalled.
+        if (m_evicted.erase(h)) ++m_false_evict_count;
         auto it = m_in_flight.find(h);
         if (it == m_in_flight.end()) {
             // Unsolicited or already handled: still remember it so a later
@@ -146,6 +151,7 @@ public:
         // Surfaced for the read-only IBD writeup (real re-issue metric, not
         // inferred) and for peer-demotion heuristics on a noisy single peer.
         m_reissue_count += evicted.size();
+        for (const auto& h : evicted) m_evicted.insert(h);
         return evicted;
     }
 
@@ -160,12 +166,19 @@ public:
     /// window lifetime (== total expire() evictions). Read-only IBD evidence.
     std::size_t reissue_count() const { return m_reissue_count; }
 
+    /// Count of evicted requests whose block later arrived anyway -- a premature
+    /// eviction (timeout too aggressive for the peer). 0 on a clean sync.
+    /// Read-only IBD evidence alongside reissue_count().
+    std::size_t false_evict_count() const { return m_false_evict_count; }
+
 private:
     std::size_t m_max_in_flight;
     std::deque<uint256> m_queue;                            // pending, chain order
     std::unordered_map<uint256, uint64_t, HashHasher> m_in_flight; // hash -> tick getdata issued
     std::unordered_set<uint256, HashHasher> m_known;        // queued ∪ inflight ∪ received
     std::size_t m_reissue_count = 0;                       // lifetime re-issues (stall-driven)
+    std::unordered_set<uint256, HashHasher> m_evicted;     // expired, awaiting (re-)arrival
+    std::size_t m_false_evict_count = 0;                   // evicted-then-arrived (premature)
 };
 
 } // namespace bch::coin::block_download

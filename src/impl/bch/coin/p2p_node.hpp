@@ -392,6 +392,14 @@ public:
     uint32_t peer_version() const { return m_peer_version; }
     const std::string& peer_subver() const { return m_peer_subver; }
     uint32_t peer_start_height() const { return m_peer_start_height; }
+
+    /// Read-only IBD block-download evidence (M5 --ibd run-loop). reissue =
+    /// stalled in-flight requests re-issued; false_evict = evicted requests
+    /// whose block arrived anyway (premature timeout). Both 0 on a clean sync.
+    std::size_t ibd_reissue_count() const { return m_block_dl.reissue_count(); }
+    std::size_t ibd_false_evict_count() const { return m_block_dl.false_evict_count(); }
+    std::size_t ibd_in_flight() const { return m_block_dl.in_flight(); }
+    std::size_t ibd_queued() const { return m_block_dl.queued(); }
     int64_t peer_uptime_sec() const {
         return std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - m_connected_at).count();
