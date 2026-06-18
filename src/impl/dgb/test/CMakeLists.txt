@@ -42,6 +42,19 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_block_broadcast_test "" AUTO)
 
+    # --- #82 broadcaster-gate: won-block DISPATCH handler --------------------
+    # Header-only contract test for coin/won_block_dispatch.hpp (the handler the
+    # run-loop wires tracker().m_on_block_found to: reconstruct share->block,
+    # then fire broadcast_won_block dual-path). Links core for the ICoinNode seam
+    # + LOG_* symbols; uses a fake ICoinNode + stub reconstructor, no OBJECT lib.
+    add_executable(dgb_won_block_dispatch_test won_block_dispatch_test.cpp)
+    target_link_libraries(dgb_won_block_dispatch_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_won_block_dispatch_test "" AUTO)
+
     # --- M3 RPC-transport standalone regression guards ---------------------
     # Header-only guards over the external-daemon RPC coin-layer SSOTs
     # (rpc_request.hpp request-shape + version floor + genesis identity, and
