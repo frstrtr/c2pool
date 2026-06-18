@@ -63,7 +63,7 @@ inline core::CoinParams make_coin_params(bool testnet)
 
     // Softforks — from PoolConfig SSOT (oracle: nversionbips,csv,segwit,reservealgo,odo,taproot)
     p.softforks_required        = PoolConfig::SOFTFORKS_REQUIRED;
-    p.segwit_activation_version = PoolConfig::SEGWIT_ACTIVATION_VERSION;  // 35
+    p.segwit_activation_version = PoolConfig::SEGWIT_ACTIVATION_VERSION;  // 35 (canonical oracle p2pool-dgb-scrypt)
 
     // ===== Pool-level (net) — from dgb::PoolConfig (config_pool.hpp) =====
     p.p2p_port    = PoolConfig::P2P_PORT;  // 5024 (DGB sharechain P2P)

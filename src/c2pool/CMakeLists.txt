@@ -170,14 +170,27 @@ target_link_libraries(c2pool-btc
 # stratum_server.o, which reference merged/payout/hashrate/ltc symbols (the
 # self-link tangle that forces c2pool-btc to drag in ltc/payout/merged) and
 # would pull Phase B forward. We therefore add ONLY yaml-cpp (header path).
-# Link deps stay at yaml-cpp + json + Boost until Phase B.
+# EXE-WIRE slice: main_dgb.cpp drives the LIVE header-only chain-score path
+# (dgb::ShareTracker::score, #132/#134) + make_coin_params; it never constructs
+# the abstract dgb::NodeImpl, so node.cpp (the run-loop TU that references core
+# web_server/stratum -> payout/merged/hashrate/ltc, i.e. the Phase B self-link
+# tangle AND merged-mining = DOGE aux, which is NOT in the V36 default DGB
+# build) is intentionally NOT compiled in. core is an OBJECT lib (links ALL its
+# objects unconditionally, incl. web_server/stratum), so linking it forces that
+# whole tangle; we therefore do NOT link core. We compile ONLY core/uint256.cpp
+# directly (base_uint symbols the header-only ScoreT/hashrate-hex path needs) -
+# additive, no other target touched - and link nothing beyond yaml-cpp(header)/
+# json/Boost. Per-coin isolation held. The embedded run-loop (NodeBridge over
+# digibyted P2P + Stratum) and its pool-runtime link land in a later Phase B
+# slice.
 add_executable(c2pool-dgb
     main_dgb.cpp
-    ${CMAKE_SOURCE_DIR}/src/impl/dgb/node.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/uint256.cpp
 )
 target_compile_definitions(c2pool-dgb PRIVATE C2POOL_VERSION="${C2POOL_GIT_VERSION}")
 target_link_libraries(c2pool-dgb
-    yaml-cpp::yaml-cpp  # include dir only: config_{coin,pool}.hpp -> core/netaddress.hpp -> <yaml-cpp/yaml.h>
+    btclibs  # STATIC util lib: HexStr/HexDigit (strencodings) for base_uint hex - pure utility, no pool runtime
+    yaml-cpp::yaml-cpp  # config_{coin,pool}.hpp -> core/netaddress.hpp -> <yaml-cpp/yaml.h>
     nlohmann_json::nlohmann_json
     ${Boost_LIBRARIES}
 )
