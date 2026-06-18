@@ -36,6 +36,27 @@ TEST(DGB_share_test, OracleConsensusParams)
     EXPECT_EQ(dgb::PoolConfig::CHAIN_LENGTH,               2880u);
 }
 
+// Pool/share layer timing + bound params — audited CONFORM to the DGB oracle
+// this slice (networks/digibyte.py + bitcoin/networks/digibyte.py). These drive
+// PPLNS weighting (SPREAD), retarget lookbehind, chain pruning (REAL_CHAIN_LENGTH),
+// block-template caps, and the tracker score() denominator (PARENT.BLOCK_PERIOD).
+TEST(DGB_share_test, OraclePoolShareLayer)
+{
+    EXPECT_EQ(dgb::PoolConfig::SPREAD,            24u);        // networks/digibyte.py SPREAD
+    EXPECT_EQ(dgb::PoolConfig::TARGET_LOOKBEHIND, 100u);       // TARGET_LOOKBEHIND
+    EXPECT_EQ(dgb::PoolConfig::REAL_CHAIN_LENGTH, 2880u);      // REAL_CHAIN_LENGTH = 12*60*60//15
+    EXPECT_EQ(dgb::PoolConfig::BLOCK_MAX_SIZE,    32000000u);  // BLOCK_MAX_SIZE
+    EXPECT_EQ(dgb::PoolConfig::BLOCK_MAX_WEIGHT,  128000000u); // BLOCK_MAX_WEIGHT
+
+    // tracker score() denominator: work / ((1 - block_rel_height) * BLOCK_PERIOD).
+    // PARENT.BLOCK_PERIOD = 75 (Scrypt-algo period), bitcoin/networks/digibyte.py.
+    EXPECT_EQ(dgb::CoinParams::BLOCK_PERIOD,      75u);
+
+    // MAX_TARGET = 2**256//2**20 - 1 = 2^236 - 1 (top 20 bits zero, rest ones).
+    EXPECT_EQ(dgb::PoolConfig::max_target().GetHex(),
+              "00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+}
+
 // v35 donation = forrestv P2PK (4104ffd0…ac, 65-byte pubkey push + CHECKSIG).
 // v36 donation = combined P2SH (23-byte). get_donation_script() switches on
 // share_version at the SEGWIT/merged boundary.
