@@ -15,6 +15,7 @@ if(BUILD_TESTING)
         abla_block_feed_gap_test
         header_sync_test          # M5: headers-first IBD continuation policy (pure)
         block_download_test       # M5: windowed headers-first block download (pure)
+        genesis_conformance_test  # M5: genesis-hash pin vs BCHN v29.0.0 chainparams (pure)
     )
     foreach(t IN LISTS BCH_ABLA_TESTS)
         add_executable(bch_${t} ${t}.cpp)

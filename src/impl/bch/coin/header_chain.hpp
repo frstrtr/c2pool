@@ -185,8 +185,8 @@ struct BCHChainParams {
 
     /// BCH testnet4 params (port 28333). NOTE: BCH testnet4 has its OWN genesis
     /// (distinct from BTC testnet4) — this is a consensus constant.
-    /// TODO(M3): verify genesis_hash against VM300 bchn-bch chainparams.cpp
-    /// before any testnet4 integration run.
+    /// Verified vs BCHN v29.0.0 src/chainparams.cpp (commit 89a591f) genesis
+    /// assert — pinned by test/genesis_conformance_test.cpp (M3 closed).
     static BCHChainParams testnet4() {
         BCHChainParams p;
         p.asert                = asert_testnet4();
