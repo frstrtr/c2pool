@@ -38,4 +38,16 @@ if(BUILD_TESTING)
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage c2pool_difficulty
         btclibs)
     add_test(NAME bch_block_connector_test COMMAND bch_block_connector_test)
+
+    # block_ordering_test: BIP130 ordering edge cases (slice 2) over the same
+    # connector seam; same link set + transaction.cpp TU as block_connector_test.
+    add_executable(bch_block_ordering_test
+        block_ordering_test.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/transaction.cpp)
+    target_include_directories(bch_block_ordering_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(bch_block_ordering_test PRIVATE
+        core pool sharechain
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage c2pool_difficulty
+        btclibs)
+    add_test(NAME bch_block_ordering_test COMMAND bch_block_ordering_test)
 endif()
