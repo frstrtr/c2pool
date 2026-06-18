@@ -2,6 +2,7 @@
 
 #include <impl/dgb/config_pool.hpp>
 #include <impl/dgb/coin/softfork_check.hpp>
+#include <impl/dgb/coin/rpc_request.hpp>
 
 #include <core/log.hpp>
 #include <core/hash.hpp>
@@ -19,12 +20,7 @@ static const char* DGB_GENESIS_MAIN =
 static const char* DGB_GENESIS_TEST =
     "308ea0711d5763be2995670dd9ca9872753561285a84da1d58be58acaa822252";
 
-// Minimum acceptable digibyted getnetworkinfo[\"version\"] int.
-// Floor conformed to oracle frstrtr/p2pool-dgb-scrypt networks/digibyte.py:
-//   VERSION_CHECK = lambda v: None if 82202 <= v else \"...Upgrade to 7.17.2 or newer!\"
-// i.e. DigiByte Core 7.17.2 (oracle HEAD 22761e7). Same getnetworkinfo version field
-// the oracle gates on, so the comparison below is byte-for-byte oracle-equivalent.
-static constexpr int DGB_MIN_DAEMON_VERSION = 82202;
+// DGB_MIN_DAEMON_VERSION / make_gbt_request: see impl/dgb/coin/rpc_request.hpp (oracle SSOT).
 
 NodeRPC::NodeRPC(io::io_context* context, dgb::interfaces::Node* coin, bool testnet)
     : m_context(context), IS_TESTNET(testnet), m_resolver(*context), m_stream(*context),
@@ -223,7 +219,7 @@ bool NodeRPC::check()
 	try
     {
 		auto networkinfo = getnetworkinfo();
-		bool version_check_result = (DGB_MIN_DAEMON_VERSION <= networkinfo["version"].get<int>());
+		bool version_check_result = daemon_version_acceptable(networkinfo["version"].get<int>());
 		if (!version_check_result)
 		{
 			LOG_ERROR << "DigiByte daemon too old! Upgrade!";
@@ -408,10 +404,8 @@ bool NodeRPC::submit_block_hex(const std::string& block_hex, bool ignore_failure
 
 nlohmann::json NodeRPC::getblocktemplate(std::vector<std::string> rules)
 {
-	// DGB GBT: segwit rule set is mandatory (digibyted rejects otherwise), and
-	// the mining algorithm is a separate top-level param. V36 is Scrypt-only.
-	nlohmann::json j = nlohmann::json::object({{"rules", rules}, {"algo", "scrypt"}});
-	return CallAPIMethod("getblocktemplate", {j});
+	// Body shape (segwit rule + separate Scrypt algo param) is the rpc_request.hpp SSOT.
+	return CallAPIMethod("getblocktemplate", {make_gbt_request(rules)});
 }
 
 nlohmann::json NodeRPC::getnetworkinfo()
