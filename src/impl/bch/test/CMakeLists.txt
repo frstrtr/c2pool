@@ -23,4 +23,19 @@ if(BUILD_TESTING)
             btclibs)
         add_test(NAME bch_${t} COMMAND bch_${t})
     endforeach()
+
+    # block_connector_test exercises the full-block -> mempool reconciliation
+    # path, so it constructs MutableTransaction objects whose ctors are out-of-line
+    # in coin/transaction.cpp. Add that single TU to this test only; the link set
+    # and header-only-over-coin/*.hpp isolation posture are otherwise identical
+    # (still no impl_bch coin lib -> per-coin isolation stays clean).
+    add_executable(bch_block_connector_test
+        block_connector_test.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/transaction.cpp)
+    target_include_directories(bch_block_connector_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(bch_block_connector_test PRIVATE
+        core pool sharechain
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage c2pool_difficulty
+        btclibs)
+    add_test(NAME bch_block_connector_test COMMAND bch_block_connector_test)
 endif()
