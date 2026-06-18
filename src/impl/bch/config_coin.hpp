@@ -9,10 +9,12 @@
 // mainchain. It is explicitly OUT OF SCOPE for this coin module. Do not add
 // HogEx commitment handling here. See feedback: hogex-not-bch.
 //
-// CashAddr scaffolding: BCH address encoding diverges from BTC base58/bech32.
-// TODO(M4): port CashAddr (prefix "bitcoincash:") encode/decode at the
-// template/address layer -- the wire/config shape below is coin-agnostic and
-// matches the btc reference 1:1 (P2P prefix + NetService + RPC userpass).
+// CashAddr: BCH address encoding diverges from BTC base58/bech32. The codec
+// (prefix "bitcoincash:"/"bchtest:"/"bchreg:", base32 + BCH-code PolyMod
+// checksum, CashTokens z/r token-aware types, P2SH32) lives in
+// coin/cashaddr.hpp -- {type,hash} <-> string, operator/payout-address layer.
+// The wire/config shape below stays coin-agnostic and matches the btc
+// reference 1:1 (P2P prefix + NetService + RPC userpass).
 
 #include <core/config.hpp>
 #include <core/fileconfig.hpp>
