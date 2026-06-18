@@ -808,14 +808,24 @@ nlohmann::json BTCWorkSource::mining_submit(
             block_bytes.insert(block_bytes.end(), tx_bytes.begin(), tx_bytes.end());
         }
 
+        // A won block is a full subsidy: it must NEVER be silently dropped.
+        // submit_block_fn_ relays via P2P (primary) and falls back to the
+        // submitblock RPC; it returns true iff the block reached at least one
+        // sink. If it reaches neither (false / throw / no fn wired) we scream.
+        bool reached_network = false;
         if (submit_block_fn_) {
             try {
-                submit_block_fn_(block_bytes, height);
+                reached_network = submit_block_fn_(block_bytes, height);
             } catch (const std::exception& e) {
-                LOG_WARNING << "[BTC-STRATUM-BLOCK] submit_block_fn threw: " << e.what();
+                LOG_ERROR << "[BTC-STRATUM-BLOCK] submit_block_fn threw: " << e.what();
+            }
+            if (!reached_network) {
+                LOG_ERROR << "[BTC-STRATUM-BLOCK] WON BLOCK height=" << height
+                          << " reached NEITHER P2P nor RPC — lost subsidy!";
             }
         } else {
-            LOG_WARNING << "[BTC-STRATUM-BLOCK] no submit_block_fn wired — block not broadcast";
+            LOG_ERROR << "[BTC-STRATUM-BLOCK] no submit_block_fn wired — WON BLOCK height="
+                      << height << " not broadcast — lost subsidy!";
         }
 
         // Update worker stats (block-find counts as accepted)
