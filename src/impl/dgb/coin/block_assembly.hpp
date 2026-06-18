@@ -80,9 +80,14 @@ reconstruct_block_header(const SmallBlockHeaderType& small_header,
 //   other_txs     : the share's transaction_hashes resolved to txs, in order
 // Returns {block_bytes, block_hex}: block_bytes is the blob the embedded P2P
 // relay sends; block_hex is the same block for the external submitblock
-// fallback.  Wire encoding is BlockType::Serialize (TX_WITH_WITNESS) -- the
-// identical path NodeRPC::submit_block uses, so the result round-trips and the
-// daemon accepts it.
+// fallback.  Wire encoding is BlockType::Serialize -> TX_WITH_WITNESS(m_txs):
+// the standard Bitcoin-Core CONDITIONAL serializer -- it emits the per-tx
+// witness marker/flag iff some tx HasWitness(), legacy otherwise.  The block's
+// witness shape is thus governed by whether the gentx carries a witness (i.e.
+// is_segwit_activated(share_version) at gentx-build time: DGB v36 segwit-active
+// => witness block; a BCH-style is_segwit_activated()==false coin => legacy),
+// NOT an unconditional witness branch here.  This is the identical path
+// NodeRPC::submit_block uses, so the result round-trips and the daemon accepts.
 inline std::pair<std::vector<unsigned char>, std::string>
 assemble_won_block(const SmallBlockHeaderType& small_header,
                    const MutableTransaction& gentx,

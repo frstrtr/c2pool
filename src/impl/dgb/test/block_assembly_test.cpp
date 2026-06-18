@@ -217,4 +217,82 @@ TEST(DgbBlockAssembly, CoinbaseOnlyBlock)
     EXPECT_EQ(blk.m_merkle_root, gtx_hash);
 }
 
+
+// === Witness predicate KATs (#82 DGB<->BCH coinbase adjudication) =============
+// The block wire codec is BlockType::Serialize -> TX_WITH_WITNESS(m_txs), the
+// standard Bitcoin-Core CONDITIONAL serializer: it emits the per-tx witness
+// marker/flag (and the witness stacks) iff some tx HasWitness(), and a legacy
+// blob otherwise. So the won-block's witness shape is governed by whether the
+// gentx carries a witness -- i.e. by is_segwit_activated(share_version) at
+// gentx-build time -- NOT by an unconditional witness branch in the framer.
+//   DGB: SEGWIT_ACTIVATION_VERSION=35 => v36 gentx carries the BIP141 coinbase
+//        witness reserved value => won block is TX_WITH_WITNESS (asserted here).
+//   BCH: SEGWIT_ACTIVATION_VERSION=0 sentinel => is_segwit_activated() false for
+//        every version => gentx has no witness => the identical codec emits a
+//        LEGACY block (the companion bch test asserts the absence).
+// These pin the predicate so emission == verification == oracle, per the paired
+// adjudication; we do not assume it.
+
+// The BIP141 coinbase witness reserved value: a single 32-byte zero stack item.
+MutableTransaction make_segwit_gentx()
+{
+    auto tx = make_gentx();
+    tx.vin[0].scriptWitness.stack.assign(1, std::vector<unsigned char>(32, 0x00));
+    return tx;
+}
+
+// --- Test 6: DGB segwit-active gentx => TX_WITH_WITNESS block (predicate true) -
+TEST(DgbBlockAssembly, SegwitGentxEmitsWitnessBlock)
+{
+    auto sh = make_small_header();
+    auto gtx_hash = fixed_gentx_hash();
+    ::dgb::MerkleLink link;
+    std::vector<MutableTransaction> none;
+
+    auto seg = make_segwit_gentx();
+    ASSERT_TRUE(seg.HasWitness());        // gentx carries the coinbase witness
+    auto [wbytes, whex] = assemble_won_block(sh, seg, gtx_hash, link, none);
+
+    // The conditional codec must have emitted the witness: the witnessful block
+    // is strictly larger than the legacy block over the same logical txs, and
+    // the round-tripped coinbase preserves the reserved value.
+    auto [lbytes, lhex] = assemble_won_block(sh, make_gentx(), gtx_hash, link, none);
+    EXPECT_GT(wbytes.size(), lbytes.size());
+
+    PackStream ps(wbytes);
+    BlockType blk;
+    ps >> blk;
+    ASSERT_EQ(blk.m_txs.size(), 1u);
+    EXPECT_TRUE(blk.m_txs[0].HasWitness());
+    ASSERT_EQ(blk.m_txs[0].vin.size(), 1u);
+    ASSERT_EQ(blk.m_txs[0].vin[0].scriptWitness.stack.size(), 1u);
+    EXPECT_EQ(blk.m_txs[0].vin[0].scriptWitness.stack[0],
+              std::vector<unsigned char>(32, 0x00));
+    EXPECT_EQ(whex, HexStr(std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(wbytes.data()), wbytes.size())));
+}
+
+// --- Test 7: no-witness gentx => LEGACY block (predicate false, BCH-shape) -----
+TEST(DgbBlockAssembly, LegacyGentxEmitsLegacyBlock)
+{
+    auto sh = make_small_header();
+    auto gtx_hash = fixed_gentx_hash();
+    ::dgb::MerkleLink link;
+    std::vector<MutableTransaction> none;
+
+    auto plain = make_gentx();
+    ASSERT_FALSE(plain.HasWitness());
+    auto [bytes, hex] = assemble_won_block(sh, plain, gtx_hash, link, none);
+
+    PackStream ps(bytes);
+    BlockType blk;
+    ps >> blk;
+    ASSERT_EQ(blk.m_txs.size(), 1u);
+    EXPECT_FALSE(blk.m_txs[0].HasWitness());   // legacy: no marker/flag emitted
+
+    // Legacy block re-serializes byte-identically (no witness round-trip drift).
+    auto [bytes2, hex2] = assemble_won_block(sh, blk.m_txs[0], gtx_hash, link, none);
+    EXPECT_EQ(hex, hex2);
+}
+
 } // namespace
