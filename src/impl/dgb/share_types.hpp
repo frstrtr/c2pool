@@ -3,11 +3,14 @@
 #include <core/uint256.hpp>
 #include <core/pack_types.hpp>
 #include <core/pack.hpp>
+#include "config_pool.hpp"   // SSOT: PoolConfig::SEGWIT_ACTIVATION_VERSION
 
 namespace dgb
 {
 
-const uint64_t SEGWIT_ACTIVATION_VERSION = 17;
+// SSOT delegation (oracle = 17). Serialization/consensus gate sources from
+// PoolConfig; no local literal. Symbol kept for share_check.hpp consumers.
+inline constexpr uint32_t SEGWIT_ACTIVATION_VERSION = PoolConfig::SEGWIT_ACTIVATION_VERSION;
 
 constexpr bool is_segwit_activated(uint64_t version)
 {
