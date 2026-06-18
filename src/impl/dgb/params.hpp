@@ -42,11 +42,13 @@ inline core::CoinParams make_coin_params(bool testnet)
         p.address_p2sh_version = CoinParams::ADDRESS_P2SH_VERSION;     // 63 (S...)
         p.bech32_hrp           = CoinParams::BECH32_HRP;               // "dgb"
     }
-    // address_p2sh_version2: secondary P2SH prefix for parse leniency only, NOT
-    // block/share validation. The oracle defines a SINGLE P2SH version (63); it
-    // is silent on a second prefix, so 5 (DGB legacy) is NOT oracle-sourced.
-    // [confirm-vs-oracle] kept open — see oracle-conformance report.
-    p.address_p2sh_version2 = testnet ? 0 : 5;
+    // address_p2sh_version2: secondary P2SH prefix. CONFORMED to oracle
+    // frstrtr/p2pool-dgb-scrypt (IDENTIFIER 4B62545B1A631AFE): bitcoin/data.py
+    // accepts EXACTLY {ADDRESS_VERSION=30, ADDRESS_P2SH_VERSION=63} and defines
+    // no secondary P2SH prefix. The prior =5 was an LTC-borrowed artifact (LTC
+    // had a real P2SH migration; DGB did not) and is unconsumed in src/.
+    // Set to 0 (disabled) on both nets so the SSOT matches the oracle exactly.
+    p.address_p2sh_version2 = 0;
 
     // PoW: Scrypt work, SHA256d block identity (same shape as LTC)
     p.pow_func        = core::pow::scrypt;
