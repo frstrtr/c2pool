@@ -33,6 +33,7 @@
 #include <impl/dash/pplns.hpp>           // dash::pplns::compute_payouts, dash::ShareChain, DashShare
 #include <impl/dash/version_negotiation.hpp> // dash::version_negotiation::get_desired_version_counts/weights
 #include <impl/dash/coin/vendor/cbtx.hpp> // dash::coin::vendor::CCbTx, parse_cbtx
+#include <impl/dash/config_pool.hpp>     // dash::PoolConfig (sharechain SSOT)
 #include <impl/bitcoin_family/coin/base_block.hpp>  // bitcoin_family::coin::SmallBlockHeaderType
 
 #include <core/hash.hpp>                     // Hash (sha256d)
@@ -741,4 +742,45 @@ TEST(DashConformanceCbtx, ParseCbtxIsExactInverseOfKat) {
     dash::coin::vendor::CCbTx tx2;
     EXPECT_FALSE(dash::coin::vendor::parse_cbtx(bytes, tx2))
         << "parse_cbtx accepted trailing garbage (wire-drift guard defeated)";
+}
+
+
+// -- Sharechain network-params conformance (S6 slice 3) -----------------------
+// Pin DASH's p2pool sharechain framing constants against its OWN older-than-v35
+// oracle (frstrtr/p2pool-dash networks/dash.py + dash_testnet.py). The expected
+// values below are an INDEPENDENT transcription of the oracle, NOT a re-export of
+// dash::PoolConfig, so the assertions catch a drift in either copy -- the same
+// anti-circularity design used by the merkle/payout KATs above.
+//
+// PREFIX/IDENTIFIER are isolation primitives: pinned per-coin here, never to be
+// unified cross-coin (operator v36_standardization_goal 2026-06-17).
+TEST(DashConformanceNetworkParams, MainnetMatchesP2poolDashOracle) {
+    dash::PoolConfig::is_testnet = false;
+    EXPECT_EQ(dash::PoolConfig::p2p_port(), 8999);
+    EXPECT_EQ(dash::PoolConfig::worker_port(), 7903);
+    EXPECT_EQ(dash::PoolConfig::share_period(), 20u);
+    EXPECT_EQ(dash::PoolConfig::chain_length(), 4320u);       // 24*60*60//20
+    EXPECT_EQ(dash::PoolConfig::real_chain_length(), 4320u);
+    EXPECT_EQ(dash::PoolConfig::TARGET_LOOKBEHIND, 100u);
+    EXPECT_EQ(dash::PoolConfig::SPREAD, 10u);
+    EXPECT_EQ(dash::PoolConfig::MINIMUM_PROTOCOL_VERSION, 1700u);
+    EXPECT_EQ(dash::PoolConfig::identifier_hex(), std::string("7242ef345e1bed6b"));
+    EXPECT_EQ(dash::PoolConfig::prefix_hex(),     std::string("3b3e1286f446b891"));
+    uint256 expect_max;
+    expect_max.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
+    EXPECT_EQ(dash::PoolConfig::max_target(), expect_max);    // 0xFFFF * 2**208
+}
+
+TEST(DashConformanceNetworkParams, TestnetMatchesP2poolDashOracle) {
+    dash::PoolConfig::is_testnet = true;
+    EXPECT_EQ(dash::PoolConfig::p2p_port(), 18999);
+    EXPECT_EQ(dash::PoolConfig::worker_port(), 17903);
+    EXPECT_EQ(dash::PoolConfig::share_period(), 20u);
+    EXPECT_EQ(dash::PoolConfig::chain_length(), 4320u);
+    EXPECT_EQ(dash::PoolConfig::identifier_hex(), std::string("b6deb1e543fe2427"));
+    EXPECT_EQ(dash::PoolConfig::prefix_hex(),     std::string("198b644f6821e3b3"));
+    uint256 expect_max;
+    expect_max.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    EXPECT_EQ(dash::PoolConfig::max_target(), expect_max);    // 2**256 // 2**20 - 1
+    dash::PoolConfig::is_testnet = false;  // restore global for any later tests
 }
