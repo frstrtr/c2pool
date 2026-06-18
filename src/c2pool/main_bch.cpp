@@ -162,7 +162,9 @@ int run_ibd(const std::string& host, uint16_t port, bool testnet, uint32_t max_s
                   << " peer_tip=" << tip
                   << " in_flight=" << daemon.ibd_in_flight()
                   << " reissue=" << daemon.ibd_reissue_count()
-                  << " false_evict=" << daemon.ibd_false_evict_count() << "\n";
+                  << " false_evict=" << daemon.ibd_false_evict_count()
+                  << " abla_cursor=" << daemon.ibd_abla_cursor()
+                  << " abla_budget=" << daemon.ibd_abla_budget() << "\n";
 
         const bool advanced  = h > init_height;
         const bool caught_up = kicked && tip > 0 && h >= tip && daemon.ibd_in_flight() == 0;
@@ -172,7 +174,9 @@ int run_ibd(const std::string& host, uint16_t port, bool testnet, uint32_t max_s
                       << " (init checkpoint=" << init_height
                       << ", advanced=" << (advanced ? "yes" : "NO") << ")"
                       << " false_evict=" << daemon.ibd_false_evict_count()
-                      << " reissue=" << daemon.ibd_reissue_count() << "\n";
+                      << " reissue=" << daemon.ibd_reissue_count()
+                      << " abla_cursor=" << daemon.ibd_abla_cursor()
+                      << " abla_budget=" << daemon.ibd_abla_budget() << "\n";
             tick.stop();
             ctx.stop();
         }

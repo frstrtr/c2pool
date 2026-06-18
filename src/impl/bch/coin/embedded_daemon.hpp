@@ -201,6 +201,21 @@ public:
         return m_node.has_p2p() ? m_node.p2p()->ibd_in_flight() : 0;
     }
 
+    /// Live ABLA size-feed evidence for the --ibd harness: the dynamic block-size
+    /// budget the feed has folded from the REAL blocks streamed off the peer
+    /// (VM300 bchn-bch), anchored at the cursor the feed has advanced to. The
+    /// budget sits at the 32 MB safe floor until the feed has folded blocks
+    /// CONTIGUOUSLY from the cursor; the cursor trails ibd_synced_height by design
+    /// (headers-first: headers race ahead, block bodies backfill through the
+    /// download window, and ONLY a folded full block advances this cursor). A
+    /// moving cursor here is the proof that full_block --> AblaBlockFeed -->
+    /// AblaTracker is live on real network data, not merely the cold-start anchor.
+    /// Read-only; no p2pool-merged-v36 surface (local ABLA budget only).
+    uint64_t ibd_abla_budget() {
+        return m_abla.tracker().budget_for_tip(m_abla.tracker().cursor_height());
+    }
+    uint32_t ibd_abla_cursor() { return m_abla.tracker().cursor_height(); }
+
     /// Apply a BCHN-pinned {height, State} captured from VM300 bchn-bch. This
     /// is the operator-gated reanchor step -- call ONLY after the read is
     /// approved; until then the floor anchor is correct and never-undercut.
