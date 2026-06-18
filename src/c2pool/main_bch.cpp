@@ -60,7 +60,7 @@ void print_banner(const char* argv0)
     std::cout
         << "c2pool-bch " << C2POOL_VERSION << " — Bitcoin Cash (SHA256d, V36)\n\n"
         << "Usage: " << argv0 << " [--version] [--help] [--selftest]\n"
-        << "       " << argv0 << " --ibd [--testnet] [--peer HOST:PORT] [--max-seconds N]\n\n"
+        << "       " << argv0 << " --ibd [--testnet] [--near-tip] [--peer HOST:PORT] [--max-seconds N]\n\n"
         << "Status: M5 pool/sharechain + embedded-daemon assembly live.\n"
         << "        The embedded daemon (coin/embedded_daemon.hpp) is the primary\n"
         << "        work source; external BCHN-RPC stays as the fallback.\n"
@@ -112,7 +112,8 @@ int run_selftest()
 // P2P front-end pointed at one BCHN peer, kicks the first getheaders once the
 // handshake is up, and logs the evidence tuple every TICK seconds until the
 // chain catches the peer tip (with no in-flight blocks) or the deadline fires.
-int run_ibd(const std::string& host, uint16_t port, bool testnet, uint32_t max_seconds)
+int run_ibd(const std::string& host, uint16_t port, bool testnet, uint32_t max_seconds,
+             bool near_tip)
 {
     boost::asio::io_context ctx;
 
@@ -135,11 +136,21 @@ int run_ibd(const std::string& host, uint16_t port, bool testnet, uint32_t max_s
         : std::vector<std::byte>{ std::byte{0xe3}, std::byte{0xe1}, std::byte{0xf3}, std::byte{0xe8} };
 
     EmbeddedDaemon<bch::Config> daemon(&ctx, &cfg, /*anchor_height=*/0);
-    daemon.start_ibd(peer);
+    // --near-tip seeds the header origin at the operator-approved BCHN anchor
+    // (height 955700) so the sync covers only anchor -> tip; this is the ONLY
+    // mode that actually advances the ABLA cursor in a harness window (the
+    // genesis-origin cold-start stays ~900k blocks below the anchor -> cursor
+    // pinned at the floor by construction; see UID 1375). Default --ibd is the
+    // genesis-origin liveness/eviction-evidence loop.
+    if (near_tip)
+        daemon.start_ibd_near_tip(peer);
+    else
+        daemon.start_ibd(peer);
 
     const uint32_t init_height = daemon.ibd_synced_height();
     std::cout << "[ibd] read-only sync vs " << host << ":" << port
               << (testnet ? " (testnet)" : " (mainnet)")
+              << (near_tip ? " [near-tip: anchor-seeded ABLA-feed]" : " [cold-start]")
               << " — init checkpoint=" << init_height
               << ", deadline=" << max_seconds << "s\n";
 
@@ -193,6 +204,7 @@ int main(int argc, char** argv)
     bool want_help = false;
     bool want_ibd = false;
     bool testnet = false;
+    bool near_tip = false;
     std::string host = "192.168.86.110";   // VM300 bchn-bch
     uint16_t port = 8333;
     uint32_t max_seconds = 600;
@@ -205,6 +217,7 @@ int main(int argc, char** argv)
         if (std::strcmp(argv[i], "--help") == 0)     want_help = true;
         if (std::strcmp(argv[i], "--ibd") == 0)      want_ibd = true;
         if (std::strcmp(argv[i], "--testnet") == 0) { testnet = true; port = 18333; }
+        if (std::strcmp(argv[i], "--near-tip") == 0) near_tip = true;
         if (std::strcmp(argv[i], "--peer") == 0 && i + 1 < argc) {
             std::string hp = argv[++i];
             const auto c = hp.rfind(char(58));  // ASCII colon
@@ -224,7 +237,7 @@ int main(int argc, char** argv)
         return 0;
 
     if (want_ibd)
-        return run_ibd(host, port, testnet, max_seconds);
+        return run_ibd(host, port, testnet, max_seconds, near_tip);
 
     // Default / --selftest: drive the live ABLA budget path, then exit.
     return run_selftest();

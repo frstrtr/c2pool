@@ -62,6 +62,7 @@
 
 #include <core/log.hpp>
 #include <core/events.hpp>   // EventDisposable (new_headers subscription handle)
+#include <core/uint256.hpp> // uint256S (near-tip checkpoint seed)   // EventDisposable (new_headers subscription handle)
 
 namespace bch {
 namespace coin {
@@ -119,6 +120,42 @@ public:
         assemble();                   // ABLA loop + CoinNode seam (network-free)
         wire_chain_ingest();          // new_headers --> HeaderChain (height advance)
         pin_cold_start_anchor();      // operator-approved floor-equivalent anchor
+        m_node.start_p2p(peer);       // read-only P2P connect to the BCHN peer
+    }
+
+    /// NEAR-TIP variant of the read-only IBD harness (UID 1375 follow-up). The
+    /// plain --ibd cold-start CANNOT exercise AblaBlockFeed advancement: by
+    /// construction the ABLA cursor only moves when full blocks arrive
+    /// CONTIGUOUSLY from the anchor (height == cursor+1), and the anchor sits at
+    /// BchnAnchorRecord::height (955700) -- only ~100+ blocks below the live
+    /// VM300 tip. A genesis-origin sync reaches at most a few ten-thousand
+    /// headers in a harness window, all far below the anchor, so every
+    /// downloaded block is height <= cursor -> idempotently ignored -> the
+    /// cursor never moves (exactly the pre-tip state UID 1375 confirmed).
+    ///
+    /// This variant seeds the header chain's dynamic checkpoint AT the
+    /// operator-approved anchor {height,hash} BEFORE connecting, so the locator
+    /// anchors at 955700 and the peer streams ONLY the last handful of headers
+    /// to its tip. Their block bodies backfill through the download window and
+    /// fold into AblaTracker as REAL serialized sizes -- advancing the cursor
+    /// 955700 -> tip, the proof that full_block --> AblaBlockFeed --> AblaTracker
+    /// is live on live-network data (UID 1369 acceptance (a): real, not
+    /// synthetic). Still strictly read-only: a seeded checkpoint + P2P
+    /// header/block pull issues NO qm/control op, VM300 stays read-only. NO
+    /// init_rpc() -- the external BCHN-RPC fallback path is run()'s, untouched.
+    /// The anchor hash is the SAME static record run() pins (no new VM read).
+    /// p2pool-merged-v36 surface: NONE (local SPV + ABLA budget only).
+    void start_ibd_near_tip(const NetService& peer) {
+        m_chain.init();               // genesis/checkpoint origin (network-free)
+        // Seed the header origin at the operator-approved BCHN anchor so the
+        // sync covers only anchor -> tip (a handful of blocks), letting the ABLA
+        // feed actually fold real block sizes within one harness run.
+        m_chain.set_dynamic_checkpoint(
+            BchnAnchorRecord::height,
+            uint256S(std::string(BchnAnchorRecord::hash)));
+        assemble();                   // ABLA loop + CoinNode seam (network-free)
+        wire_chain_ingest();          // new_headers --> HeaderChain (height advance)
+        pin_cold_start_anchor();      // ABLA anchor @ the SAME height as the seed
         m_node.start_p2p(peer);       // read-only P2P connect to the BCHN peer
     }
 
