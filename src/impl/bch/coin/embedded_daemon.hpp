@@ -51,6 +51,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "header_chain.hpp"     // HeaderChain
 #include "mempool.hpp"          // Mempool
@@ -328,6 +330,64 @@ public:
     HeaderChain&        chain()          { return m_chain; }
     Mempool&            mempool()        { return m_pool; }
     bool                is_wired() const { return m_abla.is_wired(); }
+
+    /// Outcome of a won-block broadcast: which of the two sinks fired and
+    /// whether the network accepted. P2P is primary; the external BCHN-RPC
+    /// submitblock is the dual-path FALLBACK (fired ALWAYS, per the
+    /// broadcaster-gate dual-path rule -- NOT a P2P-only path with RPC as a
+    /// catch). A `duplicate` on the RPC leg AFTER a P2P accept still proves
+    /// both paths reached the node; `landed_first` records which won the race.
+    struct BlockBroadcast {
+        bool        p2p_sent   = false;  // submit_block_p2p_raw issued (sink present)
+        bool        rpc_ok     = false;  // submitblock returned ok OR duplicate
+        const char* landed_first = "none"; // "p2p" | "rpc" | "none"
+        bool any() const { return p2p_sent || rpc_ok; }
+    };
+
+    /// Fire a won block down BOTH broadcast paths. `block_bytes` is the
+    /// pre-serialized (header || tx_count || coinbase || tx_data) blob the
+    /// embedded P2P broadcaster relays; `block_hex` is the same block hex for
+    /// the external submitblock fallback. BCH is SHA256d standalone parent --
+    /// no merged-coinbase leg. Read-only vs VM300 (a block relay/submit issues
+    /// no qm/control op). Zero p2pool-merged-v36 surface (block dispatch, not
+    /// share/PPLNS/coinbase bytes). This is the sink the pool node wires its
+    /// tracker().m_on_block_found to so an in-operation win emits immediately.
+    BlockBroadcast broadcast_won_block(const std::vector<unsigned char>& block_bytes,
+                                       const std::string& block_hex)
+    {
+        BlockBroadcast r;
+
+        // PRIMARY: embedded P2P relay (fastest propagation).
+        if (m_node.has_p2p()) {
+            m_node.submit_block_p2p_raw(block_bytes);
+            r.p2p_sent = true;
+            r.landed_first = "p2p";
+            LOG_INFO << "[EMB-BCH] won-block P2P relay issued (" << block_bytes.size()
+                     << " bytes) -- primary path.";
+        } else {
+            LOG_WARNING << "[EMB-BCH] won-block: no embedded P2P sink; relying on RPC fallback.";
+        }
+
+        // FALLBACK (always fired): external BCHN submitblock. A duplicate here
+        // after a P2P accept is success, not failure -- ignore_failure=true so a
+        // duplicate/already-have does not mask the P2P win.
+        if (m_coin_node && m_coin_node->has_rpc()) {
+            r.rpc_ok = m_coin_node->submit_block_hex(block_hex, /*ignore_failure=*/true);
+            if (r.rpc_ok && !r.p2p_sent) r.landed_first = "rpc";
+            LOG_INFO << "[EMB-BCH] won-block submitblock RPC fallback "
+                     << (r.rpc_ok ? "ok/duplicate" : "no-ack") << ".";
+        } else {
+            LOG_WARNING << "[EMB-BCH] won-block: no external BCHN-RPC fallback sink wired.";
+        }
+
+        if (!r.any())
+            LOG_ERROR << "[EMB-BCH] won-block had NEITHER broadcast sink -- block NOT relayed!";
+        else
+            LOG_INFO << "[EMB-BCH] won-block broadcast: p2p=" << (r.p2p_sent ? "sent" : "off")
+                     << " rpc=" << (r.rpc_ok ? "ok" : "off")
+                     << " landed_first=" << r.landed_first << ".";
+        return r;
+    }
 
 private:
     config_t*        m_config;   // not owned (binary entrypoint owns it)
