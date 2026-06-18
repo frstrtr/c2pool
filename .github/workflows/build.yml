@@ -68,6 +68,7 @@ jobs:
                     test_mweb_builder \
                     test_address_resolution test_compute_share_target \
                     test_utxo test_dgb_subsidy dgb_share_test \
+                    rpc_request_test softfork_check_test genesis_check_test \
                     v37_test \
             -j$(nproc)
 
@@ -195,6 +196,7 @@ jobs:
                     test_mweb_builder \
                     test_address_resolution test_compute_share_target \
                     test_utxo test_dgb_subsidy dgb_share_test \
+                    rpc_request_test softfork_check_test genesis_check_test \
                     test_coin_broadcaster test_multiaddress_pplns test_pplns_stress \
                     v37_test \
             -j$(nproc)
