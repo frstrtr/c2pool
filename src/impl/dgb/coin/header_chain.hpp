@@ -39,9 +39,11 @@
 // following slice — its inputs are pinned here so the multiply cannot reach a
 // continuity header.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <vector>
 
 #include <impl/dgb/coin/dgb_arith256.hpp>
@@ -253,6 +255,20 @@ public:
             // gate would only deepen the wrong single-algo retarget model). See
             // V37 backlog: full V4 MultiShield recompute.
 
+            // MTP monotonicity (DigiByte Core ContextualCheckBlockHeader
+            // "time-too-old"): a Scrypt header's nTime must be STRICTLY GREATER
+            // than the median timestamp of the tip and its (up to) 10 nearest
+            // ancestors. This is the daemon-independent, Scrypt-only-walk-SAFE
+            // half of header time validation -- it reads ONLY timestamps already
+            // in the local header chain, with no difficulty re-derivation (the
+            // demoted V4-MultiShield recompute). It is also the standard
+            // anti-timewarp monotonicity floor the demoted nBits gate used to
+            // imply. Genesis (empty chain) is unconstrained: median_time_past()
+            // returns INT64_MIN, so the first header always passes. A rejection
+            // never mutates the chain (checked before push_back).
+            if (h.n_time <= median_time_past())
+                return IngestResult::REJECTED;
+
             m_chain.push_back(h);
             m_cumulative_work += work_from_target(h.target);  // credited
             return IngestResult::VALIDATED_SCRYPT;
@@ -304,6 +320,31 @@ public:
 
     uint64_t    cumulative_work() const { return m_cumulative_work; }
     std::size_t size()            const { return m_chain.size(); }
+
+    // Bitcoin/DigiByte median-time-past span (ContextualCheckBlockHeader uses
+    // the tip + its 10 nearest ancestors == 11 timestamps).
+    static constexpr std::size_t MEDIAN_TIME_SPAN = 11;
+
+    // MedianTimePast: median nTime over the tip and its (up to) MEDIAN_TIME_SPAN
+    // nearest ancestors. Walks ALL appended headers regardless of algo --
+    // DigiByte Core's GetMedianTimePast walks the block index, which interleaves
+    // every algo, so continuity (non-Scrypt) headers DO contribute their
+    // timestamps to the median even though their PoW is never validated. Sorts a
+    // small fixed-size (<= 11) window and returns the upper-middle element
+    // (sorted[n/2]), matching DGB Core. Returns INT64_MIN for an empty chain so
+    // the genesis header is unconstrained.
+    int64_t median_time_past() const
+    {
+        if (m_chain.empty())
+            return std::numeric_limits<int64_t>::min();
+        const std::size_t n = std::min(m_chain.size(), MEDIAN_TIME_SPAN);
+        std::vector<int64_t> times;
+        times.reserve(n);
+        for (std::size_t i = 0; i < n; ++i)
+            times.push_back(m_chain[m_chain.size() - 1 - i].n_time);
+        std::sort(times.begin(), times.end());
+        return times[times.size() / 2];
+    }
 
 private:
     // Work proxy: inversely proportional to the target. The full-width field
