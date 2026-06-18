@@ -27,6 +27,7 @@ inline uint64_t mul128_shift(uint64_t a, uint64_t b, unsigned shift) {
 #include <core/target_utils.hpp>
 #include <core/coin_params.hpp>
 #include <core/uint256.hpp>
+#include <core/version_gate.hpp>   // SSOT: core::version_gate::is_v36_active
 #include <core/netaddress.hpp>
 #include <sharechain/weights_skiplist.hpp>
 #include <btclibs/base58.h>
@@ -958,7 +959,7 @@ public:
                         prev_hash = obj->m_prev_hash;
                         share_ver = obj->version;
                     });
-                    if (share_ver >= 36) {
+                    if (core::version_gate::is_v36_active(share_ver)) {
 
                         if (!prev_hash.IsNull() && chain.contains(prev_hash)) {
                             if (!pplns_active) {

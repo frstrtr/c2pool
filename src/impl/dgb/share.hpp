@@ -8,6 +8,7 @@
 #include <core/pack_types.hpp>
 #include <core/netaddress.hpp>
 #include <core/uint256.hpp>
+#include <core/version_gate.hpp>   // SSOT: core::version_gate::is_v36_active
 #include <core/target_utils.hpp>
 
 #include <map>
@@ -159,7 +160,7 @@ struct Formatter
         );
         
         // Address handling — version-dependent
-        if constexpr (version >= 36)
+        if constexpr (core::version_gate::is_v36_active(version))
         {
             READWRITE(obj->m_pubkey_hash);   // IntType(160)
             READWRITE(obj->m_pubkey_type);   // IntType(8)
@@ -174,7 +175,7 @@ struct Formatter
         }
 
         // Subsidy — V36 uses VarInt, others use fixed uint64
-        if constexpr (version >= 36)
+        if constexpr (core::version_gate::is_v36_active(version))
         {
             READWRITE(VarInt(obj->m_subsidy));
         }
@@ -195,7 +196,7 @@ struct Formatter
         }
 
         // V36: merged_addresses (after segwit_data, before far_share_hash)
-        if constexpr (version >= 36)
+        if constexpr (core::version_gate::is_v36_active(version))
         {
             READWRITE(obj->m_merged_addresses);
         }
@@ -214,7 +215,7 @@ struct Formatter
         );
 
         // Abswork — V36 uses VarInt-encoded uint64, others use fixed uint128
-        if constexpr (version >= 36)
+        if constexpr (core::version_gate::is_v36_active(version))
         {
             READWRITE(Using<AbsworkV36Format>(obj->m_abswork));
         }
@@ -224,7 +225,7 @@ struct Formatter
         }
 
         // V36: merged_coinbase_info + merged_payout_hash (after abswork)
-        if constexpr (version >= 36)
+        if constexpr (core::version_gate::is_v36_active(version))
         {
             READWRITE(obj->m_merged_coinbase_info);
             READWRITE(obj->m_merged_payout_hash);
@@ -244,7 +245,7 @@ struct Formatter
         );
 
         // V36: message_data (at the end)
-        if constexpr (version >= 36)
+        if constexpr (core::version_gate::is_v36_active(version))
         {
             READWRITE(obj->m_message_data);
         }
