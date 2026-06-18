@@ -35,6 +35,14 @@ namespace dgb::coin {
 struct u256 {
     uint64_t limb[4] = {0, 0, 0, 0};
 
+    // Default-zero, plus an IMPLICIT widening from uint64_t so the field-shape
+    // swap (M3 7b) leaves every existing uint64-range brace-init / literal
+    // comparison byte-identical: `target = 4096`, `h.target == expected`,
+    // `pow_limit != 0` all keep compiling and computing the same value, while
+    // the embedded-daemon port drops full-width digests through this SAME field.
+    u256() = default;
+    u256(uint64_t v) { limb[0] = v; }
+
     static u256 from_u64(uint64_t v) { u256 r; r.limb[0] = v; return r; }
 
     bool     fits_u64() const { return limb[1] == 0 && limb[2] == 0 && limb[3] == 0; }
@@ -67,6 +75,19 @@ struct u256 {
             rem       = cur % d;
         }
         return r;
+    }
+
+    // Add another 256-bit value, truncating carry past limb[3] (256-bit wrap,
+    // same width discipline as mul_u64). Accumulates the retarget window's
+    // target sum before the divide-by-count average.
+    u256& operator+=(const u256& o) {
+        unsigned __int128 carry = 0;
+        for (int i = 0; i < 4; ++i) {
+            unsigned __int128 s = (unsigned __int128)limb[i] + o.limb[i] + carry;
+            limb[i] = (uint64_t)s;
+            carry   = s >> 64;
+        }
+        return *this;
     }
 
     friend bool operator<(const u256& a, const u256& b) {

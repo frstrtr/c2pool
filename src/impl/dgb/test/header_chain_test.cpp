@@ -403,3 +403,40 @@ TEST(DigiShield256, ComparePicksTheLargerFullWidthValue)
     EXPECT_TRUE(big > small);
     EXPECT_FALSE(big < small);
 }
+
+// ---------------------------------------------------------------------------
+// 256-BIT INGEST PATH (M3 7b -- field-shape swap). The swap widened
+// HeaderSample::target/pow_hash (and the retarget fields) to u256, so the
+// ingest PoW-satisfaction check (h.pow_hash <= h.target) now runs at TRUE
+// 256-bit width through validate_and_append -- not only inside
+// digishield_next_target. This PROVES it: targets/digests living in the HIGH
+// limbs decide acceptance the SAME way arith_uint256 would and DIVERGE from a
+// uint64 (low64-only) proxy in BOTH directions. Gate + ceiling stay
+// unconfigured (default ctor) so only the PoW satisfaction check can fire.
+// ---------------------------------------------------------------------------
+TEST(HeaderChainValidate, IngestPoWSatisfactionRunsAtFullWidth)
+{
+    HeaderChain hc;   // unconfigured: only the PoW satisfaction gate can fire
+
+    // target = 2^192 + 5 (lives in the top limb; low64 == 5).
+    u256 target; target.limb[3] = 1; target.limb[0] = 5;
+
+    // pow_hash = 10 (fits u64). Full width: 10 <= 2^192+5 -> PoW SATISFIED, the
+    // header is valid. A low64-only proxy would compare 10 > 5 and WRONGLY
+    // reject -- so acceptance here proves the check is full-width.
+    HeaderSample ok{SCRYPT, 1000};
+    ok.target   = target;
+    ok.pow_hash = u256::from_u64(10);
+    EXPECT_EQ(hc.validate_and_append(ok), IngestResult::VALIDATED_SCRYPT);
+    EXPECT_EQ(hc.size(), 1u);
+
+    // pow_hash = 2^193 (top limb 2, low64 == 0) vs the same 2^192+5 target.
+    // Full width: 2^193 > 2^192+5 -> does NOT satisfy -> REJECT. A low64-only
+    // proxy would compare 0 > 5 (false) and WRONGLY accept -- divergence the
+    // other direction. No mutation on reject.
+    HeaderSample weak{SCRYPT, 1075};
+    weak.target = target;
+    weak.pow_hash.limb[3] = 2;            // 2^193, low64 == 0
+    EXPECT_EQ(hc.validate_and_append(weak), IngestResult::REJECTED);
+    EXPECT_EQ(hc.size(), 1u);             // unchanged
+}

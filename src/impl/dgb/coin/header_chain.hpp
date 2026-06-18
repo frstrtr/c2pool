@@ -64,16 +64,18 @@ using ::dgb::coin::u256;
 // retarget path needs only the algo bits (disposition + work-credit), the
 // timestamp (timespan), the expanded difficulty target (averaging), and the
 // scrypt(header) PoW digest (`pow_hash`, the CheckProofOfWork hash <= target
-// check). `target` and `pow_hash` are fixed-width proxies for the standalone CI
-// guard; the per-algo DigiShield slice swaps arith_uint256 in with the SAME
-// field shape, so the averaging/timespan assembly below is unchanged when the
-// real width lands. pow_hash == 0 is the proxy default for "scrypt(header) not
-// evaluated here" (trivially satisfies any target); the daemon port fills it.
+// check). `target` and `pow_hash` are full 256-bit (coin/dgb_arith256.hpp u256)
+// as of the field-shape swap: the implicit uint64 widening keeps every
+// uint64-range vector byte-identical while the ingest PoW/ceiling checks and the
+// DigiShield averaging now run at true arith_uint256 width, so the embedded
+// daemon port drops real digests into this SAME field with no reshape. pow_hash
+// == 0 is the default for "scrypt(header) not evaluated here" (trivially
+// satisfies any target); the daemon port fills it.
 struct HeaderSample {
     int32_t  n_version = 0;
     int64_t  n_time    = 0;
-    uint64_t target    = 0;   // expanded PoW target (smaller == more work)
-    uint64_t pow_hash  = 0;   // scrypt(header) digest; hash <= target == valid PoW
+    u256     target    = 0;   // expanded PoW target (smaller == more work)
+    u256     pow_hash  = 0;   // scrypt(header) digest; hash <= target == valid PoW
 };
 
 // Outcome of validating + ingesting one header.
@@ -89,7 +91,7 @@ enum class IngestResult {
 // the DIGISHIELD INSERTION POINT warn against.
 struct RetargetWindow {
     std::size_t scrypt_samples  = 0;     // Scrypt headers folded in (<= window)
-    uint64_t    avg_target      = 0;     // mean expanded target over samples
+    u256        avg_target      = 0;     // mean expanded target over samples
     int64_t     actual_timespan = 0;     // newest - oldest Scrypt sample time
     bool        sufficient      = false; // true iff the full window was found
 };
@@ -100,7 +102,7 @@ struct RetargetWindow {
 // it so a long stall can never relax difficulty past the network minimum.
 struct DigiShieldParams {
     int64_t  target_timespan = 0;   // nominal solve time the filter centers on
-    uint64_t pow_limit       = 0;   // max (easiest) target; result never exceeds
+    u256     pow_limit       = 0;   // max (easiest) target; result never exceeds
 };
 
 // Per-algo DigiShield/MultiShield damped retarget multiply (M3 7b).
@@ -125,19 +127,19 @@ struct DigiShieldParams {
 // (coin/dgb_arith256.hpp): arith_uint256 multiply-then-divide with 256-bit
 // overflow truncation -- the consensus behaviour DigiByte Core exhibits near
 // pow_limit, which an __int128 proxy could NOT reproduce (it would compute a
-// wider, divergent next target). `target` here is still the uint64 field proxy
-// the standalone CI guard uses; for any uint64-range avg_target the 256-bit path
-// is bit-identical to the prior intermediate, so existing vectors are unchanged.
-// The embedded-daemon port swaps real arith_uint256 into the field shape with
-// this exact multiply/clamp ordering.
+// wider, divergent next target). With the field-shape swap the target/avg_target
+// fields ARE arith_uint256 (u256); for any uint64-range avg_target the result is
+// bit-identical to the prior __int128 proxy, so existing vectors are unchanged,
+// while a >2^64 avg now retargets at full width. The embedded-daemon port reuses
+// this exact multiply/clamp ordering with real arith_uint256.
 //
 // Returns 0 when the window carries no Scrypt samples -- the caller MUST keep
 // the prior target rather than retarget off an empty window (early/genesis).
-inline uint64_t digishield_next_target(const RetargetWindow& rw,
-                                       const DigiShieldParams& params)
+inline u256 digishield_next_target(const RetargetWindow& rw,
+                                   const DigiShieldParams& params)
 {
     if (rw.scrypt_samples == 0 || params.target_timespan <= 0)
-        return 0;
+        return u256{};
 
     const int64_t nominal = params.target_timespan;
 
@@ -154,18 +156,19 @@ inline uint64_t digishield_next_target(const RetargetWindow& rw,
     // strictly positive after the clamp (floor_ts > 0 for nominal > 0). The
     // multiply truncates at 256 bits exactly as arith_uint256 does, so a target
     // near pow_limit retargets to the SAME value DigiByte Core computes.
-    const u256 bn_new = mul_div_u256(u256::from_u64(rw.avg_target),
+    const u256 bn_new = mul_div_u256(rw.avg_target,
                                      static_cast<uint64_t>(damped),
                                      static_cast<uint64_t>(nominal));
 
-    // Difficulty floor: never relax past the network's easiest target.
-    if (params.pow_limit != 0 &&
-        bn_new > u256::from_u64(params.pow_limit))
+    // Difficulty floor: never relax past the network's easiest target. The cap
+    // compare runs at full 256-bit width, so a pow_limit in the high limbs is
+    // honoured exactly (a uint64 proxy would mis-decide near 2^64).
+    if (!params.pow_limit.is_zero() && bn_new > params.pow_limit)
         return params.pow_limit;
 
-    // uint64 field proxy: a uint64-range avg keeps bn_new within 64 bits, so
-    // low64() is exact (the embedded port returns the full arith_uint256).
-    return bn_new.low64();
+    // Full-width next target (uint64-range inputs leave the high limbs zero, so
+    // this is bit-identical to the prior low64() return for existing vectors).
+    return bn_new;
 }
 
 // Work-neutral header chain with a Scrypt-only DigiShield retarget body.
@@ -201,7 +204,7 @@ public:
             // PoW validate path. A zero target is not a validatable Scrypt
             // header (the structural guard here is that a malformed target
             // never credits work).
-            if (h.target == 0)
+            if (h.target.is_zero())
                 return IngestResult::REJECTED;
 
             // Minimum-difficulty ceiling (DigiByte Core CheckProofOfWork
@@ -213,7 +216,7 @@ public:
             // could not otherwise reject a sub-minimum-difficulty header.
             // pow_limit == 0 leaves the gate unconfigured (legacy
             // default-ctor chains stay unconstrained, exactly as before).
-            if (m_ds_params.pow_limit != 0 && h.target > m_ds_params.pow_limit)
+            if (!m_ds_params.pow_limit.is_zero() && h.target > m_ds_params.pow_limit)
                 return IngestResult::REJECTED;
 
             // PoW satisfaction (DigiByte Core CheckProofOfWork second half):
@@ -239,8 +242,8 @@ public:
             // mirrors Bitcoin/DigiByte consensus: the header carries the
             // required next-work value, not merely a target it satisfies.
             const RetargetWindow rw = next_retarget_window(m_retarget_window);
-            const uint64_t expected = digishield_next_target(rw, m_ds_params);
-            if (expected != 0 && h.target != expected)
+            const u256 expected = digishield_next_target(rw, m_ds_params);
+            if (!expected.is_zero() && !(h.target == expected))
                 return IngestResult::REJECTED;
 
             m_chain.push_back(h);
@@ -278,12 +281,12 @@ public:
         if (idx.empty())
             return rw;
 
-        unsigned __int128 target_sum = 0;
+        u256 target_sum;
         for (std::size_t k : idx)
             target_sum += m_chain[depth - 1 - k].target;
 
         rw.scrypt_samples  = idx.size();
-        rw.avg_target      = static_cast<uint64_t>(target_sum / idx.size());
+        rw.avg_target      = target_sum.div_u64(static_cast<uint64_t>(idx.size()));
         // idx is nearest-first: front() == newest Scrypt sample (smallest k),
         // back() == oldest. Timespan is over Scrypt samples exclusively.
         rw.actual_timespan = m_chain[depth - 1 - idx.front()].n_time
@@ -296,12 +299,13 @@ public:
     std::size_t size()            const { return m_chain.size(); }
 
 private:
-    // Work proxy: inversely proportional to the target (smaller target == more
-    // work), matching real PoW work accounting in shape. The per-algo slice
-    // swaps the arith_uint256 work() in; only Scrypt headers ever reach here.
-    static uint64_t work_from_target(uint64_t target)
+    // Work proxy: inversely proportional to the target. The full-width field
+    // narrows to low64() for the proxy, keeping cumulative_work byte-identical
+    // for every uint64-range vector; the embedded port swaps in arith_uint256
+    // work() (2^256 / (target+1)) over the same Scrypt-only credit path.
+    static uint64_t work_from_target(const u256& target)
     {
-        return target == 0 ? 0 : (UINT64_MAX / target);
+        return target.is_zero() ? 0 : (UINT64_MAX / target.low64());
     }
 
     DigiShieldParams          m_ds_params{};        // retarget gate params
