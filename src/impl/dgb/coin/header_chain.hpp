@@ -34,5 +34,8 @@
 // ONLY — never the interleaved multi-algo header chain. On a mixed-algo chain
 // the previous-block / window walk must skip non-Scrypt (continuity) headers;
 // folding them into the window corrupts the Scrypt retarget and re-introduces
-// the work-neutrality break above. Easy to get wrong on a mixed-algo chain.
+// the work-neutrality break above. Easy to get wrong on a mixed-algo chain. The Scrypt-only
+// ancestor selection for that window is implemented + guarded in
+// coin/dgb_digishield.hpp (scrypt_window_ancestors + header_credits_work);
+// the per-algo target math layers on top of it.
 namespace c2pool::dgb { /* TODO(M3): HeaderChain w/ Scrypt-only validate() + accept-by-continuity */ }
