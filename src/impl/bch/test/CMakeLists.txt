@@ -51,6 +51,21 @@ if(BUILD_TESTING)
         btclibs)
     add_test(NAME bch_block_ordering_test COMMAND bch_block_ordering_test)
 
+    # utxo_connect_test: M5 (a) -- the now-live UTXO-connect leg. connect_block()
+    # applies a best-chain block to a wired UTXO view, then revalidate_inputs()
+    # (Phase 4) sweeps mempool txs whose inputs the connect left unspendable
+    # (double-spend rejection). Same link set + transaction.cpp TU as the other
+    # connector tests; still no impl_bch coin lib -> per-coin isolation holds.
+    add_executable(bch_utxo_connect_test
+        utxo_connect_test.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/transaction.cpp)
+    target_include_directories(bch_utxo_connect_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(bch_utxo_connect_test PRIVATE
+        core pool sharechain
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage c2pool_difficulty
+        btclibs)
+    add_test(NAME bch_utxo_connect_test COMMAND bch_utxo_connect_test)
+
     # embedded_daemon_assembly_test: network-free assembly of the full
     # EmbeddedDaemon graph (Node + EmbeddedCoinNode + AblaRuntime + CoinNode
     # seam) plus the operator-approved cold-start anchor LIVE PIN (floor-

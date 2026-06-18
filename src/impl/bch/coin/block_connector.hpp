@@ -32,11 +32,13 @@
 //                                           same-outpoint conflicts, Phase 3
 //                                           orphaned children (all txid/spent-
 //                                           outpoint based; no UTXO needed).
-//        c. revalidate_inputs(utxo)      -- Phase 4 stale-input sweep; a no-op
-//                                           when no UTXO view is wired (cold
-//                                           start / headers-only), which is the
-//                                           correct contract until the full
-//                                           UTXO connect layer lands.
+//        c. UTXO-connect + revalidate    -- when a UTXO view is wired,
+//           _inputs(utxo)                   connect_block() applies the block to
+//                                           the UTXO set (spend consumed coins,
+//                                           create outputs), then Phase 4 sweeps
+//                                           any mempool tx the connect left
+//                                           unspendable. No-op headers-only when
+//                                           no view is wired (cold-start).
 //
 // THREADING: single-threaded use from the daemon's block-processing context,
 // same contract as AblaBlockFeed and the header chain's advance path.
@@ -74,9 +76,10 @@ public:
     BlockConnector(const BlockConnector&) = delete;
     BlockConnector& operator=(const BlockConnector&) = delete;
 
-    /// Optional UTXO view for the Phase-4 stale-input sweep. Until a UTXO
-    /// connect layer is wired this stays null and revalidate_inputs() is a
-    /// no-op -- Phases 1-3 (txid + spent-outpoint based) still run fully.
+    /// Optional UTXO view. When set, each best-chain connect applies the block
+    /// to this view (connect_block) and then runs the Phase-4 stale-input sweep
+    /// (revalidate_inputs). Left null it stays a no-op -- Phases 1-3 (txid +
+    /// spent-outpoint based) still run fully, so cold-start/headers-only is safe.
     void set_utxo(core::coin::UTXOViewCache* u) { m_utxo = u; }
 
     /// Wire to a node's full_block event. Retained internally, torn down on
@@ -115,8 +118,20 @@ public:
 
         // 3. Mempool reconciliation to the new tip.
         m_pool.set_tip_height(tip->height);
-        m_pool.remove_for_block(block);          // Phase 1 + 2 + 3
-        const int evicted = m_pool.revalidate_inputs(m_utxo);  // Phase 4 (no-op if null)
+        m_pool.remove_for_block(block);          // Phase 1 + 2 + 3 (txid/outpoint)
+
+        // 4. UTXO-connect + Phase-4 stale-input sweep. Only when a UTXO view is
+        //    wired; otherwise a headers-only no-op (cold-start contract held).
+        //    connect_block() applies the block to the authoritative UTXO set so
+        //    revalidate_inputs() has a live view to sweep -- without it the view
+        //    never advances and Phase 4 finds nothing. txid_fn = BCH non-witness
+        //    compute_txid (no SegWit).
+        int evicted = 0;
+        if (m_utxo) {
+            m_utxo->connect_block(block, tip->height,
+                [](const auto& tx) { return compute_txid(tx); });
+            evicted = m_pool.revalidate_inputs(m_utxo);  // Phase 4: real sweep
+        }
 
         LOG_DEBUG_COIND << "[EMB-BCH] block-connect: tip=" << hash.GetHex().substr(0, 16)
                         << "... height=" << tip->height
