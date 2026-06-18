@@ -104,6 +104,12 @@ public:
 
     bool has_p2p() const { return m_p2p != nullptr; }
 
+    /// External BCHN-RPC client, or nullptr until run()/init_rpc() has run.
+    /// Handed to CoinNode as the live external FALLBACK sink behind the
+    /// embedded work source (v36 external_fallback invariant). Not owned by
+    /// the caller -- the Node retains ownership for its whole lifetime.
+    NodeRPC* rpc() { return m_rpc.get(); }
+
     /// Send getheaders to drive header sync.
     /// Locator should be hashes from chain tip back to genesis (sparsely);
     /// for an empty chain pass {genesis_hash}. Stop = uint256::ZERO means

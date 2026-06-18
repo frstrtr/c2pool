@@ -20,6 +20,23 @@
 //    headers/blocks are the standard SHA256d serialization.
 //  * doublespendproof (DSPROOF, 0x94a0) inv is recognized but not requested.
 //
+// >>> BLOCK-ARRIVAL EMIT CONFORMANCE (vs frstrtr/p2poolBCH @6603b79) <<<
+// The Python baseline delivers block arrivals through exactly two events in
+// p2pool/bitcoin/p2p.py:
+//   - handle_inv  -> factory.new_block.happened(inv['hash'])  (announcement)
+//   - handle_block -> get_block.got_response(hash, block)  (full block,
+//     matched to an explicit get_block ReplyMatcher request; single path,
+//     no broadcast event, no compact-block handling at all).
+// We mirror both: new_block.happened(hash) on the block inv, and the direct
+// `block` handler calls m_peer->get_block(hash, block) (the same ReplyMatcher
+// surface) before firing full_block. The two compact-block delivery paths
+// (cmpctblock-complete and cmpctblock+blocktxn) have NO Python analog -- they
+// are strictly additive embedded-daemon coverage that funnels reconstructed
+// blocks into the same full_block sink. full_block itself is internal ABLA /
+// mempool plumbing with zero p2pool-merged-v36 surface (Python reads block
+// size from the daemon, not from a broadcast event). Emit-completeness across
+// all three delivery paths therefore conforms to the baseline and is additive.
+//
 // This class is templated on ConfigType and touches the per-coin config only
 // through `m_config->coin()->m_p2p.prefix`. It carries NO concrete dependency
 // on bch's config.hpp -- the config binding is deferred to the
@@ -31,6 +48,7 @@
 #include "node_interface.hpp"
 #include "compact_blocks.hpp"
 #include "mempool.hpp"
+#include "merkle.hpp"
 
 #include <memory>
 
@@ -607,6 +625,39 @@ private:
         m_coin->new_tx.happened(Transaction(msg->m_tx));
     }
 
+    // Validate a fully-assembled/received block against its header's merkle
+    // commitment, then publish it on full_block. All three delivery paths --
+    // the direct `block` message, compact-block-complete, and the compact +
+    // getblocktxn round-trip -- funnel through here so a block can only reach
+    // the ABLA size feed (and any future block-connect consumer) once its tx
+    // set provably matches the header it was announced under.
+    //
+    // The check is the parent-chain consensus merkle (SHA256d over txids, BCH
+    // == BTC rule; CTOR fixes only tx *order*, which the block already carries).
+    // A mismatch means the peer handed us a header/txs pair that does not
+    // cohere -- we DROP it rather than fold a bogus serialized size into ABLA,
+    // where the resulting discontinuity would (safely) sink the template budget
+    // to the 32 MB floor. Mirrors BCHN CheckMerkleRoot (validation.cpp) at
+    // accept time. p2pool-merged-v36 surface: NONE -- local accept gate only.
+    void emit_full_block(const BlockType& block, const uint256& blockhash)
+    {
+        std::vector<uint256> txids;
+        txids.reserve(block.m_txs.size());
+        for (const auto& tx : block.m_txs)
+            txids.push_back(compute_txid(tx));
+        const uint256 computed = compute_merkle_root(txids);
+
+        if (computed != block.m_merkle_root) {
+            LOG_WARNING << "[" << m_chain_label << "] Block "
+                        << blockhash.GetHex().substr(0, 16) << "... merkle mismatch (header "
+                        << block.m_merkle_root.GetHex().substr(0, 16) << "... vs computed "
+                        << computed.GetHex().substr(0, 16) << "...) over "
+                        << block.m_txs.size() << " txs -- dropping, full_block NOT emitted";
+            return;
+        }
+        m_coin->full_block.happened(block);
+    }
+
     ADD_P2P_HANDLER(block)
     {
         // BCH blocks are the standard SHA256d serialization — no AuxPoW
@@ -625,7 +676,7 @@ private:
         LOG_INFO << "[" << m_chain_label << "] Full block received: "
                  << blockhash.GetHex().substr(0, 16) << "..."
                  << " txs=" << block.m_txs.size();
-        m_coin->full_block.happened(block);
+        emit_full_block(block, blockhash);
     }
 
     ADD_P2P_HANDLER(headers)
@@ -781,7 +832,7 @@ private:
             m_peer->get_block(blockhash, result.block);
             auto header = static_cast<BlockHeaderType>(result.block);
             m_peer->get_header(blockhash, header);
-            m_coin->full_block.happened(result.block);
+            emit_full_block(result.block, blockhash);
         } else {
             LOG_INFO << "[" << m_chain_label << "] Compact block incomplete, "
                      << result.missing_indexes.size() << " txs missing — requesting via getblocktxn";
@@ -908,6 +959,15 @@ private:
 
         LOG_INFO << "[" << m_chain_label << "] Compact block completed via blocktxn: "
                  << blockhash.GetHex();
+
+        // Emit the reconstructed block on full_block, exactly as the direct
+        // `block` handler and the complete-path `cmpctblock` handler do. Without
+        // this, a block delivered via the compact + getblocktxn round-trip (the
+        // common case when the mempool is missing some txns) never reaches the
+        // ABLA size feed: AblaBlockFeed would see a height discontinuity and the
+        // template budget would drop to the 32 MB safe floor. Producer-side
+        // completion of the embedded-daemon block-connect -> full_block path.
+        emit_full_block(block, blockhash);
 
         m_pending_cmpct.reset();
         m_pending_missing_indexes.clear();
