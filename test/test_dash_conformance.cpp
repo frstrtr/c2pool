@@ -539,43 +539,27 @@ TEST(DashConformancePplns, ColdChainFallsBackToSingleRecipient) {
 
 // ── S6 conformance: payout dust-threshold (A1–A4) vs frstrtr/p2pool-dash ──────
 //
-// V36 Option-A reconciliation (commit b9b3e384): the payout-dust floor is the
-// single SSOT dash::PoolConfig::dust_threshold() == 100000 sat (oracle
-// PARENT.DUST_THRESHOLD = 0.001e8), replacing the two wrong-semantic relay
-// floors (params 5460 / pplns 54600). These KATs pin the FILTER behaviour the
-// reconciliation must preserve. Amounts are OUT-OF-BAND oracle arithmetic
-// mirroring p2pool-dash data.py get_expected_payouts (floor(frac*value); the
-// unallocated remainder, INCLUDING dropped dust, accrues to the always-emitted
-// donation line). Per-share work = diff-1 (BITS_DIFF1), so each share weighs
+// V36 oracle-conformance (operator 2026-06-18 "CONFORM TO ORACLE", option a):
+// the PAYOUT path carries NO dust floor. Every worker whose proportional split
+// floor(weight_frac * miner_value) is NONZERO is paid that amount to its own
+// script, exactly as p2pool-dash data.py get_expected_payouts does
+// (amounts[script] = subsidy*weight//total_weight). Only EXACTLY-zero outputs
+// are dropped (oracle `if amounts[script]`). The always-emitted DONATION line
+// carries ONLY the rounding remainder (miner_value - Σworkers), which may be 0.
+//
+// dash::PoolConfig::dust_threshold() (100000 duff) survives as the vardiff /
+// share-difficulty floor (c2pool_refactored.cpp mirror of work.py:326); it is
+// NO LONGER consulted in the payout path. These KATs pin the oracle behaviour:
+// a sub-dust-but-nonzero worker is PAID, not swept to donation. Amounts are
+// OUT-OF-BAND oracle arithmetic; per-share work = diff-1 so each share weighs
 // exactly 1.0 and the fractions below are exact.
-//
-// RESIDUE-SINK PIN (integrator A2 ask): the dropped-dust residue flows to the
-// DONATION line (pplns.hpp: amt<threshold -> `continue`, never added to
-// `allocated`; residue = miner_value - allocated -> DONATION_SCRIPT line). It
-// does NOT go onto the largest remaining payout — the pplns.hpp:7-8 header
-// comment ("pushed onto the largest remaining payout") is stale w.r.t. the
-// code; these KATs assert the code, not that comment.
-//
-// A4 (generated boundary corpus through the p2pool-dash get_expected_payouts
-// algorithm) -- CLOSED node-free, per integrator (corpus is algorithmic, not a
-// liftable test_data.py file). data.py:682 get_expected_payouts floors each
-// proportional split (subsidy*weight//total_weight) and accrues the unallocated
-// remainder (incl. dropped dust) to DONATION_SCRIPT; with equal-difficulty
-// shares the weight fraction is n/T, so floor(n/T * V) reproduces any exact duff
-// boundary WITHOUT a live node (PR #144 @bddd38fb carries only X11/DGW-v3
-// consensus vectors, never a sub-100000 PPLNS share). A 3:1 split (B = 1/4)
-// places B at floor(V/4): V=399996 -> 99999 (just-below, DROPPED, A4a below),
-// V=400000 -> 100000 (at floor, RETAINED, A2b above), V=400004 -> 100001
-// (just-above, RETAINED, A4b below). DUST_THRESHOLD=100000 independently matches
-// dash.py:34 / dash_testnet.py:28 / dash_regtest.py:28 -- a verified-parity
-// point, not a fix.
 
-// A1 + A2: a worker whose proportional split falls below the 100000 floor is
-// dropped, and its value reappears on the DONATION line (conservation). A has
-// 3 shares, B has 1 (weights 3.0 / 1.0); V = 200000. A = floor(0.75*200000) =
-// 150000 (retained); B = floor(0.25*200000) = 50000 (< 100000, DROPPED);
-// residue = 200000 - 150000 = 50000 -> donation. B absent; donation == 50000.
-TEST(DashConformancePayoutDust, DustWorkerDroppedResidueToDonationLine) {
+// A1 + A2: a worker whose proportional split is nonzero but below the old
+// 100000 floor is PAID to its own script (oracle pays every nonzero output);
+// the donation line carries only the rounding remainder. A has 3 shares, B has
+// 1 (weights 3.0 / 1.0); V = 200000. A = floor(0.75*200000) = 150000; B =
+// floor(0.25*200000) = 50000 (sub-dust, PAID); residue = 0 -> donation = 0.
+TEST(DashConformancePayoutDust, SubDustNonzeroWorkerPaidNotSwept) {
     SyntheticChain sc;
     const uint160 A = miner_h160(0x07), B = miner_h160(0x08);
     uint256 g   = sc.add(0x60, uint256(), 0, B);  // genesis: miner B (1 share)
@@ -597,28 +581,28 @@ TEST(DashConformancePayoutDust, DustWorkerDroppedResidueToDonationLine) {
 
     const std::map<std::string, uint64_t> expected = {
         {a_hex, 150000u},
-        {d_hex,  50000u},
+        {b_hex,  50000u},
+        {d_hex,      0u},
     };
     EXPECT_EQ(payout_set(r), expected);
 
-    // A1: dust worker B is gone from the set entirely.
-    EXPECT_EQ(payout_set(r).count(b_hex), 0u) << "sub-dust worker B must be dropped";
+    // A1: sub-dust worker B is PAID its own output (oracle pays all nonzero).
+    EXPECT_EQ(payout_set(r).at(b_hex), 50000u) << "sub-dust nonzero worker B must be paid";
 
-    // A2: residue sink is the DONATION line (== dropped B value), NOT miner A.
-    EXPECT_EQ(payout_set(r).at(d_hex), 50000u) << "dropped dust must land on donation line";
-    EXPECT_EQ(payout_set(r).at(a_hex), 150000u) << "retained worker must NOT absorb the dust";
+    // A2: donation carries only the rounding remainder (here 0), NOT B's value.
+    EXPECT_EQ(payout_set(r).at(d_hex), 0u) << "donation is the rounding remainder only";
 
-    // A2: conservation — every satoshi of miner_value accounted for.
+    // A2: conservation — every duff of miner_value accounted for.
     uint64_t sum = 0;
     for (const auto& p : r.payouts) sum += p.amount;
     EXPECT_EQ(sum, V);
 }
 
-// A2b boundary: a worker landing EXACTLY on the floor is RETAINED (the filter
-// is strict `amt < threshold`). Same chain, V = 400000: B = floor(0.25*400000)
-// = 100000 == threshold -> kept; A = 300000; residue 0 -> donation line at 0
-// (always emitted). Guards against an off-by-one slip to `<=`.
-TEST(DashConformancePayoutDust, ThresholdBoundaryExactFloorRetained) {
+// A2b: every nonzero worker near the old threshold is paid. Same chain,
+// V = 400000: B = floor(0.25*400000) = 100000 (paid), A = 300000, residue 0 ->
+// donation 0. Under the oracle there is no `<`/`<=` boundary at all — any
+// nonzero output is kept; this guards that the region at the old floor is paid.
+TEST(DashConformancePayoutDust, ThresholdRegionNonzeroWorkersAllPaid) {
     SyntheticChain sc;
     const uint160 A = miner_h160(0x07), B = miner_h160(0x08);
     uint256 g   = sc.add(0x64, uint256(), 0, B);
@@ -634,7 +618,7 @@ TEST(DashConformancePayoutDust, ThresholdBoundaryExactFloorRetained) {
     ASSERT_FALSE(r.used_fallback);
     const std::map<std::string, uint64_t> expected = {
         {script_hex(dash::pubkey_hash_to_script2(A)), 300000u},
-        {script_hex(dash::pubkey_hash_to_script2(B)), 100000u},  // == floor, retained
+        {script_hex(dash::pubkey_hash_to_script2(B)), 100000u},
         {script_hex(dash::DONATION_SCRIPT),                0u},
     };
     EXPECT_EQ(payout_set(r), expected);
@@ -644,12 +628,13 @@ TEST(DashConformancePayoutDust, ThresholdBoundaryExactFloorRetained) {
     EXPECT_EQ(sum, V);
 }
 
-// A3 (donation-exemption — the property integrator most wants proven): the
-// always-emitted donation line is NOT subject to the dust floor. In the A1
-// scenario the donation amount is 50000, strictly below dust_threshold()
-// (100000), yet it is present. The dust `continue` lives only in the worker
-// proportional loop; the donation line is appended afterwards, unconditionally.
-TEST(DashConformancePayoutDust, DonationLineExemptFromDustFloor) {
+// A3 (donation = rounding remainder only): the always-emitted donation line
+// carries exactly miner_value - Σworkers, nothing else. A has 3 shares, B has 1;
+// V = 200002 (not divisible by the weight total 4). A = floor(0.75*200002) =
+// 150001; B = floor(0.25*200002) = 50000 (sub-dust, PAID); allocated = 200001;
+// residue = 1 -> donation = 1. Proves the donation line is the remainder sink,
+// not a dust sink, and that a sub-dust worker is paid alongside it.
+TEST(DashConformancePayoutDust, DonationLineIsRoundingRemainderOnly) {
     SyntheticChain sc;
     const uint160 A = miner_h160(0x07), B = miner_h160(0x08);
     uint256 g   = sc.add(0x68, uint256(), 0, B);
@@ -657,27 +642,32 @@ TEST(DashConformancePayoutDust, DonationLineExemptFromDustFloor) {
     uint256 s2  = sc.add(0x6a, s1,        0, A);
     uint256 tip = sc.add(0x6b, s2,        0, A);
 
-    const uint64_t V = 200000;
+    const uint64_t V = 200002;
     auto fallback = dash::pubkey_hash_to_script2(miner_h160(0xef));
     auto r = dash::pplns::compute_payouts(sc.chain, tip, /*window*/ 10, V,
                                           fallback, /*min_shares*/ 2);
 
     ASSERT_FALSE(r.used_fallback);
     const auto set = payout_set(r);
+    const std::string a_hex = script_hex(dash::pubkey_hash_to_script2(A));
+    const std::string b_hex = script_hex(dash::pubkey_hash_to_script2(B));
     const std::string d_hex = script_hex(dash::DONATION_SCRIPT);
 
+    EXPECT_EQ(set.at(a_hex), 150001u);
+    EXPECT_EQ(set.at(b_hex),  50000u) << "sub-dust nonzero worker still paid";
     ASSERT_EQ(set.count(d_hex), 1u) << "donation line must always be emitted";
-    EXPECT_LT(set.at(d_hex), dash::PoolConfig::dust_threshold())
-        << "this asserts the donation amount is genuinely sub-dust...";
-    EXPECT_GT(set.at(d_hex), 0u)
-        << "...and still present despite being below the dust floor (exempt)";
+    EXPECT_EQ(set.at(d_hex), 1u) << "donation == miner_value - sum(workers) (rounding remainder)";
+
+    uint64_t sum = 0;
+    for (const auto& p : r.payouts) sum += p.amount;
+    EXPECT_EQ(sum, V);
 }
 
-
-// A4a (generated boundary, just-BELOW): 3:1 split, V=399996. B = floor(399996/4)
-// = 99999 < 100000 -> DROPPED; A = floor(3*399996/4) = 299997; residue 99999 ->
-// donation line. One duff under the floor must drop.
-TEST(DashConformancePayoutDust, GeneratedBoundaryJustBelowDropped) {
+// A4a (generated boundary, just-BELOW the old floor): 3:1 split, V = 399996.
+// B = floor(399996/4) = 99999 -> under the OLD floor it was dropped; under the
+// oracle it is PAID. A = floor(3*399996/4) = 299997; residue 0 -> donation 0.
+// One duff under the old floor must now be paid to the worker.
+TEST(DashConformancePayoutDust, GeneratedBoundaryJustBelowNowPaid) {
     SyntheticChain sc;
     const uint160 A = miner_h160(0x07), B = miner_h160(0x08);
     uint256 g   = sc.add(0x70, uint256(), 0, B);
@@ -697,21 +687,22 @@ TEST(DashConformancePayoutDust, GeneratedBoundaryJustBelowDropped) {
 
     const std::map<std::string, uint64_t> expected = {
         {a_hex, 299997u},
-        {d_hex,  99999u},
+        {b_hex,  99999u},
+        {d_hex,      0u},
     };
     EXPECT_EQ(payout_set(r), expected);
-    EXPECT_EQ(payout_set(r).count(b_hex), 0u)
-        << "99999 (one duff under floor) must drop";
+    EXPECT_EQ(payout_set(r).at(b_hex), 99999u)
+        << "99999 (one duff under the old floor) must now be paid";
 
     uint64_t sum = 0;
     for (const auto& p : r.payouts) sum += p.amount;
     EXPECT_EQ(sum, V);
 }
 
-// A4b (generated boundary, just-ABOVE): same split, V=400004. B = floor(400004/4)
-// = 100001 >= 100000 -> RETAINED; A = floor(3*400004/4) = 300003; residue 0.
-// One duff over the floor must survive.
-TEST(DashConformancePayoutDust, GeneratedBoundaryJustAboveRetained) {
+// A4b (generated boundary, just-ABOVE the old floor): same split, V = 400004.
+// B = floor(400004/4) = 100001 -> paid (as before); A = floor(3*400004/4) =
+// 300003; residue 0 -> donation 0. Symmetric partner to A4a.
+TEST(DashConformancePayoutDust, GeneratedBoundaryJustAbovePaid) {
     SyntheticChain sc;
     const uint160 A = miner_h160(0x07), B = miner_h160(0x08);
     uint256 g   = sc.add(0x74, uint256(), 0, B);
@@ -737,6 +728,37 @@ TEST(DashConformancePayoutDust, GeneratedBoundaryJustAboveRetained) {
     EXPECT_EQ(sum, V);
 }
 
+// A5 (surviving zero-filter): an EXACTLY-zero proportional split is the only
+// thing still dropped (oracle `if amounts[script]`). 3:1 split, V = 3:
+// B = floor(0.25*3) = 0 -> DROPPED (zero output); A = floor(0.75*3) = 2;
+// residue = 1 -> donation = 1. Pins that the zero filter survives the floor's
+// removal.
+TEST(DashConformancePayoutDust, ExactlyZeroWorkerOutputDropped) {
+    SyntheticChain sc;
+    const uint160 A = miner_h160(0x07), B = miner_h160(0x08);
+    uint256 g   = sc.add(0x78, uint256(), 0, B);
+    uint256 s1  = sc.add(0x79, g,         0, A);
+    uint256 s2  = sc.add(0x7a, s1,        0, A);
+    uint256 tip = sc.add(0x7b, s2,        0, A);
+
+    const uint64_t V = 3;
+    auto fallback = dash::pubkey_hash_to_script2(miner_h160(0xef));
+    auto r = dash::pplns::compute_payouts(sc.chain, tip, /*window*/ 10, V,
+                                          fallback, /*min_shares*/ 2);
+
+    ASSERT_FALSE(r.used_fallback);
+    const std::string a_hex = script_hex(dash::pubkey_hash_to_script2(A));
+    const std::string b_hex = script_hex(dash::pubkey_hash_to_script2(B));
+    const std::string d_hex = script_hex(dash::DONATION_SCRIPT);
+
+    EXPECT_EQ(payout_set(r).count(b_hex), 0u) << "exactly-zero worker output must be dropped";
+    EXPECT_EQ(payout_set(r).at(a_hex), 2u);
+    EXPECT_EQ(payout_set(r).at(d_hex), 1u);
+
+    uint64_t sum = 0;
+    for (const auto& p : r.payouts) sum += p.amount;
+    EXPECT_EQ(sum, V);
+}
 
 // ── S6 conformance: share-version transition negotiation vs frstrtr/p2pool-dash ──
 //

@@ -24,7 +24,6 @@
 #include "share_chain.hpp"                 // dash::ShareChain, DashShare
 #include "share_check.hpp"                 // dash::pubkey_hash_to_script2
 #include "coinbase_builder.hpp"            // dash::coinbase::bits_to_difficulty
-#include "config_pool.hpp"               // dash::PoolConfig::dust_threshold (payout-dust SSOT)
 
 #include <algorithm>
 #include <map>
@@ -56,8 +55,7 @@ inline Result compute_payouts(
     size_t window_size,
     uint64_t miner_value,
     const std::vector<unsigned char>& fallback_script,
-    size_t   min_shares_for_pplns = 20,
-    uint64_t dust_threshold       = dash::PoolConfig::dust_threshold())  // payout-dust SSOT (config_pool.hpp)
+    size_t   min_shares_for_pplns = 20)
 {
     Result r;
     if (miner_value == 0 || fallback_script.empty()) return r;
@@ -137,13 +135,19 @@ inline Result compute_payouts(
         return r;
     }
 
-    // Proportional split with dust handling.
+    // Proportional split — oracle conformance (p2pool-dash data.py
+    // get_expected_payouts): every NONZERO worker allocation is paid to its
+    // own script; only EXACTLY-zero outputs are dropped (oracle `if
+    // amounts[script]`). There is NO payout dust floor — a sub-dust but
+    // nonzero worker is paid, not swept to donation. (PoolConfig::
+    // dust_threshold() survives only as the vardiff / share-difficulty floor
+    // in c2pool_refactored.cpp; it is not consulted here.)
     std::vector<Payout> tentative;
     uint64_t allocated = 0;
     for (auto& [key, e] : by_key) {
         double frac = e.weight / total_weight;
         uint64_t amt = static_cast<uint64_t>(frac * static_cast<double>(miner_value));
-        if (amt < dust_threshold) continue;
+        if (amt == 0) continue;  // oracle drops only zero-value outputs
         tentative.push_back({
             dash::pubkey_hash_to_script2(e.pubkey_hash),
             amt
