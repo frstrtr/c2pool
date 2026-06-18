@@ -131,6 +131,51 @@ int main()
         assert(DEFAULT_MAX_BLOCKS_IN_FLIGHT == 16);
     }
 
+    // ---- expire(): stalled in-flight requests are evicted + re-queued ------
+    {
+        BlockDownloadWindow w(2);
+        w.enqueue(hashes(0, 4));                    // [H0 H1 H2 H3]
+        auto req = w.next_requests(/*now=*/100);    // H0,H1 issued @100
+        assert(req.size() == 2);
+        assert(w.in_flight() == 2 && w.queued() == 2);
+
+        // Not yet past the timeout: nothing evicted.
+        assert(w.expire(/*now=*/105, /*timeout=*/10).empty());
+        assert(w.in_flight() == 2);
+
+        // Past the timeout (110-100 >= 10): both stalled requests evicted,
+        // window freed, and they go back to the FRONT of the queue.
+        auto evicted = w.expire(/*now=*/110, /*timeout=*/10);
+        assert(evicted.size() == 2);
+        assert(w.in_flight() == 0);
+        assert(w.queued() == 4);                    // H0,H1 re-queued ahead of H2,H3
+
+        // Retried oldest-first: the next window pulls exactly the two stalled
+        // hashes (ahead of the never-requested H2/H3).
+        auto retry = w.next_requests(/*now=*/200);
+        assert(retry.size() == 2);
+        std::vector<uint256> rset(retry.begin(), retry.end());
+        assert((rset[0] == H(0) || rset[0] == H(1)));
+        assert((rset[1] == H(0) || rset[1] == H(1)) && rset[0] != rset[1]);
+    }
+
+    // ---- expire(): only the stale request goes, fresh ones stay -----------
+    {
+        BlockDownloadWindow w(2);
+        w.enqueue(hashes(0, 3));                    // [H0 H1 H2]
+        w.next_requests(/*now=*/100);               // H0,H1 issued @100
+        assert(w.on_block_received(H(1)) == true);  // H1 arrives, frees a slot
+        w.next_requests(/*now=*/150);               // H2 issued @150
+        // in flight: H0@100, H2@150. timeout 50 at now=155 => only H0 is stale.
+        auto evicted = w.expire(/*now=*/155, /*timeout=*/50);
+        assert(evicted.size() == 1 && evicted[0] == H(0));
+        assert(w.in_flight() == 1);                 // H2 still outstanding
+
+        // A block that arrives AFTER its eviction is reported unsolicited
+        // (no longer in flight) -- caller still applies it; window unaffected.
+        assert(w.on_block_received(H(0)) == false);
+    }
+
     std::cout << "bch block_download window: ALL PASS\n";
     return 0;
 }

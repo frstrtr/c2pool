@@ -39,7 +39,9 @@
 // ---------------------------------------------------------------------------
 
 #include <cstddef>
+#include <cstdint>
 #include <deque>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -85,13 +87,13 @@ public:
     /// Pop hashes to request now, up to the free window slots
     /// (max_in_flight - in_flight). Marks them in flight. Oldest-first
     /// (chain order) so block bodies are pulled in the order they were learned.
-    std::vector<uint256> next_requests()
+    std::vector<uint256> next_requests(uint64_t now_tick = 0)
     {
         std::vector<uint256> out;
         while (m_in_flight.size() < m_max_in_flight && !m_queue.empty()) {
             uint256 h = m_queue.front();
             m_queue.pop_front();
-            m_in_flight.insert(h);
+            m_in_flight.emplace(h, now_tick);
             out.push_back(h);
         }
         return out;
@@ -114,6 +116,34 @@ public:
         return true;
     }
 
+    /// Evict in-flight requests that have gone stale -- a block we getdata'd but a
+    /// stalling peer never delivered. now_tick and timeout_ticks are in the caller's
+    /// monotonic unit (the same unit passed to next_requests()); any request issued
+    /// at issue_tick with now_tick - issue_tick >= timeout_ticks is pushed back to
+    /// the FRONT of the queue (retry oldest-first, ahead of not-yet-requested hashes)
+    /// and dropped from the in-flight set, freeing its window slot. The hash stays in
+    /// m_known (still wanted, still deduped). Returns the evicted hashes so the caller
+    /// can log / consider peer demotion. A block that arrives after eviction is handled
+    /// normally (on_block_received reports it unsolicited, but emit_full_block still
+    /// applies it). Deferred from the windowed-download slice (2cc7de44) until block
+    /// bodies actually flowed end-to-end.
+    std::vector<uint256> expire(uint64_t now_tick, uint64_t timeout_ticks)
+    {
+        std::vector<uint256> evicted;
+        for (auto it = m_in_flight.begin(); it != m_in_flight.end(); ) {
+            if (now_tick - it->second >= timeout_ticks) {
+                evicted.push_back(it->first);
+                it = m_in_flight.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        // Re-queue the stalled hashes ahead of not-yet-requested ones so a stuck
+        // block is retried before fresh tip blocks.
+        for (const auto& h : evicted) m_queue.push_front(h);
+        return evicted;
+    }
+
     std::size_t in_flight()     const { return m_in_flight.size(); }
     std::size_t queued()        const { return m_queue.size(); }
     std::size_t max_in_flight() const { return m_max_in_flight; }
@@ -125,7 +155,7 @@ public:
 private:
     std::size_t m_max_in_flight;
     std::deque<uint256> m_queue;                            // pending, chain order
-    std::unordered_set<uint256, HashHasher> m_in_flight;    // outstanding getdata
+    std::unordered_map<uint256, uint64_t, HashHasher> m_in_flight; // hash -> tick getdata issued
     std::unordered_set<uint256, HashHasher> m_known;        // queued ∪ inflight ∪ received
 };
 
