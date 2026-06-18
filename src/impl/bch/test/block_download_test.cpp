@@ -176,6 +176,27 @@ int main()
         assert(w.on_block_received(H(0)) == false);
     }
 
+    // ---- tick-driven re-issue cycle: a requeued request gets a FRESH issue
+    //      tick on redrain, so it is not immediately re-expired the next tick
+    //      (mirrors the NodeP2P expire-timer -> drain_block_window contract) --
+    {
+        BlockDownloadWindow w(1);
+        w.enqueue(hashes(0, 1));                    // [H0]
+        auto r0 = w.next_requests(/*now=*/10);      // H0 issued @10
+        assert(r0.size() == 1 && r0[0] == H(0));
+        // Stall: at now=70 (>= timeout 60) H0 is evicted + requeued to front.
+        auto ev = w.expire(/*now=*/70, /*timeout=*/60);
+        assert(ev.size() == 1 && ev[0] == H(0));
+        assert(w.in_flight() == 0 && w.queued() == 1);
+        // Redrain re-issues H0 with a NEW issue tick (=72), not the stale @10.
+        auto r1 = w.next_requests(/*now=*/72);
+        assert(r1.size() == 1 && r1[0] == H(0));
+        // One cadence later it must NOT re-expire (72..77 elapsed 5 < 60),
+        // proving the issue tick was refreshed rather than carried over.
+        assert(w.expire(/*now=*/77, /*timeout=*/60).empty());
+        assert(w.in_flight() == 1);
+    }
+
     std::cout << "bch block_download window: ALL PASS\n";
     return 0;
 }

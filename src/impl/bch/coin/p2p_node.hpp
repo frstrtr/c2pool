@@ -96,6 +96,13 @@ private:
     static constexpr time_t CONNECT_TIMEOUT_SEC = 10;
     static constexpr time_t IDLE_TIMEOUT_SEC = 100;
     static constexpr time_t PING_INTERVAL_SEC = 30;
+    // Headers-first block-download stall recovery. Every BLOCK_DL_EXPIRE_TICK_SEC
+    // the in-flight getdata(MSG_BLOCK) window is scanned; any request outstanding
+    // >= BLOCK_DL_TIMEOUT_SEC is presumed dropped by a stalling peer, requeued, and
+    // re-issued from the freed slot. Tick << timeout so a stall is caught within one
+    // cadence of the deadline without churning the window. See block_download.hpp.
+    static constexpr time_t BLOCK_DL_EXPIRE_TICK_SEC = 5;
+    static constexpr time_t BLOCK_DL_TIMEOUT_SEC = 60;
 
     bch::interfaces::Node* m_coin;
     io::io_context* m_context;
@@ -106,6 +113,7 @@ private:
     std::unique_ptr<core::Timer> m_reconnect_timer;
     std::unique_ptr<core::Timer> m_ping_timer;
     std::unique_ptr<core::Timer> m_timeout_timer;
+    std::unique_ptr<core::Timer> m_block_dl_timer;
     NetService m_target_addr;
     bool m_reconnect_enabled = false;
     bool m_handshake_complete = false;
@@ -208,6 +216,7 @@ public:
     {
         stop_ping_timer();
         stop_timeout_timer();
+        stop_block_dl_timer();
         m_handshake_complete = false;
         m_peer.reset();
     }
@@ -258,6 +267,7 @@ public:
 
         stop_ping_timer();
         stop_timeout_timer();
+        stop_block_dl_timer();
         m_handshake_complete = false;
     }
 
@@ -360,7 +370,7 @@ public:
     void drain_block_window()
     {
         if (!m_peer) return;
-        for (const auto& bhash : m_block_dl.next_requests()) {
+        for (const auto& bhash : m_block_dl.next_requests(now_tick_sec())) {
             auto getdata_msg = message_getdata::make_raw(
                 {inventory_type(inventory_type::block, bhash)});
             m_peer->write(getdata_msg);
@@ -489,6 +499,41 @@ private:
             m_ping_timer->stop();
     }
 
+    void ensure_block_dl_timer()
+    {
+        if (!m_block_dl_timer)
+            m_block_dl_timer = std::make_unique<core::Timer>(m_context, true);
+    }
+
+    void stop_block_dl_timer()
+    {
+        if (m_block_dl_timer)
+            m_block_dl_timer->stop();
+    }
+
+    /// Monotonic seconds since connect -- the tick domain for the block-download
+    /// window's issue/expire bookkeeping. steady_clock so it never runs backwards.
+    uint64_t now_tick_sec() const
+    {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - m_connected_at).count());
+    }
+
+    /// Periodic stall-recovery tick: requeue in-flight block requests outstanding
+    /// >= BLOCK_DL_TIMEOUT_SEC and re-issue from the freed slots. No-op while
+    /// nothing is in flight or nothing has timed out.
+    void expire_block_window()
+    {
+        auto requeued = m_block_dl.expire(now_tick_sec(), BLOCK_DL_TIMEOUT_SEC);
+        if (requeued.empty()) return;
+        LOG_DEBUG_COIND << "[" << m_chain_label << "] IBD block-dl expire requeued "
+                        << requeued.size() << " stalled request(s) (in flight "
+                        << m_block_dl.in_flight() << ", queued "
+                        << m_block_dl.queued() << ")";
+        drain_block_window();
+    }
+
     void on_activity()
     {
         if (!m_peer)
@@ -553,6 +598,11 @@ private:
         ensure_ping_timer();
         m_ping_timer->start(PING_INTERVAL_SEC, [this]() {
             send_ping();
+        });
+
+        ensure_block_dl_timer();
+        m_block_dl_timer->start(BLOCK_DL_EXPIRE_TICK_SEC, [this]() {
+            expire_block_window();
         });
 
         // BIP 130: request header-first block announcements
