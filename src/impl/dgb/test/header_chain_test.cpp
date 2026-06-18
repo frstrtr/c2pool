@@ -272,6 +272,46 @@ TEST(HeaderChainValidate, IngestGateRejectsTargetAbovePowLimit)
               IngestResult::VALIDATED_SCRYPT);
 }
 
+// Ingest-path PoW satisfaction (DigiByte Core CheckProofOfWork second half):
+// a Scrypt header whose scrypt(header) digest is NUMERICALLY GREATER than its
+// declared target does not meet the work it claims and is consensus-invalid --
+// rejected without mutating the chain, independent of the retarget/ceiling
+// gates. Mirrors `if (UintToArith256(hash) > bnTarget) return false`. The
+// pow_hash field defaults to 0 (every brace-init vector above), which trivially
+// satisfies any target, so all chain-helper tests run unchanged; here we set it
+// explicitly to drive the gate. A default-ctor chain leaves the retarget gate
+// and pow_limit ceiling unconfigured, so ONLY this PoW check can fire.
+TEST(HeaderChainValidate, IngestGateRejectsInsufficientScryptPoW)
+{
+    HeaderChain hc;   // gate + ceiling unconfigured: only the PoW check can fire
+
+    // pow_hash strictly ABOVE the declared target: the header does not satisfy
+    // its own difficulty. REJECT, no work credited, chain not extended.
+    HeaderSample weak{SCRYPT, 1000, 100};
+    weak.pow_hash = 101;
+    EXPECT_EQ(hc.validate_and_append(weak), IngestResult::REJECTED);
+    EXPECT_EQ(hc.size(), 0u);
+    EXPECT_EQ(hc.cumulative_work(), 0u);
+
+    // pow_hash == target is the boundary: hash <= target satisfies the work.
+    HeaderSample exact{SCRYPT, 1000, 100};
+    exact.pow_hash = 100;
+    EXPECT_EQ(hc.validate_and_append(exact), IngestResult::VALIDATED_SCRYPT);
+
+    // pow_hash strictly below target also satisfies (more work than required).
+    HeaderSample strong{SCRYPT, 1075, 100};
+    strong.pow_hash = 1;
+    EXPECT_EQ(hc.validate_and_append(strong), IngestResult::VALIDATED_SCRYPT);
+    EXPECT_EQ(hc.size(), 2u);
+
+    // A continuity (non-Scrypt) header never reaches the PoW check: its
+    // disposition short-circuits to ACCEPT_BY_CONTINUITY even with a huge
+    // pow_hash, confirming the gate is Scrypt-path only.
+    HeaderSample cont{SHA256D, 1090, 100};
+    cont.pow_hash = UINT64_MAX;
+    EXPECT_EQ(hc.validate_and_append(cont), IngestResult::ACCEPTED_CONTINUITY);
+}
+
 // ---------------------------------------------------------------------------
 // 256-BIT BOUNDARY (M3 §7b — arith_uint256 swap). Proves, not assumes, that
 // the DigiShield damped multiply runs at TRUE 256-bit width: a uint64/__int128

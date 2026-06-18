@@ -62,14 +62,18 @@ using ::dgb::coin::u256;
 // Minimal header sample the Scrypt-only retarget body consumes. The embedded
 // DigiByte Core port (M3+) carries the full CBlockHeader; the validate() +
 // retarget path needs only the algo bits (disposition + work-credit), the
-// timestamp (timespan), and the expanded difficulty target (averaging).
-// `target` is a fixed-width proxy for the standalone CI guard; the per-algo
-// DigiShield slice swaps arith_uint256 in with the SAME field shape, so the
-// averaging/timespan assembly below is unchanged when the real width lands.
+// timestamp (timespan), the expanded difficulty target (averaging), and the
+// scrypt(header) PoW digest (`pow_hash`, the CheckProofOfWork hash <= target
+// check). `target` and `pow_hash` are fixed-width proxies for the standalone CI
+// guard; the per-algo DigiShield slice swaps arith_uint256 in with the SAME
+// field shape, so the averaging/timespan assembly below is unchanged when the
+// real width lands. pow_hash == 0 is the proxy default for "scrypt(header) not
+// evaluated here" (trivially satisfies any target); the daemon port fills it.
 struct HeaderSample {
     int32_t  n_version = 0;
     int64_t  n_time    = 0;
     uint64_t target    = 0;   // expanded PoW target (smaller == more work)
+    uint64_t pow_hash  = 0;   // scrypt(header) digest; hash <= target == valid PoW
 };
 
 // Outcome of validating + ingesting one header.
@@ -195,9 +199,8 @@ public:
         case HeaderDisposition::VALIDATE_SCRYPT:
         {
             // PoW validate path. A zero target is not a validatable Scrypt
-            // header (the embedded daemon's full scrypt(header) <= target
-            // check lands with the daemon port; the structural guard here is
-            // that a malformed target never credits work).
+            // header (the structural guard here is that a malformed target
+            // never credits work).
             if (h.target == 0)
                 return IngestResult::REJECTED;
 
@@ -211,6 +214,19 @@ public:
             // pow_limit == 0 leaves the gate unconfigured (legacy
             // default-ctor chains stay unconstrained, exactly as before).
             if (m_ds_params.pow_limit != 0 && h.target > m_ds_params.pow_limit)
+                return IngestResult::REJECTED;
+
+            // PoW satisfaction (DigiByte Core CheckProofOfWork second half):
+            // the header's scrypt(header) digest must SATISFY its declared
+            // target -- hash <= target. A header claiming work it does not meet
+            // is consensus-invalid. This is the CONTEXT-FREE PoW check (mirrors
+            // `if (UintToArith256(hash) > bnTarget) return false`), run before
+            // the contextual nBits-equality gate below. pow_hash == 0 is the
+            // standalone proxy for "scrypt(header) not evaluated here" and
+            // trivially satisfies any target, so the chain-helper tests stay
+            // unconstrained; the embedded-daemon port fills pow_hash with the
+            // real Scrypt digest and this gate goes live with the SAME shape.
+            if (h.pow_hash > h.target)
                 return IngestResult::REJECTED;
 
             // Consensus retarget gate: the declared target must equal the
