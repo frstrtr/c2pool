@@ -239,6 +239,21 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_conformance PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
     gtest_add_tests(test_dash_conformance "" AUTO)
 
+    # DASH block-subsidy + UTXO adapter (S7 foundation slice): GetBlockSubsidy /
+    # masternode + platform reward split (subsidy.hpp) consumed through the
+    # header-only utxo_adapter view shim. Both are header-only over
+    # block/transaction + core/coin (utxo_view_cache/db); no ltc/pool SCC
+    # dependency. Mirrors the test_dash_conformance link set.
+    add_executable(test_dash_subsidy test_dash_subsidy.cpp)
+    target_link_libraries(test_dash_subsidy PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_subsidy PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
+    gtest_add_tests(test_dash_subsidy "" AUTO)
+
     add_executable(test_compact_blocks test_compact_blocks.cpp)
     target_link_libraries(test_compact_blocks PRIVATE
         GTest::gtest_main GTest::gtest

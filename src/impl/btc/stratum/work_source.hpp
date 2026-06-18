@@ -60,7 +60,10 @@ public:
     /// to a lambda that calls `coin_node.get_p2p()->submit_block_raw(bytes)`
     /// + adds to the B5 pending_submits map. Raw-bytes form keeps
     /// BTCWorkSource decoupled from the BlockType serialization details.
-    using SubmitBlockFn = std::function<void(const std::vector<unsigned char>& block_bytes,
+    /// Returns true iff the won block reached at least one network sink
+    /// (P2P relay or submitblock RPC fallback). A false return means it
+    /// reached NEITHER and the won-block path logs a loud error.
+    using SubmitBlockFn = std::function<bool(const std::vector<unsigned char>& block_bytes,
                                              uint32_t height)>;
 
     /// PPLNS payout query: walks back N shares from prev_share_hash and

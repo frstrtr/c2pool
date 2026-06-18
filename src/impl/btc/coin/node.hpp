@@ -4,9 +4,12 @@
 
 #include <boost/asio.hpp>
 
+#include <btclibs/util/strencodings.h>          // HexStr
+
 #include "rpc.hpp"
 #include "p2p_node.hpp"
 #include "node_interface.hpp"
+#include "block_broadcast.hpp"
 
 namespace btc
 {
@@ -91,10 +94,35 @@ public:
     /// source which already has the full block bytes assembled from
     /// (header || tx_count || coinbase || tx_data) and doesn't need to
     /// round-trip through BlockType deserialization.
-    void submit_block_p2p_raw(const std::vector<unsigned char>& block_bytes)
+    /// Returns true iff the block was relayed to a connected peer.
+    bool submit_block_p2p_raw(const std::vector<unsigned char>& block_bytes)
     {
         if (m_p2p)
-            m_p2p->submit_block_raw(block_bytes);
+            return m_p2p->submit_block_raw(block_bytes);
+        return false;
+    }
+
+    /// Submit a pre-serialized block to bitcoind via the submitblock RPC.
+    /// This is the FALLBACK sink (P2P relay is primary). Returns true iff
+    /// the daemon accepted the block. ignore_failure is set so a rejection
+    /// is logged but does not throw out of the won-block path.
+    bool submit_block_hex(const std::vector<unsigned char>& block_bytes)
+    {
+        if (!m_rpc)
+            return false;
+        return m_rpc->submit_block_hex(HexStr(block_bytes), /*ignore_failure=*/true);
+    }
+
+    /// Broadcast a WON block with FALLBACK semantics: P2P relay is primary,
+    /// the submitblock RPC fires only if P2P is unavailable or the relay did
+    /// not succeed (NOT always-both). Returns true iff the block reached at
+    /// least one sink; a false return means it reached NEITHER and the caller
+    /// MUST treat it as a lost subsidy.
+    bool submit_block_with_fallback(const std::vector<unsigned char>& block_bytes)
+    {
+        return broadcast_block_with_fallback(
+            [&]{ return submit_block_p2p_raw(block_bytes); },
+            [&]{ return submit_block_hex(block_bytes); });
     }
 
     bool has_p2p() const { return m_p2p != nullptr; }

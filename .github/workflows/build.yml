@@ -59,7 +59,7 @@ jobs:
                     test_threading test_weights \
                     test_header_chain test_mempool test_template_builder \
                     test_doge_chain test_compact_blocks test_dash_x11_kat \
-                    test_dash_header_chain test_dash_block_replay test_dash_conformance \
+                    test_dash_header_chain test_dash_block_replay test_dash_conformance test_dash_subsidy \
                     test_multiaddress_pplns test_pplns_stress \
                     test_hash_link test_decay_pplns \
                     test_pplns_consensus \
@@ -67,8 +67,8 @@ jobs:
                     test_phase4_embedded \
                     test_mweb_builder \
                     test_address_resolution test_compute_share_target \
-                    test_utxo test_dgb_subsidy dgb_share_test \
-                    rpc_request_test softfork_check_test genesis_check_test algo_select_test \
+                    test_utxo test_dgb_subsidy dgb_share_test dgb_block_assembly_test dgb_gentx_coinbase_test \
+                    rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test header_chain_test \
                     v37_test \
             -j$(nproc)
 
@@ -125,6 +125,8 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   linux-asan:
     name: Linux x86_64 (AsAN+UBSan)
+    # dash bring-up slices may opt out of sanitizers via dash-skip-sanitizers; KEEP for consensus/payout slices (default = on)
+    if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-skip-sanitizers')) }}
     runs-on: ubuntu-24.04
     continue-on-error: true
     steps:
@@ -188,15 +190,15 @@ jobs:
                     test_threading test_weights \
                     test_header_chain test_mempool test_template_builder \
                     test_doge_chain test_compact_blocks test_dash_x11_kat \
-                    test_dash_header_chain test_dash_block_replay test_dash_conformance \
+                    test_dash_header_chain test_dash_block_replay test_dash_conformance test_dash_subsidy \
                     test_hash_link test_decay_pplns \
                     test_pplns_consensus \
                     test_v36_script_sorting test_v36_cross_impl_refhash \
                     test_phase4_embedded \
                     test_mweb_builder \
                     test_address_resolution test_compute_share_target \
-                    test_utxo test_dgb_subsidy dgb_share_test \
-                    rpc_request_test softfork_check_test genesis_check_test algo_select_test \
+                    test_utxo test_dgb_subsidy dgb_share_test dgb_block_assembly_test dgb_gentx_coinbase_test \
+                    rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test header_chain_test \
                     test_coin_broadcaster test_multiaddress_pplns test_pplns_stress \
                     v37_test \
             -j$(nproc)
@@ -369,6 +371,8 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   macos:
     name: macOS ${{ matrix.arch }}
+    # dash-slice campaign: skip macOS for PRs carrying the dash-linux-only label (re-enabled at block-viable gate, ~07-01)
+    if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-linux-only')) }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -449,6 +453,8 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   windows:
     name: Windows x86_64
+    # dash-slice campaign: skip Windows for PRs carrying the dash-linux-only label (re-enabled at block-viable gate, ~07-01)
+    if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-linux-only')) }}
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v6
