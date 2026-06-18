@@ -395,6 +395,41 @@ public:
         return result;
     }
 
+    // -- Startup block-solution scan (BCH standalone parent) --
+    // Walk the verified best chain and fire m_on_block_found for any share whose
+    // cached pow_hash meets the parent BCH block target. BCH is SHA256d
+    // standalone (NOT merged-mined), so there is no merged-coinbase leg: this
+    // mirrors btc share_tracker::scan_chain_for_blocks MINUS that check. O(1) per
+    // share -- uses the pow_hash cached at init_verify, no SHA256d recompute.
+    // The m_on_block_found sink is wired by the pool node to BOTH broadcast
+    // paths: embedded P2P (Node::submit_block_p2p) + external submitblock RPC
+    // fallback (CoinNode::submit_block_hex). Zero p2pool-v36 surface (block
+    // detection, not share/PPLNS/coinbase bytes). Returns found-block count.
+    int scan_chain_for_blocks(const uint256& tip, int max_shares)
+    {
+        if (tip.IsNull() || max_shares <= 0) return 0;
+        int found = 0;
+        uint256 pos = tip;
+        for (int i = 0; i < max_shares && !pos.IsNull(); ++i) {
+            if (!chain.contains(pos)) break;
+            auto* idx = chain.get_index(pos);
+            if (!idx) break;
+
+            const uint256 pow = idx->pow_hash;
+            if (pow.IsNull()) { pos = idx->tail; continue; }
+
+            chain.get_share(pos).invoke([&](auto* obj) {
+                const uint256 block_target = chain::bits_to_target(obj->m_bits);
+                if (!block_target.IsNull() && pow <= block_target) {
+                    idx->is_block_solution = true;
+                    if (m_on_block_found) { m_on_block_found(pos); ++found; }
+                }
+            });
+            pos = idx->tail;
+        }
+        return found;
+    }
+
     // -- Expected payouts from PPLNS weights --
     // Uses exact integer arithmetic matching generate_share_transaction():
     //   V36: amount = (uint288(subsidy) * weight / total_weight).GetLow64()
