@@ -676,6 +676,26 @@ public:
         // If verification fails: remove the share (it's bad).
         // If no verification possible and chain unrooted: request parents.
         std::vector<uint256> bads;
+
+        // Reset the cross-phase verification-continuation flag once per think()
+        // cycle. Both Phase 1 and Phase 2 set it when their budget is exhausted;
+        // run_think() then reposts a continuation that releases+reacquires the
+        // exclusive lock between chunks (the lock-segmentation seam).
+        m_think_needs_continue = false;
+
+        // Phase-1 verification budget — async-model adaptation mirroring the
+        // Phase-2 THINK_VERIFY_BUDGET below. p2pool walks walk_count=head_height
+        // for rooted heads (last is None, data.py:2131) but prunes aggressively
+        // so `last` is the prune boundary -> walk <=5. c2pool can hold a large
+        // rooted chain unpruned (last.IsNull(), head_height ~= chain.size()); a
+        // backward reorg that makes every head's tip fail attempt_verify then
+        // walks the FULL chain x PPLNS under the exclusive tracker lock ->
+        // multi-minute wedge (.157 2026-06-19 19:53). Budgeting bounds the
+        // per-cycle lock hold; the remainder verifies on the next run_think()
+        // continuation. The SET of shares verified is identical to p2pool --
+        // only the scheduling is chunked, so GENTX parity is preserved.
+        constexpr int THINK_P1_VERIFY_BUDGET = 100;
+        int p1_budget_remaining = bootstrap_mode ? INT_MAX : THINK_P1_VERIFY_BUDGET;
         {
             // Snapshot heads — we'll modify chain during iteration
             auto heads_snapshot = chain.get_heads();
@@ -688,6 +708,10 @@ public:
             }
             for (auto& [head_hash, tail_hash] : heads_snapshot)
             {
+                // Phase-1 budget exhausted — defer the remaining heads to the
+                // next run_think() continuation (lock released between chunks).
+                if (p1_budget_remaining <= 0) { m_think_needs_continue = true; break; }
+
                 if (verified.get_heads().contains(head_hash)) {
                     ++p1_skipped;
                     continue;
@@ -744,7 +768,9 @@ public:
                     auto chain_view = chain.get_chain(head_hash, walk_count);
                     for (auto [hash, data] : chain_view)
                     {
-                        if (attempt_verify(hash))
+                        bool verify_ok = attempt_verify(hash);
+                        --p1_budget_remaining;  // bound the per-cycle verify storm
+                        if (verify_ok)
                         {
                             verified_one = true;
                             ++p1_verified;
@@ -756,6 +782,9 @@ public:
                         // false for mid-chain shares (NotImplementedError in
                         // p2pool), which is caught below.
                         bads.push_back(hash);
+                        // Budget spent mid-walk: stop here, resume next cycle so
+                        // the exclusive lock is released and IO can progress.
+                        if (p1_budget_remaining <= 0) { m_think_needs_continue = true; break; }
                     }
                 } catch (const std::exception& ex) {
                     ++p1_caught;
@@ -859,7 +888,9 @@ public:
         // now, so budgeting is a safety net for cold starts only.
         constexpr int THINK_VERIFY_BUDGET = 100;
         int budget_remaining = bootstrap_mode ? INT_MAX : THINK_VERIFY_BUDGET;
-        m_think_needs_continue = false;
+        // NOTE: m_think_needs_continue is reset once at the top of think();
+        // Phase 1 may have already requested a continuation, so do NOT clear
+        // it here — either phase having remaining work must keep the loop going.
         {
             static int p2_skip_log = 0;
             if (p2_skip_log++ % 20 == 0)

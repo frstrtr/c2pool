@@ -72,6 +72,26 @@ protected:
     std::atomic<bool> m_clean_running{false};
     mutable std::shared_mutex m_tracker_mutex;
 
+    // ── think()/clean watchdog (mirrors btc/node) ────────────────────────
+    // Best-effort recovery if a think()/clean cycle wedges while holding the
+    // exclusive tracker lock (the unbudgeted Phase-1 reorg-walk storm, .157
+    // 2026-06-19 19:53). The pre-existing io_context-liveness watchdog is BLIND
+    // to this: the IO thread only ever try_to_locks, so io_context stays
+    // responsive while the compute thread spins under the exclusive lock. This
+    // watchdog keys on a compute-thread deadline instead — an atomic ns-deadline
+    // polled by an IO-thread steady_timer that NEVER touches m_tracker_mutex
+    // (it would itself block on the stuck compute thread). On expiry it logs +
+    // dumps a backtrace, clears the deadline, and resets m_think_running so a
+    // fresh cycle can be scheduled. It does NOT forcibly unwind the wedged
+    // compute thread (unsafe); the stuck cycle, if it ever returns, finds the
+    // flag already false and its idempotent IO-phase drain runs harmlessly.
+    static constexpr int THINK_WATCHDOG_SECONDS = 30;
+    std::atomic<int64_t>  m_think_deadline_ns{0};
+    std::atomic<uint64_t> m_think_generation{0};
+    std::unique_ptr<boost::asio::steady_timer> m_watchdog_timer;
+    void arm_think_watchdog();
+    void disarm_think_watchdog();
+
     // ── Lock-free stats snapshot ─────────────────────────────────────────
     // Published by think() on the compute thread under m_tracker_mutex.
     // Read by ALL consumers (sync_status, loading page, global_stats,
