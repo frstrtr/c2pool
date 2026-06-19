@@ -181,8 +181,11 @@ public:
         // Route m_chain (used by BaseNode) to the tracker's main chain
         m_chain = &m_tracker.chain;
 
-        // Open LevelDB storage and load any persisted shares
-        std::string net_name = config->m_testnet ? "litecoin_testnet" : "litecoin";
+        // Open LevelDB storage and load any persisted shares. The net_name keys the
+        // per-coin LevelDB directory (SharechainStorage -> config_path/<net_name>), so
+        // it MUST be DGB-specific: an LTC-mirror "litecoin" here would collide the DGB
+        // sharechain DB with c2pool-ltc on a shared host. Bucket-1 isolation primitive.
+        std::string net_name = config->m_testnet ? "digibyte_testnet" : "digibyte";
         m_storage = std::make_unique<c2pool::storage::SharechainStorage>(net_name);
         load_persisted_shares();
 
