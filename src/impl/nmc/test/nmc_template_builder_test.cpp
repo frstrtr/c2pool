@@ -312,10 +312,53 @@ TEST(NmcAuxChainEmbedded, SubmitBlockCachesHexForRetrieval)
 
     EXPECT_EQ(backend.get_block_hex("any"), std::string(""));
     const std::string hex(200, 'a');
-    EXPECT_TRUE(backend.submit_block(hex));
+    // PE never-silent-drop: with no relay wired the block is NOT broadcast, so
+    // submit_block() must report failure - but the hex is still cached for
+    // get_block_hex() diagnostics/retrieval.
+    EXPECT_FALSE(backend.submit_block(hex));
     EXPECT_EQ(backend.get_block_hex("any"), hex);
     // No daemon peers in embedded mode.
     EXPECT_TRUE(backend.getpeerinfo().empty());
+}
+
+// PE submit path: P2P relay is primary. When a relay sink is wired and reaches
+// >=1 peer, submit_block() reports success and the sink receives the exact hex.
+TEST(NmcAuxChainEmbedded, SubmitBlockRelaysExactHexToPeers)
+{
+    HeaderChain chain(params_pinned());
+    Mempool pool;
+    AuxChainEmbedded backend(chain, pool, params_pinned(), nmc_aux_config());
+
+    std::string relayed;
+    backend.set_block_relay([&](const std::string& block_hex) -> size_t {
+        relayed = block_hex;          // capture what the broadcaster would send
+        return 2;                     // pretend 2 peers received it
+    });
+
+    const std::string hex(200, 'b');
+    EXPECT_TRUE(backend.submit_block(hex));   // relayed to >=1 peer => success
+    EXPECT_EQ(relayed, hex);                  // byte-exact hand-off to the sink
+    EXPECT_EQ(backend.get_block_hex("any"), hex);
+}
+
+// PE never-silent-drop: a relay that reaches 0 peers must NOT be reported as a
+// successful broadcast, even though the sink ran (mirrors BTC #162).
+TEST(NmcAuxChainEmbedded, SubmitBlockNeverSilentDropOnZeroPeers)
+{
+    HeaderChain chain(params_pinned());
+    Mempool pool;
+    AuxChainEmbedded backend(chain, pool, params_pinned(), nmc_aux_config());
+
+    bool sink_ran = false;
+    backend.set_block_relay([&](const std::string&) -> size_t {
+        sink_ran = true;
+        return 0;                     // no peers connected
+    });
+
+    const std::string hex(200, 'c');
+    EXPECT_FALSE(backend.submit_block(hex));  // 0 peers => not broadcast
+    EXPECT_TRUE(sink_ran);                    // sink was consulted, not skipped
+    EXPECT_EQ(backend.get_block_hex("any"), hex);  // hex still cached
 }
 
 

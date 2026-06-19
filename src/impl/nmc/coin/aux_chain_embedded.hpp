@@ -38,6 +38,7 @@
 
 #include <algorithm>
 #include <string>
+#include <functional>
 
 namespace nmc {
 namespace coin {
@@ -118,13 +119,34 @@ public:
         return get_work_template();
     }
 
+    /// PE submit path: P2P-primary block-relay sink. The host wires this to
+    /// CoinBroadcaster::submit_block_raw (the hex is decoded at the wiring site,
+    /// mirroring the BTC on_block_relay seam). Returns the number of peers the
+    /// block was relayed to (0 => not broadcast). When unset, submit_block()
+    /// REFUSES to claim success (never-silent-drop, per BTC #162).
+    using BlockRelayFn = std::function<size_t(const std::string& block_hex)>;
+    void set_block_relay(BlockRelayFn fn) { m_block_relay = std::move(fn); }
+
     bool submit_block(const std::string& block_hex) override {
-        // Embedded mode: P2P relay handled by CoinBroadcaster. Cache for
-        // get_block_hex() retrieval and log the 80-byte header prefix.
-        LOG_INFO << "[MM:" << m_config.symbol << "] Embedded: block submitted ("
-                 << block_hex.size() / 2 << " bytes)"
-                 << " header=" << block_hex.substr(0, std::min(size_t(160), block_hex.size()));
+        // PE: P2P relay is the primary route. Cache the hex for get_block_hex()
+        // regardless of outcome, but NEVER silently claim success - a found
+        // block that did not reach a peer must surface as a failure so the
+        // caller can fall back (mirrors BTC submitblock never-silent-drop #162).
         m_last_block_hex = block_hex;
+        const size_t nbytes = block_hex.size() / 2;
+        if (!m_block_relay) {
+            LOG_WARNING << "[MM:" << m_config.symbol << "] Embedded: submit_block with NO relay"
+                        << " wired - block NOT broadcast (" << nbytes << " bytes)";
+            return false;
+        }
+        const size_t npeers = m_block_relay(block_hex);
+        if (npeers == 0) {
+            LOG_WARNING << "[MM:" << m_config.symbol << "] Embedded: submit_block reached 0 peers"
+                        << " - block NOT relayed (" << nbytes << " bytes)";
+            return false;
+        }
+        LOG_INFO << "[MM:" << m_config.symbol << "] Embedded: block relayed to " << npeers
+                 << " peer(s) (" << nbytes << " bytes)";
         return true;
     }
 
@@ -166,6 +188,7 @@ private:
     c2pool::merged::AuxChainConfig     m_config;
     EmbeddedCoinNode                   m_embedded;
     std::string                        m_last_block_hex;  // cached for get_block_hex() after submit
+    BlockRelayFn                       m_block_relay;     // PE: P2P-primary relay sink (unset => never-silent fail)
 };
 
 } // namespace coin
