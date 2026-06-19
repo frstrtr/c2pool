@@ -36,6 +36,7 @@
 // ---------------------------------------------------------------------------
 
 #include <cstddef>
+#include <vector>
 
 namespace bch::coin::header_sync {
 
@@ -66,6 +67,25 @@ inline Followup classify_headers_batch(
     if (batch_size <= announce_threshold)
         return Followup::RequestBlocks;
     return Followup::Idle;
+}
+
+/// Choose the getheaders locator for a ContinueSync IBD follow-up. PURE.
+///
+/// Prefer the robust HeaderChain-backed locator (`chain_locator`): an
+/// exponential back-off set of hashes lets the peer find a common ancestor even
+/// if our latest header sits on a minority fork. Fall back to a single-hash
+/// locator anchored at the last learned header (`last_hash`) ONLY when the
+/// chain-backed locator is unavailable -- i.e. no provider wired yet -- in which
+/// case the peer may stall if it cannot anchor that lone hash (degraded, but
+/// still forward-progressing on the common-chain case). Templated on the hash
+/// type so it stays dependency-light and unit-testable without uint256/coin lib.
+template <class Hash>
+inline std::vector<Hash> choose_continue_locator(
+    std::vector<Hash> chain_locator, const Hash& last_hash)
+{
+    if (!chain_locator.empty())
+        return chain_locator;
+    return {last_hash};
 }
 
 } // namespace bch::coin::header_sync

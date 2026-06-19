@@ -123,6 +123,7 @@ public:
         wire_chain_ingest();          // new_headers --> HeaderChain (height advance)
         pin_cold_start_anchor();      // operator-approved floor-equivalent anchor
         m_node.start_p2p(peer);       // read-only P2P connect to the BCHN peer
+        bind_locator_provider();      // ContinueSync uses HeaderChain back-off locator
     }
 
     /// NEAR-TIP variant of the read-only IBD harness (UID 1375 follow-up). The
@@ -159,6 +160,7 @@ public:
         wire_chain_ingest();          // new_headers --> HeaderChain (height advance)
         pin_cold_start_anchor();      // ABLA anchor @ the SAME height as the seed
         m_node.start_p2p(peer);       // read-only P2P connect to the BCHN peer
+        bind_locator_provider();      // ContinueSync uses HeaderChain back-off locator
     }
 
     /// True once the BCHN peer handshake (version/verack) has completed, so the
@@ -196,6 +198,19 @@ public:
             return;                   // already assembled; idempotent no-op
         m_abla.wire(m_node, m_embedded);
         m_coin_node = std::make_unique<CoinNode>(&m_embedded, m_node.rpc());
+    }
+
+    /// Wire NodeP2P's IBD getheaders continuation to the authoritative
+    /// HeaderChain locator (exponential back-off from the tip). Without this the
+    /// ContinueSync follow-up falls back to a single-hash locator anchored at
+    /// the last learned header, which a peer cannot anchor if that header is on
+    /// a minority fork -- IBD then stalls silently. m_chain has already ingested
+    /// each batch (wire_chain_ingest) before ContinueSync fires, so get_locator()
+    /// reflects the just-learned tip. Call AFTER start_p2p (the p2p object must
+    /// exist). p2pool-merged-v36 surface: NONE (local SPV wire-sync only).
+    void bind_locator_provider() {
+        if (auto* p2p = m_node.p2p())
+            p2p->set_locator_provider([this]{ return m_chain.get_locator(); });
     }
 
     /// Drive the authoritative HeaderChain from the live P2P header stream.

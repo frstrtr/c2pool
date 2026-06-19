@@ -15,6 +15,8 @@
 
 #include <cassert>
 #include <iostream>
+#include <string>
+#include <vector>
 
 #include "../coin/header_sync.hpp"
 
@@ -22,6 +24,7 @@ using bch::coin::header_sync::Followup;
 using bch::coin::header_sync::classify_headers_batch;
 using bch::coin::header_sync::MAX_HEADERS_RESULTS;
 using bch::coin::header_sync::DEFAULT_ANNOUNCE_THRESHOLD;
+using bch::coin::header_sync::choose_continue_locator;
 
 int main()
 {
@@ -53,6 +56,40 @@ int main()
     // Custom small cap: at-cap batch is ContinueSync.
     assert(classify_headers_batch(10, /*announce=*/3, /*cap=*/10) == Followup::ContinueSync);
 
-    std::cout << "bch header_sync classify: ALL PASS\n";
+    // -- choose_continue_locator: ContinueSync locator selection (fork safety) --
+    // Use std::string as the hash stand-in so this stays pure (no uint256/coin lib).
+    const std::string last = "last_header";
+
+    // No provider / empty chain locator -> degraded single-hash fallback anchored
+    // at the last learned header (forward-progress on the common-chain case).
+    {
+        std::vector<std::string> empty_chain;
+        auto loc = choose_continue_locator(empty_chain, last);
+        assert(loc.size() == 1);
+        assert(loc[0] == last);
+    }
+
+    // Provider returns a robust HeaderChain back-off locator -> it is used
+    // VERBATIM (multi-hash, fork-resilient), NOT the single-hash fallback. THE FIX.
+    {
+        std::vector<std::string> chain = {"tip", "tip-1", "tip-3", "tip-7", "genesis"};
+        auto loc = choose_continue_locator(chain, last);
+        assert(loc.size() == 5);
+        assert(loc.front() == "tip");          // anchored at the just-learned tip
+        assert(loc.back() == "genesis");       // back-off reaches a deep ancestor
+        // The lone last_hash is NOT substituted when a real locator exists.
+        assert(loc != std::vector<std::string>{last});
+    }
+
+    // A single-element chain locator is still preferred over the raw fallback
+    // (the provider, not the handler, decided that one hash suffices).
+    {
+        std::vector<std::string> chain = {"only_tip"};
+        auto loc = choose_continue_locator(chain, last);
+        assert(loc.size() == 1);
+        assert(loc[0] == "only_tip");
+    }
+
+    std::cout << "bch header_sync classify + continue-locator: ALL PASS\n";
     return 0;
 }
