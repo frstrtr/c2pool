@@ -216,6 +216,155 @@ jobs:
         with: { name: test-results-linux-asan, path: build_asan/Testing/, retention-days: 7 }
 
   # ════════════════════════════════════════════════════════════════════════════
+  # COIN_BCH leg — Bitcoin Cash (SHA256d standalone parent, V36)
+  #
+  # Dedicated per-coin leg (integrator 2026-06-19 decision). build.yml previously
+  # configured ONLY -DCOIN_DGB=ON, so the 15 bch_ M5 targets never compiled and a
+  # gh rollup reported GREEN while exercising ZERO BCH — a false-green merge gate
+  # (the DGB #137 NOT_BUILT shape, but 15 targets, not one). Coin flags are
+  # additive independent if() guards (no mutual-exclusion), so -DCOIN_BCH=ON
+  # composes with COIN_DGB in one configure — but BCH ships its own c2pool-bch
+  # binary + its own 15 test targets, so a separate configure/leg is the clean
+  # per-coin signal: a BCH break reads as "COIN_BCH leg red," not buried in DGB.
+  # Mirrors the DGB linux/linux-asan coverage. Does NOT relax the per-coin
+  # source-presence guards (PR #47). ctest scoped to ^bch_ (network-free; the
+  # live VM300 IBD path lives in the c2pool-bch --ibd harness, not in ctest).
+  # ════════════════════════════════════════════════════════════════════════════
+  coin-bch:
+    name: COIN_BCH Linux x86_64
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            g++ cmake make libleveldb-dev libsecp256k1-dev
+
+      - uses: actions/setup-python@v6
+        with: { python-version: 3.12 }
+
+      - name: Install Conan 2
+        run: pip install "conan>=2.0,<3.0"
+
+      - name: Detect Conan profile
+        run: |
+          conan profile detect --force
+          sed -i 's/compiler.cppstd=.*/compiler.cppstd=20/' "$(conan profile path default)"
+
+      - name: Restore Conan cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.conan2
+          key: conan2-ubuntu24-gcc13-bch-${{ hashFiles('conanfile.txt') }}
+
+      - name: Conan install
+        run: conan install . --build=missing --output-folder=build_bch --settings=build_type=Release
+
+      - name: Configure (-DCOIN_BCH=ON)
+        run: cmake -S . -B build_bch -DCMAKE_TOOLCHAIN_FILE=build_bch/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release -DCOIN_BCH=ON
+
+      - name: Build c2pool-bch binary
+        run: cmake --build build_bch --target c2pool-bch -j$(nproc)
+
+      - name: Build BCH test targets
+        run: |
+          cmake --build build_bch \
+            --target bch_abla_floor_invariant_test bch_abla_block_feed_test \
+                    bch_abla_block_feed_gap_test bch_header_sync_test \
+                    bch_header_sync_progress_test bch_block_download_test \
+                    bch_genesis_conformance_test bch_abla_growth_soak_test \
+                    bch_coinbase_kat_segwit_predicate_test \
+                    bch_block_connector_test bch_block_ordering_test \
+                    bch_utxo_connect_test bch_reorg_connect_test \
+                    bch_compact_block_connector_test \
+                    bch_embedded_daemon_assembly_test \
+            -j$(nproc)
+
+      - name: Run BCH tests
+        working-directory: build_bch
+        run: ctest --output-on-failure -j$(nproc) -R "^bch_"
+
+      - name: Upload test results on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with: { name: test-results-coin-bch, path: build_bch/Testing/, retention-days: 7 }
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # COIN_BCH AddressSanitizer + UBSan (informational, mirrors linux-asan posture)
+  # ════════════════════════════════════════════════════════════════════════════
+  coin-bch-asan:
+    name: COIN_BCH Linux x86_64 (AsAN+UBSan)
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            g++ cmake make libleveldb-dev libsecp256k1-dev
+
+      - uses: actions/setup-python@v6
+        with: { python-version: 3.12 }
+
+      - name: Install Conan 2
+        run: pip install "conan>=2.0,<3.0"
+
+      - name: Detect Conan profile
+        run: |
+          conan profile detect --force
+          sed -i 's/compiler.cppstd=.*/compiler.cppstd=20/' "$(conan profile path default)"
+
+      - name: Restore Conan cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.conan2
+          key: conan2-ubuntu24-gcc13-bch-${{ hashFiles('conanfile.txt') }}
+
+      - name: Conan install
+        run: conan install . --build=missing --output-folder=build_bch_asan --settings=build_type=Release
+
+      - name: Configure (Release + AsAN + UBSan, -DCOIN_BCH=ON)
+        run: |
+          cmake -S . -B build_bch_asan \
+            -DCMAKE_TOOLCHAIN_FILE=build_bch_asan/conan_toolchain.cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCOIN_BCH=ON \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize=vptr -fno-omit-frame-pointer -fno-sanitize-recover=undefined -g" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined -fno-sanitize=vptr" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined -fno-sanitize=vptr"
+
+      - name: Build c2pool-bch + BCH tests
+        run: |
+          cmake --build build_bch_asan \
+            --target c2pool-bch \
+                    bch_abla_floor_invariant_test bch_abla_block_feed_test \
+                    bch_abla_block_feed_gap_test bch_header_sync_test \
+                    bch_header_sync_progress_test bch_block_download_test \
+                    bch_genesis_conformance_test bch_abla_growth_soak_test \
+                    bch_coinbase_kat_segwit_predicate_test \
+                    bch_block_connector_test bch_block_ordering_test \
+                    bch_utxo_connect_test bch_reorg_connect_test \
+                    bch_compact_block_connector_test \
+                    bch_embedded_daemon_assembly_test \
+            -j$(nproc)
+
+      - name: Run BCH tests under sanitizers
+        working-directory: build_bch_asan
+        env:
+          ASAN_OPTIONS: detect_leaks=0:check_initialization_order=1:strict_string_checks=1:abort_on_error=0
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=0
+        run: ctest --output-on-failure -j$(nproc) -R "^bch_"
+
+      - name: Upload sanitizer test results on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with: { name: test-results-coin-bch-asan, path: build_bch_asan/Testing/, retention-days: 7 }
+
+  # ════════════════════════════════════════════════════════════════════════════
   # Web-static JS verify (typecheck + build + tests + bundle-size gate)
   # Covers web-static/sharechain-explorer/: the Explorer + PPLNS View
   # bundles + Plugin SDK. Fast job (< 1 min); runs regardless of path so
