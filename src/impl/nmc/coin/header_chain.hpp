@@ -41,12 +41,15 @@
 #include <core/hash.hpp>
 #include <core/log.hpp>
 #include <core/target_utils.hpp>  // chain::bits_to_target (parent-PoW, step 4)
+#include <core/leveldb_store.hpp>  // P1f: core::LevelDBStore persistence
 
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <mutex>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -553,6 +556,78 @@ struct IndexEntry {
     std::optional<AuxPow>  auxpow;       // merge-mining proof (P0: stored, unverified)
 };
 
+/// P1f on-disk layout for an IndexEntry (mirror of btc::coin::IndexEntryDiskV1,
+/// adapted to NMC). Serialize order: header, block_hash, height, chain_work,
+/// status (as uint32_t), then the AuxPow presence flag (uint8_t: 1 if the entry
+/// carried a merge-mining proof, else 0).
+///
+/// P1f-DEFER: auxpow blob persistence -- next sub-leg. nmc::coin::AuxPow itself
+/// has NO ::Serialize/::Unserialize / C2POOL_SERIALIZE_METHODS, so per the
+/// fence we do NOT hand-roll its wire layout here. This leg persists ONLY the
+/// presence flag; on load the AuxPow is reconstructed as std::nullopt, but the
+/// entry's status (HEADER_VALID_CHAIN for a merge-mined header) is preserved
+/// faithfully so the restored chain's validation state is not lost. The actual
+/// proof blob lands in the next sub-leg behind this same flag.
+struct IndexEntryDiskV1 {
+    BlockHeaderType header;
+    uint256         block_hash;   // SHA256d(header)
+    uint32_t        height{0};
+    uint256         chain_work;   // cumulative work up to this header
+    HeaderStatus    status{HEADER_VALID_UNKNOWN};
+    uint8_t         has_auxpow{0};  // presence flag (blob deferred -- see above)
+
+    template<typename Stream>
+    void Serialize(Stream& s) const {
+        ::Serialize(s, header);
+        ::Serialize(s, block_hash);
+        ::Serialize(s, height);
+        ::Serialize(s, chain_work);
+        ::Serialize(s, static_cast<uint32_t>(status));
+        ::Serialize(s, has_auxpow);
+        // P1f-DEFER: auxpow blob persistence -- next sub-leg. Nothing follows the
+        // flag yet; when AuxPow gains serialization the blob is written here iff
+        // has_auxpow == 1.
+    }
+    template<typename Stream>
+    void Unserialize(Stream& s) {
+        ::Unserialize(s, header);
+        ::Unserialize(s, block_hash);
+        ::Unserialize(s, height);
+        ::Unserialize(s, chain_work);
+        uint32_t st;
+        ::Unserialize(s, st);
+        status = static_cast<HeaderStatus>(st);
+        ::Unserialize(s, has_auxpow);
+        // P1f-DEFER: auxpow blob persistence -- next sub-leg. The blob is not on
+        // disk yet, so there is nothing further to read behind the flag.
+    }
+
+    /// Materialize the slim in-memory form. auxpow is reconstructed as nullopt
+    /// in this leg (blob deferred); status carries the merge-mined verdict.
+    IndexEntry to_entry() const {
+        IndexEntry e;
+        e.header     = header;
+        e.block_hash = block_hash;
+        e.height     = height;
+        e.chain_work = chain_work;
+        e.status     = status;
+        e.auxpow     = std::nullopt;   // P1f-DEFER: blob not persisted yet
+        return e;
+    }
+
+    /// Build the on-disk form from a slim entry.
+    static IndexEntryDiskV1 from_entry(const IndexEntry& e) {
+        IndexEntryDiskV1 d;
+        d.header      = e.header;
+        d.block_hash  = e.block_hash;
+        d.height      = e.height;
+        d.chain_work  = e.chain_work;
+        d.status      = e.status;
+        d.has_auxpow  = e.auxpow.has_value() ? 1 : 0;
+        return d;
+    }
+};
+
 /// Work represented by a compact target. Mirror of btc::coin::get_block_proof
 /// (src/impl/btc/coin/header_chain.hpp) — NMC is a SHA256d Bitcoin fork, so the
 /// work metric is identical. Kept local to the NMC lane (btc tree is read-only;
@@ -591,9 +666,24 @@ public:
     /// P0-DEFER: no LevelDB open, no persisted-state load, no checkpoint seed.
     /// Returns true (structural success) so wiring smoke-tests pass.
     bool init() {
-        LOG_INFO << "[EMB-NMC] HeaderChain::init() (P0 structural stub) db_path="
+        LOG_INFO << "[EMB-NMC] HeaderChain::init() db_path="
                  << (m_db_path.empty() ? "(in-memory)" : m_db_path);
-        // P0-DEFER: persistence + checkpoint-seed not implemented.
+        if (m_db_path.empty())
+            return true;                        // pure in-memory mode
+
+        core::LevelDBOptions opts;
+        opts.write_buffer_size = 2 * 1024 * 1024;   // 2MB
+        opts.block_cache_size  = 4 * 1024 * 1024;   // 4MB
+        m_db = std::make_unique<core::LevelDBStore>(m_db_path, opts);
+        if (!m_db->open()) {
+            // Non-fatal (mirror of btc): degrade to in-memory and keep running.
+            LOG_WARNING << "[EMB-NMC] HeaderChain LevelDB open FAILED at "
+                        << m_db_path << " -- continuing in-memory";
+            m_db.reset();
+            return true;
+        }
+        LOG_INFO << "[EMB-NMC] HeaderChain LevelDB opened at " << m_db_path;
+        load_from_db();
         return true;
     }
 
@@ -829,6 +919,7 @@ private:
         // min-difficulty testnet where every block carries identical work.
         // Re-receiving a stored header is the idempotent reject above, so the
         // switch cannot flip-flop.
+        bool tip_changed        = false;
         const bool first        = m_tip.IsNull();
         const bool dominated    = entry_work > m_best_work;
         const bool equal_at_tip = entry_work == m_best_work
@@ -840,6 +931,7 @@ private:
             m_tip        = bh;
             m_tip_height = static_cast<uint32_t>(height);
             m_best_work  = entry_work;          // cumulative work at the new tip
+            tip_changed  = true;
             if (!first && (equal_at_tip
                            || height <= static_cast<int32_t>(old_height))) {
                 LOG_WARNING << "[EMB-NMC] "
@@ -849,11 +941,111 @@ private:
                             << " new_tip=" << bh.ToString().substr(0, 16);
             }
         }
+
+        // P1f: persist the newly-accepted header (and, if the tip moved, the
+        // tip/height pointers) atomically. Only on this success path -- the
+        // idempotent / orphan / activation-gate early returns above never reach
+        // here, so nothing is written for a rejected header.
+        persist_entry_locked(bh, tip_changed);
         return true;
+    }
+
+    // P1f: write a single accepted entry to LevelDB in one synced batch. Caller
+    // holds m_mutex and has already inserted the entry into m_index. No-op when
+    // running in pure in-memory mode (m_db null / not open).
+    void persist_entry_locked(const uint256& bh, bool tip_changed) {
+        if (!m_db || !m_db->is_open()) return;
+        auto eit = m_index.find(bh);
+        if (eit == m_index.end()) return;       // defensive -- should never miss
+
+        auto batch = m_db->create_batch();
+
+        // "h" + block_hash(32 raw bytes) -> serialized IndexEntryDiskV1.
+        auto disk   = IndexEntryDiskV1::from_entry(eit->second);
+        auto packed = pack(disk);
+        std::vector<uint8_t> data(
+            reinterpret_cast<const uint8_t*>(packed.data()),
+            reinterpret_cast<const uint8_t*>(packed.data()) + packed.size());
+        std::string hkey = "h";
+        hkey.append(reinterpret_cast<const char*>(bh.data()), 32);
+        batch.put(hkey, data);
+
+        if (tip_changed) {
+            std::vector<uint8_t> tip_data(m_tip.data(), m_tip.data() + 32);
+            batch.put("tip", tip_data);
+
+            const uint32_t h = m_tip_height;
+            std::vector<uint8_t> height_data(4);
+            height_data[0] = static_cast<uint8_t>((h >> 24) & 0xFF);
+            height_data[1] = static_cast<uint8_t>((h >> 16) & 0xFF);
+            height_data[2] = static_cast<uint8_t>((h >>  8) & 0xFF);
+            height_data[3] = static_cast<uint8_t>( h        & 0xFF);
+            batch.put("height", height_data);
+        }
+
+        if (!batch.commit_sync())
+            LOG_ERROR << "[EMB-NMC] persist_entry_locked: WriteBatch FAILED for "
+                      << bh.ToString().substr(0, 16);
+    }
+
+    // P1f: restore m_index / m_tip / m_tip_height / m_best_work from LevelDB.
+    // Schema (NMC has no height-index, so NO "i" key):
+    //   "h" + block_hash(32 raw bytes) -> serialized IndexEntryDiskV1
+    //   "tip"                          -> block_hash(32 raw bytes)
+    //   "height"                       -> uint32_t, 4 bytes big-endian
+    // Caller is init() before any concurrent access; no lock held / needed.
+    void load_from_db() {
+        if (!m_db || !m_db->is_open()) return;
+
+        // Enumerate every stored header under the "h" prefix and rebuild m_index.
+        auto h_keys = m_db->list_keys("h", 10000000);
+        size_t loaded = 0;
+        for (auto& k : h_keys) {
+            if (k.size() != 33 || k[0] != 'h') continue;  // "h" + 32 raw bytes
+            std::vector<uint8_t> data;
+            if (!m_db->get(k, data)) continue;
+            try {
+                PackStream ps(data);
+                IndexEntryDiskV1 disk;
+                ps >> disk;
+                IndexEntry e = disk.to_entry();
+                const uint256 bh = e.block_hash;
+                m_index.emplace(bh, std::move(e));
+                ++loaded;
+            } catch (const std::exception& ex) {
+                LOG_WARNING << "[EMB-NMC] load_from_db: corrupt header entry, skipped: "
+                            << ex.what();
+            }
+        }
+
+        // Restore the tip pointer (32 raw bytes) and height (4 BE bytes).
+        std::vector<uint8_t> tip_data;
+        if (m_db->get("tip", tip_data) && tip_data.size() == 32) {
+            std::memcpy(m_tip.data(), tip_data.data(), 32);
+            auto tit = m_index.find(m_tip);
+            if (tit == m_index.end()) {
+                LOG_WARNING << "[EMB-NMC] load_from_db: tip hash not in index -- resetting";
+                m_tip.SetNull();
+            } else {
+                m_best_work = tit->second.chain_work;   // recompute best-work from tip
+            }
+        }
+        std::vector<uint8_t> height_data;
+        if (!m_tip.IsNull() && m_db->get("height", height_data) && height_data.size() == 4) {
+            m_tip_height = (static_cast<uint32_t>(height_data[0]) << 24)
+                         | (static_cast<uint32_t>(height_data[1]) << 16)
+                         | (static_cast<uint32_t>(height_data[2]) <<  8)
+                         |  static_cast<uint32_t>(height_data[3]);
+        }
+
+        LOG_INFO << "[EMB-NMC] load_from_db: loaded " << loaded << " headers"
+                 << " tip=" << (m_tip.IsNull() ? "(null)" : m_tip.ToString().substr(0, 16))
+                 << " height=" << m_tip_height;
     }
 
     NMCChainParams m_params;
     std::string    m_db_path;
+    std::unique_ptr<core::LevelDBStore> m_db;   // P1f: null in pure in-memory mode
 
     mutable std::mutex m_mutex;
     std::unordered_map<uint256, IndexEntry, Uint256Hasher> m_index;

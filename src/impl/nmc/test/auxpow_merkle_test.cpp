@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <vector>
+#include <filesystem>
 
 #include <core/hash.hpp>
 #include <core/pack.hpp>
@@ -1114,6 +1115,174 @@ TEST(NmcP1fLocator, LocatorFollowsTheTipAfterAWorkReorg)
     EXPECT_EQ(loc[0], block_hash(b1));
     EXPECT_EQ(loc[1], block_hash(g));
     EXPECT_EQ(std::count(loc.begin(), loc.end(), block_hash(a2)), 0);
+}
+
+
+// ---------------------------------------------------------------------------
+// P1f LevelDB persistence leg KATs (NmcP1fPersist). The in-memory connect path
+// now writes every accepted header under "h"+block_hash plus "tip"/"height"
+// pointers in one synced batch; init() reloads them. NMC has no height-index,
+// so there is deliberately NO "i" key (full-residency m_index, unlike btc).
+// Auxpow blobs are NOT persisted yet -- only a presence flag -- so a reloaded
+// merge-mined header keeps its VALID_CHAIN status but its auxpow comes back
+// nullopt (documented P1f-DEFER). The disk-format round-trips are pure (no DB);
+// the reopen round-trips exercise the real LevelDBStore under a temp dir.
+// ---------------------------------------------------------------------------
+using nmc::coin::IndexEntry;
+using nmc::coin::IndexEntryDiskV1;
+
+// A fresh, empty on-disk path for one test (prior contents wiped).
+static std::string fresh_db_dir(const std::string& name)
+{
+    std::filesystem::path p = std::filesystem::path(testing::TempDir()) / name;
+    std::error_code ec;
+    std::filesystem::remove_all(p, ec);
+    return p.string();
+}
+
+TEST(NmcP1fPersist, IndexEntryDiskRoundTripsViaPackStream)
+{
+    IndexEntry e;
+    e.header     = plain_header(leaf_of(0x11), kEasyBits, 42);
+    e.block_hash = block_hash(e.header);
+    e.height     = 7;
+    e.chain_work = nmc::coin::get_block_proof(kEasyBits);
+    e.status     = nmc::coin::HEADER_VALID_TREE;
+    e.auxpow     = std::nullopt;
+
+    auto disk = IndexEntryDiskV1::from_entry(e);
+    EXPECT_EQ(disk.has_auxpow, 0);
+
+    auto packed = pack(disk);
+    std::vector<uint8_t> data(
+        reinterpret_cast<const uint8_t*>(packed.data()),
+        reinterpret_cast<const uint8_t*>(packed.data()) + packed.size());
+    PackStream ps(data);
+    IndexEntryDiskV1 back;
+    ps >> back;
+    IndexEntry r = back.to_entry();
+
+    EXPECT_EQ(r.block_hash, e.block_hash);
+    EXPECT_EQ(r.height,     e.height);
+    EXPECT_EQ(r.chain_work, e.chain_work);
+    EXPECT_EQ(r.status,     e.status);
+    EXPECT_FALSE(r.auxpow.has_value());
+}
+
+TEST(NmcP1fPersist, DiskRoundTripPreservesMergeMinedStatusAndAuxFlag)
+{
+    IndexEntry e;
+    e.header     = plain_header(leaf_of(0x22), kEasyBits, 9);
+    e.block_hash = block_hash(e.header);
+    e.height     = 19200;
+    e.chain_work = nmc::coin::get_block_proof(kEasyBits);
+    e.status     = nmc::coin::HEADER_VALID_CHAIN;          // merge-mined verdict
+    e.auxpow     = complete_proof(e.block_hash, 0x1d00ffffu);
+
+    auto disk = IndexEntryDiskV1::from_entry(e);
+    EXPECT_EQ(disk.has_auxpow, 1);                         // flag tracks presence
+
+    auto packed = pack(disk);
+    std::vector<uint8_t> data(
+        reinterpret_cast<const uint8_t*>(packed.data()),
+        reinterpret_cast<const uint8_t*>(packed.data()) + packed.size());
+    PackStream ps(data);
+    IndexEntryDiskV1 back;
+    ps >> back;
+    EXPECT_EQ(back.has_auxpow, 1);
+
+    IndexEntry r = back.to_entry();
+    EXPECT_EQ(r.status, nmc::coin::HEADER_VALID_CHAIN);    // status survives reload
+    EXPECT_FALSE(r.auxpow.has_value());                   // P1f-DEFER: blob not on disk
+}
+
+TEST(NmcP1fPersist, ReopenRestoresEmptyChainAsEmpty)
+{
+    const std::string dir = fresh_db_dir("nmc_p1f_empty");
+    {
+        HeaderChain a(params_activation(19200), dir);
+        ASSERT_TRUE(a.init());
+        EXPECT_EQ(a.size(), 0u);
+    }
+    {
+        HeaderChain b(params_activation(19200), dir);
+        ASSERT_TRUE(b.init());
+        EXPECT_EQ(b.size(), 0u);
+        EXPECT_FALSE(b.tip().has_value());
+        EXPECT_EQ(b.height(), 0u);
+    }
+}
+
+TEST(NmcP1fPersist, SingleHeaderSurvivesReopen)
+{
+    const std::string dir = fresh_db_dir("nmc_p1f_single");
+    uint256 z; z.SetNull();
+    BlockHeaderType g = plain_header(z, kEasyBits, 1);
+    {
+        HeaderChain a(params_activation(19200), dir);
+        ASSERT_TRUE(a.init());
+        ASSERT_TRUE(a.add_header(g));
+        ASSERT_EQ(a.size(), 1u);
+    }
+    {
+        HeaderChain b(params_activation(19200), dir);
+        ASSERT_TRUE(b.init());
+        EXPECT_EQ(b.size(), 1u);
+        EXPECT_EQ(b.height(), 0u);
+        EXPECT_TRUE(b.has_header(block_hash(g)));
+        ASSERT_TRUE(b.tip().has_value());
+        EXPECT_EQ(b.tip()->block_hash, block_hash(g));
+    }
+}
+
+TEST(NmcP1fPersist, MultiHeaderChainRestoresTipHeightAndWork)
+{
+    const std::string dir = fresh_db_dir("nmc_p1f_multi");
+    uint256 z; z.SetNull();
+    BlockHeaderType g  = plain_header(z, kEasyBits, 1);
+    BlockHeaderType c1 = plain_header(block_hash(g),  kEasyBits, 2);
+    BlockHeaderType c2 = plain_header(block_hash(c1), kEasyBits, 3);
+    uint256 want_work;
+    {
+        HeaderChain a(params_activation(19200), dir);
+        ASSERT_TRUE(a.init());
+        ASSERT_TRUE(a.add_header(g));
+        ASSERT_TRUE(a.add_header(c1));
+        ASSERT_TRUE(a.add_header(c2));
+        ASSERT_EQ(a.height(), 2u);
+        want_work = a.cumulative_work();
+    }
+    {
+        HeaderChain b(params_activation(19200), dir);
+        ASSERT_TRUE(b.init());
+        EXPECT_EQ(b.size(),   3u);                  // "height" key not mis-parsed as a header
+        EXPECT_EQ(b.height(), 2u);
+        EXPECT_EQ(b.cumulative_work(), want_work);
+        ASSERT_TRUE(b.tip().has_value());
+        EXPECT_EQ(b.tip()->block_hash, block_hash(c2));
+        EXPECT_TRUE(b.has_header(block_hash(g)));
+        EXPECT_TRUE(b.has_header(block_hash(c1)));
+        EXPECT_TRUE(b.has_header(block_hash(c2)));
+        ASSERT_TRUE(b.get_header(block_hash(c2)).has_value());
+        EXPECT_EQ(b.get_header(block_hash(c2))->height, 2u);
+    }
+}
+
+TEST(NmcP1fPersist, InMemoryModeWithoutDbPathPersistsNothing)
+{
+    uint256 z; z.SetNull();
+    BlockHeaderType g = plain_header(z, kEasyBits, 1);
+    {
+        HeaderChain mem(params_activation(19200), "");   // no db_path -> pure in-memory
+        ASSERT_TRUE(mem.init());
+        ASSERT_TRUE(mem.add_header(g));
+        EXPECT_EQ(mem.size(), 1u);
+    }
+    // A fresh in-memory chain shares no on-disk state -- it starts empty.
+    HeaderChain fresh(params_activation(19200), "");
+    ASSERT_TRUE(fresh.init());
+    EXPECT_EQ(fresh.size(), 0u);
+    EXPECT_FALSE(fresh.has_header(block_hash(g)));
 }
 
 } // namespace
