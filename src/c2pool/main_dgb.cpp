@@ -26,12 +26,17 @@
 
 #include <impl/dgb/node.hpp>
 
+#include <core/filesystem.hpp>
+#include <btclibs/util/strencodings.h>
+
 #include <boost/asio.hpp>
 
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <string>
+#include <system_error>
 
 #ifndef C2POOL_VERSION
 #define C2POOL_VERSION "dev"
@@ -93,27 +98,53 @@ int run_selftest(const core::CoinParams& params)
     return 0;
 }
 
-// Run-loop SPINE. Stands up the io_context that every node subsystem
-// (sharechain peer dgb::Node, embedded digibyted P2P, Stratum acceptor) and
-// the #82 won-block dispatch handler will hang off, plus an explicit graceful
-// shutdown driven from boost::asio::signal_set.
+// Run-loop SPINE + sharechain peer bring-up. Stands up the io_context that
+// every node subsystem hangs off, an explicit graceful shutdown driven from
+// boost::asio::signal_set, and (this slice) constructs the dgb::Config +
+// dgb::Node sharechain peer and binds its P2P listener.
 //
 // Why signal_set and not std::signal: std::signal handlers run in the
 // async-signal-only delivery context; io_context::stop is thread-safe but not
 // documented signal-safe. signal_set delivers SIGINT/SIGTERM as an ordinary
 // async callback on the io_context thread, so the shutdown path can do real
 // work (stop the stratum acceptor, close sessions) before ioc.stop() drains
-// the rest — mirrors main_btc.cpp s teardown contract.
+// the rest — mirrors main_btc.cpp's teardown contract.
 //
-// SEAM (next stacked slice): construct dgb::Config + dgb::Node(&ioc, &config),
-// listen on the sharechain P2P port, stand up the Stratum work source, and
-// bind make_on_block_found(reconstruct_won_block, p2p_sink) into
-// m_on_block_found so a won share reaches the network (closes #82). Those
-// subsystems open LevelDB + bind sockets, so they land as their own
-// build-verified increment rather than inline here.
-int run_node(const core::CoinParams& params)
+// SEAM (next stacked slice): stand up the Stratum work source and bind
+// make_on_block_found(reconstruct_won_block, p2p_sink) into m_on_block_found
+// so a won share reaches the network (closes #82's embedded P2P relay path);
+// the submitblock RPC fallback (rpc.cpp:387, already real — NOT a stub) is the
+// second arm of the dual-path broadcaster gate.
+int run_node(const core::CoinParams& params, bool testnet)
 {
     io::io_context ioc;
+
+    // Per-coin config root: ~/.c2pool/<net>/ (sharechain LevelDB + addrs.json
+    // open underneath). Bucket-1 isolation primitive: DGB never shares LTC's
+    // net dir — keep the subdir per-coin in v36 AND v37.
+    const std::string net_subdir = testnet ? "digibyte_testnet" : "digibyte";
+    const std::filesystem::path net_dir =
+        core::filesystem::config_path() / net_subdir;
+    std::error_code mkdir_ec;
+    std::filesystem::create_directories(net_dir, mkdir_ec);  // best effort
+
+    // dgb::Config = core::Config<PoolConfig, CoinConfig>. Skip Config::init()
+    // (it would load pool.yaml + coin.yaml from disk); set the sharechain
+    // identity directly from the oracle-sourced constants instead — the same
+    // contract main_btc.cpp uses for its net smoke. prefix/identifier come from
+    // the p2pool-dgb-scrypt oracle (PREFIX 1c0553f2…, IDENTIFIER 4b62545b…).
+    dgb::Config config(net_subdir);
+    config.pool()->m_prefix = ParseHexBytes(dgb::PoolConfig::DEFAULT_PREFIX_HEX);
+    config.m_testnet        = testnet;
+    // DEFAULT_BOOTSTRAP_HOSTS is empty until DGB p2pool nodes come online, so
+    // there are no outbound seeds to dial this slice — the node binds its
+    // listener and waits for inbound sharechain peers.
+    for (const auto& host : dgb::PoolConfig::DEFAULT_BOOTSTRAP_HOSTS) {
+        const std::string addr = host.find(':') == std::string::npos
+            ? host + ":" + std::to_string(dgb::PoolConfig::P2P_PORT)
+            : host;
+        config.pool()->m_bootstrap_addrs.emplace_back(addr);
+    }
 
     bool shutdown_initiated = false;
     io::signal_set signals(ioc, SIGINT, SIGTERM);
@@ -126,13 +157,29 @@ int run_node(const core::CoinParams& params)
             std::cout << "[DGB] received signal " << signo
                       << " — initiating graceful shutdown" << std::endl;
             // Next slice: stop stratum acceptor + close sessions here BEFORE
-            // ioc.stop(), so their pending async ops cancel cleanly.
+            // ioc.stop(), so their pending async ops cancel cleanly. The
+            // sharechain peer's sockets close when p2p_node destructs at scope
+            // exit after ioc.run() returns.
             ioc.stop();
         });
 
-    std::cout << "[DGB] run-loop spine up: " << network_summary(params) << "\n";
+    // Sharechain peer node: pool::NodeBridge<NodeImpl, Legacy, Actual>. The
+    // NodeImpl ctor opens ~/.c2pool/<net>/sharechain_leveldb and seeds the addr
+    // store from m_bootstrap_addrs, so config must be populated BEFORE
+    // construction (above).
+    dgb::Node p2p_node(&ioc, &config);
+    p2p_node.set_target_outbound_peers(4);
+    p2p_node.core::Server::listen(dgb::PoolConfig::P2P_PORT);
+    std::cout << "[DGB] sharechain peer listening on port "
+              << dgb::PoolConfig::P2P_PORT
+              << " — proto adv=" << dgb::PoolConfig::ADVERTISED_PROTOCOL_VERSION
+              << " min=" << dgb::PoolConfig::MINIMUM_PROTOCOL_VERSION
+              << " prefix=" << dgb::PoolConfig::DEFAULT_PREFIX_HEX << std::endl;
+    p2p_node.start_outbound_connections();  // no-op until seed hosts exist
+
+    std::cout << "[DGB] run-loop up: " << network_summary(params) << "\n";
     std::cout << "[DGB] io_context running. Ctrl-C to stop. "
-              << "(node/stratum/P2P + won-block dispatch bind in the next slice)"
+              << "(Stratum work source + won-block dispatch bind in the next slice)"
               << std::endl;
 
     ioc.run();
@@ -166,7 +213,7 @@ int main(int argc, char** argv)
 
     // --run: stand up the run-loop spine (io_context + graceful shutdown).
     if (want_run)
-        return run_node(params);
+        return run_node(params, /*testnet=*/false);
 
     // --selftest, or a bare invocation: drive the live score path so the
     // binary exercises real consensus code, then exit cleanly.

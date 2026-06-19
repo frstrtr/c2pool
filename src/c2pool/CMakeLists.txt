@@ -183,14 +183,31 @@ target_link_libraries(c2pool-btc
 # json/Boost. Per-coin isolation held. The embedded run-loop (NodeBridge over
 # digibyted P2P + Stratum) and its pool-runtime link land in a later Phase B
 # slice.
-add_executable(c2pool-dgb
-    main_dgb.cpp
-    ${CMAKE_SOURCE_DIR}/src/core/uint256.cpp
-)
+# RUN-LOOP slice (#82): main_dgb.cpp --run now constructs dgb::Config + the
+# dgb::Node sharechain peer (pool::NodeBridge<NodeImpl,...>) and binds its P2P
+# listener, so the exe must link the real dgb pool runtime — not just the
+# header-only score path. We link the `dgb` OBJECT lib (node.cpp + protocol
+# handlers) and the shared core/pool/sharechain/storage base it sits on,
+# mirroring the c2pool-btc link set. c2pool_merged_mining is pulled for SYMBOL
+# RESOLUTION of the core web_server/stratum tangle ONLY (same reason c2pool-btc
+# links it) — it does NOT enable -DAUX_DOGE; DGB default build stays standalone
+# (no DOGE aux). core provides core/uint256.cpp, so the explicit source is
+# dropped to avoid a duplicate-symbol link. Per-coin isolation holds: only the
+# c2pool-dgb target stanza changes.
+add_executable(c2pool-dgb main_dgb.cpp)
 target_compile_definitions(c2pool-dgb PRIVATE C2POOL_VERSION="${C2POOL_GIT_VERSION}")
 target_link_libraries(c2pool-dgb
-    btclibs  # STATIC util lib: HexStr/HexDigit (strencodings) for base_uint hex - pure utility, no pool runtime
-    yaml-cpp::yaml-cpp  # config_{coin,pool}.hpp -> core/netaddress.hpp -> <yaml-cpp/yaml.h>
+    c2pool_payout
+    c2pool_merged_mining  # symbol resolution for core web_server tangle (NOT -DAUX_DOGE)
+    c2pool_hashrate
+    core
+    dgb        # DGB pool-layer OBJECT lib: node.cpp NodeImpl + protocol handlers
+    dgb_coin   # DGB coin-layer: embedded P2P + mempool + transaction ctors
+    pool
+    sharechain
+    c2pool_storage
+    btclibs
+    yaml-cpp::yaml-cpp
     nlohmann_json::nlohmann_json
     ${Boost_LIBRARIES}
 )
