@@ -627,10 +627,19 @@ public:
     /// Add a single plain header.
     /// P0-DEFER: NO difficulty validation, NO PoW check, NO connection check,
     /// NO persistence. Structural skeleton only — returns false.
+    /// Add a single plain (non-merge-mined) header.
+    /// P1e storage leg: in-memory connect path. On an empty chain the header
+    /// seeds the chain root (height 0, checkpoint anchor); otherwise it must
+    /// connect to a known parent via m_previous_block. The activation gate
+    /// decides admissibility from the connected height (a plain header is
+    /// admissible only BELOW activation). While the activation height is the
+    /// -1 sentinel the gate returns REJECT_UNPINNED, so in production nothing
+    /// connects -- the P1 leaf never builds chain off a placeholder constant.
+    /// NO difficulty/PoW validation and NO cumulative-work summation yet (the
+    /// next sub-leg); this leg pins connection topology + the activation gate.
     bool add_header(const BlockHeaderType& header) {
-        (void)header;
-        // P0-DEFER: header add/validate path not implemented.
-        return false;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return connect_locked(header, std::nullopt);
     }
 
     /// Verify the AuxPow consensus GATE for an incoming merge-mined header.
@@ -644,6 +653,32 @@ public:
                                              const AuxPow& auxpow) const {
         return auxpow.check_proof(block_hash(header), m_params.aux_chain_id,
                                   header.m_bits);
+    }
+
+    /// P1e: verdict for the activation-height admission gate.
+    enum class AdmitResult {
+        ADMIT,                    // height / auxpow-presence consistent (proof checked separately)
+        REJECT_PREMATURE_AUXPOW,  // header carries an AuxPow below the activation height
+        REJECT_MISSING_AUXPOW,    // no AuxPow at/after activation height (mainnet requirement)
+        REJECT_UNPINNED,          // activation height still the -1 sentinel - refuse to judge
+    };
+
+    /// P1e: the activation-height GATE, factored out for unit-testing
+    /// independent of the (still-deferred) storage path - the same pattern as
+    /// verify_auxpow_header(). Decides admissibility from the connected `height`
+    /// and whether the header carries an AuxPow, BEFORE the four-leg proof is
+    /// walked: below activation an AuxPow is premature, at/after activation
+    /// (mainnet) one is mandatory. While auxpow_activation_height is the
+    /// unpinned -1 sentinel it refuses to judge (REJECT_UNPINNED) so the P1 leaf
+    /// never renders an activation verdict off a placeholder constant.
+    AdmitResult check_activation_gate(int32_t height, bool has_auxpow) const {
+        if (m_params.auxpow_activation_height < 0)
+            return AdmitResult::REJECT_UNPINNED;          // TO-CONFIRM unpinned
+        if (!m_params.is_auxpow_active(height))
+            return has_auxpow ? AdmitResult::REJECT_PREMATURE_AUXPOW
+                              : AdmitResult::ADMIT;
+        return has_auxpow ? AdmitResult::ADMIT
+                          : AdmitResult::REJECT_MISSING_AUXPOW;
     }
 
     /// Add a header that carries a merge-mining AuxPow proof.
@@ -661,9 +696,10 @@ public:
                         << ": AuxPow check_proof != VALID";
             return false;
         }
-        // P0-DEFER: proof verified, but header storage/connection + the
-        // is_auxpow_active(height) activation gate are not built yet.
-        return false;
+        // P1e storage leg: proof verified -- now connect into the in-memory
+        // chain, with the height-derived activation gate enforced inside.
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return connect_locked(header, auxpow);
     }
 
     /// Add a batch of plain headers. P0-DEFER: returns 0 (none accepted).
@@ -676,6 +712,69 @@ public:
     const NMCChainParams& params() const { return m_params; }
 
 private:
+    // P1e storage leg: shared in-memory connect path for plain and merge-mined
+    // headers. Caller holds m_mutex. Derives the connected height from the
+    // parent (or 0 for the chain-root seed), runs the activation gate, and on
+    // ADMIT inserts the IndexEntry and advances the tip (height-proxy fork
+    // choice; work-based reorg is a later leg). Returns false -- nothing
+    // persisted -- on already-known / orphan / activation-gate rejection.
+    bool connect_locked(const BlockHeaderType& header,
+                        const std::optional<AuxPow>& auxpow) {
+        const uint256 bh = block_hash(header);
+        if (m_index.find(bh) != m_index.end())
+            return false;                       // already known -- idempotent reject
+
+        int32_t height;
+        uint256 parent_work;
+        if (m_index.empty()) {
+            height = 0;                         // chain-root seed (checkpoint anchor)
+            parent_work.SetNull();
+        } else {
+            auto pit = m_index.find(header.m_previous_block);
+            if (pit == m_index.end()) {
+                LOG_WARNING << "[EMB-NMC] reject header " << bh.ToString()
+                            << ": unknown parent "
+                            << header.m_previous_block.ToString() << " (orphan)";
+                return false;                   // no orphan headers
+            }
+            height      = static_cast<int32_t>(pit->second.height) + 1;
+            parent_work = pit->second.chain_work;
+        }
+
+        const bool has_auxpow = auxpow.has_value();
+        switch (check_activation_gate(height, has_auxpow)) {
+            case AdmitResult::ADMIT:
+                break;
+            case AdmitResult::REJECT_PREMATURE_AUXPOW:
+                LOG_WARNING << "[EMB-NMC] reject header " << bh.ToString()
+                            << ": premature AuxPow below activation (height "
+                            << height << ")";
+                return false;
+            case AdmitResult::REJECT_MISSING_AUXPOW:
+                LOG_WARNING << "[EMB-NMC] reject header " << bh.ToString()
+                            << ": AuxPow required at/after activation (height "
+                            << height << ")";
+                return false;
+            case AdmitResult::REJECT_UNPINNED:
+                return false;                   // activation unpinned: refuse to build
+        }
+
+        IndexEntry e;
+        e.header     = header;
+        e.block_hash = bh;
+        e.height     = static_cast<uint32_t>(height);
+        e.chain_work = parent_work;             // cumulative-work summation = next sub-leg
+        e.status     = has_auxpow ? HEADER_VALID_CHAIN : HEADER_VALID_TREE;
+        e.auxpow     = auxpow;
+        m_index.emplace(bh, std::move(e));
+
+        if (m_tip.IsNull() || height > static_cast<int32_t>(m_tip_height)) {
+            m_tip        = bh;                  // height-proxy tip (no work reorg yet)
+            m_tip_height = static_cast<uint32_t>(height);
+        }
+        return true;
+    }
+
     NMCChainParams m_params;
     std::string    m_db_path;
 

@@ -635,4 +635,171 @@ TEST(NmcP1dGate, MissingAuxBitsKeepsProofIncompleteAndRejected)
     EXPECT_FALSE(chain_.add_auxpow_header(h, ap));
 }
 
+// ---------------------------------------------------------------------------
+// P1e: activation-height admission gate KATs (NmcP1eActivationGate).
+// Exercise HeaderChain::check_activation_gate() - the height-derived MM
+// activation gate, factored like the P1d proof gate so it is testable without
+// the deferred storage path. The production activation height stays the -1
+// sentinel; these fixtures pin a TEST-only height (19200, the historically
+// cited NMC mainnet value) purely to drive the gate - no consensus promotion.
+// ---------------------------------------------------------------------------
+static NMCChainParams params_activation(int32_t act_height)
+{
+    NMCChainParams p = NMCChainParams::mainnet();
+    p.aux_chain_id = 1;
+    p.auxpow_activation_height = act_height;   // TEST-only pin; production stays -1
+    return p;
+}
+
+TEST(NmcP1eActivationGate, UnpinnedActivationRefusesToJudge)
+{
+    // mainnet() leaves auxpow_activation_height at -1: the gate must refuse
+    // rather than guess, regardless of whether the header carries an AuxPow.
+    HeaderChain chain_(params_chain_id_1());
+    EXPECT_EQ(chain_.check_activation_gate(50000, /*has_auxpow=*/true),
+              HeaderChain::AdmitResult::REJECT_UNPINNED);
+    EXPECT_EQ(chain_.check_activation_gate(50000, /*has_auxpow=*/false),
+              HeaderChain::AdmitResult::REJECT_UNPINNED);
+}
+
+TEST(NmcP1eActivationGate, AuxPowBelowActivationIsPremature)
+{
+    HeaderChain chain_(params_activation(19200));
+    EXPECT_EQ(chain_.check_activation_gate(19199, /*has_auxpow=*/true),
+              HeaderChain::AdmitResult::REJECT_PREMATURE_AUXPOW);
+    // a plain (non-MM) header below activation is admissible.
+    EXPECT_EQ(chain_.check_activation_gate(19199, /*has_auxpow=*/false),
+              HeaderChain::AdmitResult::ADMIT);
+}
+
+TEST(NmcP1eActivationGate, AuxPowRequiredAtAndAfterActivation)
+{
+    HeaderChain chain_(params_activation(19200));
+    // exactly at the activation height the AuxPow becomes mandatory.
+    EXPECT_EQ(chain_.check_activation_gate(19200, /*has_auxpow=*/false),
+              HeaderChain::AdmitResult::REJECT_MISSING_AUXPOW);
+    EXPECT_EQ(chain_.check_activation_gate(19200, /*has_auxpow=*/true),
+              HeaderChain::AdmitResult::ADMIT);
+    // and well past it.
+    EXPECT_EQ(chain_.check_activation_gate(250000, /*has_auxpow=*/true),
+              HeaderChain::AdmitResult::ADMIT);
+}
+
+TEST(NmcP1eActivationGate, ActivationBoundaryIsInclusive)
+{
+    HeaderChain chain_(params_activation(19200));
+    // height == activation-1 is still pre-activation (MM not yet required);
+    // height == activation flips MM to mandatory.
+    EXPECT_EQ(chain_.check_activation_gate(19199, /*has_auxpow=*/false),
+              HeaderChain::AdmitResult::ADMIT);
+    EXPECT_EQ(chain_.check_activation_gate(19200, /*has_auxpow=*/false),
+              HeaderChain::AdmitResult::REJECT_MISSING_AUXPOW);
+}
+
+
+// ---------------------------------------------------------------------------
+// P1e storage leg: in-memory connect path KATs (NmcP1eStore). Exercise
+// HeaderChain::add_header / add_auxpow_header now that a passing header is
+// CONNECTED: genesis-seed, prev-hash linkage, height derivation, the activation
+// gate enforced from the connected height, and tip advance. Cumulative-work
+// summation + work-based reorg stay a later sub-leg.
+// ---------------------------------------------------------------------------
+static BlockHeaderType plain_header(const uint256& prev, uint32_t bits, uint32_t nonce)
+{
+    BlockHeaderType h{};
+    h.m_version        = 1;
+    h.m_previous_block = prev;
+    h.m_bits           = bits;
+    h.m_nonce          = nonce;
+    return h;
+}
+
+TEST(NmcP1eStore, EmptyChainSeedsRootAtHeightZero)
+{
+    HeaderChain chain_(params_activation(19200));   // pinned so plain<activation ADMITs
+    uint256 z; z.SetNull();
+    BlockHeaderType g = plain_header(z, 0x1d00ffffu, 1);
+    EXPECT_TRUE(chain_.add_header(g));
+    EXPECT_TRUE(chain_.has_header(block_hash(g)));
+    EXPECT_EQ(chain_.size(), 1u);
+    EXPECT_EQ(chain_.height(), 0u);
+}
+
+TEST(NmcP1eStore, ConnectsChildByPrevHashAndAdvancesTip)
+{
+    HeaderChain chain_(params_activation(19200));
+    uint256 z; z.SetNull();
+    BlockHeaderType g = plain_header(z, 0x1d00ffffu, 1);
+    ASSERT_TRUE(chain_.add_header(g));
+    BlockHeaderType c = plain_header(block_hash(g), 0x1d00ffffu, 2);
+    EXPECT_TRUE(chain_.add_header(c));
+    EXPECT_EQ(chain_.size(), 2u);
+    EXPECT_EQ(chain_.height(), 1u);
+    ASSERT_TRUE(chain_.tip().has_value());
+    EXPECT_EQ(chain_.tip()->block_hash, block_hash(c));
+}
+
+TEST(NmcP1eStore, OrphanWithUnknownParentIsRejected)
+{
+    HeaderChain chain_(params_activation(19200));
+    uint256 z; z.SetNull();
+    BlockHeaderType g = plain_header(z, 0x1d00ffffu, 1);
+    ASSERT_TRUE(chain_.add_header(g));
+    uint256 bogus = leaf_of(0xAB);                  // not g's hash
+    BlockHeaderType o = plain_header(bogus, 0x1d00ffffu, 3);
+    EXPECT_FALSE(chain_.add_header(o));
+    EXPECT_FALSE(chain_.has_header(block_hash(o)));
+    EXPECT_EQ(chain_.size(), 1u);
+}
+
+TEST(NmcP1eStore, UnpinnedActivationRefusesToConnect)
+{
+    HeaderChain chain_(params_chain_id_1());        // activation height == -1
+    uint256 z; z.SetNull();
+    BlockHeaderType g = plain_header(z, 0x1d00ffffu, 1);
+    EXPECT_FALSE(chain_.add_header(g));             // REJECT_UNPINNED: build nothing
+    EXPECT_EQ(chain_.size(), 0u);
+}
+
+TEST(NmcP1eStore, VerifiedAuxPowConnectsAtActivationHeight)
+{
+    HeaderChain chain_(params_activation(1));       // activation at height 1
+    uint256 z; z.SetNull();
+    BlockHeaderType g = plain_header(z, 0x1d00ffffu, 1);
+    ASSERT_TRUE(chain_.add_header(g));              // genesis (height 0, plain)
+
+    uint32_t aux_bits = 0x207fffffu;                // easy aux target
+    BlockHeaderType h1 = plain_header(block_hash(g), aux_bits, 7);
+    uint256 aux = block_hash(h1);                   // production seam: aux == header hash
+    AuxPow ap = complete_proof(aux, /*parent_own_bits=*/0x1d00ffffu);
+    ASSERT_TRUE(mine_parent(ap, chain::bits_to_target(aux_bits)));
+    ASSERT_EQ(chain_.verify_auxpow_header(h1, ap), AuxPow::CheckResult::VALID);
+
+    EXPECT_TRUE(chain_.add_auxpow_header(h1, ap));  // height 1 >= activation, proof VALID
+    EXPECT_TRUE(chain_.has_header(aux));
+    EXPECT_EQ(chain_.height(), 1u);
+    ASSERT_TRUE(chain_.get_header(aux).has_value());
+    EXPECT_TRUE(chain_.get_header(aux)->auxpow.has_value());
+}
+
+TEST(NmcP1eStore, PrematureAuxPowIsRejectedByStoreEvenWhenProofValid)
+{
+    HeaderChain chain_(params_activation(19200));   // activation far above height 1
+    uint256 z; z.SetNull();
+    BlockHeaderType g = plain_header(z, 0x1d00ffffu, 1);
+    ASSERT_TRUE(chain_.add_header(g));
+
+    uint32_t aux_bits = 0x207fffffu;
+    BlockHeaderType h1 = plain_header(block_hash(g), aux_bits, 9);
+    uint256 aux = block_hash(h1);
+    AuxPow ap = complete_proof(aux, 0x1d00ffffu);
+    ASSERT_TRUE(mine_parent(ap, chain::bits_to_target(aux_bits)));
+    ASSERT_EQ(chain_.verify_auxpow_header(h1, ap), AuxPow::CheckResult::VALID);
+
+    // proof is VALID, but height 1 is below activation -> premature, NOT stored.
+    EXPECT_FALSE(chain_.add_auxpow_header(h1, ap));
+    EXPECT_FALSE(chain_.has_header(aux));
+    EXPECT_EQ(chain_.height(), 0u);
+}
+
 } // namespace
