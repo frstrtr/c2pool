@@ -635,4 +635,65 @@ TEST(NmcP1dGate, MissingAuxBitsKeepsProofIncompleteAndRejected)
     EXPECT_FALSE(chain_.add_auxpow_header(h, ap));
 }
 
+// ---------------------------------------------------------------------------
+// P1e: activation-height admission gate KATs (NmcP1eActivationGate).
+// Exercise HeaderChain::check_activation_gate() - the height-derived MM
+// activation gate, factored like the P1d proof gate so it is testable without
+// the deferred storage path. The production activation height stays the -1
+// sentinel; these fixtures pin a TEST-only height (19200, the historically
+// cited NMC mainnet value) purely to drive the gate - no consensus promotion.
+// ---------------------------------------------------------------------------
+static NMCChainParams params_activation(int32_t act_height)
+{
+    NMCChainParams p = NMCChainParams::mainnet();
+    p.aux_chain_id = 1;
+    p.auxpow_activation_height = act_height;   // TEST-only pin; production stays -1
+    return p;
+}
+
+TEST(NmcP1eActivationGate, UnpinnedActivationRefusesToJudge)
+{
+    // mainnet() leaves auxpow_activation_height at -1: the gate must refuse
+    // rather than guess, regardless of whether the header carries an AuxPow.
+    HeaderChain chain_(params_chain_id_1());
+    EXPECT_EQ(chain_.check_activation_gate(50000, /*has_auxpow=*/true),
+              HeaderChain::AdmitResult::REJECT_UNPINNED);
+    EXPECT_EQ(chain_.check_activation_gate(50000, /*has_auxpow=*/false),
+              HeaderChain::AdmitResult::REJECT_UNPINNED);
+}
+
+TEST(NmcP1eActivationGate, AuxPowBelowActivationIsPremature)
+{
+    HeaderChain chain_(params_activation(19200));
+    EXPECT_EQ(chain_.check_activation_gate(19199, /*has_auxpow=*/true),
+              HeaderChain::AdmitResult::REJECT_PREMATURE_AUXPOW);
+    // a plain (non-MM) header below activation is admissible.
+    EXPECT_EQ(chain_.check_activation_gate(19199, /*has_auxpow=*/false),
+              HeaderChain::AdmitResult::ADMIT);
+}
+
+TEST(NmcP1eActivationGate, AuxPowRequiredAtAndAfterActivation)
+{
+    HeaderChain chain_(params_activation(19200));
+    // exactly at the activation height the AuxPow becomes mandatory.
+    EXPECT_EQ(chain_.check_activation_gate(19200, /*has_auxpow=*/false),
+              HeaderChain::AdmitResult::REJECT_MISSING_AUXPOW);
+    EXPECT_EQ(chain_.check_activation_gate(19200, /*has_auxpow=*/true),
+              HeaderChain::AdmitResult::ADMIT);
+    // and well past it.
+    EXPECT_EQ(chain_.check_activation_gate(250000, /*has_auxpow=*/true),
+              HeaderChain::AdmitResult::ADMIT);
+}
+
+TEST(NmcP1eActivationGate, ActivationBoundaryIsInclusive)
+{
+    HeaderChain chain_(params_activation(19200));
+    // height == activation-1 is still pre-activation (MM not yet required);
+    // height == activation flips MM to mandatory.
+    EXPECT_EQ(chain_.check_activation_gate(19199, /*has_auxpow=*/false),
+              HeaderChain::AdmitResult::ADMIT);
+    EXPECT_EQ(chain_.check_activation_gate(19200, /*has_auxpow=*/false),
+              HeaderChain::AdmitResult::REJECT_MISSING_AUXPOW);
+}
+
 } // namespace
