@@ -62,6 +62,7 @@ inline core::CoinParams make_coin_params(bool testnet)
     p.target_lookbehind        = 200;
     p.spread                   = 3;
     p.minimum_protocol_version = 3301;  // accept v35 (3502) peers for v35->v36 AutoRatchet crossing
+    p.advertised_protocol_version = 3600;  // advertise V36 capability; >= .82 latched min (3503) so crossing peers accept us
     p.block_max_size           = 1000000;
     p.block_max_weight         = 4000000;
 

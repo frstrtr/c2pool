@@ -61,6 +61,7 @@ struct CoinParams
     uint32_t target_lookbehind = 0;          // shares to look back for target calc
     uint32_t spread = 0;                     // PPLNS spread multiplier
     uint32_t minimum_protocol_version = 0;   // min p2pool protocol version
+    uint32_t advertised_protocol_version = 0; // version we ADVERTISE (our capability); >= floor, separate from accept-floor per p2pool
     uint32_t block_max_size = 0;
     uint32_t block_max_weight = 0;
 

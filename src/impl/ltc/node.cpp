@@ -247,7 +247,7 @@ int NodeImpl::get_verified_count() const { return get_tracker_snapshot().verifie
 void NodeImpl::send_version(peer_ptr peer)
 {
     auto rmsg = ltc::message_version::make_raw(
-        m_tracker.m_params->minimum_protocol_version,
+        m_tracker.m_params->advertised_protocol_version,  // advertise our V36 capability, NOT the accept-floor (handle_version:328 keeps floor)
         1,                                    // services
         addr_t{1, peer->addr()},              // addr_to (the remote)
         addr_t{1, NetService{"0.0.0.0", m_tracker.m_params->p2p_port}}, // addr_from (us)
