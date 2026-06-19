@@ -142,6 +142,18 @@ if (BUILD_TESTING AND GTest_FOUND)
         nlohmann_json::nlohmann_json)
     gtest_add_tests(dgb_work_source_test "" AUTO)
 
+    # dgb_template_builder_test: guards the build_work_template SSOT
+    # (Stage 4c extraction). Pure JSON-shaping function -> guard-weight
+    # linkage: the only out-of-line dep reachable through template_builder.hpp
+    # -> rpc_data.hpp -> core/uint256.hpp is declarations only (no uint256
+    # method is invoked), so GTest + nlohmann_json suffice. MUST also be in the build.yml
+    # --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_template_builder_test template_builder_test.cpp)
+    target_link_libraries(dgb_template_builder_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        nlohmann_json::nlohmann_json)
+    gtest_add_tests(dgb_template_builder_test "" AUTO)
+
 
     foreach(dgb_guard rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test)
         add_executable(${dgb_guard} ${dgb_guard}.cpp)

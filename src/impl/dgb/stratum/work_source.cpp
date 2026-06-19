@@ -19,6 +19,7 @@
 #include <impl/dgb/coin/mempool.hpp>
 #include <impl/dgb/coin/embedded_coinbase_value.hpp>
 #include <impl/dgb/coin/dgb_block_algo.hpp>
+#include <impl/dgb/coin/template_builder.hpp>
 
 #include <core/log.hpp>
 
@@ -239,29 +240,21 @@ nlohmann::json DGBWorkSource::get_current_work_template() const
     // and the per-connection coinbase (gentx + ShareTracker ref_hash + PPLNS
     // payout map) assembles in build_connection_coinbase() — that output is
     // consensus-bearing and surfaces for an operator tap, not in this field wire.
-    static constexpr uint32_t BIP9_BASE_VERSION = 0x20000000u;
-    const uint32_t version =
-        BIP9_BASE_VERSION |
-        static_cast<uint32_t>(dgb::coin::DGB_BLOCK_VERSION_SCRYPT);
-
-    const int64_t mtp     = chain_.median_time_past();
-    const int64_t mintime = (mtp == std::numeric_limits<int64_t>::min())
-                                ? 0 : (mtp + 1);
-    const int64_t curtime = static_cast<int64_t>(std::time(nullptr));
-
-    nlohmann::json tmpl = nlohmann::json::object();
-    tmpl["height"]        = next_h;
-    tmpl["coinbasevalue"] = coinbasevalue;
-    tmpl["version"]       = version;
-    tmpl["curtime"]       = curtime;
-    tmpl["mintime"]       = mintime;
-    tmpl["transactions"]  = nlohmann::json::array();
-
-    // previousblockhash: truthful conditional emit (see field notes above).
+    // Shape the truthfully-derivable fields into the GBT template via the
+    // dgb::coin::build_work_template SSOT so the embedded path and this work
+    // source emit one template (Stage 4c extraction). version (Scrypt lane
+    // pin), mintime (MTP+1 / 0 on empty chain), curtime, empty transactions[]
+    // and the conditional previousblockhash all live in the builder now; this
+    // method only resolves the chain-state inputs.
+    dgb::coin::WorkTemplateInputs in;
+    in.next_height       = next_h;
+    in.coinbasevalue     = coinbasevalue;
+    in.median_time_past  = chain_.median_time_past();
+    in.curtime           = static_cast<int64_t>(std::time(nullptr));
     if (auto th = chain_.tip_hash())
-        tmpl["previousblockhash"] = u256_be_display_hex(*th);
+        in.previousblockhash = u256_be_display_hex(*th);
 
-    return tmpl;
+    return dgb::coin::build_work_template(in);
 }
 
 std::vector<std::string> DGBWorkSource::get_stratum_merkle_branches() const
