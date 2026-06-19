@@ -677,6 +677,7 @@ int main(int argc, char* argv[]) {
     auto get_coin_p2p_port = [](const std::string& symbol, bool testnet) -> int {
         if (symbol == "LTC"   || symbol == "ltc")   return testnet ? 19335 : 9333;
         if (symbol == "DOGE"  || symbol == "doge")  return testnet ? 44556 : 22556;
+        if (symbol == "NMC"   || symbol == "nmc")   return testnet ? 18334 : 8334;   // SSOT: src/impl/nmc/coin/chain_seeds.hpp (namecoind addrman)
         if (symbol == "BTC"   || symbol == "btc")   return testnet ? 18333 : 8333;
         if (symbol == "DGB"   || symbol == "dgb")   return testnet ? 12026 : 12024;
         if (symbol == "PEP"   || symbol == "pep")   return testnet ? 44874 : 33874;
