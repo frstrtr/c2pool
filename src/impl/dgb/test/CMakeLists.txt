@@ -65,6 +65,20 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_header_ingest_test "" AUTO)
 
+    # dgb_mempool_ingest_test: guards c2pool::dgb::wire_mempool_ingest, the
+    # connector routing the embedded P2P `tx` relay (new_tx) into the Mempool
+    # (tx analog of wire_header_ingest). Compiles the tx serialization codec, so
+    # it links the full dgb_coin SCC set rather than the scrypt-only guard set.
+    # MUST also be in BOTH build.yml --target allowlists (#143 NOT_BUILT trap).
+    add_executable(dgb_mempool_ingest_test mempool_ingest_test.cpp)
+    target_link_libraries(dgb_mempool_ingest_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb dgb_stratum
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain
+        nlohmann_json::nlohmann_json)
+    gtest_add_tests(dgb_mempool_ingest_test "" AUTO)
+
     # --- #82: won-block reconstructor BODY (as_block composition) ----------
     # Pins coin/reconstruct_won_block.hpp: the single composition the dispatch
     # handler injects as its WonBlockReconstructor (resolve_other_tx_hashes ->
