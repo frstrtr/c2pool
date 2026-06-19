@@ -66,7 +66,7 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
     daemon.run();
 
     // 3: the pool node (sharechain, LevelDB, P2P, Stratum).
-    NodeImpl node(&ioc, &config);
+    Node node(&ioc, &config);  // concrete NodeBridge<NodeImpl,Legacy,Actual> -- NodeImpl alone is abstract (ICommunicator::handle lives in NodeBridge)
 
     // 4: bind the in-operation won-block fire path to the dual-path broadcaster.
     wire_won_block_sink(node, daemon);
