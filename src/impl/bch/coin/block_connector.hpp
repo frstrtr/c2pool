@@ -160,6 +160,12 @@ public:
 
     bool is_attached() const { return static_cast<bool>(m_sub); }
 
+    /// True once a re-request sink has been wired (set_block_requester). When
+    /// false a deep reorg falls back to warn-and-hold at the fork; when true the
+    /// missing new-branch bodies are re-getdata'd. Exposed so the daemon-assembly
+    /// path can verify the wiring without a live reorg.
+    bool has_block_requester() const { return static_cast<bool>(m_request_blocks); }
+
     /// Ingest a BIP152 compact block. Reconstructs the full block from the
     /// prefilled txs + the mempool (BCH: short IDs keyed on txid == wtxid). On a
     /// complete reconstruction the block is driven straight through the normal

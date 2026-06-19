@@ -366,6 +366,20 @@ public:
         }
     }
 
+    /// Re-request a batch of block bodies through the bounded, deduping,
+    /// reissue-accounted download window -- the wiring target for
+    /// BlockConnector::set_block_requester (deep-reorg re-request recovery).
+    /// Routed through m_block_dl (NOT request_full_block) so re-getdata'd bodies
+    /// stay under the same in-flight bound + timeout/eviction accounting as IBD;
+    /// the window dedupes against anything already requested. No-op offline
+    /// (drain_block_window is a no-op without a peer) -- safe to call before P2P.
+    void request_block_downloads(const std::vector<uint256>& hashes)
+    {
+        if (hashes.empty()) return;
+        m_block_dl.enqueue(hashes);
+        drain_block_window();
+    }
+
     /// Request a block via plain MSG_BLOCK (0x02) getdata.
     void request_block(const uint256& block_hash)
     {

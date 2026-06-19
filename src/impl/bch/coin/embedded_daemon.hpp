@@ -56,6 +56,7 @@
 
 #include "header_chain.hpp"     // HeaderChain
 #include "mempool.hpp"          // Mempool
+#include "block_connector.hpp" // BlockConnector (full-block UTXO/mempool reorg path)
 #include "template_builder.hpp" // EmbeddedCoinNode
 #include "node.hpp"             // coin::Node<Config> (interfaces::Node source)
 #include "coin_node.hpp"        // CoinNode (core::coin::ICoinNode seam)
@@ -86,7 +87,8 @@ public:
           m_pool(),
           m_embedded(m_chain, m_pool, config->m_testnet),
           m_node(context, config),
-          m_abla(config->m_testnet, anchor_height, m_chain) {}
+          m_abla(config->m_testnet, anchor_height, m_chain),
+          m_connector(m_chain, m_pool) {}
 
     EmbeddedDaemon(const EmbeddedDaemon&) = delete;
     EmbeddedDaemon& operator=(const EmbeddedDaemon&) = delete;
@@ -198,6 +200,21 @@ public:
             return;                   // already assembled; idempotent no-op
         m_abla.wire(m_node, m_embedded);
         m_coin_node = std::make_unique<CoinNode>(&m_embedded, m_node.rpc());
+
+        // Drive the full-block UTXO/mempool reorg-reconciliation path and wire its
+        // deep-reorg re-request sink to the P2P block-download window: a reorg
+        // deeper than the connector's remembered-block ring re-getdata's the
+        // missing new-branch bodies through the bounded/deduping IBD window
+        // instead of stranding the UTXO view at the fork. m_node.p2p() is null
+        // until start_p2p(), so the sink no-ops safely when assemble() runs
+        // network-free. attach() subscribes the connector to full_block (the
+        // m_coin_node guard above makes this run exactly once).
+        m_connector.set_block_requester(
+            [this](const std::vector<uint256>& hashes) {
+                if (auto* p2p = m_node.p2p())
+                    p2p->request_block_downloads(hashes);
+            });
+        m_connector.attach(m_node);
     }
 
     /// Wire NodeP2P's IBD getheaders continuation to the authoritative
@@ -342,6 +359,7 @@ public:
     CoinNode&           coin_node()      { return *m_coin_node; }
     bool                seam_ready() const { return m_coin_node != nullptr; }
     AblaRuntime&        abla()           { return m_abla; }
+    BlockConnector&     connector()      { return m_connector; }
     HeaderChain&        chain()          { return m_chain; }
     Mempool&            mempool()        { return m_pool; }
     bool                is_wired() const { return m_abla.is_wired(); }
@@ -411,6 +429,10 @@ private:
     EmbeddedCoinNode m_embedded; // in-process work source
     Node<config_t>   m_node;     // P2P + external-RPC fallback; full_block source
     AblaRuntime      m_abla;     // owns tracker + feed; wired in run()
+    // full_block -> header connect -> best-chain-gated UTXO/mempool reconcile;
+    // attached in assemble(). Declared after m_node so its full_block
+    // subscription tears down (dtor detach) before the event source m_node dies.
+    BlockConnector   m_connector;
     // new_headers -> m_chain.add_headers() subscription (headers-first IBD).
     std::shared_ptr<EventDisposable> m_headers_sub;
     // Built in run() once m_node.rpc() is live; binds raw ptrs to m_embedded

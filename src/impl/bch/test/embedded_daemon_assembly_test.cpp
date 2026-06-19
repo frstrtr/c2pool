@@ -83,6 +83,17 @@ int main() {
     CHECK(daemon.coin_node().is_embedded());     // embedded work source = primary
     CHECK(!daemon.coin_node().has_rpc());         // RPC fallback absent offline
 
+    // 2b) FULL-BLOCK REORG PATH WIRED. assemble() now also instantiates +
+    //     attaches the daemon-owned BlockConnector to full_block (so every
+    //     received block drives header connect + best-chain-gated UTXO/mempool
+    //     reconciliation) and binds its deep-reorg re-request sink to the P2P
+    //     download window. has_block_requester()=true proves a reorg deeper than
+    //     the remembered-block ring re-getdata's the missing new-branch bodies
+    //     instead of stranding the UTXO view at the fork; the sink itself no-ops
+    //     offline (m_node.p2p() null until start_p2p()), so this is network-free.
+    CHECK(daemon.connector().is_attached());
+    CHECK(daemon.connector().has_block_requester());
+
     // 3) The seam is backed by the daemon's REAL EmbeddedCoinNode, not a fake:
     //    a fresh, un-init'd HeaderChain reports NOT synced (FakeEmbedded=true).
     CHECK(!daemon.embedded().is_synced());
@@ -92,6 +103,8 @@ int main() {
     daemon.assemble();
     CHECK(&daemon.coin_node() == before);
     CHECK(daemon.seam_ready());
+    CHECK(daemon.connector().is_attached());      // connector wiring stable across re-assemble
+    CHECK(daemon.connector().has_block_requester());
 
     // 5) Cold-start anchor DRY RUN: record-only, VM300 untouched, floor no-op.
     //    (Just exercises the path -- it logs and must not throw or mutate.)
