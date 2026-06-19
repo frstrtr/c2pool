@@ -107,7 +107,16 @@ std::function<uint256()> DGBWorkSource::get_best_share_hash_fn() const
 
 std::string DGBWorkSource::get_current_gbt_prevhash() const
 {
-    // Stage 4b: read chain_.tip() and return BE-display-hex form.
+    // The tip block id as GBT-conventional big-endian display hex, drawn from
+    // the SAME source as get_current_work_template()'s previousblockhash field
+    // (chain_.tip_hash(), the #216 HeaderChain accessor) through the SAME
+    // u256_be_display_hex formatter -- ONE truthful source, so the dedicated
+    // getter and the assembled template can never silently diverge. Empty
+    // string when the chain carries no real tip hash (tip_hash() == nullopt:
+    // an empty chain, or the block_hash==0 sentinel from the not-yet-wired
+    // embedded P2P header ingest) -- a truthful absence, never a fabricated id.
+    if (auto th = chain_.tip_hash())
+        return u256_be_display_hex(*th);
     return {};
 }
 
