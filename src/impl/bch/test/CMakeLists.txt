@@ -57,6 +57,21 @@ if(BUILD_TESTING)
         btclibs)
     add_test(NAME bch_block_ordering_test COMMAND bch_block_ordering_test)
 
+    # coinbase_kat_bytevector_test: DGB<->BCH coinbase pairing slice 2 -- the
+    # byte-vector half. Serializes a full BCH coinbase via coin/transaction.hpp
+    # and pins it against p2poolBCH util/pack ground-truth, so it constructs a
+    # MutableTransaction (out-of-line ctor) -> add that one TU, same link set as
+    # block_connector_test. (Slice 1 = coinbase_kat_segwit_predicate_test, pure.)
+    add_executable(bch_coinbase_kat_bytevector_test
+        coinbase_kat_bytevector_test.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/transaction.cpp)
+    target_include_directories(bch_coinbase_kat_bytevector_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(bch_coinbase_kat_bytevector_test PRIVATE
+        core pool sharechain
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage c2pool_difficulty
+        btclibs)
+    add_test(NAME bch_coinbase_kat_bytevector_test COMMAND bch_coinbase_kat_bytevector_test)
+
     # utxo_connect_test: M5 (a) -- the now-live UTXO-connect leg. connect_block()
     # applies a best-chain block to a wired UTXO view, then revalidate_inputs()
     # (Phase 4) sweeps mempool txs whose inputs the connect left unspendable
