@@ -30,6 +30,7 @@
 #include <impl/dgb/coin/header_chain.hpp>
 #include <impl/dgb/coin/mempool.hpp>
 #include <impl/dgb/coin/coin_node.hpp>
+#include <impl/dgb/coin/won_block_dispatch.hpp>
 #include <impl/dgb/stratum/work_source.hpp>
 
 #include <core/filesystem.hpp>
@@ -43,6 +44,7 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -184,6 +186,15 @@ int run_node(const core::CoinParams& params, bool testnet,
     // NodeImpl ctor opens ~/.c2pool/<net>/sharechain_leveldb and seeds the addr
     // store from m_bootstrap_addrs, so config must be populated BEFORE
     // construction (above).
+    // CoinNode seam — the external-digibyted submitblock FALLBACK leg of the
+    // #82 dual-path broadcaster, shared by BOTH the sharechain m_on_block_found
+    // arm (just below) and the miner-facing Stratum arm (further below).
+    // Declared BEFORE p2p_node so it OUTLIVES the tracker callback that captures
+    // it. CoinNode(nullptr embedded, nullptr rpc) => has_rpc()==false =>
+    // submit_block_hex returns false LOUDLY (the #163 seam guard: no silent
+    // drop). Point a real NodeRPC at external digibyted here to light it up.
+    dgb::coin::CoinNode coin_node(/*embedded=*/nullptr, /*rpc=*/nullptr);
+
     dgb::Node p2p_node(&ioc, &config);
     p2p_node.set_target_outbound_peers(4);
     p2p_node.core::Server::listen(dgb::PoolConfig::P2P_PORT);
@@ -193,6 +204,36 @@ int run_node(const core::CoinParams& params, bool testnet,
               << " min=" << dgb::PoolConfig::MINIMUM_PROTOCOL_VERSION
               << " prefix=" << dgb::PoolConfig::DEFAULT_PREFIX_HEX << std::endl;
     p2p_node.start_outbound_connections();  // no-op until seed hosts exist
+
+    // ── #82 dual-path won-block CLOSER: sharechain (pool) arm ─────────────
+    //
+    // Bind the tracker's won-block callback to the #82 dispatcher. When a
+    // sharechain share is ALSO a valid parent block, ShareTracker fires
+    // m_on_block_found(share_hash) (share_tracker.hpp:380/531) — UNTIL NOW that
+    // callback was never installed in the run-loop, so a pool-found block
+    // SILENTLY DROPPED (the #82 root cause). make_on_block_found routes it
+    // through broadcast_won_block's dual path: the P2P-primary relay (empty
+    // here — the embedded NodeP2P submit_block_p2p_raw port binds it) plus the
+    // live external-digibyted submitblock FALLBACK via the coin_node seam.
+    //
+    // The reconstruct closure is the documented interim (won_block_dispatch.hpp:
+    // "until then a stub reconstructor + the external-RPC fallback"). A faithful
+    // reconstruct_won_block needs the share's gentx reassembly + known-tx feed,
+    // which lands with the embedded template builder (Phase B embedded). Until
+    // then it returns nullopt with a LOUD log — a won share is announced and
+    // audited rather than silently dropped, and NO malformed block is emitted.
+    // Assigned at setup (single-threaded, pre-ioc.run) — the only safe point to
+    // touch tracker() off the compute thread.
+    p2p_node.tracker().m_on_block_found = dgb::coin::make_on_block_found(
+        /*reconstruct=*/[](const uint256& share_hash)
+            -> std::optional<std::pair<std::vector<unsigned char>, std::string>> {
+            std::cout << "[DGB-POOL-BLOCK] won share " << share_hash.GetHex().substr(0, 16)
+                      << " — reconstruct deferred (embedded gentx/known-tx feed "
+                         "pending Phase B); not broadcast this build" << std::endl;
+            return std::nullopt;
+        },
+        /*p2p_relay=*/dgb::coin::P2pRelaySink{},  // no embedded P2P sink yet (guarded)
+        /*seam=*/&coin_node);                     // external-digibyted submitblock fallback
 
     // ── #82 dual-path won-block CLOSER: miner-facing Stratum standup ───────
     //
@@ -207,13 +248,10 @@ int run_node(const core::CoinParams& params, bool testnet,
     c2pool::dgb::HeaderChain header_chain;   // §7b chain, MVP-unwired (empty)
     dgb::coin::Mempool       mempool;        // unwired (no UTXO/template feed yet)
 
-    // submitblock-RPC arm of the #82 dual-path broadcaster (rpc.cpp:387
-    // submit_block_hex — REAL, not a stub). CoinNode(nullptr embedded,
-    // nullptr rpc) => has_rpc()==false => submit_block_hex returns false
-    // LOUDLY (the #163 seam guard: no silent drop). Point a real NodeRPC at
-    // external digibyted here to light this arm up.
-    dgb::coin::CoinNode coin_node(/*embedded=*/nullptr, /*rpc=*/nullptr);
-
+    // submitblock-RPC arm of the #82 dual-path broadcaster, driven from the
+    // miner-facing Stratum path. Reuses the SAME coin_node seam declared above
+    // p2p_node (the sharechain arm shares it). rpc.cpp:387 submit_block_hex is
+    // REAL, not a stub.
     auto stratum_submit_fn =
         [&coin_node](const std::vector<unsigned char>& block_bytes,
                      uint32_t height) -> bool {
@@ -221,9 +259,10 @@ int run_node(const core::CoinParams& params, bool testnet,
             std::cout << "[DGB-STRATUM-BLOCK] won block height=" << height
                       << " bytes=" << block_bytes.size()
                       << " — dispatching via submitblock-RPC arm" << std::endl;
-            // P2P-relay arm (m_on_block_found -> reconstruct_won_block ->
-            // broadcast_won_block) binds in the NEXT slice once the
-            // reconstructor stack (#163/#166/#167/#177) lands on this base.
+            // The sharechain P2P-relay arm (m_on_block_found ->
+            // reconstruct_won_block -> broadcast_won_block) is now bound above
+            // (reconstructor stack #163/#166/#167/#173/#174/#176/#177 landed);
+            // its faithful reconstruct closure follows with the embedded feed.
             const bool ok =
                 coin_node.submit_block_hex(block_hex, /*ignore_failure=*/false);
             if (!ok)
