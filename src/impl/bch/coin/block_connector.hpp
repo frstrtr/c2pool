@@ -63,6 +63,7 @@
 #include <deque>
 #include <memory>
 #include <optional>
+#include <functional>
 #include <unordered_map>
 #include <vector>
 
@@ -88,6 +89,18 @@ public:
     /// (txid/spent-outpoint based) still run fully, so cold-start/headers-only
     /// is safe.
     void set_utxo(core::coin::UTXOViewCache* u) { m_utxo = u; }
+
+    /// Optional re-request sink. A reorg deeper than the remembered-block
+    /// ring (or a headers-first reorg whose intermediate new-branch blocks
+    /// have not been downloaded yet) can no longer reconnect from cache; the
+    /// missing new-branch hashes are handed here -- wire it to
+    /// BlockDownloadWindow::enqueue() so they are re-getdata'd and the reorg
+    /// completes on their re-delivery, instead of stranding the UTXO view at
+    /// the fork. Left unset the connector falls back to the warn-and-hold
+    /// behaviour (UTXO safely parked at the fork until an external resync).
+    void set_block_requester(std::function<void(const std::vector<uint256>&)> req) {
+        m_request_blocks = std::move(req);
+    }
 
     /// Wire to a node's full_block event. Retained internally, torn down on
     /// destruction (or detach()). Call once, after node + chain + pool exist.
@@ -314,9 +327,22 @@ private:
         for (auto it = connect_path.rbegin(); it != connect_path.rend(); ++it) {
             const BlockType* blk = recall_block(*it);
             if (!blk) {
+                // Reorg deeper than the remembered ring (or a headers-first
+                // reorg whose intermediate new-branch blocks were not yet
+                // downloaded): this block and every block still above it on
+                // the path are absent from the cache. Re-request them for
+                // getdata so the reorg completes on their re-delivery instead
+                // of stranding the UTXO at the fork. The sink (enqueue())
+                // dedupes, so an overlapping request never double-getdata's.
+                // `it .. rend()` is exactly the not-yet-connected tail, in
+                // fork->tip connect order.
+                std::vector<uint256> missing(it, connect_path.rend());
                 LOG_WARNING << "[EMB-BCH] reorg: new-branch block "
                                   << it->GetHex().substr(0, 16)
-                                  << "... not retained -- UTXO left at fork, awaiting resync";
+                                  << "... not retained -- re-requesting " << missing.size()
+                                  << " block(s), UTXO held at fork until re-delivery";
+                if (m_request_blocks)
+                    m_request_blocks(missing);
                 return;
             }
             auto e = m_chain.get_header(*it);
@@ -327,6 +353,9 @@ private:
     HeaderChain&                 m_chain;
     Mempool&                     m_pool;
     core::coin::UTXOViewCache*   m_utxo {nullptr};   // optional UTXO view
+    // Re-request sink for reorg blocks absent from the remembered ring
+    // (see set_block_requester). Unset -> warn-and-hold at the fork.
+    std::function<void(const std::vector<uint256>&)> m_request_blocks;
 
     uint256                      m_connected_tip {}; // null = nothing applied yet
     std::vector<ConnectedEntry>  m_undo_stack;       // applied best-chain blocks
