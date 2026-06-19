@@ -48,6 +48,23 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_header_sample_build_test "" AUTO)
 
+    # --- embedded P2P header-download ingest connector ------------------------
+    # Pins coin/header_ingest.hpp: wire_header_ingest subscribes a HeaderChain
+    # to dgb::interfaces::Node::new_headers (the feed coin/p2p_node.hpp fires)
+    # and routes each announced header through make_header_sample ->
+    # validate_and_append. Proves the LIVE wire path advances the chain (and no
+    # other path does) without adding consensus policy of its own. Links the dgb
+    # OBJECT lib like dgb_header_sample_build_test because it pulls block.hpp
+    # (BlockHeaderType codec via node_interface.hpp) + core Hash/pack. MUST
+    # appear in BOTH this registration AND the build.yml --target allowlist.
+    add_executable(dgb_header_ingest_test header_ingest_test.cpp)
+    target_link_libraries(dgb_header_ingest_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_header_ingest_test "" AUTO)
+
     # --- #82: won-block reconstructor BODY (as_block composition) ----------
     # Pins coin/reconstruct_won_block.hpp: the single composition the dispatch
     # handler injects as its WonBlockReconstructor (resolve_other_tx_hashes ->

@@ -416,7 +416,20 @@ private:
     // work() (2^256 / (target+1)) over the same Scrypt-only credit path.
     static uint64_t work_from_target(const u256& target)
     {
-        return target.is_zero() ? 0 : (UINT64_MAX / target.low64());
+        // Crude uint64 work proxy: UINT64_MAX / low64(target). DELIBERATELY a
+        // proxy -- cumulative_work is internal bookkeeping NOT consumed by any
+        // V36 consensus path (the parent-difficulty retarget gate is demoted to
+        // a no-op; PPLNS scores shares, not header work). A REAL difficulty
+        // header has its significant bits high in the 256-bit word, so its low
+        // 64 bits are ZERO (e.g. genesis target ~2^224, low64()==0) -- dividing
+        // by that is an integer div-by-zero (SIGFPE). Guard it: an
+        // unrepresentable-in-uint64 target credits 0 proxy work rather than
+        // crashing the live ingest path. The true 2^256/(target+1) work
+        // computation lands at the embedded-daemon work-accounting boundary
+        // alongside the scrypt(header)->pow_hash fill (same V37 deferral).
+        if (target.is_zero() || target.low64() == 0)
+            return 0;
+        return UINT64_MAX / target.low64();
     }
 
     DigiShieldParams          m_ds_params{};        // retarget gate params
