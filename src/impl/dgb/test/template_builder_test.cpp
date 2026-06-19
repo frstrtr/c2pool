@@ -86,7 +86,8 @@ TEST(DgbTemplateBuilder, EmptyChainMintimeIsZero)
     EXPECT_EQ(t.at("mintime").get<int64_t>(), 0);
 }
 
-// transactions[] is always an empty array (embedded tx selection unwired);
+// transactions[] is an empty array BY DEFAULT (no tx source wired into the
+// inputs); bits is NEVER emitted (MultiShield V4 next-target is V37 -- the
 // bits is NEVER emitted (MultiShield V4 next-target is V37 — a Scrypt-only
 // walk would be a known-wrong difficulty).
 TEST(DgbTemplateBuilder, EmptyTransactionsAndNoBits)
@@ -110,6 +111,34 @@ TEST(DgbTemplateBuilder, PreviousblockhashConditionalEmit)
     in.previousblockhash = std::nullopt;
     auto without = build_work_template(in);
     EXPECT_FALSE(without.contains("previousblockhash"));
+}
+
+// transactions[] is a caller-supplied pass-through: a shaped array round-trips
+// into the template VERBATIM (the seam a wired mempool source emits through),
+// while an unset input stays an empty array (truthful absence by default). This
+// is the same conditional-shape contract previousblockhash holds.
+TEST(DgbTemplateBuilder, TransactionsPassThroughVerbatim)
+{
+    auto in = make_inputs();
+    nlohmann::json tx = nlohmann::json::object();
+    tx["data"] = "0100000001abcd";
+    tx["txid"] = std::string(64, '1');
+    tx["hash"] = std::string(64, '1');
+    tx["fee"]  = 4200;
+    in.transactions = nlohmann::json::array();
+    in.transactions.push_back(tx);
+
+    auto t = build_work_template(in);
+    ASSERT_TRUE(t.at("transactions").is_array());
+    ASSERT_EQ(t.at("transactions").size(), 1u);
+    // byte-identical pass-through: the builder shapes nothing of its own.
+    EXPECT_EQ(t.at("transactions").dump(), in.transactions.dump());
+    EXPECT_EQ(t.at("transactions")[0].at("fee").get<int64_t>(), 4200);
+
+    // Unset -> empty array (default): never absent, never fabricated.
+    auto def = build_work_template(make_inputs());
+    ASSERT_TRUE(def.at("transactions").is_array());
+    EXPECT_TRUE(def.at("transactions").empty());
 }
 
 // Divergence guard: identical inputs -> byte-identical template. This is the
