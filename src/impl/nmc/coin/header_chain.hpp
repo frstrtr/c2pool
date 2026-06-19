@@ -553,6 +553,20 @@ struct IndexEntry {
     std::optional<AuxPow>  auxpow;       // merge-mining proof (P0: stored, unverified)
 };
 
+/// Work represented by a compact target. Mirror of btc::coin::get_block_proof
+/// (src/impl/btc/coin/header_chain.hpp) — NMC is a SHA256d Bitcoin fork, so the
+/// work metric is identical. Kept local to the NMC lane (btc tree is read-only;
+/// core/ is an exceptional SSOT) rather than cross-including the btc header.
+///   work = 2^256 / (target + 1) = ~target / (target + 1) + 1
+inline uint256 get_block_proof(uint32_t bits) {
+    bool negative, overflow;
+    uint256 target;
+    target.SetCompact(bits, &negative, &overflow);
+    if (negative || target.IsNull() || overflow)
+        return uint256::ZERO;
+    return (~target / (target + uint256::ONE)) + uint256::ONE;
+}
+
 // ─── HeaderChain ─────────────────────────────────────────────────────────────
 
 /// Header-only chain skeleton for embedded NMC. Mirrors the public surface of
@@ -763,14 +777,19 @@ private:
         e.header     = header;
         e.block_hash = bh;
         e.height     = static_cast<uint32_t>(height);
-        e.chain_work = parent_work;             // cumulative-work summation = next sub-leg
+        // cumulative-work summation: this header's chain_work is the parent's
+        // running total plus its own block proof (work-based reorg fork-choice
+        // is still a later sub-leg; tip selection stays height-proxy below).
+        e.chain_work = parent_work + get_block_proof(header.m_bits);
         e.status     = has_auxpow ? HEADER_VALID_CHAIN : HEADER_VALID_TREE;
         e.auxpow     = auxpow;
+        const uint256 entry_work = e.chain_work;
         m_index.emplace(bh, std::move(e));
 
         if (m_tip.IsNull() || height > static_cast<int32_t>(m_tip_height)) {
             m_tip        = bh;                  // height-proxy tip (no work reorg yet)
             m_tip_height = static_cast<uint32_t>(height);
+            m_best_work  = entry_work;          // cumulative work at the new tip
         }
         return true;
     }
