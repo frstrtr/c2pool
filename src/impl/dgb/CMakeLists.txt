@@ -10,13 +10,15 @@
 # in this module yet: parked behind the Phase 5.8 settle (ltc-doge owns the
 # shared DOGE-aux surface). Do not add AUX_DOGE plumbing here at M2.
 #
-# LIB GATING (mirrors btc/ltc): the dgb_coin (coin-layer) and dgb (pool-layer)
-# OBJECT libs are defined UNCONDITIONALLY — the c2pool-dgb executable links
-# them, and the coin-matrix CI builds that exe WITHOUT -DCOIN_DGB, so the
-# targets MUST exist regardless of the flag (gating them behind COIN_DGB makes
-# the linker fall back to raw -ldgb/-ldgb_coin and fail). Only the test subtree
-# stays behind COIN_DGB; build.yml sets -DCOIN_DGB=ON and builds those targets.
+# LIB GATING (mirrors btc/ltc): the dgb_coin (coin-layer), dgb_stratum
+# (miner-facing IWorkSource) and dgb (pool-layer) OBJECT libs are defined
+# UNCONDITIONALLY — the c2pool-dgb executable links them, and the coin-matrix
+# CI builds that exe WITHOUT -DCOIN_DGB, so the targets MUST exist regardless
+# of the flag (gating them behind COIN_DGB makes the linker fall back to raw
+# -ldgb/-ldgb_coin/-ldgb_stratum and fail). Only the test subtree stays behind
+# COIN_DGB; build.yml sets -DCOIN_DGB=ON and builds those targets.
 add_subdirectory(coin)
+add_subdirectory(stratum)   # dgb_stratum: IWorkSource (#82 miner-facing path)
 # add_subdirectory(daemon)
 
 # dgb -- DGB Scrypt pool-layer OBJECT lib. Mirrors the ltc/btc OBJECT lib:
@@ -36,6 +38,5 @@ target_link_libraries(dgb core pool sharechain dgb_coin btclibs c2pool_storage $
 
 if(COIN_DGB)
   message(STATUS "c2pool: DGB Scrypt-only coin module enabled")
-  add_subdirectory(stratum)   # dgb_stratum: IWorkSource (#82 miner-facing path)
   add_subdirectory(test)
 endif()
