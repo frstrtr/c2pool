@@ -313,4 +313,36 @@ TEST(DgbWorkSource, WorkTemplateEmitsPreviousBlockHashWhenTipCarriesHash)
     EXPECT_FALSE(tmpl.contains("bits"));
 }
 
+// The dedicated prevhash getter and the assembled template draw the tip hash
+// from ONE source (chain_.tip_hash() through u256_be_display_hex), so they can
+// never diverge: with a real tip the getter returns the SAME BE-display-hex the
+// template emits; with no tip BOTH are absent (getter empty string, template
+// omits the field).
+TEST(DgbWorkSource, GbtPrevhashGetterMatchesTemplateField)
+{
+    Fixture fx;
+    // No tip yet -> getter empty, template omits previousblockhash.
+    {
+        auto ws = fx.make();
+        EXPECT_TRUE(ws->get_current_gbt_prevhash().empty());
+        EXPECT_FALSE(ws->get_current_work_template().contains("previousblockhash"));
+    }
+    // Seed a Scrypt header carrying a distinctive block id (mirrors the
+    // previousblockhash emit test) -> getter == template field, BE-display-hex.
+    fx.chain.set_base_height(400000);
+    c2pool::dgb::HeaderSample h;
+    h.n_version  = 0x20000000;
+    h.n_time     = 1000;
+    h.target     = 100;
+    h.block_hash = dgb::coin::u256::from_u64(0x123456789abcdef0ULL);
+    ASSERT_EQ(fx.chain.validate_and_append(h),
+              c2pool::dgb::IngestResult::VALIDATED_SCRYPT);
+
+    auto ws = fx.make();
+    const std::string expected = std::string(48, '0') + "123456789abcdef0";
+    EXPECT_EQ(ws->get_current_gbt_prevhash(), expected);
+    EXPECT_EQ(ws->get_current_work_template()["previousblockhash"].get<std::string>(),
+              expected);
+}
+
 }  // namespace
