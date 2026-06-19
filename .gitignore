@@ -165,6 +165,8 @@ tools/
 # CMake out-of-source build trees (any name starting with `build-`).
 # Catches build-spv/, build-qt/, build-relwithdebinfo/, etc.
 /build-*/
+# Same, underscore-separated (build_dgb/, build_spv/, etc.).
+/build_*/
 
 # Vendored third-party libraries under external/ (e.g. external/dashbls).
 # Source is tracked on the relevant branch; these are autotools/CMake/
