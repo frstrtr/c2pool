@@ -805,7 +805,7 @@ TEST(NmcP1eStore, PrematureAuxPowIsRejectedByStoreEvenWhenProofValid)
 // ---------------------------------------------------------------------------
 // P1e cumulative-work summation sub-leg KATs (NmcP1eWork). chain_work is now
 // parent.chain_work + get_block_proof(nBits); cumulative_work() tracks the tip.
-// Fork-choice stays height-proxy (work-based reorg is a still-later sub-leg).
+// (Tip selection itself is covered by the NmcP1eForkChoice suite below.)
 // ---------------------------------------------------------------------------
 TEST(NmcP1eWork, GetBlockProofMatchesTwoToThe256OverTargetPlusOne)
 {
@@ -879,6 +879,138 @@ TEST(NmcP1eWork, RejectedHeaderDoesNotAdvanceCumulativeWork)
     BlockHeaderType orphan = plain_header(leaf_of(0xAB), 0x1d00ffffu, 99);
     EXPECT_FALSE(chain_.add_header(orphan));         // unknown parent
     EXPECT_EQ(chain_.cumulative_work(), before);     // work unchanged on reject
+}
+
+// ---------------------------------------------------------------------------
+// P1e work-based reorg fork-choice sub-leg KATs (NmcP1eForkChoice). The tip is
+// now the header with the most CUMULATIVE work, not the greatest height: a
+// heavier competing branch reorgs the tip even when it is shorter, and an
+// equal-work header at the tip height switches the tip (network-consensus
+// tie-break). Mirrors btc::coin::HeaderChain fork choice.
+// ---------------------------------------------------------------------------
+namespace {
+constexpr uint32_t kEasyBits = 0x1d00ffffu;   // BTC genesis-era target
+constexpr uint32_t kHardBits = 0x1c0fffffu;   // ~16x more work per block
+}
+
+TEST(NmcP1eForkChoice, HeavierSingleBlockReorgsOverLongerLighterChain)
+{
+    using nmc::coin::get_block_proof;
+    HeaderChain chain_(params_activation(19200));
+    uint256 z; z.SetNull();
+    // Long, light chain: g <- a1 <- a2 <- a3  (height 3).
+    BlockHeaderType g  = plain_header(z, kEasyBits, 1);
+    ASSERT_TRUE(chain_.add_header(g));
+    BlockHeaderType a1 = plain_header(block_hash(g),  kEasyBits, 2);
+    ASSERT_TRUE(chain_.add_header(a1));
+    BlockHeaderType a2 = plain_header(block_hash(a1), kEasyBits, 3);
+    ASSERT_TRUE(chain_.add_header(a2));
+    BlockHeaderType a3 = plain_header(block_hash(a2), kEasyBits, 4);
+    ASSERT_TRUE(chain_.add_header(a3));
+    EXPECT_EQ(chain_.height(), 3u);
+    EXPECT_EQ(chain_.tip()->block_hash, block_hash(a3));
+
+    // One much-heavier sibling at height 1 outweighs the whole easy chain.
+    EXPECT_TRUE(get_block_proof(kHardBits)
+                > get_block_proof(kEasyBits) + get_block_proof(kEasyBits)
+                  + get_block_proof(kEasyBits));
+    BlockHeaderType b1 = plain_header(block_hash(g), kHardBits, 5);
+    ASSERT_TRUE(chain_.add_header(b1));
+    EXPECT_EQ(chain_.height(), 1u);                      // reorg shortened the tip
+    EXPECT_EQ(chain_.tip()->block_hash, block_hash(b1));
+    EXPECT_EQ(chain_.cumulative_work(),
+              get_block_proof(kEasyBits) + get_block_proof(kHardBits));
+}
+
+TEST(NmcP1eForkChoice, LighterSiblingIsStoredButDoesNotReorg)
+{
+    HeaderChain chain_(params_activation(19200));
+    uint256 z; z.SetNull();
+    BlockHeaderType g  = plain_header(z, kEasyBits, 1);
+    ASSERT_TRUE(chain_.add_header(g));
+    BlockHeaderType a1 = plain_header(block_hash(g), kHardBits, 2);   // heavy tip
+    ASSERT_TRUE(chain_.add_header(a1));
+    uint256 work_at_tip = chain_.cumulative_work();
+
+    BlockHeaderType b1 = plain_header(block_hash(g), kEasyBits, 3);   // lighter sibling
+    EXPECT_TRUE(chain_.add_header(b1));                 // stored...
+    EXPECT_TRUE(chain_.has_header(block_hash(b1)));
+    EXPECT_EQ(chain_.size(), 3u);
+    EXPECT_EQ(chain_.tip()->block_hash, block_hash(a1)); // ...but tip unchanged
+    EXPECT_EQ(chain_.cumulative_work(), work_at_tip);
+}
+
+TEST(NmcP1eForkChoice, EqualWorkSiblingAtTipHeightSwitchesTip)
+{
+    HeaderChain chain_(params_activation(19200));
+    uint256 z; z.SetNull();
+    BlockHeaderType g  = plain_header(z, kEasyBits, 1);
+    ASSERT_TRUE(chain_.add_header(g));
+    BlockHeaderType a1 = plain_header(block_hash(g), kEasyBits, 2);
+    ASSERT_TRUE(chain_.add_header(a1));
+    EXPECT_EQ(chain_.tip()->block_hash, block_hash(a1));
+    uint256 work_at_tip = chain_.cumulative_work();
+
+    // Same parent + same difficulty, different nonce => equal work, new hash.
+    BlockHeaderType b1 = plain_header(block_hash(g), kEasyBits, 99);
+    EXPECT_TRUE(chain_.add_header(b1));
+    EXPECT_EQ(chain_.tip()->block_hash, block_hash(b1)); // equal-work tie-break switch
+    EXPECT_EQ(chain_.height(), 1u);
+    EXPECT_EQ(chain_.cumulative_work(), work_at_tip);    // work identical
+}
+
+TEST(NmcP1eForkChoice, ReReceivingHeadersDoesNotFlipFlopTheTip)
+{
+    HeaderChain chain_(params_activation(19200));
+    uint256 z; z.SetNull();
+    BlockHeaderType g  = plain_header(z, kEasyBits, 1);
+    ASSERT_TRUE(chain_.add_header(g));
+    BlockHeaderType a1 = plain_header(block_hash(g), kEasyBits, 2);
+    ASSERT_TRUE(chain_.add_header(a1));
+    BlockHeaderType b1 = plain_header(block_hash(g), kHardBits, 3);   // reorg to heavy
+    ASSERT_TRUE(chain_.add_header(b1));
+    EXPECT_EQ(chain_.tip()->block_hash, block_hash(b1));
+    uint256 work_at_tip = chain_.cumulative_work();
+
+    // Re-receiving either stored header is an idempotent no-op; tip is stable.
+    EXPECT_FALSE(chain_.add_header(a1));
+    EXPECT_FALSE(chain_.add_header(b1));
+    EXPECT_EQ(chain_.tip()->block_hash, block_hash(b1));
+    EXPECT_EQ(chain_.cumulative_work(), work_at_tip);
+}
+
+TEST(NmcP1eForkChoice, TipExtendsAfterAWorkReorg)
+{
+    using nmc::coin::get_block_proof;
+    HeaderChain chain_(params_activation(19200));
+    uint256 z; z.SetNull();
+    BlockHeaderType g  = plain_header(z, kEasyBits, 1);
+    ASSERT_TRUE(chain_.add_header(g));
+    BlockHeaderType a1 = plain_header(block_hash(g), kEasyBits, 2);
+    ASSERT_TRUE(chain_.add_header(a1));
+    BlockHeaderType b1 = plain_header(block_hash(g), kHardBits, 3);   // reorg
+    ASSERT_TRUE(chain_.add_header(b1));
+    EXPECT_EQ(chain_.height(), 1u);
+
+    BlockHeaderType b2 = plain_header(block_hash(b1), kEasyBits, 4);  // extend heavy tip
+    ASSERT_TRUE(chain_.add_header(b2));
+    EXPECT_EQ(chain_.height(), 2u);
+    EXPECT_EQ(chain_.tip()->block_hash, block_hash(b2));
+    EXPECT_EQ(chain_.cumulative_work(),
+              get_block_proof(kEasyBits) + get_block_proof(kHardBits)
+              + get_block_proof(kEasyBits));
+}
+
+TEST(NmcP1eForkChoice, FirstHeaderBecomesTipRegardlessOfPriorState)
+{
+    HeaderChain chain_(params_activation(19200));
+    EXPECT_FALSE(chain_.tip().has_value());
+    uint256 z; z.SetNull();
+    BlockHeaderType g = plain_header(z, kEasyBits, 1);
+    ASSERT_TRUE(chain_.add_header(g));
+    ASSERT_TRUE(chain_.tip().has_value());
+    EXPECT_EQ(chain_.tip()->block_hash, block_hash(g));
+    EXPECT_EQ(chain_.cumulative_work(), nmc::coin::get_block_proof(kEasyBits));
 }
 
 } // namespace

@@ -729,9 +729,10 @@ private:
     // P1e storage leg: shared in-memory connect path for plain and merge-mined
     // headers. Caller holds m_mutex. Derives the connected height from the
     // parent (or 0 for the chain-root seed), runs the activation gate, and on
-    // ADMIT inserts the IndexEntry and advances the tip (height-proxy fork
-    // choice; work-based reorg is a later leg). Returns false -- nothing
-    // persisted -- on already-known / orphan / activation-gate rejection.
+    // ADMIT inserts the IndexEntry and advances the tip by WORK-BASED fork
+    // choice (most-cumulative-work wins, with an equal-work tie-break at the
+    // tip height). Returns false -- nothing persisted -- on already-known /
+    // orphan / activation-gate rejection.
     bool connect_locked(const BlockHeaderType& header,
                         const std::optional<AuxPow>& auxpow) {
         const uint256 bh = block_hash(header);
@@ -778,18 +779,40 @@ private:
         e.block_hash = bh;
         e.height     = static_cast<uint32_t>(height);
         // cumulative-work summation: this header's chain_work is the parent's
-        // running total plus its own block proof (work-based reorg fork-choice
-        // is still a later sub-leg; tip selection stays height-proxy below).
+        // running total plus its own block proof.
         e.chain_work = parent_work + get_block_proof(header.m_bits);
         e.status     = has_auxpow ? HEADER_VALID_CHAIN : HEADER_VALID_TREE;
         e.auxpow     = auxpow;
         const uint256 entry_work = e.chain_work;
         m_index.emplace(bh, std::move(e));
 
-        if (m_tip.IsNull() || height > static_cast<int32_t>(m_tip_height)) {
-            m_tip        = bh;                  // height-proxy tip (no work reorg yet)
+        // Work-based fork choice (mirror of btc::coin::HeaderChain): the best
+        // chain is the one with the most CUMULATIVE work, not the greatest
+        // height -- so a heavier competing branch reorgs the tip even when it
+        // is shorter. An equal-work header at the tip height also switches the
+        // tip: it represents network consensus on a tie, which matters on
+        // min-difficulty testnet where every block carries identical work.
+        // Re-receiving a stored header is the idempotent reject above, so the
+        // switch cannot flip-flop.
+        const bool first        = m_tip.IsNull();
+        const bool dominated    = entry_work > m_best_work;
+        const bool equal_at_tip = entry_work == m_best_work
+                               && height == static_cast<int32_t>(m_tip_height)
+                               && bh != m_tip;
+        if (first || dominated || equal_at_tip) {
+            const uint32_t old_height = m_tip_height;
+            const uint256  old_tip    = m_tip;
+            m_tip        = bh;
             m_tip_height = static_cast<uint32_t>(height);
             m_best_work  = entry_work;          // cumulative work at the new tip
+            if (!first && (equal_at_tip
+                           || height <= static_cast<int32_t>(old_height))) {
+                LOG_WARNING << "[EMB-NMC] "
+                            << (equal_at_tip ? "EQUAL-WORK REORG" : "REORG")
+                            << " at height " << height
+                            << ": old_tip=" << old_tip.ToString().substr(0, 16)
+                            << " new_tip=" << bh.ToString().substr(0, 16);
+            }
         }
         return true;
     }
