@@ -8,6 +8,8 @@
 #include "share_messages.hpp"
 #include "share_types.hpp"
 
+#include <impl/dgb/coin/gentx_coinbase.hpp>
+
 #include <core/coin_params.hpp>
 #include <core/hash.hpp>
 #include <core/pack.hpp>
@@ -931,7 +933,7 @@ inline std::vector<unsigned char> get_share_script(const auto* obj)
 // Reference: frstrtr/p2pool-merged-v36  p2pool/data.py  generate_transaction()
 // ============================================================================
 template <typename ShareT, typename TrackerT>
-uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, const core::CoinParams& params, bool dump_diag = false, bool v36_active = false)
+uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, const core::CoinParams& params, bool dump_diag = false, bool v36_active = false, dgb::coin::GentxCoinbase* out_gentx = nullptr)
 {
     auto gst_t0 = std::chrono::steady_clock::now();
     constexpr int64_t ver = ShareT::version;
@@ -1133,81 +1135,22 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, const
         payout_outputs.erase(payout_outputs.begin(), payout_outputs.end() - MAX_OUTPUTS);
 
     // --- 4. Serialise the coinbase transaction ---
-    // Non-witness serialization (for txid computation):
-    //   version(4) + vin_count(varint) + vin + vout_count(varint) + vouts + locktime(4)
-    PackStream tx;
+    // Wire layout (version|vin|vouts|locktime) and txid are produced by the
+    // SSOT assembler dgb::coin::assemble_gentx_coinbase() so that emission and
+    // verification can never diverge on a byte. This function only builds the
+    // per-share inputs (coinbase script, optional segwit commitment, payout
+    // outputs, donation, OP_RETURN ref commitment).
 
-    // tx version = 1
-    uint32_t tx_version = 1;
-    tx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&tx_version), 4));
-
-    // vin count = 1
-    {
-        unsigned char one = 1;
-        tx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&one), 1));
-    }
-
-    // vin[0]: prev_output = 0...0:ffffffff, script = coinbase, sequence = 0
-    {
-        // prev_hash (32 zero bytes)
-        uint256 zero_hash;
-        tx << zero_hash;
-        // prev_index (0xffffffff)
-        uint32_t prev_idx = 0xffffffff;
-        tx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&prev_idx), 4));
-        // script (VarStr)
-        tx << share.m_coinbase;
-        // sequence (0xffffffff — standard coinbase sequence, matches Python)
-        uint32_t seq = 0xffffffff;
-        tx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&seq), 4));
-    }
-
-    // Count total outputs
-    size_t n_outs = payout_outputs.size() + 1 /* donation */ + 1 /* OP_RETURN commitment */;
-    // Segwit commitment output (if applicable)
-    bool has_segwit = false;
+    // Segwit witness-commitment output (value=0) — present iff this share
+    // carries segwit data on a segwit-active version. The script is
+    //   0x6a24aa21a9ed + SHA256d(wtxid_merkle_root || P2POOL_WITNESS_NONCE).
+    std::optional<std::vector<unsigned char>> segwit_commitment_script;
     if constexpr (ver >= dgb::SEGWIT_ACTIVATION_VERSION)
     {
         if constexpr (requires { share.m_segwit_data; })
         {
             if (share.m_segwit_data.has_value())
             {
-                has_segwit = true;
-                n_outs += 1;
-            }
-        }
-    }
-
-    // vout count (varint — for < 253 outputs, it's a single byte)
-    if (n_outs < 253)
-    {
-        uint8_t cnt = static_cast<uint8_t>(n_outs);
-        tx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&cnt), 1));
-    }
-    else
-    {
-        uint8_t marker = 0xfd;
-        tx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&marker), 1));
-        uint16_t cnt = static_cast<uint16_t>(n_outs);
-        tx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&cnt), 2));
-    }
-
-    // Helper to write a single tx_out: value(8LE) + script(VarStr)
-    auto write_txout = [&](uint64_t value, const std::vector<unsigned char>& script) {
-        tx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&value), 8));
-        BaseScript bs;
-        bs.m_data = script;
-        tx << bs;
-    };
-
-    // Segwit commitment output (value=0, script=OP_RETURN + witness_commitment)
-    if (has_segwit)
-    {
-        if constexpr (requires { share.m_segwit_data; })
-        {
-            if (share.m_segwit_data.has_value())
-            {
-                // witness commitment: 0x6a24aa21a9ed + SHA256d(wtxid_merkle_root || '[P2Pool]'*4)
                 std::vector<unsigned char> wscript;
                 wscript.push_back(0x6a); // OP_RETURN
                 wscript.push_back(0x24); // PUSH 36
@@ -1219,7 +1162,7 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, const
                 uint256 commitment = compute_p2pool_witness_commitment(sd.m_wtxid_merkle_root);
                 auto commitment_bytes = commitment.GetChars();
                 wscript.insert(wscript.end(), commitment_bytes.begin(), commitment_bytes.end());
-                write_txout(0, wscript);
+                segwit_commitment_script = std::move(wscript);
                 if (dump_diag) {
                     LOG_INFO << "[WC-GST] wtxid_root=" << sd.m_wtxid_merkle_root.GetHex()
                              << " commitment=" << commitment.GetHex();
@@ -1228,17 +1171,13 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, const
         }
     }
 
-    // PPLNS payout outputs
-    for (auto& [script, amount] : payout_outputs)
-        write_txout(amount, script);
-
     // Donation output — V35 shares always use P2PK DONATION_SCRIPT,
     // V36 shares always use P2SH COMBINED_DONATION_SCRIPT.
     // Each share was created with the donation script matching its version.
     auto donation_script = params.donation_script_func(ver);
-    write_txout(donation_amount, donation_script);
 
     // OP_RETURN commitment: value=0, script = 0x6a28 + ref_hash(32) + last_txout_nonce(8)
+    std::vector<unsigned char> op_return_script;
     {
         // We need the ref_hash — recompute it from the share the same way share_init_verify does
         PackStream ref_stream;
@@ -1350,7 +1289,6 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, const
         uint256 ref_hash = check_merkle_link(hash_ref, share.m_ref_merkle_link);
 
         // Build OP_RETURN script: 0x6a 0x28 + ref_hash(32) + last_txout_nonce(8)
-        std::vector<unsigned char> op_return_script;
         op_return_script.push_back(0x6a); // OP_RETURN
         op_return_script.push_back(0x28); // PUSH 40 bytes
         op_return_script.insert(op_return_script.end(), ref_hash.data(), ref_hash.data() + 32);
@@ -1359,19 +1297,23 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, const
             auto* p = reinterpret_cast<const unsigned char*>(&nonce);
             op_return_script.insert(op_return_script.end(), p, p + 8);
         }
-        write_txout(0, op_return_script);
     }
 
-    // lock_time = 0
-    {
-        uint32_t locktime = 0;
-        tx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&locktime), 4));
-    }
+    // --- 5. Assemble + compute txid via the SSOT (double-SHA256 of
+    //         non-witness serialization). Reconstruct the PackStream tx so the
+    //         downstream V36 hash_link diagnostics keep working unchanged.
+    auto _gc = dgb::coin::assemble_gentx_coinbase(
+        share.m_coinbase.m_data, segwit_commitment_script, payout_outputs,
+        donation_amount, donation_script, op_return_script);
+    PackStream tx;
+    tx.write(std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(_gc.bytes.data()), _gc.bytes.size()));
+    auto txid = _gc.txid;
 
-    // --- 5. Compute txid (double-SHA256 of non-witness serialization) ---
-    auto tx_span = std::span<const unsigned char>(
-        reinterpret_cast<const unsigned char*>(tx.data()), tx.size());
-    auto txid = Hash(tx_span);
+    // Expose the SSOT gentx (non-witness bytes + txid) for the won-block
+    // reconstructor (#82): block tx[0] is this coinbase and gentx_hash is
+    // its merkle leaf. Default nullptr => zero change for verification callers.
+    if (out_gentx) *out_gentx = _gc;
 
     // V36 hash_link cross-check: compute prefix hash_link from our coinbase
     // and compare with the share's stored hash_link. If states differ,
@@ -1452,8 +1394,8 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, const
         LOG_WARNING << "[GENTX-DIAG] coinbase_hex=" << to_hex(cp, tx.size());
         LOG_WARNING << "[GENTX-DIAG] pplns_outputs=" << payout_outputs.size()
                     << " donation_amount=" << donation_amount
-                    << " n_outs=" << n_outs
-                    << " has_segwit=" << has_segwit;
+                    << " n_outs=" << (payout_outputs.size() + 2 + (segwit_commitment_script.has_value() ? 1u : 0u))
+                    << " has_segwit=" << segwit_commitment_script.has_value();
         LOG_WARNING << "[GENTX-DIAG] total_weight=" << total_weight.GetHex()
                     << " total_don_weight=" << total_donation_weight.GetHex();
         for (size_t i = 0; i < payout_outputs.size(); ++i) {
@@ -2729,7 +2671,8 @@ uint256 create_local_share(
     share.m_last_txout_nonce = static_cast<uint64_t>(std::time(nullptr)) ^
                                (static_cast<uint64_t>(min_header.m_nonce) << 32);
 
-    // --- Build the p2pool coinbase in the same format as generate_share_transaction ---
+    // --- Build the p2pool coinbase via the SSOT assemble_gentx_coinbase() ---
+    // (identical wire layout to generate_share_transaction; one byte path, not a twin)
     // This is needed to compute hash_link and to verify the share locally.
     // The coinbase format is: version(4) + vin(1 input) + vout(outputs...) + locktime(4)
     //
@@ -2942,41 +2885,29 @@ uint256 create_local_share(
         if (payout_outputs.size() > 4000)
             payout_outputs.erase(payout_outputs.begin(), payout_outputs.end() - 4000);
 
-        PackStream gentx;
-        { uint32_t v = 1; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&v), 4)); }
-        { unsigned char one = 1; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&one), 1)); }
-        { uint256 z; gentx << z; }
-        { uint32_t idx = 0xffffffff; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&idx), 4)); }
-        gentx << share.m_coinbase;
-        { uint32_t seq = 0xffffffff; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&seq), 4)); }
-        size_t n_outs = payout_outputs.size() + 1 + 1;
-        bool has_segwit_fb = share.m_segwit_data.has_value();
-        if (has_segwit_fb) n_outs += 1;
-        if (n_outs < 253) { uint8_t cnt = (uint8_t)n_outs; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&cnt), 1)); }
-        else { uint8_t m = 0xfd; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&m), 1)); uint16_t cnt = (uint16_t)n_outs; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&cnt), 2)); }
-        auto write_txout = [&](uint64_t value, const std::vector<unsigned char>& script) {
-            gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&value), 8));
-            BaseScript bs; bs.m_data = script; gentx << bs;
-        };
-        if (has_segwit_fb) {
+        // Build the p2pool coinbase via the SSOT assembler
+        // dgb::coin::assemble_gentx_coinbase() — identical wire layout to
+        // generate_share_transaction(). This is no longer a hand-rolled twin:
+        // both emission and verification route through the one byte path.
+        std::optional<std::vector<unsigned char>> segwit_opt;
+        if (share.m_segwit_data.has_value()) {
             auto& sd = share.m_segwit_data.value();
             std::vector<unsigned char> wscript = {0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed};
             uint256 commitment = compute_p2pool_witness_commitment(sd.m_wtxid_merkle_root);
             auto cb = commitment.GetChars();
             wscript.insert(wscript.end(), cb.begin(), cb.end());
-            write_txout(0, wscript);
+            segwit_opt = std::move(wscript);
         }
-        for (auto& [script, amount] : payout_outputs) write_txout(amount, script);
-        write_txout(donation_amount, params.donation_script_func(int64_t(36)));
-        { std::vector<unsigned char> op; op.push_back(0x6a); op.push_back(0x28);
-          op.insert(op.end(), ref_hash.data(), ref_hash.data() + 32);
-          uint64_t n = share.m_last_txout_nonce; auto* p = reinterpret_cast<const unsigned char*>(&n);
-          op.insert(op.end(), p, p + 8); write_txout(0, op); }
-        { uint32_t lt = 0; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&lt), 4)); }
-
-        coinbase_bytes_for_hashlink.assign(
-            reinterpret_cast<const unsigned char*>(gentx.data()),
-            reinterpret_cast<const unsigned char*>(gentx.data()) + gentx.size());
+        auto donation_script = params.donation_script_func(int64_t(36));
+        std::vector<unsigned char> op_return_vec;
+        op_return_vec.push_back(0x6a); op_return_vec.push_back(0x28);
+        op_return_vec.insert(op_return_vec.end(), ref_hash.data(), ref_hash.data() + 32);
+        { uint64_t n = share.m_last_txout_nonce; auto* p = reinterpret_cast<const unsigned char*>(&n);
+          op_return_vec.insert(op_return_vec.end(), p, p + 8); }
+        auto _gc = dgb::coin::assemble_gentx_coinbase(
+            share.m_coinbase.m_data, segwit_opt, payout_outputs,
+            donation_amount, donation_script, op_return_vec);
+        coinbase_bytes_for_hashlink = _gc.bytes;
     }
 
     // The split point: everything before ref_hash + last_txout_nonce + locktime
