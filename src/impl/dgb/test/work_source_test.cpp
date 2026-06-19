@@ -282,4 +282,35 @@ TEST(DgbWorkSource, CoinbaseValueHonorsGbtVerbatim)
               kGbt);
 }
 
+
+// previousblockhash: emitted as GBT-conventional big-endian display hex ONLY
+// when the HeaderChain carries a real tip hash (tip_hash() accessor). With a
+// known tip block_hash, the template surfaces it MSB-limb-first; bits stays
+// HELD (no faithful embedded V36 next-target -- MultiShield V4 is V37).
+TEST(DgbWorkSource, WorkTemplateEmitsPreviousBlockHashWhenTipCarriesHash)
+{
+    Fixture fx;
+    fx.chain.set_base_height(400000);
+    // Seed one Scrypt header carrying a distinctive block id. n_version with
+    // algo nibble 0x0000 is the Scrypt lane; target 100 with pow_hash 0 (<=
+    // target) clears the context-free PoW gate; empty-chain MTP is unconstrained.
+    c2pool::dgb::HeaderSample h;
+    h.n_version  = 0x20000000;
+    h.n_time     = 1000;
+    h.target     = 100;
+    h.block_hash = dgb::coin::u256::from_u64(0x123456789abcdef0ULL);
+    ASSERT_EQ(fx.chain.validate_and_append(h),
+              c2pool::dgb::IngestResult::VALIDATED_SCRYPT);
+
+    auto ws = fx.make();
+    auto tmpl = ws->get_current_work_template();
+    ASSERT_TRUE(tmpl.contains("previousblockhash"));
+    // limb[0] is least-significant -> renders as the trailing 16 hex digits,
+    // preceded by 48 zero digits (limbs 3..1 are zero). 64 chars total.
+    EXPECT_EQ(tmpl["previousblockhash"].get<std::string>(),
+              std::string(48, '0') + "123456789abcdef0");
+    // bits remains deliberately absent (V37 MultiShield V4 wall).
+    EXPECT_FALSE(tmpl.contains("bits"));
+}
+
 }  // namespace

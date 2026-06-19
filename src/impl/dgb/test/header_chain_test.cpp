@@ -727,3 +727,61 @@ TEST(HeaderChainBlockHeight, CheckpointSeedNumbersFirstHeader)
     EXPECT_EQ(hc.tip_height().value(), 12345u);
     EXPECT_EQ(hc.next_block_height(), 12346u);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// tip_hash(): the Scrypt-only HeaderSample now carries a sha256d block-id slot,
+// surfaced for the work template's previousblockhash. block_hash == 0 is the
+// "not populated here" sentinel (same convention as pow_hash), so the accessor
+// reports absence rather than a fabricated all-zero hash.
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(HeaderChainTipHash, EmptyChainHasNoTipHash)
+{
+    HeaderChain hc;
+    EXPECT_FALSE(hc.tip_hash().has_value());
+}
+
+TEST(HeaderChainTipHash, UnpopulatedHashStaysNullopt)
+{
+    // A header validated/appended WITHOUT a block_hash (the chain-helper path,
+    // exactly as every other test here) leaves block_hash == 0 -> nullopt, NOT
+    // a zero hash. Guards against previousblockhash being emitted as all-zeros.
+    HeaderChain hc;
+    ASSERT_EQ(hc.validate_and_append({SCRYPT, 1000, 100}),
+              IngestResult::VALIDATED_SCRYPT);
+    EXPECT_TRUE(hc.tip_height().has_value());   // height advanced...
+    EXPECT_FALSE(hc.tip_hash().has_value());    // ...but no hash carried.
+}
+
+TEST(HeaderChainTipHash, ReturnsNewestPopulatedHash)
+{
+    HeaderChain hc;
+    HeaderSample h1{SCRYPT, 1000, 100};
+    h1.block_hash = dgb::coin::u256::from_u64(0x1111ull);
+    ASSERT_EQ(hc.validate_and_append(h1), IngestResult::VALIDATED_SCRYPT);
+    ASSERT_TRUE(hc.tip_hash().has_value());
+    EXPECT_TRUE(hc.tip_hash().value() == dgb::coin::u256::from_u64(0x1111ull));
+
+    // A newer header's hash supersedes the prior tip's.
+    HeaderSample h2{SCRYPT, 1100, 100};
+    h2.block_hash = dgb::coin::u256::from_u64(0x2222ull);
+    ASSERT_EQ(hc.validate_and_append(h2), IngestResult::VALIDATED_SCRYPT);
+    EXPECT_TRUE(hc.tip_hash().value() == dgb::coin::u256::from_u64(0x2222ull));
+}
+
+TEST(HeaderChainTipHash, ContinuityHeaderHashIsTip)
+{
+    // A non-Scrypt continuity header still extends the chain and becomes the
+    // tip, so its block_hash (if carried) is the tip hash -- previousblockhash
+    // tracks the actual newest block id regardless of algo.
+    HeaderChain hc;
+    HeaderSample s1{SCRYPT, 1000, 100};
+    s1.block_hash = dgb::coin::u256::from_u64(0xaaaaull);
+    ASSERT_EQ(hc.validate_and_append(s1), IngestResult::VALIDATED_SCRYPT);
+
+    HeaderSample c1{SHA256D, 1075, 999999};
+    c1.block_hash = dgb::coin::u256::from_u64(0xbbbbull);
+    ASSERT_EQ(hc.validate_and_append(c1), IngestResult::ACCEPTED_CONTINUITY);
+    EXPECT_TRUE(hc.tip_hash().value() == dgb::coin::u256::from_u64(0xbbbbull));
+}
+
