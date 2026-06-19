@@ -44,6 +44,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <vector>
 
 #include <impl/dgb/coin/dgb_arith256.hpp>
@@ -321,6 +322,50 @@ public:
     uint64_t    cumulative_work() const { return m_cumulative_work; }
     std::size_t size()            const { return m_chain.size(); }
 
+    // ── Absolute block-height tracking (M3 §4c prerequisite) ────────────────
+    // DGB block height counts EVERY block of EVERY algo: one block == one
+    // height regardless of Scrypt / SHA256d / Skein / Qubit / Odocrypt. The
+    // Scrypt-only HeaderChain still appends non-Scrypt headers via
+    // accept-by-continuity (work-neutral but chain-extending), so block height
+    // advances on BOTH VALIDATED_SCRYPT and ACCEPTED_CONTINUITY ingests and
+    // ONLY those -- a REJECTED header never push_back()s and never advances
+    // height (rejection is checked before every push_back above). Height is
+    // therefore a pure function of the seed height + appended-header count:
+    // index i holds absolute height (m_base_height + i), with no separate
+    // mutable counter that could drift from m_chain.
+    //
+    // The embedded TemplateBuilder port (mirror of btc build_template) reads
+    // next_block_height() for the coinbase BIP34 height push and the
+    // subsidy_func(height) lookup that feeds embedded_coinbase_value (#207).
+    // External-daemon GBT still carries its own authoritative "height"; this
+    // accessor is the embedded-path source for the SAME field.
+
+    // Absolute height assigned to m_chain[0] (the seed/genesis or checkpoint
+    // header). Default 0 == sync-from-genesis; set_base_height() seeds a
+    // fast-start checkpoint before the first append.
+    uint32_t base_height() const { return m_base_height; }
+
+    // Seed the absolute height of the FIRST appended header. Must be called
+    // while the chain is still empty (a checkpoint fast-start); a no-op call
+    // order otherwise would silently mis-number live headers.
+    void set_base_height(uint32_t h) { m_base_height = h; }
+
+    // Absolute height of the newest header, or nullopt for an empty chain.
+    std::optional<uint32_t> tip_height() const
+    {
+        if (m_chain.empty())
+            return std::nullopt;
+        return static_cast<uint32_t>(m_base_height + (m_chain.size() - 1));
+    }
+
+    // Absolute height of the block the next template builds on top of the tip
+    // == tip_height()+1, or m_base_height for an empty chain. This is the
+    // template builder's `next_h` (btc template_builder.hpp: tip.height + 1).
+    uint32_t next_block_height() const
+    {
+        return static_cast<uint32_t>(m_base_height + m_chain.size());
+    }
+
     // Bitcoin/DigiByte median-time-past span (ContextualCheckBlockHeader uses
     // the tip + its 10 nearest ancestors == 11 timestamps).
     static constexpr std::size_t MEDIAN_TIME_SPAN = 11;
@@ -357,6 +402,7 @@ private:
     }
 
     DigiShieldParams          m_ds_params{};        // retarget gate params
+    uint32_t                  m_base_height = 0;   // abs height of m_chain[0]
     std::size_t               m_retarget_window = 0; // Scrypt window depth
     std::vector<HeaderSample> m_chain;          // oldest .. newest
     uint64_t                  m_cumulative_work = 0;

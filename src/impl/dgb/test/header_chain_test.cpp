@@ -646,3 +646,84 @@ TEST(HeaderChainMtp, ContinuityHeaderItselfBypassesMtp)
               IngestResult::ACCEPTED_CONTINUITY);
     EXPECT_EQ(hc.size(), 2u);
 }
+
+
+// ---------------------------------------------------------------------------
+// Absolute block-height tracking (M3 §4c prerequisite). Height is the
+// embedded TemplateBuilder's next_h source (subsidy_func(height) + BIP34
+// push). DGB counts every block of every algo, so BOTH Scrypt-validated and
+// continuity appends advance height; a rejected header never does.
+// ---------------------------------------------------------------------------
+
+TEST(HeaderChainBlockHeight, EmptyChainHasNoTipHeight)
+{
+    HeaderChain hc;
+    EXPECT_FALSE(hc.tip_height().has_value());
+    EXPECT_EQ(hc.base_height(), 0u);
+    EXPECT_EQ(hc.next_block_height(), 0u);  // genesis is the next block
+}
+
+TEST(HeaderChainBlockHeight, EveryAlgoAdvancesHeight)
+{
+    HeaderChain hc;
+    // Scrypt block at height 0.
+    ASSERT_EQ(hc.validate_and_append({SCRYPT, 1000, 100}),
+              IngestResult::VALIDATED_SCRYPT);
+    EXPECT_EQ(hc.tip_height().value(), 0u);
+    EXPECT_EQ(hc.next_block_height(), 1u);
+
+    // A continuity (non-Scrypt) block STILL occupies a height -- DGB height
+    // counts all five algos, not just the Scrypt-validated subset.
+    ASSERT_EQ(hc.validate_and_append({SHA256D, 1500, 100}),
+              IngestResult::ACCEPTED_CONTINUITY);
+    EXPECT_EQ(hc.tip_height().value(), 1u);
+    EXPECT_EQ(hc.next_block_height(), 2u);
+
+    ASSERT_EQ(hc.validate_and_append({SKEIN, 1200, 100}),
+              IngestResult::ACCEPTED_CONTINUITY);
+    EXPECT_EQ(hc.tip_height().value(), 2u);
+
+    // Another Scrypt block (time strictly above the MTP of {1000,1500,1200}).
+    ASSERT_EQ(hc.validate_and_append({SCRYPT, 2000, 100}),
+              IngestResult::VALIDATED_SCRYPT);
+    EXPECT_EQ(hc.tip_height().value(), 3u);
+    EXPECT_EQ(hc.next_block_height(), 4u);
+    EXPECT_EQ(hc.size(), 4u);
+}
+
+TEST(HeaderChainBlockHeight, RejectedHeaderNeverAdvancesHeight)
+{
+    HeaderChain hc;
+    ASSERT_EQ(hc.validate_and_append({SCRYPT, 1000, 100}),
+              IngestResult::VALIDATED_SCRYPT);
+    EXPECT_EQ(hc.tip_height().value(), 0u);
+
+    // Malformed Scrypt header (zero target) is rejected -- it must not occupy
+    // a height. tip/next stay pinned exactly where the last accepted block left
+    // them, so the embedded coinbasevalue can never be computed for a phantom
+    // block the chain never accepted.
+    EXPECT_EQ(hc.validate_and_append({SCRYPT, 1100, 0}),
+              IngestResult::REJECTED);
+    EXPECT_EQ(hc.tip_height().value(), 0u);
+    EXPECT_EQ(hc.next_block_height(), 1u);
+    EXPECT_EQ(hc.size(), 1u);
+
+    // The next genuinely-valid block takes the height the reject did NOT.
+    ASSERT_EQ(hc.validate_and_append({SCRYPT, 2000, 100}),
+              IngestResult::VALIDATED_SCRYPT);
+    EXPECT_EQ(hc.tip_height().value(), 1u);
+}
+
+TEST(HeaderChainBlockHeight, CheckpointSeedNumbersFirstHeader)
+{
+    // Fast-start: seed the absolute height of m_chain[0] before any append.
+    HeaderChain hc;
+    hc.set_base_height(12345);
+    EXPECT_FALSE(hc.tip_height().has_value());
+    EXPECT_EQ(hc.next_block_height(), 12345u);  // the seed block itself
+
+    ASSERT_EQ(hc.validate_and_append({SCRYPT, 1000, 100}),
+              IngestResult::VALIDATED_SCRYPT);
+    EXPECT_EQ(hc.tip_height().value(), 12345u);
+    EXPECT_EQ(hc.next_block_height(), 12346u);
+}
