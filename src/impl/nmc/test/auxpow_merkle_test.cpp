@@ -802,4 +802,83 @@ TEST(NmcP1eStore, PrematureAuxPowIsRejectedByStoreEvenWhenProofValid)
     EXPECT_EQ(chain_.height(), 0u);
 }
 
+// ---------------------------------------------------------------------------
+// P1e cumulative-work summation sub-leg KATs (NmcP1eWork). chain_work is now
+// parent.chain_work + get_block_proof(nBits); cumulative_work() tracks the tip.
+// Fork-choice stays height-proxy (work-based reorg is a still-later sub-leg).
+// ---------------------------------------------------------------------------
+TEST(NmcP1eWork, GetBlockProofMatchesTwoToThe256OverTargetPlusOne)
+{
+    using nmc::coin::get_block_proof;
+    // For bits=0x207fffff the target fills (almost) the whole 256-bit range, so
+    // the proof is tiny; for a harder target the proof is strictly larger.
+    uint256 easy = get_block_proof(0x207fffffu);   // regtest-easy target
+    uint256 hard = get_block_proof(0x1d00ffffu);   // BTC genesis-era target
+    EXPECT_FALSE(easy.IsNull());
+    EXPECT_TRUE(hard > easy);                       // harder target => more work
+}
+
+TEST(NmcP1eWork, MalformedBitsContributeZeroWork)
+{
+    using nmc::coin::get_block_proof;
+    EXPECT_TRUE(get_block_proof(0u).IsNull());      // null target => zero work
+}
+
+TEST(NmcP1eWork, GenesisChainWorkIsItsOwnBlockProof)
+{
+    using nmc::coin::get_block_proof;
+    HeaderChain chain_(params_activation(19200));
+    uint256 z; z.SetNull();
+    BlockHeaderType g = plain_header(z, 0x1d00ffffu, 1);
+    ASSERT_TRUE(chain_.add_header(g));
+    EXPECT_EQ(chain_.cumulative_work(), get_block_proof(0x1d00ffffu));
+    ASSERT_TRUE(chain_.tip().has_value());
+    EXPECT_EQ(chain_.tip()->chain_work, get_block_proof(0x1d00ffffu));
+}
+
+TEST(NmcP1eWork, ChildChainWorkIsParentPlusOwnProof)
+{
+    using nmc::coin::get_block_proof;
+    HeaderChain chain_(params_activation(19200));
+    uint256 z; z.SetNull();
+    BlockHeaderType g = plain_header(z, 0x1d00ffffu, 1);
+    ASSERT_TRUE(chain_.add_header(g));
+    BlockHeaderType c = plain_header(block_hash(g), 0x1d00ffffu, 2);
+    ASSERT_TRUE(chain_.add_header(c));
+    uint256 want = get_block_proof(0x1d00ffffu) + get_block_proof(0x1d00ffffu);
+    EXPECT_EQ(chain_.cumulative_work(), want);
+    ASSERT_TRUE(chain_.tip().has_value());
+    EXPECT_EQ(chain_.tip()->chain_work, want);
+}
+
+TEST(NmcP1eWork, CumulativeWorkAccumulatesMonotonicallyAcrossAChain)
+{
+    HeaderChain chain_(params_activation(19200));
+    uint256 z; z.SetNull();
+    BlockHeaderType prev = plain_header(z, 0x1d00ffffu, 1);
+    ASSERT_TRUE(chain_.add_header(prev));
+    uint256 last = chain_.cumulative_work();
+    for (uint32_t i = 2; i <= 6; ++i) {
+        BlockHeaderType c = plain_header(block_hash(prev), 0x1d00ffffu, i);
+        ASSERT_TRUE(chain_.add_header(c));
+        uint256 now = chain_.cumulative_work();
+        EXPECT_TRUE(now > last);                    // strictly increasing per block
+        last = now;
+        prev = c;
+    }
+    EXPECT_EQ(chain_.height(), 5u);
+}
+
+TEST(NmcP1eWork, RejectedHeaderDoesNotAdvanceCumulativeWork)
+{
+    HeaderChain chain_(params_activation(19200));
+    uint256 z; z.SetNull();
+    BlockHeaderType g = plain_header(z, 0x1d00ffffu, 1);
+    ASSERT_TRUE(chain_.add_header(g));
+    uint256 before = chain_.cumulative_work();
+    BlockHeaderType orphan = plain_header(leaf_of(0xAB), 0x1d00ffffu, 99);
+    EXPECT_FALSE(chain_.add_header(orphan));         // unknown parent
+    EXPECT_EQ(chain_.cumulative_work(), before);     // work unchanged on reject
+}
+
 } // namespace
