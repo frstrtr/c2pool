@@ -16,11 +16,16 @@
 // matching config_coin.hpp (namespace dgb) and the btc::coin / ltc::coin
 // pattern the family-1 seam binds against.
 
+#include <cstdint>
+#include <limits>
+#include <optional>
 #include <stdexcept>
+#include <string>
 
 #include <nlohmann/json.hpp>
 
 #include "rpc_data.hpp"
+#include "dgb_block_algo.hpp"  // DGB_BLOCK_VERSION_SCRYPT (Scrypt lane pin)
 
 namespace dgb
 {
@@ -54,6 +59,78 @@ public:
     // TODO(M3): virtual void submit_block(BlockType& block) = 0; -- restored
     // verbatim from btc once coin/block.hpp is ported.
 };
+
+
+// ── Work-template assembly SSOT (Stage 4c) ──────────────────────────────────
+// build_work_template() shapes the already-resolved field values into the
+// GBT-compatible JSON template that DGBWorkSource::get_current_work_template()
+// returns. Lifting the assembly here makes the stratum work source and the
+// embedded path emit ONE template object -- they cannot diverge once both call
+// this SSOT (the same intent as routing get_current_gbt_prevhash through
+// tip_hash() in Stage 4b).
+//
+// NON-CONSENSUS: this function only SHAPES values; it never derives or alters
+// the consensus-bearing coinbasevalue. That value is computed by the caller
+// through the #207 resolve_coinbase_value -> subsidy_func SSOT and passed in
+// verbatim. The builder fabricates nothing: transactions[] stays empty
+// (embedded mempool tx selection is not wired, fees stay 0), previousblockhash
+// is emitted ONLY when the caller supplies a real tip hash (truthful absence,
+// never a fabricated id), and `bits` is held back entirely -- DGB Core's live
+// next-target is MultiShield V4 (a global 5-algo window == V37), so a
+// Scrypt-only walk would emit a known-wrong difficulty (the same fabrication
+// the empty transactions[] deliberately avoids). bits becomes a GBT
+// pass-through once the external-daemon path is plumbed in.
+struct WorkTemplateInputs {
+    // Absolute height of the NEXT block (#209 next_block_height()).
+    uint32_t next_height = 0;
+    // Reward for the next block, already resolved via the #207 SSOT. Passed in
+    // verbatim; the builder never recomputes or scales it.
+    uint64_t coinbasevalue = 0;
+    // DGB Core ContextualCheckBlockHeader lower bound source (median-time-past).
+    // INT64_MIN means an empty chain (unconstrained) -> mintime emits 0.
+    int64_t  median_time_past = std::numeric_limits<int64_t>::min();
+    // GBT suggested header nTime. Injected by the caller (work source: wall
+    // clock) so the assembly is deterministically testable.
+    int64_t  curtime = 0;
+    // Tip block id as GBT big-endian display hex, already formatted by the
+    // caller (work source: u256_be_display_hex). nullopt -> previousblockhash
+    // omitted from the template.
+    std::optional<std::string> previousblockhash;
+};
+
+inline nlohmann::json build_work_template(const WorkTemplateInputs& in)
+{
+    // version: BIP9 base | DGB Scrypt algo nibble (dgb_block_algo.hpp SSOT). A
+    // DGB template MUST pin the Scrypt lane -- the mining algo lives in 4
+    // nVersion bits and Scrypt is the all-zero codepoint (DGB_BLOCK_VERSION_SCRYPT
+    // == 0x0000); any other nibble is a non-Scrypt algo this V36 binary never
+    // emits a template for.
+    static constexpr uint32_t BIP9_BASE_VERSION = 0x20000000u;
+    const uint32_t version =
+        BIP9_BASE_VERSION |
+        static_cast<uint32_t>(DGB_BLOCK_VERSION_SCRYPT);
+
+    // mintime: median_time_past()+1 (DGB Core's nTime > MTP lower bound). An
+    // empty chain reports INT64_MIN (unconstrained) -> emit 0.
+    const int64_t mintime =
+        (in.median_time_past == std::numeric_limits<int64_t>::min())
+            ? 0 : (in.median_time_past + 1);
+
+    nlohmann::json tmpl = nlohmann::json::object();
+    tmpl["height"]        = in.next_height;
+    tmpl["coinbasevalue"] = in.coinbasevalue;
+    tmpl["version"]       = version;
+    tmpl["curtime"]       = in.curtime;
+    tmpl["mintime"]       = mintime;
+    tmpl["transactions"]  = nlohmann::json::array();
+
+    // previousblockhash: truthful conditional emit (see struct notes).
+    if (in.previousblockhash)
+        tmpl["previousblockhash"] = *in.previousblockhash;
+
+    return tmpl;
+}
+
 
 } // namespace coin
 
