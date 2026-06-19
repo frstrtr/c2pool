@@ -526,7 +526,7 @@ struct NMCChainParams {
     int32_t testnet_auxpow_activation_height{-1}; // TO-CONFIRM: testnet analog (unpinned sentinel)
     // aux_chain_id: the chain id this NMC instance claims in the parent's
     //   merged-mining tree. -1 = unpinned sentinel.
-    int32_t aux_chain_id{-1};               // TO-CONFIRM: Namecoin mainnet chain id (unpinned)
+    int32_t aux_chain_id{1};                // Namecoin nAuxpowChainId = 0x0001 (both nets); see chainparams.cpp
 
     int64_t difficulty_adjustment_interval() const {
         return target_timespan / target_spacing;
@@ -565,11 +565,30 @@ struct NMCChainParams {
         p.target_spacing  = TESTNET_TARGET_SPACING;
         p.allow_min_difficulty = TESTNET_ALLOW_MIN_DIFF;
         p.no_retargeting = false;
-        // TO-CONFIRM: Namecoin testnet powLimit (placeholder = BTC default).
+        // Namecoin testnet powLimit = Bitcoin default (chainparams.cpp CTestNetParams).
         p.pow_limit.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
-        // TO-CONFIRM: Namecoin testnet genesis hash (placeholder = null).
-        p.genesis_hash.SetNull();
+        // Genesis PINNED against a live namecoind on namecoin testnet
+        // (getblockhash 0 / getblockheader, 2026-06-19). block_hash(genesis_header)
+        // re-derives this value (nmc_auxpow_wire_test GenesisTestnet KAT).
+        p.genesis_hash.SetHex("00000007199508e34a9ff81e6ec0c477a4cccff2a4767a8eee39c11db367b008");
         return p;
+    }
+
+    /// Namecoin testnet genesis header (the 80-byte parent the HeaderChain seeds
+    /// at height 0). Fields PINNED against a live namecoind getblockheader on
+    /// namecoin testnet, 2026-06-19:
+    ///   version=1  time=1296688602  bits=0x1d07fff8  nonce=384568319
+    ///   merkleroot=4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b
+    /// SHA256d(header) == genesis_hash() above (verified locally + by KAT).
+    static BlockHeaderType testnet_genesis_header() {
+        BlockHeaderType g;
+        g.m_previous_block.SetNull();
+        g.m_version = 1;
+        g.m_merkle_root.SetHex("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b");
+        g.m_timestamp = 1296688602;
+        g.m_bits      = 0x1d07fff8;
+        g.m_nonce     = 384568319;
+        return g;
     }
 };
 
