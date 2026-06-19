@@ -72,8 +72,10 @@ public:
 // NON-CONSENSUS: this function only SHAPES values; it never derives or alters
 // the consensus-bearing coinbasevalue. That value is computed by the caller
 // through the #207 resolve_coinbase_value -> subsidy_func SSOT and passed in
-// verbatim. The builder fabricates nothing: transactions[] stays empty
-// (embedded mempool tx selection is not wired, fees stay 0), previousblockhash
+// verbatim. The builder fabricates nothing: transactions[] is a caller-supplied
+// pass-through (empty by default until a mempool tx source is wired -- truthful
+// absence, never a fabricated tx; the fee total is folded into coinbasevalue
+// UPSTREAM via resolve_coinbase_value, not here), previousblockhash
 // is emitted ONLY when the caller supplies a real tip hash (truthful absence,
 // never a fabricated id), and `bits` is held back entirely -- DGB Core's live
 // next-target is MultiShield V4 (a global 5-algo window == V37), so a
@@ -96,6 +98,16 @@ struct WorkTemplateInputs {
     // caller (work source: u256_be_display_hex). nullopt -> previousblockhash
     // omitted from the template.
     std::optional<std::string> previousblockhash;
+    // GBT transactions[] array, already shaped by the caller (per-tx
+    // {data,txid,hash,fee} objects, the same shape btc's template_builder
+    // emits). The builder passes it through VERBATIM and shapes nothing -- the
+    // identical truthful-absence discipline as previousblockhash: it defaults
+    // to an empty array, so a caller that has wired no transaction source (the
+    // current embedded + stratum paths) emits an empty transactions[] and
+    // fabricates nothing. The fee total those txs carry is folded into
+    // coinbasevalue UPSTREAM via resolve_coinbase_value(total_fees) (#207 SSOT);
+    // the builder never derives the reward, so this field is display-only shape.
+    nlohmann::json transactions = nlohmann::json::array();
 };
 
 inline nlohmann::json build_work_template(const WorkTemplateInputs& in)
@@ -122,7 +134,7 @@ inline nlohmann::json build_work_template(const WorkTemplateInputs& in)
     tmpl["version"]       = version;
     tmpl["curtime"]       = in.curtime;
     tmpl["mintime"]       = mintime;
-    tmpl["transactions"]  = nlohmann::json::array();
+    tmpl["transactions"]  = in.transactions;  // caller-supplied; empty by default
 
     // previousblockhash: truthful conditional emit (see struct notes).
     if (in.previousblockhash)
