@@ -48,6 +48,8 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace nmc {
@@ -75,6 +77,44 @@ inline uint256 block_hash(const BlockHeaderType& header) {
 inline uint256 pow_hash(const BlockHeaderType& header) {
     auto packed = pack(header);
     return Hash(packed.get_span());
+}
+
+// ─── Merkle-branch walk (P1: AuxPow merkle-proof primitive) ────────────────
+
+/// Walk a merkle BRANCH up to its root, starting from `leaf`.
+///
+/// The core primitive of AuxPow verification: BOTH legs of the proof are
+/// merkle-branch walks — the chain-merkle leg (aux block hash → merged-mining
+/// root, AuxPow::check_proof step 1) and the parent-coinbase leg (coinbase
+/// txid → parent block tx-merkle-root, step 3). At level i, bit i of `index`
+/// selects the side: if set, branch[i] is the LEFT sibling (running hash on the
+/// right); else branch[i] is on the right. Each pair is SHA256d'd (the
+/// Bitcoin/Namecoin merkle convention).
+///
+/// Byte-faithful port of legacy libcoind/data.cpp check_merkle_link() — the
+/// same SSOT btc/ltc use — kept NMC-LOCAL per the coin fence (no btc/ltc
+/// include; only core/* primitives: Hash, PackStream).
+inline uint256 aux_merkle_root(const uint256& leaf,
+                               const std::vector<uint256>& branch,
+                               uint32_t index) {
+    if (!branch.empty() && index >= (1u << branch.size()))
+        throw std::invalid_argument("aux_merkle_root: index too large for branch depth");
+
+    uint256 cur = leaf;
+    for (size_t i = 0; i < branch.size(); ++i) {
+        PackStream ps;
+        if ((index >> i) & 1u) {
+            ps << branch[i];   // sibling on the left
+            ps << cur;
+        } else {
+            ps << cur;
+            ps << branch[i];   // sibling on the right
+        }
+        auto sp = std::span<const unsigned char>(
+            reinterpret_cast<const unsigned char*>(ps.data()), ps.size());
+        cur = Hash(sp);        // SHA256d of the 64-byte concatenation
+    }
+    return cur;
 }
 
 // ─── AuxPow (merge-mining proof) ─────────────────────────────────────────────
