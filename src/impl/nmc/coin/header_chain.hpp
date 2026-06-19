@@ -646,6 +646,32 @@ public:
                                   header.m_bits);
     }
 
+    /// P1e: verdict for the activation-height admission gate.
+    enum class AdmitResult {
+        ADMIT,                    // height / auxpow-presence consistent (proof checked separately)
+        REJECT_PREMATURE_AUXPOW,  // header carries an AuxPow below the activation height
+        REJECT_MISSING_AUXPOW,    // no AuxPow at/after activation height (mainnet requirement)
+        REJECT_UNPINNED,          // activation height still the -1 sentinel - refuse to judge
+    };
+
+    /// P1e: the activation-height GATE, factored out for unit-testing
+    /// independent of the (still-deferred) storage path - the same pattern as
+    /// verify_auxpow_header(). Decides admissibility from the connected `height`
+    /// and whether the header carries an AuxPow, BEFORE the four-leg proof is
+    /// walked: below activation an AuxPow is premature, at/after activation
+    /// (mainnet) one is mandatory. While auxpow_activation_height is the
+    /// unpinned -1 sentinel it refuses to judge (REJECT_UNPINNED) so the P1 leaf
+    /// never renders an activation verdict off a placeholder constant.
+    AdmitResult check_activation_gate(int32_t height, bool has_auxpow) const {
+        if (m_params.auxpow_activation_height < 0)
+            return AdmitResult::REJECT_UNPINNED;          // TO-CONFIRM unpinned
+        if (!m_params.is_auxpow_active(height))
+            return has_auxpow ? AdmitResult::REJECT_PREMATURE_AUXPOW
+                              : AdmitResult::ADMIT;
+        return has_auxpow ? AdmitResult::ADMIT
+                          : AdmitResult::REJECT_MISSING_AUXPOW;
+    }
+
     /// Add a header that carries a merge-mining AuxPow proof.
     /// P1d: the AuxPow VERIFICATION GATE is now wired - check_proof() must
     /// return VALID or the header is rejected, so the (future) accept path can
