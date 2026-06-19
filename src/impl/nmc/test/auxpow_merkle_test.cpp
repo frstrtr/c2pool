@@ -150,4 +150,125 @@ TEST(NmcAuxCheckProof, ChainIndexTooWideForDepthIsInvalid)
               AuxPow::CheckResult::INVALID);
 }
 
+// ---------------------------------------------------------------------------
+// P1c: AuxPow::check_proof parent-coinbase tx-merkle leg (step 3) wiring.
+//
+// step 3 reconstructs the parent block's transaction merkle root from the
+// WITNESS-STRIPPED parent coinbase txid through parent_coinbase_branch/index
+// via aux_merkle_root(), and (once a parent header is present) requires it to
+// equal parent_header.m_merkle_root. The load-bearing test asserts the exact
+// byte serialization of the txid: it is hashed over the LEGACY (no-witness)
+// layout -- txid, NOT wtxid -- so a coinbase carrying the BIP141 segwit
+// reserved value still hashes witness-stripped. The legacy preimage is
+// re-derived here field-by-field WITHOUT calling SerializeTransaction's
+// witness/marker path, so a stray marker/flag byte is caught, not mirrored.
+// Per-coin isolation: src/impl/nmc/ only; btc tree consumed READ-ONLY.
+// ---------------------------------------------------------------------------
+
+using nmc::coin::MutableTransaction;
+using nmc::coin::TxIn;
+using nmc::coin::TxOut;
+using nmc::coin::parent_coinbase_txid;
+
+// A minimal parent (BTC) coinbase carrying the BIP141 witness reserved value
+// (single 32-byte zero stack item) -- exactly what a real segwit coinbase
+// carries, so the txid path is forced to strip a present witness.
+static MutableTransaction make_parent_coinbase()
+{
+    MutableTransaction tx;
+    tx.version = 1;
+    tx.locktime = 0;
+    TxIn in;
+    in.prevout.hash.SetNull();
+    in.prevout.index = 0xffffffffu;
+    static const unsigned char sig[] = {0x03, 0x4e, 0x4d, 0x43};  // arbitrary scriptSig
+    in.scriptSig = OPScript(sig, sig + sizeof(sig));
+    in.sequence = 0xffffffffu;
+    tx.vin.push_back(in);
+    TxOut out;
+    out.value = 5000000000LL;
+    tx.vout.push_back(out);
+    tx.vin[0].scriptWitness.stack.assign(1, std::vector<unsigned char>(32, 0x00));
+    return tx;
+}
+
+// Independent legacy (no-witness) txid: lay out version|vin|vout|locktime via
+// PackStream directly (the TxIn serializer writes prevout+scriptSig+sequence,
+// NO witness) and double-SHA256 it -- never touching parent_coinbase_txid's
+// SerializeTransaction path.
+static uint256 legacy_txid(const MutableTransaction& tx)
+{
+    PackStream ref;
+    ref << tx.version;
+    ref << tx.vin;
+    ref << tx.vout;
+    ref << tx.locktime;
+    auto sp = std::span<const unsigned char>(
+        reinterpret_cast<const unsigned char*>(ref.data()), ref.size());
+    return Hash(sp);
+}
+
+TEST(NmcAuxParentCoinbase, TxidIsWitnessStrippedLegacyHashNotWtxid)
+{
+    auto cb = make_parent_coinbase();
+    ASSERT_TRUE(cb.HasWitness());  // a real BTC coinbase carries the reserved value
+
+    // (a) txid is hashed over the independently-laid-out legacy serialization.
+    EXPECT_EQ(parent_coinbase_txid(cb), legacy_txid(cb));
+
+    // (b) txid != wtxid: the with-witness hash differs precisely because the
+    //     witness is present and the txid path must strip it.
+    auto wpacked = pack(nmc::coin::TX_WITH_WITNESS(cb));
+    uint256 wtxid = Hash(wpacked.get_span());
+    EXPECT_NE(parent_coinbase_txid(cb), wtxid);
+}
+
+TEST(NmcAuxCheckProof, ParentLegReconstructingHeaderMerkleIsIncomplete)
+{
+    AuxPow ap;
+    ap.parent_coinbase = make_parent_coinbase();
+    uint256 cbid = parent_coinbase_txid(ap.parent_coinbase);
+    uint256 sib  = leaf_of(0x55);
+    ap.parent_coinbase_branch = {sib};
+    ap.parent_coinbase_index  = 0;            // bit0=0 => coinbase LEFT
+    // parent header commits the reconstructed tx-merkle-root; mark it non-null.
+    ap.parent_header.m_merkle_root = combine(cbid, sib);
+    ap.parent_header.m_bits = 1;              // non-null so the equality gate fires
+    // chain leg left at defaults (empty branch, index 0) => passes step 1.
+    EXPECT_EQ(ap.check_proof(leaf_of(0x01), 1),
+              AuxPow::CheckResult::INCOMPLETE);
+}
+
+TEST(NmcAuxCheckProof, ParentLegNotReconstructingHeaderMerkleIsInvalid)
+{
+    AuxPow ap;
+    ap.parent_coinbase = make_parent_coinbase();
+    ap.parent_coinbase_branch = {leaf_of(0x55)};
+    ap.parent_coinbase_index  = 0;
+    ap.parent_header.m_merkle_root = leaf_of(0x99);  // deliberately wrong root
+    ap.parent_header.m_bits = 1;                     // non-null => equality gate fires
+    EXPECT_EQ(ap.check_proof(leaf_of(0x01), 1),
+              AuxPow::CheckResult::INVALID);
+}
+
+TEST(NmcAuxCheckProof, NegativeParentCoinbaseIndexIsInvalid)
+{
+    AuxPow ap;
+    ap.parent_coinbase = make_parent_coinbase();
+    ap.parent_coinbase_branch = {leaf_of(0x55)};
+    ap.parent_coinbase_index  = -1;
+    EXPECT_EQ(ap.check_proof(leaf_of(0x01), 1),
+              AuxPow::CheckResult::INVALID);
+}
+
+TEST(NmcAuxCheckProof, ParentCoinbaseIndexTooWideForDepthIsInvalid)
+{
+    AuxPow ap;
+    ap.parent_coinbase = make_parent_coinbase();
+    ap.parent_coinbase_branch = {leaf_of(0x55)};  // depth 1 => max index 1
+    ap.parent_coinbase_index  = 2;
+    EXPECT_EQ(ap.check_proof(leaf_of(0x01), 1),
+              AuxPow::CheckResult::INVALID);
+}
+
 } // namespace
