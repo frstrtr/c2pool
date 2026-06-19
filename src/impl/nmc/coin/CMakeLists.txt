@@ -6,6 +6,7 @@
 set(nmc_coin_interface
     transaction.hpp transaction.cpp
     block.hpp
+    mempool.hpp
     header_chain.hpp
     coin_smoke.cpp
 )
