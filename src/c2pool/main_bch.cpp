@@ -33,6 +33,7 @@
 #include <impl/bch/coin/embedded_daemon.hpp>
 #include <impl/bch/coin/regtest_block.hpp>
 #include <impl/bch/coin/rpc.hpp>
+#include <impl/bch/coin/node.hpp>
 
 #include <core/core_util.hpp>
 
@@ -68,7 +69,8 @@ void print_banner(const char* argv0)
         << "c2pool-bch " << C2POOL_VERSION << " — Bitcoin Cash (SHA256d, V36)\n\n"
         << "Usage: " << argv0 << " [--version] [--help] [--selftest]\n"
         << "       " << argv0 << " --ibd [--testnet] [--near-tip] [--peer HOST:PORT] [--max-seconds N]\n"
-        << "       " << argv0 << " --leg-c-capture [--rpc-conf PATH]\n\n"
+        << "       " << argv0 << " --leg-c-capture [--rpc-conf PATH]\n"
+        << "       " << argv0 << " --leg-c-capture-p2p [--rpc-conf PATH] [--p2p-port N]\n\n"
         << "Status: M5 pool/sharechain + embedded-daemon assembly live.\n"
         << "        The embedded daemon (coin/embedded_daemon.hpp) is the primary\n"
         << "        work source; external BCHN-RPC stays as the fallback.\n"
@@ -313,6 +315,141 @@ int run_leg_c_capture(const std::string& conf_path)
     return ok ? 0 : 1;
 }
 
+
+// ---------------------------------------------------------------------------
+// leg-C: dual-path broadcaster capture (P2P-RELAY leg).
+//
+// Closes the SECOND half of the broadcaster gate (item 1). The RPC leg
+// (run_leg_c_capture, @81ca0ca5) proved NodeRPC::submit_block_hex reaches and
+// connects. This leg proves the PRIMARY embedded path -- Node::submit_block_
+// p2p_raw, the sink EmbeddedDaemon::broadcast_won_block fires first -- relays a
+// won block over the live P2P front-end and the node connects it (UpdateTip).
+//
+// Integrator verification catch (2026-06-19): do NOT reuse the RPC-leg block
+// bytes -- that block is already the node tip, so a re-relay hits already-have-
+// block and yields a FALSE-POSITIVE relay capture. This mode builds a FRESH
+// block on the CURRENT tip (height N+1) and relays ONLY via P2P (no submitblock
+// fired), so the resulting UpdateTip can ONLY have been caused by the embedded
+// relay path. PER-COIN ISOLATION: src/impl/bch + main_bch.cpp only; P2P-only,
+// zero p2pool-merged-v36 surface (parent BCH block dispatch, no share bytes).
+//
+// Regtest P2P magic = dab5bffa (BCHN chainparams.cpp CRegTestParams); default
+// P2P port 18444 (RPC 18443). The node negotiates compact blocks; a solo-
+// coinbase block prefills the only tx, so no getblocktxn round-trip is needed.
+int run_leg_c_capture_p2p(const std::string& conf_path, uint16_t p2p_port)
+{
+    RegtestRpcConf rc;
+    if (!load_rpc_conf(conf_path, rc)) {
+        std::cout << "[leg-c-p2p] FAIL -- no rpcuser/rpcpassword in " << conf_path
+                  << " (run scripts/gen-bch-daemon-creds.sh first)\n";
+        return 1;
+    }
+
+    boost::asio::io_context ctx;
+
+    // RPC client: reads the tip to build on + confirms the relayed block
+    // connected (bestblockhash advances to the fresh hash). Submission itself is
+    // P2P-only -- this RPC is read-back, NOT a submitblock sink.
+    bch::coin::NodeRPC rpc(&ctx, /*coin=*/nullptr, /*testnet=*/false);
+    rpc.connect(NetService(std::string("127.0.0.1"), rc.port), rc.user + ":" + rc.pass);
+
+    // P2P front-end config (built by hand, no YAML load -- mirrors run_ibd).
+    // Regtest magic dab5bffa, else core::Socket frames the version with empty
+    // magic and the node drops the peer on EOF (handshake never completes).
+    bch::Config cfg("bch-leg-c-p2p");
+    cfg.m_testnet = false;
+    const NetService p2p_addr(std::string("127.0.0.1"), p2p_port);
+    cfg.coin()->m_p2p.address = p2p_addr;
+    cfg.coin()->m_p2p.prefix = std::vector<std::byte>{
+        std::byte{0xda}, std::byte{0xb5}, std::byte{0xbf}, std::byte{0xfa} };
+
+    bch::coin::Node<bch::Config> node(&ctx, &cfg);
+    node.start_p2p(p2p_addr);
+    std::cout << "[leg-c-p2p] P2P relay connecting to 127.0.0.1:" << p2p_port
+              << " (regtest magic dab5bffa)\n";
+
+    bool     relayed   = false;
+    bool     confirmed = false;
+    uint256  want_hash;
+    uint32_t want_height = 0;
+    uint32_t elapsed     = 0;
+    const uint32_t TICK     = 2;
+    const uint32_t DEADLINE = 60;
+
+    core::Timer tick(&ctx, /*repeat=*/true);
+    tick.start(TICK, [&]() {
+        elapsed += TICK;
+
+        // Stage 1: await version/verack, then build + relay ONE fresh block.
+        if (!relayed) {
+            if (!node.is_handshake_complete()) {
+                if (elapsed >= DEADLINE) {
+                    std::cout << "[leg-c-p2p] FAIL -- P2P handshake never completed "
+                              << "(regtest daemon listening on 127.0.0.1:" << p2p_port << "?)\n";
+                    tick.stop(); ctx.stop();
+                }
+                return;
+            }
+            nlohmann::json info;
+            try { info = rpc.getblockchaininfo(); }
+            catch (const std::exception& e) {
+                std::cout << "[leg-c-p2p] FAIL -- getblockchaininfo: " << e.what() << "\n";
+                tick.stop(); ctx.stop(); return;
+            }
+            const uint256 prev = uint256S(info.at("bestblockhash").get<std::string>());
+            want_height = static_cast<uint32_t>(info.at("blocks").get<int>()) + 1;
+
+            const uint32_t REGTEST_BITS = 0x207fffffu;
+            const int32_t  VERSION      = 0x20000000;
+            const int64_t  SUBSIDY      = 5000000000LL;
+            auto built = bch::coin::regtest::build_and_solve(
+                prev, REGTEST_BITS, VERSION, core::timestamp(), want_height, SUBSIDY);
+            if (!built.solved) {
+                std::cout << "[leg-c-p2p] FAIL -- fresh block did not solve\n";
+                tick.stop(); ctx.stop(); return;
+            }
+            want_hash = built.hash;
+            std::cout << "[leg-c-p2p] built FRESH block: height=" << want_height
+                      << " hash=" << built.hash.GetHex()
+                      << " prev=" << prev.GetHex()
+                      << " bytes=" << built.bytes.size() << "\n";
+
+            // PRIMARY sink: P2P relay ONLY. No submitblock fired, so any
+            // UpdateTip at this hash is attributable solely to the embedded path.
+            node.submit_block_p2p_raw(built.bytes);
+            relayed = true;
+            std::cout << "[leg-c-p2p] relayed via submit_block_p2p_raw (P2P-only); "
+                      << "polling node for UpdateTip to " << built.hash.GetHex() << "\n";
+            return;
+        }
+
+        // Stage 2: confirm the node connected the relayed block (tip advanced).
+        nlohmann::json info;
+        try { info = rpc.getblockchaininfo(); }
+        catch (const std::exception&) { return; }
+        const uint256 tip = uint256S(info.at("bestblockhash").get<std::string>());
+        if (tip == want_hash) {
+            confirmed = true;
+            std::cout << "[leg-c-p2p] P2P relay leg: UpdateTip CONFIRMED -- node best="
+                      << tip.GetHex() << " height=" << want_height << "\n"
+                      << "[leg-c-p2p] expect in regtest debug.log -> "
+                      << "UpdateTip: new best=" << want_hash.GetHex()
+                      << " height=" << want_height << "\n";
+            tick.stop(); ctx.stop();
+            return;
+        }
+        if (elapsed >= DEADLINE) {
+            std::cout << "[leg-c-p2p] FAIL -- relayed but node tip did not advance to "
+                      << want_hash.GetHex() << " within " << DEADLINE << "s (still "
+                      << tip.GetHex() << ")\n";
+            tick.stop(); ctx.stop();
+        }
+    });
+
+    ctx.run();
+    return confirmed ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -320,6 +457,8 @@ int main(int argc, char** argv)
     bool want_help = false;
     bool want_ibd = false;
     bool want_leg_c = false;
+    bool want_leg_c_p2p = false;
+    uint16_t leg_c_p2p_port = 18444;  // BCHN regtest P2P default
     std::string rpc_conf;
     bool testnet = false;
     bool near_tip = false;
@@ -335,6 +474,9 @@ int main(int argc, char** argv)
         if (std::strcmp(argv[i], "--help") == 0)     want_help = true;
         if (std::strcmp(argv[i], "--ibd") == 0)      want_ibd = true;
         if (std::strcmp(argv[i], "--leg-c-capture") == 0) want_leg_c = true;
+        if (std::strcmp(argv[i], "--leg-c-capture-p2p") == 0) want_leg_c_p2p = true;
+        if (std::strcmp(argv[i], "--p2p-port") == 0 && i + 1 < argc)
+            leg_c_p2p_port = static_cast<uint16_t>(std::stoul(argv[++i]));
         if (std::strcmp(argv[i], "--rpc-conf") == 0 && i + 1 < argc) rpc_conf = argv[++i];
         if (std::strcmp(argv[i], "--testnet") == 0) { testnet = true; port = 18333; }
         if (std::strcmp(argv[i], "--near-tip") == 0) near_tip = true;
@@ -355,6 +497,14 @@ int main(int argc, char** argv)
     print_banner(argv[0]);
     if (want_help)
         return 0;
+
+    if (want_leg_c_p2p) {
+        if (rpc_conf.empty()) {
+            const char* home = std::getenv("HOME");
+            rpc_conf = std::string(home ? home : ".") + "/bch-regtest/bitcoin.conf";
+        }
+        return run_leg_c_capture_p2p(rpc_conf, leg_c_p2p_port);
+    }
 
     if (want_leg_c) {
         if (rpc_conf.empty()) {
