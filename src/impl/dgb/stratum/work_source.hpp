@@ -41,6 +41,7 @@
 
 #include <core/stratum_work_source.hpp>
 #include <core/uint256.hpp>
+#include <core/pow.hpp>       // core::SubsidyFunc — embedded coinbasevalue SSOT feed
 
 #include <atomic>
 #include <cstdint>
@@ -48,6 +49,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -83,6 +85,7 @@ public:
                   dgb::coin::Mempool&           mempool,
                   bool                          is_testnet,
                   SubmitBlockFn                 submit_fn,
+                  core::SubsidyFunc             subsidy_func,
                   core::stratum::StratumConfig  config = {});
     ~DGBWorkSource() override;
 
@@ -160,6 +163,16 @@ public:
     /// is constructed.
     void set_best_share_hash_fn(std::function<uint256()> fn);
 
+    /// Embedded-path coinbasevalue for the template builder (Stage 4c).
+    /// Routes through dgb::coin::resolve_coinbase_value: when the external
+    /// digibyted GBT supplied a coinbasevalue it is returned verbatim (the
+    /// external-daemon fallback that MUST PERSIST); otherwise the value is
+    /// derived locally as subsidy_func(height) + total_fees from the DGB
+    /// oracle decay schedule. First PRODUCTION invocation site of
+    /// CoinParams::subsidy_func (SSOT guarded by test_dgb_coinbase_value).
+    uint64_t coinbase_value(uint32_t height, uint64_t total_fees,
+                            std::optional<uint64_t> gbt_coinbasevalue) const;
+
 private:
     // External dependencies (non-owning references)
     c2pool::dgb::HeaderChain&   chain_;
@@ -168,6 +181,10 @@ private:
 
     // Submission dispatch
     SubmitBlockFn               submit_block_fn_;
+
+    // Embedded coinbasevalue SSOT feed (CoinParams::subsidy_func). Drives the
+    // template builder's coinbasevalue when no external-daemon GBT value.
+    core::SubsidyFunc           subsidy_func_;
 
     // Config (held by value; const after construction in MVP)
     core::stratum::StratumConfig config_;
