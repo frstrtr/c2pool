@@ -41,6 +41,7 @@
 #include <core/hash.hpp>
 #include <core/log.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -115,6 +116,122 @@ inline uint256 aux_merkle_root(const uint256& leaf,
         cur = Hash(sp);        // SHA256d of the 64-byte concatenation
     }
     return cur;
+}
+
+// ─── Parent-coinbase txid (P1c: AuxPow step-3 leaf identity) ───────
+
+/// Witness-stripped transaction id of the parent (BTC) coinbase.
+///
+/// AuxPow step 3 proves the parent coinbase is committed in the parent
+/// block's transaction merkle root. That tree commits *txids*, NOT wtxids —
+/// so the coinbase id MUST be hashed over the LEGACY (no-witness, no segwit
+/// marker/flag) serialization even though a real BTC coinbase carries a
+/// witness (the BIP141 segwit-commitment reserved value). Byte-for-byte
+/// identical to the btc tree's compute_txid() (mempool.hpp) but kept
+/// NMC-LOCAL per the coin fence: consumes only the nmc::coin transaction
+/// serializer (TX_NO_WITNESS) + core::Hash, no btc include.
+inline uint256 parent_coinbase_txid(const MutableTransaction& tx) {
+    auto packed = pack(TX_NO_WITNESS(tx));
+    return Hash(packed.get_span());
+}
+
+// ─── Merged-mining commitment scan (P1c-step2: AuxPow step-2 binding) ──
+
+/// pchMergedMiningHeader — the 4-byte magic tag that precedes the merged-mining
+/// commitment inside the parent coinbase scriptSig. Byte-faithful with
+/// Namecoin/Bitcoin auxpow.cpp (the same SSOT btc/doge consume); kept NMC-LOCAL
+/// per the coin fence (only std + core types, no btc include).
+inline constexpr unsigned char MM_HEADER_MAGIC[4] = {0xfa, 0xbe, 'm', 'm'};
+
+/// Read a little-endian uint32 from 4 bytes WITHOUT a host-endian memcpy: the
+/// on-wire MM size/nonce fields are always little-endian.
+inline uint32_t read_le32(const unsigned char* p) {
+    return  static_cast<uint32_t>(p[0])
+         | (static_cast<uint32_t>(p[1]) << 8)
+         | (static_cast<uint32_t>(p[2]) << 16)
+         | (static_cast<uint32_t>(p[3]) << 24);
+}
+
+/// Deterministic chain-merkle slot for a (nonce, chain_id, height) triple.
+/// Byte-faithful port of Namecoin/Bitcoin CAuxPow::getExpectedIndex: pins each
+/// aux chain to a pseudo-random-but-fixed slot so the same parent work cannot be
+/// replayed for two chains and inter-chain slot clashes are minimised. The
+/// arithmetic is intentionally wrap-around uint32 (LCG constants 1103515245 /
+/// 12345) to match the reference bit-for-bit.
+inline uint32_t aux_expected_index(uint32_t nonce, int32_t chain_id, unsigned height) {
+    uint32_t rnd = nonce;
+    rnd = rnd * 1103515245u + 12345u;
+    rnd += static_cast<uint32_t>(chain_id);
+    rnd = rnd * 1103515245u + 12345u;
+    return rnd % (1u << height);
+}
+
+/// Result of scanning a parent coinbase scriptSig for the merged-mining
+/// commitment of a given chain-merkle root.
+enum class MMScan {
+    ABSENT,    //!< no MM magic in the scriptSig — nothing to assert (staged leg)
+    MATCH,     //!< magic found and root/size/nonce/slot all bind correctly
+    MISMATCH,  //!< magic found but the commitment is malformed or inconsistent
+};
+
+/// Step 2 of AuxPow verification: confirm the reconstructed chain-merkle root is
+/// the one committed inside the parent coinbase's merged-mining marker, and that
+/// this chain occupies the slot the (nonce, chain_id) binding demands.
+///
+/// Byte-faithful port of the coinbase scan in Namecoin/Bitcoin auxpow.cpp
+/// (CAuxPow::check), kept NMC-LOCAL per the coin fence (only std + core types):
+///   * the 4-byte MM magic must appear exactly once;
+///   * the chain-merkle root must follow the magic immediately, stored in the
+///     REVERSED (big-endian display) byte order auxpow.cpp uses;
+///   * the next 4 LE bytes are the tree size and MUST equal 2^height;
+///   * the following 4 LE bytes are the nonce, and chain_index MUST equal
+///     aux_expected_index(nonce, chain_id, height).
+/// Returns ABSENT when the magic is absent entirely — the staged-leg posture
+/// (mirrors the null-parent-header gate in step 3): step 2 cannot be asserted off
+/// a fixture carrying no marker, and the proof never upgrades to VALID regardless.
+/// NOTE (constant-pinning): the legacy no-magic "root in the first 20 bytes"
+/// back-compat branch of the reference is intentionally NOT honoured — post-
+/// activation Namecoin merge-mining always carries the magic; the final
+/// endianness/layout cross-check happens against a live namecoind at pinning.
+/// chain_merkle_root is taken by value (base_uint::begin() is non-const).
+inline MMScan scan_mm_commitment(const std::vector<unsigned char>& script,
+                                 uint256 chain_merkle_root,
+                                 unsigned chain_height,
+                                 int32_t expected_chain_id,
+                                 uint32_t chain_index) {
+    const unsigned char* magic = MM_HEADER_MAGIC;
+    auto magic_it = std::search(script.begin(), script.end(), magic, magic + 4);
+    if (magic_it == script.end())
+        return MMScan::ABSENT;  // staged: no commitment to bind against yet
+
+    // Replay guard: exactly one MM header may appear (the reference rejects a
+    // second so one parent block cannot smuggle two commitments for one chain).
+    if (std::search(magic_it + 4, script.end(), magic, magic + 4) != script.end())
+        return MMScan::MISMATCH;
+
+    // The chain-merkle root is committed reversed (big-endian display order).
+    const unsigned char* rb =
+        reinterpret_cast<const unsigned char*>(chain_merkle_root.begin());
+    std::vector<unsigned char> root_be(rb, rb + uint256::BYTES);
+    std::reverse(root_be.begin(), root_be.end());
+
+    auto root_pos = magic_it + 4;
+    if (static_cast<size_t>(script.end() - root_pos) < root_be.size())
+        return MMScan::MISMATCH;  // truncated before the root
+    if (!std::equal(root_be.begin(), root_be.end(), root_pos))
+        return MMScan::MISMATCH;  // magic present but commits a different root
+
+    auto pc = root_pos + static_cast<std::ptrdiff_t>(root_be.size());
+    if (script.end() - pc < 8)
+        return MMScan::MISMATCH;  // missing the 4-byte size + 4-byte nonce
+    uint32_t n_size  = read_le32(&*pc);
+    uint32_t n_nonce = read_le32(&*(pc + 4));
+    if (n_size != (1u << chain_height))
+        return MMScan::MISMATCH;  // tree size disagrees with the branch depth
+    if (chain_index != aux_expected_index(n_nonce, expected_chain_id, chain_height))
+        return MMScan::MISMATCH;  // chain sits in the wrong deterministic slot
+
+    return MMScan::MATCH;
 }
 
 // ─── AuxPow (merge-mining proof) ─────────────────────────────────────────────
@@ -218,29 +335,73 @@ struct AuxPow {
     /// Until all four steps exist, NMC MUST NOT block-validate off this leaf.
     CheckResult check_proof(const uint256& aux_block_hash,
                             int32_t expected_chain_id) const {
-        // P1b — chain-merkle leg (step 1). Walk the aux (NMC) block hash up
-        // through chain_merkle_branch/chain_merkle_index to reconstruct the
-        // merged-mining merkle root via aux_merkle_root(). The remaining steps
-        // are NOT built yet: step 2 (confirm that root is committed in the
-        // parent coinbase MM marker, with the chain_id/slot binding), step 3
-        // (parent-coinbase tx-merkle leg — needs the witness-stripped BTC
-        // coinbase txid), step 4 (parent PoW vs target, consumed from the btc
-        // tree READ-ONLY). A structurally-consistent chain-merkle walk therefore
-        // returns INCOMPLETE, never VALID — NMC still MUST NOT block-validate
-        // off this leaf.
-        (void)expected_chain_id;  // step-2 (chain_id/slot) binding lands later
+        // P1b+P1c — three merkle legs wired. Step 1 (chain-merkle) walks the
+        // aux (NMC) block hash through chain_merkle_branch/index to reconstruct
+        // the merged-mining root; step 2 (MM-marker) confirms that root is the
+        // one committed inside the parent coinbase's merged-mining marker, with
+        // the (nonce, chain_id) slot binding; step 3 (parent-coinbase tx-merkle)
+        // walks the witness-stripped parent coinbase txid through
+        // parent_coinbase_branch/index and, when a parent header is present,
+        // requires it to reproduce that header's tx-merkle-root. The remaining
+        // step 4 (parent PoW vs target, consumed from the btc tree READ-ONLY) is
+        // NOT built yet. Because step 4 does not exist, a structurally-consistent
+        // proof returns INCOMPLETE, never VALID — NMC still MUST NOT block-
+        // validate off this leaf. Any malformed leg (negative slot index, an
+        // index wider than its branch depth, a parent-coinbase leg that does not
+        // reconstruct the parent header's tx-merkle-root, or an MM marker that
+        // commits a different root / wrong tree-size / wrong slot) is INVALID.
 
+        // ── step 1 (P1b): chain-merkle leg ──
         if (chain_merkle_index < 0)
             return CheckResult::INVALID;  // negative slot index is malformed
-
+        uint256 reconstructed_mm_root;
         try {
-            // Reconstructed MM root; its commitment check is step 2 (pending).
-            (void)aux_merkle_root(
+            // Reconstruct the merged-mining merkle root; step 2 binds it to the
+            // parent coinbase commitment.
+            reconstructed_mm_root = aux_merkle_root(
                 aux_block_hash, chain_merkle_branch,
                 static_cast<uint32_t>(chain_merkle_index));
         } catch (const std::invalid_argument&) {
             return CheckResult::INVALID;  // branch index out of range for depth
         }
+
+        // ── step 2 (P1c-step2): MM-marker commitment + chain_id/slot binding ──
+        // Confirm the reconstructed MM root is the one committed inside the
+        // parent coinbase's merged-mining marker, with the (nonce, chain_id)
+        // slot binding. When the coinbase carries no marker (a leg-only
+        // structural fixture, or an empty parent coinbase) there is nothing to
+        // assert yet — staged posture, mirrors the null-parent-header gate in
+        // step 3. A marker present but committing a different root / wrong size /
+        // wrong slot is INVALID.
+        if (!parent_coinbase.vin.empty()) {
+            MMScan scan = scan_mm_commitment(
+                parent_coinbase.vin[0].scriptSig.m_data,
+                reconstructed_mm_root,
+                static_cast<unsigned>(chain_merkle_branch.size()),
+                expected_chain_id,
+                static_cast<uint32_t>(chain_merkle_index));
+            if (scan == MMScan::MISMATCH)
+                return CheckResult::INVALID;
+        }
+
+        // ── step 3 (P1c): parent-coinbase tx-merkle leg ──
+        if (parent_coinbase_index < 0)
+            return CheckResult::INVALID;  // negative slot index is malformed
+        uint256 reconstructed_parent_merkle;
+        try {
+            // The parent tx-merkle tree commits the WITNESS-STRIPPED txid.
+            reconstructed_parent_merkle = aux_merkle_root(
+                parent_coinbase_txid(parent_coinbase), parent_coinbase_branch,
+                static_cast<uint32_t>(parent_coinbase_index));
+        } catch (const std::invalid_argument&) {
+            return CheckResult::INVALID;  // branch index out of range for depth
+        }
+        // The equality gate only fires once a parent header is present: a real
+        // proof always carries one, but a leg-only structural fixture leaves it
+        // null and has nothing to match against yet (steps 2/4 still pending).
+        if (!parent_header.IsNull() &&
+            reconstructed_parent_merkle != parent_header.m_merkle_root)
+            return CheckResult::INVALID;
 
         return CheckResult::INCOMPLETE;
     }
