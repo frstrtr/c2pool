@@ -141,13 +141,18 @@ test('Middleware chain: error-taxonomy normalises thrown errors', async () => {
     ...mockTransport(),
     fetchWindow: async () => { throw { status: 429, retryAfter: 2000 }; },
   };
-  // Bound retries and skip timeout so this test fences in ~ms, not the
-  // D7 unbounded production default.
+  // This test's subject is error-taxonomy normalisation, not retry/timeout.
+  // Disable both transport retry and timeout so the normalised error
+  // propagates immediately. (With retry enabled, the chain honours the
+  // server-supplied Retry-After of 2000ms — Math.max(delay, retryAfterMs)
+  // in retry.ts — and sleeps the full 2s before the final throw, pushing
+  // this test onto the CI per-test deadline. maxAttempts:1 still performs
+  // one retry, so it does not avoid the sleep.)
   await host.init({
     kind: 'shared-core',
     transport: angryTransport,
     plugins: {
-      'core.transport.retry': { baseMs: 1, capMs: 2, multiplier: 2, jitterPct: 0, maxAttempts: 1 },
+      'core.transport.retry': false,
       'core.transport.timeout': false,
     },
   });
