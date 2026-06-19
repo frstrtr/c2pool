@@ -201,6 +201,21 @@ if (BUILD_TESTING AND GTest_FOUND)
         nlohmann_json::nlohmann_json)
     gtest_add_tests(dgb_embedded_coin_node_test "" AUTO)
 
+    # dgb_embedded_tx_select_test: guards make_mempool_tx_source
+    # (embedded_tx_select.cpp), the production Mempool -> GBT transactions[]
+    # {data,txid,hash,fee} + fee-total shaper EmbeddedCoinNode injects. Compiles
+    # the tx serialization codec, so it links the same proven SCC set as
+    # dgb_embedded_coin_node_test. MUST also be in BOTH build.yml --target
+    # allowlists (#143 NOT_BUILT trap).
+    add_executable(dgb_embedded_tx_select_test embedded_tx_select_test.cpp)
+    target_link_libraries(dgb_embedded_tx_select_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb dgb_stratum
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain
+        nlohmann_json::nlohmann_json)
+    gtest_add_tests(dgb_embedded_tx_select_test "" AUTO)
+
 
     foreach(dgb_guard rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test)
         add_executable(${dgb_guard} ${dgb_guard}.cpp)

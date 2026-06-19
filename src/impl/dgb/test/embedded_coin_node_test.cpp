@@ -135,3 +135,44 @@ TEST(DgbEmbeddedCoinNode, GetworkProducesTemplateWithNoFabrication)
     EXPECT_TRUE(wd.m_hashes.empty());            // no tx hashes fabricated
     EXPECT_FALSE(node.is_synced());              // truthful: not synced yet
 }
+
+// 5. Injected tx source: the fee total folds into coinbasevalue via the #207
+//    SSOT and transactions[] passes through build_work_template verbatim.
+//    Codec-free: a stub source supplies an ALREADY-SHAPED selection, exactly
+//    as make_mempool_tx_source would, so this guard never compiles the tx
+//    serialization codec (the embedded_tx_select.cpp / dgb_embedded_tx_select_test
+//    pins the real shaping over a Mempool).
+TEST(DgbEmbeddedCoinNode, InjectedTxSourceFoldsFeesAndPassesTransactions)
+{
+    HeaderChain hc;
+    hc.validate_and_append(HeaderSample{SCRYPT, 1000, 100});
+
+    nlohmann::json txs = nlohmann::json::array();
+    nlohmann::json e1; e1["data"]="00"; e1["txid"]="aa"; e1["hash"]="aa"; e1["fee"]=700;
+    nlohmann::json e2; e2["data"]="01"; e2["txid"]="bb"; e2["hash"]="bb"; e2["fee"]=300;
+    txs.push_back(e1); txs.push_back(e2);
+    const uint64_t fees = 1000;
+
+    EmbeddedCoinNode node(hc, make_subsidy(),
+        [txs, fees]() -> dgb::coin::EmbeddedTxSelection { return {txs, fees}; });
+
+    const uint32_t h = hc.next_block_height();
+    const nlohmann::json t = build_work_template(node.make_inputs(7));
+    EXPECT_EQ(t["coinbasevalue"].get<uint64_t>(), 1000ull + h + fees); // subsidy(h)+fees
+    EXPECT_EQ(t["transactions"], txs);                                 // verbatim pass-through
+    EXPECT_EQ(t["transactions"].size(), 2u);
+}
+
+// 6. Empty (default) tx source == byte-identical to the no-source template
+//    (the #237 call-site invariant: a node with no tx source fabricates nothing).
+TEST(DgbEmbeddedCoinNode, EmptyTxSourceByteIdenticalToNoSource)
+{
+    HeaderChain hc;
+    hc.validate_and_append(HeaderSample{SCRYPT, 1000, 100});
+
+    EmbeddedCoinNode no_src(hc, make_subsidy());
+    EmbeddedCoinNode empty_src(hc, make_subsidy(), dgb::coin::EmbeddedTxSource{});
+
+    EXPECT_EQ(build_work_template(empty_src.make_inputs(5)).dump(),
+              build_work_template(no_src.make_inputs(5)).dump());
+}
