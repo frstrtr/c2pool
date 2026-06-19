@@ -1013,4 +1013,107 @@ TEST(NmcP1eForkChoice, FirstHeaderBecomesTipRegardlessOfPriorState)
     EXPECT_EQ(chain_.cumulative_work(), nmc::coin::get_block_proof(kEasyBits));
 }
 
+// ── P1f: HeaderChain::get_locator — BIP31 block locator over tip ancestry ──
+
+TEST(NmcP1fLocator, EmptyChainProducesEmptyLocator)
+{
+    HeaderChain chain_(params_activation(19200));
+    EXPECT_TRUE(chain_.get_locator().empty());
+}
+
+TEST(NmcP1fLocator, SingleHeaderLocatorIsJustTheTip)
+{
+    HeaderChain chain_(params_activation(19200));
+    uint256 z; z.SetNull();
+    BlockHeaderType g = plain_header(z, kEasyBits, 1);
+    ASSERT_TRUE(chain_.add_header(g));
+    auto loc = chain_.get_locator();
+    ASSERT_EQ(loc.size(), 1u);
+    EXPECT_EQ(loc.front(), block_hash(g));
+}
+
+TEST(NmcP1fLocator, ShortChainLocatorIsDenseTipToRoot)
+{
+    HeaderChain chain_(params_activation(19200));
+    uint256 z; z.SetNull();
+    BlockHeaderType g  = plain_header(z, kEasyBits, 1);
+    ASSERT_TRUE(chain_.add_header(g));
+    BlockHeaderType a1 = plain_header(block_hash(g),  kEasyBits, 2);
+    ASSERT_TRUE(chain_.add_header(a1));
+    BlockHeaderType a2 = plain_header(block_hash(a1), kEasyBits, 3);
+    ASSERT_TRUE(chain_.add_header(a2));
+    auto loc = chain_.get_locator();
+    ASSERT_EQ(loc.size(), 3u);          // dense: every block while <= 10 deep
+    EXPECT_EQ(loc[0], block_hash(a2));  // tip first
+    EXPECT_EQ(loc[1], block_hash(a1));
+    EXPECT_EQ(loc[2], block_hash(g));   // root last
+}
+
+TEST(NmcP1fLocator, LongChainFrontIsContiguousAndAnchoredAtRoot)
+{
+    HeaderChain chain_(params_activation(19200));
+    uint256 z; z.SetNull();
+    BlockHeaderType g = plain_header(z, kEasyBits, 1);
+    ASSERT_TRUE(chain_.add_header(g));
+    std::vector<uint256> hashes{block_hash(g)};
+    uint256 prev = block_hash(g);
+    for (uint32_t i = 1; i <= 30; ++i) {            // height 0..30 (31 headers)
+        BlockHeaderType h = plain_header(prev, kEasyBits, i + 1);
+        ASSERT_TRUE(chain_.add_header(h));
+        prev = block_hash(h);
+        hashes.push_back(prev);
+    }
+    auto loc = chain_.get_locator();
+    EXPECT_EQ(chain_.height(), 30u);
+    // First 11 entries are contiguous from the tip (step stays 1 until >10).
+    for (size_t i = 0; i < 11u; ++i)
+        EXPECT_EQ(loc[i], hashes[hashes.size() - 1 - i]);
+    // Backoff makes the locator far shorter than the chain, root-anchored.
+    EXPECT_LT(loc.size(), hashes.size());
+    EXPECT_EQ(loc.back(), block_hash(g));
+}
+
+TEST(NmcP1fLocator, BackoffStrideDoublesPastTheDenseHead)
+{
+    HeaderChain chain_(params_activation(19200));
+    uint256 z; z.SetNull();
+    BlockHeaderType g = plain_header(z, kEasyBits, 1);
+    ASSERT_TRUE(chain_.add_header(g));
+    uint256 prev = block_hash(g);
+    for (uint32_t i = 1; i <= 30; ++i) {
+        BlockHeaderType h = plain_header(prev, kEasyBits, i + 1);
+        ASSERT_TRUE(chain_.add_header(h));
+        prev = block_hash(h);
+    }
+    auto loc = chain_.get_locator();
+    // No duplicates, strictly descending toward the root, all known to the chain.
+    for (size_t i = 0; i < loc.size(); ++i)
+        EXPECT_TRUE(chain_.has_header(loc[i]));
+    for (size_t i = 1; i < loc.size(); ++i)
+        EXPECT_NE(loc[i], loc[i - 1]);
+}
+
+TEST(NmcP1fLocator, LocatorFollowsTheTipAfterAWorkReorg)
+{
+    HeaderChain chain_(params_activation(19200));
+    uint256 z; z.SetNull();
+    BlockHeaderType g  = plain_header(z, kEasyBits, 1);
+    ASSERT_TRUE(chain_.add_header(g));
+    // Light branch a1<-a2 builds the initial tip.
+    BlockHeaderType a1 = plain_header(block_hash(g),  kEasyBits, 2);
+    ASSERT_TRUE(chain_.add_header(a1));
+    BlockHeaderType a2 = plain_header(block_hash(a1), kEasyBits, 3);
+    ASSERT_TRUE(chain_.add_header(a2));
+    // One heavy sibling at height 1 reorgs the tip onto branch b.
+    BlockHeaderType b1 = plain_header(block_hash(g), kHardBits, 4);
+    ASSERT_TRUE(chain_.add_header(b1));
+    ASSERT_EQ(chain_.tip()->block_hash, block_hash(b1));
+    auto loc = chain_.get_locator();
+    // Locator tracks the NEW tip's ancestry (b1 <- g), not the abandoned a-branch.
+    ASSERT_EQ(loc.size(), 2u);
+    EXPECT_EQ(loc[0], block_hash(b1));
+    EXPECT_EQ(loc[1], block_hash(g));
+    EXPECT_EQ(std::count(loc.begin(), loc.end(), block_hash(a2)), 0);
+}
+
 } // namespace
