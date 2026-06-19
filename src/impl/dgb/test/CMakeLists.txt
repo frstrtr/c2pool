@@ -32,6 +32,21 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_block_assembly_test "" AUTO)
 
+    # --- #82: won-block reconstructor BODY (as_block composition) ----------
+    # Pins coin/reconstruct_won_block.hpp: the single composition the dispatch
+    # handler injects as its WonBlockReconstructor (resolve_other_tx_hashes ->
+    # assemble_other_txs -> assemble_won_block). Links the dgb OBJECT lib like
+    # dgb_block_assembly_test because it pulls block_assembly.hpp (BlockType /
+    # MutableTransaction / check_merkle_link). MUST appear in BOTH this
+    # registration AND the build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_reconstruct_won_block_test reconstruct_won_block_test.cpp)
+    target_link_libraries(dgb_reconstruct_won_block_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_reconstruct_won_block_test "" AUTO)
+
     # --- M3 RPC-transport standalone regression guards ---------------------
     # Header-only guards over the external-daemon RPC coin-layer SSOTs
     # (rpc_request.hpp request-shape + version floor + genesis identity, and
@@ -67,6 +82,52 @@ if (BUILD_TESTING AND GTest_FOUND)
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_gentx_share_path_test "" AUTO)
+
+    # --- #82 sub-slice 1: transaction_hash_refs -> other_tx hash walk -------
+    # coin/other_tx_resolver.hpp is the won-block reconstructor`s connecting
+    # tissue (faithful get_other_tx_hashes ancestry resolution). It pulls
+    # uint256 (SetHex TU) via share_types.hpp, so it links the proven dgb OBJECT-lib SCC set (like dgb_block_assembly_test)
+    # rather than the header-only guard foreach (linking bare `core` drags in
+    # web_server.cpp, whose symbols live in the SCC libs). The tracker ops are
+    # injected, so no dgb pool state is exercised. MUST also appear in the
+    # build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_other_tx_resolver_test other_tx_resolver_test.cpp)
+    target_link_libraries(dgb_other_tx_resolver_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_other_tx_resolver_test "" AUTO)
+
+    # --- #82 sub-slice 2: other_tx hashes -> MutableTransaction other_txs ---
+    # coin/other_tx_assembler.hpp is the won-block reconstructor`s bridge from
+    # the resolved other_tx hash list (sub-slice 1) to the deserialized txs that
+    # assemble_won_block frames (faithful as_block known_txs[h] lookup). Links
+    # the dgb OBJECT lib like dgb_block_assembly_test because the end-to-end KAT
+    # frames through dgb::check_merkle_link + the live BlockType codec. MUST also
+    # appear in the build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_other_tx_assembler_test other_tx_assembler_test.cpp)
+    target_link_libraries(dgb_other_tx_assembler_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_other_tx_assembler_test "" AUTO)
+
+    # --- #82: gentx-bytes -> MutableTransaction unpack (inverse of #173) ----
+    # coin/gentx_unpack.hpp turns the share's SSOT non-witness gentx bytes back
+    # into the MutableTransaction reconstruct_won_block injects at tx index 0.
+    # Pulls PackStream/Hash/uint256 + transaction.hpp, so it links the proven
+    # dgb OBJECT-lib SCC set like dgb_gentx_coinbase_test. Oracle round-trip +
+    # inverse-pairing KAT. MUST also appear in the build.yml --target allowlist
+    # (#143 NOT_BUILT trap).
+    add_executable(dgb_gentx_unpack_test gentx_unpack_test.cpp)
+    target_link_libraries(dgb_gentx_unpack_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_gentx_unpack_test "" AUTO)
 
     foreach(dgb_guard rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test header_chain_test)
         add_executable(${dgb_guard} ${dgb_guard}.cpp)
