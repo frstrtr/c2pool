@@ -12,16 +12,22 @@
 //      reaches avg_target nor widens actual_timespan. A naive all-headers
 //      window would corrupt both; this proves it can't.
 //
-// Header-only guard: links the header-only chain helpers + gtest, no dgb
-// OBJECT lib / transport. MUST appear in BOTH the test/CMakeLists foreach AND
-// both build.yml --target allowlists, or it becomes a #143 NOT_BUILT sentinel.
+// Links the header-only chain helpers + gtest, plus the btclibs Scrypt PoW TU
+// set (scrypt.cpp + the SHA256 family) so the M3 7b digest conversion runs
+// against the REAL scrypt_1024_1_1_256 hash -- NOT the full btclibs archive,
+// NOT the dgb OBJECT lib / transport. MUST appear in BOTH the test/CMakeLists
+// dedicated target block AND both build.yml --target allowlists, or it becomes
+// a #143 NOT_BUILT sentinel.
 // ---------------------------------------------------------------------------
 
 #include <cstdint>
+#include <cstring>
+#include <limits>
 
 #include <gtest/gtest.h>
 
 #include <impl/dgb/coin/header_chain.hpp>
+#include <btclibs/crypto/scrypt.h>
 
 using namespace c2pool::dgb;
 using dgb::coin::DGB_BLOCK_VERSION_SCRYPT;
@@ -201,40 +207,54 @@ TEST(DigiShieldRetarget, ConsumesLiveScryptOnlyWindow)
 }
 
 // ---------------------------------------------------------------------------
-// Ingest-path retarget gate: validate_and_append must demand the declared
-// Scrypt target EQUAL the DigiShield next-target computed over the Scrypt-only
-// window ending at the current tip (nBits-style exact consensus match). A
-// default-constructed chain leaves the gate unconfigured (target_timespan 0 ->
-// expected 0), so every test above runs unconstrained; this one configures it.
+// Parent-difficulty retarget gate DEMOTED to a no-op for V36 (integrator
+// decision 2026-06-18, operator FYI'd). p2pool-merged-v36 never re-derives
+// parent difficulty -- it trusts the declared nBits and checks PoW against it.
+// DGB's live retarget is MultiShield V4 (a GLOBAL cross-algo averaging window),
+// which a Scrypt-only walk cannot reproduce -> full recompute is V37 5-algo
+// scope. So a declared Scrypt target that does NOT equal the single-algo
+// DigiShield next-target is NO LONGER rejected by the ingest path; it is
+// accepted on the daemon-independent CheckProofOfWork halves alone (pow_limit
+// floor + scrypt(header) <= target). digishield_next_target() survives as test
+// scaffolding / a reference for the V37 embedded-daemon port.
 //
 //   window depth 1, nominal 80. Window(1) over a lone Scrypt tip has
 //   actual_timespan 0 (front == back) -> damped = 80 + (0-80)/8 = 70, above the
-//   floor rail 60 -> next target = avg * 70/80 = avg * 7/8, deterministically.
+//   floor rail 60 -> reference next target = avg * 70/80 = avg * 7/8.
 // ---------------------------------------------------------------------------
-TEST(HeaderChainValidate, IngestGateEnforcesDigiShieldNextTarget)
+TEST(HeaderChainValidate, IngestRetargetGateDemotedToNoOpForV36)
 {
     HeaderChain hc(DigiShieldParams{80, 0}, /*retarget_window=*/1);
 
-    // Seed: empty window -> gate no-op, any non-zero target seeds the chain.
+    // Seed a lone Scrypt tip.
     ASSERT_EQ(hc.validate_and_append({SCRYPT, 1000, 4096}),
               IngestResult::VALIDATED_SCRYPT);
 
-    // Required next target = 4096 * 7/8 = 3584. A mismatch is consensus-invalid
-    // and must REJECT without mutating the chain (size + work unchanged).
-    const std::size_t size_before = hc.size();
-    const uint64_t    work_before = hc.cumulative_work();
-    EXPECT_EQ(hc.validate_and_append({SCRYPT, 1080, 4096}),
-              IngestResult::REJECTED);
-    EXPECT_EQ(hc.size(),            size_before);
-    EXPECT_EQ(hc.cumulative_work(), work_before);
+    // The single-algo DigiShield reference next-target over window(1) is
+    // 4096 * 7/8 = 3584 -- still computable as V37 embedded-port scaffolding,
+    // even though the ingest path no longer enforces it.
+    const RetargetWindow rw = hc.next_retarget_window(1);
+    EXPECT_EQ(digishield_next_target(rw, DigiShieldParams{80, 0}), 3584u);
 
-    // The exact DigiShield target is accepted and credits work.
-    EXPECT_EQ(hc.validate_and_append({SCRYPT, 1080, 3584}),
+    // A header whose declared target does NOT equal that reference (4096 != 3584)
+    // is ACCEPTED and credits work: V36 trusts the declared nBits rather than
+    // re-deriving and demanding an exact match.
+    const uint64_t work_before = hc.cumulative_work();
+    EXPECT_EQ(hc.validate_and_append({SCRYPT, 1080, 4096}),
               IngestResult::VALIDATED_SCRYPT);
     EXPECT_GT(hc.cumulative_work(), work_before);
 
-    // Continuity headers bypass the retarget gate (work-neutral, no nBits).
-    EXPECT_EQ(hc.validate_and_append({SHA256D, 1090, 1}),
+    // The PoW satisfaction half still fires independent of the demoted gate: a
+    // header whose scrypt(header) digest exceeds its declared target is rejected
+    // without mutating the chain.
+    HeaderSample weak{SCRYPT, 1090, 4096};
+    weak.pow_hash = 4097;
+    const std::size_t size_before = hc.size();
+    EXPECT_EQ(hc.validate_and_append(weak), IngestResult::REJECTED);
+    EXPECT_EQ(hc.size(), size_before);
+
+    // Continuity headers remain work-neutral and bypass every PoW gate.
+    EXPECT_EQ(hc.validate_and_append({SHA256D, 1100, 1}),
               IngestResult::ACCEPTED_CONTINUITY);
 }
 
@@ -256,8 +276,8 @@ TEST(HeaderChainValidate, IngestGateRejectsTargetAbovePowLimit)
               IngestResult::VALIDATED_SCRYPT);
 
     // A target ABOVE pow_limit (easier than the network minimum) must REJECT
-    // without mutating the chain -- and it must do so on the ceiling alone,
-    // before the retarget-equality gate (which here would demand 4096*7/8=3584).
+    // without mutating the chain -- the ceiling is the sole rejecter here (the
+    // single-algo retarget-equality gate is demoted to a no-op in V36).
     const std::size_t size_before = hc.size();
     const uint64_t    work_before = hc.cumulative_work();
     EXPECT_EQ(hc.validate_and_append({SCRYPT, 1080, 4097}),
@@ -439,4 +459,190 @@ TEST(HeaderChainValidate, IngestPoWSatisfactionRunsAtFullWidth)
     weak.pow_hash.limb[3] = 2;            // 2^193, low64 == 0
     EXPECT_EQ(hc.validate_and_append(weak), IngestResult::REJECTED);
     EXPECT_EQ(hc.size(), 1u);             // unchanged
+}
+
+// ---------------------------------------------------------------------------
+// 256-BIT DIGEST INGEST (M3 7b) -- bytes -> field conversion. The embedded
+// DigiByte Core port produces the Scrypt PoW hash as a 32-byte little-endian
+// digest (scrypt_1024_1_1_256 output). u256::from_le_bytes is the bytes->field
+// half of dropping that digest into HeaderSample::pow_hash; the scrypt CALL
+// itself (btclibs) lands at the ingest boundary in a following slice. Pins the
+// little-endian limb mapping (limb[0] = least-significant 8 bytes, matching
+// bitcoin UintToArith256) and proves a converted digest feeds the existing
+// full-width satisfaction gate with the SAME ordering -- no low64 proxy.
+// ---------------------------------------------------------------------------
+TEST(HeaderChainValidate, ScryptDigestLittleEndianConversion)
+{
+    // Byte i = i+1, so each limb is a distinct, easily-checked LE word.
+    unsigned char d[32];
+    for (int i = 0; i < 32; ++i) d[i] = (unsigned char)(i + 1);
+    u256 h = u256::from_le_bytes(d);
+    EXPECT_EQ(h.limb[0], 0x0807060504030201ULL);
+    EXPECT_EQ(h.limb[1], 0x100f0e0d0c0b0a09ULL);
+    EXPECT_EQ(h.limb[2], 0x1817161514131211ULL);
+    EXPECT_EQ(h.limb[3], 0x201f1e1d1c1b1a19ULL);
+
+    // All-zero digest -> 0 (trivially satisfies any non-zero target).
+    unsigned char zero[32] = {0};
+    EXPECT_TRUE(u256::from_le_bytes(zero).is_zero());
+
+    // All-0xff digest -> MAX 256-bit value (every limb saturated), exceeding
+    // any real Scrypt target -> would NOT satisfy PoW.
+    unsigned char ones[32];
+    for (int i = 0; i < 32; ++i) ones[i] = 0xff;
+    u256 maxv = u256::from_le_bytes(ones);
+    for (int i = 0; i < 4; ++i) EXPECT_EQ(maxv.limb[i], 0xffffffffffffffffULL);
+
+    // Feed a converted digest through the live satisfaction gate: digest 9
+    // (low byte) vs target 2^192 + 5 -> 9 <= 2^192+5 at full width -> VALIDATED.
+    // Proves the converted value flows the SAME full-width path the field-shape
+    // swap widened, not a low64 proxy.
+    HeaderChain hc;
+    u256 target; target.limb[3] = 1; target.limb[0] = 5;
+    unsigned char nine[32] = {0}; nine[0] = 9;
+    HeaderSample s{SCRYPT, 1000};
+    s.target   = target;
+    s.pow_hash = u256::from_le_bytes(nine);
+    EXPECT_EQ(hc.validate_and_append(s), IngestResult::VALIDATED_SCRYPT);
+    EXPECT_EQ(hc.size(), 1u);
+}
+
+
+// ---------------------------------------------------------------------------
+// REAL SCRYPT DIGEST -> pow_hash, END-TO-END (M3 7b, slice (a)). The prior test
+// pins the from_le_bytes limb mapping against SYNTHETIC bytes; this one closes
+// the loop by running the ACTUAL btclibs scrypt_1024_1_1_256 PoW hash over an
+// 80-byte header, converting the 32-byte little-endian digest via from_le_bytes,
+// and feeding it through the live full-width satisfaction gate. Proves the
+// conversion primitive is correct against a GENUINE Scrypt digest. It does NOT
+// prove scrypt is wired into the production node.cpp ingest path -- that
+// (b)-shaped call lands in embedded-daemon Phase A, scoped with an exe-smoke.
+// ---------------------------------------------------------------------------
+TEST(HeaderChainValidate, RealScryptDigestFeedsSatisfactionGate)
+{
+    // Deterministic 80-byte header (content arbitrary for the conversion proof;
+    // fixed so the digest is a stable self-derived KAT).
+    char header[80];
+    for (int i = 0; i < 80; ++i) header[i] = (char)(i + 1);
+
+    unsigned char digest[32];
+    scrypt_1024_1_1_256(header, reinterpret_cast<char*>(digest));
+
+    // Deterministic: a second run yields the identical digest.
+    unsigned char digest2[32];
+    scrypt_1024_1_1_256(header, reinterpret_cast<char*>(digest2));
+    EXPECT_EQ(0, std::memcmp(digest, digest2, 32));
+
+    // Self-derived KAT: pin the actual scrypt PoW hash for this fixed header so
+    // any drift in scrypt OR the LE conversion is caught. limb[0] is the least-
+    // significant 8 bytes (from_le_bytes / UintToArith256 ordering).
+    u256 h = u256::from_le_bytes(digest);
+    EXPECT_EQ(h.limb[0], 0x3863b84a2bd8d4c7ULL);
+    EXPECT_EQ(h.limb[1], 0xdbc48fcba50b456bULL);
+    EXPECT_EQ(h.limb[2], 0x22185f7f7b983293ULL);
+    EXPECT_EQ(h.limb[3], 0x64d9ed52d29c3fbdULL);
+
+    // The real digest, converted, satisfies a max (pow_limit) target -> VALID.
+    HeaderChain hc;
+    u256 max_target; for (int i = 0; i < 4; ++i) max_target.limb[i] = 0xffffffffffffffffULL;
+    HeaderSample ok{SCRYPT, 1000};
+    ok.target   = max_target;
+    ok.pow_hash = h;
+    EXPECT_EQ(hc.validate_and_append(ok), IngestResult::VALIDATED_SCRYPT);
+    EXPECT_EQ(hc.size(), 1u);
+
+    // Same real digest vs a tiny target (value 1): the high limbs are nonzero
+    // (0x64d9...) so hash > 1 at full width -> REJECT. A low64-only proxy could
+    // not see the high limbs -- this proves the converted digest flows the
+    // full-width satisfaction path, not a truncated comparison. No mutation.
+    HeaderSample weak{SCRYPT, 1075};
+    weak.target.limb[0] = 1;        // value == 1, all high limbs zero
+    weak.pow_hash = h;
+    EXPECT_EQ(hc.validate_and_append(weak), IngestResult::REJECTED);
+    EXPECT_EQ(hc.size(), 1u);        // unchanged
+}
+
+// ---------------------------------------------------------------------------
+// MTP MONOTONICITY INGEST GUARD (M3 7b -- ContextualCheckBlockHeader
+// "time-too-old"). A Scrypt header's nTime must be STRICTLY GREATER than the
+// median timestamp of the tip and its (up to) 10 nearest ancestors. This is the
+// daemon-independent, Scrypt-only-walk-safe half of header time validation: it
+// reads only timestamps already in the local header chain, no difficulty
+// re-derivation (the demoted V4-MultiShield recompute). Every appended header of
+// EVERY algo contributes to the median exactly as DGB Core's block index does,
+// but only the Scrypt-validated path is rejected on it -- continuity headers are
+// accept-by-continuity and bypass the gate.
+// ---------------------------------------------------------------------------
+TEST(HeaderChainMtp, GenesisIsUnconstrained)
+{
+    // Empty chain -> median_time_past() == INT64_MIN -> any nTime accepted.
+    HeaderChain hc;
+    EXPECT_EQ(hc.median_time_past(), std::numeric_limits<int64_t>::min());
+    EXPECT_EQ(hc.validate_and_append({SCRYPT, 1, 100}),
+              IngestResult::VALIDATED_SCRYPT);
+    EXPECT_EQ(hc.size(), 1u);
+}
+
+TEST(HeaderChainMtp, RejectsTimeNotStrictlyAboveMedian)
+{
+    // Seed 5 monotone Scrypt headers; MTP over the last 5 is sorted[2] == 1200.
+    HeaderChain hc;
+    for (int64_t t : {1000, 1100, 1200, 1300, 1400})
+        ASSERT_EQ(hc.validate_and_append({SCRYPT, t, 100}),
+                  IngestResult::VALIDATED_SCRYPT);
+    EXPECT_EQ(hc.median_time_past(), 1200);
+
+    const std::size_t size_before = hc.size();
+    const uint64_t    work_before = hc.cumulative_work();
+
+    // nTime == median: NOT strictly greater -> reject, no mutation.
+    EXPECT_EQ(hc.validate_and_append({SCRYPT, 1200, 100}),
+              IngestResult::REJECTED);
+    // nTime below median -> reject.
+    EXPECT_EQ(hc.validate_and_append({SCRYPT, 1150, 100}),
+              IngestResult::REJECTED);
+    EXPECT_EQ(hc.size(),            size_before);
+    EXPECT_EQ(hc.cumulative_work(), work_before);
+
+    // nTime strictly above median -> accepted.
+    EXPECT_EQ(hc.validate_and_append({SCRYPT, 1500, 100}),
+              IngestResult::VALIDATED_SCRYPT);
+    EXPECT_EQ(hc.size(), size_before + 1);
+}
+
+TEST(HeaderChainMtp, ContinuityTimestampsContributeToMedian)
+{
+    // A continuity header is NOT MTP-checked (accept-by-continuity), but its
+    // timestamp DOES enter the median window -- DGB Core's GetMedianTimePast
+    // walks every block of every algo.
+    HeaderChain hc;
+    ASSERT_EQ(hc.validate_and_append({SCRYPT,  1000, 100}),
+              IngestResult::VALIDATED_SCRYPT);
+    // Continuity header far in the future: accepted, bypasses MTP.
+    ASSERT_EQ(hc.validate_and_append({SHA256D, 5000, 100}),
+              IngestResult::ACCEPTED_CONTINUITY);
+
+    // Median over the last 2 headers (1000, 5000) is sorted[1] == 5000. A Scrypt
+    // header at 4000 is ABOVE the prior Scrypt time yet <= the continuity-lifted
+    // median, so it is rejected -- proving the continuity timestamp feeds it.
+    EXPECT_EQ(hc.median_time_past(), 5000);
+    EXPECT_EQ(hc.validate_and_append({SCRYPT, 4000, 100}),
+              IngestResult::REJECTED);
+    // Strictly above the continuity-lifted median -> accepted.
+    EXPECT_EQ(hc.validate_and_append({SCRYPT, 6000, 100}),
+              IngestResult::VALIDATED_SCRYPT);
+}
+
+TEST(HeaderChainMtp, ContinuityHeaderItselfBypassesMtp)
+{
+    // A continuity header with a time AT or BELOW the median is still accepted:
+    // the gate is Scrypt-path only.
+    HeaderChain hc;
+    ASSERT_EQ(hc.validate_and_append({SCRYPT, 2000, 100}),
+              IngestResult::VALIDATED_SCRYPT);
+    EXPECT_EQ(hc.median_time_past(), 2000);
+    // A continuity header at 1500 (below the median) is NOT rejected.
+    EXPECT_EQ(hc.validate_and_append({SKEIN, 1500, 100}),
+              IngestResult::ACCEPTED_CONTINUITY);
+    EXPECT_EQ(hc.size(), 2u);
 }
