@@ -361,5 +361,30 @@ TEST(NmcAuxChainEmbedded, SubmitBlockNeverSilentDropOnZeroPeers)
     EXPECT_EQ(backend.get_block_hex("any"), hex);  // hex still cached
 }
 
+// PE dual-path gate (integrator note #3): the FALLBACK leg. submit_block() above
+// is the P2P-primary route; submit_aux_block() is the submitauxblock RPC fallback.
+// In embedded mode there is no daemon to RPC, so the fallback acknowledges (the
+// P2P relay leg is authoritative) WITHOUT claiming a daemon submission - and,
+// crucially, unlike submit_block() it does NOT populate the block-hex cache.
+// This pins the two legs as DISTINCT (P2P-primary cached vs RPC-fallback no-cache),
+// the both-paths-fire gate proven at unit level ahead of the live .140 won-block
+// soak (which is daemon-gated). A coin is not block-viable until both legs exist.
+TEST(NmcAuxChainEmbedded, SubmitAuxBlockFallbackLegIsDistinctFromP2PRelay)
+{
+    HeaderChain chain(params_pinned());
+    Mempool pool;
+    AuxChainEmbedded backend(chain, pool, params_pinned(), nmc_aux_config());
+
+    uint256 aux_hash; aux_hash.SetNull();
+    const std::string auxpow_hex(120, static_cast<char>(0x64));
+
+    // Fallback leg acknowledges: embedded has no daemon, P2P relay is primary,
+    // so the caller is not hard-failed (the block already went out over P2P).
+    EXPECT_TRUE(backend.submit_aux_block(aux_hash, auxpow_hex));
+    // ...but the RPC-fallback leg leaves the P2P submit_block() hex cache UNTOUCHED:
+    // the two broadcaster legs are independent, not aliases of one path.
+    EXPECT_EQ(backend.get_block_hex("any"), std::string(""));
+}
+
 
 } // namespace
