@@ -16,14 +16,22 @@
 #include <impl/dgb/stratum/work_source.hpp>
 #include <impl/dgb/coin/header_chain.hpp>
 #include <impl/dgb/coin/mempool.hpp>
+#include <impl/dgb/config_coin.hpp>   // dgb::CoinParams::subsidy (oracle SSOT)
+
+#include <core/pow.hpp>                 // core::SubsidyFunc
 
 #include <core/stratum_work_source.hpp>
 
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <optional>
 
 namespace {
+
+// IDENTICAL to params.hpp `p.subsidy_func` — the live CoinParams indirection.
+const core::SubsidyFunc kSubsidyFunc =
+    [](uint32_t height) -> uint64_t { return dgb::CoinParams::subsidy(height); };
 
 // Construct a DGBWorkSource over default-constructed coin deps. The submit
 // callback records whether it was invoked (it must NOT be in the 4a skeleton).
@@ -39,7 +47,7 @@ struct Fixture {
             return false;
         };
         return std::make_unique<dgb::stratum::DGBWorkSource>(
-            chain, mempool, /*is_testnet=*/false, fn);
+            chain, mempool, /*is_testnet=*/false, fn, kSubsidyFunc);
     }
 };
 
@@ -164,6 +172,57 @@ TEST(DgbWorkSource, ComputeShareDifficultyReturnsNotYetSentinel)
         /*version=*/0x20000000u, "prevhash", "1e0ffff0",
         /*merkle_branches=*/{});
     EXPECT_DOUBLE_EQ(diff, 0.0);
+}
+
+// ── Embedded coinbasevalue: first production caller of subsidy_func ──────────
+// One pin on each side of every DGB reward-era boundary (p2pool-dgb-scrypt
+// oracle vectors, test_dgb_subsidy.cpp).
+namespace {
+struct EraVec { uint32_t height; uint64_t subsidy; const char* era; };
+constexpr EraVec kEraBoundaries[] = {
+    {67199,   8000000000ULL, "phase1-fixed last"},
+    {67200,   7960000000ULL, "phase2 -0.5%/wk first"},
+    {399999,  6746441103ULL, "phase2 last"},
+    {400000,  2434410000ULL, "phase3 -1%/wk first"},
+    {1429999, 2157824200ULL, "phase3 last"},
+    {1430000, 1078500000ULL, "phase4 monthly-decay first"},
+};
+}  // namespace
+
+// No external GBT (embedded path): coinbasevalue is derived THROUGH the work
+// source's subsidy_func at every era boundary, zero fees -> oracle subsidy.
+TEST(DgbWorkSource, CoinbaseValueDerivesViaSubsidyFuncWhenNoGbt)
+{
+    Fixture fx;
+    auto ws = fx.make();
+    for (const auto& v : kEraBoundaries) {
+        EXPECT_EQ(ws->coinbase_value(v.height, /*fees=*/0, std::nullopt), v.subsidy)
+            << "embedded coinbasevalue diverged from oracle subsidy at " << v.era;
+    }
+}
+
+// Fees compose additively on the embedded path: subsidy + total_fees.
+TEST(DgbWorkSource, CoinbaseValueAddsFeesOnEmbeddedPath)
+{
+    Fixture fx;
+    auto ws = fx.make();
+    constexpr uint64_t kFees = 1234567ULL;
+    for (const auto& v : kEraBoundaries) {
+        EXPECT_EQ(ws->coinbase_value(v.height, kFees, std::nullopt), v.subsidy + kFees)
+            << "fee addition wrong at " << v.era;
+    }
+}
+
+// External-daemon fallback PERSISTS: a present GBT coinbasevalue is authoritative
+// and returned verbatim through the work source, bypassing local derivation.
+TEST(DgbWorkSource, CoinbaseValueHonorsGbtVerbatim)
+{
+    Fixture fx;
+    auto ws = fx.make();
+    constexpr uint64_t kGbt = 99999999999ULL;  // deliberately != subsidy+fees
+    EXPECT_EQ(ws->coinbase_value(/*height=*/400000, /*fees=*/500,
+                                 std::optional<uint64_t>{kGbt}),
+              kGbt);
 }
 
 }  // namespace

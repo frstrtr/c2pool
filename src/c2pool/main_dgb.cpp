@@ -277,7 +277,8 @@ int run_node(const core::CoinParams& params, bool testnet,
     // (declared just above, same scope). The StratumServer co-owns the work
     // source via shared_ptr.
     auto work_source = std::make_shared<dgb::stratum::DGBWorkSource>(
-        header_chain, mempool, testnet, std::move(stratum_submit_fn));
+        header_chain, mempool, testnet, std::move(stratum_submit_fn),
+        params.subsidy_func);
 
     if (stratum_port != 0) {
         stratum_server = std::make_unique<core::StratumServer>(

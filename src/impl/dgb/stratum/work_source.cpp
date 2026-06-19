@@ -17,6 +17,7 @@
 
 #include <impl/dgb/coin/header_chain.hpp>
 #include <impl/dgb/coin/mempool.hpp>
+#include <impl/dgb/coin/embedded_coinbase_value.hpp>
 
 #include <core/log.hpp>
 
@@ -26,11 +27,13 @@ DGBWorkSource::DGBWorkSource(c2pool::dgb::HeaderChain&     chain,
                              dgb::coin::Mempool&           mempool,
                              bool                          is_testnet,
                              SubmitBlockFn                 submit_fn,
+                             core::SubsidyFunc             subsidy_func,
                              core::stratum::StratumConfig  config)
     : chain_(chain)
     , mempool_(mempool)
     , is_testnet_(is_testnet)
     , submit_block_fn_(std::move(submit_fn))
+    , subsidy_func_(std::move(subsidy_func))
     , config_(std::move(config))
 {
     LOG_INFO << "[DGB-STRATUM] DGBWorkSource constructed"
@@ -38,10 +41,27 @@ DGBWorkSource::DGBWorkSource(c2pool::dgb::HeaderChain&     chain,
              << " min_diff=" << config_.min_difficulty
              << " max_diff=" << config_.max_difficulty
              << " target_time=" << config_.target_time
-             << "s vardiff=" << (config_.vardiff_enabled ? "on" : "off") << ")";
+             << "s vardiff=" << (config_.vardiff_enabled ? "on" : "off")
+             << " subsidy_func=" << (subsidy_func_ ? "wired" : "UNSET") << ")";
 }
 
 DGBWorkSource::~DGBWorkSource() = default;
+
+// ──────────────────────────────────────────────────────────────────
+// Embedded coinbasevalue — first PRODUCTION caller of CoinParams::subsidy_func.
+// Delegates to the dgb::coin SSOT (embedded_coinbase_value.hpp) so the embedded
+// TemplateBuilder coinbasevalue and the external-daemon GBT coinbasevalue are
+// computed from ONE definition and can never silently diverge. The GBT value,
+// when present, is authoritative and returned verbatim (external-daemon
+// fallback MUST PERSIST); otherwise subsidy_func(height)+fees is derived from
+// the DGB oracle decay schedule.
+// ──────────────────────────────────────────────────────────────────
+uint64_t DGBWorkSource::coinbase_value(uint32_t height, uint64_t total_fees,
+                                       std::optional<uint64_t> gbt_coinbasevalue) const
+{
+    return dgb::coin::resolve_coinbase_value(subsidy_func_, height, total_fees,
+                                             gbt_coinbasevalue);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // IWorkSource: config + read-only state — Stage 4b will fill these in.
