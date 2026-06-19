@@ -185,8 +185,8 @@ struct BCHChainParams {
 
     /// BCH testnet4 params (port 28333). NOTE: BCH testnet4 has its OWN genesis
     /// (distinct from BTC testnet4) — this is a consensus constant.
-    /// TODO(M3): verify genesis_hash against VM300 bchn-bch chainparams.cpp
-    /// before any testnet4 integration run.
+    /// Verified vs BCHN v29.0.0 src/chainparams.cpp (commit 89a591f) genesis
+    /// assert — pinned by test/genesis_conformance_test.cpp (M3 closed).
     static BCHChainParams testnet4() {
         BCHChainParams p;
         p.asert                = asert_testnet4();
@@ -652,7 +652,15 @@ private:
         // our mining builds on the new tip, so no new blocks appear on the
         // old fork.
         bool dominated    = entry.chain_work > m_best_work;
-        bool equal_at_tip = entry.chain_work == m_best_work
+        // First-seen-wins (BCHN / Bitcoin consensus): an equal-work competitor
+        // does NOT replace the incumbent tip. The equal-work reorg is permitted
+        // ONLY under min-difficulty params (testnet 20-minute rule), where our
+        // own miner and the network can independently mint same-work blocks at
+        // one height and the peer header represents network consensus. On
+        // mainnet this stays false, so a same-work fork can never flip-flop the
+        // tip (which would also be a cheap reorg-DoS vector).
+        bool equal_at_tip = m_params.allow_min_difficulty
+                         && entry.chain_work == m_best_work
                          && new_height == m_tip_height
                          && bhash != m_tip;
         if (dominated || equal_at_tip) {

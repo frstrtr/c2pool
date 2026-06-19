@@ -49,6 +49,8 @@
 #include "compact_blocks.hpp"
 #include "mempool.hpp"
 #include "merkle.hpp"
+#include "header_sync.hpp"
+#include "block_download.hpp"
 
 #include <memory>
 
@@ -94,6 +96,13 @@ private:
     static constexpr time_t CONNECT_TIMEOUT_SEC = 10;
     static constexpr time_t IDLE_TIMEOUT_SEC = 100;
     static constexpr time_t PING_INTERVAL_SEC = 30;
+    // Headers-first block-download stall recovery. Every BLOCK_DL_EXPIRE_TICK_SEC
+    // the in-flight getdata(MSG_BLOCK) window is scanned; any request outstanding
+    // >= BLOCK_DL_TIMEOUT_SEC is presumed dropped by a stalling peer, requeued, and
+    // re-issued from the freed slot. Tick << timeout so a stall is caught within one
+    // cadence of the deadline without churning the window. See block_download.hpp.
+    static constexpr time_t BLOCK_DL_EXPIRE_TICK_SEC = 5;
+    static constexpr time_t BLOCK_DL_TIMEOUT_SEC = 60;
 
     bch::interfaces::Node* m_coin;
     io::io_context* m_context;
@@ -104,6 +113,7 @@ private:
     std::unique_ptr<core::Timer> m_reconnect_timer;
     std::unique_ptr<core::Timer> m_ping_timer;
     std::unique_ptr<core::Timer> m_timeout_timer;
+    std::unique_ptr<core::Timer> m_block_dl_timer;
     NetService m_target_addr;
     bool m_reconnect_enabled = false;
     bool m_handshake_complete = false;
@@ -128,6 +138,10 @@ private:
     uint256   m_sent_cmpct_hash;
     // External mempool for compact block tx matching
     Mempool* m_mempool{nullptr};
+    // Headers-first windowed block download (cold-start IBD). Bounds outstanding
+    // getdata(MSG_BLOCK) so the synced header stream is pulled as block bodies at
+    // the peer's pace instead of stalling after header sync. See block_download.hpp.
+    block_download::BlockDownloadWindow m_block_dl;
 
     // Callbacks for broadcaster integration
     using AddrCallback = std::function<void(const std::vector<NetService>&)>;
@@ -202,6 +216,7 @@ public:
     {
         stop_ping_timer();
         stop_timeout_timer();
+        stop_block_dl_timer();
         m_handshake_complete = false;
         m_peer.reset();
     }
@@ -252,6 +267,7 @@ public:
 
         stop_ping_timer();
         stop_timeout_timer();
+        stop_block_dl_timer();
         m_handshake_complete = false;
     }
 
@@ -347,6 +363,24 @@ public:
         }
     }
 
+    /// Drain the IBD block-download window: issue getdata(MSG_BLOCK) for every
+    /// hash the window releases (bounded by MAX_BLOCKS_IN_FLIGHT). Called after
+    /// enqueuing a synced headers batch and again on each block arrival to top
+    /// the window back up. No-op when the window is full or the queue is empty.
+    void drain_block_window()
+    {
+        if (!m_peer) return;
+        for (const auto& bhash : m_block_dl.next_requests(now_tick_sec())) {
+            auto getdata_msg = message_getdata::make_raw(
+                {inventory_type(inventory_type::block, bhash)});
+            m_peer->write(getdata_msg);
+            LOG_DEBUG_COIND << "[" << m_chain_label << "] IBD getdata block "
+                            << bhash.GetHex().substr(0, 16) << "... (in flight "
+                            << m_block_dl.in_flight() << ", queued "
+                            << m_block_dl.queued() << ")";
+        }
+    }
+
     /// Whether this peer supports compact blocks (BIP 152).
     bool supports_compact_blocks() const { return m_peer_supports_cmpct; }
     /// Peer's service flags from version message (for NODE_BLOOM check etc.)
@@ -358,6 +392,14 @@ public:
     uint32_t peer_version() const { return m_peer_version; }
     const std::string& peer_subver() const { return m_peer_subver; }
     uint32_t peer_start_height() const { return m_peer_start_height; }
+
+    /// Read-only IBD block-download evidence (M5 --ibd run-loop). reissue =
+    /// stalled in-flight requests re-issued; false_evict = evicted requests
+    /// whose block arrived anyway (premature timeout). Both 0 on a clean sync.
+    std::size_t ibd_reissue_count() const { return m_block_dl.reissue_count(); }
+    std::size_t ibd_false_evict_count() const { return m_block_dl.false_evict_count(); }
+    std::size_t ibd_in_flight() const { return m_block_dl.in_flight(); }
+    std::size_t ibd_queued() const { return m_block_dl.queued(); }
     int64_t peer_uptime_sec() const {
         return std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - m_connected_at).count();
@@ -465,6 +507,41 @@ private:
             m_ping_timer->stop();
     }
 
+    void ensure_block_dl_timer()
+    {
+        if (!m_block_dl_timer)
+            m_block_dl_timer = std::make_unique<core::Timer>(m_context, true);
+    }
+
+    void stop_block_dl_timer()
+    {
+        if (m_block_dl_timer)
+            m_block_dl_timer->stop();
+    }
+
+    /// Monotonic seconds since connect -- the tick domain for the block-download
+    /// window's issue/expire bookkeeping. steady_clock so it never runs backwards.
+    uint64_t now_tick_sec() const
+    {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - m_connected_at).count());
+    }
+
+    /// Periodic stall-recovery tick: requeue in-flight block requests outstanding
+    /// >= BLOCK_DL_TIMEOUT_SEC and re-issue from the freed slots. No-op while
+    /// nothing is in flight or nothing has timed out.
+    void expire_block_window()
+    {
+        auto requeued = m_block_dl.expire(now_tick_sec(), BLOCK_DL_TIMEOUT_SEC);
+        if (requeued.empty()) return;
+        LOG_DEBUG_COIND << "[" << m_chain_label << "] IBD block-dl expire requeued "
+                        << requeued.size() << " stalled request(s) (in flight "
+                        << m_block_dl.in_flight() << ", queued "
+                        << m_block_dl.queued() << ")";
+        drain_block_window();
+    }
+
     void on_activity()
     {
         if (!m_peer)
@@ -529,6 +606,11 @@ private:
         ensure_ping_timer();
         m_ping_timer->start(PING_INTERVAL_SEC, [this]() {
             send_ping();
+        });
+
+        ensure_block_dl_timer();
+        m_block_dl_timer->start(BLOCK_DL_EXPIRE_TICK_SEC, [this]() {
+            expire_block_window();
         });
 
         // BIP 130: request header-first block announcements
@@ -677,6 +759,11 @@ private:
                  << blockhash.GetHex().substr(0, 16) << "..."
                  << " txs=" << block.m_txs.size();
         emit_full_block(block, blockhash);
+
+        // IBD window: this block freed a slot (if it was one we requested) --
+        // top the window back up so the next queued block bodies stream in.
+        m_block_dl.on_block_received(blockhash);
+        drain_block_window();
     }
 
     ADD_P2P_HANDLER(headers)
@@ -699,19 +786,54 @@ private:
         if (!vheaders.empty()) {
             m_coin->new_headers.happened(vheaders);
 
-            // BIP 130: when receiving a small headers batch (new block
-            // announcement), request the full block via getdata.
-            // BCH: plain MSG_BLOCK (0x02) — no witness-bearing block inv.
-            if (vheaders.size() <= 3 && m_peer) {
-                for (auto& hdr : vheaders) {
-                    auto packed = pack(hdr);
-                    auto bhash = Hash(packed.get_span());
-                    auto getdata_msg = message_getdata::make_raw(
-                        {inventory_type(inventory_type::block, bhash)});
-                    m_peer->write(getdata_msg);
-                    LOG_INFO << "[" << m_chain_label << "] Requesting full block "
-                             << bhash.GetHex().substr(0, 16) << "...";
+            // Headers-first BLOCK download is INDEPENDENT of the getheaders
+            // follow-up policy: EVERY header batch we learn -- a maximal IBD
+            // batch, a BIP130 tip announce, OR a non-maximal partial batch (the
+            // --near-tip anchor->tip span is ~100 headers) -- must have its
+            // block BODIES pulled, or the ABLA size feed / block-connector
+            // starve: the header chain advances to the peer tip but
+            // AblaTracker's cursor never moves (pinned at the 32 MB floor). The
+            // old code queued bodies ONLY inside the ContinueSync branch, so the
+            // near-tip span classified Idle and downloaded NOTHING -- exactly
+            // the pinned-cursor symptom. Queue this batch's hashes through the
+            // bounded, deduping, reissue-accounted window for ALL batch shapes;
+            // block_download.hpp dedupes overlap and bounds in_flight while
+            // accounting reissue/false_evict.
+            std::vector<uint256> batch_hashes;
+            batch_hashes.reserve(vheaders.size());
+            for (auto& hdr : vheaders) {
+                auto p = pack(hdr);
+                batch_hashes.push_back(Hash(p.get_span()));
+            }
+            m_block_dl.enqueue(batch_hashes);
+            drain_block_window();
+
+            // getheaders follow-up policy (header_sync.hpp, PURE + tested).
+            // Block bodies for ALL batch shapes were already queued above; here
+            // we only decide whether to re-issue getheaders for the NEXT header
+            // batch:
+            //   ContinueSync  -- maximal IBD batch, peer has more -> getheaders
+            //   RequestBlocks -- BIP130 tip announce / partial batch -> bodies
+            //                    only (already queued); no further header sync
+            //   Idle          -- caught up; nothing further to fetch
+            using header_sync::Followup;
+            switch (header_sync::classify_headers_batch(vheaders.size())) {
+            case Followup::ContinueSync:
+                if (m_peer) {
+                    // Anchor the next locator at the last header we just learned
+                    // so the peer streams the next batch forward to its tip.
+                    auto last_packed = pack(vheaders.back());
+                    auto last_hash = Hash(last_packed.get_span());
+                    send_getheaders(m_peer_version ? m_peer_version : 1,
+                                    {last_hash}, uint256::ZERO);
+                    LOG_INFO << "[" << m_chain_label << "] IBD: got "
+                             << vheaders.size() << " headers, continuing from "
+                             << last_hash.GetHex().substr(0, 16) << "...";
                 }
+                break;
+            case Followup::RequestBlocks:
+            case Followup::Idle:
+                break;
             }
         }
     }

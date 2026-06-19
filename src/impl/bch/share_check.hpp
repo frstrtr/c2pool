@@ -929,7 +929,8 @@ inline std::vector<unsigned char> get_share_script(const auto* obj)
 // Reference: frstrtr/p2pool-merged-v36  p2pool/data.py  generate_transaction()
 // ============================================================================
 template <typename ShareT, typename TrackerT>
-uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool dump_diag = false, bool v36_active = false)
+uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool dump_diag = false, bool v36_active = false,
+                                  std::vector<unsigned char>* out_gentx_bytes = nullptr)
 {
     auto gst_t0 = std::chrono::steady_clock::now();
     constexpr int64_t ver = ShareT::version;
@@ -1125,10 +1126,18 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
             return a.first < b.first; // asc by script for tie-breaking
         });
 
-    // Keep last MAX_OUTPUTS (highest amounts), matching Python's [-4000:]
+    // Keep last MAX_OUTPUTS (highest amounts), matching Python's [-4000:].
+    // Oracle (p2pool data.py) applies [-4000:] over the donation-INCLUSIVE dest
+    // list; we append the donation output separately below, so reserve one slot
+    // for it and clamp miners to MAX_OUTPUTS-1. This keeps total payout vouts
+    // <= 4000, byte-matching oracle. Residual edge: if the donation amount
+    // ranked below 4000 miner amounts the oracle would trim it instead -- not
+    // reachable in a BCH PPLNS window (leftover + 0.5% finder fee dominate), but
+    // documented here rather than relied on silently. (broadcaster-gate clamp)
     constexpr size_t MAX_OUTPUTS = 4000;
-    if (payout_outputs.size() > MAX_OUTPUTS)
-        payout_outputs.erase(payout_outputs.begin(), payout_outputs.end() - MAX_OUTPUTS);
+    constexpr size_t MAX_MINER_OUTPUTS = MAX_OUTPUTS - 1; // reserve donation slot
+    if (payout_outputs.size() > MAX_MINER_OUTPUTS)
+        payout_outputs.erase(payout_outputs.begin(), payout_outputs.end() - MAX_MINER_OUTPUTS);
 
     // --- 4. Serialise the coinbase transaction ---
     // Non-witness serialization (for txid computation):
@@ -1370,6 +1379,18 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
     auto tx_span = std::span<const unsigned char>(
         reinterpret_cast<const unsigned char*>(tx.data()), tx.size());
     auto txid = Hash(tx_span);
+
+    // Expose the exact serialized coinbase (gentx) bytes the txid was hashed
+    // from. This is the SAME byte buffer that produced the txid -- reusing it
+    // (rather than re-deriving in a second codepath) guarantees the won-block
+    // reconstruction emits a coinbase byte-identical to the one consensus and
+    // the sharechain validated. Coinbase byte-layout conformance vs p2poolBCH
+    // already adjudicated (no re-derivation = no divergence risk).
+    if (out_gentx_bytes) {
+        const unsigned char* p =
+            reinterpret_cast<const unsigned char*>(tx.data());
+        out_gentx_bytes->assign(p, p + tx.size());
+    }
 
     // V36 hash_link cross-check: compute prefix hash_link from our coinbase
     // and compare with the share's stored hash_link. If states differ,
@@ -2356,8 +2377,10 @@ uint256 create_local_share_v35(
                 if (a.second != b.second) return a.second < b.second;
                 return a.first < b.first;
             });
-        if (payout_outputs.size() > 4000)
-            payout_outputs.erase(payout_outputs.begin(), payout_outputs.end() - 4000);
+        // Reserve one slot for the separately-appended donation output so total
+        // payout vouts stay <= 4000, matching oracle donation-inclusive [-4000:].
+        if (payout_outputs.size() > 3999)
+            payout_outputs.erase(payout_outputs.begin(), payout_outputs.end() - 3999);
 
         PackStream gentx;
         { uint32_t v = 1; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&v), 4)); }
@@ -2910,8 +2933,10 @@ uint256 create_local_share(
                 if (a.second != b.second) return a.second < b.second;
                 return a.first < b.first;
             });
-        if (payout_outputs.size() > 4000)
-            payout_outputs.erase(payout_outputs.begin(), payout_outputs.end() - 4000);
+        // Reserve one slot for the separately-appended donation output so total
+        // payout vouts stay <= 4000, matching oracle donation-inclusive [-4000:].
+        if (payout_outputs.size() > 3999)
+            payout_outputs.erase(payout_outputs.begin(), payout_outputs.end() - 3999);
 
         PackStream gentx;
         { uint32_t v = 1; gentx.write(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&v), 4)); }

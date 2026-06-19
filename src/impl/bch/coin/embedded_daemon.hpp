@@ -51,6 +51,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "header_chain.hpp"     // HeaderChain
 #include "mempool.hpp"          // Mempool
@@ -61,6 +63,8 @@
 #include "bchn_anchor_record.hpp" // BchnAnchorRecord (cold-start anchor)
 
 #include <core/log.hpp>
+#include <core/events.hpp>   // EventDisposable (new_headers subscription handle)
+#include <core/uint256.hpp> // uint256S (near-tip checkpoint seed)   // EventDisposable (new_headers subscription handle)
 
 namespace bch {
 namespace coin {
@@ -77,7 +81,8 @@ public:
     /// daemon (owned by the binary entrypoint, same contract as coin::Node).
     EmbeddedDaemon(auto* context, config_t* config, uint32_t anchor_height)
         : m_config(config),
-          m_chain(),
+          m_chain(config->m_testnet ? BCHChainParams::testnet()
+                                    : BCHChainParams::mainnet()),
           m_pool(),
           m_embedded(m_chain, m_pool, config->m_testnet),
           m_node(context, config),
@@ -91,22 +96,192 @@ public:
     /// flow node --> feed --> tracker --> EmbeddedCoinNode dynamic budget, and
     /// EmbeddedCoinNode::getwork() is the live in-process work source.
     void run() {
+        m_chain.init();               // load genesis / fast-start checkpoint (network-free)
         m_node.run();                 // init_rpc(): external BCHN-RPC fallback retained
-        m_abla.wire(m_node, m_embedded);
-        // Build the CoinNode seam NOW (not in the ctor): m_node.rpc() is only
-        // live after run()/init_rpc(). Embedded work source = primary, the
-        // external BCHN-RPC = retained fallback (v36 external_fallback law).
-        m_coin_node = std::make_unique<CoinNode>(&m_embedded, m_node.rpc());
+        assemble();                   // network-free seam + ABLA wiring (see below)
+        wire_chain_ingest();          // new_headers --> HeaderChain (advances synced height)
+        pin_cold_start_anchor();      // operator-APPROVED VM300 anchor (decisions@ 2026-06-18); floor-equivalent
         LOG_INFO << "[EMB-BCH] embedded daemon up: embedded-primary work source,"
                  << " external BCHN-RPC fallback retained, ABLA loop closed"
-                 << " (cold-start floor anchor; VM300 pin pending operator).";
+                 << " (cold-start anchor pinned @" << BchnAnchorRecord::height << ").";
     }
+
+    /// READ-ONLY IBD evidence harness entry (drives the --ibd run-loop in
+    /// main_bch.cpp). Brings up ONLY the network-free chain + the P2P front-end
+    /// pointed at a single BCHN peer (VM300 bchn-bch .110:8333), with the
+    /// headers-first ingest subscription (wire_chain_ingest) live, so a REAL
+    /// sync advances m_chain past its init() checkpoint and the block-download
+    /// window accrues the in_flight / reissue / false_evict counters the harness
+    /// reports. Deliberately does NOT call init_rpc(): this is a read-only
+    /// header/block pull for evidence, NOT the production daemon -- run() still
+    /// owns the external BCHN-RPC fallback (external_fallback invariant intact).
+    /// A P2P peer connection issues NO qm/control op, so VM300 stays read-only.
+    /// p2pool-merged-v36 surface: NONE (local SPV header state only).
+    void start_ibd(const NetService& peer) {
+        m_chain.init();               // genesis/checkpoint origin (network-free)
+        assemble();                   // ABLA loop + CoinNode seam (network-free)
+        wire_chain_ingest();          // new_headers --> HeaderChain (height advance)
+        pin_cold_start_anchor();      // operator-approved floor-equivalent anchor
+        m_node.start_p2p(peer);       // read-only P2P connect to the BCHN peer
+    }
+
+    /// NEAR-TIP variant of the read-only IBD harness (UID 1375 follow-up). The
+    /// plain --ibd cold-start CANNOT exercise AblaBlockFeed advancement: by
+    /// construction the ABLA cursor only moves when full blocks arrive
+    /// CONTIGUOUSLY from the anchor (height == cursor+1), and the anchor sits at
+    /// BchnAnchorRecord::height (955700) -- only ~100+ blocks below the live
+    /// VM300 tip. A genesis-origin sync reaches at most a few ten-thousand
+    /// headers in a harness window, all far below the anchor, so every
+    /// downloaded block is height <= cursor -> idempotently ignored -> the
+    /// cursor never moves (exactly the pre-tip state UID 1375 confirmed).
+    ///
+    /// This variant seeds the header chain's dynamic checkpoint AT the
+    /// operator-approved anchor {height,hash} BEFORE connecting, so the locator
+    /// anchors at 955700 and the peer streams ONLY the last handful of headers
+    /// to its tip. Their block bodies backfill through the download window and
+    /// fold into AblaTracker as REAL serialized sizes -- advancing the cursor
+    /// 955700 -> tip, the proof that full_block --> AblaBlockFeed --> AblaTracker
+    /// is live on live-network data (UID 1369 acceptance (a): real, not
+    /// synthetic). Still strictly read-only: a seeded checkpoint + P2P
+    /// header/block pull issues NO qm/control op, VM300 stays read-only. NO
+    /// init_rpc() -- the external BCHN-RPC fallback path is run()'s, untouched.
+    /// The anchor hash is the SAME static record run() pins (no new VM read).
+    /// p2pool-merged-v36 surface: NONE (local SPV + ABLA budget only).
+    void start_ibd_near_tip(const NetService& peer) {
+        m_chain.init();               // genesis/checkpoint origin (network-free)
+        // Seed the header origin at the operator-approved BCHN anchor so the
+        // sync covers only anchor -> tip (a handful of blocks), letting the ABLA
+        // feed actually fold real block sizes within one harness run.
+        m_chain.set_dynamic_checkpoint(
+            BchnAnchorRecord::height,
+            uint256S(std::string(BchnAnchorRecord::hash)));
+        assemble();                   // ABLA loop + CoinNode seam (network-free)
+        wire_chain_ingest();          // new_headers --> HeaderChain (height advance)
+        pin_cold_start_anchor();      // ABLA anchor @ the SAME height as the seed
+        m_node.start_p2p(peer);       // read-only P2P connect to the BCHN peer
+    }
+
+    /// True once the BCHN peer handshake (version/verack) has completed, so the
+    /// first locator-anchored getheaders can be issued.
+    bool ibd_handshake_ready() {
+        return m_node.has_p2p() && m_node.p2p()->is_handshake_complete();
+    }
+
+    /// Kick the first headers-first getheaders from our current locator
+    /// (genesis/checkpoint). The peer streams its chain forward and the
+    /// p2p_node ContinueSync follow-up self-drives the rest of IBD; block
+    /// bodies backfill through the bounded download window. Caller issues this
+    /// once, after ibd_handshake_ready() turns true.
+    void ibd_kick_sync() {
+        m_node.send_getheaders(70016, m_chain.get_locator(), uint256::ZERO);
+    }
+
+    /// NETWORK-FREE assembly of the in-process daemon graph: close the ABLA
+    /// size loop (full_block --> feed --> tracker --> EmbeddedCoinNode budget)
+    /// and build the CoinNode seam (core::coin::ICoinNode) embedded-primary.
+    /// Split out of run() so the embedded cluster can be assembled and verified
+    /// against the REAL EmbeddedCoinNode without bringing up the external
+    /// BCHN-RPC / P2P front-end (run() = m_node.run() THEN assemble()).
+    ///
+    /// The seam binds &m_embedded (always-live, primary) + m_node.rpc() (the
+    /// external FALLBACK sink). When assemble() runs BEFORE run(), m_node.rpc()
+    /// is still null -> the seam is embedded-primary with the fallback absent,
+    /// which is the correct offline contract; run() calls assemble() AFTER
+    /// init_rpc() so production binds the live RPC fallback. Idempotent: guarded
+    /// on m_coin_node so a second call (e.g. assemble()-then-run()) is a no-op.
+    /// p2pool-merged-v36 surface: NONE -- pure local wiring, no PoW/share/
+    /// coinbase/PPLNS/WorkData-shape change.
+    void assemble() {
+        if (m_coin_node)
+            return;                   // already assembled; idempotent no-op
+        m_abla.wire(m_node, m_embedded);
+        m_coin_node = std::make_unique<CoinNode>(&m_embedded, m_node.rpc());
+    }
+
+    /// Drive the authoritative HeaderChain from the live P2P header stream.
+    /// The P2P front-end (NodeP2P) parses `headers` messages and fires
+    /// new_headers; until this subscription existed NOTHING advanced m_chain
+    /// during a sync (the handler only queued block-body downloads), so the
+    /// synced height stayed pinned at the init() checkpoint. Here we feed every
+    /// received batch into m_chain.add_headers() -- headers-first IBD: the tip
+    /// tracks the peer as batches stream, block bodies backfill via the
+    /// block-download window. The peer's advertised tip is propagated first so
+    /// add_headers() picks its fast-sync batch size. Idempotent (guarded).
+    /// p2pool-merged-v36 surface: NONE -- local SPV header state only (no
+    /// PoW/share/coinbase/PPLNS/WorkData-shape change).
+    void wire_chain_ingest() {
+        if (m_headers_sub)
+            return;                   // already wired; idempotent no-op
+        m_headers_sub = m_node.new_headers.subscribe(
+            [this](const std::vector<BlockHeaderType>& headers) {
+                if (auto* p2p = m_node.p2p()) {
+                    const uint32_t peer_tip = p2p->peer_start_height();
+                    if (peer_tip > 0)
+                        m_chain.set_peer_tip_height(peer_tip);
+                }
+                m_chain.add_headers(headers);
+            });
+    }
+
+    // Read-only IBD evidence for the --ibd run-loop: synced height vs the peer's
+    // advertised tip, plus the block-download window stall counters. All derived
+    // from live members; valid once run()/start_p2p() has connected a peer.
+    uint32_t ibd_synced_height() { return m_chain.height(); }
+    uint32_t ibd_peer_tip() {
+        return m_node.has_p2p() ? m_node.p2p()->peer_start_height() : 0;
+    }
+    std::size_t ibd_reissue_count() {
+        return m_node.has_p2p() ? m_node.p2p()->ibd_reissue_count() : 0;
+    }
+    std::size_t ibd_false_evict_count() {
+        return m_node.has_p2p() ? m_node.p2p()->ibd_false_evict_count() : 0;
+    }
+    std::size_t ibd_in_flight() {
+        return m_node.has_p2p() ? m_node.p2p()->ibd_in_flight() : 0;
+    }
+
+    /// Live ABLA size-feed evidence for the --ibd harness: the dynamic block-size
+    /// budget the feed has folded from the REAL blocks streamed off the peer
+    /// (VM300 bchn-bch), anchored at the cursor the feed has advanced to. The
+    /// budget sits at the 32 MB safe floor until the feed has folded blocks
+    /// CONTIGUOUSLY from the cursor; the cursor trails ibd_synced_height by design
+    /// (headers-first: headers race ahead, block bodies backfill through the
+    /// download window, and ONLY a folded full block advances this cursor). A
+    /// moving cursor here is the proof that full_block --> AblaBlockFeed -->
+    /// AblaTracker is live on real network data, not merely the cold-start anchor.
+    /// Read-only; no p2pool-merged-v36 surface (local ABLA budget only).
+    uint64_t ibd_abla_budget() {
+        return m_abla.tracker().budget_for_tip(m_abla.tracker().cursor_height());
+    }
+    uint32_t ibd_abla_cursor() { return m_abla.tracker().cursor_height(); }
 
     /// Apply a BCHN-pinned {height, State} captured from VM300 bchn-bch. This
     /// is the operator-gated reanchor step -- call ONLY after the read is
     /// approved; until then the floor anchor is correct and never-undercut.
     void apply_bchn_anchor(uint32_t height, abla::State state) {
         m_abla.reanchor(height, state);
+    }
+
+    /// Pin the operator-APPROVED VM300 BCHN cold-start anchor. decisions@
+    /// 2026-06-18 flipped this dry-run -> live (floor-equivalent): the recorded
+    /// control state @955700 is still at the 32 MB floor, so pinning changes NO
+    /// ABLA budget vs the cold-start floor -- it only fixes the height/chainwork
+    /// origin so a future SPV cold-start can trust the recorded header instead
+    /// of climbing from genesis. The moment a future capture is ABOVE floor this
+    /// path RAISES the budget to the real recorded limit (never undercuts). The
+    /// static record is read here; VM300 stays read-only (no qm op). Zero
+    /// p2pool-merged-v36 surface (ABLA is BCH embedded-internal).
+    void pin_cold_start_anchor() {
+        using Rec = BchnAnchorRecord;
+        apply_bchn_anchor(Rec::height, Rec::state(m_config->m_testnet));
+        const uint64_t pinned = m_abla.tracker().budget_for_tip(Rec::height);
+        if (Rec::is_floor())
+            LOG_INFO << "[EMB-BCH] cold-start anchor PINNED (operator-approved):"
+                     << " height=" << Rec::height << " budget=" << pinned
+                     << " (32 MB floor-equivalent; provenance hash=" << Rec::hash << ").";
+        else
+            LOG_WARNING << "[EMB-BCH] cold-start anchor PINNED above floor:"
+                        << " height=" << Rec::height << " budget=" << pinned << ".";
     }
 
     /// DRY RUN of the cold-start reanchor: read the STATIC VM300 anchor record
@@ -156,6 +331,64 @@ public:
     Mempool&            mempool()        { return m_pool; }
     bool                is_wired() const { return m_abla.is_wired(); }
 
+    /// Outcome of a won-block broadcast: which of the two sinks fired and
+    /// whether the network accepted. P2P is primary; the external BCHN-RPC
+    /// submitblock is the dual-path FALLBACK (fired ALWAYS, per the
+    /// broadcaster-gate dual-path rule -- NOT a P2P-only path with RPC as a
+    /// catch). A `duplicate` on the RPC leg AFTER a P2P accept still proves
+    /// both paths reached the node; `landed_first` records which won the race.
+    struct BlockBroadcast {
+        bool        p2p_sent   = false;  // submit_block_p2p_raw issued (sink present)
+        bool        rpc_ok     = false;  // submitblock returned ok OR duplicate
+        const char* landed_first = "none"; // "p2p" | "rpc" | "none"
+        bool any() const { return p2p_sent || rpc_ok; }
+    };
+
+    /// Fire a won block down BOTH broadcast paths. `block_bytes` is the
+    /// pre-serialized (header || tx_count || coinbase || tx_data) blob the
+    /// embedded P2P broadcaster relays; `block_hex` is the same block hex for
+    /// the external submitblock fallback. BCH is SHA256d standalone parent --
+    /// no merged-coinbase leg. Read-only vs VM300 (a block relay/submit issues
+    /// no qm/control op). Zero p2pool-merged-v36 surface (block dispatch, not
+    /// share/PPLNS/coinbase bytes). This is the sink the pool node wires its
+    /// tracker().m_on_block_found to so an in-operation win emits immediately.
+    BlockBroadcast broadcast_won_block(const std::vector<unsigned char>& block_bytes,
+                                       const std::string& block_hex)
+    {
+        BlockBroadcast r;
+
+        // PRIMARY: embedded P2P relay (fastest propagation).
+        if (m_node.has_p2p()) {
+            m_node.submit_block_p2p_raw(block_bytes);
+            r.p2p_sent = true;
+            r.landed_first = "p2p";
+            LOG_INFO << "[EMB-BCH] won-block P2P relay issued (" << block_bytes.size()
+                     << " bytes) -- primary path.";
+        } else {
+            LOG_WARNING << "[EMB-BCH] won-block: no embedded P2P sink; relying on RPC fallback.";
+        }
+
+        // FALLBACK (always fired): external BCHN submitblock. A duplicate here
+        // after a P2P accept is success, not failure -- ignore_failure=true so a
+        // duplicate/already-have does not mask the P2P win.
+        if (m_coin_node && m_coin_node->has_rpc()) {
+            r.rpc_ok = m_coin_node->submit_block_hex(block_hex, /*ignore_failure=*/true);
+            if (r.rpc_ok && !r.p2p_sent) r.landed_first = "rpc";
+            LOG_INFO << "[EMB-BCH] won-block submitblock RPC fallback "
+                     << (r.rpc_ok ? "ok/duplicate" : "no-ack") << ".";
+        } else {
+            LOG_WARNING << "[EMB-BCH] won-block: no external BCHN-RPC fallback sink wired.";
+        }
+
+        if (!r.any())
+            LOG_ERROR << "[EMB-BCH] won-block had NEITHER broadcast sink -- block NOT relayed!";
+        else
+            LOG_INFO << "[EMB-BCH] won-block broadcast: p2p=" << (r.p2p_sent ? "sent" : "off")
+                     << " rpc=" << (r.rpc_ok ? "ok" : "off")
+                     << " landed_first=" << r.landed_first << ".";
+        return r;
+    }
+
 private:
     config_t*        m_config;   // not owned (binary entrypoint owns it)
     HeaderChain      m_chain;    // before m_embedded + m_abla: their refs bind here
@@ -163,6 +396,8 @@ private:
     EmbeddedCoinNode m_embedded; // in-process work source
     Node<config_t>   m_node;     // P2P + external-RPC fallback; full_block source
     AblaRuntime      m_abla;     // owns tracker + feed; wired in run()
+    // new_headers -> m_chain.add_headers() subscription (headers-first IBD).
+    std::shared_ptr<EventDisposable> m_headers_sub;
     // Built in run() once m_node.rpc() is live; binds raw ptrs to m_embedded
     // (primary) + m_node's NodeRPC (fallback), both outlive it (daemon-owned).
     std::unique_ptr<CoinNode> m_coin_node;

@@ -110,6 +110,11 @@ public:
     /// the caller -- the Node retains ownership for its whole lifetime.
     NodeRPC* rpc() { return m_rpc.get(); }
 
+    /// Embedded BCHN P2P driver, or nullptr until start_p2p()/init_p2p() ran.
+    /// Exposes the read-only IBD counters (ibd_reissue_count / false_evict) to
+    /// the --ibd run-loop. Node retains ownership.
+    NodeP2P<config_t>* p2p() { return m_p2p.get(); }
+
     /// Send getheaders to drive header sync.
     /// Locator should be hashes from chain tip back to genesis (sparsely);
     /// for an empty chain pass {genesis_hash}. Stop = uint256::ZERO means
