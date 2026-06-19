@@ -638,6 +638,41 @@ public:
         return it->second;
     }
 
+    /// P1f: build a block locator for getheaders (BIP 31-style exponential
+    /// backoff) by walking the tip's ancestry through m_previous_block. Walking
+    /// parent links always follows the BEST chain we just fork-chose, so the
+    /// locator stays correct across reorgs without a separate height index.
+    /// Returns hashes tip..root: dense near the tip, doubling the stride after
+    /// the first 10 entries, with the chain root always anchoring the list.
+    std::vector<uint256> get_locator() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<uint256> locator;
+        if (m_tip.IsNull()) return locator;
+
+        // Materialise the tip's ancestry (tip..root) via parent links.
+        std::vector<uint256> ancestry;
+        uint256 cursor = m_tip;
+        while (true) {
+            auto it = m_index.find(cursor);
+            if (it == m_index.end()) break;        // dangling link -- stop cleanly
+            ancestry.push_back(cursor);
+            if (it->second.height == 0) break;     // reached chain root
+            cursor = it->second.header.m_previous_block;
+        }
+
+        // BIP 31-style exponential backoff over the ancestry.
+        int64_t step = 1;
+        for (size_t i = 0; i < ancestry.size(); i += static_cast<size_t>(step)) {
+            locator.push_back(ancestry[i]);
+            if (locator.size() > 10)
+                step *= 2;
+        }
+        // Guarantee the chain root anchors the locator.
+        if (locator.back() != ancestry.back())
+            locator.push_back(ancestry.back());
+        return locator;
+    }
+
     /// Add a single plain header.
     /// P0-DEFER: NO difficulty validation, NO PoW check, NO connection check,
     /// NO persistence. Structural skeleton only — returns false.
@@ -827,8 +862,8 @@ private:
     uint256        m_best_work;
 
     // P0-DEFER: difficulty validation, AuxPow verification, LevelDB
-    // persistence, height-index rebuild, and locator generation are all
-    // deliberately absent in this structural leaf.
+    // persistence and height-index rebuild are deliberately absent in this
+    // structural leaf (locator generation landed in P1f).
 };
 
 } // namespace coin
