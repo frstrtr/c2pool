@@ -40,6 +40,7 @@
 #include <core/pack.hpp>
 #include <core/hash.hpp>
 #include <core/log.hpp>
+#include <core/target_utils.hpp>  // chain::bits_to_target (parent-PoW, step 4)
 
 #include <algorithm>
 #include <atomic>
@@ -334,7 +335,8 @@ struct AuxPow {
     ///      from the btc tree READ-ONLY (e.g. btc::coin pow check).
     /// Until all four steps exist, NMC MUST NOT block-validate off this leaf.
     CheckResult check_proof(const uint256& aux_block_hash,
-                            int32_t expected_chain_id) const {
+                            int32_t expected_chain_id,
+                            uint32_t aux_bits = 0) const {
         // P1b+P1c — three merkle legs wired. Step 1 (chain-merkle) walks the
         // aux (NMC) block hash through chain_merkle_branch/index to reconstruct
         // the merged-mining root; step 2 (MM-marker) confirms that root is the
@@ -342,11 +344,13 @@ struct AuxPow {
         // the (nonce, chain_id) slot binding; step 3 (parent-coinbase tx-merkle)
         // walks the witness-stripped parent coinbase txid through
         // parent_coinbase_branch/index and, when a parent header is present,
-        // requires it to reproduce that header's tx-merkle-root. The remaining
-        // step 4 (parent PoW vs target, consumed from the btc tree READ-ONLY) is
-        // NOT built yet. Because step 4 does not exist, a structurally-consistent
-        // proof returns INCOMPLETE, never VALID — NMC still MUST NOT block-
-        // validate off this leaf. Any malformed leg (negative slot index, an
+        // requires it to reproduce that header's tx-merkle-root; step 4 (parent
+        // PoW) verifies the parent block's SHA256d hash clears the AUX block's
+        // target. A structurally-complete proof — all four legs, a matched MM
+        // marker, a real parent header, and an aux_bits that the parent PoW
+        // satisfies — is VALID. Absent any of those (a leg-only fixture: null
+        // parent, no marker, or aux_bits unset) the proof stays INCOMPLETE, so
+        // NMC never block-validates off a partial proof. Any malformed leg (negative slot index, an
         // index wider than its branch depth, a parent-coinbase leg that does not
         // reconstruct the parent header's tx-merkle-root, or an MM marker that
         // commits a different root / wrong tree-size / wrong slot) is INVALID.
@@ -373,6 +377,7 @@ struct AuxPow {
         // assert yet — staged posture, mirrors the null-parent-header gate in
         // step 3. A marker present but committing a different root / wrong size /
         // wrong slot is INVALID.
+        bool mm_marker_matched = false;
         if (!parent_coinbase.vin.empty()) {
             MMScan scan = scan_mm_commitment(
                 parent_coinbase.vin[0].scriptSig.m_data,
@@ -382,6 +387,7 @@ struct AuxPow {
                 static_cast<uint32_t>(chain_merkle_index));
             if (scan == MMScan::MISMATCH)
                 return CheckResult::INVALID;
+            mm_marker_matched = (scan == MMScan::MATCH);
         }
 
         // ── step 3 (P1c): parent-coinbase tx-merkle leg ──
@@ -398,10 +404,39 @@ struct AuxPow {
         }
         // The equality gate only fires once a parent header is present: a real
         // proof always carries one, but a leg-only structural fixture leaves it
-        // null and has nothing to match against yet (steps 2/4 still pending).
+        // null and has nothing to match against yet (step 2 may also pend).
         if (!parent_header.IsNull() &&
             reconstructed_parent_merkle != parent_header.m_merkle_root)
             return CheckResult::INVALID;
+
+        // ── step 4 (P1c-step4): parent proof-of-work vs the AUX target ──
+        // The parent (BTC) block's SHA256d PoW hash is the work backing this
+        // Namecoin block. Per Namecoin's CheckAuxPowProofOfWork the parent PoW
+        // hash must satisfy the AUX (NMC) block's difficulty target — aux_bits,
+        // the NMC header's nBits — NOT the parent header's own nBits. Target is
+        // expanded with the shared core helper chain::bits_to_target(); the hash
+        // is the nmc-local pow_hash(parent_header). No btc-tree dependency: both
+        // helpers live outside src/impl/btc (core + nmc-local).
+        //
+        // aux_bits == 0 is the leg-only-fixture sentinel (caller has not supplied
+        // the aux header's difficulty): step 4 is skipped and the proof stays
+        // INCOMPLETE, mirroring the null-parent / no-marker gates above.
+        bool parent_pow_ok = false;
+        if (!parent_header.IsNull() && aux_bits != 0) {
+            uint256 parent_powhash = pow_hash(parent_header);
+            uint256 aux_target     = chain::bits_to_target(aux_bits);
+            // Valid PoW means hash <= target, i.e. NOT (hash > target) — same
+            // ordering convention as the btc work_source block/share gate.
+            if (parent_powhash > aux_target)
+                return CheckResult::INVALID;  // parent has insufficient work
+            parent_pow_ok = true;
+        }
+
+        // Only a structurally-complete proof is VALID: all four legs satisfied
+        // against a real parent header, a matched MM-marker commitment, and a
+        // parent PoW that clears the aux target. Anything short stays INCOMPLETE.
+        if (parent_pow_ok && mm_marker_matched && !parent_header.IsNull())
+            return CheckResult::VALID;
 
         return CheckResult::INCOMPLETE;
     }
