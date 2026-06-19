@@ -721,7 +721,7 @@ private:
     // where the resulting discontinuity would (safely) sink the template budget
     // to the 32 MB floor. Mirrors BCHN CheckMerkleRoot (validation.cpp) at
     // accept time. p2pool-merged-v36 surface: NONE -- local accept gate only.
-    void emit_full_block(const BlockType& block, const uint256& blockhash)
+    bool emit_full_block(const BlockType& block, const uint256& blockhash)
     {
         std::vector<uint256> txids;
         txids.reserve(block.m_txs.size());
@@ -735,9 +735,10 @@ private:
                         << block.m_merkle_root.GetHex().substr(0, 16) << "... vs computed "
                         << computed.GetHex().substr(0, 16) << "...) over "
                         << block.m_txs.size() << " txs -- dropping, full_block NOT emitted";
-            return;
+            return false;
         }
         m_coin->full_block.happened(block);
+        return true;
     }
 
     ADD_P2P_HANDLER(block)
@@ -758,11 +759,19 @@ private:
         LOG_INFO << "[" << m_chain_label << "] Full block received: "
                  << blockhash.GetHex().substr(0, 16) << "..."
                  << " txs=" << block.m_txs.size();
-        emit_full_block(block, blockhash);
+        const bool accepted = emit_full_block(block, blockhash);
 
         // IBD window: this block freed a slot (if it was one we requested) --
-        // top the window back up so the next queued block bodies stream in.
-        m_block_dl.on_block_received(blockhash);
+        // top the window back up so the next queued block bodies stream in. A
+        // body that FAILED local validation (merkle mismatch) must NOT be marked
+        // permanently received -- on_block_received keeps it in m_known forever,
+        // blackholing the height so it is never re-downloaded and the ABLA feed /
+        // block-connector starve there. Route the drop through on_block_rejected
+        // so the slot frees and the height is re-requested (bounded retries).
+        if (accepted)
+            m_block_dl.on_block_received(blockhash);
+        else
+            m_block_dl.on_block_rejected(blockhash);
         drain_block_window();
     }
 
