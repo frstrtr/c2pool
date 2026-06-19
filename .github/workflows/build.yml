@@ -289,6 +289,7 @@ jobs:
                     bch_embedded_daemon_assembly_test \
                     bch_embedded_getwork_test bch_embedded_seam_workview_test \
                     bch_embedded_block_broadcast_test bch_coin_node_seam_test \
+                    bch_asert_kat_test \
             -j$(nproc)
 
       - name: Run BCH tests
@@ -362,6 +363,7 @@ jobs:
                     bch_embedded_daemon_assembly_test \
                     bch_embedded_getwork_test bch_embedded_seam_workview_test \
                     bch_embedded_block_broadcast_test bch_coin_node_seam_test \
+                    bch_asert_kat_test \
             -j$(nproc)
 
       - name: Run BCH tests under sanitizers
