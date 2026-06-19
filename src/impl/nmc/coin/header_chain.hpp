@@ -633,16 +633,36 @@ public:
         return false;
     }
 
+    /// Verify the AuxPow consensus GATE for an incoming merge-mined header.
+    /// P1d: factored out so the gate is unit-testable independently of the
+    /// (still-deferred) header-storage path. Runs the full four-leg
+    /// AuxPow::check_proof against the AUX block hash (block_hash(header)), this
+    /// chain's claimed aux_chain_id, and the header's own nBits as the aux PoW
+    /// target (Namecoin checks the parent PoW against the AUX bits, not the
+    /// parent's own). A header is admissible ONLY when this returns VALID.
+    AuxPow::CheckResult verify_auxpow_header(const BlockHeaderType& header,
+                                             const AuxPow& auxpow) const {
+        return auxpow.check_proof(block_hash(header), m_params.aux_chain_id,
+                                  header.m_bits);
+    }
+
     /// Add a header that carries a merge-mining AuxPow proof.
-    /// P0-DEFER: stores nothing and verifies nothing. The real path must call
-    /// AuxPow::check_proof() (itself a P0 stub) before accepting.
+    /// P1d: the AuxPow VERIFICATION GATE is now wired - check_proof() must
+    /// return VALID or the header is rejected, so the (future) accept path can
+    /// never admit an unproven merge-mined header. The header-storage /
+    /// chain-connection path, and the height-derived is_auxpow_active()
+    /// activation gate (which needs a connected parent), remain P0-DEFER - see
+    /// add_header(). A header that passes the gate is therefore NOT persisted
+    /// yet; P1d's contract is the rejection half: nothing unproven gets in.
     bool add_auxpow_header(const BlockHeaderType& header, const AuxPow& auxpow) {
-        (void)header;
-        (void)auxpow;
-        // P0-DEFER: auxpow header add/validate path not implemented.
-        // NOTE: even when built, must reject unless params.is_auxpow_active(h)
-        //       and auxpow.check_proof(block_hash(header), params.aux_chain_id)
-        //       == AuxPow::CheckResult::VALID.
+        if (verify_auxpow_header(header, auxpow) != AuxPow::CheckResult::VALID) {
+            LOG_WARNING << "[EMB-NMC] reject auxpow header "
+                        << block_hash(header).ToString()
+                        << ": AuxPow check_proof != VALID";
+            return false;
+        }
+        // P0-DEFER: proof verified, but header storage/connection + the
+        // is_auxpow_active(height) activation gate are not built yet.
         return false;
     }
 

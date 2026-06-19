@@ -541,4 +541,98 @@ TEST(NmcAuxStep4, ParentOwnBitsAreNotTheAuxGate)
     EXPECT_EQ(ap.check_proof(aux, 1, aux_bits), AuxPow::CheckResult::VALID);
 }
 
+// ---------------------------------------------------------------------------
+// P1d - HeaderChain::add_auxpow_header / verify_auxpow_header consensus GATE.
+//
+// The gate wires AuxPow::check_proof into the header-accept path: an incoming
+// merge-mined header is admissible ONLY when its proof fully verifies against
+// THIS chain's params (aux_chain_id) and the header's own nBits as the aux PoW
+// target. These KATs pin the rejection contract - nothing unproven gets in -
+// reusing the step-4 complete_proof/mine_parent fixtures but binding the aux
+// block hash to a REAL header via block_hash(header), the production seam.
+// Storage stays P0-DEFER, so a verified header is not persisted yet (add
+// returns false on both arms); the assertion is on the verify verdict.
+// ---------------------------------------------------------------------------
+
+using nmc::coin::HeaderChain;
+using nmc::coin::NMCChainParams;
+using nmc::coin::BlockHeaderType;
+using nmc::coin::block_hash;
+
+// Params with a pinned aux_chain_id == 1 so the fixture's MM-marker slot
+// (chain_id=1) binds. Activation height stays unpinned: the P1d gate under test
+// is the cryptographic check_proof, not the (deferred) height-activation path.
+static NMCChainParams params_chain_id_1()
+{
+    NMCChainParams p = NMCChainParams::mainnet();
+    p.aux_chain_id = 1;
+    return p;
+}
+
+// A header whose block_hash() becomes the AUX hash the proof commits to; m_bits
+// carries the aux PoW target the parent hash must clear (Namecoin aux-bits rule).
+static BlockHeaderType aux_header_for(uint32_t aux_bits)
+{
+    BlockHeaderType h{};
+    h.m_version = 1;
+    h.m_bits    = aux_bits;
+    return h;
+}
+
+TEST(NmcP1dGate, FullyVerifiedAuxPowPassesTheGate)
+{
+    uint32_t aux_bits = 0x207fffffu;                 // regtest-style easy target
+    BlockHeaderType h = aux_header_for(aux_bits);
+    uint256 aux = block_hash(h);                      // production seam
+    AuxPow ap = complete_proof(aux, /*parent_own_bits=*/0x1d00ffffu);
+    ASSERT_TRUE(mine_parent(ap, chain::bits_to_target(aux_bits)));
+
+    HeaderChain chain_(params_chain_id_1());
+    EXPECT_EQ(chain_.verify_auxpow_header(h, ap), AuxPow::CheckResult::VALID);
+    // Storage is still P0-DEFER, so even a verified header is not persisted yet.
+    EXPECT_FALSE(chain_.add_auxpow_header(h, ap));
+    EXPECT_FALSE(chain_.has_header(aux));
+}
+
+TEST(NmcP1dGate, WrongChainIdIsNotValidAndIsRejected)
+{
+    uint32_t aux_bits = 0x207fffffu;
+    BlockHeaderType h = aux_header_for(aux_bits);
+    uint256 aux = block_hash(h);
+    AuxPow ap = complete_proof(aux, 0x1d00ffffu);
+    ASSERT_TRUE(mine_parent(ap, chain::bits_to_target(aux_bits)));
+
+    NMCChainParams p = NMCChainParams::mainnet();
+    p.aux_chain_id = 2;                               // != fixture's chain_id 1
+    HeaderChain chain_(p);
+    EXPECT_NE(chain_.verify_auxpow_header(h, ap), AuxPow::CheckResult::VALID);
+    EXPECT_FALSE(chain_.add_auxpow_header(h, ap));
+}
+
+TEST(NmcP1dGate, InsufficientParentWorkIsRejected)
+{
+    BlockHeaderType h = aux_header_for(/*aux_bits=*/0x03000001u); // target == 1
+    uint256 aux = block_hash(h);
+    AuxPow ap = complete_proof(aux, 0x1d00ffffu);
+    // Unmined parent: a real double-SHA256 hash exceeds target 1 => INVALID.
+    ASSERT_TRUE(pow_hash(ap.parent_header) > chain::bits_to_target(h.m_bits));
+
+    HeaderChain chain_(params_chain_id_1());
+    EXPECT_EQ(chain_.verify_auxpow_header(h, ap), AuxPow::CheckResult::INVALID);
+    EXPECT_FALSE(chain_.add_auxpow_header(h, ap));
+}
+
+TEST(NmcP1dGate, MissingAuxBitsKeepsProofIncompleteAndRejected)
+{
+    BlockHeaderType h = aux_header_for(/*aux_bits=*/0u);  // 0 == leg-only sentinel
+    uint256 aux = block_hash(h);
+    AuxPow ap = complete_proof(aux, 0x1d00ffffu);
+
+    HeaderChain chain_(params_chain_id_1());
+    // header.m_bits == 0 feeds check_proof's leg-only sentinel: step 4 skipped,
+    // the proof stays INCOMPLETE, and the gate rejects.
+    EXPECT_EQ(chain_.verify_auxpow_header(h, ap), AuxPow::CheckResult::INCOMPLETE);
+    EXPECT_FALSE(chain_.add_auxpow_header(h, ap));
+}
+
 } // namespace
