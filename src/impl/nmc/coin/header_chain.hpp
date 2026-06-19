@@ -117,6 +117,23 @@ inline uint256 aux_merkle_root(const uint256& leaf,
     return cur;
 }
 
+// ─── Parent-coinbase txid (P1c: AuxPow step-3 leaf identity) ───────
+
+/// Witness-stripped transaction id of the parent (BTC) coinbase.
+///
+/// AuxPow step 3 proves the parent coinbase is committed in the parent
+/// block's transaction merkle root. That tree commits *txids*, NOT wtxids —
+/// so the coinbase id MUST be hashed over the LEGACY (no-witness, no segwit
+/// marker/flag) serialization even though a real BTC coinbase carries a
+/// witness (the BIP141 segwit-commitment reserved value). Byte-for-byte
+/// identical to the btc tree's compute_txid() (mempool.hpp) but kept
+/// NMC-LOCAL per the coin fence: consumes only the nmc::coin transaction
+/// serializer (TX_NO_WITNESS) + core::Hash, no btc include.
+inline uint256 parent_coinbase_txid(const MutableTransaction& tx) {
+    auto packed = pack(TX_NO_WITNESS(tx));
+    return Hash(packed.get_span());
+}
+
 // ─── AuxPow (merge-mining proof) ─────────────────────────────────────────────
 
 /// One aux-chain slot inside a parent coinbase's merged-mining merkle tree.
@@ -218,21 +235,25 @@ struct AuxPow {
     /// Until all four steps exist, NMC MUST NOT block-validate off this leaf.
     CheckResult check_proof(const uint256& aux_block_hash,
                             int32_t expected_chain_id) const {
-        // P1b — chain-merkle leg (step 1). Walk the aux (NMC) block hash up
-        // through chain_merkle_branch/chain_merkle_index to reconstruct the
-        // merged-mining merkle root via aux_merkle_root(). The remaining steps
-        // are NOT built yet: step 2 (confirm that root is committed in the
-        // parent coinbase MM marker, with the chain_id/slot binding), step 3
-        // (parent-coinbase tx-merkle leg — needs the witness-stripped BTC
-        // coinbase txid), step 4 (parent PoW vs target, consumed from the btc
-        // tree READ-ONLY). A structurally-consistent chain-merkle walk therefore
-        // returns INCOMPLETE, never VALID — NMC still MUST NOT block-validate
-        // off this leaf.
+        // P1b+P1c — two merkle legs wired. Step 1 (chain-merkle) walks the
+        // aux (NMC) block hash through chain_merkle_branch/index to reconstruct
+        // the merged-mining root; step 3 (parent-coinbase tx-merkle) walks the
+        // witness-stripped parent coinbase txid through
+        // parent_coinbase_branch/index and, when a parent header is present,
+        // requires it to reproduce that header's tx-merkle-root. The remaining
+        // steps are NOT built yet: step 2 (confirm the reconstructed MM root is
+        // committed in the parent coinbase's MM marker, with the chain_id/slot
+        // binding) and step 4 (parent PoW vs target, consumed from the btc tree
+        // READ-ONLY). Because those gates do not exist yet, a structurally-
+        // consistent proof returns INCOMPLETE, never VALID — NMC still MUST NOT
+        // block-validate off this leaf. Any malformed leg (negative slot index,
+        // an index wider than its branch depth, or a parent-coinbase leg that
+        // does not reconstruct the parent header's tx-merkle-root) is INVALID.
         (void)expected_chain_id;  // step-2 (chain_id/slot) binding lands later
 
+        // ── step 1 (P1b): chain-merkle leg ──
         if (chain_merkle_index < 0)
             return CheckResult::INVALID;  // negative slot index is malformed
-
         try {
             // Reconstructed MM root; its commitment check is step 2 (pending).
             (void)aux_merkle_root(
@@ -241,6 +262,25 @@ struct AuxPow {
         } catch (const std::invalid_argument&) {
             return CheckResult::INVALID;  // branch index out of range for depth
         }
+
+        // ── step 3 (P1c): parent-coinbase tx-merkle leg ──
+        if (parent_coinbase_index < 0)
+            return CheckResult::INVALID;  // negative slot index is malformed
+        uint256 reconstructed_parent_merkle;
+        try {
+            // The parent tx-merkle tree commits the WITNESS-STRIPPED txid.
+            reconstructed_parent_merkle = aux_merkle_root(
+                parent_coinbase_txid(parent_coinbase), parent_coinbase_branch,
+                static_cast<uint32_t>(parent_coinbase_index));
+        } catch (const std::invalid_argument&) {
+            return CheckResult::INVALID;  // branch index out of range for depth
+        }
+        // The equality gate only fires once a parent header is present: a real
+        // proof always carries one, but a leg-only structural fixture leaves it
+        // null and has nothing to match against yet (steps 2/4 still pending).
+        if (!parent_header.IsNull() &&
+            reconstructed_parent_merkle != parent_header.m_merkle_root)
+            return CheckResult::INVALID;
 
         return CheckResult::INCOMPLETE;
     }
