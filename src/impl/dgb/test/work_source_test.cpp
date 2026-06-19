@@ -282,4 +282,67 @@ TEST(DgbWorkSource, CoinbaseValueHonorsGbtVerbatim)
               kGbt);
 }
 
+
+// previousblockhash: emitted as GBT-conventional big-endian display hex ONLY
+// when the HeaderChain carries a real tip hash (tip_hash() accessor). With a
+// known tip block_hash, the template surfaces it MSB-limb-first; bits stays
+// HELD (no faithful embedded V36 next-target -- MultiShield V4 is V37).
+TEST(DgbWorkSource, WorkTemplateEmitsPreviousBlockHashWhenTipCarriesHash)
+{
+    Fixture fx;
+    fx.chain.set_base_height(400000);
+    // Seed one Scrypt header carrying a distinctive block id. n_version with
+    // algo nibble 0x0000 is the Scrypt lane; target 100 with pow_hash 0 (<=
+    // target) clears the context-free PoW gate; empty-chain MTP is unconstrained.
+    c2pool::dgb::HeaderSample h;
+    h.n_version  = 0x20000000;
+    h.n_time     = 1000;
+    h.target     = 100;
+    h.block_hash = dgb::coin::u256::from_u64(0x123456789abcdef0ULL);
+    ASSERT_EQ(fx.chain.validate_and_append(h),
+              c2pool::dgb::IngestResult::VALIDATED_SCRYPT);
+
+    auto ws = fx.make();
+    auto tmpl = ws->get_current_work_template();
+    ASSERT_TRUE(tmpl.contains("previousblockhash"));
+    // limb[0] is least-significant -> renders as the trailing 16 hex digits,
+    // preceded by 48 zero digits (limbs 3..1 are zero). 64 chars total.
+    EXPECT_EQ(tmpl["previousblockhash"].get<std::string>(),
+              std::string(48, '0') + "123456789abcdef0");
+    // bits remains deliberately absent (V37 MultiShield V4 wall).
+    EXPECT_FALSE(tmpl.contains("bits"));
+}
+
+// The dedicated prevhash getter and the assembled template draw the tip hash
+// from ONE source (chain_.tip_hash() through u256_be_display_hex), so they can
+// never diverge: with a real tip the getter returns the SAME BE-display-hex the
+// template emits; with no tip BOTH are absent (getter empty string, template
+// omits the field).
+TEST(DgbWorkSource, GbtPrevhashGetterMatchesTemplateField)
+{
+    Fixture fx;
+    // No tip yet -> getter empty, template omits previousblockhash.
+    {
+        auto ws = fx.make();
+        EXPECT_TRUE(ws->get_current_gbt_prevhash().empty());
+        EXPECT_FALSE(ws->get_current_work_template().contains("previousblockhash"));
+    }
+    // Seed a Scrypt header carrying a distinctive block id (mirrors the
+    // previousblockhash emit test) -> getter == template field, BE-display-hex.
+    fx.chain.set_base_height(400000);
+    c2pool::dgb::HeaderSample h;
+    h.n_version  = 0x20000000;
+    h.n_time     = 1000;
+    h.target     = 100;
+    h.block_hash = dgb::coin::u256::from_u64(0x123456789abcdef0ULL);
+    ASSERT_EQ(fx.chain.validate_and_append(h),
+              c2pool::dgb::IngestResult::VALIDATED_SCRYPT);
+
+    auto ws = fx.make();
+    const std::string expected = std::string(48, '0') + "123456789abcdef0";
+    EXPECT_EQ(ws->get_current_gbt_prevhash(), expected);
+    EXPECT_EQ(ws->get_current_work_template()["previousblockhash"].get<std::string>(),
+              expected);
+}
+
 }  // namespace
