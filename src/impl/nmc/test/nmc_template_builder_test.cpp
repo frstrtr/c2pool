@@ -14,8 +14,9 @@
 //                             HeaderChain + Mempool: a present tip yields a
 //                             GBT-shaped WorkData; an empty chain yields nullopt.
 //
-// PC is the STRUCTURAL builder only; merge-mining commitment / dual-target
-// (phase PD) are NOT exercised here.
+// PC is the STRUCTURAL builder only. Phase PD (the embedded IAuxChainBackend
+// build-side: dual-target + the aux block-hash committed in the parent
+// coinbase) is exercised by the NmcAuxChainEmbedded suite at the end.
 //
 // Per-coin isolation: src/impl/nmc/ only; btc tree consumed READ-ONLY. MUST
 // appear in BOTH test/CMakeLists.txt AND the build.yml --target allowlist or it
@@ -36,6 +37,9 @@
 #include "../coin/header_chain.hpp"
 #include "../coin/mempool.hpp"
 #include "../coin/template_builder.hpp"
+#include "../coin/aux_chain_embedded.hpp"
+
+#include <c2pool/merged/merged_mining.hpp>
 
 namespace {
 
@@ -47,6 +51,7 @@ using nmc::coin::TemplateBuilder;
 using nmc::coin::compute_merkle_root;
 using nmc::coin::get_block_subsidy;
 using nmc::coin::block_hash;
+using nmc::coin::AuxChainEmbedded;
 
 // Build NMC params with a TEST-only pinned activation height so plain headers
 // below it ADMIT (production stays the -1 sentinel). Mirror of the auxpow test
@@ -204,5 +209,114 @@ TEST(NmcTemplateBuild, StaleTipReportsNotSynced)
     auto wd = TemplateBuilder::build_template(chain, pool, /*is_testnet=*/false);
     EXPECT_TRUE(wd.has_value());
 }
+
+
+// -- P1 PD: AuxChainEmbedded (embedded IAuxChainBackend build-side) ----------
+//
+// Pins the merge-mining aux-work the BTC parent pulls from the embedded NMC
+// node: dual-target (aux PoW target from template bits), the aux block-hash
+// committed in the parent coinbase (= NMC tip), and the consensus chain_id
+// (= NMCChainParams::aux_chain_id, the SAME field the verify side pins). Sync
+// gating: an empty chain yields empty work (no daemon, no leak of a stale tip).
+
+static c2pool::merged::AuxChainConfig nmc_aux_config()
+{
+    c2pool::merged::AuxChainConfig cfg;
+    cfg.symbol   = "NMC";
+    cfg.chain_id = 1;
+    return cfg;
+}
+
+// Seed a synced two-header chain (fresh tip) and return its tip hash via out-param.
+static void seed_synced_chain(HeaderChain& chain, uint256& tip_hash_out)
+{
+    auto now = static_cast<uint32_t>(std::time(nullptr));
+    uint256 z; z.SetNull();
+    BlockHeaderType g = plain_header(z, 0x1d00ffffu, 1, now - 100);
+    ASSERT_TRUE(chain.add_header(g));
+    BlockHeaderType c = plain_header(block_hash(g), 0x1d00ffffu, 2, now - 50);
+    ASSERT_TRUE(chain.add_header(c));
+    tip_hash_out = block_hash(c);
+}
+
+TEST(NmcAuxChainEmbedded, SyncedChainYieldsAuxWork)
+{
+    HeaderChain chain(params_pinned());
+    Mempool pool;
+    uint256 tip_hash;
+    seed_synced_chain(chain, tip_hash);
+    ASSERT_TRUE(chain.is_synced());
+
+    AuxChainEmbedded backend(chain, pool, params_pinned(), nmc_aux_config(),
+                             /*testnet=*/false);
+    ASSERT_TRUE(backend.connect());
+
+    auto work = backend.get_work_template();
+
+    // Aux block-hash committed in the parent coinbase == NMC tip.
+    EXPECT_EQ(work.block_hash, tip_hash);
+    // chain_id is the consensus params value (1), not left at the default 0.
+    EXPECT_EQ(work.chain_id, 1u);
+    // Next block builds on the tip: height == 2.
+    EXPECT_EQ(work.height, 2);
+    EXPECT_EQ(work.coinbase_value, get_block_subsidy(2u));
+    EXPECT_EQ(work.prev_block_hash, tip_hash.GetHex());
+
+    // Dual-target: aux PoW target re-derived INDEPENDENTLY from bits 0x1d00ffff.
+    uint256 expected_target; expected_target.SetCompact(0x1d00ffffu);
+    EXPECT_EQ(work.target, expected_target);
+    EXPECT_FALSE(work.target == uint256::ZERO);
+
+    EXPECT_EQ(backend.get_best_block_hash(), tip_hash.GetHex());
+    EXPECT_EQ(backend.config().symbol, std::string("NMC"));
+}
+
+TEST(NmcAuxChainEmbedded, EmptyChainYieldsEmptyWork)
+{
+    HeaderChain chain(params_pinned());   // no headers -> not synced
+    Mempool pool;
+    ASSERT_FALSE(chain.is_synced());
+
+    AuxChainEmbedded backend(chain, pool, params_pinned(), nmc_aux_config());
+    auto work = backend.get_work_template();
+
+    // Sync gate fired: no template fields leaked.
+    EXPECT_TRUE(work.block_template.is_null());
+    EXPECT_EQ(work.height, 0);
+    EXPECT_EQ(work.coinbase_value, 0u);
+    EXPECT_EQ(backend.get_best_block_hash(), std::string(""));
+}
+
+TEST(NmcAuxChainEmbedded, CreateAuxBlockMatchesGetWorkTemplate)
+{
+    HeaderChain chain(params_pinned());
+    Mempool pool;
+    uint256 tip_hash;
+    seed_synced_chain(chain, tip_hash);
+
+    AuxChainEmbedded backend(chain, pool, params_pinned(), nmc_aux_config());
+    // Embedded mode is always multiaddress: createauxblock == getblocktemplate.
+    auto a = backend.create_aux_block("ignored-address");
+    auto b = backend.get_work_template();
+    EXPECT_EQ(a.block_hash, b.block_hash);
+    EXPECT_EQ(a.target, b.target);
+    EXPECT_EQ(a.chain_id, b.chain_id);
+    EXPECT_EQ(a.height, b.height);
+}
+
+TEST(NmcAuxChainEmbedded, SubmitBlockCachesHexForRetrieval)
+{
+    HeaderChain chain(params_pinned());
+    Mempool pool;
+    AuxChainEmbedded backend(chain, pool, params_pinned(), nmc_aux_config());
+
+    EXPECT_EQ(backend.get_block_hex("any"), std::string(""));
+    const std::string hex(200, 'a');
+    EXPECT_TRUE(backend.submit_block(hex));
+    EXPECT_EQ(backend.get_block_hex("any"), hex);
+    // No daemon peers in embedded mode.
+    EXPECT_TRUE(backend.getpeerinfo().empty());
+}
+
 
 } // namespace
