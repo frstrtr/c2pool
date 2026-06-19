@@ -59,3 +59,33 @@ TEST(DashX11Kat, Deterministic) {
     EXPECT_EQ(dash::crypto::hash_x11(header, 80).GetHex(),
               dash::crypto::hash_x11(header, 80).GetHex());
 }
+
+// ── Real-node KAT: DASH testnet3 block #1497944 ─────────────────────────────
+// Captured from a fully-synced testnet3 dashd (getblockheader RPC; blocks==
+// headers, initialblockdownload=false). Hashing the real 80-byte header with
+// X11 must reproduce the block hash the node reports. Unlike the static mainnet
+// genesis above, this pins the pipeline against live-mined consensus data.
+TEST(DashX11Kat, Testnet3Block1497944ReproducesBlockHash) {
+    constexpr uint32_t version = 536870912u;
+    constexpr uint32_t time    = 1781737170u;
+    constexpr uint32_t bits    = 0x1e00f256u;
+    constexpr uint32_t nonce   = 721236u;
+    const char* prev_hex   = "000000dbbc08ee519459b38b02bb7754b455dd00cd74069a1352f08f0dd986db";
+    const char* merkle_hex = "0464a4ac5f058a742f6aa42b2b3c7489abde7609b529612bcfa5da34b10bdb1b";
+    const char* expected   = "000000b6a4e5ea1a0854ef83f0028dde5b96cdaacc604decd8b064d0cea38234";
+
+    uint256 prev_block;  prev_block.SetHex(prev_hex);
+    uint256 merkle_root; merkle_root.SetHex(merkle_hex);
+
+    unsigned char header[80];
+    size_t off = 0;
+    std::memcpy(header + off, &version, 4);            off += 4;
+    std::memcpy(header + off, prev_block.data(), 32);  off += 32;
+    std::memcpy(header + off, merkle_root.data(), 32); off += 32;
+    std::memcpy(header + off, &time, 4);               off += 4;
+    std::memcpy(header + off, &bits, 4);               off += 4;
+    std::memcpy(header + off, &nonce, 4);              off += 4;
+
+    uint256 pow = dash::crypto::hash_x11(header, sizeof(header));
+    EXPECT_EQ(pow.GetHex(), expected);
+}
