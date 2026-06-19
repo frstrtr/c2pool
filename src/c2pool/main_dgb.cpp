@@ -30,6 +30,7 @@
 #include <impl/dgb/coin/header_chain.hpp>
 #include <impl/dgb/coin/mempool.hpp>
 #include <impl/dgb/coin/coin_node.hpp>
+#include <impl/dgb/coin/embedded_coin_node.hpp>
 #include <impl/dgb/coin/won_block_dispatch.hpp>
 #include <impl/dgb/stratum/work_source.hpp>
 
@@ -186,14 +187,31 @@ int run_node(const core::CoinParams& params, bool testnet,
     // NodeImpl ctor opens ~/.c2pool/<net>/sharechain_leveldb and seeds the addr
     // store from m_bootstrap_addrs, so config must be populated BEFORE
     // construction (above).
-    // CoinNode seam — the external-digibyted submitblock FALLBACK leg of the
-    // #82 dual-path broadcaster, shared by BOTH the sharechain m_on_block_found
-    // arm (just below) and the miner-facing Stratum arm (further below).
-    // Declared BEFORE p2p_node so it OUTLIVES the tracker callback that captures
-    // it. CoinNode(nullptr embedded, nullptr rpc) => has_rpc()==false =>
-    // submit_block_hex returns false LOUDLY (the #163 seam guard: no silent
-    // drop). Point a real NodeRPC at external digibyted here to light it up.
-    dgb::coin::CoinNode coin_node(/*embedded=*/nullptr, /*rpc=*/nullptr);
+    // §7b embedded chain — backs the in-process work source below and is
+    // fed by the embedded P2P header ingest once that lands. Declared HERE
+    // (ahead of coin_node) so EmbeddedCoinNode, which holds a HeaderChain&,
+    // and coin_node, which holds the EmbeddedCoinNode*, both outlive the
+    // tracker callback captured below. The DGBWorkSource further down holds
+    // the same non-owning ref.
+    c2pool::dgb::HeaderChain header_chain;
+
+    // Embedded in-process work source: assembles GBT-compatible templates
+    // ENTIRELY from embedded chain state + the coin subsidy schedule (no
+    // external digibyted). coinbasevalue resolves through the #207 ->
+    // subsidy_func SSOT; transactions[]/bits are held back truthfully until
+    // the embedded mempool + next-target source are plumbed.
+    dgb::coin::EmbeddedCoinNode embedded_coin(header_chain, params.subsidy_func);
+
+    // CoinNode seam — embedded-preferred work source (embedded_coin) with the
+    // external-digibyted submitblock FALLBACK leg of the #82 dual-path
+    // broadcaster. Shared by BOTH the sharechain m_on_block_found arm (just
+    // below) and the miner-facing Stratum arm (further below). Declared
+    // BEFORE p2p_node so it OUTLIVES the tracker callback that captures it.
+    // rpc=nullptr => has_rpc()==false => submit_block_hex returns false
+    // LOUDLY (the #163 seam guard: no silent drop, INDEPENDENT of the
+    // embedded source). Point a real NodeRPC at external digibyted here to
+    // light the submit sink up.
+    dgb::coin::CoinNode coin_node(/*embedded=*/&embedded_coin, /*rpc=*/nullptr);
 
     dgb::Node p2p_node(&ioc, &config);
     p2p_node.set_target_outbound_peers(4);
@@ -245,7 +263,8 @@ int run_node(const core::CoinParams& params, bool testnet,
     // emitted — the standup proves the StratumServer<->IWorkSource wiring
     // end-to-end. Real work-gen / Scrypt share-validation land in 4b/4c.
     // This mirrors btc::stratum standing its skeleton wiring up first.
-    c2pool::dgb::HeaderChain header_chain;   // §7b chain, MVP-unwired (empty)
+    // header_chain is declared above coin_node (it backs the EmbeddedCoinNode
+    // work source); only the unwired Mempool is declared here.
     dgb::coin::Mempool       mempool;        // unwired (no UTXO/template feed yet)
 
     // submitblock-RPC arm of the #82 dual-path broadcaster, driven from the
