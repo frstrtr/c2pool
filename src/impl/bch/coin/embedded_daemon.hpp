@@ -269,6 +269,28 @@ public:
         return true;
     }
 
+    /// PRODUCTION-FIDELITY read-only arming for the --with-peer-verify harness.
+    /// Runs run()'s EXACT bring-up sequence MINUS m_node.run() (init_rpc): the
+    /// external BCHN-RPC fallback is deliberately NOT brought up so the harness
+    /// exercises ONLY the embedded P2P leg #231 wired, and drives the REAL
+    /// maybe_start_p2p() through its configured-peer gate -- the method under
+    /// test. Returns what maybe_start_p2p() returned (true => the won-block P2P
+    /// relay leg + the BlockConnector deep-reorg re-request sink are both LIVE).
+    /// After this returns true broadcast_route() reports "p2p": the won-block
+    /// dispatcher now takes the embedded P2P relay, not the RPC-only
+    /// degradation #231 closed. Strictly read-only vs VM300 (start_p2p connects
+    /// + getheaders; no qm/control op, no init_rpc). The caller must have set
+    /// the configured peer (config->coin()->m_p2p.address) BEFORE calling, just
+    /// as a YAML load would for the production run(). p2pool-merged-v36 surface:
+    /// NONE (transport wiring only -- no PoW/share/coinbase/PPLNS change).
+    bool arm_p2p_no_rpc() {
+        m_chain.init();               // genesis/checkpoint origin (network-free)
+        assemble();                   // ABLA loop + CoinNode seam + connector sink
+        wire_chain_ingest();          // new_headers --> HeaderChain (height advance)
+        pin_cold_start_anchor();      // operator-approved floor-equivalent anchor
+        return maybe_start_p2p();     // the #231 method under test (configured-peer gate)
+    }
+
     /// Drive the authoritative HeaderChain from the live P2P header stream.
     /// The P2P front-end (NodeP2P) parses `headers` messages and fires
     /// new_headers; until this subscription existed NOTHING advanced m_chain
@@ -459,6 +481,21 @@ public:
                      << " rpc=" << (r.rpc_ok ? "ok" : "off")
                      << " landed_first=" << r.landed_first << ".";
         return r;
+    }
+
+    /// Read-only routing decision mirroring broadcast_won_block's sink-selection
+    /// guards WITHOUT transmitting: reports which leg a won block WOULD take
+    /// given the currently-armed sinks -- "p2p" once the embedded P2P transport
+    /// is live (maybe_start_p2p armed it), "rpc" if only the external BCHN-RPC
+    /// fallback is up, "none" offline. Lets the --with-peer-verify harness
+    /// assert the P2P leg is SELECTED post-arm WITHOUT relaying a block onto the
+    /// live network, so VM300 stays strictly read-only. Selection order matches
+    /// broadcast_won_block exactly: embedded P2P is PRIMARY (checked first), the
+    /// external BCHN-RPC submitblock is the FALLBACK.
+    const char* broadcast_route() {
+        if (m_node.has_p2p()) return "p2p";
+        if (m_coin_node && m_coin_node->has_rpc()) return "rpc";
+        return "none";
     }
 
 private:

@@ -69,6 +69,7 @@ void print_banner(const char* argv0)
         << "c2pool-bch " << C2POOL_VERSION << " — Bitcoin Cash (SHA256d, V36)\n\n"
         << "Usage: " << argv0 << " [--version] [--help] [--selftest]\n"
         << "       " << argv0 << " --ibd [--testnet] [--near-tip] [--auto-kick] [--peer HOST:PORT] [--max-seconds N]\n"
+        << "       " << argv0 << " --with-peer-verify [--testnet] [--peer HOST:PORT] [--max-seconds N]\n"
         << "       " << argv0 << " --leg-c-capture [--rpc-conf PATH]\n"
         << "       " << argv0 << " --leg-c-capture-p2p [--rpc-conf PATH] [--p2p-port N]\n\n"
         << "Status: M5 pool/sharechain + embedded-daemon assembly live.\n"
@@ -221,6 +222,122 @@ int run_ibd(const std::string& host, uint16_t port, bool testnet, uint32_t max_s
 
     ctx.run();
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// --with-peer-verify: WITH-PEER end-to-end check of the #231 production arming.
+//
+// #231 wired the embedded P2P leg into the PRODUCTION run() (maybe_start_p2p),
+// closing the won-block RPC-only degradation. Its unit slice only proved the
+// OFFLINE no-peer contract; the leg actually FIRING with a configured peer was
+// unverified end-to-end (integrator UID 1560). This mode closes that gap
+// against the live VM300 bchn-bch peer, strictly READ-ONLY (start_p2p connects
+// + getheaders + getdata only -- no init_rpc, no qm/control op):
+//
+//   (a) drives the REAL maybe_start_p2p() through arm_p2p_no_rpc() (run() minus
+//       init_rpc) and asserts it returned true AND broadcast_route()=="p2p" --
+//       the won-block dispatcher now TAKES the embedded P2P relay leg, not the
+//       RPC-only fallback. Routing is asserted WITHOUT relaying a block onto
+//       mainnet (broadcast_route is a dry sink-selection read); actual
+//       fire+ACCEPT of a c2pool-built block is the CLOSED co-located-regtest
+//       broadcaster gate (leg-C), not repeated against live mainnet here.
+//   (b) forces a REAL download-window stall: enqueues an unservable block hash
+//       through request_block_downloads -- the EXACT sink the BlockConnector
+//       deep-reorg re-request wires to (set_block_requester ->
+//       p2p->request_block_downloads). VM300 never delivers it, so after
+//       BLOCK_DL_TIMEOUT_SEC the expire tick requeues it and ibd_reissue_count()
+//       goes NONZERO off the live window -- not the synthetic-tick substitute
+//       the unit test uses.
+//
+// p2pool-merged-v36 surface: NONE (transport + local block-dl plumbing only).
+// ---------------------------------------------------------------------------
+int run_with_peer_verify(const std::string& host, uint16_t port, bool testnet,
+                         uint32_t max_seconds)
+{
+    boost::asio::io_context ctx;
+
+    bch::Config cfg("bch-with-peer-verify");
+    cfg.m_testnet = testnet;
+    const NetService peer(host, port);
+    cfg.coin()->m_p2p.address = peer;               // the production "configured peer"
+    cfg.coin()->m_p2p.prefix = testnet
+        ? std::vector<std::byte>{ std::byte{0xf4}, std::byte{0xe5}, std::byte{0xf3}, std::byte{0xf4} }
+        : std::vector<std::byte>{ std::byte{0xe3}, std::byte{0xe1}, std::byte{0xf3}, std::byte{0xe8} };
+
+    EmbeddedDaemon<bch::Config> daemon(&ctx, &cfg, /*anchor_height=*/0);
+
+    // (a) Production arming: run() minus init_rpc, driving the real
+    //     maybe_start_p2p() through its configured-peer gate.
+    const bool armed = daemon.arm_p2p_no_rpc();
+    const std::string route0 = daemon.broadcast_route();
+    std::cout << "[verify] arm_p2p_no_rpc -> " << (armed ? "P2P-LIVE" : "RPC-ONLY")
+              << "; broadcast_route=" << route0
+              << " (peer " << host << ":" << port
+              << (testnet ? " testnet" : " mainnet") << ")\n";
+
+    int failures = 0;
+    if (!armed) { std::cerr << "FAIL: maybe_start_p2p did not arm with a configured peer\n"; ++failures; }
+
+    bool kicked = false;
+    bool stall_injected = false;
+    bool route_p2p_seen = false;
+    uint32_t elapsed = 0;
+    const uint32_t TICK = 5;
+
+    // An unservable (orphan) block hash: VM300 has no such block, so a getdata
+    // for it is never satisfied -> the window must time out and reissue it.
+    uint256 orphan; orphan.SetHex(
+        "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+
+    core::Timer tick(&ctx, /*repeat=*/true);
+    tick.start(TICK, [&]() {
+        elapsed += TICK;
+
+        if (!kicked && daemon.ibd_handshake_ready()) {
+            kicked = true;
+            // Handshake up => P2P transport live => dispatcher takes the P2P leg.
+            const std::string route = daemon.broadcast_route();
+            route_p2p_seen = (route == "p2p");
+            std::cout << "[verify] handshake up; broadcast_route=" << route
+                      << " (expect p2p) -- won-block dispatcher takes P2P leg\n";
+            // (b) Inject the forced stall through the connector's re-request sink.
+            if (auto* p2p = daemon.node().p2p()) {
+                p2p->request_block_downloads({orphan});
+                stall_injected = true;
+                std::cout << "[verify] forced stall: enqueued 1 unservable block via"
+                          << " request_block_downloads (connector re-request sink);"
+                          << " awaiting timeout->reissue (BLOCK_DL_TIMEOUT 60s)\n";
+            }
+        }
+
+        const std::size_t reissue = daemon.ibd_reissue_count();
+        std::cout << "[verify] t=" << elapsed << "s handshake=" << (kicked ? "up" : "down")
+                  << " route=" << daemon.broadcast_route()
+                  << " in_flight=" << daemon.ibd_in_flight()
+                  << " reissue=" << reissue << "\n";
+
+        const bool reissue_seen = stall_injected && reissue > 0;
+        if (reissue_seen || elapsed >= max_seconds) {
+            std::cout << "[verify] " << (reissue_seen ? "REISSUE-CONFIRMED" : "DEADLINE")
+                      << " -- armed=" << (armed ? "yes" : "NO")
+                      << " route_p2p=" << (route_p2p_seen ? "yes" : "NO")
+                      << " reissue=" << reissue << "\n";
+            tick.stop();
+            ctx.stop();
+        }
+    });
+
+    ctx.run();
+
+    if (!route_p2p_seen) { std::cerr << "FAIL: broadcast_route never == p2p after handshake\n"; ++failures; }
+    if (daemon.ibd_reissue_count() == 0) { std::cerr << "FAIL: reissue_count stayed 0 (no live stall recovery)\n"; ++failures; }
+
+    if (failures == 0) {
+        std::cout << "with_peer_verify: ALL PASS (P2P leg armed+selected; live reissue confirmed)\n";
+        return 0;
+    }
+    std::cerr << "with_peer_verify: " << failures << " FAILURE(S)\n";
+    return 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -474,6 +591,7 @@ int main(int argc, char** argv)
     bool want_ibd = false;
     bool want_leg_c = false;
     bool want_leg_c_p2p = false;
+    bool want_with_peer_verify = false;
     uint16_t leg_c_p2p_port = 18444;  // BCHN regtest P2P default
     std::string rpc_conf;
     bool testnet = false;
@@ -490,6 +608,7 @@ int main(int argc, char** argv)
         }
         if (std::strcmp(argv[i], "--help") == 0)     want_help = true;
         if (std::strcmp(argv[i], "--ibd") == 0)      want_ibd = true;
+        if (std::strcmp(argv[i], "--with-peer-verify") == 0) want_with_peer_verify = true;
         if (std::strcmp(argv[i], "--leg-c-capture") == 0) want_leg_c = true;
         if (std::strcmp(argv[i], "--leg-c-capture-p2p") == 0) want_leg_c_p2p = true;
         if (std::strcmp(argv[i], "--p2p-port") == 0 && i + 1 < argc)
@@ -531,6 +650,9 @@ int main(int argc, char** argv)
         }
         return run_leg_c_capture(rpc_conf);
     }
+
+    if (want_with_peer_verify)
+        return run_with_peer_verify(host, port, testnet, max_seconds);
 
     if (want_ibd)
         return run_ibd(host, port, testnet, max_seconds, near_tip, auto_kick);
