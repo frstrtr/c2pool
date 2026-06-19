@@ -148,6 +148,15 @@ private:
     AddrCallback m_addr_callback;
     using PeerHeightCallback = std::function<void(uint32_t)>;
     PeerHeightCallback m_on_peer_height;
+    // Robust getheaders locator provider (exponential back-off over the
+    // authoritative HeaderChain). When set, IBD continuation re-issues
+    // getheaders with this multi-hash locator so the peer can always find a
+    // common ancestor even if our latest header sits on a minority fork. When
+    // unset we fall back to a single-hash locator anchored at the last header
+    // (degraded -- may stall if the peer cannot anchor that lone hash). Pure
+    // SPV wire-sync; no PoW/share/coinbase/PPLNS surface.
+    using LocatorProvider = std::function<std::vector<uint256>()>;
+    LocatorProvider m_locator_provider;
 
 public:
     NodeP2P(io::io_context* context, bch::interfaces::Node* coin, config_t* config,
@@ -321,6 +330,10 @@ public:
     void set_addr_callback(AddrCallback cb) { m_addr_callback = std::move(cb); }
     /// Set callback for peer's reported chain height (from version message).
     void set_on_peer_height(PeerHeightCallback cb) { m_on_peer_height = std::move(cb); }
+    /// Set provider for the robust IBD getheaders locator (HeaderChain
+    /// exponential back-off). Without it, ContinueSync falls back to a
+    /// single-hash locator anchored at the last learned header.
+    void set_locator_provider(LocatorProvider cb) { m_locator_provider = std::move(cb); }
 
     /// Send getaddr to request peer addresses.
     void send_getaddr()
@@ -829,15 +842,25 @@ private:
             switch (header_sync::classify_headers_batch(vheaders.size())) {
             case Followup::ContinueSync:
                 if (m_peer) {
-                    // Anchor the next locator at the last header we just learned
-                    // so the peer streams the next batch forward to its tip.
+                    // The header chain already ingested this batch (new_headers
+                    // fired above), so a HeaderChain-backed locator is anchored
+                    // at the just-learned tip AND carries exponential back-off
+                    // references -- the peer can find a common ancestor even if
+                    // our tip is on a minority fork. Fall back to a single-hash
+                    // anchor only when no provider is wired (degraded).
                     auto last_packed = pack(vheaders.back());
                     auto last_hash = Hash(last_packed.get_span());
+                    std::vector<uint256> chain_locator;
+                    if (m_locator_provider)
+                        chain_locator = m_locator_provider();
+                    auto locator = header_sync::choose_continue_locator(
+                        std::move(chain_locator), last_hash);
                     send_getheaders(m_peer_version ? m_peer_version : 1,
-                                    {last_hash}, uint256::ZERO);
+                                    locator, uint256::ZERO);
                     LOG_INFO << "[" << m_chain_label << "] IBD: got "
                              << vheaders.size() << " headers, continuing from "
-                             << last_hash.GetHex().substr(0, 16) << "...";
+                             << last_hash.GetHex().substr(0, 16) << "... ("
+                             << locator.size() << "-hash locator)";
                 }
                 break;
             case Followup::RequestBlocks:
