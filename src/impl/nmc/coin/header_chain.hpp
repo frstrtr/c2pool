@@ -311,6 +311,45 @@ struct AuxPow {
 
     bool IsNull() const { return parent_header.IsNull(); }
 
+    /// Canonical Namecoin CAuxPow wire layout, fenced to the NMC tree (only
+    /// core/* + nmc::coin types -- no btc/ or bitcoin_family/ include). A
+    /// byte-faithful port of Namecoin CAuxPow / classic Bitcoin auxpow: the
+    /// CMerkleTx coinbase leg, then the chain-merkle leg, then the parent
+    /// header, in daemon field order:
+    ///   1. parent_coinbase        -- parent (BTC) coinbase CTransaction,
+    ///      serialized WITNESS-STRIPPED (TX_NO_WITNESS) so the bytes match the
+    ///      txid the parent tx-merkle tree commits (see parent_coinbase_txid)
+    ///      and the daemon auxpow encoding -- NOT the wtxid form;
+    ///   2. parent_block_hash      -- CMerkleTx::hashBlock;
+    ///   3. parent_coinbase_branch -- CMerkleTx::vMerkleBranch;
+    ///   4. parent_coinbase_index  -- CMerkleTx::nIndex (int32 LE);
+    ///   5. chain_merkle_branch    -- CAuxPow::vChainMerkleBranch;
+    ///   6. chain_merkle_index     -- CAuxPow::nChainIndex (int32 LE);
+    ///   7. parent_header          -- CAuxPow::parentBlock (80-byte header).
+    /// Hand-written (not C2POOL_SERIALIZE_METHODS) because the parent coinbase
+    /// needs the explicit TX_NO_WITNESS param wrapper. Backs the P1f on-disk
+    /// auxpow blob and is reused by PD dual-target wire path.
+    template<typename Stream>
+    void Serialize(Stream& s) const {
+        ::Serialize(s, TX_NO_WITNESS(parent_coinbase));
+        ::Serialize(s, parent_block_hash);
+        ::Serialize(s, parent_coinbase_branch);
+        ::Serialize(s, parent_coinbase_index);
+        ::Serialize(s, chain_merkle_branch);
+        ::Serialize(s, chain_merkle_index);
+        ::Serialize(s, parent_header);
+    }
+    template<typename Stream>
+    void Unserialize(Stream& s) {
+        ::Unserialize(s, TX_NO_WITNESS(parent_coinbase));
+        ::Unserialize(s, parent_block_hash);
+        ::Unserialize(s, parent_coinbase_branch);
+        ::Unserialize(s, parent_coinbase_index);
+        ::Unserialize(s, chain_merkle_branch);
+        ::Unserialize(s, chain_merkle_index);
+        ::Unserialize(s, parent_header);
+    }
+
     /// Result of a (future) AuxPow verification.
     enum class CheckResult {
         NOT_IMPLEMENTED_P0,   //!< P0 leaf — verification path not built yet
@@ -561,20 +600,20 @@ struct IndexEntry {
 /// status (as uint32_t), then the AuxPow presence flag (uint8_t: 1 if the entry
 /// carried a merge-mining proof, else 0).
 ///
-/// P1f-DEFER: auxpow blob persistence -- next sub-leg. nmc::coin::AuxPow itself
-/// has NO ::Serialize/::Unserialize / C2POOL_SERIALIZE_METHODS, so per the
-/// fence we do NOT hand-roll its wire layout here. This leg persists ONLY the
-/// presence flag; on load the AuxPow is reconstructed as std::nullopt, but the
-/// entry's status (HEADER_VALID_CHAIN for a merge-mined header) is preserved
-/// faithfully so the restored chain's validation state is not lost. The actual
-/// proof blob lands in the next sub-leg behind this same flag.
+/// P1f(a): the AuxPow proof blob is persisted behind has_auxpow using the
+/// canonical Namecoin CAuxPow wire layout (AuxPow::Serialize, fenced to
+/// src/impl/nmc/). When has_auxpow == 1 the blob trails the flag and is
+/// restored verbatim on load; when 0, nothing follows. The entry's status
+/// (HEADER_VALID_CHAIN for a merge-mined header) is preserved either way, so
+/// the restored chain's validation state is never lost.
 struct IndexEntryDiskV1 {
     BlockHeaderType header;
     uint256         block_hash;   // SHA256d(header)
     uint32_t        height{0};
     uint256         chain_work;   // cumulative work up to this header
     HeaderStatus    status{HEADER_VALID_UNKNOWN};
-    uint8_t         has_auxpow{0};  // presence flag (blob deferred -- see above)
+    uint8_t         has_auxpow{0};  // presence flag for the trailing blob
+    std::optional<AuxPow> auxpow;   // P1f(a): proof blob, present iff has_auxpow
 
     template<typename Stream>
     void Serialize(Stream& s) const {
@@ -584,9 +623,9 @@ struct IndexEntryDiskV1 {
         ::Serialize(s, chain_work);
         ::Serialize(s, static_cast<uint32_t>(status));
         ::Serialize(s, has_auxpow);
-        // P1f-DEFER: auxpow blob persistence -- next sub-leg. Nothing follows the
-        // flag yet; when AuxPow gains serialization the blob is written here iff
-        // has_auxpow == 1.
+        // P1f(a): the canonical CAuxPow blob trails the flag iff present.
+        if (has_auxpow)
+            ::Serialize(s, *auxpow);
     }
     template<typename Stream>
     void Unserialize(Stream& s) {
@@ -598,8 +637,14 @@ struct IndexEntryDiskV1 {
         ::Unserialize(s, st);
         status = static_cast<HeaderStatus>(st);
         ::Unserialize(s, has_auxpow);
-        // P1f-DEFER: auxpow blob persistence -- next sub-leg. The blob is not on
-        // disk yet, so there is nothing further to read behind the flag.
+        // P1f(a): read the canonical CAuxPow blob iff the flag says it is there.
+        if (has_auxpow) {
+            AuxPow ap;
+            ::Unserialize(s, ap);
+            auxpow = std::move(ap);
+        } else {
+            auxpow = std::nullopt;
+        }
     }
 
     /// Materialize the slim in-memory form. auxpow is reconstructed as nullopt
@@ -611,7 +656,7 @@ struct IndexEntryDiskV1 {
         e.height     = height;
         e.chain_work = chain_work;
         e.status     = status;
-        e.auxpow     = std::nullopt;   // P1f-DEFER: blob not persisted yet
+        e.auxpow     = auxpow;         // P1f(a): blob restored behind has_auxpow
         return e;
     }
 
@@ -624,6 +669,7 @@ struct IndexEntryDiskV1 {
         d.chain_work  = e.chain_work;
         d.status      = e.status;
         d.has_auxpow  = e.auxpow.has_value() ? 1 : 0;
+        d.auxpow      = e.auxpow;      // P1f(a): carry the proof blob too
         return d;
     }
 };
