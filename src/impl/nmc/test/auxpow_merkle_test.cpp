@@ -35,6 +35,7 @@
 namespace {
 
 using nmc::coin::aux_merkle_root;
+using nmc::coin::AuxPow;
 
 // Build a uint256 whose first byte is `b` (rest zero) — distinct, legible leaves.
 static uint256 leaf_of(unsigned char b)
@@ -98,6 +99,55 @@ TEST(NmcAuxMerkle, IndexTooLargeForBranchThrows)
     uint256 sib  = leaf_of(0x22);
     // one-element branch admits indices 0..1; 2 overflows the implied tree.
     EXPECT_THROW(aux_merkle_root(leaf, {sib}, 2u), std::invalid_argument);
+}
+
+
+// ---------------------------------------------------------------------------
+// P1b: AuxPow::check_proof chain-merkle leg (step 1) wiring.
+//
+// check_proof() now reconstructs the merged-mining merkle root from the aux
+// block hash through chain_merkle_branch/index via aux_merkle_root(). Steps 2
+// (MM-marker commitment), 3 (parent-coinbase tx-merkle leg) and 4 (parent PoW)
+// are NOT built, so a structurally-consistent walk returns INCOMPLETE — never
+// VALID. A malformed slot index (negative, or wider than the branch depth)
+// returns INVALID. These KATs pin exactly that boundary so the leg can never
+// silently regress into asserting VALID before the rest of the proof exists.
+// ---------------------------------------------------------------------------
+
+TEST(NmcAuxCheckProof, ChainLegStructurallyValidIsIncomplete)
+{
+    AuxPow ap;
+    ap.chain_merkle_branch = {leaf_of(0xbe)};
+    ap.chain_merkle_index = 0;
+    EXPECT_EQ(ap.check_proof(leaf_of(0x01), /*expected_chain_id=*/1),
+              AuxPow::CheckResult::INCOMPLETE);
+}
+
+TEST(NmcAuxCheckProof, EmptyChainBranchIsIncompleteNeverValid)
+{
+    AuxPow ap;  // empty branch, index 0 => identity walk, still not provable
+    EXPECT_EQ(ap.check_proof(leaf_of(0x07), 1),
+              AuxPow::CheckResult::INCOMPLETE);
+    EXPECT_NE(ap.check_proof(leaf_of(0x07), 1),
+              AuxPow::CheckResult::VALID);
+}
+
+TEST(NmcAuxCheckProof, NegativeChainIndexIsInvalid)
+{
+    AuxPow ap;
+    ap.chain_merkle_branch = {leaf_of(0x0a)};
+    ap.chain_merkle_index = -1;
+    EXPECT_EQ(ap.check_proof(leaf_of(0x02), 1),
+              AuxPow::CheckResult::INVALID);
+}
+
+TEST(NmcAuxCheckProof, ChainIndexTooWideForDepthIsInvalid)
+{
+    AuxPow ap;
+    ap.chain_merkle_branch = {leaf_of(0x0a)};  // depth 1 => max index 1
+    ap.chain_merkle_index = 2;
+    EXPECT_EQ(ap.check_proof(leaf_of(0x02), 1),
+              AuxPow::CheckResult::INVALID);
 }
 
 } // namespace

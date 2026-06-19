@@ -193,6 +193,7 @@ struct AuxPow {
     /// Result of a (future) AuxPow verification.
     enum class CheckResult {
         NOT_IMPLEMENTED_P0,   //!< P0 leaf — verification path not built yet
+        INCOMPLETE,           //!< P1b — merkle leg(s) wired; steps 2/3/4 pending
         VALID,
         INVALID,
     };
@@ -200,7 +201,8 @@ struct AuxPow {
     /// Verify that this AuxPow actually proves work for `aux_block_hash`
     /// against the given expected aux chain id.
     ///
-    /// P0-DEFER: NOT IMPLEMENTED in P0. The real implementation must, against
+    /// P1b: step 1 (chain-merkle leg) is wired below via aux_merkle_root().
+    /// The FULL implementation must, against
     /// a properly-pinned Namecoin chainparams:
     ///   1. recompute the merged-mining merkle root from `chain_merkle_branch`
     ///      + `chain_merkle_index` starting at `aux_block_hash`, and confirm
@@ -216,10 +218,31 @@ struct AuxPow {
     /// Until all four steps exist, NMC MUST NOT block-validate off this leaf.
     CheckResult check_proof(const uint256& aux_block_hash,
                             int32_t expected_chain_id) const {
-        // P0-DEFER: structural stub. Deliberately performs NO verification.
-        (void)aux_block_hash;
-        (void)expected_chain_id;
-        return CheckResult::NOT_IMPLEMENTED_P0;
+        // P1b — chain-merkle leg (step 1). Walk the aux (NMC) block hash up
+        // through chain_merkle_branch/chain_merkle_index to reconstruct the
+        // merged-mining merkle root via aux_merkle_root(). The remaining steps
+        // are NOT built yet: step 2 (confirm that root is committed in the
+        // parent coinbase MM marker, with the chain_id/slot binding), step 3
+        // (parent-coinbase tx-merkle leg — needs the witness-stripped BTC
+        // coinbase txid), step 4 (parent PoW vs target, consumed from the btc
+        // tree READ-ONLY). A structurally-consistent chain-merkle walk therefore
+        // returns INCOMPLETE, never VALID — NMC still MUST NOT block-validate
+        // off this leaf.
+        (void)expected_chain_id;  // step-2 (chain_id/slot) binding lands later
+
+        if (chain_merkle_index < 0)
+            return CheckResult::INVALID;  // negative slot index is malformed
+
+        try {
+            // Reconstructed MM root; its commitment check is step 2 (pending).
+            (void)aux_merkle_root(
+                aux_block_hash, chain_merkle_branch,
+                static_cast<uint32_t>(chain_merkle_index));
+        } catch (const std::invalid_argument&) {
+            return CheckResult::INVALID;  // branch index out of range for depth
+        }
+
+        return CheckResult::INCOMPLETE;
     }
 };
 
