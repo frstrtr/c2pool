@@ -23,9 +23,32 @@
 #include <core/log.hpp>
 
 #include <ctime>
+#include <string>
 #include <limits>
 
 namespace dgb::stratum {
+
+namespace {
+
+// Render a u256 as the GBT-conventional big-endian block-hash display hex:
+// most-significant limb first, 64 lowercase hex digits, no 0x prefix. Mirrors
+// uint256::GetHex() ordering for a hash stored with limb[0] least-significant.
+// Header-only u256 has no GetHex(), and this TU must not depend on btclibs'
+// uint256, so we format the limbs directly.
+std::string u256_be_display_hex(const dgb::coin::u256& v)
+{
+    static constexpr char H[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(64);
+    for (int li = 3; li >= 0; --li) {
+        const uint64_t w = v.limb[li];
+        for (int sh = 60; sh >= 0; sh -= 4)
+            out.push_back(H[(w >> sh) & 0xF]);
+    }
+    return out;
+}
+
+} // namespace
 
 DGBWorkSource::DGBWorkSource(c2pool::dgb::HeaderChain&     chain,
                              dgb::coin::Mempool&           mempool,
@@ -184,11 +207,26 @@ nlohmann::json DGBWorkSource::get_current_work_template() const
     //                  so no transactions are fabricated and fees stay 0
     //                  (consistent with the total_fees=0 coinbasevalue above).
     //
-    // Deliberately NOT emitted yet — they need accessors the Scrypt-only
-    // HeaderSample does not carry, and land in the following Stage 4c/4d slices:
-    //   previousblockhash — the tip block hash (HeaderSample stores no hash yet)
-    //   bits              — the next-block compact target off the DigiShield
-    //                       retarget window
+    // previousblockhash — the tip block id. Emitted ONLY when the HeaderChain
+    //                  carries a real tip hash (tip_hash() accessor): the
+    //                  Scrypt-only HeaderSample now carries a block_hash slot,
+    //                  but the embedded P2P header-download -> validate_and_append
+    //                  ingest that POPULATES it lands in a following slice, so on
+    //                  today's chain state tip_hash() is nullopt and the field is
+    //                  held back -- a truthful absence, never a fabricated hash.
+    // bits          — HELD BACK. The only embedded next-target source is the
+    //                  DigiShield/MultiShield damped multiply, which DGB Core
+    //                  runs as MultiShield V4: a GLOBAL window across all 5 algos
+    //                  with per-algo adjust + MTP deltas. A Scrypt-only header
+    //                  walk cannot reconstruct that window (== V37, 5-algo
+    //                  validation), so the ingest path deliberately demotes the
+    //                  retarget gate to a no-op (see header_chain.hpp). Emitting
+    //                  a digishield_next_target()-derived bits would be a
+    //                  KNOWN-WRONG value -- the same fabrication the empty
+    //                  transactions[] and total_fees=0 avoid. The authoritative
+    //                  bits is the external-daemon GBT value, which is not
+    //                  plumbed into this embedded template path yet; bits stays
+    //                  absent until then. [decision-needed] surfaced to integrator.
     // and the per-connection coinbase (gentx + ShareTracker ref_hash + PPLNS
     // payout map) assembles in build_connection_coinbase() — that output is
     // consensus-bearing and surfaces for an operator tap, not in this field wire.
@@ -209,6 +247,11 @@ nlohmann::json DGBWorkSource::get_current_work_template() const
     tmpl["curtime"]       = curtime;
     tmpl["mintime"]       = mintime;
     tmpl["transactions"]  = nlohmann::json::array();
+
+    // previousblockhash: truthful conditional emit (see field notes above).
+    if (auto th = chain_.tip_hash())
+        tmpl["previousblockhash"] = u256_be_display_hex(*th);
+
     return tmpl;
 }
 

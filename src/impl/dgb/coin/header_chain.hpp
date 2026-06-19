@@ -75,10 +75,11 @@ using ::dgb::coin::u256;
 // == 0 is the default for "scrypt(header) not evaluated here" (trivially
 // satisfies any target); the daemon port fills it.
 struct HeaderSample {
-    int32_t  n_version = 0;
-    int64_t  n_time    = 0;
-    u256     target    = 0;   // expanded PoW target (smaller == more work)
-    u256     pow_hash  = 0;   // scrypt(header) digest; hash <= target == valid PoW
+    int32_t  n_version  = 0;
+    int64_t  n_time     = 0;
+    u256     target     = 0;   // expanded PoW target (smaller == more work)
+    u256     pow_hash    = 0;  // scrypt(header) digest; hash <= target == valid PoW
+    u256     block_hash  = 0;  // sha256d(header) block id; 0 == not populated here
 };
 
 // Outcome of validating + ingesting one header.
@@ -356,6 +357,23 @@ public:
         if (m_chain.empty())
             return std::nullopt;
         return static_cast<uint32_t>(m_base_height + (m_chain.size() - 1));
+    }
+
+    // Block hash of the newest header, or nullopt when the chain is empty OR
+    // the tip carries no hash. DGB's block id is sha256d over the 80-byte
+    // header (params.hpp block_hash_func == sha256d) -- distinct from pow_hash,
+    // which is the scrypt(header) PoW digest. HeaderSample stores it as a u256
+    // and the work-template emitter renders the GBT-conventional big-endian
+    // display hex. block_hash == 0 is the "not populated here" sentinel (the
+    // SAME convention pow_hash uses): the embedded-daemon header-ingest port
+    // fills it at the validate_and_append boundary, so until that lands this
+    // returns nullopt and get_current_work_template holds previousblockhash
+    // back -- a truthful absence, never a fabricated hash.
+    std::optional<u256> tip_hash() const
+    {
+        if (m_chain.empty() || m_chain.back().block_hash.is_zero())
+            return std::nullopt;
+        return m_chain.back().block_hash;
     }
 
     // Absolute height of the block the next template builds on top of the tip
