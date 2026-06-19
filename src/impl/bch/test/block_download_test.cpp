@@ -25,6 +25,7 @@
 
 using bch::coin::block_download::BlockDownloadWindow;
 using bch::coin::block_download::DEFAULT_MAX_BLOCKS_IN_FLIGHT;
+using bch::coin::block_download::DEFAULT_MAX_BLOCK_REJECTS;
 
 // Deterministic distinct hashes (no Math.random) -- hash i = uint256(i+1).
 static uint256 H(uint64_t i) { return uint256(base_uint<256>(i + 1)); }
@@ -227,6 +228,59 @@ int main()
         assert(w.queued() == 0);
         assert(w.next_requests(/*now=*/300).empty());
         assert(w.idle());
+    }
+
+    // ---- arrived-but-INVALID body: re-download, do NOT blackhole the height -
+    //      A block whose body fails local validation (merkle mismatch) must be
+    //      RE-QUEUED rather than marked permanently received -- on_block_received
+    //      keeps the hash in m_known forever, and enqueue() dedupes on m_known,
+    //      so a once-rejected block could never be re-requested and that height
+    //      would starve the ABLA feed / block-connector. on_block_rejected frees
+    //      the slot and requeues to the front; the height recovers.
+    {
+        BlockDownloadWindow w(2);
+        w.enqueue(hashes(0, 2));                       // [H0 H1]
+        auto req = w.next_requests();                  // H0,H1 issued
+        assert(req.size() == 2 && w.in_flight() == 2);
+        assert(w.reject_count() == 0);
+
+        // H0's body arrives but fails validation -> re-queued, slot freed.
+        assert(w.on_block_rejected(H(0)) == true);
+        assert(w.reject_count() == 1);
+        assert(w.in_flight() == 1);                    // slot freed
+        assert(w.queued() == 1);                       // H0 back in the queue
+        // The next drain re-requests H0 (front) -- the height is NOT blackholed.
+        auto re = w.next_requests();
+        assert(re.size() == 1 && re[0] == H(0));
+        assert(w.in_flight() == 2);
+
+        // A rejected body never DOUBLE-queues even if expire() already requeued
+        // it: force-evict everything to the front, then reject H0 again.
+        w.expire(/*now=*/1, /*timeout=*/0);            // H0,H1 -> front of queue
+        assert(w.queued() == 2 && w.in_flight() == 0);
+        assert(w.on_block_rejected(H(0)) == true);     // already pending: no dup
+        assert(w.queued() == 2);                       // still exactly two queued
+        assert(w.reject_count() == 2);
+    }
+
+    // ---- bounded rejects: a persistently-bad peer cannot loop forever -------
+    //      After DEFAULT_MAX_BLOCK_REJECTS re-downloads the hash is abandoned
+    //      (returns false, not re-queued) and stays deduped so a re-announce
+    //      does not resurrect it -- the cap that stops an unbounded getdata loop.
+    {
+        BlockDownloadWindow w(1);
+        w.enqueue(hashes(0, 1));                        // [H0]
+        w.next_requests();                              // H0 in flight
+        for (std::size_t i = 0; i < DEFAULT_MAX_BLOCK_REJECTS; ++i) {
+            assert(w.on_block_rejected(H(0)) == true);  // re-queued...
+            w.next_requests();                          // ...and re-issued
+        }
+        // The next reject exceeds the budget -> abandoned.
+        assert(w.on_block_rejected(H(0)) == false);
+        assert(w.queued() == 0 && w.in_flight() == 0);  // not re-queued
+        // Still deduped: a re-announce does not resurrect an abandoned hash.
+        assert(w.enqueue(hashes(0, 1)) == 0);
+        assert(w.queued() == 0);
     }
 
     std::cout << "bch block_download window: ALL PASS\n";

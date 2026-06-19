@@ -55,6 +55,13 @@ namespace bch::coin::block_download {
 /// peer's pipe full without unbounded memory on a slow one.
 inline constexpr std::size_t DEFAULT_MAX_BLOCKS_IN_FLIGHT = 16;
 
+/// Default cap on re-download attempts for a block whose BODY failed local
+/// validation (merkle-root mismatch in emit_full_block). A flaky or malicious
+/// peer that repeatedly serves the same bad body must not drive an unbounded
+/// re-getdata loop, so after this many rejects the hash is abandoned (left in
+/// m_known, never re-queued) and the caller should consider peer demotion.
+inline constexpr std::size_t DEFAULT_MAX_BLOCK_REJECTS = 3;
+
 /// Bounded headers-first block-download window. Peer-free + deterministic:
 /// callers feed it learned header hashes (enqueue), drain the requests it wants
 /// issued now (next_requests), and report arrivals (on_block_received) which
@@ -133,6 +140,36 @@ public:
         return true;
     }
 
+    /// Report an arrived block whose BODY FAILED local validation (a merkle-root
+    /// mismatch in emit_full_block). Contrast on_block_received, which remembers
+    /// the hash permanently and would thus BLACKHOLE the height -- enqueue()
+    /// skips anything in m_known, so a once-rejected block could never be
+    /// re-requested and the ABLA feed / block-connector would silently skip that
+    /// height forever. This instead frees the window slot and RE-QUEUES the hash
+    /// to the FRONT for another download attempt (ideally answered by a healthier
+    /// peer). Bounded: after max_rejects attempts the hash is abandoned (left in
+    /// m_known, no further re-queue) so a peer that persistently lies cannot
+    /// drive an unbounded getdata loop; the caller logs / demotes that peer.
+    /// Returns true iff the block was re-queued for another attempt.
+    bool on_block_rejected(const uint256& h,
+                           std::size_t max_rejects = DEFAULT_MAX_BLOCK_REJECTS)
+    {
+        m_in_flight.erase(h);   // free the window slot (no-op if not in flight)
+        m_evicted.erase(h);     // a rejected body also clears any stale eviction marker
+        ++m_reject_count;
+        if (++m_rejects[h] > max_rejects) {
+            // Give up: leave it in m_known so it is neither re-queued nor
+            // re-counted, and stop hammering the peer.
+            return false;
+        }
+        // Re-download: push to the FRONT (retry before fresh tip blocks), but
+        // only if not already pending -- expire() may have requeued it. m_known
+        // still holds it, so a parallel headers batch won't add a second copy.
+        for (const auto& q : m_queue) if (q == h) return true;
+        m_queue.push_front(h);
+        return true;
+    }
+
     /// Evict in-flight requests that have gone stale -- a block we getdata'd but a
     /// stalling peer never delivered. now_tick and timeout_ticks are in the caller's
     /// monotonic unit (the same unit passed to next_requests()); any request issued
@@ -183,6 +220,11 @@ public:
     /// Read-only IBD evidence alongside reissue_count().
     std::size_t false_evict_count() const { return m_false_evict_count; }
 
+    /// Cumulative count of arrived block bodies that FAILED local validation
+    /// (merkle mismatch) and were routed through on_block_rejected. 0 on a clean
+    /// sync; non-zero means a peer served a corrupt body. Read-only IBD evidence.
+    std::size_t reject_count() const { return m_reject_count; }
+
 private:
     std::size_t m_max_in_flight;
     std::deque<uint256> m_queue;                            // pending, chain order
@@ -191,6 +233,8 @@ private:
     std::size_t m_reissue_count = 0;                       // lifetime re-issues (stall-driven)
     std::unordered_set<uint256, HashHasher> m_evicted;     // expired, awaiting (re-)arrival
     std::size_t m_false_evict_count = 0;                   // evicted-then-arrived (premature)
+    std::size_t m_reject_count = 0;                        // arrived-but-invalid (merkle mismatch)
+    std::unordered_map<uint256, std::size_t, HashHasher> m_rejects; // hash -> reject attempts
 };
 
 } // namespace bch::coin::block_download
