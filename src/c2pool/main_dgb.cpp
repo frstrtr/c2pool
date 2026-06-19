@@ -6,15 +6,17 @@
 //
 //   --selftest / bare : drive the LIVE dgb::ShareTracker::score() path so the
 //                       coin smoke gate exercises real consensus code, then exit.
-//   --run             : stand up the run-loop SPINE (this slice) — io_context +
-//                       graceful SIGINT/SIGTERM shutdown. The node/stratum/P2P
-//                       subsystems and the won-block dispatch binding
+//   --run             : stand up the run-loop — io_context + graceful
+//                       SIGINT/SIGTERM shutdown, the dgb::Node sharechain peer
+//                       (P2P listener), and (this slice) the miner-facing
+//                       Stratum work source. A won Scrypt block reaches the
+//                       network via the #82 dual-path broadcaster: the
+//                       submitblock-RPC arm (rpc.cpp:387 submit_block_hex, REAL)
+//                       is wired here; the embedded P2P-relay arm
 //                       (m_on_block_found -> reconstruct_won_block ->
-//                       broadcast_won_block, #82 connecting tissue landed across
-//                       PRs #163/#166/#167/#173/#174/#176/#177/#179) bind onto
-//                       this io_context in the NEXT stacked slice. Standing the
-//                       spine up first gives those subsystems the lifecycle they
-//                       hang off and keeps each increment build-verifiable.
+//                       broadcast_won_block, PRs #163/#166/#167/#173/#174/#176/
+//                       #177/#179) binds in the NEXT stacked slice once that
+//                       reconstructor stack lands on this base.
 //
 // V36 scope: Scrypt blocks validated; the other 4 DGB algos (SHA256d, Skein,
 // Qubit, Odocrypt) are accept-by-continuity / ignored — full 5-algo support is
@@ -25,8 +27,13 @@
 // Mirrors src/c2pool/main_btc.cpp s target shape.
 
 #include <impl/dgb/node.hpp>
+#include <impl/dgb/coin/header_chain.hpp>
+#include <impl/dgb/coin/mempool.hpp>
+#include <impl/dgb/coin/coin_node.hpp>
+#include <impl/dgb/stratum/work_source.hpp>
 
 #include <core/filesystem.hpp>
+#include <core/stratum_server.hpp>
 #include <btclibs/util/strencodings.h>
 
 #include <boost/asio.hpp>
@@ -35,8 +42,11 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <system_error>
+#include <utility>
+#include <vector>
 
 #ifndef C2POOL_VERSION
 #define C2POOL_VERSION "dev"
@@ -62,11 +72,14 @@ void print_banner(const char* argv0, const core::CoinParams& p)
 {
     std::cout
         << "c2pool-dgb " << C2POOL_VERSION << " — DigiByte Scrypt-only (V36)\n\n"
-        << "Usage: " << argv0 << " [--version] [--help] [--selftest] [--run]\n\n"
-        << "Status: pool/sharechain pillars live (Phase B); run-loop spine up\n"
-        << "        (--run: io_context + graceful shutdown). Node/stratum/P2P +\n"
-        << "        won-block dispatch binding land in the next slice; external\n"
-        << "        digibyted RPC stays as a fallback.\n"
+        << "Usage: " << argv0
+        << " [--version] [--help] [--selftest] [--run] [--stratum [H:]P]\n\n"
+        << "Status: pool/sharechain pillars live (Phase B); run-loop up\n"
+        << "        (--run: io_context + sharechain peer + Stratum standup).\n"
+        << "        --stratum [HOST:]PORT binds a miner-facing TCP listener\n"
+        << "        (e.g. --stratum 5022 or --stratum 127.0.0.1:5022); omit to\n"
+        << "        disable. Embedded P2P won-block relay + external digibyted\n"
+        << "        RPC fallback land in the next slices.\n"
         << "Network: " << network_summary(p) << "\n";
 }
 
@@ -98,10 +111,11 @@ int run_selftest(const core::CoinParams& params)
     return 0;
 }
 
-// Run-loop SPINE + sharechain peer bring-up. Stands up the io_context that
-// every node subsystem hangs off, an explicit graceful shutdown driven from
-// boost::asio::signal_set, and (this slice) constructs the dgb::Config +
-// dgb::Node sharechain peer and binds its P2P listener.
+// Run-loop: sharechain peer bring-up + miner-facing Stratum standup. Stands up
+// the io_context that every node subsystem hangs off, an explicit graceful
+// shutdown driven from boost::asio::signal_set, the dgb::Node sharechain peer
+// (P2P listener), and (this slice) the Stratum work source + acceptor so a
+// won Scrypt block reaches the network.
 //
 // Why signal_set and not std::signal: std::signal handlers run in the
 // async-signal-only delivery context; io_context::stop is thread-safe but not
@@ -109,13 +123,8 @@ int run_selftest(const core::CoinParams& params)
 // async callback on the io_context thread, so the shutdown path can do real
 // work (stop the stratum acceptor, close sessions) before ioc.stop() drains
 // the rest — mirrors main_btc.cpp's teardown contract.
-//
-// SEAM (next stacked slice): stand up the Stratum work source and bind
-// make_on_block_found(reconstruct_won_block, p2p_sink) into m_on_block_found
-// so a won share reaches the network (closes #82's embedded P2P relay path);
-// the submitblock RPC fallback (rpc.cpp:387, already real — NOT a stub) is the
-// second arm of the dual-path broadcaster gate.
-int run_node(const core::CoinParams& params, bool testnet)
+int run_node(const core::CoinParams& params, bool testnet,
+             const std::string& stratum_addr, uint16_t stratum_port)
 {
     io::io_context ioc;
 
@@ -146,20 +155,28 @@ int run_node(const core::CoinParams& params, bool testnet)
         config.pool()->m_bootstrap_addrs.emplace_back(addr);
     }
 
+    // Stratum acceptor handle, declared BEFORE the signal_set so the shutdown
+    // callback can stop it (cancel acceptor + close sessions) ahead of
+    // ioc.stop(). Populated below once the work source is built.
+    std::unique_ptr<core::StratumServer> stratum_server;
+
     bool shutdown_initiated = false;
     io::signal_set signals(ioc, SIGINT, SIGTERM);
     signals.async_wait(
-        [&ioc, &shutdown_initiated](const boost::system::error_code& ec, int signo) {
+        [&ioc, &stratum_server, &shutdown_initiated]
+        (const boost::system::error_code& ec, int signo) {
             if (ec) return;
             if (shutdown_initiated) return;
             shutdown_initiated = true;
 
             std::cout << "[DGB] received signal " << signo
                       << " — initiating graceful shutdown" << std::endl;
-            // Next slice: stop stratum acceptor + close sessions here BEFORE
-            // ioc.stop(), so their pending async ops cancel cleanly. The
-            // sharechain peer's sockets close when p2p_node destructs at scope
-            // exit after ioc.run() returns.
+            // Stop stratum BEFORE ioc.stop() so the acceptor cancels and live
+            // miner sessions close cleanly (their pending async ops unwind on
+            // the io_context). The sharechain peer's sockets close when
+            // p2p_node destructs at scope exit after ioc.run() returns.
+            if (stratum_server)
+                stratum_server->stop();
             ioc.stop();
         });
 
@@ -177,12 +194,79 @@ int run_node(const core::CoinParams& params, bool testnet)
               << " prefix=" << dgb::PoolConfig::DEFAULT_PREFIX_HEX << std::endl;
     p2p_node.start_outbound_connections();  // no-op until seed hosts exist
 
+    // ── #82 dual-path won-block CLOSER: miner-facing Stratum standup ───────
+    //
+    // Stand the miner path up so a Scrypt block found by a connected miner
+    // reaches the network. The embedded coin side is MVP-unwired this slice
+    // (empty HeaderChain + Mempool): the DGBWorkSource 4a skeleton returns
+    // default work and mining_submit low-diff-rejects before the broadcaster
+    // (compute_share_difficulty's 0.0 sentinel), so NO garbage block is ever
+    // emitted — the standup proves the StratumServer<->IWorkSource wiring
+    // end-to-end. Real work-gen / Scrypt share-validation land in 4b/4c.
+    // This mirrors btc::stratum standing its skeleton wiring up first.
+    c2pool::dgb::HeaderChain header_chain;   // §7b chain, MVP-unwired (empty)
+    dgb::coin::Mempool       mempool;        // unwired (no UTXO/template feed yet)
+
+    // submitblock-RPC arm of the #82 dual-path broadcaster (rpc.cpp:387
+    // submit_block_hex — REAL, not a stub). CoinNode(nullptr embedded,
+    // nullptr rpc) => has_rpc()==false => submit_block_hex returns false
+    // LOUDLY (the #163 seam guard: no silent drop). Point a real NodeRPC at
+    // external digibyted here to light this arm up.
+    dgb::coin::CoinNode coin_node(/*embedded=*/nullptr, /*rpc=*/nullptr);
+
+    auto stratum_submit_fn =
+        [&coin_node](const std::vector<unsigned char>& block_bytes,
+                     uint32_t height) -> bool {
+            const std::string block_hex = HexStr(block_bytes);
+            std::cout << "[DGB-STRATUM-BLOCK] won block height=" << height
+                      << " bytes=" << block_bytes.size()
+                      << " — dispatching via submitblock-RPC arm" << std::endl;
+            // P2P-relay arm (m_on_block_found -> reconstruct_won_block ->
+            // broadcast_won_block) binds in the NEXT slice once the
+            // reconstructor stack (#163/#166/#167/#177) lands on this base.
+            const bool ok =
+                coin_node.submit_block_hex(block_hex, /*ignore_failure=*/false);
+            if (!ok)
+                std::cout << "[DGB-STRATUM-BLOCK] submitblock arm reached NO sink "
+                             "(no embedded backend / no digibyted RPC wired yet) "
+                             "— P2P-relay arm pending reconstructor stack"
+                          << std::endl;
+            return ok;
+        };
+
+    // DGBWorkSource holds non-owning refs to chain + mempool; both outlive it
+    // (declared just above, same scope). The StratumServer co-owns the work
+    // source via shared_ptr.
+    auto work_source = std::make_shared<dgb::stratum::DGBWorkSource>(
+        header_chain, mempool, testnet, std::move(stratum_submit_fn));
+
+    if (stratum_port != 0) {
+        stratum_server = std::make_unique<core::StratumServer>(
+            ioc, stratum_addr, stratum_port, work_source);
+        if (stratum_server->start()) {
+            std::cout << "[DGB] stratum listening on " << stratum_addr << ":"
+                      << stratum_port
+                      << " (work source: DGBWorkSource 4a skeleton — Scrypt-only;"
+                      << " work-gen/share-validation land in 4b/4c)" << std::endl;
+        } else {
+            std::cout << "[DGB] stratum FAILED to bind " << stratum_addr << ":"
+                      << stratum_port << " — stratum disabled" << std::endl;
+            stratum_server.reset();
+        }
+    } else {
+        std::cout << "[DGB] stratum disabled (no --stratum flag)" << std::endl;
+    }
+
     std::cout << "[DGB] run-loop up: " << network_summary(params) << "\n";
-    std::cout << "[DGB] io_context running. Ctrl-C to stop. "
-              << "(Stratum work source + won-block dispatch bind in the next slice)"
-              << std::endl;
+    std::cout << "[DGB] io_context running. Ctrl-C to stop." << std::endl;
 
     ioc.run();
+
+    // Tear the acceptor + sessions down while the work source and the coin
+    // objects it references (header_chain / mempool / coin_node) are still
+    // alive — explicit reset keeps destruction order safe (stratum_server was
+    // declared first, so it would otherwise outlive them).
+    stratum_server.reset();
 
     std::cout << "[DGB] io_context stopped — clean exit" << std::endl;
     return 0;
@@ -195,6 +279,8 @@ int main(int argc, char** argv)
     bool want_help = false;
     bool want_selftest = false;
     bool want_run = false;
+    std::string stratum_addr = "0.0.0.0";  // bind all interfaces by default
+    uint16_t    stratum_port = 0;           // 0 disables stratum; --stratum sets it
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
             std::cout << "c2pool-dgb " << C2POOL_VERSION << "\n";
@@ -203,6 +289,17 @@ int main(int argc, char** argv)
         if (std::strcmp(argv[i], "--help") == 0)     want_help = true;
         if (std::strcmp(argv[i], "--selftest") == 0) want_selftest = true;
         if (std::strcmp(argv[i], "--run") == 0)      want_run = true;
+        if (std::strcmp(argv[i], "--stratum") == 0 && i + 1 < argc) {
+            // --stratum [HOST:]PORT — bind a stratum TCP listener for miners.
+            const std::string ep = argv[++i];
+            const auto colon = ep.find(':');
+            if (colon == std::string::npos) {
+                stratum_port = static_cast<uint16_t>(std::stoi(ep));
+            } else {
+                stratum_addr = ep.substr(0, colon);
+                stratum_port = static_cast<uint16_t>(std::stoi(ep.substr(colon + 1)));
+            }
+        }
     }
 
     const core::CoinParams params = dgb::make_coin_params(/*testnet=*/false);
@@ -211,9 +308,9 @@ int main(int argc, char** argv)
     if (want_help)
         return 0;
 
-    // --run: stand up the run-loop spine (io_context + graceful shutdown).
+    // --run: stand up the run-loop (io_context + sharechain peer + stratum).
     if (want_run)
-        return run_node(params, /*testnet=*/false);
+        return run_node(params, /*testnet=*/false, stratum_addr, stratum_port);
 
     // --selftest, or a bare invocation: drive the live score path so the
     // binary exercises real consensus code, then exit cleanly.

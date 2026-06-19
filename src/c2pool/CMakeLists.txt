@@ -203,6 +203,7 @@ target_link_libraries(c2pool-dgb
     core
     dgb        # DGB pool-layer OBJECT lib: node.cpp NodeImpl + protocol handlers
     dgb_coin   # DGB coin-layer: embedded P2P + mempool + transaction ctors
+    dgb_stratum  # DGB miner-facing IWorkSource (DGBWorkSource) — #82 stratum standup
     pool
     sharechain
     c2pool_storage
