@@ -31,6 +31,13 @@
 #include <impl/bch/coin/abla.hpp>
 #include <impl/bch/config.hpp>
 #include <impl/bch/coin/embedded_daemon.hpp>
+#include <impl/bch/coin/regtest_block.hpp>
+#include <impl/bch/coin/rpc.hpp>
+
+#include <core/core_util.hpp>
+
+#include <cstdlib>
+#include <fstream>
 
 #include <core/netaddress.hpp>
 #include <core/timer.hpp>
@@ -60,7 +67,8 @@ void print_banner(const char* argv0)
     std::cout
         << "c2pool-bch " << C2POOL_VERSION << " — Bitcoin Cash (SHA256d, V36)\n\n"
         << "Usage: " << argv0 << " [--version] [--help] [--selftest]\n"
-        << "       " << argv0 << " --ibd [--testnet] [--near-tip] [--peer HOST:PORT] [--max-seconds N]\n\n"
+        << "       " << argv0 << " --ibd [--testnet] [--near-tip] [--peer HOST:PORT] [--max-seconds N]\n"
+        << "       " << argv0 << " --leg-c-capture [--rpc-conf PATH]\n\n"
         << "Status: M5 pool/sharechain + embedded-daemon assembly live.\n"
         << "        The embedded daemon (coin/embedded_daemon.hpp) is the primary\n"
         << "        work source; external BCHN-RPC stays as the fallback.\n"
@@ -197,12 +205,122 @@ int run_ibd(const std::string& host, uint16_t port, bool testnet, uint32_t max_s
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// leg-C: dual-path broadcaster capture (RPC leg).
+//
+// The broadcaster-gate dual-path close needs ONE regtest capture proving a
+// c2pool-BUILT, consensus-valid block is ACCEPTED by the node: submitblock=
+// accept + a verbatim BCHN "UpdateTip: new best=... height=N" connect-block
+// line. This mode drives the RPC leg of EmbeddedDaemon::broadcast_won_block --
+// NodeRPC::submit_block_hex, the exact submitblock sink -- against the co-
+// located self-provisioned regtest node (leg-C host, integrator 2026-06-18).
+//
+// Isolated regtest has zero peers, so getblocktemplate is node-gated
+// ("Bitcoin is not connected!"); submitblock carries no such guard, so the
+// block params are sourced directly (regtest::build_and_solve) off the live
+// tip via getblockchaininfo. The P2P-relay leg (submit_block_p2p_raw over the
+// embedded front-end) is the immediate follow-on sub-slice and reuses THIS
+// built blocks raw bytes. PER-COIN ISOLATION: src/impl/bch only; zero
+// p2pool-merged-v36 surface (parent BCH block dispatch, no share/PPLNS bytes).
+struct RegtestRpcConf { std::string user; std::string pass; uint16_t port = 18443; };
+
+inline std::string trim_conf(std::string s)
+{
+    const char* ws = " \t\r\n";
+    const auto b = s.find_first_not_of(ws);
+    if (b == std::string::npos) return {};
+    const auto e = s.find_last_not_of(ws);
+    return s.substr(b, e - b + 1);
+}
+
+// Parse rpcuser/rpcpassword/rpcport from a bitcoin.conf-style file (also accepts
+// the c2pool bch_rpc_user/bch_rpc_password keys). The password stays in-file and
+// is NEVER echoed (operator self-provision rule 2026-06-19).
+bool load_rpc_conf(const std::string& path, RegtestRpcConf& out)
+{
+    std::ifstream f(path);
+    if (!f) return false;
+    std::string line;
+    while (std::getline(f, line)) {
+        const auto h = line.find(char(35));
+        if (h != std::string::npos) line = line.substr(0, h);
+        const auto eq = line.find(char(61));
+        if (eq == std::string::npos) continue;
+        const std::string key = trim_conf(line.substr(0, eq));
+        const std::string val = trim_conf(line.substr(eq + 1));
+        if (val.empty()) continue;
+        if (key == "rpcuser" || key == "bch_rpc_user")             out.user = val;
+        else if (key == "rpcpassword" || key == "bch_rpc_password") out.pass = val;
+        else if (key == "rpcport")                                 out.port = static_cast<uint16_t>(std::stoi(val));
+    }
+    return !out.user.empty() && !out.pass.empty();
+}
+
+int run_leg_c_capture(const std::string& conf_path)
+{
+    RegtestRpcConf rc;
+    if (!load_rpc_conf(conf_path, rc)) {
+        std::cout << "[leg-c] FAIL -- no rpcuser/rpcpassword in " << conf_path
+                  << " (run scripts/gen-bch-daemon-creds.sh first)\n";
+        return 1;
+    }
+
+    boost::asio::io_context ctx;
+    bch::coin::NodeRPC rpc(&ctx, /*coin=*/nullptr, /*testnet=*/false);
+    const NetService addr(std::string("127.0.0.1"), rc.port);
+    // connect() posts async resolve/connect; the first synchronous Send() below
+    // self-heals via NodeRPC::sync_reconnect() (blocking connect) on the not-yet-
+    // connected stream -- the same path coin::Node::init_rpc() relies on.
+    rpc.connect(addr, rc.user + ":" + rc.pass);
+
+    nlohmann::json info;
+    try {
+        info = rpc.getblockchaininfo();
+    } catch (const std::exception& e) {
+        std::cout << "[leg-c] FAIL -- getblockchaininfo: " << e.what()
+                  << " (regtest daemon up on 127.0.0.1:" << rc.port << "?)\n";
+        return 1;
+    }
+    const uint256  prev   = uint256S(info.at("bestblockhash").get<std::string>());
+    const uint32_t height = static_cast<uint32_t>(info.at("blocks").get<int>()) + 1;
+
+    // Regtest consensus params (BCHN chainparams.cpp CRegTestParams): powLimit
+    // nBits 0x207fffff (trivial target -> short nonce sweep), BIP9 version bit,
+    // 50-coin subsidy for heights 1..149 (regtest halving interval 150).
+    const uint32_t REGTEST_BITS = 0x207fffffu;
+    const int32_t  VERSION      = 0x20000000;
+    const int64_t  SUBSIDY      = 5000000000LL;
+    const uint32_t curtime      = core::timestamp();
+
+    auto built = bch::coin::regtest::build_and_solve(
+        prev, REGTEST_BITS, VERSION, curtime, height, SUBSIDY);
+    if (!built.solved) {
+        std::cout << "[leg-c] FAIL -- regtest block did not solve (nBits misconfigured)\n";
+        return 1;
+    }
+    std::cout << "[leg-c] built consensus-valid block: height=" << height
+              << " hash=" << built.hash.GetHex()
+              << " bytes=" << built.bytes.size() << "\n";
+
+    // RPC leg of the dual-path broadcaster: NodeRPC::submit_block_hex is the exact
+    // submitblock sink EmbeddedDaemon::broadcast_won_block fires. ignore_failure
+    // false so a reject surfaces.
+    const bool ok = rpc.submit_block_hex(built.hex, /*ignore_failure=*/false);
+    std::cout << "[leg-c] submitblock RPC leg: " << (ok ? "ACCEPTED" : "REJECTED") << "\n"
+              << "[leg-c] expect in regtest debug.log -> "
+              << "UpdateTip: new best=" << built.hash.GetHex()
+              << " height=" << height << "\n";
+    return ok ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
 {
     bool want_help = false;
     bool want_ibd = false;
+    bool want_leg_c = false;
+    std::string rpc_conf;
     bool testnet = false;
     bool near_tip = false;
     std::string host = "192.168.86.110";   // VM300 bchn-bch
@@ -216,6 +334,8 @@ int main(int argc, char** argv)
         }
         if (std::strcmp(argv[i], "--help") == 0)     want_help = true;
         if (std::strcmp(argv[i], "--ibd") == 0)      want_ibd = true;
+        if (std::strcmp(argv[i], "--leg-c-capture") == 0) want_leg_c = true;
+        if (std::strcmp(argv[i], "--rpc-conf") == 0 && i + 1 < argc) rpc_conf = argv[++i];
         if (std::strcmp(argv[i], "--testnet") == 0) { testnet = true; port = 18333; }
         if (std::strcmp(argv[i], "--near-tip") == 0) near_tip = true;
         if (std::strcmp(argv[i], "--peer") == 0 && i + 1 < argc) {
@@ -235,6 +355,14 @@ int main(int argc, char** argv)
     print_banner(argv[0]);
     if (want_help)
         return 0;
+
+    if (want_leg_c) {
+        if (rpc_conf.empty()) {
+            const char* home = std::getenv("HOME");
+            rpc_conf = std::string(home ? home : ".") + "/bch-regtest/bitcoin.conf";
+        }
+        return run_leg_c_capture(rpc_conf);
+    }
 
     if (want_ibd)
         return run_ibd(host, port, testnet, max_seconds, near_tip);
