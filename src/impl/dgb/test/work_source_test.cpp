@@ -135,8 +135,10 @@ TEST(DgbWorkSource, WorkGenStubsReturnSafeDefaults)
     // 4a skeleton: every work-generation getter returns its documented
     // empty/default form (4c fills them in).
     EXPECT_TRUE(ws->get_current_gbt_prevhash().empty());
+    // get_current_work_template() now emits height + coinbasevalue (Stage 4c
+    // coinbasevalue wire); its dedicated assertions live in
+    // WorkTemplateEmitsHeightAndCoinbaseValueViaSsot below.
     EXPECT_TRUE(ws->get_current_work_template().is_object());
-    EXPECT_TRUE(ws->get_current_work_template().empty());
     EXPECT_TRUE(ws->get_stratum_merkle_branches().empty());
     auto parts = ws->get_coinbase_parts();
     EXPECT_TRUE(parts.first.empty());
@@ -172,6 +174,26 @@ TEST(DgbWorkSource, ComputeShareDifficultyReturnsNotYetSentinel)
         /*version=*/0x20000000u, "prevhash", "1e0ffff0",
         /*merkle_branches=*/{});
     EXPECT_DOUBLE_EQ(diff, 0.0);
+}
+
+// Stage 4c coinbasevalue wire: the work template surfaces the NEXT-block
+// height and its coinbasevalue, the latter derived THROUGH the #207 SSOT
+// (subsidy_func) keyed on next_block_height() == tip.height + 1 (#209). An
+// empty chain makes next_block_height() == base_height, so seeding an oracle
+// era boundary pins the value unambiguously to the p2pool-dgb-scrypt subsidy.
+TEST(DgbWorkSource, WorkTemplateEmitsHeightAndCoinbaseValueViaSsot)
+{
+    Fixture fx;
+    fx.chain.set_base_height(400000);  // phase3 first block (oracle boundary)
+    auto ws = fx.make();
+    auto tmpl = ws->get_current_work_template();
+    ASSERT_TRUE(tmpl.is_object());
+    ASSERT_TRUE(tmpl.contains("height"));
+    ASSERT_TRUE(tmpl.contains("coinbasevalue"));
+    // next_h = next_block_height() = base_height (empty chain) = 400000.
+    EXPECT_EQ(tmpl["height"].get<uint32_t>(), 400000u);
+    // Zero embedded fees, no external GBT -> oracle subsidy at the boundary.
+    EXPECT_EQ(tmpl["coinbasevalue"].get<uint64_t>(), 2434410000ULL);
 }
 
 // ── Embedded coinbasevalue: first production caller of subsidy_func ──────────
