@@ -139,10 +139,12 @@ test('Middleware chain: error-taxonomy normalises thrown errors', async () => {
   registerBaseline(host);
   const angryTransport: Transport = {
     ...mockTransport(),
-    fetchWindow: async () => { throw { status: 429, retryAfter: 2000 }; },
+    fetchWindow: async () => { throw { status: 429, retryAfter: 25 }; },
   };
-  // Bound retries and skip timeout so this test fences in ~ms, not the
-  // D7 unbounded production default.
+  // Bound retries and skip timeout so this test fences in ~ms. The retry
+  // middleware honours server Retry-After (clamps its backoff up to
+  // retryAfterMs), so retryAfter MUST stay small here -- a realistic 2000ms
+  // would make this test really sleep ~2s and trip CI's per-test timeout.
   await host.init({
     kind: 'shared-core',
     transport: angryTransport,
@@ -157,7 +159,7 @@ test('Middleware chain: error-taxonomy normalises thrown errors', async () => {
     (err: unknown) => {
       if (typeof err !== 'object' || err === null) return false;
       const e = err as { type?: unknown; retryAfterMs?: unknown };
-      return e.type === 'rate_limited' && e.retryAfterMs === 2000;
+      return e.type === 'rate_limited' && e.retryAfterMs === 25;
     },
   );
   await host.destroy();
