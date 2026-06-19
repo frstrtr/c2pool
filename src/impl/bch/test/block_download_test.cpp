@@ -201,6 +201,34 @@ int main()
         assert(w.reissue_count() == 1);
     }
 
+    // ---- evicted-then-arrived: false_evict accounting + NO re-download ------
+    //      A block we expired() but the (merely slow) peer delivers anyway is a
+    //      PREMATURE eviction. The window must (a) flag it via false_evict_count
+    //      -- distinct from a clean arrival -- and (b) drop it from the pending
+    //      queue so the next drain does NOT re-getdata a block we already hold.
+    {
+        BlockDownloadWindow w(2);
+        w.enqueue(hashes(0, 2));                    // [H0 H1]
+        w.next_requests(/*now=*/100);               // H0,H1 issued @100
+        assert(w.on_block_received(H(1)) == true);  // H1 arrives clean
+        assert(w.false_evict_count() == 0);         // a clean arrival is NOT premature
+
+        // H0 stalls past the timeout -> evicted + requeued to the front.
+        auto evicted = w.expire(/*now=*/200, /*timeout=*/50);
+        assert(evicted.size() == 1 && evicted[0] == H(0));
+        assert(w.reissue_count() == 1);
+        assert(w.queued() == 1 && w.in_flight() == 0);
+
+        // The peer was merely slow: H0 arrives AFTER its eviction.
+        assert(w.on_block_received(H(0)) == false); // unsolicited (no longer in flight)
+        assert(w.false_evict_count() == 1);         // flagged as a premature eviction
+
+        // ...and it must NOT be re-requested -- we already hold the body.
+        assert(w.queued() == 0);
+        assert(w.next_requests(/*now=*/300).empty());
+        assert(w.idle());
+    }
+
     std::cout << "bch block_download window: ALL PASS\n";
     return 0;
 }

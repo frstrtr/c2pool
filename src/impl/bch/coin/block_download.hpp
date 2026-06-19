@@ -27,10 +27,11 @@
 // re-requested, so an overlapping getheaders locator batch or a re-announce
 // cannot double-download.
 //
-// NOT IN THIS SLICE (deferred per integrator 2026-06-18): in-flight timeout /
-// eviction (a block requested but never delivered by a stalling peer). That is
-// robustness hardening worth doing only once blocks are actually flowing; this
-// slice builds the happy-path window first.
+// IN-FLIGHT TIMEOUT / EVICTION (expire()): a block getdata'd but never delivered
+// by a stalling peer is timed out, requeued oldest-first, and re-issued; an
+// evicted block the peer later delivers anyway is flagged via false_evict_count
+// and dropped from the queue so it is not re-downloaded. NodeP2P drives this on
+// a steady-clock timer (see p2p_node.hpp BLOCK_DL_TIMEOUT_SEC).
 //
 // p2pool-merged-v36 SURFACE: NONE -- pure SPV/IBD wire-sync plumbing; no PoW
 // hash, share format, coinbase commitment, AuxPoW, or PPLNS math. PER-COIN
@@ -109,7 +110,18 @@ public:
         // On a healthy peer with a generous timeout NOTHING expires, so this
         // stays 0 -- a non-zero value means the BLOCK_DL_TIMEOUT_SEC fired on a
         // request the peer was merely slow to answer, not genuinely stalled.
-        if (m_evicted.erase(h)) ++m_false_evict_count;
+        if (m_evicted.erase(h)) {
+            ++m_false_evict_count;
+            // expire() requeued this hash to the FRONT when it timed out; the
+            // (merely slow) peer has now delivered it, so drop it from the pending
+            // queue -- otherwise the next drain would re-getdata a block we already
+            // hold. Linear scan is fine: eviction is rare (a healthy sync keeps
+            // false_evict at 0). If it was already re-issued it is in m_in_flight,
+            // not m_queue, and the scan simply finds nothing.
+            for (auto qit = m_queue.begin(); qit != m_queue.end(); ++qit) {
+                if (*qit == h) { m_queue.erase(qit); break; }
+            }
+        }
         auto it = m_in_flight.find(h);
         if (it == m_in_flight.end()) {
             // Unsolicited or already handled: still remember it so a later
