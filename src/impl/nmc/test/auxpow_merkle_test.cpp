@@ -30,6 +30,7 @@
 #include <core/hash.hpp>
 #include <core/pack.hpp>
 #include <core/uint256.hpp>
+#include <core/target_utils.hpp>
 
 #include "../coin/header_chain.hpp"
 
@@ -37,6 +38,7 @@ namespace {
 
 using nmc::coin::aux_merkle_root;
 using nmc::coin::AuxPow;
+using nmc::coin::pow_hash;
 
 // Build a uint256 whose first byte is `b` (rest zero) — distinct, legible leaves.
 static uint256 leaf_of(unsigned char b)
@@ -444,6 +446,99 @@ TEST(NmcAuxStep2, NoMarkerLeavesProofIncomplete)
     ap.chain_merkle_branch = {sib};
     ap.chain_merkle_index = 0;
     EXPECT_EQ(ap.check_proof(aux, 1), AuxPow::CheckResult::INCOMPLETE);
+}
+
+// ---------------------------------------------------------------------------
+// P1c-step4: AuxPow::check_proof parent proof-of-work leg (step 4).
+//
+// The parent (BTC) block's SHA256d PoW hash must clear the AUX (NMC) block's
+// difficulty target (Namecoin CheckAuxPowProofOfWork: the parent PoW is checked
+// against the aux bits, NOT the parent's own bits). With steps 1-3 satisfied,
+// a sufficient parent PoW finally yields VALID; an insufficient one is INVALID;
+// and a caller that supplies no aux_bits (default 0) keeps the otherwise-
+// complete proof INCOMPLETE so NMC never block-validates off a partial proof.
+// Per-coin isolation: src/impl/nmc/ only; chain::bits_to_target is core, the
+// PoW hash is nmc-local pow_hash() -- the btc tree is not touched.
+// ---------------------------------------------------------------------------
+
+// A structurally-complete AuxPow whose steps 1-3 all pass: a parent coinbase
+// carrying the MM marker committing the chain-merkle root (slot 0: nonce=1,
+// chain_id=1, height=1), itself linked into the parent header tx-merkle-root.
+static AuxPow complete_proof(uint256 aux, uint32_t parent_own_bits)
+{
+    uint256 sib  = leaf_of(0x55);
+    uint256 root = combine(aux, sib);                       // chain-merkle root
+    auto    script = mm_script(root_reversed(root), /*size=*/2, /*nonce=*/1);
+
+    AuxPow ap;
+    ap.parent_coinbase     = coinbase_with_script(script);
+    ap.chain_merkle_branch = {sib};
+    ap.chain_merkle_index  = 0;                             // expected slot 0
+
+    uint256 cbid = parent_coinbase_txid(ap.parent_coinbase);
+    uint256 sib2 = leaf_of(0x77);
+    ap.parent_coinbase_branch = {sib2};
+    ap.parent_coinbase_index  = 0;                          // coinbase LEFT
+    ap.parent_header.m_merkle_root = combine(cbid, sib2);
+    ap.parent_header.m_bits        = parent_own_bits;       // non-null header
+    return ap;
+}
+
+// "Mine" a parent header against an easy target: bump m_nonce until the
+// SHA256d PoW clears `target`. Touches ONLY m_nonce, so the merkle legs
+// (steps 1-3) are unaffected. At regtest-style difficulty this lands in a
+// couple of iterations; the bound makes it deterministic-or-loud.
+static bool mine_parent(AuxPow& ap, const uint256& target)
+{
+    for (uint32_t n = 0; n < 100000u; ++n) {
+        ap.parent_header.m_nonce = n;
+        if (!(pow_hash(ap.parent_header) > target)) return true;
+    }
+    return false;
+}
+
+TEST(NmcAuxStep4, CompleteProofWithSufficientParentWorkIsValid)
+{
+    uint256 aux = leaf_of(0x01);
+    AuxPow ap = complete_proof(aux, /*parent_own_bits=*/0x1d00ffffu);
+    uint32_t aux_bits = 0x207fffffu;                        // regtest-style easy target
+    ASSERT_TRUE(mine_parent(ap, chain::bits_to_target(aux_bits)));
+    EXPECT_EQ(ap.check_proof(aux, 1, aux_bits), AuxPow::CheckResult::VALID);
+}
+
+TEST(NmcAuxStep4, CompleteProofWithInsufficientParentWorkIsInvalid)
+{
+    uint256 aux = leaf_of(0x01);
+    AuxPow ap = complete_proof(aux, 0x1d00ffffu);
+    // Maximally-hard aux target (compact for target == 1). A real double-SHA256
+    // parent hash exceeds it (guarded), so the parent fails the aux PoW.
+    uint32_t hard_bits = 0x03000001u;                       // bits_to_target => 1
+    uint256  pow       = pow_hash(ap.parent_header);
+    ASSERT_TRUE(pow > chain::bits_to_target(hard_bits));    // precondition
+    EXPECT_EQ(ap.check_proof(aux, 1, hard_bits), AuxPow::CheckResult::INVALID);
+}
+
+TEST(NmcAuxStep4, CompleteProofWithoutAuxBitsStaysIncomplete)
+{
+    uint256 aux = leaf_of(0x01);
+    AuxPow ap = complete_proof(aux, 0x1d00ffffu);
+    // Default aux_bits (0): the parent-PoW gate is skipped and the otherwise-
+    // complete proof stays INCOMPLETE -- never VALID.
+    EXPECT_EQ(ap.check_proof(aux, 1), AuxPow::CheckResult::INCOMPLETE);
+    EXPECT_NE(ap.check_proof(aux, 1), AuxPow::CheckResult::VALID);
+}
+
+TEST(NmcAuxStep4, ParentOwnBitsAreNotTheAuxGate)
+{
+    // Parent header's OWN nBits set maximally hard (target == 1); if check_proof
+    // wrongly used the parent's own bits the proof would be INVALID. The AUX
+    // target (easy) governs instead -- pinning the Namecoin consensus rule that
+    // the parent PoW is checked against the aux bits, not the parent's own.
+    uint256 aux = leaf_of(0x01);
+    AuxPow ap = complete_proof(aux, /*parent_own_bits=*/0x03000001u);
+    uint32_t aux_bits = 0x207fffffu;                        // easy aux target
+    ASSERT_TRUE(mine_parent(ap, chain::bits_to_target(aux_bits)));
+    EXPECT_EQ(ap.check_proof(aux, 1, aux_bits), AuxPow::CheckResult::VALID);
 }
 
 } // namespace
