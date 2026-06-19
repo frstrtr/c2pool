@@ -23,6 +23,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <vector>
 
@@ -269,6 +270,180 @@ TEST(NmcAuxCheckProof, ParentCoinbaseIndexTooWideForDepthIsInvalid)
     ap.parent_coinbase_index  = 2;
     EXPECT_EQ(ap.check_proof(leaf_of(0x01), 1),
               AuxPow::CheckResult::INVALID);
+}
+
+
+// ---------------------------------------------------------------------------
+// P1c-step2: AuxPow::check_proof MM-marker commitment + chain_id/slot binding.
+//
+// step 2 confirms the chain-merkle root reconstructed in step 1 is the one
+// committed inside the parent coinbase's merged-mining marker (pchMergedMiningHeader
+// = fa be 6d 6d), that the marker's tree size == 2^height, and that the chain
+// occupies the slot aux_expected_index(nonce, chain_id, height) demands. A
+// coinbase with NO marker leaves the proof INCOMPLETE (staged: nothing to
+// assert, mirrors the null-parent-header gate). A marker present but committing
+// a different root / wrong size / wrong slot, or a duplicated marker, is INVALID.
+// The proof never reaches VALID — step 4 (parent PoW) is still unbuilt.
+//
+// aux_expected_index is pinned against values computed OFFLINE (not by calling
+// the production helper), so an LCG-constant/typo in the port is caught. The
+// committed root is laid out here by hand (magic|reversed-root|LE size|LE nonce)
+// without touching scan_mm_commitment, so a scan/parse bug is caught not mirrored.
+// Per-coin isolation: src/impl/nmc/ only; btc tree consumed READ-ONLY.
+// ---------------------------------------------------------------------------
+
+using nmc::coin::scan_mm_commitment;
+using nmc::coin::aux_expected_index;
+using nmc::coin::MMScan;
+
+static const unsigned char MM_MAGIC[4] = {0xfa, 0xbe, 'm', 'm'};
+
+static void put_le32(std::vector<unsigned char>& v, uint32_t x)
+{
+    v.push_back(static_cast<unsigned char>( x        & 0xff));
+    v.push_back(static_cast<unsigned char>((x >> 8)  & 0xff));
+    v.push_back(static_cast<unsigned char>((x >> 16) & 0xff));
+    v.push_back(static_cast<unsigned char>((x >> 24) & 0xff));
+}
+
+// The chain-merkle root as committed: reversed (big-endian display) byte order,
+// derived here without touching scan_mm_commitment.
+static std::vector<unsigned char> root_reversed(uint256 r)
+{
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(r.begin());
+    std::vector<unsigned char> v(p, p + uint256::BYTES);
+    std::reverse(v.begin(), v.end());
+    return v;
+}
+
+// [dummy coinbase-height prefix][magic][reversed root][LE size][LE nonce].
+static std::vector<unsigned char> mm_script(const std::vector<unsigned char>& reversed_root,
+                                            uint32_t size, uint32_t nonce)
+{
+    std::vector<unsigned char> s = {0x03, 0x11, 0x22, 0x33};  // arbitrary prefix
+    s.insert(s.end(), MM_MAGIC, MM_MAGIC + 4);
+    s.insert(s.end(), reversed_root.begin(), reversed_root.end());
+    put_le32(s, size);
+    put_le32(s, nonce);
+    return s;
+}
+
+static MutableTransaction coinbase_with_script(const std::vector<unsigned char>& script)
+{
+    MutableTransaction tx;
+    tx.version = 1; tx.locktime = 0;
+    TxIn in;
+    in.prevout.hash.SetNull();
+    in.prevout.index = 0xffffffffu;
+    in.scriptSig = OPScript(script.data(), script.data() + script.size());
+    in.sequence = 0xffffffffu;
+    tx.vin.push_back(in);
+    TxOut out; out.value = 5000000000LL; tx.vout.push_back(out);
+    tx.vin[0].scriptWitness.stack.assign(1, std::vector<unsigned char>(32, 0x00));
+    return tx;
+}
+
+TEST(NmcAuxExpectedIndex, MatchesPinnedOfflineReference)
+{
+    // values computed offline via the LCG (1103515245 / 12345), chain_id = 1.
+    EXPECT_EQ(aux_expected_index(0,     1, 3), 3u);
+    EXPECT_EQ(aux_expected_index(1,     1, 3), 4u);
+    EXPECT_EQ(aux_expected_index(7,     1, 3), 2u);
+    EXPECT_EQ(aux_expected_index(0,     1, 1), 1u);
+    EXPECT_EQ(aux_expected_index(1,     1, 1), 0u);
+    EXPECT_EQ(aux_expected_index(12345, 1, 4), 12u);
+}
+
+TEST(NmcAuxStep2, ScanReturnsMatchAbsentMismatch)
+{
+    uint256 aux = leaf_of(0x01), sib = leaf_of(0x55);
+    uint256 root = combine(aux, sib);          // index bit0=0 => leaf left
+    unsigned h = 1; int32_t cid = 1; uint32_t nonce = 1; uint32_t index = 0;  // slot 0
+
+    auto good = mm_script(root_reversed(root), 1u << h, nonce);
+    EXPECT_EQ(scan_mm_commitment(good, root, h, cid, index), MMScan::MATCH);
+
+    std::vector<unsigned char> nomagic = {0x03, 0x11, 0x22, 0x33};
+    EXPECT_EQ(scan_mm_commitment(nomagic, root, h, cid, index), MMScan::ABSENT);
+
+    auto badroot = mm_script(root_reversed(leaf_of(0x99)), 1u << h, nonce);
+    EXPECT_EQ(scan_mm_commitment(badroot, root, h, cid, index), MMScan::MISMATCH);
+}
+
+TEST(NmcAuxStep2, ValidCommitmentIsIncompleteNeverValid)
+{
+    uint256 aux = leaf_of(0x01), sib = leaf_of(0x55);
+    uint256 root = combine(aux, sib);
+    auto script = mm_script(root_reversed(root), /*size=*/2, /*nonce=*/1);  // slot 0
+
+    AuxPow ap;
+    ap.parent_coinbase = coinbase_with_script(script);
+    ap.chain_merkle_branch = {sib};
+    ap.chain_merkle_index = 0;
+    // parent_header null => step 3 equality skipped; step 2 MATCH; step 4 unbuilt.
+    EXPECT_EQ(ap.check_proof(aux, 1), AuxPow::CheckResult::INCOMPLETE);
+    EXPECT_NE(ap.check_proof(aux, 1), AuxPow::CheckResult::VALID);
+}
+
+TEST(NmcAuxStep2, WrongCommittedRootIsInvalid)
+{
+    uint256 aux = leaf_of(0x01), sib = leaf_of(0x55);
+    auto script = mm_script(root_reversed(leaf_of(0x99)), 2, 1);  // commits wrong root
+    AuxPow ap;
+    ap.parent_coinbase = coinbase_with_script(script);
+    ap.chain_merkle_branch = {sib};
+    ap.chain_merkle_index = 0;
+    EXPECT_EQ(ap.check_proof(aux, 1), AuxPow::CheckResult::INVALID);
+}
+
+TEST(NmcAuxStep2, WrongTreeSizeIsInvalid)
+{
+    uint256 aux = leaf_of(0x01), sib = leaf_of(0x55);
+    uint256 root = combine(aux, sib);
+    auto script = mm_script(root_reversed(root), /*size=*/4, /*nonce=*/1);  // h=1 wants 2
+    AuxPow ap;
+    ap.parent_coinbase = coinbase_with_script(script);
+    ap.chain_merkle_branch = {sib};
+    ap.chain_merkle_index = 0;
+    EXPECT_EQ(ap.check_proof(aux, 1), AuxPow::CheckResult::INVALID);
+}
+
+TEST(NmcAuxStep2, WrongDeterministicSlotIsInvalid)
+{
+    uint256 aux = leaf_of(0x01), sib = leaf_of(0x55);
+    uint256 root = combine(aux, sib);          // correct root for index 0
+    // nonce 0 => expected slot 1 (pinned) != chain_merkle_index 0 => binding fails;
+    // root + size are correct so only the slot check rejects this.
+    auto script = mm_script(root_reversed(root), 2, /*nonce=*/0);
+    AuxPow ap;
+    ap.parent_coinbase = coinbase_with_script(script);
+    ap.chain_merkle_branch = {sib};
+    ap.chain_merkle_index = 0;
+    EXPECT_EQ(ap.check_proof(aux, 1), AuxPow::CheckResult::INVALID);
+}
+
+TEST(NmcAuxStep2, DuplicateMergedMiningHeaderIsInvalid)
+{
+    uint256 aux = leaf_of(0x01), sib = leaf_of(0x55);
+    uint256 root = combine(aux, sib);
+    auto script = mm_script(root_reversed(root), 2, 1);
+    script.insert(script.end(), MM_MAGIC, MM_MAGIC + 4);  // a second, illegal header
+    AuxPow ap;
+    ap.parent_coinbase = coinbase_with_script(script);
+    ap.chain_merkle_branch = {sib};
+    ap.chain_merkle_index = 0;
+    EXPECT_EQ(ap.check_proof(aux, 1), AuxPow::CheckResult::INVALID);
+}
+
+TEST(NmcAuxStep2, NoMarkerLeavesProofIncomplete)
+{
+    uint256 aux = leaf_of(0x01), sib = leaf_of(0x55);
+    std::vector<unsigned char> nomagic = {0x03, 0x4e, 0x4d, 0x43};  // no MM magic
+    AuxPow ap;
+    ap.parent_coinbase = coinbase_with_script(nomagic);
+    ap.chain_merkle_branch = {sib};
+    ap.chain_merkle_index = 0;
+    EXPECT_EQ(ap.check_proof(aux, 1), AuxPow::CheckResult::INCOMPLETE);
 }
 
 } // namespace
