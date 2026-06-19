@@ -180,4 +180,82 @@ TEST(NmcP1AuxPowWire, MainnetBlock757000RoundTrip)
     EXPECT_LT(80 + auxlen, total);
 }
 
+// Raw `getblock f876ce3f...e6b92b 0` hex -- Namecoin mainnet block 829949,
+// pulled LIVE 2026-06-19 from the .140 pruned mainnet node (getblockchaininfo:
+// height 829950, initialblockdownload=false, verificationprogress 0.99999).
+// Second, independently node-verified external-truth vector: a different NMC
+// height with a different BTC parent (parent versionHex 0x234c4000) than the
+// 757000 case, so the round-trip is pinned against more than one distinct
+// daemon-produced CAuxPow blob -- not a single fixture a self-consistent but
+// wrong serializer could still satisfy.
+static const std::string NMC_BLOCK_829949_HEX =
+    "0401010063a63c3b4a3f50d85cc27890128e1f5c8ab88ad4192376ffc03ac1fb0f3011576d"
+    "1be5ace52caaf22ac7ec9f3852e7720476f97006281b563b7c895e4564d4248484356ac6e5"
+    "03170000000002000000010000000000000000000000000000000000000000000000000000"
+    "000000000000ffffffff54033e900e047e85356a537069646572506f6f6c2f3431332ffabe"
+    "6d6d108edf3f6f0d5e6794562466477661c7cf38437324ed421f47b88e85d44cd3a7080000"
+    "00d820c5fc6824474510575dfbeb37000000000000ffffffff06247dae12000000001976a9"
+    "14717a4c9074577a05af94271c32b249d298a22d9888ac0000000000000000266a24aa21a9"
+    "ed0c6af4e8de4e1d9494b4c992ee6fcac30365198ea6164ba05b92fe13ab861ea900000000"
+    "000000002f6a2d434f52450164db24a662e20bbdf72d1cc6e973dbb2d12897d596a6689031"
+    "f48a857d344e1a42fdb272bb15d6210000000000000000126a10455853415401120f080304"
+    "111f12001300000000000000002b6a2952534b424c4f434b3a1098a733a3b7ba1da26d8b3e"
+    "dad4a525260a95cbec3b3f6ce3d65f170088c4c00000000000000000296a277379739a4337"
+    "8cb4e3ed3e0f4dad616257c201db312962b831fcd101363e793d79da400079220000000000"
+    "00000000000000000000000000000000000000000000000000000000000000000dc5b0d439"
+    "febb9946215f2b877b172204cc6ddef37aab34a0506414f27f0e1f64ec1946737fbe6259f2"
+    "691c109eb57a20ec4bd00235687abaf74c20eb8052d62cc2e407d82b77c5c55b9a350588a8"
+    "c4b47e2afce378562130fcf090d581f0864f2af90e07113ef7d5698f6b2235f52f60408ddb"
+    "7e1040b11fe4adcad8359c1221c2229624c31434358f2261a7710bb6bc3d1e7111fe1e814f"
+    "74e72ed726369dcc838616c8ca60fd3d10a150d010b36fa909bf4b47286b1e5e7b457302a8"
+    "3210963d43b345d03ce4cbd8ff0593980f596e88e5c4edf4a4e34720bd0a0ab60bc8e9db18"
+    "7ac6bfb5d7adadf90cc31c8e3bfac5cb644e52da80b2145e246f4757460590139e0cf518b5"
+    "08f7c27f168b6379aac5c2ad003a5e04aae5873cf9be83ecd4f47d691e13fa13930ab8c6ec"
+    "5f8cb9baadfffb79ce10fbfa317fa9b105525f3729875a7d64a80f6f5cc3ec430dab35980f"
+    "578498b8c226271ca0db3c33794a356aa4d1705ac87bf68395bb28a73e5d7c7be728132e6e"
+    "6a084a2204a3c541e3156019db028f7ff85e7243edd7f59a1967b666e277ea91108b1c1906"
+    "6f77aee2880000000003a063791c82c6d23126e5c76c4818d483ec9704a528576c43c923f7"
+    "dfdd53414ae2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf9"
+    "c3b4297fb9fbd67db907bdb8b031e85f2ce92999b5d0894ec9ab699e3ecd30f50300000000"
+    "404c23c6a99943d93cc5a0d966d1ba59cf44c2329be5dd791b0200000000000000000084f8"
+    "377730a9643e3663c715d57d59c0159dd3cd51bdfe5b07bd5b5fe67db16b8585356ac34002"
+    "17bd06b5cf0101000000000101000000000000000000000000000000000000000000000000"
+    "0000000000000000ffffffff0503fda90c00ffffffff0240be4025000000001976a9140397"
+    "9141426f8bc480a5d7bfb78c1012621ad39e88ac0000000000000000266a24aa21a9ede2f6"
+    "1c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf901200000000000"
+    "00000000000000000000000000000000000000000000000000000000000000";
+
+TEST(NmcP1AuxPowWire, MainnetBlock829949RoundTrip)
+{
+    PackStream ps;
+    ps.from_hex(NMC_BLOCK_829949_HEX);
+
+    const std::byte* const base = ps.data();
+    const size_t total = ps.size();
+    ASSERT_EQ(total, NMC_BLOCK_829949_HEX.size() / 2);
+
+    // --- 80-byte NMC block header -----------------------------------------
+    BlockHeaderType hdr;
+    ps >> hdr;
+    const uint32_t version = static_cast<uint32_t>(hdr.m_version);
+    EXPECT_EQ(version & 0xffu, 0x04u);     // base block version 4
+    EXPECT_NE(version & 0x100u, 0u);       // auxpow flag bit set
+    EXPECT_EQ(version >> 16, 1u);          // chain_id == 1 (Namecoin)
+    EXPECT_FALSE(hdr.IsNull());
+
+    // --- CAuxPow blob ------------------------------------------------------
+    AuxPow ap;
+    ps >> ap;
+    EXPECT_FALSE(ap.parent_header.IsNull());      // real BTC parent header
+    EXPECT_EQ(ap.parent_coinbase_index, 0);
+
+    // External-truth byte-for-byte round-trip of region [80, 80+auxlen).
+    PackStream out;
+    out << ap;
+    const size_t auxlen = out.size();
+    ASSERT_LE(80 + auxlen, total);
+    EXPECT_EQ(0, std::memcmp(out.data(), base + 80, auxlen));
+    EXPECT_LT(80 + auxlen, total);
+}
+
 }  // namespace
