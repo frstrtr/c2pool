@@ -258,4 +258,29 @@ TEST(NmcP1AuxPowWire, MainnetBlock829949RoundTrip)
     EXPECT_LT(80 + auxlen, total);
 }
 
+// ---------------------------------------------------------------------------
+// Genesis pin KAT (P1 PE 2b-0). NMCChainParams::testnet_genesis_header() is the
+// 80-byte parent the embedded HeaderChain seeds at height 0. Its SHA256d MUST
+// reproduce NMCChainParams::testnet().genesis_hash, which was pinned against a
+// live namecoind (getblockhash 0 / getblockheader) on namecoin testnet,
+// 2026-06-19. A wrong field (endianness, bits, nonce, merkleroot) makes the
+// re-derived hash diverge from the daemon-sourced value rather than be mirrored
+// -- the expected hash is external truth, not self-derived from the header.
+// chain_id is also pinned to Namecoin's nAuxpowChainId (0x0001).
+// ---------------------------------------------------------------------------
+TEST(NmcP1Genesis, TestnetHeaderRederivesPinnedHash)
+{
+    const auto params = nmc::coin::NMCChainParams::testnet();
+    const auto g      = nmc::coin::NMCChainParams::testnet_genesis_header();
+
+    EXPECT_TRUE(g.m_previous_block.IsNull());
+    EXPECT_EQ(nmc::coin::block_hash(g), params.genesis_hash);
+
+    uint256 expect;
+    expect.SetHex("00000007199508e34a9ff81e6ec0c477a4cccff2a4767a8eee39c11db367b008");
+    EXPECT_EQ(params.genesis_hash, expect);
+
+    EXPECT_EQ(params.aux_chain_id, 1);  // Namecoin nAuxpowChainId = 0x0001
+}
+
 }  // namespace
