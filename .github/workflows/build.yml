@@ -282,6 +282,8 @@ jobs:
                     bch_utxo_connect_test bch_reorg_connect_test \
                     bch_compact_block_connector_test \
                     bch_embedded_daemon_assembly_test \
+                    bch_embedded_getwork_test bch_embedded_seam_workview_test \
+                    bch_embedded_block_broadcast_test bch_coin_node_seam_test \
             -j$(nproc)
 
       - name: Run BCH tests
@@ -352,6 +354,8 @@ jobs:
                     bch_utxo_connect_test bch_reorg_connect_test \
                     bch_compact_block_connector_test \
                     bch_embedded_daemon_assembly_test \
+                    bch_embedded_getwork_test bch_embedded_seam_workview_test \
+                    bch_embedded_block_broadcast_test bch_coin_node_seam_test \
             -j$(nproc)
 
       - name: Run BCH tests under sanitizers

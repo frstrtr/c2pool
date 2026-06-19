@@ -119,4 +119,33 @@ if(BUILD_TESTING)
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage c2pool_difficulty
         btclibs)
     add_test(NAME bch_embedded_daemon_assembly_test COMMAND bch_embedded_daemon_assembly_test)
+
+    # M5 embedded-daemon body tests (#156): EmbeddedDaemon / EmbeddedCoinNode /
+    # CoinNode-seam coverage that was authored alongside the body but never wired
+    # into CMake -> it built locally yet never ran in CI (authored-but-unrun =
+    # false-green). Same TU + link set as bch_embedded_daemon_assembly_test (each
+    # constructs the real Node/EmbeddedCoinNode/CoinNode graph, so it needs the
+    # out-of-line coin_node/p2p/rpc/transaction TUs). No impl_bch coin lib ->
+    # per-coin isolation holds.
+    set(BCH_EMBEDDED_BODY_TESTS
+        embedded_getwork_test          # EmbeddedCoinNode::getwork() contract: sync gate + GBT + ABLA at-tip/stale floor
+        embedded_seam_workview_test    # EmbeddedDaemon real-seam + network-free assemble() split
+        embedded_block_broadcast_test  # dual-path won-block broadcaster (gate A submitblock-RPC + B BIP152 P2P)
+        coin_node_seam_test            # CoinNode seam: embedded-primary / external-RPC-fallback invariants
+    )
+    foreach(t IN LISTS BCH_EMBEDDED_BODY_TESTS)
+        add_executable(bch_${t}
+            ${t}.cpp
+            ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/transaction.cpp
+            ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/coin_node.cpp
+            ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/p2p_connection.cpp
+            ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/p2p_node.cpp
+            ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/rpc.cpp)
+        target_include_directories(bch_${t} PRIVATE ${CMAKE_SOURCE_DIR}/src)
+        target_link_libraries(bch_${t} PRIVATE
+            core pool sharechain
+            c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage c2pool_difficulty
+            btclibs)
+        add_test(NAME bch_${t} COMMAND bch_${t})
+    endforeach()
 endif()
