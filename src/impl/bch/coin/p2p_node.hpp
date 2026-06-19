@@ -130,6 +130,12 @@ private:
     std::chrono::steady_clock::time_point m_connected_at{std::chrono::steady_clock::now()};
     // BIP 35: request full mempool inventory after handshake
     bool m_request_mempool_on_connect{false};
+    // Embedded header-sync self-start: when set, the handshake completion
+    // (verack) self-issues the initial getheaders using the HeaderChain
+    // back-off locator, so the embedded P2P node drives IBD without an
+    // external getheaders kick. Off by default: tests that drive header sync
+    // manually (and the BCHN-RPC fallback path) keep the prior behaviour.
+    bool m_auto_getheaders_on_handshake{false};
     // Compact block reconstruction state: pending compact block awaiting blocktxn
     std::unique_ptr<CompactBlock> m_pending_cmpct;
     std::vector<uint32_t> m_pending_missing_indexes;
@@ -440,6 +446,13 @@ public:
     /// Call after UTXO is initialized so incoming txs can have fees computed.
     void enable_mempool_request() { m_request_mempool_on_connect = true; }
 
+    /// Enable embedded header-sync self-start: the handshake-complete (verack)
+    /// path self-issues the initial getheaders from the HeaderChain back-off
+    /// locator. Requires a locator provider (set_locator_provider) for a
+    /// well-anchored kick; without one it falls back to an empty locator
+    /// (peer serves from its best header). Idempotent.
+    void enable_auto_getheaders() { m_auto_getheaders_on_handshake = true; }
+
     /// Relay a pre-serialized block via P2P.
     /// Uses compact block format (BIP 152 v1) for peers that support it,
     /// falling back to full block otherwise.
@@ -668,6 +681,21 @@ private:
                          << " — peer lacks NODE_BLOOM (0x" << std::hex << m_peer_services
                          << std::dec << "), would cause disconnect";
             }
+        }
+
+        // Embedded header-sync self-start. The HeaderChain-backed locator is
+        // anchored at our current tip and carries exponential back-off, so the
+        // peer can find a common ancestor even on a minority fork; with no
+        // provider we send an empty locator (peer serves from its best header).
+        // Mirrors the ContinueSync getheaders policy for the INITIAL batch.
+        if (m_auto_getheaders_on_handshake && m_peer) {
+            std::vector<uint256> locator;
+            if (m_locator_provider)
+                locator = m_locator_provider();
+            send_getheaders(m_peer_version ? m_peer_version : 1,
+                            locator, uint256::ZERO);
+            LOG_INFO << "[" << m_chain_label << "] IBD: auto getheaders kick ("
+                     << locator.size() << "-hash locator)";
         }
     }
 

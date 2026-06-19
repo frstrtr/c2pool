@@ -182,6 +182,15 @@ public:
         m_node.send_getheaders(70016, m_chain.get_locator(), uint256::ZERO);
     }
 
+    /// Arm the handshake-gated header-sync self-start on the harness P2P node
+    /// (the same enable as the production maybe_start_p2p path). With this set,
+    /// the verack handler self-issues the initial getheaders -- the --ibd
+    /// harness needs NO ibd_kick_sync() poll. Call after start_ibd*/start_p2p.
+    void arm_auto_getheaders() {
+        if (auto* p2p = m_node.p2p())
+            p2p->enable_auto_getheaders();
+    }
+
     /// NETWORK-FREE assembly of the in-process daemon graph: close the ABLA
     /// size loop (full_block --> feed --> tracker --> EmbeddedCoinNode budget)
     /// and build the CoinNode seam (core::coin::ICoinNode) embedded-primary.
@@ -255,6 +264,8 @@ public:
             return false;
         m_node.start_p2p(peer);           // embedded BCHN P2P relay/IBD transport
         bind_locator_provider();          // HeaderChain back-off locator for ContinueSync
+        if (auto* p2p = m_node.p2p())     // self-start IBD: kick getheaders at handshake
+            p2p->enable_auto_getheaders();
         return true;
     }
 

@@ -68,7 +68,7 @@ void print_banner(const char* argv0)
     std::cout
         << "c2pool-bch " << C2POOL_VERSION << " — Bitcoin Cash (SHA256d, V36)\n\n"
         << "Usage: " << argv0 << " [--version] [--help] [--selftest]\n"
-        << "       " << argv0 << " --ibd [--testnet] [--near-tip] [--peer HOST:PORT] [--max-seconds N]\n"
+        << "       " << argv0 << " --ibd [--testnet] [--near-tip] [--auto-kick] [--peer HOST:PORT] [--max-seconds N]\n"
         << "       " << argv0 << " --leg-c-capture [--rpc-conf PATH]\n"
         << "       " << argv0 << " --leg-c-capture-p2p [--rpc-conf PATH] [--p2p-port N]\n\n"
         << "Status: M5 pool/sharechain + embedded-daemon assembly live.\n"
@@ -123,7 +123,7 @@ int run_selftest()
 // handshake is up, and logs the evidence tuple every TICK seconds until the
 // chain catches the peer tip (with no in-flight blocks) or the deadline fires.
 int run_ibd(const std::string& host, uint16_t port, bool testnet, uint32_t max_seconds,
-             bool near_tip)
+             bool near_tip, bool auto_kick)
 {
     boost::asio::io_context ctx;
 
@@ -157,6 +157,16 @@ int run_ibd(const std::string& host, uint16_t port, bool testnet, uint32_t max_s
     else
         daemon.start_ibd(peer);
 
+    // --auto-kick proves the handshake-gated self-start: arm the embedded
+    // header-sync kick on the P2P node and DO NOT poll ibd_kick_sync(). If the
+    // synced height advances, the verack handler self-issued the initial
+    // getheaders on-wire with no external kick (production run() contract).
+    if (auto_kick) {
+        daemon.arm_auto_getheaders();
+        std::cout << "[ibd] auto-kick armed — header sync self-starts at handshake"
+                     " (no manual getheaders poll)\n";
+    }
+
     const uint32_t init_height = daemon.ibd_synced_height();
     std::cout << "[ibd] read-only sync vs " << host << ":" << port
               << (testnet ? " (testnet)" : " (mainnet)")
@@ -172,10 +182,16 @@ int run_ibd(const std::string& host, uint16_t port, bool testnet, uint32_t max_s
     tick.start(TICK, [&]() {
         elapsed += TICK;
         if (!kicked && daemon.ibd_handshake_ready()) {
-            daemon.ibd_kick_sync();
+            if (!auto_kick) {
+                daemon.ibd_kick_sync();
+                std::cout << "[ibd] handshake up; getheaders kicked from height "
+                          << daemon.ibd_synced_height() << "\n";
+            } else {
+                std::cout << "[ibd] handshake up; AUTO getheaders self-started"
+                             " (no manual kick) from height "
+                          << daemon.ibd_synced_height() << "\n";
+            }
             kicked = true;
-            std::cout << "[ibd] handshake up; getheaders kicked from height "
-                      << daemon.ibd_synced_height() << "\n";
         }
         const uint32_t h   = daemon.ibd_synced_height();
         const uint32_t tip = daemon.ibd_peer_tip();
@@ -462,6 +478,7 @@ int main(int argc, char** argv)
     std::string rpc_conf;
     bool testnet = false;
     bool near_tip = false;
+    bool auto_kick = false;
     std::string host = "192.168.86.110";   // VM300 bchn-bch
     uint16_t port = 8333;
     uint32_t max_seconds = 600;
@@ -480,6 +497,7 @@ int main(int argc, char** argv)
         if (std::strcmp(argv[i], "--rpc-conf") == 0 && i + 1 < argc) rpc_conf = argv[++i];
         if (std::strcmp(argv[i], "--testnet") == 0) { testnet = true; port = 18333; }
         if (std::strcmp(argv[i], "--near-tip") == 0) near_tip = true;
+        if (std::strcmp(argv[i], "--auto-kick") == 0) auto_kick = true;
         if (std::strcmp(argv[i], "--peer") == 0 && i + 1 < argc) {
             std::string hp = argv[++i];
             const auto c = hp.rfind(char(58));  // ASCII colon
@@ -515,7 +533,7 @@ int main(int argc, char** argv)
     }
 
     if (want_ibd)
-        return run_ibd(host, port, testnet, max_seconds, near_tip);
+        return run_ibd(host, port, testnet, max_seconds, near_tip, auto_kick);
 
     // Default / --selftest: drive the live ABLA budget path, then exit.
     return run_selftest();
