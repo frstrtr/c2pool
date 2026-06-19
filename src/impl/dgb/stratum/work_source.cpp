@@ -20,6 +20,7 @@
 #include <impl/dgb/coin/embedded_coinbase_value.hpp>
 #include <impl/dgb/coin/dgb_block_algo.hpp>
 #include <impl/dgb/coin/template_builder.hpp>
+#include <impl/dgb/coin/hash_format.hpp>
 
 #include <core/log.hpp>
 
@@ -31,23 +32,11 @@ namespace dgb::stratum {
 
 namespace {
 
-// Render a u256 as the GBT-conventional big-endian block-hash display hex:
-// most-significant limb first, 64 lowercase hex digits, no 0x prefix. Mirrors
-// uint256::GetHex() ordering for a hash stored with limb[0] least-significant.
-// Header-only u256 has no GetHex(), and this TU must not depend on btclibs'
-// uint256, so we format the limbs directly.
-std::string u256_be_display_hex(const dgb::coin::u256& v)
-{
-    static constexpr char H[] = "0123456789abcdef";
-    std::string out;
-    out.reserve(64);
-    for (int li = 3; li >= 0; --li) {
-        const uint64_t w = v.limb[li];
-        for (int sh = 60; sh >= 0; sh -= 4)
-            out.push_back(H[(w >> sh) & 0xF]);
-    }
-    return out;
-}
+// previousblockhash big-endian display-hex rendering is the dgb::coin SSOT
+// (coin/hash_format.hpp), shared with the embedded work path
+// (coin/embedded_coin_node.hpp) so the two build_work_template callers
+// cannot emit a divergent previousblockhash encoding.
+using dgb::coin::u256_be_display_hex;
 
 } // namespace
 

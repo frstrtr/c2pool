@@ -1,0 +1,112 @@
+#pragma once
+// ===========================================================================
+// dgb::coin::EmbeddedCoinNode -- embedded (no external digibyted) work source.
+//
+// Implements CoinNodeInterface::getwork() (coin/template_builder.hpp) by
+// assembling a GBT-compatible work template ENTIRELY from in-process embedded
+// chain state -- the HeaderChain (coin/header_chain.hpp) plus the coin's
+// subsidy schedule -- with NO external RPC. This is the SECOND caller of
+// dgb::coin::build_work_template(): the stratum work source
+// (DGBWorkSource::get_current_work_template, stratum/work_source.cpp) is the
+// first. Routing BOTH the miner-facing stratum path and the embedded
+// CoinNodeInterface path through the one build_work_template SSOT is what makes
+// the "the two paths cannot emit a divergent template" guarantee CONCRETE
+// rather than theoretical (integrator directive, 2026-06-19).
+//
+// CONSENSUS DISCIPLINE (identical to build_work_template + the stratum caller):
+//   * coinbasevalue is resolved through the #207 resolve_coinbase_value SSOT.
+//     On the embedded path there is no external GBT figure, so it is derived
+//     as subsidy_func(height) + total_fees via embedded_coinbase_value.hpp.
+//     The external-daemon GBT fallback (NodeRPC::getwork) is a SEPARATE path
+//     and is untouched -- this node is the no-external-daemon source only.
+//   * version pins the Scrypt lane (build_work_template, DGB_BLOCK_VERSION_SCRYPT).
+//   * transactions[] stays empty and total_fees is 0: embedded mempool tx
+//     selection is not wired yet, so the template fabricates no transactions
+//     (the same truthful-absence discipline the stratum caller keeps).
+//   * previousblockhash is emitted ONLY when HeaderChain::tip_hash() carries a
+//     real tip id, rendered through the coin/hash_format.hpp SSOT so it is
+//     byte-identical to the stratum caller's previousblockhash.
+//   * bits is HELD BACK (MultiShield V4 next-target is a 5-algo global window
+//     == V37; a Scrypt-only walk would emit a known-wrong difficulty). It
+//     becomes a GBT pass-through once an external-daemon bits source is plumbed.
+//
+// Header-only + pure w.r.t. its inputs: make_inputs(curtime) is split out so
+// the assembly is deterministically unit-testable without a wall clock or a
+// running node; getwork() supplies std::time(nullptr) in production exactly as
+// the stratum caller does.
+// ===========================================================================
+
+#include <ctime>
+#include <cstdint>
+#include <optional>
+
+#include <core/pow.hpp>   // core::SubsidyFunc
+
+#include "header_chain.hpp"            // c2pool::dgb::HeaderChain
+#include "hash_format.hpp"            // u256_be_display_hex SSOT
+#include "embedded_coinbase_value.hpp"  // resolve_coinbase_value SSOT (#207)
+#include "template_builder.hpp"       // build_work_template SSOT + CoinNodeInterface
+#include "rpc_data.hpp"               // rpc::WorkData
+
+namespace dgb::coin
+{
+
+class EmbeddedCoinNode : public CoinNodeInterface
+{
+public:
+    EmbeddedCoinNode(c2pool::dgb::HeaderChain& chain,
+                     core::SubsidyFunc        subsidy_func)
+        : m_chain(chain), m_subsidy_func(std::move(subsidy_func))
+    {
+    }
+
+    // Assemble the build_work_template inputs from the live embedded chain
+    // state. Split from getwork() so the curtime is injectable for
+    // deterministic tests (the stratum caller does the same with std::time).
+    WorkTemplateInputs make_inputs(int64_t curtime) const
+    {
+        const uint32_t height = m_chain.next_block_height();
+
+        WorkTemplateInputs in;
+        in.next_height      = height;
+        // Embedded path: no external GBT value -> derive subsidy(height)+fees.
+        // total_fees is 0 until embedded mempool tx selection is wired.
+        in.coinbasevalue    = resolve_coinbase_value(m_subsidy_func, height,
+                                                      /*total_fees=*/0,
+                                                      /*gbt_coinbasevalue=*/std::nullopt);
+        in.median_time_past = m_chain.median_time_past();
+        in.curtime          = curtime;
+        if (auto th = m_chain.tip_hash())
+            in.previousblockhash = u256_be_display_hex(*th);
+        return in;
+    }
+
+    // CoinNodeInterface: produce a WorkData carrying the embedded template.
+    // m_hashes stays empty (transactions[] is empty), m_latency 0 (no RPC).
+    rpc::WorkData getwork() override
+    {
+        rpc::WorkData wd;
+        wd.m_data = build_work_template(make_inputs(std::time(nullptr)));
+        return wd;
+    }
+
+    // Minimal chain-info shaped like getblockchaininfo's relevant fields. The
+    // embedded chain reports its absolute tip height (0 on an empty chain).
+    nlohmann::json getblockchaininfo() override
+    {
+        nlohmann::json info = nlohmann::json::object();
+        info["blocks"] = m_chain.tip_height().value_or(0);
+        return info;
+    }
+
+    // Not synced until the embedded P2P header-download ingest is wired (it is
+    // what populates HeaderSample.block_hash and gives real UTXO depth). A
+    // truthful false, never an optimistic claim of readiness.
+    bool is_synced() const override { return false; }
+
+private:
+    c2pool::dgb::HeaderChain& m_chain;
+    core::SubsidyFunc         m_subsidy_func;
+};
+
+} // namespace dgb::coin
