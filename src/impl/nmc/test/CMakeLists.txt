@@ -19,6 +19,10 @@ if (BUILD_TESTING AND GTest_FOUND)
     # share/coin libs are needed -- this KAT only folds with core::Hash.
     target_link_libraries(nmc_auxpow_merkle_test PRIVATE
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
+    # P1b: the check_proof KATs construct AuxPow, whose parent_coinbase member
+    # is an nmc::coin::MutableTransaction with an out-of-line ctor -> link the
+    # nmc_coin lib (transaction.cpp). Still no node/pool/share libs (none exist).
+    target_link_libraries(nmc_auxpow_merkle_test PRIVATE nmc_coin)
 
     include(GoogleTest)
     include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
