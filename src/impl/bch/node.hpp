@@ -24,6 +24,7 @@
 #include "share_tracker.hpp"
 #include "peer.hpp"
 #include "messages.hpp"
+#include <core/version_gate.hpp>   // SSOT: core::version_gate::is_v36_active
 
 #include <pool/node.hpp>
 #include <pool/protocol.hpp>
@@ -290,7 +291,7 @@ public:
         chain.get_share(share_hash).invoke([&](auto* s) {
             using ST = std::remove_pointer_t<decltype(s)>;
             constexpr int64_t ver = ST::version;
-            const bool v36 = (ver >= 36);
+            const bool v36 = core::version_gate::is_v36_active(ver);
             const uint256 gentx_hash =
                 generate_share_transaction(*s, m_tracker, false, v36, &gentx_bytes);
             const uint256 merkle_root =
