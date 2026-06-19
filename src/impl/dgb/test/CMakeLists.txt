@@ -114,6 +114,21 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_other_tx_assembler_test "" AUTO)
 
+    # --- #82: gentx-bytes -> MutableTransaction unpack (inverse of #173) ----
+    # coin/gentx_unpack.hpp turns the share's SSOT non-witness gentx bytes back
+    # into the MutableTransaction reconstruct_won_block injects at tx index 0.
+    # Pulls PackStream/Hash/uint256 + transaction.hpp, so it links the proven
+    # dgb OBJECT-lib SCC set like dgb_gentx_coinbase_test. Oracle round-trip +
+    # inverse-pairing KAT. MUST also appear in the build.yml --target allowlist
+    # (#143 NOT_BUILT trap).
+    add_executable(dgb_gentx_unpack_test gentx_unpack_test.cpp)
+    target_link_libraries(dgb_gentx_unpack_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_gentx_unpack_test "" AUTO)
+
     foreach(dgb_guard rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test header_chain_test)
         add_executable(${dgb_guard} ${dgb_guard}.cpp)
         target_link_libraries(${dgb_guard} PRIVATE
