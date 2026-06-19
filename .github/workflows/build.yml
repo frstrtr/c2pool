@@ -302,6 +302,11 @@ jobs:
   qt-webengine:
     name: Qt WebEngine leak gate
     runs-on: ubuntu-24.04
+    # Hard ceiling: orphaned QtWebEngine/Chromium helper children survive
+    # the inner `timeout 180`, holding the xvfb pipe open and hanging the
+    # job to the 360-min runner default. Cap it so a hung leak gate is
+    # force-killed (with its whole process tree) in minutes, not hours.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
 
