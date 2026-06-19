@@ -68,6 +68,22 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_gentx_share_path_test "" AUTO)
 
+    # --- #82 sub-slice 1: transaction_hash_refs -> other_tx hash walk -------
+    # coin/other_tx_resolver.hpp is the won-block reconstructor`s connecting
+    # tissue (faithful get_other_tx_hashes ancestry resolution). It pulls
+    # uint256 (SetHex TU) via share_types.hpp, so it links the proven dgb OBJECT-lib SCC set (like dgb_block_assembly_test)
+    # rather than the header-only guard foreach (linking bare `core` drags in
+    # web_server.cpp, whose symbols live in the SCC libs). The tracker ops are
+    # injected, so no dgb pool state is exercised. MUST also appear in the
+    # build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_other_tx_resolver_test other_tx_resolver_test.cpp)
+    target_link_libraries(dgb_other_tx_resolver_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_other_tx_resolver_test "" AUTO)
+
     foreach(dgb_guard rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test header_chain_test)
         add_executable(${dgb_guard} ${dgb_guard}.cpp)
         target_link_libraries(${dgb_guard} PRIVATE
