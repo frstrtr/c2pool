@@ -103,6 +103,24 @@ if(BUILD_TESTING)
         btclibs)
     add_test(NAME bch_reorg_connect_test COMMAND bch_reorg_connect_test)
 
+    # reorg_rerequest_test: M5 reorg recovery leg -- the COMPLEMENT of
+    # reorg_connect_test. When the new branch's intermediate blocks are NOT
+    # in the remembered ring (headers-first race, or a reorg deeper than the
+    # ring retains), the connector hands the missing new-branch hashes to a
+    # set_block_requester() sink (wired to BlockDownloadWindow::enqueue) so
+    # they are re-getdata'd and the reorg completes on re-delivery, instead
+    # of stranding the UTXO at the fork. Same link set + transaction.cpp TU;
+    # no impl_bch coin lib -> per-coin isolation holds.
+    add_executable(bch_reorg_rerequest_test
+        reorg_rerequest_test.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/transaction.cpp)
+    target_include_directories(bch_reorg_rerequest_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(bch_reorg_rerequest_test PRIVATE
+        core pool sharechain
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage c2pool_difficulty
+        btclibs)
+    add_test(NAME bch_reorg_rerequest_test COMMAND bch_reorg_rerequest_test)
+
     # compact_block_connector_test: M5 (b) -- BIP152 compact-block depth on the
     # connector seam. on_compact_block reconstructs from prefilled + mempool; a
     # missing tx drives a getblocktxn round that on_block_txn closes out before

@@ -38,6 +38,7 @@
 
 #include <boost/asio/io_context.hpp>
 
+#include <core/netaddress.hpp>   // NetService (no-peer RPC-only contract)
 #include "../coin/embedded_daemon.hpp"
 
 namespace {
@@ -55,7 +56,7 @@ struct TestConfig {
     // Duck-typed coin()->m_p2p.prefix: NodeP2P<Config>::get_prefix() is a virtual
     // override (eagerly instantiated via the vtable) and reads it. Empty here --
     // assemble() never sends a P2P message, so the value is inert.
-    struct P2P { std::vector<std::byte> prefix; };
+    struct P2P { std::vector<std::byte> prefix; NetService address; };
     struct Coin { P2P m_p2p; };
     Coin m_coin;
     const Coin* coin() const { return &m_coin; }
@@ -83,6 +84,17 @@ int main() {
     CHECK(daemon.coin_node().is_embedded());     // embedded work source = primary
     CHECK(!daemon.coin_node().has_rpc());         // RPC fallback absent offline
 
+    // 2b) FULL-BLOCK REORG PATH WIRED. assemble() now also instantiates +
+    //     attaches the daemon-owned BlockConnector to full_block (so every
+    //     received block drives header connect + best-chain-gated UTXO/mempool
+    //     reconciliation) and binds its deep-reorg re-request sink to the P2P
+    //     download window. has_block_requester()=true proves a reorg deeper than
+    //     the remembered-block ring re-getdata's the missing new-branch bodies
+    //     instead of stranding the UTXO view at the fork; the sink itself no-ops
+    //     offline (m_node.p2p() null until start_p2p()), so this is network-free.
+    CHECK(daemon.connector().is_attached());
+    CHECK(daemon.connector().has_block_requester());
+
     // 3) The seam is backed by the daemon's REAL EmbeddedCoinNode, not a fake:
     //    a fresh, un-init'd HeaderChain reports NOT synced (FakeEmbedded=true).
     CHECK(!daemon.embedded().is_synced());
@@ -92,6 +104,8 @@ int main() {
     daemon.assemble();
     CHECK(&daemon.coin_node() == before);
     CHECK(daemon.seam_ready());
+    CHECK(daemon.connector().is_attached());      // connector wiring stable across re-assemble
+    CHECK(daemon.connector().has_block_requester());
 
     // 5) Cold-start anchor DRY RUN: record-only, VM300 untouched, floor no-op.
     //    (Just exercises the path -- it logs and must not throw or mutate.)
@@ -108,6 +122,17 @@ int main() {
     CHECK(Rec::is_floor());                        // record provenance: at floor
     CHECK(daemon.abla().tracker().budget_for_tip(Rec::height)
           == Rec::abla_blocksizelimit);          // floor-equivalent: 32 MB
+
+    // 7) NO-PEER RPC-ONLY CONTRACT (maybe_start_p2p offline contract). With no
+    //    P2P peer configured (default NetService, port==0) maybe_start_p2p() is a
+    //    no-op: returns false and leaves node().has_p2p() false, so the daemon
+    //    stays strictly on the external BCHN-RPC submitblock leg -- the won-block
+    //    P2P relay leg and the connector re-request sink stay correctly dormant.
+    //    This is exactly the path run() takes when coin()->m_p2p.address is unset,
+    //    and it must never spin up a transport (no qm/control op -> VM300 read-only).
+    CHECK(config.m_coin.m_p2p.address.port() == 0); // precondition: no peer set
+    CHECK(!daemon.maybe_start_p2p());                // no peer -> no-op, returns false
+    CHECK(!daemon.node().has_p2p());                 // P2P leg stays dormant (RPC-only)
 
     if (failures == 0) {
         std::cout << "embedded_daemon_assembly_test: ALL PASS\n";

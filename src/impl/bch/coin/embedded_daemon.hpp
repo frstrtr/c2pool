@@ -56,6 +56,7 @@
 
 #include "header_chain.hpp"     // HeaderChain
 #include "mempool.hpp"          // Mempool
+#include "block_connector.hpp" // BlockConnector (full-block UTXO/mempool reorg path)
 #include "template_builder.hpp" // EmbeddedCoinNode
 #include "node.hpp"             // coin::Node<Config> (interfaces::Node source)
 #include "coin_node.hpp"        // CoinNode (core::coin::ICoinNode seam)
@@ -86,7 +87,8 @@ public:
           m_pool(),
           m_embedded(m_chain, m_pool, config->m_testnet),
           m_node(context, config),
-          m_abla(config->m_testnet, anchor_height, m_chain) {}
+          m_abla(config->m_testnet, anchor_height, m_chain),
+          m_connector(m_chain, m_pool) {}
 
     EmbeddedDaemon(const EmbeddedDaemon&) = delete;
     EmbeddedDaemon& operator=(const EmbeddedDaemon&) = delete;
@@ -101,9 +103,11 @@ public:
         assemble();                   // network-free seam + ABLA wiring (see below)
         wire_chain_ingest();          // new_headers --> HeaderChain (advances synced height)
         pin_cold_start_anchor();      // operator-APPROVED VM300 anchor (decisions@ 2026-06-18); floor-equivalent
+        const bool p2p_up = maybe_start_p2p(); // arm won-block P2P relay leg + connector re-request sink (gated on configured peer)
         LOG_INFO << "[EMB-BCH] embedded daemon up: embedded-primary work source,"
                  << " external BCHN-RPC fallback retained, ABLA loop closed"
-                 << " (cold-start anchor pinned @" << BchnAnchorRecord::height << ").";
+                 << " (cold-start anchor pinned @" << BchnAnchorRecord::height << "),"
+                 << " P2P relay leg " << (p2p_up ? "LIVE" : "OFF (no peer configured -> RPC-only)") << ".";
     }
 
     /// READ-ONLY IBD evidence harness entry (drives the --ibd run-loop in
@@ -198,6 +202,21 @@ public:
             return;                   // already assembled; idempotent no-op
         m_abla.wire(m_node, m_embedded);
         m_coin_node = std::make_unique<CoinNode>(&m_embedded, m_node.rpc());
+
+        // Drive the full-block UTXO/mempool reorg-reconciliation path and wire its
+        // deep-reorg re-request sink to the P2P block-download window: a reorg
+        // deeper than the connector's remembered-block ring re-getdata's the
+        // missing new-branch bodies through the bounded/deduping IBD window
+        // instead of stranding the UTXO view at the fork. m_node.p2p() is null
+        // until start_p2p(), so the sink no-ops safely when assemble() runs
+        // network-free. attach() subscribes the connector to full_block (the
+        // m_coin_node guard above makes this run exactly once).
+        m_connector.set_block_requester(
+            [this](const std::vector<uint256>& hashes) {
+                if (auto* p2p = m_node.p2p())
+                    p2p->request_block_downloads(hashes);
+            });
+        m_connector.attach(m_node);
     }
 
     /// Wire NodeP2P's IBD getheaders continuation to the authoritative
@@ -211,6 +230,32 @@ public:
     void bind_locator_provider() {
         if (auto* p2p = m_node.p2p())
             p2p->set_locator_provider([this]{ return m_chain.get_locator(); });
+    }
+
+    /// Bring up the embedded BCH P2P transport against the configured peer
+    /// (coin()->m_p2p.address) when one is set, then bind the HeaderChain
+    /// locator provider so any IBD continuation anchors at the learned tip.
+    /// Returns true if the transport was started, false when no peer is
+    /// configured (port == 0) -- in which case the daemon stays strictly
+    /// RPC-only (offline/no-peer contract preserved).
+    ///
+    /// Closes the won-block P2P-leg gap: broadcast_won_block submit_block_p2p*
+    /// calls no-op while m_node.p2p() is null, so EVERY won block degraded to
+    /// the RPC-only submitblock leg; likewise the BlockConnector
+    /// request_block_downloads re-request sink (wired in assemble) stayed
+    /// dormant with no download window to issue getdata on. Both go live the
+    /// instant the transport exists. The external BCHN-RPC fallback (init_rpc,
+    /// already brought up by run) is untouched -- this only ADDS the P2P leg.
+    /// A P2P connect issues no qm/control op, so VM300 bchn-bch stays read-only.
+    /// p2pool-merged-v36 surface: NONE (transport wiring only -- no PoW/share/
+    /// coinbase/PPLNS/WorkData-shape change).
+    bool maybe_start_p2p() {
+        const auto& peer = m_config->coin()->m_p2p.address;
+        if (peer.port() == 0)             // no peer configured -> RPC-only
+            return false;
+        m_node.start_p2p(peer);           // embedded BCHN P2P relay/IBD transport
+        bind_locator_provider();          // HeaderChain back-off locator for ContinueSync
+        return true;
     }
 
     /// Drive the authoritative HeaderChain from the live P2P header stream.
@@ -342,6 +387,7 @@ public:
     CoinNode&           coin_node()      { return *m_coin_node; }
     bool                seam_ready() const { return m_coin_node != nullptr; }
     AblaRuntime&        abla()           { return m_abla; }
+    BlockConnector&     connector()      { return m_connector; }
     HeaderChain&        chain()          { return m_chain; }
     Mempool&            mempool()        { return m_pool; }
     bool                is_wired() const { return m_abla.is_wired(); }
@@ -411,6 +457,10 @@ private:
     EmbeddedCoinNode m_embedded; // in-process work source
     Node<config_t>   m_node;     // P2P + external-RPC fallback; full_block source
     AblaRuntime      m_abla;     // owns tracker + feed; wired in run()
+    // full_block -> header connect -> best-chain-gated UTXO/mempool reconcile;
+    // attached in assemble(). Declared after m_node so its full_block
+    // subscription tears down (dtor detach) before the event source m_node dies.
+    BlockConnector   m_connector;
     // new_headers -> m_chain.add_headers() subscription (headers-first IBD).
     std::shared_ptr<EventDisposable> m_headers_sub;
     // Built in run() once m_node.rpc() is live; binds raw ptrs to m_embedded
