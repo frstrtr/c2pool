@@ -11,6 +11,21 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     gtest_discover_tests(test_dgb_subsidy DISCOVERY_MODE PRE_TEST)
 
+    # DGB embedded-path coinbasevalue SSOT (forward-only #82 wiring TODO):
+    # embedded_coinbase_value.hpp routes CoinParams::subsidy_func(height)+fees
+    # into the coinbasevalue and preserves the external-daemon GBT fallback.
+    # Header-only like test_dgb_subsidy (config_coin.hpp subsidy is static); no
+    # dgb runtime link. MUST also be in the build.yml --target allowlist (#143).
+    add_executable(test_dgb_coinbase_value test_dgb_coinbase_value.cpp)
+    target_link_libraries(test_dgb_coinbase_value PRIVATE
+        GTest::gtest_main GTest::gtest
+        btclibs
+        yaml-cpp::yaml-cpp
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    gtest_discover_tests(test_dgb_coinbase_value DISCOVERY_MODE PRE_TEST)
+
     add_executable(test_coin_broadcaster test_coin_broadcaster.cpp)
     target_link_libraries(test_coin_broadcaster PRIVATE
         GTest::gtest_main GTest::gtest
