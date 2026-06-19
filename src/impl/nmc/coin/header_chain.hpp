@@ -42,11 +42,13 @@
 #include <core/log.hpp>
 #include <core/target_utils.hpp>  // chain::bits_to_target (parent-PoW, step 4)
 #include <core/leveldb_store.hpp>  // P1f: core::LevelDBStore persistence
+#include <core/coin/utxo.hpp>      // P1 PC: core::coin::DEFAULT_MAX_TIP_AGE (is_synced)
 
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <functional>
 #include <mutex>
 #include <memory>
@@ -688,6 +690,116 @@ inline uint256 get_block_proof(uint32_t bits) {
     return (~target / (target + uint256::ONE)) + uint256::ONE;
 }
 
+// NMC Difficulty Retarget
+// Mirror of btc::coin::calculate_next_work_required / get_next_work_required
+// (src/impl/btc/coin/header_chain.hpp). Namecoin is a SHA256d Bitcoin fork and
+// shares Bitcoin's 2016-block retarget window / 10-minute spacing, so the
+// retarget algorithm is identical. Kept local to the NMC lane (the btc tree is
+// read-only; core/ is the exceptional SSOT) rather than cross-including the btc
+// header. Adapted from Bitcoin Core pow.cpp (MIT license).
+
+/// Core retarget calculation: adjust difficulty based on actual vs target
+/// timespan.
+inline uint32_t calculate_next_work_required(
+    uint32_t tip_bits,
+    int64_t tip_time,
+    int64_t first_block_time,
+    const NMCChainParams& params)
+{
+    if (params.no_retargeting)
+        return tip_bits;
+
+    int64_t actual_timespan = tip_time - first_block_time;
+
+    // Clamp to [timespan/4, timespan*4].
+    if (actual_timespan < params.target_timespan / 4)
+        actual_timespan = params.target_timespan / 4;
+    if (actual_timespan > params.target_timespan * 4)
+        actual_timespan = params.target_timespan * 4;
+
+    // Retarget.
+    uint256 bn_new;
+    bn_new.SetCompact(tip_bits);
+    const uint256 bn_pow_limit = params.pow_limit;
+
+    // Intermediate uint256 can overflow by 1 bit (same guard as btc/ltc).
+    bool shift = bn_new.bits() > bn_pow_limit.bits() - 1;
+    if (shift)
+        bn_new >>= 1;
+    bn_new *= static_cast<uint32_t>(actual_timespan);
+    bn_new /= uint256(static_cast<uint64_t>(params.target_timespan));
+    if (shift)
+        bn_new <<= 1;
+
+    if (bn_new > bn_pow_limit)
+        bn_new = bn_pow_limit;
+
+    return bn_new.GetCompact();
+}
+
+/// Calculate next work required at a given height.
+/// @param get_ancestor  Function to look up ancestor header by height.
+/// @param tip_height    Height of the current tip (the block we're building on).
+/// @param tip_bits      nBits of the current tip.
+/// @param tip_time      Timestamp of the current tip.
+/// @param new_time      Timestamp of the new block being validated.
+/// @param params        Chain parameters.
+inline uint32_t get_next_work_required(
+    std::function<std::optional<IndexEntry>(uint32_t)> get_ancestor,
+    uint32_t tip_height,
+    uint32_t tip_bits,
+    uint32_t tip_time,
+    uint32_t new_time,
+    const NMCChainParams& params)
+{
+    uint256 pow_limit_compact;
+    pow_limit_compact = params.pow_limit;
+    uint32_t pow_limit_bits = pow_limit_compact.GetCompact();
+
+    // Next block height.
+    uint32_t new_height = tip_height + 1;
+    int64_t interval = params.difficulty_adjustment_interval();
+
+    // Only change once per difficulty adjustment interval.
+    if (new_height % interval != 0) {
+        if (params.allow_min_difficulty) {
+            // Testnet special rule: if >2x target spacing since last block,
+            // allow a min-difficulty block.
+            if (static_cast<int64_t>(new_time) > static_cast<int64_t>(tip_time) + params.target_spacing * 2)
+                return pow_limit_bits;
+
+            // Return the last non-special-min-difficulty-rules block.
+            uint32_t h = tip_height;
+            uint32_t last_bits = tip_bits;
+            while (h > 0 && (h % interval) != 0 && last_bits == pow_limit_bits) {
+                auto ancestor = get_ancestor(h - 1);
+                if (!ancestor) break;
+                last_bits = ancestor->header.m_bits;
+                h--;
+            }
+            return last_bits;
+        }
+        return tip_bits;
+    }
+
+    if (params.no_retargeting)
+        return tip_bits;
+
+    // Bitcoin (and Namecoin) always go back `interval - 1` blocks (= 2015 for
+    // the 2016-block retarget window). The Litecoin "Art Forz" off-by-one is
+    // not part of Namecoin's history.
+    int64_t blocks_to_go_back = interval - 1;
+
+    uint32_t first_height = static_cast<uint32_t>(tip_height - blocks_to_go_back);
+    auto first_entry = get_ancestor(first_height);
+    if (!first_entry)
+        return tip_bits; // shouldn't happen for a connected chain
+
+    int64_t first_time = first_entry->header.m_timestamp;
+
+    return calculate_next_work_required(tip_bits, tip_time, first_time, params);
+}
+
 // ─── HeaderChain ─────────────────────────────────────────────────────────────
 
 /// Header-only chain skeleton for embedded NMC. Mirrors the public surface of
@@ -892,6 +1004,44 @@ public:
         (void)headers;
         // P0-DEFER: batch header path not implemented.
         return 0;
+    }
+
+    /// P1 PC: look up a header by absolute height by walking the tip's ancestry
+    /// through m_previous_block. NMC keeps NO height index (mirror of
+    /// get_locator()'s note) so a height lookup walks parent links down the
+    /// BEST chain. Returns nullopt when the height is above the tip or the walk
+    /// hits a dangling parent. The TemplateBuilder's difficulty retarget needs
+    /// at most `interval` ancestors, so this O(depth) walk is bounded in
+    /// practice. Caller must NOT hold m_mutex (this acquires it).
+    std::optional<IndexEntry> get_header_by_height(uint32_t h) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_tip.IsNull()) return std::nullopt;
+        auto it = m_index.find(m_tip);
+        if (it == m_index.end()) return std::nullopt;
+        if (h > it->second.height) return std::nullopt;   // above the tip
+        // Walk parent links from the tip down to height h.
+        uint256 cursor = m_tip;
+        while (true) {
+            auto cit = m_index.find(cursor);
+            if (cit == m_index.end()) return std::nullopt; // dangling link
+            if (cit->second.height == h) return cit->second;
+            if (cit->second.height == 0) return std::nullopt; // reached root, not found
+            cursor = cit->second.header.m_previous_block;
+        }
+    }
+
+    /// P1 PC: whether the chain tip is recent enough to be considered synced
+    /// with the network (mirror of btc::coin::HeaderChain::is_synced). Uses the
+    /// shared core::coin::DEFAULT_MAX_TIP_AGE (24h) gate: a chain whose tip is
+    /// older than that is still in IBD. An empty chain is never synced.
+    bool is_synced() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_tip.IsNull()) return false;
+        auto it = m_index.find(m_tip);
+        if (it == m_index.end()) return false;
+        auto now = static_cast<uint32_t>(std::time(nullptr));
+        uint32_t age = now - it->second.header.m_timestamp;
+        return age < core::coin::DEFAULT_MAX_TIP_AGE;
     }
 
     const NMCChainParams& params() const { return m_params; }

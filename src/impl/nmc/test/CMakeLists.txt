@@ -24,7 +24,19 @@ if (BUILD_TESTING AND GTest_FOUND)
     # nmc_coin lib (transaction.cpp). Still no node/pool/share libs (none exist).
     target_link_libraries(nmc_auxpow_merkle_test PRIVATE nmc_coin)
 
+    # P1 PC: embedded template builder KATs. Header-only builder
+    # (template_builder.hpp / rpc_data.hpp); links the same SCC the sibling
+    # merkle test does (core + nmc_coin for the out-of-line transaction ctor).
+    add_executable(nmc_template_builder_test nmc_template_builder_test.cpp)
+    target_link_libraries(nmc_template_builder_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core nlohmann_json::nlohmann_json)
+    target_link_libraries(nmc_template_builder_test PRIVATE
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
+    target_link_libraries(nmc_template_builder_test PRIVATE nmc_coin)
+
     include(GoogleTest)
     include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
     gtest_add_tests(nmc_auxpow_merkle_test "" AUTO)
+    gtest_add_tests(nmc_template_builder_test "" AUTO)
 endif()

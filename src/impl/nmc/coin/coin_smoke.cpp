@@ -9,6 +9,8 @@
 #include "header_chain.hpp"
 #include "block.hpp"
 #include "mempool.hpp"
+#include "rpc_data.hpp"
+#include "template_builder.hpp"
 
 namespace nmc {
 namespace coin {
@@ -36,6 +38,17 @@ void nmc_coin_p0_smoke()
     std::vector<AuxChain> aux_chains; // nmc-local list (fence #4)
     aux_chains.push_back(aux_slot);
     (void)aux_chains;
+
+    // P1 PC: force-compile the embedded template builder + work-data types.
+    Mempool pool;
+    (void)pool.size();
+    (void)get_block_subsidy(0u);
+    (void)compute_merkle_root(std::vector<uint256>{});
+    auto wd = TemplateBuilder::build_template(chain, pool, /*is_testnet=*/false);
+    (void)wd;  // nullopt on an empty chain -- structural compile-check only
+    EmbeddedCoinNode node(chain, pool, /*testnet=*/false);
+    (void)node.getblockchaininfo();
+    (void)node.is_synced();
 }
 
 } // namespace coin
