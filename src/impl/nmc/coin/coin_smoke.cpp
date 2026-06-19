@@ -11,6 +11,7 @@
 #include "mempool.hpp"
 #include "rpc_data.hpp"
 #include "template_builder.hpp"
+#include "chain_seeds.hpp"
 
 namespace nmc {
 namespace coin {
@@ -49,6 +50,12 @@ void nmc_coin_p0_smoke()
     EmbeddedCoinNode node(chain, pool, /*testnet=*/false);
     (void)node.getblockchaininfo();
     (void)node.is_synced();
+
+    // P1 PE 2a: force-compile embedded NMC seed tables (DNS + fixed).
+    (void)nmc_dns_seeds(false);
+    (void)nmc_fixed_seeds(false);
+    (void)nmc_dns_seeds(true);
+    (void)nmc_fixed_seeds(true);
 }
 
 } // namespace coin

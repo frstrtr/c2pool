@@ -8,6 +8,7 @@ set(nmc_coin_interface
     block.hpp
     mempool.hpp
     header_chain.hpp
+    chain_seeds.hpp
     rpc_data.hpp
     template_builder.hpp
     coin_smoke.cpp
