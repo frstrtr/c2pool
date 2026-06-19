@@ -84,6 +84,21 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_other_tx_resolver_test "" AUTO)
 
+    # --- #82 sub-slice 2: other_tx hashes -> MutableTransaction other_txs ---
+    # coin/other_tx_assembler.hpp is the won-block reconstructor`s bridge from
+    # the resolved other_tx hash list (sub-slice 1) to the deserialized txs that
+    # assemble_won_block frames (faithful as_block known_txs[h] lookup). Links
+    # the dgb OBJECT lib like dgb_block_assembly_test because the end-to-end KAT
+    # frames through dgb::check_merkle_link + the live BlockType codec. MUST also
+    # appear in the build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_other_tx_assembler_test other_tx_assembler_test.cpp)
+    target_link_libraries(dgb_other_tx_assembler_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_other_tx_assembler_test "" AUTO)
+
     foreach(dgb_guard rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test header_chain_test)
         add_executable(${dgb_guard} ${dgb_guard}.cpp)
         target_link_libraries(${dgb_guard} PRIVATE
