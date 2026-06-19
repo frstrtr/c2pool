@@ -34,6 +34,7 @@
 #include <core/target_utils.hpp>
 
 #include "../coin/header_chain.hpp"
+#include "../coin/mempool.hpp"
 
 namespace {
 
@@ -1376,6 +1377,81 @@ TEST(NmcAuxPowPersist, IndexEntryDiskV1RoundTripsAuxPowBlob)
     PackStream ps2; ps2 << pdisk;
     IndexEntryDiskV1 pback; ps2 >> pback;
     EXPECT_FALSE(pback.to_entry().auxpow.has_value());
+}
+
+
+// ─── P1 PB: NMC mempool (re-homed btc mirror) ───────────────────────────────
+// Pins nmc::coin::Mempool basics against the nmc::coin transaction/block types:
+// add/contains/remove + duplicate rejection, feerate-ordered selection, and
+// confirmed-block cleanup. The pool is a byte-faithful mirror of the btc pool
+// re-homed into namespace nmc::coin (no btc::coin symbols).
+
+static nmc::coin::MutableTransaction mempool_tx(uint8_t seed, int64_t out_value) {
+    nmc::coin::MutableTransaction tx;
+    tx.version  = 2;
+    tx.locktime = 0;
+    nmc::coin::TxIn in;
+    in.prevout.hash  = leaf_of(seed);
+    in.prevout.index = 0;
+    in.sequence      = 0xffffffffu;
+    tx.vin.push_back(in);
+    nmc::coin::TxOut out;
+    out.value = out_value;
+    tx.vout.push_back(out);
+    return tx;
+}
+
+TEST(NmcMempool, AddContainsRemoveAndDedup) {
+    nmc::coin::Mempool pool;
+    auto tx = mempool_tx(0x11, 5000);
+    uint256 txid = nmc::coin::compute_txid(tx);
+
+    EXPECT_TRUE(pool.add_tx(tx));
+    EXPECT_TRUE(pool.contains(txid));
+    EXPECT_EQ(pool.size(), 1u);
+    EXPECT_FALSE(pool.add_tx(tx));      // duplicate rejected
+    EXPECT_EQ(pool.size(), 1u);
+
+    pool.remove_tx(txid);
+    EXPECT_FALSE(pool.contains(txid));
+    EXPECT_EQ(pool.size(), 0u);
+}
+
+TEST(NmcMempool, FeerateOrderedSelection) {
+    nmc::coin::Mempool pool;
+    auto lo = mempool_tx(0x21, 1000);
+    auto hi = mempool_tx(0x22, 1000);
+    uint256 lo_id = nmc::coin::compute_txid(lo);
+    uint256 hi_id = nmc::coin::compute_txid(hi);
+    ASSERT_TRUE(pool.add_tx(lo));
+    ASSERT_TRUE(pool.add_tx(hi));
+    // Equal weight, different fees -> higher fee is the higher feerate.
+    pool.set_tx_fee(lo_id, 1000);
+    pool.set_tx_fee(hi_id, 9000);
+
+    auto sel = pool.get_sorted_txs_with_fees(4000000u);
+    ASSERT_EQ(sel.first.size(), 2u);
+    EXPECT_EQ(sel.first[0].fee, 9000u);   // highest feerate first
+    EXPECT_EQ(sel.first[1].fee, 1000u);
+    EXPECT_EQ(sel.second, 10000u);
+    EXPECT_EQ(pool.total_fees(), 10000u);
+}
+
+TEST(NmcMempool, RemoveForBlockClearsConfirmed) {
+    nmc::coin::Mempool pool;
+    auto a = mempool_tx(0x31, 2000);
+    auto b = mempool_tx(0x32, 2000);
+    uint256 a_id = nmc::coin::compute_txid(a);
+    ASSERT_TRUE(pool.add_tx(a));
+    ASSERT_TRUE(pool.add_tx(b));
+    EXPECT_EQ(pool.size(), 2u);
+
+    nmc::coin::BlockType block;
+    block.m_txs.push_back(a);             // a confirmed in this block
+    pool.remove_for_block(block);
+
+    EXPECT_FALSE(pool.contains(a_id));
+    EXPECT_EQ(pool.size(), 1u);           // b remains
 }
 
 } // namespace

@@ -8,6 +8,7 @@
 
 #include "header_chain.hpp"
 #include "block.hpp"
+#include "mempool.hpp"
 
 namespace nmc {
 namespace coin {
