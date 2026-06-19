@@ -32,6 +32,21 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_block_assembly_test "" AUTO)
 
+    # --- #82: won-block reconstructor BODY (as_block composition) ----------
+    # Pins coin/reconstruct_won_block.hpp: the single composition the dispatch
+    # handler injects as its WonBlockReconstructor (resolve_other_tx_hashes ->
+    # assemble_other_txs -> assemble_won_block). Links the dgb OBJECT lib like
+    # dgb_block_assembly_test because it pulls block_assembly.hpp (BlockType /
+    # MutableTransaction / check_merkle_link). MUST appear in BOTH this
+    # registration AND the build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_reconstruct_won_block_test reconstruct_won_block_test.cpp)
+    target_link_libraries(dgb_reconstruct_won_block_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_reconstruct_won_block_test "" AUTO)
+
     # --- M3 RPC-transport standalone regression guards ---------------------
     # Header-only guards over the external-daemon RPC coin-layer SSOTs
     # (rpc_request.hpp request-shape + version floor + genesis identity, and
