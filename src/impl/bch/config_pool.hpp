@@ -6,7 +6,6 @@
 #include <btclibs/util/strencodings.h>
 #include <btclibs/crypto/sha256.h>
 #include <core/uint256.hpp>
-#include <core/version_gate.hpp>   // SSOT: core::version_gate::is_v36_active
 
 #include <array>
 #include <cstdint>
@@ -154,7 +153,7 @@ public:
     // use the combined P2SH 1-of-2 multisig script. Same shape as BTC/LTC.
     static std::vector<unsigned char> get_donation_script(int64_t share_version)
     {
-        if (core::version_gate::is_v36_active(share_version))
+        if (share_version >= 36)
             return {COMBINED_DONATION_SCRIPT.begin(), COMBINED_DONATION_SCRIPT.end()};
         return {DONATION_SCRIPT.begin(), DONATION_SCRIPT.end()};
     }
