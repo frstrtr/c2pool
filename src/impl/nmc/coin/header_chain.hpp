@@ -45,6 +45,7 @@
 #include <core/coin/utxo.hpp>      // P1 PC: core::coin::DEFAULT_MAX_TIP_AGE (is_synced)
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -511,6 +512,12 @@ struct NMCChainParams {
     bool    no_retargeting{false};
     uint256 pow_limit;
     uint256 genesis_hash;
+    // P2P network magic (Namecoin Core pchMessageStart). The 4-byte frame
+    // prefix every parent-NMC P2P message carries; the embedded won-block
+    // broadcaster (PE) needs it to talk the NMC wire protocol. SSOT for the
+    // host get_chain_p2p_prefix table (a follow-on host slice references this).
+    // Sourced from namecoin-core src/kernel/chainparams.cpp, NOT from memory.
+    std::array<unsigned char, 4> p2p_magic{};
 
     // ── Merge-mining consensus parameters ──
     //
@@ -554,6 +561,11 @@ struct NMCChainParams {
         p.pow_limit.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
         // TO-CONFIRM: Namecoin mainnet genesis hash (placeholder = null).
         p.genesis_hash.SetNull();
+        // P2P magic PINNED: namecoin-core kernel/chainparams.cpp CMainParams
+        // pchMessageStart = { 0xf9, 0xbe, 0xb4, 0xfe }. (Magic is a published
+        // network constant, distinct from the genesis hash which stays
+        // TO-CONFIRM pending a mainnet namecoind.)
+        p.p2p_magic = {{ 0xf9, 0xbe, 0xb4, 0xfe }};
         // TO-CONFIRM: activation height + chain id stay unpinned (-1).
         return p;
     }
@@ -571,6 +583,10 @@ struct NMCChainParams {
         // (getblockhash 0 / getblockheader, 2026-06-19). block_hash(genesis_header)
         // re-derives this value (nmc_auxpow_wire_test GenesisTestnet KAT).
         p.genesis_hash.SetHex("00000007199508e34a9ff81e6ec0c477a4cccff2a4767a8eee39c11db367b008");
+        // P2P magic PINNED: namecoin-core kernel/chainparams.cpp CTestNetParams
+        // pchMessageStart = { 0xfa, 0xbf, 0xb5, 0xfe } (testnet3 -- matches the
+        // pinned testnet3 genesis time=1296688602 above; testnet4 differs).
+        p.p2p_magic = {{ 0xfa, 0xbf, 0xb5, 0xfe }};
         return p;
     }
 

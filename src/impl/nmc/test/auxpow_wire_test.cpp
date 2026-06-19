@@ -27,6 +27,7 @@
 #include <cstring>
 #include <cstdint>
 #include <string>
+#include <array>
 
 #include <core/pack.hpp>
 #include <core/uint256.hpp>
@@ -281,6 +282,28 @@ TEST(NmcP1Genesis, TestnetHeaderRederivesPinnedHash)
     EXPECT_EQ(params.genesis_hash, expect);
 
     EXPECT_EQ(params.aux_chain_id, 1);  // Namecoin nAuxpowChainId = 0x0001
+}
+
+// ---------------------------------------------------------------------------
+// P2P network-magic pin KAT (P1 PE 2b-ii). NMCChainParams::p2p_magic is the
+// 4-byte frame prefix the embedded won-block broadcaster (PE) puts on every
+// parent-NMC P2P message. Pinned from namecoin-core src/kernel/chainparams.cpp
+// (pchMessageStart), NOT from memory: a wrong byte makes namecoind drop the
+// peer on EOF (handshake never completes) -- the same failure main_bch.cpp:138
+// documents for a zero/garbage magic. Testnet3 magic must pair with the
+// testnet3 genesis pinned above (time=1296688602); testnet4 magic differs.
+// ---------------------------------------------------------------------------
+TEST(NmcP1Genesis, P2PMagicPinned)
+{
+    const std::array<unsigned char, 4> kMain{{0xf9, 0xbe, 0xb4, 0xfe}};
+    const std::array<unsigned char, 4> kTest{{0xfa, 0xbf, 0xb5, 0xfe}};
+
+    EXPECT_EQ(nmc::coin::NMCChainParams::mainnet().p2p_magic, kMain);
+    EXPECT_EQ(nmc::coin::NMCChainParams::testnet().p2p_magic, kTest);
+
+    // Mainnet and testnet must NOT share a magic (network isolation primitive).
+    EXPECT_NE(nmc::coin::NMCChainParams::mainnet().p2p_magic,
+              nmc::coin::NMCChainParams::testnet().p2p_magic);
 }
 
 }  // namespace
