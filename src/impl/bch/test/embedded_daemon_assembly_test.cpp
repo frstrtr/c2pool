@@ -38,6 +38,7 @@
 
 #include <boost/asio/io_context.hpp>
 
+#include <core/netaddress.hpp>   // NetService (no-peer RPC-only contract)
 #include "../coin/embedded_daemon.hpp"
 
 namespace {
@@ -55,7 +56,7 @@ struct TestConfig {
     // Duck-typed coin()->m_p2p.prefix: NodeP2P<Config>::get_prefix() is a virtual
     // override (eagerly instantiated via the vtable) and reads it. Empty here --
     // assemble() never sends a P2P message, so the value is inert.
-    struct P2P { std::vector<std::byte> prefix; };
+    struct P2P { std::vector<std::byte> prefix; NetService address; };
     struct Coin { P2P m_p2p; };
     Coin m_coin;
     const Coin* coin() const { return &m_coin; }
@@ -121,6 +122,17 @@ int main() {
     CHECK(Rec::is_floor());                        // record provenance: at floor
     CHECK(daemon.abla().tracker().budget_for_tip(Rec::height)
           == Rec::abla_blocksizelimit);          // floor-equivalent: 32 MB
+
+    // 7) NO-PEER RPC-ONLY CONTRACT (maybe_start_p2p offline contract). With no
+    //    P2P peer configured (default NetService, port==0) maybe_start_p2p() is a
+    //    no-op: returns false and leaves node().has_p2p() false, so the daemon
+    //    stays strictly on the external BCHN-RPC submitblock leg -- the won-block
+    //    P2P relay leg and the connector re-request sink stay correctly dormant.
+    //    This is exactly the path run() takes when coin()->m_p2p.address is unset,
+    //    and it must never spin up a transport (no qm/control op -> VM300 read-only).
+    CHECK(config.m_coin.m_p2p.address.port() == 0); // precondition: no peer set
+    CHECK(!daemon.maybe_start_p2p());                // no peer -> no-op, returns false
+    CHECK(!daemon.node().has_p2p());                 // P2P leg stays dormant (RPC-only)
 
     if (failures == 0) {
         std::cout << "embedded_daemon_assembly_test: ALL PASS\n";

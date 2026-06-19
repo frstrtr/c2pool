@@ -103,9 +103,11 @@ public:
         assemble();                   // network-free seam + ABLA wiring (see below)
         wire_chain_ingest();          // new_headers --> HeaderChain (advances synced height)
         pin_cold_start_anchor();      // operator-APPROVED VM300 anchor (decisions@ 2026-06-18); floor-equivalent
+        const bool p2p_up = maybe_start_p2p(); // arm won-block P2P relay leg + connector re-request sink (gated on configured peer)
         LOG_INFO << "[EMB-BCH] embedded daemon up: embedded-primary work source,"
                  << " external BCHN-RPC fallback retained, ABLA loop closed"
-                 << " (cold-start anchor pinned @" << BchnAnchorRecord::height << ").";
+                 << " (cold-start anchor pinned @" << BchnAnchorRecord::height << "),"
+                 << " P2P relay leg " << (p2p_up ? "LIVE" : "OFF (no peer configured -> RPC-only)") << ".";
     }
 
     /// READ-ONLY IBD evidence harness entry (drives the --ibd run-loop in
@@ -228,6 +230,32 @@ public:
     void bind_locator_provider() {
         if (auto* p2p = m_node.p2p())
             p2p->set_locator_provider([this]{ return m_chain.get_locator(); });
+    }
+
+    /// Bring up the embedded BCH P2P transport against the configured peer
+    /// (coin()->m_p2p.address) when one is set, then bind the HeaderChain
+    /// locator provider so any IBD continuation anchors at the learned tip.
+    /// Returns true if the transport was started, false when no peer is
+    /// configured (port == 0) -- in which case the daemon stays strictly
+    /// RPC-only (offline/no-peer contract preserved).
+    ///
+    /// Closes the won-block P2P-leg gap: broadcast_won_block submit_block_p2p*
+    /// calls no-op while m_node.p2p() is null, so EVERY won block degraded to
+    /// the RPC-only submitblock leg; likewise the BlockConnector
+    /// request_block_downloads re-request sink (wired in assemble) stayed
+    /// dormant with no download window to issue getdata on. Both go live the
+    /// instant the transport exists. The external BCHN-RPC fallback (init_rpc,
+    /// already brought up by run) is untouched -- this only ADDS the P2P leg.
+    /// A P2P connect issues no qm/control op, so VM300 bchn-bch stays read-only.
+    /// p2pool-merged-v36 surface: NONE (transport wiring only -- no PoW/share/
+    /// coinbase/PPLNS/WorkData-shape change).
+    bool maybe_start_p2p() {
+        const auto& peer = m_config->coin()->m_p2p.address;
+        if (peer.port() == 0)             // no peer configured -> RPC-only
+            return false;
+        m_node.start_p2p(peer);           // embedded BCHN P2P relay/IBD transport
+        bind_locator_provider();          // HeaderChain back-off locator for ContinueSync
+        return true;
     }
 
     /// Drive the authoritative HeaderChain from the live P2P header stream.
