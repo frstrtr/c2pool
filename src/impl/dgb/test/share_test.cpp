@@ -14,6 +14,7 @@
 #include <impl/dgb/config_pool.hpp>
 #include <impl/dgb/config_coin.hpp>
 #include <impl/dgb/share.hpp>
+#include <impl/dgb/share_tracker.hpp>   // DensePPLNSWindow — V36 decayed-PPLNS SSOT
 
 // Sharechain-identity: the isolation primitives (PREFIX / IDENTIFIER) are the
 // per-coin namespacing boundary — they MUST stay byte-exact to the DGB oracle.
@@ -87,4 +88,51 @@ TEST(DGB_share_test, LoadShareSymbolLinks)
 {
     auto fn = static_cast<dgb::ShareType (*)(chain::RawShare&, NetService)>(&dgb::load_share);
     EXPECT_NE(fn, nullptr);
+}
+
+// ── V36 decayed-PPLNS bit-exact KAT ───────────────────────────────────────
+// Pins DensePPLNSWindow's decay constants + weight recurrence to the V36 MASTER
+// (frstrtr/p2pool-merged-v36 data.py get_decayed_cumulative_weights) — NOT the
+// legacy flat-weight oracle (that path is pre-v36 compat, replaced in the
+// transition). 3-bucket: decayed-PPLNS = BUCKET 2 v36-native shared structure
+// (DGB == ltc == merged-v36 ref). Ground truth re-derived independently with
+// bigint integer math mirroring the exact fixed-point ops (DECAY_PRECISION=40,
+// LN2_MICRO=693147, half_life=max(chain_len/4,1), iterative mul128_shift). This
+// guard fails loudly if any decay constant or the weight math drifts.
+TEST(DGB_share_test, DecayedPPLNSWeightsKAT)
+{
+    using W = dgb::DensePPLNSWindow;
+
+    // chain_len = 8 -> half_life = max(8/4,1) = 2. Pin the per-step factor and
+    // the full depth-0..7 decay table against the independent bigint oracle.
+    W::init_decay_table(8);
+    EXPECT_EQ(W::s_decay_per, 718450034647ull);
+    ASSERT_EQ(W::s_decay_table.size(), 8u);
+    EXPECT_EQ(W::s_decay_table[0], 1099511627776ull);  // == DECAY_SCALE = 2^40
+    EXPECT_EQ(W::s_decay_table[1], 718450034647ull);
+    EXPECT_EQ(W::s_decay_table[2], 469454291564ull);
+    EXPECT_EQ(W::s_decay_table[3], 306753874646ull);
+    EXPECT_EQ(W::s_decay_table[4], 200441110671ull);
+    EXPECT_EQ(W::s_decay_table[5], 130973533401ull);
+    EXPECT_EQ(W::s_decay_table[6], 85581577522ull);
+    EXPECT_EQ(W::s_decay_table[7], 55921270664ull);
+
+    // Hand-built window (depth 0 = newest). att kept small so every product
+    // stays < 2^64 and the expected weights are exact uint64 literals.
+    std::vector<unsigned char> A{0xAA}, B{0xBB}, C{0xCC};
+    dgb::DensePPLNSWindow win;
+    win.m_entries.push_back({uint288(1000000ull), 0u,     A});  // depth 0
+    win.m_entries.push_back({uint288(1000000ull), 6553u,  B});  // depth 1
+    win.m_entries.push_back({uint288(2000000ull), 0u,     A});  // depth 2
+    win.m_entries.push_back({uint288(500000ull),  65535u, C});  // depth 3 (full donation)
+
+    auto w = win.compute_v36_weights();
+
+    // Per-script address weight: A = depth0 + depth2, B = depth1, C = 0 (full
+    // donation consumed the weight). Totals from the same re-derivation.
+    EXPECT_EQ(w.weights.at(A),           121497433620ull);
+    EXPECT_EQ(w.weights.at(B),           38540372332ull);
+    EXPECT_EQ(w.weights.at(C),           0ull);
+    EXPECT_EQ(w.total_weight,            173461511355ull);
+    EXPECT_EQ(w.total_donation_weight,   13423705403ull);
 }
