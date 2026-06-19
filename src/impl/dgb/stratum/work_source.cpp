@@ -18,8 +18,12 @@
 #include <impl/dgb/coin/header_chain.hpp>
 #include <impl/dgb/coin/mempool.hpp>
 #include <impl/dgb/coin/embedded_coinbase_value.hpp>
+#include <impl/dgb/coin/dgb_block_algo.hpp>
 
 #include <core/log.hpp>
+
+#include <ctime>
+#include <limits>
 
 namespace dgb::stratum {
 
@@ -148,11 +152,64 @@ void DGBWorkSource::update_stratum_worker(const std::string& session_id,
 
 nlohmann::json DGBWorkSource::get_current_work_template() const
 {
-    // Stage 4c: drive dgb::coin::TemplateBuilder over chain_ + mempool_ and
-    // shape its WorkData into the GBT-style JSON the stratum session expects
-    // (previousblockhash, bits, version, curtime, mintime, height,
-    // coinbasevalue, transactions[]). Scrypt nBits, not SHA256d.
-    return nlohmann::json::object();
+    // Stage 4c (coinbasevalue wire): the full GBT-shaped template
+    // (previousblockhash, bits, version, curtime, mintime, transactions[])
+    // is assembled by the embedded dgb::coin::TemplateBuilder in a following
+    // slice. What lands here is the consensus-bearing reward field: the
+    // coinbasevalue for the NEXT block, derived through the #207 SSOT
+    // (coinbase_value -> resolve_coinbase_value -> subsidy_func) keyed on the
+    // absolute next-block height from the #209 HeaderChain accessor
+    // (next_block_height() == tip_height()+1, or base_height for an empty
+    // chain). Embedded path: no external-daemon GBT value is plumbed in yet
+    // and mempool-fee aggregation is not wired, so total_fees = 0 here. Both
+    // compose in later slices WITHOUT changing this SSOT call (a present GBT
+    // coinbasevalue stays authoritative; fees add on top of subsidy).
+    const uint32_t next_h = chain_.next_block_height();
+    const uint64_t coinbasevalue =
+        coinbase_value(next_h, /*total_fees=*/0, /*gbt_coinbasevalue=*/std::nullopt);
+
+    // GBT-scaffold fields the embedded path can derive TRUTHFULLY from current
+    // chain state, ahead of a full dgb::coin::TemplateBuilder port (M3 TODO):
+    //   version      — BIP9 base | the DGB Scrypt algo nibble. A DGB block
+    //                  template MUST pin the Scrypt lane: the mining algo lives
+    //                  in 4 nVersion bits (coin/dgb_block_algo.hpp SSOT) and
+    //                  Scrypt is the all-zero codepoint (DGB_BLOCK_VERSION_SCRYPT
+    //                  == 0x0000); any other nibble is a non-Scrypt algo that is
+    //                  accept-by-continuity / V37 here, never a template we emit.
+    //   curtime      — current wall-clock; GBT's suggested header nTime.
+    //   mintime      — median_time_past()+1 (#209 accessor): DGB Core's
+    //                  ContextualCheckBlockHeader lower bound (nTime > MTP). An
+    //                  empty chain returns INT64_MIN (unconstrained) -> emit 0.
+    //   transactions — empty array: embedded mempool tx SELECTION is not wired,
+    //                  so no transactions are fabricated and fees stay 0
+    //                  (consistent with the total_fees=0 coinbasevalue above).
+    //
+    // Deliberately NOT emitted yet — they need accessors the Scrypt-only
+    // HeaderSample does not carry, and land in the following Stage 4c/4d slices:
+    //   previousblockhash — the tip block hash (HeaderSample stores no hash yet)
+    //   bits              — the next-block compact target off the DigiShield
+    //                       retarget window
+    // and the per-connection coinbase (gentx + ShareTracker ref_hash + PPLNS
+    // payout map) assembles in build_connection_coinbase() — that output is
+    // consensus-bearing and surfaces for an operator tap, not in this field wire.
+    static constexpr uint32_t BIP9_BASE_VERSION = 0x20000000u;
+    const uint32_t version =
+        BIP9_BASE_VERSION |
+        static_cast<uint32_t>(dgb::coin::DGB_BLOCK_VERSION_SCRYPT);
+
+    const int64_t mtp     = chain_.median_time_past();
+    const int64_t mintime = (mtp == std::numeric_limits<int64_t>::min())
+                                ? 0 : (mtp + 1);
+    const int64_t curtime = static_cast<int64_t>(std::time(nullptr));
+
+    nlohmann::json tmpl = nlohmann::json::object();
+    tmpl["height"]        = next_h;
+    tmpl["coinbasevalue"] = coinbasevalue;
+    tmpl["version"]       = version;
+    tmpl["curtime"]       = curtime;
+    tmpl["mintime"]       = mintime;
+    tmpl["transactions"]  = nlohmann::json::array();
+    return tmpl;
 }
 
 std::vector<std::string> DGBWorkSource::get_stratum_merkle_branches() const

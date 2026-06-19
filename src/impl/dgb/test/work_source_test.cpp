@@ -135,8 +135,10 @@ TEST(DgbWorkSource, WorkGenStubsReturnSafeDefaults)
     // 4a skeleton: every work-generation getter returns its documented
     // empty/default form (4c fills them in).
     EXPECT_TRUE(ws->get_current_gbt_prevhash().empty());
+    // get_current_work_template() now emits height + coinbasevalue (Stage 4c
+    // coinbasevalue wire); its dedicated assertions live in
+    // WorkTemplateEmitsHeightAndCoinbaseValueViaSsot below.
     EXPECT_TRUE(ws->get_current_work_template().is_object());
-    EXPECT_TRUE(ws->get_current_work_template().empty());
     EXPECT_TRUE(ws->get_stratum_merkle_branches().empty());
     auto parts = ws->get_coinbase_parts();
     EXPECT_TRUE(parts.first.empty());
@@ -172,6 +174,61 @@ TEST(DgbWorkSource, ComputeShareDifficultyReturnsNotYetSentinel)
         /*version=*/0x20000000u, "prevhash", "1e0ffff0",
         /*merkle_branches=*/{});
     EXPECT_DOUBLE_EQ(diff, 0.0);
+}
+
+// Stage 4c coinbasevalue wire: the work template surfaces the NEXT-block
+// height and its coinbasevalue, the latter derived THROUGH the #207 SSOT
+// (subsidy_func) keyed on next_block_height() == tip.height + 1 (#209). An
+// empty chain makes next_block_height() == base_height, so seeding an oracle
+// era boundary pins the value unambiguously to the p2pool-dgb-scrypt subsidy.
+TEST(DgbWorkSource, WorkTemplateEmitsHeightAndCoinbaseValueViaSsot)
+{
+    Fixture fx;
+    fx.chain.set_base_height(400000);  // phase3 first block (oracle boundary)
+    auto ws = fx.make();
+    auto tmpl = ws->get_current_work_template();
+    ASSERT_TRUE(tmpl.is_object());
+    ASSERT_TRUE(tmpl.contains("height"));
+    ASSERT_TRUE(tmpl.contains("coinbasevalue"));
+    // next_h = next_block_height() = base_height (empty chain) = 400000.
+    EXPECT_EQ(tmpl["height"].get<uint32_t>(), 400000u);
+    // Zero embedded fees, no external GBT -> oracle subsidy at the boundary.
+    EXPECT_EQ(tmpl["coinbasevalue"].get<uint64_t>(), 2434410000ULL);
+}
+
+// Stage 4c GBT scaffold: alongside height + coinbasevalue, the work template
+// now surfaces the GBT fields the embedded path can derive truthfully without
+// a TemplateBuilder port -- version (Scrypt algo lane), curtime, mintime, and
+// an (empty) transactions[]. previousblockhash + bits intentionally stay absent
+// until HeaderSample carries the tip hash / next-target compact (later slices).
+TEST(DgbWorkSource, WorkTemplateEmitsGbtScaffoldFields)
+{
+    Fixture fx;
+    fx.chain.set_base_height(400000);
+    auto ws = fx.make();
+    auto tmpl = ws->get_current_work_template();
+    ASSERT_TRUE(tmpl.is_object());
+
+    // version pins the DGB Scrypt lane: BIP9 base | algo nibble 0x0000.
+    ASSERT_TRUE(tmpl.contains("version"));
+    EXPECT_EQ(tmpl["version"].get<uint32_t>(), 0x20000000u);
+
+    // Empty chain -> median_time_past() == INT64_MIN -> mintime emitted as 0
+    // (unconstrained), and curtime is a real wall-clock stamp (>= 0).
+    ASSERT_TRUE(tmpl.contains("mintime"));
+    EXPECT_EQ(tmpl["mintime"].get<int64_t>(), 0);
+    ASSERT_TRUE(tmpl.contains("curtime"));
+    EXPECT_GE(tmpl["curtime"].get<int64_t>(), 0);
+
+    // No embedded tx selection yet -> transactions[] present but empty (no
+    // fabricated entries; consistent with the total_fees=0 coinbasevalue).
+    ASSERT_TRUE(tmpl.contains("transactions"));
+    EXPECT_TRUE(tmpl["transactions"].is_array());
+    EXPECT_TRUE(tmpl["transactions"].empty());
+
+    // The two hash/difficulty fields are deliberately NOT emitted yet.
+    EXPECT_FALSE(tmpl.contains("previousblockhash"));
+    EXPECT_FALSE(tmpl.contains("bits"));
 }
 
 // ── Embedded coinbasevalue: first production caller of subsidy_func ──────────
