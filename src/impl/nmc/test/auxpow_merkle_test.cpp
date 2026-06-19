@@ -1193,7 +1193,10 @@ TEST(NmcP1fPersist, DiskRoundTripPreservesMergeMinedStatusAndAuxFlag)
 
     IndexEntry r = back.to_entry();
     EXPECT_EQ(r.status, nmc::coin::HEADER_VALID_CHAIN);    // status survives reload
-    EXPECT_FALSE(r.auxpow.has_value());                   // P1f-DEFER: blob not on disk
+    ASSERT_TRUE(r.auxpow.has_value());                    // P1f(a): blob now restored
+    EXPECT_EQ(r.auxpow->chain_merkle_index, e.auxpow->chain_merkle_index);
+    EXPECT_EQ(parent_coinbase_txid(r.auxpow->parent_coinbase),
+              parent_coinbase_txid(e.auxpow->parent_coinbase));
 }
 
 TEST(NmcP1fPersist, ReopenRestoresEmptyChainAsEmpty)
@@ -1283,6 +1286,96 @@ TEST(NmcP1fPersist, InMemoryModeWithoutDbPathPersistsNothing)
     ASSERT_TRUE(fresh.init());
     EXPECT_EQ(fresh.size(), 0u);
     EXPECT_FALSE(fresh.has_header(block_hash(g)));
+}
+
+// ---------------------------------------------------------------------------
+// P1f(a): nmc::coin::AuxPow canonical CAuxPow serialization round-trip.
+//
+// Pins the on-disk / wire codec for the merge-mining proof. A fully-populated
+// AuxPow (the same complete_proof fixture steps 1-4 validate) is packed and
+// unpacked; every field must survive, AND the restored proof must still verify
+// VALID through check_proof -- so a field-order or witness-flag regression in
+// the codec is caught against the consensus verifier, not merely a self-compare.
+// Ground-truth wire-vector assertion against the Namecoin daemon's own bytes is
+// the immediate follow-up (needs a captured testnet auxpow blob).
+// Per-coin isolation: src/impl/nmc/ only; core/pack + nmc::coin types.
+// ---------------------------------------------------------------------------
+TEST(NmcAuxPowCodec, FullProofRoundTripsAndStillVerifies)
+{
+    uint256 aux = leaf_of(0x01);
+    AuxPow ap = complete_proof(aux, /*parent_own_bits=*/0x1d00ffffu);
+    uint32_t aux_bits = 0x207fffffu;
+    ASSERT_TRUE(mine_parent(ap, chain::bits_to_target(aux_bits)));
+    ASSERT_EQ(ap.check_proof(aux, 1, aux_bits), AuxPow::CheckResult::VALID);
+
+    PackStream ps;
+    ps << ap;
+    AuxPow back;
+    ps >> back;
+
+    // Every field survives the round-trip.
+    EXPECT_EQ(back.parent_block_hash,        ap.parent_block_hash);
+    EXPECT_EQ(back.parent_coinbase_branch,   ap.parent_coinbase_branch);
+    EXPECT_EQ(back.parent_coinbase_index,    ap.parent_coinbase_index);
+    EXPECT_EQ(back.chain_merkle_branch,      ap.chain_merkle_branch);
+    EXPECT_EQ(back.chain_merkle_index,       ap.chain_merkle_index);
+    EXPECT_EQ(block_hash(back.parent_header), block_hash(ap.parent_header));
+    EXPECT_EQ(parent_coinbase_txid(back.parent_coinbase),
+              parent_coinbase_txid(ap.parent_coinbase));
+
+    // The restored proof is consensus-equivalent: still VALID.
+    EXPECT_EQ(back.check_proof(aux, 1, aux_bits), AuxPow::CheckResult::VALID);
+}
+
+// ---------------------------------------------------------------------------
+// P1f(a): IndexEntryDiskV1 persists the AuxPow blob behind has_auxpow.
+//
+// The persistence leg (#201) stored only the presence flag; this leg writes the
+// canonical CAuxPow blob after it iff has_auxpow == 1, and restores it on load.
+// Asserts: a merge-mined entry round-trips its proof through from_entry ->
+// PackStream -> to_entry; and a proofless entry trails no blob and restores to
+// std::nullopt (so the flag/blob coupling cannot desync the disk format).
+// ---------------------------------------------------------------------------
+TEST(NmcAuxPowPersist, IndexEntryDiskV1RoundTripsAuxPowBlob)
+{
+    using nmc::coin::IndexEntry;
+    using nmc::coin::IndexEntryDiskV1;
+
+    uint256 aux = leaf_of(0x01);
+    AuxPow ap = complete_proof(aux, /*parent_own_bits=*/0x1d00ffffu);
+
+    IndexEntry e;
+    e.header     = ap.parent_header;   // any 80-byte header
+    e.block_hash = leaf_of(0xAB);
+    e.height     = 42;
+    e.chain_work = leaf_of(0xCD);
+    e.status     = nmc::coin::HEADER_VALID_CHAIN;
+    e.auxpow     = ap;
+
+    IndexEntryDiskV1 disk = IndexEntryDiskV1::from_entry(e);
+    ASSERT_EQ(disk.has_auxpow, 1);
+
+    PackStream ps; ps << disk;
+    IndexEntryDiskV1 back; ps >> back;
+    ASSERT_EQ(back.has_auxpow, 1);
+    ASSERT_TRUE(back.auxpow.has_value());
+
+    IndexEntry r = back.to_entry();
+    EXPECT_EQ(r.height, e.height);
+    EXPECT_EQ(r.status, e.status);
+    ASSERT_TRUE(r.auxpow.has_value());
+    EXPECT_EQ(r.auxpow->chain_merkle_index,      e.auxpow->chain_merkle_index);
+    EXPECT_EQ(r.auxpow->parent_coinbase_branch,  e.auxpow->parent_coinbase_branch);
+    EXPECT_EQ(parent_coinbase_txid(r.auxpow->parent_coinbase),
+              parent_coinbase_txid(e.auxpow->parent_coinbase));
+
+    // A proofless entry trails no blob and restores to nullopt.
+    IndexEntry plain = e; plain.auxpow = std::nullopt;
+    IndexEntryDiskV1 pdisk = IndexEntryDiskV1::from_entry(plain);
+    ASSERT_EQ(pdisk.has_auxpow, 0);
+    PackStream ps2; ps2 << pdisk;
+    IndexEntryDiskV1 pback; ps2 >> pback;
+    EXPECT_FALSE(pback.to_entry().auxpow.has_value());
 }
 
 } // namespace
