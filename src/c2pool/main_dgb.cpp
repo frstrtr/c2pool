@@ -31,6 +31,7 @@
 #include <impl/dgb/coin/mempool.hpp>
 #include <impl/dgb/coin/coin_node.hpp>
 #include <impl/dgb/coin/embedded_coin_node.hpp>
+#include <impl/dgb/coin/embedded_tx_select.hpp>   // make_mempool_tx_source (EmbeddedTxSource)
 #include <impl/dgb/coin/won_block_dispatch.hpp>
 #include <impl/dgb/stratum/work_source.hpp>
 
@@ -195,12 +196,31 @@ int run_node(const core::CoinParams& params, bool testnet,
     // the same non-owning ref.
     c2pool::dgb::HeaderChain header_chain;
 
+    // Embedded mempool — the in-process pool the work template selects from.
+    // Declared HERE (ahead of embedded_coin) because the injected
+    // EmbeddedTxSource below captures it by reference and MUST be outlived by
+    // it; reverse-order destruction tears embedded_coin (and its source) down
+    // before mempool. FEED: wire_mempool_ingest (coin/mempool_ingest.hpp, #245)
+    // subscribes this pool to an ::dgb::interfaces::Node new_tx relay — but no
+    // embedded coin-daemon P2P node is constructed in this run-loop yet (the M3
+    // embedded port; header_chain is likewise still unfed), so nothing calls
+    // add_tx and the pool stays empty until that node lands. The selection
+    // below is therefore byte-identical to the subsidy-only #237 baseline today.
+    dgb::coin::Mempool       mempool;
+
     // Embedded in-process work source: assembles GBT-compatible templates
     // ENTIRELY from embedded chain state + the coin subsidy schedule (no
     // external digibyted). coinbasevalue resolves through the #207 ->
-    // subsidy_func SSOT; transactions[]/bits are held back truthfully until
-    // the embedded mempool + next-target source are plumbed.
-    dgb::coin::EmbeddedCoinNode embedded_coin(header_chain, params.subsidy_func);
+    // subsidy_func SSOT; bits are held back truthfully until the next-target
+    // source is plumbed. transactions[] + the fee total come from an injected
+    // make_mempool_tx_source over the embedded mempool (#244 seam): fee-sorted
+    // txs up to BLOCK_MAX_WEIGHT with their fees folded into coinbasevalue via
+    // the #207 SSOT. The source returns an EMPTY selection while the mempool is
+    // unfed (see above), so the served template stays at the #237 baseline
+    // until live `tx` ingest lands.
+    dgb::coin::EmbeddedCoinNode embedded_coin(
+        header_chain, params.subsidy_func,
+        dgb::coin::make_mempool_tx_source(mempool, dgb::PoolConfig::BLOCK_MAX_WEIGHT));
 
     // CoinNode seam — embedded-preferred work source (embedded_coin) with the
     // external-digibyted submitblock FALLBACK leg of the #82 dual-path
@@ -263,9 +283,9 @@ int run_node(const core::CoinParams& params, bool testnet,
     // emitted — the standup proves the StratumServer<->IWorkSource wiring
     // end-to-end. Real work-gen / Scrypt share-validation land in 4b/4c.
     // This mirrors btc::stratum standing its skeleton wiring up first.
-    // header_chain is declared above coin_node (it backs the EmbeddedCoinNode
-    // work source); only the unwired Mempool is declared here.
-    dgb::coin::Mempool       mempool;        // unwired (no UTXO/template feed yet)
+    // header_chain AND mempool are both declared above coin_node now — mempool
+    // backs the injected EmbeddedCoinNode tx source (declared there so it
+    // outlives the capturing source).
 
     // submitblock-RPC arm of the #82 dual-path broadcaster, driven from the
     // miner-facing Stratum path. Reuses the SAME coin_node seam declared above
