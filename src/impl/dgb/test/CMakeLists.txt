@@ -128,6 +128,19 @@ if (BUILD_TESTING AND GTest_FOUND)
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_gentx_unpack_test "" AUTO)
+    # --- #82 miner-facing path: DGBWorkSource (IWorkSource) Stage 4a skeleton -
+    # Constructs dgb::stratum::DGBWorkSource over the live coin deps and pins
+    # the IWorkSource contract + real-now surface (config/atomics/workers).
+    # Links dgb_stratum + the same proven SCC set as the sibling dgb tests.
+    # MUST also be in the build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_work_source_test work_source_test.cpp)
+    target_link_libraries(dgb_work_source_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb dgb_stratum
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain
+        nlohmann_json::nlohmann_json)
+    gtest_add_tests(dgb_work_source_test "" AUTO)
 
     foreach(dgb_guard rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test header_chain_test)
         add_executable(${dgb_guard} ${dgb_guard}.cpp)

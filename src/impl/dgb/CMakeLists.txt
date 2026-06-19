@@ -19,6 +19,7 @@
 if(COIN_DGB)
   message(STATUS "c2pool: DGB Scrypt-only coin module enabled")
   add_subdirectory(coin)
+  add_subdirectory(stratum)   # dgb_stratum: IWorkSource (#82 miner-facing path)
   # add_subdirectory(daemon)
   add_subdirectory(test)
 
