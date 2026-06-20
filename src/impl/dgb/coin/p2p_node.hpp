@@ -706,6 +706,22 @@ private:
                              << bhash.GetHex().substr(0, 16) << "...";
                 }
             }
+            // Walk-forward sync: a full (non-announcement) batch means the
+            // peer likely has more headers past our new tip. Re-issue
+            // getheaders anchored on the last header received so initial sync
+            // advances past the 2000-header-per-message cap until the peer
+            // returns a short batch (caught up -> empty -> loop terminates).
+            // Producer-transport only, non-consensus.
+            else if (vheaders.size() > 3 && m_peer) {
+                auto packed_tip = pack(vheaders.back());
+                auto tip_hash = Hash(packed_tip.get_span());
+                auto getheaders_msg = message_getheaders::make_raw(
+                    1, {tip_hash}, uint256());
+                m_peer->write(getheaders_msg);
+                LOG_INFO << "[" << m_chain_label << "] Walk-forward getheaders from "
+                         << tip_hash.GetHex().substr(0, 16) << "..."
+                         << " (batch=" << vheaders.size() << ")";
+            }
         }
     }
 
