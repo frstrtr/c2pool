@@ -35,6 +35,7 @@
 
 #include "block.hpp"
 #include "transaction.hpp"
+#include "aux_id.hpp"        // NMC_AUXPOW_CHAIN_ID SSOT
 
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
@@ -533,7 +534,7 @@ struct NMCChainParams {
     int32_t testnet_auxpow_activation_height{-1}; // TO-CONFIRM: testnet analog (unpinned sentinel)
     // aux_chain_id: the chain id this NMC instance claims in the parent's
     //   merged-mining tree. -1 = unpinned sentinel.
-    int32_t aux_chain_id{1};                // Namecoin nAuxpowChainId = 0x0001 (both nets); see chainparams.cpp
+    int32_t aux_chain_id{static_cast<int32_t>(NMC_AUXPOW_CHAIN_ID)};                // Namecoin nAuxpowChainId = 0x0001 (both nets); see chainparams.cpp
 
     int64_t difficulty_adjustment_interval() const {
         return target_timespan / target_spacing;

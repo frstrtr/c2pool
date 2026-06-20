@@ -19,6 +19,8 @@ inline uint64_t mul128_shift(uint64_t a, uint64_t b, unsigned shift) {
 #endif
 
 #include "share.hpp"
+#include <impl/doge/coin/chain_params.hpp>  // DOGEChainParams::AUXPOW_CHAIN_ID (aux payout diag SSOT)
+#include <impl/nmc/coin/aux_id.hpp>          // nmc::coin::NMC_AUXPOW_CHAIN_ID (v37 bucket-2)
 #include "share_check.hpp"
 #include "config_pool.hpp"
 
@@ -2471,15 +2473,20 @@ public:
                 }
                 LOG_INFO << "[MERGED-PPLNS]   hash=" << hash_result.GetHex();
 
-                // DOGE payout weights (chain_id=98, with Tier 1/1.5/2 resolution)
-                // This is what actually determines DOGE coinbase outputs.
-                // During death valley, compare address count and keys vs [MERGED-PPLNS].
-                constexpr uint32_t DOGE_CHAIN_ID = 98;
-                uint288 doge_unlimited;
-                doge_unlimited.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-                auto doge_result = get_merged_cumulative_weights(
-                    prev_share_hash, chain_len, doge_unlimited, DOGE_CHAIN_ID);
-                auto classify_doge = [](const std::vector<unsigned char>& s) -> const char* {
+                // Per-aux-chain payout weights (Tier 1/1.5/2 resolution) -- the
+                // distribution that drives each merged child's coinbase outputs.
+                // During death valley, compare address count and keys vs
+                // [MERGED-PPLNS]. chain_id is sourced from each backend's own
+                // params (v37 bucket-2 standardization, note #2): no hardcoded
+                // chain_id literal lives in this shared path.
+                struct AuxPayoutChain { const char* name; uint32_t chain_id; };
+                static constexpr AuxPayoutChain kAuxPayoutChains[] = {
+                    { "DOGE", doge::coin::DOGEChainParams::AUXPOW_CHAIN_ID }, // 0x0062
+                    { "NMC",  nmc::coin::NMC_AUXPOW_CHAIN_ID },               // 0x0001
+                };
+                uint288 aux_unlimited;
+                aux_unlimited.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+                auto classify_aux = [](const std::vector<unsigned char>& s) -> const char* {
                     if (is_merged_key(s)) return "MERGED";
                     if (s.size() == 25 && s[0] == 0x76 && s[1] == 0xa9) return "P2PKH";
                     if (s.size() == 23 && s[0] == 0xa9) return "P2SH";
@@ -2488,19 +2495,24 @@ public:
                     if (s.size() == 34 && s[0] == 0x51 && s[1] == 0x20) return "P2TR-RAW";
                     return "OTHER";
                 };
-                auto doge_miner_w = doge_result.total_weight - doge_result.total_donation_weight;
-                LOG_INFO << "[DOGE-PAYOUT] height=" << height
-                         << " addrs=" << doge_result.weights.size()
-                         << " total_w=" << to_decimal(doge_result.total_weight)
-                         << " don_w=" << to_decimal(doge_result.total_donation_weight);
-                for (const auto& [script, w] : doge_result.weights) {
-                    double pct = 0;
-                    if (!doge_miner_w.IsNull())
-                        pct = (w * 10000 / doge_miner_w).GetLow64() / 100.0;
-                    LOG_INFO << "[DOGE-PAYOUT]   " << classify_doge(script)
-                             << " " << script_to_hex(script).substr(0, 50)
-                             << " w=" << to_decimal(w)
-                             << " pct=" << std::fixed << std::setprecision(2) << pct << "%";
+                for (const auto& aux : kAuxPayoutChains) {
+                    auto aux_result = get_merged_cumulative_weights(
+                        prev_share_hash, chain_len, aux_unlimited, aux.chain_id);
+                    auto aux_miner_w = aux_result.total_weight - aux_result.total_donation_weight;
+                    LOG_INFO << "[" << aux.name << "-PAYOUT] height=" << height
+                             << " chain_id=" << aux.chain_id
+                             << " addrs=" << aux_result.weights.size()
+                             << " total_w=" << to_decimal(aux_result.total_weight)
+                             << " don_w=" << to_decimal(aux_result.total_donation_weight);
+                    for (const auto& [script, w] : aux_result.weights) {
+                        double pct = 0;
+                        if (!aux_miner_w.IsNull())
+                            pct = (w * 10000 / aux_miner_w).GetLow64() / 100.0;
+                        LOG_INFO << "[" << aux.name << "-PAYOUT]   " << classify_aux(script)
+                                 << " " << script_to_hex(script).substr(0, 50)
+                                 << " w=" << to_decimal(w)
+                                 << " pct=" << std::fixed << std::setprecision(2) << pct << "%";
+                    }
                 }
             }
         }
