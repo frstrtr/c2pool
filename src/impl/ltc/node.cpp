@@ -11,7 +11,9 @@
 #include <fstream>
 #include <iomanip>
 #include <random>
-#include <execinfo.h>  // backtrace() for think() watchdog stack dump
+#ifndef _WIN32
+#include <execinfo.h>  // backtrace() for think() watchdog stack dump (glibc-only)
+#endif
 
 // Static members for DensePPLNSWindow precomputed decay table
 std::vector<uint64_t> ltc::DensePPLNSWindow::s_decay_table;
@@ -1425,6 +1427,7 @@ void NodeImpl::arm_think_watchdog()
                   << ", pending_adds=" << m_pending_adds.size()
                   << ") — compute thread appears wedged under the tracker lock;"
                   << " recovering pipeline";
+#ifndef _WIN32
         {
             void* frames[64];
             int n = ::backtrace(frames, 64);
@@ -1435,6 +1438,10 @@ void NodeImpl::arm_think_watchdog()
                 ::free(syms);
             }
         }
+#else
+        // Native backtrace is glibc-only (execinfo.h); on MSVC the timeout log
+        // above plus pending_adds is the diagnostic. Recovery below is identical.
+#endif
 
         // Let a fresh cycle be scheduled. Does NOT unwind the stuck compute
         // thread; the m_think_pool has a single thread, so a re-dispatched
