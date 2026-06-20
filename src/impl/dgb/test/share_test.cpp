@@ -19,6 +19,8 @@
 #include <impl/dgb/coin/rpc_conf.hpp>   // #82 external-daemon RPC creds (digibyte.conf)
 
 #include <cstdio>
+#include <set>
+#include <string>
 #include <fstream>
 
 // Sharechain-identity: the isolation primitives (PREFIX / IDENTIFIER) are the
@@ -61,6 +63,23 @@ TEST(DGB_share_test, OraclePoolShareLayer)
     // MAX_TARGET = 2**256//2**20 - 1 = 2^236 - 1 (top 20 bits zero, rest ones).
     EXPECT_EQ(dgb::PoolConfig::max_target().GetHex(),
               "00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+}
+
+// SOFTFORKS_REQUIRED — DGB-distinctive softfork-signalling set. reservealgo
+// and odo are DigiByte-unique (absent from BTC/LTC); a silent drop here makes
+// the embedded daemon mis-signal softfork requirements vs the oracle network.
+// Oracle SSOT: frstrtr/p2pool-dgb-scrypt networks/digibyte.py:25
+//   set([nversionbips,csv,segwit,reservealgo,odo,taproot])
+TEST(DGB_share_test, OracleSoftforksRequired)
+{
+    const std::set<std::string> kExpected = {
+        "nversionbips", "csv", "segwit", "reservealgo", "odo", "taproot"
+    };
+    EXPECT_EQ(dgb::PoolConfig::SOFTFORKS_REQUIRED, kExpected);
+    // Loud guard on the DGB-unique members + cardinality (catches add OR drop).
+    EXPECT_EQ(dgb::PoolConfig::SOFTFORKS_REQUIRED.count("reservealgo"), 1u);
+    EXPECT_EQ(dgb::PoolConfig::SOFTFORKS_REQUIRED.count("odo"),         1u);
+    EXPECT_EQ(dgb::PoolConfig::SOFTFORKS_REQUIRED.size(),               6u);
 }
 
 // v35 donation = forrestv P2PK (4104ffd0…ac, 65-byte pubkey push + CHECKSIG).
