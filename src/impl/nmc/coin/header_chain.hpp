@@ -522,10 +522,14 @@ struct NMCChainParams {
 
     // ── Merge-mining consensus parameters ──
     //
-    // TO-CONFIRM: NONE of the following are committed constants. They are
-    // placeholder sentinels pending pinning against Namecoin chainparams
-    // (CChainParams) + a live namecoind. Do NOT promote to consensus until
-    // verified.
+    // PINNED: every field below is now committed against namecoin-core
+    // src/kernel/chainparams.cpp and cross-checked on a live namecoind
+    // (synced .140). auxpow_activation_height (#258), pow_limit + genesis_hash
+    // (#261/#262), aux_chain_id (#264) and p2p_magic (2b-ii) all carry their
+    // per-field provenance in the inline comments. The earlier "placeholder
+    // sentinel / TO-CONFIRM" banner is retired; default sentinels (-1) remain
+    // only as a fail-safe so a hand-built Params never claims merge-mining is
+    // active off an unset value.
     //
     // auxpow_activation_height: the height at/after which a Namecoin block MAY
     //   (and on mainnet, MUST) carry an AuxPow. Historically cited as 19200 on
