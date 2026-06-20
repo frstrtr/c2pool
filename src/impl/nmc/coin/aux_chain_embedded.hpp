@@ -151,13 +151,19 @@ public:
     }
 
     bool submit_aux_block(const uint256& block_hash, const std::string& auxpow_hex) override {
-        // Fallback (submitauxblock) path: embedded mode has no daemon to RPC,
-        // the frozen-block submit_block() + P2P relay is the primary route.
+        // PE broadcaster gate (integrator UID1610): the submitauxblock RPC route is
+        // external-namecoind-only and conditional - it is NOT a same-process fallback
+        // like BTC submitblock-to-bitcoind, so it does NOT satisfy the embedded leg.
+        // Embedded mode has no daemon to RPC, therefore this path cannot itself
+        // broadcast and MUST NOT claim success: the P2P relay via submit_block() is
+        // the one authoritative embedded route. Same never-silent-drop invariant as
+        // submit_block() - never claim a broadcast that did not occur (#162).
         LOG_WARNING << "[MM:" << m_config.symbol << "] Embedded: submit_aux_block called"
-                    << " (fallback path) hash=" << block_hash.GetHex().substr(0, 16) << "..."
+                    << " (RPC fallback) hash=" << block_hash.GetHex().substr(0, 16) << "..."
                     << " auxpow=" << auxpow_hex.size() / 2 << " bytes"
-                    << " - no daemon to submit to, relying on P2P relay";
-        return true;
+                    << " - no daemon to submit to; embedded RPC leg cannot broadcast,"
+                    << " returning false (P2P relay via submit_block is authoritative)";
+        return false;
     }
 
     std::string get_block_hex(const std::string& /*block_hash*/) override {
