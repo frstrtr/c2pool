@@ -32,6 +32,9 @@
 #include <impl/dgb/coin/coin_node.hpp>
 #include <impl/dgb/coin/embedded_coin_node.hpp>
 #include <impl/dgb/coin/won_block_dispatch.hpp>
+#include <impl/dgb/coin/node_interface.hpp>
+#include <impl/dgb/coin/header_ingest.hpp>
+#include <impl/dgb/coin/mempool_ingest.hpp>
 #include <impl/dgb/stratum/work_source.hpp>
 
 #include <core/filesystem.hpp>
@@ -266,6 +269,33 @@ int run_node(const core::CoinParams& params, bool testnet,
     // header_chain is declared above coin_node (it backs the EmbeddedCoinNode
     // work source); only the unwired Mempool is declared here.
     dgb::coin::Mempool       mempool;        // unwired (no UTXO/template feed yet)
+
+    // ── Embedded coin-daemon ingest surface (Phase B P2P-node standup) ──
+    //
+    // dgb::interfaces::Node (coin/node_interface.hpp) is the shared-state
+    // surface the embedded coin-daemon P2P node (coin/p2p_node.hpp, NodeP2P)
+    // binds against: NodeP2P fires new_headers on each received `headers`
+    // batch and new_tx on each relayed `tx`. Construct it here and subscribe
+    // BOTH the HeaderChain and the Mempool to those feeds through the
+    // wire_*_ingest SSOT connectors (coin/header_ingest.hpp,
+    // coin/mempool_ingest.hpp), so a live header/tx feed flows into
+    // HeaderChain::validate_and_append and Mempool::add_tx the moment the
+    // NodeP2P is connected (NodeP2P construct + connect is the next slice).
+    // Declared AFTER header_chain + mempool so coin_iface (and its event
+    // subscriptions) destructs FIRST: the wire_*_ingest handlers capture
+    // chain/pool by reference and must not outlive them. The returned
+    // EventDisposable handles are held for the run-loop lifetime.
+    //
+    // No behavior change this slice: with no NodeP2P producer constructed yet,
+    // new_headers/new_tx never fire, so the chain and mempool stay exactly as
+    // before. This stands the CONSUMER seam up that the NodeP2P producer binds
+    // to next — header+mempool ingest together, the unblock order integrator
+    // directed (2026-06-20).
+    dgb::interfaces::Node coin_iface;
+    auto header_ingest_sub  = c2pool::dgb::wire_header_ingest(coin_iface, header_chain);
+    auto mempool_ingest_sub = c2pool::dgb::wire_mempool_ingest(coin_iface, mempool);
+    std::cout << "[DGB] embedded coin-daemon ingest surface up — header+tx "
+                 "feeds wired (NodeP2P producer standup next)" << std::endl;
 
     // submitblock-RPC arm of the #82 dual-path broadcaster, driven from the
     // miner-facing Stratum path. Reuses the SAME coin_node seam declared above
