@@ -9,6 +9,19 @@ on:
 
 jobs:
   # ════════════════════════════════════════════════════════════════════════════
+  # Test-allowlist drift-guard (fast, no build): every per-coin test executable
+  # declared in src/impl/<coin>/test/CMakeLists.txt must appear in a build.yml
+  # --target list, else it becomes a NOT_BUILT CTest sentinel that silently
+  # passes (the DGB #137 / test_dgb_subsidy class that red'd master).
+  # ════════════════════════════════════════════════════════════════════════════
+  test-allowlist-guard:
+    name: Test allowlist drift-guard
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check coin test targets vs build.yml --target allowlist
+        run: python3 tools/ci/check_test_target_allowlist.py
+  # ════════════════════════════════════════════════════════════════════════════
   # Linux (Ubuntu 24.04, GCC 13, Conan)
   # ════════════════════════════════════════════════════════════════════════════
   linux:
