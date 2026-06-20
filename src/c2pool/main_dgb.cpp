@@ -38,6 +38,9 @@
 #include <impl/dgb/coin/mempool_ingest.hpp>
 #include <impl/dgb/stratum/work_source.hpp>
 #include <impl/dgb/coin/p2p_node.hpp>
+#include <impl/dgb/coin/rpc.hpp>        // NodeRPC — external-daemon submitblock arm (#82)
+#include <impl/dgb/coin/rpc_conf.hpp>   // digibyte.conf creds resolution (rpcpassword off argv)
+#include <impl/dgb/config_coin.hpp>     // dgb::CoinParams::MAINNET_RPC_PORT default
 
 #include <core/filesystem.hpp>
 #include <core/stratum_server.hpp>
@@ -135,7 +138,9 @@ int run_node(const core::CoinParams& params, bool testnet,
              const std::string& stratum_addr, uint16_t stratum_port,
              const std::string& coin_daemon,
              const std::vector<std::byte>& coin_magic,
-             const uint256& coin_genesis)
+             const uint256& coin_genesis,
+             const std::string& rpc_endpoint,
+             const std::string& rpc_conf_path)
 {
     io::io_context ioc;
 
@@ -238,7 +243,42 @@ int run_node(const core::CoinParams& params, bool testnet,
     // LOUDLY (the #163 seam guard: no silent drop, INDEPENDENT of the
     // embedded source). Point a real NodeRPC at external digibyted here to
     // light the submit sink up.
-    dgb::coin::CoinNode coin_node(/*embedded=*/&embedded_coin, /*rpc=*/nullptr);
+    // ── #82 external-daemon submitblock arm (RPC leg of the dual-path
+    // broadcaster) ── Creds come from digibyte.conf (default
+    // ~/.digibyte/digibyte.conf, overridable with --coin-rpc-auth PATH) so the
+    // rpcpassword NEVER touches argv; --coin-rpc HOST:PORT overrides only the
+    // endpoint. When no creds resolve (no daemon provisioned) the arm stays
+    // UNARMED (rpc=nullptr) and submit_block_hex returns false LOUDLY (the #163
+    // CoinNode seam guard) — byte-identical to today's daemon-less default
+    // build, so --run still works without a digibyted. NodeRPC is declared
+    // BEFORE coin_node so it OUTLIVES the tracker callback that captures it.
+    dgb::coin::RpcConf rpc_conf;
+    {
+        std::string conf_path = rpc_conf_path;
+        if (conf_path.empty()) {
+            const char* home = std::getenv("HOME");
+            conf_path = std::string(home ? home : ".") + "/.digibyte/digibyte.conf";
+        }
+        if (dgb::coin::load_rpc_conf(conf_path, rpc_conf)) {
+            if (rpc_conf.port == 0)
+                rpc_conf.port = testnet ? dgb::CoinParams::TESTNET_RPC_PORT
+                                        : dgb::CoinParams::MAINNET_RPC_PORT;
+            dgb::coin::apply_endpoint_override(rpc_endpoint, rpc_conf);
+        }
+    }
+    std::unique_ptr<dgb::coin::NodeRPC> rpc;
+    if (rpc_conf.armed()) {
+        rpc = std::make_unique<dgb::coin::NodeRPC>(&ioc, /*coin=*/nullptr, testnet);
+        rpc->connect(NetService(rpc_conf.host, rpc_conf.port), rpc_conf.userpass());
+        std::cout << "[DGB] external-daemon submit arm ARMED: NodeRPC -> "
+                  << rpc_conf.host << ":" << rpc_conf.port
+                  << " (creds from digibyte.conf)" << std::endl;
+    } else {
+        std::cout << "[DGB] external-daemon submit arm UNARMED "
+                     "(no digibyte.conf creds; embedded-only submit path)" << std::endl;
+    }
+
+    dgb::coin::CoinNode coin_node(/*embedded=*/&embedded_coin, /*rpc=*/rpc.get());
 
     dgb::Node p2p_node(&ioc, &config);
     p2p_node.set_target_outbound_peers(4);
@@ -483,6 +523,8 @@ int main(int argc, char** argv)
     std::string coin_daemon;                // --coin-daemon HOST:PORT (embedded P2P producer target)
     std::vector<std::byte> coin_magic;      // --coin-magic HEX (network pchMessageStart)
     uint256 coin_genesis;                   // --coin-genesis HASH (initial getheaders locator base)
+    std::string rpc_endpoint;               // --coin-rpc HOST:PORT (external digibyted submit arm)
+    std::string rpc_conf_path;              // --coin-rpc-auth PATH to digibyte.conf (creds source)
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
             std::cout << "c2pool-dgb " << C2POOL_VERSION << "\n";
@@ -511,6 +553,12 @@ int main(int argc, char** argv)
         if (std::strcmp(argv[i], "--coin-genesis") == 0 && i + 1 < argc) {
             coin_genesis = uint256S(argv[++i]);    // genesis hash for initial getheaders
         }
+        if (std::strcmp(argv[i], "--coin-rpc") == 0 && i + 1 < argc) {
+            rpc_endpoint = argv[++i];              // HOST:PORT endpoint override (no secret)
+        }
+        if (std::strcmp(argv[i], "--coin-rpc-auth") == 0 && i + 1 < argc) {
+            rpc_conf_path = argv[++i];             // path to digibyte.conf (rpcpassword stays in-file)
+        }
     }
 
     const core::CoinParams params = dgb::make_coin_params(/*testnet=*/false);
@@ -522,7 +570,8 @@ int main(int argc, char** argv)
     // --run: stand up the run-loop (io_context + sharechain peer + stratum).
     if (want_run)
         return run_node(params, /*testnet=*/false, stratum_addr, stratum_port,
-                        coin_daemon, coin_magic, coin_genesis);
+                        coin_daemon, coin_magic, coin_genesis,
+                        rpc_endpoint, rpc_conf_path);
 
     // --selftest, or a bare invocation: drive the live score path so the
     // binary exercises real consensus code, then exit cleanly.

@@ -16,6 +16,10 @@
 #include <impl/dgb/share.hpp>
 #include <impl/dgb/share_tracker.hpp>   // DensePPLNSWindow — V36 decayed-PPLNS SSOT
 #include <impl/dgb/params.hpp>          // make_coin_params — assembled CoinParams SSOT
+#include <impl/dgb/coin/rpc_conf.hpp>   // #82 external-daemon RPC creds (digibyte.conf)
+
+#include <cstdio>
+#include <fstream>
 
 // Sharechain-identity: the isolation primitives (PREFIX / IDENTIFIER) are the
 // per-coin namespacing boundary — they MUST stay byte-exact to the DGB oracle.
@@ -219,4 +223,87 @@ TEST(DGB_share_test, OracleAddressAndRelayParams)
     EXPECT_EQ(test.address_p2sh_version,  0x8c);      // 140 (testnet P2SH)
     EXPECT_EQ(test.address_p2sh_version2, 0x00);      // disabled on testnet too
     EXPECT_EQ(test.bech32_hrp,            "dgbt");
+}
+
+
+// ---------------------------------------------------------------------------
+// #82 external-daemon submit arm — digibyte.conf credential resolution.
+// Guards dgb::coin::load_rpc_conf / apply_endpoint_override / RpcConf::armed():
+// the RPC leg of the dual-path broadcaster is armed ONLY when both creds AND a
+// port resolve, and the rpcpassword is sourced from-file (never argv). The
+// endpoint override carries no secret. Header-only helper, so this lives in the
+// already-allowlisted dgb_share_test target (no new gtest binary; avoids #143).
+namespace {
+std::string write_tmp_conf(const char* tag, const std::string& body)
+{
+    const std::string path = std::string(::testing::TempDir()) + "/dgb_rpc_conf_" + tag + ".conf";
+    std::ofstream(path) << body;
+    return path;
+}
+}
+
+TEST(DGB_rpc_conf, ParsesUserPassPortAndConnect)
+{
+    const std::string path = write_tmp_conf("full",
+        "# digibyte.conf\n"
+        "rpcuser=dgbuser\n"
+        "rpcpassword=s3cr3t=with=eq\n"   // value may contain '=' after the first
+        "rpcport=14024\n"
+        "rpcconnect=10.0.0.7\n");
+    dgb::coin::RpcConf c;
+    EXPECT_TRUE(dgb::coin::load_rpc_conf(path, c));
+    EXPECT_EQ(c.user, "dgbuser");
+    EXPECT_EQ(c.pass, "s3cr3t=with=eq");
+    EXPECT_EQ(c.port, 14024u);
+    EXPECT_EQ(c.host, "10.0.0.7");
+    EXPECT_TRUE(c.armed());
+    EXPECT_EQ(c.userpass(), "dgbuser:s3cr3t=with=eq");
+    std::remove(path.c_str());
+}
+
+TEST(DGB_rpc_conf, AcceptsC2poolAliasesAndComments)
+{
+    const std::string path = write_tmp_conf("alias",
+        "dgb_rpc_user = aliasuser   # inline comment stripped\n"
+        "dgb_rpc_password = aliaspass\n");
+    dgb::coin::RpcConf c;
+    EXPECT_TRUE(dgb::coin::load_rpc_conf(path, c));
+    EXPECT_EQ(c.user, "aliasuser");
+    EXPECT_EQ(c.pass, "aliaspass");
+    EXPECT_EQ(c.port, 0u);              // no rpcport -> caller fills net default
+    EXPECT_FALSE(c.armed());           // armed() requires a non-zero port
+    std::remove(path.c_str());
+}
+
+TEST(DGB_rpc_conf, MissingPasswordIsNotArmedAndLoadFails)
+{
+    const std::string path = write_tmp_conf("nopass", "rpcuser=lonely\n");
+    dgb::coin::RpcConf c;
+    EXPECT_FALSE(dgb::coin::load_rpc_conf(path, c));  // both user+pass required
+    EXPECT_FALSE(c.armed());
+    std::remove(path.c_str());
+}
+
+TEST(DGB_rpc_conf, MissingFileReturnsFalse)
+{
+    dgb::coin::RpcConf c;
+    EXPECT_FALSE(dgb::coin::load_rpc_conf("/nonexistent/dgb/digibyte.conf", c));
+    EXPECT_FALSE(c.armed());
+}
+
+TEST(DGB_rpc_conf, EndpointOverrideCarriesNoSecret)
+{
+    dgb::coin::RpcConf c;
+    c.user = "u"; c.pass = "p"; c.port = 14024; c.host = "127.0.0.1";
+    dgb::coin::apply_endpoint_override("192.168.1.50:15001", c);
+    EXPECT_EQ(c.host, "192.168.1.50");
+    EXPECT_EQ(c.port, 15001u);
+    // host-only override keeps the resolved port
+    dgb::coin::apply_endpoint_override("example.host", c);
+    EXPECT_EQ(c.host, "example.host");
+    EXPECT_EQ(c.port, 15001u);
+    // empty override is a no-op; creds untouched (still off the process table)
+    dgb::coin::apply_endpoint_override("", c);
+    EXPECT_EQ(c.host, "example.host");
+    EXPECT_EQ(c.userpass(), "u:p");
 }
