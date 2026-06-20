@@ -33,6 +33,8 @@
 #include <impl/dgb/coin/embedded_coin_node.hpp>
 #include <impl/dgb/coin/embedded_tx_select.hpp>   // make_mempool_tx_source (EmbeddedTxSource)
 #include <impl/dgb/coin/won_block_dispatch.hpp>
+#include <impl/dgb/coin/reconstruct_closure.hpp>  // make_reconstruct_closure_from_template (#280)
+#include <impl/dgb/coin/won_share_inputs.hpp>      // won_share_inputs (#279)
 #include <impl/dgb/coin/node_interface.hpp>
 #include <impl/dgb/coin/header_ingest.hpp>
 #include <impl/dgb/coin/mempool_ingest.hpp>
@@ -314,14 +316,71 @@ int run_node(const core::CoinParams& params, bool testnet,
     // supplied (stays null otherwise -> sink no-ops, RPC fallback still fires).
     std::unique_ptr<dgb::coin::p2p::NodeP2P<dgb::Config>> coin_p2p;
 
-    p2p_node.tracker().m_on_block_found = dgb::coin::make_on_block_found(
-        /*reconstruct=*/[](const uint256& share_hash)
-            -> std::optional<std::pair<std::vector<unsigned char>, std::string>> {
-            std::cout << "[DGB-POOL-BLOCK] won share " << share_hash.GetHex().substr(0, 16)
-                      << " — reconstruct deferred (embedded gentx/known-tx feed "
-                         "pending Phase B); not broadcast this build" << std::endl;
-            return std::nullopt;
+    // ── #82 FAITHFUL won-block reconstruct closure (replaces the interim
+    // nullopt stub) ── make_reconstruct_closure_from_template (#280) composes
+    // the three version-AGNOSTIC won-block inputs, bound here to the LIVE
+    // sharechain tracker:
+    //   won_share_fields_fn   -> share.m_min_header + m_merkle_link (#279, the
+    //                            two inputs a won share carries verbatim)
+    //   gentx_bytes_fn        -> generate_share_transaction(...).GentxCoinbase
+    //                            .bytes (#173 SSOT). v36_active is re-derived
+    //                            from the share's COMPILE-TIME version inside
+    //                            GST (share_check.hpp:943), so passing false is
+    //                            byte-identical to the verify-path invocation
+    //                            (share_check.hpp:1728) -> the regenerated gentx
+    //                            matches the one that passed verification.
+    //   template_other_txs_fn -> the captured-GBT template's non-coinbase set
+    //                            (#271). EMPTY today: no per-job template-
+    //                            retention seam in the run-loop yet AND the
+    //                            embedded mempool is unfed, so the served
+    //                            template is coinbase-only => the won block's
+    //                            non-coinbase set IS empty. Correct-and-empty (a
+    //                            valid coinbase-only block), NOT fail-closed; it
+    //                            fills with NO change to this seam once retention
+    //                            + tx-selection land.
+    //
+    // FIRES on the COMPUTE thread already holding the tracker lock
+    // (attempt_verify -> m_on_block_found, share_tracker.hpp:537), so the fns
+    // read tracker().chain DIRECTLY and must NOT take read_tracker() (would
+    // self-deadlock — the corrected consume-seam audit). Fail-closed end to
+    // end: any error in a builder fn throws, is caught inside the closure ->
+    // std::nullopt (announce + audit; the RPC submitblock fallback still fires).
+    auto& reconstruct_tracker = p2p_node.tracker();
+    auto faithful_reconstruct = dgb::coin::make_reconstruct_closure_from_template(
+        /*won_share_fields_fn=*/
+        [&reconstruct_tracker](const uint256& h) -> dgb::coin::WonShareInputs {
+            dgb::coin::WonShareInputs si{};
+            bool found = false;
+            reconstruct_tracker.chain.get_share(h).invoke([&](auto* obj) {
+                si = dgb::coin::won_share_inputs(*obj);
+                found = true;
+            });
+            if (!found)
+                throw std::runtime_error("won_share_inputs: share absent from chain");
+            return si;
         },
+        /*gentx_bytes_fn=*/
+        [&reconstruct_tracker, &params](const uint256& h)
+            -> std::vector<unsigned char> {
+            dgb::coin::GentxCoinbase gc;
+            bool found = false;
+            reconstruct_tracker.chain.get_share(h).invoke([&](auto* obj) {
+                (void)dgb::generate_share_transaction(
+                    *obj, reconstruct_tracker, params,
+                    /*dump_diag=*/false, /*v36_active=*/false, &gc);
+                found = true;
+            });
+            if (!found || gc.bytes.empty())
+                throw std::runtime_error("gentx regen: share absent / empty gentx");
+            return gc.bytes;
+        },
+        /*template_other_txs_fn=*/
+        [](const uint256&) -> std::vector<dgb::coin::MutableTransaction> {
+            return {};  // coinbase-only today (see note above)
+        });
+
+    p2p_node.tracker().m_on_block_found = dgb::coin::make_on_block_found(
+        /*reconstruct=*/std::move(faithful_reconstruct),
         /*p2p_relay=*/[&ioc, &coin_p2p](const std::vector<unsigned char>& block_bytes) {
             // #82 PRIMARY arm: relay the won block over the embedded coin-daemon
             // P2P producer. The sink fires from the compute thread, so post the
@@ -459,15 +518,18 @@ int run_node(const core::CoinParams& params, bool testnet,
                       << " bytes=" << block_bytes.size()
                       << " — dispatching via submitblock-RPC arm" << std::endl;
             // The sharechain P2P-relay arm (m_on_block_found ->
-            // reconstruct_won_block -> broadcast_won_block) is now bound above
-            // (reconstructor stack #163/#166/#167/#173/#174/#176/#177 landed);
-            // its faithful reconstruct closure follows with the embedded feed.
+            // reconstruct_won_block -> broadcast_won_block) is bound above with
+            // the FAITHFUL template-based reconstruct closure (#280, wired here):
+            // share fields (#279) + regenerated gentx (#173) + the captured-GBT
+            // template's non-coinbase set (#271, empty until the embedded feed
+            // lands). That arm reconstructs + broadcasts a won pool block
+            // INDEPENDENTLY of this Stratum submitblock fallback.
             const bool ok =
                 coin_node.submit_block_hex(block_hex, /*ignore_failure=*/false);
             if (!ok)
                 std::cout << "[DGB-STRATUM-BLOCK] submitblock arm reached NO sink "
                              "(no embedded backend / no digibyted RPC wired yet) "
-                             "— P2P-relay arm pending reconstructor stack"
+                             "— sharechain P2P-relay arm reconstructs+broadcasts independently"
                           << std::endl;
             return ok;
         };
