@@ -44,10 +44,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 DATADIR_A="${NMC_REGTEST_DATADIR:-$HOME/.c2pool-nmc-regtest}"
 DATADIR_B="${DATADIR_A}-peer"
-RPCPORT_A=18443
-RPCPORT_B=18453
-P2PPORT_A=18444
-P2PPORT_B=18454
+# NMC-distinct, env-overridable ports. Defaults sit OUTSIDE the 1844x
+# bitcoin-family regtest band (18443/18444) that sibling-coin regtest nodes
+# (btc/bch) bind, so a co-resident steward's regtest daemon never collides
+# with this NMC soak. Override via NMC_RPCPORT_A/B + NMC_P2PPORT_A/B if needed.
+RPCPORT_A=${NMC_RPCPORT_A:-18743}
+RPCPORT_B=${NMC_RPCPORT_B:-18753}
+P2PPORT_A=${NMC_P2PPORT_A:-18744}
+P2PPORT_B=${NMC_P2PPORT_B:-18754}
 PAYOUT_LABEL="c2pool-soak"
 
 log()  { echo "[2e-soak $(printf "%(%H:%M:%S)T")] $*" >&2; }
@@ -86,6 +90,9 @@ wait_rpc() { local n=0; until "$@" getblockcount >/dev/null 2>&1; do n=$((n+1));
 log "LEG 1: starting node A (regtest, RPC $RPCPORT_A)"
 "$DAEMON_BIN" -regtest -datadir="$DATADIR_A" -rpcport=$RPCPORT_A -port=$P2PPORT_A -daemon >/dev/null
 wait_rpc cli_a
+# namecoind v23+ (descriptor era) no longer auto-creates a default wallet --
+# the won-block payout address + generatetoaddress need one explicitly.
+cli_a createwallet "$PAYOUT_LABEL" >/dev/null 2>&1 || cli_a loadwallet "$PAYOUT_LABEL" >/dev/null 2>&1 || true
 
 ADDR_A="$(cli_a getnewaddress "$PAYOUT_LABEL")"
 log "mining 101 maturity blocks to $ADDR_A"
@@ -95,8 +102,9 @@ log "createauxblock -> assert chain_id == NMC SSOT ($NMC_AUXPOW_CHAIN_ID)"
 AUX_JSON="$(cli_a createauxblock "$ADDR_A")"
 CHAINID="$(echo "$AUX_JSON" | grep -o "\"chainid\"[^,]*" | grep -o "[0-9]*$")"
 [ "$CHAINID" = "$NMC_AUXPOW_CHAIN_ID" ] || die "createauxblock chainid=$CHAINID, expected $NMC_AUXPOW_CHAIN_ID (aux_id.hpp SSOT mismatch)"
-echo "$AUX_JSON" | grep -q "\"hash\""   || die "createauxblock template missing target hash"
-echo "$AUX_JSON" | grep -q "\"target\"" || die "createauxblock template missing target bits"
+echo "$AUX_JSON" | grep -q "\"hash\""    || die "createauxblock template missing target hash"
+echo "$AUX_JSON" | grep -q "\"bits\""    || die "createauxblock template missing compact bits"
+echo "$AUX_JSON" | grep -q "\"_target\"" || die "createauxblock template missing _target (256-bit)"
 log "LEG 1 OK: aux-RPC surface live, template well-formed, chain_id conforms to SSOT"
 
 # [DEFERRED -- NOT YET PROVEN] submitauxblock won-block submit is deferred to the
