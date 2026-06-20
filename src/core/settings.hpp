@@ -27,6 +27,7 @@ protected:
 
 public:
     bool m_testnet;
+    bool m_regtest{false};   // --regtest: trivial-difficulty parent for PE-2e won-block soak (additive)
     std::vector<std::string> m_networks;
     float m_fee;
 

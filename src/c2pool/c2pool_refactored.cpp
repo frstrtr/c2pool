@@ -363,6 +363,7 @@ void print_help() {
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
     std::cout << "  --help, -h                Show this help message and exit\n";
     std::cout << "  --testnet                 Use testnet instead of mainnet\n";
+    std::cout << "  --regtest                 Use regtest (trivial-difficulty parent; won-block soak only)\n";
     std::cout << "  --integrated              Full P2P pool with sharechain (DEFAULT)\n";
     std::cout << "  --solo                    Solo pool mode (no P2P sharechain, local payouts)\n";
     std::cout << "  --custodial               Custodial pool (coinbase to --address, stratum for accounting)\n";
@@ -747,6 +748,10 @@ int main(int argc, char* argv[]) {
         else if (arg == "--testnet") {
             settings->m_testnet = true;
             cli_explicit.insert("testnet");
+        }
+        else if (arg == "--regtest") {
+            settings->m_regtest = true;
+            cli_explicit.insert("regtest");
         }
         // Log level (p2pool: --debug; c2pool extends with standard levels)
         else if (arg == "--loglevel-trace")    { cli_log_level = "trace"; cli_explicit.insert("log_level"); }

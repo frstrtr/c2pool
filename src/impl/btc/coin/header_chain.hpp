@@ -212,6 +212,27 @@ struct BTCChainParams {
         return p;
     }
 
+    /// BTC regtest params (Bitcoin Core CRegTestParams). Trivial-difficulty
+    /// parent substrate for the embedded won-block soak (PE-2e): no_retargeting
+    /// keeps the target pinned at pow_limit so a freshly built share clears the
+    /// parent target, letting on_block_found actually fire under a deterministic
+    /// regtest namecoind. STRICTLY additive — selected only under --regtest;
+    /// mainnet/testnet/testnet4 paths are untouched. Constants per
+    /// ref/bitcoin/src/kernel/chainparams.cpp (CRegTestParams).
+    static BTCChainParams regtest() {
+        BTCChainParams p;
+        p.target_timespan = MAINNET_TARGET_TIMESPAN;
+        p.target_spacing  = MAINNET_TARGET_SPACING;
+        p.allow_min_difficulty = true;   // fPowAllowMinDifficultyBlocks
+        p.no_retargeting = true;         // fPowNoRetargeting -- the PE-2e hook
+        // CRegTestParams consensus.powLimit = ~uint256(0) >> 1.
+        p.pow_limit.SetHex("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        // CRegTestParams hashGenesisBlock.
+        p.genesis_hash.SetHex("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206");
+        p.fast_start_checkpoint = Checkpoint{0, p.genesis_hash};
+        return p;
+    }
+
     int64_t difficulty_adjustment_interval() const {
         return target_timespan / target_spacing;
     }
