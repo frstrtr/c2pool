@@ -25,10 +25,13 @@
 #
 # This script provisions + validates the SUBSTRATE (nodes, creds, aux-RPC surface,
 # peering). PE-2d has LANDED (#247/#253/#254 on master), so submit_block() is out of
-# stub: the P2P won-block path (LEG 2) is the live embedded route -- this soak is
-# UN-GATED from 2d. It fires end-to-end once the in-loop c2pool embedded regtest
-# process drives node A (process standup = next slice, per integrator design call
-# 2026-06-20). LEG 1 (submitauxblock) is DEFERRED to the external-daemon deployment
+# stub: the P2P won-block path (LEG 2) is the live embedded route. The won-block
+# CORRECTNESS proof is now in-tree as the test-only KAT seam
+# nmc::coin::reconstruct_won_block_from_template (PR #276 @c525949b7, master 009ac59a4)
+# -- integrator chose that forced-won-share seam over a live --regtest CLI, so this
+# soak no longer needs to fire a won-block assert; its role is SUBSTRATE validation
+# (nodes/creds/aux-RPC/peering) plus the external-daemon deployment soak path.
+# LEG 1 (submitauxblock) is DEFERRED to the external-daemon deployment
 # soak (the mainnet .140 path), NOT exercised in embedded regtest -- it still requires
 # its own on-the-wire verification and must NOT be read as "covered" by this soak.
 #
@@ -128,13 +131,13 @@ done
 [ "${PEERS:-0}" -ge 1 ] || die "node A has 0 peers after addnode -- P2P substrate not established"
 log "LEG 2 OK: paired-node P2P substrate up (node A peers=$PEERS); broadcast has a peer to land on"
 
-# [PE-2e LIVE PATH -- UN-GATED] real P2P won-block relay via on_block_found:
-#   PE-2d has landed (submit_block() out of stub, #247/#253/#254 on master 294fb30e3),
-#   so the embedded CoinBroadcaster submit_block() relays the frozen aux block over
-#   this peer link; assert node B receives it (getblockcount advances). Fires once the
-#   in-loop c2pool embedded regtest process drives node A (next slice: stand up the
-#   embedded process per integrator design call 2026-06-20).
+# [PE-2e WON-BLOCK -- PROVEN VIA KAT SEAM] the frozen-aux-block broadcast source is
+#   verified by nmc::coin::reconstruct_won_block_from_template + its 4 KATs (#276,
+#   merged to master 009ac59a4): forced-won-share -> faithful parent block, test-only,
+#   no --regtest CLI. This paired-node leg validates the P2P SUBSTRATE the embedded
+#   CoinBroadcaster submit_block() would relay over (a real peer to land on); the
+#   end-to-end relay is exercised in the external-daemon deployment soak.
 
-log "SUBSTRATE READY: P2P substrate provisioned + validated. LEG 1 (submitauxblock)"
-log "is DEFERRED to external-daemon deployment (mainnet .140 path), not yet wire-proven;"
-log "landed) and fires once the in-loop c2pool embedded regtest process drives node A."
+log "SUBSTRATE READY: P2P substrate provisioned + validated. Won-block correctness is"
+log "proven by the test-only KAT seam reconstruct_won_block_from_template (#276, master"
+log "009ac59a4); LEG 1 (submitauxblock) is DEFERRED to external-daemon deployment (.140)."
