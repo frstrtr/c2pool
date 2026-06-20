@@ -6,7 +6,7 @@
 # DO NOT soak the merged-aux path against the synced mainnet node (real-block /
 # real-funds risk). Two legs, both on regtest:
 #
-#   LEG 1 (N/A IN EMBEDDED) -- external-RPC-deployment-only. In embedded mode the
+#   LEG 1 (DEFERRED -- EXTERNAL-DAEMON DEPLOYMENT, NOT YET PROVEN ON THE WIRE) -- in
 #                            broadcaster relies SOLELY on P2P relay; submit_aux_block()
 #                            (aux_chain_embedded.hpp:153) is INTENTIONALLY inert in-process,
 #                            mirroring the doge embedded path (integrator design call,
@@ -28,7 +28,9 @@
 # stub: the P2P won-block path (LEG 2) is the live embedded route -- this soak is
 # UN-GATED from 2d. It fires end-to-end once the in-loop c2pool embedded regtest
 # process drives node A (process standup = next slice, per integrator design call
-# 2026-06-20). LEG 1 (submitauxblock) is N/A in embedded -- deployment-only.
+# 2026-06-20). LEG 1 (submitauxblock) is DEFERRED to the external-daemon deployment
+# soak (the mainnet .140 path), NOT exercised in embedded regtest -- it still requires
+# its own on-the-wire verification and must NOT be read as "covered" by this soak.
 #
 # PER-COIN ISOLATION: NMC only. Localhost-only. Generated creds via
 # gen-nmc-daemon-creds.sh; no secret ever touches a coordination card.
@@ -97,7 +99,7 @@ echo "$AUX_JSON" | grep -q "\"hash\""   || die "createauxblock template missing 
 echo "$AUX_JSON" | grep -q "\"target\"" || die "createauxblock template missing target bits"
 log "LEG 1 OK: aux-RPC surface live, template well-formed, chain_id conforms to SSOT"
 
-# [N/A IN EMBEDDED] submitauxblock won-block submit is external-RPC-deployment-only.
+# [DEFERRED -- NOT YET PROVEN] submitauxblock won-block submit is deferred to the
 #   Embedded relies SOLELY on P2P relay (LEG 2); submit_aux_block() is intentionally
 #   inert in-process (aux_chain_embedded.hpp:153, mirrors doge). This leg is exercised
 #   ONLY in external-daemon deployment mode, where the dual-path submitblock fallback
@@ -126,5 +128,5 @@ log "LEG 2 OK: paired-node P2P substrate up (node A peers=$PEERS); broadcast has
 #   embedded process per integrator design call 2026-06-20).
 
 log "SUBSTRATE READY: P2P substrate provisioned + validated. LEG 1 (submitauxblock)"
-log "is N/A in embedded (deployment-only); the P2P won-block assert is UN-GATED (PE-2d"
+log "is DEFERRED to external-daemon deployment (mainnet .140 path), not yet wire-proven;"
 log "landed) and fires once the in-loop c2pool embedded regtest process drives node A."
