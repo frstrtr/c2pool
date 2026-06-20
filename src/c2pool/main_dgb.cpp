@@ -249,6 +249,11 @@ int run_node(const core::CoinParams& params, bool testnet,
     // audited rather than silently dropped, and NO malformed block is emitted.
     // Assigned at setup (single-threaded, pre-ioc.run) — the only safe point to
     // touch tracker() off the compute thread.
+    // Declared ahead of the m_on_block_found binding so the won-block P2P-relay
+    // sink below can capture it. Constructed later only when --coin-daemon is
+    // supplied (stays null otherwise -> sink no-ops, RPC fallback still fires).
+    std::unique_ptr<dgb::coin::p2p::NodeP2P<dgb::Config>> coin_p2p;
+
     p2p_node.tracker().m_on_block_found = dgb::coin::make_on_block_found(
         /*reconstruct=*/[](const uint256& share_hash)
             -> std::optional<std::pair<std::vector<unsigned char>, std::string>> {
@@ -257,7 +262,17 @@ int run_node(const core::CoinParams& params, bool testnet,
                          "pending Phase B); not broadcast this build" << std::endl;
             return std::nullopt;
         },
-        /*p2p_relay=*/dgb::coin::P2pRelaySink{},  // no embedded P2P sink yet (guarded)
+        /*p2p_relay=*/[&ioc, &coin_p2p](const std::vector<unsigned char>& block_bytes) {
+            // #82 PRIMARY arm: relay the won block over the embedded coin-daemon
+            // P2P producer. The sink fires from the compute thread, so post the
+            // peer write onto the io thread (NodeP2P is single-thread-confined).
+            // No-op when --coin-daemon is absent (coin_p2p null) — the RPC
+            // fallback below still fires (dual-path rule).
+            if (!coin_p2p) return;
+            io::post(ioc, [&coin_p2p, bytes = block_bytes]() {
+                if (coin_p2p) coin_p2p->submit_block_p2p_raw(bytes);
+            });
+        },
         /*seam=*/&coin_node);                     // external-digibyted submitblock fallback
 
     // ── #82 dual-path won-block CLOSER: miner-facing Stratum standup ───────
@@ -320,7 +335,6 @@ int run_node(const core::CoinParams& params, bool testnet,
     //
     // No behavior change when --coin-daemon is absent: coin_p2p stays null, the
     // consumer seam idles exactly as before this slice.
-    std::unique_ptr<dgb::coin::p2p::NodeP2P<dgb::Config>> coin_p2p;
     io::steady_timer coin_getheaders_timer(ioc);
     if (!coin_daemon.empty()) {
         if (coin_magic.empty())
