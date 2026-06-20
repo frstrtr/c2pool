@@ -264,8 +264,22 @@ bool NodeRPC::check()
 		}
 	}
 
+	// Regtest does not deploy the DGB-specific algo softforks (reservealgo, odo)
+	// nor nversionbips — those are mainnet/testnet deployments, so a regtest
+	// digibyted legitimately signals only csv/segwit/taproot. Gating startup on
+	// deployments the connected chain cannot carry would make the regtest
+	// won-block path (and CI against regtest) impossible to start, with no
+	// consensus benefit. Relax ONLY on regtest; mainnet/testnet keep the full
+	// SSOT requirement set. Non-consensus startup readiness gate only.
+	std::set<std::string> required = dgb::PoolConfig::SOFTFORKS_REQUIRED;
+	if (blockchaininfo.value("chain", std::string{}) == "regtest")
+	{
+		for (const char* algo_fork : {"reservealgo", "odo", "nversionbips"})
+			required.erase(algo_fork);
+	}
+
 	std::vector<std::string> missing;
-	for (const auto& req : dgb::PoolConfig::SOFTFORKS_REQUIRED)
+	for (const auto& req : required)
 	{
 		if (!softforks_supported.contains(req))
 			missing.push_back(req);
