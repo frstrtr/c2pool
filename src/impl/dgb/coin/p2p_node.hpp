@@ -166,7 +166,7 @@ public:
             addr_t{our_services, m_peer->get_addr()},
             addr_t{our_services, NetService{"192.168.0.1", 12024}},
             core::random::random_nonce(),
-            "c2pool-btc",
+            "c2pool-dgb",  // user-agent (subversion): DGB node, not the BTC mirror it forked from
             0
         );
 
