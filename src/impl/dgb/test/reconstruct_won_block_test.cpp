@@ -30,6 +30,7 @@
 #include <util/strencodings.h>
 
 #include "../coin/reconstruct_won_block.hpp"
+#include "../coin/won_share_inputs.hpp"
 
 using dgb::coin::reconstruct_won_block;
 using dgb::coin::reconstruct_won_block_from_template;
@@ -41,6 +42,8 @@ using dgb::coin::BlockType;
 using dgb::coin::SmallBlockHeaderType;
 using dgb::coin::MutableTransaction;
 using dgb::TxHashRefs;
+using dgb::coin::won_share_inputs;
+using dgb::coin::WonShareInputs;
 
 namespace {
 
@@ -314,4 +317,77 @@ TEST(DgbReconstructWonBlock, EmptyTemplateGentxOnly)
     EXPECT_EQ(got.hex, HexStr(sp));
 }
 
+
+// --- Test 7: won_share_inputs extracts the two share-carried inputs verbatim --
+// The share-side half of the faithful reconstruct closure: a won share carries
+// small_header (m_min_header) + merkle_link (m_merkle_link) verbatim. The seam
+// is a pure read -- no field is transformed, reordered, or dropped.
+TEST(DgbReconstructWonBlock, WonShareInputsExtractsHeaderAndMerkleLink)
+{
+    // Minimal duck-typed stand-in for dgb::Share (keeps this TU off share.hpp's
+    // tracker/base_uint TU, per won_share_inputs.hpp's #143 note). Exposes the
+    // two members won_share_inputs reads by name.
+    struct FakeShare {
+        SmallBlockHeaderType m_min_header;
+        ::dgb::MerkleLink    m_merkle_link;
+    };
+
+    FakeShare s;
+    s.m_min_header = make_small_header();
+    s.m_merkle_link.m_branch = { H("b0"), H("b1") };
+    s.m_merkle_link.m_index = 0;
+
+    WonShareInputs got = won_share_inputs(s);
+
+    EXPECT_EQ(got.small_header.m_version, s.m_min_header.m_version);
+    EXPECT_EQ(got.small_header.m_previous_block, s.m_min_header.m_previous_block);
+    EXPECT_EQ(got.small_header.m_timestamp, s.m_min_header.m_timestamp);
+    EXPECT_EQ(got.small_header.m_bits, s.m_min_header.m_bits);
+    EXPECT_EQ(got.small_header.m_nonce, s.m_min_header.m_nonce);
+    ASSERT_EQ(got.merkle_link.m_branch.size(), 2u);
+    EXPECT_EQ(got.merkle_link.m_branch[0], H("b0"));
+    EXPECT_EQ(got.merkle_link.m_branch[1], H("b1"));
+    EXPECT_EQ(got.merkle_link.m_index, 0u);
+}
+
+// --- Test 8: won_share_inputs feeds reconstruct_won_block_from_template -------
+// End-to-end seam check: the extracted {small_header, merkle_link} drive a block
+// byte-identical to passing those same fields directly. Proves the share-side
+// seam is a faithful pass-through into the won-block framing path -- the run-loop
+// closure may source small_header/merkle_link via won_share_inputs(share) with
+// no change to the reconstructed block.
+TEST(DgbReconstructWonBlock, WonShareInputsDrivesTemplateReconstructIdentically)
+{
+    struct FakeShare {
+        SmallBlockHeaderType m_min_header;
+        ::dgb::MerkleLink    m_merkle_link;
+    };
+
+    FakeShare s;
+    s.m_min_header = make_small_header();
+    // Non-empty link so the merkle-root math actually consumes it.
+    s.m_merkle_link.m_branch = { H("b0") };
+    s.m_merkle_link.m_index = 0;
+
+    auto gentx = make_gentx();
+    auto gh = fixed_gentx_hash();
+    std::vector<MutableTransaction> template_txs = { make_tx(11), make_tx(22) };
+
+    WonShareInputs in = won_share_inputs(s);
+
+    auto via_seam = reconstruct_won_block_from_template(
+        in.small_header, in.merkle_link, gentx, gh, template_txs);
+    auto direct = reconstruct_won_block_from_template(
+        s.m_min_header, s.m_merkle_link, gentx, gh, template_txs);
+
+    EXPECT_EQ(via_seam.bytes, direct.bytes);
+    EXPECT_EQ(via_seam.hex, direct.hex);
+
+    PackStream ps(via_seam.bytes);
+    BlockType blk;
+    ps >> blk;
+    ASSERT_EQ(blk.m_txs.size(), 3u);                    // gentx + 2 template txs
+    EXPECT_EQ(blk.m_txs[0].vin[0].prevout.index, 0xffffffffu);
+}
 } // namespace
+
