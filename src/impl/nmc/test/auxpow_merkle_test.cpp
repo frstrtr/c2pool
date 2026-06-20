@@ -1454,4 +1454,40 @@ TEST(NmcMempool, RemoveForBlockClearsConfirmed) {
     EXPECT_EQ(pool.size(), 1u);           // b remains
 }
 
+// ---------------------------------------------------------------------------
+// PF-conformance: production retarget + network-policy pins (NmcPFConsensusParams).
+// Lock the source-verified namecoin-core consensus/network constants baked into
+// the mainnet()/testnet() factories so a future edit cannot silently drift them.
+// Sourced from namecoin-core src/kernel/chainparams.cpp (NOT from memory):
+//   consensus.nPowTargetTimespan = 1209600 (2 weeks), nPowTargetSpacing = 600
+//   (10 min)  => difficulty_adjustment_interval() == 2016 on both nets;
+//   fPowAllowMinDifficultyBlocks = false (CMainParams) / true (CTestNetParams);
+//   fPowNoRetargeting = false; pchMessageStart = {f9,be,b4,fe} (CMainParams) /
+//   {fa,bf,b5,fe} (CTestNetParams). powLimit + mainnet genesis stay TO-CONFIRM
+//   placeholders and are deliberately NOT asserted here.
+// ---------------------------------------------------------------------------
+TEST(NmcPFConsensusParams, MainnetRetargetAndMagicPinned)
+{
+    NMCChainParams p = NMCChainParams::mainnet();
+    EXPECT_EQ(p.target_timespan, 1209600);          // 2 weeks
+    EXPECT_EQ(p.target_spacing, 600);               // 10 minutes
+    EXPECT_EQ(p.difficulty_adjustment_interval(), 2016);
+    EXPECT_FALSE(p.allow_min_difficulty);           // CMainParams: strict difficulty
+    EXPECT_FALSE(p.no_retargeting);
+    const std::array<unsigned char, 4> kMagic{{0xf9, 0xbe, 0xb4, 0xfe}};
+    EXPECT_EQ(p.p2p_magic, kMagic);                 // CMainParams pchMessageStart
+}
+
+TEST(NmcPFConsensusParams, TestnetRetargetAndMagicPinned)
+{
+    NMCChainParams p = NMCChainParams::testnet();
+    EXPECT_EQ(p.target_timespan, 1209600);          // 2 weeks (shared with mainnet)
+    EXPECT_EQ(p.target_spacing, 600);               // 10 minutes
+    EXPECT_EQ(p.difficulty_adjustment_interval(), 2016);
+    EXPECT_TRUE(p.allow_min_difficulty);            // CTestNetParams: min-diff allowed
+    EXPECT_FALSE(p.no_retargeting);
+    const std::array<unsigned char, 4> kMagic{{0xfa, 0xbf, 0xb5, 0xfe}};
+    EXPECT_EQ(p.p2p_magic, kMagic);                 // CTestNetParams pchMessageStart
+}
+
 } // namespace
