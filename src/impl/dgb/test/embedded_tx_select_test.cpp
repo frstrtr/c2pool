@@ -125,3 +125,97 @@ TEST(DgbEmbeddedTxSelect, UnknownFeeTxExcluded)
     EXPECT_EQ(sel.total_fees, 0u);
     EXPECT_TRUE(sel.transactions.empty());
 }
+
+// ---------------------------------------------------------------------------
+// CONFORMANCE: selection ORDER + weight-cap skip semantics.
+//
+// p2pool consumes the daemon GBT transactions[] in the order Core emits it --
+// ancestor-feerate descending (CreateNewBlock). The embedded shaper must emit
+// the same ordering so the share's tx set and any p2pool-side fee accounting
+// line up. get_sorted_txs_with_fees walks m_feerate_index, a
+// std::multimap<double,uint256,std::greater<double>> -> highest feerate first.
+// These pin that ordering and the weight-cap skip (a `continue`, NOT a `break`:
+// a high-feerate tx that overflows the cap is skipped while a lighter,
+// lower-feerate tx further down can still be packed).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// A tx with `n` outputs (each tagged distinct via index), to vary weight.
+MutableTransaction wide_tx(uint32_t index, int n_outputs)
+{
+    MutableTransaction tx;
+    tx.version = 1;
+    tx.locktime = 0;
+    TxIn in;
+    in.prevout.hash.SetNull();
+    in.prevout.index = index;
+    in.sequence = 0xffffffff;
+    tx.vin.push_back(in);
+    for (int i = 0; i < n_outputs; ++i) {
+        TxOut out;
+        out.value = 1000 + i;
+        tx.vout.push_back(out);
+    }
+    return tx;
+}
+
+uint32_t tx_weight(const MutableTransaction& tx)
+{
+    uint32_t base = 0, wit = 0, weight = 0;
+    dgb::coin::compute_tx_weight(tx, base, wit, weight);
+    return weight;
+}
+
+} // namespace
+
+// transactions[] are emitted highest-feerate-first (equal weight -> by fee).
+TEST(DgbEmbeddedTxSelect, EmitsFeerateDescendingOrder)
+{
+    Mempool pool;
+    MutableTransaction lo  = tagged_tx(10, 0);   // fee 300 -> lowest feerate
+    MutableTransaction mid = tagged_tx(20, 1);   // fee 600
+    MutableTransaction hi  = tagged_tx(30, 2);   // fee 900 -> highest feerate
+    // Insert out of feerate order to prove the index, not arrival, drives order.
+    ASSERT_TRUE(pool.add_tx(mid));
+    ASSERT_TRUE(pool.add_tx(lo));
+    ASSERT_TRUE(pool.add_tx(hi));
+    pool.set_tx_fee(compute_txid(lo),  300);
+    pool.set_tx_fee(compute_txid(mid), 600);
+    pool.set_tx_fee(compute_txid(hi),  900);
+
+    auto source = make_mempool_tx_source(pool, /*max_weight=*/4'000'000);
+    const auto sel = source();
+
+    ASSERT_EQ(sel.transactions.size(), 3u);
+    EXPECT_EQ(sel.transactions[0]["txid"], compute_txid(hi).GetHex());
+    EXPECT_EQ(sel.transactions[1]["txid"], compute_txid(mid).GetHex());
+    EXPECT_EQ(sel.transactions[2]["txid"], compute_txid(lo).GetHex());
+    EXPECT_EQ(sel.total_fees, 1800u);
+}
+
+// Weight cap skips an over-cap high-feerate tx but still packs a lighter one
+// below it (skip-not-break). total_fees reflects only the packed tx.
+TEST(DgbEmbeddedTxSelect, WeightCapSkipsHeavyButPacksLighter)
+{
+    Mempool pool;
+    MutableTransaction heavy = wide_tx(0, /*n_outputs=*/40);  // large weight
+    MutableTransaction light = tagged_tx(50, 1);              // single output
+    ASSERT_TRUE(pool.add_tx(heavy));
+    ASSERT_TRUE(pool.add_tx(light));
+    pool.set_tx_fee(compute_txid(heavy), 10'000'000);  // huge fee -> top feerate
+    pool.set_tx_fee(compute_txid(light), 100);         // low feerate, low weight
+
+    const uint32_t w_heavy = tx_weight(heavy);
+    const uint32_t w_light = tx_weight(light);
+    ASSERT_GT(w_heavy, w_light) << "test needs heavy strictly heavier than light";
+
+    // Cap exactly fits `light` but not `heavy`: heavy is first (top feerate),
+    // overflows -> skipped; light follows and fits.
+    auto source = make_mempool_tx_source(pool, /*max_weight=*/w_light);
+    const auto sel = source();
+
+    ASSERT_EQ(sel.transactions.size(), 1u);
+    EXPECT_EQ(sel.transactions[0]["txid"], compute_txid(light).GetHex());
+    EXPECT_EQ(sel.total_fees, 100u);
+}
