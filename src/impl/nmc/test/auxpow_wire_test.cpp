@@ -306,4 +306,42 @@ TEST(NmcP1Genesis, P2PMagicPinned)
               nmc::coin::NMCChainParams::testnet().p2p_magic);
 }
 
+
+// ---------------------------------------------------------------------------
+// powLimit / genesis-hash consensus-value pin KAT (P1 PF). These are genuine
+// consensus VALUES (pow_limit feeds the retarget clamp in apply_retarget),
+// source-verified against namecoin-core src/kernel/chainparams.cpp and pinned
+// so silent drift reddens CI rather than mis-clamping difficulty. The prior
+// placeholders were the BTC genesis-bits expansion (00000000ffff0000..), NOT
+// the actual powLimit -- a real consensus divergence, caught by this guard.
+//   mainnet powLimit = 2^224-1  (chainparams.cpp:151)
+//   testnet powLimit = 2^228-1  (chainparams.cpp:314, one nibble wider)
+//   mainnet genesis  = 000000000062b72c...c770 (chainparams.cpp:202)
+// ---------------------------------------------------------------------------
+TEST(NmcPFConsensusPin, PowLimitAndGenesisMatchNamecoinCore)
+{
+    const auto main = nmc::coin::NMCChainParams::mainnet();
+    const auto test = nmc::coin::NMCChainParams::testnet();
+
+    uint256 main_pow, test_pow, main_gen;
+    main_pow.SetHex("00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    test_pow.SetHex("0000000fffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    main_gen.SetHex("000000000062b72c5e2ceb45fbc8587e807c155b0da735e6483dfba2f0a9c770");
+
+    EXPECT_EQ(main.pow_limit, main_pow);   // 2^224-1
+    EXPECT_EQ(test.pow_limit, test_pow);   // 2^228-1
+    EXPECT_EQ(main.genesis_hash, main_gen);
+
+    // Networks' powLimits must differ (testnet one nibble wider) and neither
+    // may regress to the old genesis-bits-expansion placeholder.
+    EXPECT_NE(main.pow_limit, test.pow_limit);
+    uint256 stale;
+    stale.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
+    EXPECT_NE(main.pow_limit, stale);
+    EXPECT_NE(test.pow_limit, stale);
+
+    // Mainnet genesis must no longer be the null sentinel the placeholder used.
+    EXPECT_FALSE(main.genesis_hash.IsNull());
+}
+
 }  // namespace
