@@ -136,3 +136,53 @@ TEST(DGB_share_test, DecayedPPLNSWeightsKAT)
     EXPECT_EQ(w.total_weight,            173461511355ull);
     EXPECT_EQ(w.total_donation_weight,   13423705403ull);
 }
+
+// ── get_desired_version_weights: attempts-weighted, NOT a flat count ─────────
+// The check()-phase version-switch gate (share_check step 2) tallies each
+// share's desired_version vote weighted by target_to_average_attempts(target)
+// (= ShareIndex::work), per canonical p2pool get_desired_version_counts
+// (data.py:2651) — NOT one-share-one-vote. Bucket-2 v36-native shared structure
+// (must stay byte-identical with p2pool-merged-v36 across all coins). Guard: a
+// SINGLE high-difficulty share out-votes TWO low-difficulty shares — exactly the
+// property a flat tally (2 vs 1) inverts. test-only, no prod change.
+TEST(DGB_share_test, DesiredVersionWeightsByAttempts)
+{
+    dgb::ShareTracker tracker;
+
+    auto mk = [&](const char* hh, const char* ph, uint64_t dv, uint32_t bits) {
+        auto* s = new dgb::MergedMiningShare();
+        s->m_hash.SetHex(hh);
+        if (ph) s->m_prev_hash.SetHex(ph); else s->m_prev_hash.SetNull();
+        s->m_desired_version = dv;
+        s->m_bits = bits;
+        s->m_max_bits = bits;
+        dgb::ShareType st; st = s;
+        tracker.add(st);
+    };
+
+    // chain: h0 <- h1 (dv=36, easy target => low work) <- h2 (dv=35, hard target
+    // => high work). flat count would read dv36=2, dv35=1; attempts read dv35 >>.
+    const char* h0 = "00000000000000000000000000000000000000000000000000000000000000a0";
+    const char* h1 = "00000000000000000000000000000000000000000000000000000000000000a1";
+    const char* h2 = "00000000000000000000000000000000000000000000000000000000000000a2";
+    mk(h0, nullptr, 36, 0x1e0fffff);
+    mk(h1, h0,      36, 0x1e0fffff);
+    mk(h2, h1,      35, 0x1d00ffff);
+
+    uint256 tip; tip.SetHex(h2);
+    auto w = tracker.get_desired_version_weights(tip, 100);
+
+    ASSERT_EQ(w.count(35u), 1u);
+    ASSERT_EQ(w.count(36u), 1u);
+
+    // Weight per desired_version == sum of ShareIndex::work over its shares,
+    // tied directly to the SSOT work fn (no magic literals).
+    const uint288 easy_work = chain::target_to_average_attempts(chain::bits_to_target(0x1e0fffff));
+    const uint288 hard_work = chain::target_to_average_attempts(chain::bits_to_target(0x1d00ffff));
+    EXPECT_EQ(w.at(36u), easy_work + easy_work);  // two equal dv=36 shares
+    EXPECT_EQ(w.at(35u), hard_work);              // one dv=35 share
+
+    // Attempts-weighting: the lone high-difficulty dv=35 share outweighs the two
+    // low-difficulty dv=36 shares — the exact property a flat count inverts.
+    EXPECT_GT(w.at(35u), w.at(36u));
+}
