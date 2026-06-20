@@ -18,6 +18,14 @@
 //      REJECTS (unknown algo bits) never reaches the chain; the connector adds
 //      no policy of its own and never force-appends.
 //
+// LIVE PoW gate: make_header_sample now fills pow_hash = scrypt(header) for
+// Scrypt-algo headers, so validate_and_append's satisfaction check (pow_hash <=
+// target) fires on the ingest path. The Scrypt fixtures below therefore carry
+// GENUINE PoW: an easy max-compact target plus a nonce searched until the real
+// scrypt digest satisfies it (~2 scrypt evaluations). This keeps the WIRING
+// assertions deterministic without hand-mining a hard block -- the sha256d
+// block-id KAT (Bitcoin genesis) lives in dgb_header_sample_build_test.
+//
 // Pulls dgb::interfaces::Node (block.hpp codec) + header_chain.hpp + the
 // make_header_sample SSOT, so it links the proven dgb OBJECT-lib SCC set like
 // dgb_header_sample_build_test. MUST also appear in BOTH build.yml --target
@@ -45,33 +53,35 @@ using dgb::coin::DGB_BLOCK_VERSION_ALGO;
 
 namespace {
 
-// Canonical Bitcoin genesis header -- same 80-byte serialization DGB uses, and
-// a Scrypt header (version 1 -> algo nibble 0 == SCRYPT), so it walks the
-// VALIDATE_SCRYPT path. pow_hash is left 0 by make_header_sample (trivially
-// satisfies any target), and a default-ctor HeaderChain leaves pow_limit /
-// target_timespan 0 so the ceiling + DigiShield gates are no-ops -- exactly the
-// bootstrap posture the embedded port starts from.
-BlockHeaderType genesis_header()
+// An easy max-compact target: nBits 0x207fffff expands (compact_to_target,
+// arith_uint256::SetCompact) to ~2^255, comfortably below the unconfigured
+// chain's (absent) pow_limit ceiling. A uniformly-random scrypt digest lands at
+// or under it with ~1/2 probability, so the nonce search below terminates in a
+// couple of evaluations.
+constexpr uint32_t EASY_BITS = 0x207fffffu;
+
+// Build a Scrypt header (version 1 -> algo nibble 0 == SCRYPT) carrying real,
+// satisfiable PoW: starting from seed_nonce, advance the nonce until the live
+// make_header_sample scrypt(header) digest is <= the declared target. Returns a
+// header validate_and_append's now-live satisfaction gate accepts.
+BlockHeaderType satisfiable_scrypt_header(uint32_t seed_nonce, uint32_t timestamp)
 {
     BlockHeaderType h;
     h.m_version = 1;
     h.m_previous_block.SetNull();
     h.m_merkle_root.SetHex(
         "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b");
-    h.m_timestamp = 1231006505u;
-    h.m_bits      = 0x1d00ffffu;
-    h.m_nonce     = 2083236893u;
-    return h;
-}
+    h.m_timestamp = timestamp;
+    h.m_bits      = EASY_BITS;
 
-// A second Scrypt header whose nTime is strictly greater than genesis' (the MTP
-// monotonicity gate requires nTime > median-of-ancestors), with a distinct
-// nonce so its sha256d block id differs from genesis'.
-BlockHeaderType second_scrypt_header()
-{
-    BlockHeaderType h = genesis_header();
-    h.m_timestamp = 1231006506u;  // genesis + 1 -> passes MTP over [genesis]
-    h.m_nonce     = 12345u;       // distinct id
+    for (uint32_t n = seed_nonce; n < seed_nonce + 1000000u; ++n) {
+        h.m_nonce = n;
+        auto s = make_header_sample(h);
+        if (!(s.pow_hash > s.target))   // pow_hash <= target -> PoW satisfied
+            return h;
+    }
+    ADD_FAILURE() << "no satisfiable nonce found for EASY_BITS (astronomically "
+                     "unlikely -- check compact_to_target / scrypt wiring)";
     return h;
 }
 
@@ -79,13 +89,10 @@ BlockHeaderType second_scrypt_header()
 // dgb_header_disposition() -> REJECT. validate_and_append must drop it.
 BlockHeaderType unknown_algo_header()
 {
-    BlockHeaderType h = genesis_header();
+    BlockHeaderType h = satisfiable_scrypt_header(0, 1231006505u);
     h.m_version = 1 | 0x0100;  // nibble 1 == ALGO_UNKNOWN
     return h;
 }
-
-const std::string GENESIS_ID =
-    "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
 
 } // namespace
 
@@ -99,35 +106,42 @@ TEST(HeaderIngest, EmptyChainHasNoTip)
 
 // 1. A Scrypt header announced on new_headers is ingested through
 //    make_header_sample + validate_and_append: the chain grows and tip_hash()
-//    is the header's sha256d block id (the well-known genesis hash).
+//    is the header's sha256d block id. The live scrypt PoW gate accepts it
+//    because the fixture carries genuine (easy-target) PoW.
 TEST(HeaderIngest, AnnouncedScryptHeaderIsIngested)
 {
     HeaderChain chain;
     dgb::interfaces::Node node;
     auto sub = wire_header_ingest(node, chain);
 
-    node.new_headers.happened(std::vector<BlockHeaderType>{ genesis_header() });
+    BlockHeaderType h = satisfiable_scrypt_header(0, 1231006505u);
+    node.new_headers.happened(std::vector<BlockHeaderType>{ h });
 
     ASSERT_TRUE(chain.tip_height().has_value());
     ASSERT_TRUE(chain.tip_hash().has_value());
-    EXPECT_EQ(u256_be_display_hex(*chain.tip_hash()), GENESIS_ID);
+    EXPECT_EQ(u256_be_display_hex(*chain.tip_hash()),
+              u256_be_display_hex(make_header_sample(h).block_hash));
 }
 
 // 2. A multi-header batch is ingested in arrival order: the tip is the LAST
 //    header, and the chain grew by the full batch length (height delta == 1
-//    versus a single-header chain).
+//    versus a single-header chain). The second header's nTime is strictly
+//    greater (MTP monotonicity gate) and its nonce-search seed distinct, so it
+//    is a different, independently-satisfiable Scrypt block.
 TEST(HeaderIngest, BatchIngestedInArrivalOrder)
 {
+    BlockHeaderType h1 = satisfiable_scrypt_header(0, 1231006505u);
+    BlockHeaderType h2 = satisfiable_scrypt_header(1000, 1231006506u);
+
     HeaderChain one;
     dgb::interfaces::Node node_one;
     auto sub_one = wire_header_ingest(node_one, one);
-    node_one.new_headers.happened(std::vector<BlockHeaderType>{ genesis_header() });
+    node_one.new_headers.happened(std::vector<BlockHeaderType>{ h1 });
 
     HeaderChain two;
     dgb::interfaces::Node node_two;
     auto sub_two = wire_header_ingest(node_two, two);
-    node_two.new_headers.happened(
-        std::vector<BlockHeaderType>{ genesis_header(), second_scrypt_header() });
+    node_two.new_headers.happened(std::vector<BlockHeaderType>{ h1, h2 });
 
     ASSERT_TRUE(one.tip_height().has_value());
     ASSERT_TRUE(two.tip_height().has_value());
@@ -136,8 +150,9 @@ TEST(HeaderIngest, BatchIngestedInArrivalOrder)
     // Tip is the LAST header of the batch, not the first.
     ASSERT_TRUE(two.tip_hash().has_value());
     EXPECT_EQ(u256_be_display_hex(*two.tip_hash()),
-              u256_be_display_hex(make_header_sample(second_scrypt_header()).block_hash));
-    EXPECT_NE(u256_be_display_hex(*two.tip_hash()), GENESIS_ID);
+              u256_be_display_hex(make_header_sample(h2).block_hash));
+    EXPECT_NE(u256_be_display_hex(*two.tip_hash()),
+              u256_be_display_hex(make_header_sample(h1).block_hash));
 }
 
 // 3. The connector is the driver: a node with NO ingest subscription appends
@@ -147,7 +162,8 @@ TEST(HeaderIngest, UnwiredNodeIngestsNothing)
     HeaderChain chain;
     dgb::interfaces::Node node;  // deliberately NOT wired
 
-    node.new_headers.happened(std::vector<BlockHeaderType>{ genesis_header() });
+    node.new_headers.happened(
+        std::vector<BlockHeaderType>{ satisfiable_scrypt_header(0, 1231006505u) });
 
     EXPECT_FALSE(chain.tip_height().has_value());
     EXPECT_FALSE(chain.tip_hash().has_value());

@@ -25,8 +25,13 @@
 #include <string>
 
 #include <core/uint256.hpp>
+#include <span>
+
+#include <core/pack.hpp>
+#include <core/pow.hpp>
 
 #include "../coin/block.hpp"
+#include "../coin/dgb_block_algo.hpp"
 #include "../coin/hash_format.hpp"
 #include "../coin/header_sample_build.hpp"
 
@@ -82,15 +87,51 @@ TEST(MakeHeaderSample, GenesisBlockHash)
         "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f");
 }
 
-// Scalar fields pass through verbatim; target decodes the header's nBits;
-// pow_hash stays 0 (scrypt digest lands at the daemon-port boundary).
-TEST(MakeHeaderSample, ScalarFieldsAndTargetAndPowHash)
+// Scalar fields pass through verbatim; target decodes the header's nBits.
+TEST(MakeHeaderSample, ScalarFieldsAndTarget)
 {
     HeaderSample s = make_header_sample(genesis_header());
     EXPECT_EQ(s.n_version, 1);
     EXPECT_EQ(s.n_time, 1231006505);
     EXPECT_EQ(u256_be_display_hex(s.target),
         "00000000ffff0000000000000000000000000000000000000000000000000000");
+}
+
+// A Scrypt-disposition header (algo bits == 0; the Bitcoin-genesis v1 used here
+// qualifies under DGB's GetAlgo mask) gets pow_hash = scrypt(80-byte header),
+// stored little-endian like target. Self-consistency KAT: the field must equal
+// an INDEPENDENT scrypt over the same canonical serialization routed through the
+// SAME from_le_bytes convention -- proving make_header_sample wires header bytes
+// -> core::pow::scrypt -> pow_hash with no byte-order drift, and that the
+// previously-stubbed (== 0) field is now live for the satisfaction gate.
+TEST(MakeHeaderSample, ScryptHeaderPowHashFilled)
+{
+    BlockHeaderType h = genesis_header();
+    ASSERT_TRUE(::dgb::coin::is_scrypt_header(static_cast<int32_t>(h.m_version)));
+
+    HeaderSample s = make_header_sample(h);
+
+    auto packed = pack(h);
+    auto tspan = packed.get_span();
+    uint256 ph = core::pow::scrypt(std::span<const unsigned char>(
+        reinterpret_cast<const unsigned char*>(tspan.data()), tspan.size()));
+    dgb::coin::u256 expected = dgb::coin::u256::from_le_bytes(
+        reinterpret_cast<const unsigned char*>(ph.begin()));
+
+    EXPECT_EQ(u256_be_display_hex(s.pow_hash), u256_be_display_hex(expected));
+    EXPECT_FALSE(s.pow_hash.is_zero());
+}
+
+// A non-Scrypt header (SHA256D algo bits) is accept-by-continuity in V36; its
+// PoW gate never runs, so make_header_sample leaves pow_hash == 0 rather than
+// computing a scrypt digest nothing reads.
+TEST(MakeHeaderSample, NonScryptHeaderPowHashZero)
+{
+    BlockHeaderType h = genesis_header();
+    h.m_version = ::dgb::coin::DGB_BLOCK_VERSION_SHA256D;  // 0x0200 algo bits
+    ASSERT_FALSE(::dgb::coin::is_scrypt_header(static_cast<int32_t>(h.m_version)));
+
+    HeaderSample s = make_header_sample(h);
     EXPECT_TRUE(s.pow_hash.is_zero());
 }
 

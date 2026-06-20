@@ -23,12 +23,14 @@
 //                   big-endian explorer/GBT hash. This is what lights up
 //                   HeaderChain::tip_hash() -> previousblockhash in the work
 //                   template (previously always nullopt: "0 == not populated").
-//   * pow_hash   <- 0  -- LEFT UNSET HERE. block_hash is sha256d (cheap,
-//                   daemon-independent); pow_hash is scrypt(header), filled at
-//                   the embedded-daemon port boundary in a following slice
-//                   (the scrypt CALL pulls btclibs scrypt; the satisfaction
-//                   gate already compares pow_hash <= target with the SAME u256
-//                   shape, so dropping the digest in later is a no-op rewire).
+//   * pow_hash   <- scrypt(80-byte header) for Scrypt-algo headers, else 0.
+//                   This is the field validate_and_append's PoW-satisfaction
+//                   gate (pow_hash <= target) consumes, and that gate runs only
+//                   on the VALIDATE_SCRYPT disposition -- so non-Scrypt
+//                   continuity headers leave it 0 (their gate never reads it).
+//                   Stored little-endian via from_le_bytes, the SAME u256
+//                   convention as target, so the two compare directly. (Lands
+//                   the scrypt(header) fill deferred from the #227 skeleton.)
 //
 // btclibs-bearing: includes core/pow.hpp's Hash (sha256d) and core/pack.hpp, so
 // this header is for the FULL build + a btclibs-linking test TU, NOT the
@@ -36,12 +38,15 @@
 // ---------------------------------------------------------------------------
 
 #include <cstdint>
+#include <span>
 
 #include <core/pack.hpp>
 #include <core/hash.hpp>
+#include <core/pow.hpp>                     // core::pow::scrypt (80-byte hdr -> uint256)
 #include <core/uint256.hpp>
 
 #include <impl/dgb/coin/block.hpp>          // dgb::coin::BlockHeaderType
+#include <impl/dgb/coin/dgb_block_algo.hpp> // dgb::coin::is_scrypt_header
 #include <impl/dgb/coin/header_chain.hpp>   // c2pool::dgb::HeaderSample, u256
 
 namespace c2pool::dgb {
@@ -86,14 +91,33 @@ inline HeaderSample make_header_sample(const ::dgb::coin::BlockHeaderType& h)
     s.n_time    = static_cast<int64_t>(h.m_timestamp);
     s.target    = compact_to_target(h.m_bits);
 
+    // Serialize once: the block-identity hash and the Scrypt PoW digest are
+    // both pure functions of the same canonical 80-byte header.
+    auto packed = pack(h);
+    auto header_span = packed.get_span();
+
     // sha256d over the canonical 80-byte serialization (params.hpp block hash
     // func). uint256 stores the digest little-endian; from_le_bytes reads it in
     // the SAME order so u256_be_display_hex round-trips to GetHex().
-    uint256 id = Hash(pack(h).get_span());
+    uint256 id = Hash(header_span);
     s.block_hash = u256::from_le_bytes(
         reinterpret_cast<const unsigned char*>(id.begin()));
 
-    s.pow_hash = 0;  // filled with scrypt(header) at the embedded-daemon port
+    // pow_hash = scrypt(header) for Scrypt-algo headers ONLY. The satisfaction
+    // gate (pow_hash <= target) runs solely on the VALIDATE_SCRYPT disposition;
+    // non-Scrypt continuity (and reject-disposition) headers leave pow_hash == 0
+    // -- their gate never reads it, and scrypt over a non-Scrypt header would be
+    // a meaningless cycle. from_le_bytes gives the SAME u256 shape as target so
+    // the gate compares them directly.
+    if (::dgb::coin::is_scrypt_header(s.n_version)) {
+        uint256 ph = core::pow::scrypt(std::span<const unsigned char>(
+            reinterpret_cast<const unsigned char*>(header_span.data()),
+            header_span.size()));
+        s.pow_hash = u256::from_le_bytes(
+            reinterpret_cast<const unsigned char*>(ph.begin()));
+    } else {
+        s.pow_hash = 0;
+    }
     return s;
 }
 
