@@ -132,6 +132,7 @@ void NodeRPC::sync_reconnect()
 
 std::string NodeRPC::Send(const std::string &request)
 {
+	std::lock_guard<std::mutex> _rpc_lock(m_rpc_mutex);
 	// Retry once after synchronous reconnect on write/read failure
 	for (int attempt = 0; attempt < 2; ++attempt)
 	{
