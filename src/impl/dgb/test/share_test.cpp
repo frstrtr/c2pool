@@ -15,6 +15,7 @@
 #include <impl/dgb/config_coin.hpp>
 #include <impl/dgb/share.hpp>
 #include <impl/dgb/share_tracker.hpp>   // DensePPLNSWindow — V36 decayed-PPLNS SSOT
+#include <impl/dgb/params.hpp>          // make_coin_params — assembled CoinParams SSOT
 
 // Sharechain-identity: the isolation primitives (PREFIX / IDENTIFIER) are the
 // per-coin namespacing boundary — they MUST stay byte-exact to the DGB oracle.
@@ -185,4 +186,37 @@ TEST(DGB_share_test, DesiredVersionWeightsByAttempts)
     // Attempts-weighting: the lone high-difficulty dv=35 share outweighs the two
     // low-difficulty dv=36 shares — the exact property a flat count inverts.
     EXPECT_GT(w.at(35u), w.at(36u));
+}
+
+
+// ── Address-encoding + relay-policy SSOT KAT (assembled CoinParams) ─────────
+// Pins the values make_coin_params() actually hands the pool, on BOTH nets,
+// against the DGB oracle frstrtr/p2pool-dgb-scrypt (switch-oracle Option B).
+// Otherwise-unguarded: the mainnet/testnet address bytes + BECH32 HRPs
+// (config_coin SSOT) and three values that live ONLY in the params.hpp
+// assembly — address_p2sh_version2 (the disabled secondary P2SH prefix),
+// worker_port, and dust_threshold. 3-bucket: the address bytes + ports are
+// BUCKET-1 isolation/identity primitives (KEEP per-coin, v36 AND v37);
+// dust_threshold is local relay policy. test-only, no prod change.
+//
+// REGRESSION GUARD of note: address_p2sh_version2 MUST stay 0 (disabled). The
+// oracle (bitcoin/data.py) accepts exactly {30, 63} and defines no secondary
+// P2SH prefix; the prior =5 was an LTC-borrowed artifact. A silent revert to a
+// non-zero secondary prefix would re-introduce that artifact — this fails loud.
+TEST(DGB_share_test, OracleAddressAndRelayParams)
+{
+    const core::CoinParams main = dgb::make_coin_params(/*testnet=*/false);
+    EXPECT_EQ(main.address_version,       0x1e);      // 30 - D... (P2PKH)
+    EXPECT_EQ(main.address_p2sh_version,  0x3f);      // 63 - S... (P2SH)
+    EXPECT_EQ(main.address_p2sh_version2, 0x00);      // disabled - oracle has no 2nd P2SH prefix
+    EXPECT_EQ(main.bech32_hrp,            "dgb");
+    EXPECT_EQ(main.p2p_port,              5024u);     // oracle P2P_PORT (assembled)
+    EXPECT_EQ(main.worker_port,           5025u);     // oracle WORKER_PORT
+    EXPECT_EQ(main.dust_threshold,        100000u);   // DUST_THRESHOLD = 0.001e8
+
+    const core::CoinParams test = dgb::make_coin_params(/*testnet=*/true);
+    EXPECT_EQ(test.address_version,       0x7e);      // 126 (testnet)
+    EXPECT_EQ(test.address_p2sh_version,  0x8c);      // 140 (testnet P2SH)
+    EXPECT_EQ(test.address_p2sh_version2, 0x00);      // disabled on testnet too
+    EXPECT_EQ(test.bech32_hrp,            "dgbt");
 }
