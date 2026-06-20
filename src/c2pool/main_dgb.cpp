@@ -86,7 +86,7 @@ void print_banner(const char* argv0, const core::CoinParams& p)
     std::cout
         << "c2pool-dgb " << C2POOL_VERSION << " — DigiByte Scrypt-only (V36)\n\n"
         << "Usage: " << argv0
-        << " [--version] [--help] [--selftest] [--run] [--stratum [H:]P]\n\n"
+        << " [--version] [--help] [--selftest] [--run] [--no-p2p-relay] [--stratum [H:]P]\n\n"
         << "Status: pool/sharechain pillars live (Phase B); run-loop up\n"
         << "        (--run: io_context + sharechain peer + Stratum standup).\n"
         << "        --stratum [HOST:]PORT binds a miner-facing TCP listener\n"
@@ -142,7 +142,8 @@ int run_node(const core::CoinParams& params, bool testnet,
              const std::vector<std::byte>& coin_magic,
              const uint256& coin_genesis,
              const std::string& rpc_endpoint,
-             const std::string& rpc_conf_path)
+             const std::string& rpc_conf_path,
+             bool no_p2p_relay)
 {
     io::io_context ioc;
 
@@ -381,12 +382,24 @@ int run_node(const core::CoinParams& params, bool testnet,
 
     p2p_node.tracker().m_on_block_found = dgb::coin::make_on_block_found(
         /*reconstruct=*/std::move(faithful_reconstruct),
-        /*p2p_relay=*/[&ioc, &coin_p2p](const std::vector<unsigned char>& block_bytes) {
+        /*p2p_relay=*/[&ioc, &coin_p2p, no_p2p_relay](const std::vector<unsigned char>& block_bytes) {
             // #82 PRIMARY arm: relay the won block over the embedded coin-daemon
             // P2P producer. The sink fires from the compute thread, so post the
             // peer write onto the io thread (NodeP2P is single-thread-confined).
             // No-op when --coin-daemon is absent (coin_p2p null) — the RPC
             // fallback below still fires (dual-path rule).
+            //
+            // --no-p2p-relay (#82 ARM B isolation): suppress ONLY this embedded
+            // P2P-relay arm and leave the external-digibyted submitblock seam
+            // (fallback) live, so a regtest soak can prove the RPC fallback lands
+            // the block ON ITS OWN — not masked by a silent or dead P2P relay
+            // (the historical #82 gap). A real operator toggle, not a test seam.
+            if (no_p2p_relay) {
+                std::cout << "[DGB-BLOCK] --no-p2p-relay: embedded P2P-relay arm "
+                             "SUPPRESSED; submitblock-RPC fallback remains live"
+                          << std::endl;
+                return;
+            }
             if (!coin_p2p) return;
             io::post(ioc, [&coin_p2p, bytes = block_bytes]() {
                 if (coin_p2p) coin_p2p->submit_block_p2p_raw(bytes);
@@ -587,6 +600,7 @@ int main(int argc, char** argv)
     uint256 coin_genesis;                   // --coin-genesis HASH (initial getheaders locator base)
     std::string rpc_endpoint;               // --coin-rpc HOST:PORT (external digibyted submit arm)
     std::string rpc_conf_path;              // --coin-rpc-auth PATH to digibyte.conf (creds source)
+    bool no_p2p_relay = false;              // --no-p2p-relay: suppress embedded P2P-relay arm (#82 ARM B isolation)
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
             std::cout << "c2pool-dgb " << C2POOL_VERSION << "\n";
@@ -621,6 +635,7 @@ int main(int argc, char** argv)
         if (std::strcmp(argv[i], "--coin-rpc-auth") == 0 && i + 1 < argc) {
             rpc_conf_path = argv[++i];             // path to digibyte.conf (rpcpassword stays in-file)
         }
+        if (std::strcmp(argv[i], "--no-p2p-relay") == 0) no_p2p_relay = true;
     }
 
     const core::CoinParams params = dgb::make_coin_params(/*testnet=*/false);
@@ -633,7 +648,7 @@ int main(int argc, char** argv)
     if (want_run)
         return run_node(params, /*testnet=*/false, stratum_addr, stratum_port,
                         coin_daemon, coin_magic, coin_genesis,
-                        rpc_endpoint, rpc_conf_path);
+                        rpc_endpoint, rpc_conf_path, no_p2p_relay);
 
     // --selftest, or a bare invocation: drive the live score path so the
     // binary exercises real consensus code, then exit cleanly.
