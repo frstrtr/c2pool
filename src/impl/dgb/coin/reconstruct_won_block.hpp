@@ -123,5 +123,48 @@ reconstruct_won_block(
     return ReconstructedWonBlock{std::move(framed.first), std::move(framed.second)};
 }
 
+// ---------------------------------------------------------------------------
+// reconstruct_won_block_from_template -- the CORRECT won-block tx source, per
+// the p2pool-merged-v36 block-assembly audit (work.py @ 42ccca53):
+//
+//     transactions       = self.current_work.value['transactions']        # ~2486
+//     tx_map             = dict(zip(transaction_hashes, transactions))     # ~2489
+//     other_transactions = [tx_map[h] for h in other_transaction_hashes]  # ~2638
+//     submit txs         = [new_hexed_gentx]
+//                          + [tx['data'] for tx in other_transactions]    # ~2728
+//
+// The broadcast block's non-coinbase tx set is the GBT TEMPLATE snapshot the
+// miner was handed at job hand-out time (current_work), NOT the share's
+// transaction_hash_refs.  The ref-walk above (reconstruct_won_block) is a
+// share-CHAIN peer-propagation mechanism; it is never the block-broadcast
+// source.  That is why this path is version-AGNOSTIC: pre-v34 vs v34+/v36 makes
+// no difference, because the share never carried the block tx set in the first
+// place (this dissolves the "v34+ carries no m_tx_info -> reconstruct fails"
+// concern -- there is nothing to source from the share for any version).
+//
+//   template_other_txs : the captured template's non-coinbase txs, in template
+//                        order (current_work transactions[]).  Empty today --
+//                        the embedded path emits transactions[]==[] until
+//                        mempool tx-selection wires -- which yields a valid
+//                        coinbase-only block (correct-and-empty, NOT
+//                        fail-closed).  It fills automatically as tx-selection
+//                        lands, with no change to this seam.
+//
+// Frames [gentx] ++ template_other_txs via the same assemble_won_block SSOT
+// (identical merkle-root math + BlockType codec the live submitblock path
+// uses), so the result round-trips and the daemon accepts.
+inline ReconstructedWonBlock
+reconstruct_won_block_from_template(
+    const SmallBlockHeaderType& small_header,
+    const ::dgb::MerkleLink& merkle_link,
+    const MutableTransaction& gentx,
+    const uint256& gentx_hash,
+    const std::vector<MutableTransaction>& template_other_txs)
+{
+    auto framed = assemble_won_block(small_header, gentx, gentx_hash, merkle_link,
+                                     template_other_txs);
+    return ReconstructedWonBlock{std::move(framed.first), std::move(framed.second)};
+}
+
 } // namespace coin
 } // namespace dgb
