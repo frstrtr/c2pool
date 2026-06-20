@@ -251,7 +251,11 @@ public:
     }
 
     /// Broadcast raw block bytes to ALL connected peers (parent chain).
-    void submit_block_raw(const std::vector<unsigned char>& block_bytes)
+    /// Relay a raw block to every connected peer. Returns the number of peers
+    /// the block was successfully sent to (0 => NOT broadcast). Embedded aux
+    /// backends rely on this count to honour the never-silent-drop invariant
+    /// (#162): a found block that reached 0 peers must surface as a failure.
+    size_t submit_block_raw(const std::vector<unsigned char>& block_bytes)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         int sent = 0, failed = 0;
@@ -275,6 +279,7 @@ public:
                      << sent << "/" << (sent + failed) << " peers ("
                      << block_bytes.size() << " bytes)";
         }
+        return static_cast<size_t>(sent);
     }
 
     /// Send inv announcement to ALL connected peers (merged chain relay).
