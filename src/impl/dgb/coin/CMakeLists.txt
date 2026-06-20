@@ -26,6 +26,9 @@ set(dgb_coin_interface
     header_chain.hpp
     mempool.hpp
     template_builder.hpp
+    embedded_coinbase_value.hpp
+    embedded_coin_node.hpp
+    embedded_tx_select.hpp embedded_tx_select.cpp
 )
 
 add_library(dgb_coin ${dgb_coin_interface} ${dgb_coin_impl})
