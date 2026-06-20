@@ -5,6 +5,7 @@
 #include "node_interface.hpp"
 
 #include <iostream>
+#include <mutex>
 
 #include <core/uint256.hpp>
 #include <core/timer.hpp>
@@ -38,6 +39,11 @@ private:
     beast::tcp_stream m_stream;
     boost::asio::ip::tcp::resolver m_resolver;
     http::request<http::string_body> m_http_request; 
+    // Serializes Send(): m_http_request + m_stream are NOT thread-safe. The asio
+    // thread_pool worker (clean_tracker->think->score->getblockheader) and the main
+    // thread both drive Send() on this single shared client; without this lock T0's
+    // prepare_payload() frees the Content-Length field element mid-write on T8 -> UAF.
+    std::mutex m_rpc_mutex;
 
     std::unique_ptr<RPCAuthData> m_auth;
     jsonrpccxx::JsonRpcClient m_client;
