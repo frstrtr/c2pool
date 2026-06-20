@@ -500,6 +500,22 @@ TEST(CoinBroadcaster, ConstructionDefaults)
     EXPECT_EQ(bc.connected_count(), 0);
 }
 
+// PE never-silent-drop (#162): with no peers connected, submit_block_raw must
+// report 0 relays so embedded aux backends surface a found block as a failure
+// rather than claiming a phantom broadcast.
+TEST(CoinBroadcaster, SubmitBlockRawNoPeersReturnsZero)
+{
+    boost::asio::io_context ioc;
+    std::vector<std::byte> prefix = {std::byte{0xfd}, std::byte{0xd2},
+                                      std::byte{0xc8}, std::byte{0xf1}};
+    CoinBroadcaster bc(ioc, "LTC", prefix, NetService("192.168.1.1", 19335));
+
+    ASSERT_EQ(bc.connected_count(), 0);
+    std::vector<unsigned char> dummy_block(80, 0x00);
+    EXPECT_EQ(bc.submit_block_raw(dummy_block), 0u)
+        << "no peers => 0 relays => caller must NOT claim broadcast success";
+}
+
 TEST(CoinBroadcaster, ConstructionWithConfig)
 {
     boost::asio::io_context ioc;
