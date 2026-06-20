@@ -32,6 +32,7 @@
 #include "../coin/reconstruct_won_block.hpp"
 
 using dgb::coin::reconstruct_won_block;
+using dgb::coin::reconstruct_won_block_from_template;
 using dgb::coin::assemble_won_block;
 using dgb::coin::resolve_other_tx_hashes;
 using dgb::coin::assemble_other_txs;
@@ -252,6 +253,65 @@ TEST(DgbReconstructWonBlock, UnknownKnownTxThrows)
         reconstruct_won_block(sh, link, gentx, gh, f.won, refs,
                               f.nth_parent(), f.new_tx(), f.known_fn()),
         std::out_of_range);
+}
+
+// --- Test 5: template path == ref path for the SAME tx set (equivalence) ------
+// Proves reconstruct_won_block_from_template (the CORRECT block-broadcast
+// source: captured GBT template txs) frames a byte-identical block to the
+// ref-walk path when fed the same non-coinbase tx set -- i.e. the re-scope is a
+// pure SOURCE swap, the framing/merkle/codec are unchanged.
+TEST(DgbReconstructWonBlock, TemplatePathMatchesRefPathForSameTxSet)
+{
+    Fixture f;
+    auto sh = make_small_header();
+    auto gentx = make_gentx();
+    auto gh = fixed_gentx_hash();
+    ::dgb::MerkleLink link;
+    std::vector<TxHashRefs> refs = { TxHashRefs(0, 1), TxHashRefs(1, 0) };
+
+    // Ref-walk path: resolve hashes -> assemble the other_txs the share refs to.
+    auto hashes = resolve_other_tx_hashes(f.won, refs, f.nth_parent(), f.new_tx());
+    auto template_txs = assemble_other_txs(hashes, f.known_fn());
+
+    auto ref_got = reconstruct_won_block(sh, link, gentx, gh, f.won, refs,
+                                         f.nth_parent(), f.new_tx(), f.known_fn());
+    auto tmpl_got = reconstruct_won_block_from_template(sh, link, gentx, gh,
+                                                        template_txs);
+
+    EXPECT_EQ(tmpl_got.bytes, ref_got.bytes);
+    EXPECT_EQ(tmpl_got.hex, ref_got.hex);
+
+    PackStream ps(tmpl_got.bytes);
+    BlockType blk;
+    ps >> blk;
+    ASSERT_EQ(blk.m_txs.size(), 3u);                       // gentx + 2 template txs
+    EXPECT_EQ(blk.m_txs[0].vin[0].prevout.index, 0xffffffffu);
+    EXPECT_EQ(blk.m_txs[1].vout[0].value, 11);             // template order preserved
+    EXPECT_EQ(blk.m_txs[2].vout[0].value, 22);
+}
+
+// --- Test 6: empty captured template => valid coinbase-only block -------------
+// Today's embedded path emits transactions[]==[]; reconstruct must yield a
+// valid gentx-only block (correct-and-empty), never throw / fail closed.
+TEST(DgbReconstructWonBlock, EmptyTemplateGentxOnly)
+{
+    auto sh = make_small_header();
+    auto gentx = make_gentx();
+    auto gh = fixed_gentx_hash();
+    ::dgb::MerkleLink link;
+    std::vector<MutableTransaction> template_txs;  // captured template was empty
+
+    auto got = reconstruct_won_block_from_template(sh, link, gentx, gh, template_txs);
+
+    PackStream ps(got.bytes);
+    BlockType blk;
+    ps >> blk;
+    ASSERT_EQ(blk.m_txs.size(), 1u);
+    EXPECT_EQ(blk.m_txs[0].vin[0].prevout.index, 0xffffffffu);
+    EXPECT_EQ(blk.m_merkle_root, gh);  // empty link => root == gentx_hash
+    auto sp = std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(got.bytes.data()), got.bytes.size());
+    EXPECT_EQ(got.hex, HexStr(sp));
 }
 
 } // namespace
