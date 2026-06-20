@@ -568,6 +568,9 @@ static NMCChainParams params_chain_id_1()
 {
     NMCChainParams p = NMCChainParams::mainnet();
     p.aux_chain_id = 1;
+    // mainnet() now PINS auxpow_activation_height=19200; these fixtures exercise
+    // the unpinned refuse-to-judge gate, so force the sentinel back explicitly.
+    p.auxpow_activation_height = -1;
     return p;
 }
 
@@ -641,22 +644,23 @@ TEST(NmcP1dGate, MissingAuxBitsKeepsProofIncompleteAndRejected)
 // P1e: activation-height admission gate KATs (NmcP1eActivationGate).
 // Exercise HeaderChain::check_activation_gate() - the height-derived MM
 // activation gate, factored like the P1d proof gate so it is testable without
-// the deferred storage path. The production activation height stays the -1
-// sentinel; these fixtures pin a TEST-only height (19200, the historically
-// cited NMC mainnet value) purely to drive the gate - no consensus promotion.
+// the deferred storage path. The production height is now PINNED (mainnet=19200
+// via the factory, against namecoin-core chainparams.cpp); these P1e fixtures
+// still inject a height explicitly to drive every gate branch in isolation.
+// See NmcPFActivationPin for the production-factory pin assertions.
 // ---------------------------------------------------------------------------
 static NMCChainParams params_activation(int32_t act_height)
 {
     NMCChainParams p = NMCChainParams::mainnet();
     p.aux_chain_id = 1;
-    p.auxpow_activation_height = act_height;   // TEST-only pin; production stays -1
+    p.auxpow_activation_height = act_height;   // TEST-only override of the pinned production height
     return p;
 }
 
 TEST(NmcP1eActivationGate, UnpinnedActivationRefusesToJudge)
 {
-    // mainnet() leaves auxpow_activation_height at -1: the gate must refuse
-    // rather than guess, regardless of whether the header carries an AuxPow.
+    // params_chain_id_1() forces auxpow_activation_height to -1 (unpinned): the
+    // gate must refuse rather than guess, regardless of AuxPow presence.
     HeaderChain chain_(params_chain_id_1());
     EXPECT_EQ(chain_.check_activation_gate(50000, /*has_auxpow=*/true),
               HeaderChain::AdmitResult::REJECT_UNPINNED);
@@ -696,6 +700,34 @@ TEST(NmcP1eActivationGate, ActivationBoundaryIsInclusive)
               HeaderChain::AdmitResult::ADMIT);
     EXPECT_EQ(chain_.check_activation_gate(19200, /*has_auxpow=*/false),
               HeaderChain::AdmitResult::REJECT_MISSING_AUXPOW);
+}
+
+// ---------------------------------------------------------------------------
+// PF-conformance: production auxpow_activation_height pin (NmcPFActivationPin).
+// Unlike the P1e gate KATs above (which inject a TEST-only height), these
+// exercise the values baked into the mainnet()/testnet() factories, pinned
+// against namecoin-core src/kernel/chainparams.cpp consensus.nAuxpowStartHeight:
+// mainnet=19200 (CMainParams), testnet=0 (CTestNetParams, MM active from
+// genesis). A regression here means the production pin drifted from source.
+// ---------------------------------------------------------------------------
+TEST(NmcPFActivationPin, MainnetActivatesAt19200)
+{
+    NMCChainParams p = NMCChainParams::mainnet();
+    EXPECT_EQ(p.auxpow_activation_height, 19200);
+    EXPECT_EQ(p.aux_chain_id, 1);               // nAuxpowChainId = 0x0001
+    EXPECT_FALSE(p.is_auxpow_active(19199));     // one below activation: inactive
+    EXPECT_TRUE(p.is_auxpow_active(19200));      // boundary inclusive: active
+    EXPECT_TRUE(p.is_auxpow_active(250000));     // well past activation: active
+}
+
+TEST(NmcPFActivationPin, TestnetActivatesFromGenesis)
+{
+    NMCChainParams p = NMCChainParams::testnet();
+    EXPECT_EQ(p.auxpow_activation_height, 0);
+    // nAuxpowStartHeight=0 / fStrictChainId=false: AuxPoW is active from genesis
+    // on Namecoin testnet, so height 0 must already report active.
+    EXPECT_TRUE(p.is_auxpow_active(0));
+    EXPECT_TRUE(p.is_auxpow_active(1));
 }
 
 
