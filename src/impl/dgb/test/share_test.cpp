@@ -11,6 +11,9 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <array>
+
 #include <impl/dgb/config_pool.hpp>
 #include <impl/dgb/config_coin.hpp>
 #include <impl/dgb/share.hpp>
@@ -77,6 +80,36 @@ TEST(DGB_share_test, OracleDonationScript)
 
     EXPECT_EQ(dgb::PoolConfig::get_donation_script(35).size(), 67u);  // v35 P2PK
     EXPECT_EQ(dgb::PoolConfig::get_donation_script(36).size(), 23u);  // v36 combined P2SH
+}
+
+// v36 combined-donation P2SH — FULL 23-byte pin (bucket-2 standardization).
+// OracleDonationScript above pins only the SIZE of the v36 path; a drift in the
+// 20-byte hash160 would slip past it. This locks the exact bytes get_donation_
+// script(36) emits: OP_HASH160 PUSH20 <hash160> OP_EQUAL, where the hash160 is
+// the canonical FLAG6 unified cross-coin v36 donation (1-of-2 forrestv+c2pool
+// dev key). 3-bucket rule: the v36 donation target is BUCKET 2 (v36-native
+// shared structure), so this hash is byte-identical across ALL v36 coins — the
+// same 8c627262… as src/impl/ltc/config_pool.hpp COMBINED_DONATION_SCRIPT.
+// Guards against a coin-local fork of the donation target during the transition.
+TEST(DGB_share_test, V36CombinedDonationScriptBytes)
+{
+    // hash160 of the FLAG6 1-of-2 P2MS redeem script (forrestv + c2pool dev).
+    static constexpr std::array<uint8_t, 23> kExpected = {
+        0xa9, 0x14,                                       // OP_HASH160 PUSH20
+        0x8c, 0x62, 0x72, 0x62, 0x1d, 0x89, 0xe8, 0xfa,
+        0x52, 0x6d, 0xd8, 0x6a, 0xcf, 0xf6, 0x0c, 0x71,
+        0x36, 0xbe, 0x8e, 0x85,
+        0x87                                              // OP_EQUAL
+    };
+
+    const auto got = dgb::PoolConfig::get_donation_script(36);
+    ASSERT_EQ(got.size(), kExpected.size());
+    for (size_t i = 0; i < kExpected.size(); ++i)
+        EXPECT_EQ(got[i], kExpected[i]) << "donation byte " << i << " drifted";
+
+    // The raw constant the switch returns must match too (no copy divergence).
+    EXPECT_TRUE(std::equal(kExpected.begin(), kExpected.end(),
+                           dgb::PoolConfig::COMBINED_DONATION_SCRIPT.begin()));
 }
 
 // Address byte versions (D… P2PKH / S… P2SH) — DigiByte mainnet.
