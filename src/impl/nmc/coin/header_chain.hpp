@@ -530,8 +530,11 @@ struct NMCChainParams {
     // auxpow_activation_height: the height at/after which a Namecoin block MAY
     //   (and on mainnet, MUST) carry an AuxPow. Historically cited as 19200 on
     //   Namecoin mainnet — but this is left UNBAKED on purpose; -1 = unpinned.
-    int32_t auxpow_activation_height{-1};   // TO-CONFIRM: mainnet ~19200 (unpinned sentinel)
-    int32_t testnet_auxpow_activation_height{-1}; // TO-CONFIRM: testnet analog (unpinned sentinel)
+    // PINNED per-network in mainnet()/testnet() factories below against
+    // namecoin-core src/kernel/chainparams.cpp (consensus.nAuxpowStartHeight):
+    // mainnet=19200, testnet=0, regtest/signet=0. Default -1 = unpinned so a
+    // hand-built Params never claims merge-mining is active off a placeholder.
+    int32_t auxpow_activation_height{-1};   // -1 = unpinned default; pinned per-net in factory
     // aux_chain_id: the chain id this NMC instance claims in the parent's
     //   merged-mining tree. -1 = unpinned sentinel.
     int32_t aux_chain_id{static_cast<int32_t>(NMC_AUXPOW_CHAIN_ID)};                // Namecoin nAuxpowChainId = 0x0001 (both nets); see chainparams.cpp
@@ -567,7 +570,10 @@ struct NMCChainParams {
         // network constant, distinct from the genesis hash which stays
         // TO-CONFIRM pending a mainnet namecoind.)
         p.p2p_magic = {{ 0xf9, 0xbe, 0xb4, 0xfe }};
-        // TO-CONFIRM: activation height + chain id stay unpinned (-1).
+        // PINNED: namecoin-core CMainParams consensus.nAuxpowStartHeight = 19200
+        // (src/kernel/chainparams.cpp). AuxPoW MAY appear at/after height 19200;
+        // chain_id stays 1 (field default, nAuxpowChainId = 0x0001).
+        p.auxpow_activation_height = 19200;
         return p;
     }
 
@@ -588,6 +594,10 @@ struct NMCChainParams {
         // pchMessageStart = { 0xfa, 0xbf, 0xb5, 0xfe } (testnet3 -- matches the
         // pinned testnet3 genesis time=1296688602 above; testnet4 differs).
         p.p2p_magic = {{ 0xfa, 0xbf, 0xb5, 0xfe }};
+        // PINNED: namecoin-core CTestNetParams consensus.nAuxpowStartHeight = 0
+        // (fStrictChainId=false). AuxPoW is active from genesis on testnet, so
+        // is_auxpow_active(0) must be true.
+        p.auxpow_activation_height = 0;
         return p;
     }
 
