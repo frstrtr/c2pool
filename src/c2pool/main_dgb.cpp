@@ -33,6 +33,7 @@
 #include <impl/dgb/coin/embedded_coin_node.hpp>
 #include <impl/dgb/coin/embedded_tx_select.hpp>   // make_mempool_tx_source (EmbeddedTxSource)
 #include <impl/dgb/coin/won_block_dispatch.hpp>
+#include <impl/dgb/coin/reconstruct_closure.hpp>   // #82 faithful make_reconstruct_closure (5 live tracker seams)
 #include <impl/dgb/coin/node_interface.hpp>
 #include <impl/dgb/coin/header_ingest.hpp>
 #include <impl/dgb/coin/mempool_ingest.hpp>
@@ -274,14 +275,101 @@ int run_node(const core::CoinParams& params, bool testnet,
     // supplied (stays null otherwise -> sink no-ops, RPC fallback still fires).
     std::unique_ptr<dgb::coin::p2p::NodeP2P<dgb::Config>> coin_p2p;
 
-    p2p_node.tracker().m_on_block_found = dgb::coin::make_on_block_found(
-        /*reconstruct=*/[](const uint256& share_hash)
-            -> std::optional<std::pair<std::vector<unsigned char>, std::string>> {
-            std::cout << "[DGB-POOL-BLOCK] won share " << share_hash.GetHex().substr(0, 16)
-                      << " — reconstruct deferred (embedded gentx/known-tx feed "
-                         "pending Phase B); not broadcast this build" << std::endl;
-            return std::nullopt;
+    // ── #82 faithful won-block reconstruct closure (5 live tracker seams) ──
+    //
+    // Replaces the interim `return nullopt` stub: make_reconstruct_closure
+    // (coin/reconstruct_closure.hpp, KAT'd) composes the share's gentx regen +
+    // skip-list ancestry walk + known-tx feed into a real p2pool Share.as_block()
+    // port, so a pool-won DGB block is actually reconstructed for both #82 arms.
+    //
+    // THREADING (integrator 2026-06-20, CORRECTED decision (a)): this closure is
+    // invoked from m_on_block_found, which fires on the COMPUTE thread while that
+    // thread ALREADY holds m_tracker_mutex EXCLUSIVELY (run_think node.cpp:1433
+    // unique_lock -> attempt_verify -> share_tracker.hpp:537). The five seams
+    // therefore read tracker chain + known-tx state DIRECTLY with NO further
+    // locking -- a shared_lock from the lock-owning thread on the non-recursive
+    // shared_mutex would self-deadlock. VERIFIED (commit msg) that none of the
+    // seam reads re-takes m_tracker_mutex: get_share + get_nth_parent_via_skip are
+    // ShareChain methods (hash-map / skip-list lookups), the tx-hash and
+    // known_txs() reads are plain member access -- m_tracker_mutex lives only in
+    // NodeImpl and no seam touches it.
+    auto reconstruct_closure = dgb::coin::make_reconstruct_closure(
+        // share_fields_fn: chain.get_share(h) -> {min_header, merkle_link, refs}.
+        // get_share throws std::out_of_range on a miss -> closure fails closed.
+        [&p2p_node](const uint256& h) -> dgb::coin::ShareReconstructFields {
+            dgb::coin::ShareReconstructFields f;
+            p2p_node.tracker().chain.get_share(h).invoke([&](auto* obj) {
+                f.small_header = obj->m_min_header;
+                f.merkle_link  = obj->m_merkle_link;
+                // m_tx_info (new_transaction_hashes + transaction_hash_refs) is
+                // on-wire ONLY for share version < 34 (Share=17 / NewShare=33 --
+                // the p2pool-dgb-scrypt oracle baseline). v34+ segwit/merged
+                // shares carry no tx refs in the DGB share format, so a won block
+                // of one of those types fails closed here (caught -> nullopt,
+                // never a malformed broadcast). The generic invoke must still
+                // COMPILE for every variant, hence the constexpr guard.
+                if constexpr (requires { obj->m_tx_info; })
+                    f.refs = obj->m_tx_info.m_transaction_hash_refs;
+                else
+                    throw std::runtime_error(
+                        "reconstruct: won share version lacks m_tx_info "
+                        "(v34+ carries no tx refs in DGB format) -- fail closed");
+            });
+            return f;
         },
+        // gentx_bytes_fn: regenerate the share's SSOT gentx and surface its
+        // non-witness bytes. v36_active=false per the documented binding
+        // (coin/reconstruct_closure.hpp).
+        [&p2p_node, &params](const uint256& h) -> std::vector<unsigned char> {
+            auto& tracker = p2p_node.tracker();
+            std::vector<unsigned char> bytes;
+            tracker.chain.get_share(h).invoke([&](auto* obj) {
+                dgb::coin::GentxCoinbase gc;
+                (void)dgb::generate_share_transaction(*obj, tracker, params,
+                                                      /*dump_diag=*/false,
+                                                      /*v36_active=*/false, &gc);
+                bytes = gc.bytes;
+            });
+            return bytes;
+        },
+        // nth_parent_fn: O(log n) skip-list ancestry walk.
+        [&p2p_node](const uint256& h, uint64_t n) -> uint256 {
+            return p2p_node.tracker().chain.get_nth_parent_via_skip(
+                h, static_cast<int32_t>(n));
+        },
+        // new_tx_hashes_fn: ref into the share's m_new_transaction_hashes, read
+        // under the held exclusive lock (compute thread).
+        [&p2p_node](const uint256& h) -> const std::vector<uint256>& {
+            const std::vector<uint256>* out = nullptr;
+            p2p_node.tracker().chain.get_share(h).invoke([&](auto* obj) {
+                // Same v<34 guard as share_fields_fn: only Share/NewShare carry
+                // m_tx_info; v34+ leaves out null -> fail closed below.
+                if constexpr (requires { obj->m_tx_info; })
+                    out = &obj->m_tx_info.m_new_transaction_hashes;
+            });
+            if (!out) throw std::out_of_range(
+                "new_tx_hashes: share missing or version lacks m_tx_info");
+            return *out;
+        },
+        // known_txs_fn: live known-tx pool (node.hpp known_txs(), non-locking)
+        // bridged coin::Transaction -> coin::MutableTransaction. Cached in a
+        // per-closure map so the returned pointer stays stable across the
+        // multiple lookups one reconstruct performs (won blocks are rare). A
+        // missing known-tx returns nullptr -> reconstruct throws -> fail closed.
+        [&p2p_node, cache = std::make_shared<
+                std::map<uint256, dgb::coin::MutableTransaction>>()]
+        (const uint256& h) -> const dgb::coin::MutableTransaction* {
+            auto cit = cache->find(h);
+            if (cit != cache->end()) return &cit->second;
+            const auto& known = p2p_node.known_txs();
+            auto kit = known.find(h);
+            if (kit == known.end()) return nullptr;
+            auto ins = cache->emplace(h, dgb::coin::MutableTransaction(kit->second));
+            return &ins.first->second;
+        });
+
+    p2p_node.tracker().m_on_block_found = dgb::coin::make_on_block_found(
+        /*reconstruct=*/std::move(reconstruct_closure),
         /*p2p_relay=*/[&ioc, &coin_p2p](const std::vector<unsigned char>& block_bytes) {
             // #82 PRIMARY arm: relay the won block over the embedded coin-daemon
             // P2P producer. The sink fires from the compute thread, so post the

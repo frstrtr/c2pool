@@ -225,6 +225,24 @@ public:
     /// or startup code (before compute thread exists).
     /// IO-thread code MUST use read_tracker() instead.
     ShareTracker& tracker() { return m_tracker; }
+
+    /// #82 won-block CONSUME seam: a NON-LOCKING const-ref view of the live
+    /// known-tx pool the faithful reconstruct closure (coin/reconstruct_closure
+    /// .hpp) reads to resolve a won share's other_txs.
+    ///
+    /// LOCKING (integrator 2026-06-20, CORRECTED decision (a)): m_on_block_found
+    /// fires on the COMPUTE thread -- run_think (node.cpp:1433 takes
+    /// unique_lock(m_tracker_mutex), EXCLUSIVE) -> think -> attempt_verify ->
+    /// ShareTracker (share_tracker.hpp:537). That thread ALREADY holds
+    /// m_tracker_mutex exclusively, so a shared_lock from the SAME thread on this
+    /// non-recursive std::shared_mutex is UB/self-deadlock. The reconstruct path
+    /// therefore must NOT re-lock: it reads chain + known-tx state directly under
+    /// the exclusive lock the compute thread already owns. This accessor takes NO
+    /// lock and is ONLY safe from the compute thread (the won-block callback) or
+    /// single-threaded startup -- never from an IO thread without the lock held.
+    /// (Supersedes the by-value snapshot_known_txs() whose blocking shared_lock
+    /// would have self-deadlocked on this exact path.)
+    const std::map<uint256, coin::Transaction>& known_txs() const { return m_known_txs; }
     const core::CoinParams& coin_params() const { return m_coin_params; }
 
     /// RAII guard for IO-thread tracker reads.
