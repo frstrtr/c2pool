@@ -56,6 +56,7 @@
 #include "reconstruct_won_block.hpp"   // reconstruct_won_block, ReconstructedWonBlock, SmallBlockHeaderType, MutableTransaction
 #include "gentx_unpack.hpp"            // unpack_gentx_coinbase, UnpackedGentx
 #include "won_block_dispatch.hpp"      // WonBlockReconstructor
+#include "won_share_inputs.hpp"        // WonShareInputs, won_share_inputs (#279)
 
 namespace dgb
 {
@@ -115,6 +116,82 @@ make_reconstruct_closure(
             // block. The RPC submitblock fallback still attempts independently.
             std::cout << "[DGB-POOL-BLOCK] won share " << share_hash.GetHex().substr(0, 16)
                       << " -- reconstruct FAILED CLOSED (" << e.what()
+                      << "); NOT broadcast on P2P arm (RPC fallback still attempts)"
+                      << std::endl;
+            return std::nullopt;
+        }
+    };
+}
+
+
+// ---------------------------------------------------------------------------
+// make_reconstruct_closure_from_template -- the version-AGNOSTIC #82 closure,
+// and the one the run-loop should install. reconstruct_won_block_from_template
+// (reconstruct_won_block.hpp) is the CORRECT won-block tx source per the
+// work.py @42ccca53 audit: the broadcast block's non-coinbase set is the GBT
+// TEMPLATE the miner was handed at job hand-out (current_work transactions[]),
+// NOT the share's transaction_hash_refs. That dissolves the "v34+ carries no
+// m_tx_info -> reconstruct fails" concern entirely -- the share never carried
+// the block tx set for ANY version. This builder composes the three version-
+// agnostic inputs into the run-loop WonBlockReconstructor:
+//   won_share_fields_fn   = won_share_inputs(chain.get_share(h)) (#279) ->
+//                           { small_header = share.m_min_header,
+//                             merkle_link  = share.m_merkle_link }
+//   gentx_bytes_fn        = generate_share_transaction(share,...).bytes (#173)
+//                           -> unpack_gentx_coinbase -> { tx, txid }
+//   template_other_txs_fn = the captured-GBT template's non-coinbase txs in
+//                           template order (#271). Empty today (mempool tx-
+//                           selection pending) => a valid coinbase-only block,
+//                           correct-and-empty, NOT fail-closed. It fills with
+//                           NO change to this seam as tx-selection lands.
+//
+// Same FAIL-CLOSED posture as make_reconstruct_closure: fires on the compute
+// thread for a won share, NEVER throws and NEVER emits a partial/wrong block --
+// any error is caught, logged LOUDLY, and yields std::nullopt (announce +
+// audit; the RPC submitblock fallback still attempts independently).
+//
+// Prefer THIS over make_reconstruct_closure for the run-loop install: the
+// ref-walk variant is a share-CHAIN peer-propagation mechanism, never the
+// block-broadcast source. Per-coin isolation: src/impl/dgb/ only.
+// p2pool-merged-v36 surface: NONE.
+// ---------------------------------------------------------------------------
+inline WonBlockReconstructor
+make_reconstruct_closure_from_template(
+    std::function<WonShareInputs(const uint256&)> won_share_fields_fn,
+    std::function<std::vector<unsigned char>(const uint256&)> gentx_bytes_fn,
+    std::function<std::vector<MutableTransaction>(const uint256&)> template_other_txs_fn)
+{
+    return [won_share_fields_fn = std::move(won_share_fields_fn),
+            gentx_bytes_fn = std::move(gentx_bytes_fn),
+            template_other_txs_fn = std::move(template_other_txs_fn)](
+               const uint256& share_hash)
+        -> std::optional<std::pair<std::vector<unsigned char>, std::string>>
+    {
+        try
+        {
+            // 1. share-side inputs the won share carries verbatim (#279).
+            const WonShareInputs si = won_share_fields_fn(share_hash);
+
+            // 2. regenerate + unpack the share's SSOT gentx (block tx index 0).
+            const UnpackedGentx ug = unpack_gentx_coinbase(gentx_bytes_fn(share_hash));
+
+            // 3. the captured-GBT template's non-coinbase set (template order).
+            const std::vector<MutableTransaction> other_txs =
+                template_other_txs_fn(share_hash);
+
+            // 4. frame [gentx] ++ template_other_txs via the assemble_won_block
+            //    SSOT (version-agnostic; empty other_txs => coinbase-only).
+            ReconstructedWonBlock r = reconstruct_won_block_from_template(
+                si.small_header, si.merkle_link, ug.tx, ug.txid, other_txs);
+
+            return std::make_pair(std::move(r.bytes), std::move(r.hex));
+        }
+        catch (const std::exception& e)
+        {
+            // Fail closed: announce + audit, never broadcast a partial/wrong
+            // block. The RPC submitblock fallback still attempts independently.
+            std::cout << "[DGB-POOL-BLOCK] won share " << share_hash.GetHex().substr(0, 16)
+                      << " -- reconstruct (from-template) FAILED CLOSED (" << e.what()
                       << "); NOT broadcast on P2P arm (RPC fallback still attempts)"
                       << std::endl;
             return std::nullopt;
