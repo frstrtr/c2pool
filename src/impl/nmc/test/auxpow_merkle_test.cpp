@@ -1522,4 +1522,51 @@ TEST(NmcPFConsensusParams, TestnetRetargetAndMagicPinned)
     EXPECT_EQ(p.p2p_magic, kMagic);                 // CTestNetParams pchMessageStart
 }
 
+// ── AuxPoW chain-id SSOT conformance (PF) ───────────────────────────────────
+//
+// Locks the merge-mining chain id against namecoin-core nAuxpowChainId.
+// chain_id is a BUCKET-1 ISOLATION PRIMITIVE (per-coin namespacing of the
+// parent merged-mining slot): pinned per coin, NEVER standardized away. The
+// verify side (HeaderChain::verify_auxpow_header -> AuxPow::check_proof) reads
+// m_params.aux_chain_id, and the embedded build side (AuxChainEmbedded) casts
+// the SAME field into AuxWork.chain_id. A single drift in the factory default
+// silently breaks the build<->verify slot binding on BOTH sides, while the
+// hand-set fixtures above (which force aux_chain_id = 1) keep passing. These
+// KATs pin the FACTORY OUTPUT, not a hand-set fixture, so factory drift reds.
+//
+// Source: Namecoin Core src/kernel/chainparams.cpp -- nAuxpowChainId = 0x0001
+// on BOTH mainnet and testnet (NOT Dogecoin 0x0062).
+
+TEST(NmcAuxChainIdConformance, SSOTConstantMatchesNamecoinCore)
+{
+    EXPECT_EQ(nmc::coin::NMC_AUXPOW_CHAIN_ID, 0x0001u);
+    EXPECT_NE(nmc::coin::NMC_AUXPOW_CHAIN_ID, 0x0062u);   // != DOGE chain id
+}
+
+TEST(NmcAuxChainIdConformance, MainnetFactoryEmitsSSOT)
+{
+    NMCChainParams p = NMCChainParams::mainnet();
+    EXPECT_EQ(p.aux_chain_id, static_cast<int32_t>(nmc::coin::NMC_AUXPOW_CHAIN_ID));
+    EXPECT_EQ(p.aux_chain_id, 1);
+}
+
+TEST(NmcAuxChainIdConformance, TestnetFactoryEmitsSSOT)
+{
+    // Namecoin uses the SAME aux chain id (0x0001) on testnet as mainnet.
+    NMCChainParams p = NMCChainParams::testnet();
+    EXPECT_EQ(p.aux_chain_id, static_cast<int32_t>(nmc::coin::NMC_AUXPOW_CHAIN_ID));
+    EXPECT_EQ(p.aux_chain_id, 1);
+}
+
+TEST(NmcAuxChainIdConformance, BuildVerifySymmetryOnFactoryDefault)
+{
+    // Build side casts m_params.aux_chain_id -> uint32_t AuxWork.chain_id;
+    // verify side passes m_params.aux_chain_id as expected_chain_id into
+    // check_proof. Pin that the factory default is no -1 sentinel and survives
+    // the uint32_t cast the build path performs -- both sides agree on 1u.
+    NMCChainParams p = NMCChainParams::mainnet();
+    EXPECT_GE(p.aux_chain_id, 0);                          // not the -1 unpinned sentinel
+    EXPECT_EQ(static_cast<uint32_t>(p.aux_chain_id), 1u);  // build-side AuxWork.chain_id
+}
+
 } // namespace
