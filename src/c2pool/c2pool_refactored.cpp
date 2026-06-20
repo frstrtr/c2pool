@@ -260,6 +260,8 @@ static void segfault_handler(int sig) {
 #include <impl/doge/coin/template_builder.hpp>
 #include <impl/doge/coin/aux_chain_embedded.hpp>
 #include <impl/doge/coin/auxpow_header.hpp>
+// 2b-ii: embedded NMC merged-mining backend (host activation)
+#include <impl/nmc/coin/aux_chain_embedded.hpp>
 
 // V36-compatible operational features
 #include <impl/ltc/pool_monitor.hpp>
@@ -4933,6 +4935,10 @@ int main(int argc, char* argv[]) {
             std::unique_ptr<doge::coin::HeaderChain>  doge_chain;
             std::unique_ptr<ltc::coin::Mempool>       doge_pool;
             std::unique_ptr<doge::coin::DOGEChainParams> doge_params_ptr;
+            // 2b-ii: Embedded NMC chain objects (mirror DOGE; created before mm_manager)
+            std::unique_ptr<nmc::coin::HeaderChain>     nmc_chain;
+            std::unique_ptr<nmc::coin::Mempool>         nmc_pool;
+            std::unique_ptr<nmc::coin::NMCChainParams>  nmc_params_ptr;
             // DOGE UTXO set for fee computation (no segwit/MWEB — simplified)
             std::unique_ptr<core::coin::UTXOViewDB>    doge_utxo_db;
             std::unique_ptr<core::coin::UTXOViewCache> doge_utxo_cache;
@@ -5147,6 +5153,59 @@ int main(int argc, char* argv[]) {
                                 auto rpc_fallback = std::make_unique<c2pool::merged::AuxChainRPC>(ioc, cfg);
                                 mm_manager->set_fallback_backend(cfg.chain_id, std::move(rpc_fallback));
                                 LOG_INFO << "Merged mining: DOGE RPC fallback at "
+                                         << cfg.rpc_host << ":" << cfg.rpc_port;
+                            }
+                        }
+                    } else if (cfg.symbol == "NMC") {
+                        // 2b-ii: Embedded NMC merged-mining host activation
+                        // (mirror DOGE @ same loop). NMC is aux-only: no UTXO
+                        // maturity gate; embedded HeaderChain + Mempool + P2P
+                        // relay is the authoritative route (never-silent-drop #162).
+                        if (!nmc_chain) {
+                            auto np = settings->m_testnet
+                                ? nmc::coin::NMCChainParams::testnet()
+                                : nmc::coin::NMCChainParams::mainnet();
+                            nmc_params_ptr = std::make_unique<nmc::coin::NMCChainParams>(np);
+                            std::string nmc_net_dir = settings->m_testnet ? "namecoin_testnet" : "namecoin";
+                            std::string nmc_db = (core::filesystem::config_path()
+                                / nmc_net_dir / "embedded_headers").string();
+                            nmc_chain = std::make_unique<nmc::coin::HeaderChain>(*nmc_params_ptr, nmc_db);
+                            if (!nmc_chain->init())
+                                LOG_WARNING << "[EMB-NMC] HeaderChain init failed - P2P sync will rebuild";
+                            if (!settings->m_testnet && nmc_chain->size() == 0) {
+                                auto g = nmc::coin::NMCChainParams::mainnet_genesis_header();
+                                if (nmc_chain->add_header(g))
+                                    LOG_INFO << "[EMB-NMC] seeded mainnet genesis header";
+                            }
+                        }
+                        if (!nmc_pool) nmc_pool = std::make_unique<nmc::coin::Mempool>();
+                        {
+                            auto backend = std::make_unique<nmc::coin::AuxChainEmbedded>(
+                                *nmc_chain, *nmc_pool, *nmc_params_ptr, cfg, settings->m_testnet);
+                            // Wire the embedded P2P relay sink - the host call-site
+                            // that was previously zero. Looked up lazily in
+                            // merged_broadcasters (registered later in this loop),
+                            // mirroring the manager-level set_block_relay_fn below.
+                            // submit_block_raw returns the relayed peer count.
+                            uint32_t nmc_chain_id = cfg.chain_id;
+                            auto* mbs = &merged_broadcasters;
+                            backend->set_block_relay(
+                                [mbs, nmc_chain_id](const std::string& block_hex) -> size_t {
+                                    auto it = mbs->find(nmc_chain_id);
+                                    if (it == mbs->end()) return 0;
+                                    try {
+                                        return it->second->submit_block_raw(ParseHex(block_hex));
+                                    } catch (const std::exception& e) {
+                                        LOG_WARNING << "[MM:NMC] embedded P2P relay failed: " << e.what();
+                                        return 0;
+                                    }
+                                });
+                            mm_manager->add_chain(cfg, std::move(backend));
+                            LOG_INFO << "Merged mining: NMC embedded (primary) chain_id=" << cfg.chain_id;
+                            if (cfg.rpc_port > 0 && !cfg.rpc_userpass.empty()) {
+                                auto rpc_fallback = std::make_unique<c2pool::merged::AuxChainRPC>(ioc, cfg);
+                                mm_manager->set_fallback_backend(cfg.chain_id, std::move(rpc_fallback));
+                                LOG_INFO << "Merged mining: NMC RPC fallback at "
                                          << cfg.rpc_host << ":" << cfg.rpc_port;
                             }
                         }
