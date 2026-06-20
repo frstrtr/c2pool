@@ -11,6 +11,9 @@
 #include <fstream>
 #include <iomanip>
 #include <random>
+#ifndef _WIN32
+#include <execinfo.h>  // backtrace() for think() watchdog stack dump (glibc-only)
+#endif
 
 // Static members for DensePPLNSWindow precomputed decay table
 std::vector<uint64_t> ltc::DensePPLNSWindow::s_decay_table;
@@ -1388,6 +1391,78 @@ void NodeImpl::prune_shares(const uint256& /*best_share*/)
 
 // (old phases 5-7 removed — replaced by p2pool-style pruning above)
 
+// ── think() watchdog (IO-thread timer; never touches m_tracker_mutex) ────
+// Atomic deadline + generation counter so a late fire cannot act on a newer
+// cycle. Mirrors btc/node.cpp. Armed on dispatch (run_think / clean_tracker),
+// disarmed in the corresponding IO-phase on normal completion.
+void NodeImpl::arm_think_watchdog()
+{
+    if (!m_context)
+        return;
+    auto deadline = std::chrono::steady_clock::now()
+                  + std::chrono::seconds(THINK_WATCHDOG_SECONDS);
+    m_think_deadline_ns.store(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            deadline.time_since_epoch()).count(),
+        std::memory_order_relaxed);
+    uint64_t gen = m_think_generation.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    if (!m_watchdog_timer)
+        m_watchdog_timer = std::make_unique<boost::asio::steady_timer>(*m_context);
+    m_watchdog_timer->expires_after(std::chrono::seconds(THINK_WATCHDOG_SECONDS));
+    m_watchdog_timer->async_wait([this, gen](const boost::system::error_code& ec) {
+        if (ec) return;  // cancelled by disarm (normal completion)
+        if (m_think_generation.load(std::memory_order_relaxed) != gen)
+            return;  // a newer cycle armed since — not ours
+        int64_t dl = m_think_deadline_ns.load(std::memory_order_relaxed);
+        if (dl == 0)
+            return;  // cycle completed in the gap before this fire
+        auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (now_ns < dl)
+            return;  // not actually overdue (spurious) — let next arm handle it
+
+        LOG_ERROR << "[THINK-WATCHDOG] think()/clean cycle exceeded "
+                  << THINK_WATCHDOG_SECONDS << "s (gen=" << gen
+                  << ", pending_adds=" << m_pending_adds.size()
+                  << ") — compute thread appears wedged under the tracker lock;"
+                  << " recovering pipeline";
+#ifndef _WIN32
+        {
+            void* frames[64];
+            int n = ::backtrace(frames, 64);
+            char** syms = ::backtrace_symbols(frames, n);
+            if (syms) {
+                for (int i = 0; i < n; ++i)
+                    LOG_ERROR << "[THINK-WATCHDOG] bt[" << i << "] " << syms[i];
+                ::free(syms);
+            }
+        }
+#else
+        // Native backtrace is glibc-only (execinfo.h); on MSVC the timeout log
+        // above plus pending_adds is the diagnostic. Recovery below is identical.
+#endif
+
+        // Let a fresh cycle be scheduled. Does NOT unwind the stuck compute
+        // thread; the m_think_pool has a single thread, so a re-dispatched
+        // think() simply queues behind the wedged one (no concurrency), and the
+        // stuck cycle's IO-phase is idempotent if it ever returns.
+        m_think_deadline_ns.store(0, std::memory_order_relaxed);
+        m_think_running.store(false, std::memory_order_relaxed);
+        LOG_WARNING << "[THINK-WATCHDOG] m_think_running reset to false; "
+                       "a new think() cycle may now be scheduled";
+    });
+}
+
+void NodeImpl::disarm_think_watchdog()
+{
+    // Mark cycle complete: clears the deadline so a racing watchdog fire is a
+    // no-op, and cancels the pending timer.
+    m_think_deadline_ns.store(0, std::memory_order_relaxed);
+    if (m_watchdog_timer)
+        m_watchdog_timer->cancel();
+}
+
 void NodeImpl::run_think()
 {
     // Skip if a think() is already running on the compute thread.
@@ -1398,6 +1473,10 @@ void NodeImpl::run_think()
             LOG_INFO << "[ASYNC-THINK] skipped — compute thread busy (skip_count=" << skip_log << ")";
         return;
     }
+
+    // Arm the compute-thread watchdog for this think() cycle (disarmed in the
+    // IO-phase on normal completion).
+    arm_think_watchdog();
     LOG_INFO << "[ASYNC-THINK] dispatching to compute thread"
              << " pending_adds=" << m_pending_adds.size()
              << " peers=" << m_peers.size();
@@ -1498,6 +1577,9 @@ void NodeImpl::run_think()
       boost::asio::post(*m_context, [this, result = std::move(result),
                                       best_changed, needs_continue]() {
         try {
+            // think() returned normally — disarm the watchdog for this cycle.
+            disarm_think_watchdog();
+
             // Ban peers that provided invalid/unverifiable shares
             auto now = std::chrono::steady_clock::now();
             for (const auto& bad_addr : result.bad_peer_addresses) {
@@ -1795,6 +1877,10 @@ void NodeImpl::clean_tracker()
     // never concurrent with think() or IO-thread reads.
     m_think_running.store(true);  // block think() re-entry during clean
 
+    // clean_tracker runs think()+the removal walk under the same exclusive
+    // lock — arm the watchdog here too (disarmed in this path's IO-phase).
+    arm_think_watchdog();
+
     boost::asio::post(m_think_pool, [this]() {
       m_compute_thread_id.store(std::this_thread::get_id(), std::memory_order_relaxed);
 
@@ -2063,6 +2149,7 @@ void NodeImpl::clean_tracker()
       // Work refresh (1-5s) runs WITHOUT any lock so shared_lock readers
       // (handle_get_share, send_shares) are never blocked.
       boost::asio::post(*m_context, [this, clean_best_changed]() {
+        disarm_think_watchdog();
         if (clean_best_changed && m_on_best_share_changed) {
             LOG_INFO << "[CLEAN] IO-phase: work refresh (best changed)";
             m_on_best_share_changed();
