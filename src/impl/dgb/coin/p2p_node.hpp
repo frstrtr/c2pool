@@ -276,6 +276,25 @@ public:
         }
     }
 
+    // Broadcast an ALREADY-serialized won block to the connected coin daemon as
+    // a `block` P2P message. The #82 won-block dispatcher hands raw block bytes
+    // (the reconstructed blob), so unlike submit_block(BlockType&) this frames
+    // the pre-serialized payload directly — no decode/re-encode round trip. The
+    // embedded P2P-relay (PRIMARY) arm of the dual-path broadcaster binds this.
+    void submit_block_p2p_raw(const std::vector<unsigned char>& raw_block)
+    {
+        if (!m_peer)
+        {
+            LOG_ERROR << "[" << m_chain_label << "] No coin-daemon connection; "
+                         "cannot relay won block over embedded P2P";
+            return;
+        }
+        auto rmsg = std::make_unique<RawMessage>("block", PackStream(raw_block));
+        m_peer->write(rmsg);
+        LOG_INFO << "[" << m_chain_label << "] won-block relayed over embedded P2P ("
+                 << raw_block.size() << " bytes)";
+    }
+
     /// Set callback for received addr messages (peer discovery).
     void set_addr_callback(AddrCallback cb) { m_addr_callback = std::move(cb); }
     /// Set callback for peer's reported chain height (from version message).
