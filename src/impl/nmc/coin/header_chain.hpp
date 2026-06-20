@@ -606,6 +606,27 @@ struct NMCChainParams {
         g.m_nonce     = 384568319;
         return g;
     }
+
+    /// Namecoin MAINNET genesis header (the 80-byte parent the HeaderChain seeds
+    /// at height 0). Fields PINNED against a live SYNCED mainnet namecoind
+    /// (getblockhash 0 / getblockheader <hash> false, .140 PID 5860,
+    /// blocks=830010 IBD=false, 2026-06-20):
+    ///   version=1  time=1303000001  bits=0x1c007fff  nonce=0xa21ea192
+    ///   merkleroot=41c62dbd9068c89a449525e3cd5ac61b20ece28c3c38b3f35b2161f0e6d3cb0d
+    /// SHA256d(header) == 000000000062b72c..c770 == mainnet genesis_hash
+    /// (verified locally + by the MainnetHeaderRederivesPinnedHash KAT). This
+    /// retires the deferred mainnet_genesis_header() seed; the expected hash is
+    /// external daemon truth, not self-derived from the header fields.
+    static BlockHeaderType mainnet_genesis_header() {
+        BlockHeaderType g;
+        g.m_previous_block.SetNull();
+        g.m_version = 1;
+        g.m_merkle_root.SetHex("41c62dbd9068c89a449525e3cd5ac61b20ece28c3c38b3f35b2161f0e6d3cb0d");
+        g.m_timestamp = 1303000001;
+        g.m_bits      = 0x1c007fff;
+        g.m_nonce     = 0xa21ea192;  // 2719621522
+        return g;
+    }
 };
 
 // ─── Index Entry ─────────────────────────────────────────────────────────────
