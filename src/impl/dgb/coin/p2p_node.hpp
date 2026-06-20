@@ -3,11 +3,13 @@
 // DGB embedded P2P node. 1:1 mirror of src/impl/btc/coin/p2p_node.hpp (NON-MWEB).
 // Speaks the DigiByte Core wire protocol to the embedded daemon; Scrypt-only.
 //
-// TODO(M3 / [decision-needed]): two P2P-handshake constants are carried from BTC
-// and MUST be reconciled against DigiByte Core params before mainnet wiring:
-//   - protocol_version (70016 here) -> confirm DigiByte Core PROTOCOL_VERSION
-//   - advertised NetService port (8333 here) -> DGB mainnet default is 12024
-// Neither is consensus; both are P2P-layer and should ultimately come from config.
+// P2P-handshake constants RECONCILED against DigiByte Core source (../digibyte):
+//   - protocol_version = 70019  (src/version.h PROTOCOL_VERSION; NOT BTC 70016).
+//       WTXID_RELAY_VERSION = 70018 < 70019, so BIP 339 wtxidrelay still applies.
+//   - DGB mainnet P2P default port = 12024 (kernel/chainparams.cpp:178; testnet
+//       12026, regtest 18444). The connect target is supplied by run_node via
+//       NetService; the advertised addr_from port is set to 12024 to match.
+// Neither is consensus; both are P2P-layer. run_node passes the real target.
 
 #include "p2p_messages.hpp"
 #include "p2p_connection.hpp"
@@ -150,19 +152,19 @@ public:
 
         // BTC service flags + protocol version:
         // BTC: NODE_NETWORK | NODE_WITNESS (no MWEB; LTC-only).
-        // Protocol 70016 = BIP 339 wtxidrelay activation point (Bitcoin Core 0.21+).
+        // DGB Core PROTOCOL_VERSION 70019 (>= WTXID_RELAY_VERSION 70018 => BIP 339 active).
         // (LTC-DOGE conditional removed; this is the BTC-specific module.)
         static constexpr uint64_t NODE_NETWORK = 1;
         static constexpr uint64_t NODE_WITNESS = (1 << 3);
         uint64_t our_services = NODE_NETWORK | NODE_WITNESS;
-        uint32_t protocol_version = 70016;
+        uint32_t protocol_version = 70019;  // DigiByte Core PROTOCOL_VERSION (src/version.h)
 
         auto msg_version = message_version::make_raw(
             protocol_version,
             our_services,
             core::timestamp(),
             addr_t{our_services, m_peer->get_addr()},
-            addr_t{our_services, NetService{"192.168.0.1", 8333}},
+            addr_t{our_services, NetService{"192.168.0.1", 12024}},
             core::random::random_nonce(),
             "c2pool-btc",
             0
