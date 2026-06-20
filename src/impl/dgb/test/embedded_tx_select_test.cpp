@@ -25,9 +25,12 @@
 #include <impl/dgb/coin/embedded_tx_select.hpp>
 #include <impl/dgb/coin/mempool.hpp>
 #include <impl/dgb/coin/transaction.hpp>
+#include <impl/dgb/coin/template_builder.hpp>
+#include <impl/dgb/coin/embedded_coinbase_value.hpp>
 
 #include <core/pack.hpp>
 #include <core/hash.hpp>
+#include <core/pow.hpp>
 #include <btclibs/util/strencodings.h>
 
 using dgb::coin::Mempool;
@@ -218,4 +221,71 @@ TEST(DgbEmbeddedTxSelect, WeightCapSkipsHeavyButPacksLighter)
     ASSERT_EQ(sel.transactions.size(), 1u);
     EXPECT_EQ(sel.transactions[0]["txid"], compute_txid(light).GetHex());
     EXPECT_EQ(sel.total_fees, 100u);
+}
+
+// ---------------------------------------------------------------------------
+// END-TO-END ASSEMBLY CONFORMANCE: the full embedded path the production
+// EmbeddedCoinNode wires -- Mempool -> make_mempool_tx_source() selection ->
+// WorkTemplateInputs.transactions + (subsidy + total_fees) coinbasevalue ->
+// build_work_template(). The isolated shaper tests above and the isolated
+// build_work_template pass-through test (dgb_template_builder_test) each pin
+// HALF; nothing pins that the two seams COMPOSE faithfully -- that the shaper's
+// fee-sorted entries survive into tmpl["transactions"] byte-for-byte and IN
+// ORDER, and that the SAME selection's total_fees folds into
+// tmpl["coinbasevalue"] through the #188/#207 embedded_coinbase_value SSOT.
+// This is the seam where a reorder/drop/double-count would silently desync the
+// embedded template from the frstrtr/p2pool-dgb-scrypt GBT consumer.
+// ---------------------------------------------------------------------------
+TEST(DgbEmbeddedTxSelect, EndToEndTemplateAssemblyConformance)
+{
+    Mempool pool;
+    MutableTransaction lo  = tagged_tx(11, 0);   // lowest feerate
+    MutableTransaction mid = tagged_tx(22, 1);
+    MutableTransaction hi  = tagged_tx(33, 2);   // highest feerate
+    ASSERT_TRUE(pool.add_tx(lo));
+    ASSERT_TRUE(pool.add_tx(mid));
+    ASSERT_TRUE(pool.add_tx(hi));
+    pool.set_tx_fee(compute_txid(lo),  250);
+    pool.set_tx_fee(compute_txid(mid), 500);
+    pool.set_tx_fee(compute_txid(hi),  900);
+
+    // 1) production shaper selects + shapes the fee-sorted transactions[].
+    auto source = make_mempool_tx_source(pool, /*max_weight=*/4'000'000);
+    const auto sel = source();
+    ASSERT_EQ(sel.transactions.size(), 3u);
+    EXPECT_EQ(sel.total_fees, 1650u);            // 250 + 500 + 900
+
+    // 2) coinbasevalue folds total_fees through the embedded SSOT (#188) -- the
+    //    SAME definition the external-daemon GBT path resolves against.
+    const uint32_t height  = 1'000'000;
+    const uint64_t subsidy = 64'200'000'000ull;  // fixed subsidy for the KAT
+    core::SubsidyFunc subsidy_func = [&](uint32_t) -> uint64_t { return subsidy; };
+    const uint64_t coinbasevalue =
+        dgb::coin::embedded_coinbase_value(subsidy_func, height, sel.total_fees);
+    EXPECT_EQ(coinbasevalue, subsidy + 1650ull);
+
+    // 3) assemble the work template from that one selection.
+    dgb::coin::WorkTemplateInputs in;
+    in.next_height   = height;
+    in.coinbasevalue = coinbasevalue;
+    in.curtime       = 1'700'000'000;
+    in.transactions  = sel.transactions;
+    const nlohmann::json tmpl = dgb::coin::build_work_template(in);
+
+    // transactions[] survive the seam byte-for-byte AND in feerate-desc order.
+    ASSERT_TRUE(tmpl["transactions"].is_array());
+    EXPECT_EQ(tmpl["transactions"], sel.transactions);
+    ASSERT_EQ(tmpl["transactions"].size(), 3u);
+    EXPECT_EQ(tmpl["transactions"][0]["txid"], compute_txid(hi).GetHex());
+    EXPECT_EQ(tmpl["transactions"][1]["txid"], compute_txid(mid).GetHex());
+    EXPECT_EQ(tmpl["transactions"][2]["txid"], compute_txid(lo).GetHex());
+    // every entry keeps the full p2pool GBT {data,txid,hash,fee} shape.
+    for (const auto& e : tmpl["transactions"]) {
+        EXPECT_TRUE(e.contains("data"));
+        EXPECT_TRUE(e.contains("txid"));
+        EXPECT_TRUE(e.contains("hash"));
+        EXPECT_TRUE(e.contains("fee"));
+    }
+    // coinbasevalue carries the folded fee total verbatim (no double count).
+    EXPECT_EQ(tmpl["coinbasevalue"].get<uint64_t>(), subsidy + 1650ull);
 }
