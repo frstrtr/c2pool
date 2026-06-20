@@ -285,6 +285,36 @@ TEST(NmcP1Genesis, TestnetHeaderRederivesPinnedHash)
 }
 
 // ---------------------------------------------------------------------------
+// MAINNET genesis pin KAT (P1 PF, retires the deferred mainnet seed).
+// NMCChainParams::mainnet_genesis_header() is the 80-byte parent the embedded
+// HeaderChain seeds at height 0. Its SHA256d MUST reproduce the Namecoin
+// mainnet genesis hash pinned against a live SYNCED mainnet namecoind
+// (getblockhash 0 / getblockheader <hash> false; .140 PID 5860, blocks=830010,
+// IBD=false; 2026-06-20). The expected hash is asserted as an external literal,
+// NOT params.genesis_hash, so the guard holds regardless of merge order with
+// the mainnet genesis_hash pin (#261). A wrong field (endianness, bits, nonce,
+// merkleroot) makes the re-derived hash diverge from daemon truth.
+// ---------------------------------------------------------------------------
+TEST(NmcP1Genesis, MainnetHeaderRederivesPinnedHash)
+{
+    const auto g = nmc::coin::NMCChainParams::mainnet_genesis_header();
+
+    EXPECT_TRUE(g.m_previous_block.IsNull());
+    EXPECT_EQ(g.m_version, 1);
+    EXPECT_EQ(g.m_timestamp, 1303000001u);
+    EXPECT_EQ(g.m_bits, 0x1c007fffu);
+    EXPECT_EQ(g.m_nonce, 0xa21ea192u);
+
+    uint256 expect;
+    expect.SetHex("000000000062b72c5e2ceb45fbc8587e807c155b0da735e6483dfba2f0a9c770");
+    EXPECT_EQ(nmc::coin::block_hash(g), expect);
+
+    // Mainnet and testnet genesis headers must NOT collide (network isolation).
+    EXPECT_NE(nmc::coin::block_hash(g),
+              nmc::coin::block_hash(nmc::coin::NMCChainParams::testnet_genesis_header()));
+}
+
+// ---------------------------------------------------------------------------
 // P2P network-magic pin KAT (P1 PE 2b-ii). NMCChainParams::p2p_magic is the
 // 4-byte frame prefix the embedded won-block broadcaster (PE) puts on every
 // parent-NMC P2P message. Pinned from namecoin-core src/kernel/chainparams.cpp
