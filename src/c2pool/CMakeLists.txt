@@ -115,6 +115,7 @@ target_link_libraries(c2pool
     # propagate their objects into the exe link; name them directly (#22/#39).
     c2pool_storage
     ltc_coin
+    nmc_coin   # NMC coin-layer: out-of-line Transaction/MutableTransaction ctors for embedded merged-mining (2b-ii)
     nlohmann_json::nlohmann_json
     ${Boost_LIBRARIES}
 )
@@ -130,6 +131,7 @@ target_link_libraries(c2pool_enhanced
     ltc
     c2pool_storage
     ltc_coin
+    nmc_coin   # NMC coin-layer: out-of-line Transaction/MutableTransaction ctors for embedded merged-mining (2b-ii)
     nlohmann_json::nlohmann_json
     ${Boost_LIBRARIES}
 )
