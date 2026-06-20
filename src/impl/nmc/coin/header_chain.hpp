@@ -547,20 +547,23 @@ struct NMCChainParams {
         return height >= auxpow_activation_height;
     }
 
-    /// NMC mainnet params skeleton.
-    /// TO-CONFIRM: pow_limit + genesis_hash below are placeholders copied from
-    /// the Bitcoin-family default; they MUST be replaced with Namecoin's actual
-    /// chainparams values before any validation use.
+    /// NMC mainnet params skeleton. pow_limit + genesis_hash PINNED from
+    /// namecoin-core src/kernel/chainparams.cpp (CMainParams). The 80-byte
+    /// mainnet_genesis_header() seed (SHA256d cross-check) stays deferred.
     static NMCChainParams mainnet() {
         NMCChainParams p;
         p.target_timespan = MAINNET_TARGET_TIMESPAN;
         p.target_spacing  = MAINNET_TARGET_SPACING;
         p.allow_min_difficulty = MAINNET_ALLOW_MIN_DIFF;
         p.no_retargeting = false;
-        // TO-CONFIRM: Namecoin mainnet powLimit (placeholder = BTC default).
-        p.pow_limit.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
-        // TO-CONFIRM: Namecoin mainnet genesis hash (placeholder = null).
-        p.genesis_hash.SetNull();
+        // Namecoin mainnet powLimit = 2^224-1, PINNED from namecoin-core
+        // src/kernel/chainparams.cpp:151 (CMainParams consensus.powLimit). Feeds
+        // the retarget clamp (apply_retarget below); a genuine consensus value,
+        // NOT the 0x1c007fff genesis-bits expansion the placeholder carried.
+        p.pow_limit.SetHex("00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        // Namecoin mainnet genesis hash PINNED from namecoin-core
+        // src/kernel/chainparams.cpp:202 (CMainParams hashGenesisBlock assert).
+        p.genesis_hash.SetHex("000000000062b72c5e2ceb45fbc8587e807c155b0da735e6483dfba2f0a9c770");
         // P2P magic PINNED: namecoin-core kernel/chainparams.cpp CMainParams
         // pchMessageStart = { 0xf9, 0xbe, 0xb4, 0xfe }. (Magic is a published
         // network constant, distinct from the genesis hash which stays
@@ -570,15 +573,19 @@ struct NMCChainParams {
         return p;
     }
 
-    /// NMC testnet params skeleton (same TO-CONFIRM caveats as mainnet()).
+    /// NMC testnet params skeleton. pow_limit PINNED (CTestNetParams); genesis
+    /// PINNED + KAT-cross-checked against testnet_genesis_header().
     static NMCChainParams testnet() {
         NMCChainParams p;
         p.target_timespan = TESTNET_TARGET_TIMESPAN;
         p.target_spacing  = TESTNET_TARGET_SPACING;
         p.allow_min_difficulty = TESTNET_ALLOW_MIN_DIFF;
         p.no_retargeting = false;
-        // Namecoin testnet powLimit = Bitcoin default (chainparams.cpp CTestNetParams).
-        p.pow_limit.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
+        // Namecoin testnet powLimit = 2^228-1, PINNED from namecoin-core
+        // src/kernel/chainparams.cpp:314 (CTestNetParams consensus.powLimit).
+        // Distinct from mainnet 2^224-1; consistent with the testnet3 genesis
+        // bits=0x1d07fff8 pinned below (genesis target < powLimit).
+        p.pow_limit.SetHex("0000000fffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
         // Genesis PINNED against a live namecoind on namecoin testnet
         // (getblockhash 0 / getblockheader, 2026-06-19). block_hash(genesis_header)
         // re-derives this value (nmc_auxpow_wire_test GenesisTestnet KAT).
