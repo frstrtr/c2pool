@@ -41,6 +41,9 @@ using dgb::coin::unpack_gentx_coinbase;
 using dgb::coin::SmallBlockHeaderType;
 using dgb::coin::MutableTransaction;
 using dgb::TxHashRefs;
+using dgb::coin::make_reconstruct_closure_from_template;
+using dgb::coin::reconstruct_won_block_from_template;
+using dgb::coin::WonShareInputs;
 
 namespace {
 
@@ -275,4 +278,121 @@ TEST(DgbReconstructClosure, MalformedGentxBytesFailsClosed)
         f.nth_parent(), f.new_tx(), f.known_fn());
 
     EXPECT_FALSE(closure(f.won).has_value());
+}
+
+
+// =============================================================================
+// from-template closure (#82 version-AGNOSTIC path, #271 source + #279 share
+// fields). This is the closure the run-loop installs: its non-coinbase tx set
+// is the captured GBT template, NOT the share's tx_hash_refs, so there is no
+// ancestry walk and no known-tx store -- only the two share-side fields, the
+// gentx, and the template's other txs.
+// =============================================================================
+
+// won_share_fields_fn knows ONLY the won share; throws for any other hash
+// (the run-loop's chain.get_share miss).
+static std::function<WonShareInputs(const uint256&)>
+won_fields(const uint256& won, SmallBlockHeaderType sh, ::dgb::MerkleLink link)
+{
+    return [won, sh, link](const uint256& h) -> WonShareInputs {
+        if (h != won) throw std::out_of_range("won_share_fields: unknown share");
+        return WonShareInputs{sh, link};
+    };
+}
+
+// --- Test 7: from-template success == reconstruct_won_block_from_template -----
+TEST(DgbReconstructClosure, FromTemplateSuccessComposesIdenticalBlock)
+{
+    auto sh = make_small_header();
+    ::dgb::MerkleLink link;
+    uint256 won = H("a0");
+    auto gentx_bytes = noseg_bytes(make_gentx());
+    auto ug = unpack_gentx_coinbase(gentx_bytes);
+    std::vector<MutableTransaction> other = { make_tx(11), make_tx(22) };
+
+    auto expected =
+        reconstruct_won_block_from_template(sh, link, ug.tx, ug.txid, other);
+
+    auto closure = make_reconstruct_closure_from_template(
+        won_fields(won, sh, link),
+        [gentx_bytes](const uint256&) { return gentx_bytes; },
+        [other](const uint256&) { return other; });
+
+    auto got = closure(won);
+    ASSERT_TRUE(got.has_value());
+    EXPECT_FALSE(got->first.empty());
+    EXPECT_EQ(got->first, expected.bytes);       // closure adds seams, not bytes
+    EXPECT_EQ(got->second, expected.hex);
+}
+
+// --- Test 8: empty template => valid coinbase-only block (NOT fail-closed) ----
+TEST(DgbReconstructClosure, FromTemplateEmptyOtherTxsIsCoinbaseOnly)
+{
+    auto sh = make_small_header();
+    ::dgb::MerkleLink link;
+    uint256 won = H("a0");
+    auto gentx_bytes = noseg_bytes(make_gentx());
+    auto ug = unpack_gentx_coinbase(gentx_bytes);
+
+    auto expected = reconstruct_won_block_from_template(
+        sh, link, ug.tx, ug.txid, std::vector<MutableTransaction>{});
+
+    auto closure = make_reconstruct_closure_from_template(
+        won_fields(won, sh, link),
+        [gentx_bytes](const uint256&) { return gentx_bytes; },
+        [](const uint256&) { return std::vector<MutableTransaction>{}; });
+
+    auto got = closure(won);
+    ASSERT_TRUE(got.has_value());                 // correct-and-empty, not nullopt
+    EXPECT_EQ(got->first, expected.bytes);
+}
+
+// --- Test 9: unknown share => nullopt (won_share_fields miss) -----------------
+TEST(DgbReconstructClosure, FromTemplateUnknownShareFailsClosed)
+{
+    auto sh = make_small_header();
+    ::dgb::MerkleLink link;
+    uint256 won = H("a0");
+    auto gentx_bytes = noseg_bytes(make_gentx());
+
+    auto closure = make_reconstruct_closure_from_template(
+        won_fields(won, sh, link),
+        [gentx_bytes](const uint256&) { return gentx_bytes; },
+        [](const uint256&) { return std::vector<MutableTransaction>{}; });
+
+    EXPECT_FALSE(closure(H("ff")).has_value());   // not the won share
+}
+
+// --- Test 10: malformed gentx bytes => nullopt (unpack out_of_range) ----------
+TEST(DgbReconstructClosure, FromTemplateMalformedGentxFailsClosed)
+{
+    auto sh = make_small_header();
+    ::dgb::MerkleLink link;
+    uint256 won = H("a0");
+    auto bad = noseg_bytes(make_gentx());
+    bad.push_back(0xff);                          // trailing byte => unpack throws
+
+    auto closure = make_reconstruct_closure_from_template(
+        won_fields(won, sh, link),
+        [bad](const uint256&) { return bad; },
+        [](const uint256&) { return std::vector<MutableTransaction>{}; });
+
+    EXPECT_FALSE(closure(won).has_value());
+}
+
+// --- Test 11: template source throws (non-out_of_range) => still nullopt ------
+TEST(DgbReconstructClosure, FromTemplateOtherTxsThrowFailsClosed)
+{
+    auto sh = make_small_header();
+    ::dgb::MerkleLink link;
+    uint256 won = H("a0");
+    auto gentx_bytes = noseg_bytes(make_gentx());
+
+    auto closure = make_reconstruct_closure_from_template(
+        won_fields(won, sh, link),
+        [gentx_bytes](const uint256&) { return gentx_bytes; },
+        [](const uint256&) -> std::vector<MutableTransaction> {
+            throw std::runtime_error("template boom"); });
+
+    EXPECT_FALSE(closure(won).has_value());       // broad catch, not just out_of_range
 }
