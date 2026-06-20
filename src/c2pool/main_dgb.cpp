@@ -36,6 +36,7 @@
 #include <impl/dgb/coin/header_ingest.hpp>
 #include <impl/dgb/coin/mempool_ingest.hpp>
 #include <impl/dgb/stratum/work_source.hpp>
+#include <impl/dgb/coin/p2p_node.hpp>
 
 #include <core/filesystem.hpp>
 #include <core/stratum_server.hpp>
@@ -130,7 +131,10 @@ int run_selftest(const core::CoinParams& params)
 // work (stop the stratum acceptor, close sessions) before ioc.stop() drains
 // the rest — mirrors main_btc.cpp's teardown contract.
 int run_node(const core::CoinParams& params, bool testnet,
-             const std::string& stratum_addr, uint16_t stratum_port)
+             const std::string& stratum_addr, uint16_t stratum_port,
+             const std::string& coin_daemon,
+             const std::vector<std::byte>& coin_magic,
+             const uint256& coin_genesis)
 {
     io::io_context ioc;
 
@@ -297,6 +301,78 @@ int run_node(const core::CoinParams& params, bool testnet,
     std::cout << "[DGB] embedded coin-daemon ingest surface up — header+tx "
                  "feeds wired (NodeP2P producer standup next)" << std::endl;
 
+    // ── Embedded coin-daemon P2P PRODUCER standup (Phase B) ───────────────
+    //
+    // dgb::coin::p2p::NodeP2P<dgb::Config> (coin/p2p_node.hpp) is the producer that
+    // binds against coin_iface: it dials the local digibyted, speaks the
+    // DigiByte Core wire protocol (Scrypt-only consumer), and fires
+    // coin_iface.new_headers on each `headers` batch / new_tx on each relayed
+    // `tx`. The wire_*_ingest connectors above already route those onto
+    // HeaderChain::validate_and_append and Mempool::add_tx, so a live feed now
+    // flows end-to-end the moment the handshake completes.
+    //
+    // The coin-daemon wire MAGIC (coin_magic, the network pchMessageStart) is
+    // DISTINCT from the sharechain PREFIX (PoolConfig::DEFAULT_PREFIX_HEX, the
+    // p2pool peer-namespace isolation primitive): different layers, never
+    // conflated. Both endpoint and magic are supplied by main() so the binary
+    // can target mainnet (magic faf3b6da / port 12024) or a dev regtest daemon
+    // (magic fabfb5da) without hard-coding either here.
+    //
+    // No behavior change when --coin-daemon is absent: coin_p2p stays null, the
+    // consumer seam idles exactly as before this slice.
+    std::unique_ptr<dgb::coin::p2p::NodeP2P<dgb::Config>> coin_p2p;
+    io::steady_timer coin_getheaders_timer(ioc);
+    if (!coin_daemon.empty()) {
+        if (coin_magic.empty())
+            std::cout << "[DGB] WARNING: --coin-daemon set without --coin-magic "
+                         "— handshake will fail (wrong network magic)" << std::endl;
+        config.coin()->m_p2p.prefix = coin_magic;
+        const auto colon = coin_daemon.rfind(':');
+        const std::string host = coin_daemon.substr(0, colon);
+        const uint16_t port =
+            static_cast<uint16_t>(std::stoi(coin_daemon.substr(colon + 1)));
+        const NetService target(host, port);
+        config.coin()->m_p2p.address = target;
+
+        coin_p2p = std::make_unique<dgb::coin::p2p::NodeP2P<dgb::Config>>(
+            &ioc, &coin_iface, &config, "DGB-CoinP2P");
+        coin_p2p->enable_mempool_request();  // also exercise the tx ingest seam
+        coin_p2p->connect(target);
+        std::cout << "[DGB] embedded coin-daemon P2P producer dialing "
+                  << target.to_string() << " magic=" << HexStr(coin_magic)
+                  << " (proto adv per coin/p2p_node.hpp)" << std::endl;
+
+        // After the version/verack handshake, drive an initial getheaders from
+        // the genesis locator (or current tip) so the peer streams its header
+        // chain into validate_and_append. 3s mirrors main_btc.cpp's driver.
+        coin_getheaders_timer.expires_after(std::chrono::seconds(3));
+        coin_getheaders_timer.async_wait(
+            [&coin_p2p, coin_genesis]
+            (const boost::system::error_code& ec) {
+                if (ec) return;
+                if (!coin_p2p->is_handshake_complete()) {
+                    std::cout << "[DGB] coin-daemon handshake not complete yet "
+                                 "(peer slow?) — reconnect/getheaders retry on "
+                                 "the NodeP2P 30s timer" << std::endl;
+                    return;
+                }
+                // Empty chain (fresh regtest) -> locator = [genesis]; one
+                // getheaders batch (<=2000) covers a short regtest chain. Walk-
+                // forward continuation for long chains is a follow-up slice.
+                std::vector<uint256> locator;
+                if (!coin_genesis.IsNull())
+                    locator.push_back(coin_genesis);
+                std::cout << "[DGB] coin-daemon handshake OK — sending initial "
+                             "getheaders, locator="
+                          << (locator.empty()
+                                  ? std::string("<empty>")
+                                  : locator.front().GetHex().substr(0, 16))
+                          << std::endl;
+                // 70019 == DigiByte Core PROTOCOL_VERSION (coin/p2p_node.hpp).
+                coin_p2p->send_getheaders(70019, locator, uint256::ZERO);
+            });
+    }
+
     // submitblock-RPC arm of the #82 dual-path broadcaster, driven from the
     // miner-facing Stratum path. Reuses the SAME coin_node seam declared above
     // p2p_node (the sharechain arm shares it). rpc.cpp:387 submit_block_hex is
@@ -370,6 +446,9 @@ int main(int argc, char** argv)
     bool want_run = false;
     std::string stratum_addr = "0.0.0.0";  // bind all interfaces by default
     uint16_t    stratum_port = 0;           // 0 disables stratum; --stratum sets it
+    std::string coin_daemon;                // --coin-daemon HOST:PORT (embedded P2P producer target)
+    std::vector<std::byte> coin_magic;      // --coin-magic HEX (network pchMessageStart)
+    uint256 coin_genesis;                   // --coin-genesis HASH (initial getheaders locator base)
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
             std::cout << "c2pool-dgb " << C2POOL_VERSION << "\n";
@@ -389,6 +468,15 @@ int main(int argc, char** argv)
                 stratum_port = static_cast<uint16_t>(std::stoi(ep.substr(colon + 1)));
             }
         }
+        if (std::strcmp(argv[i], "--coin-daemon") == 0 && i + 1 < argc) {
+            coin_daemon = argv[++i];               // embedded coin-daemon P2P endpoint
+        }
+        if (std::strcmp(argv[i], "--coin-magic") == 0 && i + 1 < argc) {
+            coin_magic = ParseHexBytes(argv[++i]); // network magic (pchMessageStart)
+        }
+        if (std::strcmp(argv[i], "--coin-genesis") == 0 && i + 1 < argc) {
+            coin_genesis = uint256S(argv[++i]);    // genesis hash for initial getheaders
+        }
     }
 
     const core::CoinParams params = dgb::make_coin_params(/*testnet=*/false);
@@ -399,7 +487,8 @@ int main(int argc, char** argv)
 
     // --run: stand up the run-loop (io_context + sharechain peer + stratum).
     if (want_run)
-        return run_node(params, /*testnet=*/false, stratum_addr, stratum_port);
+        return run_node(params, /*testnet=*/false, stratum_addr, stratum_port,
+                        coin_daemon, coin_magic, coin_genesis);
 
     // --selftest, or a bare invocation: drive the live score path so the
     // binary exercises real consensus code, then exit cleanly.
