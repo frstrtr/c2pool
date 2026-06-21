@@ -388,4 +388,22 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(dgb_regrind_block_test PRIVATE
         GTest::gtest_main GTest::gtest)
     gtest_add_tests(dgb_regrind_block_test "" AUTO)
+    # --- #82 gate: grind->reconstruct->submit JOINT (coin/won_block_finalize.hpp)
+    # Pins finalize_won_block_pow: takes a faithfully reconstructed block (header
+    # at [0..79], merkle_root already set -- merkle FIRST) and grinds the nonce
+    # at [76..79] THROUGH grind_won_nonce -> scrypt_pow_hash (#286 SSOT) until the
+    # DGB-Scrypt PoW satisfies the parent target, splicing the winning nonce back
+    # and regenerating the RPC-fallback hex in lockstep with the P2P-arm bytes.
+    # Asserts: finalized header pow<=target via the same SSOT; nonce spliced LE
+    # into [76..79]; hex == bytes; ONLY the 4 nonce bytes mutate (merkle + tx tail
+    # untouched); fail-closed (nullopt) on a sub-80-byte input. Reuses the SAME
+    # _dgb_scrypt_tus real-scrypt set as dgb_nonce_grinder_test -- header-only
+    # u256, no core / no dgb OBJECT lib. Same standalone-guard discipline; MUST
+    # stay in BOTH build.yml --target allowlists (#143 trap).
+    add_executable(dgb_won_block_finalize_test won_block_finalize_test.cpp ${_dgb_scrypt_tus})
+    target_include_directories(dgb_won_block_finalize_test PRIVATE ${CMAKE_SOURCE_DIR}/src/btclibs)
+    target_link_libraries(dgb_won_block_finalize_test PRIVATE
+        GTest::gtest_main GTest::gtest)
+    gtest_add_tests(dgb_won_block_finalize_test "" AUTO)
+
 endif()
