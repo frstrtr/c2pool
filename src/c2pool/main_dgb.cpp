@@ -387,22 +387,27 @@ int run_node(const core::CoinParams& params, bool testnet,
             return {};  // coinbase-only today (see note above)
         });
 
+    // #82 PRIMARY arm (ARM A): relay the won block over the embedded coin-daemon
+    // P2P producer. The sink fires from the compute thread, so post the peer
+    // write onto the io thread (NodeP2P is single-thread-confined). No-op when
+    // --coin-daemon is absent (coin_p2p null) — the RPC fallback still fires
+    // (dual-path rule). --no-p2p-relay passes an EMPTY sink so a forced-won-share
+    // A/B run cleanly ISOLATES ARM B (external submitblock) in the broadcaster's
+    // own accounting (p2p=off), not just suppressed inside a non-empty sink.
+    dgb::coin::P2pRelaySink p2p_relay_sink;
+    if (!no_p2p_relay) {
+        p2p_relay_sink =
+            [&ioc, &coin_p2p](const std::vector<unsigned char>& block_bytes) {
+                if (!coin_p2p) return;
+                io::post(ioc, [&coin_p2p, bytes = block_bytes]() {
+                    if (coin_p2p) coin_p2p->submit_block_p2p_raw(bytes);
+                });
+            };
+    }
+
     p2p_node.tracker().m_on_block_found = dgb::coin::make_on_block_found(
         /*reconstruct=*/std::move(faithful_reconstruct),
-        /*p2p_relay=*/[&ioc, &coin_p2p, no_p2p_relay](const std::vector<unsigned char>& block_bytes) {
-            // #82 PRIMARY arm: relay the won block over the embedded coin-daemon
-            // P2P producer. The sink fires from the compute thread, so post the
-            // peer write onto the io thread (NodeP2P is single-thread-confined).
-            // No-op when --coin-daemon is absent (coin_p2p null) — the RPC
-            // fallback below still fires (dual-path rule). --no-p2p-relay
-            // suppresses this arm so a forced-won-share A/B run can isolate ARM B
-            // (external submitblock) on the record.
-            if (no_p2p_relay) return;
-            if (!coin_p2p) return;
-            io::post(ioc, [&coin_p2p, bytes = block_bytes]() {
-                if (coin_p2p) coin_p2p->submit_block_p2p_raw(bytes);
-            });
-        },
+        /*p2p_relay=*/std::move(p2p_relay_sink),
         /*seam=*/&coin_node);                     // external-digibyted submitblock fallback
 
     // ── #82 dual-path won-block CLOSER: miner-facing Stratum standup ───────
