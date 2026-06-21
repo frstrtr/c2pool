@@ -105,6 +105,14 @@ cli_a createwallet "$PAYOUT_LABEL" >/dev/null 2>&1 || cli_a loadwallet "$PAYOUT_
 ADDR_A="$(cli_a getnewaddress "$PAYOUT_LABEL")"
 log "mining 101 maturity blocks to $ADDR_A"
 cli_a generatetoaddress 101 "$ADDR_A" >/dev/null
+# Wait for node B to FULLY IBD-sync node A's chain before baselining. Otherwise
+# BASE_B captures B mid-sync (e.g. 96 < A=101) and the ARM A won-detector
+# (tip_b > BASE_B) fires on B's normal sync catch-up rather than on a genuine
+# c2pool-relayed won block -- a false positive that defeats the gate.
+HEIGHT_A="$(cli_a getblockcount)"
+n=0; until [ "$(tip_b)" -ge "$HEIGHT_A" ]; do
+  n=$((n+1)); [ $n -gt 120 ] && die "node B never synced to A height $HEIGHT_A (got $(tip_b))"; sleep 0.5
+done
 BASE_B="$(tip_b)"
 
 # regtest magic + genesis are read from the running daemon's chainparams so the
