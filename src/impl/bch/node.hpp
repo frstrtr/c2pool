@@ -291,9 +291,9 @@ public:
         chain.get_share(share_hash).invoke([&](auto* s) {
             using ST = std::remove_pointer_t<decltype(s)>;
             constexpr int64_t ver = ST::version;
-            const bool v36 = core::version_gate::is_v36_active(ver);
+            const bool v36_active = core::version_gate::is_v36_active(ver);
             const uint256 gentx_hash =
-                generate_share_transaction(*s, m_tracker, false, v36, &gentx_bytes);
+                generate_share_transaction(*s, m_tracker, false, v36_active, &gentx_bytes);
             const uint256 merkle_root =
                 check_merkle_link(gentx_hash, s->m_merkle_link);
             uint32_t hdr_version = static_cast<uint32_t>(s->m_min_header.m_version);
