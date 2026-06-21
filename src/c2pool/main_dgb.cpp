@@ -34,6 +34,8 @@
 #include <impl/dgb/coin/embedded_tx_select.hpp>   // make_mempool_tx_source (EmbeddedTxSource)
 #include <impl/dgb/coin/won_block_dispatch.hpp>
 #include <impl/dgb/coin/reconstruct_closure.hpp>  // make_reconstruct_closure_from_template (#280)
+#include <impl/dgb/coin/regrind_block.hpp>        // regrind_block_nonce -- forced-won soak PoW (#82 4b/4c)
+#include <impl/dgb/coin/header_sample_build.hpp>  // c2pool::dgb::compact_to_target (nBits -> u256)
 #include <impl/dgb/coin/won_share_inputs.hpp>      // won_share_inputs (#279)
 #include <impl/dgb/coin/node_interface.hpp>
 #include <impl/dgb/coin/header_ingest.hpp>
@@ -86,7 +88,7 @@ void print_banner(const char* argv0, const core::CoinParams& p)
     std::cout
         << "c2pool-dgb " << C2POOL_VERSION << " — DigiByte Scrypt-only (V36)\n\n"
         << "Usage: " << argv0
-        << " [--version] [--help] [--selftest] [--run] [--no-p2p-relay] [--stratum [H:]P]\n\n"
+        << " [--version] [--help] [--selftest] [--run] [--no-p2p-relay] [--soak-regrind] [--stratum [H:]P]\n\n"
         << "Status: pool/sharechain pillars live (Phase B); run-loop up\n"
         << "        (--run: io_context + sharechain peer + Stratum standup).\n"
         << "        --stratum [HOST:]PORT binds a miner-facing TCP listener\n"
@@ -143,7 +145,8 @@ int run_node(const core::CoinParams& params, bool testnet,
              const uint256& coin_genesis,
              const std::string& rpc_endpoint,
              const std::string& rpc_conf_path,
-             bool no_p2p_relay)
+             bool no_p2p_relay,
+             bool soak_regrind)
 {
     io::io_context ioc;
 
@@ -380,6 +383,48 @@ int run_node(const core::CoinParams& params, bool testnet,
             return {};  // coinbase-only today (see note above)
         });
 
+    // -- #82 forced-won SOAK regrind (--soak-regrind, default OFF) ---------
+    // A genuine pool-won share already satisfies the parent target, so the
+    // reconstructed block's PoW is valid as-framed and the PRODUCTION path
+    // NEVER regrinds. A *forced*-won soak share (injected with no real Scrypt
+    // work) reconstructs a block node B rejects as high-hash. With
+    // --soak-regrind, grind the reconstructed block's nonce until its DGB-Scrypt
+    // digest satisfies the block's OWN declared nBits -- exactly the target node
+    // B validates against -- so the soak proves a node-B ACCEPT end to end.
+    // Mutates header[76..79] ONLY (regrind_block_nonce): merkle root + tx tail
+    // untouched. OFF in any real deployment.
+    if (soak_regrind) {
+        auto inner = std::move(faithful_reconstruct);
+        faithful_reconstruct =
+            [inner = std::move(inner)](const uint256& share_hash)
+            -> std::optional<std::pair<std::vector<unsigned char>, std::string>> {
+            auto blk = inner(share_hash);
+            if (!blk) return blk;                   // unassemblable -- pass through
+            if (blk->first.size() < 80) return blk; // runt -- leave to fail closed
+            // nBits is header bytes [72..75], little-endian.
+            const uint32_t nbits =
+                  static_cast<uint32_t>(blk->first[72])
+                | (static_cast<uint32_t>(blk->first[73]) << 8)
+                | (static_cast<uint32_t>(blk->first[74]) << 16)
+                | (static_cast<uint32_t>(blk->first[75]) << 24);
+            const auto target = c2pool::dgb::compact_to_target(nbits);
+            auto out = dgb::coin::regrind_block_nonce(blk->first, target);
+            if (!out) {
+                std::cout << "[DGB-BLOCK] --soak-regrind: nonce search EXHAUSTED "
+                             "(nBits=" << std::hex << nbits << std::dec
+                          << ") -- block UNCHANGED, will reject high-hash"
+                          << std::endl;
+                return blk;
+            }
+            blk->second = HexStr(blk->first);       // hex tracks the mutated bytes
+            std::cout << "[DGB-BLOCK] --soak-regrind: ground winning nonce="
+                      << out->nonce << " after " << out->iters
+                      << " iters (PoW now satisfies nBits=" << std::hex
+                      << nbits << std::dec << ")" << std::endl;
+            return blk;
+        };
+    }
+
     p2p_node.tracker().m_on_block_found = dgb::coin::make_on_block_found(
         /*reconstruct=*/std::move(faithful_reconstruct),
         /*p2p_relay=*/[&ioc, &coin_p2p, no_p2p_relay](const std::vector<unsigned char>& block_bytes) {
@@ -601,6 +646,7 @@ int main(int argc, char** argv)
     std::string rpc_endpoint;               // --coin-rpc HOST:PORT (external digibyted submit arm)
     std::string rpc_conf_path;              // --coin-rpc-auth PATH to digibyte.conf (creds source)
     bool no_p2p_relay = false;              // --no-p2p-relay: suppress embedded P2P-relay arm (#82 ARM B isolation)
+    bool soak_regrind  = false;             // --soak-regrind: grind reconstructed block PoW for forced-won regtest soak (OFF in prod)
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
             std::cout << "c2pool-dgb " << C2POOL_VERSION << "\n";
@@ -636,6 +682,7 @@ int main(int argc, char** argv)
             rpc_conf_path = argv[++i];             // path to digibyte.conf (rpcpassword stays in-file)
         }
         if (std::strcmp(argv[i], "--no-p2p-relay") == 0) no_p2p_relay = true;
+        if (std::strcmp(argv[i], "--soak-regrind") == 0)  soak_regrind = true;
     }
 
     const core::CoinParams params = dgb::make_coin_params(/*testnet=*/false);
@@ -648,7 +695,7 @@ int main(int argc, char** argv)
     if (want_run)
         return run_node(params, /*testnet=*/false, stratum_addr, stratum_port,
                         coin_daemon, coin_magic, coin_genesis,
-                        rpc_endpoint, rpc_conf_path, no_p2p_relay);
+                        rpc_endpoint, rpc_conf_path, no_p2p_relay, soak_regrind);
 
     // --selftest, or a bare invocation: drive the live score path so the
     // binary exercises real consensus code, then exit cleanly.
