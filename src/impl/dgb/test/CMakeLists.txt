@@ -406,4 +406,17 @@ if (BUILD_TESTING AND GTest_FOUND)
         GTest::gtest_main GTest::gtest)
     gtest_add_tests(dgb_won_block_finalize_test "" AUTO)
 
+    # --- #82 Stage 4d: mining_submit decision SSOT (coin/submit_classify.hpp) --
+    # Pins classify_submission: the three-way pow_hash ladder (WonBlock /
+    # ShareAccept / Reject) with BOTH boundaries inclusive, mirroring DigiByte
+    # Core CheckProofOfWork (hash>target = the only reject) and p2pool-merged-v36
+    # share-accept. Tighten-first order so block beats share; safety KAT proves an
+    # inverted (malformed) target pair can only mis-Reject, never spurious-WonBlock.
+    # Pure header-only u256 -- no scrypt, no core, no dgb OBJECT lib. MUST stay in
+    # BOTH build.yml --target allowlists (#143 trap).
+    add_executable(dgb_submit_classify_test submit_classify_test.cpp)
+    target_link_libraries(dgb_submit_classify_test PRIVATE
+        GTest::gtest_main GTest::gtest)
+    gtest_add_tests(dgb_submit_classify_test "" AUTO)
+
 endif()
