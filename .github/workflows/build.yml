@@ -82,7 +82,7 @@ jobs:
                     test_address_resolution test_compute_share_target \
                     test_utxo test_dgb_subsidy test_dgb_coinbase_value dgb_share_test dgb_block_assembly_test dgb_header_sample_build_test dgb_header_ingest_test dgb_mempool_ingest_test \
                     dgb_gentx_coinbase_test nmc_auxpow_merkle_test nmc_template_builder_test nmc_auxpow_wire_test nmc_reconstruct_won_block_test dgb_gentx_share_path_test dgb_other_tx_resolver_test \
-                    dgb_other_tx_assembler_test dgb_reconstruct_won_block_test dgb_reconstruct_closure_test dgb_gentx_unpack_test dgb_work_source_test dgb_template_builder_test dgb_embedded_coin_node_test dgb_embedded_tx_select_test dgb_template_other_txs_test dgb_coinbase_value_parity_test dgb_submit_classify_test dgb_aux_parent_coinbase_parity_test \
+                    dgb_other_tx_assembler_test dgb_reconstruct_won_block_test dgb_reconstruct_closure_test dgb_gentx_unpack_test dgb_work_source_test dgb_template_builder_test dgb_embedded_coin_node_test dgb_embedded_tx_select_test dgb_template_other_txs_test dgb_coinbase_value_parity_test dgb_submit_classify_test dgb_aux_parent_coinbase_parity_test dgb_merkle_link_build_test \
                     rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test header_chain_test \
                     dgb_coin_node_seam_test dgb_block_broadcast_test dgb_won_block_dispatch_test dgb_forced_won_share_dualpath_test dgb_scrypt_pow_test dgb_nonce_grinder_test dgb_regrind_block_test dgb_won_block_finalize_test v37_test \
             -j$(nproc)
@@ -214,7 +214,7 @@ jobs:
                     test_address_resolution test_compute_share_target \
                     test_utxo test_dgb_subsidy test_dgb_coinbase_value dgb_share_test dgb_block_assembly_test dgb_header_sample_build_test dgb_header_ingest_test dgb_mempool_ingest_test \
                     dgb_gentx_coinbase_test nmc_auxpow_merkle_test nmc_template_builder_test nmc_auxpow_wire_test nmc_reconstruct_won_block_test dgb_gentx_share_path_test dgb_other_tx_resolver_test \
-                    dgb_other_tx_assembler_test dgb_reconstruct_won_block_test dgb_reconstruct_closure_test dgb_gentx_unpack_test dgb_work_source_test dgb_template_builder_test dgb_embedded_coin_node_test dgb_embedded_tx_select_test dgb_template_other_txs_test dgb_coinbase_value_parity_test dgb_submit_classify_test dgb_aux_parent_coinbase_parity_test \
+                    dgb_other_tx_assembler_test dgb_reconstruct_won_block_test dgb_reconstruct_closure_test dgb_gentx_unpack_test dgb_work_source_test dgb_template_builder_test dgb_embedded_coin_node_test dgb_embedded_tx_select_test dgb_template_other_txs_test dgb_coinbase_value_parity_test dgb_submit_classify_test dgb_aux_parent_coinbase_parity_test dgb_merkle_link_build_test \
                     rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test header_chain_test \
                     dgb_coin_node_seam_test dgb_block_broadcast_test dgb_won_block_dispatch_test dgb_forced_won_share_dualpath_test dgb_scrypt_pow_test dgb_nonce_grinder_test dgb_regrind_block_test dgb_won_block_finalize_test test_coin_broadcaster test_multiaddress_pplns test_pplns_stress \
                     v37_test \

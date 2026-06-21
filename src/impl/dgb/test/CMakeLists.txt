@@ -451,5 +451,20 @@ if (BUILD_TESTING AND GTest_FOUND)
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_aux_parent_coinbase_parity_test "" AUTO)
+    # --- won-block multi-tx: forward merkle-link builder (coin/merkle_link_build.hpp)
+    # Pins calculate_merkle_link as the exact inverse of check_merkle_link: the
+    # rebuilt branch replays (same double-SHA combine, Bitcoin duplicate-last
+    # rule) to the full-tree BlockMerkleRoot across coinbase-only / even / odd tx
+    # counts -- the prerequisite for rooting a tx-bearing forced-won block so node
+    # B does not reject bad-txnmrklroot. Round-trip is asserted through the
+    # PRODUCTION dgb::check_merkle_link (links the dgb lib), not a re-impl. MUST
+    # stay in BOTH build.yml --target allowlists (#143 NOT_BUILT trap).
+    add_executable(dgb_merkle_link_build_test merkle_link_build_test.cpp)
+    target_link_libraries(dgb_merkle_link_build_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_merkle_link_build_test "" AUTO)
 
 endif()
