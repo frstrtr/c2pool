@@ -342,4 +342,50 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(header_chain_test PRIVATE
         GTest::gtest_main GTest::gtest nlohmann_json::nlohmann_json)
     gtest_add_tests(header_chain_test "" AUTO)
+
+    # --- Stage 4b/4c: DGB-Scrypt PoW digest CALL (coin/scrypt_pow.hpp) --------
+    # Pins scrypt_pow_hash = scrypt_1024_1_1_256(80-byte header) decoded via
+    # u256::from_le_bytes, plus the satisfaction-gate byte order (pow_hash <=
+    # target) header_chain.hpp compares. Reuses the SAME _dgb_scrypt_tus set as
+    # header_chain_test (real scrypt, not synthetic) -- header-only u256, no core
+    # / no dgb OBJECT lib, the standalone-guard discipline dgb_arith256.hpp keeps.
+    # Same target name, so it stays in BOTH build.yml --target allowlists.
+    add_executable(dgb_scrypt_pow_test scrypt_pow_test.cpp ${_dgb_scrypt_tus})
+    target_include_directories(dgb_scrypt_pow_test PRIVATE ${CMAKE_SOURCE_DIR}/src/btclibs)
+    target_link_libraries(dgb_scrypt_pow_test PRIVATE
+        GTest::gtest_main GTest::gtest)
+    gtest_add_tests(dgb_scrypt_pow_test "" AUTO)
+
+    # --- Stage 4b/4c: DGB-Scrypt nonce grinder (coin/nonce_grinder.hpp) -------
+    # Pins grind_won_nonce: increments the 80-byte header nonce until
+    # scrypt_pow_hash(header) <= target (the EXACT header_chain.hpp satisfaction
+    # gate), calling THROUGH the #286 scrypt_pow.hpp digest SSOT -- never a
+    # bypass hash -- so the nonce it finds is one node B accepts. Asserts it
+    # terminates well inside the test budget, writes the winning nonce LE into
+    # [76..79], and fails closed (nullopt) when no nonce satisfies in budget.
+    # Reuses the SAME _dgb_scrypt_tus real-scrypt set as dgb_scrypt_pow_test --
+    # header-only u256, no core / no dgb OBJECT lib. Same standalone-guard
+    # discipline; MUST stay in BOTH build.yml --target allowlists (#143 trap).
+    add_executable(dgb_nonce_grinder_test nonce_grinder_test.cpp ${_dgb_scrypt_tus})
+    target_include_directories(dgb_nonce_grinder_test PRIVATE ${CMAKE_SOURCE_DIR}/src/btclibs)
+    target_link_libraries(dgb_nonce_grinder_test PRIVATE
+        GTest::gtest_main GTest::gtest)
+    gtest_add_tests(dgb_nonce_grinder_test "" AUTO)
+
+    # --- Stage 4b/4c: grind -> reconstruct -> submit seam (coin/regrind_block.hpp)
+    # Pins regrind_block_nonce: grinds the header nonce of an ALREADY-FRAMED
+    # reconstructed-block blob until its DGB-Scrypt PoW satisfies the parent
+    # target, writing the winning nonce back into header [76..79] IN PLACE --
+    # the wiring between reconstruct (merkle root fixed) and a node-B
+    # ProcessNewBlock ACCEPT. Asserts the re-ground header satisfies the EXACT
+    # pow <= target gate via the #286 SSOT, that ONLY [76..79] mutate (merkle
+    # region [36..67] + tx tail byte-preserved), and fail-closed (nullopt,
+    # bytes UNCHANGED) on a runt blob or exhausted budget. Reuses the SAME
+    # _dgb_scrypt_tus real-scrypt set; header-only u256, no core / no OBJECT
+    # lib. MUST stay in BOTH build.yml --target allowlists (#143 trap).
+    add_executable(dgb_regrind_block_test regrind_block_test.cpp ${_dgb_scrypt_tus})
+    target_include_directories(dgb_regrind_block_test PRIVATE ${CMAKE_SOURCE_DIR}/src/btclibs)
+    target_link_libraries(dgb_regrind_block_test PRIVATE
+        GTest::gtest_main GTest::gtest)
+    gtest_add_tests(dgb_regrind_block_test "" AUTO)
 endif()
