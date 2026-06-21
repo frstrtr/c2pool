@@ -34,6 +34,8 @@
 #include <impl/dgb/coin/embedded_tx_select.hpp>   // make_mempool_tx_source (EmbeddedTxSource)
 #include <impl/dgb/coin/won_block_dispatch.hpp>
 #include <impl/dgb/coin/reconstruct_closure.hpp>  // make_reconstruct_closure_from_template (#280)
+#include <impl/dgb/coin/template_capture.hpp>      // TemplateCapture per-job retain (#300/#271)
+#include <impl/dgb/coin/template_other_txs.hpp>    // make_template_other_txs_fn bridge (#299)
 #include <impl/dgb/coin/won_block_finalize.hpp>   // finalize_won_block_pow -- forced-won PoW grind JOINT (#82 gate)
 #include <impl/dgb/coin/header_sample_build.hpp>  // c2pool::dgb::compact_to_target (nBits -> u256)
 #include <impl/dgb/coin/won_share_inputs.hpp>      // won_share_inputs (#279)
@@ -356,6 +358,14 @@ int run_node(const core::CoinParams& params, bool testnet,
     // self-deadlock — the corrected consume-seam audit). Fail-closed end to
     // end: any error in a builder fn throws, is caught inside the closure ->
     // std::nullopt (announce + audit; the RPC submitblock fallback still fires).
+    // #82 tx-bearing won block: retain each handed-out template's
+    // transactions[] keyed by the resulting share_hash so the reconstructor
+    // replays the EXACT non-coinbase set the share committed to (merkle-
+    // consistent), replacing the interim coinbase-only stub. Plain local:
+    // outlives every tracker callback the provider() is installed into
+    // (all bound within this main scope, before ioc.run()).
+    dgb::coin::TemplateCapture template_capture;
+
     auto& reconstruct_tracker = p2p_node.tracker();
     auto faithful_reconstruct = dgb::coin::make_reconstruct_closure_from_template(
         /*won_share_fields_fn=*/
@@ -386,9 +396,10 @@ int run_node(const core::CoinParams& params, bool testnet,
             return gc.bytes;
         },
         /*template_other_txs_fn=*/
-        [](const uint256&) -> std::vector<dgb::coin::MutableTransaction> {
-            return {};  // coinbase-only today (see note above)
-        });
+        // #300/#299: replay the captured per-job template transactions[]
+        // keyed by share_hash (TemplateCapture above feeds it at seed time);
+        // a capture MISS decodes to an empty set -> valid coinbase-only block.
+        dgb::coin::make_template_other_txs_fn(template_capture.provider()));
 
     // -- #82 forced-won PoW finalize -------------------------------------
     // A forced-won share (the regtest --regtest-force-won-share live seam)
@@ -714,7 +725,7 @@ int run_node(const core::CoinParams& params, bool testnet,
             // reconstruct closure frames it; --soak-regrind then grinds the
             // nonce to satisfy THIS bits. Regtest-only; coinbase-only =>
             // merkle root == gentx txid by construction (no bad-txnmrklroot).
-            auto seed_forced_from_gbt = [forced, &rpc, &header_chain]() {
+            auto seed_forced_from_gbt = [forced, forced_hash, &rpc, &template_capture, &header_chain]() {
                 if (!rpc) {
                     // Unreachable on the gated path (--regtest-force-won-share
                     // requires --coin-daemon, which arms rpc); without the GBT
@@ -727,6 +738,13 @@ int run_node(const core::CoinParams& params, bool testnet,
                 }
                 try {
                     auto gbt = rpc->getblocktemplate({"segwit"});
+                    // #82 tx-bearing: retain this template transactions[]
+                    // under the forced share hash so the won-block
+                    // reconstructor replays them (coinbasevalue already
+                    // includes their fees -> subsidy/merkle consistent).
+                    template_capture.capture(
+                        forced_hash,
+                        gbt.value("transactions", nlohmann::json::array()));
                     auto& mh = forced->m_min_header;
                     mh.m_version = gbt.at("version").get<uint64_t>();
                     mh.m_previous_block.SetHex(

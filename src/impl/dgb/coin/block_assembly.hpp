@@ -45,6 +45,7 @@
 #include "block.hpp"
 #include "../share_check.hpp"   // dgb::check_merkle_link (SSOT merkle-branch walk)
 #include "../share_types.hpp"   // dgb::MerkleLink
+#include "mempool.hpp"          // dgb::coin::compute_txid (block-body txid SSOT)
 
 namespace dgb
 {
@@ -70,6 +71,28 @@ reconstruct_block_header(const SmallBlockHeaderType& small_header,
     // PoW hash was computed at verification time.
     header.m_merkle_root    = ::dgb::check_merkle_link(gentx_hash, merkle_link);
     return header;
+}
+
+// Build the canonical Bitcoin block merkle root over an ordered txid list
+// ([gentx_hash] ++ other-tx txids): duplicate-the-last on an odd count, then
+// sha256d each adjacent pair up to the single root.  This is the BLOCK-BODY
+// SSOT for the header merkle_root -- it MUST be recomputed over the txs the
+// block actually carries, NOT walked up the share's merkle_link, or a
+// tx-bearing reconstruct emits a header root for the coinbase-only set and the
+// daemon rejects the block with bad-txnmrklroot (#82 funded-soak regression).
+inline uint256 build_block_merkle_root(std::vector<uint256> txids)
+{
+    if (txids.empty()) return uint256();
+    while (txids.size() > 1) {
+        if (txids.size() % 2 == 1)
+            txids.push_back(txids.back());
+        std::vector<uint256> next;
+        next.reserve(txids.size() / 2);
+        for (size_t i = 0; i + 1 < txids.size(); i += 2)
+            next.push_back(Hash(txids[i], txids[i + 1]));
+        txids = std::move(next);
+    }
+    return txids[0];
 }
 
 // Assemble the full serialized parent block for a won share.
@@ -104,6 +127,26 @@ assemble_won_block(const SmallBlockHeaderType& small_header,
     block.m_txs.push_back(gentx);
     for (const auto& tx : other_txs)
         block.m_txs.push_back(tx);
+
+    // Recompute the header merkle_root over the ACTUAL block tx vector
+    // ([gentx_hash] ++ each other-tx txid), overriding the merkle_link walk
+    // reconstruct_block_header did.  The share's merkle_link only spans the txs
+    // it was built over; when the reconstruct sources its body from the captured
+    // GBT template (reconstruct_won_block_from_template) that link can reflect a
+    // different (coinbase-only) set, so trusting it emits a header root that
+    // disagrees with the body -> daemon bad-txnmrklroot.  Deriving the root from
+    // the body keeps header and body consistent by construction (coinbase-only:
+    // build_block_merkle_root([gentx_hash]) == gentx_hash, identical to the
+    // empty-branch walk -- no regression).  Set BEFORE serialize so the
+    // nonce-grind seam (regrind_block.hpp) grinds the final, correct header.
+    {
+        std::vector<uint256> txids;
+        txids.reserve(block.m_txs.size());
+        txids.push_back(gentx_hash);
+        for (const auto& tx : other_txs)
+            txids.push_back(compute_txid(tx));
+        block.m_merkle_root = build_block_merkle_root(std::move(txids));
+    }
 
     PackStream packed = pack<BlockType>(block);
     auto sp = packed.get_span();
