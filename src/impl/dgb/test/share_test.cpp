@@ -22,6 +22,7 @@
 #include <impl/dgb/coin/rpc_conf.hpp>   // #82 external-daemon RPC creds (digibyte.conf)
 #include <impl/dgb/auto_ratchet.hpp> // Phase B: mint-side share-version ratchet
 #include <impl/dgb/auto_ratchet_wire.hpp> // Phase B: production wire-in (base_version=35)
+#include <impl/dgb/run_loop_mint.hpp>     // Phase B: worker->mint adapter (re-landed #294)
 #include <unistd.h>                  // getpid (AutoRatchet KAT temp state file)
 
 #include <cstdio>
@@ -464,4 +465,75 @@ TEST(DGB_share_test, AutoRatchetWireBootstrapMints35Votes36)
     EXPECT_EQ(mint, 35);   // baseline share version (oracle)
     EXPECT_EQ(vote, 36);   // always vote target
     EXPECT_EQ(ar.state(), dgb::RatchetState::VOTING);
+}
+
+// ----------------------------------------------------------------------------
+// run_loop_mint.hpp — Phase B worker->mint adapter (re-landed #294 helper).
+// The adapter maps a ShareAccept submission's raw header/coinbase bytes into
+// create_local_share()'s arguments, stamping the ratchet-selected {mint, vote}
+// version pair. These KATs pin the novel logic: the 80-byte header parse and the
+// fail-closed guard. The version-selection delegation is pinned by the
+// AutoRatchetWire* tests above; create_local_share's own insertion path is
+// covered by its existing fixtures.
+// ----------------------------------------------------------------------------
+
+// Local stand-in for DGBWorkSource::MintShareInputs — the adapter is duck-typed
+// on the inputs so this TU need not pull the stratum work_source in.
+struct MintInputsKAT {
+    std::vector<unsigned char> header_bytes;
+    std::vector<unsigned char> coinbase_bytes;
+    uint64_t                   subsidy = 0;
+    uint256                    prev_share;
+    std::vector<uint256>       merkle_branches;
+    std::vector<unsigned char> payout_script;
+    bool                       segwit_active = false;
+};
+
+TEST(DGB_run_loop_mint, ParseMinHeader80RoundTrip)
+{
+    dgb::coin::BlockHeaderType hdr;
+    hdr.m_version        = 0x20000000u;        // version bits | SCRYPT marker shape
+    hdr.m_previous_block = uint256S(
+        "00000000000000000000000000000000000000000000000000000000deadbeef");
+    hdr.m_merkle_root    = uint256S(
+        "00000000000000000000000000000000000000000000000000000000cafef00d");
+    hdr.m_timestamp      = 0x5f5e1000u;
+    hdr.m_bits           = 0x1e0ffff0u;
+    hdr.m_nonce          = 0x12345678u;
+
+    PackStream packed = pack<dgb::coin::BlockHeaderType>(hdr);
+    std::vector<unsigned char> bytes(
+        reinterpret_cast<unsigned char*>(packed.data()),
+        reinterpret_cast<unsigned char*>(packed.data()) + packed.size());
+    ASSERT_EQ(bytes.size(), 80u);  // 4+32+32+4+4+4
+
+    auto small = dgb::parse_min_header_80(bytes);
+    ASSERT_TRUE(small.has_value());
+    EXPECT_EQ(small->m_version,        0x20000000u);
+    EXPECT_EQ(small->m_previous_block, hdr.m_previous_block);
+    EXPECT_EQ(small->m_timestamp,      0x5f5e1000u);
+    EXPECT_EQ(small->m_bits,           0x1e0ffff0u);
+    EXPECT_EQ(small->m_nonce,          0x12345678u);
+}
+
+TEST(DGB_run_loop_mint, ParseMinHeaderShortFailsClosed)
+{
+    EXPECT_FALSE(dgb::parse_min_header_80({}).has_value());
+    EXPECT_FALSE(dgb::parse_min_header_80(std::vector<unsigned char>(79, 0)).has_value());
+}
+
+// A malformed (short) header returns NULL uint256 WITHOUT touching the tracker —
+// and exercises the template instantiation of mint_local_share_with_ratchet
+// against master's create_local_share signature (compile+link drift guard).
+TEST(DGB_run_loop_mint, AdapterFailsClosedOnShortHeader)
+{
+    dgb::ShareTracker tracker;
+    auto params  = dgb::make_coin_params(/*testnet=*/false);
+    auto ratchet = dgb::make_dgb_ratchet();
+
+    MintInputsKAT in;
+    in.header_bytes = std::vector<unsigned char>(40, 0);  // too short -> fail-closed
+
+    uint256 h = dgb::mint_local_share_with_ratchet(in, tracker, params, ratchet);
+    EXPECT_TRUE(h.IsNull());
 }
