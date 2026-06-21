@@ -144,7 +144,7 @@ log "ARM A: launching embedded c2pool-dgb against node A (regtest diff -> natura
   --coin-rpc 127.0.0.1:$RPCPORT_A \
   --coin-rpc-auth "$DATADIR_A/digibyte.conf" \
   --coin-magic "$DGB_REGTEST_MAGIC" \
-  --coin-genesis "$DGB_REGTEST_GENESIS" >/tmp/c2pool-dgb-soak.log 2>&1 &
+  --coin-genesis "$DGB_REGTEST_GENESIS" --regtest --regtest-force-won-share >/tmp/c2pool-dgb-soak.log 2>&1 &
 C2POOL_PID=$!
 log "c2pool-dgb PID $C2POOL_PID; waiting for a won share to relay a coinbase-only block to node B"
 n=0
