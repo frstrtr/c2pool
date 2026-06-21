@@ -451,5 +451,24 @@ if (BUILD_TESTING AND GTest_FOUND)
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_aux_parent_coinbase_parity_test "" AUTO)
+    # --- #271 per-job template-retention seam (coin/template_capture.hpp) ------
+    # dgb_template_capture_test: pins the PRODUCTION captured_template_txs_fn the
+    # won-block reconstructor's template_other_txs_fn is built from (via the #299
+    # make_template_other_txs_fn bridge) -- capture(share,txs[]) -> provide(share)
+    # replays the exact template, a MISS replays empty (coinbase-only valid, NOT
+    # fail-closed), and composed through the bridge a HIT decodes to the same
+    # MutableTransaction vector deserialize_template_other_txs yields directly.
+    # Replaces main_dgb's interim mempool re-selection lambda (static-mempool-
+    # only). Compiles the tx codec + bridge, so it links the same embedded_tx_
+    # select SCC set as dgb_template_other_txs_test. MUST also be in BOTH build.yml
+    # --target allowlists (#143 NOT_BUILT trap).
+    add_executable(dgb_template_capture_test template_capture_test.cpp)
+    target_link_libraries(dgb_template_capture_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb dgb_stratum
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain
+        nlohmann_json::nlohmann_json)
+    gtest_add_tests(dgb_template_capture_test "" AUTO)
 
 endif()
