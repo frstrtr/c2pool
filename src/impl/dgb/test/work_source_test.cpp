@@ -112,6 +112,87 @@ TEST(DgbWorkSource, BestShareHashFnEmptyUntilWired)
     EXPECT_EQ(fn(), uint256::ZERO);
 }
 
+// ── Worker->mint sharechain-accept seam (set_mint_share_fn / try_mint_share) ──
+// The producer half of the worker->mint run-loop standup: DGBWorkSource hands a
+// share-difficulty submission's found-share fields to a callback main_dgb.cpp
+// binds to mint_local_share_with_ratchet (#294) -> create_local_share. These
+// pin the seam contract before the stage-4d classify branch reaches it.
+
+TEST(DgbWorkSource, MintShareFnEmptyUntilWiredReturnsNullNoSilentDrop)
+{
+    Fixture fx;
+    auto ws = fx.make();
+    // Unbound: try_mint_share must NOT crash and must return a NULL hash
+    // (the accepted share is logged, never silently dispatched into a null fn).
+    dgb::stratum::DGBWorkSource::MintShareInputs in;
+    in.subsidy = 500000000;
+    EXPECT_EQ(ws->try_mint_share(in), uint256::ZERO);
+}
+
+TEST(DgbWorkSource, MintShareFnForwardsInputsAndReturnsHash)
+{
+    Fixture fx;
+    auto ws = fx.make();
+
+    // Spy mint callback: capture the inputs (forward) and return a sentinel
+    // hash (pass-through back to the classify branch).
+    dgb::stratum::DGBWorkSource::MintShareInputs seen;
+    bool called = false;
+    uint256 sentinel; sentinel.SetHex(
+        "00000000000000000000000000000000000000000000000000000000cafe5a7e");
+
+    ws->set_mint_share_fn(
+        [&](const dgb::stratum::DGBWorkSource::MintShareInputs& got) -> uint256 {
+            called = true;
+            seen = got;
+            return sentinel;
+        });
+
+    dgb::stratum::DGBWorkSource::MintShareInputs in;
+    in.header_bytes   = std::vector<unsigned char>(80, 0xab);
+    in.coinbase_bytes = {0x03, 0x01, 0x02, 0x03};
+    in.subsidy        = 0x1234567890ULL;
+    in.prev_share.SetHex(
+        "00000000000000000000000000000000000000000000000000000000000000aa");
+    in.merkle_branches.push_back(in.prev_share);
+    in.payout_script  = {0x76, 0xa9};
+    in.segwit_active  = true;
+
+    uint256 minted = ws->try_mint_share(in);
+
+    EXPECT_TRUE(called);
+    EXPECT_EQ(minted, sentinel);                  // minted hash flows back verbatim
+    EXPECT_EQ(seen.header_bytes.size(), 80u);     // inputs forwarded, not dropped
+    EXPECT_EQ(seen.coinbase_bytes.size(), 4u);
+    EXPECT_EQ(seen.subsidy, 0x1234567890ULL);
+    EXPECT_EQ(seen.prev_share, in.prev_share);
+    ASSERT_EQ(seen.merkle_branches.size(), 1u);
+    EXPECT_EQ(seen.merkle_branches[0], in.prev_share);
+    EXPECT_EQ(seen.payout_script.size(), 2u);
+    EXPECT_TRUE(seen.segwit_active);
+}
+
+// No behavior change this slice: the seam is stood up but the 4a mining_submit
+// stub still rejects every submission and must NOT reach the mint callback
+// (the classify branch that calls try_mint_share lands in stage 4d).
+TEST(DgbWorkSource, MiningSubmitStubDoesNotInvokeMintFnYet)
+{
+    Fixture fx;
+    auto ws = fx.make();
+    bool mint_called = false;
+    ws->set_mint_share_fn(
+        [&](const dgb::stratum::DGBWorkSource::MintShareInputs&) -> uint256 {
+            mint_called = true;
+            return uint256{};
+        });
+    auto result = ws->mining_submit(
+        "DGBaddr.worker1", "job-0", "en1", "en2", "ntime", "nonce", "rid-0",
+        /*merged_addresses=*/{}, /*job=*/nullptr);
+    ASSERT_TRUE(result.is_array());
+    EXPECT_FALSE(result[0].get<bool>());   // 4a stub still rejects
+    EXPECT_FALSE(mint_called);             // seam wired but NOT yet reached
+}
+
 TEST(DgbWorkSource, WorkerRegistryRoundTrip)
 {
     Fixture fx;
