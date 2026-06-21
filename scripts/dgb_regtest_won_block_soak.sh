@@ -154,7 +154,7 @@ until [ "$(tip_b)" -gt "$BASE_B" ]; do
   sleep 0.5
 done
 WON_HASH="$(cli_b getblockhash "$(tip_b)")"
-NTX="$(cli_b getblock "$WON_HASH" | grep -o '"tx"[^]]*]' | grep -o '"[0-9a-f]\{64\}"' | wc -l)"
+NTX="$(cli_b getblock "$WON_HASH" | tr -d '\n' | grep -o '"tx"[^]]*]' | grep -o '"[0-9a-f]\{64\}"' | wc -l)"
 [ "$NTX" -eq 1 ] || die "ARM A: won block $WON_HASH has $NTX txs, expected 1 (coinbase-only, PROP 1)"
 log "ARM A OK: P2P-relayed coinbase-only won block $WON_HASH accepted by peer node B (PROP 1 + ARM A)"
 kill "$C2POOL_PID" >/dev/null 2>&1; C2POOL_PID=""
@@ -182,7 +182,7 @@ until [ "$(tip_b)" -gt "$BASE_B2" ]; do
   sleep 0.5
 done
 WON_HASH_B="$(cli_b getblockhash "$(tip_b)")"
-NTX_B="$(cli_b getblock "$WON_HASH_B" | grep -o '"tx"[^]]*]' | grep -o '"[0-9a-f]\{64\}"' | wc -l)"
+NTX_B="$(cli_b getblock "$WON_HASH_B" | tr -d '\n' | grep -o '"tx"[^]]*]' | grep -o '"[0-9a-f]\{64\}"' | wc -l)"
 [ "$NTX_B" -eq 1 ] || die "ARM B: won block $WON_HASH_B has $NTX_B txs, expected 1 (coinbase-only, PROP 1)"
 log "ARM B OK: submitblock-RPC-only coinbase-only won block $WON_HASH_B accepted by peer node B (PROP 1 + ARM B, P2P arm suppressed)"
 kill "$C2POOL_PID" >/dev/null 2>&1; C2POOL_PID=""
