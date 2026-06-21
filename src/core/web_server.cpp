@@ -2837,6 +2837,18 @@ nlohmann::json MiningInterface::getinfo(const std::string& request_id)
         connections = m_node->get_connected_peers_count();
     }
     
+    // Prefer the live MiningInterface hooks over the m_node accessors.
+    // In the embedded prod build m_node is the unpopulated enhanced_node stub
+    // whose peer/hashrate accessors return 0 -- the source of the false
+    // "no peers / 0 hashrate" dashboard alarms. m_peer_info_fn (real c2pool
+    // share peers) and m_pool_hashrate_fn (real attempts/s) are wired live.
+    if (m_peer_info_fn) {
+        auto pi = m_peer_info_fn();
+        if (pi.is_array()) connections = pi.size();
+    }
+    if (double real_hs = get_pool_hashrate(); real_hs > 0.0)
+        pool_hashrate = real_hs;
+
     // Read block height from cached template
     uint64_t block_height = 0;
     double network_hashps = 0.0;
@@ -2894,6 +2906,14 @@ nlohmann::json MiningInterface::getstats(const std::string& request_id)
         if (ds.contains("global_pool_difficulty"))
             difficulty = ds["global_pool_difficulty"];
     }
+
+    // Prefer live hooks over the empty m_node stub (see getinfo above).
+    if (m_peer_info_fn) {
+        auto pi = m_peer_info_fn();
+        if (pi.is_array()) connected_peers = pi.size();
+    }
+    if (double real_hs = get_pool_hashrate(); real_hs > 0.0)
+        pool_hashrate = real_hs;
 
     auto* pm = m_payout_manager_ptr ? m_payout_manager_ptr : m_payout_manager.get();
     if (pm)
