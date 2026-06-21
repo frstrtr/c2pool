@@ -34,6 +34,8 @@
 #include <impl/dgb/coin/embedded_tx_select.hpp>   // make_mempool_tx_source (EmbeddedTxSource)
 #include <impl/dgb/coin/won_block_dispatch.hpp>
 #include <impl/dgb/coin/reconstruct_closure.hpp>  // make_reconstruct_closure_from_template (#280)
+#include <impl/dgb/coin/won_block_finalize.hpp>   // finalize_won_block_pow -- forced-won PoW grind JOINT (#82 gate)
+#include <impl/dgb/coin/header_sample_build.hpp>  // c2pool::dgb::compact_to_target (nBits -> u256)
 #include <impl/dgb/coin/won_share_inputs.hpp>      // won_share_inputs (#279)
 #include <impl/dgb/coin/node_interface.hpp>
 #include <impl/dgb/coin/header_ingest.hpp>
@@ -55,6 +57,7 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <functional>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -86,13 +89,19 @@ void print_banner(const char* argv0, const core::CoinParams& p)
     std::cout
         << "c2pool-dgb " << C2POOL_VERSION << " — DigiByte Scrypt-only (V36)\n\n"
         << "Usage: " << argv0
-        << " [--version] [--help] [--selftest] [--run] [--no-p2p-relay] [--stratum [H:]P]\n\n"
+        << " [--version] [--help] [--selftest] [--run] [--stratum [H:]P]\n"
+        << "       [--coin-daemon H:P] [--coin-magic HEX] [--regtest]\n"
+        << "       [--regtest-force-won-share] [--no-p2p-relay]\n\n"
         << "Status: pool/sharechain pillars live (Phase B); run-loop up\n"
         << "        (--run: io_context + sharechain peer + Stratum standup).\n"
         << "        --stratum [HOST:]PORT binds a miner-facing TCP listener\n"
         << "        (e.g. --stratum 5022 or --stratum 127.0.0.1:5022); omit to\n"
         << "        disable. Embedded P2P won-block relay + external digibyted\n"
         << "        RPC fallback land in the next slices.\n"
+        << "        --regtest-force-won-share (regtest-ONLY; requires\n"
+        << "        --regtest AND --coin-daemon) drives ONE forced won\n"
+        << "        share through the live dual-path broadcaster;\n"
+        << "        --no-p2p-relay isolates the submitblock arm.\n"
         << "Network: " << network_summary(p) << "\n";
 }
 
@@ -143,7 +152,8 @@ int run_node(const core::CoinParams& params, bool testnet,
              const uint256& coin_genesis,
              const std::string& rpc_endpoint,
              const std::string& rpc_conf_path,
-             bool no_p2p_relay)
+             bool regtest = false, bool force_won_share = false,
+             bool no_p2p_relay = false)
 {
     io::io_context ioc;
 
@@ -380,6 +390,46 @@ int run_node(const core::CoinParams& params, bool testnet,
             return {};  // coinbase-only today (see note above)
         });
 
+    // -- #82 forced-won PoW finalize -------------------------------------
+    // A forced-won share (the regtest --regtest-force-won-share live seam)
+    // carries no real Scrypt work, so the reconstructed block is daemon-rejected
+    // high-hash (observed: ProcessNewBlock AcceptBlock FAILED, proof of work
+    // failed). Grind the reconstructed header nonce to satisfy the block's OWN
+    // declared nBits via the won_block_finalize JOINT (over the #286 scrypt_pow
+    // SSOT) BEFORE dispatch, so the dual-path broadcaster relays a PoW-valid
+    // block the peer ACCEPTs. Gated to the regtest forced-won path ONLY: a
+    // genuine pool-won share already satisfies the parent target and is NEVER
+    // reground -- zero production behaviour change.
+    if (regtest && force_won_share) {
+        auto inner = std::move(faithful_reconstruct);
+        faithful_reconstruct =
+            [inner = std::move(inner)](const uint256& share_hash)
+            -> std::optional<std::pair<std::vector<unsigned char>, std::string>> {
+            auto blk = inner(share_hash);
+            if (!blk || blk->first.size() < 80) return blk;  // pass through / fail closed
+            // nBits is header bytes [72..75], little-endian.
+            const uint32_t nbits =
+                  static_cast<uint32_t>(blk->first[72])
+                | (static_cast<uint32_t>(blk->first[73]) << 8)
+                | (static_cast<uint32_t>(blk->first[74]) << 16)
+                | (static_cast<uint32_t>(blk->first[75]) << 24);
+            const auto target = c2pool::dgb::compact_to_target(nbits);
+            auto fin = dgb::coin::finalize_won_block_pow(blk->first, target);
+            if (!fin) {
+                std::cout << "[DGB-BLOCK] forced-won finalize: no satisfying nonce "
+                             "for nBits=" << std::hex << nbits << std::dec
+                          << " -- relaying UNGROUND (peer will reject high-hash)"
+                          << std::endl;
+                return blk;
+            }
+            std::cout << "[DGB-BLOCK] forced-won finalize: ground nonce="
+                      << fin->grind.nonce << " after " << fin->grind.iters
+                      << " iters (PoW now satisfies nBits=" << std::hex << nbits
+                      << std::dec << ")" << std::endl;
+            return std::make_pair(std::move(fin->bytes), std::move(fin->hex));
+        };
+    }
+
     p2p_node.tracker().m_on_block_found = dgb::coin::make_on_block_found(
         /*reconstruct=*/std::move(faithful_reconstruct),
         /*p2p_relay=*/[&ioc, &coin_p2p, no_p2p_relay](const std::vector<unsigned char>& block_bytes) {
@@ -571,6 +621,202 @@ int run_node(const core::CoinParams& params, bool testnet,
         std::cout << "[DGB] stratum disabled (no --stratum flag)" << std::endl;
     }
 
+    // ── #82 REGTEST-GATED forced-won-share LIVE seam (decision (a), 2026-06-21) ──
+    //
+    // Synthesize ONE won share, insert it into the LIVE dgb::ShareTracker chain,
+    // and fire m_on_block_found(share_hash) AFTER both broadcast arms are bound
+    // (above). This drives the REAL faithful reconstruct closure
+    // (make_reconstruct_closure_from_template) + the REAL dual-path dispatch
+    // (make_on_block_found) over a genuine tracker share — the live counterpart
+    // of the dgb_forced_won_share_dualpath KAT, whose seams are synthetic.
+    //
+    // FAIL-CLOSED GATE: this seam is REACHABLE ONLY on a regtest run. There is
+    // no regtest CoinParam (the run builds make_coin_params(testnet=false)), so
+    // "regtest" is asserted conservatively as BOTH --regtest AND a --coin-daemon
+    // target (a dev regtest digibyted, e.g. magic fabfb5da). If --regtest-force-
+    // won-share is passed WITHOUT that, it is REFUSED (logged, not fired): it can
+    // never run on a production/mainnet path. The share is posted on a short
+    // timer so it fires after the producer handshake driver, on the io thread.
+    io::steady_timer force_won_timer(ioc);
+    if (force_won_share) {
+        const bool gated_regtest = regtest && !coin_daemon.empty();
+        if (!gated_regtest) {
+            std::cout << "[DGB] REFUSED --regtest-force-won-share: not a regtest "
+                         "run (requires BOTH --regtest AND --coin-daemon <regtest "
+                         "digibyted>). Seam NOT fired — fail-closed." << std::endl;
+        } else {
+            // Build a v36 MergedMiningShare with a NULL parent so the PPLNS walk
+            // is skipped entirely (no chain ancestry needed) — payouts empty,
+            // donation == subsidy. The reconstruct closure reads this share via
+            // chain.get_share(h): won_share_inputs(*obj) (m_min_header +
+            // m_merkle_link, both default-constructed here) and
+            // generate_share_transaction(*obj, ...) (the SSOT gentx regen). The
+            // share is inserted under its m_hash so the get_share lookup hits.
+            auto* forced = new dgb::MergedMiningShare();
+            // Deterministic synthetic share hash (all-hex; no real PoW). The
+            // tag "f02ced" marks it as the #82 forced-won-share seam in logs.
+            forced->m_hash.SetHex(
+                "00000000000000000000000000000000000000000000000000000000f02ced01");
+            forced->m_prev_hash.SetNull();             // null parent => PPLNS skipped
+            forced->m_coinbase.m_data =
+                { 0x03, 0xa1, 0xb2, 0xc3, 0x04, 0x11, 0x22, 0x33, 0x44 };
+            forced->m_nonce = 0x12345678;
+            forced->m_pubkey_hash.SetNull();
+            forced->m_pubkey_type = 0;
+            forced->m_subsidy = 500000000ull;
+            forced->m_donation = 0;
+            forced->m_stale_info = dgb::none;
+            forced->m_desired_version = 36;
+            forced->m_segwit_data = std::nullopt;
+            forced->m_far_share_hash.SetNull();
+            forced->m_max_bits = 0x1e0fffff;
+            forced->m_bits = 0x1e0fffff;
+            forced->m_timestamp = 1718700000;
+            forced->m_absheight = 1000;
+            forced->m_merged_payout_hash.SetNull();
+            forced->m_last_txout_nonce = 0x0001020304050607ull;
+            // m_min_header / m_merkle_link / m_ref_merkle_link default-construct.
+            const uint256 forced_hash = forced->m_hash;
+            p2p_node.tracker().add(forced);            // chain indexes by m_hash
+
+            // ── Fire AFTER work-template/UpdateTip-ready, not a blind one-shot ──
+            //
+            // The historical 0-shares/120s timeout had a SECOND cause behind the
+            // stale port-5024 collision: a fixed 5s one-shot fired the won-share
+            // BEFORE the embedded coin-daemon P2P producer finished its
+            // version/verack handshake and before any header reached HeaderChain
+            // (the first UpdateTip). A won block dispatched then cannot reach
+            // node B by the P2P-relay arm (peer not yet connected) and races
+            // ahead of node B's own sync, so neither path produced a
+            // ProcessNewBlock ACCEPT and the soak grep saw "Final share count: 0".
+            //
+            // Gate the fire on a genuine readiness signal instead (integrator
+            // 2026-06-21): poll until BOTH (a) the coin-daemon P2P handshake is
+            // complete (node B reachable for the P2P-relay arm + the submitblock
+            // RPC fallback) AND (b) HeaderChain::tip_hash() carries a tip (>=1
+            // UpdateTip ingested -> a work template with a real
+            // previousblockhash now exists). Latch-once. A bounded fallback fires
+            // after the cap with a LOUD, attributable log so a slow/stuck peer
+            // surfaces as a named blocker, not a silent no-fire. Regtest-only;
+            // zero production-path behaviour change.
+            auto fw_attempt = std::make_shared<int>(0);
+            constexpr int FW_MAX_ATTEMPTS = 40;        // 40 * 1.5s = 60s cap
+            auto fw_poll = std::make_shared<
+                std::function<void(const boost::system::error_code&)>>();
+            // -- #82 faithful seed: rebuild the synthetic won share header
+            // from node B's LIVE getblocktemplate (integrator 2026-06-21) --
+            // Bare prevhash seeding fixes only bad-prevblk; node B can still
+            // reject on a wrong nBits (high-hash), a mismatched BIP34 height
+            // (bad-cb-height) or an over-claimed coinbase (bad-cb-amount).
+            // Pulling node B's OWN Scrypt-lane GBT (make_gbt_request pins
+            // algo=scrypt) yields a fully connectable coinbase-only block in
+            // one move: correct prev + bits + height + coinbasevalue. The
+            // reconstruct closure frames it; --soak-regrind then grinds the
+            // nonce to satisfy THIS bits. Regtest-only; coinbase-only =>
+            // merkle root == gentx txid by construction (no bad-txnmrklroot).
+            auto seed_forced_from_gbt = [forced, &rpc, &header_chain]() {
+                if (!rpc) {
+                    // Unreachable on the gated path (--regtest-force-won-share
+                    // requires --coin-daemon, which arms rpc); without the GBT
+                    // there is no authoritative bits/height anyway, so the block
+                    // cannot connect. Surface, do not fabricate.
+                    std::cout << "[DGB] #82 forced-won seed: no RPC arm - cannot "
+                                 "pull node-B GBT; block will not connect"
+                              << std::endl;
+                    return;
+                }
+                try {
+                    auto gbt = rpc->getblocktemplate({"segwit"});
+                    auto& mh = forced->m_min_header;
+                    mh.m_version = gbt.at("version").get<uint64_t>();
+                    mh.m_previous_block.SetHex(
+                        gbt.at("previousblockhash").get<std::string>());
+                    mh.m_bits = static_cast<uint32_t>(
+                        std::stoul(gbt.at("bits").get<std::string>(), nullptr, 16));
+                    mh.m_timestamp = gbt.at("curtime").get<uint32_t>();
+                    forced->m_bits      = mh.m_bits;
+                    forced->m_max_bits  = mh.m_bits;
+                    forced->m_timestamp = mh.m_timestamp;
+                    forced->m_absheight = gbt.at("height").get<uint32_t>();
+                    forced->m_subsidy   = gbt.at("coinbasevalue").get<uint64_t>();
+                    // BIP34: the coinbase scriptSig MUST begin with the
+                    // serialized block height (minimal CScriptNum push) or
+                    // node B rejects bad-cb-height. The synthetic
+                    // m_coinbase.m_data is passed through verbatim by
+                    // generate_share_transaction, so encode node B's GBT
+                    // height here. height>0 always (won block is tip+1).
+                    {
+                        uint32_t h = forced->m_absheight;
+                        std::vector<unsigned char> hb;
+                        while (h) { hb.push_back(h & 0xff); h >>= 8; }
+                        if (hb.empty()) hb.push_back(0);
+                        if (hb.back() & 0x80) hb.push_back(0);
+                        std::vector<unsigned char> cb;
+                        cb.push_back(static_cast<unsigned char>(hb.size()));
+                        cb.insert(cb.end(), hb.begin(), hb.end());
+                        const unsigned char tail[] = {0x04, 0x11, 0x22, 0x33, 0x44};
+                        cb.insert(cb.end(), std::begin(tail), std::end(tail));
+                        forced->m_coinbase.m_data = cb;
+                    }
+                    std::cout << "[DGB] #82 forced-won seed from node-B GBT: height="
+                              << forced->m_absheight << " prev="
+                              << gbt.at("previousblockhash").get<std::string>().substr(0, 16)
+                              << " bits=" << gbt.at("bits").get<std::string>()
+                              << " coinbasevalue=" << forced->m_subsidy << std::endl;
+                } catch (const std::exception& e) {
+                    std::cout << "[DGB] #82 forced-won seed: getblocktemplate FAILED ("
+                              << e.what()
+                              << ") - NAMED BLOCKER, block will not connect"
+                              << std::endl;
+                }
+            };
+            auto fire_forced =
+                [&p2p_node, forced_hash, no_p2p_relay, seed_forced_from_gbt](const char* why) {
+                    seed_forced_from_gbt();   // node-B-faithful header before reconstruct
+                    std::cout << "[DGB] #82 forced-won-share seam firing "
+                              << "m_on_block_found("
+                              << forced_hash.GetHex().substr(0, 16)
+                              << ") — regtest, " << why << "; "
+                              << (no_p2p_relay ? "ARM B (submitblock) ISOLATED "
+                                                 "(--no-p2p-relay)"
+                                               : "BOTH arms (P2P relay + submitblock)")
+                              << std::endl;
+                    auto& cb = p2p_node.tracker().m_on_block_found;
+                    if (cb) cb(forced_hash);
+                    else
+                        std::cout << "[DGB] forced-won-share: m_on_block_found "
+                                     "UNBOUND — nothing fired" << std::endl;
+                };
+            *fw_poll = [&force_won_timer, &coin_p2p, &header_chain, fw_poll,
+                        fw_attempt, fire_forced]
+                (const boost::system::error_code& ec) {
+                if (ec) return;
+                const bool handshake_ready =
+                    coin_p2p && coin_p2p->is_handshake_complete();
+                const bool tip_ready = header_chain.tip_hash().has_value();
+                if (handshake_ready && tip_ready) {
+                    fire_forced("work-template/UpdateTip-ready "
+                                "(handshake complete + tip present)");
+                    return;
+                }
+                if (++(*fw_attempt) >= FW_MAX_ATTEMPTS) {
+                    std::cout << "[DGB] forced-won-share readiness TIMEOUT after "
+                              << FW_MAX_ATTEMPTS << " polls — unmet: "
+                              << (handshake_ready ? "" : "[handshake] ")
+                              << (tip_ready ? "" : "[tip] ")
+                              << "— firing anyway (last-resort; node B may reject)"
+                              << std::endl;
+                    fire_forced("readiness-TIMEOUT last-resort");
+                    return;
+                }
+                force_won_timer.expires_after(std::chrono::milliseconds(1500));
+                force_won_timer.async_wait(*fw_poll);
+            };
+            force_won_timer.expires_after(std::chrono::milliseconds(1500));
+            force_won_timer.async_wait(*fw_poll);
+        }
+    }
+
     std::cout << "[DGB] run-loop up: " << network_summary(params) << "\n";
     std::cout << "[DGB] io_context running. Ctrl-C to stop." << std::endl;
 
@@ -600,7 +846,19 @@ int main(int argc, char** argv)
     uint256 coin_genesis;                   // --coin-genesis HASH (initial getheaders locator base)
     std::string rpc_endpoint;               // --coin-rpc HOST:PORT (external digibyted submit arm)
     std::string rpc_conf_path;              // --coin-rpc-auth PATH to digibyte.conf (creds source)
-    bool no_p2p_relay = false;              // --no-p2p-relay: suppress embedded P2P-relay arm (#82 ARM B isolation)
+    // ── #82 regtest-gated forced-won-share LIVE seam (decision (a), 2026-06-21) ──
+    // --regtest-force-won-share synthesizes ONE won share into the live
+    // ShareTracker and fires m_on_block_found AFTER both broadcast arms are
+    // bound, driving the faithful reconstruct closure + dual-path dispatch live.
+    // FAIL-CLOSED: it is REFUSED unless the run is regtest. There is no regtest
+    // CoinParam yet (make_coin_params(testnet=false)), so 'regtest' here means an
+    // explicit --regtest marker AND a --coin-daemon target (a dev regtest
+    // digibyted). Absent either, the flag is logged-and-ignored — it can NEVER
+    // fire on a production/mainnet run path. --no-p2p-relay isolates ARM B
+    // (external submitblock) by suppressing the embedded P2P-relay sink.
+    bool regtest        = false;            // --regtest (dev/regtest marker; gates the forced seam)
+    bool force_won_share = false;           // --regtest-force-won-share (regtest-ONLY won-block live seam)
+    bool no_p2p_relay   = false;            // --no-p2p-relay (suppress ARM A to isolate ARM B)
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
             std::cout << "c2pool-dgb " << C2POOL_VERSION << "\n";
@@ -635,6 +893,9 @@ int main(int argc, char** argv)
         if (std::strcmp(argv[i], "--coin-rpc-auth") == 0 && i + 1 < argc) {
             rpc_conf_path = argv[++i];             // path to digibyte.conf (rpcpassword stays in-file)
         }
+        if (std::strcmp(argv[i], "--regtest") == 0)  regtest = true;
+        if (std::strcmp(argv[i], "--regtest-force-won-share") == 0)
+            force_won_share = true;                 // gated below: regtest-ONLY
         if (std::strcmp(argv[i], "--no-p2p-relay") == 0) no_p2p_relay = true;
     }
 
@@ -648,7 +909,8 @@ int main(int argc, char** argv)
     if (want_run)
         return run_node(params, /*testnet=*/false, stratum_addr, stratum_port,
                         coin_daemon, coin_magic, coin_genesis,
-                        rpc_endpoint, rpc_conf_path, no_p2p_relay);
+                        rpc_endpoint, rpc_conf_path,
+                        regtest, force_won_share, no_p2p_relay);
 
     // --selftest, or a bare invocation: drive the live score path so the
     // binary exercises real consensus code, then exit cleanly.
