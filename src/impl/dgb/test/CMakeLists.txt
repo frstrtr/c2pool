@@ -342,4 +342,17 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(header_chain_test PRIVATE
         GTest::gtest_main GTest::gtest nlohmann_json::nlohmann_json)
     gtest_add_tests(header_chain_test "" AUTO)
+
+    # --- Stage 4b/4c: DGB-Scrypt PoW digest CALL (coin/scrypt_pow.hpp) --------
+    # Pins scrypt_pow_hash = scrypt_1024_1_1_256(80-byte header) decoded via
+    # u256::from_le_bytes, plus the satisfaction-gate byte order (pow_hash <=
+    # target) header_chain.hpp compares. Reuses the SAME _dgb_scrypt_tus set as
+    # header_chain_test (real scrypt, not synthetic) -- header-only u256, no core
+    # / no dgb OBJECT lib, the standalone-guard discipline dgb_arith256.hpp keeps.
+    # Same target name, so it stays in BOTH build.yml --target allowlists.
+    add_executable(dgb_scrypt_pow_test scrypt_pow_test.cpp ${_dgb_scrypt_tus})
+    target_include_directories(dgb_scrypt_pow_test PRIVATE ${CMAKE_SOURCE_DIR}/src/btclibs)
+    target_link_libraries(dgb_scrypt_pow_test PRIVATE
+        GTest::gtest_main GTest::gtest)
+    gtest_add_tests(dgb_scrypt_pow_test "" AUTO)
 endif()

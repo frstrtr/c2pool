@@ -84,7 +84,7 @@ jobs:
                     dgb_gentx_coinbase_test nmc_auxpow_merkle_test nmc_template_builder_test nmc_auxpow_wire_test nmc_reconstruct_won_block_test dgb_gentx_share_path_test dgb_other_tx_resolver_test \
                     dgb_other_tx_assembler_test dgb_reconstruct_won_block_test dgb_reconstruct_closure_test dgb_gentx_unpack_test dgb_work_source_test dgb_template_builder_test dgb_embedded_coin_node_test dgb_embedded_tx_select_test dgb_coinbase_value_parity_test \
                     rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test header_chain_test \
-                    dgb_coin_node_seam_test dgb_block_broadcast_test dgb_won_block_dispatch_test dgb_forced_won_share_dualpath_test \
+                    dgb_coin_node_seam_test dgb_block_broadcast_test dgb_won_block_dispatch_test dgb_forced_won_share_dualpath_test dgb_scrypt_pow_test \
                     v37_test \
             -j$(nproc)
 
@@ -217,7 +217,7 @@ jobs:
                     dgb_gentx_coinbase_test nmc_auxpow_merkle_test nmc_template_builder_test nmc_auxpow_wire_test nmc_reconstruct_won_block_test dgb_gentx_share_path_test dgb_other_tx_resolver_test \
                     dgb_other_tx_assembler_test dgb_reconstruct_won_block_test dgb_reconstruct_closure_test dgb_gentx_unpack_test dgb_work_source_test dgb_template_builder_test dgb_embedded_coin_node_test dgb_embedded_tx_select_test dgb_coinbase_value_parity_test \
                     rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test header_chain_test \
-                    dgb_coin_node_seam_test dgb_block_broadcast_test dgb_won_block_dispatch_test dgb_forced_won_share_dualpath_test \
+                    dgb_coin_node_seam_test dgb_block_broadcast_test dgb_won_block_dispatch_test dgb_forced_won_share_dualpath_test dgb_scrypt_pow_test \
                     test_coin_broadcaster test_multiaddress_pplns test_pplns_stress \
                     v37_test \
             -j$(nproc)
