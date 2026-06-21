@@ -333,4 +333,26 @@ void DGBWorkSource::set_best_share_hash_fn(std::function<uint256()> fn)
     best_share_hash_fn_ = std::move(fn);
 }
 
+void DGBWorkSource::set_mint_share_fn(MintShareFn fn)
+{
+    std::lock_guard<std::mutex> lk(mint_share_mutex_);
+    mint_share_fn_ = std::move(fn);
+}
+
+uint256 DGBWorkSource::try_mint_share(const MintShareInputs& in) const
+{
+    MintShareFn fn;
+    {
+        std::lock_guard<std::mutex> lk(mint_share_mutex_);
+        fn = mint_share_fn_;  // copy so a concurrent set cannot tear it out mid-call
+    }
+    if (!fn) {
+        LOG_WARNING << "[DGB-STRATUM] share met share-target but no mint callback "
+                       "wired -- share NOT recorded (set_mint_share_fn unbound). "
+                       "No silent drop: logged.";
+        return uint256{};
+    }
+    return fn(in);
+}
+
 }  // namespace dgb::stratum
