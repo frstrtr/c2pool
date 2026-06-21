@@ -22,6 +22,7 @@
 #include <impl/dgb/coin/rpc_conf.hpp>   // #82 external-daemon RPC creds (digibyte.conf)
 #include <impl/dgb/auto_ratchet.hpp> // Phase B: mint-side share-version ratchet
 #include <impl/dgb/auto_ratchet_wire.hpp> // Phase B: production wire-in (base_version=35)
+#include <impl/dgb/run_loop_mint.hpp> // Phase B: run-loop {mint,vote} binding
 #include <unistd.h>                  // getpid (AutoRatchet KAT temp state file)
 
 #include <cstdio>
@@ -464,4 +465,63 @@ TEST(DGB_share_test, AutoRatchetWireBootstrapMints35Votes36)
     EXPECT_EQ(mint, 35);   // baseline share version (oracle)
     EXPECT_EQ(vote, 36);   // always vote target
     EXPECT_EQ(ar.state(), dgb::RatchetState::VOTING);
+}
+
+// ---------------------------------------------------------------------------
+// Run-loop mint binding (run_loop_mint.hpp) — Phase B pool/share.
+// Proves the live create_local_share() caller stamps the version pair the
+// AutoRatchet selector returns, NOT a hardcoded 36/36. A bootstrap (VOTING,
+// empty tracker) node must mint the DGB baseline 35 while voting 36.
+// ---------------------------------------------------------------------------
+TEST(DGB_share_test, RunLoopMintBindsRatchetVersionsNotHardcoded)
+{
+    auto ar = dgb::make_dgb_ratchet();
+    dgb::ShareTracker tracker;
+
+    int64_t  seen_share_version   = -1;
+    uint64_t seen_desired_version = 0;
+    uint256  sentinel; sentinel.SetHex(
+        "00000000000000000000000000000000000000000000000000000000deadbeef");
+
+    // Inject a spy create-step: capture the version pair the helper forwards,
+    // return a sentinel hash so we can also confirm pass-through.
+    uint256 got = dgb::mint_local_share_with_ratchet(
+        ar, tracker, uint256{},
+        [&](int64_t sv, uint64_t dv) -> uint256 {
+            seen_share_version   = sv;
+            seen_desired_version = dv;
+            return sentinel;
+        });
+
+    EXPECT_EQ(seen_share_version,   35);   // ratchet baseline (oracle), NOT 36
+    EXPECT_EQ(seen_desired_version, 36u);  // always vote target
+    EXPECT_NE(seen_share_version, seen_desired_version); // 35 != 36: both fields
+                                                         // independently threaded
+    EXPECT_EQ(got, sentinel);              // result returned verbatim
+    EXPECT_EQ(ar.state(), dgb::RatchetState::VOTING);
+}
+
+// The helper must not consult/alter the ratchet beyond get_share_version — a
+// second call on the same VOTING state yields the same pair (idempotent stamp).
+TEST(DGB_share_test, RunLoopMintStampIsStableWhileVoting)
+{
+    auto ar = dgb::make_dgb_ratchet();
+    dgb::ShareTracker tracker;
+
+    auto stamp = [&]() {
+        std::pair<int64_t, uint64_t> p{0, 0};
+        dgb::mint_local_share_with_ratchet(
+            ar, tracker, uint256{},
+            [&](int64_t sv, uint64_t dv) -> uint256 {
+                p = {sv, dv};
+                return uint256{};
+            });
+        return p;
+    };
+
+    auto a = stamp();
+    auto b = stamp();
+    EXPECT_EQ(a, b);
+    EXPECT_EQ(a.first,  35);
+    EXPECT_EQ(a.second, 36u);
 }
