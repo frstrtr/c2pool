@@ -180,7 +180,16 @@ TEST(DgbBlockAssembly, AssembleRoundTripsCoinbaseFirst)
     EXPECT_EQ(blk.m_timestamp, sh.m_timestamp);
     EXPECT_EQ(blk.m_bits, sh.m_bits);
     EXPECT_EQ(blk.m_nonce, sh.m_nonce);
-    EXPECT_EQ(blk.m_merkle_root, gtx_hash);
+    // header merkle_root is recomputed over the ACTUAL block tx vector
+    // ([gentx_hash] ++ other-tx txids), NOT the (empty here) share merkle_link:
+    // with two other_txs it must differ from the coinbase-only root and equal
+    // build_block_merkle_root over the real leaves (#82 bad-txnmrklroot fix).
+    {
+        std::vector<uint256> leaves = { gtx_hash,
+            dgb::coin::compute_txid(other[0]), dgb::coin::compute_txid(other[1]) };
+        EXPECT_EQ(blk.m_merkle_root, dgb::coin::build_block_merkle_root(leaves));
+        EXPECT_NE(blk.m_merkle_root, gtx_hash);
+    }
 
     // txs = [gentx] ++ other_txs : coinbase at index 0, total = 1 + 2.
     ASSERT_EQ(blk.m_txs.size(), 3u);
@@ -293,6 +302,34 @@ TEST(DgbBlockAssembly, LegacyGentxEmitsLegacyBlock)
     // Legacy block re-serializes byte-identically (no witness round-trip drift).
     auto [bytes2, hex2] = assemble_won_block(sh, blk.m_txs[0], gtx_hash, link, none);
     EXPECT_EQ(hex, hex2);
+}
+
+// --- Test 8: tx-bearing block header root == body root, != coinbase-only ------
+// Regression lock for the #82 funded multi-tx gate: a reconstructed block that
+// carries 1+ non-coinbase txs MUST publish a header merkle_root computed over
+// [gentx]++other_txs, so a peer/daemon validating the body accepts it.  The
+// pre-fix path walked the share merkle_link (empty == coinbase-only => gentx_hash)
+// and the daemon rejected bad-txnmrklroot.
+TEST(DgbBlockAssembly, TxBearingRootMatchesBodyNotMerkleLink)
+{
+    auto sh = make_small_header();
+    auto gentx = make_gentx();
+    auto gtx_hash = fixed_gentx_hash();
+    ::dgb::MerkleLink link;            // empty link == the coinbase-only branch
+    std::vector<MutableTransaction> other = { make_tx(42) };
+
+    auto [bytes, hex] = assemble_won_block(sh, gentx, gtx_hash, link, other);
+    PackStream ps(bytes);
+    BlockType blk;
+    ps >> blk;
+
+    ASSERT_EQ(blk.m_txs.size(), 2u);
+    const uint256 body_root = dgb::coin::build_block_merkle_root(
+        { gtx_hash, dgb::coin::compute_txid(other[0]) });
+    EXPECT_EQ(blk.m_merkle_root, body_root);
+    // the empty merkle_link would have yielded gentx_hash -- prove we did NOT.
+    EXPECT_NE(blk.m_merkle_root, gtx_hash);
+    EXPECT_NE(body_root, gtx_hash);
 }
 
 } // namespace
