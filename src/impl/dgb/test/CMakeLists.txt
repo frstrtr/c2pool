@@ -434,4 +434,22 @@ if (BUILD_TESTING AND GTest_FOUND)
         GTest::gtest_main GTest::gtest)
     gtest_add_tests(dgb_submit_classify_test "" AUTO)
 
+    # --- DGB+DOGE (D0) aux-pow parent-coinbase serialization PARITY BASELINE ----
+    # Pins the pre-templating wire image of the shared aux module struct
+    # doge::coin::CMerkleTx (src/impl/doge/coin/auxpow.hpp) anchored to master
+    # f732061bc, so the v36-standardize Scrypt value-type extraction can prove
+    # its parent-coinbase type swap is byte-neutral. Links the ltc OBJECT lib
+    # (member type ltc::coin::MutableTransaction) + dgb (neutral stand-in type
+    # for the cross-type byte-identity assert) — the -DAUX_DOGE consumption path
+    # legitimately couples to ltc. Test-only; consumes the shared module, does
+    # not modify it. MUST appear in BOTH this registration AND the build.yml
+    # --target allowlist.
+    add_executable(dgb_aux_parent_coinbase_parity_test aux_parent_coinbase_parity_test.cpp)
+    target_link_libraries(dgb_aux_parent_coinbase_parity_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb ltc_coin
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_aux_parent_coinbase_parity_test "" AUTO)
+
 endif()
