@@ -111,7 +111,7 @@ BASE_B="$(tip_b)"
 # embedded backend's getheaders bootstrap matches node A exactly (no hand-typed
 # consensus literal). DGB regtest magic is fixed in DigiByte Core chainparams.
 DGB_REGTEST_GENESIS="$(cli_a getblockhash 0)"
-: "${DGB_REGTEST_MAGIC:?set DGB_REGTEST_MAGIC to the DigiByte regtest pchMessageStart hex (from chainparams)}"
+: "${DGB_REGTEST_MAGIC:=fabfb5da}"   # DGB regtest pchMessageStart (DigiByte Core chainparams); override for a custom regtest
 log "substrate OK: node A height $(cli_a getblockcount), peer B $BASE_B, genesis $DGB_REGTEST_GENESIS"
 
 # --- ARM A (P2P PRIMARY): live UpdateTip won block relayed to node B ----------
