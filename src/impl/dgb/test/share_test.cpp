@@ -20,6 +20,8 @@
 #include <impl/dgb/share_tracker.hpp>   // DensePPLNSWindow — V36 decayed-PPLNS SSOT
 #include <impl/dgb/params.hpp>          // make_coin_params — assembled CoinParams SSOT
 #include <impl/dgb/coin/rpc_conf.hpp>   // #82 external-daemon RPC creds (digibyte.conf)
+#include <impl/dgb/auto_ratchet.hpp> // Phase B: mint-side share-version ratchet
+#include <unistd.h>                  // getpid (AutoRatchet KAT temp state file)
 
 #include <cstdio>
 #include <set>
@@ -358,4 +360,77 @@ TEST(DGB_rpc_conf, EndpointOverrideCarriesNoSecret)
     dgb::coin::apply_endpoint_override("", c);
     EXPECT_EQ(c.host, "example.host");
     EXPECT_EQ(c.userpass(), "u:p");
+}
+
+// ----------------------------------------------------------------------------
+// AutoRatchet (mint-side share-version ratchet) — Phase B pool/share.
+// Bucket-2 v36-native shared structure (standardized cross-coin toward v37).
+// These cases pin the threshold constants + bootstrap/persistence semantics
+// and, critically, prove the DGB VOTING-output version is the oracle baseline
+// parameter (base_version_), NOT the ltc hardcode target-1. The live baseline
+// value itself is a [decision-needed] vs frstrtr/p2pool-dgb-scrypt; the module
+// stays unwired (surface-for-tap) until that lands.
+// ----------------------------------------------------------------------------
+
+TEST(DGB_share_test, AutoRatchetThresholdsMatchCanonical)
+{
+    EXPECT_EQ(dgb::AutoRatchet::ACTIVATION_THRESHOLD,    95);
+    EXPECT_EQ(dgb::AutoRatchet::DEACTIVATION_THRESHOLD,  50);
+    EXPECT_EQ(dgb::AutoRatchet::CONFIRMATION_MULTIPLIER,  2);
+    EXPECT_EQ(dgb::AutoRatchet::SWITCH_THRESHOLD,        60);
+}
+
+// The DGB divergence: base_version must be honored as a parameter, never the
+// ltc target-1 hardcode. Compile default keeps the module buildable.
+TEST(DGB_share_test, AutoRatchetBaseVersionParameterized)
+{
+    dgb::AutoRatchet def("", 36);          // default: target-1
+    EXPECT_EQ(def.target_version(), 36);
+    EXPECT_EQ(def.base_version(),   35);
+
+    dgb::AutoRatchet older("", 36, 33);    // DGB oracle baseline override
+    EXPECT_EQ(older.target_version(), 36);
+    EXPECT_EQ(older.base_version(),   33);
+    EXPECT_EQ(older.state(), dgb::RatchetState::VOTING);
+}
+
+// Bootstrap with no chain: VOTING node votes target but still MINTS the
+// baseline version (an empty/just-started tracker must not skip ahead).
+TEST(DGB_share_test, AutoRatchetBootstrapMintsBaselineWhileVoting)
+{
+    dgb::AutoRatchet ar("", 36, 33);
+    dgb::ShareTracker tracker;
+    auto [mint, vote] = ar.get_share_version(tracker, uint256{}); // null best hash
+    EXPECT_EQ(mint, 33);   // baseline, NOT 35, NOT 36
+    EXPECT_EQ(vote, 36);   // always vote for target
+    EXPECT_EQ(ar.state(), dgb::RatchetState::VOTING);
+}
+
+// State persists across restart via the JSON state file.
+TEST(DGB_share_test, AutoRatchetStatePersistsAcrossRestart)
+{
+    std::string path = std::string("/tmp/dgb_autoratchet_kat_") +
+                       std::to_string(::getpid()) + ".json";
+    std::remove(path.c_str());
+    {
+        // Seed a CONFIRMED state file.
+        nlohmann::json j;
+        j["state"] = "confirmed";
+        j["activated_at"] = 1;
+        j["activated_height"] = 2;
+        j["confirmed_at"] = 3;
+        j["confirm_count"] = 4;
+        j["target_version"] = 36;
+        j["base_version"] = 33;
+        std::ofstream f(path);
+        f << j.dump(2);
+    }
+    dgb::AutoRatchet ar(path, 36, 33);
+    EXPECT_EQ(ar.state(), dgb::RatchetState::CONFIRMED);
+    // CONFIRMED bootstrap (no chain) mints the target version.
+    dgb::ShareTracker tracker;
+    auto [mint, vote] = ar.get_share_version(tracker, uint256{});
+    EXPECT_EQ(mint, 36);
+    EXPECT_EQ(vote, 36);
+    std::remove(path.c_str());
 }
