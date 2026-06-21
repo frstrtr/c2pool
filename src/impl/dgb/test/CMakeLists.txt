@@ -371,4 +371,21 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(dgb_nonce_grinder_test PRIVATE
         GTest::gtest_main GTest::gtest)
     gtest_add_tests(dgb_nonce_grinder_test "" AUTO)
+
+    # --- Stage 4b/4c: grind -> reconstruct -> submit seam (coin/regrind_block.hpp)
+    # Pins regrind_block_nonce: grinds the header nonce of an ALREADY-FRAMED
+    # reconstructed-block blob until its DGB-Scrypt PoW satisfies the parent
+    # target, writing the winning nonce back into header [76..79] IN PLACE --
+    # the wiring between reconstruct (merkle root fixed) and a node-B
+    # ProcessNewBlock ACCEPT. Asserts the re-ground header satisfies the EXACT
+    # pow <= target gate via the #286 SSOT, that ONLY [76..79] mutate (merkle
+    # region [36..67] + tx tail byte-preserved), and fail-closed (nullopt,
+    # bytes UNCHANGED) on a runt blob or exhausted budget. Reuses the SAME
+    # _dgb_scrypt_tus real-scrypt set; header-only u256, no core / no OBJECT
+    # lib. MUST stay in BOTH build.yml --target allowlists (#143 trap).
+    add_executable(dgb_regrind_block_test regrind_block_test.cpp ${_dgb_scrypt_tus})
+    target_include_directories(dgb_regrind_block_test PRIVATE ${CMAKE_SOURCE_DIR}/src/btclibs)
+    target_link_libraries(dgb_regrind_block_test PRIVATE
+        GTest::gtest_main GTest::gtest)
+    gtest_add_tests(dgb_regrind_block_test "" AUTO)
 endif()
