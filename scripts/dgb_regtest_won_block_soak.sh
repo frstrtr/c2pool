@@ -92,6 +92,21 @@ provision "$DATADIR_B" "$RPCPORT_B"
 wait_rpc() { local n=0; until "$@" getblockcount >/dev/null 2>&1; do n=$((n+1)); [ $n -gt 60 ] && die "rpc never came up: $*"; sleep 0.5; done; }
 tip_b() { cli_b getblockcount; }
 
+# pre-flight: a stale c2pool-dgb from a prior run holds the FIXED pool P2P
+# listen port (5024, PREFIX-derived) -> ARM A aborts on "bind: Address already
+# in use" and the gate FAILS as a phantom timeout. Free it before substrate up.
+# DGB-only match; never touches other coins or the bitcoin-family regtest band.
+kill_stale_c2pool() {
+  local pids; pids="$(pgrep -f 'c2pool-dgb .*--run' 2>/dev/null || true)"
+  [ -z "$pids" ] && return 0
+  log "pre-flight: freeing pool P2P port from stale c2pool-dgb: $pids"
+  kill $pids 2>/dev/null || true; sleep 2
+  pids="$(pgrep -f 'c2pool-dgb .*--run' 2>/dev/null || true)"
+  [ -n "$pids" ] && { kill -9 $pids 2>/dev/null || true; sleep 1; }
+  return 0
+}
+kill_stale_c2pool
+
 # --- substrate: two peered regtest nodes --------------------------------------
 log "starting node A (regtest RPC $RPCPORT_A / P2P $P2PPORT_A)"
 "$DAEMON_BIN" -regtest -datadir="$DATADIR_A" -rpcport=$RPCPORT_A -port=$P2PPORT_A -daemon >/dev/null
