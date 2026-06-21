@@ -21,6 +21,7 @@
 #include <impl/dgb/params.hpp>          // make_coin_params — assembled CoinParams SSOT
 #include <impl/dgb/coin/rpc_conf.hpp>   // #82 external-daemon RPC creds (digibyte.conf)
 #include <impl/dgb/auto_ratchet.hpp> // Phase B: mint-side share-version ratchet
+#include <impl/dgb/auto_ratchet_wire.hpp> // Phase B: production wire-in (base_version=35)
 #include <unistd.h>                  // getpid (AutoRatchet KAT temp state file)
 
 #include <cstdio>
@@ -433,4 +434,34 @@ TEST(DGB_share_test, AutoRatchetStatePersistsAcrossRestart)
     EXPECT_EQ(mint, 36);
     EXPECT_EQ(vote, 36);
     std::remove(path.c_str());
+}
+
+// ----------------------------------------------------------------------------
+// Production wire-in (auto_ratchet_wire.hpp). The DGB baseline [decision-needed]
+// is RESOLVED: oracle frstrtr/p2pool-dgb-scrypt @22761e7 mints share VERSION=35
+// (SUCCESSOR=None), so base_version=35. These KATs pin that constant where it
+// enters production code, so a future edit that regresses it to the ltc
+// hardcode fails loudly.
+// ----------------------------------------------------------------------------
+TEST(DGB_share_test, AutoRatchetWireBaselineConstantsFromOracle)
+{
+    EXPECT_EQ(dgb::DGB_BASE_VERSION,   35);
+    EXPECT_EQ(dgb::DGB_TARGET_VERSION, 36);
+
+    auto ar = dgb::make_dgb_ratchet();
+    EXPECT_EQ(ar.base_version(),   35);   // oracle 22761e7, NOT a hardcode coincidence
+    EXPECT_EQ(ar.target_version(), 36);
+    EXPECT_EQ(ar.state(), dgb::RatchetState::VOTING);
+}
+
+// A freshly-started production node votes V36 but MINTS the V35 baseline — it
+// must not skip ahead of the network on an empty tracker.
+TEST(DGB_share_test, AutoRatchetWireBootstrapMints35Votes36)
+{
+    auto ar = dgb::make_dgb_ratchet();
+    dgb::ShareTracker tracker;
+    auto [mint, vote] = dgb::dgb_select_mint_versions(ar, tracker, uint256{});
+    EXPECT_EQ(mint, 35);   // baseline share version (oracle)
+    EXPECT_EQ(vote, 36);   // always vote target
+    EXPECT_EQ(ar.state(), dgb::RatchetState::VOTING);
 }
