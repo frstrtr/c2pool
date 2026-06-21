@@ -259,6 +259,21 @@ if (BUILD_TESTING AND GTest_FOUND)
         nlohmann_json::nlohmann_json)
     gtest_add_tests(dgb_embedded_tx_select_test "" AUTO)
 
+    # dgb_template_other_txs_test: pins coin/template_other_txs.hpp, the producer
+    # bridge decoding the embedded template transactions[] (make_mempool_tx_source
+    # GBT data) back into the MutableTransaction vector the won-block reconstructor
+    # frames as [gentx] ++ other_txs. Compiles the tx codec AND the reconstruct
+    # closure, so it links the embedded_tx_select SCC set + pool/sharechain. MUST
+    # also be in BOTH build.yml --target allowlists (#143 NOT_BUILT trap).
+    add_executable(dgb_template_other_txs_test template_other_txs_test.cpp)
+    target_link_libraries(dgb_template_other_txs_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb dgb_stratum
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain
+        nlohmann_json::nlohmann_json)
+    gtest_add_tests(dgb_template_other_txs_test "" AUTO)
+
     # dgb_coinbase_value_parity_test: END-TO-END GBT-parity KAT. Drives a
     # populated Mempool through the production make_mempool_tx_source ->
     # EmbeddedCoinNode -> build_work_template path and asserts coinbasevalue ==
