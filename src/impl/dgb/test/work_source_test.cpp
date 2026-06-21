@@ -226,6 +226,100 @@ TEST(DgbWorkSource, WorkGenStubsReturnSafeDefaults)
     EXPECT_TRUE(parts.second.empty());
 }
 
+// -- Stage-4d mining_submit classify ladder (live invocation point) ----------
+// A real JobSnapshot drives reconstruct -> Scrypt digest -> classify_submission
+// -> dispatch. The Scrypt PoW of an arbitrary header is not steerable, so each
+// KAT pins the OUTCOME CLASS by the TARGETS, not the hash: a genuinely-maximal
+// compact target (0x2100ffff -> 0xffff<<240, ~2^256 -- clears every digest, NOT
+// the regtest 0x207fffff which is only ~2^255 and rejects MSB-set digests) makes
+// WonBlock/ShareAccept deterministic; a near-zero target (0x03000001 -> target 1)
+// is satisfied by none (Reject). This exercises
+// the exact tighten-first ladder the hot path runs without a scrypt fixture.
+namespace {
+core::stratum::JobSnapshot make_job(uint32_t share_bits, const std::string& block_nbits)
+{
+    core::stratum::JobSnapshot j;
+    j.coinb1        = "01000000";   // minimal coinbase head (well-formed hex)
+    j.coinb2        = "00000000";   // minimal coinbase tail
+    j.gbt_prevhash  = std::string(64, '0');  // 32-byte prevhash, BE display hex
+    j.nbits         = "1e0fffff";   // header (share) bits
+    j.version       = 0x20000000u;
+    j.share_bits    = share_bits;
+    j.block_nbits   = block_nbits;
+    j.subsidy       = 500000000ULL;
+    j.segwit_active = false;
+    return j;
+}
+const char* kEN1 = "00000000";
+const char* kEN2 = "00000000";
+const char* kNT  = "60000000";
+const char* kNON = "00000000";
+}  // namespace
+
+TEST(DgbWorkSource, MiningSubmitWonBlockDispatchesBroadcaster)
+{
+    Fixture fx;
+    auto ws = fx.make();
+    // block_nbits = 0x2100ffff (maximal target ~2^256): every Scrypt digest
+    // clears it -> WonBlock -> submit_block_fn_ MUST fire (dual-path broadcaster, #82).
+    auto job = make_job(/*share_bits=*/0x2100ffffu, /*block_nbits=*/"2100ffff");
+    auto result = ws->mining_submit(
+        "DGBaddr.worker1", "job-won", kEN1, kEN2, kNT, kNON, "rid",
+        /*merged_addresses=*/{}, &job);
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());     // won block -> accepted reply
+    EXPECT_TRUE(fx.submit_called);       // broadcaster reached
+}
+
+TEST(DgbWorkSource, MiningSubmitShareAcceptDispatchesMint)
+{
+    Fixture fx;
+    auto ws = fx.make();
+    bool minted = false;
+    dgb::stratum::DGBWorkSource::MintShareInputs seen;
+    ws->set_mint_share_fn(
+        [&](const dgb::stratum::DGBWorkSource::MintShareInputs& got) -> uint256 {
+            minted = true; seen = got;
+            uint256 h; h.SetHex(
+                "00000000000000000000000000000000000000000000000000000000000b10c5");
+            return h;
+        });
+    // block_nbits = 0x03000001 (target 1: no digest is a block) but share_bits =
+    // 0x2100ffff (maximal -> any digest clears) -> ShareAccept -> try_mint_share
+    // fires, the won-block broadcaster does NOT.
+    auto job = make_job(/*share_bits=*/0x2100ffffu, /*block_nbits=*/"03000001");
+    auto result = ws->mining_submit(
+        "DGBaddr.worker1", "job-share", kEN1, kEN2, kNT, kNON, "rid",
+        /*merged_addresses=*/{}, &job);
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());       // valid share -> accepted reply
+    EXPECT_TRUE(minted);                   // mint dispatch reached
+    EXPECT_FALSE(fx.submit_called);        // NOT a block -> no broadcast
+    EXPECT_EQ(seen.header_bytes.size(), 80u);   // 80-byte header forwarded
+    EXPECT_EQ(seen.subsidy, 500000000ULL);      // subsidy carried from the job
+}
+
+TEST(DgbWorkSource, MiningSubmitLowDifficultyRejectsNeitherDispatch)
+{
+    Fixture fx;
+    auto ws = fx.make();
+    bool minted = false;
+    ws->set_mint_share_fn(
+        [&](const dgb::stratum::DGBWorkSource::MintShareInputs&) -> uint256 {
+            minted = true; return uint256{};
+        });
+    // Both targets near-zero (0x03000001 -> target 1): no Scrypt digest clears
+    // either -> Reject. Neither the broadcaster nor the mint dispatch fires.
+    auto job = make_job(/*share_bits=*/0x03000001u, /*block_nbits=*/"03000001");
+    auto result = ws->mining_submit(
+        "DGBaddr.worker1", "job-rej", kEN1, kEN2, kNT, kNON, "rid",
+        /*merged_addresses=*/{}, &job);
+    ASSERT_TRUE(result.is_array());
+    EXPECT_FALSE(result[0].get<bool>());   // reject form [false, [code,msg,null]]
+    EXPECT_FALSE(fx.submit_called);
+    EXPECT_FALSE(minted);
+}
+
 TEST(DgbWorkSource, MiningSubmitStubRejectsWithoutCallingBroadcaster)
 {
     Fixture fx;
