@@ -703,8 +703,76 @@ int run_node(const core::CoinParams& params, bool testnet,
             constexpr int FW_MAX_ATTEMPTS = 40;        // 40 * 1.5s = 60s cap
             auto fw_poll = std::make_shared<
                 std::function<void(const boost::system::error_code&)>>();
+            // -- #82 faithful seed: rebuild the synthetic won share header
+            // from node B's LIVE getblocktemplate (integrator 2026-06-21) --
+            // Bare prevhash seeding fixes only bad-prevblk; node B can still
+            // reject on a wrong nBits (high-hash), a mismatched BIP34 height
+            // (bad-cb-height) or an over-claimed coinbase (bad-cb-amount).
+            // Pulling node B's OWN Scrypt-lane GBT (make_gbt_request pins
+            // algo=scrypt) yields a fully connectable coinbase-only block in
+            // one move: correct prev + bits + height + coinbasevalue. The
+            // reconstruct closure frames it; --soak-regrind then grinds the
+            // nonce to satisfy THIS bits. Regtest-only; coinbase-only =>
+            // merkle root == gentx txid by construction (no bad-txnmrklroot).
+            auto seed_forced_from_gbt = [forced, &rpc, &header_chain]() {
+                if (!rpc) {
+                    // Unreachable on the gated path (--regtest-force-won-share
+                    // requires --coin-daemon, which arms rpc); without the GBT
+                    // there is no authoritative bits/height anyway, so the block
+                    // cannot connect. Surface, do not fabricate.
+                    std::cout << "[DGB] #82 forced-won seed: no RPC arm - cannot "
+                                 "pull node-B GBT; block will not connect"
+                              << std::endl;
+                    return;
+                }
+                try {
+                    auto gbt = rpc->getblocktemplate({"segwit"});
+                    auto& mh = forced->m_min_header;
+                    mh.m_version = gbt.at("version").get<uint64_t>();
+                    mh.m_previous_block.SetHex(
+                        gbt.at("previousblockhash").get<std::string>());
+                    mh.m_bits = static_cast<uint32_t>(
+                        std::stoul(gbt.at("bits").get<std::string>(), nullptr, 16));
+                    mh.m_timestamp = gbt.at("curtime").get<uint32_t>();
+                    forced->m_bits      = mh.m_bits;
+                    forced->m_max_bits  = mh.m_bits;
+                    forced->m_timestamp = mh.m_timestamp;
+                    forced->m_absheight = gbt.at("height").get<uint32_t>();
+                    forced->m_subsidy   = gbt.at("coinbasevalue").get<uint64_t>();
+                    // BIP34: the coinbase scriptSig MUST begin with the
+                    // serialized block height (minimal CScriptNum push) or
+                    // node B rejects bad-cb-height. The synthetic
+                    // m_coinbase.m_data is passed through verbatim by
+                    // generate_share_transaction, so encode node B's GBT
+                    // height here. height>0 always (won block is tip+1).
+                    {
+                        uint32_t h = forced->m_absheight;
+                        std::vector<unsigned char> hb;
+                        while (h) { hb.push_back(h & 0xff); h >>= 8; }
+                        if (hb.empty()) hb.push_back(0);
+                        if (hb.back() & 0x80) hb.push_back(0);
+                        std::vector<unsigned char> cb;
+                        cb.push_back(static_cast<unsigned char>(hb.size()));
+                        cb.insert(cb.end(), hb.begin(), hb.end());
+                        const unsigned char tail[] = {0x04, 0x11, 0x22, 0x33, 0x44};
+                        cb.insert(cb.end(), std::begin(tail), std::end(tail));
+                        forced->m_coinbase.m_data = cb;
+                    }
+                    std::cout << "[DGB] #82 forced-won seed from node-B GBT: height="
+                              << forced->m_absheight << " prev="
+                              << gbt.at("previousblockhash").get<std::string>().substr(0, 16)
+                              << " bits=" << gbt.at("bits").get<std::string>()
+                              << " coinbasevalue=" << forced->m_subsidy << std::endl;
+                } catch (const std::exception& e) {
+                    std::cout << "[DGB] #82 forced-won seed: getblocktemplate FAILED ("
+                              << e.what()
+                              << ") - NAMED BLOCKER, block will not connect"
+                              << std::endl;
+                }
+            };
             auto fire_forced =
-                [&p2p_node, forced_hash, no_p2p_relay](const char* why) {
+                [&p2p_node, forced_hash, no_p2p_relay, seed_forced_from_gbt](const char* why) {
+                    seed_forced_from_gbt();   // node-B-faithful header before reconstruct
                     std::cout << "[DGB] #82 forced-won-share seam firing "
                               << "m_on_block_found("
                               << forced_hash.GetHex().substr(0, 16)

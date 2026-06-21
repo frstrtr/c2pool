@@ -144,7 +144,8 @@ log "ARM A: launching embedded c2pool-dgb against node A (regtest diff -> natura
   --coin-rpc 127.0.0.1:$RPCPORT_A \
   --coin-rpc-auth "$DATADIR_A/digibyte.conf" \
   --coin-magic "$DGB_REGTEST_MAGIC" \
-  --coin-genesis "$DGB_REGTEST_GENESIS" --regtest --regtest-force-won-share >/tmp/c2pool-dgb-soak.log 2>&1 &
+  --coin-genesis "$DGB_REGTEST_GENESIS" --regtest --regtest-force-won-share \
+  --soak-regrind >/tmp/c2pool-dgb-soak.log 2>&1 &
 C2POOL_PID=$!
 log "c2pool-dgb PID $C2POOL_PID; waiting for a won share to relay a coinbase-only block to node B"
 n=0
@@ -158,11 +159,32 @@ NTX="$(cli_b getblock "$WON_HASH" | grep -o '"tx"[^]]*]' | grep -o '"[0-9a-f]\{6
 log "ARM A OK: P2P-relayed coinbase-only won block $WON_HASH accepted by peer node B (PROP 1 + ARM A)"
 kill "$C2POOL_PID" >/dev/null 2>&1; C2POOL_PID=""
 
-# --- ARM B (RPC FALLBACK): GATED on integrator isolation-mechanism decision ----
-# No --no-p2p-relay flag exists; isolating the submitblock fallback from the P2P arm
-# is an open design call (see header item 2). Until integrator picks the mechanism,
-# ARM B is NOT asserted -- shipping a placeholder assert would be the silent-gap the
-# gate exists to prevent.
-log "ARM B: GATED -- submitblock-fallback isolation mechanism pending integrator decision (header item 2)"
+# --- ARM B (RPC FALLBACK, ISOLATED): submitblock-only via --no-p2p-relay -------
+# The --no-p2p-relay flag (main_dgb.cpp) suppresses the embedded P2P `block`
+# relay sink, leaving the external-digibyted submitblock RPC fallback as the
+# SOLE path to the network. A second forced won block reaching node B with the
+# P2P arm muted proves ARM B reaches the network INDEPENDENTLY (header item 2,
+# now resolved by the flag).
+BASE_B2="$(tip_b)"
+log "ARM B (isolated): relaunching c2pool-dgb with --no-p2p-relay (submitblock fallback only)"
+"$C2POOL_DGB" --run \
+  --coin-daemon 127.0.0.1:$P2PPORT_A \
+  --coin-rpc 127.0.0.1:$RPCPORT_A \
+  --coin-rpc-auth "$DATADIR_A/digibyte.conf" \
+  --coin-magic "$DGB_REGTEST_MAGIC" \
+  --coin-genesis "$DGB_REGTEST_GENESIS" --regtest --regtest-force-won-share \
+  --soak-regrind --no-p2p-relay >/tmp/c2pool-dgb-soak-armb.log 2>&1 &
+C2POOL_PID=$!
+log "c2pool-dgb (ARM B) PID $C2POOL_PID; waiting for submitblock-only won block on node B"
+n=0
+until [ "$(tip_b)" -gt "$BASE_B2" ]; do
+  n=$((n+1)); [ $n -gt 240 ] && die "ARM B: no won block reached node B within 120s (submitblock RPC fallback)"
+  sleep 0.5
+done
+WON_HASH_B="$(cli_b getblockhash "$(tip_b)")"
+NTX_B="$(cli_b getblock "$WON_HASH_B" | grep -o '"tx"[^]]*]' | grep -o '"[0-9a-f]\{64\}"' | wc -l)"
+[ "$NTX_B" -eq 1 ] || die "ARM B: won block $WON_HASH_B has $NTX_B txs, expected 1 (coinbase-only, PROP 1)"
+log "ARM B OK: submitblock-RPC-only coinbase-only won block $WON_HASH_B accepted by peer node B (PROP 1 + ARM B, P2P arm suppressed)"
+kill "$C2POOL_PID" >/dev/null 2>&1; C2POOL_PID=""
 
-log "ARM A proven; ARM B + digibyted provisioning are the two remaining live-leg items for the #82 gate."
+log "BOTH ARMS PROVEN: ARM A (P2P relay) block $WON_HASH + ARM B (submitblock isolated) block $WON_HASH_B each accepted by peer node B. #82 dual-path broadcaster gate satisfied (digibyted self-provisioned)."
