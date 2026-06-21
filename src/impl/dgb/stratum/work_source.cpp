@@ -21,10 +21,21 @@
 #include <impl/dgb/coin/dgb_block_algo.hpp>
 #include <impl/dgb/coin/template_builder.hpp>
 #include <impl/dgb/coin/hash_format.hpp>
+#include <impl/dgb/coin/scrypt_pow.hpp>        // scrypt_pow_hash (DGB-Scrypt PoW SSOT)
+#include <impl/dgb/coin/submit_classify.hpp>   // classify_submission (Stage-4d decision SSOT)
+#include <impl/dgb/coin/header_sample_build.hpp>// compact_to_target (compact bits -> u256)
 
 #include <core/log.hpp>
+#include <core/hash.hpp>                        // Hash (sha256d) for coinbase txid + merkle pair
+#include <core/address_utils.hpp>              // address_to_script (share payout from username)
 
+#include <btclibs/util/strencodings.h>          // ParseHex
+
+#include <array>
+#include <cstdio>
+#include <cstring>
 #include <ctime>
+#include <span>
 #include <string>
 #include <limits>
 
@@ -37,6 +48,53 @@ namespace {
 // (coin/embedded_coin_node.hpp) so the two build_work_template callers
 // cannot emit a divergent previousblockhash encoding.
 using dgb::coin::u256_be_display_hex;
+
+// -- Byte-stream helpers for the Stage-4d header/block reconstruction --------
+// Little-endian Bitcoin wire encodings, identical to btc::stratum's own
+// mining_submit assembly (the DGB header layout is byte-for-byte Bitcoin's;
+// only the PoW digest differs -- Scrypt, not SHA256d).
+inline void push_u32_le(std::vector<uint8_t>& v, uint32_t x) {
+    v.push_back(static_cast<uint8_t>( x        & 0xff));
+    v.push_back(static_cast<uint8_t>((x >>  8) & 0xff));
+    v.push_back(static_cast<uint8_t>((x >> 16) & 0xff));
+    v.push_back(static_cast<uint8_t>((x >> 24) & 0xff));
+}
+
+inline void push_u64_le(std::vector<uint8_t>& v, uint64_t x) {
+    for (int i = 0; i < 8; ++i)
+        v.push_back(static_cast<uint8_t>((x >> (i * 8)) & 0xff));
+}
+
+inline void push_varint(std::vector<uint8_t>& v, uint64_t n) {
+    if (n < 0xfd) {
+        v.push_back(static_cast<uint8_t>(n));
+    } else if (n <= 0xffff) {
+        v.push_back(0xfd);
+        v.push_back(static_cast<uint8_t>(n & 0xff));
+        v.push_back(static_cast<uint8_t>((n >> 8) & 0xff));
+    } else if (n <= 0xffffffff) {
+        v.push_back(0xfe);
+        push_u32_le(v, static_cast<uint32_t>(n));
+    } else {
+        v.push_back(0xff);
+        push_u64_le(v, n);
+    }
+}
+
+// Stratum sends ntime/nonce/version as big-endian hex; sscanf(%x) decodes them.
+inline uint32_t parse_be_hex_u32(const std::string& s) {
+    uint32_t v = 0;
+    std::sscanf(s.c_str(), "%x", &v);
+    return v;
+}
+
+// One merkle ascent step: sha256d(left||right) over the two LE-internal 32-byte
+// node hashes (the dgb-local equivalent of btc::coin::merkle_hash_pair -- kept
+// in-tree per the per-coin isolation invariant rather than reaching into btc).
+inline uint256 merkle_pair(const uint256& left, const uint256& right) {
+    return Hash(std::span<const uint8_t>(left.data(),  32),
+                std::span<const uint8_t>(right.data(), 32));
+}
 
 } // namespace
 
@@ -277,35 +335,210 @@ core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase(
 
 nlohmann::json DGBWorkSource::mining_submit(
     const std::string& username, const std::string& job_id,
-    const std::string& /*extranonce1*/, const std::string& /*extranonce2*/,
-    const std::string& /*ntime*/, const std::string& /*nonce*/,
+    const std::string& extranonce1, const std::string& extranonce2,
+    const std::string& ntime, const std::string& nonce,
     const std::string& /*request_id*/,
     const std::map<uint32_t, std::vector<unsigned char>>& /*merged_addresses*/,
-    const core::stratum::JobSnapshot* /*job*/)
+    const core::stratum::JobSnapshot* job)
 {
-    // Stage 4d will:
-    //   1. Reconstruct the 80-byte block header from JobSnapshot + miner inputs
-    //   2. Scrypt(header) → pow_hash (scrypt_1024_1_1_256, the DGB-Scrypt algo)
-    //   3. Decode share target from job->share_bits (compact)
-    //   4. Decode block target from job->block_nbits (compact)
-    //   5. Classify:
-    //        pow_hash <= block target → submit_block_fn_(full_block, height)
-    //        pow_hash <= share target → record share in tracker (sharechain accept)
-    //        otherwise                → reject as low-difficulty
-    //   6. Update worker stats accordingly
-    //
-    // For now: log + reject everything as low-difficulty. Miners will see
-    // stratum errors but the binary won't crash.
-    LOG_WARNING << "[DGB-STRATUM] mining_submit not implemented (stage 4d): "
-                << "user=" << username << " job=" << job_id
-                << " — submission rejected as low-difficulty";
+    // Stage 4d -- the hot path. Reconstruct the 80-byte block header from the
+    // JobSnapshot + miner inputs, run the DGB-Scrypt PoW digest, and place the
+    // result in EXACTLY ONE of three classes via the decision SSOT
+    // (coin/submit_classify.hpp): WonBlock -> dual-path broadcaster (#82),
+    // ShareAccept -> sharechain mint (try_mint_share -> #294), Reject -> stratum
+    // low-difficulty error. The header assembly mirrors btc::stratum byte-for-
+    // byte (the DGB header layout IS Bitcoin's); ONLY the PoW digest differs
+    // (scrypt_1024_1_1_256, the sole algo c2pool-dgb validates in V36).
 
-    return nlohmann::json::array({
-        false,
-        nlohmann::json::array({23, "Low difficulty share (stratum stub: stage 4d not implemented)", nullptr})
-    });
+    // Stratum JSON-RPC error payload (false + [code, message, null]).
+    auto reject = [](int code, const char* msg) {
+        return nlohmann::json::array({
+            false, nlohmann::json::array({code, msg, nullptr})
+        });
+    };
+
+    if (!job) {
+        LOG_WARNING << "[DGB-STRATUM] submit reject (no JobSnapshot): user=" << username
+                    << " job=" << job_id;
+        return reject(21, "Job not found");
+    }
+
+    // 1. coinbase = coinb1 || extranonce1 || extranonce2 || coinb2
+    auto coinb1_bytes = ParseHex(job->coinb1);
+    auto en1_bytes    = ParseHex(extranonce1);
+    auto en2_bytes    = ParseHex(extranonce2);
+    auto coinb2_bytes = ParseHex(job->coinb2);
+
+    std::vector<uint8_t> coinbase;
+    coinbase.reserve(coinb1_bytes.size() + en1_bytes.size()
+                     + en2_bytes.size() + coinb2_bytes.size());
+    coinbase.insert(coinbase.end(), coinb1_bytes.begin(), coinb1_bytes.end());
+    coinbase.insert(coinbase.end(), en1_bytes.begin(),    en1_bytes.end());
+    coinbase.insert(coinbase.end(), en2_bytes.begin(),    en2_bytes.end());
+    coinbase.insert(coinbase.end(), coinb2_bytes.begin(), coinb2_bytes.end());
+
+    // 2. coinbase_txid = sha256d(coinbase) (non-witness txid for the merkle root)
+    uint256 coinbase_txid = Hash(
+        std::span<const uint8_t>(coinbase.data(), coinbase.size()));
+
+    // 3. merkle_root = ascend the frozen stratum merkle branches from the txid.
+    //    Branches are LE-internal bytes (ParseHex+memcpy, NOT SetHex which
+    //    reverses). Keep the parsed branches to hand to the share-mint path.
+    std::vector<uint256> branch_hashes;
+    branch_hashes.reserve(job->merkle_branches.size());
+    uint256 merkle_root = coinbase_txid;
+    for (const auto& branch_hex : job->merkle_branches) {
+        uint256 b;
+        auto bb = ParseHex(branch_hex);
+        if (bb.size() == 32) std::memcpy(b.begin(), bb.data(), 32);
+        branch_hashes.push_back(b);
+        merkle_root = merkle_pair(merkle_root, b);
+    }
+
+    // 4. header = version(LE) || prev(LE) || merkle_root || ntime(LE)
+    //             || nbits(LE) || nonce(LE)  -- prevhash arrives BE-display, so
+    //    reverse to internal byte order.
+    auto prevhash_be = ParseHex(job->gbt_prevhash);
+    std::vector<uint8_t> prevhash_le(prevhash_be.rbegin(), prevhash_be.rend());
+
+    std::vector<uint8_t> header;
+    header.reserve(80);
+    push_u32_le(header, job->version);
+    header.insert(header.end(), prevhash_le.begin(), prevhash_le.end());
+    header.insert(header.end(), merkle_root.data(), merkle_root.data() + 32);
+    push_u32_le(header, parse_be_hex_u32(ntime));
+    push_u32_le(header, parse_be_hex_u32(job->nbits));   // header carries share bits
+    push_u32_le(header, parse_be_hex_u32(nonce));
+
+    if (header.size() != 80) {
+        LOG_WARNING << "[DGB-STRATUM] submit reject (reconstructed header "
+                    << header.size() << "B != 80): user=" << username
+                    << " job=" << job_id;
+        return reject(20, "Malformed header reconstruction");
+    }
+
+    // 5. DGB-Scrypt PoW digest (scrypt_1024_1_1_256, the ONLY algo V36 validates).
+    dgb::coin::u256 pow_hash = dgb::coin::scrypt_pow_hash(header.data());
+
+    // Expand both compact targets to u256 (compact_to_target SSOT). Fall back to
+    // a permissive diff-1 share target for jobs frozen before share_bits was set
+    // so a missing share target never silently rejects every share.
+    dgb::coin::u256 share_target = c2pool::dgb::compact_to_target(
+        job->share_bits != 0 ? job->share_bits : 0x1d00ffffu);
+    dgb::coin::u256 block_target = c2pool::dgb::compact_to_target(parse_be_hex_u32(
+        job->block_nbits.empty() ? job->nbits : job->block_nbits));
+
+    // 6. Classify via the Stage-4d SSOT (tighten-first: block target before share).
+    const dgb::coin::SubmitClass klass =
+        dgb::coin::classify_submission(pow_hash, block_target, share_target);
+
+    auto bump_accepted = [&] {
+        std::lock_guard<std::mutex> lk(workers_mutex_);
+        for (auto& kv : workers_) {
+            if (kv.second.username == username) { kv.second.accepted++; break; }
+        }
+    };
+
+    switch (klass) {
+    case dgb::coin::SubmitClass::WonBlock: {
+        // pow_hash <= block_target -> a full network block. NEVER drop it.
+        const uint32_t height = chain_.next_block_height();
+        LOG_WARNING << "[DGB-STRATUM-BLOCK] *** BLOCK FOUND *** user=" << username
+                    << " height~=" << height << " job=" << job_id;
+
+        // Serialize the block: header || tx_count || coinbase[+witness] || txs.
+        // A segwit-active coinbase is reserialized in BIP144 form with the
+        // 32-byte witness reserved value (digibyted validates the aa21a9ed
+        // commitment by hashing witness_root||reserved; a missing witness ->
+        // bad-witness-merkle-match -> block rejected).
+        std::vector<uint8_t> coinbase_serialized = coinbase;
+        if (job->segwit_active) {
+            const std::array<uint8_t, 2> marker_flag = {0x00, 0x01};
+            coinbase_serialized.insert(coinbase_serialized.begin() + 4,
+                marker_flag.begin(), marker_flag.end());
+            std::array<uint8_t, 34> witness_bytes{};
+            witness_bytes[0] = 0x01;  // stack_count = 1
+            witness_bytes[1] = 0x20;  // item_len    = 32 (reserved value, all zero)
+            coinbase_serialized.insert(coinbase_serialized.end() - 4,
+                witness_bytes.begin(), witness_bytes.end());
+        }
+
+        static const std::vector<std::string> kEmptyTxData;
+        const std::vector<std::string>& txs =
+            job->tx_data ? *job->tx_data : kEmptyTxData;
+
+        std::vector<uint8_t> block_bytes;
+        block_bytes.reserve(80 + 9 + coinbase_serialized.size() + txs.size() * 256);
+        block_bytes.insert(block_bytes.end(), header.begin(), header.end());
+        push_varint(block_bytes, 1 + txs.size());   // total tx count (coinbase + others)
+        block_bytes.insert(block_bytes.end(),
+            coinbase_serialized.begin(), coinbase_serialized.end());
+        for (const auto& tx_hex : txs) {
+            auto tx_bytes = ParseHex(tx_hex);
+            block_bytes.insert(block_bytes.end(), tx_bytes.begin(), tx_bytes.end());
+        }
+
+        // Dual-path broadcaster (#82): submit_block_fn_ relays via P2P (primary)
+        // and falls back to the submitblock RPC; true iff it reached >=1 sink. A
+        // won block reaching NEITHER is a lost subsidy -- scream, never drop.
+        bool reached_network = false;
+        if (submit_block_fn_) {
+            try {
+                reached_network = submit_block_fn_(block_bytes, height);
+            } catch (const std::exception& e) {
+                LOG_ERROR << "[DGB-STRATUM-BLOCK] submit_block_fn threw: " << e.what();
+            }
+            if (!reached_network) {
+                LOG_ERROR << "[DGB-STRATUM-BLOCK] WON BLOCK height=" << height
+                          << " reached NEITHER P2P relay NOR submitblock RPC -- "
+                          << "lost subsidy!";
+            }
+        } else {
+            LOG_ERROR << "[DGB-STRATUM-BLOCK] no submit_block_fn wired -- WON BLOCK"
+                      << " height=" << height << " not broadcast -- lost subsidy!";
+        }
+
+        bump_accepted();
+        return nlohmann::json(true);
+    }
+
+    case dgb::coin::SubmitClass::ShareAccept: {
+        // share_target >= pow_hash > block_target -> meets sharechain difficulty
+        // but not the full block. Hand the found-share fields to the run-loop
+        // mint dispatch (try_mint_share -> mint_local_share_with_ratchet, #294).
+        MintShareInputs in;
+        in.header_bytes    = header;
+        in.coinbase_bytes  = coinbase;
+        in.subsidy         = job->subsidy;
+        in.prev_share      = job->prev_share_hash;
+        in.merkle_branches = branch_hashes;
+        in.payout_script   = core::address_to_script(username);
+        in.segwit_active   = job->segwit_active;
+
+        uint256 share_hash = try_mint_share(in);
+
+        if (!share_hash.IsNull()) {
+            LOG_INFO << "[DGB-STRATUM-SHARE] ACCEPTED + MINTED user=" << username
+                     << " share_hash=" << share_hash.GetHex().substr(0, 16)
+                     << " job=" << job_id;
+        } else {
+            // PoW was valid (cleared the share target) so the miner still gets a
+            // success reply; the share just earned no sharechain credit (no mint
+            // fn wired, or the mint deferred/failed). try_mint_share logs the
+            // reason -- never a silent drop.
+            LOG_INFO << "[DGB-STRATUM-SHARE] accepted (no sharechain credit) user="
+                     << username << " job=" << job_id;
+        }
+
+        bump_accepted();
+        return nlohmann::json(true);
+    }
+
+    case dgb::coin::SubmitClass::Reject:
+    default:
+        return reject(23, "Low difficulty share");
+    }
 }
-
 double DGBWorkSource::compute_share_difficulty(
     const std::string& /*coinb1*/, const std::string& /*coinb2*/,
     const std::string& /*extranonce1*/, const std::string& /*extranonce2*/,
