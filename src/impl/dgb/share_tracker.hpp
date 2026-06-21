@@ -2126,10 +2126,17 @@ public:
     // Canonical p2pool get_desired_version_counts (data.py:2651) weights each
     // share by target_to_average_attempts(share.target) — NOT a flat count.
     // The check()-phase 60% switch rule (share_check step 2) is a consensus gate
-    // and MUST use these weights to stay byte-identical with p2pool. AutoRatchet
-    // and its tail guard deliberately keep the FLAT-COUNT variant above
-    // (count-based per F10 finding #1 — weighting them would shift activation
-    // timing across the soak). Weight = ShareIndex::work (share.hpp).
+    // and MUST use these weights to stay byte-identical with p2pool. When the
+    // DGB AutoRatchet minter is ported (Phase B) its activation tail guard MUST
+    // ALSO read these work-weights over the SAME [9/10*CL, CL] window at the SAME
+    // 60% threshold the accept gate enforces (share_check step 2), so activation
+    // strictly implies the accept rule and a minted boundary share can never be
+    // rejected. This SUPERSEDES the earlier F10 keep-flat-count choice, which the
+    // LTC v35->v36 crossing soak (#97) proved unsafe: under heterogeneous hashrate
+    // a 95%-by-COUNT activation outruns the 60%-by-WORK accept gate and wedges the
+    // crossing. Cross-coin v36-native standardization (mirrors ltc 865fdd78). The
+    // flat-count accessor above stays for diagnostics/KAT only, never the gate.
+    // Weight = ShareIndex::work (share.hpp).
     std::map<uint64_t, uint288> get_desired_version_weights(const uint256& share_hash, int32_t lookbehind)
     {
         std::map<uint64_t, uint288> weights;
@@ -2643,7 +2650,8 @@ public:
 
     // F10/(b): should_punish_version (the 95%-obsolescence punish) was removed.
     // It was non-canonical — canonical p2pool check() has no 95% obsolescence
-    // rule; the count-based AutoRatchet plus the 60% weighted switch rule
+    // rule; the AutoRatchet (work-weighted at Phase-B port, per 865fdd78) plus the
+    // 60% weighted switch rule
     // (share_check step 2) are the only version gates. Keeping it would
     // punish/score-down shares canonical accepts, breaking the #81 zero-
     // divergence gate. Head-scoring (Phase 4) now punishes only naughty heads.
