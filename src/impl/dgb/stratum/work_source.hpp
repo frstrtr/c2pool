@@ -81,6 +81,35 @@ public:
     using SubmitBlockFn = std::function<bool(const std::vector<unsigned char>& block_bytes,
                                              uint32_t height)>;
 
+    /// Inputs the worker->mint sharechain-accept path hands to the run-loop:
+    /// the assembled fields of a submission whose **Scrypt** PoW met the SHARE
+    /// target (but NOT the full block target). Raw-bytes form (header +
+    /// coinbase) keeps DGBWorkSource decoupled from the share/BlockType
+    /// serialization details, exactly like SubmitBlockFn -- main_dgb.cpp parses
+    /// these into create_local_share()'s arguments.
+    struct MintShareInputs {
+        std::vector<unsigned char> header_bytes;    ///< 80-byte reconstructed block header
+        std::vector<unsigned char> coinbase_bytes;  ///< p2pool coinbase scriptSig (BIP34 height + marker)
+        uint64_t                   subsidy = 0;      ///< coinbasevalue (block reward)
+        uint256                    prev_share;       ///< current sharechain tip = the new share's parent
+        std::vector<uint256>       merkle_branches;  ///< coinbase txid -> merkle root branches
+        std::vector<unsigned char> payout_script;    ///< finder's scriptPubKey
+        bool                       segwit_active = false;
+    };
+
+    /// Callback invoked when `mining_submit` validates a submission whose
+    /// **Scrypt** PoW meets the SHARE target but NOT the full block target --
+    /// the worker->mint sharechain-accept branch (the mining_submit classify
+    /// step "pow_hash <= share target -> record share in tracker"). main_dgb.cpp
+    /// binds this to mint_local_share_with_ratchet (run_loop_mint.hpp, #294)
+    /// -> create_local_share: the WorkSource hands out the found-share fields,
+    /// the run-loop asks the AutoRatchet for the {mint, vote} version pair and
+    /// inserts the share. Returns the minted share hash (NULL uint256 on
+    /// failure). Parallel to SubmitBlockFn but for the share-difficulty (not
+    /// block-difficulty) outcome -- the two non-reject classes of mining_submit.
+    using MintShareFn =
+        std::function<uint256(const MintShareInputs&)>;
+
     DGBWorkSource(c2pool::dgb::HeaderChain&     chain,
                   dgb::coin::Mempool&           mempool,
                   bool                          is_testnet,
@@ -163,6 +192,22 @@ public:
     /// is constructed.
     void set_best_share_hash_fn(std::function<uint256()> fn);
 
+    /// Wire the worker->mint sharechain-accept dispatch. Called once at startup
+    /// from main_dgb.cpp, bound to mint_local_share_with_ratchet (#294) ->
+    /// create_local_share. Empty until wired (mirrors set_best_share_hash_fn);
+    /// while empty, try_mint_share() no-ops with a loud log rather than
+    /// silently dropping an accepted share.
+    void set_mint_share_fn(MintShareFn fn);
+
+    /// Dispatch one share-difficulty submission to the bound mint callback.
+    /// The stage-4d mining_submit classify branch calls this on the
+    /// "pow_hash <= share target" outcome. Returns the minted share hash, or a
+    /// NULL uint256 when no mint callback is wired (logged, never crashes) or
+    /// when the callback itself returns null. Thread-safe: copies the callback
+    /// under lock before invoking so a concurrent set_mint_share_fn() cannot
+    /// tear it out mid-call.
+    uint256 try_mint_share(const MintShareInputs& in) const;
+
     /// Embedded-path coinbasevalue for the template builder (Stage 4c).
     /// Routes through dgb::coin::resolve_coinbase_value: when the external
     /// digibyted GBT supplied a coinbasevalue it is returned verbatim (the
@@ -201,6 +246,12 @@ private:
     // Best-share callback (from ShareTracker)
     mutable std::mutex          best_share_mutex_;
     std::function<uint256()>    best_share_hash_fn_;
+
+    // Worker->mint sharechain-accept callback (to mint_local_share_with_ratchet
+    // -> create_local_share, wired in main_dgb.cpp). Empty until set; the
+    // mining_submit classify branch no-ops the mint when unbound.
+    mutable std::mutex          mint_share_mutex_;
+    MintShareFn                 mint_share_fn_;
 
     // Template cache (filled lazily; invalidated when work_generation_ bumps)
     // Stage 4c populates these.
