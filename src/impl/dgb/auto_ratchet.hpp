@@ -24,15 +24,16 @@
 // Port of p2pool-v36 data.py AutoRatchet (lines 2109-2344), mirroring
 // src/impl/ltc/auto_ratchet.hpp.
 //
-// DGB DIVERGENCE FROM LTC (per operator 2026-06-17 re-scope): DGB's live
-// pre-v36 baseline is NOT necessarily V35 — it conforms to the DGB oracle
-// frstrtr/p2pool-dgb-scrypt, which runs an OLDER share version than LTC's
-// v35. The VOTING-state output version is therefore a CONSTRUCTOR PARAMETER
-// (base_version_), NOT the ltc hardcode `target_version_ - 1`. The exact live
-// value is a [decision-needed] for the wiring step; the default below keeps
-// the module compilable and KAT-exercisable but MUST be overridden at the
-// run-loop wire-in once confirmed against the oracle. Until then this module
-// is surface-for-tap (unwired).
+// DGB DIVERGENCE FROM LTC (per operator 2026-06-17 re-scope): DGB's
+// VOTING-state output version is a CONSTRUCTOR PARAMETER (base_version_), NOT
+// the ltc hardcode `target_version_ - 1`. The "older than LTC" axis is the P2P
+// PROTOCOL version (p2p.py VERSION=3501 vs LTC 3503), not the share version.
+// BASELINE RESOLVED 2026-06-21: oracle frstrtr/p2pool-dgb-scrypt @22761e7
+// mints share VERSION=35 (data.py:636, SUCCESSOR=None) => base_version=35.
+// The production wire-in pins this constant in auto_ratchet_wire.hpp
+// (make_dgb_ratchet); this module keeps the parameter explicit so the v37
+// unified shape stays clean. The compile default (target-1) only applies to
+// bare AutoRatchet(...) construction in tests.
 
 #include "config_pool.hpp"
 #include "share_tracker.hpp"
