@@ -140,25 +140,41 @@ public:
                 // (jtoomim rule). Prevents activation before the entire PPLNS
                 // window has transitioned — p2pool check() rejects V36 shares
                 // when the oldest 10% has < 60% signaling.
+                // WORK-WEIGHTED tail guard (mint<->accept coupling). The
+                // consensus accept gate (share_check step 2 / p2pool check()
+                // data.py:1399) keys the 60% switch rule off
+                // get_desired_version_counts, which in canonical p2pool
+                // (data.py:2651) weights each share by
+                // target_to_average_attempts(target) -- i.e. WORK, not a flat
+                // head-count. AutoRatchet must evaluate the SAME work-weighted
+                // 60% rule over the SAME [9/10*CL, CL] window before it
+                // activates; otherwise a 95%-by-COUNT activation can outrun the
+                // 60%-by-WORK accept gate under heterogeneous hashrate, the node
+                // mints a V36 boundary share that every peer rejects, and the
+                // crossing wedges. The weighted tally makes activation strictly
+                // imply the accept gate, so a minted boundary share can never be
+                // rejected.
                 uint32_t tail_start = (chain_length * 9) / 10;
                 uint32_t tail_size  = chain_length / 10;
                 auto tail_ancestor = tracker.chain.get_nth_parent_key(best_share_hash, tail_start);
-                auto tail_counts = tracker.get_desired_version_counts(tail_ancestor, tail_size);
+                auto tail_weights = tracker.get_desired_version_weights(tail_ancestor, tail_size);
 
-                int64_t tail_target = 0, tail_total = 0;
-                for (auto& [ver, cnt] : tail_counts) {
-                    tail_total += cnt;
-                    if (ver >= target_version_)
-                        tail_target += cnt;
+                // mapped_type is the work-weight accumulator (uint288); default 0.
+                decltype(tail_weights)::mapped_type tail_target{}, tail_total{};
+                for (auto& [ver, w] : tail_weights) {
+                    tail_total = tail_total + w;
+                    if (static_cast<int64_t>(ver) >= target_version_)
+                        tail_target = tail_target + w;
                 }
-                int tail_pct = (tail_total > 0) ? static_cast<int>(tail_target * 100 / tail_total) : 0;
+                // Canonical: counts.get(VERSION,0) < sum(counts)*60//100
+                bool tail_ok = !(tail_target * uint32_t(100) < tail_total * uint32_t(SWITCH_THRESHOLD));
 
-                if (tail_pct < SWITCH_THRESHOLD) {
+                if (!tail_ok) {
                     static int tail_log = 0;
                     if (tail_log++ % 20 == 0)
                         LOG_INFO << "[AutoRatchet] VOTING: full window " << vote_pct
-                                 << "% >= " << ACTIVATION_THRESHOLD << "% but oldest 10% only "
-                                 << tail_pct << "% (need " << SWITCH_THRESHOLD << "%) — waiting";
+                                 << "% >= " << ACTIVATION_THRESHOLD << "% but oldest 10% work-weighted V"
+                                 << target_version_ << " desire < " << SWITCH_THRESHOLD << "%) — waiting";
                     // Don't transition yet
                 }
                 else
