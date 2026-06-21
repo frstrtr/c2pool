@@ -34,6 +34,8 @@
 #include <impl/dgb/coin/embedded_tx_select.hpp>   // make_mempool_tx_source (EmbeddedTxSource)
 #include <impl/dgb/coin/won_block_dispatch.hpp>
 #include <impl/dgb/coin/reconstruct_closure.hpp>  // make_reconstruct_closure_from_template (#280)
+#include <impl/dgb/coin/won_block_finalize.hpp>   // finalize_won_block_pow -- forced-won PoW grind JOINT (#82 gate)
+#include <impl/dgb/coin/header_sample_build.hpp>  // c2pool::dgb::compact_to_target (nBits -> u256)
 #include <impl/dgb/coin/won_share_inputs.hpp>      // won_share_inputs (#279)
 #include <impl/dgb/coin/node_interface.hpp>
 #include <impl/dgb/coin/header_ingest.hpp>
@@ -55,6 +57,7 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <functional>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -387,6 +390,46 @@ int run_node(const core::CoinParams& params, bool testnet,
             return {};  // coinbase-only today (see note above)
         });
 
+    // -- #82 forced-won PoW finalize -------------------------------------
+    // A forced-won share (the regtest --regtest-force-won-share live seam)
+    // carries no real Scrypt work, so the reconstructed block is daemon-rejected
+    // high-hash (observed: ProcessNewBlock AcceptBlock FAILED, proof of work
+    // failed). Grind the reconstructed header nonce to satisfy the block's OWN
+    // declared nBits via the won_block_finalize JOINT (over the #286 scrypt_pow
+    // SSOT) BEFORE dispatch, so the dual-path broadcaster relays a PoW-valid
+    // block the peer ACCEPTs. Gated to the regtest forced-won path ONLY: a
+    // genuine pool-won share already satisfies the parent target and is NEVER
+    // reground -- zero production behaviour change.
+    if (regtest && force_won_share) {
+        auto inner = std::move(faithful_reconstruct);
+        faithful_reconstruct =
+            [inner = std::move(inner)](const uint256& share_hash)
+            -> std::optional<std::pair<std::vector<unsigned char>, std::string>> {
+            auto blk = inner(share_hash);
+            if (!blk || blk->first.size() < 80) return blk;  // pass through / fail closed
+            // nBits is header bytes [72..75], little-endian.
+            const uint32_t nbits =
+                  static_cast<uint32_t>(blk->first[72])
+                | (static_cast<uint32_t>(blk->first[73]) << 8)
+                | (static_cast<uint32_t>(blk->first[74]) << 16)
+                | (static_cast<uint32_t>(blk->first[75]) << 24);
+            const auto target = c2pool::dgb::compact_to_target(nbits);
+            auto fin = dgb::coin::finalize_won_block_pow(blk->first, target);
+            if (!fin) {
+                std::cout << "[DGB-BLOCK] forced-won finalize: no satisfying nonce "
+                             "for nBits=" << std::hex << nbits << std::dec
+                          << " -- relaying UNGROUND (peer will reject high-hash)"
+                          << std::endl;
+                return blk;
+            }
+            std::cout << "[DGB-BLOCK] forced-won finalize: ground nonce="
+                      << fin->grind.nonce << " after " << fin->grind.iters
+                      << " iters (PoW now satisfies nBits=" << std::hex << nbits
+                      << std::dec << ")" << std::endl;
+            return std::make_pair(std::move(fin->bytes), std::move(fin->hex));
+        };
+    }
+
     p2p_node.tracker().m_on_block_found = dgb::coin::make_on_block_found(
         /*reconstruct=*/std::move(faithful_reconstruct),
         /*p2p_relay=*/[&ioc, &coin_p2p, no_p2p_relay](const std::vector<unsigned char>& block_bytes) {
@@ -636,14 +679,36 @@ int run_node(const core::CoinParams& params, bool testnet,
             const uint256 forced_hash = forced->m_hash;
             p2p_node.tracker().add(forced);            // chain indexes by m_hash
 
-            force_won_timer.expires_after(std::chrono::seconds(5));
-            force_won_timer.async_wait(
-                [&p2p_node, forced_hash, no_p2p_relay]
-                (const boost::system::error_code& ec) {
-                    if (ec) return;
+            // ── Fire AFTER work-template/UpdateTip-ready, not a blind one-shot ──
+            //
+            // The historical 0-shares/120s timeout had a SECOND cause behind the
+            // stale port-5024 collision: a fixed 5s one-shot fired the won-share
+            // BEFORE the embedded coin-daemon P2P producer finished its
+            // version/verack handshake and before any header reached HeaderChain
+            // (the first UpdateTip). A won block dispatched then cannot reach
+            // node B by the P2P-relay arm (peer not yet connected) and races
+            // ahead of node B's own sync, so neither path produced a
+            // ProcessNewBlock ACCEPT and the soak grep saw "Final share count: 0".
+            //
+            // Gate the fire on a genuine readiness signal instead (integrator
+            // 2026-06-21): poll until BOTH (a) the coin-daemon P2P handshake is
+            // complete (node B reachable for the P2P-relay arm + the submitblock
+            // RPC fallback) AND (b) HeaderChain::tip_hash() carries a tip (>=1
+            // UpdateTip ingested -> a work template with a real
+            // previousblockhash now exists). Latch-once. A bounded fallback fires
+            // after the cap with a LOUD, attributable log so a slow/stuck peer
+            // surfaces as a named blocker, not a silent no-fire. Regtest-only;
+            // zero production-path behaviour change.
+            auto fw_attempt = std::make_shared<int>(0);
+            constexpr int FW_MAX_ATTEMPTS = 40;        // 40 * 1.5s = 60s cap
+            auto fw_poll = std::make_shared<
+                std::function<void(const boost::system::error_code&)>>();
+            auto fire_forced =
+                [&p2p_node, forced_hash, no_p2p_relay](const char* why) {
                     std::cout << "[DGB] #82 forced-won-share seam firing "
-                              << "m_on_block_found(" << forced_hash.GetHex().substr(0, 16)
-                              << ") — regtest; "
+                              << "m_on_block_found("
+                              << forced_hash.GetHex().substr(0, 16)
+                              << ") — regtest, " << why << "; "
                               << (no_p2p_relay ? "ARM B (submitblock) ISOLATED "
                                                  "(--no-p2p-relay)"
                                                : "BOTH arms (P2P relay + submitblock)")
@@ -653,7 +718,34 @@ int run_node(const core::CoinParams& params, bool testnet,
                     else
                         std::cout << "[DGB] forced-won-share: m_on_block_found "
                                      "UNBOUND — nothing fired" << std::endl;
-                });
+                };
+            *fw_poll = [&force_won_timer, &coin_p2p, &header_chain, fw_poll,
+                        fw_attempt, fire_forced]
+                (const boost::system::error_code& ec) {
+                if (ec) return;
+                const bool handshake_ready =
+                    coin_p2p && coin_p2p->is_handshake_complete();
+                const bool tip_ready = header_chain.tip_hash().has_value();
+                if (handshake_ready && tip_ready) {
+                    fire_forced("work-template/UpdateTip-ready "
+                                "(handshake complete + tip present)");
+                    return;
+                }
+                if (++(*fw_attempt) >= FW_MAX_ATTEMPTS) {
+                    std::cout << "[DGB] forced-won-share readiness TIMEOUT after "
+                              << FW_MAX_ATTEMPTS << " polls — unmet: "
+                              << (handshake_ready ? "" : "[handshake] ")
+                              << (tip_ready ? "" : "[tip] ")
+                              << "— firing anyway (last-resort; node B may reject)"
+                              << std::endl;
+                    fire_forced("readiness-TIMEOUT last-resort");
+                    return;
+                }
+                force_won_timer.expires_after(std::chrono::milliseconds(1500));
+                force_won_timer.async_wait(*fw_poll);
+            };
+            force_won_timer.expires_after(std::chrono::milliseconds(1500));
+            force_won_timer.async_wait(*fw_poll);
         }
     }
 
