@@ -2169,6 +2169,36 @@ public:
         return counts;
     }
 
+    // Work-weighted version tally over a lookbehind window. Mirrors
+    // get_desired_version_counts but weights each share by its work
+    // (target_to_average_attempts), matching canonical p2pool
+    // get_desired_version_counts (data.py:2651) — the COUNTS name is a
+    // misnomer; the canonical tally is WORK-weighted. The consensus accept
+    // gate keys the 60% switch rule off this work-weighted tally, so the
+    // AutoRatchet mint gate must evaluate the same weighting to stay coupled.
+    // Returns map of version -> accumulated work weight.
+    std::map<uint64_t, uint288> get_desired_version_weights(const uint256& share_hash, int32_t lookbehind)
+    {
+        std::map<uint64_t, uint288> weights;
+        if (!chain.contains(share_hash))
+            return weights;
+        auto height = chain.get_height(share_hash);
+        auto actual = std::min(lookbehind, height);
+        if (actual <= 0)
+            return weights;
+
+        auto view = chain.get_chain(share_hash, actual);
+        for (auto [hash, data] : view)
+        {
+            uint64_t dv = 0;
+            data.share.invoke([&](auto* obj) { dv = obj->m_desired_version; });
+            auto* idx = chain.get_index(hash);
+            if (idx)
+                weights[dv] = weights[dv] + idx->work;
+        }
+        return weights;
+    }
+
     // -- Merged mining: per-chain PPLNS weights --
     // For a specific aux chain_id, walk the share chain and accumulate PPLNS
     // weights for V36-signaling shares.  Uses O(log n) skip list.
