@@ -108,6 +108,21 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_reconstruct_closure_test "" AUTO)
 
+    # --- #82 broadcaster-gate BINDING KAT: forced won share -> dual path ------
+    # Drives a forced won share through the REAL from-template reconstruct
+    # closure wired into make_on_block_found, asserting BOTH broadcast arms
+    # (P2P relay + submitblock fallback) carry the byte-identical faithful block.
+    # Links the dgb OBJECT lib like dgb_reconstruct_closure_test (pulls
+    # reconstruct_won_block / block_assembly via the closure). MUST also appear
+    # in the build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_forced_won_share_dualpath_test forced_won_share_dualpath_test.cpp)
+    target_link_libraries(dgb_forced_won_share_dualpath_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_forced_won_share_dualpath_test "" AUTO)
+
     # --- M3 RPC-transport standalone regression guards ---------------------
     # Header-only guards over the external-daemon RPC coin-layer SSOTs
     # (rpc_request.hpp request-shape + version floor + genesis identity, and
