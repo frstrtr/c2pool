@@ -196,8 +196,20 @@ TEST(DgbReconstructWonBlock, CoinbaseFirstThenRefOrder)
     BlockType blk;
     ps >> blk;
 
-    EXPECT_EQ(blk.m_merkle_root, gh);          // empty link => root == gentx_hash
     ASSERT_EQ(blk.m_txs.size(), 3u);           // gentx + 2 others
+    // Header merkle_root is recomputed over the ACTUAL block tx vector
+    // ([gentx_hash] ++ each other-tx txid), per the #303 bad-txnmrklroot fix --
+    // NOT the empty-merkle_link walk (which would yield gentx_hash alone).  Pin
+    // header/body consistency via the same build_block_merkle_root SSOT.
+    {
+        std::vector<uint256> expect_txids = {
+            gh,
+            dgb::coin::compute_txid(blk.m_txs[1]),
+            dgb::coin::compute_txid(blk.m_txs[2]),
+        };
+        EXPECT_EQ(blk.m_merkle_root,
+                  dgb::coin::build_block_merkle_root(expect_txids));
+    }
     EXPECT_EQ(blk.m_txs[0].vin[0].prevout.index, 0xffffffffu); // coinbase at 0
     EXPECT_TRUE(blk.m_txs[0].vin[0].prevout.hash.IsNull());
     EXPECT_EQ(blk.m_txs[1].vout[0].value, 11); // c1 -> make_tx(11), ref order
