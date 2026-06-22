@@ -72,9 +72,10 @@ struct CMerkleLink
 ///     ('tx',          tx_id_type)        -> m_tx  (witness-stripped; see §12-Q1)
 ///     ('block_hash',  IntType(256))      -> m_block_hash
 ///     ('merkle_link', merkle_link_type)  -> m_merkle_link
+template <typename ParentCoinbaseTx = ltc::coin::MutableTransaction>
 struct CMerkleTx
 {
-    ltc::coin::MutableTransaction m_tx;          // parent-chain (LTC) coinbase == gentx
+    ParentCoinbaseTx m_tx;          // parent-chain coinbase == gentx (default LTC; DGB binds dgb::coin::MutableTransaction)
     uint256                       m_block_hash;
     CMerkleLink                   m_merkle_link;
 
@@ -91,7 +92,7 @@ struct CMerkleTx
     }
 
     void SetNull() {
-        m_tx = ltc::coin::MutableTransaction{};
+        m_tx = ParentCoinbaseTx{};
         m_block_hash.SetNull();
         m_merkle_link.SetNull();
     }
@@ -101,9 +102,10 @@ struct CMerkleTx
 ///     ('merkle_tx',           merkle_tx_type)    -> m_merkle_tx
 ///     ('merkle_link',         merkle_link_type)  -> m_chain_merkle_link
 ///     ('parent_block_header', block_header_type) -> m_parent_block_header
+template <typename ParentCoinbaseTx = ltc::coin::MutableTransaction>
 struct CAuxPow
 {
-    CMerkleTx        m_merkle_tx;            // parent coinbase + branch to parent merkle root
+    CMerkleTx<ParentCoinbaseTx> m_merkle_tx;  // parent coinbase + branch to parent merkle root
     CMerkleLink      m_chain_merkle_link;    // aux/chain merkle branch + slot index
     CPureBlockHeader m_parent_block_header;  // parent (LTC) 80-byte header
 
@@ -144,8 +146,8 @@ inline bool is_auxpow_version(int32_t version) { return (version & 0x100) != 0; 
 /// pack.hpp surface, not merely skipped. The 80-byte base header is what
 /// HeaderChain consumes; `out_aux` carries the proof for validation
 /// (CAuxPow::check_proof, future milestone). Throws on truncation/parse failure.
-template <typename Stream>
-CPureBlockHeader parse_aux_header(Stream& s, CAuxPow& out_aux, bool& has_aux)
+template <typename Stream, typename ParentCoinbaseTx = ltc::coin::MutableTransaction>
+CPureBlockHeader parse_aux_header(Stream& s, CAuxPow<ParentCoinbaseTx>& out_aux, bool& has_aux)
 {
     CPureBlockHeader hdr;
     ::Unserialize(s, hdr);                                  // 80-byte base header
