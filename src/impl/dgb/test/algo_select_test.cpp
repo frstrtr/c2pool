@@ -81,3 +81,25 @@ TEST(DgbAlgoSelect, DispositionThreeWay)
     EXPECT_EQ(dgb_header_disposition(PRIMARY | (10 << 8)),
               HeaderDisposition::REJECT);
 }
+
+// V36 multi-algo posture: the FOUR known non-Scrypt PoW lanes (SHA256d, Skein,
+// Qubit, Odo) and the legacy Groestl lane are all ACCEPT_BY_CONTINUITY -- never
+// validated (would feed a non-Scrypt header into the Scrypt PoW lane) and never
+// rejected (would drop real parent work and fork off the DGB chain). The
+// classifier reaches this via the switch `default:`, so a future explicit
+// `case DgbAlgo::QUBIT: return REJECT;` style regression must fail HERE.
+// Full 5-algo PoW validation is V37 scope; in V36 every non-Scrypt known algo
+// extends the chain work-neutrally. (DigiByte Core src/primitives/block.h.)
+TEST(DgbAlgoSelect, AllKnownNonScryptAlgosAreContinuity)
+{
+    EXPECT_EQ(dgb_header_disposition(PRIMARY | DGB_BLOCK_VERSION_SHA256D),
+              HeaderDisposition::ACCEPT_BY_CONTINUITY);
+    EXPECT_EQ(dgb_header_disposition(PRIMARY | DGB_BLOCK_VERSION_GROESTL),
+              HeaderDisposition::ACCEPT_BY_CONTINUITY);
+    EXPECT_EQ(dgb_header_disposition(PRIMARY | DGB_BLOCK_VERSION_SKEIN),
+              HeaderDisposition::ACCEPT_BY_CONTINUITY);
+    EXPECT_EQ(dgb_header_disposition(PRIMARY | DGB_BLOCK_VERSION_QUBIT),
+              HeaderDisposition::ACCEPT_BY_CONTINUITY);
+    EXPECT_EQ(dgb_header_disposition(PRIMARY | DGB_BLOCK_VERSION_ODO),
+              HeaderDisposition::ACCEPT_BY_CONTINUITY);
+}
