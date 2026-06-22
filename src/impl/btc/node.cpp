@@ -12,7 +12,9 @@
 #include <iomanip>
 #include <random>
 
-#include <execinfo.h>  // backtrace() for think() watchdog stack dump
+#ifndef _WIN32
+#include <execinfo.h>  // backtrace() for think() watchdog stack dump (glibc-only)
+#endif
 
 // Static members for DensePPLNSWindow precomputed decay table
 std::vector<uint64_t> btc::DensePPLNSWindow::s_decay_table;
@@ -1427,6 +1429,7 @@ void NodeImpl::arm_think_watchdog()
                   << THINK_WATCHDOG_SECONDS << "s (gen=" << gen
                   << ", pending_adds=" << m_pending_adds.size()
                   << ") — compute thread appears wedged; recovering pipeline";
+#ifndef _WIN32
         {
             void* frames[64];
             int n = ::backtrace(frames, 64);
@@ -1437,6 +1440,10 @@ void NodeImpl::arm_think_watchdog()
                 ::free(syms);
             }
         }
+#else
+        // Native backtrace is glibc-only (execinfo.h); on MSVC the timeout log
+        // above plus pending_adds is the diagnostic. Recovery below is identical.
+#endif
 
         // (2)+(3) Flag the cycle aborted and reset the running flag so the
         // pipeline recovers. NOTE: this does NOT forcibly unwind the compute
