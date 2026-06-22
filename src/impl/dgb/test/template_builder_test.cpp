@@ -87,9 +87,8 @@ TEST(DgbTemplateBuilder, EmptyChainMintimeIsZero)
 }
 
 // transactions[] is an empty array BY DEFAULT (no tx source wired into the
-// inputs); bits is NEVER emitted (MultiShield V4 next-target is V37 -- the
-// bits is NEVER emitted (MultiShield V4 next-target is V37 — a Scrypt-only
-// walk would be a known-wrong difficulty).
+// inputs); bits is NEVER emitted (MultiShield V4 next-target is V37 — a
+// Scrypt-only walk would be a known-wrong difficulty).
 TEST(DgbTemplateBuilder, EmptyTransactionsAndNoBits)
 {
     auto t = build_work_template(make_inputs());
