@@ -400,8 +400,25 @@ inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParam
     ref_stream << p.stale_info;
     ::Serialize(ref_stream, VarInt(p.desired_version));
 
-    if (p.has_segwit)
-        ref_stream << p.segwit_data;
+    // Segwit field (PARITY FIX): for share versions >= SEGWIT_ACTIVATION_VERSION
+    // the ref preimage ALWAYS carries a segwit field -- the SegwitData when
+    // present, else an explicit (empty merkle branch, zero wtxid root)
+    // placeholder. This mirrors generate_share_transaction() / share_init_verify()
+    // byte-for-byte (PossiblyNoneType writes the default when None). The prior
+    // `if (p.has_segwit)` omitted the placeholder, so a no-segwit v36 share got a
+    // ref_hash 33 bytes shorter than the verifier computes -- a Stratum-emitted
+    // OP_RETURN would never match the share it commits to. Latent until now: no
+    // live DGB caller until the per-connection coinbase producer seam is bound.
+    if (p.share_version >= dgb::SEGWIT_ACTIVATION_VERSION) {
+        if (p.has_segwit) {
+            ref_stream << p.segwit_data;
+        } else {
+            std::vector<uint256> empty_branch;
+            ref_stream << empty_branch;
+            uint256 zero_root;
+            ref_stream << zero_root;
+        }
+    }
 
     // V36: merged_addresses (after segwit_data, before far_share_hash)
     if (core::version_gate::is_v36_active(p.share_version))
