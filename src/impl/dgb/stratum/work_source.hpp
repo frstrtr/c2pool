@@ -199,6 +199,16 @@ public:
     /// silently dropping an accepted share.
     void set_mint_share_fn(MintShareFn fn);
 
+    /// Optional node-local fallback payout selector (Redistribute V2, #307).
+    /// Invoked by the ShareAccept mint path when a submission's stratum
+    /// username yields NO valid payout script (empty/broken credentials): it
+    /// returns the scriptPubKey this node stamps onto the minted share per the
+    /// operator's --redistribute policy. Empty until bound (opt-in only);
+    /// while unbound the empty-credential path is byte-identical to before.
+    /// Consensus-safe: chooses only this node's own stamp, not sharechain rules.
+    using FallbackPayoutFn = std::function<std::vector<unsigned char>()>;
+    void set_fallback_payout_fn(FallbackPayoutFn fn);
+
     /// Dispatch one share-difficulty submission to the bound mint callback.
     /// The stage-4d mining_submit classify branch calls this on the
     /// "pow_hash <= share target" outcome. Returns the minted share hash, or a
@@ -252,6 +262,12 @@ private:
     // mining_submit classify branch no-ops the mint when unbound.
     mutable std::mutex          mint_share_mutex_;
     MintShareFn                 mint_share_fn_;
+
+    // Node-local --redistribute fallback payout selector (#307). Empty until
+    // bound in main_dgb; consumed by the ShareAccept mint path when a
+    // submitted username carries no valid payout address.
+    mutable std::mutex          fallback_payout_mutex_;
+    FallbackPayoutFn            fallback_payout_fn_;
 
     // Template cache (filled lazily; invalidated when work_generation_ bumps)
     // Stage 4c populates these.
