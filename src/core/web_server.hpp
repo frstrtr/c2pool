@@ -506,6 +506,15 @@ public:
     void set_coin_peers_fn(coin_peers_fn_t fn) { m_coin_peers_fn = std::move(fn); }
     nlohmann::json rest_coin_peers(const std::string& remote_ip);
 
+    // D0.3 per-coin stats seam + D0.2 auto-detect. node_topology_fn, when set
+    // by the wiring layer, feeds the real per-coin embedded-daemon topology
+    // (coin label, embedded/has_rpc/synced, peers, hashrate). When unset,
+    // rest_node_topology() auto-detects the node's real coin set from the live
+    // coin-peer map + m_blockchain -- never a hardcoded {ltc,doge} shape.
+    using node_topology_fn_t = std::function<nlohmann::json()>;
+    void set_node_topology_fn(node_topology_fn_t fn) { m_node_topology_fn = std::move(fn); }
+    nlohmann::json rest_node_topology();              // /api/node_topology
+
     // Sharechain stats callback — returns live tracker data for the /sharechain/stats endpoint
     using sharechain_stats_fn_t = std::function<nlohmann::json()>;
     void set_sharechain_stats_fn(sharechain_stats_fn_t fn) { m_sharechain_stats_fn = thread_safe_wrap(std::move(fn)); }
@@ -1016,6 +1025,7 @@ private:
     sharechain_stats_fn_t m_sharechain_stats_fn;
     spv_progress_fn_t m_spv_progress_fn;
     coin_peers_fn_t m_coin_peers_fn;
+    node_topology_fn_t m_node_topology_fn;  // D0.3 per-coin stats provider (optional)
     // Rate limiter for /api/coin_peers: IP → last request time
     std::map<std::string, std::chrono::steady_clock::time_point> m_coin_peers_rate_limit;
     sharechain_window_fn_t m_sharechain_window_fn;

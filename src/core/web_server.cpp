@@ -380,6 +380,8 @@ void HttpSession::process_request()
                 rest_result = mining_interface_->rest_stale_rates();
             else if (target == "/node_info")
                 rest_result = mining_interface_->rest_node_info();
+            else if (target == "/api/node_topology")
+                rest_result = mining_interface_->rest_node_topology();
             else if (target == "/luck_stats")
                 rest_result = mining_interface_->rest_luck_stats();
             else if (target == "/ban_stats")
@@ -5105,6 +5107,79 @@ void MiningInterface::auto_detect_external_info()
     // Version is set at build time via C2POOL_VERSION from git describe.
     // No runtime GitHub fetch needed (requires HTTPS which we can't do
     // with raw TCP sockets).
+}
+
+// D0.2/D0.3 -- truthful per-node topology. Each node in the 6-coin fleet
+// (LTC/DOGE/BTC/DGB/DASH/BCH) runs a different coin set + embedded daemons;
+// the dashboard must reflect THAT node's REAL shape, auto-detected from live
+// state -- never a hardcoded LTC+DOGE shape. Web/diagnostic layer only.
+nlohmann::json MiningInterface::rest_node_topology()
+{
+    // D0.3 seam: prefer the per-coin StatsProvider hook when the wiring layer
+    // feeds one (richer -- per-coin synced flag + hashrate). Falls back to the
+    // D0.2 auto-detect below when unset, so the endpoint is always truthful.
+    if (m_node_topology_fn) {
+        auto t = m_node_topology_fn();
+        if (!t.is_null())
+            return t;
+    }
+
+    auto upper = [](std::string str) {
+        for (auto& ch : str)
+            if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 32);
+        return str;
+    };
+
+    // This node's own chain.
+    std::string primary;
+    switch (m_blockchain) {
+    case Blockchain::LITECOIN: primary = "LTC";  break;
+    case Blockchain::BITCOIN:  primary = "BTC";  break;
+    case Blockchain::DOGECOIN: primary = "DOGE"; break;
+    case Blockchain::DASH:     primary = "DASH"; break;
+    }
+
+    nlohmann::json coins = nlohmann::json::array();
+    auto has_coin = [&](const std::string& sym) {
+        for (const auto& c : coins)
+            if (c.value("coin", std::string{}) == sym) return true;
+        return false;
+    };
+    auto add_coin = [&](const std::string& sym, bool is_primary, int peers) {
+        if (sym.empty() || has_coin(sym)) return;
+        nlohmann::json entry = nlohmann::json::object();
+        entry["coin"]    = sym;
+        entry["primary"] = is_primary;
+        entry["peers"]   = peers;
+        if (is_primary) {
+            // Real embedded/RPC flags for this node's own daemon.
+            entry["embedded"] = (m_coin_node && m_coin_node->is_embedded());
+            entry["has_rpc"]  = (m_coin_node && m_coin_node->has_rpc());
+        }
+        coins.push_back(std::move(entry));
+    };
+
+    // Auto-detect the embedded/aux coin set from the live coin-peer map keys
+    // (e.g. an LTC node also runs embedded DOGE) -- the node's REAL shape, not
+    // a baked-in assumption.
+    nlohmann::json peer_map = m_coin_peers_fn ? m_coin_peers_fn()
+                                              : nlohmann::json::object();
+    if (peer_map.is_object()) {
+        for (auto it = peer_map.begin(); it != peer_map.end(); ++it) {
+            std::string sym = upper(it.key());
+            int peers = it.value().is_array()
+                          ? static_cast<int>(it.value().size()) : 0;
+            add_coin(sym, sym == primary, peers);
+        }
+    }
+    // Guarantee the primary chain is always present even if absent from the map.
+    add_coin(primary, true, 0);
+
+    nlohmann::json result = nlohmann::json::object();
+    result["node_symbol"]   = primary;
+    result["auto_detected"] = true;
+    result["coins"]         = coins;
+    return result;
 }
 
 nlohmann::json MiningInterface::rest_node_info()
