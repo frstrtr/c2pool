@@ -18,6 +18,7 @@
 #include <gtest/gtest.h>
 #include <impl/dgb/coin/connection_coinbase.hpp>
 
+#include <map>
 #include <optional>
 #include <string>
 #include <utility>
@@ -99,6 +100,108 @@ TEST(ConnCoinbase, RefOpReturnLayout) {
         uint256(std::vector<unsigned char>(32, 0xab)), NONCE);
     std::string ref32; for (int i = 0; i < 32; ++i) ref32 += "ab";
     EXPECT_EQ(tohex(op), std::string("6a28") + ref32 + "0807060504030201");
+}
+
+
+// ============================================================================
+// (5)-(8) PPLNS SSOT wiring: build_connection_coinbase_from_pplns delegates the
+// payout split to compute_pplns_payout_split (the #329 verification SSOT) and
+// forwards every non-payout field unchanged into build_connection_coinbase_parts.
+//
+// These are DELEGATION-IDENTITY tests, not a second payout implementation: each
+// asserts the PPLNS-sourced path produces bytes identical to the manual path
+// fed by the SAME SSOT split. Reintroducing inline payout math, dropping the
+// v36 floor, or mis-forwarding a field would diverge them. The split MATH
+// itself is pinned independently in pplns_payout_split_test.cpp.
+
+using Script = std::vector<unsigned char>;
+
+// Build the manual reference: run the SSOT split, hand it to the parts builder.
+dgb::coin::ConnCoinbaseParts manual_from_split(
+    const std::map<Script, uint288>& w, const uint288& total, uint64_t subsidy,
+    bool v36, const Script& finder,
+    const std::optional<Script>& seg, const uint256& ref, uint64_t nonce) {
+    auto split = dgb::coin::compute_pplns_payout_split(w, total, subsidy, v36, finder);
+    dgb::coin::ConnCoinbaseInputs in;
+    in.coinbase_script = CB;
+    in.segwit_commitment_script = seg;
+    in.payout_outputs = split.payout_outputs;
+    in.donation_amount = split.donation_amount;
+    in.donation_script = DON;
+    in.ref_hash = ref;
+    in.last_txout_nonce = nonce;
+    return dgb::coin::build_connection_coinbase_parts(in);
+}
+
+dgb::coin::ConnCoinbaseParts wired_from_pplns(
+    const std::map<Script, uint288>& w, const uint288& total, uint64_t subsidy,
+    bool v36, const Script& finder,
+    const std::optional<Script>& seg, const uint256& ref, uint64_t nonce) {
+    dgb::coin::ConnCoinbasePplnsInputs in;
+    in.coinbase_script = CB;
+    in.segwit_commitment_script = seg;
+    in.weights = w;
+    in.total_weight = total;
+    in.subsidy = subsidy;
+    in.use_v36_pplns = v36;
+    in.finder_script = finder;
+    in.donation_script = DON;
+    in.ref_hash = ref;
+    in.last_txout_nonce = nonce;
+    return dgb::coin::build_connection_coinbase_from_pplns(in);
+}
+
+void expect_parts_eq(const dgb::coin::ConnCoinbaseParts& a,
+                     const dgb::coin::ConnCoinbaseParts& b) {
+    EXPECT_EQ(tohex(a.gentx.bytes), tohex(b.gentx.bytes));
+    EXPECT_EQ(a.coinb1, b.coinb1);
+    EXPECT_EQ(a.coinb2, b.coinb2);
+    EXPECT_EQ(a.gentx.txid, b.gentx.txid);
+}
+
+// (5) V36 split (no finder fee, >=1 sat donation floor) flows through identically.
+TEST(ConnCoinbasePplns, V36WiredEqualsManual) {
+    std::map<Script, uint288> w{{P1, uint288(3)}, {P2, uint288(1)}};
+    uint256 ref(std::vector<unsigned char>(32, 0xab));
+    auto wired  = wired_from_pplns(w, uint288(4), 10000, true, {}, std::nullopt, ref, NONCE);
+    auto manual = manual_from_split(w, uint288(4), 10000, true, {}, std::nullopt, ref, NONCE);
+    expect_parts_eq(wired, manual);
+}
+
+// (6) Pre-V36 path (use_v36_pplns=false + finder_script) forwards the flag and
+//     the 0.5% finder fee target — proves both are wired, not hard-coded.
+TEST(ConnCoinbasePplns, PreV36FinderFeeWiredEqualsManual) {
+    std::map<Script, uint288> w{{P1, uint288(1)}, {P2, uint288(1)}};
+    uint256 ref(std::vector<unsigned char>(32, 0xab));
+    auto wired  = wired_from_pplns(w, uint288(2), 20000, false, P1, std::nullopt, ref, NONCE);
+    auto manual = manual_from_split(w, uint288(2), 20000, false, P1, std::nullopt, ref, NONCE);
+    expect_parts_eq(wired, manual);
+}
+
+// (7) Non-payout fields (segwit commitment, distinct ref_hash, distinct nonce)
+//     forward unchanged into the assembler.
+TEST(ConnCoinbasePplns, SegwitAndRefFieldsForwarded) {
+    std::map<Script, uint288> w{{P1, uint288(5)}, {P2, uint288(2)}};
+    Script seg = unhex("6a24aa21a9ed" + std::string(64, 'c'));
+    uint256 ref(std::vector<unsigned char>(32, 0x5c));
+    const uint64_t alt_nonce = 0x1112131415161718ull;
+    auto wired  = wired_from_pplns(w, uint288(7), 7777777, true, {}, seg, ref, alt_nonce);
+    auto manual = manual_from_split(w, uint288(7), 7777777, true, {}, seg, ref, alt_nonce);
+    expect_parts_eq(wired, manual);
+}
+
+// (8) Value anchor (independent of the wiring): the SSOT split the wired path
+//     consumes carries the hand-computed V36 amounts in ascending order, and
+//     the assembled coinbase preserves that exact PPLNS vout sequence.
+//     subsidy 1000, P1:2 P2:1 (total 3) -> P1=666, P2=333, sum 999, donation 1;
+//     >=1 sat floor satisfied without deduction. asc(amount): P2(333), P1(666).
+TEST(ConnCoinbasePplns, ValueAnchorAscendingPayoutOrder) {
+    std::map<Script, uint288> w{{P1, uint288(2)}, {P2, uint288(1)}};
+    auto split = dgb::coin::compute_pplns_payout_split(w, uint288(3), 1000, true, {});
+    std::vector<std::pair<Script, uint64_t>> expect{{P2, 333}, {P1, 666}};
+    EXPECT_EQ(split.payout_outputs, expect);
+    EXPECT_EQ(split.donation_amount, 1u);
+    // The wired coinbase is assembled from exactly this split (covered by (5)-(7)).
 }
 
 } // namespace

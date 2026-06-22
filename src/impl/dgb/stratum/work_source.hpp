@@ -42,6 +42,7 @@
 #include <core/stratum_work_source.hpp>
 #include <core/uint256.hpp>
 #include <core/pow.hpp>       // core::SubsidyFunc — embedded coinbasevalue SSOT feed
+#include <impl/dgb/coin/connection_coinbase.hpp>  // ConnCoinbasePplnsInputs (PPLNS->coinbase SSOT)
 
 #include <atomic>
 #include <cstdint>
@@ -209,6 +210,26 @@ public:
     using FallbackPayoutFn = std::function<std::vector<unsigned char>()>;
     void set_fallback_payout_fn(FallbackPayoutFn fn);
 
+    /// Producer seam for the per-connection coinbase (Phase B live-wire).
+    /// Given the share-chain tip a miner builds ON TOP OF, plus this session's
+    /// extranonce1 and resolved payout/merged scripts, returns the fully
+    /// populated PPLNS inputs (weight map sourced from the ShareTracker, ref_hash,
+    /// subsidy, donation script). Bound once at startup in main_dgb.cpp where the
+    /// ShareTracker + CoinParams are in scope; the tracker walk lives THERE so no
+    /// sharechain logic leaks into the work source. While UNBOUND,
+    /// build_connection_coinbase() returns an empty result (byte-identical to the
+    /// pre-wire stub -- no behavior change until the producer is bound). Returning
+    /// std::nullopt (e.g. tip not yet known) also yields an empty, safe job. The
+    /// emitted coinbase is byte-identical to the verifier's
+    /// generate_share_transaction() BY CONSTRUCTION: both delegate to the single
+    /// compute_pplns_payout_split() SSOT via build_connection_coinbase_from_pplns.
+    using PplnsInputsFn = std::function<std::optional<dgb::coin::ConnCoinbasePplnsInputs>(
+        const uint256& prev_share_hash,
+        const std::string& extranonce1_hex,
+        const std::vector<unsigned char>& payout_script,
+        const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs)>;
+    void set_pplns_inputs_fn(PplnsInputsFn fn);
+
     /// Dispatch one share-difficulty submission to the bound mint callback.
     /// The stage-4d mining_submit classify branch calls this on the
     /// "pow_hash <= share target" outcome. Returns the minted share hash, or a
@@ -268,6 +289,12 @@ private:
     // submitted username carries no valid payout address.
     mutable std::mutex          fallback_payout_mutex_;
     FallbackPayoutFn            fallback_payout_fn_;
+
+    // Per-connection coinbase PPLNS-inputs producer (#327/#330 live-wire).
+    // Empty until set_pplns_inputs_fn() bound in main_dgb; while empty the
+    // per-connection coinbase path returns an empty job (pre-wire behavior).
+    mutable std::mutex          pplns_inputs_mutex_;
+    PplnsInputsFn               pplns_inputs_fn_;
 
     // Template cache (filled lazily; invalidated when work_generation_ bumps)
     // Stage 4c populates these.

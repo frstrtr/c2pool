@@ -18,6 +18,8 @@
 #include <impl/dgb/config_coin.hpp>
 #include <impl/dgb/share.hpp>
 #include <impl/dgb/share_tracker.hpp>   // DensePPLNSWindow — V36 decayed-PPLNS SSOT
+#include <impl/dgb/coin/pplns_weight_walk.hpp> // SSOT: PPLNS step-1 tracker walk (shared emission/verify)
+#include <impl/dgb/coin/pplns_payout_split.hpp> // #328 SSOT: weights -> payout outputs (invariance tie-in)
 #include <impl/dgb/params.hpp>          // make_coin_params — assembled CoinParams SSOT
 #include <impl/dgb/coin/rpc_conf.hpp>   // #82 external-daemon RPC creds (digibyte.conf)
 #include <impl/dgb/auto_ratchet.hpp> // Phase B: mint-side share-version ratchet
@@ -246,6 +248,69 @@ TEST(DGB_share_test, DesiredVersionWeightsByAttempts)
     // Attempts-weighting: the lone high-difficulty dv=35 share outweighs the two
     // low-difficulty dv=36 shares — the exact property a flat count inverts.
     EXPECT_GT(w.at(35u), w.at(36u));
+}
+
+// ── compute_pplns_weight_walk() SSOT contract KAT ───────────────────────────
+// The PPLNS step-1 tracker walk is now ONE helper shared by the share-
+// VERIFICATION path (generate_share_transaction) and the per-connection Stratum
+// coinbase EMISSION path (build_connection_coinbase producer seam). Value-level
+// faithfulness of the lift is proven by the unchanged generate_share_transaction
+// fixtures (they route through the helper now); this KAT independently locks the
+// helper's CONTRACT so a later edit that breaks the emission path is caught even
+// where no verifier test covers it:
+//   (1) it forwards verbatim to get_v36_decayed_cumulative_weights on the V36
+//       path (byte-identical weights/totals), and
+//   (2) it returns an empty, safe result (no throw) when the parent is null or
+//       absent from the chain — the "safe coinbase-only / empty job" the seam
+//       relies on while the tip is unknown.
+TEST(DGB_share_test, WeightWalkSSOTContract)
+{
+    const core::CoinParams params = dgb::make_coin_params(/*testnet=*/false);
+
+    dgb::ShareTracker tracker;
+    auto mk = [&](const char* hh, const char* ph, uint32_t bits) {
+        auto* s = new dgb::MergedMiningShare();
+        s->m_hash.SetHex(hh);
+        if (ph) s->m_prev_hash.SetHex(ph); else s->m_prev_hash.SetNull();
+        s->m_bits = bits;
+        s->m_max_bits = bits;
+        dgb::ShareType st; st = s;
+        tracker.add(st);
+    };
+    const char* h0 = "00000000000000000000000000000000000000000000000000000000000000b0";
+    const char* h1 = "00000000000000000000000000000000000000000000000000000000000000b1";
+    const char* h2 = "00000000000000000000000000000000000000000000000000000000000000b2";
+    mk(h0, nullptr,    0x1e0fffff);
+    mk(h1, h0,         0x1e0fffff);
+    mk(h2, h1,         0x1e0fffff);
+
+    uint256 tip; tip.SetHex(h2);
+    const auto chain_len = static_cast<int32_t>(params.real_chain_length);
+
+    // (1) V36 path forwards verbatim to the tracker's decayed-weights SSOT.
+    uint288 unlimited_weight;
+    unlimited_weight.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    const auto direct = tracker.get_v36_decayed_cumulative_weights(tip, chain_len, unlimited_weight);
+    const auto via_helper = dgb::coin::compute_pplns_weight_walk(
+        tracker, tip, /*block_bits=*/0x1e0fffff, params, /*use_v36_pplns=*/true);
+    EXPECT_EQ(via_helper.weights,               direct.weights);
+    EXPECT_EQ(via_helper.total_weight,          direct.total_weight);
+    EXPECT_EQ(via_helper.total_donation_weight, direct.total_donation_weight);
+
+    // (2a) null parent -> empty, safe (no throw).
+    const auto null_walk = dgb::coin::compute_pplns_weight_walk(
+        tracker, uint256::ZERO, 0x1e0fffff, params, /*use_v36_pplns=*/true);
+    EXPECT_TRUE(null_walk.weights.empty());
+    EXPECT_TRUE(null_walk.total_weight.IsNull());
+    EXPECT_TRUE(null_walk.total_donation_weight.IsNull());
+
+    // (2b) parent absent from the chain -> empty, safe (no throw).
+    uint256 absent; absent.SetHex(
+        "00000000000000000000000000000000000000000000000000000000deadbeef");
+    const auto absent_walk = dgb::coin::compute_pplns_weight_walk(
+        tracker, absent, 0x1e0fffff, params, /*use_v36_pplns=*/true);
+    EXPECT_TRUE(absent_walk.weights.empty());
+    EXPECT_TRUE(absent_walk.total_weight.IsNull());
 }
 
 
@@ -565,4 +630,211 @@ TEST(DGB_run_loop_mint, AdapterFailsClosedOnShortHeader)
 
     uint256 h = dgb::mint_local_share_with_ratchet(in, tracker, params, ratchet);
     EXPECT_TRUE(h.IsNull());
+}
+
+// ── PPLNS weight-walk VALUE-INVARIANCE (before-vs-after) differential KAT ────
+// SAME BAR as the #328 payout-split invariance KAT: prove the #333 lift of
+// generate_share_transaction() step-1 into dgb::coin::compute_pplns_weight_walk()
+// moves ZERO weight. We embed the PRE-REFACTOR inline walk here VERBATIM
+// (transcribed line-for-line from the share_check.hpp generate_share_transaction()
+// body that commit a5c23b7fb removed) as legacy_inline_weight_walk(), and assert
+// the helper reproduces it weight-for-weight — per-script weights, total_weight
+// AND total_donation_weight — across a battery exercising BOTH PPLNS branches
+// (V36 decay / pre-V36 grandparent-start + max_weight cap), the donation split,
+// zero-addr-weight shares (full-donation), the insufficient-depth guard (throw),
+// null/absent parents, and a chain that EXCEEDS the real_chain_length window.
+// Then BOTH weight maps are fed through the #328 payout-split SSOT and the
+// resulting outputs + donation asserted byte-identical — closing the end-to-end
+// "no payout satoshi drifts between emission and verification" proof.
+//
+// COVERAGE NOTE (no silent cap): the >4000-distinct-OUTPUT truncation
+// (PPLNS_MAX_OUTPUTS) is proven on the payout-split side by the #328 KAT
+// (PplnsPayoutSplitInvariance, case n=4096). Here the weight-walk "window" is
+// the real_chain_length share cap; the window case below drives the walk past it
+// on testnet params (window=400) to prove the cap truncates the walk identically
+// before vs after the lift.
+
+// Verbatim transcription of share_check.hpp generate_share_transaction() step 1
+// as it stood BEFORE commit a5c23b7fb (the #333 weight-walk lift). The only
+// adaptation: block_bits is taken as a parameter (the helper extracted exactly
+// share.m_min_header.m_bits into this same parameter) and the three result
+// fields are returned in the deduced CumulativeWeights instead of assigned to
+// generate_share_transaction()'s locals.
+template <typename TrackerT>
+static auto legacy_inline_weight_walk(
+    TrackerT& tracker, const uint256& prev_hash, uint32_t block_bits,
+    const core::CoinParams& params, bool use_v36_pplns)
+    -> decltype(tracker.get_v36_decayed_cumulative_weights(
+           prev_hash, std::int32_t{0}, std::declval<const uint288&>()))
+{
+    using Result = decltype(tracker.get_v36_decayed_cumulative_weights(
+        prev_hash, std::int32_t{0}, std::declval<const uint288&>()));
+    Result out{};
+
+    if (!prev_hash.IsNull() && tracker.chain.contains(prev_hash))
+    {
+        auto chain_len = static_cast<int32_t>(params.real_chain_length);
+        {
+            auto pplns_height = tracker.chain.get_height(prev_hash);
+            auto pplns_last = tracker.chain.get_last(prev_hash);
+            if (!(pplns_height >= chain_len || pplns_last.IsNull()))
+                throw std::invalid_argument(
+                    "share chain not long enough for PPLNS verification (height="
+                    + std::to_string(pplns_height) + " need="
+                    + std::to_string(chain_len) + ")");
+        }
+
+        auto block_target = chain::bits_to_target(block_bits);
+        auto max_weight = chain::target_to_average_attempts(block_target)
+                          * params.spread * 65535;
+
+        if (use_v36_pplns) {
+            uint288 unlimited_weight;
+            unlimited_weight.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+            auto result = tracker.get_v36_decayed_cumulative_weights(prev_hash, chain_len, unlimited_weight);
+            out.weights = std::move(result.weights);
+            out.total_weight = result.total_weight;
+            out.total_donation_weight = result.total_donation_weight;
+        } else {
+            uint256 pplns_start;
+            tracker.chain.get(prev_hash).share.invoke([&](auto* s) {
+                pplns_start = s->m_prev_hash;  // grandparent
+            });
+            auto available = tracker.chain.get_height(prev_hash);
+            auto walk_count = static_cast<int32_t>(
+                std::max(0, std::min(chain_len, available) - 1));
+
+            if (!pplns_start.IsNull() && tracker.chain.contains(pplns_start) && walk_count > 0) {
+                auto result = tracker.get_cumulative_weights(pplns_start, walk_count, max_weight);
+                out.weights = std::move(result.weights);
+                out.total_weight = result.total_weight;
+                out.total_donation_weight = result.total_donation_weight;
+            }
+        }
+    }
+    return out;
+}
+
+namespace {
+// Build a share into the tracker. prev==nullptr => null parent (resolved chain
+// genesis). bits drives per-share work (target_to_average_attempts); donation in
+// [0,65535] drives the addr/donation weight split (65535 => zero addr weight).
+inline void add_walk_share(dgb::ShareTracker& tracker, const uint256& hh,
+                           const uint256* ph, uint32_t bits, uint16_t donation)
+{
+    auto* s = new dgb::MergedMiningShare();
+    s->m_hash = hh;
+    if (ph) s->m_prev_hash = *ph; else s->m_prev_hash.SetNull();
+    s->m_bits = bits;
+    s->m_max_bits = bits;
+    s->m_min_header.m_bits = bits;
+    s->m_donation = donation;
+    dgb::ShareType st; st = s;
+    tracker.add(st);
+}
+inline uint256 hx(const std::string& tail) {
+    uint256 v; v.SetHex(std::string(64 - tail.size(), '0') + tail); return v;
+}
+} // namespace
+
+TEST(DGB_share_test, WeightWalkValueInvarianceBattery)
+{
+    const core::CoinParams params = dgb::make_coin_params(/*testnet=*/false);
+    const uint32_t bb = 0x1e0fffff;  // block-header bits feeding the pre-V36 cap
+
+    auto assert_walk_identical =
+        [&](dgb::ShareTracker& tk, const uint256& prev, bool v36, const char* tag) {
+            const auto legacy = legacy_inline_weight_walk(tk, prev, bb, params, v36);
+            const auto helper = dgb::coin::compute_pplns_weight_walk(tk, prev, bb, params, v36);
+            EXPECT_EQ(helper.weights,               legacy.weights)               << tag << " weights";
+            EXPECT_EQ(helper.total_weight,          legacy.total_weight)          << tag << " total_weight";
+            EXPECT_EQ(helper.total_donation_weight, legacy.total_donation_weight) << tag << " donation_weight";
+
+            // End-to-end: identical weights => identical payout split (the #328
+            // SSOT), proven on the SAME inputs both paths feed.
+            std::vector<unsigned char> finder = helper.weights.empty() ? std::vector<unsigned char>{} : helper.weights.begin()->first;
+            for (uint64_t subsidy : {uint64_t(0), uint64_t(625000000)}) {
+                auto sp_h = dgb::coin::compute_pplns_payout_split(
+                    helper.weights, helper.total_weight, subsidy, v36, finder);
+                auto sp_l = dgb::coin::compute_pplns_payout_split(
+                    legacy.weights, legacy.total_weight, subsidy, v36, finder);
+                EXPECT_EQ(sp_h.payout_outputs,  sp_l.payout_outputs)  << tag << " payout_outputs s=" << subsidy;
+                EXPECT_EQ(sp_h.donation_amount, sp_l.donation_amount) << tag << " donation s=" << subsidy;
+            }
+        };
+
+    // Resolved chain g <- a <- b <- c (g.prev null). Mixed donation incl. 0 and
+    // full-donation (65535 => that share contributes ZERO addr weight) and
+    // varied bits (varied per-share work).
+    {
+        dgb::ShareTracker tk;
+        uint256 g = hx("c0"), a = hx("c1"), b = hx("c2"), c = hx("c3");
+        add_walk_share(tk, g, nullptr, 0x1e0fffff, 0);
+        add_walk_share(tk, a, &g,      0x1e07ffff, 32767);
+        add_walk_share(tk, b, &a,      0x1e0fffff, 65535);   // zero addr-weight share
+        add_walk_share(tk, c, &b,      0x1d00ffff, 100);
+        assert_walk_identical(tk, c, /*v36=*/true,  "v36-basic");
+        assert_walk_identical(tk, c, /*v36=*/false, "preV36-basic(grandparent+cap)");
+
+        // Donation weight is genuinely exercised (>0) so the donation field is
+        // not a trivial zero on both sides.
+        const auto w = dgb::coin::compute_pplns_weight_walk(tk, c, bb, params, true);
+        EXPECT_FALSE(w.total_donation_weight.IsNull()) << "battery must exercise non-zero donation weight";
+        EXPECT_FALSE(w.total_weight.IsNull())          << "battery must exercise non-zero total weight";
+    }
+
+    // prev points at genesis directly => pre-V36 grandparent is null => empty
+    // (both), even though prev IS in the chain.
+    {
+        dgb::ShareTracker tk;
+        uint256 g = hx("d0"), a = hx("d1");
+        add_walk_share(tk, g, nullptr, 0x1e0fffff, 0);
+        add_walk_share(tk, a, &g,      0x1e0fffff, 0);
+        assert_walk_identical(tk, g, /*v36=*/false, "preV36-grandparent-null");
+    }
+
+    // null parent / absent parent => empty, no throw (both).
+    {
+        dgb::ShareTracker tk;
+        uint256 g = hx("e0");
+        add_walk_share(tk, g, nullptr, 0x1e0fffff, 0);
+        assert_walk_identical(tk, uint256::ZERO, true, "null-parent");
+        assert_walk_identical(tk, hx("deadbeef"), true, "absent-parent");
+    }
+
+    // Insufficient-depth guard: a chain whose oldest share points at a NON-null
+    // hash absent from the tracker (so chain.get_last(prev) is non-null) and
+    // whose height < real_chain_length MUST throw — identically, both paths.
+    {
+        dgb::ShareTracker tk;
+        uint256 root_missing = hx("beef"), a = hx("f1"), b = hx("f2");
+        add_walk_share(tk, a, &root_missing, 0x1e0fffff, 0);  // a.prev absent => get_last non-null
+        add_walk_share(tk, b, &a,            0x1e0fffff, 0);
+        EXPECT_THROW(legacy_inline_weight_walk(tk, b, bb, params, true), std::invalid_argument)
+            << "legacy guard must throw on insufficient depth";
+        EXPECT_THROW(dgb::coin::compute_pplns_weight_walk(tk, b, bb, params, true), std::invalid_argument)
+            << "helper guard must throw identically";
+    }
+
+    // Exceeds the real_chain_length window: testnet params (window=400); build a
+    // resolved chain LONGER than the window and prove the walk caps identically.
+    {
+        const core::CoinParams tn = dgb::make_coin_params(/*testnet=*/true);
+        const int32_t window = static_cast<int32_t>(tn.real_chain_length);  // 400
+        dgb::ShareTracker tk;
+        uint256 prev; prev.SetNull();
+        uint256 tip;
+        for (int i = 0; i < window + 5; ++i) {
+            char buf[16]; std::snprintf(buf, sizeof(buf), "%x", 0x9000 + i);
+            uint256 h = hx(buf);
+            add_walk_share(tk, h, (i == 0 ? nullptr : &prev),
+                           0x1e0fffff, static_cast<uint16_t>((i * 7919) % 65535));
+            prev = h; tip = h;
+        }
+        const auto legacy = legacy_inline_weight_walk(tk, tip, bb, tn, /*v36=*/true);
+        const auto helper = dgb::coin::compute_pplns_weight_walk(tk, tip, bb, tn, /*v36=*/true);
+        EXPECT_EQ(helper.weights,               legacy.weights)               << "window weights";
+        EXPECT_EQ(helper.total_weight,          legacy.total_weight)          << "window total_weight";
+        EXPECT_EQ(helper.total_donation_weight, legacy.total_donation_weight) << "window donation_weight";
+    }
 }
