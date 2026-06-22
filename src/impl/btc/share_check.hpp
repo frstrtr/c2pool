@@ -1117,8 +1117,23 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, bool 
     auto gst_t2 = std::chrono::steady_clock::now(); // after amounts
     // Python: sorted(dests, key=lambda a: (amounts[a], a))[-4000:]
     // = ascending by (amount, script), keep last 4000 (highest amounts)
-    std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs(
-        amounts.begin(), amounts.end());
+    // F11: canonical exclude-then-append donation handling (p2pool data.py
+    // generate_transaction). The per-miner dests list excludes BOTH donation
+    // scripts; a COMBINED_DONATION_SCRIPT-keyed weight folds into the single
+    // donation-last output, and any DONATION_SCRIPT-keyed weight is dropped.
+    const std::vector<unsigned char> combined_donation_script(
+        core::donation::COMBINED_DONATION_SCRIPT.begin(), core::donation::COMBINED_DONATION_SCRIPT.end());
+    const std::vector<unsigned char> p2pk_donation_script(
+        core::donation::DONATION_SCRIPT.begin(), core::donation::DONATION_SCRIPT.end());
+    if (auto _dit = amounts.find(combined_donation_script); _dit != amounts.end())
+        donation_amount += _dit->second;
+    std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs;
+    payout_outputs.reserve(amounts.size());
+    for (auto& _kv : amounts) {
+        if (_kv.first == combined_donation_script || _kv.first == p2pk_donation_script)
+            continue;
+        payout_outputs.emplace_back(_kv.first, _kv.second);
+    }
     std::sort(payout_outputs.begin(), payout_outputs.end(),
         [](const auto& a, const auto& b) {
             if (a.second != b.second) return a.second < b.second; // asc by amount
@@ -2390,8 +2405,23 @@ uint256 create_local_share_v35(
         // V35: no minimum donation enforcement (unlike v36)
         uint64_t donation_amount = (subsidy > sum_amounts) ? (subsidy - sum_amounts) : 0;
 
-        std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs(
-            amounts.begin(), amounts.end());
+        // F11: canonical exclude-then-append donation handling (p2pool data.py
+        // generate_transaction). The per-miner dests list excludes BOTH donation
+        // scripts; a COMBINED_DONATION_SCRIPT-keyed weight folds into the single
+        // donation-last output, and any DONATION_SCRIPT-keyed weight is dropped.
+        const std::vector<unsigned char> combined_donation_script(
+            core::donation::COMBINED_DONATION_SCRIPT.begin(), core::donation::COMBINED_DONATION_SCRIPT.end());
+        const std::vector<unsigned char> p2pk_donation_script(
+            core::donation::DONATION_SCRIPT.begin(), core::donation::DONATION_SCRIPT.end());
+        if (auto _dit = amounts.find(combined_donation_script); _dit != amounts.end())
+            donation_amount += _dit->second;
+        std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs;
+        payout_outputs.reserve(amounts.size());
+        for (auto& _kv : amounts) {
+            if (_kv.first == combined_donation_script || _kv.first == p2pk_donation_script)
+                continue;
+            payout_outputs.emplace_back(_kv.first, _kv.second);
+        }
         std::sort(payout_outputs.begin(), payout_outputs.end(),
             [](const auto& a, const auto& b) {
                 if (a.second != b.second) return a.second < b.second;
@@ -2944,8 +2974,23 @@ uint256 create_local_share(
             }
         }
 
-        std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs(
-            amounts.begin(), amounts.end());
+        // F11: canonical exclude-then-append donation handling (p2pool data.py
+        // generate_transaction). The per-miner dests list excludes BOTH donation
+        // scripts; a COMBINED_DONATION_SCRIPT-keyed weight folds into the single
+        // donation-last output, and any DONATION_SCRIPT-keyed weight is dropped.
+        const std::vector<unsigned char> combined_donation_script(
+            core::donation::COMBINED_DONATION_SCRIPT.begin(), core::donation::COMBINED_DONATION_SCRIPT.end());
+        const std::vector<unsigned char> p2pk_donation_script(
+            core::donation::DONATION_SCRIPT.begin(), core::donation::DONATION_SCRIPT.end());
+        if (auto _dit = amounts.find(combined_donation_script); _dit != amounts.end())
+            donation_amount += _dit->second;
+        std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs;
+        payout_outputs.reserve(amounts.size());
+        for (auto& _kv : amounts) {
+            if (_kv.first == combined_donation_script || _kv.first == p2pk_donation_script)
+                continue;
+            payout_outputs.emplace_back(_kv.first, _kv.second);
+        }
         std::sort(payout_outputs.begin(), payout_outputs.end(),
             [](const auto& a, const auto& b) {
                 if (a.second != b.second) return a.second < b.second;
