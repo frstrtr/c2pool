@@ -145,6 +145,22 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_gentx_coinbase_test "" AUTO)
 
+    # --- Phase B: per-connection Stratum coinbase assembler + split KAT -----
+    # Pins coin/connection_coinbase.hpp: build_connection_coinbase_parts builds
+    # the per-connection gentx via the assemble_gentx_coinbase SSOT and splits
+    # it into coinb1/coinb2 around the OP_RETURN 8-byte extranonce slot. Proves
+    # bytes==oracle (same NOSEG vector as dgb_gentx_coinbase_test) AND the
+    # split invariant coinb1||en1||en2||coinb2 == full gentx. Links the dgb
+    # OBJECT-lib SCC set like dgb_gentx_coinbase_test. MUST appear in BOTH this
+    # registration AND the build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_connection_coinbase_test connection_coinbase_test.cpp)
+    target_link_libraries(dgb_connection_coinbase_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_connection_coinbase_test "" AUTO)
+
     # --- #172 share-path gentx KAT (collapse consumption proof) ------------
     # Proves generate_share_transaction (the verification SSOT call site #172
     # rewired) EMITS assemble_gentx_coinbase framing for a real v36 share, via
