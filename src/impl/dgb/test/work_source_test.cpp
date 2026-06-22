@@ -16,6 +16,7 @@
 #include <impl/dgb/stratum/work_source.hpp>
 #include <impl/dgb/coin/header_chain.hpp>
 #include <impl/dgb/coin/mempool.hpp>
+#include <impl/dgb/coin/connection_coinbase.hpp>  // build_connection_coinbase_from_pplns (SSOT under test)
 #include <impl/dgb/config_coin.hpp>   // dgb::CoinParams::subsidy (oracle SSOT)
 
 #include <core/pow.hpp>                 // core::SubsidyFunc
@@ -24,6 +25,7 @@
 
 #include <gtest/gtest.h>
 
+#include <map>
 #include <memory>
 #include <optional>
 
@@ -518,6 +520,91 @@ TEST(DgbWorkSource, GbtPrevhashGetterMatchesTemplateField)
     EXPECT_EQ(ws->get_current_gbt_prevhash(), expected);
     EXPECT_EQ(ws->get_current_work_template()["previousblockhash"].get<std::string>(),
               expected);
+}
+
+
+// ── Per-connection coinbase live-wire (set_pplns_inputs_fn / build_connection_coinbase) ──
+// The producer half of the Phase-B coinbase wire: build_connection_coinbase
+// delegates to the build_connection_coinbase_from_pplns SSOT (which the verifier
+// also calls). These pin three contracts: (1) UNBOUND -> empty job (pre-wire
+// byte-identical no-op), (2) bound -> coinb1/coinb2 byte-identical to the SSOT
+// called directly with the same inputs (proving build_connection_coinbase is a
+// pure pass-through, not a second payout implementation), (3) producer nullopt
+// -> empty job.
+namespace {
+
+using Script = std::vector<unsigned char>;
+
+// A fixed, fully-populated PPLNS input set (two payout scripts, v36 no-finder).
+dgb::coin::ConnCoinbasePplnsInputs sample_pplns_inputs()
+{
+    dgb::coin::ConnCoinbasePplnsInputs in;
+    in.coinbase_script = Script{0x03, 0x01, 0x02, 0x03};       // BIP34-ish scriptSig
+    in.weights = { {Script{0x76, 0xa9, 0x14, 0xaa}, uint288(3)},
+                   {Script{0x76, 0xa9, 0x14, 0xbb}, uint288(1)} };
+    in.total_weight = uint288(4);
+    in.subsidy = 1234567;
+    in.use_v36_pplns = true;
+    in.donation_script = Script{0xa9, 0x14, 0xcc};
+    in.ref_hash = uint256(std::vector<unsigned char>(32, 0xab));
+    in.last_txout_nonce = 0x0102030405060708ULL;
+    return in;
+}
+
+}  // namespace
+
+TEST(DgbWorkSource, ConnectionCoinbaseEmptyUntilPplnsInputsWired)
+{
+    Fixture fx;
+    auto ws = fx.make();
+    auto r = ws->build_connection_coinbase(
+        uint256::ZERO, "deadbeef", Script{}, {});
+    EXPECT_TRUE(r.coinb1.empty());
+    EXPECT_TRUE(r.coinb2.empty());
+}
+
+TEST(DgbWorkSource, ConnectionCoinbaseDelegatesToPplnsSsotByteIdentical)
+{
+    Fixture fx;
+    auto ws = fx.make();
+    const auto inputs = sample_pplns_inputs();
+
+    // Bind a producer that hands back the fixed inputs regardless of args.
+    ws->set_pplns_inputs_fn(
+        [&](const uint256&, const std::string&, const Script&,
+            const std::vector<std::pair<uint32_t, Script>>&)
+            -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> {
+            return inputs;
+        });
+
+    auto wired = ws->build_connection_coinbase(
+        uint256(std::vector<unsigned char>(32, 0x11)), "cafef00d", Script{0x01}, {});
+
+    // The SSOT called directly with the same inputs is the oracle.
+    auto oracle = dgb::coin::build_connection_coinbase_from_pplns(inputs);
+
+    EXPECT_EQ(wired.coinb1, oracle.coinb1);
+    EXPECT_EQ(wired.coinb2, oracle.coinb2);
+    EXPECT_FALSE(wired.coinb1.empty());
+    // Consensus ref fields are frozen onto the snapshot for the submit path.
+    EXPECT_EQ(wired.snapshot.frozen_ref.ref_hash, inputs.ref_hash);
+    EXPECT_EQ(wired.snapshot.frozen_ref.last_txout_nonce, inputs.last_txout_nonce);
+    EXPECT_EQ(wired.snapshot.subsidy, inputs.subsidy);
+}
+
+TEST(DgbWorkSource, ConnectionCoinbaseProducerNulloptYieldsEmptyJob)
+{
+    Fixture fx;
+    auto ws = fx.make();
+    ws->set_pplns_inputs_fn(
+        [&](const uint256&, const std::string&, const Script&,
+            const std::vector<std::pair<uint32_t, Script>>&)
+            -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> {
+            return std::nullopt;  // tip not yet known
+        });
+    auto r = ws->build_connection_coinbase(uint256::ZERO, "00", Script{}, {});
+    EXPECT_TRUE(r.coinb1.empty());
+    EXPECT_TRUE(r.coinb2.empty());
 }
 
 }  // namespace

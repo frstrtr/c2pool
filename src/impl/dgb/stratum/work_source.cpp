@@ -25,6 +25,7 @@
 #include <impl/dgb/coin/hash_format.hpp>
 #include <impl/dgb/coin/scrypt_pow.hpp>        // scrypt_pow_hash (DGB-Scrypt PoW SSOT)
 #include <impl/dgb/coin/submit_classify.hpp>   // classify_submission (Stage-4d decision SSOT)
+#include <impl/dgb/coin/connection_coinbase.hpp>  // build_connection_coinbase_from_pplns SSOT
 #include <impl/dgb/coin/header_sample_build.hpp>// compact_to_target (compact bits -> u256)
 
 #include <core/log.hpp>
@@ -333,16 +334,49 @@ std::pair<std::string, std::string> DGBWorkSource::get_coinbase_parts() const
 }
 
 core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase(
-    const uint256& /*prev_share_hash*/,
-    const std::string& /*extranonce1_hex*/,
-    const std::vector<unsigned char>& /*payout_script*/,
-    const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& /*merged_addrs*/) const
+    const uint256& prev_share_hash,
+    const std::string& extranonce1_hex,
+    const std::vector<unsigned char>& payout_script,
+    const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs) const
 {
-    // Stage 4c: build per-connection coinbase using the SSOT gentx assembler
-    // (coin/gentx_coinbase.hpp) + ShareTracker ref_hash + PPLNS payout map.
-    // For now return an empty result; sessions calling this will get an empty
-    // job and skip pushing work, which is safe but non-functional.
-    return {};
+    // Phase B live-wire: delegate to the PPLNS->coinbase SSOT
+    // (build_connection_coinbase_from_pplns), which itself routes through the
+    // single compute_pplns_payout_split() the verifier uses -- so the coinbase a
+    // miner hashes here is byte-identical to the one generate_share_transaction()
+    // enforces, by construction (no second payout implementation to keep in sync).
+    //
+    // The PPLNS inputs (weight map walked from the ShareTracker, ref_hash,
+    // subsidy, donation script) are produced by the seam bound in main_dgb.cpp
+    // -- the tracker walk lives there, not in the work source. While the seam is
+    // UNBOUND (or returns nullopt) this is byte-identical to the pre-wire stub:
+    // an empty result, so the session pushes no work (safe, non-functional).
+    PplnsInputsFn fn;
+    {
+        std::lock_guard<std::mutex> lk(pplns_inputs_mutex_);
+        fn = pplns_inputs_fn_;  // copy under lock; a concurrent set_*_fn() cannot
+                                // tear it out mid-call.
+    }
+    if (!fn)
+        return {};  // unbound: pre-wire behavior (empty job).
+
+    std::optional<dgb::coin::ConnCoinbasePplnsInputs> inputs =
+        fn(prev_share_hash, extranonce1_hex, payout_script, merged_addrs);
+    if (!inputs)
+        return {};  // producer declined (e.g. tip not yet known) -> safe empty job.
+
+    dgb::coin::ConnCoinbaseParts parts =
+        dgb::coin::build_connection_coinbase_from_pplns(*inputs);
+
+    core::stratum::CoinbaseResult out;
+    out.coinb1 = std::move(parts.coinb1);
+    out.coinb2 = std::move(parts.coinb2);
+    // Freeze the consensus-bearing ref fields the submit path (mining_submit)
+    // re-derives the won-block reconstruct from; the remaining snapshot fields
+    // (merkle_branches / segwit) are populated by the template-cache follow-on.
+    out.snapshot.subsidy                   = inputs->subsidy;
+    out.snapshot.frozen_ref.ref_hash       = inputs->ref_hash;
+    out.snapshot.frozen_ref.last_txout_nonce = inputs->last_txout_nonce;
+    return out;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -608,6 +642,12 @@ void DGBWorkSource::set_fallback_payout_fn(FallbackPayoutFn fn)
 {
     std::lock_guard<std::mutex> lk(fallback_payout_mutex_);
     fallback_payout_fn_ = std::move(fn);
+}
+
+void DGBWorkSource::set_pplns_inputs_fn(PplnsInputsFn fn)
+{
+    std::lock_guard<std::mutex> lk(pplns_inputs_mutex_);
+    pplns_inputs_fn_ = std::move(fn);
 }
 
 uint256 DGBWorkSource::try_mint_share(const MintShareInputs& in) const
