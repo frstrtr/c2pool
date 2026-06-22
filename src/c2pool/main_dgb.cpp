@@ -43,6 +43,8 @@
 #include <impl/dgb/coin/header_ingest.hpp>
 #include <impl/dgb/coin/mempool_ingest.hpp>
 #include <impl/dgb/stratum/work_source.hpp>
+#include <impl/dgb/redistribute.hpp>    // Redistribute V2 node-local payout policy (#307)
+#include <impl/dgb/config_pool.hpp>     // PoolConfig::COMBINED_DONATION_SCRIPT (donate identity)
 #include <impl/dgb/coin/p2p_node.hpp>
 #include <impl/dgb/coin/rpc.hpp>        // NodeRPC — external-daemon submitblock arm (#82)
 #include <impl/dgb/coin/rpc_conf.hpp>   // digibyte.conf creds resolution (rpcpassword off argv)
@@ -93,7 +95,8 @@ void print_banner(const char* argv0, const core::CoinParams& p)
         << "Usage: " << argv0
         << " [--version] [--help] [--selftest] [--run] [--stratum [H:]P]\n"
         << "       [--coin-daemon H:P] [--coin-magic HEX] [--regtest]\n"
-        << "       [--regtest-force-won-share] [--no-p2p-relay]\n\n"
+        << "       [--regtest-force-won-share] [--no-p2p-relay]\n"
+        << "       [--redistribute SPEC]\n\n"
         << "Status: pool/sharechain pillars live (Phase B); run-loop up\n"
         << "        (--run: io_context + sharechain peer + Stratum standup).\n"
         << "        --stratum [HOST:]PORT binds a miner-facing TCP listener\n"
@@ -155,7 +158,8 @@ int run_node(const core::CoinParams& params, bool testnet,
              const std::string& rpc_endpoint,
              const std::string& rpc_conf_path,
              bool regtest = false, bool force_won_share = false,
-             bool no_p2p_relay = false)
+             bool no_p2p_relay = false,
+             const std::string& redistribute_spec = "")
 {
     io::io_context ioc;
 
@@ -615,6 +619,59 @@ int run_node(const core::CoinParams& params, bool testnet,
         header_chain, mempool, testnet, std::move(stratum_submit_fn),
         params.subsidy_func);
 
+    // -- --redistribute: node-local payout policy (Redistribute V2, #307) ------
+    // Opt-in ONLY. Chooses the pubkey this node stamps onto shares minted from
+    // submissions whose stratum username carries no valid payout address. It
+    // touches NOTHING on the sharechain (validation/codec/PPLNS unchanged) -- it
+    // is node-local and consensus-safe. Absent --redistribute the fallback stays
+    // unbound and the empty-credential path is byte-identical to prior builds.
+    if (!redistribute_spec.empty()) {
+        auto redistributor = std::make_shared<dgb::Redistributor>();
+        redistributor->set_hybrid_weights(dgb::parse_redistribute_spec(redistribute_spec));
+        // "donate" identity: P2SH hash160 == COMBINED_DONATION_SCRIPT[2..22]
+        // (V36 1-of-2 forrestv+maintainer combined donation, byte-identical to
+        // the gentx donation output). "fee" needs an operator payout identity
+        // not yet plumbed here -> pick() returns a null hash for it and the
+        // fallback yields an empty script (fail-safe: never a burn output).
+        {
+            const auto& ds = dgb::PoolConfig::COMBINED_DONATION_SCRIPT;
+            uint160 donation_hash;
+            std::memcpy(donation_hash.data(), ds.data() + 2, 20);
+            redistributor->set_donation_identity(donation_hash, /*P2SH=*/2);
+        }
+        auto& redist_tracker = p2p_node.tracker();
+        work_source->set_fallback_payout_fn(
+            [redistributor, &redist_tracker, ws = work_source.get()]()
+                -> std::vector<unsigned char> {
+                uint256 best;
+                if (auto bf = ws->get_best_share_hash_fn()) best = bf();
+                const dgb::RedistributeResult r = redistributor->pick(redist_tracker, best);
+                if (r.pubkey_hash.IsNull())
+                    return {};   // unconfigured identity -> fail-safe (no burn)
+                // Build the scriptPubKey from the RAW 20-byte hash (storage
+                // order). NB: do NOT route through uint160::GetHex() -- it
+                // emits reversed (big-endian) hex, which would stamp a byte-
+                // reversed hash. .data() gives the script-order bytes verbatim.
+                unsigned char hb[20];
+                std::memcpy(hb, r.pubkey_hash.data(), 20);
+                std::vector<unsigned char> script;
+                if (r.pubkey_type == 2) {            // P2SH: a9 14 <hash160> 87
+                    script = {0xa9, 0x14};
+                    script.insert(script.end(), hb, hb + 20);
+                    script.push_back(0x87);
+                } else {                             // P2PKH: 76 a9 14 <hash160> 88 ac
+                    script = {0x76, 0xa9, 0x14};
+                    script.insert(script.end(), hb, hb + 20);
+                    script.push_back(0x88);
+                    script.push_back(0xac);
+                }
+                return script;
+            });
+        std::cout << "[DGB] redistribute policy ENABLED: \"" << redistribute_spec
+                  << "\" (node-local payout for unnamed miners; consensus-safe)"
+                  << std::endl;
+    }
+
     if (stratum_port != 0) {
         stratum_server = std::make_unique<core::StratumServer>(
             ioc, stratum_addr, stratum_port, work_source);
@@ -864,6 +921,7 @@ int main(int argc, char** argv)
     uint256 coin_genesis;                   // --coin-genesis HASH (initial getheaders locator base)
     std::string rpc_endpoint;               // --coin-rpc HOST:PORT (external digibyted submit arm)
     std::string rpc_conf_path;              // --coin-rpc-auth PATH to digibyte.conf (creds source)
+    std::string redistribute_spec;         // --redistribute SPEC (node-local payout policy, #307)
     // ── #82 regtest-gated forced-won-share LIVE seam (decision (a), 2026-06-21) ──
     // --regtest-force-won-share synthesizes ONE won share into the live
     // ShareTracker and fires m_on_block_found AFTER both broadcast arms are
@@ -915,6 +973,9 @@ int main(int argc, char** argv)
         if (std::strcmp(argv[i], "--regtest-force-won-share") == 0)
             force_won_share = true;                 // gated below: regtest-ONLY
         if (std::strcmp(argv[i], "--no-p2p-relay") == 0) no_p2p_relay = true;
+        if (std::strcmp(argv[i], "--redistribute") == 0 && i + 1 < argc) {
+            redistribute_spec = argv[++i];     // pplns|fee|boost|donate or hybrid "boost:70,donate:20"
+        }
     }
 
     const core::CoinParams params = dgb::make_coin_params(/*testnet=*/false);
@@ -928,7 +989,8 @@ int main(int argc, char** argv)
         return run_node(params, /*testnet=*/false, stratum_addr, stratum_port,
                         coin_daemon, coin_magic, coin_genesis,
                         rpc_endpoint, rpc_conf_path,
-                        regtest, force_won_share, no_p2p_relay);
+                        regtest, force_won_share, no_p2p_relay,
+                        redistribute_spec);
 
     // --selftest, or a bare invocation: drive the live score path so the
     // binary exercises real consensus code, then exit cleanly.
