@@ -20,6 +20,8 @@
 #include <impl/dgb/coin/embedded_coinbase_value.hpp>
 #include <impl/dgb/coin/dgb_block_algo.hpp>
 #include <impl/dgb/coin/template_builder.hpp>
+#include <impl/dgb/coin/embedded_tx_select.hpp>  // make_mempool_tx_source (mempool -> GBT transactions[])
+#include <impl/dgb/config_pool.hpp>              // dgb::PoolConfig::BLOCK_MAX_WEIGHT
 #include <impl/dgb/coin/hash_format.hpp>
 #include <impl/dgb/coin/scrypt_pow.hpp>        // scrypt_pow_hash (DGB-Scrypt PoW SSOT)
 #include <impl/dgb/coin/submit_classify.hpp>   // classify_submission (Stage-4d decision SSOT)
@@ -245,8 +247,20 @@ nlohmann::json DGBWorkSource::get_current_work_template() const
     // compose in later slices WITHOUT changing this SSOT call (a present GBT
     // coinbasevalue stays authoritative; fees add on top of subsidy).
     const uint32_t next_h = chain_.next_block_height();
+
+    // Phase B: feed the served template from the in-process embedded Mempool,
+    // mirroring the embedded node path (#248, embedded_coin_node.hpp). The
+    // make_mempool_tx_source SSOT selects fee-sorted txs up to BLOCK_MAX_WEIGHT
+    // and shapes them into the GBT transactions[] form build_work_template passes
+    // through verbatim; their fee total folds into coinbasevalue via the #207
+    // resolve_coinbase_value SSOT (NOT added to the template). On today's empty
+    // embedded mempool this yields an empty transactions[] and total_fees=0 --
+    // byte-identical to the prior coinbase-only template; it lights up unchanged
+    // once the embedded P2P mempool feed populates the pool.
+    const dgb::coin::EmbeddedTxSelection tx_sel =
+        dgb::coin::make_mempool_tx_source(mempool_, dgb::PoolConfig::BLOCK_MAX_WEIGHT)();
     const uint64_t coinbasevalue =
-        coinbase_value(next_h, /*total_fees=*/0, /*gbt_coinbasevalue=*/std::nullopt);
+        coinbase_value(next_h, /*total_fees=*/tx_sel.total_fees, /*gbt_coinbasevalue=*/std::nullopt);
 
     // GBT-scaffold fields the embedded path can derive TRUTHFULLY from current
     // chain state, ahead of a full dgb::coin::TemplateBuilder port (M3 TODO):
@@ -260,9 +274,10 @@ nlohmann::json DGBWorkSource::get_current_work_template() const
     //   mintime      — median_time_past()+1 (#209 accessor): DGB Core's
     //                  ContextualCheckBlockHeader lower bound (nTime > MTP). An
     //                  empty chain returns INT64_MIN (unconstrained) -> emit 0.
-    //   transactions — empty array: embedded mempool tx SELECTION is not wired,
-    //                  so no transactions are fabricated and fees stay 0
-    //                  (consistent with the total_fees=0 coinbasevalue above).
+    //   transactions — fee-sorted mempool selection via make_mempool_tx_source
+    //                  (BLOCK_MAX_WEIGHT cap), shaped into GBT {data,txid,hash,fee}
+    //                  objects; their fee total folds into the coinbasevalue above
+    //                  (#207 SSOT). Empty embedded mempool -> empty array, fees 0.
     //
     // previousblockhash — the tip block id. Emitted ONLY when the HeaderChain
     //                  carries a real tip hash (tip_hash() accessor): the
@@ -298,6 +313,7 @@ nlohmann::json DGBWorkSource::get_current_work_template() const
     in.coinbasevalue     = coinbasevalue;
     in.median_time_past  = chain_.median_time_past();
     in.curtime           = static_cast<int64_t>(std::time(nullptr));
+    in.transactions      = tx_sel.transactions;
     if (auto th = chain_.tip_hash())
         in.previousblockhash = u256_be_display_hex(*th);
 
