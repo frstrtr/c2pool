@@ -686,6 +686,34 @@ public:
 
         return attempts / uint288(time_span);
     }
+
+    // -- AutoRatchet: PPLNS-weighted desired-version tally (canonical) --
+    // Mirrors p2pool get_desired_version_counts (data.py:2651): walk `lookbehind`
+    // shares back from share_hash and accumulate per-desired-version WORK weight
+    // (idx->work = target_to_average_attempts), NOT a flat share count. Consumed by
+    // share_check's 60% weighted version-switch boundary gate. BCH is a standalone
+    // SHA256d parent — no merged/aux dimension here.
+    std::map<uint64_t, uint288> get_desired_version_weights(const uint256& share_hash, int32_t lookbehind)
+    {
+        std::map<uint64_t, uint288> weights;
+        if (!chain.contains(share_hash))
+            return weights;
+        auto height = chain.get_height(share_hash);
+        auto actual = std::min(lookbehind, height);
+        if (actual <= 0)
+            return weights;
+
+        auto view = chain.get_chain(share_hash, actual);
+        for (auto [hash, data] : view)
+        {
+            uint64_t dv = 0;
+            data.share.invoke([&](auto* obj) { dv = obj->m_desired_version; });
+            auto* idx = chain.get_index(hash);
+            if (idx)
+                weights[dv] = weights[dv] + idx->work;
+        }
+        return weights;
+    }
 };
 
 } // namespace bch
