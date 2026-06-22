@@ -297,6 +297,19 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_simplifiedmns PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_simplifiedmns "" AUTO)
 
+    # Header-only LLMQ quorum-tail verification leaf over core/uint256 +
+    # core/pack; no ltc/pool SCC dependency. Sits between the
+    # SimplifiedMNList leaf (#309) and embedded_gbt main (S7).
+    add_executable(test_dash_quorum test_dash_quorum.cpp)
+    target_link_libraries(test_dash_quorum PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_quorum PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_quorum "" AUTO)
+
     add_executable(test_compact_blocks test_compact_blocks.cpp)
     target_link_libraries(test_compact_blocks PRIVATE
         GTest::gtest_main GTest::gtest
