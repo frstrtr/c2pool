@@ -161,6 +161,21 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_connection_coinbase_test "" AUTO)
 
+    # --- Phase B: PPLNS weights -> consensus-sorted payout outputs KAT ------
+    # Pins coin/pplns_payout_split.hpp: compute_pplns_payout_split reproduces
+    # steps 2-3 of share_check.hpp generate_share_transaction (the verification
+    # SSOT) satoshi-for-satoshi -- the bridge that lets build_connection_coinbase
+    # draw the SAME PPLNS amount split the share check enforces. Header-only over
+    # uint288, registered with the proven dgb link set for parity with sibling
+    # coinbase KATs. MUST also be in the build.yml --target allowlist (#143 trap).
+    add_executable(dgb_pplns_payout_split_test pplns_payout_split_test.cpp)
+    target_link_libraries(dgb_pplns_payout_split_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_pplns_payout_split_test "" AUTO)
+
     # --- #172 share-path gentx KAT (collapse consumption proof) ------------
     # Proves generate_share_transaction (the verification SSOT call site #172
     # rewired) EMITS assemble_gentx_coinbase framing for a real v36 share, via
