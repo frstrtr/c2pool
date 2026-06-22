@@ -38,6 +38,7 @@
 #include <core/uint256.hpp>
 
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <span>
 #include <utility>
@@ -303,6 +304,119 @@ TEST(DgbGentxSharePath, SsotGentxBytesExposedForReconstruct)
         reinterpret_cast<const unsigned char*>(repacked.data()),
         reinterpret_cast<const unsigned char*>(repacked.data()) + repacked.size());
     EXPECT_EQ(rebytes, gc.bytes) << "coinbase tx does not round-trip the SSOT bytes";
+}
+
+
+// ============================================================================
+// Emission==verification ref_hash parity KAT.
+//
+// dgb::compute_ref_hash_for_work() is the Stratum WORK-GENERATION ref_hash SSOT
+// the per-connection coinbase producer seam (set_pplns_inputs_fn) will call to
+// build each connection's OP_RETURN commitment. generate_share_transaction() is
+// the VERIFICATION SSOT. The OP_RETURN a miner hashes MUST commit to the exact
+// ref_hash the verifier recomputes for the share that mines it, or the won
+// block / share is rejected.
+//
+// This pins them production-vs-production: the ref_hash compute_ref_hash_for_work
+// returns must equal the 32 bytes generate_share_transaction actually embeds in
+// the gentx OP_RETURN (6a 28 <ref32> <nonce8>) for the SAME share. No test-side
+// re-serialization -- both sides are production code.
+//
+// REGRESSION CAUGHT: for ver >= SEGWIT_ACTIVATION_VERSION (=35) the verifier
+// ALWAYS serializes a segwit field -- the SegwitData, or an (empty branch, zero
+// root) placeholder when None. The prior compute_ref_hash_for_work wrote the
+// field ONLY when has_segwit, so a no-segwit v36 share got a 33-byte-shorter
+// preimage and a non-matching ref_hash. There is no live DGB caller yet (work
+// path is the 4a skeleton), so this was latent until the producer seam binds.
+namespace {
+dgb::RefHashParams ref_params_from_share(const dgb::MergedMiningShare& s)
+{
+    dgb::RefHashParams p;
+    p.share_version      = dgb::MergedMiningShare::version;   // 36
+    p.prev_share         = s.m_prev_hash;
+    p.coinbase_scriptSig = s.m_coinbase.m_data;
+    p.share_nonce        = s.m_nonce;
+    p.pubkey_hash        = s.m_pubkey_hash;
+    p.pubkey_type        = s.m_pubkey_type;
+    p.subsidy            = s.m_subsidy;
+    p.donation           = s.m_donation;
+    p.stale_info         = static_cast<uint8_t>(s.m_stale_info);
+    p.desired_version    = s.m_desired_version;
+    p.has_segwit         = s.m_segwit_data.has_value();
+    if (p.has_segwit) p.segwit_data = s.m_segwit_data.value();
+    p.merged_addresses     = s.m_merged_addresses;
+    p.far_share_hash       = s.m_far_share_hash;
+    p.max_bits             = s.m_max_bits;
+    p.bits                 = s.m_bits;
+    p.timestamp            = s.m_timestamp;
+    p.absheight            = s.m_absheight;
+    p.abswork              = s.m_abswork;
+    p.merged_coinbase_info = s.m_merged_coinbase_info;
+    p.merged_payout_hash   = s.m_merged_payout_hash;
+    p.message_data         = s.m_message_data;
+    return p;
+}
+
+// Extract the 32 ref_hash bytes from the gentx OP_RETURN (6a 28 <ref32><nonce8>).
+uint256 op_return_ref_hash(const std::vector<unsigned char>& gentx_bytes)
+{
+    for (size_t i = 0; i + 42 <= gentx_bytes.size(); ++i) {
+        if (gentx_bytes[i] == 0x6a && gentx_bytes[i + 1] == 0x28) {
+            uint256 rh;
+            std::memcpy(rh.data(), gentx_bytes.data() + i + 2, 32);
+            return rh;
+        }
+    }
+    return uint256::ZERO;
+}
+} // namespace (parity helpers)
+
+TEST(DgbGentxSharePath, RefHashWorkPathMatchesVerifierOpReturn_NoSegwit)
+{
+    auto params = dgb::make_coin_params(/*testnet=*/false);
+    dgb::ShareTracker tracker;                 // empty chain (null parent share)
+    auto share = make_v36_share();             // v36, no segwit_data
+
+    // Verification side: the ref_hash generate_share_transaction embeds.
+    dgb::coin::GentxCoinbase gc;
+    dgb::generate_share_transaction(
+        share, tracker, params, /*dump_diag=*/false, /*v36_active=*/true, &gc);
+    ASSERT_FALSE(gc.bytes.empty());
+    uint256 verifier_ref = op_return_ref_hash(gc.bytes);
+    ASSERT_FALSE(verifier_ref.IsNull()) << "no OP_RETURN ref commitment found in gentx";
+
+    // Emission side: the work-generation SSOT the producer seam will call.
+    auto [work_ref, nonce] = dgb::compute_ref_hash_for_work(
+        ref_params_from_share(share), params);
+
+    EXPECT_EQ(work_ref, verifier_ref)
+        << "compute_ref_hash_for_work ref_hash != verifier OP_RETURN ref_hash "
+           "(no-segwit v36 segwit-placeholder parity)";
+}
+
+// Guards the fix from regressing back to `if (p.has_segwit)`: toggling has_segwit
+// MUST change the emitted ref_hash, proving the segwit field (value-or-
+// placeholder) is now part of the preimage for ver >= SEGWIT_ACTIVATION_VERSION.
+TEST(DgbGentxSharePath, RefHashWorkPathSegwitFieldIsLoadBearing)
+{
+    auto params = dgb::make_coin_params(/*testnet=*/false);
+    auto share = make_v36_share();
+
+    auto base = ref_params_from_share(share);
+    base.has_segwit = false;
+    auto [ref_placeholder, n0] = dgb::compute_ref_hash_for_work(base, params);
+
+    auto withseg = base;
+    withseg.has_segwit = true;                 // serialize SegwitData instead of placeholder
+    // A DEFAULT SegwitData serializes byte-identically to the (empty branch,
+    // zero root) placeholder, so give it a non-zero wtxid root to prove the
+    // field is genuinely part of the preimage.
+    withseg.segwit_data.m_wtxid_merkle_root.SetHex(
+        "00000000000000000000000000000000000000000000000000000000deadbeef");
+    auto [ref_value, n1] = dgb::compute_ref_hash_for_work(withseg, params);
+
+    EXPECT_NE(ref_placeholder, ref_value)
+        << "segwit field not reaching the ref preimage -- placeholder regressed away";
 }
 
 } // namespace
