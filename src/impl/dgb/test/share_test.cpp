@@ -537,3 +537,65 @@ TEST(DGB_run_loop_mint, AdapterFailsClosedOnShortHeader)
     uint256 h = dgb::mint_local_share_with_ratchet(in, tracker, params, ratchet);
     EXPECT_TRUE(h.IsNull());
 }
+
+// ----------------------------------------------------------------------------
+// mint_local_share_locked -- the run-loop bind main_dgb.cpp installs into
+// DGBWorkSource::set_mint_share_fn. It takes the tracker write-lock NON-BLOCKING
+// (the Stratum-submission thread is NOT the compute thread, so it MUST lock, but
+// must never block the io_context on think()s exclusive hold) and declines the
+// mint when the tracker is busy. These pin the lock discipline -- the novel,
+// thread-safety-critical code of this slice.
+// ----------------------------------------------------------------------------
+
+namespace {
+// Minimal node stand-in exposing the two accessors mint_local_share_locked is
+// duck-typed on, over a caller-owned tracker + shared_mutex (production: dgb::Node).
+struct FakeMintNode {
+    dgb::ShareTracker&   t;
+    std::shared_mutex&   m;
+    dgb::ShareTracker&   tracker()       { return t; }
+    std::shared_mutex&   tracker_mutex() { return m; }
+};
+} // namespace
+
+// When think() holds the tracker exclusively, the mint is DECLINED immediately
+// (NULL, no block -- the test would hang if it blocked) and the tracker is left
+// untouched (no silent racy write).
+TEST(DGB_run_loop_mint, LockedMintDeclinesWhenTrackerBusyNoBlock)
+{
+    dgb::ShareTracker tracker;
+    std::shared_mutex mtx;
+    FakeMintNode node{tracker, mtx};
+    auto params  = dgb::make_coin_params(/*testnet=*/false);
+    auto ratchet = dgb::make_dgb_ratchet();
+
+    MintInputsKAT in;
+    in.header_bytes = std::vector<unsigned char>(80, 0);  // would-be-valid length
+
+    std::unique_lock<std::shared_mutex> held(mtx);  // simulate think() exclusive hold
+    const size_t before = tracker.chain.size();
+    uint256 h = dgb::mint_local_share_locked(in, node, params, ratchet);
+    EXPECT_TRUE(h.IsNull());                      // declined, not minted, not blocked
+    EXPECT_EQ(tracker.chain.size(), before);      // tracker untouched under contention
+}
+
+// With the tracker lock FREE, the helper acquires it, runs the adapter, and
+// RELEASES it (RAII) -- proven by re-acquiring exclusively afterward. The short
+// header makes the adapter fail-closed (NULL), which is irrelevant here: the
+// point is the lock was taken and dropped, never held or leaked.
+TEST(DGB_run_loop_mint, LockedMintAcquiresAndReleasesFreeTrackerLock)
+{
+    dgb::ShareTracker tracker;
+    std::shared_mutex mtx;
+    FakeMintNode node{tracker, mtx};
+    auto params  = dgb::make_coin_params(/*testnet=*/false);
+    auto ratchet = dgb::make_dgb_ratchet();
+
+    MintInputsKAT in;
+    in.header_bytes = std::vector<unsigned char>(40, 0);  // short -> adapter fail-closed
+    uint256 h = dgb::mint_local_share_locked(in, node, params, ratchet);
+    EXPECT_TRUE(h.IsNull());
+
+    std::unique_lock<std::shared_mutex> reacquire(mtx, std::try_to_lock);
+    EXPECT_TRUE(reacquire.owns_lock());           // helper released the tracker lock
+}

@@ -43,6 +43,7 @@
 #include <impl/dgb/coin/header_ingest.hpp>
 #include <impl/dgb/coin/mempool_ingest.hpp>
 #include <impl/dgb/stratum/work_source.hpp>
+#include <impl/dgb/run_loop_mint.hpp>   // Phase B: worker->mint run-loop bind (mint_local_share_locked)
 #include <impl/dgb/coin/p2p_node.hpp>
 #include <impl/dgb/coin/rpc.hpp>        // NodeRPC — external-daemon submitblock arm (#82)
 #include <impl/dgb/coin/rpc_conf.hpp>   // digibyte.conf creds resolution (rpcpassword off argv)
@@ -608,12 +609,38 @@ int run_node(const core::CoinParams& params, bool testnet,
             return ok;
         };
 
+    // AutoRatchet mint-side state machine (base_version=35, target=36; oracle
+    // frstrtr/p2pool-dgb-scrypt @22761e7). Declared BEFORE work_source so it
+    // OUTLIVES the mint callback that captures it by reference. In-memory for
+    // now (no state-file path wired -- a restart re-bootstraps to VOTING, which
+    // is safe: it never regresses a crossed share; persistence is a follow-up).
+    // Accessed ONLY from the mint closure below, and only while that closure
+    // holds the tracker write-lock, so its state is serialized -- no extra mutex.
+    dgb::AutoRatchet dgb_mint_ratchet = dgb::make_dgb_ratchet();
+
     // DGBWorkSource holds non-owning refs to chain + mempool; both outlive it
     // (declared just above, same scope). The StratumServer co-owns the work
     // source via shared_ptr.
     auto work_source = std::make_shared<dgb::stratum::DGBWorkSource>(
         header_chain, mempool, testnet, std::move(stratum_submit_fn),
         params.subsidy_func);
+
+    // -- Phase B worker->mint run-loop bind --------------------------------
+    // Complete the worker->mint path: when mining_submit classifies a Scrypt
+    // submission as ShareAccept (meets the SHARE target but NOT the block
+    // target), DGBWorkSource::try_mint_share invokes this. mint_local_share_
+    // locked mints the found share into the LIVE sharechain tracker under the
+    // tracker write-lock -- taken NON-BLOCKING on this Stratum-submission thread
+    // (declined, never blocked, if think() holds the exclusive lock; the
+    // ShareAccept handler logs minted-vs-no-credit off the returned hash) --
+    // stamping the AutoRatchet-selected {mint=35, vote=36} version pair. This
+    // replaces the unbound no-op (set_mint_share_fn previously never called).
+    work_source->set_mint_share_fn(
+        [&p2p_node, &params, &dgb_mint_ratchet](
+            const dgb::stratum::DGBWorkSource::MintShareInputs& in) -> uint256 {
+            return dgb::mint_local_share_locked(
+                in, p2p_node, params, dgb_mint_ratchet);
+        });
 
     if (stratum_port != 0) {
         stratum_server = std::make_unique<core::StratumServer>(
