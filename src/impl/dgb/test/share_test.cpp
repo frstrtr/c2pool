@@ -280,6 +280,35 @@ TEST(DGB_share_test, OracleAddressAndRelayParams)
     EXPECT_EQ(test.bech32_hrp,            "dgbt");
 }
 
+// -- Sharechain isolation-primitive SSOT KAT (assembled CoinParams) ----------
+// Pins the two network-namespacing values make_coin_params() hands the pool --
+// identifier_hex (sharechain IDENTIFIER) and prefix_hex (P2P message PREFIX) --
+// against the DGB oracle frstrtr/p2pool-dgb-scrypt, on BOTH nets. These are the
+// peer/sharechain namespacing + multi-instance isolation boundary.
+//
+// 3-bucket rule (v36 standardization): identifier_hex / prefix_hex are
+// BUCKET-1 ISOLATION PRIMITIVES. KEEP per-coin AND per-pool-instance, in v36
+// AND v37 -- the v37 unified multichain datastructure unifies the CODE, NOT
+// these namespaces (each ParentChainInstance keeps its own PREFIX/IDENTIFIER).
+// TRAP: never "standardize"/unify these toward a cross-coin value. A silent
+// drift to the LTC prefix/identifier (the LTC-borrowed-artifact failure mode)
+// would collapse DGB onto the LTC sharechain namespace -- this fails loud.
+// test-only, no prod change.
+TEST(DGB_share_test, OracleSharechainIsolationPrimitives)
+{
+    const core::CoinParams p = dgb::make_coin_params(/*testnet=*/false);
+    // mainnet + testnet carriers are assembled unconditionally (params.hpp)
+    EXPECT_EQ(p.identifier_hex,         "4b62545b1a631afe");  // oracle IDENTIFIER
+    EXPECT_EQ(p.prefix_hex,             "1c0553f23ebfcffe");  // oracle PREFIX
+    EXPECT_EQ(p.testnet_identifier_hex, "4b62545b1a631afe");  // oracle (same on testnet)
+    EXPECT_EQ(p.testnet_prefix_hex,     "1c0553f23ebfcffe");  // oracle (same on testnet)
+
+    // active_*() selectors must resolve to the same isolation namespace.
+    core::CoinParams m = p; m.is_testnet = false;
+    EXPECT_EQ(m.active_identifier_hex(), "4b62545b1a631afe");
+    EXPECT_EQ(m.active_prefix_hex(),     "1c0553f23ebfcffe");
+}
+
 
 // ---------------------------------------------------------------------------
 // #82 external-daemon submit arm — digibyte.conf credential resolution.
