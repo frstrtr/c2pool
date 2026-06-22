@@ -471,4 +471,20 @@ if (BUILD_TESTING AND GTest_FOUND)
         nlohmann_json::nlohmann_json)
     gtest_add_tests(dgb_template_capture_test "" AUTO)
 
+    # dgb_redistribute_test: pins src/impl/dgb/redistribute.hpp, the node-local
+    # Redistribute V2 policy ported byte-for-byte from src/impl/ltc (namespace
+    # flip only) -- mode/spec parsing, hybrid format round-trip, stratum-password
+    # options, and the deterministic FEE/DONATE/empty-PPLNS pick branches. The
+    # header consumes share_tracker + share_check + config_pool, so it links the
+    # same set as dgb_share_test. CONSENSUS-SAFE (only the locally-stamped
+    # pubkey_hash), bucket-2 cross-coin standardization. MUST also be in BOTH
+    # build.yml --target allowlists (#143 NOT_BUILT trap).
+    add_executable(dgb_redistribute_test redistribute_test.cpp)
+    target_link_libraries(dgb_redistribute_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_redistribute_test "" AUTO)
+
 endif()
