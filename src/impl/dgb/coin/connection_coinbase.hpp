@@ -21,12 +21,14 @@
 // ============================================================================
 
 #include "gentx_coinbase.hpp"
+#include "pplns_payout_split.hpp"   // compute_pplns_payout_split SSOT
 
 #include <core/uint256.hpp>
 #include <util/strencodings.h>   // HexStr
 #include <btclibs/span.h>        // Span
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <utility>
@@ -101,6 +103,52 @@ inline ConnCoinbaseParts build_connection_coinbase_parts(const ConnCoinbaseInput
     out.coinb2 = HexStr(Span<const unsigned char>(b.data() + (n - 4), 4));
     out.gentx  = std::move(g);
     return out;
+}
+
+
+// ============================================================================
+// PPLNS-sourced per-connection coinbase (the #328/#329 SSOT bridge).
+//
+// Instead of pre-resolved payout_outputs/donation_amount, the caller passes the
+// raw PPLNS weight map + subsidy and we delegate the amount split to
+// compute_pplns_payout_split() -- the SAME helper share_check.hpp
+// generate_share_transaction() (the verification path) calls (see #329). The
+// per-connection coinbase a miner hashes and the coinbase the share check
+// enforces are therefore byte-identical on every payout satoshi BY
+// CONSTRUCTION: there is exactly one payout implementation, not two that must
+// be kept in agreement. No payout arithmetic lives here -- pure delegation +
+// field forwarding into build_connection_coinbase_parts().
+// ============================================================================
+struct ConnCoinbasePplnsInputs
+{
+    std::vector<unsigned char> coinbase_script;   // scriptSig (BIP34 height + tag)
+    std::optional<std::vector<unsigned char>> segwit_commitment_script;
+    // PPLNS weight map + total, exactly as produced by the ShareTracker
+    // (share_tracker.hpp get_v36_decayed_cumulative_weights / get_cumulative_weights).
+    std::map<std::vector<unsigned char>, uint288> weights;
+    uint288  total_weight;
+    uint64_t subsidy{0};                          // block subsidy + fees to split
+    bool     use_v36_pplns{true};                 // V36 (no finder fee) vs pre-V36
+    std::vector<unsigned char> finder_script;     // pre-V36 0.5% finder-fee target
+    std::vector<unsigned char> donation_script;
+    uint256  ref_hash;                            // p2pool ref_hash (32B)
+    uint64_t last_txout_nonce{0};                 // OP_RETURN nonce (extranonce slot)
+};
+
+inline ConnCoinbaseParts build_connection_coinbase_from_pplns(const ConnCoinbasePplnsInputs& in)
+{
+    PplnsPayoutSplit split = compute_pplns_payout_split(
+        in.weights, in.total_weight, in.subsidy, in.use_v36_pplns, in.finder_script);
+
+    ConnCoinbaseInputs ci;
+    ci.coinbase_script          = in.coinbase_script;
+    ci.segwit_commitment_script = in.segwit_commitment_script;
+    ci.payout_outputs           = std::move(split.payout_outputs);
+    ci.donation_amount          = split.donation_amount;
+    ci.donation_script          = in.donation_script;
+    ci.ref_hash                 = in.ref_hash;
+    ci.last_txout_nonce         = in.last_txout_nonce;
+    return build_connection_coinbase_parts(ci);
 }
 
 } // namespace dgb::coin
