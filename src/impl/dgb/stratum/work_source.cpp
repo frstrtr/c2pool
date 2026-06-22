@@ -513,6 +513,22 @@ nlohmann::json DGBWorkSource::mining_submit(
         in.prev_share      = job->prev_share_hash;
         in.merkle_branches = branch_hashes;
         in.payout_script   = core::address_to_script(username);
+        // Redistribute V2 (#307): a miner with empty/broken stratum creds
+        // yields no payout script. When the operator opted into a
+        // --redistribute policy (fallback bound) let it choose the pubkey this
+        // node stamps onto the minted share; else leave it empty (byte-
+        // identical to before). Fail-safe: an empty fallback is left empty.
+        if (in.payout_script.empty()) {
+            FallbackPayoutFn fb;
+            { std::lock_guard<std::mutex> lk(fallback_payout_mutex_); fb = fallback_payout_fn_; }
+            if (fb) {
+                in.payout_script = fb();
+                if (!in.payout_script.empty())
+                    LOG_INFO << "[DGB-STRATUM-SHARE] empty payout addr (user=" << username
+                             << ") -> redistribute policy stamped fallback script ("
+                             << in.payout_script.size() << "B)";
+            }
+        }
         in.segwit_active   = job->segwit_active;
 
         uint256 share_hash = try_mint_share(in);
@@ -570,6 +586,12 @@ void DGBWorkSource::set_mint_share_fn(MintShareFn fn)
 {
     std::lock_guard<std::mutex> lk(mint_share_mutex_);
     mint_share_fn_ = std::move(fn);
+}
+
+void DGBWorkSource::set_fallback_payout_fn(FallbackPayoutFn fn)
+{
+    std::lock_guard<std::mutex> lk(fallback_payout_mutex_);
+    fallback_payout_fn_ = std::move(fn);
 }
 
 uint256 DGBWorkSource::try_mint_share(const MintShareInputs& in) const
