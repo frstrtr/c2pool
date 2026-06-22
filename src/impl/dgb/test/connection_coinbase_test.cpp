@@ -17,8 +17,10 @@
 
 #include <gtest/gtest.h>
 #include <impl/dgb/coin/connection_coinbase.hpp>
+#include <impl/dgb/coin/last_txout_nonce.hpp>
 
 #include <map>
+#include <set>
 #include <optional>
 #include <string>
 #include <utility>
@@ -202,6 +204,43 @@ TEST(ConnCoinbasePplns, ValueAnchorAscendingPayoutOrder) {
     EXPECT_EQ(split.payout_outputs, expect);
     EXPECT_EQ(split.donation_amount, 1u);
     // The wired coinbase is assembled from exactly this split (covered by (5)-(7)).
+}
+
+
+// ============================================================================
+// last_txout_nonce SSOT (coin/last_txout_nonce.hpp) -- oracle-faithful uniform
+// 64-bit draw. Replaced three drifted std::time()-XOR formulas in
+// share_check.hpp. The value is consensus-irrelevant (carried verbatim into the
+// minted share, re-read on verify), so these KATs pin the DRAW PROPERTY, not a
+// fixed vector: full-width entropy + uniqueness -- exactly what the old
+// clock-seeded, low-entropy formulas did not provide.
+// ============================================================================
+
+// (A) Full-width entropy: over many draws every bit position is observed both
+//     set and clear. The old time-XOR formulas left whole sub-words constrained
+//     (low half = std::time, high half = header nonce); a uniform draw saturates
+//     all 64 bits. Failure probability for a real uniform source is ~2^-N.
+TEST(LastTxoutNonceSsot, FullWidthEntropy) {
+    constexpr int N = 4096;
+    uint64_t or_acc = 0;
+    uint64_t and_acc = ~0ull;
+    for (int i = 0; i < N; ++i) {
+        const uint64_t v = dgb::make_last_txout_nonce();
+        or_acc  |= v;
+        and_acc &= v;
+    }
+    EXPECT_EQ(or_acc, ~0ull);   // every bit set at least once
+    EXPECT_EQ(and_acc, 0ull);   // every bit clear at least once
+}
+
+// (B) Uniqueness intent: the draw exists to make the OP_RETURN unique per share.
+//     Over N draws in a 2^64 space collisions are astronomically unlikely, so
+//     the full set must be distinct (birthday collision prob here ~2^-40).
+TEST(LastTxoutNonceSsot, DrawsAreDistinct) {
+    constexpr int N = 4096;
+    std::set<uint64_t> seen;
+    for (int i = 0; i < N; ++i) seen.insert(dgb::make_last_txout_nonce());
+    EXPECT_EQ(seen.size(), static_cast<size_t>(N));
 }
 
 } // namespace
