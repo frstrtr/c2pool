@@ -178,7 +178,7 @@ jobs:
           - arch: arm64
             runner: macos-14
           - arch: x86_64
-            runner: macos-13
+            runner: [self-hosted, macOS, X64, c2pool-mac-intel]
     steps:
       - uses: actions/checkout@v6
 
@@ -199,6 +199,21 @@ jobs:
           else
             echo "exists=0" >> "$GITHUB_OUTPUT"
             echo "::warning::c2pool-${{ matrix.coin }} source not on this ref — no ${{ matrix.coin }} macOS ${{ matrix.arch }} package will be produced."
+          fi
+
+      - name: Set up Homebrew PATH
+        # Self-hosted Intel runner (macpro-intel-204) launches the Actions
+        # service from launchd, whose PATH omits Homebrew (#100: brew exit 127).
+        # GitHub-hosted arm64 keeps /opt/homebrew on PATH; appending is harmless.
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          if [ -x /opt/homebrew/bin/brew ]; then
+            echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+          elif [ -x /usr/local/bin/brew ]; then
+            echo "/usr/local/bin" >> "$GITHUB_PATH"
+          else
+            echo "::error::Homebrew not found at /opt/homebrew or /usr/local on ${RUNNER_NAME:-runner}" >&2
+            exit 1
           fi
 
       - name: Install dependencies
