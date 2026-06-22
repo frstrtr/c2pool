@@ -190,6 +190,19 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_gentx_share_path_test "" AUTO)
 
+    # --- Phase B: per-connection PPLNS-inputs producer-assembly KAT ---------
+    # conn_pplns_producer.hpp binds the verifier ref-hash primitive
+    # (compute_ref_hash_for_work, #336) onto the per-connection coinbase inputs.
+    # Links the dgb OBJECT-lib SCC set like dgb_gentx_share_path_test (pulls
+    # share_check.hpp). MUST also be in the build.yml --target allowlist (#143).
+    add_executable(dgb_conn_pplns_producer_test conn_pplns_producer_test.cpp)
+    target_link_libraries(dgb_conn_pplns_producer_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_conn_pplns_producer_test "" AUTO)
+
     # --- #82 sub-slice 1: transaction_hash_refs -> other_tx hash walk -------
     # coin/other_tx_resolver.hpp is the won-block reconstructor`s connecting
     # tissue (faithful get_other_tx_hashes ancestry resolution). It pulls
