@@ -55,7 +55,7 @@ inline BlockHeaderType parse_doge_header(const uint8_t*& pos, const uint8_t* end
         static_cast<size_t>(end - pos)));
     const size_t avail = ps.cursor_size();
 
-    CAuxPow aux;
+    CAuxPow<> aux;
     bool has_aux = false;
     BlockHeaderType hdr = parse_aux_header(ps, aux, has_aux);
 
@@ -90,7 +90,7 @@ inline std::vector<BlockHeaderType> parse_doge_headers_message(
     // A 'headers' message carries at most 2000; cap the speculative reserve.
     result.reserve(static_cast<size_t>(std::min<uint64_t>(count, 4096)));
 
-    CAuxPow aux;
+    CAuxPow<> aux;
     bool has_aux = false;
     for (uint64_t i = 0; i < count && ps.cursor_size() > 0; ++i) {
         try {
@@ -117,7 +117,7 @@ inline ltc::coin::BlockType parse_doge_block(const uint8_t* data, size_t len)
     PackStream ps(std::span<const std::byte>(
         reinterpret_cast<const std::byte*>(data), len));
 
-    CAuxPow aux;
+    CAuxPow<> aux;
     bool has_aux = false;
     BlockHeaderType hdr = parse_aux_header(ps, aux, has_aux);
 

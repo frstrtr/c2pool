@@ -293,7 +293,7 @@ namespace {
 // proof + tx_count(CompactSize). Mirrors the DOGE 'headers'-message wire layout.
 std::vector<uint8_t> build_extended_header(
     const bitcoin_family::coin::BlockHeaderType& base,
-    const doge::coin::CAuxPow* aux)
+    const doge::coin::CAuxPow<>* aux)
 {
     PackStream ps;
     ::Serialize(ps, base);
@@ -305,9 +305,9 @@ std::vector<uint8_t> build_extended_header(
     return std::vector<uint8_t>(b, b + sp.size());
 }
 
-doge::coin::CAuxPow make_sample_auxpow()
+doge::coin::CAuxPow<> make_sample_auxpow()
 {
-    doge::coin::CAuxPow aux;
+    doge::coin::CAuxPow<> aux;
 
     // Parent-chain (LTC) coinbase == the pool's own gentx, carried in the proof
     // witness-stripped via tx_id_type (auxpow.hpp §12-Q1). Give it a realistic
@@ -392,7 +392,7 @@ TEST(AuxPowStructuredTest, ParseAuxPowHeaderRoundTripsProof) {
 
     PackStream ps(std::span<const std::byte>(
         reinterpret_cast<const std::byte*>(blob.data()), blob.size()));
-    doge::coin::CAuxPow out;
+    doge::coin::CAuxPow<> out;
     bool has_aux = false;
     auto hdr = doge::coin::parse_aux_header(ps, out, has_aux);
 
@@ -430,7 +430,7 @@ TEST(AuxPowStructuredTest, HasAuxFalseForPlainHeader) {
 
     PackStream ps(std::span<const std::byte>(
         reinterpret_cast<const std::byte*>(blob.data()), blob.size()));
-    doge::coin::CAuxPow out;
+    doge::coin::CAuxPow<> out;
     bool has_aux = true;
     auto hdr = doge::coin::parse_aux_header(ps, out, has_aux);
     EXPECT_FALSE(has_aux);
@@ -555,7 +555,7 @@ TEST(AuxPowKnownAnswerTest, Mainnet371337StructuredDecodesRealProof) {
     auto blob = hex_to_bytes(DOGE_371337_EXTHEADER);
     PackStream ps(std::span<const std::byte>(
         reinterpret_cast<const std::byte*>(blob.data()), blob.size()));
-    doge::coin::CAuxPow out;
+    doge::coin::CAuxPow<> out;
     bool has_aux = false;
     auto hdr = doge::coin::parse_aux_header(ps, out, has_aux);
 
@@ -623,7 +623,7 @@ TEST(AuxPowKnownAnswerTest, RegtestH20CAuxPowDecodesRealProof) {
 
     PackStream ps(std::span<const std::byte>(
         reinterpret_cast<const std::byte*>(blob.data()), blob.size()));
-    doge::coin::CAuxPow out;
+    doge::coin::CAuxPow<> out;
     ::Unserialize(ps, out);   // c2pool CAuxPow parser, on dogecoind's own bytes
 
     // Parent coinbase: single null-prevout input carrying the merged-mining
