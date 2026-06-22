@@ -127,8 +127,8 @@ const uint256 MERKLE_BRANCH_0 =
     uint256S("ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100");
 constexpr uint32_t MERKLE_INDEX = 1;
 
-doge::coin::CMerkleTx build_merkle_tx() {
-    doge::coin::CMerkleTx mt;
+doge::coin::CMerkleTx<> build_merkle_tx() {
+    doge::coin::CMerkleTx<> mt;
     mt.m_tx = build_parent_coinbase<ltc::coin::MutableTransaction>();
     mt.m_block_hash = BLOCK_HASH;
     mt.m_merkle_link.m_branch = {MERKLE_BRANCH_0};
@@ -182,7 +182,7 @@ TEST(DGB_AuxParentCoinbaseParity, MerkleTxWireGoldenAnchored) {
 TEST(DGB_AuxParentCoinbaseParity, MerkleTxRoundTripStable) {
     auto mt = build_merkle_tx();
     auto packed = pack(mt);
-    doge::coin::CMerkleTx rt;
+    doge::coin::CMerkleTx<> rt;
     packed >> rt;
     EXPECT_EQ(pack_hex(rt), MERKLE_TX_WIRE);
 }

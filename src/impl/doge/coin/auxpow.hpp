@@ -68,30 +68,51 @@ struct CMerkleLink
     bool IsNull() const { return m_branch.empty() && m_index == 0; }
 };
 
+/// Witness-strip params for the PARENT coinbase tx (tx_id_type, data.py:232).
+/// Each parent chain owns its TxParams *type*: LTC/DASH reuse
+/// bitcoin_family::coin::TxParams via a using-declaration, while DGB declares
+/// its own dgb::coin::TxParams. The no-witness wrapper must therefore resolve
+/// from the PARENT type instead of hardcoding bitcoin_family's -- a DGB parent
+/// coinbase handed a bitcoin_family::coin::TxParams cannot serialize through
+/// dgb's SerializeTransaction (distinct type -> hard compile error). LTC is
+/// only spared today because it shares bitcoin_family's TxParams type.
+///
+/// Primary template -> bitcoin_family's TX_NO_WITNESS: byte-identical to the
+/// pre-template hardcode for every parent that reuses bitcoin_family TxParams
+/// (LTC, DASH). A parent with its OWN TxParams type specializes this in ITS
+/// OWN tree (never here) to point at its namespace TX_NO_WITNESS, keeping this
+/// shared module free of any per-parent (e.g. DGB) include.
+template <typename ParentCoinbaseTx>
+struct parent_coinbase_no_witness
+{
+    static constexpr auto value = bitcoin_family::coin::TX_NO_WITNESS;
+};
+
 /// merkle_tx_type (data.py:231-235)
 ///     ('tx',          tx_id_type)        -> m_tx  (witness-stripped; see §12-Q1)
 ///     ('block_hash',  IntType(256))      -> m_block_hash
 ///     ('merkle_link', merkle_link_type)  -> m_merkle_link
+template <typename ParentCoinbaseTx = ltc::coin::MutableTransaction>
 struct CMerkleTx
 {
-    ltc::coin::MutableTransaction m_tx;          // parent-chain (LTC) coinbase == gentx
+    ParentCoinbaseTx m_tx;          // parent-chain coinbase == gentx (default LTC; DGB binds dgb::coin::MutableTransaction)
     uint256                       m_block_hash;
     CMerkleLink                   m_merkle_link;
 
     // tx_id_type == witness-stripped tx serialization (data.py:232).
     template <typename Stream> void Serialize(Stream& s) const {
-        ::Serialize(s, bitcoin_family::coin::TX_NO_WITNESS(m_tx));
+        ::Serialize(s, parent_coinbase_no_witness<ParentCoinbaseTx>::value(m_tx));
         ::Serialize(s, m_block_hash);
         ::Serialize(s, m_merkle_link);
     }
     template <typename Stream> void Unserialize(Stream& s) {
-        ::Unserialize(s, bitcoin_family::coin::TX_NO_WITNESS(m_tx));
+        ::Unserialize(s, parent_coinbase_no_witness<ParentCoinbaseTx>::value(m_tx));
         ::Unserialize(s, m_block_hash);
         ::Unserialize(s, m_merkle_link);
     }
 
     void SetNull() {
-        m_tx = ltc::coin::MutableTransaction{};
+        m_tx = ParentCoinbaseTx{};
         m_block_hash.SetNull();
         m_merkle_link.SetNull();
     }
@@ -101,9 +122,10 @@ struct CMerkleTx
 ///     ('merkle_tx',           merkle_tx_type)    -> m_merkle_tx
 ///     ('merkle_link',         merkle_link_type)  -> m_chain_merkle_link
 ///     ('parent_block_header', block_header_type) -> m_parent_block_header
+template <typename ParentCoinbaseTx = ltc::coin::MutableTransaction>
 struct CAuxPow
 {
-    CMerkleTx        m_merkle_tx;            // parent coinbase + branch to parent merkle root
+    CMerkleTx<ParentCoinbaseTx> m_merkle_tx;  // parent coinbase + branch to parent merkle root
     CMerkleLink      m_chain_merkle_link;    // aux/chain merkle branch + slot index
     CPureBlockHeader m_parent_block_header;  // parent (LTC) 80-byte header
 
@@ -144,8 +166,8 @@ inline bool is_auxpow_version(int32_t version) { return (version & 0x100) != 0; 
 /// pack.hpp surface, not merely skipped. The 80-byte base header is what
 /// HeaderChain consumes; `out_aux` carries the proof for validation
 /// (CAuxPow::check_proof, future milestone). Throws on truncation/parse failure.
-template <typename Stream>
-CPureBlockHeader parse_aux_header(Stream& s, CAuxPow& out_aux, bool& has_aux)
+template <typename Stream, typename ParentCoinbaseTx = ltc::coin::MutableTransaction>
+CPureBlockHeader parse_aux_header(Stream& s, CAuxPow<ParentCoinbaseTx>& out_aux, bool& has_aux)
 {
     CPureBlockHeader hdr;
     ::Unserialize(s, hdr);                                  // 80-byte base header
