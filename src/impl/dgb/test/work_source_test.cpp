@@ -17,6 +17,7 @@
 #include <impl/dgb/coin/header_chain.hpp>
 #include <impl/dgb/coin/mempool.hpp>
 #include <impl/dgb/config_coin.hpp>   // dgb::CoinParams::subsidy (oracle SSOT)
+#include <impl/dgb/params.hpp>        // dgb::make_coin_params -- the LIVE production binding
 
 #include <core/pow.hpp>                 // core::SubsidyFunc
 
@@ -455,6 +456,28 @@ TEST(DgbWorkSource, CoinbaseValueHonorsGbtVerbatim)
     EXPECT_EQ(ws->coinbase_value(/*height=*/400000, /*fees=*/500,
                                  std::optional<uint64_t>{kGbt}),
               kGbt);
+}
+
+
+// Production-binding guard. The era-boundary tests above trust kSubsidyFunc, a
+// hand-written DUPLICATE of params.hpp p.subsidy_func: they pin the schedule
+// math but are blind to a regression in the ACTUAL wiring. If make_coin_params()
+// shipped subsidy_func unbound (the work source then logs subsidy_func=UNSET and
+// the embedded coinbasevalue silently falls through to the GBT-only path) or
+// bound it to the wrong function, every test above would still pass off its
+// private copy. Pin the LIVE production binding directly.
+TEST(DgbCoinParams, SubsidyFuncBoundToOracleScheduleInProduction)
+{
+    const core::CoinParams p = dgb::make_coin_params(/*testnet=*/false);
+    ASSERT_TRUE(static_cast<bool>(p.subsidy_func))
+        << "make_coin_params shipped subsidy_func UNSET -- embedded coinbasevalue "
+           "would silently degrade to the external-GBT-only path";
+    for (const auto& v : kEraBoundaries) {
+        EXPECT_EQ(p.subsidy_func(v.height), v.subsidy)
+            << "production subsidy_func diverged from oracle subsidy at " << v.era;
+        EXPECT_EQ(p.subsidy_func(v.height), kSubsidyFunc(v.height))
+            << "production binding diverged from the schedule under test at " << v.era;
+    }
 }
 
 
