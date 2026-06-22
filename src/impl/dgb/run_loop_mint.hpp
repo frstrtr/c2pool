@@ -29,7 +29,9 @@
 // prev_share, merkle_branches, payout_script, segwit_active } binds — in
 // production that is DGBWorkSource::MintShareInputs.
 
+#include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <vector>
 
 #include <core/pack.hpp>                  // PackStream, operator>>
@@ -108,6 +110,38 @@ inline uint256 mint_local_share_with_ratchet(
         std::vector<unsigned char>{},        // frozen_merged_coinbase_info
         static_cast<int64_t>(mint_version),  // share_version (ratchet-selected)
         static_cast<uint64_t>(vote_version)); // desired_version (always target)
+}
+
+// -- Lock-guarded run-loop mint (worker->mint on the Stratum-submission thread) --
+//
+// main_dgb.cpp binds DGBWorkSource::set_mint_share_fn to this. A ShareAccept
+// submission is classified + dispatched on the Stratum-submission thread, which
+// is NOT the compute (think()) thread -- so, unlike the m_on_block_found won-block
+// path, this path does NOT already hold the tracker lock. create_local_share is a
+// tracker WRITE, so the mint MUST take the lock. Per the NodeImpl locking
+// discipline (node.hpp:83-92, mirrored by node.cpp processing_shares_phase2) an
+// IO-thread write takes unique_lock(try_to_lock) and NEVER blocks the io_context
+// on the compute thread exclusive hold. If think() holds the lock the mint is
+// DECLINED this round (NULL uint256; the caller logs the no-credit outcome -- no
+// silent drop, the worker simply earns no sharechain credit until its next
+// submission) rather than blocking the reactor or racing the tracker. A durable
+// defer-queue (cf. the node.cpp pending-share batches) is a tracked follow-up.
+//
+// Duck-typed on NodeT: any node exposing tracker() (-> ShareTracker&) and
+// tracker_mutex() (-> std::shared_mutex&) binds -- in production that is
+// dgb::Node (pool::NodeBridge<NodeImpl, ...>, which inherits both).
+template <typename NodeT, typename InputsT>
+inline uint256 mint_local_share_locked(
+    const InputsT&          in,
+    NodeT&                  node,
+    const core::CoinParams& params,
+    AutoRatchet&            ratchet,
+    uint16_t                donation = 50)
+{
+    std::unique_lock<std::shared_mutex> lock(node.tracker_mutex(), std::try_to_lock);
+    if (!lock.owns_lock())
+        return uint256();  // tracker busy (think() holds exclusive) -- declined, caller logs
+    return mint_local_share_with_ratchet(in, node.tracker(), params, ratchet, donation);
 }
 
 } // namespace dgb
