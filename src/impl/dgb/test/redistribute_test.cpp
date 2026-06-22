@@ -21,6 +21,7 @@
 
 #include <impl/dgb/redistribute.hpp>
 #include <impl/dgb/share_tracker.hpp>
+#include <impl/dgb/config_pool.hpp>
 
 namespace {
 
@@ -134,6 +135,65 @@ TEST(DgbRedistribute, DeterministicPickPaths)
 
     // Mode accessor reflects the last single-mode set.
     EXPECT_EQ(r.mode(), dgb::RedistributeMode::PPLNS);
+}
+
+// --- #307 follow-up: --redistribute arg-spec -> configured policy + the
+//     node-local fallback payout SELECTOR wired in main_dgb. The donate
+//     identity must resolve byte-for-byte to the canonical V36 combined-
+//     donation P2SH; fee without an operator identity is fail-safe null;
+//     the arg spec must drive the hybrid weights. --------------------------
+TEST(DgbRedistribute, ArgSpecConfiguresHybridWeights)
+{
+    dgb::Redistributor r;
+    r.set_hybrid_weights(dgb::parse_redistribute_spec("boost:70,donate:20,fee:10"));
+    ASSERT_EQ(r.hybrid_weights().size(), 3u);
+    EXPECT_EQ(r.hybrid_weights()[0].mode, dgb::RedistributeMode::BOOST);
+    EXPECT_EQ(r.hybrid_weights()[0].weight, 70u);
+    EXPECT_EQ(r.hybrid_weights()[1].mode, dgb::RedistributeMode::DONATE);
+    EXPECT_EQ(r.hybrid_weights()[2].mode, dgb::RedistributeMode::FEE);
+}
+
+TEST(DgbRedistribute, DonateIdentityRoundTripsCombinedDonationP2SH)
+{
+    // Reproduce exactly what main_dgb does: donation hash160 == bytes [2..22]
+    // of the canonical V36 combined-donation P2SH script, type P2SH (2).
+    uint160 dh;
+    std::memcpy(dh.data(), dgb::PoolConfig::COMBINED_DONATION_SCRIPT.data() + 2, 20);
+    dgb::Redistributor r;
+    r.set_donation_identity(dh, /*P2SH*/ 2);
+    r.set_mode(dgb::RedistributeMode::DONATE);
+
+    dgb::ShareTracker tracker;   // empty
+    uint256 best;                // null
+    auto res = r.pick(tracker, best);
+    EXPECT_EQ(res.pubkey_hash, dh);
+    EXPECT_EQ(res.pubkey_type, 2);
+
+    // Rebuild the P2SH scriptPubKey the main_dgb fallback would stamp (same
+    // RAW 20-byte path -- NOT GetHex, which reverses) and assert byte-identity
+    // with the canonical combined-donation script.
+    unsigned char hb[20];
+    std::memcpy(hb, res.pubkey_hash.data(), 20);
+    std::vector<unsigned char> script = {0xa9, 0x14};
+    script.insert(script.end(), hb, hb + 20);
+    script.push_back(0x87);
+    const std::vector<unsigned char> expected(
+        dgb::PoolConfig::COMBINED_DONATION_SCRIPT.begin(),
+        dgb::PoolConfig::COMBINED_DONATION_SCRIPT.end());
+    EXPECT_EQ(script, expected);
+}
+
+TEST(DgbRedistribute, FeeWithoutOperatorIdentityIsFailSafeNull)
+{
+    // main_dgb does not (yet) plumb an operator payout identity, so a bare
+    // --redistribute fee must yield a NULL pubkey -> the fallback returns an
+    // empty script (never a burn output to the all-zero hash).
+    dgb::Redistributor r;
+    r.set_mode(dgb::RedistributeMode::FEE);   // operator identity unset
+    dgb::ShareTracker tracker;
+    uint256 best;
+    auto res = r.pick(tracker, best);
+    EXPECT_TRUE(res.pubkey_hash.IsNull());
 }
 
 } // namespace
