@@ -283,6 +283,20 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_mempool PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_mempool "" AUTO)
 
+    # DASH SimplifiedMNList (DIP-0004, S7 leaf): vendored CSimplifiedMNListEntry /
+    # CSimplifiedMNList wire + CalcHash (SER_GETHASH) + memcmp sort + merkle root.
+    # Header-only over core/uint256 + core/pack + core/hash; no ltc/pool SCC
+    # dependency. Base leaf of the embedded_gbt dependency chain (S7 main).
+    add_executable(test_dash_simplifiedmns test_dash_simplifiedmns.cpp)
+    target_link_libraries(test_dash_simplifiedmns PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_simplifiedmns PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_simplifiedmns "" AUTO)
+
     add_executable(test_compact_blocks test_compact_blocks.cpp)
     target_link_libraries(test_compact_blocks PRIVATE
         GTest::gtest_main GTest::gtest
