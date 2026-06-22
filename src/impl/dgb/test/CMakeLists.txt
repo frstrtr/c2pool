@@ -487,4 +487,22 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_redistribute_test "" AUTO)
 
+
+    # --- DGB+DOGE (phase DB) — DGB-as-parent AuxPoW commitment binding KAT -----
+    # Instantiates the TEMPLATED shared aux module (PR #313) with the DGB parent
+    # coinbase type: doge::coin::CAuxPow<dgb::coin::MutableTransaction>. Proves
+    # the DB binding round-trips byte-stable AND is wire byte-identical to the
+    # ltc default for identical commitment content (the DGB analog of #313's
+    # named LTC acceptance gate). Links ltc_coin like dgb_aux_parent_coinbase_
+    # parity_test — the -DAUX_DOGE consumption path legitimately couples to ltc.
+    # Test-only; consumes the shared module, does not modify it. Built on the
+    # #313 branch until #313 lands. MUST appear in BOTH this registration AND the
+    # build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_aux_doge_db_commitment_bind_test aux_doge_db_commitment_bind_test.cpp)
+    target_link_libraries(dgb_aux_doge_db_commitment_bind_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb ltc_coin
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_aux_doge_db_commitment_bind_test "" AUTO)
 endif()
