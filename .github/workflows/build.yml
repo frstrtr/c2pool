@@ -707,5 +707,67 @@ jobs:
           name: windows-x86_64
           path: c2pool-*-windows-x86_64.zip*
 
+  # ════════════════════════════════════════════════════════════════════════════
+  # COIN_DGB + AUX_DOGE=ON (dual-parent stretch seam, phase DA) — keeps the
+  # opt-in seam landed in #310 from rotting dark: a configure flag with no CI
+  # coverage drifts silently. This arm configures c2pool-dgb with the flag ON
+  # so the node.hpp #ifdef AUX_DOGE seam is compiled on every PR. Default build
+  # (flag OFF) is unchanged and still covered by the linux + dgb-smoke jobs.
+  # ════════════════════════════════════════════════════════════════════════════
+  coin-dgb-auxdoge:
+    name: COIN_DGB +AUX_DOGE Linux x86_64
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            g++ cmake make libleveldb-dev libsecp256k1-dev
+
+      - uses: actions/setup-python@v6
+        with: { python-version: 3.12 }
+
+      - name: Install Conan 2
+        run: pip install "conan>=2.0,<3.0"
+
+      - name: Detect Conan profile
+        run: |
+          conan profile detect --force
+          sed -i 's/compiler.cppstd=.*/compiler.cppstd=20/' "$(conan profile path default)"
+
+      - name: Restore Conan cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.conan2
+          key: conan2-ubuntu24-gcc13-dgb-auxdoge-${{ hashFiles('conanfile.txt') }}
+
+      - name: Conan install
+        run: conan install . --build=missing --output-folder=build_dgb_auxdoge --settings=build_type=Release
+
+      - name: Configure (-DCOIN_DGB=ON -DAUX_DOGE=ON)
+        run: cmake -S . -B build_dgb_auxdoge -DCMAKE_TOOLCHAIN_FILE=build_dgb_auxdoge/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release -DCOIN_DGB=ON -DAUX_DOGE=ON
+
+      - name: Build c2pool-dgb binary (AUX_DOGE seam ON)
+        run: cmake --build build_dgb_auxdoge --target c2pool-dgb -j$(nproc)
+
+      - name: Smoke test (--help)
+        run: |
+          BIN=build_dgb_auxdoge/src/c2pool/c2pool-dgb
+          file "$BIN"
+          "$BIN" --help 2>&1 | head -5 || true
+
+      - name: Upload build artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coin-dgb-auxdoge-fail
+          path: |
+            build_dgb_auxdoge/CMakeFiles/CMakeOutput.log
+            build_dgb_auxdoge/CMakeFiles/CMakeError.log
+          retention-days: 7
+          if-no-files-found: ignore
+
   # Releases are built and published manually (not via CI).
   # See installer/ for packaging scripts (DMG, ZIP, Inno Setup).
