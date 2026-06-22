@@ -68,6 +68,26 @@ struct CMerkleLink
     bool IsNull() const { return m_branch.empty() && m_index == 0; }
 };
 
+/// Witness-strip params for the PARENT coinbase tx (tx_id_type, data.py:232).
+/// Each parent chain owns its TxParams *type*: LTC/DASH reuse
+/// bitcoin_family::coin::TxParams via a using-declaration, while DGB declares
+/// its own dgb::coin::TxParams. The no-witness wrapper must therefore resolve
+/// from the PARENT type instead of hardcoding bitcoin_family's -- a DGB parent
+/// coinbase handed a bitcoin_family::coin::TxParams cannot serialize through
+/// dgb's SerializeTransaction (distinct type -> hard compile error). LTC is
+/// only spared today because it shares bitcoin_family's TxParams type.
+///
+/// Primary template -> bitcoin_family's TX_NO_WITNESS: byte-identical to the
+/// pre-template hardcode for every parent that reuses bitcoin_family TxParams
+/// (LTC, DASH). A parent with its OWN TxParams type specializes this in ITS
+/// OWN tree (never here) to point at its namespace TX_NO_WITNESS, keeping this
+/// shared module free of any per-parent (e.g. DGB) include.
+template <typename ParentCoinbaseTx>
+struct parent_coinbase_no_witness
+{
+    static constexpr auto value = bitcoin_family::coin::TX_NO_WITNESS;
+};
+
 /// merkle_tx_type (data.py:231-235)
 ///     ('tx',          tx_id_type)        -> m_tx  (witness-stripped; see §12-Q1)
 ///     ('block_hash',  IntType(256))      -> m_block_hash
@@ -81,12 +101,12 @@ struct CMerkleTx
 
     // tx_id_type == witness-stripped tx serialization (data.py:232).
     template <typename Stream> void Serialize(Stream& s) const {
-        ::Serialize(s, bitcoin_family::coin::TX_NO_WITNESS(m_tx));
+        ::Serialize(s, parent_coinbase_no_witness<ParentCoinbaseTx>::value(m_tx));
         ::Serialize(s, m_block_hash);
         ::Serialize(s, m_merkle_link);
     }
     template <typename Stream> void Unserialize(Stream& s) {
-        ::Unserialize(s, bitcoin_family::coin::TX_NO_WITNESS(m_tx));
+        ::Unserialize(s, parent_coinbase_no_witness<ParentCoinbaseTx>::value(m_tx));
         ::Unserialize(s, m_block_hash);
         ::Unserialize(s, m_merkle_link);
     }
