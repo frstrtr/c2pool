@@ -9,6 +9,7 @@
 #include "share_types.hpp"
 
 #include <impl/dgb/coin/gentx_coinbase.hpp>
+#include <impl/dgb/coin/pplns_payout_split.hpp>
 
 #include <core/coin_params.hpp>
 #include <core/hash.hpp>
@@ -1029,7 +1030,6 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, const
     //   donation = subsidy - sum(amounts)
 
     auto gst_t1 = std::chrono::steady_clock::now(); // after PPLNS walk
-    std::map<std::vector<unsigned char>, uint64_t> amounts;
 
     // Periodic dump of PPLNS weights for cross-impl comparison
     {
@@ -1051,88 +1051,35 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, const
         }
     }
 
-    if (!total_weight.IsNull())
-    {
-        for (auto& [script, weight] : weights)
-        {
-            uint64_t amount;
-            if (use_v36_pplns)
-            {
-                // V36: amounts[script] = subsidy * weight / total_weight
-                uint288 num = uint288(subsidy) * weight;
-                amount = (num / total_weight).GetLow64();
-            }
-            else
-            {
-                // Pre-V36: amounts[script] = subsidy * (199 * weight) / (200 * total_weight)
-                uint288 num = uint288(subsidy) * (weight * 199);
-                uint288 den = total_weight * 200;
-                amount = (num / den).GetLow64();
-            }
-            if (amount > 0)
-                amounts[script] = amount;
-        }
-    }
+    // --- 2-3. PPLNS amount math + consensus output ordering (SSOT) ----------
+    // Steps 2-3 are now the single tracker-free helper compute_pplns_payout_split().
+    // The per-connection Stratum coinbase assembler draws the SAME split, so
+    // emission and this verification path cannot diverge on a payout satoshi.
+    // The helper is a verbatim lift of the former inline math (exact V36 /
+    // pre-V36 formulae, 0.5% finder fee, >=1-sat V36 donation floor with the
+    // (amount, script) tiebreak, and the ascending sort truncated to [-4000:]).
+    // Reference: frstrtr/p2pool-merged-v36 data.py generate_transaction().
+    auto finder_script = get_share_script(&share);
+    auto pplns_split = dgb::coin::compute_pplns_payout_split(
+        weights, total_weight, subsidy, use_v36_pplns, finder_script);
+    auto& payout_outputs = pplns_split.payout_outputs;
+    uint64_t donation_amount = pplns_split.donation_amount;
 
-    // Pre-V36: add 0.5% finder fee to share creator
-    if (!use_v36_pplns)
-    {
-        auto finder_script = get_share_script(&share);
-        amounts[finder_script] += subsidy / 200;
-    }
+    auto gst_t2 = std::chrono::steady_clock::now(); // after amounts+ordering
 
-    // Donation output = subsidy minus sum of all payout amounts
-    uint64_t sum_amounts = 0;
-    for (auto& [s, a] : amounts)
-        sum_amounts += a;
-    uint64_t donation_amount = (subsidy > sum_amounts) ? (subsidy - sum_amounts) : 0;
-
-    // Dump amounts for cross-impl debugging
+    // Dump payouts for cross-impl debugging
     if (dump_diag) {
-        LOG_DEBUG_DIAG << "[GST-AMOUNTS] subsidy=" << subsidy << " addrs=" << amounts.size()
+        uint64_t sum_amounts = 0;
+        for (auto& [s, a] : payout_outputs) sum_amounts += a;
+        LOG_DEBUG_DIAG << "[GST-AMOUNTS] subsidy=" << subsidy << " addrs=" << payout_outputs.size()
                  << " sum=" << sum_amounts << " donation=" << donation_amount
                  << " prev=" << prev_hash.GetHex().substr(0,16);
-        for (auto& [s, a] : amounts) {
+        for (auto& [s, a] : payout_outputs) {
             static const char* HX = "0123456789abcdef";
             std::string sh; for (size_t i = 0; i < std::min(s.size(), size_t(10)); ++i) { sh += HX[s[i]>>4]; sh += HX[s[i]&0xf]; }
             LOG_DEBUG_DIAG << "[GST-AMOUNTS]   " << sh << "... = " << a;
         }
     }
-
-    // V36 consensus: donation output must carry >= 1 satoshi (a60f7f7f)
-    if (use_v36_pplns) {
-        if (donation_amount < 1 && subsidy > 0 && !amounts.empty()) {
-            // Deduct 1 sat from the largest miner payout
-            // Deterministic tiebreak: (amount, script) — largest script wins when equal
-            auto largest = std::max_element(amounts.begin(), amounts.end(),
-                [](const auto& a, const auto& b) {
-                    if (a.second != b.second) return a.second < b.second;
-                    return a.first < b.first;
-                });
-            if (largest != amounts.end() && largest->second > 0) {
-                largest->second -= 1;
-                sum_amounts -= 1;
-                donation_amount = subsidy - sum_amounts;
-            }
-        }
-    }
-
-    // --- 3. Build sorted output list ---
-    auto gst_t2 = std::chrono::steady_clock::now(); // after amounts
-    // Python: sorted(dests, key=lambda a: (amounts[a], a))[-4000:]
-    // = ascending by (amount, script), keep last 4000 (highest amounts)
-    std::vector<std::pair<std::vector<unsigned char>, uint64_t>> payout_outputs(
-        amounts.begin(), amounts.end());
-    std::sort(payout_outputs.begin(), payout_outputs.end(),
-        [](const auto& a, const auto& b) {
-            if (a.second != b.second) return a.second < b.second; // asc by amount
-            return a.first < b.first; // asc by script for tie-breaking
-        });
-
-    // Keep last MAX_OUTPUTS (highest amounts), matching Python's [-4000:]
-    constexpr size_t MAX_OUTPUTS = 4000;
-    if (payout_outputs.size() > MAX_OUTPUTS)
-        payout_outputs.erase(payout_outputs.begin(), payout_outputs.end() - MAX_OUTPUTS);
 
     // --- 4. Serialise the coinbase transaction ---
     // Wire layout (version|vin|vouts|locktime) and txid are produced by the
