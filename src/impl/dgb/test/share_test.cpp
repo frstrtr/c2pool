@@ -18,6 +18,7 @@
 #include <impl/dgb/config_coin.hpp>
 #include <impl/dgb/share.hpp>
 #include <impl/dgb/share_tracker.hpp>   // DensePPLNSWindow — V36 decayed-PPLNS SSOT
+#include <impl/dgb/coin/pplns_weight_walk.hpp> // SSOT: PPLNS step-1 tracker walk (shared emission/verify)
 #include <impl/dgb/params.hpp>          // make_coin_params — assembled CoinParams SSOT
 #include <impl/dgb/coin/rpc_conf.hpp>   // #82 external-daemon RPC creds (digibyte.conf)
 #include <impl/dgb/auto_ratchet.hpp> // Phase B: mint-side share-version ratchet
@@ -246,6 +247,69 @@ TEST(DGB_share_test, DesiredVersionWeightsByAttempts)
     // Attempts-weighting: the lone high-difficulty dv=35 share outweighs the two
     // low-difficulty dv=36 shares — the exact property a flat count inverts.
     EXPECT_GT(w.at(35u), w.at(36u));
+}
+
+// ── compute_pplns_weight_walk() SSOT contract KAT ───────────────────────────
+// The PPLNS step-1 tracker walk is now ONE helper shared by the share-
+// VERIFICATION path (generate_share_transaction) and the per-connection Stratum
+// coinbase EMISSION path (build_connection_coinbase producer seam). Value-level
+// faithfulness of the lift is proven by the unchanged generate_share_transaction
+// fixtures (they route through the helper now); this KAT independently locks the
+// helper's CONTRACT so a later edit that breaks the emission path is caught even
+// where no verifier test covers it:
+//   (1) it forwards verbatim to get_v36_decayed_cumulative_weights on the V36
+//       path (byte-identical weights/totals), and
+//   (2) it returns an empty, safe result (no throw) when the parent is null or
+//       absent from the chain — the "safe coinbase-only / empty job" the seam
+//       relies on while the tip is unknown.
+TEST(DGB_share_test, WeightWalkSSOTContract)
+{
+    const core::CoinParams params = dgb::make_coin_params(/*testnet=*/false);
+
+    dgb::ShareTracker tracker;
+    auto mk = [&](const char* hh, const char* ph, uint32_t bits) {
+        auto* s = new dgb::MergedMiningShare();
+        s->m_hash.SetHex(hh);
+        if (ph) s->m_prev_hash.SetHex(ph); else s->m_prev_hash.SetNull();
+        s->m_bits = bits;
+        s->m_max_bits = bits;
+        dgb::ShareType st; st = s;
+        tracker.add(st);
+    };
+    const char* h0 = "00000000000000000000000000000000000000000000000000000000000000b0";
+    const char* h1 = "00000000000000000000000000000000000000000000000000000000000000b1";
+    const char* h2 = "00000000000000000000000000000000000000000000000000000000000000b2";
+    mk(h0, nullptr,    0x1e0fffff);
+    mk(h1, h0,         0x1e0fffff);
+    mk(h2, h1,         0x1e0fffff);
+
+    uint256 tip; tip.SetHex(h2);
+    const auto chain_len = static_cast<int32_t>(params.real_chain_length);
+
+    // (1) V36 path forwards verbatim to the tracker's decayed-weights SSOT.
+    uint288 unlimited_weight;
+    unlimited_weight.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    const auto direct = tracker.get_v36_decayed_cumulative_weights(tip, chain_len, unlimited_weight);
+    const auto via_helper = dgb::coin::compute_pplns_weight_walk(
+        tracker, tip, /*block_bits=*/0x1e0fffff, params, /*use_v36_pplns=*/true);
+    EXPECT_EQ(via_helper.weights,               direct.weights);
+    EXPECT_EQ(via_helper.total_weight,          direct.total_weight);
+    EXPECT_EQ(via_helper.total_donation_weight, direct.total_donation_weight);
+
+    // (2a) null parent -> empty, safe (no throw).
+    const auto null_walk = dgb::coin::compute_pplns_weight_walk(
+        tracker, uint256::ZERO, 0x1e0fffff, params, /*use_v36_pplns=*/true);
+    EXPECT_TRUE(null_walk.weights.empty());
+    EXPECT_TRUE(null_walk.total_weight.IsNull());
+    EXPECT_TRUE(null_walk.total_donation_weight.IsNull());
+
+    // (2b) parent absent from the chain -> empty, safe (no throw).
+    uint256 absent; absent.SetHex(
+        "00000000000000000000000000000000000000000000000000000000deadbeef");
+    const auto absent_walk = dgb::coin::compute_pplns_weight_walk(
+        tracker, absent, 0x1e0fffff, params, /*use_v36_pplns=*/true);
+    EXPECT_TRUE(absent_walk.weights.empty());
+    EXPECT_TRUE(absent_walk.total_weight.IsNull());
 }
 
 
