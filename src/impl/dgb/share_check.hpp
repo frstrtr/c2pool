@@ -11,6 +11,7 @@
 #include <impl/dgb/coin/gentx_coinbase.hpp>
 #include <impl/dgb/coin/pplns_payout_split.hpp>
 #include <impl/dgb/coin/pplns_weight_walk.hpp>   // SSOT: PPLNS step-1 tracker walk (shared w/ emission)
+#include <impl/dgb/coin/last_txout_nonce.hpp> // SSOT: oracle-faithful OP_RETURN extranonce draw
 
 #include <core/coin_params.hpp>
 #include <core/hash.hpp>
@@ -448,9 +449,7 @@ inline std::pair<uint256, uint64_t> compute_ref_hash_for_work(const RefHashParam
     }
 
     // Generate a random-ish last_txout_nonce
-    uint64_t nonce = static_cast<uint64_t>(std::time(nullptr)) ^
-                     (static_cast<uint64_t>(p.timestamp) << 32) ^
-                     (static_cast<uint64_t>(p.absheight) << 16);
+    uint64_t nonce = make_last_txout_nonce();
 
     return {ref_hash, nonce};
 }
@@ -2114,8 +2113,7 @@ uint256 create_local_share_v35(
     }
 
     // Random last_txout_nonce
-    share.m_last_txout_nonce = static_cast<uint64_t>(std::time(nullptr)) ^
-                               (static_cast<uint64_t>(min_header.m_nonce) << 32);
+    share.m_last_txout_nonce = make_last_txout_nonce();
 
     // ref_merkle_link: empty
     share.m_ref_merkle_link.m_branch.clear();
@@ -2578,8 +2576,7 @@ uint256 create_local_share(
     }
 
     // Random last_txout_nonce for OP_RETURN uniqueness
-    share.m_last_txout_nonce = static_cast<uint64_t>(std::time(nullptr)) ^
-                               (static_cast<uint64_t>(min_header.m_nonce) << 32);
+    share.m_last_txout_nonce = make_last_txout_nonce();
 
     // --- Build the p2pool coinbase via the SSOT assemble_gentx_coinbase() ---
     // (identical wire layout to generate_share_transaction; one byte path, not a twin)
