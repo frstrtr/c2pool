@@ -10,6 +10,7 @@
 
 #include <impl/dgb/coin/gentx_coinbase.hpp>
 #include <impl/dgb/coin/pplns_payout_split.hpp>
+#include <impl/dgb/coin/pplns_weight_walk.hpp>   // SSOT: PPLNS step-1 tracker walk (shared w/ emission)
 
 #include <core/coin_params.hpp>
 #include <core/hash.hpp>
@@ -967,59 +968,17 @@ uint256 generate_share_transaction(const ShareT& share, TrackerT& tracker, const
     uint288 total_weight;
     uint288 total_donation_weight;
 
-    if (!prev_hash.IsNull() && tracker.chain.contains(prev_hash))
+    // Step 1 of the PPLNS computation now lives in the shared SSOT
+    // dgb::coin::compute_pplns_weight_walk() so the per-connection Stratum
+    // coinbase EMISSION path walks the tracker through the SAME code this
+    // VERIFICATION path does — byte-identical weights and identical insufficient-
+    // depth guard, no second walk to drift. Verbatim lift; see pplns_weight_walk.hpp.
     {
-        // p2pool data.py:762-764 — refuse to compute PPLNS with insufficient depth.
-        // Without this guard, attempt_verify() (which allows CHAIN_LENGTH+1) can
-        // trigger a PPLNS walk that terminates early, producing wrong coinbase
-        // amounts and causing persistent GENTX-MISMATCH during bootstrap.
-        auto chain_len = static_cast<int32_t>(params.real_chain_length);
-        {
-            auto pplns_height = tracker.chain.get_height(prev_hash);
-            auto pplns_last = tracker.chain.get_last(prev_hash);
-            if (!(pplns_height >= chain_len || pplns_last.IsNull()))
-                throw std::invalid_argument(
-                    "share chain not long enough for PPLNS verification (height="
-                    + std::to_string(pplns_height) + " need="
-                    + std::to_string(chain_len) + ")");
-        }
-
-        // block_target from block header bits (matches Python: self.header['bits'].target)
-        auto block_target = chain::bits_to_target(share.m_min_header.m_bits);
-        auto max_weight = chain::target_to_average_attempts(block_target)
-                          * params.spread * 65535;
-
-        // PPLNS formula selected by runtime v36_active (AutoRatchet state),
-        // not compile-time share version. Ref: p2pool data.py:879, work.py:759.
-        if (use_v36_pplns) {
-            // V36 PPLNS: exponential depth-decay, walk from parent
-            uint288 unlimited_weight;
-            unlimited_weight.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-            auto result = tracker.get_v36_decayed_cumulative_weights(prev_hash, chain_len, unlimited_weight);
-            weights = std::move(result.weights);
-            total_weight = result.total_weight;
-            total_donation_weight = result.total_donation_weight;
-        } else {
-            // Pre-V36 PPLNS: flat cumulative weights (no decay)
-            // CRITICAL: Walk from GRANDPARENT for HEIGHT-1 shares.
-            // p2pool data.py:884-885:
-            //   _pplns_start = previous_share.share_data['previous_share_hash']
-            //   _pplns_max_shares = max(0, min(height, REAL_CHAIN_LENGTH) - 1)
-            uint256 pplns_start;
-            tracker.chain.get(prev_hash).share.invoke([&](auto* s) {
-                pplns_start = s->m_prev_hash;  // grandparent
-            });
-            auto available = tracker.chain.get_height(prev_hash);
-            auto walk_count = static_cast<int32_t>(
-                std::max(0, std::min(chain_len, available) - 1));
-
-            if (!pplns_start.IsNull() && tracker.chain.contains(pplns_start) && walk_count > 0) {
-                auto result = tracker.get_cumulative_weights(pplns_start, walk_count, max_weight);
-                weights = std::move(result.weights);
-                total_weight = result.total_weight;
-                total_donation_weight = result.total_donation_weight;
-            }
-        }
+        auto cw = dgb::coin::compute_pplns_weight_walk(
+            tracker, prev_hash, share.m_min_header.m_bits, params, use_v36_pplns);
+        weights = std::move(cw.weights);
+        total_weight = cw.total_weight;
+        total_donation_weight = cw.total_donation_weight;
     }
 
     // --- 2. Convert weights to exact integer payout amounts ---
