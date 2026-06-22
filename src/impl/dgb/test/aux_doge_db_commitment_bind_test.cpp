@@ -41,6 +41,7 @@
 #include <impl/doge/coin/auxpow.hpp>          // the REAL shared module (SSOT, templated by #313)
 #include <impl/ltc/coin/transaction.hpp>      // ltc::coin::MutableTransaction (default parent type)
 #include <impl/dgb/coin/transaction.hpp>      // dgb::coin::MutableTransaction (DGB-as-parent type)
+#include <impl/dgb/coin/aux_doge_parent_traits.hpp> // DGB-tree parent_coinbase_no_witness<> specialization (per #313 doc)
 
 #include <core/pack.hpp>
 #include <core/uint256.hpp>
