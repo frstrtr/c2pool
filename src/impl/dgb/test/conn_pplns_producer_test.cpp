@@ -102,9 +102,15 @@ TEST(ConnPplnsProducer, RefHashDelegatesToVerifierPrimitiveNoSegwit) {
 
     auto out = dgb::make_conn_pplns_inputs(make_assembly_inputs(rp), params);
 
-    const auto [ref_hash, nonce] = dgb::compute_ref_hash_for_work(rp, params);
+    // Delegation invariant: the producers ref_hash IS the verifier primitives
+    // output verbatim. The ref preimage is a pure function of the ref params and
+    // does NOT commit to last_txout_nonce, so this equality is deterministic.
+    // last_txout_nonce is an independent uniform 64-bit draw per call (the #338
+    // SSOT, mirroring oracle random.randrange(2**64)); two draws never match, so
+    // it is NOT asserted here -- its real contract (carried verbatim into the
+    // coinbase OP_RETURN) is pinned by RoundTripEmbedsRefInOpReturn below.
+    const auto ref_hash = dgb::compute_ref_hash_for_work(rp, params).first;
     EXPECT_EQ(out.ref_hash, ref_hash);
-    EXPECT_EQ(out.last_txout_nonce, nonce);
     EXPECT_FALSE(out.ref_hash.IsNull());
 }
 
@@ -117,9 +123,10 @@ TEST(ConnPplnsProducer, RefHashDelegatesToVerifierPrimitiveWithSegwit) {
 
     auto out = dgb::make_conn_pplns_inputs(make_assembly_inputs(rp), params);
 
-    const auto [ref_hash, nonce] = dgb::compute_ref_hash_for_work(rp, params);
+    // Same delegation invariant as the no-segwit case: ref_hash is deterministic;
+    // last_txout_nonce is an independent per-call draw (see note above).
+    const auto ref_hash = dgb::compute_ref_hash_for_work(rp, params).first;
     EXPECT_EQ(out.ref_hash, ref_hash);
-    EXPECT_EQ(out.last_txout_nonce, nonce);
 }
 
 // (2) Caller-resolved PPLNS weights + design points forward verbatim.
