@@ -577,4 +577,18 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_pool_msg_wire_test "" AUTO)
 
+    # dgb_get_shares_walk_test: FENCED, additive KAT pinning the pool share-
+    # exchange GetShares walk (SHAREREQ -> SHAREREPLY) in get_shares_walk.hpp vs
+    # the p2pool node.py handle_get_shares oracle (parents cap, per-hash walk
+    # bound, stop-hash break, missing-hash + rejected-share skip). Pure header +
+    # fake chain -> links only core (uint256). MUST also be in the build.yml
+    # --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_get_shares_walk_test get_shares_walk_test.cpp)
+    target_link_libraries(dgb_get_shares_walk_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_get_shares_walk_test "" AUTO)
+
 endif()
