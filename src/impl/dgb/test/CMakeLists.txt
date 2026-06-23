@@ -632,4 +632,19 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_think_p1_desired_emit_test "" AUTO)
 
+    # dgb_think_p6_desired_cutoff_test: FENCED, additive KAT pinning the think()
+    # Phase-6 desired-shares timestamp cutoff in think_p6_desired_cutoff.hpp vs
+    # the p2pool data.py think() tail oracle (min(now,best_ts)-3600 / 24h no-best
+    # fallback; inclusive keep predicate), plus a non-circular delegation anchor
+    # vs the verbatim pre-delegation inline cutoff/keep expressions. Pure
+    # arithmetic -> links only core. MUST also be in the build.yml --target
+    # allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_think_p6_desired_cutoff_test think_p6_desired_cutoff_test.cpp)
+    target_link_libraries(dgb_think_p6_desired_cutoff_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_think_p6_desired_cutoff_test "" AUTO)
+
 endif()
