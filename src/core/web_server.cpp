@@ -6256,6 +6256,7 @@ const char* blockchain_short_symbol(Blockchain b)
         case Blockchain::LITECOIN: return "LTC";
         case Blockchain::BITCOIN:  return "BTC";
         case Blockchain::DOGECOIN: return "DOGE";
+        case Blockchain::DASH:     return "DASH";
         case Blockchain::DIGIBYTE: return "DGB";
         case Blockchain::ETHEREUM: return "ETH";
         case Blockchain::MONERO:   return "XMR";
