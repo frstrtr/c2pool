@@ -563,6 +563,19 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_share_target_genesis_test "" AUTO)
 
+    # dgb_g1_oracle_byte_parity_test: FENCED greenlight-gate G1 KAT. Pins the
+    # assembled make_coin_params() net/consensus constants AND bucket-1
+    # isolation primitives (PREFIX/IDENTIFIER) against oracle-transcribed
+    # literals from frstrtr/p2pool-dgb-scrypt (non-circular). MUST also be in
+    # the build.yml --target allowlist (#143).
+    add_executable(dgb_g1_oracle_byte_parity_test g1_oracle_byte_parity_test.cpp)
+    target_link_libraries(dgb_g1_oracle_byte_parity_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_g1_oracle_byte_parity_test "" AUTO)
+
     # dgb_pool_msg_wire_test: FENCED conformance KAT for the pool P2P wire-message
     # layer (messages.hpp) — command-name parity, scalar LE byte pins, and
     # serialize/read-back field equality vs p2pool-merged-v36 message numbering.
