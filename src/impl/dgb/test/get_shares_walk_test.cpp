@@ -196,3 +196,61 @@ TEST(DgbGetSharesWalk, MultiHashSharedCap) {
     // tip: min(501, height=6)=6 -> 5,4,3,2,1,0 ; mid: min(501, height=3)=3 -> 2,1,0
     EXPECT_EQ(ids(shares), (std::vector<int>{5, 4, 3, 2, 1, 0, 2, 1, 0}));
 }
+
+// --------------------------------------------------------------------------
+// 9. DELEGATION EQUIVALENCE — node.cpp NodeImpl::handle_get_share was rewired
+//    to call collect_get_shares (was an inline walk). This pins that the SSOT
+//    reproduces the EXACT pre-delegation node.cpp walk, byte-for-byte, across a
+//    combined scenario (absent hash + rejected share + stop-hash + multi-hash).
+//    inline_walk_oracle below is the verbatim pre-delegation node.cpp body — an
+//    independent subject — and the result is ALSO pinned to a hand-walked value
+//    so the check is not circular.
+// --------------------------------------------------------------------------
+namespace {
+// Verbatim copy of the node.cpp inline walk as it stood BEFORE the SSOT
+// delegation (rejected = set<string-of-hash>, on_missing = skip). If a future
+// edit drifts the SSOT from this captured behavior, this test fails.
+std::vector<FakeShare> inline_walk_oracle(
+    const FakeChain& chain,
+    std::vector<uint256> hashes,
+    uint64_t parents,
+    const std::vector<uint256>& stops,
+    const std::set<std::string>& rejected) {
+    std::vector<FakeShare> shares;
+    if (hashes.empty()) return shares;
+    parents = std::min(parents, (uint64_t)1000 / hashes.size());
+    for (const auto& handle_hash : hashes) {
+        if (!chain.contains(handle_hash)) continue;
+        uint64_t n = std::min(parents + 1, (uint64_t)chain.get_height(handle_hash));
+        for (auto [hash, data] : chain.get_chain(handle_hash, n)) {
+            if (std::find(stops.begin(), stops.end(), hash) != stops.end()) break;
+            if (rejected.count(hash.ToString()) > 0) continue;
+            shares.push_back(data.share);
+        }
+    }
+    return shares;
+}
+} // namespace
+
+TEST(DgbGetSharesWalk, DelegationMatchesPreDelegationInlineWalk) {
+    FakeChain c = make_chain();
+    uint256 absent = u256("deadbeef");
+    uint256 tip = c.m_order.back();      // position 5
+    uint256 mid = c.m_order[2];          // position 2 (height 3)
+    std::vector<uint256> hashes{absent, tip, mid};
+    uint64_t parents = 3;
+    std::vector<uint256> stops{ c.m_order[1] };          // position 1 is a stop
+    std::set<std::string> rejected{ c.m_order[4].ToString() };  // position 4 rejected
+    auto is_rejected = [&](const uint256& h){ return rejected.count(h.ToString()) > 0; };
+
+    auto via_ssot = dgb::collect_get_shares<FakeShare>(
+        c, hashes, parents, stops, is_rejected);
+    auto via_inline = inline_walk_oracle(c, hashes, parents, stops, rejected);
+
+    // SSOT == verbatim pre-delegation inline walk.
+    EXPECT_EQ(ids(via_ssot), ids(via_inline));
+    // ... and both == the hand-walked span:
+    //   absent -> skip; tip(5): walk 5,4,3,2 with 4 rejected -> [5,3,2];
+    //   mid(2): walk 2,1,0 with 1=stop -> break after 2 -> [2].
+    EXPECT_EQ(ids(via_ssot), (std::vector<int>{5, 3, 2, 2}));
+}

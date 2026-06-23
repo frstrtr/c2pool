@@ -5,6 +5,7 @@
 #include <core/random.hpp>
 #include <core/target_utils.hpp>
 #include <sharechain/prepared_list.hpp>
+#include <impl/dgb/get_shares_walk.hpp>
 
 #include <algorithm>
 #include <filesystem>
@@ -599,30 +600,25 @@ std::vector<dgb::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
         return {};
     }
 
-    parents = std::min(parents, (uint64_t)1000/hashes.size());
-	std::vector<dgb::ShareType> shares;
-	for (const auto& handle_hash : hashes)
-	{
-		if (!m_chain->contains(handle_hash))
-		{
-			static int miss_log = 0;
-			if (miss_log++ < 5)
-				LOG_WARNING << "[handle_get_share] hash NOT in chain: "
-				            << handle_hash.ToString().substr(0, 16)
-				            << " chain_size=" << m_chain->size()
-				            << " tracker_chain_size=" << m_tracker.chain.size();
-			continue;
-		}
-		uint64_t n = std::min(parents+1, (uint64_t) m_chain->get_height(handle_hash));
-		for (auto [hash, data] : m_chain->get_chain(handle_hash, n))
-        {
-			if (std::find(stops.begin(), stops.end(), hash) != stops.end())
-				break;
-			if (m_rejected_share_hashes.count(hash))
-				continue;
-			shares.push_back(data.share);
-		}
-	}
+    // Delegate the walk to the SSOT (get_shares_walk.hpp) so the parents cap,
+    // the per-hash walk bound, the stop-hash break, and the missing/rejected
+    // skips stay byte-identical to the p2pool node.py oracle and are pinned by
+    // the get_shares_walk conformance KAT. The try_to_lock guard above and the
+    // node-local logging stay here; only the pure walk moves to the SSOT.
+    auto shares = dgb::collect_get_shares<dgb::ShareType>(
+        *m_chain,
+        hashes,
+        parents,
+        stops,
+        [this](const uint256& h) { return m_rejected_share_hashes.count(h) != 0; },
+        [this](const uint256& handle_hash) {
+            static int miss_log = 0;
+            if (miss_log++ < 5)
+                LOG_WARNING << "[handle_get_share] hash NOT in chain: "
+                            << handle_hash.ToString().substr(0, 16)
+                            << " chain_size=" << m_chain->size()
+                            << " tracker_chain_size=" << m_tracker.chain.size();
+        });
 
 	if (!shares.empty())
 	{
