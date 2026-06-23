@@ -591,4 +591,18 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_get_shares_walk_test "" AUTO)
 
+    # dgb_download_stops_test: FENCED, additive KAT pinning the requester-side
+    # SHAREREQ stops-list in download_stops.hpp vs the p2pool node.py
+    # download_shares oracle (heads | nth-parent at min(max(0,height-1),10),
+    # null-parent skip, dedup, [:100] cap). Pure header + fakes -> links only
+    # core (uint256). MUST also be in the build.yml --target allowlist
+    # (#143 NOT_BUILT trap).
+    add_executable(dgb_download_stops_test download_stops_test.cpp)
+    target_link_libraries(dgb_download_stops_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_download_stops_test "" AUTO)
+
 endif()
