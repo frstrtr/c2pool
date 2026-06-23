@@ -4631,9 +4631,13 @@ nlohmann::json MiningInterface::rest_coin_peers(const std::string& remote_ip)
         }
     }
 
+    // No embedded-coin-peer source wired for this node: return an EMPTY
+    // object rather than a fabricated {ltc,doge} skeleton. Inventing a fixed
+    // LTC+DOGE shape lies about a node that may run a different coin set (or
+    // none) -- the dashboard must reflect THIS node's real topology, never a
+    // hardcoded one. Empty object => dashboard shows no embedded chains.
     if (!m_coin_peers_fn)
-        return {{"ltc", nlohmann::json::array()},
-                {"doge", nlohmann::json::array()}};
+        return nlohmann::json::object();
 
     return m_coin_peers_fn();
 }
