@@ -920,6 +920,101 @@ TEST(DashConformanceVersionNeg, SwitchClassifier5CaseKat) {
                                  successor_switch_allowed(clears, 36u)));
 }
 
+// === verify_version_transition: the WIRED accept-path gate (not the isolated
+// primitives above). Proves dash::verify_version_transition composes the
+// version_negotiation primitives into admit/reject enforcement at a version
+// boundary -- the mint<->accept coupling that was previously ZERO-consumer on
+// dash. CHAIN_LENGTH (CL) is small (20) so the [9/10..10/10] tail window is
+// reachable in a synthetic chain; the exact 60%/95% floors are pinned by the
+// isolation KATs above, so these lock the WIRING, not the thresholds.
+namespace {
+// Build a uniform run of `count` shares (all `version`/`bits`) on a fresh chain
+// and return the tip hash. The candidate is added separately by each test.
+uint256 build_uniform(SyntheticChain& sc, int count, uint64_t version,
+                      uint32_t bits, const uint160& pkh, uint8_t tag0 = 0x60) {
+    uint256 prev = uint256();
+    for (int i = 0; i < count; ++i)
+        prev = add_versioned(sc, static_cast<uint8_t>(tag0 + i), prev, version, bits, pkh);
+    return prev;
+}
+constexpr uint64_t CL = 20;  // synthetic CHAIN_LENGTH for the gate window
+}  // namespace
+
+// Same-version share is never a boundary -> always admitted (data.py:382).
+TEST(DashConformanceVersionWiring, SameVersionAdmitted) {
+    SyntheticChain sc;
+    const uint160 A = miner_h160(0x10);
+    uint256 tip = build_uniform(sc, 22, 36, BITS_DIFF1, A);
+    add_versioned(sc, 0x80, tip, 36, BITS_DIFF1, A);
+    EXPECT_NO_THROW(dash::verify_version_transition(*sc.pool.back(), sc.chain, CL));
+}
+
+// Upgrade boundary with fewer than CHAIN_LENGTH ancestors -> rejected
+// ("switch without enough history"). data.py:385-387.
+TEST(DashConformanceVersionWiring, UpgradeWithoutHistoryRejected) {
+    SyntheticChain sc;
+    const uint160 A = miner_h160(0x11);
+    uint256 tip = build_uniform(sc, 5, 16, BITS_DIFF1, A);  // < CL ancestors
+    add_versioned(sc, 0x81, tip, 36, BITS_DIFF1, A);        // v16 -> v36 upgrade
+    try {
+        dash::verify_version_transition(*sc.pool.back(), sc.chain, CL);
+        FAIL() << "expected throw on upgrade without enough history";
+    } catch (const std::invalid_argument& e) {
+        EXPECT_NE(std::string(e.what()).find("enough history"), std::string::npos);
+    }
+}
+
+// Upgrade boundary, history present, tail window already on the successor
+// version -> admitted (>=60% plain successor votes). data.py:388-393.
+TEST(DashConformanceVersionWiring, UpgradeWithSuccessorMajorityAdmitted) {
+    SyntheticChain sc;
+    const uint160 A = miner_h160(0x12);
+    uint256 tip = build_uniform(sc, 22, 36, BITS_DIFF1, A);   // tail window = v36
+    uint256 prev = add_versioned(sc, 0x82, tip, 16, BITS_DIFF1, A);  // a lone v16 prev
+    add_versioned(sc, 0x83, prev, 36, BITS_DIFF1, A);         // v16 -> v36 upgrade
+    EXPECT_NO_THROW(dash::verify_version_transition(*sc.pool.back(), sc.chain, CL));
+}
+
+// Upgrade boundary, history present, but the tail window has NO successor votes
+// -> rejected ("without enough hash power upgraded"). data.py:392.
+TEST(DashConformanceVersionWiring, UpgradeWithoutSuccessorVotesRejected) {
+    SyntheticChain sc;
+    const uint160 A = miner_h160(0x13);
+    uint256 tip = build_uniform(sc, 22, 16, BITS_DIFF1, A);   // tail window = all v16
+    add_versioned(sc, 0x84, tip, 36, BITS_DIFF1, A);          // v16 -> v36 upgrade
+    try {
+        dash::verify_version_transition(*sc.pool.back(), sc.chain, CL);
+        FAIL() << "expected throw on upgrade without successor votes";
+    } catch (const std::invalid_argument& e) {
+        EXPECT_NE(std::string(e.what()).find("hash power upgraded"),
+                  std::string::npos);
+    }
+}
+
+// Obsolescence gate: a pre-v36 share whose CHAIN_LENGTH lookbehind is already
+// >=95% WEIGHTED v36 -> rejected ("share version too old"). Mirrors btc
+// should_punish_version; consumes the WEIGHTED tally (work.py v36_active).
+TEST(DashConformanceVersionWiring, StalePreV36ShareRejected) {
+    SyntheticChain sc;
+    const uint160 A = miner_h160(0x14);
+    uint256 tip = build_uniform(sc, 22, 36, BITS_DIFF1, A);   // lookbehind = all v36
+    add_versioned(sc, 0x85, tip, 16, BITS_DIFF1, A);          // stale v16 on v36 tip
+    try {
+        dash::verify_version_transition(*sc.pool.back(), sc.chain, CL);
+        FAIL() << "expected throw on stale pre-v36 share";
+    } catch (const std::invalid_argument& e) {
+        EXPECT_NE(std::string(e.what()).find("too old"), std::string::npos);
+    }
+}
+
+// Genesis / no-parent share is admitted unconditionally (nothing to gate).
+TEST(DashConformanceVersionWiring, GenesisShareAdmitted) {
+    SyntheticChain sc;
+    const uint160 A = miner_h160(0x15);
+    add_versioned(sc, 0x86, uint256(), 36, BITS_DIFF1, A);    // null prev_hash
+    EXPECT_NO_THROW(dash::verify_version_transition(*sc.pool.back(), sc.chain, CL));
+}
+
 // ── DIP4 special-tx coinbase payload (CCbTx) wire-encoding conformance ──────
 // DASH coinbase transactions carry a DIP-0004 "special transaction" extra
 // payload: the CCbTx. Its merkleRootMNList / merkleRootQuorums fields are what
