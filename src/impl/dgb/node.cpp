@@ -6,6 +6,7 @@
 #include <core/target_utils.hpp>
 #include <sharechain/prepared_list.hpp>
 #include <impl/dgb/get_shares_walk.hpp>
+#include <impl/dgb/download_stops.hpp>
 
 #include <algorithm>
 #include <filesystem>
@@ -1011,25 +1012,25 @@ void NodeImpl::download_shares(peer_ptr /*unused_peer*/, const uint256& target_h
     // parents=random(500), the chain grows along one lineage until it
     // crosses 2*CHAIN_LENGTH+10, at which point clean_tracker drop-tails
     // collapses the whole branch and verified resets to 0.
-    std::vector<uint256> stops;
-    {
-        std::set<uint256> stop_set;
-        for (auto& [head_hash, tail_hash] : m_tracker.chain.get_heads()) {
-            stop_set.insert(head_hash);
-            auto h = m_tracker.chain.get_acc_height(head_hash);
-            auto nth = std::min(std::max(0, h - 1), 10);
-            if (nth > 0) {
-                auto parent = m_tracker.chain.get_nth_parent_via_skip(head_hash, nth);
-                if (!parent.IsNull())
-                    stop_set.insert(parent);
-            }
-        }
-        int count = 0;
-        for (auto& s : stop_set) {
-            if (count++ >= 100) break;
-            stops.push_back(s);
-        }
-    }
+    //
+    // Delegate the stops construction to the SSOT (download_stops.hpp) so the
+    // per-head nth-parent depth min(max(0,height-1),10), the head-inclusion,
+    // the null-parent skip, and the 100-cap stay byte-identical to the p2pool
+    // node.py download_shares oracle and are pinned by the download_stops
+    // conformance KAT (#348). Only the pure stops computation moves; the
+    // duplicate-request / fail-count / random-peer / random-parents node-local
+    // logic above stays here. The std::set<uint256> ordering inside the SSOT
+    // reproduces this region's prior inline std::set insert + ordered-iteration
+    // (and 100-cap survivor selection) exactly.
+    std::vector<uint256> heads;
+    for (auto& [head_hash, tail_hash] : m_tracker.chain.get_heads())
+        heads.push_back(head_hash);
+    std::vector<uint256> stops = dgb::compute_download_stops(
+        heads,
+        [this](const uint256& h) { return m_tracker.chain.get_acc_height(h); },
+        [this](const uint256& h, int nth) {
+            return m_tracker.chain.get_nth_parent_via_skip(h, nth);
+        });
 
     auto req_id = core::random::random_uint256();
     std::vector<uint256> hashes = { target_hash };

@@ -146,3 +146,81 @@ TEST(DgbDownloadStops, CustomCapHonoured) {
     EXPECT_EQ(stops[1], id256(2));
     EXPECT_EQ(stops[2], id256(3));
 }
+
+// --------------------------------------------------------------------------
+// DELEGATION EQUIVALENCE — NodeImpl::download_shares (src/impl/dgb/node.cpp)
+// was rewired to call compute_download_stops (was an inline std::set walk).
+// This pins that the SSOT reproduces the EXACT pre-delegation node.cpp stops
+// computation, byte-for-byte, across a combined scenario (deep head + 10-cap
+// head + height-1 head with no lookup + null nth-parent skip + dedup/order).
+// inline_stops_oracle below is the verbatim pre-delegation node.cpp body — an
+// independent subject — and the result is ALSO pinned to a hand-walked value
+// so the check is not circular.
+// --------------------------------------------------------------------------
+namespace {
+// Verbatim copy of the node.cpp inline stops walk as it stood BEFORE the SSOT
+// delegation. heads mirrors m_tracker.chain.get_heads() (head -> tail map);
+// the height / nth-parent callables mirror get_acc_height /
+// get_nth_parent_via_skip. If a future edit drifts the SSOT from this captured
+// behaviour, this test fails.
+std::vector<uint256> inline_stops_oracle(
+    const std::map<uint256, uint256>& heads,
+    const std::function<int(const uint256&)>& get_acc_height,
+    const std::function<uint256(const uint256&, int)>& get_nth_parent_via_skip) {
+    std::vector<uint256> stops;
+    std::set<uint256> stop_set;
+    for (auto& [head_hash, tail_hash] : heads) {
+        (void)tail_hash;
+        stop_set.insert(head_hash);
+        auto h = get_acc_height(head_hash);
+        auto nth = std::min(std::max(0, h - 1), 10);
+        if (nth > 0) {
+            auto parent = get_nth_parent_via_skip(head_hash, nth);
+            if (!parent.IsNull())
+                stop_set.insert(parent);
+        }
+    }
+    int count = 0;
+    for (auto& s : stop_set) {
+        if (count++ >= 100) break;
+        stops.push_back(s);
+    }
+    return stops;
+}
+} // namespace
+
+TEST(DgbDownloadStops, DelegationMatchesPreDelegationInlineWalk) {
+    uint256 ha = id256(0x0a), hb = id256(0x0b), hc = id256(0x0c), hd = id256(0x0d);
+    uint256 pa = id256(0x01), pc = id256(0x02);
+
+    // head -> tail (tail unused), mirrors m_tracker.chain.get_heads()
+    std::map<uint256, uint256> heads_map{
+        {ha, NULLH}, {hb, NULLH}, {hc, NULLH}, {hd, NULLH}};
+
+    std::map<uint256, int> height{
+        {ha, 5},    // nth = 4
+        {hb, 1},    // nth = 0  -> no parent lookup
+        {hc, 12},   // nth = 10
+        {hd, 20}};  // nth = 10, but parent resolves NULL -> skipped
+    auto get_acc_height = [&](const uint256& h) { return height.at(h); };
+    auto get_nth_parent = [&](const uint256& h, int nth) -> uint256 {
+        if (h == ha) { EXPECT_EQ(nth, 4);  return pa; }
+        if (h == hc) { EXPECT_EQ(nth, 10); return pc; }
+        if (h == hd) { EXPECT_EQ(nth, 10); return NULLH; }  // unresolved -> skipped
+        ADD_FAILURE() << "nth-parent queried for a height<=1 head";
+        return NULLH;
+    };
+
+    std::vector<uint256> heads_vec;
+    for (auto& [h, t] : heads_map) { (void)t; heads_vec.push_back(h); }
+
+    auto via_ssot   = dgb::compute_download_stops(heads_vec, get_acc_height, get_nth_parent);
+    auto via_inline = inline_stops_oracle(heads_map, get_acc_height, get_nth_parent);
+
+    // SSOT == verbatim pre-delegation inline walk.
+    EXPECT_EQ(via_ssot, via_inline);
+    // ... and both == the hand-walked, ascending-uint256-ordered span:
+    //   stop_set = {ha,hb,hc,hd, pa,pc}  (pd NULL skipped); ascending by id:
+    //   pa(01) < pc(02) < ha(0a) < hb(0b) < hc(0c) < hd(0d).
+    EXPECT_EQ(via_ssot, (std::vector<uint256>{pa, pc, ha, hb, hc, hd}));
+}
