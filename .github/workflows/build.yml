@@ -72,7 +72,7 @@ jobs:
                     test_threading test_weights \
                     test_header_chain test_mempool test_template_builder \
                     test_doge_chain test_compact_blocks test_dash_x11_kat \
-                    test_dash_header_chain test_dash_block_replay test_dash_conformance test_dash_subsidy test_dash_mempool test_dash_simplifiedmns test_dash_quorum test_dash_quorum_root test_dash_mn_state test_dash_embedded_gbt test_dash_smldiff test_dash_p2p_messages \
+                    test_dash_header_chain test_dash_block_replay test_dash_conformance test_dash_subsidy test_dash_mempool test_dash_simplifiedmns test_dash_quorum test_dash_quorum_root test_dash_mn_state test_dash_embedded_gbt test_dash_smldiff test_dash_p2p_messages test_dash_rpc_request \
                     test_multiaddress_pplns test_pplns_stress \
                     test_hash_link test_decay_pplns \
                     test_pplns_consensus \
@@ -205,7 +205,7 @@ jobs:
                     test_threading test_weights \
                     test_header_chain test_mempool test_template_builder \
                     test_doge_chain test_compact_blocks test_dash_x11_kat \
-                    test_dash_header_chain test_dash_block_replay test_dash_conformance test_dash_subsidy test_dash_mempool test_dash_simplifiedmns test_dash_quorum test_dash_quorum_root test_dash_mn_state test_dash_embedded_gbt test_dash_smldiff test_dash_p2p_messages \
+                    test_dash_header_chain test_dash_block_replay test_dash_conformance test_dash_subsidy test_dash_mempool test_dash_simplifiedmns test_dash_quorum test_dash_quorum_root test_dash_mn_state test_dash_embedded_gbt test_dash_smldiff test_dash_p2p_messages test_dash_rpc_request \
                     test_hash_link test_decay_pplns \
                     test_pplns_consensus \
                     test_v36_script_sorting test_v36_cross_impl_refhash \

@@ -385,6 +385,19 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_p2p_messages PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_p2p_messages "" AUTO)
 
+    # DASH external-dashd-RPC request-shape guard (launcher slice 3). Pins the
+    # oracle-conformed RPC contract: version-floor + the DASH<->DGB GBT
+    # divergence (X11 / no segwit -> NO algo param, NO injected segwit rule) +
+    # the DASH genesis-identity hashes. Header-only over coin/rpc_request.hpp;
+    # links ONLY gtest + nlohmann (no boost::beast/jsonrpccxx transport), like
+    # the dgb rpc_request_test guard. MUST appear in BOTH this registration AND
+    # the build.yml --target allowlists (#143 NOT_BUILT trap).
+    add_executable(test_dash_rpc_request test_dash_rpc_request.cpp)
+    target_link_libraries(test_dash_rpc_request PRIVATE
+        GTest::gtest_main GTest::gtest
+        nlohmann_json::nlohmann_json)
+    gtest_add_tests(test_dash_rpc_request "" AUTO)
+
     add_executable(test_compact_blocks test_compact_blocks.cpp)
     target_link_libraries(test_compact_blocks PRIVATE
         GTest::gtest_main GTest::gtest
