@@ -726,4 +726,19 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_think_p2_walk_bounds_test "" AUTO)
 
+    # dgb_think_p5_best_share_punish_test: FENCED, additive KAT pinning the
+    # think() Phase-5 best-share punish walk in think_p5_best_share_punish.hpp
+    # vs the p2pool data.py:2142-2166 best-share resolution oracle (walk back off
+    # naughty heads, dive to deepest non-naughty descendant, report punishment),
+    # plus hand-derived non-circular fake-chain anchors. Pure graph traversal ->
+    # links only core. MUST also be in the build.yml --target allowlist (#143
+    # NOT_BUILT trap).
+    add_executable(dgb_think_p5_best_share_punish_test think_p5_best_share_punish_test.cpp)
+    target_link_libraries(dgb_think_p5_best_share_punish_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_think_p5_best_share_punish_test "" AUTO)
+
 endif()
