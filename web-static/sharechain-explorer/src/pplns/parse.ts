@@ -49,6 +49,15 @@ function num(v: unknown, fallback = 0): number {
   return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
 }
 
+// A sum of individually-finite per-miner amounts can still overflow to
+// +/-Infinity when values approach Number.MAX_VALUE (each passes the
+// amount>0 guard, but their aggregate does not). Clamp so totalPrimary
+// stays finite at the server->client trust boundary. Regression:
+// tests/unit/pplns-parse-properties.test.ts overflow case (seed 1831858192).
+function finiteTotal(sum: number): number {
+  return Number.isFinite(sum) ? sum : Number.MAX_VALUE;
+}
+
 function str(v: unknown): string | undefined {
   return typeof v === 'string' && v.length > 0 ? v : undefined;
 }
@@ -119,7 +128,7 @@ function parseNewShape(obj: Record<string, unknown>): PplnsSnapshot {
   const snap: PplnsSnapshot = {
     totalPrimary: totalPrimary > 0
       ? totalPrimary
-      : miners.reduce((s, m) => s + m.amount, 0),
+      : finiteTotal(miners.reduce((s, m) => s + m.amount, 0)),
     mergedChains,
     mergedTotals,
     schemaVersion: str(obj.schema_version) ?? '1.0',
@@ -258,7 +267,7 @@ function parseLegacyShape(obj: Record<string, unknown>): PplnsSnapshot {
     entries.push({ address: addr, amount, merged });
   }
 
-  const totalPrimary = entries.reduce((s, e) => s + e.amount, 0);
+  const totalPrimary = finiteTotal(entries.reduce((s, e) => s + e.amount, 0));
   entries.sort((a, b) => b.amount - a.amount);
 
   const miners: PplnsMiner[] = entries.map((e) => ({

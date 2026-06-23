@@ -300,6 +300,30 @@ test('parseSnapshot: non-finite amounts are dropped, total stays finite', () => 
   }
 });
 
+test('parseSnapshot: finite amounts whose SUM overflows stay finite', () => {
+  // Each amount is finite and passes the amount>0 guard, but the
+  // aggregate overflows to +Infinity. totalPrimary must be clamped
+  // finite (finiteTotal). Shrunk counterexample: seed 1831858192,
+  // raw = [8.98e292, 1.797e308] (legacy bare-number / array path).
+  const big = 1.797693134862315e+308; // just under Number.MAX_VALUE
+  for (const raw of [
+    [8.98128139290624e+292, big],                 // legacy array path
+    { a: big, b: big },                            // legacy dict path
+    { total_primary: 0,                            // new-shape fallback sum
+      miners: [{ address: 'a', amount: big, pct: 0 },
+               { address: 'b', amount: big, pct: 0 }] },
+  ]) {
+    const snap = parseSnapshot(raw);
+    assert.ok(Number.isFinite(snap.totalPrimary),
+      `totalPrimary overflowed for ${JSON.stringify(raw).slice(0, 40)}`);
+    // Per-miner pct must remain a finite number in [0,1].
+    for (const m of snap.miners) {
+      assert.ok(Number.isFinite(m.pct));
+      assert.ok(m.pct >= 0 && m.pct <= 1.0000001);
+    }
+  }
+});
+
 test('parseSnapshot: non-finite legacy-object amounts are dropped', () => {
   // Legacy { addr: { amount } } shape with a non-finite amount field.
   for (const bad of [Infinity, -Infinity, NaN]) {
