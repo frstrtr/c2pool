@@ -395,6 +395,20 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_p2p_connection PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_p2p_connection "" AUTO)
 
+    # Dash coin-daemon P2P node (S8 socket-node skeleton leaf). Pins the node
+    # lifecycle (attach/teardown), the outbound-request->inbound-reply exchange
+    # through Connection, and the real-timer idle-timeout path. Header-only over
+    # the dash_x11 + core link set; same set as the p2p_connection leaf.
+    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp)
+    target_link_libraries(test_dash_p2p_node PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_p2p_node PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_p2p_node "" AUTO)
+
     add_executable(test_compact_blocks test_compact_blocks.cpp)
     target_link_libraries(test_compact_blocks PRIVATE
         GTest::gtest_main GTest::gtest
