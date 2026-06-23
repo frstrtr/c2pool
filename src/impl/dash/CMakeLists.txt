@@ -18,3 +18,20 @@ add_subdirectory(crypto)
 add_library(dash_block_replay STATIC coin/vendor/blockencodings.cpp)
 target_include_directories(dash_block_replay PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(dash_block_replay PRIVATE core nlohmann_json::nlohmann_json ${Boost_LIBRARIES})
+
+# Launcher slice-3 external-dashd-RPC client (won-block dual-path broadcaster,
+# RPC leg). coin/rpc.cpp is a real boost::beast + jsonrpccxx HTTP JSON-RPC
+# client to an external dashd, mirroring src/impl/dgb/coin/rpc.cpp conformed to
+# DASH (X11, no segwit -> plain getblocktemplate body, NO algo param; rich
+# DashWorkData getwork(); DASH genesis identity probe; submit_block_hex dashd
+# submitblock fallback). The embedded-P2P relay leg of the broadcaster is still
+# DEFERRED. SAFE-ADDITIVE: additive static lib; the ONLY existing target that
+# links it is c2pool-dash (this slice), so the ltc/btc/doge/dgb build + ctest
+# surfaces are untouched. Per-coin isolation held: src/impl/dash only, no
+# shared-base/core SOURCE edit, dashd RPC fallback preserved.
+add_library(dash_rpc STATIC coin/rpc.cpp)
+target_include_directories(dash_rpc PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/btclibs
+    ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(dash_rpc PRIVATE core nlohmann_json::nlohmann_json ${Boost_LIBRARIES})
