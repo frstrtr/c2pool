@@ -838,3 +838,201 @@ TEST(DGB_share_test, WeightWalkValueInvarianceBattery)
         EXPECT_EQ(helper.total_donation_weight, legacy.total_donation_weight) << "window donation_weight";
     }
 }
+
+// ============================================================================
+// WorkRefHashAssembler — prospective-work RefHashParams assembler KAT.
+//
+// Pins dgb::coin::make_work_ref_hash_params() (coin/work_ref_hash.hpp): the
+// tracker-free SSOT that assembles the ~25-field RefHashParams a per-connection
+// Stratum coinbase commits to, lifting the field-for-field mapping out of
+// share_check.hpp create_local_share() / create_local_share_v35().
+//
+// EMISSION == VERIFICATION: for a fixed set of prospective-work inputs we build
+// a RefHashParams TWO independent ways —
+//   (E) via the new assembler make_work_ref_hash_params() (the EMISSION path), and
+//   (V) a verbatim field-build mirroring how create_local_share() populates the
+//       ref preimage (the VERIFICATION reference) —
+// then run BOTH through the SAME verifier primitive compute_ref_hash_for_work()
+// and assert the resulting ref_hash is byte-identical. A divergence on any of
+// the ~25 fields (payout-identity classification, V35 address derivation, the
+// V36/V35 conditionals, the no-segwit placeholder) would split the two
+// ref_hashes — exactly the Stratum OP_RETURN mismatch the assembler exists to
+// prevent. compute_ref_hash_for_work() is itself the byte-exact oracle the share
+// verifier uses (share_init_verify / generate_share_transaction), so equality
+// here is emission==verification by construction.
+//
+// Covers: V36 no-segwit (the #336 placeholder branch), V36 with-segwit, V35
+// (the address-VarStr path), and all three payout-script identity classes.
+// ============================================================================
+
+#include <impl/dgb/coin/work_ref_hash.hpp>   // make_work_ref_hash_params, classify_payout_identity
+
+namespace {
+
+using WScript = std::vector<unsigned char>;
+
+WScript wrh_unhex(const std::string& h) {
+    WScript v; v.reserve(h.size() / 2);
+    auto nyb = [](char c) -> int { return (c <= '9') ? c - '0' : (c | 0x20) - 'a' + 10; };
+    for (size_t i = 0; i + 1 < h.size(); i += 2)
+        v.push_back(static_cast<unsigned char>((nyb(h[i]) << 4) | nyb(h[i + 1])));
+    return v;
+}
+
+// A canonical P2PKH scriptPubKey: 76 a9 14 <20B hash160> 88 ac.
+const WScript WRH_P2PKH = wrh_unhex(
+    "76a914000102030405060708090a0b0c0d0e0f1011121388ac");
+// P2SH: a9 14 <20B> 87.
+const WScript WRH_P2SH = wrh_unhex(
+    "a914202122232425262728292a2b2c2d2e2f3031323387");
+// P2WPKH: 00 14 <20B>.
+const WScript WRH_P2WPKH = wrh_unhex(
+    "0014404142434445464748494a4b4c4d4e4f50515253");
+
+const WScript WRH_CB = wrh_unhex("03a1b2c3041122334455667788");
+
+// Build the prospective-work inputs for a non-trivial share. mirror_to_params()
+// below builds the SAME fields the verification reference uses.
+dgb::coin::WorkRefHashInputs make_inputs(int64_t version, const WScript& payout_script,
+                                         bool has_segwit) {
+    dgb::coin::WorkRefHashInputs in;
+    in.share_version       = version;
+    in.desired_version     = 36;
+    in.prev_share          = uint256();      // genesis-ish; ref serialises it raw
+    in.coinbase_scriptSig  = WRH_CB;
+    in.share_nonce         = 0x12345678u;
+    in.payout_script       = payout_script;
+    in.subsidy             = 64000000u;
+    in.donation            = 37u;
+    in.stale_info          = 0u;
+    in.has_segwit          = has_segwit;
+    // SegwitData default-constructed (empty branch / zero root) — both paths see
+    // the identical value, so when has_segwit is true the data still matches.
+    in.merged_payout_hash.SetNull();
+    in.far_share_hash.SetNull();
+    in.max_bits            = 0x1e0fffffu;
+    in.bits                = 0x1e0fffffu;
+    in.timestamp           = 1718700000u;
+    in.absheight           = 1000u;
+    in.abswork             = uint128(123456789u);
+    return in;
+}
+
+// VERIFICATION reference: populate RefHashParams the way create_local_share() /
+// create_local_share_v35() feed the ref preimage, WITHOUT going through the new
+// assembler. This is the independent oracle the assembler must reproduce.
+dgb::RefHashParams mirror_to_params(const dgb::coin::WorkRefHashInputs& in,
+                                    const core::CoinParams& params) {
+    dgb::RefHashParams p;
+    p.share_version      = in.share_version;
+    p.desired_version    = in.desired_version;
+    p.prev_share         = in.prev_share;
+    p.coinbase_scriptSig = in.coinbase_scriptSig;
+    p.share_nonce        = in.share_nonce;
+    p.subsidy            = in.subsidy;
+    p.donation           = in.donation;
+    p.stale_info         = in.stale_info;
+
+    // Payout identity — verbatim from create_local_share()'s scriptPubKey tests.
+    const auto& ps = in.payout_script;
+    if (ps.size() == 25 && ps[0] == 0x76 && ps[1] == 0xa9 && ps[2] == 0x14 &&
+        ps[23] == 0x88 && ps[24] == 0xac) {
+        std::memcpy(p.pubkey_hash.data(), ps.data() + 3, 20); p.pubkey_type = 0;
+    } else if (ps.size() == 23 && ps[0] == 0xa9 && ps[1] == 0x14 && ps[22] == 0x87) {
+        std::memcpy(p.pubkey_hash.data(), ps.data() + 2, 20); p.pubkey_type = 2;
+    } else if (ps.size() == 22 && ps[0] == 0x00 && ps[1] == 0x14) {
+        std::memcpy(p.pubkey_hash.data(), ps.data() + 2, 20); p.pubkey_type = 1;
+    } else if (ps.size() >= 20) {
+        std::memcpy(p.pubkey_hash.data(), ps.data(), 20); p.pubkey_type = 0;
+    }
+    {
+        std::string addr = dgb::pubkey_hash_to_address(p.pubkey_hash, p.pubkey_type, params);
+        p.address.assign(addr.begin(), addr.end());
+    }
+
+    p.has_segwit         = in.has_segwit;
+    p.segwit_data        = in.segwit_data;
+    p.merged_addresses   = in.merged_addresses;
+    p.merged_coinbase_info = in.merged_coinbase_info;
+    p.merged_payout_hash = in.merged_payout_hash;
+    p.message_data       = in.message_data;
+    p.far_share_hash     = in.far_share_hash;
+    p.max_bits           = in.max_bits;
+    p.bits               = in.bits;
+    p.timestamp          = in.timestamp;
+    p.absheight          = in.absheight;
+    p.abswork            = in.abswork;
+    return p;
+}
+
+// (1) V36, no segwit: the assembler ref_hash == the verification-reference
+//     ref_hash. Exercises the #336 no-segwit placeholder branch.
+TEST(WorkRefHashAssembler, V36NoSegwitEmissionEqualsVerification) {
+    const auto params = dgb::make_coin_params(/*testnet=*/false);
+    const auto in = make_inputs(/*version=*/36, WRH_P2PKH, /*has_segwit=*/false);
+
+    const auto emit_params   = dgb::coin::make_work_ref_hash_params(in, params);
+    const auto verify_params = mirror_to_params(in, params);
+
+    const auto emit_ref   = dgb::compute_ref_hash_for_work(emit_params, params).first;
+    const auto verify_ref = dgb::compute_ref_hash_for_work(verify_params, params).first;
+
+    EXPECT_EQ(emit_ref, verify_ref);
+    EXPECT_FALSE(emit_ref.IsNull());
+    // Assembler classified the P2PKH script correctly.
+    EXPECT_EQ(emit_params.pubkey_type, 0);
+}
+
+// (2) V36, with segwit: same delegation, segwit field carried verbatim.
+TEST(WorkRefHashAssembler, V36WithSegwitEmissionEqualsVerification) {
+    const auto params = dgb::make_coin_params(/*testnet=*/false);
+    const auto in = make_inputs(/*version=*/36, WRH_P2WPKH, /*has_segwit=*/true);
+
+    const auto emit_ref =
+        dgb::compute_ref_hash_for_work(dgb::coin::make_work_ref_hash_params(in, params), params).first;
+    const auto verify_ref =
+        dgb::compute_ref_hash_for_work(mirror_to_params(in, params), params).first;
+
+    EXPECT_EQ(emit_ref, verify_ref);
+    // P2WPKH -> type 1.
+    EXPECT_EQ(dgb::coin::make_work_ref_hash_params(in, params).pubkey_type, 1);
+}
+
+// (3) V35: the address-VarStr path. The assembler must derive the address the
+//     same way create_local_share_v35() does, or the V35 ref_hash splits.
+TEST(WorkRefHashAssembler, V35AddressPathEmissionEqualsVerification) {
+    const auto params = dgb::make_coin_params(/*testnet=*/false);
+    const auto in = make_inputs(/*version=*/35, WRH_P2SH, /*has_segwit=*/false);
+
+    const auto emit_params   = dgb::coin::make_work_ref_hash_params(in, params);
+    const auto verify_params = mirror_to_params(in, params);
+
+    const auto emit_ref   = dgb::compute_ref_hash_for_work(emit_params, params).first;
+    const auto verify_ref = dgb::compute_ref_hash_for_work(verify_params, params).first;
+
+    EXPECT_EQ(emit_ref, verify_ref);
+    EXPECT_FALSE(emit_ref.IsNull());
+    // The V35 ref serialises the address string — confirm the assembler filled it
+    // and that it round-trips the P2SH identity.
+    EXPECT_FALSE(emit_params.address.empty());
+    EXPECT_EQ(emit_params.address, verify_params.address);
+    EXPECT_EQ(emit_params.pubkey_type, 2);
+}
+
+// (4) classify_payout_identity covers all three script classes byte-for-byte
+//     (the one judgment call shared with both mint paths).
+TEST(WorkRefHashAssembler, PayoutIdentityClassification) {
+    auto p2pkh = dgb::coin::classify_payout_identity(WRH_P2PKH);
+    EXPECT_EQ(p2pkh.pubkey_type, 0);
+    EXPECT_EQ(std::memcmp(p2pkh.pubkey_hash.data(), WRH_P2PKH.data() + 3, 20), 0);
+
+    auto p2sh = dgb::coin::classify_payout_identity(WRH_P2SH);
+    EXPECT_EQ(p2sh.pubkey_type, 2);
+    EXPECT_EQ(std::memcmp(p2sh.pubkey_hash.data(), WRH_P2SH.data() + 2, 20), 0);
+
+    auto p2wpkh = dgb::coin::classify_payout_identity(WRH_P2WPKH);
+    EXPECT_EQ(p2wpkh.pubkey_type, 1);
+    EXPECT_EQ(std::memcmp(p2wpkh.pubkey_hash.data(), WRH_P2WPKH.data() + 2, 20), 0);
+}
+
+}  // namespace
