@@ -7145,6 +7145,12 @@ void MiningInterface::update_stat_log()
             case Blockchain::DASH:
                 return m_testnet ? std::make_tuple<uint8_t, uint8_t, std::string>(140, 19, "")
                                  : std::make_tuple<uint8_t, uint8_t, std::string>(76, 16, "");
+            case Blockchain::DOGECOIN:
+                // Dogecoin mainnet version bytes (address_validator.cpp:163):
+                // D addresses p2pkh=30, 9/A p2sh=22, no bech32 HRP. Without
+                // this a primary-DOGE node fell to the Bitcoin default and
+                // surfaced payout addresses with the wrong (BTC) version bytes.
+                return std::make_tuple<uint8_t, uint8_t, std::string>(30, 22, "");
             case Blockchain::BITCOIN:
             default:
                 return m_testnet ? std::make_tuple<uint8_t, uint8_t, std::string>(0x6f, 0xc4, "tb")
