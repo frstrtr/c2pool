@@ -5446,9 +5446,9 @@ nlohmann::json MiningInterface::rest_best_share()
         result["round"] = round;
     }
 
-    // ── Merged chain (DOGE) best share stats ──
+    // ── Merged (aux) chain best share stats - symbol from the real aux chain, never hardcoded ──
     double merged_net_diff = 0.0;
-    std::string merged_symbol = "DOGE";
+    std::string merged_symbol;  // empty until sourced from the live aux chain
     if (m_mm_manager && m_mm_manager->has_chains()) {
         auto chain_infos = m_mm_manager->get_chain_infos();
         if (!chain_infos.empty()) {
