@@ -85,7 +85,8 @@ inline core::CoinParams make_coin_params(bool testnet)
 
     p.target_lookbehind        = PoolConfig::TARGET_LOOKBEHIND;          // 100
     p.spread                   = PoolConfig::SPREAD;                     // 24
-    p.minimum_protocol_version = PoolConfig::MINIMUM_PROTOCOL_VERSION;   // 1700 floor
+    p.minimum_protocol_version = PoolConfig::MINIMUM_PROTOCOL_VERSION;   // 1700 floor (digibyte.py NEW_MIN; accept-floor only)
+    p.advertised_protocol_version = PoolConfig::ADVERTISED_PROTOCOL_VERSION; // 3501 (oracle p2p.py VERSION) -- what we ADVERTISE, not the accept-floor
     p.block_max_size           = PoolConfig::BLOCK_MAX_SIZE;
     p.block_max_weight         = PoolConfig::BLOCK_MAX_WEIGHT;
 
