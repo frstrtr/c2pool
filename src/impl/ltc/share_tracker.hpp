@@ -2152,10 +2152,11 @@ public:
     // Canonical p2pool get_desired_version_counts (data.py:2651) weights each
     // share by target_to_average_attempts(share.target) — NOT a flat count.
     // The check()-phase 60% switch rule (share_check step 2) is a consensus gate
-    // and MUST use these weights to stay byte-identical with p2pool. AutoRatchet
-    // and its tail guard deliberately keep the FLAT-COUNT variant above
-    // (count-based per F10 finding #1 — weighting them would shift activation
-    // timing across the soak). Weight = ShareIndex::work (share.hpp).
+    // and MUST use these weights to stay byte-identical with p2pool. The
+    // AutoRatchet VOTING tail guard ALSO uses these work-weights (auto_ratchet.hpp
+    // calls get_desired_version_weights), coupling activation to the check()-phase
+    // 60% accept gate so a minted boundary share can never be rejected. There is
+    // no flat-count tail-guard codepath. Weight = ShareIndex::work (share.hpp).
     std::map<uint64_t, uint288> get_desired_version_weights(const uint256& share_hash, int32_t lookbehind)
     {
         std::map<uint64_t, uint288> weights;
