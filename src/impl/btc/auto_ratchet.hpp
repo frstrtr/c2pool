@@ -273,60 +273,11 @@ public:
             return {current_version, target_version_};
     }
 
-    /// Validate a version switch between consecutive shares.
-    /// Returns empty string if valid, error message if invalid.
-    /// Implements the 60% switch rule from Python check() method.
-    static std::string validate_version_switch(
-        int64_t share_version, int64_t prev_version,
-        ShareTracker& tracker, const uint256& prev_hash)
-    {
-        // Same version — always ok
-        if (share_version == prev_version)
-            return {};
-
-        int32_t height = tracker.chain.get_height(prev_hash);
-        uint32_t chain_length = PoolConfig::chain_length();
-
-        if (height < static_cast<int32_t>(chain_length))
-        {
-            // Not enough history for version switch
-            if (share_version > prev_version)
-                return "version switch without enough history";
-            return {}; // downgrade ok without history
-        }
-
-        // Upgrade: requires 60% in sampling window [CHAIN_LENGTH*9/10, CHAIN_LENGTH]
-        if (share_version == prev_version + 1)
-        {
-            uint32_t window_start = (chain_length * 9) / 10;
-            uint32_t window_size = chain_length / 10;
-            auto ancestor = tracker.chain.get_nth_parent_key(prev_hash, window_start);
-            auto counts = tracker.get_desired_version_counts(ancestor, window_size);
-
-            int64_t new_ver_count = 0;
-            int64_t total_count = 0;
-            for (auto& [ver, cnt] : counts)
-            {
-                total_count += cnt;
-                if (ver >= share_version)
-                    new_ver_count += cnt;
-            }
-
-            if (total_count > 0 && new_ver_count * 100 < total_count * SWITCH_THRESHOLD)
-                return "version switch without enough hash power upgraded ("
-                       + std::to_string(new_ver_count * 100 / total_count)
-                       + "% < " + std::to_string(SWITCH_THRESHOLD) + "%)";
-            return {};
-        }
-
-        // Downgrade by 1 (AutoRatchet deactivation): allowed
-        if (share_version == prev_version - 1)
-            return {};
-
-        // Multi-version jump: not allowed
-        return "invalid version jump from " + std::to_string(prev_version)
-             + " to " + std::to_string(share_version);
-    }
+    // F10 (per ltc): validate_version_switch is intentionally absent — the
+    // single source of truth for the version-switch gate is share_check step 2,
+    // which calls ShareTracker::get_desired_version_weights and matches p2pool
+    // check() (data.py:1396-1414) exactly. The VOTING tail guard above stays
+    // inline and work-weighted (mint<->accept coupling).
 
 private:
     std::string state_file_;
