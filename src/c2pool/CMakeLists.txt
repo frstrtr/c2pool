@@ -263,6 +263,30 @@ target_link_libraries(c2pool-bch
     ${Boost_LIBRARIES}
 )
 
+# c2pool-dash: DASH (X11 standalone parent, older-than-v35 -> V36) — EXE-WIRE
+# slice 2 (integrator 2026-06-23, stacked on launcher slice 1 #387). Closes the
+# "DASH is impl-files-only, not runnable" gap: slice 1 registered DASH in the
+# unified dispatch; this gives DASH its own executable driving the REAL header-
+# only consensus path (make_coin_params + X11 PoW + subsidy). Mirrors the
+# c2pool-bch --selftest tier: main_dash.cpp + the dash_x11 sph lib; params/
+# subsidy/utxo_adapter are header-only. Block submission (won-block dual-path
+# broadcaster: dashd-RPC submitblock + embedded P2P relay) is DEFERRED to the
+# next stacked slice and is an explicit, labelled --run stub (NOT silent). The
+# core OBJECT-lib link set matches c2pool-bch/the dash tests (core monolith SCC
+# direct-naming, #22/#39); per-coin isolation held: src/impl/dash only, no
+# shared-base/core SOURCE edit, dashd RPC fallback untouched.
+add_executable(c2pool-dash main_dash.cpp)
+target_compile_definitions(c2pool-dash PRIVATE C2POOL_VERSION="${C2POOL_GIT_VERSION}")
+target_link_libraries(c2pool-dash
+    core pool sharechain
+    c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage c2pool_difficulty
+    dash_x11   # DASH X11 PoW sph reference (BLAKE->...->ECHO), additive static lib
+    btclibs
+    yaml-cpp::yaml-cpp
+    nlohmann_json::nlohmann_json
+    ${Boost_LIBRARIES}
+)
+
 # Windows: Boost.Asio requires Winsock libraries; /bigobj for large translation units
 if(WIN32)
     target_link_libraries(c2pool ws2_32 mswsock bcrypt dbghelp)
