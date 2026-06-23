@@ -662,4 +662,19 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_think_p4_head_keys_test "" AUTO)
 
+    # dgb_think_p3_best_head_test: FENCED, additive KAT pinning the think()
+    # Phase-3 per-tail best-head selection in think_p3_best_head.hpp vs the
+    # p2pool data.py think() oracle (max(verified.tails[t], key=get_work),
+    # first-max tiebreak: skip unverified, first-seen wins, strict-greater
+    # replace), plus a non-circular reference-scan anchor vs the verbatim
+    # pre-delegation inline loop. Pure selection -> links only core. MUST also
+    # be in the build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_think_p3_best_head_test think_p3_best_head_test.cpp)
+    target_link_libraries(dgb_think_p3_best_head_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_think_p3_best_head_test "" AUTO)
+
 endif()
