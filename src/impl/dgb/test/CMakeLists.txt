@@ -563,4 +563,18 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_share_target_genesis_test "" AUTO)
 
+    # dgb_pool_msg_wire_test: FENCED conformance KAT for the pool P2P wire-message
+    # layer (messages.hpp) — command-name parity, scalar LE byte pins, and
+    # serialize/read-back field equality vs p2pool-merged-v36 message numbering.
+    # First coverage of this layer in the repo. Same proven link set as
+    # dgb_share_test (messages.hpp pulls coin/block + sharechain share). MUST
+    # also be in the build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_pool_msg_wire_test dgb_pool_msg_wire_test.cpp)
+    target_link_libraries(dgb_pool_msg_wire_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_pool_msg_wire_test "" AUTO)
+
 endif()
