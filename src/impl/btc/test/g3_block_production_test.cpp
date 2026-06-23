@@ -22,6 +22,11 @@
 //   submit_block_p2p_raw / submitblock RPC calls. The state-machine wiring and
 //   the regime-independence invariant are locked HERE, on host CI, today.
 //
+//   LIVE LEG (realized): tools/conformance/g3_live_submitblock.py performs that
+//   exact sink swap against a live regtest bitcoind (VM420), driving the real
+//   submitblock RPC for each regime and asserting the same regime _|_ reach
+//   invariant on accepted blocks. Run it on a VM with an authed regtest node.
+//
 // THE LOAD-BEARING INVARIANT (regime _|_ reaches_network):
 //   core::version_gate governs the SHARE encoding / consensus revision. It must
 //   NEVER gate whether a found block reaches the chain. A v35 win and a v36 win
