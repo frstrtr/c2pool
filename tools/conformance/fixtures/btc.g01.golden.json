@@ -1,0 +1,28 @@
+{
+  "coin": "bitcoin",
+  "constants": {
+    "DONATION_SCRIPT": "4104ffd03de44a6e11b9917f3a29f9443283d9871c9d743ef30d5eddcd37094b64d1b3d8090496b53256786bf5c82932ec23c3b74d9f05a6f95a8b5529352656664bac",
+    "IDENTIFIER": "fc70035c7a81bc6f",
+    "MINIMUM_PROTOCOL_VERSION": 3301,
+    "P2P_PORT": 9333,
+    "PREFIX": "2472ef181efcd37b",
+    "SEGWIT_ACTIVATION_VERSION": 33,
+    "gentx_before_refhash_expr": "pack.VarStrType().pack(DONATION_SCRIPT) + pack.IntType(64).pack(0) + pack.VarStrType().pack('\\x6a\\x28' + pack.IntType(256).pack(0) + pack.IntType(64).pack(0))[:3]",
+    "gentx_layout_sig": "5193e3e6ee1a562e23a5a36be01c7d072306a1743bd0998abaa1d7874372c62f",
+    "share_versions": [
+      0,
+      17,
+      32,
+      33,
+      34,
+      35
+    ]
+  },
+  "provenance": {
+    "data_source": "p2pool/data.py",
+    "git_rev": "ece15b03fc23",
+    "network_source": "p2pool/networks/bitcoin.py",
+    "tree": "/home/ubuntu/Github/p2pool-btc-jtoomim"
+  },
+  "schema": "c2pool.g01.share-format/v1"
+}
