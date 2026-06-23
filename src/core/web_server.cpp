@@ -4707,6 +4707,30 @@ nlohmann::json MiningInterface::rest_web_currency_info()
             result["tx_explorer_url_prefix"]      = "https://blockchair.com/dash/transaction/";
         }
         break;
+    case Blockchain::DIGIBYTE:
+        result["symbol"] = "DGB";
+        result["name"] = "DigiByte";
+        result["block_period"] = 15;   // ~15 s average (multi-algo)
+        if (!m_custom_address_explorer.empty()) {
+            result["address_explorer_url_prefix"] = m_custom_address_explorer;
+            result["block_explorer_url_prefix"]   = m_custom_block_explorer;
+            result["tx_explorer_url_prefix"]      = m_custom_tx_explorer;
+        } else {
+            result["address_explorer_url_prefix"] = "https://blockchair.com/digibyte/address/";
+            result["block_explorer_url_prefix"]   = "https://blockchair.com/digibyte/block/";
+            result["tx_explorer_url_prefix"]      = "https://blockchair.com/digibyte/transaction/";
+        }
+        break;
+    default:
+        // Per-node truthfulness: never fabricate a coin identity we do not know.
+        // Honor an operator-configured custom explorer if present; otherwise leave
+        // symbol/name unset so the dashboard shows unknown rather than a wrong coin.
+        if (!m_custom_address_explorer.empty()) {
+            result["address_explorer_url_prefix"] = m_custom_address_explorer;
+            result["block_explorer_url_prefix"]   = m_custom_block_explorer;
+            result["tx_explorer_url_prefix"]      = m_custom_tx_explorer;
+        }
+        break;
     }
 
     // Expose explorer state so dashboard JS can link to internal explorer
