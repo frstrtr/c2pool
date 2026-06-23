@@ -1,0 +1,64 @@
+name: attribution-gate
+
+# Standing rule: ZERO AI attribution anywhere — commit messages, PR body/title,
+# branch names. This required check fails any PR that leaks vendor co-author
+# trailers, generated-with lines, the bot emoji, vendor URLs/emails, or bare
+# model names. Server-side backstop so no clone/worktree can reintroduce it.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  attribution-gate:
+    name: attribution-gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan commits + PR metadata for AI attribution
+        env:
+          PR_BODY:  ${{ github.event.pull_request.body }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -uo pipefail
+          # ERE applied case-insensitively (grep -i)
+          PATTERN='co-authored-by:.*(claude|anthropic)|generated with[[:space:]]*\[?claude|claude\.com/claude-code|noreply@anthropic\.com|🤖|claude-|\bopus\b|\bsonnet\b|\bhaiku\b|\banthropic\b|\bfable\b'
+          fail=0
+
+          echo "::group::Commit range ${BASE_SHA}..${HEAD_SHA}"
+          if ! git log --format=%H%n%B%n--END-- "${BASE_SHA}..${HEAD_SHA}" > /tmp/commits.txt 2>/dev/null; then
+            git log --format=%H%n%B%n--END-- -50 "${HEAD_SHA}" > /tmp/commits.txt
+          fi
+          cat /tmp/commits.txt
+          echo "::endgroup::"
+
+          if grep -nEi "$PATTERN" /tmp/commits.txt; then
+            echo "::error::AI attribution found in a commit message in this PR range"
+            fail=1
+          fi
+
+          printf %s "$PR_BODY"  > /tmp/pr_body.txt
+          printf %s "$PR_TITLE" > /tmp/pr_title.txt
+          printf %s "$HEAD_REF" > /tmp/pr_ref.txt
+          for f in body title ref; do
+            if grep -nEi "$PATTERN" /tmp/pr_$f.txt; then
+              echo "::error::AI attribution found in PR $f"
+              fail=1
+            fi
+          done
+
+          if [ "$fail" -ne 0 ]; then
+            echo "attribution-gate FAILED — strip all AI attribution (vendor co-author trailers, generated-with lines, bot emoji, vendor URLs/emails, bare model names) from commits, PR body/title, and branch name."
+            exit 1
+          fi
+          echo "attribution-gate: clean"
