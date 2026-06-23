@@ -43,6 +43,7 @@
 
 #include <core/uint256.hpp>
 #include <core/timer.hpp>
+#include <core/netaddress.hpp>   // NetService m_address / connect() endpoint
 
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>

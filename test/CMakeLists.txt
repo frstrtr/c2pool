@@ -269,6 +269,20 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_subsidy PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
     gtest_add_tests(test_dash_subsidy "" AUTO)
 
+    # DASH external-dashd RPC creds-resolution KAT (launcher slice 4): dash.conf
+    # rpcuser/rpcpassword/rpcport parse + --coin-rpc endpoint override + armed()
+    # gating that main_dash --run consults before ARMing the submitblock fallback.
+    # Header-only over impl/dash/coin/rpc_conf.hpp (pure std); no ltc/pool SCC dep.
+    add_executable(test_dash_rpc_conf test_dash_rpc_conf.cpp)
+    target_link_libraries(test_dash_rpc_conf PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_rpc_conf PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
+    gtest_add_tests(test_dash_rpc_conf "" AUTO)
+
     # DASH in-memory mempool (S7 leaf): storage + UTXO-fee + LRU eviction +
     # double-spend conflict removal + feerate-sorted selection. Header-only over
     # block/transaction/utxo_adapter + core/coin; no ltc/pool SCC dependency.

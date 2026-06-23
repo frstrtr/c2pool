@@ -4,6 +4,7 @@
 
 #include <core/log.hpp>
 #include <core/hash.hpp>
+#include <core/core_util.hpp>    // core::timestamp() (getwork latency)
 
 #include <util/strencodings.h>   // ParseHex / HexStr
 
@@ -303,7 +304,7 @@ DashWorkData NodeRPC::getwork()
             {
                 LOG_WARNING << "getwork: tx deserialize failed: " << ex.what();
             }
-            w.m_txs.push_back(mtx);
+            w.m_txs.emplace_back(mtx);   // Transaction(MutableTransaction) is explicit
 
             // txid: prefer GBT's "txid" field, else recompute (DASH non-witness
             // canonical serialization == dash_txid).
