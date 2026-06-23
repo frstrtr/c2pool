@@ -25,3 +25,46 @@ TEST(LTC_share_test, Init)
 
     auto share = btc::load_share(rshare, NetService{"0.0.0.0", 0});
 }
+#include <core/version_gate.hpp>
+
+// G1 — version_gate SSOT boundary KAT (BTC reference adoption).
+// Proves the V36 share-format / consensus-revision boundary: is_v36_active()
+// flips at EXACTLY version 36, uniformly across coins, independent of any
+// per-coin segwit activation. This pins the v36-delta BOUNDARY only; full v35
+// byte-parity is closed separately by the canonical golden-hex vector (G0).
+TEST(BTC_version_gate, V36ActivationBoundary)
+{
+    using core::version_gate::is_v36_active;
+    using core::version_gate::V36_ACTIVATION_VERSION;
+
+    // Activation number is the uniform cross-coin 36 (no per-coin network state).
+    EXPECT_EQ(V36_ACTIVATION_VERSION, 36u);
+
+    // Pre-v36 versions use the legacy sharechain encoding.
+    EXPECT_FALSE(is_v36_active(0));
+    EXPECT_FALSE(is_v36_active(17));   // ltc/bch segwit version — NOT a v36 gate
+    EXPECT_FALSE(is_v36_active(33));   // BTC segwit version — NOT a v36 gate
+    EXPECT_FALSE(is_v36_active(35));   // exactly one below the boundary
+
+    // v36 and above use the V36 encoding + V36 consensus semantics.
+    EXPECT_TRUE(is_v36_active(36));    // exactly at the boundary
+    EXPECT_TRUE(is_v36_active(37));
+    EXPECT_TRUE(is_v36_active(1000));
+
+    // The flip is a single version step — no off-by-one at the boundary.
+    EXPECT_NE(is_v36_active(35), is_v36_active(36));
+
+    // constexpr: serves `if constexpr` template gates as well as runtime checks.
+    static_assert(!is_v36_active(35), "v35 must be pre-v36 at compile time");
+    static_assert(is_v36_active(36), "v36 must activate at compile time");
+}
+
+// SCOPE guard: segwit activation is coin-SPECIFIC and MUST NOT be folded into
+// the uniform v36 gate. BTC segwit=33 sits below 36, so a share can be
+// segwit-active yet pre-v36 — the two boundaries are independent by design.
+TEST(BTC_version_gate, SegwitNotFoldedIntoV36Gate)
+{
+    static_assert(33u < core::version_gate::V36_ACTIVATION_VERSION,
+                  "BTC segwit version must remain below the v36 gate");
+    EXPECT_FALSE(core::version_gate::is_v36_active(33));
+}
