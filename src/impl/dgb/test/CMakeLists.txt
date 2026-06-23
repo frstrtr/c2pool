@@ -618,4 +618,18 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_think_p1_walk_bounds_test "" AUTO)
 
+    # dgb_think_p1_desired_emit_test: FENCED, additive KAT pinning the think()
+    # Phase-1 desired-emit decision in think_p1_desired_emit.hpp vs the p2pool
+    # data.py think() oracle (no-parent -> prune-zone(2*CL+10 inclusive) ->
+    # dedup -> emit ladder), plus a non-circular delegation anchor vs the verbatim
+    # pre-delegation inline ladder. Pure arithmetic/bools -> links only core. MUST
+    # also be in the build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_think_p1_desired_emit_test think_p1_desired_emit_test.cpp)
+    target_link_libraries(dgb_think_p1_desired_emit_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_think_p1_desired_emit_test "" AUTO)
+
 endif()
