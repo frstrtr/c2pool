@@ -4337,8 +4337,13 @@ nlohmann::json MiningInterface::rest_local_stats()
     {
         auto workers = get_stratum_workers();
         for (const auto& [sid, w] : workers) {
-            // Aggregate by username (address) — multiple workers may share same address
-            std::string key = w.username;
+            // Key by the FULL stratum username (ADDRESS.worker) so each D9/worker
+            // gets its own bucket; fall back to the bare address when no worker
+            // suffix was supplied. Read/web-stats path only — pool-wide aggregates
+            // (poolhashps, shares, payouts) are unchanged.
+            std::string key = w.worker_name.empty()
+                                  ? w.username
+                                  : w.username + "." + w.worker_name;
             double existing = miner_rates.value(key, 0.0);
             miner_rates[key] = existing + w.hashrate;
             double existing_dead = miner_dead.value(key, 0.0);
