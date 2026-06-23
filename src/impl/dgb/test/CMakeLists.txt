@@ -647,4 +647,19 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_think_p6_desired_cutoff_test "" AUTO)
 
+    # dgb_think_p4_head_keys_test: FENCED, additive KAT pinning the think()
+    # Phase-4 head-score KEY construction in think_p4_head_keys.hpp vs the
+    # p2pool data.py think() oracle (selection key (adjusted_work,-reason,-ts)
+    # with a min(punish,1) one-share work deduction iff naughty; traditional
+    # key (work_score,-ts,-reason)), plus a non-circular reference-scan anchor
+    # vs the verbatim pre-delegation inline arithmetic. Pure key build -> links
+    # only core. MUST also be in the build.yml --target allowlist (#143 trap).
+    add_executable(dgb_think_p4_head_keys_test think_p4_head_keys_test.cpp)
+    target_link_libraries(dgb_think_p4_head_keys_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_think_p4_head_keys_test "" AUTO)
+
 endif()
