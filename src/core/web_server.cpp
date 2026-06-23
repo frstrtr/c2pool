@@ -4794,6 +4794,57 @@ nlohmann::json MiningInterface::rest_web_currency_info()
     default:                   result["share_version"] = 36; break;
     }
 
+    // ─── Per-coin explorer map (operator 2026-06-23: each coin = a distinct
+    // blockchain). On merged-mining nodes (e.g. LTC primary + DOGE aux) the
+    // dashboard switcher must link each coin's blocks/txs/addresses to the
+    // RIGHT explorer, never the primary coin's. Sourced from live MM state —
+    // never hardcoded per node.
+    {
+        auto blockchair_slug = [](const std::string& sym) -> std::string {
+            if (sym == "LTC")  return "litecoin";
+            if (sym == "DOGE") return "dogecoin";
+            if (sym == "BTC")  return "bitcoin";
+            if (sym == "DASH") return "dash";
+            if (sym == "DGB")  return "digibyte";
+            if (sym == "BCH")  return "bitcoin-cash";
+            if (sym == "NMC")  return "namecoin";
+            return "";
+        };
+        nlohmann::json coins = nlohmann::json::array();
+        // Primary coin: reuse the prefixes already resolved above so we never
+        // diverge from the top-level fields (honors operator custom-explorer).
+        if (result.contains("symbol")) {
+            nlohmann::json primary = {
+                {"symbol", result.value("symbol", std::string())},
+                {"name",   result.value("name",   std::string())},
+                {"primary", true},
+            };
+            if (result.contains("address_explorer_url_prefix")) {
+                primary["address_explorer_url_prefix"] = result["address_explorer_url_prefix"];
+                primary["block_explorer_url_prefix"]   = result["block_explorer_url_prefix"];
+                primary["tx_explorer_url_prefix"]      = result["tx_explorer_url_prefix"];
+            }
+            coins.push_back(primary);
+        }
+        // Merged aux chains (DOGE-into-LTC, NMC-into-BTC, ...) from live MM state.
+        if (m_mm_manager) {
+            for (const auto& ci : m_mm_manager->get_chain_infos()) {
+                nlohmann::json c = {{"symbol", ci.symbol}, {"merged", true}};
+                c["current_height"] = ci.current_height;
+                if (!ci.current_tip.empty()) c["current_tip"] = ci.current_tip;
+                std::string slug = blockchair_slug(ci.symbol);
+                if (!slug.empty()) {
+                    std::string base = "https://blockchair.com/" + slug + "/";
+                    c["address_explorer_url_prefix"] = base + "address/";
+                    c["block_explorer_url_prefix"]   = base + "block/";
+                    c["tx_explorer_url_prefix"]      = base + "transaction/";
+                }
+                coins.push_back(c);
+            }
+        }
+        result["coins"] = coins;
+    }
+
     return result;
 }
 
