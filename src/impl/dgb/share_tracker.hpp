@@ -24,6 +24,7 @@ inline uint64_t mul128_shift(uint64_t a, uint64_t b, unsigned shift) {
 #include <impl/doge/coin/chain_params.hpp>  // DOGEChainParams::AUXPOW_CHAIN_ID (aux payout diag SSOT)
 #include <impl/nmc/coin/aux_id.hpp>          // nmc::coin::NMC_AUXPOW_CHAIN_ID (v37 bucket-2)
 #include "share_check.hpp"
+#include "think_p1_walk_bounds.hpp"  // SSOT: think_p1_walk_count / think_p1_in_pruning_zone
 #include "config_pool.hpp"
 
 #include <core/target_utils.hpp>
@@ -707,9 +708,11 @@ public:
                 // get_height now returns accumulated height (including parent
                 // chain for new_fork shares). get_last follows segments to
                 // the true last. No special fork detection needed.
-                auto walk_count = last.IsNull()
-                    ? head_height
-                    : std::min(5, std::max(0, head_height - static_cast<int32_t>(PoolConfig::chain_length())));
+                // Delegated to SSOT (think_p1_walk_bounds.hpp): full height when
+                // unrooted, else clamp-5 over shares above CHAIN_LENGTH.
+                auto walk_count = think_p1_walk_count(
+                    head_height, !last.IsNull(),
+                    static_cast<int32_t>(PoolConfig::chain_length()));
 
                 if (walk_count <= 0) {
                     ++p1_walk0;
@@ -723,7 +726,7 @@ public:
                         // pruning zone (height >= 2*CHAIN_LENGTH+10). These parents
                         // would be immediately re-pruned by clean_tracker.
                         auto CL_prune = static_cast<int32_t>(PoolConfig::chain_length());
-                        if (head_height >= 2 * CL_prune + 10) {
+                        if (think_p1_in_pruning_zone(head_height, CL_prune)) {
                             static int prune_skip_log = 0;
                             if (prune_skip_log++ % 20 == 0)
                                 LOG_INFO << "[think-P1] pruning-zone skip: head="
@@ -777,7 +780,7 @@ public:
                 {
                     // Option A: skip if chain already in pruning zone
                     auto CL_prune = static_cast<int32_t>(PoolConfig::chain_length());
-                    if (head_height >= 2 * CL_prune + 10) {
+                    if (think_p1_in_pruning_zone(head_height, CL_prune)) {
                         static int prune_skip2_log = 0;
                         if (prune_skip2_log++ % 20 == 0)
                             LOG_INFO << "[think-P1] pruning-zone skip (for/else): head="
