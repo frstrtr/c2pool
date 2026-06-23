@@ -2859,6 +2859,13 @@ nlohmann::json MiningInterface::getinfo(const std::string& request_id)
         if (!m_cached_template.is_null() && m_cached_template.contains("height"))
             block_height = m_cached_template["height"].get<uint64_t>();
     }
+    // Real network hashrate -- same source as /global_rate (net_difficulty
+    // * 2^32 / block_period, template fallback). Previously left at 0.0,
+    // which made the dashboard graphs/stats tabs report networkhashps:0
+    // while the chain was live. rest_global_rate() locks m_work_mutex
+    // itself, so it MUST be called after the block above releases it.
+    if (auto gr = rest_global_rate(); gr.is_number())
+        network_hashps = gr.get<double>();
     
     nlohmann::json protocol_messages = nlohmann::json::array();
     if (m_protocol_messages_fn) {
