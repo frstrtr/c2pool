@@ -660,6 +660,18 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_think_p6_desired_cutoff_test "" AUTO)
 
+    # dgb_expected_time_to_block_test: FENCED, additive KAT pinning the
+    # EXPECTED-TIME-TO-BLOCK diagnostic arithmetic in expected_time_to_block.hpp
+    # vs the p2pool main.py status-loop oracle (average_attempts(target) /
+    # real_att_s, with the uint64-overflow 1e18 sentinel). Pure header
+    # (<cstdint> only) -> links only GTest. node.cpp NOT yet rewired (delegation
+    # is the byte-identity follow-on). MUST also be in the build.yml --target
+    # allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_expected_time_to_block_test expected_time_to_block_test.cpp)
+    target_link_libraries(dgb_expected_time_to_block_test PRIVATE
+        GTest::gtest_main GTest::gtest)
+    gtest_add_tests(dgb_expected_time_to_block_test "" AUTO)
+
     # dgb_think_p4_head_keys_test: FENCED, additive KAT pinning the think()
     # Phase-4 head-score KEY construction in think_p4_head_keys.hpp vs the
     # p2pool data.py think() oracle (selection key (adjusted_work,-reason,-ts)
