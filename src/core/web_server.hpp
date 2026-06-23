@@ -1223,6 +1223,22 @@ public:
     bool is_explorer_enabled() const { return m_explorer_enabled; }
     void set_explorer_url(const std::string& url) { m_explorer_url = url; }
     const std::string& get_explorer_url() const { return m_explorer_url; }
+
+    // Primary chain key for THIS node, derived from its configured blockchain
+    // (lowercase symbol). Used as the default chain for explorer / coin-admin
+    // endpoints instead of a hardcoded "ltc": a DGB/DASH/BTC node must not
+    // silently serve Litecoin data. Empty for UNKNOWN so callers surface a
+    // truthful "chain not enabled" rather than a fabricated coin identity.
+    std::string primary_chain_key() const {
+        switch (m_blockchain) {
+            case Blockchain::LITECOIN: return "ltc";
+            case Blockchain::BITCOIN:  return "btc";
+            case Blockchain::DOGECOIN: return "doge";
+            case Blockchain::DASH:     return "dash";
+            case Blockchain::DIGIBYTE: return "dgb";
+            default:                   return "";
+        }
+    }
     void set_explorer_chaininfo_fn(explorer_chaininfo_fn_t fn) { m_explorer_chaininfo_fn = thread_safe_wrap(std::move(fn)); }
     void set_explorer_blockhash_fn(explorer_blockhash_fn_t fn) { m_explorer_blockhash_fn = thread_safe_wrap(std::move(fn)); }
     void set_explorer_getblock_fn(explorer_getblock_fn_t fn) { m_explorer_getblock_fn = thread_safe_wrap(std::move(fn)); }
