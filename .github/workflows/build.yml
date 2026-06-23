@@ -68,7 +68,7 @@ jobs:
             --target test_hardening test_share_messages test_coin_broadcaster \
                     test_redistribute_address test_redistribute test_auto_ratchet \
                     test_stratum_extensions \
-                    core_test sharechain_test share_test \
+                    core_test sharechain_test share_test btc_share_test \
                     test_threading test_weights \
                     test_header_chain test_mempool test_template_builder \
                     test_doge_chain test_compact_blocks test_dash_x11_kat \
@@ -201,7 +201,7 @@ jobs:
                     test_hardening test_share_messages \
                     test_redistribute_address test_redistribute test_auto_ratchet \
                     test_stratum_extensions \
-                    core_test sharechain_test share_test \
+                    core_test sharechain_test share_test btc_share_test \
                     test_threading test_weights \
                     test_header_chain test_mempool test_template_builder \
                     test_doge_chain test_compact_blocks test_dash_x11_kat \
@@ -537,9 +537,9 @@ jobs:
   # btc-embedded branch involvement and never fired on master, so removing it
   # changes no live coverage.
   #
-  # Deferred btc test wiring (unchanged, owned by the btc-heap-opt arc):
-  #   - src/impl/btc/test/share_test.cpp — add_subdirectory(test) disabled in
-  #     src/impl/btc/CMakeLists.txt (still references LTC types).
+  # Deferred btc test wiring (owned by the btc-heap-opt arc):
+  #   - src/impl/btc/test/share_test.cpp — NOW WIRED as the btc_share_test target
+  #     (F11 value-invariance KAT); uniquely named to avoid CMP0002 vs ltc share_test.
   #   - src/impl/btc/test/template_parity_test.cpp — standalone consensus
   #     oracle harness; needs proper CMake target wiring (nlohmann_json,
   #     leveldb_store, core/log) to be CI-reliable.
