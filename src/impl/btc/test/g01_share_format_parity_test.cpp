@@ -3,6 +3,7 @@
 #include <string>
 
 #include <impl/btc/config_pool.hpp>
+#include <core/version_gate.hpp>   // SSOT: V36_ACTIVATION_VERSION / is_v36_active
 
 // G0/G1 — BTC share-format byte-parity against the BAKED p2pool baseline.
 //
@@ -59,4 +60,34 @@ TEST(BTC_g01_share_format, ProtocolFloorIsForwardCompatibleRaise)
 {
     EXPECT_GE(btc::PoolConfig::MINIMUM_PROTOCOL_VERSION, GOLDEN_MINIMUM_PROTOCOL_VERSION)
         << "c2pool floor must not drop below the p2pool baseline";
+}
+
+
+// Share-version additive discipline (G1 bucket-2): the c2pool sharechain extends
+// the p2pool baseline version set by EXACTLY ONE sanctioned version -- 36 -- the
+// V36 share-format / consensus-revision boundary owned by the core::version_gate
+// SSOT. c2pool has no p2pool-style share-version array to compare element-wise,
+// so the additive is locked against the SSOT instead. The baseline set is
+// transcribed from the golden fixture (constants.share_versions @ ece15b03fc23).
+// This catches two drift modes the byte-parity TESTs above do not:
+//   1. boundary drift -- V36_ACTIVATION_VERSION moving off 36 (an unsanctioned /
+//      shifted version) fails here;
+//   2. baseline-composition drift -- no baseline version may be treated as V36.
+TEST(BTC_g01_share_format, ShareVersionAdditiveIsExactlyV36)
+{
+    // Transcribed from btc.g01.golden.json -> constants.share_versions.
+    constexpr uint64_t GOLDEN_BASELINE_VERSIONS[] = {0, 17, 32, 33, 34, 35};
+
+    // The SINGLE sanctioned additive over the p2pool baseline is the V36 boundary.
+    EXPECT_EQ(core::version_gate::V36_ACTIVATION_VERSION, 36u)
+        << "only sanctioned c2pool version added over the baseline is 36";
+
+    // No baseline version is on the V36 side of the gate -- all pre-revision.
+    for (uint64_t v : GOLDEN_BASELINE_VERSIONS)
+        EXPECT_FALSE(core::version_gate::is_v36_active(v))
+            << "baseline version " << v << " must remain pre-V36";
+
+    // Boundary is exact: 36 activates, 35 (max baseline) does not.
+    EXPECT_TRUE (core::version_gate::is_v36_active(36));
+    EXPECT_FALSE(core::version_gate::is_v36_active(35));
 }
