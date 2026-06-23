@@ -648,7 +648,7 @@ void HttpSession::process_request()
                     if (qpos != std::string::npos) ep = ep.substr(0, qpos);
 
                     std::string chain = getQueryParam("chain");
-                    if (chain.empty()) chain = "ltc";
+                    if (chain.empty()) chain = mining_interface_->primary_chain_key();
 
                     if (ep == "peers/list") {
                         rest_result = mining_interface_->call_admin_coin_list_peers(chain);
@@ -694,7 +694,7 @@ void HttpSession::process_request()
                     }
 
                     std::string chain = getQueryParam("chain");
-                    if (chain.empty()) chain = "ltc";
+                    if (chain.empty()) chain = mining_interface_->primary_chain_key();
 
                     std::string ep = target.substr(14);
 
@@ -1019,7 +1019,7 @@ void MiningInterface::setup_methods()
     // as if it were a standard Bitcoin/Litecoin daemon.
     Add("getblockchaininfo", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
         if (has_explorer_chaininfo_fn())
-            return call_explorer_chaininfo("ltc");
+            return call_explorer_chaininfo(primary_chain_key());
         return nlohmann::json{{"error", "explorer not enabled"}};
     }));
 
@@ -1027,26 +1027,26 @@ void MiningInterface::setup_methods()
         if (!has_explorer_blockhash_fn() || params.empty())
             return nullptr;
         uint32_t h = params[0].get<uint32_t>();
-        return call_explorer_blockhash(h, "ltc");
+        return call_explorer_blockhash(h, primary_chain_key());
     }));
 
     Add("getblock", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
         if (!has_explorer_getblock_fn() || params.empty())
             return nullptr;
         std::string hash = params[0].get<std::string>();
-        return call_explorer_getblock(hash, "ltc");
+        return call_explorer_getblock(hash, primary_chain_key());
     }));
 
     Add("getmempoolinfo", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
         if (has_explorer_mempoolinfo_fn())
-            return call_explorer_mempoolinfo("ltc");
+            return call_explorer_mempoolinfo(primary_chain_key());
         return nlohmann::json::object();
     }));
 
     Add("getrawmempool", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
         if (has_explorer_rawmempool_fn()) {
             bool verbose = (!params.empty() && params[0].get<bool>());
-            return call_explorer_rawmempool("ltc", verbose, 500);
+            return call_explorer_rawmempool(primary_chain_key(), verbose, 500);
         }
         return nlohmann::json::array();
     }));
