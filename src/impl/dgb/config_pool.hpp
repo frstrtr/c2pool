@@ -3,6 +3,7 @@
 #include <core/config.hpp>
 #include <core/fileconfig.hpp>
 #include <core/netaddress.hpp>
+#include <core/version_gate.hpp>   // SSOT: core::version_gate::is_v36_active (V36 donation-transition boundary)
 
 #include <array>
 #include <cstdint>
@@ -108,7 +109,7 @@ public:
 
     static std::vector<unsigned char> get_donation_script(int64_t share_version)
     {
-        if (share_version >= 36)
+        if (core::version_gate::is_v36_active(share_version))
             return {COMBINED_DONATION_SCRIPT.begin(), COMBINED_DONATION_SCRIPT.end()};
         return {DONATION_SCRIPT.begin(), DONATION_SCRIPT.end()};
     }
