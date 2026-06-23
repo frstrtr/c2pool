@@ -43,6 +43,11 @@
 #include <impl/dgb/coin/header_ingest.hpp>
 #include <impl/dgb/coin/mempool_ingest.hpp>
 #include <impl/dgb/stratum/work_source.hpp>
+#include <impl/dgb/coin/work_ref_hash.hpp>      // make_work_ref_hash_params (ref preimage SSOT)
+#include <impl/dgb/conn_pplns_producer.hpp>        // make_conn_pplns_inputs (ref-hash bind SSOT)
+#include <impl/dgb/coin/pplns_weight_walk.hpp>   // compute_pplns_weight_walk (PPLNS step-1 SSOT)
+#include <core/target_utils.hpp>                 // chain::bits_to_target / target_to_average_attempts
+#include <core/version_gate.hpp>                 // core::version_gate::is_v36_active
 #include <impl/dgb/redistribute.hpp>    // Redistribute V2 node-local payout policy (#307)
 #include <impl/dgb/config_pool.hpp>     // PoolConfig::COMBINED_DONATION_SCRIPT (donate identity)
 #include <impl/dgb/coin/p2p_node.hpp>
@@ -618,6 +623,176 @@ int run_node(const core::CoinParams& params, bool testnet,
     auto work_source = std::make_shared<dgb::stratum::DGBWorkSource>(
         header_chain, mempool, testnet, std::move(stratum_submit_fn),
         params.subsidy_func);
+
+    // -- Phase-B producer bind: per-connection coinbase PPLNS inputs ----------
+    // Bind DGBWorkSource::set_pplns_inputs_fn -- the SOLE empty-jobs seam. While
+    // unbound, build_connection_coinbase() returns an empty job (pre-wire stub);
+    // binding it here is what lets a Stratum session emit a real per-connection
+    // coinbase. ALL sharechain/tracker logic stays in THIS lambda (the seam
+    // exists precisely to keep it out of stratum/); the work source only forwards
+    // the resolved ConnCoinbasePplnsInputs into build_connection_coinbase_from_pplns
+    // -- the SAME compute_pplns_payout_split() the verifier's
+    // generate_share_transaction() calls -- so the emitted coinbase is byte-
+    // identical to the one the share check enforces BY CONSTRUCTION.
+    //
+    // PAYOUT half: take a NON-BLOCKING try-lock read of the ShareTracker
+    // (read_tracker(), shared_lock(try_to_lock) off the IO thread). If contended,
+    // or if the tip is unknown / absent from the chain, return std::nullopt -- a
+    // safe empty job, never a block on the compute thread. Walk PPLNS weights via
+    // the compute_pplns_weight_walk() SSOT (no parent -> empty weights).
+    //
+    // REF half: assemble the prospective-share ref preimage via the
+    // make_work_ref_hash_params() SSOT (coin/work_ref_hash.hpp) from a tracker-
+    // walked snapshot whose FROZEN template-time fields (timestamp clip,
+    // compute_share_target, merged_payout_hash, absheight/abswork/far_share_hash)
+    // are derived EXACTLY as create_local_share() derives them, then run it
+    // through compute_ref_hash_for_work() (share_check.hpp) for the ref_hash. The
+    // V36-vs-V35 split is owned by compute_ref_hash_for_work() -- not duplicated
+    // here.
+    {
+        auto& pplns_tracker = p2p_node.tracker();
+        work_source->set_pplns_inputs_fn(
+            [&pplns_tracker, &p2p_node, &params](
+                const uint256& prev_share_hash,
+                const std::string& /*extranonce1_hex*/,
+                const std::vector<unsigned char>& payout_script,
+                const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs)
+                -> std::optional<dgb::coin::ConnCoinbasePplnsInputs>
+            {
+                // Non-blocking tracker read. Contended -> decline (empty job).
+                auto guard = p2p_node.read_tracker();
+                if (!guard)
+                    return std::nullopt;
+
+                // No tip / parent not in chain -> safe coinbase-only empty job
+                // (pre-wire behavior; nothing to PPLNS-split yet).
+                if (prev_share_hash.IsNull() || !pplns_tracker.chain.contains(prev_share_hash))
+                    return std::nullopt;
+
+                // Prospective block bits: at emission there is no found block, so
+                // the prospective NEXT share reuses the tip share's block target
+                // -- the same value create_local_share() reads from the found
+                // block header (share.m_min_header.m_bits) and the walk feeds into
+                // the pre-V36 max_weight cap. Read under the held tracker lock.
+                uint32_t block_bits = 0;
+                uint32_t prev_ts    = 0;
+                uint128  prev_abswork;
+                uint32_t prev_absheight = 0;
+                pplns_tracker.chain.get(prev_share_hash).share.invoke([&](auto* prev) {
+                    block_bits      = prev->m_min_header.m_bits;
+                    prev_ts         = prev->m_timestamp;
+                    prev_abswork    = prev->m_abswork;
+                    prev_absheight  = prev->m_absheight;
+                });
+                if (block_bits == 0)
+                    return std::nullopt;  // tip share carries no usable target.
+
+                const bool use_v36_pplns =
+                    core::version_gate::is_v36_active(/*share_version=*/36);
+
+                // PAYOUT half -- PPLNS weight walk SSOT (the verifier's step 1).
+                dgb::CumulativeWeights walk;
+                try {
+                    walk = dgb::coin::compute_pplns_weight_walk(
+                        pplns_tracker, prev_share_hash, block_bits, params, use_v36_pplns);
+                } catch (const std::invalid_argument&) {
+                    // Insufficient-depth guard (the SAME boundary the verifier
+                    // refuses): decline rather than emit a wrong split.
+                    return std::nullopt;
+                }
+                if (walk.weights.empty())
+                    return std::nullopt;  // no payout recipients yet -> empty job.
+
+                // -- FROZEN template-time fields (mirror create_local_share) --
+                // timestamp: clip to >= prev.timestamp + 1.
+                uint32_t timestamp = static_cast<uint32_t>(std::time(nullptr));
+                if (timestamp <= prev_ts)
+                    timestamp = prev_ts + 1;
+
+                // share target AFTER timestamp clip (== create_local_share order).
+                const auto desired_target = chain::bits_to_target(block_bits);
+                const auto st = pplns_tracker.compute_share_target(
+                    prev_share_hash, timestamp, desired_target);
+                const uint32_t max_bits = st.max_bits;
+                const uint32_t bits     = st.bits;
+
+                // absheight / abswork / far_share_hash from the parent.
+                const uint32_t absheight = prev_absheight + 1;
+                const auto cur_attempts = chain::target_to_average_attempts(
+                    chain::bits_to_target(bits));
+                const uint128 abswork = prev_abswork + uint128(cur_attempts.GetLow64());
+
+                uint256 far_share_hash;
+                {
+                    auto [prev_height, last] =
+                        pplns_tracker.chain.get_height_and_last(prev_share_hash);
+                    if (last.IsNull() && prev_height < 99)
+                        far_share_hash = uint256();  // chain complete & < 99 deep
+                    else
+                        far_share_hash =
+                            pplns_tracker.chain.get_nth_parent_key(prev_share_hash, 99);
+                }
+
+                // merged_payout_hash (V36) over the same block target.
+                const uint256 merged_payout_hash =
+                    pplns_tracker.compute_merged_payout_hash(prev_share_hash, desired_target);
+
+                // Merged-mining addresses forwarded from the session.
+                std::vector<dgb::MergedAddressEntry> merged_addresses;
+                merged_addresses.reserve(merged_addrs.size());
+                for (const auto& entry : merged_addrs) {
+                    dgb::MergedAddressEntry e;
+                    e.m_chain_id = entry.first;
+                    e.m_script.m_data = entry.second;
+                    merged_addresses.push_back(std::move(e));
+                }
+
+                // subsidy for the prospective NEXT block (== create_local_share
+                // subsidy arg): subsidy_func(next_height). total_fees fold into
+                // the embedded coinbasevalue elsewhere; the PPLNS split here uses
+                // the block reward the verifier splits.
+                const uint64_t subsidy = params.subsidy_func
+                    ? params.subsidy_func(absheight)
+                    : 0;
+
+                // REF half -- assemble the ref preimage via the SSOT and hash it
+                // through the verifier primitive. V36/V35 split owned by
+                // compute_ref_hash_for_work().
+                dgb::coin::WorkRefHashInputs rin;
+                rin.share_version   = 36;
+                rin.desired_version = 36;
+                rin.prev_share      = prev_share_hash;
+                rin.share_nonce     = 0;            // share commitment nonce (not block)
+                rin.payout_script   = payout_script;
+                rin.subsidy         = subsidy;
+                rin.donation        = 50;          // 0.5% bps (create_local_share default)
+                rin.stale_info      = 0;
+                rin.has_segwit      = false;       // segwit populated by template-cache follow-on
+                rin.merged_addresses    = merged_addresses;
+                rin.merged_payout_hash  = merged_payout_hash;
+                rin.far_share_hash  = far_share_hash;
+                rin.max_bits        = max_bits;
+                rin.bits            = bits;
+                rin.timestamp       = timestamp;
+                rin.absheight       = absheight;
+                rin.abswork         = abswork;
+
+                // Assemble the final PPLNS inputs via the make_conn_pplns_inputs()
+                // SSOT (conn_pplns_producer.hpp): it computes ref_hash /
+                // last_txout_nonce from the SAME verifier primitive
+                // (compute_ref_hash_for_work) and forwards the walked weights into
+                // ConnCoinbasePplnsInputs -- ONE ref-hash and ONE payout
+                // implementation shared with the verifier, by construction.
+                dgb::ConnPplnsAssemblyInputs ain;
+                ain.weights         = std::move(walk.weights);
+                ain.total_weight    = walk.total_weight;
+                ain.subsidy         = subsidy;
+                ain.use_v36_pplns   = use_v36_pplns;
+                ain.donation_script = dgb::PoolConfig::get_donation_script(/*share_version=*/36);
+                ain.ref_params      = dgb::coin::make_work_ref_hash_params(rin, params);
+                return dgb::make_conn_pplns_inputs(ain, params);
+            });
+    }
 
     // -- --redistribute: node-local payout policy (Redistribute V2, #307) ------
     // Opt-in ONLY. Chooses the pubkey this node stamps onto shares minted from
