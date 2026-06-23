@@ -339,6 +339,25 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_mn_state PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_mn_state "" AUTO)
 
+    # DASH embedded getblocktemplate bit-parity capstone (S7 main): fuses the
+    # landed S7 leaves -- subsidy.hpp + mempool get_sorted_txs_with_fees +
+    # mn_state_machine find_expected_payee/script_to_address payee projection +
+    # DIP-0027 platform-burn ordering + the CCbTx (merkleRootMNList /
+    # merkleRootQuorums / bestCL* / creditPool) wire encoder, plus the
+    # gbt_xcheck / cbtx_xcheck dashd-RPC cross-check comparators. Oracle =
+    # frstrtr/p2pool-dash getwork (pre-v35). Header-only over the dash leaves +
+    # core (links core for script_to_address in address_utils.cpp). Last S7
+    # capstone; node-backed end-to-end parity deferred to a live-harness leaf.
+    add_executable(test_dash_embedded_gbt test_dash_embedded_gbt.cpp)
+    target_link_libraries(test_dash_embedded_gbt PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_embedded_gbt PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_embedded_gbt "" AUTO)
+
     add_executable(test_compact_blocks test_compact_blocks.cpp)
     target_link_libraries(test_compact_blocks PRIVATE
         GTest::gtest_main GTest::gtest
