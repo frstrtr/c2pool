@@ -1190,16 +1190,16 @@ public:
                     if (!head_idx) continue;
                     int64_t ts = head_idx->time_seen;
 
-                    // Punish heads: version obsolescence OR naughty (invalid block)
+                    // Punish heads: naughty (invalid block) only.
+                    // F10/(b): the non-canonical 95%-version-obsolescence punish
+                    // is dropped — canonical Phase-4 head-scoring punishes only
+                    // naughty heads. The version gate is the check() 60% weighted
+                    // switch rule (share_check), not head-scoring.
                     int32_t reason = 0;
                     {
-                        auto share_version = chain.get_share(hh).version();
-                        auto lookbehind = static_cast<int32_t>(PoolConfig::chain_length());
-                        if (should_punish_version(hh, share_version, lookbehind))
-                            reason = 1;
                         auto* idx = chain.get_index(hh);
                         if (idx && idx->naughty > 0)
-                            reason = std::max(reason, idx->naughty);
+                            reason = idx->naughty;
                     }
 
                     // p2pool: sort key = (work - min(punish,1)*ata(target), -reason, -time_seen)
@@ -2683,30 +2683,12 @@ public:
         return result;
     }
 
-    // Returns true if shares at `share_version` should be punished because
-    // a newer version has reached the 95% activation threshold.
-    // Python ref: share.check() version_after_check logic
-    bool should_punish_version(const uint256& share_hash, int64_t share_version, int32_t lookbehind)
-    {
-        if (!chain.contains(share_hash))
-            return false;
-        auto counts = get_desired_version_counts(share_hash, lookbehind);
-        auto height = chain.get_height(share_hash);
-        auto actual = std::min(lookbehind, height);
-        if (actual <= 0)
-            return false;
-
-        // Check if any version higher than share_version has >= 95% support
-        for (auto& [ver, count] : counts)
-        {
-            if (static_cast<int64_t>(ver) > share_version)
-            {
-                if (count * 100 >= actual * 95) // 95% threshold
-                    return true;
-            }
-        }
-        return false;
-    }
+    // F10/(b): should_punish_version (the 95%-obsolescence punish) was removed.
+    // It was non-canonical — canonical p2pool check() has no 95% obsolescence
+    // rule; the AutoRatchet (work-weighted, per #290) plus the 60% weighted
+    // switch rule (share_check step 2) are the only version gates. Keeping it
+    // would punish/score-down shares canonical accepts, breaking the #81 zero-
+    // divergence gate. Head-scoring (Phase 4) now punishes only naughty heads.
 
 private:
     std::vector<stale_callback_t> m_stale_callbacks;
