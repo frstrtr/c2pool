@@ -827,8 +827,20 @@ void HttpSession::process_request()
                         send_response(std::move(response));
                         return;
                     }
+
+                    // Dashboard IS configured, the request matched no REST
+                    // endpoint above, and no such on-disk asset exists -> a real
+                    // 404. Previously this fell through to getinfo() below, so
+                    // unknown paths (explorer.html, blocks.html, typos, scanner
+                    // probes) leaked the node-info JSON instead of Not Found.
+                    response.result(http::status::not_found);
+                    response.set(http::field::content_type, "text/plain; charset=utf-8");
+                    response.body() = "404 Not Found";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
                 }
-                // Fallback to getinfo JSON
+                // Fallback to getinfo JSON (API-only mode: no --dashboard-dir set)
                 rest_result = mining_interface_->getinfo();
                 }  // end static file serving else
             }  // end explorer/static dispatch
