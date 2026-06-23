@@ -5959,27 +5959,48 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
 nlohmann::json MiningInterface::rest_v36_status()
 {
     nlohmann::json result = nlohmann::json::object();
+
+    // Source the real ratchet state + share counts from rest_version_signaling()
+    // â the canonical, chain-derived V35âV36 computation â so /v36_status never
+    // lies about the cross. The old body returned a frozen "voting" / 0 v36
+    // shares regardless of reality (the founding-charter stub class). On
+    // non-transition coins version_signaling returns {}, leaving the truthful
+    // zeros below; on a too-short chain it early-returns before populating the
+    // overall_* fields, which .value() defaults handle.
+    nlohmann::json vs = rest_version_signaling();
+
+    std::string state = "voting";
+    if (vs.contains("auto_ratchet") && vs["auto_ratchet"].contains("state"))
+        state = vs["auto_ratchet"].value("state", std::string("voting"));
+
     result["auto_ratchet"] = {
-        {"state", "voting"},
-        {"persisted_state", ""},
+        {"state", state},
+        {"persisted_state", state},
         {"activated_at", nullptr},
         {"activated_height", nullptr},
         {"confirmed_at", nullptr}
     };
-    result["share_chain"] = {
-        {"height", 0},
-        {"sample_size", 0},
-        {"v35_shares", 0},
-        {"v36_shares", 0},
-        {"v36_percentage", 0.0}
-    };
+
+    int sample_size = vs.value("overall_total", 0);
+    int v36_shares  = vs.value("overall_v36_shares", 0);
+    int v35_shares  = std::max(0, sample_size - v36_shares);
+    double v36_pct  = vs.value("overall_v36_share_pct", 0.0);
+
+    int height = 0;
     if (m_sharechain_stats_fn) {
         auto sc = m_sharechain_stats_fn();
-        if (sc.contains("chain_height"))
-            result["share_chain"]["height"] = sc["chain_height"];
-        if (sc.contains("total_shares"))
-            result["share_chain"]["sample_size"] = sc["total_shares"];
+        height = sc.value("chain_height", 0);
+        if (sample_size == 0)
+            sample_size = sc.value("total_shares", 0);
     }
+
+    result["share_chain"] = {
+        {"height", height},
+        {"sample_size", sample_size},
+        {"v35_shares", v35_shares},
+        {"v36_shares", v36_shares},
+        {"v36_percentage", v36_pct}
+    };
     return result;
 }
 
