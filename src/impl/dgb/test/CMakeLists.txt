@@ -549,4 +549,18 @@ if (BUILD_TESTING AND GTest_FOUND)
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_aux_doge_db_commitment_bind_test "" AUTO)
+
+    # dgb_share_target_genesis_test: FENCED KAT pinning ShareTracker::compute_
+    # share_target genesis/unknown-prev clamp to [MAX_TARGET/30, MAX_TARGET] vs
+    # the DGB oracle data.py generate_transaction. Links the same proven set as
+    # dgb_share_test (ShareTracker pulls in the pool/share TU). MUST also be in
+    # the build.yml --target allowlist (#143).
+    add_executable(dgb_share_target_genesis_test share_target_genesis_test.cpp)
+    target_link_libraries(dgb_share_target_genesis_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_share_target_genesis_test "" AUTO)
+
 endif()
