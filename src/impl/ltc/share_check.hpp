@@ -1748,8 +1748,9 @@ bool share_check(const ShareT& share,
     // The weight is target_to_average_attempts per share — get_desired_version_weights,
     // matching canonical get_desired_version_counts (data.py:2651) — NOT a flat count.
     // F10/(b): the prior non-canonical 95%-obsolescence punish is removed; the
-    // canonical 60% switch rule is now the ONLY version gate. AutoRatchet stays
-    // count-based and does not gate peer shares here.
+    // canonical 60% switch rule is now the ONLY version gate. AutoRatchet's
+    // VOTING tail guard is work-weighted (get_desired_version_weights) and does
+    // not gate peer shares here.
     {
         auto chain_length = static_cast<int32_t>(params.chain_length);
         if (!share.m_prev_hash.IsNull() && tracker.chain.contains(share.m_prev_hash))

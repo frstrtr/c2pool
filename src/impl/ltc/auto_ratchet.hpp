@@ -279,7 +279,11 @@ public:
     // source of truth for the version-switch gate is now share_check step 2,
     // which calls ShareTracker::get_desired_version_weights and matches
     // p2pool check() (data.py:1396-1414) exactly. The VOTING tail guard above
-    // stays inline and count-based (finding #1).
+    // is ALSO work-weighted: it calls ShareTracker::get_desired_version_weights
+    // over the oldest 10% of the window and couples activation to that same
+    // check()-phase 60% accept gate (mint<->accept coupling). It is NOT
+    // count-based -- a flat-count tail guard would let a 95%-by-count activation
+    // outrun the 60%-by-work accept gate and wedge the crossing.
 
 private:
     std::string state_file_;
