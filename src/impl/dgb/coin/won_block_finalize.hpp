@@ -100,7 +100,21 @@ finalize_won_block_pow(std::vector<unsigned char> block_bytes, const u256& targe
         return std::nullopt;   // too short to frame a header -> fail closed
 
     std::array<unsigned char, 80> header{};
+    // The size>=80 guard above proves this 80-byte read is in-bounds. GCC 13's
+    // -Wstringop-overread mis-tracks the vector extent through inlining when a
+    // caller passes a compile-time-known short (<80) vector by value (e.g. the
+    // FailsClosedOnShortInput KAT's 79-byte buffer): it false-positives here
+    // ("reading 80 bytes from a region of size 79") even though that path early-
+    // returns std::nullopt above. Suppress narrowly; the runtime guard is the
+    // real (and only) safety net. No behavior change.
+#if defined(__GNUC__) && !defined(__clang__)
+#  pragma GCC diagnostic push
+#  pragma GCC diagnostic ignored "-Wstringop-overread"
+#endif
     std::copy(block_bytes.begin(), block_bytes.begin() + 80, header.begin());
+#if defined(__GNUC__) && !defined(__clang__)
+#  pragma GCC diagnostic pop
+#endif
 
     auto out = grind_won_nonce(header, target, start_nonce, max_iters);
     if (!out.has_value())
