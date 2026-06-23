@@ -64,4 +64,52 @@ TEST(ThinkP1WalkBounds, PruningZoneInclusiveThreshold)
     EXPECT_TRUE (dgb::think_p1_in_pruning_zone(58, CL2));
 }
 
+// ---- Non-circular delegation proof ---------------------------------------
+// share_tracker.hpp think() Phase-1 was rewired to CALL the SSOT functions
+// above (the walk_count ternary + the two prune-zone guards). This test does
+// NOT stand up a ShareTracker; instead it re-implements the EXACT pre-delegation
+// inline expressions verbatim (copied from the share_tracker.hpp think() body
+// as it stood before this slice) and asserts they are byte-identical to the SSOT
+// across a dense input grid. Independent code path => non-circular: if the
+// delegation ever drifts from the open-coded original, this fails.
+namespace {
+
+// Verbatim copy of the pre-delegation inline walk_count expression.
+// Original: last.IsNull() ? head_height
+//                         : std::min(5, std::max(0, head_height - CHAIN_LENGTH))
+inline int32_t inline_walk_count_verbatim(int32_t head_height, bool last_is_null,
+                                          int32_t chain_length)
+{
+    return last_is_null
+        ? head_height
+        : std::min(5, std::max(0, head_height - chain_length));
+}
+
+// Verbatim copy of the pre-delegation inline prune-zone guard.
+// Original: head_height >= 2 * CL_prune + 10
+inline bool inline_in_pruning_zone_verbatim(int32_t head_height, int32_t chain_length)
+{
+    return head_height >= 2 * chain_length + 10;
+}
+
+} // namespace
+
+TEST(ThinkP1WalkBounds, DelegationMatchesPreDelegationInlineWalk)
+{
+    for (int32_t CL : {1, 8, 10, 16, 24, 50}) {
+        for (int32_t h = 0; h <= 4 * CL + 30; ++h) {
+            for (bool last_is_null : {false, true}) {
+                // last_is_null == true  -> unrooted head (has_last == false)
+                EXPECT_EQ(dgb::think_p1_walk_count(h, /*has_last=*/!last_is_null, CL),
+                          inline_walk_count_verbatim(h, last_is_null, CL))
+                    << "walk_count drift @ h=" << h << " CL=" << CL
+                    << " last_is_null=" << last_is_null;
+            }
+            EXPECT_EQ(dgb::think_p1_in_pruning_zone(h, CL),
+                      inline_in_pruning_zone_verbatim(h, CL))
+                << "prune-zone drift @ h=" << h << " CL=" << CL;
+        }
+    }
+}
+
 } // namespace
