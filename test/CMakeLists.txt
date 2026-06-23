@@ -323,6 +323,22 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_quorum_root PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_quorum_root "" AUTO)
 
+    # DASH masternode state-machine (S7 leaf): vendored ProTx wire
+    # (providertx.hpp) + MNState persistence (mn_state_db.hpp) +
+    # apply_block RebuildListFromBlock + find_expected_payee / pick_paid_mn
+    # over the SimplifiedMNList leaf (#309). Last absent header before the
+    # embedded_gbt capstone. Header-only over core/uint256 + core/pack +
+    # core/hash; no ltc/pool SCC dependency.
+    add_executable(test_dash_mn_state test_dash_mn_state.cpp)
+    target_link_libraries(test_dash_mn_state PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_mn_state PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_mn_state "" AUTO)
+
     add_executable(test_compact_blocks test_compact_blocks.cpp)
     target_link_libraries(test_compact_blocks PRIVATE
         GTest::gtest_main GTest::gtest
