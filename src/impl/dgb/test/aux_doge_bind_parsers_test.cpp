@@ -197,6 +197,8 @@ TEST(DGB_AuxDogeBindParsers, BlobMatchesBuilder) {
     EXPECT_EQ(tohex(build_canonical_blob()), std::string(CANONICAL_AUX_BLOB));
 }
 
+#ifdef AUX_DOGE  // node seam (bind_aux_doge_parsers/aux_doge_parser) exists
+                 // only in the dual-parent build; default Scrypt-only arm skips these.
 // CORE: the production seam binds a NON-HOLLOW parser. Build a node, bind, feed
 // the canonical blob through the bound member, assert the DGB-parent proof is
 // parsed (has_aux true) and carries the expected parent coinbase value.
@@ -246,3 +248,5 @@ TEST(DGB_AuxDogeBindParsers, BoundParserAuxRoundTripsByteIdentical) {
     reemit.insert(reemit.end(), aux.begin(), aux.end());
     EXPECT_EQ(tohex(reemit), tohex(whole));
 }
+
+#endif  // AUX_DOGE
