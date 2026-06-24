@@ -5217,6 +5217,8 @@ nlohmann::json MiningInterface::rest_node_topology()
     case Blockchain::BITCOIN:  primary = "BTC";  break;
     case Blockchain::DOGECOIN: primary = "DOGE"; break;
     case Blockchain::DASH:     primary = "DASH"; break;
+    case Blockchain::DIGIBYTE: primary = "DGB";  break;
+    default: break;
     }
 
     nlohmann::json coins = nlohmann::json::array();
@@ -5287,6 +5289,11 @@ nlohmann::json MiningInterface::rest_node_info()
         result["network"] = m_testnet ? "dash_testnet" : "dash";
         result["symbol"] = "DASH";
         break;
+    case Blockchain::DIGIBYTE:
+        result["network"] = m_testnet ? "digibyte_testnet" : "digibyte";
+        result["symbol"] = "DGB";
+        break;
+    default: break;
     }
     return result;
 }
