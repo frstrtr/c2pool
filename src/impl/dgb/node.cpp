@@ -7,6 +7,8 @@
 #include <sharechain/prepared_list.hpp>
 #include <impl/dgb/get_shares_walk.hpp>
 #include <impl/dgb/download_stops.hpp>
+#include <impl/dgb/pool_efficiency.hpp>
+#include <impl/dgb/expected_time_to_block.hpp>
 
 #include <algorithm>
 #include <filesystem>
@@ -1718,8 +1720,7 @@ void NodeImpl::heartbeat_log()
             }
         }
     }
-    double stale_prop = total_recent > 0
-        ? static_cast<double>(orphan_count + doa_count) / total_recent : 0.0;
+    double stale_prop = dgb::compute_stale_prop(orphan_count, doa_count, total_recent);
 
     {
         std::ostringstream shares_line;
@@ -1763,8 +1764,7 @@ void NodeImpl::heartbeat_log()
                 std::min(height - 1, static_cast<int>(m_tracker.m_params->target_lookbehind)),
                 /*min_work=*/false);
             double pool_hs = static_cast<double>(aps.GetLow64());
-            double real_pool_hs = (stale_prop < 0.999 && pool_hs > 0)
-                ? pool_hs / (1.0 - stale_prop) : pool_hs;
+            double real_pool_hs = dgb::compute_real_pool_hashrate(pool_hs, stale_prop);
             double etb_secs = 0;
             uint32_t block_bits = 0;
             if (!m_best_share_hash.IsNull() && m_tracker.chain.contains(m_best_share_hash)) {
@@ -1775,9 +1775,10 @@ void NodeImpl::heartbeat_log()
             if (real_pool_hs > 0 && block_bits != 0) {
                 auto block_target = chain::bits_to_target(block_bits);
                 auto block_aps = chain::target_to_average_attempts(block_target);
-                etb_secs = static_cast<double>(block_aps.GetLow64()) / real_pool_hs;
-                if (block_aps.IsNull() && !block_target.IsNull())
-                    etb_secs = 1e18;
+                etb_secs = dgb::compute_expected_time_to_block(
+                    static_cast<double>(block_aps.GetLow64()), real_pool_hs,
+                    /*average_attempts_overflowed=*/block_aps.IsNull(),
+                    /*block_target_nonzero=*/!block_target.IsNull());
             }
             LOG_INFO << " Pool: " << format_hashrate(real_pool_hs)
                      << " Stale rate: " << std::fixed << std::setprecision(1)
