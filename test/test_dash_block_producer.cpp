@@ -231,3 +231,27 @@ TEST(DashBlockProducer, MineBlockDeterministic)
     EXPECT_EQ(a.nonce, b.nonce);
     EXPECT_EQ(a.block_hex, b.block_hex);
 }
+
+// BIP34 height encoding: dashd ContextualCheckBlock expects the canonical
+// CScript() << nHeight form -- 0->OP_0, 1..16->OP_1..OP_16 (single opcode),
+// else minimal data push. The slice-5 fixup added the OP_N branch (regtest
+// blocks 1-16 were rejected bad-cb-height before it). This KAT pins the low
+// (<=16) path that realistic mainnet heights never exercise so it cannot
+// silently regress. Block 7 is the height actually crossed on regtest.
+TEST(DashBlockProducer, Bip34HeightOpNForm)
+{
+    using dash::coinbase::push_bip34_height;
+    // OP_0 for height 0.
+    EXPECT_EQ(push_bip34_height(0), (std::vector<unsigned char>{0x00}));
+    // OP_1..OP_16 single opcode (0x51..0x60) for heights 1..16.
+    for (uint32_t h = 1; h <= 16; ++h)
+        EXPECT_EQ(push_bip34_height(h),
+                  (std::vector<unsigned char>{static_cast<unsigned char>(0x50 + h)}))
+            << "height " << h;
+    // The proven regtest crossing height (7) -> OP_7 (0x57).
+    EXPECT_EQ(push_bip34_height(7), (std::vector<unsigned char>{0x57}));
+    // >16 takes the minimal data-push branch: 17 -> [len=1][0x11].
+    EXPECT_EQ(push_bip34_height(17), (std::vector<unsigned char>{0x01, 0x11}));
+    // Sign-byte avoidance still holds on the data-push branch: 128 -> [2][80][00].
+    EXPECT_EQ(push_bip34_height(128), (std::vector<unsigned char>{0x02, 0x80, 0x00}));
+}
