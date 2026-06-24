@@ -61,6 +61,20 @@
 #include <stdexcept>
 #include <vector>
 
+// PD SSOT wire-in: build_mm_commitment() below delegates the merged-mining
+// commitment byte layout to the cross-coin canonical builder rather than
+// re-emitting it NMC-locally. Forward-declared here (instead of #include
+// <c2pool/merged/merged_mining.hpp>) so this foundational coin header stays
+// clear of that header boost/asio + jsonrpccxx include graph. The signature
+// MUST track c2pool::merged::build_auxpow_commitment in merged_mining.hpp; the
+// drift-guard KAT in test/auxpow_merkle_test.cpp fails closed if the layouts
+// ever diverge. Definition lives in c2pool_merged_mining (linked by the test).
+namespace c2pool { namespace merged {
+std::vector<std::uint8_t> build_auxpow_commitment(const uint256& mm_root,
+                                                  std::uint32_t tree_size,
+                                                  std::uint32_t nonce);
+} }  // namespace c2pool::merged
+
 namespace nmc {
 namespace coin {
 
@@ -251,32 +265,23 @@ inline MMScan scan_mm_commitment(const std::vector<unsigned char>& script,
 /// occupies slot aux_expected_index(nonce, chain_id, chain_height). The root is
 /// stored reversed (big-endian display order) to match auxpow.cpp. This emits
 /// ONLY the MM marker payload; the caller (PD dual-target build path) prepends
-/// any coinbase scriptSig framing (height push, extranonce). Kept NMC-LOCAL per
-/// the coin fence (only std + core types). chain_merkle_root is taken by value
+/// any coinbase scriptSig framing (height push, extranonce). Delegates the byte layout to the cross-coin
+/// SSOT c2pool::merged::build_auxpow_commitment (see body). chain_merkle_root is taken by value
 /// because base_uint::begin() is non-const (same as scan_mm_commitment).
 inline std::vector<unsigned char> build_mm_commitment(uint256 chain_merkle_root,
                                                       unsigned chain_height,
                                                       uint32_t nonce) {
-    std::vector<unsigned char> out;
-    out.reserve(4 + uint256::BYTES + 8);
-    out.insert(out.end(), MM_HEADER_MAGIC, MM_HEADER_MAGIC + 4);
-
-    // Chain-merkle root committed reversed (big-endian display order).
-    const unsigned char* rb =
-        reinterpret_cast<const unsigned char*>(chain_merkle_root.begin());
-    std::vector<unsigned char> root_be(rb, rb + uint256::BYTES);
-    std::reverse(root_be.begin(), root_be.end());
-    out.insert(out.end(), root_be.begin(), root_be.end());
-
-    auto put_le32 = [&out](uint32_t x) {
-        out.push_back(static_cast<unsigned char>( x        & 0xff));
-        out.push_back(static_cast<unsigned char>((x >> 8)  & 0xff));
-        out.push_back(static_cast<unsigned char>((x >> 16) & 0xff));
-        out.push_back(static_cast<unsigned char>((x >> 24) & 0xff));
-    };
-    put_le32(1u << chain_height);   // tree size = 2^chain_height
-    put_le32(nonce);
-    return out;
+    // SSOT adapter (bucket-2: v36-NATIVE SHARED STRUCTURE). The merged-mining
+    // commitment byte layout is IDENTICAL across every merge-mined coin, so this
+    // emits no parallel NMC-local path: it delegates to the cross-coin canonical
+    // builder c2pool::merged::build_auxpow_commitment and contributes ONLY the
+    // NMC-typed height->size mapping (chain-merkle tree size = 2^chain_height).
+    // A single-NMC-under-BTC slot has chain_height == 0 -> size == 1. The byte
+    // output (magic | root BE(32) | size LE32 | nonce LE32) is pinned identical
+    // to the SSOT by the drift-guard KAT in test/auxpow_merkle_test.cpp.
+    return c2pool::merged::build_auxpow_commitment(chain_merkle_root,
+                                                   1u << chain_height,
+                                                   nonce);
 }
 
 // ─── AuxPow (merge-mining proof) ─────────────────────────────────────────────
