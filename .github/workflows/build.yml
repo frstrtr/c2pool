@@ -60,7 +60,7 @@ jobs:
         run: cmake -S . -B build_ci -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=Release -DCOIN_DGB=ON
 
       - name: Build
-        run: cmake --build build_ci --target c2pool -j$(nproc)
+        run: cmake --build build_ci --target c2pool -j8
 
       - name: Build tests
         run: |
@@ -85,11 +85,11 @@ jobs:
                     dgb_other_tx_assembler_test dgb_reconstruct_won_block_test dgb_reconstruct_closure_test dgb_gentx_unpack_test dgb_work_source_test dgb_template_builder_test dgb_embedded_coin_node_test dgb_embedded_tx_select_test dgb_template_other_txs_test dgb_coinbase_value_parity_test dgb_submit_classify_test dgb_aux_parent_coinbase_parity_test dgb_template_capture_test dgb_aux_doge_db_commitment_bind_test dgb_aux_doge_mm_commitment_test dgb_aux_doge_dc_proof_test dgb_aux_doge_bind_parsers_test dgb_compact_blocks_bip152_parity_test dgb_aux_dual_target_select_test dgb_aux_broadcast_path_election_test \
                     rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test header_chain_test \
                     dgb_coin_node_seam_test dgb_block_broadcast_test dgb_won_block_dispatch_test dgb_forced_won_share_dualpath_test dgb_scrypt_pow_test dgb_nonce_grinder_test dgb_regrind_block_test dgb_won_block_finalize_test dgb_share_target_genesis_test dgb_pool_msg_wire_test dgb_get_shares_walk_test dgb_download_stops_test dgb_think_p1_walk_bounds_test dgb_think_p1_desired_emit_test dgb_think_p6_desired_cutoff_test dgb_think_p4_head_keys_test dgb_think_p3_best_head_test dgb_g1_oracle_byte_parity_test dgb_think_p2_walk_bounds_test dgb_expected_time_to_block_test dgb_tail_score_endpoints_test dgb_pool_attempts_per_second_test dgb_pool_efficiency_test dgb_think_p5_best_share_punish_test dgb_auto_ratchet_tail_guard_test dgb_binomial_conf_interval_test dgb_desired_version_tally_test dgb_get_height_and_last_endpoints_test dgb_chain_walk_window_test dgb_redistribute_delegate_ghal_test dgb_share_weight_decay_test dgb_naughty_propagation_test dgb_hash_format_parity_test v37_test \
-            -j$(nproc)
+            -j8
 
       - name: Run tests
         working-directory: build_ci
-        run: ctest --output-on-failure -j$(nproc) --exclude-regex "LiveTest\."
+        run: ctest --output-on-failure -j8 --exclude-regex "LiveTest\."
 
       - name: Package release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -219,14 +219,14 @@ jobs:
                     rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test header_chain_test \
                     dgb_coin_node_seam_test dgb_block_broadcast_test dgb_won_block_dispatch_test dgb_forced_won_share_dualpath_test dgb_scrypt_pow_test dgb_nonce_grinder_test dgb_regrind_block_test dgb_won_block_finalize_test dgb_share_target_genesis_test dgb_pool_msg_wire_test dgb_get_shares_walk_test dgb_download_stops_test dgb_think_p1_walk_bounds_test dgb_think_p1_desired_emit_test dgb_think_p6_desired_cutoff_test dgb_think_p4_head_keys_test dgb_think_p3_best_head_test dgb_g1_oracle_byte_parity_test dgb_think_p2_walk_bounds_test dgb_expected_time_to_block_test dgb_tail_score_endpoints_test dgb_pool_attempts_per_second_test dgb_pool_efficiency_test dgb_think_p5_best_share_punish_test dgb_auto_ratchet_tail_guard_test dgb_binomial_conf_interval_test dgb_desired_version_tally_test dgb_get_height_and_last_endpoints_test dgb_chain_walk_window_test dgb_redistribute_delegate_ghal_test dgb_share_weight_decay_test dgb_naughty_propagation_test dgb_hash_format_parity_test test_coin_broadcaster test_multiaddress_pplns test_pplns_stress \
                     v37_test \
-            -j$(nproc)
+            -j8
 
       - name: Run tests under sanitizers
         working-directory: build_asan
         env:
           ASAN_OPTIONS: detect_leaks=0:check_initialization_order=1:strict_string_checks=1:abort_on_error=0
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=0
-        run: ctest --output-on-failure -j$(nproc) --exclude-regex "LiveTest\."
+        run: ctest --output-on-failure -j8 --exclude-regex "LiveTest\."
 
       - name: Upload sanitizer test results on failure
         if: failure()
@@ -284,7 +284,7 @@ jobs:
         run: cmake -S . -B build_bch -DCMAKE_TOOLCHAIN_FILE=build_bch/conan_toolchain.cmake -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=Release -DCOIN_BCH=ON
 
       - name: Build c2pool-bch binary
-        run: cmake --build build_bch --target c2pool-bch -j$(nproc)
+        run: cmake --build build_bch --target c2pool-bch -j8
 
       - name: Build BCH test targets
         run: |
@@ -303,11 +303,11 @@ jobs:
                     bch_embedded_getwork_test bch_embedded_seam_workview_test \
                     bch_embedded_block_broadcast_test bch_coin_node_seam_test \
                     bch_asert_kat_test \
-            -j$(nproc)
+            -j8
 
       - name: Run BCH tests
         working-directory: build_bch
-        run: ctest --output-on-failure -j$(nproc) -R "^bch_"
+        run: ctest --output-on-failure -j8 -R "^bch_"
 
       - name: Upload test results on failure
         if: failure()
@@ -379,14 +379,14 @@ jobs:
                     bch_embedded_getwork_test bch_embedded_seam_workview_test \
                     bch_embedded_block_broadcast_test bch_coin_node_seam_test \
                     bch_asert_kat_test \
-            -j$(nproc)
+            -j8
 
       - name: Run BCH tests under sanitizers
         working-directory: build_bch_asan
         env:
           ASAN_OPTIONS: detect_leaks=0:check_initialization_order=1:strict_string_checks=1:abort_on_error=0
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=0
-        run: ctest --output-on-failure -j$(nproc) -R "^bch_"
+        run: ctest --output-on-failure -j8 -R "^bch_"
 
       - name: Upload sanitizer test results on failure
         if: failure()
@@ -505,7 +505,7 @@ jobs:
         run: cmake -S ui/c2pool-qt -B build-qt -DC2POOL_QT_BUILD_TESTS=ON -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build leak harness
-        run: cmake --build build-qt --target c2pool-qt_test_embedded_leak -j$(nproc)
+        run: cmake --build build-qt --target c2pool-qt_test_embedded_leak -j8
 
       - name: Run leak harness under xvfb
         continue-on-error: true
@@ -759,7 +759,7 @@ jobs:
         run: cmake -S . -B build_dgb_auxdoge -DCMAKE_TOOLCHAIN_FILE=build_dgb_auxdoge/conan_toolchain.cmake -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=Release -DCOIN_DGB=ON -DAUX_DOGE=ON
 
       - name: Build c2pool-dgb binary (AUX_DOGE seam ON)
-        run: cmake --build build_dgb_auxdoge --target c2pool-dgb -j$(nproc)
+        run: cmake --build build_dgb_auxdoge --target c2pool-dgb -j8
 
       - name: Smoke test (--help)
         run: |
