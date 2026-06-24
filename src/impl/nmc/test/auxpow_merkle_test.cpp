@@ -299,6 +299,7 @@ TEST(NmcAuxCheckProof, ParentCoinbaseIndexTooWideForDepthIsInvalid)
 using nmc::coin::scan_mm_commitment;
 using nmc::coin::aux_expected_index;
 using nmc::coin::MMScan;
+using nmc::coin::build_mm_commitment;
 
 static const unsigned char MM_MAGIC[4] = {0xfa, 0xbe, 'm', 'm'};
 
@@ -448,6 +449,63 @@ TEST(NmcAuxStep2, NoMarkerLeavesProofIncomplete)
     ap.chain_merkle_branch = {sib};
     ap.chain_merkle_index = 0;
     EXPECT_EQ(ap.check_proof(aux, 1), AuxPow::CheckResult::INCOMPLETE);
+}
+
+// ---------------------------------------------------------------------------
+// build_mm_commitment -- the BUILD-side inverse of scan_mm_commitment (PC-prep
+// auxpow commitment scaffolding, overlapping PD's dual-target parent coinbase).
+// The commitment a c2pool-built parent coinbase embeds must round-trip through
+// the SAME scanner the verifier runs: emit then scan the marker for the slot
+// aux_expected_index(nonce, chain_id, height) and it MUST return MATCH; any
+// tamper (committed root / slot / tree size) MUST NOT. The byte layout is pinned
+// explicitly so a build-side layout drift is caught, not mirrored.
+// Per-coin isolation: src/impl/nmc/ only; btc tree consumed READ-ONLY.
+// ---------------------------------------------------------------------------
+
+TEST(NmcBuildMMCommitment, RoundTripsThroughScannerAtExpectedSlot)
+{
+    uint256 aux = leaf_of(0x01), sib = leaf_of(0x55);
+    uint256 root = combine(aux, sib);
+    const unsigned h = 1; const int32_t cid = 1; const uint32_t nonce = 1;
+
+    auto payload = build_mm_commitment(root, h, nonce);
+    const uint32_t slot = aux_expected_index(nonce, cid, h);
+    EXPECT_EQ(scan_mm_commitment(payload, root, h, cid, slot), MMScan::MATCH);
+}
+
+TEST(NmcBuildMMCommitment, ByteLayoutIsMagicReversedRootSizeNonce)
+{
+    uint256 root = leaf_of(0x01);
+    const unsigned h = 3; const uint32_t nonce = 0x04030201u;
+
+    auto got = build_mm_commitment(root, h, nonce);
+
+    std::vector<unsigned char> want;
+    want.insert(want.end(), MM_MAGIC, MM_MAGIC + 4);
+    auto rr = root_reversed(root);
+    want.insert(want.end(), rr.begin(), rr.end());
+    put_le32(want, 1u << h);   // tree size = 2^h = 8
+    put_le32(want, nonce);
+
+    EXPECT_EQ(got, want);
+    EXPECT_EQ(got.size(), static_cast<size_t>(4 + 32 + 4 + 4));
+}
+
+TEST(NmcBuildMMCommitment, TamperedRootOrSlotFailsScan)
+{
+    uint256 aux = leaf_of(0x02), sib = leaf_of(0x77);
+    uint256 root = combine(aux, sib);
+    const unsigned h = 2; const int32_t cid = 1; const uint32_t nonce = 7;
+
+    auto payload = build_mm_commitment(root, h, nonce);
+    const uint32_t slot = aux_expected_index(nonce, cid, h);
+
+    EXPECT_EQ(scan_mm_commitment(payload, root, h, cid, slot), MMScan::MATCH);
+    // Wrong committed root.
+    EXPECT_EQ(scan_mm_commitment(payload, leaf_of(0x99), h, cid, slot), MMScan::MISMATCH);
+    // Right marker read at the wrong deterministic slot.
+    EXPECT_EQ(scan_mm_commitment(payload, root, h, cid, (slot + 1u) & ((1u << h) - 1u)),
+              MMScan::MISMATCH);
 }
 
 // ---------------------------------------------------------------------------
