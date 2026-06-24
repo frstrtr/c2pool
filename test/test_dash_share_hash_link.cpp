@@ -70,6 +70,23 @@ void put_le(std::vector<unsigned char>& v, uint64_t x, int n) {
     for (int i = 0; i < n; ++i) v.push_back(static_cast<unsigned char>((x >> (8 * i)) & 0xff));
 }
 
+// Parse a hex string to bytes (test fixtures embed real on-chain payloads).
+std::vector<unsigned char> bytes_from_hex(const std::string& h) {
+    std::vector<unsigned char> v; v.reserve(h.size() / 2);
+    auto nib = [](char c) -> int { return c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10; };
+    for (size_t i = 0; i + 1 < h.size(); i += 2)
+        v.push_back(static_cast<unsigned char>((nib(h[i]) << 4) | nib(h[i + 1])));
+    return v;
+}
+
+// Append Bitcoin CompactSize(n) == oracle pack.VarStrType length prefix.
+void append_compactsize(std::vector<unsigned char>& v, uint64_t n) {
+    if (n < 0xfd) { v.push_back(static_cast<unsigned char>(n)); }
+    else if (n <= 0xffff) { v.push_back(0xfd); put_le(v, n, 2); }
+    else if (n <= 0xffffffffULL) { v.push_back(0xfe); put_le(v, n, 4); }
+    else { v.push_back(0xff); put_le(v, n, 8); }
+}
+
 const std::vector<unsigned char> kPayload = {0xde, 0xad, 0xbe, 0xef};
 
 } // namespace
@@ -99,6 +116,56 @@ TEST(DashShareHashLink, OracleCheckHashLinkVarStrPayload) {
     uint256 gr = dash::check_hash_link(hl, raw, ce);
     EXPECT_EQ(hex_of(gr), "75e4562b843ac74b7c78db29dc40ce10d6659c578159c5952638b3340f877fb2");
     EXPECT_NE(hex_of(g), hex_of(gr)) << "compactsize prefix must change gentx_hash";
+}
+
+// (1b) Non-circular oracle anchor over REAL testnet3 DIP4 special-tx payloads.
+// #412 proved the VarStr(coinbase_payload) assembly with a 4-byte synthetic
+// payload; G0/G1 (per-coin byte-parity gate before the G2 crossing) pins the
+// SAME assembly against ACTUAL on-chain extraPayloads captured from dashd
+// (testnet3), covering BOTH compactsize branches: single-byte (<0xfd) and
+// 0xfd+u16-LE. Expected digests are computed OUT-OF-BAND with CPython
+// (sha256d), so they are non-circular with the C++ check_hash_link path.
+//   A: blk 1502030 txid 7d292a63... type-5 CbTx, 175B (compactsize 0xaf)
+//   B: blk 1501948 txid b4d1a2a5... type-6 qcTx, 419B (compactsize 0xfd a3 01)
+TEST(DashShareHashLink, RealTestnet3SpecialTxVarStrParity) {
+    auto hl = iv_hash_link();
+    const auto ce = dash::compute_gentx_before_refhash();  // unused at length%64==0
+
+    struct CbTxKat { const char* name; const char* payload_hex;
+                     const char* varstr; const char* raw_append; };
+    const CbTxKat kats[] = {
+        {"testnet3-1502030-cbtx-type5",
+         "03004eeb1600286ca33b2ec502759646df1259df9ee5b599722122f5bb4ba6a01062782e489ff09af4994ea6306dbe1aa636373c0d9c0fabc6c61d4402754b9878f63f4c277e008b96e1d2f74c1717728f47d319e151460adc51ffd76686c10ede2e3a31d5faaeb724a65736167a7d8f17b1f880585a0c1164f6882d5e5d6c8a5ff3b75d47ee6359d0662964109e7fa17658d04843e4c6eca499a55ed01bd4efd49b10848aa04a5a36b0fcdb1d0000",
+         "6e985201f8a1d0cf46c97a1379c140c9564ee56c1649af5cbce8b7d9cc986665",
+         "69ebfd8ee54d039ffece6bb1c8cab97ec3c6b24715e4ae57c30428a9dbc4ac1a"},
+        {"testnet3-1501948-qctx-type6",
+         "0100fcea160003000270282f59392f2433c05a9f4c948c9f31dab53cf42e112ca68b9854fdc5000000fd90010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000fd900100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+         "e60ea7ea8c11c17af6a7573b0399c87e4672175986cf54d407875bf33c05c84f",
+         "4fa8a56bb753593362540b9d8006c2b80a191d2d194eba2714162a9cd41bbe56"},
+    };
+    for (const auto& k : kats) {
+        const auto payload = bytes_from_hex(k.payload_hex);
+
+        // VarStr(payload) = CompactSize(len) || payload  (oracle data.py:278)
+        std::vector<unsigned char> data;
+        for (int i = 0; i < 32; ++i) data.push_back(static_cast<unsigned char>(i));
+        put_le(data, 0, 8);   // last_txout_nonce
+        put_le(data, 0, 4);   // IntType(32).pack(0)
+        append_compactsize(data, payload.size());
+        data.insert(data.end(), payload.begin(), payload.end());
+        uint256 g = dash::check_hash_link(hl, data, ce);
+        EXPECT_EQ(hex_of(g), k.varstr) << k.name;
+
+        // Buggy raw-append (no compactsize) -> separately-pinned, must differ.
+        std::vector<unsigned char> raw;
+        for (int i = 0; i < 32; ++i) raw.push_back(static_cast<unsigned char>(i));
+        put_le(raw, 0, 8);
+        put_le(raw, 0, 4);
+        raw.insert(raw.end(), payload.begin(), payload.end());
+        uint256 gr = dash::check_hash_link(hl, raw, ce);
+        EXPECT_EQ(hex_of(gr), k.raw_append) << k.name;
+        EXPECT_NE(hex_of(g), hex_of(gr)) << k.name << ": compactsize prefix must matter";
+    }
 }
 
 // (2) End-to-end through the production share_init_verify().
