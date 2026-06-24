@@ -101,7 +101,7 @@ void print_banner(const char* argv0, const core::CoinParams& p)
         << " [--version] [--help] [--selftest] [--run] [--stratum [H:]P]\n"
         << "       [--coin-daemon H:P] [--coin-magic HEX] [--regtest]\n"
         << "       [--regtest-force-won-share] [--no-p2p-relay]\n"
-        << "       [--redistribute SPEC]\n\n"
+        << "       [--redistribute SPEC] [--sharechain-port P]\n\n"
         << "Status: pool/sharechain pillars live (Phase B); run-loop up\n"
         << "        (--run: io_context + sharechain peer + Stratum standup).\n"
         << "        --stratum [HOST:]PORT binds a miner-facing TCP listener\n"
@@ -157,6 +157,7 @@ int run_selftest(const core::CoinParams& params)
 // the rest — mirrors main_btc.cpp's teardown contract.
 int run_node(const core::CoinParams& params, bool testnet,
              const std::string& stratum_addr, uint16_t stratum_port,
+             uint16_t sharechain_port,
              const std::string& coin_daemon,
              const std::vector<std::byte>& coin_magic,
              const uint256& coin_genesis,
@@ -306,9 +307,15 @@ int run_node(const core::CoinParams& params, bool testnet,
 
     dgb::Node p2p_node(&ioc, &config);
     p2p_node.set_target_outbound_peers(4);
-    p2p_node.core::Server::listen(dgb::PoolConfig::P2P_PORT);
+    // Default sharechain P2P port is 5024 (oracle byte-parity); --sharechain-port
+    // overrides it for an isolated second instance (G3b tuned-net) without
+    // touching the default or any shared-base constant.
+    const uint16_t effective_p2p_port =
+        sharechain_port ? sharechain_port : dgb::PoolConfig::P2P_PORT;
+    p2p_node.core::Server::listen(effective_p2p_port);
     std::cout << "[DGB] sharechain peer listening on port "
-              << dgb::PoolConfig::P2P_PORT
+              << effective_p2p_port
+              << (sharechain_port ? " (--sharechain-port override; default 5024)" : "")
               << " — proto adv=" << dgb::PoolConfig::ADVERTISED_PROTOCOL_VERSION
               << " min=" << dgb::PoolConfig::MINIMUM_PROTOCOL_VERSION
               << " prefix=" << dgb::PoolConfig::DEFAULT_PREFIX_HEX << std::endl;
@@ -1091,6 +1098,7 @@ int main(int argc, char** argv)
     bool want_run = false;
     std::string stratum_addr = "0.0.0.0";  // bind all interfaces by default
     uint16_t    stratum_port = 0;           // 0 disables stratum; --stratum sets it
+    uint16_t    sharechain_port = 0;        // 0 = default P2P_PORT (5024); --sharechain-port overrides (opt-in isolation)
     std::string coin_daemon;                // --coin-daemon HOST:PORT (embedded P2P producer target)
     std::vector<std::byte> coin_magic;      // --coin-magic HEX (network pchMessageStart)
     uint256 coin_genesis;                   // --coin-genesis HASH (initial getheaders locator base)
@@ -1151,6 +1159,14 @@ int main(int argc, char** argv)
         if (std::strcmp(argv[i], "--redistribute") == 0 && i + 1 < argc) {
             redistribute_spec = argv[++i];     // pplns|fee|boost|donate or hybrid "boost:70,donate:20"
         }
+        if (std::strcmp(argv[i], "--sharechain-port") == 0 && i + 1 < argc) {
+            // --sharechain-port PORT - bind the sharechain (pool P2P) listener on
+            // a non-default port so a SECOND isolated c2pool-dgb instance can run
+            // on a host where 5024 is already taken (e.g. G3b tuned-net). Default
+            // STAYS 5024 (PoolConfig::P2P_PORT) when omitted, preserving G1 oracle
+            // byte-parity + share_test pins. DGB-fenced opt-in; no shared-base touch.
+            sharechain_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        }
     }
 
     const core::CoinParams params = dgb::make_coin_params(/*testnet=*/false);
@@ -1162,6 +1178,7 @@ int main(int argc, char** argv)
     // --run: stand up the run-loop (io_context + sharechain peer + stratum).
     if (want_run)
         return run_node(params, /*testnet=*/false, stratum_addr, stratum_port,
+                        sharechain_port,
                         coin_daemon, coin_magic, coin_genesis,
                         rpc_endpoint, rpc_conf_path,
                         regtest, force_won_share, no_p2p_relay,
