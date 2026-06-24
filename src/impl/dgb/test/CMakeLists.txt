@@ -702,6 +702,22 @@ if (BUILD_TESTING AND GTest_FOUND)
         GTest::gtest_main GTest::gtest)
     gtest_add_tests(dgb_pool_efficiency_test "" AUTO)
 
+    # dgb_auto_ratchet_tail_guard_test: FENCED, additive conformance KAT for the
+    # AutoRatchet WORK-WEIGHTED 60% tail-guard SSOT (auto_ratchet_tail_guard.hpp)
+    # vs the p2pool-dgb-scrypt switch rule data.py:1399
+    # (SWITCHED iff target_weight >= floor(total_weight*60/100)). Non-circular:
+    # hand-derived oracle values + a verbatim replica of the live inline to pin
+    # the one floor-boundary divergence. uint288 arithmetic -> links core.
+    # auto_ratchet.hpp NOT rewired (delegation is the byte-id follow-on). MUST
+    # also be in the build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_auto_ratchet_tail_guard_test auto_ratchet_tail_guard_test.cpp)
+    target_link_libraries(dgb_auto_ratchet_tail_guard_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_auto_ratchet_tail_guard_test "" AUTO)
+
     # dgb_think_p4_head_keys_test: FENCED, additive KAT pinning the think()
     # Phase-4 head-score KEY construction in think_p4_head_keys.hpp vs the
     # p2pool data.py think() oracle (selection key (adjusted_work,-reason,-ts)
