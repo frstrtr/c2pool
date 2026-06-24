@@ -16,7 +16,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   test-allowlist-guard:
     name: Test allowlist drift-guard
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v4
       - name: Check coin test targets vs build.yml --target allowlist
@@ -26,7 +26,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   linux:
     name: Linux x86_64
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -34,7 +34,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            g++ cmake make libleveldb-dev libsecp256k1-dev
+            g++ ccache cmake make libleveldb-dev libsecp256k1-dev
 
       - uses: actions/setup-python@v6
         with: { python-version: '3.12' }
@@ -57,7 +57,7 @@ jobs:
         run: conan install . --build=missing --output-folder=build_ci --settings=build_type=Release
 
       - name: Configure
-        run: cmake -S . -B build_ci -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release -DCOIN_DGB=ON
+        run: cmake -S . -B build_ci -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=Release -DCOIN_DGB=ON
 
       - name: Build
         run: cmake --build build_ci --target c2pool -j$(nproc)
@@ -142,7 +142,7 @@ jobs:
     name: Linux x86_64 (AsAN+UBSan)
     # dash bring-up slices may opt out of sanitizers via dash-skip-sanitizers; KEEP for consensus/payout slices (default = on)
     if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-skip-sanitizers')) }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     continue-on-error: true
     steps:
       - uses: actions/checkout@v6
@@ -151,7 +151,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            g++ cmake make libleveldb-dev libsecp256k1-dev
+            g++ ccache cmake make libleveldb-dev libsecp256k1-dev
 
       - uses: actions/setup-python@v6
         with: { python-version: '3.12' }
@@ -188,6 +188,7 @@ jobs:
         run: |
           cmake -S . -B build_asan \
             -DCMAKE_TOOLCHAIN_FILE=build_asan/conan_toolchain.cmake \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_BUILD_TYPE=Release \
             -DCOIN_DGB=ON \
             -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize=vptr -fno-omit-frame-pointer -fno-sanitize-recover=undefined -g" \
@@ -249,7 +250,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   coin-bch:
     name: COIN_BCH Linux x86_64
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -257,7 +258,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            g++ cmake make libleveldb-dev libsecp256k1-dev
+            g++ ccache cmake make libleveldb-dev libsecp256k1-dev
 
       - uses: actions/setup-python@v6
         with: { python-version: 3.12 }
@@ -280,7 +281,7 @@ jobs:
         run: conan install . --build=missing --output-folder=build_bch --settings=build_type=Release
 
       - name: Configure (-DCOIN_BCH=ON)
-        run: cmake -S . -B build_bch -DCMAKE_TOOLCHAIN_FILE=build_bch/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release -DCOIN_BCH=ON
+        run: cmake -S . -B build_bch -DCMAKE_TOOLCHAIN_FILE=build_bch/conan_toolchain.cmake -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=Release -DCOIN_BCH=ON
 
       - name: Build c2pool-bch binary
         run: cmake --build build_bch --target c2pool-bch -j$(nproc)
@@ -318,7 +319,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   coin-bch-asan:
     name: COIN_BCH Linux x86_64 (AsAN+UBSan)
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     continue-on-error: true
     steps:
       - uses: actions/checkout@v6
@@ -327,7 +328,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            g++ cmake make libleveldb-dev libsecp256k1-dev
+            g++ ccache cmake make libleveldb-dev libsecp256k1-dev
 
       - uses: actions/setup-python@v6
         with: { python-version: 3.12 }
@@ -353,6 +354,7 @@ jobs:
         run: |
           cmake -S . -B build_bch_asan \
             -DCMAKE_TOOLCHAIN_FILE=build_bch_asan/conan_toolchain.cmake \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_BUILD_TYPE=Release \
             -DCOIN_BCH=ON \
             -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize=vptr -fno-omit-frame-pointer -fno-sanitize-recover=undefined -g" \
@@ -399,7 +401,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   web-static:
     name: Web-static verify
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     defaults:
       run:
         working-directory: web-static/sharechain-explorer
@@ -477,7 +479,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   qt-webengine:
     name: Qt WebEngine leak gate
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     # Hard ceiling: orphaned QtWebEngine/Chromium helper children survive
     # the inner `timeout 180`, holding the xvfb pipe open and hanging the
     # job to the 360-min runner default. Cap it so a hung leak gate is
@@ -490,7 +492,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            cmake g++ \
+            cmake g++ ccache \
             qt6-base-dev qt6-webengine-dev qt6-webchannel-dev \
             qt6-tools-dev \
             libgl1-mesa-dev libegl1-mesa-dev \
@@ -500,7 +502,7 @@ jobs:
             xvfb
 
       - name: Configure
-        run: cmake -S ui/c2pool-qt -B build-qt -DC2POOL_QT_BUILD_TESTS=ON
+        run: cmake -S ui/c2pool-qt -B build-qt -DC2POOL_QT_BUILD_TESTS=ON -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build leak harness
         run: cmake --build build-qt --target c2pool-qt_test_embedded_leak -j$(nproc)
@@ -721,7 +723,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   coin-dgb-auxdoge:
     name: COIN_DGB +AUX_DOGE Linux x86_64
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -729,7 +731,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            g++ cmake make libleveldb-dev libsecp256k1-dev
+            g++ ccache cmake make libleveldb-dev libsecp256k1-dev
 
       - uses: actions/setup-python@v6
         with: { python-version: 3.12 }
@@ -752,7 +754,7 @@ jobs:
         run: conan install . --build=missing --output-folder=build_dgb_auxdoge --settings=build_type=Release
 
       - name: Configure (-DCOIN_DGB=ON -DAUX_DOGE=ON)
-        run: cmake -S . -B build_dgb_auxdoge -DCMAKE_TOOLCHAIN_FILE=build_dgb_auxdoge/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release -DCOIN_DGB=ON -DAUX_DOGE=ON
+        run: cmake -S . -B build_dgb_auxdoge -DCMAKE_TOOLCHAIN_FILE=build_dgb_auxdoge/conan_toolchain.cmake -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=Release -DCOIN_DGB=ON -DAUX_DOGE=ON
 
       - name: Build c2pool-dgb binary (AUX_DOGE seam ON)
         run: cmake --build build_dgb_auxdoge --target c2pool-dgb -j$(nproc)
