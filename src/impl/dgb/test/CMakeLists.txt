@@ -569,6 +569,24 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_aux_doge_dc_proof_test "" AUTO)
 
+    # --- DGB+DOGE (M3) -- bind_aux_doge_parsers() PRODUCTION-binding KAT --------
+    # Proves the production dgb node seam coin/node.hpp's bind_aux_doge_parsers()
+    # is NON-HOLLOW: it instantiates a dgb::coin::Node, calls the (now real) bind
+    # body, and drives a canonical DGB-parent AuxPoW blob THROUGH the bound member
+    # -- ODR-USING parse_aux_header<dgb::coin::MutableTransaction> + CAuxPow<dgb::
+    # coin::MutableTransaction> in the PRODUCTION dgb object library, not merely in
+    # fixtures. Links the production dgb lib + ltc_coin like the DB/DC siblings --
+    # the -DAUX_DOGE consumption path legitimately couples to ltc. Test-only;
+    # consumes the shared module, modifies nothing in src/impl/doge. MUST appear in
+    # BOTH this registration AND the build.yml --target allowlist (#143 NOT_BUILT).
+    add_executable(dgb_aux_doge_bind_parsers_test aux_doge_bind_parsers_test.cpp)
+    target_link_libraries(dgb_aux_doge_bind_parsers_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb ltc_coin
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_aux_doge_bind_parsers_test "" AUTO)
+
     # dgb_share_target_genesis_test: FENCED KAT pinning ShareTracker::compute_
     # share_target genesis/unknown-prev clamp to [MAX_TARGET/30, MAX_TARGET] vs
     # the DGB oracle data.py generate_transaction. Links the same proven set as
