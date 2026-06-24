@@ -80,6 +80,19 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(nmc_block_broadcast_test PRIVATE
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
 
+    # PE item 3 (host half): host-level dual-path won-aux broadcaster regression
+    # lock. Reconstructs the run-loop binding (set_block_relay -> submit_block_raw
+    # + set_fallback_backend -> AuxChainRPC::submit_aux_block) with fakes and
+    # locks DELIVERY through both legs -- net-new vs the presence-only helper KAT
+    # above. Same header-only dispatcher, so the same SCC (core + c2pool_* object
+    # libs); no nmc_coin (no transaction ctor).
+    add_executable(nmc_host_dualpath_test nmc_host_dualpath_test.cpp)
+    target_link_libraries(nmc_host_dualpath_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core nlohmann_json::nlohmann_json)
+    target_link_libraries(nmc_host_dualpath_test PRIVATE
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
+
     include(GoogleTest)
     include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
     gtest_add_tests(nmc_auxpow_merkle_test "" AUTO)
@@ -88,4 +101,5 @@ if (BUILD_TESTING AND GTest_FOUND)
     gtest_add_tests(nmc_reconstruct_won_block_test "" AUTO)
     gtest_add_tests(nmc_mempool_name_test "" AUTO)
     gtest_add_tests(nmc_block_broadcast_test "" AUTO)
+    gtest_add_tests(nmc_host_dualpath_test "" AUTO)
 endif()
