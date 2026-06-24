@@ -5218,7 +5218,12 @@ nlohmann::json MiningInterface::rest_node_topology()
     // Primary coin's REAL current block height from the embedded daemon's cached
     // template -- the same source rest_local_stats uses. Lets the auto-detect
     // fallback emit "height" (tip) so the topology card shows the primary tip even
-    // when no per-coin StatsProvider hook is wired. (synced still needs the hook.)
+    // when no per-coin StatsProvider hook is wired. A truthful embedded-daemon
+    // "synced" flag is intentionally NOT emitted in this fallback: the only
+    // authoritative source is the per-coin StatsProvider hook (m_node_topology_fn),
+    // which reads the embedded daemon's own getblockchaininfo. The
+    // explorer_chaininfo_fn reports c2pool SHARECHAIN height -- a different thing --
+    // so deriving synced from it would lie. Omit rather than guess.
     uint64_t primary_height = 0;
     {
         std::lock_guard<std::mutex> lock(m_work_mutex);
