@@ -54,30 +54,6 @@ using tcp = net::ip::tcp;
 // Forward declarations
 class MiningInterface;
 class StratumServer;
-class LitecoinRpcClient;
-
-/// Litecoin Core RPC client for blockchain sync status
-class LitecoinRpcClient
-{
-public:
-    LitecoinRpcClient(bool testnet = true);
-    
-    struct SyncStatus {
-        bool is_synced;
-        double progress;
-        uint64_t current_blocks;
-        uint64_t total_headers;
-        bool initial_block_download;
-        std::string error_message;
-    };
-    
-    SyncStatus get_sync_status();
-    bool is_connected();
-    std::string execute_cli_command(const std::string& command);
-    
-private:
-    bool testnet_;
-};
 
 /// HTTP Session handler for incoming connections
 class HttpSession : public std::enable_shared_from_this<HttpSession>
@@ -956,7 +932,6 @@ private:
     // Internal state
     uint64_t m_work_id_counter;
     std::map<std::string, nlohmann::json> m_active_work;
-    std::unique_ptr<LitecoinRpcClient> m_rpc_client;
     bool m_testnet;  // Store testnet flag
     Blockchain m_blockchain;  // Store blockchain type
     std::shared_ptr<IMiningNode> m_node;  // Connection to c2pool node for difficulty tracking
