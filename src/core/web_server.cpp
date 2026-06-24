@@ -5215,6 +5215,17 @@ nlohmann::json MiningInterface::rest_node_topology()
     // so a node never advertises a blank primary symbol.
     std::string primary = node_symbol();
 
+    // Primary coin's REAL current block height from the embedded daemon's cached
+    // template -- the same source rest_local_stats uses. Lets the auto-detect
+    // fallback emit "height" (tip) so the topology card shows the primary tip even
+    // when no per-coin StatsProvider hook is wired. (synced still needs the hook.)
+    uint64_t primary_height = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_work_mutex);
+        if (!m_cached_template.is_null() && m_cached_template.contains("height"))
+            primary_height = m_cached_template["height"].get<uint64_t>();
+    }
+
     nlohmann::json coins = nlohmann::json::array();
     auto has_coin = [&](const std::string& sym) {
         for (const auto& c : coins)
@@ -5231,6 +5242,10 @@ nlohmann::json MiningInterface::rest_node_topology()
             // Real embedded/RPC flags for this node's own daemon.
             entry["embedded"] = (m_coin_node && m_coin_node->is_embedded());
             entry["has_rpc"]  = (m_coin_node && m_coin_node->has_rpc());
+            // Truthful tip from the embedded daemon's cached template (front-end
+            // renders it only when > 0, so omit a meaningless 0).
+            if (primary_height > 0)
+                entry["height"] = primary_height;
         }
         coins.push_back(std::move(entry));
     };
