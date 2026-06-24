@@ -1248,7 +1248,26 @@
                 max-width: 100%;
             }
         }
-        
+
+        /* Narrow phones (<=480px): the header info boxes carry INLINE
+           min-width (280px / 220px) which the wider breakpoints cannot
+           override, and the monospace config lines (stratum URL, the
+           <ADDR>,<DOGE_ADDR>.WORKER username) are unbreakable tokens.
+           Together they force horizontal overflow that clips the view on
+           a phone. Neutralize the inline mins and let long tokens wrap.
+           Static drop-in; serves the operator-flagged D-WEB.4 mobile clip. */
+        @media (max-width: 480px) {
+            #miner-info, #network-info {
+                min-width: 0 !important;
+                flex: 1 1 100% !important;
+            }
+            .miner-info [style*="monospace"],
+            .miner-info [style*="monospace"] span {
+                overflow-wrap: anywhere;
+                word-break: break-word;
+            }
+        }
+
         /* Two-column layout for sections */
         .two-col {
             display: grid;
