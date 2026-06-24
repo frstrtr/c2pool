@@ -530,6 +530,105 @@ TEST(NmcBuildMMCommitment, TamperedRootOrSlotFailsScan)
     EXPECT_EQ(scan_mm_commitment(payload, root, h, cid, (slot + 1u) & ((1u << h) - 1u)),
               MMScan::MISMATCH);
 }
+// ---------------------------------------------------------------------------
+// PD dual-target parent coinbase -- FRAMED scriptSig coverage.
+//
+// build_mm_commitment() emits ONLY the bare MM marker; the PD dual-target build
+// path splices it into a real parent (BTC) coinbase scriptSig that ALSO carries
+// the BIP34 height push and the c2pool extranonce/tag framing. The verifier's
+// scan_mm_commitment() std::search()es for the magic, so the marker MUST still
+// resolve to MATCH at aux_expected_index() when it sits AFTER arbitrary leading
+// framing and BEFORE a trailing extranonce -- and the replay/truncation guards
+// must still fire under that framing. The bare-payload KATs above do not
+// exercise this; these pin the framed dual-target coinbase the production path
+// produces. Per-coin isolation: src/impl/nmc/ only; btc tree consumed READ-ONLY.
+// ---------------------------------------------------------------------------
+
+namespace {
+// Splice a bare MM marker into a representative parent-coinbase scriptSig:
+//   [BIP34 height push] [ "/c2pool/" tag ] [ marker ] [ extranonce ]
+// Mirrors the live parent-coinbase scriptSig framing (OP_1..OP_16 for small
+// heights, minimal-push + sign byte otherwise) so the scan exercises the same
+// leading bytes the production coinbase carries ahead of the MM marker.
+std::vector<unsigned char> frame_parent_coinbase_script(
+        int parent_height,
+        const std::vector<unsigned char>& marker,
+        const std::vector<unsigned char>& extranonce)
+{
+    std::vector<unsigned char> sig;
+    if (parent_height > 0 && parent_height <= 16) {
+        sig.push_back(static_cast<unsigned char>(0x50 + parent_height));  // OP_1..OP_16
+    } else if (parent_height > 0) {
+        std::vector<unsigned char> hb;
+        uint32_t hh = static_cast<uint32_t>(parent_height);
+        while (hh > 0) { hb.push_back(static_cast<unsigned char>(hh & 0xff)); hh >>= 8; }
+        if (!hb.empty() && (hb.back() & 0x80)) hb.push_back(0);  // BIP34 sign byte
+        sig.push_back(static_cast<unsigned char>(hb.size()));
+        sig.insert(sig.end(), hb.begin(), hb.end());
+    }
+    static const char tag[] = "/c2pool/";
+    sig.insert(sig.end(), tag, tag + (sizeof(tag) - 1));
+    sig.insert(sig.end(), marker.begin(), marker.end());
+    sig.insert(sig.end(), extranonce.begin(), extranonce.end());
+    return sig;
+}
+}  // namespace
+
+TEST(NmcDualTargetCoinbaseFraming, MarkerResolvesAfterHeightAndTagFraming)
+{
+    uint256 aux = leaf_of(0x01), sib = leaf_of(0x55);
+    uint256 root = combine(aux, sib);
+    const unsigned h = 1; const int32_t cid = 1; const uint32_t nonce = 1;
+
+    auto marker = build_mm_commitment(root, h, nonce);
+    const std::vector<unsigned char> extranonce = {0xde, 0xad, 0xbe, 0xef};
+    auto sig = frame_parent_coinbase_script(0x2a3b4c, marker, extranonce);  // height > 16
+
+    const uint32_t slot = aux_expected_index(nonce, cid, h);
+    EXPECT_EQ(scan_mm_commitment(sig, root, h, cid, slot), MMScan::MATCH);
+}
+
+TEST(NmcDualTargetCoinbaseFraming, SmallHeightOpNPushStillResolves)
+{
+    uint256 root = combine(leaf_of(0x02), leaf_of(0x77));
+    const unsigned h = 2; const int32_t cid = 1; const uint32_t nonce = 7;
+
+    auto marker = build_mm_commitment(root, h, nonce);
+    auto sig = frame_parent_coinbase_script(3, marker, {});  // OP_3 height push, no extranonce
+
+    const uint32_t slot = aux_expected_index(nonce, cid, h);
+    EXPECT_EQ(scan_mm_commitment(sig, root, h, cid, slot), MMScan::MATCH);
+}
+
+TEST(NmcDualTargetCoinbaseFraming, SecondMarkerInFramedScriptIsRejected)
+{
+    uint256 root = combine(leaf_of(0x03), leaf_of(0x33));
+    const unsigned h = 1; const int32_t cid = 1; const uint32_t nonce = 1;
+
+    auto marker = build_mm_commitment(root, h, nonce);
+    // A framed coinbase that smuggles a SECOND marker must not validate
+    // (replay guard holds under framing, mirroring CAuxPow::check).
+    std::vector<unsigned char> two = marker;
+    two.insert(two.end(), marker.begin(), marker.end());
+    auto sig = frame_parent_coinbase_script(100, two, {0x01, 0x02});
+
+    const uint32_t slot = aux_expected_index(nonce, cid, h);
+    EXPECT_EQ(scan_mm_commitment(sig, root, h, cid, slot), MMScan::MISMATCH);
+}
+
+TEST(NmcDualTargetCoinbaseFraming, TruncatedMarkerInFramedScriptFails)
+{
+    uint256 root = combine(leaf_of(0x04), leaf_of(0x44));
+    const unsigned h = 2; const int32_t cid = 1; const uint32_t nonce = 5;
+
+    auto marker = build_mm_commitment(root, h, nonce);
+    marker.pop_back();  // drop the last nonce byte -> size+nonce field truncated
+    auto sig = frame_parent_coinbase_script(50, marker, {});
+
+    const uint32_t slot = aux_expected_index(nonce, cid, h);
+    EXPECT_EQ(scan_mm_commitment(sig, root, h, cid, slot), MMScan::MISMATCH);
+}
+
 
 // ---------------------------------------------------------------------------
 // P1c-step4: AuxPow::check_proof parent proof-of-work leg (step 4).
