@@ -934,6 +934,7 @@ private:
     std::map<std::string, nlohmann::json> m_active_work;
     bool m_testnet;  // Store testnet flag
     Blockchain m_blockchain;  // Store blockchain type
+    std::string m_coin_label; // Raw configured coin string; fallback label for chains absent from the Blockchain enum
     std::shared_ptr<IMiningNode> m_node;  // Connection to c2pool node for difficulty tracking
     BlockchainAddressValidator m_address_validator;  // New address validator
     std::unique_ptr<c2pool::payout::PayoutManager> m_payout_manager;  // Payout management
@@ -1199,6 +1200,23 @@ public:
     void set_explorer_url(const std::string& url) { m_explorer_url = url; }
     const std::string& get_explorer_url() const { return m_explorer_url; }
 
+    // Uppercase coin symbol for THIS node. Enum-derived for the consensus-
+    // supported coins; falls back to the config-driven m_coin_label when the
+    // chain has no Blockchain enum entry (BCH / NMC-aux), so topology and
+    // node_info never emit a blank symbol. "" only when truly unconfigured.
+    std::string node_symbol() const {
+        switch (m_blockchain) {
+            case Blockchain::LITECOIN: return "LTC";
+            case Blockchain::BITCOIN:  return "BTC";
+            case Blockchain::DOGECOIN: return "DOGE";
+            case Blockchain::DASH:     return "DASH";
+            case Blockchain::DIGIBYTE: return "DGB";
+            default:                   break;
+        }
+        std::string s = m_coin_label;
+        for (auto& ch : s) if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 32);
+        return s;
+    }
     // Primary chain key for THIS node, derived from its configured blockchain
     // (lowercase symbol). Used as the default chain for explorer / coin-admin
     // endpoints instead of a hardcoded "ltc": a DGB/DASH/BTC node must not
@@ -1211,8 +1229,11 @@ public:
             case Blockchain::DOGECOIN: return "doge";
             case Blockchain::DASH:     return "dash";
             case Blockchain::DIGIBYTE: return "dgb";
-            default:                   return "";
+            default:                   break;
         }
+        std::string s = m_coin_label;
+        for (auto& ch : s) if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch + 32);
+        return s;  // "" only when truly unconfigured -> callers surface "not enabled"
     }
     void set_explorer_chaininfo_fn(explorer_chaininfo_fn_t fn) { m_explorer_chaininfo_fn = thread_safe_wrap(std::move(fn)); }
     void set_explorer_blockhash_fn(explorer_blockhash_fn_t fn) { m_explorer_blockhash_fn = thread_safe_wrap(std::move(fn)); }
@@ -1296,6 +1317,12 @@ public:
     void set_worker_port(uint16_t port) { m_worker_port = port; }
     void set_external_ip(const std::string& ip) { m_external_ip = ip; }
     void set_pool_version(const std::string& ver) { m_pool_version = ver; }
+    // Config-driven coin label (raw --blockchain/cfg string). Only consulted
+    // by node_symbol()/primary_chain_key() when the consensus Blockchain enum
+    // has no entry for this chain (e.g. embedded BCH / NMC-aux), so the
+    // dashboard labels every node truthfully instead of going blank. Web-layer
+    // only -- never feeds consensus/address-validation.
+    void set_coin_label(const std::string& sym) { m_coin_label = sym; }
     const std::string& get_pool_version() const { return m_pool_version; }
 
     /// Auto-detect public IP and version from external services.
