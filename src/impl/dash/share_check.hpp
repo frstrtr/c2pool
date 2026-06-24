@@ -231,12 +231,24 @@ inline uint256 share_init_verify(const DashShare& share,
         auto* p = reinterpret_cast<const unsigned char*>(&zero);
         hash_link_data.insert(hash_link_data.end(), p, p + 4);
     }
-    // Append outer coinbase_payload (coinbase_payload_data in Python)
-    // Reference: data.py line 342-348
+    // Append outer coinbase_payload (coinbase_payload_data in Python).
+    // Oracle data.py:278,346-348: coinbase_payload_data = pack.VarStrType().pack(payload)
+    // = [compactsize(len)][payload]; check_hash_link appends THAT (or b"" when None).
+    // BaseScript C2POOL_SERIALIZE_METHODS does READWRITE(m_data) over a byte vector,
+    // which strips one VarStr layer on read (so m_data holds the RAW payload) and
+    // re-adds the compactsize prefix on write. Serialize via the stream rather than
+    // appending m_data raw — the raw append dropped the prefix, diverging gentx_hash
+    // from the oracle on any non-empty (DIP4 CbTx) payload. PRESERVE the empty branch:
+    // the oracle appends nothing (b"") when the payload is None/empty, NOT a 0x00.
     {
         auto& cpd = share.m_coinbase_payload_outer.m_data;
         if (!cpd.empty())
-            hash_link_data.insert(hash_link_data.end(), cpd.begin(), cpd.end());
+        {
+            PackStream cpd_stream;
+            cpd_stream << share.m_coinbase_payload_outer;   // VarStr-pack: [compactsize][payload]
+            auto* cp = reinterpret_cast<const unsigned char*>(cpd_stream.data());
+            hash_link_data.insert(hash_link_data.end(), cp, cp + cpd_stream.size());
+        }
     }
 
     auto gentx_before_refhash = compute_gentx_before_refhash();
