@@ -724,6 +724,83 @@ TEST(NmcPDEquivLock, Size1FramedTruncationGuardFires)
 }
 
 
+// ---------------------------------------------------------------------------
+// PE production dual-target caller equiv-lock (integrator 2026-06-24 (b)).
+//
+// The KATs above pin the bare marker (build_mm_commitment) and the test-local
+// frame helper. These pin the PRODUCTION caller itself --
+// nmc::coin::build_dual_target_coinbase_scriptsig() -- the function the live
+// parent (BTC) work-source will CALL to splice this aux chain's commitment into
+// the dual-target coinbase scriptSig. The lock is byte-level and fail-build (a
+// gtest in the CI-allowlisted nmc_auxpow_merkle_test): the marker the production
+// caller embeds MUST be byte-identical to the size==1 cross-coin SSOT output
+// c2pool::merged::build_auxpow_commitment(root, 1, nonce). If the caller ever
+// re-derives the commitment NMC-locally and drifts, this turns CI red -- it does
+// not warn. Per-coin isolation: src/impl/nmc/ only; SSOT consumed READ-ONLY.
+// ---------------------------------------------------------------------------
+
+namespace {
+// The leading parent-coinbase scriptSig framing the BTC work-source builds and
+// hands to the production caller as scriptsig_prefix (BIP34 height push + pool
+// tag) -- the SAME bytes frame_parent_coinbase_script() prepends, minus the
+// marker/extranonce the production caller is responsible for appending.
+std::vector<unsigned char> btc_scriptsig_prefix(int parent_height)
+{
+    return frame_parent_coinbase_script(parent_height, /*marker=*/{}, /*extranonce=*/{});
+}
+}  // namespace
+
+TEST(NmcPDProdCaller, EmbeddedMarkerIsByteIdenticalToCrossCoinSSOT)
+{
+    // Single NMC chain under BTC: chain_height == 0 -> tree size == 1.
+    uint256 root = combine(leaf_of(0x21), leaf_of(0x22));
+    const unsigned chain_height = 0; const uint32_t nonce = 0xdeadbeef;
+    const std::vector<unsigned char> extranonce = {0xa1, 0xb2, 0xc3, 0xd4};
+
+    // What the PRODUCTION caller actually emits as the full coinbase scriptSig.
+    auto sig = nmc::coin::build_dual_target_coinbase_scriptsig(
+        btc_scriptsig_prefix(123456), root, chain_height, nonce, extranonce);
+
+    // The cross-coin canonical SSOT for the size==1 single-chain case -- the
+    // ONLY source the caller is allowed to derive the commitment from.
+    const auto ssot = c2pool::merged::build_auxpow_commitment(root, /*size=*/1u, nonce);
+
+    // FAIL-BUILD equiv-lock: the marker the production caller spliced into the
+    // coinbase scriptSig is byte-for-byte the SSOT output, NOT merely present.
+    EXPECT_EQ(extract_mm_marker(sig), ssot);
+}
+
+TEST(NmcPDProdCaller, EmbeddedMarkerResolvesAtSlotZeroUnderProductionFraming)
+{
+    uint256 root = combine(leaf_of(0x23), leaf_of(0x24));
+    const unsigned chain_height = 0; const int32_t cid = 1; const uint32_t nonce = 7;
+
+    const uint32_t slot = aux_expected_index(nonce, cid, chain_height);
+    ASSERT_EQ(slot, 0u);
+
+    auto sig = nmc::coin::build_dual_target_coinbase_scriptsig(
+        btc_scriptsig_prefix(700000), root, chain_height, nonce, {0x09, 0x0a});
+    EXPECT_EQ(scan_mm_commitment(sig, root, chain_height, cid, slot), MMScan::MATCH);
+}
+
+TEST(NmcPDProdCaller, SecondSmuggledMarkerInProducedScriptIsRejected)
+{
+    uint256 root = combine(leaf_of(0x25), leaf_of(0x26));
+    const unsigned chain_height = 0; const int32_t cid = 1; const uint32_t nonce = 1;
+
+    // A prefix that already carries a (replayed) marker -- the production caller
+    // appends its own, yielding two. scan_mm_commitment must reject the dup.
+    auto smuggled = build_mm_commitment(root, chain_height, nonce);
+    auto prefix = btc_scriptsig_prefix(900);
+    prefix.insert(prefix.end(), smuggled.begin(), smuggled.end());
+
+    auto sig = nmc::coin::build_dual_target_coinbase_scriptsig(
+        prefix, root, chain_height, nonce, {0x07, 0x08});
+
+    const uint32_t slot = aux_expected_index(nonce, cid, chain_height);
+    EXPECT_EQ(scan_mm_commitment(sig, root, chain_height, cid, slot), MMScan::MISMATCH);
+}
+
 
 // ---------------------------------------------------------------------------
 // P1c-step4: AuxPow::check_proof parent proof-of-work leg (step 4).
