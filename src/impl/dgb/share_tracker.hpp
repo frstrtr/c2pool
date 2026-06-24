@@ -25,6 +25,7 @@ inline uint64_t mul128_shift(uint64_t a, uint64_t b, unsigned shift) {
 #include <impl/nmc/coin/aux_id.hpp>          // nmc::coin::NMC_AUXPOW_CHAIN_ID (v37 bucket-2)
 #include "share_check.hpp"
 #include "think_p1_walk_bounds.hpp"  // SSOT: think_p1_walk_count / think_p1_in_pruning_zone
+#include "coin/naughty_propagation.hpp"  // SSOT: propagate_naughty_from_parent (data.py:543-549)
 #include "config_pool.hpp"
 
 #include <core/target_utils.hpp>
@@ -565,11 +566,13 @@ public:
             share_var.invoke([&](auto* obj) { prev_hash = obj->m_prev_hash; });
             if (!prev_hash.IsNull() && chain.contains(prev_hash)) {
                 auto* parent_idx = chain.get_index(prev_hash);
-                if (parent_idx && parent_idx->naughty > 0) {
-                    auto* my_idx = chain.get_index(share_hash);
-                    if (my_idx) {
-                        my_idx->naughty = parent_idx->naughty + 1;
-                        if (my_idx->naughty > 6) my_idx->naughty = 0; // reset after 6 generations
+                if (parent_idx) {
+                    // Delegate the +1/clamp-at-6 generation arithmetic AND the
+                    // "parent is naughty" guard to the SSOT. nullopt == oracle's
+                    // non-naughty-parent case: leave the child's naughty as-is.
+                    if (auto child = dgb::propagate_naughty_from_parent(parent_idx->naughty)) {
+                        auto* my_idx = chain.get_index(share_hash);
+                        if (my_idx) my_idx->naughty = *child;
                     }
                 }
             }
