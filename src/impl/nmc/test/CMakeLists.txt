@@ -58,10 +58,22 @@ if (BUILD_TESTING AND GTest_FOUND)
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
     target_link_libraries(nmc_reconstruct_won_block_test PRIVATE nmc_coin)
 
+    # P1 PB: Namecoin name-operation relay KATs (coin/mempool.hpp name_* path +
+    # fee flow through template_builder.hpp). Same SCC the sibling tests link
+    # (core + nmc_coin for the out-of-line MutableTransaction ctor).
+    add_executable(nmc_mempool_name_test nmc_mempool_name_test.cpp)
+    target_link_libraries(nmc_mempool_name_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core nlohmann_json::nlohmann_json)
+    target_link_libraries(nmc_mempool_name_test PRIVATE
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
+    target_link_libraries(nmc_mempool_name_test PRIVATE nmc_coin)
+
     include(GoogleTest)
     include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
     gtest_add_tests(nmc_auxpow_merkle_test "" AUTO)
     gtest_add_tests(nmc_template_builder_test "" AUTO)
     gtest_add_tests(nmc_auxpow_wire_test "" AUTO)
     gtest_add_tests(nmc_reconstruct_won_block_test "" AUTO)
+    gtest_add_tests(nmc_mempool_name_test "" AUTO)
 endif()
