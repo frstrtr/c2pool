@@ -16,7 +16,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   test-allowlist-guard:
     name: Test allowlist drift-guard
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","c2pool-build"]') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v4
       - name: Check coin test targets vs build.yml --target allowlist
@@ -26,7 +26,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   linux:
     name: Linux x86_64
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","c2pool-build"]') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -142,7 +142,7 @@ jobs:
     name: Linux x86_64 (AsAN+UBSan)
     # dash bring-up slices may opt out of sanitizers via dash-skip-sanitizers; KEEP for consensus/payout slices (default = on)
     if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-skip-sanitizers')) }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","c2pool-build"]') || 'ubuntu-24.04' }}
     continue-on-error: true
     steps:
       - uses: actions/checkout@v6
@@ -249,7 +249,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   coin-bch:
     name: COIN_BCH Linux x86_64
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","c2pool-build"]') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -318,7 +318,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   coin-bch-asan:
     name: COIN_BCH Linux x86_64 (AsAN+UBSan)
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","c2pool-build"]') || 'ubuntu-24.04' }}
     continue-on-error: true
     steps:
       - uses: actions/checkout@v6
@@ -399,7 +399,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   web-static:
     name: Web-static verify
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","c2pool-build"]') || 'ubuntu-24.04' }}
     defaults:
       run:
         working-directory: web-static/sharechain-explorer
@@ -477,7 +477,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   qt-webengine:
     name: Qt WebEngine leak gate
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","c2pool-build"]') || 'ubuntu-24.04' }}
     # Hard ceiling: orphaned QtWebEngine/Chromium helper children survive
     # the inner `timeout 180`, holding the xvfb pipe open and hanging the
     # job to the 360-min runner default. Cap it so a hung leak gate is
@@ -721,7 +721,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   coin-dgb-auxdoge:
     name: COIN_DGB +AUX_DOGE Linux x86_64
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","c2pool-build"]') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v6
 
