@@ -1783,6 +1783,13 @@
                     <div class="stat-sub">DOA+Orphan: <span id="pool_stale">-</span></div>
                     <div class="stat-detail">Share Difficulty: <span id="difficulty">-</span></div>
                 </div>
+                <!-- V36 crossing-state: truthful ratchet visibility from /v36_status (charter #3) -->
+                <div class="stat-card" id="v36_card" style="display:none;">
+                    <h3><span class="icon">🔀</span> Share-Version Crossing</h3>
+                    <div class="stat-value" id="v36_status_label">-</div>
+                    <div class="stat-sub">Vote: <span id="v36_vote_pct">-</span> &nbsp;·&nbsp; Work-weighted: <span id="v36_ww_pct">-</span></div>
+                    <div class="stat-detail"><span id="v36_share_label">-</span> &rarr; <span id="v36_target_label">-</span> <span id="v36_msg" style="opacity:0.7;"></span></div>
+                </div>
             </div>
             
             <!-- Right Column: Top stats row + Graph -->
@@ -2880,6 +2887,31 @@
             d3.json('../global_stats', function(d) { _gs = d; _tryRenderStats(); });
             d3.json('../merged_stats', function(d) { _ms = d || {}; _tryRenderStats(); });
             d3.json('../best_share', function(d) { _bs = d || {}; _tryRenderStats(); });
+            d3.json('../v36_status', function(d) { if (d) renderV36Status(d); });
+        }
+
+        // V36 crossing widget: maps /v36_status ratchet state to an at-a-glance label.
+        // Sourced from the same internal state debug.log uses -- never a stub.
+        function renderV36Status(v) {
+            var card = document.getElementById('v36_card');
+            if (!card) return;
+            var labels = {
+                no_transition: 'ACTIVATED',
+                activating: 'ACTIVATING',
+                signaling_strong: 'VOTING (strong)',
+                signaling: 'VOTING',
+                propagating: 'PROPAGATING',
+                building_chain: 'BUILDING CHAIN',
+                waiting: 'WAITING'
+            };
+            card.style.display = '';
+            card.classList.toggle('transitioning', !!v.is_transitioning);
+            d3.select('#v36_status_label').text(labels[v.status] || v.status || '-');
+            d3.select('#v36_vote_pct').text(v.overall_v36_vote_pct != null ? v.overall_v36_vote_pct + '%' : '-');
+            d3.select('#v36_ww_pct').text(v.sampling_signaling != null ? v.sampling_signaling + '%' : '-');
+            d3.select('#v36_share_label').text(v.current_share_name || (v.current_share_type != null ? 'V' + v.current_share_type : '-'));
+            d3.select('#v36_target_label').text(v.target_version_name || (v.target_version != null ? 'V' + v.target_version : '-'));
+            d3.select('#v36_msg').text(v.message ? '\u00b7 ' + v.message : '');
         }
 
         function renderBestShare(bs) {
