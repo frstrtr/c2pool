@@ -3,6 +3,7 @@
 <html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">
     <head>
         <meta http-equiv="Content-Type" content="text/html;charset=UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
         <title>c2pool</title>
         <link rel="shortcut icon" type="image/x-icon" href="favicon.ico" />
         <script type="text/javascript" src="d3.v2.min.js"></script>
@@ -486,6 +487,18 @@
             fill('../web/tails', '#tails');
             fill('../web/my_share_hashes50', '#my_share_hashes');
         </script>
+        <style type="text/css">
+            /* D-WEB.4 mobile-responsive shim (dashboard-steward) */
+            @media screen and (max-width: 760px) {
+                body { margin: 8px; -webkit-text-size-adjust: 100%; }
+                h1 { font-size: 1.4em; word-wrap: break-word; }
+                /* keep wide tables on their own horizontal scroll instead of
+                   forcing the whole page wide (the mobile-clip the operator hit) */
+                table { display: block; max-width: 100%; overflow-x: auto;
+                        -webkit-overflow-scrolling: touch; }
+                img, canvas { max-width: 100%; height: auto; }
+            }
+        </style>
     </head>
     <body>
         <h1>c2pool <span class="symbol"></span></h1>

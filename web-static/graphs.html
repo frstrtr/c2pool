@@ -2,6 +2,7 @@
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
 <html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">
     <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
         <title>c2pool Graphs</title>
         <link rel="shortcut icon" type="image/x-icon" href="favicon.ico" />
         <script type="text/javascript" src="d3.v2.min.js"></script>
@@ -33,6 +34,18 @@
             .pool-tab.active { background: #008de4; color: white; border-color: rgba(255,255,255,0.15); box-shadow: 0 2px 8px rgba(0,141,228,0.3); }
             .pool-tab-add { background: transparent !important; color: #8888a0 !important; border: 1px dashed #3a3a5a !important; font-size: 1rem; padding: 2px 10px; opacity: 0.6; box-shadow: none !important; }
             .pool-tab-add:hover { opacity: 1; border-color: #008de4 !important; color: #008de4 !important; }
+        </style>
+        <style type="text/css">
+            /* D-WEB.4 mobile-responsive shim (dashboard-steward) */
+            @media screen and (max-width: 760px) {
+                body { margin: 8px; -webkit-text-size-adjust: 100%; }
+                h1 { font-size: 1.4em; word-wrap: break-word; }
+                /* keep wide tables on their own horizontal scroll instead of
+                   forcing the whole page wide (the mobile-clip the operator hit) */
+                table { display: block; max-width: 100%; overflow-x: auto;
+                        -webkit-overflow-scrolling: touch; }
+                img, canvas { max-width: 100%; height: auto; }
+            }
         </style>
     </head>
     
