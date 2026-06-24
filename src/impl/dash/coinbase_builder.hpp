@@ -194,6 +194,15 @@ struct CoinbaseLayout {
 // BIP34 minimal push of a positive integer. Writes length byte + height LE.
 inline std::vector<unsigned char> push_bip34_height(uint32_t height)
 {
+    // BIP34 height == CScript() << nHeight (push_int64): 0->OP_0; 1..16->
+    // OP_1..OP_16 (single opcode 0x51..0x60); else minimal CScriptNum data push.
+    // dashd ContextualCheckBlock compares the coinbase scriptSig prefix to this
+    // exact form -> mismatch == bad-cb-height. OP_N only bites at low heights
+    // (regtest blocks 1-16); mainnet heights >> 16 take the data-push branch
+    // (why realistic-height KATs passed).
+    if (height == 0) return { 0x00 };
+    if (height <= 16) return { static_cast<unsigned char>(0x50 + height) };
+
     std::vector<unsigned char> le;
     le.reserve(4);
     uint32_t h = height;
@@ -201,7 +210,6 @@ inline std::vector<unsigned char> push_bip34_height(uint32_t height)
         le.push_back(static_cast<unsigned char>(h & 0xff));
         h >>= 8;
     }
-    if (le.empty()) le.push_back(0x00);                 // push 0 → [01 00]
     if (le.back() & 0x80) le.push_back(0x00);           // avoid sign
 
     std::vector<unsigned char> out;
