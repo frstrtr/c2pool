@@ -822,6 +822,20 @@ if (BUILD_TESTING AND GTest_FOUND)
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_auto_ratchet_tail_guard_test "" AUTO)
+    # dgb_chain_walk_window_test: FENCED, additive KAT pinning the LOOKBEHIND
+    # chain-walk WINDOW clamp in coin/chain_walk_window.hpp vs the
+    # p2pool-dgb-scrypt oracle idiom actual = min(lookbehind, height) with the
+    # (actual<=0) empty-walk guard, open-coded today in share_tracker.hpp
+    # get_average_stale_prop / get_stale_counts / get_desired_version_counts /
+    # get_desired_version_weights (forest.py get_chain under the main.py call-site
+    # clamp). Pure header (<algorithm>/<cstdint>) -> links only GTest.
+    # share_tracker.hpp NOT yet rewired (delegation is the byte-identity
+    # follow-on). MUST also be in the build.yml --target allowlist
+    # (#143 NOT_BUILT trap).
+    add_executable(dgb_chain_walk_window_test chain_walk_window_test.cpp)
+    target_link_libraries(dgb_chain_walk_window_test PRIVATE
+        GTest::gtest_main GTest::gtest)
+    gtest_add_tests(dgb_chain_walk_window_test "" AUTO)
 
     # dgb_think_p4_head_keys_test: FENCED, additive KAT pinning the think()
     # Phase-4 head-score KEY construction in think_p4_head_keys.hpp vs the
