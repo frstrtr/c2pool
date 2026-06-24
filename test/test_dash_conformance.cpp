@@ -367,6 +367,33 @@ TEST(DashConformanceDifficulty, BitsToDifficultyMatchesP2poolDash) {
     }
 }
 
+// ── Pillar-3 conformance: share-target validity guard vs p2pool-dash oracle ──
+// Oracle data.py Share.__init__ rejects `self.target > net.MAX_TARGET`
+// ("share target invalid") AND a zero target. c2pool share_init_verify previously
+// enforced only the zero case — no share-diff-floor upper bound. This pins the
+// restored guard against the mainnet floor (params.max_target == 0xFFFF*2**208).
+TEST(DashConformanceShareTarget, RejectsTargetEasierThanFloorAndZero) {
+    core::CoinParams params;
+    params.max_target = dash::PoolConfig::max_target();   // 00000000ffff00..00
+
+    const uint256 floor = params.max_target;
+
+    // exactly at the floor -> accepted (boundary, not "> floor")
+    EXPECT_NO_THROW(dash::check_share_target_valid(floor, params));
+
+    // strictly harder (numerically smaller target) -> accepted
+    uint256 harder; harder.SetHex("000000000000ffff000000000000000000000000000000000000000000000000");
+    EXPECT_NO_THROW(dash::check_share_target_valid(harder, params));
+
+    // strictly easier than the floor (numerically larger) -> rejected
+    uint256 easier; easier.SetHex("00000001ffff0000000000000000000000000000000000000000000000000000");
+    EXPECT_THROW(dash::check_share_target_valid(easier, params), std::invalid_argument);
+
+    // zero target -> rejected
+    uint256 zero;
+    EXPECT_THROW(dash::check_share_target_valid(zero, params), std::invalid_argument);
+}
+
 // ── PPLNS payout-SET equality conformance (S6 slice 6) ───────────────────────
 // The miner-facing output of the whole sharechain is the PPLNS payout SET:
 // the {scriptPubKey -> amount} map a coinbase pays. For DASH to be value-

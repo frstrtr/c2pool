@@ -158,6 +158,23 @@ inline std::vector<unsigned char> compute_gentx_before_refhash()
     return result;
 }
 
+// ── check_share_target_valid (Dash v16) ─────────────────────────────
+// Conformance with p2pool-dash oracle data.py Share.__init__:
+//     if self.target > net.MAX_TARGET: raise PeerMisbehavingError('share target invalid')
+// The claimed share target must be no easier than the network share-diff floor
+// (params.max_target == net.MAX_TARGET); a zero target is likewise invalid. This is
+// a structural validity guard on share_info['bits'], independent of the PoW check.
+// v36 3-bucket: the GUARD is v36-native SHARED validation (Bucket 2 — cross-coin
+// identical); only the per-coin max_target constant differs (a consensus param, not
+// an isolation primitive).
+inline void check_share_target_valid(const uint256& target, const core::CoinParams& params)
+{
+    if (target.IsNull())
+        throw std::invalid_argument("share target is zero");
+    if (target > params.max_target)
+        throw std::invalid_argument("share target invalid");
+}
+
 // ── share_init_verify (Dash v16) ─────────────────────────────────────────────
 // Verifies PoW, hash_link, merkle_link. Returns share hash (SHA256d of header).
 inline uint256 share_init_verify(const DashShare& share,
@@ -166,6 +183,10 @@ inline uint256 share_init_verify(const DashShare& share,
 {
     if (share.m_coinbase.m_data.size() < 2 || share.m_coinbase.m_data.size() > 100)
         throw std::invalid_argument("bad coinbase size");
+
+    // ── Share target validity (oracle: target > MAX_TARGET → "share target invalid") ──
+    // Unconditional — NOT gated by check_pow, matching p2pool-dash Share.__init__.
+    check_share_target_valid(chain::bits_to_target(share.m_bits), params);
 
     // ── Compute ref_hash ──
     PackStream ref_stream;
@@ -269,9 +290,6 @@ inline uint256 share_init_verify(const DashShare& share,
     if (check_pow)
     {
         uint256 target = chain::bits_to_target(share.m_bits);
-        if (target.IsNull())
-            throw std::invalid_argument("share target is zero");
-
         if (share_hash > target)
             throw std::invalid_argument("share PoW hash does not meet target");
     }
