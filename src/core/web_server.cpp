@@ -5210,16 +5210,10 @@ nlohmann::json MiningInterface::rest_node_topology()
         return str;
     };
 
-    // This node's own chain.
-    std::string primary;
-    switch (m_blockchain) {
-    case Blockchain::LITECOIN: primary = "LTC";  break;
-    case Blockchain::BITCOIN:  primary = "BTC";  break;
-    case Blockchain::DOGECOIN: primary = "DOGE"; break;
-    case Blockchain::DASH:     primary = "DASH"; break;
-    case Blockchain::DIGIBYTE: primary = "DGB";  break;
-    default: break;
-    }
+    // This node's own chain. node_symbol() falls back to the config-driven
+    // coin label for chains with no Blockchain enum entry (BCH / NMC-aux),
+    // so a node never advertises a blank primary symbol.
+    std::string primary = node_symbol();
 
     nlohmann::json coins = nlohmann::json::array();
     auto has_coin = [&](const std::string& sym) {
@@ -5294,6 +5288,17 @@ nlohmann::json MiningInterface::rest_node_info()
         result["symbol"] = "DGB";
         break;
     default: break;
+    }
+    // Config-driven fallback for chains absent from the Blockchain enum
+    // (BCH / NMC-aux): label from the configured coin string rather than
+    // leaving symbol/network blank.
+    if (!result.contains("symbol")) {
+        std::string sym = node_symbol();
+        if (!sym.empty()) result["symbol"] = sym;
+    }
+    if (!result.contains("network")) {
+        std::string ck = primary_chain_key();
+        if (!ck.empty()) result["network"] = m_testnet ? (ck + "_testnet") : ck;
     }
     return result;
 }

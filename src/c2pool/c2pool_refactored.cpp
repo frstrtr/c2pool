@@ -578,6 +578,7 @@ int main(int argc, char* argv[]) {
     std::string doge_p2p_address;            // --doge-p2p-address HOST
     int doge_p2p_port = 0;                   // --doge-p2p-port PORT
     Blockchain blockchain = Blockchain::LITECOIN;  // Default to Litecoin
+    std::string blockchain_label = "ltc";  // Raw coin string -> web layer node_symbol() fallback (config-driven labeling)
 
     // Coin daemon P2P connection (for fast block relay alongside RPC)
     std::string coind_p2p_address;   // defaults to rpc_host (same machine as RPC)
@@ -765,7 +766,8 @@ int main(int argc, char* argv[]) {
         else if (arg == "--loglevel-critical") { cli_log_level = "fatal"; cli_explicit.insert("log_level"); }
         // Network / blockchain selection (p2pool: --net)
         else if ((arg == "--net" || arg == "--blockchain") && i + 1 < argc) {
-            blockchain = parse_blockchain(argv[++i]);
+            blockchain_label = argv[++i];
+            blockchain = parse_blockchain(blockchain_label);
             cli_explicit.insert("blockchain");
         }
         // P2Pool P2P sharechain port (p2pool: --p2pool-port)
@@ -1142,8 +1144,10 @@ int main(int argc, char* argv[]) {
                 else if (m == "wait") startup_mode = StartupMode::WAIT;
                 else startup_mode = StartupMode::AUTO;
             }
-            if (!cli_explicit.count("blockchain") && cfg["blockchain"])
-                blockchain = parse_blockchain(cfg["blockchain"].as<std::string>());
+            if (!cli_explicit.count("blockchain") && cfg["blockchain"]) {
+                blockchain_label = cfg["blockchain"].as<std::string>();
+                blockchain = parse_blockchain(blockchain_label);
+            }
 
             // Ports
             if (!cli_explicit.count("p2p_port") && cfg["port"])
@@ -1568,6 +1572,7 @@ int main(int argc, char* argv[]) {
             if (!external_ip.empty())
                 web_server.get_mining_interface()->set_external_ip(external_ip);
 #ifdef C2POOL_VERSION
+            web_server.get_mining_interface()->set_coin_label(blockchain_label);
             web_server.get_mining_interface()->set_pool_version(
                 "c2pool/" C2POOL_VERSION);
 #endif
