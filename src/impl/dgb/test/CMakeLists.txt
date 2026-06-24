@@ -671,6 +671,17 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(dgb_expected_time_to_block_test PRIVATE
         GTest::gtest_main GTest::gtest)
     gtest_add_tests(dgb_expected_time_to_block_test "" AUTO)
+    # dgb_pool_efficiency_test: FENCED, additive KAT pinning the pool
+    # EFFICIENCY / REAL-HASHRATE diagnostics arithmetic in pool_efficiency.hpp vs
+    # the p2pool main.py status-loop oracle (stale_prop = (orphan+doa)/total;
+    # real_att_s = pool_hs / (1 - stale_prop) with the near-all-stale guard).
+    # Pure header (<cstdint> only) -> links only GTest. node.cpp NOT yet rewired
+    # (delegation is the byte-identity follow-on). MUST also be in the build.yml
+    # --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_pool_efficiency_test pool_efficiency_test.cpp)
+    target_link_libraries(dgb_pool_efficiency_test PRIVATE
+        GTest::gtest_main GTest::gtest)
+    gtest_add_tests(dgb_pool_efficiency_test "" AUTO)
 
     # dgb_think_p4_head_keys_test: FENCED, additive KAT pinning the think()
     # Phase-4 head-score KEY construction in think_p4_head_keys.hpp vs the
