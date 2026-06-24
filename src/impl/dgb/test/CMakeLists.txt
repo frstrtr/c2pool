@@ -550,6 +550,25 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_aux_doge_db_commitment_bind_test "" AUTO)
 
+    # --- DGB+DOGE (phase DC) -- DGB-as-parent AuxPoW PROOF byte-parity + dual ---
+    # Proves the neutral producer build_auxpow_proof (c2pool/merged) is byte-
+    # identical to the typed doge::coin::CAuxPow<dgb::coin::MutableTransaction>
+    # the DOGE-win handler assembles, round-trips that proof through parse_aux_
+    # header<..., dgb::coin::MutableTransaction> (EVERY call site binds the DGB
+    # parent type EXPLICITLY -- the LTC default would silently mis-serialize), and
+    # pins the independent dual-target share-check. Links c2pool_merged_mining
+    # (build_auxpow_proof) + ltc_coin like the DB/parity siblings -- the -DAUX_DOGE
+    # consumption path legitimately couples to ltc. Test-only; consumes the shared
+    # module + merged primitive, modifies neither. MUST appear in BOTH this
+    # registration AND the build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_aux_doge_dc_proof_test aux_doge_dc_proof_test.cpp)
+    target_link_libraries(dgb_aux_doge_dc_proof_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb ltc_coin
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_aux_doge_dc_proof_test "" AUTO)
+
     # dgb_share_target_genesis_test: FENCED KAT pinning ShareTracker::compute_
     # share_target genesis/unknown-prev clamp to [MAX_TARGET/30, MAX_TARGET] vs
     # the DGB oracle data.py generate_transaction. Links the same proven set as
