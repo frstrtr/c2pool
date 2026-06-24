@@ -736,6 +736,18 @@ if (BUILD_TESTING AND GTest_FOUND)
         GTest::gtest_main GTest::gtest
         core c2pool_hashrate c2pool_merged_mining c2pool_payout c2pool_storage)
     gtest_add_tests(dgb_pool_attempts_per_second_test "" AUTO)
+    # dgb_binomial_conf_interval_test: FENCED, additive KAT pinning the pure
+    # Wilson-score confidence-interval arithmetic of p2pool util/math.py:133
+    # binomial_conf_interval (+ ierf/erf A&S-7.1.26 helpers) lifted into
+    # coin/binomial_conf_interval.hpp. DIAGNOSTICS-ONLY stale-rate display math
+    # (main.py format_binomial_conf), no consensus surface; golden endpoints are
+    # non-circular Python-oracle output. Pure header (<cmath>/<array>) -> links
+    # only GTest. No call site rewired. MUST also be in the build.yml --target
+    # allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_binomial_conf_interval_test binomial_conf_interval_test.cpp)
+    target_link_libraries(dgb_binomial_conf_interval_test PRIVATE
+        GTest::gtest_main GTest::gtest)
+    gtest_add_tests(dgb_binomial_conf_interval_test "" AUTO)
     # dgb_pool_efficiency_test: FENCED, additive KAT pinning the pool
     # EFFICIENCY / REAL-HASHRATE diagnostics arithmetic in pool_efficiency.hpp vs
     # the p2pool main.py status-loop oracle (stale_prop = (orphan+doa)/total;
