@@ -618,4 +618,17 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_think_p1_walk_bounds_test "" AUTO)
 
+    # dgb_think_p2_extend_bounds_test: FENCED, additive KAT pinning the think()
+    # Phase-2 verification-extension bound in think_p2_extend_bounds.hpp vs the
+    # p2pool data.py think() oracle (want=max(CL-head,0); can=max(last-1-CL,0) if
+    # tail rooted else last; get=min(want,can)). Pure arithmetic -> links only
+    # core. MUST also be in the build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_think_p2_extend_bounds_test think_p2_extend_bounds_test.cpp)
+    target_link_libraries(dgb_think_p2_extend_bounds_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_think_p2_extend_bounds_test "" AUTO)
+
 endif()
