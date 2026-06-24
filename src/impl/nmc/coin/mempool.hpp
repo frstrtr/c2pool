@@ -42,6 +42,52 @@ namespace coin {
 // MAX_MONEY, consensus.h COINBASE_MATURITY.
 static constexpr core::coin::ChainLimits NMC_LIMITS = {2'100'000'000'000'000LL, 100, 0};
 
+// ─── Namecoin name operations (PB) ────────────────────────
+//
+// Namecoin extends Bitcoin with three name operations encoded as a prefix on an
+// output scriptPubKey, gated by a distinguishing tx-version marker. c2pool is a
+// merge-miner, NOT a name registry: it RELAYS name txs into the block template
+// WITHOUT performing name-db consensus validation (no expiry / no
+// name_new->name_firstupdate linkage / no duplicate-name checks). namecoind owns
+// name-db consensus. The trust is SPV-trust in the configured daemon backend:
+// a name tx is only consensus-TRUSTED when sourced from the trusted
+// namecoind-backed mempool/GBT (TxSource::Daemon), NOT from arbitrary peer relay
+// (integrator §4 caveat 1). PB records the daemon-vs-relay provenance per entry
+// and admits both; binding the trust to the daemon source is a PF KAT item.
+//
+// Reference: namecoin-core script/names.cpp CNameScript; primitives/transaction.h
+// NAMECOIN_TX_VERSION / getNamecoinVersion().
+
+// Namecoin name-tx version marker. Namecoin packs the name version into the high
+// 16 bits of nVersion; getNamecoinVersion() == NAMECOIN_TX_VERSION (0x7100)
+// distinguishes a name tx from a bare Bitcoin tx that merely starts an output
+// with OP_1..OP_3 (segwit v1+/taproot, bare multisig).
+static constexpr int32_t NAMECOIN_TX_VERSION = 0x7100;
+inline int32_t name_version(int32_t nVersion) { return (nVersion >> 16) & 0xffff; }
+
+// Name-op prefix opcodes (namecoin-core reuses OP_1/OP_2/OP_3).
+enum : unsigned char {
+    OP_NAME_NEW         = 0x51,  // OP_1
+    OP_NAME_FIRSTUPDATE = 0x52,  // OP_2
+    OP_NAME_UPDATE      = 0x53,  // OP_3
+};
+
+enum class NameOp : uint8_t { None = 0, New, FirstUpdate, Update };
+
+// Provenance of an admitted tx. A name tx is consensus-TRUSTED only when
+// daemon-sourced (SPV-trust boundary); a PeerRelay name tx is admitted but not
+// trusted — PF enforces the binding (integrator §4 caveat 1).
+enum class TxSource : uint8_t { Daemon = 0, PeerRelay };
+
+inline const char* name_op_str(NameOp op) {
+    switch (op) {
+        case NameOp::New:         return "name_new";
+        case NameOp::FirstUpdate: return "name_firstupdate";
+        case NameOp::Update:      return "name_update";
+        default:                  return "none";
+    }
+}
+
 // ─── MempoolEntry ────────────────────────────────────────────────────────────
 
 struct MempoolEntry {
@@ -53,6 +99,10 @@ struct MempoolEntry {
     uint64_t fee{0};            // satoshi (computed from UTXO when available)
     bool     fee_known{false};  // true when fee was computed from UTXO lookups
     time_t   time_added{0};
+    NameOp   name_op{NameOp::None}; // Namecoin name op class (PB), None for plain tx
+    TxSource source{TxSource::PeerRelay};   // provenance: daemon-trusted vs peer-relay
+
+    bool is_name() const { return name_op != NameOp::None; }
 
     double feerate() const {
         uint32_t vsize = (weight + 3) / 4;  // ceil(weight/4)
@@ -81,6 +131,28 @@ inline void compute_tx_weight(const MutableTransaction& tx,
     uint32_t full_sz = static_cast<uint32_t>(full.size());
     witness_size = full_sz > base_size ? full_sz - base_size : 0;
     weight = base_size * 4 + witness_size;
+}
+
+/// Classify a transaction as a Namecoin name operation WITHOUT name-db
+/// validation. A name tx is identified by the Namecoin version marker AND a
+/// leading name opcode on one of its output scripts; the version gate prevents
+/// false-positives against bare OP_1..OP_3 outputs (taproot / multisig) in plain
+/// Bitcoin txs. Returns the FIRST name op found, else NameOp::None. Full
+/// CNameScript structural + name-db validation is namecoind's job (SPV-trust).
+inline NameOp classify_name_op(const MutableTransaction& tx) {
+    if (name_version(tx.version) != NAMECOIN_TX_VERSION)
+        return NameOp::None;
+    for (const auto& out : tx.vout) {
+        const auto& d = out.scriptPubKey.m_data;
+        if (d.empty()) continue;
+        switch (d[0]) {
+            case OP_NAME_NEW:         return NameOp::New;
+            case OP_NAME_FIRSTUPDATE: return NameOp::FirstUpdate;
+            case OP_NAME_UPDATE:      return NameOp::Update;
+            default: break;
+        }
+    }
+    return NameOp::None;
 }
 
 // ─── Mempool ─────────────────────────────────────────────────────────────────
@@ -122,7 +194,8 @@ public:
     /// When utxo is non-null, computes fee = sum(input_values) - sum(output_values).
     /// Falls back to fee_known=false if any input is missing from the UTXO set
     /// or from a parent mempool transaction (chain-of-unconfirmed / CPFP).
-    bool add_tx(const MutableTransaction& tx, core::coin::UTXOViewCache* utxo) {
+    bool add_tx(const MutableTransaction& tx, core::coin::UTXOViewCache* utxo,
+                TxSource source = TxSource::PeerRelay) {
         uint256 txid = compute_txid(tx);
 
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -136,6 +209,18 @@ public:
         entry.txid  = txid;
         compute_tx_weight(tx, entry.base_size, entry.witness_size, entry.weight);
         entry.time_added  = std::time(nullptr);
+
+        // PB: classify Namecoin name ops and record provenance. Name txs are
+        // RELAYED into the template without name-db validation (SPV-trust in the
+        // daemon source); namecoind owns name consensus.
+        entry.source  = source;
+        entry.name_op = classify_name_op(tx);
+        if (entry.name_op != NameOp::None) {
+            LOG_INFO << "[EMB-NMC] Mempool: admit " << name_op_str(entry.name_op)
+                     << " (relay WITHOUT name-db validation; namecoind owns name consensus)"
+                     << " src=" << (source == TxSource::Daemon ? "daemon" : "peer-relay")
+                     << " txid=" << txid.GetHex().substr(0, 16);
+        }
 
         // Compute fee from UTXO + mempool parent lookups
         compute_fee_locked(entry, utxo);
@@ -312,6 +397,24 @@ public:
                 sum += entry.fee;
         }
         return sum;
+    }
+
+    /// Count of admitted Namecoin name-operation txs currently in the pool.
+    size_t name_op_count() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        size_t n = 0;
+        for (const auto& [txid, e] : m_pool) if (e.is_name()) ++n;
+        return n;
+    }
+
+    /// Count of name-op txs sourced from the trusted daemon backend (the only
+    /// ones PF will treat as consensus-trusted; SPV-trust boundary).
+    size_t trusted_name_op_count() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        size_t n = 0;
+        for (const auto& [txid, e] : m_pool)
+            if (e.is_name() && e.source == TxSource::Daemon) ++n;
+        return n;
     }
 
     std::optional<MempoolEntry> get_entry(const uint256& txid) const {
