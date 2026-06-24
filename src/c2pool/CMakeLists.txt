@@ -281,6 +281,7 @@ target_link_libraries(c2pool-dash
     core pool sharechain
     c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage c2pool_difficulty
     dash_x11   # DASH X11 PoW sph reference (BLAKE->...->ECHO), additive static lib
+    dash_rpc   # launcher slice-3: external-dashd-RPC client (submitblock fallback)
     btclibs
     yaml-cpp::yaml-cpp
     nlohmann_json::nlohmann_json
