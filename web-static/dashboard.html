@@ -1809,6 +1809,12 @@
                     <div class="stat-sub">Vote: <span id="v36_vote_pct">-</span> &nbsp;·&nbsp; Work-weighted: <span id="v36_ww_pct">-</span></div>
                     <div class="stat-detail"><span id="v36_share_label">-</span> &rarr; <span id="v36_target_label">-</span> <span id="v36_msg" style="opacity:0.7;"></span></div>
                 </div>
+                <!-- Per-node topology: THIS node's REAL coin set from /api/node_topology (charter #2, config-driven/auto-detected -- never a baked-in coin list) -->
+                <div class="stat-card" id="node_topology_card" style="display:none;">
+                    <h3><span class="icon">🧭</span> Node Topology <span id="node_topology_symbol" style="font-size:0.6em;opacity:0.6;"></span></h3>
+                    <div id="node_topology_coins" class="stat-sub" style="line-height:1.6;"></div>
+                    <div class="stat-detail" id="node_topology_note" style="opacity:0.6;"></div>
+                </div>
             </div>
             
             <!-- Right Column: Top stats row + Graph -->
@@ -2907,6 +2913,7 @@
             d3.json('../merged_stats', function(d) { _ms = d || {}; _tryRenderStats(); });
             d3.json('../best_share', function(d) { _bs = d || {}; _tryRenderStats(); });
             d3.json('../v36_status', function(d) { if (d) renderV36Status(d); });
+            d3.json('../api/node_topology', function(d) { if (d) renderNodeTopology(d); });
         }
 
         // V36 crossing widget: maps /v36_status ratchet state to an at-a-glance label.
@@ -2931,6 +2938,28 @@
             d3.select('#v36_share_label').text(v.current_share_name || (v.current_share_type != null ? 'V' + v.current_share_type : '-'));
             d3.select('#v36_target_label').text(v.target_version_name || (v.target_version != null ? 'V' + v.target_version : '-'));
             d3.select('#v36_msg').text(v.message ? '\u00b7 ' + v.message : '');
+        }
+
+        // Per-node topology: renders THIS node's real coin set (primary + embedded/aux),
+        // peer counts and embedded/RPC flags, straight from /api/node_topology.
+        // Config-driven/auto-detected -- never a baked-in coin list (charter #2).
+        function renderNodeTopology(t) {
+            var card = document.getElementById('node_topology_card');
+            if (!card || !t || !Array.isArray(t.coins) || !t.coins.length) return;
+            var rows = t.coins.map(function(c) {
+                var tags = [];
+                if (c.primary) tags.push('primary');
+                if (c.embedded) tags.push('embedded');
+                if (c.has_rpc) tags.push('rpc');
+                var tagStr = tags.length ? ' <span style="opacity:0.6;">[' + tags.join(', ') + ']</span>' : '';
+                var peers = (c.peers != null ? c.peers : 0);
+                return '<div><strong>' + c.coin + '</strong>' + tagStr +
+                       ' &nbsp;&middot;&nbsp; ' + peers + ' peer' + (peers === 1 ? '' : 's') + '</div>';
+            }).join('');
+            document.getElementById('node_topology_coins').innerHTML = rows;
+            d3.select('#node_topology_symbol').text(t.node_symbol ? '(' + t.node_symbol + ')' : '');
+            d3.select('#node_topology_note').text(t.auto_detected ? 'auto-detected' : '');
+            card.style.display = '';
         }
 
         function renderBestShare(bs) {
