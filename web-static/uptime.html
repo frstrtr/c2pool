@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <title>Worker Uptime - c2pool</title>
+    <link rel="shortcut icon" type="image/x-icon" href="favicon.ico" />
+    <style>
+        :root {
+            --primary: #008de4;
+            --primary-dark: #0066a9;
+            --success: #28a745;
+            --warning: #ffc107;
+            --danger: #dc3545;
+            --dark: #1a1a2e;
+            --darker: #16162a;
+            --card-bg: #252540;
+            --text: #e0e0e0;
+            --text-muted: #8888a0;
+            --border: #3a3a5a;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, var(--dark) 0%, var(--darker) 100%);
+            color: var(--text); min-height: 100vh; line-height: 1.6;
+        }
+        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+        header { background: var(--card-bg); border-bottom: 1px solid var(--border); padding: 15px 0; margin-bottom: 20px; }
+        .header-content { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 15px; }
+        .logo { display: flex; align-items: center; gap: 12px; }
+        .logo h1 { font-size: 1.5rem; font-weight: 600; color: var(--primary); }
+        nav { display: flex; gap: 6px; flex-wrap: wrap; }
+        nav a { color: var(--text-muted); text-decoration: none; padding: 6px 12px; border-radius: 6px; font-size: 0.9rem; }
+        nav a:hover { background: rgba(255,255,255,0.06); color: var(--text); }
+        nav a.active { background: var(--primary); color: #fff; }
+        .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px; margin-bottom: 20px; }
+        .controls { display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-end; }
+        .field { display: flex; flex-direction: column; gap: 4px; }
+        .field label { font-size: 0.78rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; }
+        select, input[type="date"] {
+            background: var(--darker); color: var(--text); border: 1px solid var(--border);
+            border-radius: 6px; padding: 8px 10px; font-size: 0.9rem; min-width: 160px;
+        }
+        button {
+            background: var(--primary); color: #fff; border: none; border-radius: 6px;
+            padding: 9px 16px; font-size: 0.9rem; cursor: pointer; font-weight: 600;
+        }
+        button:hover { background: var(--primary-dark); }
+        button.secondary { background: transparent; border: 1px solid var(--border); color: var(--text); }
+        .summary { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 4px; }
+        .stat { background: var(--darker); border: 1px solid var(--border); border-radius: 8px; padding: 12px 18px; min-width: 150px; }
+        .stat .v { font-size: 1.4rem; font-weight: 700; color: var(--primary); }
+        .stat .l { font-size: 0.78rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; }
+        table { width: 100%; border-collapse: collapse; margin-top: 4px; }
+        th, td { text-align: right; padding: 8px 12px; border-bottom: 1px solid var(--border); font-size: 0.9rem; }
+        th { color: var(--text-muted); text-transform: uppercase; font-size: 0.72rem; letter-spacing: 0.04em; }
+        th:first-child, td:first-child { text-align: left; }
+        tr:hover td { background: rgba(255,255,255,0.03); }
+        .partial { color: var(--warning); font-size: 0.78rem; }
+        .cal { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 8px; }
+        .cal .cell { width: 15px; height: 15px; border-radius: 3px; background: var(--darker); border: 1px solid var(--border); }
+        .cal-legend { display: flex; align-items: center; gap: 6px; margin-top: 10px; font-size: 0.78rem; color: var(--text-muted); }
+        .cal-legend .cell { width: 13px; height: 13px; border-radius: 3px; }
+        .muted { color: var(--text-muted); }
+        .banner { background: rgba(220,53,69,0.12); border: 1px solid var(--danger); color: #ffb3bb; padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; display: none; }
+        h2 { font-size: 1.05rem; margin-bottom: 10px; color: var(--text); }
+        .row-gap { margin-top: 18px; }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <div class="header-content">
+                <div class="logo"><h1>⛏️ Worker Uptime</h1></div>
+                <nav>
+                    <a href="dashboard.html">Dashboard</a>
+                    <a href="graphs.html">Graphs</a>
+                    <a href="stratum.html">Stratum</a>
+                    <a href="miners.html">Miners</a>
+                    <a href="uptime.html" class="active">Uptime</a>
+                    <a href="index.html">Classic</a>
+                    <a href="#" onclick="load(); return false;">🔄 Refresh</a>
+                </nav>
+            </div>
+        </div>
+    </header>
+
+    <div class="container">
+        <div id="banner" class="banner"></div>
+
+        <div class="card">
+            <div class="controls">
+                <div class="field">
+                    <label for="worker">Worker</label>
+                    <select id="worker"></select>
+                </div>
+                <div class="field">
+                    <label for="from">From</label>
+                    <input type="date" id="from">
+                </div>
+                <div class="field">
+                    <label for="to">To</label>
+                    <input type="date" id="to">
+                </div>
+                <button onclick="load()">Apply</button>
+                <button class="secondary" id="csv">⬇ Download CSV</button>
+            </div>
+        </div>
+
+        <div class="card" id="summary-card" style="display:none">
+            <div class="summary" id="summary"></div>
+        </div>
+
+        <div class="card" id="cal-card" style="display:none">
+            <h2>Daily presence</h2>
+            <div class="cal" id="cal"></div>
+            <div class="cal-legend">
+                <span>0h</span>
+                <span class="cell" style="background:var(--darker)"></span>
+                <span class="cell" style="background:#1d4d2b"></span>
+                <span class="cell" style="background:#2f7d43"></span>
+                <span class="cell" style="background:#3fae5c"></span>
+                <span class="cell" style="background:#5fe084"></span>
+                <span>24h</span>
+            </div>
+        </div>
+
+        <div class="card row-gap">
+            <h2>Per-day detail</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Day</th><th>Hours online</th><th>Avg hashrate</th>
+                        <th>Samples</th><th>Stale %</th><th>Partial</th>
+                    </tr>
+                </thead>
+                <tbody id="rows"><tr><td colspan="6" class="muted">Select a worker…</td></tr></tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        // Same-origin reverse-proxy path by default (web_server route -> 127.0.0.1:8089).
+        // A deploy may override by setting window.UPTIME_API_BASE before this script.
+        var API = (window.UPTIME_API_BASE || '/uptime-api').replace(/\/+$/, '');
+
+        function banner(msg) {
+            var b = document.getElementById('banner');
+            if (!msg) { b.style.display = 'none'; return; }
+            b.textContent = msg; b.style.display = 'block';
+        }
+        function fmtHr(hs) {
+            hs = +hs || 0;
+            var u = ['H/s','KH/s','MH/s','GH/s','TH/s','PH/s']; var i = 0;
+            while (hs >= 1000 && i < u.length - 1) { hs /= 1000; i++; }
+            return hs.toFixed(2) + ' ' + u[i];
+        }
+        function isoDate(d) {
+            return d.getUTCFullYear() + '-' +
+                String(d.getUTCMonth() + 1).padStart(2, '0') + '-' +
+                String(d.getUTCDate()).padStart(2, '0');
+        }
+        function calColor(hours) {
+            var f = Math.max(0, Math.min(1, (+hours || 0) / 24));
+            if (f <= 0) return 'var(--darker)';
+            if (f < 0.25) return '#1d4d2b';
+            if (f < 0.5) return '#2f7d43';
+            if (f < 0.75) return '#3fae5c';
+            return '#5fe084';
+        }
+        function getJSON(url, cb) {
+            var x = new XMLHttpRequest();
+            x.open('GET', url, true);
+            x.onreadystatechange = function () {
+                if (x.readyState !== 4) return;
+                if (x.status >= 200 && x.status < 300) {
+                    try { cb(null, JSON.parse(x.responseText)); }
+                    catch (e) { cb(e); }
+                } else { cb(new Error('HTTP ' + x.status)); }
+            };
+            x.onerror = function () { cb(new Error('network error')); };
+            x.send();
+        }
+
+        function curParams() {
+            var f = document.getElementById('from').value;
+            var t = document.getElementById('to').value;
+            var q = [];
+            if (f) q.push('from=' + f);
+            if (t) q.push('to=' + t);
+            return q.length ? '?' + q.join('&') : '';
+        }
+
+        function load() {
+            var w = document.getElementById('worker').value;
+            if (!w) return;
+            banner('');
+            getJSON(API + '/api/miner/' + encodeURIComponent(w) + '/uptime' + curParams(), function (err, data) {
+                if (err) { banner('Could not reach uptime API (' + err.message + '). Is the uptime service / proxy route up?'); return; }
+                render(data);
+            });
+        }
+
+        function render(data) {
+            var days = data.days || [];
+            var totals = data.totals || {};
+
+            var sc = document.getElementById('summary-card');
+            sc.style.display = 'block';
+            document.getElementById('summary').innerHTML =
+                stat((totals.hours_online || 0).toFixed(1) + 'h', 'Hours online') +
+                stat(totals.days_present || days.length, 'Days present') +
+                stat(fmtHr(totals.avg_hashrate), 'Avg hashrate');
+
+            var cc = document.getElementById('cal-card');
+            cc.style.display = days.length ? 'block' : 'none';
+            document.getElementById('cal').innerHTML = days.map(function (d) {
+                return '<div class="cell" title="' + d.day + ': ' + (d.hours_online || 0).toFixed(1) +
+                    'h" style="background:' + calColor(d.hours_online) + '"></div>';
+            }).join('');
+
+            var rows = document.getElementById('rows');
+            if (!days.length) {
+                rows.innerHTML = '<tr><td colspan="6" class="muted">No samples in range.</td></tr>';
+                return;
+            }
+            rows.innerHTML = days.map(function (d) {
+                return '<tr><td>' + d.day + '</td>' +
+                    '<td>' + (d.hours_online || 0).toFixed(2) + '</td>' +
+                    '<td>' + fmtHr(d.avg_hashrate) + '</td>' +
+                    '<td>' + (d.samples || 0) + '</td>' +
+                    '<td>' + (d.stale_pct != null ? (+d.stale_pct).toFixed(1) + '%' : '—') + '</td>' +
+                    '<td>' + (d.partial ? '<span class="partial">partial</span>' : '') + '</td></tr>';
+            }).join('');
+        }
+        function stat(v, l) { return '<div class="stat"><div class="v">' + v + '</div><div class="l">' + l + '</div></div>'; }
+
+        document.getElementById('csv').onclick = function () {
+            var w = document.getElementById('worker').value;
+            if (!w) return;
+            window.location = API + '/api/miner/' + encodeURIComponent(w) + '/uptime.csv' + curParams();
+        };
+
+        // init: default range = last 30 days, populate worker list
+        (function init() {
+            var now = new Date();
+            var from = new Date(now.getTime() - 29 * 86400000);
+            document.getElementById('to').value = isoDate(now);
+            document.getElementById('from').value = isoDate(from);
+
+            getJSON(API + '/api/miners', function (err, data) {
+                var sel = document.getElementById('worker');
+                if (err) {
+                    banner('Could not reach uptime API (' + err.message + '). Is the uptime service / proxy route up?');
+                    return;
+                }
+                var miners = (data && data.miners) || data || [];
+                if (!miners.length) { sel.innerHTML = '<option value="">(no workers yet)</option>'; return; }
+                sel.innerHTML = miners.map(function (m) {
+                    var name = (typeof m === 'string') ? m : (m.worker || m.name);
+                    return '<option value="' + name + '">' + name + '</option>';
+                }).join('');
+                load();
+            });
+        })();
+    </script>
+</body>
+</html>
