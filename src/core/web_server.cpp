@@ -911,7 +911,6 @@ void HttpSession::handle_error(beast::error_code ec, char const* what)
 /// MiningInterface Implementation
 MiningInterface::MiningInterface(bool testnet, std::shared_ptr<IMiningNode> node, Blockchain blockchain)
     : m_work_id_counter(1)
-    , m_rpc_client(std::make_unique<LitecoinRpcClient>(testnet))
     , m_testnet(testnet)
     , m_blockchain(blockchain)
     , m_node(node)
@@ -8548,35 +8547,6 @@ bool WebServer::is_stratum_running() const
 uint16_t WebServer::get_stratum_port() const
 {
     return stratum_port_;
-}
-
-/// LitecoinRpcClient Implementation
-LitecoinRpcClient::LitecoinRpcClient(bool testnet)
-    : testnet_(testnet)
-{
-}
-
-LitecoinRpcClient::SyncStatus LitecoinRpcClient::get_sync_status()
-{
-    SyncStatus status;
-    status.is_synced = true;  // Assume synced for now
-    status.progress = 1.0;
-    status.current_blocks = 3945867;  // Mock value for testing
-    status.total_headers = 3945867;
-    status.initial_block_download = false;
-    status.error_message = "";
-    
-    return status;
-}
-
-bool LitecoinRpcClient::is_connected()
-{
-    return true;  // Assume connected for now
-}
-
-std::string LitecoinRpcClient::execute_cli_command(const std::string& command)
-{
-    return "OK";  // Mock response for testing
 }
 
 
