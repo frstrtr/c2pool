@@ -708,6 +708,22 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(dgb_expected_time_to_block_test PRIVATE
         GTest::gtest_main GTest::gtest)
     gtest_add_tests(dgb_expected_time_to_block_test "" AUTO)
+
+    # dgb_tail_score_endpoints_test: FENCED, additive KAT pinning the
+    # TAIL-HASHRATE-SCORE chain-walk endpoint arithmetic in
+    # coin/tail_score_endpoints.hpp vs the p2pool-dgb-scrypt data.py:843-855
+    # ShareTracker.score() oracle (end-point offset CHAIN_LENGTH*15//16, trailing
+    # walk CHAIN_LENGTH//16, short-chain guard, unresolvable-block 1e6 fallback,
+    # work/(block_span*BLOCK_PERIOD) divide). Pure header (uint288) -> links core.
+    # share_tracker.hpp NOT yet rewired (delegation is the byte-identity
+    # follow-on). MUST also be in the build.yml --target allowlist (#143
+    # NOT_BUILT trap).
+    add_executable(dgb_tail_score_endpoints_test tail_score_endpoints_test.cpp)
+    target_link_libraries(dgb_tail_score_endpoints_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
+    gtest_add_tests(dgb_tail_score_endpoints_test "" AUTO)
     # dgb_pool_efficiency_test: FENCED, additive KAT pinning the pool
     # EFFICIENCY / REAL-HASHRATE diagnostics arithmetic in pool_efficiency.hpp vs
     # the p2pool main.py status-loop oracle (stale_prop = (orphan+doa)/total;
