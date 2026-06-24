@@ -54,6 +54,15 @@ jobs:
           path: ~/.conan2
           key: conan2-ubuntu24-gcc13-${{ hashFiles('conanfile.txt') }}
 
+      # Self-hosted runners reuse the workspace across runs; a stale build_ci/
+      # leaves gtest_discover_tests POST_BUILD artifacts that ctest then
+      # includes as empty/placeholder files ("Unknown CMake command
+      # gtest_discover_tests_impl", ctest exit 8). Wipe it for a clean
+      # configure+discovery. ccache (in ~/.cache/ccache) keeps recompiles fast.
+      - name: Clean stale build dir (self-hosted workspace is reused)
+        if: runner.environment != 'github-hosted'
+        run: rm -rf build_ci
+
       - name: Conan install
         run: conan install . --build=missing --output-folder=build_ci --settings=build_type=Release
 
@@ -172,6 +181,15 @@ jobs:
           path: ~/.conan2
           key: conan2-ubuntu24-gcc13-${{ hashFiles('conanfile.txt') }}
 
+      # Self-hosted runners reuse the workspace across runs; a stale build_asan/
+      # leaves gtest_discover_tests POST_BUILD artifacts that ctest then
+      # includes as empty/placeholder files ("Unknown CMake command
+      # gtest_discover_tests_impl", ctest exit 8). Wipe it for a clean
+      # configure+discovery. ccache (in ~/.cache/ccache) keeps recompiles fast.
+      - name: Clean stale build dir (self-hosted workspace is reused)
+        if: runner.environment != 'github-hosted'
+        run: rm -rf build_asan
+
       - name: Conan install
         run: conan install . --build=missing --output-folder=build_asan --settings=build_type=Release
 
@@ -280,6 +298,15 @@ jobs:
           path: ~/.conan2
           key: conan2-ubuntu24-gcc13-bch-${{ hashFiles('conanfile.txt') }}
 
+      # Self-hosted runners reuse the workspace across runs; a stale build_bch/
+      # leaves gtest_discover_tests POST_BUILD artifacts that ctest then
+      # includes as empty/placeholder files ("Unknown CMake command
+      # gtest_discover_tests_impl", ctest exit 8). Wipe it for a clean
+      # configure+discovery. ccache (in ~/.cache/ccache) keeps recompiles fast.
+      - name: Clean stale build dir (self-hosted workspace is reused)
+        if: runner.environment != 'github-hosted'
+        run: rm -rf build_bch
+
       - name: Conan install
         run: conan install . --build=missing --output-folder=build_bch --settings=build_type=Release
 
@@ -350,6 +377,15 @@ jobs:
         with:
           path: ~/.conan2
           key: conan2-ubuntu24-gcc13-bch-${{ hashFiles('conanfile.txt') }}
+
+      # Self-hosted runners reuse the workspace across runs; a stale build_bch_asan/
+      # leaves gtest_discover_tests POST_BUILD artifacts that ctest then
+      # includes as empty/placeholder files ("Unknown CMake command
+      # gtest_discover_tests_impl", ctest exit 8). Wipe it for a clean
+      # configure+discovery. ccache (in ~/.cache/ccache) keeps recompiles fast.
+      - name: Clean stale build dir (self-hosted workspace is reused)
+        if: runner.environment != 'github-hosted'
+        run: rm -rf build_bch_asan
 
       - name: Conan install
         run: conan install . --build=missing --output-folder=build_bch_asan --settings=build_type=Release
@@ -429,18 +465,27 @@ jobs:
 
       - name: Install Chrome for pixel-regression harness
         run: |
-          flock /tmp/c2pool-apt.lock bash -e -c '
-            sudo apt-get update -qq
-            sudo apt-get install -y --no-install-recommends google-chrome-stable || \
-            sudo apt-get install -y --no-install-recommends chromium-browser
-          '
-          # Export the first one that exists so capture.mjs picks it up.
-          for bin in /usr/bin/google-chrome-stable /usr/bin/google-chrome /usr/bin/chromium /usr/bin/chromium-browser; do
-            if [ -x "$bin" ]; then
-              echo "CHROME_BIN=$bin" >> "$GITHUB_ENV"
-              break
-            fi
-          done
+          # GitHub-hosted: apt google-chrome/chromium is a real .deb and launches.
+          # Self-hosted VM905 only offers snap chromium, which refuses to launch
+          # under the runner systemd cgroup ("not a snap cgroup for tag
+          # snap.chromium.chromium"). Provision a real Chrome-for-Testing build
+          # via @puppeteer/browsers (a puppeteer-core dep, present after npm ci);
+          # it unpacks under ~/.cache/puppeteer with no snap confinement. The
+          # harness already launches with --no-sandbox (tests/visual/capture.mjs).
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            flock /tmp/c2pool-apt.lock bash -e -c '
+              sudo apt-get update -qq
+              sudo apt-get install -y --no-install-recommends google-chrome-stable || \
+              sudo apt-get install -y --no-install-recommends chromium-browser
+            '
+            for bin in /usr/bin/google-chrome-stable /usr/bin/google-chrome /usr/bin/chromium /usr/bin/chromium-browser; do
+              if [ -x "$bin" ]; then echo "CHROME_BIN=$bin" >> "$GITHUB_ENV"; break; fi
+            done
+          else
+            CHROME_BIN="$(npx --yes @puppeteer/browsers install chrome@stable | tail -1 | awk '{print $NF}')"
+            test -x "$CHROME_BIN" || { echo "puppeteer chrome install failed"; exit 1; }
+            echo "CHROME_BIN=$CHROME_BIN" >> "$GITHUB_ENV"
+          fi
 
       - name: Visual pixel-diff harness
         run: npm run visual
@@ -759,6 +804,15 @@ jobs:
         with:
           path: ~/.conan2
           key: conan2-ubuntu24-gcc13-dgb-auxdoge-${{ hashFiles('conanfile.txt') }}
+
+      # Self-hosted runners reuse the workspace across runs; a stale build_dgb_auxdoge/
+      # leaves gtest_discover_tests POST_BUILD artifacts that ctest then
+      # includes as empty/placeholder files ("Unknown CMake command
+      # gtest_discover_tests_impl", ctest exit 8). Wipe it for a clean
+      # configure+discovery. ccache (in ~/.cache/ccache) keeps recompiles fast.
+      - name: Clean stale build dir (self-hosted workspace is reused)
+        if: runner.environment != 'github-hosted'
+        run: rm -rf build_dgb_auxdoge
 
       - name: Conan install
         run: conan install . --build=missing --output-folder=build_dgb_auxdoge --settings=build_type=Release
