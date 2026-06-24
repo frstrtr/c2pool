@@ -2953,8 +2953,20 @@
                 if (c.has_rpc) tags.push('rpc');
                 var tagStr = tags.length ? ' <span style="opacity:0.6;">[' + tags.join(', ') + ']</span>' : '';
                 var peers = (c.peers != null ? c.peers : 0);
+                // Surface the embedded daemon REAL sync state + tip height when the
+                // backend reports them (StatsProvider path emits synced/height per
+                // coin). Only rendered when present -- a coin we hold no handle for
+                // stays silent rather than claim a sync state it cannot read.
+                var sync = '';
+                if (typeof c.synced === 'boolean')
+                    sync = c.synced
+                        ? ' &nbsp;&middot;&nbsp; <span style="color:#3c3;">synced</span>'
+                        : ' &nbsp;&middot;&nbsp; <span style="color:#e90;">syncing</span>';
+                var tip = (c.height != null && c.height > 0)
+                    ? ' &nbsp;&middot;&nbsp; tip ' + c.height : '';
                 return '<div><strong>' + c.coin + '</strong>' + tagStr +
-                       ' &nbsp;&middot;&nbsp; ' + peers + ' peer' + (peers === 1 ? '' : 's') + '</div>';
+                       ' &nbsp;&middot;&nbsp; ' + peers + ' peer' + (peers === 1 ? '' : 's') +
+                       sync + tip + '</div>';
             }).join('');
             document.getElementById('node_topology_coins').innerHTML = rows;
             d3.select('#node_topology_symbol').text(t.node_symbol ? '(' + t.node_symbol + ')' : '');
