@@ -31,6 +31,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install system dependencies
+        if: runner.environment == 'github-hosted'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
@@ -148,6 +149,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install system dependencies
+        if: runner.environment == 'github-hosted'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
@@ -255,6 +257,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install system dependencies
+        if: runner.environment == 'github-hosted'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
@@ -325,6 +328,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install system dependencies
+        if: runner.environment == 'github-hosted'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
@@ -425,10 +429,11 @@ jobs:
 
       - name: Install Chrome for pixel-regression harness
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            google-chrome-stable || \
-          sudo apt-get install -y --no-install-recommends chromium-browser
+          flock /tmp/c2pool-apt.lock bash -e -c '
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends google-chrome-stable || \
+            sudo apt-get install -y --no-install-recommends chromium-browser
+          '
           # Export the first one that exists so capture.mjs picks it up.
           for bin in /usr/bin/google-chrome-stable /usr/bin/google-chrome /usr/bin/chromium /usr/bin/chromium-browser; do
             if [ -x "$bin" ]; then
@@ -490,16 +495,18 @@ jobs:
 
       - name: Install Qt6 + WebEngine + xvfb
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            cmake g++ ccache \
-            qt6-base-dev qt6-webengine-dev qt6-webchannel-dev \
-            qt6-tools-dev \
-            libgl1-mesa-dev libegl1-mesa-dev \
-            libxkbcommon-dev libnss3 libxcomposite1 libxdamage1 \
-            libxrandr2 libxtst6 libatk1.0-0 libatk-bridge2.0-0 \
-            libasound2t64 libdrm2 libgbm1 \
-            xvfb
+          flock /tmp/c2pool-apt.lock bash -e -c '
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends \
+              cmake g++ ccache \
+              qt6-base-dev qt6-webengine-dev qt6-webchannel-dev \
+              qt6-tools-dev \
+              libgl1-mesa-dev libegl1-mesa-dev \
+              libxkbcommon-dev libnss3 libxcomposite1 libxdamage1 \
+              libxrandr2 libxtst6 libatk1.0-0 libatk-bridge2.0-0 \
+              libasound2t64 libdrm2 libgbm1 \
+              xvfb
+          '
 
       - name: Configure
         run: cmake -S ui/c2pool-qt -B build-qt -DC2POOL_QT_BUILD_TESTS=ON -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
@@ -730,6 +737,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install system dependencies
+        if: runner.environment == 'github-hosted'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
