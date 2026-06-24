@@ -636,7 +636,11 @@ jobs:
     name: Windows x86_64
     # dash-slice campaign: skip Windows for PRs carrying the dash-linux-only label (re-enabled at block-viable gate, ~07-01)
     if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-linux-only')) }}
-    runs-on: windows-2022
+    # Self-hosted fleet (VM217 c2pool-windows-217): internal-branch PRs and
+    # pushes run on the self-hosted Windows runner for speed; fork PRs fall
+    # back to GitHub-hosted windows-2022 so untrusted code never lands on the
+    # self-hosted box (defense-in-depth atop the repo fork-approval gate).
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Windows","X64","c2pool-build"]') || 'windows-2022' }}
     steps:
       - uses: actions/checkout@v6
 
