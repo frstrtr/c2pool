@@ -780,6 +780,21 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(dgb_naughty_propagation_test PRIVATE
         GTest::gtest_main GTest::gtest)
     gtest_add_tests(dgb_naughty_propagation_test "" AUTO)
+    # dgb_get_height_and_last_endpoints_test: FENCED, additive KAT pinning the
+    # get_height_and_last chain-walk WINDOW arithmetic in
+    # coin/get_height_and_last_endpoints.hpp vs the p2pool-dgb-scrypt oracle:
+    # forest.py:171-173 (height,last), data.py:161 / data.py:696 rooted-tail
+    # invariant, PPLNS window depth = min(height, REAL_CHAIN_LENGTH) /
+    # _pplns_max_shares = max(0, depth-1), pool_monitor.hpp:98 height>=10 gate.
+    # redistribute.hpp / pool_monitor.hpp NOT yet rewired (delegation is the
+    # byte-identity follow-on). MUST also be in the build.yml --target allowlist
+    # (#143 NOT_BUILT trap).
+    add_executable(dgb_get_height_and_last_endpoints_test get_height_and_last_endpoints_test.cpp)
+    target_link_libraries(dgb_get_height_and_last_endpoints_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
+    gtest_add_tests(dgb_get_height_and_last_endpoints_test "" AUTO)
     # dgb_pool_efficiency_test: FENCED, additive KAT pinning the pool
     # EFFICIENCY / REAL-HASHRATE diagnostics arithmetic in pool_efficiency.hpp vs
     # the p2pool main.py status-loop oracle (stale_prop = (orphan+doa)/total;
