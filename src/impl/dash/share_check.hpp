@@ -20,6 +20,7 @@
 
 #include "share.hpp"
 #include "share_types.hpp"
+#include "version_negotiation.hpp"   // dash::version_negotiation:: accept-path version gate
 
 #include <core/coin_params.hpp>
 #include <core/hash.hpp>
@@ -585,6 +586,79 @@ uint256 generate_share_transaction(const DashShare& share, TrackerT& tracker,
     auto tx_span = std::span<const unsigned char>(
         reinterpret_cast<const unsigned char*>(tx.data()), tx.size());
     return Hash(tx_span);
+}
+
+// === verify_version_transition (Dash accept-path step 2: mint<->accept coupling) ===
+// Gates which shares the accept path ADMITS at a share-VERSION boundary, closing
+// the gap where dash had the version_negotiation primitives KAT-proven in
+// isolation but ZERO accept-path consumers (btc/dgb carry this coupling live).
+// Composes the already-pinned primitives into the enforcement a node runs on
+// every incoming share, mirroring the cross-coin STANDARD shape in
+// src/impl/btc/auto_ratchet.hpp::validate_version_switch (60% successor guard)
+// and src/impl/btc/share_tracker.hpp::should_punish_version (95% obsolescence)
+// so the v37 unification is a clean migration, not a per-coin v36 dialect.
+//
+// Oracle: ref/p2pool-dash/p2pool/data.py Share.check() lines 384-393 (the
+// SUCCESSOR confirmed-state guard). DELIBERATE Bucket-2 standardization: that
+// older-oracle branch is DORMANT (Share.SUCCESSOR=None, data.py:71) and, where
+// it would fire, gated on 85%-WEIGHTED votes (data.py:392 sum*85//100 over the
+// WEIGHTED get_desired_version_counts, data.py:690-691). We standardize to the
+// v36/v37 shape -- 60% WEIGHTED successor guard + 95% WEIGHTED v36 activation --
+// identical to the btc/dgb live coupling and to the cross-coin standard the
+// fleet is converging on for v37. Throws std::invalid_argument on a disallowed
+// switch; returns normally when the share is admissible.
+template <typename ChainT>
+inline void verify_version_transition(const DashShare& share, ChainT& chain,
+                                      uint64_t chain_length)
+{
+    namespace vn = dash::version_negotiation;
+
+    const uint256 prev_hash = share.m_prev_hash;
+    if (prev_hash.IsNull() || !chain.contains(prev_hash))
+        return;  // genesis / unknown parent -- nothing to gate against
+
+    // Predecessor desired_version (single-share window reuse; no new chain API).
+    auto prev_counts = vn::get_desired_version_counts(chain, prev_hash, 1);
+    if (prev_counts.empty())
+        return;
+    const uint64_t prev_version = prev_counts.begin()->first;
+    const uint64_t this_version = share.m_desired_version;
+
+    // Not a boundary: a share matching its parent's version was valid when it was
+    // minted and is always admitted (data.py:382 type(self) is type(previous)).
+    if (this_version == prev_version)
+        return;
+
+    const bool have_history =
+        chain.get_height(prev_hash) >= static_cast<int64_t>(chain_length);
+
+    // (a) Obsolescence gate -- once v36 holds >= 95% of the WEIGHTED signaling in
+    // the CHAIN_LENGTH lookbehind, a pre-v36 share is stale and rejected. Mirrors
+    // btc should_punish_version; consumes the WEIGHTED tally (work.py v36_active).
+    if (this_version < 36 && have_history)
+    {
+        auto weights = vn::get_desired_version_weights(chain, prev_hash, chain_length);
+        if (vn::v36_active(weights))
+            throw std::invalid_argument(
+                "share version too old -- v36 has 95%+ weighted activation");
+    }
+
+    // (b) SUCCESSOR confirmed-state guard on an UPGRADE boundary: requires both
+    // CHAIN_LENGTH history and >= 60% WEIGHTED successor votes in the [9/10..10/10]
+    // tail window. data.py:385-393 (standardized 85%-weighted -> 60%-weighted, matching btc share_check.hpp:1781).
+    if (this_version > prev_version)
+    {
+        auto win = vn::negotiation_window(chain, prev_hash, chain_length);
+        if (!win)
+            throw std::invalid_argument("version switch without enough history");
+        auto weights =
+            vn::get_desired_version_weights(chain, win->start_hash, win->dist);
+        if (!vn::successor_switch_allowed(weights, this_version))
+            throw std::invalid_argument(
+                "version switch without enough hash power upgraded");
+    }
+    // Downgrade by AutoRatchet deactivation (this_version < prev_version, not v36-
+    // obsolete) is permitted, matching btc validate_version_switch. No gate.
 }
 
 } // namespace dash
