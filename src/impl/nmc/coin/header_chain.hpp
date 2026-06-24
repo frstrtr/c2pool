@@ -242,6 +242,43 @@ inline MMScan scan_mm_commitment(const std::vector<unsigned char>& script,
     return MMScan::MATCH;
 }
 
+/// Build side -- the inverse of scan_mm_commitment(). Emit the canonical
+/// merged-mining commitment payload a parent (BTC) coinbase scriptSig must carry
+/// so this aux chain's work is provable. The byte layout is exactly the sequence
+/// scan_mm_commitment() walks:
+///     MM_HEADER_MAGIC(4) | chain_merkle_root REVERSED(32) | size_le32 | nonce_le32
+/// where size = 2^chain_height is the chain-merkle tree size and the aux chain
+/// occupies slot aux_expected_index(nonce, chain_id, chain_height). The root is
+/// stored reversed (big-endian display order) to match auxpow.cpp. This emits
+/// ONLY the MM marker payload; the caller (PD dual-target build path) prepends
+/// any coinbase scriptSig framing (height push, extranonce). Kept NMC-LOCAL per
+/// the coin fence (only std + core types). chain_merkle_root is taken by value
+/// because base_uint::begin() is non-const (same as scan_mm_commitment).
+inline std::vector<unsigned char> build_mm_commitment(uint256 chain_merkle_root,
+                                                      unsigned chain_height,
+                                                      uint32_t nonce) {
+    std::vector<unsigned char> out;
+    out.reserve(4 + uint256::BYTES + 8);
+    out.insert(out.end(), MM_HEADER_MAGIC, MM_HEADER_MAGIC + 4);
+
+    // Chain-merkle root committed reversed (big-endian display order).
+    const unsigned char* rb =
+        reinterpret_cast<const unsigned char*>(chain_merkle_root.begin());
+    std::vector<unsigned char> root_be(rb, rb + uint256::BYTES);
+    std::reverse(root_be.begin(), root_be.end());
+    out.insert(out.end(), root_be.begin(), root_be.end());
+
+    auto put_le32 = [&out](uint32_t x) {
+        out.push_back(static_cast<unsigned char>( x        & 0xff));
+        out.push_back(static_cast<unsigned char>((x >> 8)  & 0xff));
+        out.push_back(static_cast<unsigned char>((x >> 16) & 0xff));
+        out.push_back(static_cast<unsigned char>((x >> 24) & 0xff));
+    };
+    put_le32(1u << chain_height);   // tree size = 2^chain_height
+    put_le32(nonce);
+    return out;
+}
+
 // ─── AuxPow (merge-mining proof) ─────────────────────────────────────────────
 
 /// One aux-chain slot inside a parent coinbase's merged-mining merkle tree.
