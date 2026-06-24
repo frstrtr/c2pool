@@ -748,6 +748,24 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(dgb_binomial_conf_interval_test PRIVATE
         GTest::gtest_main GTest::gtest)
     gtest_add_tests(dgb_binomial_conf_interval_test "" AUTO)
+    # dgb_desired_version_tally_test: FENCED, additive KAT pinning the
+    # version->work / version->count accumulation core lifted into
+    # coin/desired_version_tally.hpp vs the p2pool-dgb-scrypt data.py:918-922
+    # get_desired_version_counts oracle (res[dv] += target_to_average_attempts(
+    # share.target)). The work-weighted map is the CONSENSUS 60%-by-work switch
+    # input (share_check step 2 / #288 AutoRatchet tail guard); the flat-count
+    # accumulator is diagnostics-only and pinned just to lock the documented
+    # divergence. The work-equivalence anchor uses chain::target_to_average_attempts
+    # over 2^k-1 targets (hand-derived ttaa), so links core for uint288 +
+    # target_utils. share_tracker.hpp NOT yet rewired (delegation is the
+    # byte-identity follow-on). MUST also be in the build.yml --target allowlist
+    # (#143 NOT_BUILT trap).
+    add_executable(dgb_desired_version_tally_test desired_version_tally_test.cpp)
+    target_link_libraries(dgb_desired_version_tally_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
+    gtest_add_tests(dgb_desired_version_tally_test "" AUTO)
     # dgb_pool_efficiency_test: FENCED, additive KAT pinning the pool
     # EFFICIENCY / REAL-HASHRATE diagnostics arithmetic in pool_efficiency.hpp vs
     # the p2pool main.py status-loop oracle (stale_prop = (orphan+doa)/total;
