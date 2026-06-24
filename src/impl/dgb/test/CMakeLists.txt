@@ -724,6 +724,18 @@ if (BUILD_TESTING AND GTest_FOUND)
         core
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
     gtest_add_tests(dgb_tail_score_endpoints_test "" AUTO)
+    # dgb_pool_attempts_per_second_test: FENCED, additive KAT pinning the pure
+    # arithmetic core of ShareTracker::get_pool_attempts_per_second lifted into
+    # coin/pool_attempts_per_second.hpp vs the p2pool data.py oracle
+    # (attempts // max(1, near_ts - far_ts), with the dist>=2 + endpoint guards).
+    # Links core for uint288. share_tracker.hpp NOT yet rewired (delegation is the
+    # byte-identity follow-on). MUST also be in the build.yml --target allowlist
+    # (#143 NOT_BUILT trap).
+    add_executable(dgb_pool_attempts_per_second_test pool_attempts_per_second_test.cpp)
+    target_link_libraries(dgb_pool_attempts_per_second_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core c2pool_hashrate c2pool_merged_mining c2pool_payout c2pool_storage)
+    gtest_add_tests(dgb_pool_attempts_per_second_test "" AUTO)
     # dgb_pool_efficiency_test: FENCED, additive KAT pinning the pool
     # EFFICIENCY / REAL-HASHRATE diagnostics arithmetic in pool_efficiency.hpp vs
     # the p2pool main.py status-loop oracle (stale_prop = (orphan+doa)/total;
