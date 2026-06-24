@@ -3525,6 +3525,78 @@ int main(int argc, char* argv[]) {
                 return r;
             });
 
+            // D0.3 StatsProvider: feed /api/node_topology the REAL per-node shape
+            // from live embedded-coin state -- per-coin peer count + synced flag
+            // + tip height, read from the same handles debug.log uses. Without
+            // this hook rest_node_topology() falls back to the Blockchain-enum
+            // auto-detect, which can label coins + count map peers but cannot
+            // surface embedded-daemon synced/tip. Web/diagnostic layer only.
+            web_server.get_mining_interface()->set_node_topology_fn(
+                [coin_peer_sources, &ltc_utxo_cache, &embedded_chain,
+                 &doge_utxo_ptr, blockchain]() {
+                auto upcase = [](std::string s) {
+                    for (auto& ch : s)
+                        if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 32);
+                    return s;
+                };
+                std::string primary;
+                switch (blockchain) {
+                case Blockchain::LITECOIN: primary = "LTC";  break;
+                case Blockchain::BITCOIN:  primary = "BTC";  break;
+                case Blockchain::DOGECOIN: primary = "DOGE"; break;
+                case Blockchain::DASH:     primary = "DASH"; break;
+                case Blockchain::DIGIBYTE: primary = "DGB";  break;
+                default: break;
+                }
+                nlohmann::json coins = nlohmann::json::array();
+                auto has_coin = [&](const std::string& sym) {
+                    for (const auto& c : coins)
+                        if (c.value("coin", std::string{}) == sym) return true;
+                    return false;
+                };
+                for (auto* bc : *coin_peer_sources) {
+                    if (!bc) continue;
+                    std::string sym = upcase(bc->symbol());
+                    if (sym.empty() || has_coin(sym)) continue;
+                    nlohmann::json e = nlohmann::json::object();
+                    e["coin"]     = sym;
+                    e["primary"]  = (sym == primary);
+                    e["embedded"] = true;
+                    e["peers"]    = static_cast<int>(bc->connected_count());
+                    // Real synced/tip from the live embedded handles (same reads
+                    // as set_spv_progress_fn) -- never fabricated for a coin we
+                    // hold no handle for.
+                    if (sym == "LTC") {
+                        int connected = ltc_utxo_cache
+                            ? static_cast<int>(ltc_utxo_cache->blocks_connected()) : 0;
+                        e["synced"] = connected >= static_cast<int>(core::coin::LTC_MINING_GATE_DEPTH);
+                        if (embedded_chain)
+                            e["height"] = static_cast<int>(embedded_chain->height());
+                    } else if (sym == "DOGE") {
+                        int connected = doge_utxo_ptr
+                            ? static_cast<int>(doge_utxo_ptr->blocks_connected()) : 0;
+                        e["synced"] = connected >= static_cast<int>(core::coin::DOGE_MINING_GATE_DEPTH);
+                    }
+                    coins.push_back(std::move(e));
+                }
+                // Guarantee the node own chain is always present, even with no
+                // broadcaster source pushed for it yet.
+                if (!primary.empty() && !has_coin(primary)) {
+                    nlohmann::json e = nlohmann::json::object();
+                    e["coin"]     = primary;
+                    e["primary"]  = true;
+                    e["embedded"] = true;
+                    e["peers"]    = 0;
+                    coins.push_back(std::move(e));
+                }
+                nlohmann::json r = nlohmann::json::object();
+                r["node_symbol"]   = primary;
+                r["source"]        = "stats_provider";
+                r["auto_detected"] = false;
+                r["coins"]         = std::move(coins);
+                return r;
+            });
+
             // Wire per-share window data for the defragmenter grid
             web_server.get_mining_interface()->set_sharechain_window_fn([&p2p_node, &web_server]()
                     -> nlohmann::json {
