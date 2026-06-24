@@ -284,6 +284,33 @@ inline std::vector<unsigned char> build_mm_commitment(uint256 chain_merkle_root,
                                                    nonce);
 }
 
+/// PRODUCTION PD dual-target caller (integrator 2026-06-24 decision (b):
+/// equiv-lock the production coinbase caller to the cross-coin manager; do NOT
+/// fork an NMC-local commitment builder). Given the parent (BTC) coinbase
+/// scriptSig prefix the parent work-source already assembles (BIP34 height push
+/// + pool tag), APPEND this aux chain's merged-mining commitment marker followed
+/// by the trailing extranonce -- yielding the dual-target parent coinbase
+/// scriptSig the miner solves against. The marker bytes are produced ONLY by
+/// build_mm_commitment(), which delegates to the cross-coin SSOT
+/// c2pool::merged::build_auxpow_commitment: there is NO NMC-local re-derivation
+/// of the commitment byte layout. The parent (btc) tree SUPPLIES scriptsig_prefix
+/// and CALLS this; it never copies the commitment math (per-coin isolation +
+/// v36-native shared structure standardized cross-coin). The byte-identity of
+/// the embedded marker to the size==1 SSOT output is pinned, fail-build, by the
+/// NmcPDProdCaller KATs in test/auxpow_merkle_test.cpp.
+inline std::vector<unsigned char> build_dual_target_coinbase_scriptsig(
+        const std::vector<unsigned char>& scriptsig_prefix,
+        uint256 chain_merkle_root,
+        unsigned chain_height,
+        uint32_t nonce,
+        const std::vector<unsigned char>& extranonce = {}) {
+    std::vector<unsigned char> sig(scriptsig_prefix);
+    const auto marker = build_mm_commitment(chain_merkle_root, chain_height, nonce);
+    sig.insert(sig.end(), marker.begin(), marker.end());
+    sig.insert(sig.end(), extranonce.begin(), extranonce.end());
+    return sig;
+}
+
 // ─── AuxPow (merge-mining proof) ─────────────────────────────────────────────
 
 /// One aux-chain slot inside a parent coinbase's merged-mining merkle tree.
