@@ -46,10 +46,25 @@
 
 #include <core/coin_params.hpp>
 #include <core/uint256.hpp>
+#include <core/netaddress.hpp>             // NetService (dashd RPC endpoint)
+
+#include <impl/dash/coin/rpc.hpp>          // dash::coin::NodeRPC — external-dashd submitblock arm (slice 3)
+#include <impl/dash/coin/rpc_conf.hpp>     // dash.conf creds resolution (rpcpassword off argv)
+#include <impl/dash/coin/node_interface.hpp>
+#include <impl/dash/coin/block_producer.hpp>  // dash::coin::mine_block / serialize_full_block_hex (slice 5)
+#include <impl/dash/coinbase_builder.hpp>      // dash::coinbase::build / compute_dash_payouts (slice 5)
+#include <impl/dash/params.hpp>                // dash::make_coin_params (already via top include)
+#include <core/uint256.hpp>                    // uint160 payout pubkey hash
+
+#include <boost/asio.hpp>
 
 #include <cstdint>
+#include <cstdlib>      // std::getenv
 #include <cstring>
+#include <fstream>
 #include <iostream>
+#include <map>
+#include <memory>
 #include <string>
 
 #ifndef C2POOL_VERSION
@@ -66,10 +81,15 @@ void print_banner(const char* argv0)
     std::cout
         << "c2pool-dash " << C2POOL_VERSION << " — DASH (X11, older-than-v35 -> V36)\n\n"
         << "Usage: " << argv0 << " [--version] [--help] [--selftest]\n"
-        << "       " << argv0 << " --run   (block-submission DEFERRED — see status)\n\n"
+        << "       " << argv0 << " --run [--coin-rpc H:P] [--coin-rpc-auth PATH]\n"
+        << "           [--testnet] [--submit-block HEX | --submit-block-file PATH]\n"
+        << "       " << argv0 << " --mine-block [--coin-rpc H:P] [--coin-rpc-auth PATH]\n"
+        << "           [--testnet] [--payout-pubkey-hash HEX] [--max-nonce N]\n\n"
         << "Status: consensus layer live (X11 PoW, subsidy, oracle CoinParams).\n"
-        << "        Block submission (won-block dual-path broadcaster) is the\n"
-        << "        next stacked slice; external dashd RPC stays the fallback.\n"
+        << "        --run stands up the run-loop and ARMS the external-dashd\n"
+        << "        submitblock fallback (creds from dash.conf, never on argv).\n"
+        << "        --submit-block[-file] drives ONE real submitblock then exits\n"
+        << "        (the won-block-reaches-network leg); embedded P2P relay = S8.\n"
         << "Consensus: X11 PoW + block identity; 2.5 min spacing; 5 DASH post-V20\n"
         << "        base, -1/14 per 210240; masternode payment 3/4 of block value.\n";
 }
@@ -191,19 +211,182 @@ int run_selftest()
     return 1;
 }
 
-// --run: block submission is DEFERRED. Print the exact deferral status so a smoke
-// gate is never misled, then exit cleanly (the consensus layer IS exercised by
-// --selftest; the run-loop standup lands with the broadcaster slice).
-int run_node_stub()
+// --run: stand up a real run-loop and ARM the external-dashd submitblock fallback
+// arm (rpc.cpp submit_block_hex -- the RPC leg of the won-block dual-path
+// broadcaster). The embedded-P2P relay leg is still S8-deferred; this slice lights
+// the dashd-RPC sink so a won DASH block CAN reach the network today.
+//
+// Creds posture (operator self-provision, 2026-06-19): the rpcpassword NEVER
+// reaches the process table. --coin-rpc HOST:PORT carries only the endpoint;
+// rpcuser/rpcpassword come from dash.conf (default ~/.dashcore/dash.conf, override
+// --coin-rpc-auth PATH). No creds (or no port) => the arm stays UNARMED and
+// submit_block_hex is never reached -- the run-loop still stands up cleanly.
+//
+// --submit-block HEX drives ONE real submitblock against the configured dashd and
+// reports accept/reject, then exits: the G2 "won-block-reaches-network" evidence
+// lever (point it at the VM200/201 dashd). NodeRPC::Send is synchronous with a
+// blocking sync_reconnect fallback, so the submit self-connects -- no async race.
+// A synthetic-only pass does NOT earn block-viable; the live dashd-reached run is
+// the gate.
+int run_node(bool testnet, const std::string& rpc_endpoint,
+             const std::string& rpc_conf_path, const std::string& submit_hex)
 {
-    std::cout
-        << "[run] DASH block submission is DEFERRED to the next stacked slice.\n"
-        << "[run]   - dashd-RPC submitblock fallback: needs a DASH NodeRPC TU\n"
-        << "[run]     (rpc.cpp/rpc.hpp/rpc_conf.hpp); only coin/rpc_data.hpp exists.\n"
-        << "[run]   - embedded P2P relay arm: S8 broadcaster/reconstruct stack.\n"
-        << "[run] The oracle CoinParams path the fallback consumes IS wired; run\n"
-        << "[run] --selftest to exercise the live consensus layer (X11 + subsidy).\n";
+    namespace io = boost::asio;
+
+    dash::coin::RpcConf conf;
+    std::string conf_path = rpc_conf_path;
+    if (conf_path.empty()) {
+        const char* home = std::getenv("HOME");
+        conf_path = std::string(home ? home : ".") + "/.dashcore/dash.conf";
+    }
+    dash::coin::load_rpc_conf(conf_path, conf);
+    dash::coin::apply_endpoint_override(rpc_endpoint, conf);
+    if (conf.port == 0)
+        conf.port = testnet ? 19998 : 9998;   // dashd default RPC ports
+
+    io::io_context ioc;
+    io::signal_set signals(ioc, SIGINT, SIGTERM);
+    signals.async_wait([&ioc](const boost::system::error_code&, int) {
+        std::cout << "[run] shutdown signal -- stopping run-loop\n";
+        ioc.stop();
+    });
+
+    dash::interfaces::Node coin_state;
+    std::unique_ptr<dash::coin::NodeRPC> rpc;
+    if (conf.armed()) {
+        rpc = std::make_unique<dash::coin::NodeRPC>(&ioc, &coin_state, testnet);
+        rpc->connect(NetService(conf.host, conf.port), conf.userpass());
+        std::cout << "[run] external-daemon submit arm ARMED: NodeRPC -> "
+                  << conf.host << ":" << conf.port << " (creds from dash.conf)\n";
+    } else {
+        std::cout << "[run] external-daemon submit arm UNARMED "
+                     "(no dash.conf creds / no port); embedded P2P relay leg is S8.\n";
+    }
+
+    // One-shot submit: the G2 won-block-reaches-network evidence path.
+    if (!submit_hex.empty()) {
+        if (!rpc) {
+            std::cout << "[run] --submit-block given but submit arm UNARMED; supply "
+                         "dashd creds via dash.conf or --coin-rpc-auth PATH\n";
+            return 2;
+        }
+        std::cout << "[run] submitting block (" << submit_hex.size() / 2
+                  << " bytes) to dashd " << conf.host << ":" << conf.port << "...\n";
+        const bool accepted = rpc->submit_block_hex(submit_hex, /*ignore_failure=*/false);
+        std::cout << "[run] submitblock " << (accepted ? "ACCEPTED" : "REJECTED")
+                  << " by dashd\n";
+        return accepted ? 0 : 1;
+    }
+
+    std::cout << "[run] run-loop up (Ctrl-C to stop); won blocks relay via the\n"
+                 "[run] dashd-RPC submitblock fallback. Embedded P2P relay = S8.\n";
+    ioc.run();
+    std::cout << "[run] run-loop stopped cleanly\n";
     return 0;
+}
+
+// --mine-block: the slice-5 PRODUCER one-shot. Pull a block template (dashd
+// getblocktemplate via NodeRPC::getwork), build the coinbase, X11-mine the
+// 80-byte header over the nonce until it meets the compact-bits target,
+// serialize the FULL block to hex, and feed it into the EXISTING submit arm
+// (NodeRPC::submit_block_hex). This is the "c2pool-dash builds and wins the
+// block itself" lever -- slice-4 only re-submitted a pre-built hex.
+//
+// Creds posture is IDENTICAL to --submit-block: endpoint via --coin-rpc, creds
+// from dash.conf (never argv). The optional --payout-pubkey-hash HEX (40 hex =
+// 20 bytes) names the block-finder P2PKH payout; default all-zero placeholder
+// (genesis-style: empty PPLNS weights, total_weight 0). max_nonce is bounded;
+// regtest bits (0x207fffff) make the target trivial so a winner is found fast.
+int run_mine_block(bool testnet, const std::string& rpc_endpoint,
+                   const std::string& rpc_conf_path,
+                   const std::string& payout_pkh_hex,
+                   uint64_t max_nonce)
+{
+    namespace io = boost::asio;
+
+    dash::coin::RpcConf conf;
+    std::string conf_path = rpc_conf_path;
+    if (conf_path.empty()) {
+        const char* home = std::getenv("HOME");
+        conf_path = std::string(home ? home : ".") + "/.dashcore/dash.conf";
+    }
+    dash::coin::load_rpc_conf(conf_path, conf);
+    dash::coin::apply_endpoint_override(rpc_endpoint, conf);
+    if (conf.port == 0)
+        conf.port = testnet ? 19998 : 9998;
+
+    if (!conf.armed()) {
+        std::cout << "[mine] submit arm UNARMED (no dash.conf creds / no port); "
+                     "supply dashd creds via dash.conf or --coin-rpc-auth PATH\n";
+        return 2;
+    }
+
+    io::io_context ioc;
+    dash::interfaces::Node coin_state;
+    dash::coin::NodeRPC rpc(&ioc, &coin_state, testnet);
+    rpc.connect(NetService(conf.host, conf.port), conf.userpass());
+    std::cout << "[mine] producer ARMED: NodeRPC -> " << conf.host << ":"
+              << conf.port << " (creds from dash.conf)\n";
+
+    // 1) Pull the template.
+    std::cout << "[mine] fetching block template (getblocktemplate)...\n";
+    dash::coin::DashWorkData work = rpc.getwork();
+    std::cout << "[mine] template: height=" << work.m_height
+              << " bits=0x" << std::hex << work.m_bits << std::dec
+              << " prev=" << work.m_previous_block.GetHex().substr(0, 16) << "..."
+              << " ntx(gbt)=" << work.m_tx_data_hex.size()
+              << " coinbase_value=" << work.m_coinbase_value << "\n";
+
+    // 2) Build the coinbase. Genesis-style payout (no prior shares): empty
+    //    weights, total_weight 0 -> all of worker_payout goes to the finder
+    //    (this_script, 2% rule) + donation remainder.
+    uint160 payout_pkh;   // default all-zero
+    if (!payout_pkh_hex.empty()) {
+        if (payout_pkh_hex.size() != 40) {
+            std::cout << "[mine] --payout-pubkey-hash must be 40 hex chars (20 bytes)\n";
+            return 2;
+        }
+        payout_pkh.SetHex(payout_pkh_hex);
+    }
+    const core::CoinParams params = dash::make_coin_params(testnet);
+    std::map<std::vector<unsigned char>, uint64_t> empty_weights;
+    auto tx_outs = dash::coinbase::compute_dash_payouts(
+        work.m_coinbase_value, work.m_packed_payments, payout_pkh,
+        empty_weights, /*total_weight=*/0, params);
+    // ref_hash is the PPLNS commitment; for a standalone producer block we use
+    // zero (no sharechain commitment) -- consensus-irrelevant to dashd validity.
+    auto layout = dash::coinbase::build(work, tx_outs, /*pool_tag=*/"c2pool",
+                                        params, /*ref_hash=*/uint256::ZERO);
+    std::cout << "[mine] coinbase built: " << layout.bytes.size()
+              << " bytes, " << tx_outs.size() << " outputs\n";
+
+    // 3) X11-mine.
+    std::cout << "[mine] X11-mining header (max_nonce=" << max_nonce << ")...\n";
+    dash::coin::MineResult mr =
+        dash::coin::mine_block(work, layout.bytes, max_nonce);
+    if (!mr.found) {
+        std::cout << "[mine] NO winning nonce in [0, " << max_nonce
+                  << "] -- raise --max-nonce or check bits\n";
+        return 1;
+    }
+    std::cout << "[mine] WON: nonce=" << mr.nonce
+              << " powhash=" << mr.block_hash.GetHex()
+              << " block=" << (mr.block_hex.size() / 2) << " bytes\n";
+
+    // 4) Submit via the EXISTING arm.
+    const int64_t before = static_cast<int64_t>(
+        rpc.getblockchaininfo().value("blocks", -1));
+    std::cout << "[mine] getblockcount(before)=" << before << "\n";
+    std::cout << "[mine] submitting mined block to dashd "
+              << conf.host << ":" << conf.port << "...\n";
+    const bool accepted = rpc.submit_block_hex(mr.block_hex, /*ignore_failure=*/false);
+    const int64_t after = static_cast<int64_t>(
+        rpc.getblockchaininfo().value("blocks", -1));
+    std::cout << "[mine] submitblock " << (accepted ? "ACCEPTED" : "REJECTED")
+              << " by dashd; block_hash=" << mr.block_hash.GetHex()
+              << " getblockcount(after)=" << after
+              << (after > before ? " (+1, tip advanced)\n" : "\n");
+    return accepted ? 0 : 1;
 }
 
 } // namespace
@@ -212,20 +395,60 @@ int main(int argc, char** argv)
 {
     bool want_help = false;
     bool want_run  = false;
+    bool want_mine = false;
+    bool testnet   = false;
+    std::string payout_pkh_hex;   // --payout-pubkey-hash HEX (20-byte P2PKH finder)
+    uint64_t    max_nonce = 0xffffffffull;  // --max-nonce N (producer search bound)
+    std::string rpc_endpoint;     // --coin-rpc / --coin-daemon HOST:PORT (endpoint only)
+    std::string rpc_conf_path;    // --coin-rpc-auth PATH (creds; default ~/.dashcore/dash.conf)
+    std::string submit_hex;       // --submit-block HEX (one-shot won-block submit)
+    std::string submit_file;      // --submit-block-file PATH
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
             std::cout << "c2pool-dash " << C2POOL_VERSION << "\n";
             return 0;
         }
-        if (std::strcmp(argv[i], "--help") == 0)     want_help = true;
-        if (std::strcmp(argv[i], "--run") == 0)      want_run  = true;
+        else if (std::strcmp(argv[i], "--help") == 0)    want_help = true;
+        else if (std::strcmp(argv[i], "--run") == 0)     want_run  = true;
+        else if (std::strcmp(argv[i], "--mine-block") == 0) want_mine = true;
+        else if (std::strcmp(argv[i], "--payout-pubkey-hash") == 0 && i + 1 < argc)
+            payout_pkh_hex = argv[++i];
+        else if (std::strcmp(argv[i], "--max-nonce") == 0 && i + 1 < argc)
+            max_nonce = std::strtoull(argv[++i], nullptr, 0);
+        else if (std::strcmp(argv[i], "--testnet") == 0 ||
+                 std::strcmp(argv[i], "--regtest") == 0)  testnet = true;
+        else if ((std::strcmp(argv[i], "--coin-rpc") == 0 ||
+                  std::strcmp(argv[i], "--coin-daemon") == 0) && i + 1 < argc)
+            rpc_endpoint = argv[++i];
+        else if (std::strcmp(argv[i], "--coin-rpc-auth") == 0 && i + 1 < argc)
+            rpc_conf_path = argv[++i];
+        else if (std::strcmp(argv[i], "--submit-block") == 0 && i + 1 < argc)
+            submit_hex = argv[++i];
+        else if (std::strcmp(argv[i], "--submit-block-file") == 0 && i + 1 < argc)
+            submit_file = argv[++i];
         // --selftest is the default; accepted explicitly for symmetry.
     }
 
     print_banner(argv[0]);
     if (want_help)
         return 0;
-    if (want_run)
-        return run_node_stub();
+    if (want_mine)
+        return run_mine_block(testnet, rpc_endpoint, rpc_conf_path,
+                              payout_pkh_hex, max_nonce);
+    if (want_run) {
+        if (!submit_file.empty() && submit_hex.empty()) {
+            std::ifstream bf(submit_file);
+            if (!bf) {
+                std::cout << "[run] cannot open --submit-block-file " << submit_file << "\n";
+                return 2;
+            }
+            std::getline(bf, submit_hex, '\0');   // whole-file slurp
+            while (!submit_hex.empty() &&
+                   (submit_hex.back() == '\n' || submit_hex.back() == '\r' ||
+                    submit_hex.back() == ' '  || submit_hex.back() == '\t'))
+                submit_hex.pop_back();
+        }
+        return run_node(testnet, rpc_endpoint, rpc_conf_path, submit_hex);
+    }
     return run_selftest();
 }
