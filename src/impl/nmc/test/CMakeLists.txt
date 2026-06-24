@@ -69,6 +69,17 @@ if (BUILD_TESTING AND GTest_FOUND)
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
     target_link_libraries(nmc_mempool_name_test PRIVATE nmc_coin)
 
+    # PE item 3: dual-path won-aux-block broadcaster contract KAT. Header-only
+    # dispatcher (coin/block_broadcast.hpp) -- pulls only core/log.hpp, so it
+    # links the same SCC the sibling tests do (core resolves stratum_server refs
+    # via the c2pool_* object libs). No nmc_coin needed (no transaction ctor).
+    add_executable(nmc_block_broadcast_test nmc_block_broadcast_test.cpp)
+    target_link_libraries(nmc_block_broadcast_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core nlohmann_json::nlohmann_json)
+    target_link_libraries(nmc_block_broadcast_test PRIVATE
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
+
     include(GoogleTest)
     include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
     gtest_add_tests(nmc_auxpow_merkle_test "" AUTO)
@@ -76,4 +87,5 @@ if (BUILD_TESTING AND GTest_FOUND)
     gtest_add_tests(nmc_auxpow_wire_test "" AUTO)
     gtest_add_tests(nmc_reconstruct_won_block_test "" AUTO)
     gtest_add_tests(nmc_mempool_name_test "" AUTO)
+    gtest_add_tests(nmc_block_broadcast_test "" AUTO)
 endif()
