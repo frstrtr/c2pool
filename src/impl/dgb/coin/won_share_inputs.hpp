@@ -2,8 +2,9 @@
 // ---------------------------------------------------------------------------
 // dgb::coin::won_share_inputs -- the SHARE-SIDE half of the #82 faithful
 // won-block reconstruct closure (the closure the run-loop installs as
-// ShareTracker::m_on_block_found, today an interim nullopt stub in
-// main_dgb.cpp). reconstruct_won_block_from_template (reconstruct_won_block.hpp)
+// ShareTracker::m_on_block_found, now bound in main_dgb.cpp via
+// dgb::coin::make_on_block_found -- the #82 dual-path broadcaster, no longer
+// a nullopt stub). reconstruct_won_block_from_template (reconstruct_won_block.hpp)
 // needs five inputs to frame a broadcastable block:
 //
 //     { small_header, merkle_link, gentx, gentx_hash, template_other_txs }
