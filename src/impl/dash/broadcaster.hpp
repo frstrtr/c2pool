@@ -263,6 +263,20 @@ public:
         return n;
     }
 
+    // Opaque "host:port" keys of the LIVE slots, in deterministic (std::map,
+    // sorted) order. The won-block planner fans an inv out to exactly these
+    // keys; this is the read seam that lets the relay binding pull the live
+    // pool WITHOUT touching a socket. Pure: same liveness predicate as
+    // live_count(), no dial, no I/O. broadcaster_full still owns writing the
+    // frames onto the live slot sockets.
+    std::vector<std::string> live_slot_keys() const
+    {
+        std::vector<std::string> keys;
+        for (const auto& [key, slot] : m_slots)
+            if (slot && m_is_live && m_is_live(*slot)) keys.push_back(key);
+        return keys;
+    }
+
     size_t slot_count() const { return m_slots.size(); }
 
     bool has_slot(const std::string& key) const { return m_slots.count(key) != 0; }
