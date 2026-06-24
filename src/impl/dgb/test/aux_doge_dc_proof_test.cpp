@@ -250,3 +250,49 @@ TEST(DGB_AuxDogeDCProof, DualTargetIndependentThresholds) {
     EXPECT_FALSE(hits(above_both, DGB_TARGET));
     EXPECT_FALSE(hits(above_both, DOGE_TARGET));
 }
+
+// 5) REAL-DAEMON byte-parity (integrator acceptance gate). The exact 217-byte
+//    CAuxPow blob dogecoind emits at regtest height 20 -- the SAME independent-
+//    serializer fixture the LTC path pins in test/test_doge_chain.cpp -- decoded
+//    here through the EXPLICIT DGB-parent binding. Because parent_coinbase_no_
+//    witness<> is byte-identical for any bitcoin_family-TxParams parent, the DGB
+//    path must consume the daemon's own bytes EXACTLY, re-emit them bit-for-bit,
+//    AND serialize identically to the LTC default. This is the wrong-wire trap's
+//    smoke detector: a silently-LTC parent coinbase strip diverges here at once.
+//    Fixture embedded locally so the diff stays inside src/impl/dgb/ (the shared
+//    LTC+DOGE test is ltc-doge's, untouched).
+TEST(DGB_AuxDogeDCProof, RegtestH20RealDaemonDecodesThroughDgbBinding) {
+    const char* const H20 =
+        "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff2cfabe6d6df091be03e588d8f33a0bc14145cb034dbf68e0a8ca774f0f842027a1366275900100000000000000ffffffff0000000000106303778e4f91a2984bb151de0bf0126c6cde013e9e11f86f7a942818f635f00000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000013175e533f07d6a5e7ab3df1fb0e67283b2b52daf0aaba1efbb2a22c77e96695000000000000000000000001";
+
+    const auto blob = unhex(H20);
+    ASSERT_EQ(blob.size(), 217u);
+
+    // Decode dogecoind's own bytes through the EXPLICIT DGB-parent binding.
+    PackStream ps_dgb(blob);
+    doge::coin::CAuxPow<dgb::coin::MutableTransaction> out_dgb;
+    ::Unserialize(ps_dgb, out_dgb);
+
+    // Parent coinbase carries the fabe6d6d merged-mining commitment; null prevout,
+    // no outputs, locktime 0 -- the canonical merged-mining coinbase shape.
+    ASSERT_EQ(out_dgb.m_merkle_tx.m_tx.vin.size(), 1u);
+    EXPECT_TRUE(out_dgb.m_merkle_tx.m_tx.vin[0].prevout.hash.IsNull());
+    EXPECT_EQ(out_dgb.m_merkle_tx.m_tx.vin[0].prevout.index, 0xffffffffu);
+    EXPECT_EQ(out_dgb.m_merkle_tx.m_tx.vout.size(), 0u);
+    EXPECT_EQ(out_dgb.m_merkle_tx.m_tx.locktime, 0u);
+
+    // Exact consumption -- no trailing bytes, no overrun, on the daemon's bytes.
+    EXPECT_EQ(ps_dgb.cursor_size(), 0u)
+        << "DGB-bound CAuxPow parser must consume exactly 217 bytes";
+
+    // Re-emit: the DGB-decoded record packs back to the daemon's ORIGINAL bytes.
+    EXPECT_EQ(pack_hex(out_dgb), std::string(H20));
+
+    // Cross-type byte identity on REAL daemon bytes: the LTC default and the
+    // explicit DGB binding must serialize identically (template-on-parent is a
+    // no-op for the live LTC+DOGE wire -- the bucket-3 transition-compat shape).
+    PackStream ps_ltc(blob);
+    doge::coin::CAuxPow<ltc::coin::MutableTransaction> out_ltc;
+    ::Unserialize(ps_ltc, out_ltc);
+    EXPECT_EQ(pack_hex(out_dgb), pack_hex(out_ltc));
+}
