@@ -546,9 +546,10 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
 
   # ════════════════════════════════════════════════════════════════════════════
-  # macOS (matrix: arm64 on GitHub-hosted macos-14, x86_64 on the self-hosted
-  # Intel runner labeled c2pool-mac-intel). The self-hosted lane resolves the
-  # macOS x86_64 CI starvation (#42) — macpro-intel-204 standup 2026-06-16.
+  # macOS (matrix). Both arches self-hosted on push/internal-branch PRs, with
+  # GitHub-hosted fork fallback: arm64 -> Mac-mini-Alonso-227 (c2pool-mac-arm)
+  # else macos-14; x86_64 -> macpro-intel-204 (c2pool-mac-intel). Resolves the
+  # macOS x86_64 CI starvation (#42). sccache caches across self-hosted runs.
   # ════════════════════════════════════════════════════════════════════════════
   macos:
     name: macOS ${{ matrix.arch }}
@@ -560,7 +561,7 @@ jobs:
       matrix:
         include:
           - arch: arm64
-            runner: macos-14
+            runner: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","c2pool-mac-arm"]') || 'macos-14' }}
           - arch: x86_64
             runner: [self-hosted, macOS, X64, c2pool-mac-intel]
     steps:
@@ -583,10 +584,10 @@ jobs:
           fi
 
       - name: Install dependencies
-        run: brew install cmake boost leveldb secp256k1 nlohmann-json yaml-cpp
+        run: brew install cmake boost leveldb secp256k1 nlohmann-json yaml-cpp sccache
 
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
 
       - name: Build
         run: cmake --build build --target c2pool -j$(sysctl -n hw.ncpu)
