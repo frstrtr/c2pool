@@ -1569,4 +1569,156 @@ TEST(NmcAuxChainIdConformance, BuildVerifySymmetryOnFactoryDefault)
     EXPECT_EQ(static_cast<uint32_t>(p.aux_chain_id), 1u);  // build-side AuxWork.chain_id
 }
 
+// ---------------------------------------------------------------------------
+// PD-prep GOLDEN FIXTURE: dual-target coinbase merged-mining commitment layout.
+//
+// Pins PD's acceptance target AHEAD of the build code. PD's dual-target coinbase
+// path (PR #408's nmc::coin::build_mm_commitment) must emit the merged-mining
+// marker in EXACTLY the Namecoin/Bitcoin auxpow.cpp reference layout:
+//
+//     [ fa be 6d 6d ]  4-byte MM magic  ("\xfa\xbe" + "mm")
+//     [ 32 bytes    ]  chain-merkle root, REVERSED (big-endian display order)
+//     [ 4 bytes LE  ]  chain-merkle tree size = 2^chain_height
+//     [ 4 bytes LE  ]  nonce
+//
+// The expected 44-byte marker is hand-computed here from that reference oracle
+// and asserted as an explicit byte LITERAL. This fixture DELIBERATELY does NOT
+// import or invoke build_mm_commitment: that is PD's surface, and calling it
+// would re-introduce the #408 dependency and merely mirror a build bug instead
+// of catching it. The literal is the independent oracle PD's output reproduces.
+//
+// Binding to the already-merged consensus surface (build-independent):
+//   * the literal is fed through scan_mm_commitment (the verify-side SSOT) and
+//     must return MMScan::MATCH;
+//   * the deterministic slot is cross-checked against aux_expected_index, and a
+//     wrong slot is shown to be rejected (the slot field is load-bearing);
+//   * the local hand layout (root_reversed + mm_script, NOT build_mm_commitment)
+//     is asserted byte-equal to the literal so a layout drift on either side reds.
+//
+// Per-coin isolation (P0 fence #4): src/impl/nmc/ test target only; additive;
+// rides the already-allowlisted nmc_auxpow_merkle_test exe (no build.yml change,
+// no consensus-value change). Pure layout/byte-order pin, no other-coin tree.
+// ---------------------------------------------------------------------------
+
+// uint256 whose 32 INTERNAL (little-endian) bytes ascend from `start`.
+static uint256 root_ascending(unsigned char start)
+{
+    uint256 u; u.SetNull();
+    // begin() is a typed (word-strided) iterator; cast to raw bytes like
+    // root_reversed does so we set 32 CONTIGUOUS internal bytes, not every 4th.
+    unsigned char* p = reinterpret_cast<unsigned char*>(u.begin());
+    for (size_t i = 0; i < uint256::BYTES; ++i)
+        p[i] = static_cast<unsigned char>(start + i);
+    return u;
+}
+
+TEST(NmcPdGoldenFixture, SingleSlotMarkerMatchesHandComputedLiteral)
+{
+    // Live NMC-under-BTC posture: a length-1 chain tree (height 0 => size 1),
+    // so the aux chain always occupies slot 0 regardless of nonce. A legible
+    // non-zero nonce exercises the little-endian nonce field.
+    uint256 root = root_ascending(0x01);          // internal LE = 01 02 .. 20
+    const unsigned  h     = 0;
+    const int32_t   cid   = 1;
+    const uint32_t  nonce = 0x12345678u;
+
+    // Hand-computed golden marker (44 bytes), reference layout above.
+    const std::vector<unsigned char> golden = {
+        0xfa, 0xbe, 0x6d, 0x6d,                          // MM magic
+        // chain-merkle root, reversed (big-endian display order):
+        0x20, 0x1f, 0x1e, 0x1d, 0x1c, 0x1b, 0x1a, 0x19,
+        0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,
+        0x10, 0x0f, 0x0e, 0x0d, 0x0c, 0x0b, 0x0a, 0x09,
+        0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+        0x01, 0x00, 0x00, 0x00,                          // size = 2^0 = 1 (LE)
+        0x78, 0x56, 0x34, 0x12,                          // nonce 0x12345678 (LE)
+    };
+    ASSERT_EQ(golden.size(), 4u + uint256::BYTES + 8u);
+
+    // Independent hand layout (NOT build_mm_commitment) reproduces the literal.
+    // mm_script() frames the marker with a 4-byte dummy coinbase-height prefix
+    // (build_mm_commitment emits ONLY the marker payload; the caller prepends the
+    // scriptSig framing), so strip that prefix before the byte-equality check.
+    std::vector<unsigned char> framed = mm_script(root_reversed(root), 1u << h, nonce);
+    std::vector<unsigned char> payload(framed.begin() + 4, framed.end());
+    EXPECT_EQ(payload, golden);
+
+    // Deterministic slot is 0 and is what the verify-side arithmetic demands.
+    const uint32_t slot = aux_expected_index(nonce, cid, h);
+    EXPECT_EQ(slot, 0u);
+
+    // The merged verify-side scanner accepts exactly this layout, both as the
+    // bare marker and embedded after scriptSig framing (found by search).
+    EXPECT_EQ(scan_mm_commitment(golden, root, h, cid, slot), MMScan::MATCH);
+    EXPECT_EQ(scan_mm_commitment(framed, root, h, cid, slot), MMScan::MATCH);
+}
+
+TEST(NmcPdGoldenFixture, MultiSlotMarkerPinsDeterministicSlotAndLiteral)
+{
+    // height 2 => 4-leaf chain tree; nonce 2 pins the aux chain to slot 1
+    // (aux_expected_index(2, 1, 2) == 1), exercising both the LE tree-size
+    // field (= 4) and the deterministic-slot binding the single-slot case cannot.
+    uint256 root = root_ascending(0x41);          // internal LE = 41 42 .. 60
+    const unsigned  h     = 2;
+    const int32_t   cid   = 1;
+    const uint32_t  nonce = 2u;
+
+    const std::vector<unsigned char> golden = {
+        0xfa, 0xbe, 0x6d, 0x6d,                          // MM magic
+        0x60, 0x5f, 0x5e, 0x5d, 0x5c, 0x5b, 0x5a, 0x59,
+        0x58, 0x57, 0x56, 0x55, 0x54, 0x53, 0x52, 0x51,
+        0x50, 0x4f, 0x4e, 0x4d, 0x4c, 0x4b, 0x4a, 0x49,
+        0x48, 0x47, 0x46, 0x45, 0x44, 0x43, 0x42, 0x41,
+        0x04, 0x00, 0x00, 0x00,                          // size = 2^2 = 4 (LE)
+        0x02, 0x00, 0x00, 0x00,                          // nonce 2 (LE)
+    };
+    ASSERT_EQ(golden.size(), 44u);
+
+    std::vector<unsigned char> framed = mm_script(root_reversed(root), 1u << h, nonce);
+    std::vector<unsigned char> payload(framed.begin() + 4, framed.end());
+    EXPECT_EQ(payload, golden);
+
+    const uint32_t slot = aux_expected_index(nonce, cid, h);
+    EXPECT_EQ(slot, 1u);   // hand-pinned: nonce 2, chain_id 1, height 2 => slot 1
+
+    EXPECT_EQ(scan_mm_commitment(golden, root, h, cid, slot), MMScan::MATCH);
+
+    // Negative pin: the SAME marker presented for the WRONG slot is rejected,
+    // proving the slot field is load-bearing, not decorative.
+    EXPECT_EQ(scan_mm_commitment(golden, root, h, cid, slot ^ 1u), MMScan::MISMATCH);
+}
+
+TEST(NmcPdGoldenFixture, MarkerFieldOffsetsAreThePinnedLayout)
+{
+    // Pin the exact field offsets PD's build path must emit. Slicing the marker
+    // proves WHERE each field sits; each slice is checked against an independent
+    // literal (not against the builder), so a field-order/width drift reds.
+    uint256 root = root_ascending(0x01);
+    std::vector<unsigned char> framed =
+        mm_script(root_reversed(root), /*size=*/1u, /*nonce=*/0x12345678u);
+    // Drop the 4-byte dummy coinbase-height prefix; index the bare marker from 0.
+    const std::vector<unsigned char> marker(framed.begin() + 4, framed.end());
+    ASSERT_EQ(marker.size(), 44u);
+
+    // [0,4) MM magic.
+    EXPECT_EQ((std::vector<unsigned char>(marker.begin(), marker.begin() + 4)),
+              (std::vector<unsigned char>{0xfa, 0xbe, 0x6d, 0x6d}));
+
+    // [4,36) reversed root == big-endian display order of the internal bytes,
+    // re-derived here by an independent reverse of the ascending internal bytes.
+    std::vector<unsigned char> expect_root(uint256::BYTES);
+    for (size_t i = 0; i < uint256::BYTES; ++i)
+        expect_root[i] = static_cast<unsigned char>(0x01 + (uint256::BYTES - 1 - i));
+    EXPECT_EQ((std::vector<unsigned char>(marker.begin() + 4, marker.begin() + 36)),
+              expect_root);
+
+    // [36,40) tree size = 1 (LE).
+    EXPECT_EQ((std::vector<unsigned char>(marker.begin() + 36, marker.begin() + 40)),
+              (std::vector<unsigned char>{0x01, 0x00, 0x00, 0x00}));
+
+    // [40,44) nonce 0x12345678 (LE).
+    EXPECT_EQ((std::vector<unsigned char>(marker.begin() + 40, marker.begin() + 44)),
+              (std::vector<unsigned char>{0x78, 0x56, 0x34, 0x12}));
+}
+
 } // namespace
