@@ -766,6 +766,20 @@ if (BUILD_TESTING AND GTest_FOUND)
         core
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
     gtest_add_tests(dgb_desired_version_tally_test "" AUTO)
+    # dgb_naughty_propagation_test: FENCED, additive KAT pinning the
+    # NAUGHTY-PROPAGATION ancestor-punishment generation arithmetic in
+    # coin/naughty_propagation.hpp vs the p2pool-dgb-scrypt data.py:543-549
+    # oracle (child = 1 + parent.naughty; reset to 0 after 6 generations; the
+    # "parent is naughty" guard leaves a clean-parent child untouched). The rule
+    # decides which sharechain tails the pool refuses to build on (best_descendent
+    # skips naughty children), so it is consensus-bearing. Pure unsigned
+    # arithmetic -> links only GTest. share_tracker.hpp:561-577 NOT yet rewired
+    # (delegation is the byte-identity follow-on). MUST also be in the build.yml
+    # --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_naughty_propagation_test naughty_propagation_test.cpp)
+    target_link_libraries(dgb_naughty_propagation_test PRIVATE
+        GTest::gtest_main GTest::gtest)
+    gtest_add_tests(dgb_naughty_propagation_test "" AUTO)
     # dgb_pool_efficiency_test: FENCED, additive KAT pinning the pool
     # EFFICIENCY / REAL-HASHRATE diagnostics arithmetic in pool_efficiency.hpp vs
     # the p2pool main.py status-loop oracle (stale_prop = (orphan+doa)/total;
