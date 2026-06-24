@@ -35,6 +35,7 @@
 
 #include "../coin/header_chain.hpp"
 #include "../coin/mempool.hpp"
+#include <c2pool/merged/merged_mining.hpp>  // PD SSOT drift-guard: build_auxpow_commitment
 
 namespace {
 
@@ -489,6 +490,28 @@ TEST(NmcBuildMMCommitment, ByteLayoutIsMagicReversedRootSizeNonce)
 
     EXPECT_EQ(got, want);
     EXPECT_EQ(got.size(), static_cast<size_t>(4 + 32 + 4 + 4));
+}
+
+TEST(NmcBuildMMCommitment, DelegatesByteForByteToCrossCoinSSOT)
+{
+    // PD SSOT drift-guard. build_mm_commitment is a thin NMC-typed ADAPTER over
+    // the cross-coin canonical builder c2pool::merged::build_auxpow_commitment;
+    // its only added semantics is the height->size map (tree size = 2^height).
+    // Pin byte-for-byte equality so the adapter can never silently fork a
+    // parallel NMC-local commitment layout -- the bucket-2 v37-convergence trap.
+    struct Case { uint256 root; unsigned h; uint32_t nonce; };
+    const std::vector<Case> cases = {
+        { leaf_of(0x01), 0, 0u },                              // single NMC under BTC: size == 1
+        { leaf_of(0xAB), 1, 1u },
+        { combine(leaf_of(0x02), leaf_of(0x77)), 3, 0x04030201u },
+        { leaf_of(0xFF), 5, 0xDEADBEEFu },
+    };
+    for (const auto& c : cases) {
+        auto adapter = build_mm_commitment(c.root, c.h, c.nonce);
+        auto ssot    = c2pool::merged::build_auxpow_commitment(c.root, 1u << c.h, c.nonce);
+        EXPECT_EQ(adapter, ssot)
+            << "MM commitment adapter diverged from cross-coin SSOT at h=" << c.h;
+    }
 }
 
 TEST(NmcBuildMMCommitment, TamperedRootOrSlotFailsScan)
