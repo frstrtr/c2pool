@@ -669,9 +669,10 @@ int main(int argc, char* argv[]) {
         if (blockchain_str == "xmr" || blockchain_str == "monero") return Blockchain::MONERO;
         if (blockchain_str == "zec" || blockchain_str == "zcash") return Blockchain::ZCASH;
         if (blockchain_str == "doge" || blockchain_str == "dogecoin") return Blockchain::DOGECOIN;
+        if (blockchain_str == "dash" || blockchain_str == "darkcoin") return Blockchain::DASH;
 
         LOG_ERROR << "Unknown blockchain: " << blockchain_str;
-        LOG_INFO << "Supported blockchains: ltc, dgb, btc, doge";
+        LOG_INFO << "Supported blockchains: ltc, dgb, btc, doge, dash";
         throw std::invalid_argument("Unknown blockchain type");
     };
 
@@ -682,6 +683,7 @@ int main(int argc, char* argv[]) {
         if (symbol == "NMC"   || symbol == "nmc")   return testnet ? 18334 : 8334;   // SSOT: src/impl/nmc/coin/chain_seeds.hpp (namecoind addrman)
         if (symbol == "BTC"   || symbol == "btc")   return testnet ? 18333 : 8333;
         if (symbol == "DGB"   || symbol == "dgb")   return testnet ? 12026 : 12024;
+        if (symbol == "DASH"  || symbol == "dash")  return testnet ? 19999 : 9999;   // SSOT: src/impl/dash/coin/chain_seeds.hpp (dashd addrman)
         if (symbol == "PEP"   || symbol == "pep")   return testnet ? 44874 : 33874;
         if (symbol == "BELLS" || symbol == "bells")  return testnet ? 29919 : 19919;
         if (symbol == "LKY"   || symbol == "lky")   return testnet ? 19917 : 9917;
@@ -696,6 +698,7 @@ int main(int argc, char* argv[]) {
             case Blockchain::DIGIBYTE: return "DGB";
             case Blockchain::BITCOIN:  return "BTC";
             case Blockchain::DOGECOIN: return "DOGE";
+            case Blockchain::DASH:     return "DASH";
             default: return "";
         }
     };
@@ -714,6 +717,10 @@ int main(int argc, char* argv[]) {
         }
         if (symbol == "DGB" || symbol == "dgb") {
             return testnet ? ParseHexBytes("fdc8bddd") : ParseHexBytes("fac3b6da");
+        }
+        if (symbol == "DASH" || symbol == "dash") {
+            // Dash pchMessageStart: mainnet bf0c6bbd, testnet3 cee2caff (dashd net magic).
+            return testnet ? ParseHexBytes("cee2caff") : ParseHexBytes("bf0c6bbd");
         }
         if (symbol == "PEP" || symbol == "pep") {
             return testnet ? ParseHexBytes("fec1dbcc") : ParseHexBytes("c0a0f0e0");
