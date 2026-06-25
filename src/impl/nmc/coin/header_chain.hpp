@@ -601,7 +601,9 @@ struct NMCChainParams {
 
     /// NMC mainnet params skeleton. pow_limit + genesis_hash PINNED from
     /// namecoin-core src/kernel/chainparams.cpp (CMainParams). The 80-byte
-    /// mainnet_genesis_header() seed (SHA256d cross-check) stays deferred.
+    /// mainnet_genesis_header() seed is now PINNED + SHA256d-cross-checked
+    /// (mainnet_genesis_header() below, KAT MainnetHeaderRederivesPinnedHash);
+    /// no longer deferred.
     static NMCChainParams mainnet() {
         NMCChainParams p;
         p.target_timespan = MAINNET_TARGET_TIMESPAN;
@@ -679,6 +681,10 @@ struct NMCChainParams {
     /// blocks=830010 IBD=false, 2026-06-20):
     ///   version=1  time=1303000001  bits=0x1c007fff  nonce=0xa21ea192
     ///   merkleroot=41c62dbd9068c89a449525e3cd5ac61b20ece28c3c38b3f35b2161f0e6d3cb0d
+    /// Source-anchored to namecoin-core@6697dba src/kernel/chainparams.cpp:200
+    ///   CreateGenesisBlock(1303000001, 0xa21ea192, 0x1c007fff, 1, 50 * COIN):
+    ///   version/time/bits/nonce match those literals, so the pin no longer
+    ///   rests solely on the ephemeral .140 daemon.
     /// SHA256d(header) == 000000000062b72c..c770 == mainnet genesis_hash
     /// (verified locally + by the MainnetHeaderRederivesPinnedHash KAT). This
     /// retires the deferred mainnet_genesis_header() seed; the expected hash is
