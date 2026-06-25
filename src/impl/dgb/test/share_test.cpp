@@ -864,6 +864,88 @@ TEST(DGB_share_test, WeightWalkValueInvarianceBattery)
     }
 }
 
+// ── #429 follow-on: ShareTracker delegation byte-identity over {2,4,8} ───────
+// #429 lifted the per-version tally accumulation into the desired_version_tally
+// SSOT (accumulate_version_weights / accumulate_version_counts) WITHOUT rewiring
+// ShareTracker. This slice rewires get_desired_version_weights() (the CONSENSUS
+// 60%-by-work switch gate input) and its flat-count diagnostic sibling
+// get_desired_version_counts() to delegate into that SSOT, keeping the
+// chain-walk + lookbehind clamp inline. This KAT proves the rewire is
+// value-identical NON-CIRCULARLY: the expected maps are derived from first
+// principles (production chain::target_to_average_attempts over the known input
+// bits, and a hand counted flat tally) — NOT from the SSOT under test — over
+// chains of exactly 2, 4 and 8 shares (the {2,4,8} anchors).
+TEST(DGB_share_test, DesiredVersionTallyDelegationByteIdentity)
+{
+    struct In { uint64_t dv; uint32_t bits; };
+
+    auto run = [](const std::vector<In>& shares, const char* tag) {
+        dgb::ShareTracker tracker;
+        std::vector<uint256> hashes;
+        for (size_t i = 0; i < shares.size(); ++i) {
+            char buf[16]; std::snprintf(buf, sizeof(buf), "%zx", 0x4290 + i);
+            uint256 h = hx(buf);
+            auto* sh = new dgb::MergedMiningShare();
+            sh->m_hash = h;
+            if (i == 0) sh->m_prev_hash.SetNull(); else sh->m_prev_hash = hashes.back();
+            sh->m_desired_version = shares[i].dv;
+            sh->m_bits = shares[i].bits;
+            sh->m_max_bits = shares[i].bits;
+            dgb::ShareType st; st = sh;
+            tracker.add(st);
+            hashes.push_back(h);
+        }
+        const uint256& tip = hashes.back();
+
+        // Expected, hand-derived from first principles (not via the SSOT):
+        //  counts  = flat occurrence per desired_version
+        //  weights = sum of production work per desired_version
+        std::map<uint64_t, int32_t> want_counts;
+        std::map<uint64_t, uint288> want_weights;
+        for (const auto& in : shares) {
+            want_counts[in.dv] += 1;
+            const uint288 w = chain::target_to_average_attempts(chain::bits_to_target(in.bits));
+            want_weights[in.dv] = want_weights[in.dv] + w;
+        }
+
+        const auto got_counts  = tracker.get_desired_version_counts(tip, 1000);
+        const auto got_weights = tracker.get_desired_version_weights(tip, 1000);
+        EXPECT_EQ(got_counts,  want_counts)  << tag << " counts (flat, diag)";
+        EXPECT_EQ(got_weights, want_weights) << tag << " weights (consensus gate)";
+    };
+
+    // 2 shares: split versions, equal work => flat-count and weight agree on keys
+    run({{36, 0x1e0fffff}, {35, 0x1e0fffff}}, "anchor-2");
+
+    // 4 shares: 3x dv=36 (easy) vs 1x dv=35 (hard) — the exact case where a flat
+    // count (36 leads 3:1) inverts under work-weighting (35 outweighs).
+    run({{36, 0x1e0fffff}, {36, 0x1e0fffff}, {35, 0x1d00ffff}, {36, 0x1e0fffff}}, "anchor-4");
+
+    // 8 shares: three versions, mixed difficulty, repeated keys.
+    run({{35, 0x1d00ffff}, {36, 0x1e0fffff}, {36, 0x1e07ffff}, {37, 0x1e0fffff},
+         {35, 0x1e0fffff}, {36, 0x1d00ffff}, {37, 0x1e07ffff}, {36, 0x1e0fffff}},
+        "anchor-8");
+
+    // Lookbehind clamp stays inline & correct: a window shorter than the chain
+    // tallies ONLY the clamped tail, and a height/<=0 guard yields an empty map.
+    {
+        dgb::ShareTracker tracker;
+        uint256 g = hx("7a0"), a = hx("7a1"), b = hx("7a2");
+        auto mk = [&](const uint256& h, const uint256* ph, uint64_t dv) {
+            auto* sh = new dgb::MergedMiningShare();
+            sh->m_hash = h;
+            if (ph) sh->m_prev_hash = *ph; else sh->m_prev_hash.SetNull();
+            sh->m_desired_version = dv; sh->m_bits = 0x1e0fffff; sh->m_max_bits = 0x1e0fffff;
+            dgb::ShareType st; st = sh; tracker.add(st);
+        };
+        mk(g, nullptr, 35); mk(a, &g, 36); mk(b, &a, 36);
+        EXPECT_TRUE(tracker.get_desired_version_counts(b, 0).empty()) << "clamp<=0 empty";
+        EXPECT_TRUE(tracker.get_desired_version_weights(b, 0).empty()) << "clamp<=0 empty";
+        auto c2 = tracker.get_desired_version_counts(b, 2);   // tail of 2 => both dv=36
+        ASSERT_EQ(c2.size(), 1u); EXPECT_EQ(c2.at(36u), 2);
+    }
+}
+
 // ============================================================================
 // WorkRefHashAssembler — prospective-work RefHashParams assembler KAT.
 //

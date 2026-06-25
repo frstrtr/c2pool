@@ -26,6 +26,7 @@ inline uint64_t mul128_shift(uint64_t a, uint64_t b, unsigned shift) {
 #include "share_check.hpp"
 #include "think_p1_walk_bounds.hpp"  // SSOT: think_p1_walk_count / think_p1_in_pruning_zone
 #include "coin/naughty_propagation.hpp"  // SSOT: propagate_naughty_from_parent (data.py:543-549)
+#include <impl/dgb/coin/desired_version_tally.hpp>  // SSOT: accumulate_version_weights / accumulate_version_counts (#429 follow-on)
 #include "config_pool.hpp"
 
 #include <core/target_utils.hpp>
@@ -2110,22 +2111,26 @@ public:
     // Python ref: tracker.get_desired_version_counts(...)
     std::map<uint64_t, int32_t> get_desired_version_counts(const uint256& share_hash, int32_t lookbehind)
     {
-        std::map<uint64_t, int32_t> counts;
+        // Chain-walk + lookbehind clamp stay inline (the clamp is the separate
+        // chain_walk_window SSOT); ONLY the per-version accumulation delegates to
+        // dgb::accumulate_version_counts (desired_version_tally SSOT, #429). The
+        // window vector below is the exact (desired_version) sequence the prior
+        // inline counts[dv]++ loop read, so the result is byte-identical.
         if (!chain.contains(share_hash))
-            return counts;
+            return {};
         auto height = chain.get_height(share_hash);
         auto actual = std::min(lookbehind, height);
         if (actual <= 0)
-            return counts;
+            return {};
 
-        auto view = chain.get_chain(share_hash, actual);
-        for (auto [hash, data] : view)
+        std::vector<uint64_t> window;
+        for (auto [hash, data] : chain.get_chain(share_hash, actual))
         {
             uint64_t dv = 0;
             data.share.invoke([&](auto* obj) { dv = obj->m_desired_version; });
-            counts[dv]++;
+            window.push_back(dv);
         }
-        return counts;
+        return dgb::accumulate_version_counts(window);
     }
 
     // -- PPLNS-weighted version counting for the consensus 60% switch rule --
@@ -2145,24 +2150,29 @@ public:
     // Weight = ShareIndex::work (share.hpp).
     std::map<uint64_t, uint288> get_desired_version_weights(const uint256& share_hash, int32_t lookbehind)
     {
-        std::map<uint64_t, uint288> weights;
+        // Chain-walk + lookbehind clamp stay inline; ONLY the per-version work
+        // accumulation delegates to dgb::accumulate_version_weights (SSOT, #429).
+        // Shares whose ShareIndex is absent are skipped exactly as before (they
+        // never touched weights[dv]), so the delegated map is byte-identical to
+        // the prior inline weights[dv] = weights[dv] + idx->work loop -- the
+        // CONSENSUS 60%-by-work switch gate input is unchanged.
         if (!chain.contains(share_hash))
-            return weights;
+            return {};
         auto height = chain.get_height(share_hash);
         auto actual = std::min(lookbehind, height);
         if (actual <= 0)
-            return weights;
+            return {};
 
-        auto view = chain.get_chain(share_hash, actual);
-        for (auto [hash, data] : view)
+        std::vector<dgb::VersionWork> window;
+        for (auto [hash, data] : chain.get_chain(share_hash, actual))
         {
             uint64_t dv = 0;
             data.share.invoke([&](auto* obj) { dv = obj->m_desired_version; });
             auto* idx = chain.get_index(hash);
             if (idx)
-                weights[dv] = weights[dv] + idx->work;
+                window.push_back({dv, idx->work});
         }
-        return weights;
+        return dgb::accumulate_version_weights(window);
     }
 
     // -- Merged mining: per-chain PPLNS weights --

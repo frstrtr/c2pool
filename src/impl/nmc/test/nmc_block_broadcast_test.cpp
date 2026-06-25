@@ -18,6 +18,8 @@
 
 #include <gtest/gtest.h>
 
+#include <stdexcept>
+
 #include <string>
 #include <vector>
 
@@ -110,4 +112,48 @@ TEST(NmcAuxBlockBroadcast, FallbackNoAckDoesNotMaskP2p) {
     EXPECT_TRUE(r.any());
     EXPECT_STREQ(r.landed_first, "p2p");
     EXPECT_EQ(calls, 1);
+}
+
+
+// 6) PRIMARY-LEG GUARD: a throwing embedded P2P relay sink must NOT prevent the
+//    ALWAYS-fire submitauxblock RPC fallback -- the won aux block still reaches
+//    namecoind via the safety net, p2p_sent stays false (the relay never
+//    actually sent), any()=true (NOT silent-dropped), and the dispatcher does
+//    not propagate the throw. Locks the doc-comment "each leg is guarded so the
+//    dispatcher never throws" contract that the un-guarded impl violated.
+TEST(NmcAuxBlockBroadcast, ThrowingP2pStillFiresRpcFallback) {
+    auto relay = [&](const std::vector<unsigned char>&) {
+        throw std::runtime_error("p2p relay down mid-teardown");
+    };
+    int  calls = 0;
+    auto aux_rpc = [&](const std::string&, const std::string&) { ++calls; return true; };
+
+    nmc::coin::AuxBlockBroadcast r;
+    EXPECT_NO_THROW(r = nmc::coin::broadcast_won_aux_block(relay, aux_rpc,
+                                                           kBytes, kHashHex, kAuxpowHex));
+    EXPECT_FALSE(r.p2p_sent);             // relay threw -> never marked sent
+    EXPECT_TRUE(r.rpc_ok);                // always-fire fallback STILL fired
+    EXPECT_EQ(calls, 1);
+    EXPECT_TRUE(r.any());                 // won block was NOT silent-dropped
+    EXPECT_STREQ(r.landed_first, "rpc");  // fallback carried it
+}
+
+// 7) FALLBACK-LEG GUARD: a throwing submitauxblock RPC sink must not propagate
+//    and must not mask a P2P win already recorded -- rpc_ok=false, the P2P win
+//    still stands (landed_first="p2p", any()=true).
+TEST(NmcAuxBlockBroadcast, ThrowingRpcDoesNotMaskP2pWin) {
+    bool relayed = false;
+    auto relay = [&](const std::vector<unsigned char>&) { relayed = true; };
+    auto aux_rpc = [&](const std::string&, const std::string&) -> bool {
+        throw std::runtime_error("submitauxblock client socket reset");
+    };
+
+    nmc::coin::AuxBlockBroadcast r;
+    EXPECT_NO_THROW(r = nmc::coin::broadcast_won_aux_block(relay, aux_rpc,
+                                                           kBytes, kHashHex, kAuxpowHex));
+    EXPECT_TRUE(relayed);
+    EXPECT_TRUE(r.p2p_sent);
+    EXPECT_FALSE(r.rpc_ok);
+    EXPECT_TRUE(r.any());
+    EXPECT_STREQ(r.landed_first, "p2p");
 }

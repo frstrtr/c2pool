@@ -22,6 +22,7 @@
 #include "config_pool.hpp"
 #include "share_tracker.hpp"
 #include "share_check.hpp"
+#include "coin/get_height_and_last_endpoints.hpp"
 
 #include <core/log.hpp>
 #include <core/target_utils.hpp>
@@ -450,8 +451,8 @@ private:
             return;
 
         auto [height, last] = tracker.chain.get_height_and_last(best);
-        int32_t depth = std::min(height, static_cast<int32_t>(PoolConfig::real_chain_length()));
-        if (depth < 1)
+        int32_t depth = dgb::pplns_window_depth(height, static_cast<int32_t>(PoolConfig::real_chain_length()));
+        if (!dgb::pplns_window_active(depth))
             return;
 
         struct AccumEntry { std::vector<unsigned char> script; uint160 hash; uint8_t type; uint64_t weight; };
