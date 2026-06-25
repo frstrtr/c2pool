@@ -2946,9 +2946,24 @@ nlohmann::json MiningInterface::getstats(const std::string& request_id)
             block_height = m_cached_template["height"].get<uint64_t>();
     }
 
+    // Prefer the live sharechain-stats hook over the empty m_node stub: m_node
+    // returns zeros on prod, so getstats lied about orphan/DOA/stale shares while
+    // /stale_rates (same hook) reported the truth. Charter: dashboards must not lie.
     nlohmann::json stale = {{"orphan_count", 0}, {"doa_count", 0}, {"stale_count", 0}, {"stale_prop", 0.0}};
-    if (m_node)
+    if (m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        uint64_t total  = sc.value("total_shares", uint64_t(0));
+        uint64_t orphan = sc.value("orphan_shares", uint64_t(0));
+        uint64_t dead   = sc.value("dead_shares", uint64_t(0));
+        stale["orphan_count"] = orphan;
+        stale["doa_count"]    = dead;
+        stale["stale_count"]  = orphan + dead;
+        stale["stale_prop"]   = total > 0
+            ? static_cast<double>(orphan + dead) / static_cast<double>(total)
+            : 0.0;
+    } else if (m_node) {
         stale = m_node->get_stale_stats();
+    }
 
     nlohmann::json protocol_messages = nlohmann::json::array();
     if (m_protocol_messages_fn) {
