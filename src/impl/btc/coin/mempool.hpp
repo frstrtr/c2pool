@@ -96,6 +96,12 @@ public:
     void set_tip_height(uint32_t h) { m_tip_height = h; }
     void set_utxo(core::coin::UTXOViewCache* u) { m_utxo.store(u); }
 
+    /// Monotonic mutation counter, bumped on every add/remove/clear that
+    /// could change the selected tx set. Readers (e.g. the stratum work
+    /// template cache) compare it across calls to skip rebuilding when the
+    /// mempool is unchanged. Value-invariant: changes IFF the tx set could.
+    uint64_t epoch() const { return m_epoch.load(std::memory_order_relaxed); }
+
     // Disable copy
     Mempool(const Mempool&) = delete;
     Mempool& operator=(const Mempool&) = delete;
@@ -162,6 +168,7 @@ public:
                      << " fee=" << (stored.fee_known ? std::to_string(stored.fee) : "?")
                      << (evicted > 0 ? " evict=" + std::to_string(evicted) : "");
         }
+        m_epoch.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
 
@@ -274,6 +281,7 @@ public:
         m_feerate_index.clear();
         m_spent_outputs.clear();
         m_total_bytes = 0;
+        m_epoch.fetch_add(1, std::memory_order_relaxed);
     }
 
     // ─── Queries ─────────────────────────────────────────────────────────
@@ -701,6 +709,7 @@ private:
         }
 
         m_pool.erase(it);
+        m_epoch.fetch_add(1, std::memory_order_relaxed);
     }
 
     void evict_one_locked(const uint256& txid) {
@@ -710,6 +719,8 @@ private:
     // ─── State ───────────────────────────────────────────────────────────
 
     mutable std::mutex m_mutex;
+    // Monotonic tx-set mutation counter; see epoch().
+    std::atomic<uint64_t> m_epoch{0};
 
     std::map<uint256, MempoolEntry>  m_pool;        // txid → entry
     std::multimap<time_t, uint256>   m_time_index;  // arrival time → txid (FIFO)
