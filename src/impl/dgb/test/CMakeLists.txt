@@ -934,4 +934,22 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_think_p5_best_share_punish_test "" AUTO)
 
+    # dgb_compact_blocks_bip152_parity_test: FENCED, additive KAT pinning the
+    # BIP 152 compact-block RELAY wire primitives in coin/compact_blocks.hpp --
+    # ShortTxID 6-byte little-endian layout + to_uint64() inverse, and the
+    # BlockTransactionsRequest (getblocktxn) differential transaction-index
+    # encode/decode. RELAY-ONLY (reconstructed block is validated normally): no
+    # consensus / PoW / share-format / payout surface. NON-CIRCULAR: short-ID
+    # bytes and the {0,2,6,10,11}->{0,1,3,3,0} diff sequence are hand-derived
+    # from the BIP 152 spec, asserted against the on-the-wire serialiser output.
+    # No call site rewired. MUST also be in BOTH build.yml --target allowlists
+    # (#143 NOT_BUILT trap).
+    add_executable(dgb_compact_blocks_bip152_parity_test compact_blocks_bip152_parity_test.cpp)
+    target_link_libraries(dgb_compact_blocks_bip152_parity_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_compact_blocks_bip152_parity_test "" AUTO)
+
 endif()
