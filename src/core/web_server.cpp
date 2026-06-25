@@ -2862,6 +2862,21 @@ nlohmann::json MiningInterface::getinfo(const std::string& request_id)
     if (double real_hs = get_pool_hashrate(); real_hs > 0.0)
         pool_hashrate = real_hs;
 
+    // poolshares + difficulty previously came ONLY from the empty m_node stub
+    // (get_total_mining_shares()/get_difficulty_stats() return 0 on the
+    // embedded prod build) -- the same false-zero source as the founding
+    // connections/poolhashps bug. Source them from the live sharechain stats
+    // hook (the truthful source #462 used for stale/DOA): total_shares =
+    // current sharechain length, average_difficulty = PPLNS-window share diff.
+    if (m_sharechain_stats_fn) {
+        auto ss = m_sharechain_stats_fn();
+        if (ss.contains("total_shares") && ss["total_shares"].is_number())
+            total_shares = ss["total_shares"].get<uint64_t>();
+        if (ss.contains("average_difficulty") && ss["average_difficulty"].is_number()
+            && ss["average_difficulty"].get<double>() > 0.0)
+            current_difficulty = ss["average_difficulty"].get<double>();
+    }
+
     // Read block height from cached template
     uint64_t block_height = 0;
     double network_hashps = 0.0;
