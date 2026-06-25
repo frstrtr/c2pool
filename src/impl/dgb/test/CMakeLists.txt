@@ -550,6 +550,22 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_aux_doge_db_commitment_bind_test "" AUTO)
 
+    # --- DGB+DOGE (phase DB) -- DGB-side AuxPoW merged-mining coinbase ---
+    # commitment BUILDER KAT. FENCED / test-only: pins the canonical
+    # fabe6d6d || aux_root(32 BE) || size(4 LE) || nonce(4 LE) byte layout
+    # emitted by dgb::coin::build_aux_mm_commitment, non-circularly (goldens
+    # hand-built from raw inputs, not the builder). Pure dgb/+core value
+    # transform -- no ltc/doge linkage, flag-agnostic (builds in default AND
+    # -DAUX_DOGE arms). MUST appear in BOTH this registration AND the build.yml
+    # --target allowlist or it becomes a NOT_BUILT sentinel that reds master
+    # (cf. DGB #137 / #143).
+    add_executable(dgb_aux_doge_mm_commitment_test aux_doge_mm_commitment_test.cpp)
+    target_link_libraries(dgb_aux_doge_mm_commitment_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
+    gtest_add_tests(dgb_aux_doge_mm_commitment_test "" AUTO)
+
     # --- DGB+DOGE (phase DC) -- DGB-as-parent AuxPoW PROOF byte-parity + dual ---
     # Proves the neutral producer build_auxpow_proof (c2pool/merged) is byte-
     # identical to the typed doge::coin::CAuxPow<dgb::coin::MutableTransaction>
