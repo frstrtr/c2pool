@@ -70,16 +70,18 @@ namespace io = boost::asio;
 static void print_usage()
 {
     std::cerr <<
-        "Usage: c2pool-btc [--testnet | --testnet4] --bitcoind HOST:PORT\n"
+        "Usage: c2pool-btc [--testnet | --testnet4 | --regtest] --bitcoind HOST:PORT\n"
         "                  [--p2pool HOST:PORT]\n"
         "\n"
         "  --testnet       BTC testnet3 chain (genesis 000000000933ea01...)\n"
         "  --testnet4      BTC testnet4 chain (genesis 00000000da84f2ba...)\n"
+        "  --regtest       BTC regtest chain (genesis 0f9188f13cb7b2c7...)\n"
         "                  default: mainnet\n"
         "  --bitcoind H:P  bitcoind P2P endpoint host:port\n"
         "                  e.g. 127.0.0.1:8333  (mainnet)\n"
         "                       127.0.0.1:18333 (testnet3)\n"
         "                       127.0.0.1:48333 (testnet4)\n"
+        "                       127.0.0.1:18443 (regtest)\n"
         "  --p2pool H:P    BTC p2pool peer (jtoomim/SPB v35 + protocol 3502)\n"
         "                  e.g. p2p-spb.xyz:9333\n"
         "  --stratum [H:]P stratum TCP listener for miners (B4-stratum)\n"
@@ -101,10 +103,11 @@ static void print_usage()
 
 /// BTC wire-protocol magic bytes per network (pchMessageStart).
 /// Source: ref/bitcoin/src/kernel/chainparams.cpp.
-static std::vector<std::byte> btc_magic_bytes(bool testnet, bool testnet4)
+static std::vector<std::byte> btc_magic_bytes(bool testnet, bool testnet4, bool regtest)
 {
     std::string hex;
-    if (testnet4)      hex = "1c163f28";   // testnet4 (line 335-338)
+    if (regtest)       hex = "fabfb5da";   // regtest  (CRegTestParams)
+    else if (testnet4) hex = "1c163f28";   // testnet4 (line 335-338)
     else if (testnet)  hex = "0b110907";   // testnet3 (line 235-238)
     else               hex = "f9beb4d9";   // mainnet  (line 117-120)
     return ParseHexBytes(hex);
@@ -116,6 +119,7 @@ int main(int argc, char* argv[])
 
     bool        testnet       = false;
     bool        testnet4      = false;
+    bool        regtest       = false;
     std::string bitcoind_host;
     uint16_t    bitcoind_port = 0;
     std::string p2pool_host;
@@ -142,6 +146,10 @@ int main(int argc, char* argv[])
         {
             testnet  = true;
             testnet4 = true;
+        }
+        else if (arg == "--regtest")
+        {
+            regtest = true;
         }
         else if (arg == "--bitcoind" && i + 1 < argc)
         {
@@ -223,14 +231,17 @@ int main(int argc, char* argv[])
         std::cerr << "[BTC] warning: --prefix ignored without --network-id\n";
     btc::PoolConfig::set_network_id(network_id_hex, prefix_hex);
 
-    auto chain_params = testnet4
-        ? btc::coin::BTCChainParams::testnet4()
-        : (testnet ? btc::coin::BTCChainParams::testnet()
-                   : btc::coin::BTCChainParams::mainnet());
+    auto chain_params = regtest
+        ? btc::coin::BTCChainParams::regtest()
+        : (testnet4
+            ? btc::coin::BTCChainParams::testnet4()
+            : (testnet ? btc::coin::BTCChainParams::testnet()
+                       : btc::coin::BTCChainParams::mainnet()));
 
-    const std::string net_subdir = testnet4 ? "bitcoin_testnet4"
+    const std::string net_subdir = regtest ? "bitcoin_regtest"
+                                : (testnet4 ? "bitcoin_testnet4"
                                 : (testnet  ? "bitcoin_testnet"
-                                            : "bitcoin");
+                                            : "bitcoin"));
 
     const std::filesystem::path net_dir = core::filesystem::config_path() / net_subdir;
     std::error_code ec;
@@ -240,7 +251,7 @@ int main(int argc, char* argv[])
     const std::string utxo_db_path  = (net_dir / "utxo_view_db").string();
 
     LOG_INFO << "[BTC] c2pool-btc starting — net="
-             << (testnet4 ? "testnet4" : (testnet ? "testnet3" : "mainnet"));
+             << (regtest ? "regtest" : (testnet4 ? "testnet4" : (testnet ? "testnet3" : "mainnet")));
     LOG_INFO << "[BTC] HeaderChain DB: " << chain_db_path;
     LOG_INFO << "[BTC] UTXO DB:        " << utxo_db_path;
     LOG_INFO << "[BTC] Genesis:        " << chain_params.genesis_hash.GetHex();
@@ -346,9 +357,9 @@ int main(int argc, char* argv[])
     btc::Config config(net_subdir);
     // Skip Config::init() — it would try to load pool.yaml + coin.yaml
     // from disk; for B2-net smoke we set fields directly from chainparams.
-    config.coin()->m_p2p.prefix  = btc_magic_bytes(testnet, testnet4);
+    config.coin()->m_p2p.prefix  = btc_magic_bytes(testnet, testnet4, regtest);
     config.coin()->m_p2p.address = NetService(bitcoind_host, bitcoind_port);
-    config.coin()->m_testnet     = testnet;
+    config.coin()->m_testnet     = testnet || regtest;
     config.coin()->m_symbol      = "BTC";
 
     btc::coin::Node<btc::Config> coin_node(&ioc, &config);

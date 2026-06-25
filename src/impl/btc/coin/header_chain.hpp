@@ -212,6 +212,24 @@ struct BTCChainParams {
         return p;
     }
 
+    /// BTC regtest params (p2p port 18444) — local block-production / bitaxe
+    /// testbed. powLimit + genesis + fPowNoRetargeting per Bitcoin Core
+    /// CRegTestParams (ref/bitcoin/src/kernel/chainparams.cpp). Min-diff +
+    /// no-retarget so a single rig (or generatetoaddress) produces blocks now.
+    static BTCChainParams regtest() {
+        BTCChainParams p;
+        p.target_timespan = MAINNET_TARGET_TIMESPAN;
+        p.target_spacing  = MAINNET_TARGET_SPACING;
+        p.allow_min_difficulty = true;
+        p.no_retargeting = true;
+        // Regtest powLimit (CRegTestParams): nBits 0x207fffff.
+        p.pow_limit.SetHex("7fffff0000000000000000000000000000000000000000000000000000000000");
+        // Regtest genesis (Bitcoin Core CRegTestParams).
+        p.genesis_hash.SetHex("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206");
+        p.fast_start_checkpoint = Checkpoint{0, p.genesis_hash};
+        return p;
+    }
+
     int64_t difficulty_adjustment_interval() const {
         return target_timespan / target_spacing;
     }
