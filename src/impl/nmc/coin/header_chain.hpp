@@ -294,12 +294,13 @@ inline std::vector<unsigned char> build_mm_commitment(uint256 chain_merkle_root,
 /// keyed by (chain_id, merkle size, nonce). For NMC under a BTC parent the
 /// list is normally length 1, but the type models the general case.
 struct AuxChain {
-    // TO-CONFIRM: Namecoin mainnet chain id. Namecoin historically uses
-    // chain_id = 1 for mainnet merge-mining, but this MUST be pinned against
-    // Namecoin chainparams (CChainParams::nAuxpowChainId) + namecoind before
-    // it is treated as consensus. Sentinel below is a placeholder, NOT a
-    // committed constant.
-    int32_t  chain_id{-1};        // TO-CONFIRM: sentinel (-1 = unpinned)
+    // chain_id: PINNED from canonical Namecoin Core @ 6697dba480 (branch
+    // auxpow), src/kernel/chainparams.cpp:179/345/620/725 -> nAuxpowChainId =
+    // 0x0001 across all four nets (main/testnet/testnet4/regtest). Defaults to
+    // the aux_id.hpp SSOT so this slot-modeling struct never disagrees with the
+    // consensus-bearing NMCChainParams::aux_chain_id. Live cross-check vs .140
+    // namecoind deferred to PE item4 soak.
+    int32_t  chain_id{static_cast<int32_t>(NMC_AUXPOW_CHAIN_ID)};  // = 0x0001 (pinned)
     uint256  aux_block_hash;      // the aux (NMC) block hash being committed
     uint32_t merkle_index{0};     // slot index within the chain merkle tree
 };
@@ -582,8 +583,9 @@ struct NMCChainParams {
     // hand-built Params never claims merge-mining is active off a placeholder.
     int32_t auxpow_activation_height{-1};   // -1 = unpinned default; pinned per-net in factory
     // aux_chain_id: the chain id this NMC instance claims in the parent's
-    //   merged-mining tree. -1 = unpinned sentinel.
-    int32_t aux_chain_id{static_cast<int32_t>(NMC_AUXPOW_CHAIN_ID)};                // Namecoin nAuxpowChainId = 0x0001 (both nets); see chainparams.cpp
+    //   merged-mining tree. PINNED via the aux_id.hpp SSOT (no longer a -1
+    //   sentinel); live cross-check vs .140 namecoind deferred to PE item4 soak.
+    int32_t aux_chain_id{static_cast<int32_t>(NMC_AUXPOW_CHAIN_ID)};                // = 0x0001; namecoin-core@6697dba src/kernel/chainparams.cpp:179/345/620/725
 
     int64_t difficulty_adjustment_interval() const {
         return target_timespan / target_spacing;
