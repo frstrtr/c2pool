@@ -1225,14 +1225,18 @@ TEST(DashConformanceFactory, CoinFieldsMatchDashOracle) {
     EXPECT_EQ(tn.address_p2sh_version, 19);
 }
 
-// The factory donation script is byte-identical to the DONATION_SCRIPT SSOT for
-// every share version (DASH is always P2PKH; no v36 combined-P2SH switch).
+// The factory donation script is version-gated SSOT: pre-v36 share versions use
+// the per-coin P2PKH DONATION_SCRIPT (Bucket-3, keep-for-soak); v36+ shares use
+// the unified cross-coin COMBINED_DONATION_SCRIPT P2SH (Bucket-2). Both pinned to
+// the SSOT symbols, never an ad-hoc literal.
 TEST(DashConformanceFactory, DonationScriptIsSSOTForAllVersions) {
     auto p = dash::make_coin_params(/*testnet=*/false);
-    for (int64_t v : {0, 15, 16, 35, 36}) {
+    for (int64_t v : {0, 15, 16, 35}) {
         EXPECT_EQ(p.donation_script_func(v), dash::DONATION_SCRIPT)
-            << "donation script diverged at share_version=" << v;
+            << "pre-v36 donation script diverged at share_version=" << v;
     }
+    EXPECT_EQ(p.donation_script_func(36), dash::COMBINED_DONATION_SCRIPT)
+        << "v36 donation script must be the unified combined P2SH";
 }
 
 // PoW and block-identity hashes are BOTH X11 (DASH identifies blocks by X11,
@@ -1293,6 +1297,9 @@ TEST(DashConformanceFactory, OverridesNeverTouchConsensusOrIsolation) {
     EXPECT_EQ(p.max_target,             ssot.max_target);
     EXPECT_EQ(p.current_share_version,  ssot.current_share_version);
     EXPECT_EQ(p.minimum_protocol_version, ssot.minimum_protocol_version);
+    // Overrides must not change the donation script at ANY version: the override
+    // overload must agree with the pure-SSOT overload version-for-version
+    // (pre-v36 P2PKH and v36 combined-P2SH alike).
     for (int64_t v : {0, 16, 35, 36})
-        EXPECT_EQ(p.donation_script_func(v), dash::DONATION_SCRIPT);
+        EXPECT_EQ(p.donation_script_func(v), ssot.donation_script_func(v));
 }
