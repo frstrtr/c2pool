@@ -11,8 +11,10 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdio>
 #include <fstream>
 #include <string>
+#include <unistd.h>
 
 #include <impl/dash/coin/rpc_conf.hpp>
 
@@ -20,17 +22,39 @@ using dash::coin::RpcConf;
 using dash::coin::load_rpc_conf;
 using dash::coin::apply_endpoint_override;
 
-namespace {
-std::string write_conf(const std::string& body)
+// gtest_add_tests (AUTO) registers EACH case as its own ctest add_test, so under
+// `ctest -j` the cases run as concurrent OS processes. A single shared conf path
+// in TempDir() therefore races: one process overwrites the file between another's
+// write and read, randomly reding the two file-backed cases under ASan (which
+// widens the window). Isolate per-test: a path unique by PID (cross-process) and
+// test name (intra-process), created fresh in SetUp and removed in TearDown.
+class DashRpcConf : public ::testing::Test
 {
-    const std::string path = ::testing::TempDir() + "/dash_rpc_conf_kat.conf";
-    std::ofstream(path) << body;
-    return path;
-}
-} // namespace
+protected:
+    std::string conf_path_;
+
+    void SetUp() override
+    {
+        const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+        conf_path_ = ::testing::TempDir() + "/dash_rpc_conf_kat_" +
+                     info->name() + "_" + std::to_string(::getpid()) + ".conf";
+        std::remove(conf_path_.c_str());
+    }
+
+    void TearDown() override
+    {
+        std::remove(conf_path_.c_str());
+    }
+
+    std::string write_conf(const std::string& body)
+    {
+        std::ofstream(conf_path_) << body;
+        return conf_path_;
+    }
+};
 
 // dash.conf rpcuser/rpcpassword/rpcport/rpcconnect parse + armed() + userpass().
-TEST(DashRpcConf, ParsesCredsEndpointAndArms)
+TEST_F(DashRpcConf, ParsesCredsEndpointAndArms)
 {
     const auto p = write_conf(
         "# dash.conf\n"
@@ -49,7 +73,7 @@ TEST(DashRpcConf, ParsesCredsEndpointAndArms)
 }
 
 // c2pool aliases + whitespace trim + inline-comment stripping.
-TEST(DashRpcConf, AcceptsAliasesAndTrims)
+TEST_F(DashRpcConf, AcceptsAliasesAndTrims)
 {
     const auto p = write_conf(
         "  # comment line\n"
@@ -63,7 +87,7 @@ TEST(DashRpcConf, AcceptsAliasesAndTrims)
 
 // arm-gating: the single gate main_dash --run consults. No creds OR no port
 // keeps the submit arm UNARMED (submit_block_hex never reached).
-TEST(DashRpcConf, UnarmedWithoutCredsOrPort)
+TEST_F(DashRpcConf, UnarmedWithoutCredsOrPort)
 {
     RpcConf c;                       // defaults: empty creds, port 0
     EXPECT_FALSE(c.armed());
@@ -75,7 +99,7 @@ TEST(DashRpcConf, UnarmedWithoutCredsOrPort)
 
 // --coin-rpc HOST:PORT override (endpoint only; carries no secret). Bare HOST
 // leaves the conf/default port untouched.
-TEST(DashRpcConf, EndpointOverride)
+TEST_F(DashRpcConf, EndpointOverride)
 {
     RpcConf c;
     apply_endpoint_override("192.168.1.9:19998", c);
@@ -95,7 +119,7 @@ TEST(DashRpcConf, EndpointOverride)
 }
 
 // A missing conf leaves the struct unarmed (the daemon-less default build path).
-TEST(DashRpcConf, MissingFileLeavesUnarmed)
+TEST_F(DashRpcConf, MissingFileLeavesUnarmed)
 {
     RpcConf c;
     EXPECT_FALSE(load_rpc_conf("/nonexistent/path/dash.conf.xyz", c));
