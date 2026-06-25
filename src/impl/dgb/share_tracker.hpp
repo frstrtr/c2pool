@@ -28,6 +28,7 @@ inline uint64_t mul128_shift(uint64_t a, uint64_t b, unsigned shift) {
 #include "coin/naughty_propagation.hpp"  // SSOT: propagate_naughty_from_parent (data.py:543-549)
 #include <impl/dgb/coin/desired_version_tally.hpp>  // SSOT: accumulate_version_weights / accumulate_version_counts (#429 follow-on)
 #include "coin/pool_attempts_per_second.hpp"  // SSOT: compute_pool_attempts_per_second (#407 follow-on)
+#include "coin/tail_score_endpoints.hpp"  // SSOT: score_* endpoint arithmetic (ShareTracker::score chain-walk, #411 follow-on)
 #include "config_pool.hpp"
 
 #include <core/target_utils.hpp>
@@ -605,19 +606,19 @@ public:
         // unverified shares, causing short verified chains to tie on
         // chain_len with long chains and win on hashrate tiebreak.
         auto head_height = verified.get_acc_height(share_hash);
-        if (head_height < static_cast<int32_t>(PoolConfig::chain_length()))
+        if (score_head_too_short(head_height, static_cast<int32_t>(PoolConfig::chain_length())))
             return {head_height, score_res};
 
         // p2pool: end_point = self.verified.get_nth_parent_hash(
         //     share_hash, self.net.CHAIN_LENGTH*15//16)
         // SubsetTracker delegates to parent's skip list (shared navigation).
         auto end_point = verified.get_nth_parent_via_skip(share_hash,
-            (PoolConfig::chain_length() * 15) / 16);
+            score_endpoint_offset(static_cast<int32_t>(PoolConfig::chain_length())));
 
         // p2pool: self.verified.get_chain(end_point, self.net.CHAIN_LENGTH//16)
         std::optional<int32_t> block_height;
-        auto tail_count = std::min(
-            static_cast<int32_t>(PoolConfig::chain_length() / 16),
+        auto tail_count = score_tail_walk_count(
+            static_cast<int32_t>(PoolConfig::chain_length()),
             verified.get_acc_height(end_point));
         if (tail_count <= 0)
             return {static_cast<int32_t>(PoolConfig::chain_length()), score_res};
@@ -643,8 +644,8 @@ public:
         // confirmation count so the score is tiny but non-zero, preventing
         // oscillation where short chains beat long chains simply because the
         // long chain's old blocks are unresolvable.
-        if (!block_height.has_value() || block_height.value() <= 0)
-            block_height = 1000000;  // ~1M confirmations → time_span ≈ 75M seconds
+        block_height = score_resolved_block_span(
+            block_height.has_value(), block_height.value_or(0));  // ~1M conf when unresolved → time_span ≈ 75M seconds
 
         // p2pool: self.verified.get_delta(share_hash, end_point).work
         auto total_work = verified.get_delta_work(share_hash, end_point);
@@ -653,11 +654,10 @@ public:
         // c2pool confirmations: 1=tip → 75s, 4 → 300s (matches p2pool).
         // BLOCK_PERIOD sourced from the make_coin_params-populated CoinParams
         // (oracle PARENT.BLOCK_PERIOD, config_coin.hpp = 75s) — no hardcoded holdover.
-        auto time_span = block_height.value() * static_cast<int32_t>(m_params->block_period);
-        if (time_span <= 0)
-            time_span = 1;
+        auto time_span = score_time_span(
+            block_height.value(), static_cast<int32_t>(m_params->block_period));
 
-        score_res = total_work / static_cast<uint32_t>(time_span);
+        score_res = score_value(total_work, time_span);
         return {static_cast<int32_t>(PoolConfig::chain_length()), score_res};
     }
 
