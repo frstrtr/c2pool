@@ -3795,7 +3795,7 @@ void MiningInterface::start_pplns_precompute()
                                 template_addr_ltc = merged_template[addr]["amount"].get<double>();
                             double scale = (template_addr_ltc > 0) ? (ltc_amt / template_addr_ltc) : 1.0;
                             entry["merged"].push_back({
-                                {"symbol", m.value("symbol", "DOGE")},
+                                {"symbol", m.value("symbol", "")},  // honesty: never fabricate a coin label
                                 {"address", m.value("address", "")},
                                 {"amount", template_doge * scale}
                             });
@@ -6552,11 +6552,18 @@ nlohmann::json MiningInterface::rest_pplns_current()
                 for (const auto& mm : entry["merged"]) {
                     double mm_amount = mm.value("amount", 0.0);
                     if (!(mm_amount > 0)) continue;
-                    std::string sym = mm.value("symbol", std::string("DOGE"));
+                    // Charter honesty: a merged entry must carry its real
+                    // aux-chain symbol (producers set it from ci.symbol). If it
+                    // is somehow absent we must NOT fabricate a specific coin --
+                    // the old "DOGE" default lied on non-DOGE aux nodes and
+                    // folded the amount into a bogus DOGE merged_total. Leave it
+                    // unlabelled (== unknown) so it never masquerades as DOGE.
+                    std::string sym = mm.value("symbol", std::string(""));
                     std::string mm_addr = mm.value("address", std::string(""));
                     if (mm_addr.empty() && mm.contains("addr"))
                         mm_addr = mm.value("addr", std::string(""));
-                    merged_totals[sym] += mm_amount;
+                    if (!sym.empty())
+                        merged_totals[sym] += mm_amount;
                     nlohmann::json me;
                     me["symbol"]  = sym;
                     me["address"] = mm_addr;
