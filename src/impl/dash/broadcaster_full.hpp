@@ -47,6 +47,7 @@
 #include "config.hpp"
 
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <span>
 #include <string>
@@ -134,14 +135,37 @@ public:
     {
         Outcome out;
 
-        // ARM A — embedded P2P fan-out via the leaf scaffold.
-        if (m_pool)
-            out.peers_reached = m_pool->submit_block_raw_all(block_bytes);
+        // ARM A — embedded P2P fan-out via the leaf scaffold. GUARDED: a
+        // throwing per-slot relay must NOT prevent the ARM B submitblock RPC
+        // fallback below — otherwise a P2P-leg fault silently drops a won block
+        // AND skips its safety net. peers_reached stays 0 unless the fan-out
+        // returns cleanly. (Mirror of NMC #468 / DGB #469 / BCH #471.)
+        if (m_pool) {
+            try {
+                out.peers_reached = m_pool->submit_block_raw_all(block_bytes);
+            } catch (const std::exception& e) {
+                LOG_ERROR << "[DashBroadcastFull] ARM A (embedded P2P fan-out) threw ("
+                          << e.what() << ") — falling through to submitblock RPC fallback.";
+            } catch (...) {
+                LOG_ERROR << "[DashBroadcastFull] ARM A (embedded P2P fan-out) threw "
+                             "(non-std) — falling through to submitblock RPC fallback.";
+            }
+        }
 
-        // ARM B — submitblock RPC fallback (dashd authoritative).
+        // ARM B — submitblock RPC fallback (dashd authoritative). GUARDED: a
+        // throwing RPC sink must not propagate and must not mask an ARM A win
+        // already recorded — rpc_submitted stays false, peers_reached stands.
         if (m_rpc_submit) {
             out.rpc_attempted = true;
-            out.rpc_submitted = m_rpc_submit(to_hex(block_bytes));
+            try {
+                out.rpc_submitted = m_rpc_submit(to_hex(block_bytes));
+            } catch (const std::exception& e) {
+                LOG_ERROR << "[DashBroadcastFull] ARM B (submitblock RPC) threw ("
+                          << e.what() << ") — treated as no-ack, ARM A win (if any) preserved.";
+            } catch (...) {
+                LOG_ERROR << "[DashBroadcastFull] ARM B (submitblock RPC) threw "
+                             "(non-std) — treated as no-ack.";
+            }
         }
 
         if (out.reached_network())

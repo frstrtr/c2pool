@@ -26,6 +26,8 @@
 
 #include <gtest/gtest.h>
 
+#include <stdexcept>
+
 #include <impl/dash/broadcaster_full.hpp>
 #include <impl/dash/broadcaster.hpp>
 #include <impl/dash/config.hpp>
@@ -226,4 +228,60 @@ TEST(DashBroadcasterFull, HexEncodingMatchesDashd)
     std::vector<unsigned char> b = {0x00, 0x0f, 0xff, 0x10, 0xa5};
     EXPECT_EQ(DashBroadcasterFull::to_hex(b), "000fff10a5");
     EXPECT_EQ(DashBroadcasterFull::to_hex({}), "");
+}
+
+// (8) ARM-A LEG GUARD: a throwing embedded P2P fan-out must NOT prevent the
+//     ARM B submitblock RPC fallback — the won block still reaches the network
+//     via dashd, peers_reached stays 0 (the fan-out never completed),
+//     reached_network() is true (NOT silent-dropped), and on_block_found does
+//     NOT propagate the throw. Mirror of NMC #468 / DGB #469 / BCH #471.
+TEST(DashBroadcasterFull, ThrowingEmbeddedArmStillFiresRpcFallback)
+{
+    PoolEnv env;
+    env.dial(3);
+
+    DashBroadcasterFull full{env.pool.get()};
+    full.set_peer_submit([&](dash::coin::p2p::NodeP2P&,
+                             std::span<const unsigned char>) {
+        throw std::runtime_error("embedded peer socket reset mid-fanout");
+    });
+    bool rpc_called = false;
+    full.set_rpc_submit([&](const std::string& hex) {
+        rpc_called = true;
+        EXPECT_EQ(hex, "deadbeef0102");
+        return true;  // dashd accepted
+    });
+
+    DashBroadcasterFull::Outcome out;
+    EXPECT_NO_THROW(out = full.on_block_found(kBlock));
+    EXPECT_EQ(out.peers_reached, 0u);   // ARM A threw -> never counted reached
+    EXPECT_TRUE(out.rpc_attempted);
+    EXPECT_TRUE(out.rpc_submitted);     // ARM B safety net STILL fired
+    EXPECT_TRUE(rpc_called);
+    EXPECT_TRUE(out.reached_network()); // won block was NOT silent-dropped
+}
+
+// (9) ARM-B LEG GUARD: a throwing submitblock RPC sink must not propagate and
+//     must not mask an ARM A win already recorded — rpc_submitted stays false,
+//     the P2P win stands (peers_reached==N, reached_network() true).
+TEST(DashBroadcasterFull, ThrowingRpcDoesNotMaskEmbeddedWin)
+{
+    PoolEnv env;
+    env.dial(2);
+
+    DashBroadcasterFull full{env.pool.get()};
+    size_t peer_calls = 0;
+    full.set_peer_submit(
+        [&](dash::coin::p2p::NodeP2P&, std::span<const unsigned char>) { ++peer_calls; });
+    full.set_rpc_submit([&](const std::string&) -> bool {
+        throw std::runtime_error("submitblock client socket reset");
+    });
+
+    DashBroadcasterFull::Outcome out;
+    EXPECT_NO_THROW(out = full.on_block_found(kBlock));
+    EXPECT_EQ(out.peers_reached, 2u);   // ARM A win stands
+    EXPECT_EQ(peer_calls, 2u);
+    EXPECT_TRUE(out.rpc_attempted);
+    EXPECT_FALSE(out.rpc_submitted);    // ARM B threw -> treated as no-ack
+    EXPECT_TRUE(out.reached_network()); // P2P win not masked
 }
