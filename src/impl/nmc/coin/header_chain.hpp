@@ -1119,11 +1119,12 @@ public:
     /// Add a header that carries a merge-mining AuxPow proof.
     /// P1d: the AuxPow VERIFICATION GATE is now wired - check_proof() must
     /// return VALID or the header is rejected, so the (future) accept path can
-    /// never admit an unproven merge-mined header. The header-storage /
-    /// chain-connection path, and the height-derived is_auxpow_active()
-    /// activation gate (which needs a connected parent), remain P0-DEFER - see
-    /// add_header(). A header that passes the gate is therefore NOT persisted
-    /// yet; P1d's contract is the rejection half: nothing unproven gets in.
+    /// never admit an unproven merge-mined header. P1e/P1f then wired the rest:
+    /// a header that passes the gate is CONNECTED via connect_locked() (prev-hash
+    /// linkage, height-derived activation gate, work-based fork choice) and
+    /// PERSISTED to LevelDB by persist_entry_locked() -- including its AuxPow
+    /// blob -- so it survives a reopen. The rejection half still runs first:
+    /// nothing unproven (or premature, or orphan) gets in.
     bool add_auxpow_header(const BlockHeaderType& header, const AuxPow& auxpow) {
         if (verify_auxpow_header(header, auxpow) != AuxPow::CheckResult::VALID) {
             LOG_WARNING << "[EMB-NMC] reject auxpow header "
@@ -1387,9 +1388,11 @@ private:
     uint32_t       m_tip_height{0};
     uint256        m_best_work;
 
-    // P0-DEFER: difficulty validation, AuxPow verification, LevelDB
-    // persistence and height-index rebuild are deliberately absent in this
-    // structural leaf (locator generation landed in P1f).
+    // Wired so far: AuxPow verification (P1d), the in-memory connect /
+    // cumulative-work / fork-choice path (P1e), and LevelDB persistence +
+    // reload incl. the AuxPow blob (P1f). Still deferred: nBits difficulty
+    // RETARGET validation (calculate_next_work is provided but not enforced in
+    // connect_locked). NMC keeps a full-residency m_index with no height-index.
 };
 
 } // namespace coin

@@ -633,8 +633,10 @@ TEST(NmcAuxStep4, ParentOwnBitsAreNotTheAuxGate)
 // target. These KATs pin the rejection contract - nothing unproven gets in -
 // reusing the step-4 complete_proof/mine_parent fixtures but binding the aux
 // block hash to a REAL header via block_hash(header), the production seam.
-// Storage stays P0-DEFER, so a verified header is not persisted yet (add
-// returns false on both arms); the assertion is on the verify verdict.
+// These KATs assert the verify VERDICT. add_auxpow_header returns false here
+// because the fixtures leave auxpow_activation_height at the -1 sentinel, so the
+// activation gate REJECT_UNPINNEDs -- NOT because storage is deferred (the
+// P1e/P1f connect+persist path is live; see NmcP1eStore / NmcP1fPersist).
 // ---------------------------------------------------------------------------
 
 using nmc::coin::HeaderChain;
@@ -675,7 +677,8 @@ TEST(NmcP1dGate, FullyVerifiedAuxPowPassesTheGate)
 
     HeaderChain chain_(params_chain_id_1());
     EXPECT_EQ(chain_.verify_auxpow_header(h, ap), AuxPow::CheckResult::VALID);
-    // Storage is still P0-DEFER, so even a verified header is not persisted yet.
+    // Verified, but NOT admitted: params_chain_id_1() leaves activation at the
+    // -1 sentinel, so connect_locked REJECT_UNPINNEDs -> nothing persisted.
     EXPECT_FALSE(chain_.add_auxpow_header(h, ap));
     EXPECT_FALSE(chain_.has_header(aux));
 }
@@ -1237,9 +1240,9 @@ TEST(NmcP1fLocator, LocatorFollowsTheTipAfterAWorkReorg)
 // now writes every accepted header under "h"+block_hash plus "tip"/"height"
 // pointers in one synced batch; init() reloads them. NMC has no height-index,
 // so there is deliberately NO "i" key (full-residency m_index, unlike btc).
-// Auxpow blobs are NOT persisted yet -- only a presence flag -- so a reloaded
-// merge-mined header keeps its VALID_CHAIN status but its auxpow comes back
-// nullopt (documented P1f-DEFER). The disk-format round-trips are pure (no DB);
+// P1f(a) persists the AuxPow blob too (behind has_auxpow), so a reloaded
+// merge-mined header keeps both its VALID_CHAIN status and its auxpow proof.
+// The disk-format round-trips are pure (no DB);
 // the reopen round-trips exercise the real LevelDBStore under a temp dir.
 // ---------------------------------------------------------------------------
 using nmc::coin::IndexEntry;
@@ -1400,6 +1403,78 @@ TEST(NmcP1fPersist, InMemoryModeWithoutDbPathPersistsNothing)
     ASSERT_TRUE(fresh.init());
     EXPECT_EQ(fresh.size(), 0u);
     EXPECT_FALSE(fresh.has_header(block_hash(g)));
+}
+
+// ---------------------------------------------------------------------------
+// P1f end-to-end accept-path persistence KATs (NmcP1fAcceptPersist). The suites
+// above prove the disk codec (synthetic IndexEntryDiskV1) and the reopen of a
+// PLAIN chain separately. These two compose the missing seam: drive the LIVE
+// proof-gated add_auxpow_header() into a LevelDB-backed chain, reopen, and
+// assert a VALID merge-mined header (tip + AuxPow blob) survives -- and that an
+// INVALID-proof header is neither connected nor written, surviving as nothing.
+// ---------------------------------------------------------------------------
+TEST(NmcP1fAcceptPersist, ValidatedAuxPowHeaderSurvivesReopenViaAcceptPath)
+{
+    const std::string dir = fresh_db_dir("nmc_p1f_auxpow_accept");
+    uint256 z; z.SetNull();
+    BlockHeaderType g = plain_header(z, kEasyBits, 1);           // genesis, height 0
+    uint32_t aux_bits = 0x207fffffu;                            // easy aux target
+    BlockHeaderType h1 = plain_header(block_hash(g), aux_bits, 7);
+    uint256 aux = block_hash(h1);                               // production seam
+    AuxPow ap = complete_proof(aux, /*parent_own_bits=*/0x1d00ffffu);
+    ASSERT_TRUE(mine_parent(ap, chain::bits_to_target(aux_bits)));
+    {
+        HeaderChain a(params_activation(1), dir);               // activation at height 1
+        ASSERT_TRUE(a.init());
+        ASSERT_TRUE(a.add_header(g));                           // height 0, plain
+        ASSERT_EQ(a.verify_auxpow_header(h1, ap), AuxPow::CheckResult::VALID);
+        ASSERT_TRUE(a.add_auxpow_header(h1, ap));               // LIVE proof-gated accept
+        ASSERT_EQ(a.height(), 1u);
+        ASSERT_TRUE(a.tip().has_value());
+        ASSERT_EQ(a.tip()->block_hash, aux);
+    }
+    {
+        HeaderChain b(params_activation(1), dir);
+        ASSERT_TRUE(b.init());                                  // reload from disk
+        EXPECT_EQ(b.size(), 2u);
+        EXPECT_EQ(b.height(), 1u);
+        ASSERT_TRUE(b.tip().has_value());
+        EXPECT_EQ(b.tip()->block_hash, aux);                   // tip advanced + survived
+        ASSERT_TRUE(b.get_header(aux).has_value());
+        EXPECT_EQ(b.get_header(aux)->status, nmc::coin::HEADER_VALID_CHAIN);
+        EXPECT_TRUE(b.get_header(aux)->auxpow.has_value());    // P1f(a) blob restored thru live path
+    }
+}
+
+TEST(NmcP1fAcceptPersist, InvalidProofAuxPowLeavesNothingOnDiskAfterReopen)
+{
+    const std::string dir = fresh_db_dir("nmc_p1f_auxpow_reject");
+    uint256 z; z.SetNull();
+    BlockHeaderType g = plain_header(z, kEasyBits, 1);
+    // height-1 header carrying an UNMINED parent: aux target == 1, so the parent
+    // PoW cannot clear it => check_proof INVALID => never connected, never written.
+    BlockHeaderType h1 = plain_header(block_hash(g), /*aux_bits=*/0x03000001u, 7);
+    uint256 aux = block_hash(h1);
+    AuxPow ap = complete_proof(aux, 0x1d00ffffu);
+    ASSERT_TRUE(pow_hash(ap.parent_header) > chain::bits_to_target(h1.m_bits));
+    {
+        HeaderChain a(params_activation(1), dir);
+        ASSERT_TRUE(a.init());
+        ASSERT_TRUE(a.add_header(g));
+        ASSERT_EQ(a.verify_auxpow_header(h1, ap), AuxPow::CheckResult::INVALID);
+        EXPECT_FALSE(a.add_auxpow_header(h1, ap));              // rejected before connect
+        EXPECT_FALSE(a.has_header(aux));
+        EXPECT_EQ(a.size(), 1u);                               // genesis only
+    }
+    {
+        HeaderChain b(params_activation(1), dir);
+        ASSERT_TRUE(b.init());                                  // reload
+        EXPECT_EQ(b.size(), 1u);                               // reject left no disk row
+        EXPECT_FALSE(b.has_header(aux));
+        EXPECT_EQ(b.height(), 0u);
+        ASSERT_TRUE(b.tip().has_value());
+        EXPECT_EQ(b.tip()->block_hash, block_hash(g));
+    }
 }
 
 // ---------------------------------------------------------------------------
