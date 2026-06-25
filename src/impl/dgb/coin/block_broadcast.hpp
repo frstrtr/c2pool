@@ -31,6 +31,7 @@
 // ---------------------------------------------------------------------------
 
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <string>
 #include <vector>
@@ -61,8 +62,11 @@ struct BlockBroadcast
 // Fire a won block down BOTH broadcast paths. `block_bytes` is the pre-
 // serialized block blob the embedded P2P relay sends; `block_hex` is the same
 // block hex for the external submitblock fallback. `p2p_relay` may be empty
-// (no embedded sink yet); `seam` may be null or RPC-less -- each leg is guarded
-// so the dispatcher never throws or dereferences a null sink.
+// (no embedded sink yet); `seam` may be null or RPC-less -- each leg is wrapped
+// in try/catch so a throwing sink can NEVER propagate out of the dispatcher: a
+// throwing P2P leg falls through to the always-fire submitblock RPC fallback
+// (no silent won-block drop / lost subsidy), and a throwing RPC leg is a no-ack
+// that never masks a P2P win. The dispatcher also never dereferences a null sink.
 inline BlockBroadcast broadcast_won_block(const P2pRelaySink& p2p_relay,
                                           core::coin::ICoinNode* seam,
                                           const std::vector<unsigned char>& block_bytes,
@@ -70,13 +74,24 @@ inline BlockBroadcast broadcast_won_block(const P2pRelaySink& p2p_relay,
 {
     BlockBroadcast r;
 
-    // PRIMARY: embedded P2P relay (fastest propagation).
+    // PRIMARY: embedded P2P relay (fastest propagation). Guarded so a throwing
+    // relay sink can NEVER propagate out and skip the always-fire RPC fallback
+    // below -- a P2P-leg fault must degrade to the fallback, not silently drop a
+    // won block (lost subsidy).
     if (p2p_relay) {
-        p2p_relay(block_bytes);
-        r.p2p_sent = true;
-        r.landed_first = "p2p";
-        LOG_INFO << "[EMB-DGB] won-block P2P relay issued (" << block_bytes.size()
-                 << " bytes) -- primary path.";
+        try {
+            p2p_relay(block_bytes);
+            r.p2p_sent = true;
+            r.landed_first = "p2p";
+            LOG_INFO << "[EMB-DGB] won-block P2P relay issued (" << block_bytes.size()
+                     << " bytes) -- primary path.";
+        } catch (const std::exception& e) {
+            LOG_ERROR << "[EMB-DGB] won-block P2P relay threw (" << e.what()
+                      << ") -- falling through to submitblock RPC fallback.";
+        } catch (...) {
+            LOG_ERROR << "[EMB-DGB] won-block P2P relay threw (non-std) -- "
+                         "falling through to submitblock RPC fallback.";
+        }
     } else {
         LOG_WARNING << "[EMB-DGB] won-block: no embedded P2P sink; relying on RPC fallback.";
     }
@@ -85,10 +100,18 @@ inline BlockBroadcast broadcast_won_block(const P2pRelaySink& p2p_relay,
     // after a P2P accept is success, not failure -- ignore_failure=true so a
     // duplicate/already-have does not mask the P2P win.
     if (seam && seam->has_rpc()) {
-        r.rpc_ok = seam->submit_block_hex(block_hex, /*ignore_failure=*/true);
-        if (r.rpc_ok && !r.p2p_sent) r.landed_first = "rpc";
-        LOG_INFO << "[EMB-DGB] won-block submitblock RPC fallback "
-                 << (r.rpc_ok ? "ok/duplicate" : "no-ack") << ".";
+        try {
+            r.rpc_ok = seam->submit_block_hex(block_hex, /*ignore_failure=*/true);
+            if (r.rpc_ok && !r.p2p_sent) r.landed_first = "rpc";
+            LOG_INFO << "[EMB-DGB] won-block submitblock RPC fallback "
+                     << (r.rpc_ok ? "ok/duplicate" : "no-ack") << ".";
+        } catch (const std::exception& e) {
+            LOG_ERROR << "[EMB-DGB] won-block submitblock RPC fallback threw ("
+                      << e.what() << ") -- no-ack; not masking any P2P win.";
+        } catch (...) {
+            LOG_ERROR << "[EMB-DGB] won-block submitblock RPC fallback threw "
+                         "(non-std) -- no-ack; not masking any P2P win.";
+        }
     } else {
         LOG_WARNING << "[EMB-DGB] won-block: no external digibyted-RPC fallback sink wired.";
     }

@@ -736,6 +736,18 @@ if (BUILD_TESTING AND GTest_FOUND)
         GTest::gtest_main GTest::gtest
         core c2pool_hashrate c2pool_merged_mining c2pool_payout c2pool_storage)
     gtest_add_tests(dgb_pool_attempts_per_second_test "" AUTO)
+    # dgb_share_weight_decay_test: FENCED, additive KAT pinning the V36 PPLNS
+    # exponential weight-decay rate arithmetic (half_life = CHAIN_LENGTH/4,
+    # decay_per = SCALE - SCALE*693147/(1e6*half_life), decayed_att =
+    # (att*decay_fp)>>40) lifted into coin/share_weight_decay.hpp vs the
+    # frstrtr/p2pool-merged-v36 data.py get_decayed_cumulative_weights oracle.
+    # Header-only constexpr (no core types); share_tracker.hpp NOT yet rewired
+    # (the 3-copy delegation is the byte-identity follow-on). MUST also be in
+    # the build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_share_weight_decay_test share_weight_decay_test.cpp)
+    target_link_libraries(dgb_share_weight_decay_test PRIVATE
+        GTest::gtest_main GTest::gtest)
+    gtest_add_tests(dgb_share_weight_decay_test "" AUTO)
     # dgb_binomial_conf_interval_test: FENCED, additive KAT pinning the pure
     # Wilson-score confidence-interval arithmetic of p2pool util/math.py:133
     # binomial_conf_interval (+ ierf/erf A&S-7.1.26 helpers) lifted into
@@ -795,6 +807,18 @@ if (BUILD_TESTING AND GTest_FOUND)
         core
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
     gtest_add_tests(dgb_get_height_and_last_endpoints_test "" AUTO)
+
+    # dgb_redistribute_delegate_ghal_test: FENCED, additive byte-identity proof
+    # that redistribute.hpp's PPLNS-window guard was rewired onto the SSOT
+    # coin/get_height_and_last_endpoints.hpp with NO value change. Non-circular:
+    # re-derives the inline std::min/(depth<1) directly. MUST also be in the
+    # build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_redistribute_delegate_ghal_test redistribute_delegate_ghal_test.cpp)
+    target_link_libraries(dgb_redistribute_delegate_ghal_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
+    gtest_add_tests(dgb_redistribute_delegate_ghal_test "" AUTO)
     # dgb_pool_efficiency_test: FENCED, additive KAT pinning the pool
     # EFFICIENCY / REAL-HASHRATE diagnostics arithmetic in pool_efficiency.hpp vs
     # the p2pool main.py status-loop oracle (stale_prop = (orphan+doa)/total;

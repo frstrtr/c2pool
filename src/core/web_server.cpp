@@ -3064,10 +3064,21 @@ nlohmann::json MiningInterface::getmessageblob(const std::string& request_id)
 
 nlohmann::json MiningInterface::getpeerinfo(const std::string& request_id)
 {
+    // Prefer the live share-peer hook (real per-peer list from
+    // p2p_node->get_peer_info_json) over the empty m_node stub. On the
+    // embedded prod build m_node->get_connected_peers_count() returns 0 while
+    // the node is fully peered -- the same founding-charter lie that getinfo/
+    // getstats already route around. getpeerinfo must report the real peers.
+    if (m_peer_info_fn) {
+        auto pi = m_peer_info_fn();
+        if (pi.is_array())
+            return pi;
+    }
+
     nlohmann::json peers = nlohmann::json::array();
     if (m_node) {
         size_t count = m_node->get_connected_peers_count();
-        // Return minimal info — detailed peer data requires NodeImpl access
+        // Fallback only (API-only mode, no live hook): minimal aggregate count.
         peers.push_back({
             {"connected_peers", count}
         });
@@ -5248,7 +5259,12 @@ nlohmann::json MiningInterface::rest_node_topology()
     // Primary coin's REAL current block height from the embedded daemon's cached
     // template -- the same source rest_local_stats uses. Lets the auto-detect
     // fallback emit "height" (tip) so the topology card shows the primary tip even
-    // when no per-coin StatsProvider hook is wired. (synced still needs the hook.)
+    // when no per-coin StatsProvider hook is wired. A truthful embedded-daemon
+    // "synced" flag is intentionally NOT emitted in this fallback: the only
+    // authoritative source is the per-coin StatsProvider hook (m_node_topology_fn),
+    // which reads the embedded daemon's own getblockchaininfo. The
+    // explorer_chaininfo_fn reports c2pool SHARECHAIN height -- a different thing --
+    // so deriving synced from it would lie. Omit rather than guess.
     uint64_t primary_height = 0;
     {
         std::lock_guard<std::mutex> lock(m_work_mutex);
@@ -5396,11 +5412,21 @@ nlohmann::json MiningInterface::rest_ban_stats()
 
 nlohmann::json MiningInterface::rest_stratum_security()
 {
-    // Stub — DDoS detection/security metrics placeholder
+    // Honesty over a fake all-clear. There is no stratum DDoS/rate-limit/ban
+    // instrumentation reachable from the web layer on this build, and the
+    // operator-facing stratum.html security panel expects a rich schema
+    // (rate_10s / rate_60s / burst_ratio / banned_*_count / threat_level /
+    // limits) that this endpoint never produced. The old body returned fixed
+    // zeros under DIFFERENT keys (connections_per_second / potential_ddos /
+    // blacklisted_ips), so the panel silently painted "0.0 / normal / 0 banned
+    // / Normal" forever -- a security widget that can never go red. That is the
+    // founding-charter lie class. Until real stratum security metrics are wired,
+    // signal not-instrumented so the page guard (`secData.error`) trips and the
+    // panel shows "-" (no data) rather than a fabricated green all-clear.
     nlohmann::json result = nlohmann::json::object();
-    result["connections_per_second"] = 0.0;
-    result["potential_ddos"] = false;
-    result["blacklisted_ips"] = nlohmann::json::array();
+    result["available"] = false;
+    result["error"] = "not_instrumented";
+    result["note"] = "stratum security metrics are not instrumented in this build";
     return result;
 }
 
@@ -5497,11 +5523,20 @@ nlohmann::json MiningInterface::rest_miner_stats(const std::string& address)
     result["network_difficulty"] = net_diff;
     result["chance_to_find_block"] = (net_diff > 0 && total_hr > 0)
         ? (total_hr / (net_diff * 4294967296.0) * 100.0) : 0.0;
+    // Per-worker share-outcome breakdown. The stratum layer tracks three
+    // counters (accepted / rejected / stale); map them onto the wire fields
+    // using this codebase's own stale_info enum (253=orphan, 254=doa):
+    //   - stale    = job template expired at submit -> ORPHAN (stale_info 253)
+    //   - rejected = low-diff / invalid submission  -> never counted as a share
+    // There is no per-worker daemon-DOA *share* counter; DOA is surfaced as
+    // dead_hashrate instead, so doa_shares is honestly 0 here rather than a
+    // copy of the stale counter (the prior code reported doa=stale, orphan=0).
     result["total_shares"] = accepted + stale;
     result["unstale_shares"] = accepted;
-    result["dead_shares"] = stale;
-    result["orphan_shares"] = 0;
-    result["doa_shares"] = stale;
+    result["dead_shares"] = stale;            // dead = orphan + doa; only orphans counted per-worker
+    result["orphan_shares"] = stale;          // stale-template shares are orphans
+    result["doa_shares"] = 0;                 // no per-worker DOA share counter (see dead_hashrate)
+    result["rejected_shares"] = rejected;     // invalid/low-diff submissions, never counted as shares
 
     return result;
 }

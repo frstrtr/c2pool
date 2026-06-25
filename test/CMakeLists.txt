@@ -478,6 +478,16 @@ if (BUILD_TESTING AND GTest_FOUND)
         nlohmann_json::nlohmann_json)
     gtest_add_tests(test_dash_rpc_request "" AUTO)
 
+    add_executable(test_dash_broadcaster_full test_dash_broadcaster_full.cpp)
+    target_link_libraries(test_dash_broadcaster_full PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_broadcaster_full PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_broadcaster_full "" AUTO)
+
     add_executable(test_dash_block_relay test_dash_block_relay.cpp)
     target_link_libraries(test_dash_block_relay PRIVATE
         GTest::gtest_main GTest::gtest

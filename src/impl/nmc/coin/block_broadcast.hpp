@@ -33,6 +33,7 @@
 // ---------------------------------------------------------------------------
 
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <string>
 #include <vector>
@@ -81,13 +82,24 @@ inline AuxBlockBroadcast broadcast_won_aux_block(const P2pRelaySink& p2p_relay,
 {
     AuxBlockBroadcast r;
 
-    // PRIMARY: embedded P2P relay (fastest propagation).
+    // PRIMARY: embedded P2P relay (fastest propagation). GUARDED: a throwing
+    // relay sink must NOT prevent the always-fire submitauxblock fallback below
+    // -- otherwise a P2P-leg fault silently drops a won block AND skips its
+    // safety net. p2p_sent is only set after the sink returns cleanly.
     if (p2p_relay) {
-        p2p_relay(block_bytes);
-        r.p2p_sent = true;
-        r.landed_first = "p2p";
-        LOG_INFO << "[EMB-NMC] won-aux-block P2P relay issued (" << block_bytes.size()
-                 << " bytes) -- primary path.";
+        try {
+            p2p_relay(block_bytes);
+            r.p2p_sent = true;
+            r.landed_first = "p2p";
+            LOG_INFO << "[EMB-NMC] won-aux-block P2P relay issued (" << block_bytes.size()
+                     << " bytes) -- primary path.";
+        } catch (const std::exception& e) {
+            LOG_ERROR << "[EMB-NMC] won-aux-block P2P relay threw (" << e.what()
+                      << ") -- falling through to submitauxblock RPC fallback.";
+        } catch (...) {
+            LOG_ERROR << "[EMB-NMC] won-aux-block P2P relay threw (non-std) -- "
+                         "falling through to submitauxblock RPC fallback.";
+        }
     } else {
         LOG_WARNING << "[EMB-NMC] won-aux-block: no embedded P2P sink; relying on submitauxblock RPC fallback.";
     }
@@ -96,10 +108,17 @@ inline AuxBlockBroadcast broadcast_won_aux_block(const P2pRelaySink& p2p_relay,
     // after a P2P accept is success, not failure -- the sink uses ignore-failure
     // semantics so a duplicate/already-have never masks the P2P win.
     if (aux_rpc) {
-        r.rpc_ok = aux_rpc(block_hash_hex, auxpow_hex);
-        if (r.rpc_ok && !r.p2p_sent) r.landed_first = "rpc";
-        LOG_INFO << "[EMB-NMC] won-aux-block submitauxblock RPC fallback "
-                 << (r.rpc_ok ? "accept/duplicate" : "no-ack") << ".";
+        try {
+            r.rpc_ok = aux_rpc(block_hash_hex, auxpow_hex);
+            if (r.rpc_ok && !r.p2p_sent) r.landed_first = "rpc";
+            LOG_INFO << "[EMB-NMC] won-aux-block submitauxblock RPC fallback "
+                     << (r.rpc_ok ? "accept/duplicate" : "no-ack") << ".";
+        } catch (const std::exception& e) {
+            LOG_ERROR << "[EMB-NMC] won-aux-block submitauxblock RPC fallback threw ("
+                      << e.what() << ") -- treated as no-ack, P2P win (if any) preserved.";
+        } catch (...) {
+            LOG_ERROR << "[EMB-NMC] won-aux-block submitauxblock RPC fallback threw (non-std) -- treated as no-ack.";
+        }
     } else {
         LOG_WARNING << "[EMB-NMC] won-aux-block: no external namecoind submitauxblock fallback sink wired.";
     }

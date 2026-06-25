@@ -302,10 +302,6 @@ public:
     // Access to payout manager (for Stratum sessions)
     c2pool::payout::PayoutManager* get_payout_manager() const { return m_payout_manager.get(); }
     
-    // Sync status checking
-    bool is_blockchain_synced() const;
-    void log_sync_progress() const;
-    
     // Difficulty calculation utilities
     double calculate_share_difficulty(const std::string& job_id, const std::string& extranonce1,
                                      const std::string& extranonce2, 
