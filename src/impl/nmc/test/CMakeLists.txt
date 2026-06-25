@@ -93,6 +93,19 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(nmc_host_dualpath_test PRIVATE
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
 
+    # PF (fallback-path conformance): locks that the RETAINED external-daemon
+    # fallback is the .140 namecoind submitauxblock RPC (a real daemon that can
+    # ack), NOT the embedded backend daemon-less submit_aux_block (structurally
+    # false). Mis-wiring the fallback to the embedded self-leg silently loses a
+    # won block when P2P is down -- this test makes that RED. Same header-only
+    # dispatcher SCC (core + c2pool_* object libs); no nmc_coin (no transaction ctor).
+    add_executable(nmc_fallback_path_conformance_test nmc_fallback_path_conformance_test.cpp)
+    target_link_libraries(nmc_fallback_path_conformance_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core nlohmann_json::nlohmann_json)
+    target_link_libraries(nmc_fallback_path_conformance_test PRIVATE
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
+
     include(GoogleTest)
     include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
     gtest_add_tests(nmc_auxpow_merkle_test "" AUTO)
@@ -102,4 +115,5 @@ if (BUILD_TESTING AND GTest_FOUND)
     gtest_add_tests(nmc_mempool_name_test "" AUTO)
     gtest_add_tests(nmc_block_broadcast_test "" AUTO)
     gtest_add_tests(nmc_host_dualpath_test "" AUTO)
+    gtest_add_tests(nmc_fallback_path_conformance_test "" AUTO)
 endif()
