@@ -4334,13 +4334,23 @@ void MiningInterface::schedule_block_verification(const std::string& block_hash)
             chain_name = m_found_blocks[idx].chain;
     }
 
+    // Per-coin block target (seconds). Confirmation checks below are spaced by
+    // this value, so it MUST track each chain's real block time. Previously only
+    // LTC/DOGE were known and every other coin fell through to 60s -- meaning a
+    // genuine found block on a slow chain (BTC/BCH ~10 min) exhausted all 6
+    // confirmation checks inside ~1 real block and was falsely marked orphaned.
+    // A dashboard must never lie that a real found block was lost.
+    std::string cn = chain_name;
+    if (cn.size() > 1 && cn[0] == 't')   // strip testnet prefix (tLTC, tBTC, ...)
+        cn = cn.substr(1);
     int block_time_sec;
-    if (chain_name == "LTC" || chain_name == "tLTC")
-        block_time_sec = 150;   // 2.5 minutes
-    else if (chain_name == "DOGE")
-        block_time_sec = 60;    // 1 minute
-    else
-        block_time_sec = 60;
+    if      (cn == "LTC")  block_time_sec = 150;   // 2.5 min
+    else if (cn == "DOGE") block_time_sec = 60;    // 1 min
+    else if (cn == "BTC")  block_time_sec = 600;   // 10 min
+    else if (cn == "BCH")  block_time_sec = 600;   // 10 min
+    else if (cn == "DASH") block_time_sec = 150;   // 2.5 min
+    else if (cn == "DGB")  block_time_sec = 15;    // ~15 s
+    else                   block_time_sec = 60;    // safe fallback
 
     // Check at: first_check, then every block_time for 6 blocks,
     // then one final check at 10 blocks
