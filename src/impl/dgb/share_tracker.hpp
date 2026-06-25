@@ -27,6 +27,7 @@ inline uint64_t mul128_shift(uint64_t a, uint64_t b, unsigned shift) {
 #include "think_p1_walk_bounds.hpp"  // SSOT: think_p1_walk_count / think_p1_in_pruning_zone
 #include "coin/naughty_propagation.hpp"  // SSOT: propagate_naughty_from_parent (data.py:543-549)
 #include <impl/dgb/coin/desired_version_tally.hpp>  // SSOT: accumulate_version_weights / accumulate_version_counts (#429 follow-on)
+#include "coin/pool_attempts_per_second.hpp"  // SSOT: compute_pool_attempts_per_second (#407 follow-on)
 #include "config_pool.hpp"
 
 #include <core/target_utils.hpp>
@@ -1309,13 +1310,21 @@ public:
     ///   return attempts // time   (integer=True in generate_transaction)
     uint288 get_pool_attempts_per_second(const uint256& share_hash, int32_t dist, bool use_min_work = false)
     {
-        if (dist < 2 || !chain.contains(share_hash))
-            return uint288(0);
+        // SSOT delegation (#407): this member performs the chain walk and hands the
+        // resolved endpoints to dgb::compute_pool_attempts_per_second, which owns the
+        // guards (dist<2 / near absent / far unresolved -> 0) and the integer span
+        // divide. Byte-identical to the prior inline arithmetic.
+        dgb::PoolAttemptsInputs in;
+        in.dist = dist;
+        in.near_in_chain = chain.contains(share_hash);
+        if (in.dist < 2 || !in.near_in_chain)
+            return dgb::compute_pool_attempts_per_second(in);
 
         // p2pool: far = tracker.items[tracker.get_nth_parent_hash(share_hash, dist - 1)]
         auto far_hash = chain.get_nth_parent_via_skip(share_hash, dist - 1);
-        if (far_hash.IsNull() || !chain.contains(far_hash))
-            return uint288(0);
+        in.far_resolved = !far_hash.IsNull() && chain.contains(far_hash);
+        if (!in.far_resolved)
+            return dgb::compute_pool_attempts_per_second(in);
 
         // Verify skip list vs naive walk (periodic — detect stale pointers)
         {
@@ -1335,17 +1344,16 @@ public:
 
         // p2pool: tracker.get_delta(near.hash, far.hash)  — O(1) via TrackerView
         auto delta = chain.get_delta(share_hash, far_hash);
-        uint288 attempts = use_min_work ? delta.min_work : delta.work;
+        in.attempts = use_min_work ? delta.min_work : delta.work;
 
         // p2pool: time = near.timestamp - far.timestamp; if time <= 0: time = 1
         uint32_t near_ts = 0, far_ts = 0;
         chain.get_share(share_hash).invoke([&](auto* obj) { near_ts = obj->m_timestamp; });
         chain.get_share(far_hash).invoke([&](auto* obj) { far_ts = obj->m_timestamp; });
+        in.near_ts = near_ts;
+        in.far_ts = far_ts;
 
-        int32_t time_span = static_cast<int32_t>(near_ts) - static_cast<int32_t>(far_ts);
-        if (time_span <= 0) time_span = 1;
-
-        return attempts / uint288(time_span);
+        return dgb::compute_pool_attempts_per_second(in);
     }
 
     // -- Share target computation --
