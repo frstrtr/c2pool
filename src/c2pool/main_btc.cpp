@@ -360,6 +360,7 @@ int main(int argc, char* argv[])
     config.coin()->m_p2p.prefix  = btc_magic_bytes(testnet, testnet4, regtest);
     config.coin()->m_p2p.address = NetService(bitcoind_host, bitcoind_port);
     config.coin()->m_testnet     = testnet || regtest;
+    config.coin()->m_regtest     = regtest;
     config.coin()->m_symbol      = "BTC";
 
     btc::coin::Node<btc::Config> coin_node(&ioc, &config);
@@ -678,6 +679,14 @@ int main(int argc, char* argv[])
         LOG_INFO << "[BTC] Sharechain bootstrap: explicit --p2pool "
                  << p2pool_host << ":" << p2pool_port
                  << " (addrs.json reset to enforce exclusive target)";
+    }
+    else if (regtest)
+    {
+        // Isolated regtest standup: NEVER dial the public mainnet p2pool seeds
+        // (DEFAULT_BOOTSTRAP_HOSTS). Leaving the addr store empty keeps the
+        // sharechain solo/local so a won block is never relayed to real peers.
+        // Supply --p2pool HOST:PORT to dial an explicit isolated tuned-net peer.
+        LOG_INFO << "[BTC] Sharechain bootstrap: regtest — 0 public seeds (isolated)";
     }
     else
     {

@@ -90,6 +90,7 @@ public:
     std::string m_symbol;
     int m_share_period{};
     bool m_testnet {false};
+    bool m_regtest {false};  // --regtest: isolated sharechain net namespace (bitcoin_regtest)
     // std::string coin_prefix; //TODO: const unsigned char*? + int identifier lenght
     // int32_t block_period;
     // std::string p2p_address;
