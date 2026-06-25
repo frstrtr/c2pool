@@ -635,6 +635,23 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_aux_dual_target_select_test "" AUTO)
 
+    # --- DGB+DOGE (phase DC) -- broadcast-path single-fire PROOF KAT ----------
+    # Proves the integrator HARD precondition (UID2478): the submitauxblock RPC
+    # fallback cannot double-fire the same DOGE block hash alongside the embedded
+    # submit path. Pins coin/aux_broadcast_path_election.hpp -- election returns
+    # exactly one carrier per won block (embedded primary / RPC fallback) and the
+    # idempotent ledger suppresses any second broadcast of an already-fired hash.
+    # Pure helpers, consumes nothing in src/impl/doge, touches no node seam. MUST
+    # appear in BOTH this registration AND the build.yml --target allowlist
+    # (#143 NOT_BUILT trap).
+    add_executable(dgb_aux_broadcast_path_election_test aux_broadcast_path_election_test.cpp)
+    target_link_libraries(dgb_aux_broadcast_path_election_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_aux_broadcast_path_election_test "" AUTO)
+
     # dgb_share_target_genesis_test: FENCED KAT pinning ShareTracker::compute_
     # share_target genesis/unknown-prev clamp to [MAX_TARGET/30, MAX_TARGET] vs
     # the DGB oracle data.py generate_transaction. Links the same proven set as
