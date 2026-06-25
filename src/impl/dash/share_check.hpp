@@ -115,6 +115,21 @@ static const std::vector<unsigned char> DONATION_SCRIPT = {
     0x88, 0xac
 };
 
+// ── v36 unified cross-coin donation P2SH (Bucket-2 standardization, operator
+//    FLAG6 2026-06-17) ─────────────────────────────────────────────────────
+// Byte-identical to btc/bch/dgb/ltc COMBINED_DONATION_SCRIPT: P2SH wrapping the
+// 1-of-2 (forrestv + c2pool dev key) redeem script. Selected for v36+ shares;
+// pre-v36 shares keep the DASH-specific P2PKH DONATION_SCRIPT above (Bucket-3,
+// per-coin keep-for-soak). This is the cross-coin v36-native shape, NOT a
+// DASH isolation primitive — must match the other coins byte-for-byte.
+static const std::vector<unsigned char> COMBINED_DONATION_SCRIPT = {
+    0xa9, 0x14,
+    0x8c, 0x62, 0x72, 0x62, 0x1d, 0x89, 0xe8, 0xfa,
+    0x52, 0x6d, 0xd8, 0x6a, 0xcf, 0xf6, 0x0c, 0x71,
+    0x36, 0xbe, 0x8e, 0x85,
+    0x87
+};
+
 // ── compute_gentx_before_refhash (Dash v16) ──────────────────────────────────
 inline std::vector<unsigned char> compute_gentx_before_refhash()
 {
