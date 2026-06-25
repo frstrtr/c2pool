@@ -329,6 +329,21 @@ public:
 
     const std::string& symbol() const { return m_symbol; }
 
+    /// D0.4 per-coin StatsProvider seam. Each coin's init wires this hook so
+    /// the dashboard /api/node_topology can surface the embedded daemon's REAL
+    /// synced flag + tip height for THAT coin -- read from the same handles
+    /// debug.log uses. Unset = unknown: callers omit synced/tip rather than
+    /// fabricate them. Generalizes the prior LTC/DOGE-only special-case so the
+    /// per-coin stewards (BTC/DGB/DASH/BCH) light up their own coin by
+    /// implementing this hook, not by editing the web wiring. Returns a JSON
+    /// object {synced:bool, height:int} (either key optional), or null.
+    using SyncStateFn = std::function<nlohmann::json()>;
+    void set_sync_state_fn(SyncStateFn fn) { m_sync_state_fn = std::move(fn); }
+    nlohmann::json sync_state() const
+    {
+        return m_sync_state_fn ? m_sync_state_fn() : nlohmann::json(nullptr);
+    }
+
     /// Request a full block (MSG_MWEB_BLOCK) from all peers via getdata.
     /// Used after a chain reorg to re-fetch MWEB state for the new tip.
     void request_full_block(const uint256& block_hash)
@@ -567,6 +582,7 @@ private:
 
     boost::asio::io_context& m_ioc;
     std::string m_symbol;
+    SyncStateFn m_sync_state_fn;  // D0.4 per-coin stats seam (optional)
     std::vector<std::byte> m_prefix;
     std::optional<PeerEndpoint> m_local_daemon;  // nullopt = seed-only mode
     CoinPeerManager m_peer_manager;

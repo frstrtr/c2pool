@@ -3511,6 +3511,23 @@ int main(int argc, char* argv[]) {
             // coin_peer_sources is declared in outer scope. Add LTC broadcaster.
             if (embedded_broadcaster)
                 coin_peer_sources->push_back(embedded_broadcaster.get());
+            // D0.4 per-coin StatsProvider: LTC plugs its REAL synced/tip from the
+            // same embedded handles debug.log reads (migrated off the former
+            // /api/node_topology LTC special-case). Lifetime mirrors the
+            // topology lambda below, which captures the same handles by ref.
+            if (embedded_broadcaster) {
+                embedded_broadcaster->set_sync_state_fn(
+                    [&ltc_utxo_cache, &embedded_chain]() -> nlohmann::json {
+                        nlohmann::json r = nlohmann::json::object();
+                        int connected = ltc_utxo_cache
+                            ? static_cast<int>(ltc_utxo_cache->blocks_connected()) : 0;
+                        r["synced"] = connected >=
+                            static_cast<int>(core::coin::LTC_MINING_GATE_DEPTH);
+                        if (embedded_chain)
+                            r["height"] = static_cast<int>(embedded_chain->height());
+                        return r;
+                    });
+            }
             web_server.get_mining_interface()->set_coin_peers_fn(
                 [coin_peer_sources]() {
                 nlohmann::json r;
@@ -3568,19 +3585,19 @@ int main(int argc, char* argv[]) {
                     e["primary"]  = (sym == primary);
                     e["embedded"] = true;
                     e["peers"]    = static_cast<int>(bc->connected_count());
-                    // Real synced/tip from the live embedded handles (same reads
-                    // as set_spv_progress_fn) -- never fabricated for a coin we
-                    // hold no handle for.
-                    if (sym == "LTC") {
-                        int connected = ltc_utxo_cache
-                            ? static_cast<int>(ltc_utxo_cache->blocks_connected()) : 0;
-                        e["synced"] = connected >= static_cast<int>(core::coin::LTC_MINING_GATE_DEPTH);
-                        if (embedded_chain)
-                            e["height"] = static_cast<int>(embedded_chain->height());
-                    } else if (sym == "DOGE") {
-                        int connected = doge_utxo_ptr
-                            ? static_cast<int>(doge_utxo_ptr->blocks_connected()) : 0;
-                        e["synced"] = connected >= static_cast<int>(core::coin::DOGE_MINING_GATE_DEPTH);
+                    // D0.4: synced/tip come uniformly from the per-coin
+                    // StatsProvider seam (set_sync_state_fn). Each coin's init
+                    // wires the hook from the SAME live embedded handles
+                    // debug.log uses; a coin with no hook contributes no
+                    // synced/tip key (omitted, never fabricated). This drops the
+                    // former LTC/DOGE-only special-case so every coin plugs in
+                    // the same way.
+                    nlohmann::json ss = bc->sync_state();
+                    if (ss.is_object()) {
+                        if (ss.contains("synced"))
+                            e["synced"] = ss["synced"];
+                        if (ss.contains("height") && ss["height"].is_number())
+                            e["height"] = ss["height"];
                     }
                     coins.push_back(std::move(e));
                 }
@@ -5857,6 +5874,30 @@ int main(int argc, char* argv[]) {
                                      << " → " << local_daemon_str;
                             // Register for /api/coin_peers endpoint
                             coin_peer_sources->push_back(broadcaster.get());
+                            // D0.4 per-coin StatsProvider: DOGE plugs its REAL
+                            // synced flag from its embedded UTXO handle (migrated
+                            // off the topology special-case). DOGE exposes no
+                            // separate tip handle here, so height is omitted --
+                            // never fabricated. Guarded to DOGE since this loop is
+                            // generic over merged coins.
+                            {
+                                std::string msym = cfg.symbol;
+                                for (auto& ch : msym)
+                                    if (ch >= 'a' && ch <= 'z')
+                                        ch = static_cast<char>(ch - 32);
+                                if (msym == "DOGE") {
+                                    broadcaster->set_sync_state_fn(
+                                        [&doge_utxo_ptr]() -> nlohmann::json {
+                                            nlohmann::json r = nlohmann::json::object();
+                                            int connected = doge_utxo_ptr
+                                                ? static_cast<int>(doge_utxo_ptr->blocks_connected())
+                                                : 0;
+                                            r["synced"] = connected >=
+                                                static_cast<int>(core::coin::DOGE_MINING_GATE_DEPTH);
+                                            return r;
+                                        });
+                                }
+                            }
                             merged_broadcasters[cfg.chain_id] = std::move(broadcaster);
                         } else {
                             LOG_WARNING << "Unknown P2P prefix for " << cfg.symbol
