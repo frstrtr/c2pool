@@ -1711,6 +1711,8 @@ std::vector<MergedMiningManager::ChainInfo> MergedMiningManager::get_chain_infos
         info.current_height = c.current_work.height;
         info.current_tip    = c.last_tip;
         info.coinbase_value = c.current_work.coinbase_value;
+        info.address_version = c.config.address_version;
+        info.p2sh_version    = c.config.p2sh_version;
         info.target         = c.current_work.target;
         info.block_hash     = c.current_work.block_hash.GetHex();
         // Compute difficulty from target: diff = 2^256 / (target+1)

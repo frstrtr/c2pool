@@ -266,6 +266,8 @@ public:
         int         current_height{0};
         std::string current_tip;
         uint64_t    coinbase_value{0};  // satoshis
+        uint8_t     address_version{0}; // P2PKH version byte (from aux chain config)
+        uint8_t     p2sh_version{0};    // P2SH version byte (from aux chain config)
         double      difficulty{0.0};    // from target
         uint256     target;             // current aux chain target (for peer block detection)
         std::string block_hash;         // current aux block hash hex
