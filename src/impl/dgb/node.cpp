@@ -9,6 +9,7 @@
 #include <impl/dgb/download_stops.hpp>
 #include <impl/dgb/pool_efficiency.hpp>
 #include <impl/dgb/expected_time_to_block.hpp>
+#include <impl/dgb/coin/binomial_conf_interval.hpp>
 
 #include <algorithm>
 #include <filesystem>
@@ -71,34 +72,35 @@ static std::string format_duration(double secs) {
 // Returns "~X.Y% (lo-hi%)" string for binomial proportion x/n at 95% confidence.
 static std::string format_binomial_conf(int x, int n, double conf = 0.95) {
     if (n == 0) return "???";
-    // z for 95% ≈ 1.96 (inverse error function approximation)
-    double z = 1.96;
-    double p = static_cast<double>(x) / n;
-    double topa = p + z * z / (2.0 * n);
-    double topb = z * std::sqrt(p * (1.0 - p) / n + z * z / (4.0 * n * n));
-    double bottom = 1.0 + z * z / n;
-    double lo = std::max(0.0, (topa - topb) / bottom);
-    double hi = std::min(1.0, (topa + topb) / bottom);
+    // Oracle-faithful Wilson score interval via the dgb::coin SSOT
+    // (coin/binomial_conf_interval.hpp; p2pool util/math.py:133). This delegates
+    // the prior inline z=1.96 + plain-[0,1]-clip approximation onto the SSOT,
+    // which uses z = sqrt(2)*ierf(conf) and add_to_range bracketing. Output is
+    // oracle-faithful and NOT byte-identical to the old literal-z form; diag
+    // display only (heartbeat log), zero consensus surface.
+    const std::array<double, 2> ci = dgb::coin::binomial_conf_interval(
+        static_cast<double>(x), static_cast<double>(n), conf);
+    const double p = static_cast<double>(x) / n;
     std::ostringstream os;
     os << "~" << std::fixed << std::setprecision(1) << (100.0 * p) << "% ("
-       << static_cast<int>(std::floor(100.0 * lo)) << "-"
-       << static_cast<int>(std::ceil(100.0 * hi)) << "%)";
+       << static_cast<int>(std::floor(100.0 * ci[0])) << "-"
+       << static_cast<int>(std::ceil(100.0 * ci[1])) << "%)";
     return os.str();
 }
 
 // Wilson score confidence interval for efficiency: 1 - stale_rate, scaled
 static std::string format_binomial_conf_efficiency(int stale, int n, double stale_prop) {
     if (n == 0) return "???";
-    double z = 1.96;
-    double p = static_cast<double>(stale) / n;
-    double topa = p + z * z / (2.0 * n);
-    double topb = z * std::sqrt(p * (1.0 - p) / n + z * z / (4.0 * n * n));
-    double bottom = 1.0 + z * z / n;
-    double lo_stale = std::max(0.0, (topa - topb) / bottom);
-    double hi_stale = std::min(1.0, (topa + topb) / bottom);
-    // Efficiency = (1 - stale_rate) / (1 - stale_prop)
-    double denom = (stale_prop < 0.999) ? (1.0 - stale_prop) : 1.0;
-    double eff = (1.0 - p) / denom;
+    // Stale-rate CI via the oracle-faithful SSOT, then mapped to efficiency.
+    // See format_binomial_conf note: oracle-faithful, NOT byte-identical to the
+    // prior inline z=1.96 form; diag display only.
+    const std::array<double, 2> ci = dgb::coin::binomial_conf_interval(
+        static_cast<double>(stale), static_cast<double>(n), 0.95);
+    const double p = static_cast<double>(stale) / n;
+    const double lo_stale = ci[0];
+    const double hi_stale = ci[1];
+    const double denom = (stale_prop < 0.999) ? (1.0 - stale_prop) : 1.0;
+    const double eff = (1.0 - p) / denom;
     double eff_lo = (1.0 - hi_stale) / denom;
     double eff_hi = (1.0 - lo_stale) / denom;
     eff_lo = std::max(0.0, eff_lo);
