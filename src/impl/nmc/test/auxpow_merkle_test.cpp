@@ -1803,3 +1803,79 @@ TEST(NmcPdGoldenFixture, MarkerFieldOffsetsAreThePinnedLayout)
 }
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// NMC chain-id source-pin KAT.
+//
+// Pins consensus.nAuxpowChainId = 0x0001, sourced from canonical Namecoin Core
+// @ 6697dba480 (branch auxpow), src/kernel/chainparams.cpp:179 (CMainParams),
+// :345 (CTestNetParams), :620 (CTestNet4Params), :725 (CRegTestParams) -- the
+// value is 0x0001 across all four nets. The live cross-check vs .140 namecoind
+// is DEFERRED to the PE item4 soak (the gate stays visible; it is not retired).
+//
+// Three bindings prove the pin is load-bearing, not decorative:
+//   1. the aux_id.hpp SSOT constant, the slot-modeling AuxChain default and the
+//      consensus-bearing NMCChainParams::aux_chain_id all read 0x0001 -- drift on
+//      any one reds (the -1 placeholder cannot creep back);
+//   2. an AuxPow round-trip carrying the PINNED chain_id reaches the same staged
+//      state a correct proof does (INCOMPLETE -- step 4 parent-PoW still unbuilt --
+//      and never spuriously VALID);
+//   3. presenting the SAME proof under a DIFFERENT expected chain id moves the
+//      demanded slot (aux_expected_index folds chain_id in), so the marker no
+//      longer occupies the required slot and the proof is no longer staged --
+//      chain_id genuinely participates in the consensus slot binding.
+// Per-coin isolation (P0 fence #4): src/impl/nmc/ test target only; rides the
+// already-allowlisted nmc_auxpow_merkle_test exe; no build.yml change.
+// ---------------------------------------------------------------------------
+
+TEST(NmcChainIdPin, PinnedValueIsAuxpowChainId0x0001)
+{
+    EXPECT_EQ(nmc::coin::NMC_AUXPOW_CHAIN_ID, 0x0001u);
+    // slot-modeling struct default is the SSOT, no longer the -1 sentinel:
+    EXPECT_EQ(nmc::coin::AuxChain{}.chain_id, 0x0001);
+    // consensus-bearing params field agrees with the SSOT:
+    EXPECT_EQ(nmc::coin::NMCChainParams::mainnet().aux_chain_id, 0x0001);
+}
+
+TEST(NmcChainIdPin, RoundTripUnderPinnedChainIdIsStagedNotInvalid)
+{
+    const int32_t cid = static_cast<int32_t>(nmc::coin::NMC_AUXPOW_CHAIN_ID); // 0x0001
+    uint256 aux = leaf_of(0x01), sib = leaf_of(0x55);
+    uint256 root = combine(aux, sib);                 // index bit0=0 => leaf left
+    const unsigned h = 1; const uint32_t nonce = 1;
+    const uint32_t slot = aux_expected_index(nonce, cid, h);   // (1,1,1) => 0
+    ASSERT_EQ(slot, 0u);
+    auto script = mm_script(root_reversed(root), 1u << h, nonce);
+
+    AuxPow ap;
+    ap.parent_coinbase = coinbase_with_script(script);
+    ap.chain_merkle_branch = {sib};
+    ap.chain_merkle_index = slot;
+    // pinned chain id: marker scans, slot binds, proof staged (step 4 unbuilt).
+    EXPECT_EQ(ap.check_proof(aux, cid), AuxPow::CheckResult::INCOMPLETE);
+    EXPECT_NE(ap.check_proof(aux, cid), AuxPow::CheckResult::VALID);
+}
+
+TEST(NmcChainIdPin, WrongExpectedChainIdBreaksSlotBinding)
+{
+    const int32_t cid   = static_cast<int32_t>(nmc::coin::NMC_AUXPOW_CHAIN_ID); // 1
+    const int32_t wrong = cid + 1;                                              // 2
+    const unsigned h = 1; const uint32_t nonce = 1;
+    // chain_id folds into the deterministic slot: the demanded slot moves.
+    EXPECT_NE(aux_expected_index(nonce, cid, h),
+              aux_expected_index(nonce, wrong, h));        // 0 vs 1
+
+    uint256 aux = leaf_of(0x01), sib = leaf_of(0x55);
+    uint256 root = combine(aux, sib);
+    const uint32_t slot = aux_expected_index(nonce, cid, h);   // marker laid at slot 0
+    auto script = mm_script(root_reversed(root), 1u << h, nonce);
+
+    AuxPow ap;
+    ap.parent_coinbase = coinbase_with_script(script);
+    ap.chain_merkle_branch = {sib};
+    ap.chain_merkle_index = slot;
+    // Same proof, WRONG expected chain id -> verifier demands a different slot,
+    // so the staged MATCH is lost; never INCOMPLETE, never VALID.
+    EXPECT_NE(ap.check_proof(aux, wrong), AuxPow::CheckResult::INCOMPLETE);
+    EXPECT_NE(ap.check_proof(aux, wrong), AuxPow::CheckResult::VALID);
+}
