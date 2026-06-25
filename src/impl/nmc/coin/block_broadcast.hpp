@@ -74,6 +74,20 @@ struct AuxBlockBroadcast
 // client yet) -- each leg is guarded so the dispatcher never throws or
 // dereferences an unset sink. Never silent-drops a won block: with NEITHER sink
 // present it logs an ERROR (lost-subsidy scream) and returns any()==false.
+// --- v37 BUCKET CLASSIFICATION (3-bucket rule) -------------------------------
+// BUCKET 1 (per-coin isolation invariant) -- KEEP, do NOT standardize/converge.
+// This dispatcher deliberately does NOT delegate to
+// core::broadcast_block_with_fallback() (src/core/block_broadcast.hpp). That
+// core SSOT SHORT-CIRCUITS on a P2P win (if p2p_ok return true) to avoid
+// a double-broadcast -- correct for a single-chain won block (BTC delegates to
+// it). NMC is merge-mined: the external namecoind submitauxblock RPC leg is
+// fired ALWAYS, even after a P2P win (a duplicate aux submission is a harmless
+// daemon rejection, never a silent drop). Converging NMC onto the core short-
+// circuit SSOT would DROP the always-fire aux leg -- a consensus-path
+// regression. The always-fire property is KAT-locked by
+// NmcAuxBlockBroadcast.DualPathAlwaysFiresFallback. v37 multichain migration
+// MUST preserve this per-coin aux contract, not collapse it onto the SSOT.
+// -----------------------------------------------------------------------------
 inline AuxBlockBroadcast broadcast_won_aux_block(const P2pRelaySink& p2p_relay,
                                                  const AuxRpcSink&   aux_rpc,
                                                  const std::vector<unsigned char>& block_bytes,
