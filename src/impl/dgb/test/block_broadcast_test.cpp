@@ -17,6 +17,7 @@
 
 #include <gtest/gtest.h>
 
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -31,6 +32,7 @@ class FakeSeam : public core::coin::ICoinNode {
 public:
     bool rpc_present = true;
     bool submit_ack  = true;
+    bool throw_on_submit = false;
     int  submit_calls = 0;
     bool last_ignore_failure = false;
 
@@ -39,6 +41,7 @@ public:
     bool submit_block_hex(const std::string&, bool ignore_failure) override {
         ++submit_calls;
         last_ignore_failure = ignore_failure;
+        if (throw_on_submit) throw std::runtime_error("submitblock RPC boom");
         return submit_ack;
     }
 
@@ -121,4 +124,44 @@ TEST(DgbBlockBroadcast, FallbackNoAckDoesNotMaskP2p) {
     EXPECT_TRUE(r.any());
     EXPECT_STREQ(r.landed_first, "p2p");
     EXPECT_EQ(seam.submit_calls, 1);
+}
+
+
+// 6) GUARD (NMC #468 mirror -- throw->fallback-fires): the PRIMARY P2P relay
+//    sink THROWS. The dispatcher must NOT propagate; it falls through to the
+//    always-fire submitblock RPC fallback so a P2P-leg fault never silently
+//    drops a won block (lost subsidy) nor removes the external-daemon fallback.
+TEST(DgbBlockBroadcast, P2pThrowFallsThroughToRpcFallback) {
+    auto relay = [&](const std::vector<unsigned char>&) {
+        throw std::runtime_error("p2p relay boom");
+    };
+    FakeSeam seam; seam.rpc_present = true; seam.submit_ack = true;
+
+    dgb::coin::BlockBroadcast r;
+    ASSERT_NO_THROW({ r = dgb::coin::broadcast_won_block(relay, &seam, kBytes, kHex); });
+
+    EXPECT_FALSE(r.p2p_sent);            // a throwing relay did not actually send
+    EXPECT_TRUE(r.rpc_ok);              // fallback STILL fired despite the P2P fault
+    EXPECT_TRUE(r.any());
+    EXPECT_EQ(seam.submit_calls, 1);    // always-fire fallback preserved, not skipped
+    EXPECT_STREQ(r.landed_first, "rpc");
+}
+
+// 7) GUARD (NMC #468 mirror -- throw->p2p-win-preserved): the FALLBACK RPC leg
+//    THROWS. The dispatcher must NOT propagate and must never mask the P2P win:
+//    p2p_sent stays true, rpc_ok=false (a throw is a no-ack).
+TEST(DgbBlockBroadcast, RpcThrowDoesNotMaskP2pWin) {
+    bool relayed = false;
+    auto relay = [&](const std::vector<unsigned char>&) { relayed = true; };
+    FakeSeam seam; seam.rpc_present = true; seam.throw_on_submit = true;
+
+    dgb::coin::BlockBroadcast r;
+    ASSERT_NO_THROW({ r = dgb::coin::broadcast_won_block(relay, &seam, kBytes, kHex); });
+
+    EXPECT_TRUE(relayed);
+    EXPECT_TRUE(r.p2p_sent);            // P2P win preserved through the RPC fault
+    EXPECT_FALSE(r.rpc_ok);            // a throwing RPC leg = no-ack, not a mask
+    EXPECT_TRUE(r.any());
+    EXPECT_STREQ(r.landed_first, "p2p");
+    EXPECT_EQ(seam.submit_calls, 1);   // it was attempted (then threw)
 }
