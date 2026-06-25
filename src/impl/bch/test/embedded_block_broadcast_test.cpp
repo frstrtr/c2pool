@@ -23,6 +23,7 @@
 // ---------------------------------------------------------------------------
 
 #include <cstdint>
+#include <exception>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -30,6 +31,7 @@
 #include <boost/asio/io_context.hpp>
 
 #include "../coin/embedded_daemon.hpp"
+#include "../coin/block_broadcast_guard.hpp" // guarded_dual_broadcast (throw-injection KATs)
 
 namespace {
 
@@ -43,6 +45,15 @@ struct TestConfig {
     struct Coin { P2P m_p2p; };
     Coin m_coin;
     const Coin* coin() const { return &m_coin; }
+};
+
+
+// A sink that throws -- simulates a P2P relay / submitblock that raises mid-send
+// (socket error, serialization assert, RPC transport teardown). The dual-path
+// guard must contain it so the dispatcher never propagates and never drops the
+// won block.
+struct SinkThrew : std::exception {
+    const char* what() const noexcept override { return "simulated broadcast sink failure"; }
 };
 
 } // namespace
@@ -72,6 +83,77 @@ int main() {
     CHECK(daemon.seam_ready());
     CHECK(!daemon.coin_node().has_rpc());   // confirms why the fallback leg was skipped
     CHECK(!daemon.node().has_p2p());        // confirms why the primary leg was skipped
+
+    // -----------------------------------------------------------------------
+    // Net-new guard KATs (mirror of NMC #468): each leg independently guarded
+    // so a throwing leg neither propagates out nor masks the other path. These
+    // exercise guarded_dual_broadcast directly -- the SAME helper the production
+    // broadcast_won_block dispatcher delegates to -- with injected throwing
+    // sinks, which a live-sink-only daemon test cannot reach.
+    // -----------------------------------------------------------------------
+
+    // KAT 1 -- throw -> fallback-fires: P2P relay THROWS, submitblock RPC is up
+    // and accepts. The throw must be swallowed and the always-fire RPC fallback
+    // must still run, so the won block reaches the network via RPC (NOT dropped,
+    // fallback NOT runtime-removed).
+    {
+        bool rpc_called = false;
+        auto g = bch::coin::guarded_dual_broadcast(
+            /*have_p2p=*/true,  [&]() { throw SinkThrew(); },
+            /*have_rpc=*/true,  [&]() { rpc_called = true; return true; });
+        CHECK(!g.p2p_sent);                              // P2P threw -> not sent
+        CHECK(rpc_called);                               // fallback STILL fired
+        CHECK(g.rpc_ok);                                 // and accepted
+        CHECK(g.any());                                  // block reached network
+        CHECK(std::string(g.landed_first) == "rpc");
+    }
+
+    // KAT 2 -- throw -> p2p-win-preserved: P2P relay SUCCEEDS, then the
+    // submitblock RPC fallback THROWS. The RPC throw must be a no-ack that does
+    // NOT mask or unwind the recorded P2P win.
+    {
+        auto g = bch::coin::guarded_dual_broadcast(
+            /*have_p2p=*/true,  [&]() { /* relay ok */ },
+            /*have_rpc=*/true,  [&]() -> bool { throw SinkThrew(); });
+        CHECK(g.p2p_sent);                               // P2P win recorded
+        CHECK(!g.rpc_ok);                                // RPC threw -> no-ack
+        CHECK(g.any());                                  // win preserved
+        CHECK(std::string(g.landed_first) == "p2p");     // RPC throw did not mask it
+    }
+
+    // KAT 3 -- both legs throw: dispatcher still must not propagate; reports
+    // any()=false / landed_first="none" so the caller logs a hard NOT-relayed
+    // error rather than crashing the win path.
+    {
+        bool threw_out = false;
+        try {
+            auto g = bch::coin::guarded_dual_broadcast(
+                /*have_p2p=*/true, [&]() { throw SinkThrew(); },
+                /*have_rpc=*/true, [&]() -> bool { throw SinkThrew(); });
+            CHECK(!g.any());
+            CHECK(std::string(g.landed_first) == "none");
+        } catch (...) {
+            threw_out = true;
+        }
+        CHECK(!threw_out);                               // guard never propagates
+    }
+
+    // KAT 4 -- P2P throws with NO RPC fallback wired: still no propagation
+    // (any()=false), proving the guard holds even when the fallback is absent.
+    {
+        bool threw_out = false;
+        try {
+            auto g = bch::coin::guarded_dual_broadcast(
+                /*have_p2p=*/true,  [&]() { throw SinkThrew(); },
+                /*have_rpc=*/false, [&]() { return true; });
+            CHECK(!g.any());
+            CHECK(!g.p2p_sent);
+            CHECK(!g.rpc_ok);
+        } catch (...) {
+            threw_out = true;
+        }
+        CHECK(!threw_out);
+    }
 
     if (failures == 0) {
         std::cout << "embedded_block_broadcast_test: ALL PASS\n";

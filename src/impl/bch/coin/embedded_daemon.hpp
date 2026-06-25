@@ -60,6 +60,7 @@
 #include "template_builder.hpp" // EmbeddedCoinNode
 #include "node.hpp"             // coin::Node<Config> (interfaces::Node source)
 #include "coin_node.hpp"        // CoinNode (core::coin::ICoinNode seam)
+#include "block_broadcast_guard.hpp" // guarded_dual_broadcast + BlockBroadcast
 #include "abla_runtime.hpp"     // AblaRuntime (owns tracker + feed)
 #include "bchn_anchor_record.hpp" // BchnAnchorRecord (cold-start anchor)
 
@@ -425,18 +426,9 @@ public:
     Mempool&            mempool()        { return m_pool; }
     bool                is_wired() const { return m_abla.is_wired(); }
 
-    /// Outcome of a won-block broadcast: which of the two sinks fired and
-    /// whether the network accepted. P2P is primary; the external BCHN-RPC
-    /// submitblock is the dual-path FALLBACK (fired ALWAYS, per the
-    /// broadcaster-gate dual-path rule -- NOT a P2P-only path with RPC as a
-    /// catch). A `duplicate` on the RPC leg AFTER a P2P accept still proves
-    /// both paths reached the node; `landed_first` records which won the race.
-    struct BlockBroadcast {
-        bool        p2p_sent   = false;  // submit_block_p2p_raw issued (sink present)
-        bool        rpc_ok     = false;  // submitblock returned ok OR duplicate
-        const char* landed_first = "none"; // "p2p" | "rpc" | "none"
-        bool any() const { return p2p_sent || rpc_ok; }
-    };
+    // BlockBroadcast result type + the guarded dual-path dispatch live in
+    // block_broadcast_guard.hpp (shared single source of guard truth; the
+    // throw-injection KATs exercise the same helper).
 
     /// Fire a won block down BOTH broadcast paths. `block_bytes` is the
     /// pre-serialized (header || tx_count || coinbase || tx_data) blob the
@@ -449,33 +441,36 @@ public:
     BlockBroadcast broadcast_won_block(const std::vector<unsigned char>& block_bytes,
                                        const std::string& block_hex)
     {
-        BlockBroadcast r;
+        // Each leg is independently guarded via guarded_dual_broadcast so a
+        // throwing embedded-P2P relay can never propagate out and skip the
+        // always-fire submitblock fallback (silent won-block drop + runtime
+        // removal of the external-daemon fallback). A throwing RPC submit =
+        // no-ack that never masks a P2P win. Same contract as NMC #468.
+        BlockBroadcast r = guarded_dual_broadcast(
+            m_node.has_p2p(),
+            [&] {
+                m_node.submit_block_p2p_raw(block_bytes);
+                LOG_INFO << "[EMB-BCH] won-block P2P relay issued (" << block_bytes.size()
+                         << " bytes) -- primary path.";
+            },
+            (m_coin_node && m_coin_node->has_rpc()),
+            [&] {
+                bool ok = m_coin_node->submit_block_hex(block_hex, /*ignore_failure=*/true);
+                LOG_INFO << "[EMB-BCH] won-block submitblock RPC fallback "
+                         << (ok ? "ok/duplicate" : "no-ack") << ".";
+                return ok;
+            });
 
-        // PRIMARY: embedded P2P relay (fastest propagation).
-        if (m_node.has_p2p()) {
-            m_node.submit_block_p2p_raw(block_bytes);
-            r.p2p_sent = true;
-            r.landed_first = "p2p";
-            LOG_INFO << "[EMB-BCH] won-block P2P relay issued (" << block_bytes.size()
-                     << " bytes) -- primary path.";
-        } else {
+        if (m_node.has_p2p() && !r.p2p_sent)
+            LOG_WARNING << "[EMB-BCH] won-block: P2P leg present but did not send (threw) -- "
+                           "relied on RPC fallback.";
+        else if (!m_node.has_p2p())
             LOG_WARNING << "[EMB-BCH] won-block: no embedded P2P sink; relying on RPC fallback.";
-        }
-
-        // FALLBACK (always fired): external BCHN submitblock. A duplicate here
-        // after a P2P accept is success, not failure -- ignore_failure=true so a
-        // duplicate/already-have does not mask the P2P win.
-        if (m_coin_node && m_coin_node->has_rpc()) {
-            r.rpc_ok = m_coin_node->submit_block_hex(block_hex, /*ignore_failure=*/true);
-            if (r.rpc_ok && !r.p2p_sent) r.landed_first = "rpc";
-            LOG_INFO << "[EMB-BCH] won-block submitblock RPC fallback "
-                     << (r.rpc_ok ? "ok/duplicate" : "no-ack") << ".";
-        } else {
+        if (!(m_coin_node && m_coin_node->has_rpc()))
             LOG_WARNING << "[EMB-BCH] won-block: no external BCHN-RPC fallback sink wired.";
-        }
 
         if (!r.any())
-            LOG_ERROR << "[EMB-BCH] won-block had NEITHER broadcast sink -- block NOT relayed!";
+            LOG_ERROR << "[EMB-BCH] won-block had NEITHER broadcast sink (or both threw) -- block NOT relayed!";
         else
             LOG_INFO << "[EMB-BCH] won-block broadcast: p2p=" << (r.p2p_sent ? "sent" : "off")
                      << " rpc=" << (r.rpc_ok ? "ok" : "off")
