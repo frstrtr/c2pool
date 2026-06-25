@@ -530,6 +530,277 @@ TEST(NmcBuildMMCommitment, TamperedRootOrSlotFailsScan)
     EXPECT_EQ(scan_mm_commitment(payload, root, h, cid, (slot + 1u) & ((1u << h) - 1u)),
               MMScan::MISMATCH);
 }
+// ---------------------------------------------------------------------------
+// PD dual-target parent coinbase -- FRAMED scriptSig coverage.
+//
+// build_mm_commitment() emits ONLY the bare MM marker; the PD dual-target build
+// path splices it into a real parent (BTC) coinbase scriptSig that ALSO carries
+// the BIP34 height push and the c2pool extranonce/tag framing. The verifier's
+// scan_mm_commitment() std::search()es for the magic, so the marker MUST still
+// resolve to MATCH at aux_expected_index() when it sits AFTER arbitrary leading
+// framing and BEFORE a trailing extranonce -- and the replay/truncation guards
+// must still fire under that framing. The bare-payload KATs above do not
+// exercise this; these pin the framed dual-target coinbase the production path
+// produces. Per-coin isolation: src/impl/nmc/ only; btc tree consumed READ-ONLY.
+// ---------------------------------------------------------------------------
+
+namespace {
+// Splice a bare MM marker into a representative parent-coinbase scriptSig:
+//   [BIP34 height push] [ "/c2pool/" tag ] [ marker ] [ extranonce ]
+// Mirrors the live parent-coinbase scriptSig framing (OP_1..OP_16 for small
+// heights, minimal-push + sign byte otherwise) so the scan exercises the same
+// leading bytes the production coinbase carries ahead of the MM marker.
+std::vector<unsigned char> frame_parent_coinbase_script(
+        int parent_height,
+        const std::vector<unsigned char>& marker,
+        const std::vector<unsigned char>& extranonce)
+{
+    std::vector<unsigned char> sig;
+    if (parent_height > 0 && parent_height <= 16) {
+        sig.push_back(static_cast<unsigned char>(0x50 + parent_height));  // OP_1..OP_16
+    } else if (parent_height > 0) {
+        std::vector<unsigned char> hb;
+        uint32_t hh = static_cast<uint32_t>(parent_height);
+        while (hh > 0) { hb.push_back(static_cast<unsigned char>(hh & 0xff)); hh >>= 8; }
+        if (!hb.empty() && (hb.back() & 0x80)) hb.push_back(0);  // BIP34 sign byte
+        sig.push_back(static_cast<unsigned char>(hb.size()));
+        sig.insert(sig.end(), hb.begin(), hb.end());
+    }
+    static const char tag[] = "/c2pool/";
+    sig.insert(sig.end(), tag, tag + (sizeof(tag) - 1));
+    sig.insert(sig.end(), marker.begin(), marker.end());
+    sig.insert(sig.end(), extranonce.begin(), extranonce.end());
+    return sig;
+}
+}  // namespace
+
+TEST(NmcDualTargetCoinbaseFraming, MarkerResolvesAfterHeightAndTagFraming)
+{
+    uint256 aux = leaf_of(0x01), sib = leaf_of(0x55);
+    uint256 root = combine(aux, sib);
+    const unsigned h = 1; const int32_t cid = 1; const uint32_t nonce = 1;
+
+    auto marker = build_mm_commitment(root, h, nonce);
+    const std::vector<unsigned char> extranonce = {0xde, 0xad, 0xbe, 0xef};
+    auto sig = frame_parent_coinbase_script(0x2a3b4c, marker, extranonce);  // height > 16
+
+    const uint32_t slot = aux_expected_index(nonce, cid, h);
+    EXPECT_EQ(scan_mm_commitment(sig, root, h, cid, slot), MMScan::MATCH);
+}
+
+TEST(NmcDualTargetCoinbaseFraming, SmallHeightOpNPushStillResolves)
+{
+    uint256 root = combine(leaf_of(0x02), leaf_of(0x77));
+    const unsigned h = 2; const int32_t cid = 1; const uint32_t nonce = 7;
+
+    auto marker = build_mm_commitment(root, h, nonce);
+    auto sig = frame_parent_coinbase_script(3, marker, {});  // OP_3 height push, no extranonce
+
+    const uint32_t slot = aux_expected_index(nonce, cid, h);
+    EXPECT_EQ(scan_mm_commitment(sig, root, h, cid, slot), MMScan::MATCH);
+}
+
+TEST(NmcDualTargetCoinbaseFraming, SecondMarkerInFramedScriptIsRejected)
+{
+    uint256 root = combine(leaf_of(0x03), leaf_of(0x33));
+    const unsigned h = 1; const int32_t cid = 1; const uint32_t nonce = 1;
+
+    auto marker = build_mm_commitment(root, h, nonce);
+    // A framed coinbase that smuggles a SECOND marker must not validate
+    // (replay guard holds under framing, mirroring CAuxPow::check).
+    std::vector<unsigned char> two = marker;
+    two.insert(two.end(), marker.begin(), marker.end());
+    auto sig = frame_parent_coinbase_script(100, two, {0x01, 0x02});
+
+    const uint32_t slot = aux_expected_index(nonce, cid, h);
+    EXPECT_EQ(scan_mm_commitment(sig, root, h, cid, slot), MMScan::MISMATCH);
+}
+
+TEST(NmcDualTargetCoinbaseFraming, TruncatedMarkerInFramedScriptFails)
+{
+    uint256 root = combine(leaf_of(0x04), leaf_of(0x44));
+    const unsigned h = 2; const int32_t cid = 1; const uint32_t nonce = 5;
+
+    auto marker = build_mm_commitment(root, h, nonce);
+    marker.pop_back();  // drop the last nonce byte -> size+nonce field truncated
+    auto sig = frame_parent_coinbase_script(50, marker, {});
+
+    const uint32_t slot = aux_expected_index(nonce, cid, h);
+    EXPECT_EQ(scan_mm_commitment(sig, root, h, cid, slot), MMScan::MISMATCH);
+}
+
+
+// ---------------------------------------------------------------------------
+// PD equivalence-lock -- the SINGLE-NMC-under-BTC (size == 1) production case.
+//
+// The live PD dual-target build path commits ONE aux chain (NMC) under the BTC
+// parent: chain_height == 0, so the chain-merkle tree has size == 1 and the
+// only valid slot is 0. The production caller MUST emit, inside the framed
+// parent-coinbase scriptSig, the marker produced by the cross-coin canonical
+// SSOT c2pool::merged::build_auxpow_commitment(root, /*size=*/1, nonce) -- with
+// ZERO NMC-local re-derivation of the commitment byte layout. These KATs LOCK
+// that: the marker the caller frames is byte-identical to the size==1 SSOT
+// output, it resolves to MATCH at slot 0, and the replay/truncation guards
+// still fire under framing. The assertions are on the BYTES, not on a green
+// build. Per-coin isolation: src/impl/nmc/ only; the cross-coin SSOT is
+// consumed READ-ONLY (merged_mining.hpp is NOT mutated).
+// ---------------------------------------------------------------------------
+
+namespace {
+// Pull the bare MM marker (magic | reversed-root | size | nonce = 44 bytes) the
+// caller spliced into a framed coinbase scriptSig, the way the verifier's
+// std::search() locates it. Returns empty if the magic is absent or truncated.
+std::vector<unsigned char> extract_mm_marker(const std::vector<unsigned char>& sig)
+{
+    auto it = std::search(sig.begin(), sig.end(), MM_MAGIC, MM_MAGIC + 4);
+    if (it == sig.end()) return {};
+    const std::ptrdiff_t kMarkerLen = 4 + 32 + 4 + 4;  // magic|root|size|nonce
+    if (sig.end() - it < kMarkerLen) return {};
+    return std::vector<unsigned char>(it, it + kMarkerLen);
+}
+}  // namespace
+
+TEST(NmcPDEquivLock, Size1FramedMarkerIsByteIdenticalToCrossCoinSSOT)
+{
+    // Single NMC chain under BTC: chain_height == 0 -> tree size == 1.
+    uint256 root = combine(leaf_of(0x01), leaf_of(0x02));
+    const unsigned chain_height = 0; const uint32_t nonce = 0x11223344;
+
+    // What the production caller emits as the MM marker for the single-chain case.
+    const auto caller_marker = build_mm_commitment(root, chain_height, nonce);
+    // The cross-coin canonical SSOT, invoked with the size==1 the single-chain
+    // case demands -- THE path the live wire reuses, with no NMC-local fork.
+    const auto ssot = c2pool::merged::build_auxpow_commitment(root, /*size=*/1u, nonce);
+
+    ASSERT_EQ(caller_marker.size(), ssot.size());
+    EXPECT_EQ(caller_marker, ssot);  // byte-for-byte, NOT merely a green build
+
+    // ...and the marker the caller actually splices into the framed coinbase
+    // scriptSig is the SAME bytes once leading height/tag framing is prepended.
+    const std::vector<unsigned char> extranonce = {0xab, 0xcd};
+    auto sig = frame_parent_coinbase_script(120000, caller_marker, extranonce);
+    EXPECT_EQ(extract_mm_marker(sig), ssot);
+}
+
+TEST(NmcPDEquivLock, Size1FramedMarkerResolvesAtSlotZero)
+{
+    uint256 root = combine(leaf_of(0x03), leaf_of(0x04));
+    const unsigned chain_height = 0; const int32_t cid = 1; const uint32_t nonce = 99;
+
+    // size == 1 has exactly one slot; aux_expected_index MUST resolve to 0.
+    const uint32_t slot = aux_expected_index(nonce, cid, chain_height);
+    ASSERT_EQ(slot, 0u);
+
+    auto marker = build_mm_commitment(root, chain_height, nonce);
+    auto sig = frame_parent_coinbase_script(7, marker, {0xff});  // OP_7 height push
+    EXPECT_EQ(scan_mm_commitment(sig, root, chain_height, cid, slot), MMScan::MATCH);
+}
+
+TEST(NmcPDEquivLock, Size1FramedReplayGuardFires)
+{
+    uint256 root = combine(leaf_of(0x05), leaf_of(0x06));
+    const unsigned chain_height = 0; const int32_t cid = 1; const uint32_t nonce = 1;
+
+    auto marker = build_mm_commitment(root, chain_height, nonce);
+    std::vector<unsigned char> two = marker;
+    two.insert(two.end(), marker.begin(), marker.end());  // smuggle a 2nd marker
+    auto sig = frame_parent_coinbase_script(200, two, {0x07, 0x08});
+
+    const uint32_t slot = aux_expected_index(nonce, cid, chain_height);
+    EXPECT_EQ(scan_mm_commitment(sig, root, chain_height, cid, slot), MMScan::MISMATCH);
+}
+
+TEST(NmcPDEquivLock, Size1FramedTruncationGuardFires)
+{
+    uint256 root = combine(leaf_of(0x07), leaf_of(0x08));
+    const unsigned chain_height = 0; const int32_t cid = 1; const uint32_t nonce = 3;
+
+    auto marker = build_mm_commitment(root, chain_height, nonce);
+    marker.pop_back();  // drop the last nonce byte -> size+nonce field truncated
+    auto sig = frame_parent_coinbase_script(80, marker, {});  // no extranonce to backfill
+
+    const uint32_t slot = aux_expected_index(nonce, cid, chain_height);
+    EXPECT_EQ(scan_mm_commitment(sig, root, chain_height, cid, slot), MMScan::MISMATCH);
+}
+
+
+// ---------------------------------------------------------------------------
+// PE production dual-target caller equiv-lock (integrator 2026-06-24 (b)).
+//
+// The KATs above pin the bare marker (build_mm_commitment) and the test-local
+// frame helper. These pin the PRODUCTION caller itself --
+// nmc::coin::build_dual_target_coinbase_scriptsig() -- the function the live
+// parent (BTC) work-source will CALL to splice this aux chain's commitment into
+// the dual-target coinbase scriptSig. The lock is byte-level and fail-build (a
+// gtest in the CI-allowlisted nmc_auxpow_merkle_test): the marker the production
+// caller embeds MUST be byte-identical to the size==1 cross-coin SSOT output
+// c2pool::merged::build_auxpow_commitment(root, 1, nonce). If the caller ever
+// re-derives the commitment NMC-locally and drifts, this turns CI red -- it does
+// not warn. Per-coin isolation: src/impl/nmc/ only; SSOT consumed READ-ONLY.
+// ---------------------------------------------------------------------------
+
+namespace {
+// The leading parent-coinbase scriptSig framing the BTC work-source builds and
+// hands to the production caller as scriptsig_prefix (BIP34 height push + pool
+// tag) -- the SAME bytes frame_parent_coinbase_script() prepends, minus the
+// marker/extranonce the production caller is responsible for appending.
+std::vector<unsigned char> btc_scriptsig_prefix(int parent_height)
+{
+    return frame_parent_coinbase_script(parent_height, /*marker=*/{}, /*extranonce=*/{});
+}
+}  // namespace
+
+TEST(NmcPDProdCaller, EmbeddedMarkerIsByteIdenticalToCrossCoinSSOT)
+{
+    // Single NMC chain under BTC: chain_height == 0 -> tree size == 1.
+    uint256 root = combine(leaf_of(0x21), leaf_of(0x22));
+    const unsigned chain_height = 0; const uint32_t nonce = 0xdeadbeef;
+    const std::vector<unsigned char> extranonce = {0xa1, 0xb2, 0xc3, 0xd4};
+
+    // What the PRODUCTION caller actually emits as the full coinbase scriptSig.
+    auto sig = nmc::coin::build_dual_target_coinbase_scriptsig(
+        btc_scriptsig_prefix(123456), root, chain_height, nonce, extranonce);
+
+    // The cross-coin canonical SSOT for the size==1 single-chain case -- the
+    // ONLY source the caller is allowed to derive the commitment from.
+    const auto ssot = c2pool::merged::build_auxpow_commitment(root, /*size=*/1u, nonce);
+
+    // FAIL-BUILD equiv-lock: the marker the production caller spliced into the
+    // coinbase scriptSig is byte-for-byte the SSOT output, NOT merely present.
+    EXPECT_EQ(extract_mm_marker(sig), ssot);
+}
+
+TEST(NmcPDProdCaller, EmbeddedMarkerResolvesAtSlotZeroUnderProductionFraming)
+{
+    uint256 root = combine(leaf_of(0x23), leaf_of(0x24));
+    const unsigned chain_height = 0; const int32_t cid = 1; const uint32_t nonce = 7;
+
+    const uint32_t slot = aux_expected_index(nonce, cid, chain_height);
+    ASSERT_EQ(slot, 0u);
+
+    auto sig = nmc::coin::build_dual_target_coinbase_scriptsig(
+        btc_scriptsig_prefix(700000), root, chain_height, nonce, {0x09, 0x0a});
+    EXPECT_EQ(scan_mm_commitment(sig, root, chain_height, cid, slot), MMScan::MATCH);
+}
+
+TEST(NmcPDProdCaller, SecondSmuggledMarkerInProducedScriptIsRejected)
+{
+    uint256 root = combine(leaf_of(0x25), leaf_of(0x26));
+    const unsigned chain_height = 0; const int32_t cid = 1; const uint32_t nonce = 1;
+
+    // A prefix that already carries a (replayed) marker -- the production caller
+    // appends its own, yielding two. scan_mm_commitment must reject the dup.
+    auto smuggled = build_mm_commitment(root, chain_height, nonce);
+    auto prefix = btc_scriptsig_prefix(900);
+    prefix.insert(prefix.end(), smuggled.begin(), smuggled.end());
+
+    auto sig = nmc::coin::build_dual_target_coinbase_scriptsig(
+        prefix, root, chain_height, nonce, {0x07, 0x08});
+
+    const uint32_t slot = aux_expected_index(nonce, cid, chain_height);
+    EXPECT_EQ(scan_mm_commitment(sig, root, chain_height, cid, slot), MMScan::MISMATCH);
+}
+
 
 // ---------------------------------------------------------------------------
 // P1c-step4: AuxPow::check_proof parent proof-of-work leg (step 4).
