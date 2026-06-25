@@ -5407,11 +5407,21 @@ nlohmann::json MiningInterface::rest_ban_stats()
 
 nlohmann::json MiningInterface::rest_stratum_security()
 {
-    // Stub — DDoS detection/security metrics placeholder
+    // Honesty over a fake all-clear. There is no stratum DDoS/rate-limit/ban
+    // instrumentation reachable from the web layer on this build, and the
+    // operator-facing stratum.html security panel expects a rich schema
+    // (rate_10s / rate_60s / burst_ratio / banned_*_count / threat_level /
+    // limits) that this endpoint never produced. The old body returned fixed
+    // zeros under DIFFERENT keys (connections_per_second / potential_ddos /
+    // blacklisted_ips), so the panel silently painted "0.0 / normal / 0 banned
+    // / Normal" forever -- a security widget that can never go red. That is the
+    // founding-charter lie class. Until real stratum security metrics are wired,
+    // signal not-instrumented so the page guard (`secData.error`) trips and the
+    // panel shows "-" (no data) rather than a fabricated green all-clear.
     nlohmann::json result = nlohmann::json::object();
-    result["connections_per_second"] = 0.0;
-    result["potential_ddos"] = false;
-    result["blacklisted_ips"] = nlohmann::json::array();
+    result["available"] = false;
+    result["error"] = "not_instrumented";
+    result["note"] = "stratum security metrics are not instrumented in this build";
     return result;
 }
 

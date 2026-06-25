@@ -1107,6 +1107,12 @@
             d3.json('../stratum_security', function(secData) {
                 if (!secData || secData.error) {
                     console.log('Security stats not available:', secData ? secData.error : 'no data');
+                    // Honesty: this build does not instrument stratum security
+                    // metrics. Show an explicit not-monitored state instead of
+                    // leaving "-" placeholders that read like a perpetual load,
+                    // and never a fabricated green all-clear.
+                    var tb = d3.select('#threat-badge');
+                    if (!tb.empty()) tb.text('● not monitored').attr('class', 'threat-badge threat-elevated');
                     return;
                 }
                 
