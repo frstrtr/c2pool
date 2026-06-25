@@ -5744,10 +5744,15 @@ nlohmann::json MiningInterface::rest_miner_payouts(const std::string& address)
 
 nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cached_sc)
 {
-    // V35→V36 transition tracking applies to the v36 coins (LTC and DOGE).
-    // Other blockchains (e.g. Dash v16) don't have a pending transition, so
-    // return an empty object to keep the dashboard's transition banners hidden.
-    if (m_blockchain != Blockchain::LITECOIN && m_blockchain != Blockchain::DOGECOIN)
+    // V35→V36 transition tracking applies to every v36-ratcheting coin
+    // (LTC/DOGE/BTC/DGB, plus BCH which reaches this path as its embedded base
+    // coin). Only static-version coins (Dash = v16) have no pending transition,
+    // so for those return an empty object to keep the crossing banner hidden.
+    // A prior hardcoded {LTC,DOGE} allowlist suppressed the crossing banner on
+    // BTC/DGB/BCH nodes mid-cross — a charter #3 blind spot. Coins whose
+    // sharechain stats carry no vote data simply fall through to an empty result
+    // below, so the banner stays hidden until there is real crossing state.
+    if (m_blockchain == Blockchain::DASH)
         return nlohmann::json::object();
 
     // Matches p2pool's get_version_signaling() — all fields the dashboard JS expects.
