@@ -244,7 +244,23 @@ TEST(DgbOtherTxAssembler, WitnessOtherTxEmitsWitnessBlock)
     BlockType blk;
     ps >> blk;
     ASSERT_EQ(blk.m_txs.size(), 2u);
-    EXPECT_FALSE(blk.m_txs[0].HasWitness());   // coinbase legacy
+    // #458: a witness-bearing body now drives the BIP141 path, so the coinbase
+    // is no longer legacy -- it carries the single 32-byte all-zero witness
+    // reserved value AND an appended OP_RETURN witness-commitment output. A
+    // populated won block WITHOUT this commitment is what triggered the live
+    // "unexpected-witness" reject; this pins the fix.
+    EXPECT_TRUE(blk.m_txs[0].HasWitness());     // coinbase now BIP141
+    ASSERT_EQ(blk.m_txs[0].vin[0].scriptWitness.stack.size(), 1u);
+    EXPECT_EQ(blk.m_txs[0].vin[0].scriptWitness.stack[0],
+              std::vector<unsigned char>(32, 0x00)); // reserved value
+    {
+        // commitment output appended LAST: OP_RETURN 0x24 0xaa21a9ed <32B>.
+        const auto& spk = blk.m_txs[0].vout.back().scriptPubKey.m_data;
+        ASSERT_GE(spk.size(), 6u);
+        EXPECT_EQ(spk[0], 0x6a); EXPECT_EQ(spk[1], 0x24);
+        EXPECT_EQ(spk[2], 0xaa); EXPECT_EQ(spk[3], 0x21);
+        EXPECT_EQ(spk[4], 0xa9); EXPECT_EQ(spk[5], 0xed);
+    }
     EXPECT_TRUE(blk.m_txs[1].HasWitness());    // other_tx carries witness
     ASSERT_EQ(blk.m_txs[1].vin[0].scriptWitness.stack.size(), 1u);
     EXPECT_EQ(blk.m_txs[1].vin[0].scriptWitness.stack[0],

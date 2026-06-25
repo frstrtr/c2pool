@@ -46,6 +46,8 @@
 #include "../share_check.hpp"   // dgb::check_merkle_link (SSOT merkle-branch walk)
 #include "../share_types.hpp"   // dgb::MerkleLink
 #include "mempool.hpp"          // dgb::coin::compute_txid (block-body txid SSOT)
+#include "merkle_root.hpp"          // dgb::coin::build_block_merkle_root (merkle SSOT)
+#include "witness_commitment.hpp"   // body_has_witness, add_witness_commitment (BIP141)
 
 namespace dgb
 {
@@ -73,27 +75,9 @@ reconstruct_block_header(const SmallBlockHeaderType& small_header,
     return header;
 }
 
-// Build the canonical Bitcoin block merkle root over an ordered txid list
-// ([gentx_hash] ++ other-tx txids): duplicate-the-last on an odd count, then
-// sha256d each adjacent pair up to the single root.  This is the BLOCK-BODY
-// SSOT for the header merkle_root -- it MUST be recomputed over the txs the
-// block actually carries, NOT walked up the share's merkle_link, or a
-// tx-bearing reconstruct emits a header root for the coinbase-only set and the
-// daemon rejects the block with bad-txnmrklroot (#82 funded-soak regression).
-inline uint256 build_block_merkle_root(std::vector<uint256> txids)
-{
-    if (txids.empty()) return uint256();
-    while (txids.size() > 1) {
-        if (txids.size() % 2 == 1)
-            txids.push_back(txids.back());
-        std::vector<uint256> next;
-        next.reserve(txids.size() / 2);
-        for (size_t i = 0; i + 1 < txids.size(); i += 2)
-            next.push_back(Hash(txids[i], txids[i + 1]));
-        txids = std::move(next);
-    }
-    return txids[0];
-}
+// build_block_merkle_root now lives in merkle_root.hpp (the block-body merkle
+// SSOT), shared with witness_commitment.hpp without a circular include.
+
 
 // Assemble the full serialized parent block for a won share.
 //   small_header  : share.m_min_header (version|prev|time|bits|nonce)
@@ -122,9 +106,24 @@ assemble_won_block(const SmallBlockHeaderType& small_header,
     static_cast<BlockHeaderType&>(block) =
         reconstruct_block_header(small_header, gentx_hash, merkle_link);
 
-    // txs = [gentx] ++ other_txs  (coinbase first; data.py as_block ordering).
+    // BIP141: the conditional codec emits a SEGWIT block whenever any tx
+    // HasWitness().  A witness-bearing body that ships with a plain coinbase is
+    // rejected `unexpected-witness` (CheckWitnessMalleation) -- the coinbase must
+    // publish the witness commitment + carry the 32-byte reserved value.  Inject
+    // it into a LOCAL coinbase copy when (and only when) the body carries witness
+    // data; a coinbase-only / all-legacy body is left byte-identical to the proven
+    // legacy + coinbase-only paths.  Injection changes the coinbase txid, so the
+    // body merkle_root below is computed over the post-injection txid.
+    MutableTransaction coinbase = gentx;
+    uint256 coinbase_txid = gentx_hash;
+    if (body_has_witness(other_txs)) {
+        add_witness_commitment(coinbase, other_txs);
+        coinbase_txid = compute_txid(coinbase);
+    }
+
+    // txs = [coinbase] ++ other_txs  (coinbase first; data.py as_block ordering).
     block.m_txs.reserve(1 + other_txs.size());
-    block.m_txs.push_back(gentx);
+    block.m_txs.push_back(coinbase);
     for (const auto& tx : other_txs)
         block.m_txs.push_back(tx);
 
@@ -142,7 +141,7 @@ assemble_won_block(const SmallBlockHeaderType& small_header,
     {
         std::vector<uint256> txids;
         txids.reserve(block.m_txs.size());
-        txids.push_back(gentx_hash);
+        txids.push_back(coinbase_txid);
         for (const auto& tx : other_txs)
             txids.push_back(compute_txid(tx));
         block.m_merkle_root = build_block_merkle_root(std::move(txids));

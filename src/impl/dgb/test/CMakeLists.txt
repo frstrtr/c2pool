@@ -32,6 +32,22 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_block_assembly_test "" AUTO)
 
+    # --- #82 broadcaster-gate: BIP141 coinbase witness commitment ----------
+    # Pins coin/witness_commitment.hpp + assemble_won_block's injector: a
+    # forced-won reconstruct over a WITNESS-BEARING body must publish the
+    # coinbase witness commitment + the 32-byte reserved value, or node B
+    # rejects the populated block `unexpected-witness`.  Links the dgb OBJECT
+    # lib like dgb_block_assembly_test (shares block_assembly.hpp / the merkle
+    # SSOT + the tx codec).  MUST appear in BOTH this registration AND the
+    # build.yml --target allowlist.
+    add_executable(dgb_witness_commitment_test witness_commitment_test.cpp)
+    target_link_libraries(dgb_witness_commitment_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_witness_commitment_test "" AUTO)
+
     # --- embedded-ingest HeaderSample builder ---------------------------------
     # Pins coin/header_sample_build.hpp: a parsed BlockHeaderType -> HeaderSample
     # (block_hash = sha256d(80-byte header), target = SetCompact(nBits)), the
