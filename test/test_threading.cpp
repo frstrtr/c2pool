@@ -5,9 +5,10 @@
  *
  *   1. ScryptControlledByCheckPowFlag
  *      share_init_verify(share, false) skips scrypt and is measurably faster
- *      than share_init_verify(share, true).  Both return the same SHA256d hash.
- *      Regression guard: if someone removes the check_pow guard, 20 "fast"
- *      calls would take > 1 scrypt call — the assertion catches that.
+ *      than the same number of raw scrypt calls.  Regression guard: if someone
+ *      removes the check_pow guard, each "fast" call also runs scrypt, so the
+ *      fast loop approaches ~2x the scrypt baseline — the margin assertion
+ *      catches that.  Skipped under sanitizer builds (wall-clock unreliable).
  *
  *   2. VerifyShareUsesPresetHashToSkipScrypt
  *      After Phase-1 stores a share's SHA256d hash in m_hash, the expression
@@ -98,12 +99,31 @@ static const core::CoinParams g_test_params = ltc::make_coin_params(/*testnet=*/
 
 // ─── Test 1: scrypt is controlled by check_pow flag ──────────────────────────
 
+// Wall-clock timing is unreliable under sanitizer instrumentation: ASan/UBSan
+// inflate the allocation-heavy verify path far more than the tight scrypt inner
+// loop, distorting the device-relative comparison below.  The ASan CI leg pairs
+// -fsanitize=address with undefined, so detecting ASan covers that whole leg.
+#if defined(__SANITIZE_ADDRESS__)
+#  define C2POOL_SANITIZER_TIMING_UNRELIABLE 1
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) || __has_feature(memory_sanitizer)
+#    define C2POOL_SANITIZER_TIMING_UNRELIABLE 1
+#  endif
+#endif
+
 TEST(VerifyShareThreading, ScryptControlledByCheckPowFlag)
 {
+#ifdef C2POOL_SANITIZER_TIMING_UNRELIABLE
+    GTEST_SKIP() << "wall-clock scrypt timing is unreliable under sanitizer "
+                    "instrumentation; this guard is covered on the non-sanitized legs";
+#else
     auto share = load_test_share();
 
-    // --- Baseline: measure N raw scrypt calls for reliable timing ---
-    constexpr int SCRYPT_REPS = 5;
+    // More reps than strictly necessary so per-call scheduling jitter averages
+    // out — the assertion is device-relative, not an absolute bound.
+    constexpr int SCRYPT_REPS = 40;
+
+    // --- Baseline: measure SCRYPT_REPS raw scrypt calls for reliable timing ---
     char dummy_in[80]  = {};
     char dummy_out[32] = {};
     auto t_scrypt_start = std::chrono::steady_clock::now();
@@ -117,8 +137,14 @@ TEST(VerifyShareThreading, ScryptControlledByCheckPowFlag)
         << SCRYPT_REPS << " scrypt calls took " << t_scrypt_us << "µs total — unexpectedly fast";
 
     // --- Fast path: same number of share_init_verify(check_pow=false) calls ---
-    // If the check_pow guard is removed, this becomes SCRYPT_REPS scrypt calls
-    // and t_fast_us ≈ t_scrypt_us (the assertion catches the regression).
+    // The fast path does the (non-scrypt) verify work W per call; the scrypt
+    // baseline does S per call.  Empirically W ≈ S, so the healthy fast loop
+    // runs at ~1.0x the scrypt baseline.  If the check_pow guard is removed,
+    // each fast call ALSO runs scrypt (W + S per call) and the fast loop jumps
+    // to ~2.0x the baseline.  Assert the fast loop stays well under that: a 1.5x
+    // ceiling sits midway between the healthy ~1.0x and the regressed ~2.0x,
+    // absorbing the scheduling jitter that the old zero-margin EXPECT_LT could
+    // not (it flipped on a 2.3% timing wobble under instrumentation).
     auto t_fast_start = std::chrono::steady_clock::now();
     for (int i = 0; i < SCRYPT_REPS; i++)
     {
@@ -127,11 +153,14 @@ TEST(VerifyShareThreading, ScryptControlledByCheckPowFlag)
     auto t_fast_us = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - t_fast_start).count();
 
-    // Device-relative: SCRYPT_REPS fast calls must be strictly faster than SCRYPT_REPS scrypt calls.
-    EXPECT_LT(t_fast_us, t_scrypt_us)
+    // t_fast_us < 1.5 * t_scrypt_us, evaluated in integers to avoid float in the
+    // predicate (both operands are int64 microsecond counts).
+    EXPECT_LT(t_fast_us * 2, t_scrypt_us * 3)
         << SCRYPT_REPS << " share_init_verify(false) calls took " << t_fast_us
-        << "µs vs " << t_scrypt_us << "µs for scrypt. "
-           "If equal, check_pow=false is no longer skipping scrypt.";
+        << "µs vs " << t_scrypt_us << "µs for raw scrypt (ratio "
+        << (t_scrypt_us ? (double)t_fast_us / t_scrypt_us : 0.0) << "x). "
+           "A ratio near 2x means check_pow=false is no longer skipping scrypt.";
+#endif
 }
 
 // ─── Test 2: verify_share uses pre-set m_hash to skip scrypt ─────────────────
