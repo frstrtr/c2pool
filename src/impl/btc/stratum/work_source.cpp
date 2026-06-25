@@ -27,6 +27,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <utility>
 
 namespace {
@@ -216,6 +217,26 @@ void BTCWorkSource::update_stratum_worker(const std::string& session_id,
 // IWorkSource: work generation — Stage 4c will fill these in.
 // ─────────────────────────────────────────────────────────────────────────────
 
+std::shared_ptr<const btc::coin::rpc::WorkData>
+BTCWorkSource::cached_template() const
+{
+    const uint64_t gen = work_generation_.load(std::memory_order_relaxed);
+    const uint64_t mep = mempool_.epoch();
+    {
+        std::lock_guard<std::mutex> lk(template_mutex_);
+        if (template_cache_ && template_cache_gen_ == gen && template_cache_epoch_ == mep)
+            return template_cache_;
+    }
+    auto built = btc::coin::TemplateBuilder::build_template(chain_, mempool_, is_testnet_);
+    if (!built) return nullptr;
+    auto sp = std::make_shared<const btc::coin::rpc::WorkData>(std::move(*built));
+    std::lock_guard<std::mutex> lk(template_mutex_);
+    template_cache_       = sp;
+    template_cache_gen_   = gen;
+    template_cache_epoch_ = mep;
+    return sp;
+}
+
 nlohmann::json BTCWorkSource::get_current_work_template() const
 {
     // TemplateBuilder::build_template already shapes the result as a
@@ -225,9 +246,11 @@ nlohmann::json BTCWorkSource::get_current_work_template() const
     //
     // Returns an empty object if HeaderChain isn't past genesis yet — the
     // session will skip work-push and retry on next poll.
-    auto wd = btc::coin::TemplateBuilder::build_template(chain_, mempool_, is_testnet_);
+    auto wd = cached_template();
     if (!wd) return nlohmann::json::object();
-    return wd->m_data;
+    nlohmann::json data = wd->m_data;
+    data["curtime"] = static_cast<int64_t>(std::time(nullptr));
+    return data;
 }
 
 std::vector<std::string> BTCWorkSource::get_stratum_merkle_branches() const
@@ -242,7 +265,7 @@ std::vector<std::string> BTCWorkSource::get_stratum_merkle_branches() const
     // Algorithm matches Bitcoin Core's merkle.cpp: at every level, if the
     // count is odd, duplicate the last element. The branches list is
     // typically log2(N) entries for N transactions.
-    auto wd = btc::coin::TemplateBuilder::build_template(chain_, mempool_, is_testnet_);
+    auto wd = cached_template();
     if (!wd || wd->m_hashes.empty()) return {};
 
     // wd->m_hashes[0] is the coinbase placeholder — the actual coinbase
@@ -319,7 +342,7 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
     // subsidy to the miner, no OP_RETURN. Valid BTC block but no c2pool
     // sharechain credit.
 
-    auto wd = btc::coin::TemplateBuilder::build_template(chain_, mempool_, is_testnet_);
+    auto wd = cached_template();
     if (!wd) return {};
 
     const uint32_t height        = wd->m_data.value("height", 0u);
@@ -329,7 +352,7 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
     uint32_t block_bits = 0;
     if (auto it = wd->m_data.find("bits"); it != wd->m_data.end() && it->is_string())
         block_bits = parse_be_hex_u32(it->get<std::string>());
-    const uint32_t curtime = wd->m_data.value("curtime", uint32_t{0});
+    const uint32_t curtime = static_cast<uint32_t>(std::time(nullptr));
 
     // Detect segwit activation. GBT exposes this in two redundant ways:
     // a "rules" array containing "!segwit" or "segwit", or the presence of

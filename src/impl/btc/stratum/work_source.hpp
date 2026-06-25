@@ -48,6 +48,7 @@
 namespace btc::coin {
 class HeaderChain;
 class Mempool;
+namespace rpc { struct WorkData; }
 }  // namespace btc::coin
 
 namespace btc::stratum {
@@ -275,6 +276,17 @@ private:
     // shared_ptr instead of re-serializing the mempool. See tx_data_memo.hpp.
     mutable uint256                                     tx_data_fp_;
     mutable std::shared_ptr<std::vector<std::string>>   tx_data_memo_;
+
+    // Full work-template cache (heap opt). TemplateBuilder::build_template
+    // (mempool walk + merkle + tx serialization) is the dominant per-notify
+    // allocation. Reuse its result while neither the chain tip
+    // (work_generation_) nor the mempool tx set (Mempool::epoch()) changed.
+    // curtime is re-stamped fresh by callers, so this is value-invariant.
+    mutable std::shared_ptr<const btc::coin::rpc::WorkData> template_cache_;
+    mutable uint64_t template_cache_gen_{~0ull};
+    mutable uint64_t template_cache_epoch_{~0ull};
+    // Build-or-reuse the cached template under template_mutex_.
+    std::shared_ptr<const btc::coin::rpc::WorkData> cached_template() const;
 };
 
 }  // namespace btc::stratum
