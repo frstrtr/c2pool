@@ -795,6 +795,18 @@ if (BUILD_TESTING AND GTest_FOUND)
         core
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
     gtest_add_tests(dgb_get_height_and_last_endpoints_test "" AUTO)
+
+    # dgb_redistribute_delegate_ghal_test: FENCED, additive byte-identity proof
+    # that redistribute.hpp's PPLNS-window guard was rewired onto the SSOT
+    # coin/get_height_and_last_endpoints.hpp with NO value change. Non-circular:
+    # re-derives the inline std::min/(depth<1) directly. MUST also be in the
+    # build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_redistribute_delegate_ghal_test redistribute_delegate_ghal_test.cpp)
+    target_link_libraries(dgb_redistribute_delegate_ghal_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
+    gtest_add_tests(dgb_redistribute_delegate_ghal_test "" AUTO)
     # dgb_pool_efficiency_test: FENCED, additive KAT pinning the pool
     # EFFICIENCY / REAL-HASHRATE diagnostics arithmetic in pool_efficiency.hpp vs
     # the p2pool main.py status-loop oracle (stale_prop = (orphan+doa)/total;
