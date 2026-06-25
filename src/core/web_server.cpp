@@ -6250,10 +6250,13 @@ nlohmann::json MiningInterface::compute_current_merged_payouts()
             auto merged_payouts = m_mm_manager->get_payouts(ci.chain_id, ci.coinbase_value);
             if (merged_payouts.empty()) continue;
 
-            // DOGE address version bytes (mainnet P2PKH=0x1e, P2SH=0x16)
-            uint8_t merged_p2pkh_ver = 0x1e;
-            uint8_t merged_p2sh_ver = 0x16;
-            // TODO: testnet detection for DOGE address versions
+            // Per-coin aux-payout address version bytes from the merged
+            // chain's own config -- never a hardcoded DOGE assumption, so a
+            // node merging NMC/other into its primary renders truthful aux
+            // payout addresses. Falls back to DOGE mainnet bytes (0x1e/0x16)
+            // only when the chain config leaves them unset (legacy DOGE).
+            uint8_t merged_p2pkh_ver = ci.address_version ? ci.address_version : 0x1e;
+            uint8_t merged_p2sh_ver  = ci.p2sh_version    ? ci.p2sh_version    : 0x16;
 
             for (auto& [script, amount] : merged_payouts) {
                 // Determine source label (p2pool: auto-convert, donation, explicit)
