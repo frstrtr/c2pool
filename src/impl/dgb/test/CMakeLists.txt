@@ -619,6 +619,22 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_aux_doge_bind_parsers_test "" AUTO)
 
+    # --- DGB+DOGE (phase DC) -- dual-target SELECTION scaffold KAT ------------
+    # Pins the pure DC decision contract (coin/aux_dual_target_select.hpp): the
+    # mint-time fabe6d6d embed rule (#486 nullopt no-op), the independent dual-
+    # target submit thresholds (mirrors dc_proof), and the load-bearing
+    # fire_doge_aux ==> embed_commitment linkage back to the #475/#486 mint.
+    # Pure helpers, consumes nothing in src/impl/doge and touches no node
+    # seam. MUST appear in BOTH this registration AND the
+    # build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_aux_dual_target_select_test aux_dual_target_select_test.cpp)
+    target_link_libraries(dgb_aux_dual_target_select_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_aux_dual_target_select_test "" AUTO)
+
     # dgb_share_target_genesis_test: FENCED KAT pinning ShareTracker::compute_
     # share_target genesis/unknown-prev clamp to [MAX_TARGET/30, MAX_TARGET] vs
     # the DGB oracle data.py generate_transaction. Links the same proven set as
