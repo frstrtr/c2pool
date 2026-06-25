@@ -760,6 +760,21 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(dgb_binomial_conf_interval_test PRIVATE
         GTest::gtest_main GTest::gtest)
     gtest_add_tests(dgb_binomial_conf_interval_test "" AUTO)
+    # dgb_hash_format_parity_test: FENCED, additive KAT pinning the pure GBT
+    # block-hash display formatter coin/hash_format.hpp u256_be_display_hex
+    # (most-significant-limb-first 64-hex render of the LE u256, the encoding
+    # both work paths emit for "previousblockhash"). NON-CIRCULAR anchor = the
+    # DGB mainnet genesis hash pinned at p2pool-dgb-scrypt
+    # bitcoin/networks/digibyte.py:55; the test reverses that external display
+    # constant into LE storage bytes, feeds u256::from_le_bytes, and asserts the
+    # formatter reproduces it byte for byte. DIAGNOSTICS/wire-display only, no
+    # consensus surface. Pure header (<cstdint>/<string>) -> links only GTest.
+    # No call site rewired. MUST also be in the build.yml --target allowlist
+    # (#143 NOT_BUILT trap).
+    add_executable(dgb_hash_format_parity_test hash_format_parity_test.cpp)
+    target_link_libraries(dgb_hash_format_parity_test PRIVATE
+        GTest::gtest_main GTest::gtest)
+    gtest_add_tests(dgb_hash_format_parity_test "" AUTO)
     # dgb_desired_version_tally_test: FENCED, additive KAT pinning the
     # version->work / version->count accumulation core lifted into
     # coin/desired_version_tally.hpp vs the p2pool-dgb-scrypt data.py:918-922
