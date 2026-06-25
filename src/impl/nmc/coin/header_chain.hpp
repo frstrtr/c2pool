@@ -1,6 +1,6 @@
 #pragma once
 
-/// NMC (Namecoin) Header Chain — P0 STRUCTURAL LEAF
+/// NMC (Namecoin) Header Chain — embedded merge-mined Namecoin
 ///
 /// Validated header-only chain skeleton for embedded merge-mined Namecoin.
 ///
@@ -20,17 +20,27 @@
 /// block.hpp are consumed. The btc tree is consumed READ-ONLY and is NOT
 /// modified.
 ///
-/// ============================ P0 FENCE ====================================
-/// This is a STRUCTURE-ONLY leaf: correct types + class skeleton, NOT a
-/// working consensus validator. In particular:
-///   * AuxPow::check_proof() is a P0-DEFER STUB (see below). It does NOT walk
-///     the coinbase merkle branch, does NOT verify the chain-merkle-root, and
-///     does NOT verify the parent block's proof-of-work. NMC MUST NOT be used
-///     to block-validate off this P0 leaf.
-///   * Consensus constants (auxpow activation height, chain id, parent powhash
-///     path) are NOT baked as compiled constants. They are left as
-///     // TO-CONFIRM: placeholders with sentinel values, pending pinning
-///     against Namecoin chainparams + namecoind.
+/// ======================= STATUS (P1d+ / PF-conformance) ==================
+/// The AuxPow VERIFICATION GATE is WIRED — this is no longer a P0 stub:
+///   * AuxPow::check_proof() walks all four legs — (1) chain-merkle to
+///     reconstruct the merged-mining root, (2) the parent-coinbase MM-marker
+///     commitment with the (nonce, chain_id) slot binding, (3) the parent-
+///     coinbase tx-merkle leg against the parent header's merkle root, and
+///     (4) the parent-block SHA256d PoW against the AUX target. add_auxpow_
+///     header() REJECTS any header whose proof is not VALID (P1d rejection
+///     contract) so an unproven merge-mined header can never be admitted.
+///   * Consensus constants are PINNED as compiled values against
+///     namecoin-core@6697dba src/kernel/chainparams.cpp, each guarded by a
+///     red-able conformance KAT (PF): auxpow activation height (mainnet
+///     19200 / testnet 0), aux chain id (0x0001), P2P magic, and the mainnet
+///     genesis seed + hash. No TO-CONFIRM sentinel remains on the production
+///     (factory) path; the -1 activation-height default is a deliberate
+///     fail-closed sentinel for hand-built Params only.
+/// STILL DEFERRED (scoped later, NOT a P0 fence):
+///   * The header-STORAGE / chain-connection path — a proof that passes the
+///     gate is verified but NOT yet persisted (see add_auxpow_header()).
+///   * Live cross-check of the pinned constants vs a running .140 namecoind,
+///     deferred to the PE item4 soak.
 /// ==========================================================================
 
 #include "block.hpp"
