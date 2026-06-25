@@ -4813,13 +4813,19 @@ nlohmann::json MiningInterface::rest_web_currency_info()
 
     // p2pool share version for the current coin — consumed by the
     // bundled @c2pool/sharechain-explorer to classify share cells.
-    // Dash = v16, LTC/DOGE/BTC = v36.
+    // For the V35/V36-ratcheting coins this MUST be the node's LIVE
+    // ratchet-selected version (m_cached_share_version, fed from the
+    // AutoRatchet), never a static 36: during the V35->V36 cross a node that
+    // is still VOTING is actually producing V35 shares, and reporting 36 would
+    // make the explorer misclassify live V35 share cells as V36 — a lie about
+    // the crossing state. DASH (v16, non-ratcheting on this path) keeps its
+    // protocol version since the LTC AutoRatchet does not drive its cache.
     switch (m_blockchain) {
     case Blockchain::DASH:     result["share_version"] = 16; break;
     case Blockchain::LITECOIN:
     case Blockchain::BITCOIN:
     case Blockchain::DOGECOIN:
-    default:                   result["share_version"] = 36; break;
+    default:                   result["share_version"] = m_cached_share_version; break;
     }
 
     // ─── Per-coin explorer map (operator 2026-06-23: each coin = a distinct
