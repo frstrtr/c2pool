@@ -133,6 +133,17 @@ struct ConnCoinbasePplnsInputs
     std::vector<unsigned char> donation_script;
     uint256  ref_hash;                            // p2pool ref_hash (32B)
     uint64_t last_txout_nonce{0};                 // OP_RETURN nonce (extranonce slot)
+
+    // DGB-as-DOGE-parent merged-mining commitment (-DAUX_DOGE=ON path only).
+    // The pre-built 44-byte AuxPoW MM tag (magic fabe6d6d || aux_merkle_root32 BE
+    // || size4 LE || nonce4 LE) produced by dgb::coin::build_aux_mm_commitment
+    // (the #475 SSOT).  When set, it is appended to the coinbase scriptSig at
+    // mint so a won DGB block carries the DOGE merged-mining commitment the aux
+    // verifier decodes.  DEFAULT nullopt -> coinbase_script is emitted unchanged,
+    // so the assembled coinbase is BYTE-IDENTICAL to the standalone-parent build.
+    // The producer (main_dgb seam) only ever populates this under #ifdef AUX_DOGE;
+    // sourcing a LIVE aux merkle root is the gated DC routing slice, not this one.
+    std::optional<std::vector<unsigned char>> aux_mm_commitment;
 };
 
 inline ConnCoinbaseParts build_connection_coinbase_from_pplns(const ConnCoinbasePplnsInputs& in)
@@ -142,6 +153,13 @@ inline ConnCoinbaseParts build_connection_coinbase_from_pplns(const ConnCoinbase
 
     ConnCoinbaseInputs ci;
     ci.coinbase_script          = in.coinbase_script;
+    // Embed-at-mint: append the DGB-as-DOGE-parent MM commitment to the
+    // coinbase scriptSig when present.  nullopt (default / standalone parent)
+    // leaves coinbase_script byte-identical -- the no-op is structural.
+    if (in.aux_mm_commitment)
+        ci.coinbase_script.insert(ci.coinbase_script.end(),
+                                  in.aux_mm_commitment->begin(),
+                                  in.aux_mm_commitment->end());
     ci.segwit_commitment_script = in.segwit_commitment_script;
     ci.payout_outputs           = std::move(split.payout_outputs);
     ci.donation_amount          = split.donation_amount;
