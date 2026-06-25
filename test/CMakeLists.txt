@@ -1,4 +1,13 @@
 if (BUILD_TESTING AND GTest_FOUND)
+    # include(GoogleTest) MUST precede any gtest_discover_tests() call below:
+    # it sets _GOOGLETEST_DISCOVER_TESTS_SCRIPT (path to GoogleTestAddTests.cmake).
+    # In PRE_TEST mode the generated <tgt>[1]_include.cmake includes that script
+    # to define gtest_discover_tests_impl; if the var is unset the include path is
+    # empty and ctest dies "Unknown CMake command gtest_discover_tests_impl" (exit
+    # 8). The clean-build-dir step (8d05ef2b) removed the cached _tests.cmake that
+    # had masked this, surfacing it on test_dgb_subsidy (the first PRE_TEST call).
+    include(GoogleTest)
+
     # DGB block subsidy oracle-conformance (card #156). config_coin.hpp
     # subsidy() is header-only/static; no dgb runtime link required.
     add_executable(test_dgb_subsidy test_dgb_subsidy.cpp)
