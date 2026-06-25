@@ -18,6 +18,7 @@
 #include <gtest/gtest.h>
 #include <impl/dgb/coin/connection_coinbase.hpp>
 #include <impl/dgb/coin/last_txout_nonce.hpp>
+#include <c2pool/merged/merged_mining.hpp>  // core SSOT: build_auxpow_commitment
 
 #include <map>
 #include <set>
@@ -204,6 +205,75 @@ TEST(ConnCoinbasePplns, ValueAnchorAscendingPayoutOrder) {
     EXPECT_EQ(split.payout_outputs, expect);
     EXPECT_EQ(split.donation_amount, 1u);
     // The wired coinbase is assembled from exactly this split (covered by (5)-(7)).
+}
+
+
+// ============================================================================
+// DGB+DOGE phase DB -- embed-at-mint: the optional aux_mm_commitment field on
+// ConnCoinbasePplnsInputs appends the core c2pool::merged::build_auxpow_commitment blob to the
+// coinbase scriptSig at mint (the -DAUX_DOGE=ON DGB-as-DOGE-parent path).
+// Two invariants, both proven non-circularly off the same fixed inputs:
+//   (E1) DEFAULT (nullopt) is BYTE-IDENTICAL to the standalone-parent coinbase
+//        -- the no-op is structural, so the standalone build cannot regress.
+//   (E2) When set, the assembled scriptSig is the baseline scriptSig with the
+//        44-byte MM tag appended verbatim (magic..root..size..nonce), and the
+//        gentx grows by EXACTLY 44 bytes -- nothing else in the coinbase moves.
+// ============================================================================
+
+// (E1) nullopt leaves the gentx byte-identical to the no-aux build.
+TEST(ConnCoinbaseEmbedAtMint, NulloptIsByteIdentical) {
+    std::map<Script, uint288> w{{P1, uint288(3)}, {P2, uint288(1)}};
+    uint256 ref(std::vector<unsigned char>(32, 0xab));
+    // baseline: aux_mm_commitment defaults to nullopt inside wired_from_pplns.
+    auto baseline = wired_from_pplns(w, uint288(4), 10000, true, {}, std::nullopt, ref, NONCE);
+
+    dgb::coin::ConnCoinbasePplnsInputs in;
+    in.coinbase_script = CB;
+    in.segwit_commitment_script = std::nullopt;
+    in.weights = w; in.total_weight = uint288(4); in.subsidy = 10000;
+    in.use_v36_pplns = true; in.donation_script = DON;
+    in.ref_hash = ref; in.last_txout_nonce = NONCE;
+    in.aux_mm_commitment = std::nullopt;            // explicit default
+    auto with_field = dgb::coin::build_connection_coinbase_from_pplns(in);
+
+    EXPECT_EQ(tohex(baseline.gentx.bytes), tohex(with_field.gentx.bytes));
+    EXPECT_EQ(baseline.gentx.txid, with_field.gentx.txid);
+}
+
+// (E2) a populated commitment appends the 44-byte MM tag to the scriptSig and
+//      grows the gentx by exactly 44 bytes; the tag bytes match the core SSOT.
+TEST(ConnCoinbaseEmbedAtMint, AppendsMmTagToScriptSig) {
+    std::map<Script, uint288> w{{P1, uint288(3)}, {P2, uint288(1)}};
+    uint256 ref(std::vector<unsigned char>(32, 0xab));
+    auto baseline = wired_from_pplns(w, uint288(4), 10000, true, {}, std::nullopt, ref, NONCE);
+
+    // aux merkle root = 0x11..0x11 (internal LE); build the canonical 44-byte tag.
+    uint256 aux_root(std::vector<unsigned char>(32, 0x11));
+    auto tag = c2pool::merged::build_auxpow_commitment(aux_root, /*size=*/1, /*nonce=*/0);
+    ASSERT_EQ(tag.size(), size_t{44});  // magic4+root32+size4+nonce4
+
+    dgb::coin::ConnCoinbasePplnsInputs in;
+    in.coinbase_script = CB;
+    in.segwit_commitment_script = std::nullopt;
+    in.weights = w; in.total_weight = uint288(4); in.subsidy = 10000;
+    in.use_v36_pplns = true; in.donation_script = DON;
+    in.ref_hash = ref; in.last_txout_nonce = NONCE;
+    in.aux_mm_commitment = tag;
+    auto embedded = dgb::coin::build_connection_coinbase_from_pplns(in);
+
+    // gentx grows by EXACTLY the 44-byte tag -- nothing else shifts.
+    EXPECT_EQ(embedded.gentx.bytes.size(), baseline.gentx.bytes.size() + tag.size());
+
+    // the embedded scriptSig is the baseline scriptSig (CB) followed by the tag.
+    std::vector<unsigned char> expect_script = CB;
+    expect_script.insert(expect_script.end(), tag.begin(), tag.end());
+    // the scriptSig sits right after the 42-byte coinbase txin prologue
+    // (version4 + vin_count1 + prevout36 + script_len1); locate it by content.
+    const std::string g = tohex(embedded.gentx.bytes);
+    EXPECT_NE(g.find(tohex(expect_script)), std::string::npos);
+    // and the bare tag is present where the baseline had none.
+    EXPECT_NE(g.find(tohex(tag)), std::string::npos);
+    EXPECT_EQ(tohex(baseline.gentx.bytes).find(tohex(tag)), std::string::npos);
 }
 
 
