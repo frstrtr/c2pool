@@ -5523,11 +5523,20 @@ nlohmann::json MiningInterface::rest_miner_stats(const std::string& address)
     result["network_difficulty"] = net_diff;
     result["chance_to_find_block"] = (net_diff > 0 && total_hr > 0)
         ? (total_hr / (net_diff * 4294967296.0) * 100.0) : 0.0;
+    // Per-worker share-outcome breakdown. The stratum layer tracks three
+    // counters (accepted / rejected / stale); map them onto the wire fields
+    // using this codebase's own stale_info enum (253=orphan, 254=doa):
+    //   - stale    = job template expired at submit -> ORPHAN (stale_info 253)
+    //   - rejected = low-diff / invalid submission  -> never counted as a share
+    // There is no per-worker daemon-DOA *share* counter; DOA is surfaced as
+    // dead_hashrate instead, so doa_shares is honestly 0 here rather than a
+    // copy of the stale counter (the prior code reported doa=stale, orphan=0).
     result["total_shares"] = accepted + stale;
     result["unstale_shares"] = accepted;
-    result["dead_shares"] = stale;
-    result["orphan_shares"] = 0;
-    result["doa_shares"] = stale;
+    result["dead_shares"] = stale;            // dead = orphan + doa; only orphans counted per-worker
+    result["orphan_shares"] = stale;          // stale-template shares are orphans
+    result["doa_shares"] = 0;                 // no per-worker DOA share counter (see dead_hashrate)
+    result["rejected_shares"] = rejected;     // invalid/low-diff submissions, never counted as shares
 
     return result;
 }
