@@ -2862,6 +2862,21 @@ nlohmann::json MiningInterface::getinfo(const std::string& request_id)
     if (double real_hs = get_pool_hashrate(); real_hs > 0.0)
         pool_hashrate = real_hs;
 
+    // poolshares + difficulty previously came ONLY from the empty m_node stub
+    // (get_total_mining_shares()/get_difficulty_stats() return 0 on the
+    // embedded prod build) -- the same false-zero source as the founding
+    // connections/poolhashps bug. Source them from the live sharechain stats
+    // hook (the truthful source #462 used for stale/DOA): total_shares =
+    // current sharechain length, average_difficulty = PPLNS-window share diff.
+    if (m_sharechain_stats_fn) {
+        auto ss = m_sharechain_stats_fn();
+        if (ss.contains("total_shares") && ss["total_shares"].is_number())
+            total_shares = ss["total_shares"].get<uint64_t>();
+        if (ss.contains("average_difficulty") && ss["average_difficulty"].is_number()
+            && ss["average_difficulty"].get<double>() > 0.0)
+            current_difficulty = ss["average_difficulty"].get<double>();
+    }
+
     // Read block height from cached template
     uint64_t block_height = 0;
     double network_hashps = 0.0;
@@ -2946,9 +2961,24 @@ nlohmann::json MiningInterface::getstats(const std::string& request_id)
             block_height = m_cached_template["height"].get<uint64_t>();
     }
 
+    // Prefer the live sharechain-stats hook over the empty m_node stub: m_node
+    // returns zeros on prod, so getstats lied about orphan/DOA/stale shares while
+    // /stale_rates (same hook) reported the truth. Charter: dashboards must not lie.
     nlohmann::json stale = {{"orphan_count", 0}, {"doa_count", 0}, {"stale_count", 0}, {"stale_prop", 0.0}};
-    if (m_node)
+    if (m_sharechain_stats_fn) {
+        auto sc = m_sharechain_stats_fn();
+        uint64_t total  = sc.value("total_shares", uint64_t(0));
+        uint64_t orphan = sc.value("orphan_shares", uint64_t(0));
+        uint64_t dead   = sc.value("dead_shares", uint64_t(0));
+        stale["orphan_count"] = orphan;
+        stale["doa_count"]    = dead;
+        stale["stale_count"]  = orphan + dead;
+        stale["stale_prop"]   = total > 0
+            ? static_cast<double>(orphan + dead) / static_cast<double>(total)
+            : 0.0;
+    } else if (m_node) {
         stale = m_node->get_stale_stats();
+    }
 
     nlohmann::json protocol_messages = nlohmann::json::array();
     if (m_protocol_messages_fn) {
@@ -3034,10 +3064,21 @@ nlohmann::json MiningInterface::getmessageblob(const std::string& request_id)
 
 nlohmann::json MiningInterface::getpeerinfo(const std::string& request_id)
 {
+    // Prefer the live share-peer hook (real per-peer list from
+    // p2p_node->get_peer_info_json) over the empty m_node stub. On the
+    // embedded prod build m_node->get_connected_peers_count() returns 0 while
+    // the node is fully peered -- the same founding-charter lie that getinfo/
+    // getstats already route around. getpeerinfo must report the real peers.
+    if (m_peer_info_fn) {
+        auto pi = m_peer_info_fn();
+        if (pi.is_array())
+            return pi;
+    }
+
     nlohmann::json peers = nlohmann::json::array();
     if (m_node) {
         size_t count = m_node->get_connected_peers_count();
-        // Return minimal info — detailed peer data requires NodeImpl access
+        // Fallback only (API-only mode, no live hook): minimal aggregate count.
         peers.push_back({
             {"connected_peers", count}
         });

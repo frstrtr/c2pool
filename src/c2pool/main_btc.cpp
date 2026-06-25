@@ -86,6 +86,11 @@ static void print_usage()
         "                  e.g. --stratum 9332           (binds 0.0.0.0:9332)\n"
         "                       --stratum 127.0.0.1:9332 (loopback only)\n"
         "                  Omit to disable stratum listener.\n"
+        "  --sharechain-port P  bind the sharechain (pool P2P) listener on\n"
+        "                  port P instead of the default 9333, so a SECOND\n"
+        "                  isolated c2pool-btc instance can run on one host\n"
+        "                  (e.g. G3b tuned-net A->B crossing). Omit to keep\n"
+        "                  the default PoolConfig::P2P_PORT.\n"
         "  --network-id ID c2pool sharechain IDENTIFIER (hex, <=8 bytes) for a\n"
         "                  private/custom p2pool network. Omit for public BTC.\n"
         "  --prefix HEX    c2pool sharechain PREFIX (hex, <=8 bytes), an\n"
@@ -117,6 +122,7 @@ int main(int argc, char* argv[])
     uint16_t    p2pool_port   = 0;
     std::string stratum_addr  = "0.0.0.0";  // listen all interfaces by default
     uint16_t    stratum_port  = 0;          // 0 disables stratum; --stratum sets it
+    uint16_t    sharechain_port = 0;        // 0 = default P2P_PORT (9333); --sharechain-port overrides (opt-in isolation)
     std::string network_id_hex;             // --network-id: c2pool IDENTIFIER override (empty = public net)
     std::string prefix_hex;                 // --prefix: c2pool PREFIX override (empty = compiled default)
 
@@ -174,6 +180,16 @@ int main(int argc, char* argv[])
                 stratum_addr = ep.substr(0, colon);
                 stratum_port = static_cast<uint16_t>(std::stoi(ep.substr(colon + 1)));
             }
+        }
+        else if (arg == "--sharechain-port" && i + 1 < argc)
+        {
+            // --sharechain-port PORT - bind the sharechain (pool P2P) listener
+            // on a non-default port so a SECOND isolated c2pool-btc instance can
+            // run on a host where 9333 is already taken (e.g. G3b tuned-net A->B
+            // crossing). Default STAYS 9333 (PoolConfig::P2P_PORT) when omitted,
+            // preserving G0/G1 oracle byte-parity + btc_share_test pins. BTC-fenced
+            // opt-in; no shared-base / PoolConfig constant touch.
+            sharechain_port = static_cast<uint16_t>(std::stoi(argv[++i]));
         }
         else if (arg == "--network-id" && i + 1 < argc)
         {
@@ -670,9 +686,15 @@ int main(int argc, char* argv[])
 
     auto p2p_node = std::make_unique<btc::Node>(&ioc, &config);
     p2p_node->set_target_outbound_peers(p2pool_host.empty() ? 4 : 1);
-    p2p_node->core::Server::listen(btc::PoolConfig::P2P_PORT);
+    // Default sharechain P2P port is 9333 (oracle byte-parity); --sharechain-port
+    // overrides it for an isolated second instance (G3b tuned-net) without
+    // touching the default or any shared-base constant.
+    const uint16_t effective_p2p_port =
+        sharechain_port ? sharechain_port : btc::PoolConfig::P2P_PORT;
+    p2p_node->core::Server::listen(effective_p2p_port);
     LOG_INFO << "[BTC] Sharechain peer listening on port "
-             << btc::PoolConfig::P2P_PORT
+             << effective_p2p_port
+             << (sharechain_port ? " (--sharechain-port override; default 9333)" : "")
              << " — proto adv=" << btc::PoolConfig::ADVERTISED_PROTOCOL_VERSION
              << " min=" << btc::PoolConfig::MINIMUM_PROTOCOL_VERSION
              << " share=v35 prefix=" << btc::PoolConfig::prefix_hex();
