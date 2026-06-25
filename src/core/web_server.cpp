@@ -6104,9 +6104,17 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
         } else {
             effective_state = "voting";
         }
+        // The chain-derived state above can momentarily disagree with what the
+        // node is ACTUALLY mining: m_cached_share_version is the live ratchet
+        // output (the version stamped on this node's new shares). Surface it as
+        // ground truth so a transient sampling dip cannot make the dashboard
+        // claim "voting" while the node has already latched to V36 (charter #3).
+        int64_t live_share_version = m_cached_share_version;
         result["auto_ratchet"] = {
             {"state", effective_state},
             {"persisted_state", effective_state},
+            {"live_share_version", live_share_version},
+            {"v36_active", live_share_version >= TARGET_VERSION},
             {"activated_at", nullptr},
             {"activated_height", nullptr},
             {"confirmed_at", nullptr}
@@ -6130,12 +6138,20 @@ nlohmann::json MiningInterface::rest_v36_status()
     nlohmann::json vs = rest_version_signaling();
 
     std::string state = "voting";
-    if (vs.contains("auto_ratchet") && vs["auto_ratchet"].contains("state"))
-        state = vs["auto_ratchet"].value("state", std::string("voting"));
+    int64_t live_share_version = m_cached_share_version;
+    bool v36_active = live_share_version >= 36;
+    if (vs.contains("auto_ratchet")) {
+        const auto& ar = vs["auto_ratchet"];
+        state = ar.value("state", std::string("voting"));
+        live_share_version = ar.value("live_share_version", live_share_version);
+        v36_active = ar.value("v36_active", v36_active);
+    }
 
     result["auto_ratchet"] = {
         {"state", state},
         {"persisted_state", state},
+        {"live_share_version", live_share_version},
+        {"v36_active", v36_active},
         {"activated_at", nullptr},
         {"activated_height", nullptr},
         {"confirmed_at", nullptr}
