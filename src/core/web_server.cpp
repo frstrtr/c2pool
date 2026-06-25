@@ -3064,10 +3064,21 @@ nlohmann::json MiningInterface::getmessageblob(const std::string& request_id)
 
 nlohmann::json MiningInterface::getpeerinfo(const std::string& request_id)
 {
+    // Prefer the live share-peer hook (real per-peer list from
+    // p2p_node->get_peer_info_json) over the empty m_node stub. On the
+    // embedded prod build m_node->get_connected_peers_count() returns 0 while
+    // the node is fully peered -- the same founding-charter lie that getinfo/
+    // getstats already route around. getpeerinfo must report the real peers.
+    if (m_peer_info_fn) {
+        auto pi = m_peer_info_fn();
+        if (pi.is_array())
+            return pi;
+    }
+
     nlohmann::json peers = nlohmann::json::array();
     if (m_node) {
         size_t count = m_node->get_connected_peers_count();
-        // Return minimal info — detailed peer data requires NodeImpl access
+        // Fallback only (API-only mode, no live hook): minimal aggregate count.
         peers.push_back({
             {"connected_peers", count}
         });
