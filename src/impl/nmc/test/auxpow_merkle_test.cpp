@@ -1802,6 +1802,61 @@ TEST(NmcPdGoldenFixture, MarkerFieldOffsetsAreThePinnedLayout)
               (std::vector<unsigned char>{0x78, 0x56, 0x34, 0x12}));
 }
 
+// ── Merged-mining marker magic SSOT conformance (PF) ────────────────────────
+//
+// Pins the 4th and last source-verified consensus constant of the NMC arc:
+// pchMergedMiningHeader, the magic tag that precedes the merged-mining
+// commitment inside the parent coinbase scriptSig. Like chain_id (above) it is
+// a BUCKET-1 isolation/wire primitive -- pinned per coin, never standardized --
+// but unlike chain_id it had NO value-pin: every golden fixture above hard-codes
+// the {fa,be,6d,6d} hex literal directly, so an edit to the PRODUCTION
+// MM_HEADER_MAGIC constant would red ZERO fixtures, yet the live scanner would
+// silently stop matching real Namecoin coinbases. These KATs reference the
+// production constant, closing that drift gap.
+//
+// Source: Namecoin/Bitcoin auxpow.cpp pchMergedMiningHeader =
+//   { 0xfa, 0xbe, 'm', 'm' }  ==  { 0xfa, 0xbe, 0x6d, 0x6d }   ('m' == 0x6d).
+
+TEST(NmcMergedMiningMagicConformance, ProductionConstantMatchesAuxpowReference)
+{
+    using nmc::coin::MM_HEADER_MAGIC;
+    // Byte-for-byte against the canonical reference, in BOTH spellings: the
+    // char-literal form the constant is written in, and the hex form every
+    // golden fixture above spells out -- proving the two are the same 4 bytes.
+    const unsigned char kRef[4]    = {0xfa, 0xbe, 'm', 'm'};
+    const unsigned char kRefHex[4] = {0xfa, 0xbe, 0x6d, 0x6d};
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_EQ(MM_HEADER_MAGIC[i], kRef[i]);
+        EXPECT_EQ(MM_HEADER_MAGIC[i], kRefHex[i]);
+    }
+    // Document the char->byte identity every fixture above silently relies on.
+    EXPECT_EQ(static_cast<unsigned char>('m'), 0x6du);
+}
+
+TEST(NmcMergedMiningMagicConformance, ScannerBindsToExactlyThePinnedMagic)
+{
+    // A canonical single-slot marker the scanner accepts (mirrors the golden
+    // fixture above), then a copy whose magic final byte is flipped by one bit.
+    uint256 root = root_ascending(0x01);
+    const unsigned h = 0; const int32_t cid = 1; const uint32_t nonce = 0x12345678u;
+    std::vector<unsigned char> good = mm_script(root_reversed(root), 1u << h, nonce);
+    const uint32_t slot = aux_expected_index(nonce, cid, h);
+    ASSERT_EQ(scan_mm_commitment(good, root, h, cid, slot), MMScan::MATCH);
+
+    // Locate the production magic inside the framed script and corrupt ONE byte.
+    auto it = std::search(good.begin(), good.end(),
+                          nmc::coin::MM_HEADER_MAGIC,
+                          nmc::coin::MM_HEADER_MAGIC + 4);
+    ASSERT_NE(it, good.end());
+    std::vector<unsigned char> drifted = good;
+    drifted[(it - good.begin()) + 3] ^= 0x01;             // 0x6d -> 0x6c
+    // A one-byte drift makes the marker UNDETECTABLE: the scanner reports ABSENT
+    // (staged-leg posture), not a malformed MISMATCH -- i.e. the commitment
+    // vanishes from the parent coinbase entirely. This is exactly the silent
+    // failure mode a production-constant edit would cause on live coinbases.
+    EXPECT_EQ(scan_mm_commitment(drifted, root, h, cid, slot), MMScan::ABSENT);
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
