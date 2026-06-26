@@ -170,3 +170,81 @@ TEST(DgbWeightDecay, DecayedCumulativeWeightVectorInvariance) {
             << "cum_don depth " << d;
     }
 }
+
+// ---- compounding decayed-cumulative walk over a chain --------------------
+//
+// Pins the actual V36-native PPLNS shape produced by the oracle
+// p2pool/data.py get_decayed_cumulative_weights: walking shares tip->back,
+// each share's attempts are scaled by the running decay factor for its depth
+// and the cumulative (prefix-sum) weights are what feed the PPLNS payout
+// split. The per-share factor tests above pin single factors; this exercises
+// the prefix-sum COMPOSITION over a chain via the SSOT decayed_attempts
+// primitive.
+//
+// The per-depth running factors are passed in as literals rather than
+// recomputed in-loop on purpose: factor[d] = decay_per^d in 40-bit fixed
+// point, and a fp*fp product (~2^80) overflows uint64 -- the production hot
+// path uses a precomputed decay table for exactly this reason, and the SSOT
+// deliberately exposes only the single-step primitive. factor[1] is asserted
+// to equal decay_per_share(cl), tying the table's first step back to the SSOT.
+//
+// All goldens (factors, decayed, cumulative) are HAND-DERIVED from the oracle
+// expression in an independent Python reference (NON-CIRCULAR).
+#include <vector>
+
+namespace {
+struct WalkResult {
+    std::vector<uint64_t> decayed;
+    std::vector<uint64_t> cumulative;
+    uint64_t total = 0;
+};
+// decayed[i] = decayed_attempts(att[i], factor[i]); cumulative = prefix sum.
+inline WalkResult decayed_cumulative_walk(const std::vector<uint64_t>& atts_tip_first,
+                                          const std::vector<uint64_t>& depth_factors) {
+    WalkResult r;
+    for (size_t i = 0; i < atts_tip_first.size(); ++i) {
+        const uint64_t d = wd::decayed_attempts(atts_tip_first[i], depth_factors[i]);
+        r.decayed.push_back(d);
+        r.total += d;
+        r.cumulative.push_back(r.total);
+    }
+    return r;
+}
+} // namespace
+
+TEST(DgbWeightDecay, DecayedCumulativeWalkV36ChainLength) {
+    // V36 DGB CHAIN_LENGTH = 8640 (half_life 2160), six equal shares tip->back.
+    const std::vector<uint64_t> factors{1099511627776, 1099158792968, 1098806071385,
+                                        1098453462991, 1098100967749, 1097748585623};
+    EXPECT_EQ(factors[0], wd::DECAY_SCALE);            // depth 0 == 1.0
+    EXPECT_EQ(factors[1], wd::decay_per_share(8640));  // depth 1 == one SSOT step
+    const auto r = decayed_cumulative_walk(
+        {1000000, 1000000, 1000000, 1000000, 1000000, 1000000}, factors);
+    EXPECT_EQ(r.decayed,
+              (std::vector<uint64_t>{1000000, 999679, 999358, 999037, 998717, 998396}));
+    EXPECT_EQ(r.cumulative,
+              (std::vector<uint64_t>{1000000, 1999679, 2999037, 3998074, 4996791, 5995187}));
+    EXPECT_EQ(r.total, uint64_t(5995187));
+}
+
+TEST(DgbWeightDecay, DecayedCumulativeWalkBaselineChainLength) {
+    // Older p2pool-dgb-scrypt baseline CHAIN_LENGTH = 2880 (half_life 720).
+    const std::vector<uint64_t> factors{1099511627776, 1098453123351,
+                                        1097395637952, 1096339170599};
+    EXPECT_EQ(factors[1], wd::decay_per_share(2880));
+    const auto r = decayed_cumulative_walk({800000, 800000, 800000, 800000}, factors);
+    EXPECT_EQ(r.decayed, (std::vector<uint64_t>{800000, 799229, 798460, 797691}));
+    EXPECT_EQ(r.cumulative, (std::vector<uint64_t>{800000, 1599229, 2397689, 3195380}));
+    EXPECT_EQ(r.total, uint64_t(3195380));
+}
+
+TEST(DgbWeightDecay, DecayedCumulativeWalkVisibleDecayTinyHalfLife) {
+    // half_life=2 (CL=8) makes the compounding visible (~0.653 retained per hop).
+    const std::vector<uint64_t> factors{1099511627776, 718450034647,
+                                        469454291564, 306753874646};
+    EXPECT_EQ(factors[1], wd::decay_per_share(8));
+    const auto r = decayed_cumulative_walk({1000, 1000, 1000, 1000}, factors);
+    EXPECT_EQ(r.decayed, (std::vector<uint64_t>{1000, 653, 426, 278}));
+    EXPECT_EQ(r.cumulative, (std::vector<uint64_t>{1000, 1653, 2079, 2357}));
+    EXPECT_EQ(r.total, uint64_t(2357));
+}
