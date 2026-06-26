@@ -180,9 +180,9 @@ public:
         // (regtest checked FIRST: under --regtest CoinConfig::m_testnet is
         // reset to false in main_btc, so a testnet-only switch would resolve
         // to "bitcoin" = MAINNET and silently join the prod sharechain.)
-        std::string net_name = config->m_regtest ? "bitcoin_regtest"
-                             : config->m_testnet ? "bitcoin_testnet"
-                                                 : "bitcoin";
+        // Isolation invariant extracted to a pure helper (locked by
+        // regtest_sharechain_isolation_test.cpp); regtest checked first.
+        std::string net_name = sharechain_net_name(config->m_regtest, config->m_testnet);
         m_storage = std::make_unique<c2pool::storage::SharechainStorage>(net_name);
         load_persisted_shares();
 

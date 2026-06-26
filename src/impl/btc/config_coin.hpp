@@ -3,6 +3,7 @@
 #include <core/config.hpp>
 #include <core/fileconfig.hpp>
 #include <core/netaddress.hpp>
+#include <string>
 
 #include <yaml-cpp/yaml.h>
 
@@ -68,7 +69,23 @@ template<> struct convert<btc::config::RPCData>
 
 namespace btc
 {
-    
+
+// Sharechain LevelDB + P2P-listen namespace isolation.
+//
+// regtest MUST be evaluated FIRST: main_btc resets CoinConfig::m_testnet to
+// false under --regtest (it drives only the parent chainparams), so a
+// testnet-only switch would resolve to "bitcoin" = MAINNET and silently join
+// the production p2pool sharechain -- the .121 standup incident of
+// 2026-06-26, where a won regtest block would have relayed to real peers.
+// Pure free function so the isolation invariant is lockable without standing
+// up a node. Locked by regtest_sharechain_isolation_test.cpp.
+inline std::string sharechain_net_name(bool regtest, bool testnet)
+{
+    if (regtest) return "bitcoin_regtest";
+    if (testnet) return "bitcoin_testnet";
+    return "bitcoin";
+}
+
 class CoinConfig : protected core::Fileconfig
 {
 
