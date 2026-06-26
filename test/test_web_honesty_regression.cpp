@@ -495,3 +495,34 @@ TEST(WebHonestyRegression, NodeTopologyPrefersStatsProviderHookWhenWired) {
     EXPECT_EQ(ltc.value("height", 0), 2710001)
         << "the hook's real embedded-daemon tip must survive verbatim";
 }
+
+// /patron_sendmany/<total> is an UNIMPLEMENTED payout-split helper. The charter
+// rule is not "every endpoint must be real" -- it is "never let an unreal one
+// read as real." This endpoint stays honest by SELF-LABELLING: it carries an
+// explicit "patron_sendmany stub" note and an EMPTY destinations object, so the
+// operator can never mistake it for a computed payout lane. This pins that
+// disclosure: if someone fills destinations with fabricated splits, they must
+// also drop the stub label (and wire real data) or this fails loudly. A
+// non-empty destinations while still flagged a stub is exactly the silent-lie
+// regression we forbid.
+TEST(WebHonestyRegression, PatronSendmanySelfLabelsAsStubNeverFabricatesPayouts) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+
+    json p = mi.rest_patron_sendmany("12.5");
+
+    ASSERT_TRUE(p.contains("destinations"));
+    const bool labelled_stub =
+        p.value("note", std::string{}).find("stub") != std::string::npos;
+    const bool has_payouts =
+        p["destinations"].is_object() && !p["destinations"].empty();
+
+    EXPECT_TRUE(labelled_stub)
+        << "an unimplemented payout helper must self-label as a stub";
+    EXPECT_FALSE(has_payouts)
+        << "a stub must not present fabricated payout destinations as real";
+    // The forbidden state: data shown WHILE still flagged a stub.
+    EXPECT_FALSE(labelled_stub && has_payouts)
+        << "never label-as-stub while surfacing payout splits -- silent lie";
+    EXPECT_EQ(p.value("total", std::string{}), "12.5")
+        << "the echoed total must be the operator-supplied value, not invented";
+}
