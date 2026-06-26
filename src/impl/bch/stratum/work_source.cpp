@@ -25,6 +25,8 @@
 
 #include <impl/bch/stratum/work_source.hpp>
 
+#include <impl/bch/stratum/coinbase_outputs.hpp>  // assemble_v36_coinbase_outputs
+
 #include <impl/bch/coin/header_chain.hpp>
 #include <impl/bch/coin/mempool.hpp>
 #include <impl/bch/coin/merkle.hpp>            // merkle_hash_pair (CTOR SHA256d)
@@ -384,56 +386,12 @@ core::stratum::CoinbaseResult BCHWorkSource::build_connection_coinbase(
     // V36 >= 1-satoshi consensus marker rule. PPLNS dests sort ascending and are
     // capped to the largest 4000 (oracle dests[-4000:]).
 
-    // Separate the donation/marker entry from the PPLNS payout set.
-    uint64_t donation_amount = 0;
-    bool have_donation = false;
-    if (!donation_script.empty()) {
-        auto dit = payouts.find(donation_script);
-        if (dit != payouts.end()) {
-            donation_amount = static_cast<uint64_t>(dit->second);
-            have_donation = true;
-            payouts.erase(dit);
-        }
-    }
-
-    // V36 CONSENSUS RULE (data.py: total_donation < 1 path): the donation/marker
-    // output must carry >= 1 satoshi. If it rounds to 0 while subsidy > 0,
-    // decrement the largest PPLNS payout by 1 sat (deterministic tiebreak on
-    // (amount, script)) and move that satoshi into the donation output.
-    if (have_donation && donation_amount < 1 && coinbasevalue > 0 && !payouts.empty()) {
-        auto largest = payouts.begin();
-        for (auto it = payouts.begin(); it != payouts.end(); ++it) {
-            const uint64_t a  = static_cast<uint64_t>(it->second);
-            const uint64_t la = static_cast<uint64_t>(largest->second);
-            if (a > la || (a == la && it->first > largest->first)) largest = it;
-        }
-        if (static_cast<uint64_t>(largest->second) >= 1) {
-            largest->second -= 1.0;
-            donation_amount += 1;
-        }
-    }
-
-    // PPLNS dests: drop zero-value entries, sort (amount asc, script asc), then
-    // keep only the largest 4000 (oracle dests[-4000:]).
-    std::vector<std::pair<std::vector<unsigned char>, uint64_t>> outputs;
-    outputs.reserve(payouts.size() + 1);
-    for (const auto& [script, amount_d] : payouts) {
-        if (script.empty()) continue;
-        const uint64_t amount = static_cast<uint64_t>(amount_d);
-        if (amount > 0) outputs.emplace_back(script, amount);
-    }
-    std::sort(outputs.begin(), outputs.end(), [](const auto& a, const auto& b) {
-        if (a.second != b.second) return a.second < b.second;
-        return a.first < b.first;
-    });
-    if (outputs.size() > 4000)
-        outputs.erase(outputs.begin(), outputs.end() - 4000);
-
-    // Donation/marker output appended LAST, before the OP_RETURN. It is NOT
-    // filtered by the amount>0 rule: a zero-value donation (subsidy==0) is still
-    // emitted to preserve gentx_before_refhash byte-parity with the oracle.
-    if (have_donation)
-        outputs.emplace_back(donation_script, donation_amount);
+    // The donation forced-LAST rule, the V36 >=1-sat marker rule, the
+    // (amount asc, script asc) sort and the dests[-4000:] cap all live in the
+    // pure, header-only assemble_v36_coinbase_outputs() so the byte-shape is
+    // pinned by coinbase_author_kat_test against the p2pool-merged-v36 oracle
+    // (data.py generate_transaction) rather than asserted against this builder.
+    auto outputs = assemble_v36_coinbase_outputs(std::move(payouts), donation_script, coinbasevalue);
 
     // ref_hash + frozen chain-walk values.
     core::stratum::RefHashResult rh_result;
