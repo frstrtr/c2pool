@@ -1,0 +1,67 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Luck — the cruel beast — P2Pool scientific basics</title><style>
+ body{font-family:Georgia,'Times New Roman',serif;max-width:800px;margin:2.2em auto;padding:0 1.2em;color:#1a1a1a;line-height:1.6;font-size:16.5px;background:#fff;}
+ h1{font-size:1.55em;line-height:1.3;margin:0 0 .15em;font-weight:600;} .sub{color:#666;margin:0 0 1.6em;font-size:.92em;}
+ h2{font-size:1.12em;margin:1.7em 0 .45em;font-weight:600;border-bottom:1px solid #e6e6e6;padding-bottom:.2em;}
+ h3{font-size:1.0em;margin:1.2em 0 .35em;font-weight:600;color:#333;}
+ p{margin:0 0 .85em;text-align:justify;} ul{margin:0 0 .85em;padding-left:1.4em;} li{margin:.25em 0;}
+ code{font-family:'SF Mono',Consolas,monospace;font-size:.88em;background:#f4f1f8;padding:.05em .3em;border-radius:3px;}
+ pre{font-family:'SF Mono',Consolas,monospace;font-size:.82em;background:#f7f5fb;border:1px solid #e7e2f0;border-radius:5px;padding:.8em 1em;overflow-x:auto;line-height:1.45;}
+ .v37{background:#faf8fc;border-left:4px solid #6c4f9c;padding:.9em 1.1em;margin:1.5em 0;border-radius:0 4px 4px 0;}
+ .v37 .tag{display:inline-block;background:#6c4f9c;color:#fff;font-family:sans-serif;font-size:.7em;font-weight:700;letter-spacing:.05em;padding:.15em .55em;border-radius:3px;vertical-align:middle;margin-right:.5em;}
+ a{color:#6c4f9c;} nav{font-family:sans-serif;font-size:.85em;margin:0 0 1.8em;color:#888;} nav a{margin-right:.8em;}
+</style></head><body>
+<nav><a href="./">← Purple Paper</a> · <a href="real-difficulty.html">Real difficulty</a> · <a href="difficulty-adjustment.html">Difficulty adjustment</a> · <a href="taproot-coinbase.html">Taproot coinbase</a> · <a href="bitcoin-leveldb.html">Bitcoin LevelDB</a> · <a href="weighted-multisig.html">Weighted multisig</a> · <a href="luck.html">Luck</a></nav><h1>Luck &mdash; the cruel beast</h1><p class="sub">P2Pool scientific basics &mdash; a field guide to mining variance and the rituals that (do not) defeat it</p>
+
+<h2>Bad luck hits you sometimes&hellip;</h2>
+<p>In the world of crypto mining, &ldquo;luck&rdquo; is statistically just variance, but every veteran miner knows that when the <b>Variance Monster</b> hits, it feels personal. When the math says you should find blocks but the pool is dry, logic often goes out the window.</p>
+<p>What follows is untraditional, non-scientific, and superstitious &mdash; the kind whispered in old Bitcoin Talk forums and IRC channels. Here is a collection of mining folklore and &ldquo;rituals&rdquo; to reset your luck.</p>
+
+<h3>1. The &ldquo;Watcher&rdquo; Effect (Quantum Zeno Effect)</h3>
+<p>The most widely cited superstition: <i>&ldquo;A watched miner never finds a block.&rdquo;</i></p>
+<ul><li><b>The Ritual:</b> You must stop looking at the dashboard. Completely.</li>
+<li><b>The Method:</b> Close your monitoring tabs, disable your block-notification bot, and physically walk away from the screen for at least 24 hours. The universe knows you are looking, and it is shy.</li>
+<li><b>The &ldquo;Science&rdquo;:</b> It reduces your stress levels, making time pass faster until the next block naturally hits.</li></ul>
+
+<h3>2. The &ldquo;Sacrificial&rdquo; Transaction</h3>
+<p>In the early days of Bitcoin, miners would send small amounts of coins to &ldquo;burn addresses&rdquo; or famous addresses (like the Genesis block) as an offering to the crypto gods.</p>
+<ul><li><b>The Ritual:</b> Take a tiny amount of the coin you are mining (some dust) and send it to a charity or a random address.</li>
+<li><b>The Logic:</b> You are creating &ldquo;positive karmic flow&rdquo; on the blockchain. If you only take (mining reward) without giving (transaction fees), the network punishes you.</li></ul>
+
+<h3>3. Server Feng Shui &amp; The &ldquo;Cleanse&rdquo;</h3>
+<p>The physical state of the machine is believed to affect its &ldquo;digital aura.&rdquo;</p>
+<ul><li><b>Cable Management:</b> If your cables are a mess, the luck gets &ldquo;tangled.&rdquo; Straighten your ethernet cables to ensure the &ldquo;packets flow smoothly&rdquo; (obviously false, but satisfying).</li>
+<li><b>Dusting:</b> Power down the rig completely. Use compressed air. While doing it, verbally tell the server it is a &ldquo;good machine.&rdquo;</li>
+<li><b>Re-seating:</b> Unplug the ethernet cable and plug it back in. Sometimes the luck just gets &ldquo;stuck&rdquo; in the port.</li></ul>
+
+<h3>4. The &ldquo;Name Change&rdquo; Deception</h3>
+<p>Some miners believe the pool or the network has &ldquo;cursed&rdquo; a specific worker name or wallet address.</p>
+<ul><li><b>The Ritual:</b> Change your worker names in the config. If it was <code>worker1</code>, name it <code>lucky_strike</code> or <code>block_finder</code>.</li>
+<li><b>The Identity Shift:</b> Change the pool's CSS/theme color or logo temporarily. Trick the universe into thinking this is a brand new, lucky pool that deserves a &ldquo;beginner's luck&rdquo; bonus.</li></ul>
+
+<h3>5. The &ldquo;Full Power Cycle&rdquo; (The Hard Reset)</h3>
+<p>Not just a reboot &mdash; a spiritual reset.</p>
+<ul><li><b>The Ritual:</b> Shut down the pool software and the server. Unplug the power cord from the wall. Wait 5 minutes.</li>
+<li><b>The Goal:</b> Let all the capacitors drain. Let the &ldquo;bad electrons&rdquo; dissipate. When you boot back up, it is a fresh timeline.</li></ul>
+
+<h3>6. The &ldquo;Reverse Psychology&rdquo;</h3>
+<ul><li><b>The Ritual:</b> Loudly announce in your room (or Discord) that you are &ldquo;thinking about shutting the pool down&rdquo; or &ldquo;switching to a different coin.&rdquo;</li>
+<li><b>The Belief:</b> Hardware is sentient and afraid of being turned off. It will suddenly find a block to prove its worth and save its own life.</li></ul>
+
+<h3>7. The Lunar Retarget <span style="font-weight:400;color:#888;font-size:.85em">(new for this edition)</span></h3>
+<ul><li><b>The Ritual:</b> Cross-reference your block timestamps with the moon phase. Blocks found on a full moon are &ldquo;werewolf blocks&rdquo; and carry extra hashpower into the next epoch.</li>
+<li><b>The Belief:</b> Difficulty retargets every 2016 blocks; the moon retargets every 29.5 days; clearly these are connected, and clearly nobody has proven they aren&rsquo;t.</li></ul>
+
+<h3>8. The Coffee Tax <span style="font-weight:400;color:#888;font-size:.85em">(new for this edition)</span></h3>
+<ul><li><b>The Ritual:</b> Pour the first coffee of the morning <i>before</i> checking the pool, and leave a sip in the cup next to the rig. The machine works for tips.</li>
+<li><b>The Belief:</b> A rig that smells coffee believes its operator is awake and vigilant, and politely declines to orphan your shares out of professional courtesy.</li></ul>
+
+<h2>Summary</h2>
+<p>Ultimately, variance is a cruel beast. You can have 300% luck one week and 10% the next. But if you have checked your logs, verified your connectivity, and ensured your latency is low, sometimes the only thing left to do is clean the dust filters, grab a drink, and stop staring at the hashrate.</p>
+
+<div class="v37"><span class="tag">V37</span><b>Meet the actual beast (it has a probability distribution, and no mean).</b>
+<p>The cruel beast isn&rsquo;t superstition &mdash; it&rsquo;s a <i>power law</i>. The amount by which a winning hash overshoots its target, <code>R = target / hash</code>, obeys <code>Pr[R &ge; r] = 1/r</code> &mdash; a Pareto tail whose expectation does not converge. In plain terms: half of all blocks overshoot by less than 2&times;, but every so often a single hash overshoots by <b>thousands</b> of times, and that one lucky strike can out-earn a whole month of honest grinding. That spike <i>is</i> the Variance Monster, and you can <a href="real-difficulty.html">see it plotted from real Bitcoin blocks</a> &mdash; the lonely tower at block ~1,450 hitting R&nbsp;&asymp;&nbsp;7,000 is one miner&rsquo;s entire month of luck compressed into a single hash.</p>
+<p>There is exactly one ritual that actually tames the beast, and it isn&rsquo;t coffee: <b>get paid for the work you really did, not the luck you happened to have.</b> That is the whole point of pooling &mdash; and of V37&rsquo;s decayed-weight, luck-neutral accounting, which credits your <i>target</i> work and never the fortunate hash. The beast still roars; it just stops eating your paycheck. See the <a href="./">Purple Paper</a>, &sect;5 (Proof-of-Work as Measurement).</p>
+</div>
+
+<hr style="margin:2.4em 0 1em;border:none;border-top:1px solid #eee"><p class="sub">P2Pool scientific basics — republished and version-controlled. <a href="./">V37 Purple Paper &rarr;</a></p>
+</body></html>

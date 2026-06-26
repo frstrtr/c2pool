@@ -1,0 +1,53 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Weighted multisig wallets — P2Pool scientific basics</title><style>
+ body{font-family:Georgia,'Times New Roman',serif;max-width:800px;margin:2.2em auto;padding:0 1.2em;color:#1a1a1a;line-height:1.6;font-size:16.5px;background:#fff;}
+ h1{font-size:1.55em;line-height:1.3;margin:0 0 .15em;font-weight:600;} .sub{color:#666;margin:0 0 1.6em;font-size:.92em;}
+ h2{font-size:1.12em;margin:1.7em 0 .45em;font-weight:600;border-bottom:1px solid #e6e6e6;padding-bottom:.2em;}
+ h3{font-size:1.0em;margin:1.2em 0 .35em;font-weight:600;color:#333;}
+ p{margin:0 0 .85em;text-align:justify;} ul{margin:0 0 .85em;padding-left:1.4em;} li{margin:.25em 0;}
+ code{font-family:'SF Mono',Consolas,monospace;font-size:.88em;background:#f4f1f8;padding:.05em .3em;border-radius:3px;}
+ pre{font-family:'SF Mono',Consolas,monospace;font-size:.82em;background:#f7f5fb;border:1px solid #e7e2f0;border-radius:5px;padding:.8em 1em;overflow-x:auto;line-height:1.45;}
+ .v37{background:#faf8fc;border-left:4px solid #6c4f9c;padding:.9em 1.1em;margin:1.5em 0;border-radius:0 4px 4px 0;}
+ .v37 .tag{display:inline-block;background:#6c4f9c;color:#fff;font-family:sans-serif;font-size:.7em;font-weight:700;letter-spacing:.05em;padding:.15em .55em;border-radius:3px;vertical-align:middle;margin-right:.5em;}
+ a{color:#6c4f9c;} nav{font-family:sans-serif;font-size:.85em;margin:0 0 1.8em;color:#888;} nav a{margin-right:.8em;}
+</style></head><body>
+<nav><a href="./">← Purple Paper</a> · <a href="real-difficulty.html">Real difficulty</a> · <a href="difficulty-adjustment.html">Difficulty adjustment</a> · <a href="taproot-coinbase.html">Taproot coinbase</a> · <a href="bitcoin-leveldb.html">Bitcoin LevelDB</a> · <a href="weighted-multisig.html">Weighted multisig</a></nav><h1>Enhancing security with weighted multisig wallets on PoW blockchains</h1><p class="sub">P2Pool scientific basics</p>
+
+<h2>Introduction</h2>
+<p>In the evolving landscape of blockchain technology, security and distributed control over funds remain paramount. This article delves into the concept of weighted multisig (multi-signature) wallets, an innovative approach to manage and secure funds on Proof of Work (PoW) blockchains like Bitcoin. We will explore how such wallets can be configured to distribute funds using predetermined percentages, offering a robust solution for partnerships, corporate governance, and other collaborative financial operations.</p>
+<h2>Concept of Weighted Multisig Wallets</h2>
+<p>A multisig wallet typically requires multiple signatures to approve a transaction, thereby adding a layer of security beyond traditional single-signature wallets. In a weighted multisig setup, different parties involved in the wallet have varying degrees of influence or &lsquo;weight&rsquo; in approving transactions. This flexibility allows for a dynamic and secure management of blockchain transactions.</p>
+<h2>Practical Example</h2>
+<p>Consider a scenario with three stakeholders: Alice, Bob, and Charlie, who have formed a joint venture and decided to manage their funds through a multisig wallet. Their voting weights are distributed as follows:</p>
+<ul><li>Alice: 50% of the vote.</li><li>Bob: 30% of the vote.</li><li>Charlie: 20% of the vote.</li></ul>
+<p>For transactions to be executed, the combined weights of approving signatures must reach at least a 60% threshold.</p>
+<h2>Transaction Scenario</h2>
+<p>To illustrate, let's assume the trio wishes to withdraw 1000 units of cryptocurrency. The transaction would proceed as follows: Alice's approval, holding 50%, is insufficient alone. With Bob's additional 30%, the combined weight reaches 80%, surpassing the required threshold. The transaction is executed, with funds being allocated as per their business rules.</p>
+<h2>Implementing Weighted Multisig in PoW Blockchains</h2>
+<p>While Bitcoin's basic multisig capabilities are powerful, integrating a weighted system involves script modifications. Below is a simplified pseudocode to demonstrate how such a script might be structured:</p>
+<pre># Public keys for Alice, Bob, and Charlie
+alice_pubkey   = &quot;Alice&#x27;s public key&quot;
+bob_pubkey     = &quot;Bob&#x27;s public key&quot;
+charlie_pubkey = &quot;Charlie&#x27;s public key&quot;
+
+# Multisig script with weights
+multisig_script = &quot;&quot;&quot;
+2 &lt;Alice&#x27;s pubkey&gt; 5 &lt;Bob&#x27;s pubkey&gt; 3 &lt;Charlie&#x27;s pubkey&gt; 3 CHECKMULTISIG
+&quot;&quot;&quot;
+# Explanation:
+#   &#x27;2&#x27; is the minimum weight sum required (i.e., 60%).
+#   Weights are: Alice = 5, Bob = 3, Charlie = 2.
+#   CHECKMULTISIG verifies the transaction against these weights.
+
+# Transaction logic
+if transaction_signed_by(alice_pubkey) and transaction_signed_by(bob_pubkey):
+    if combined_weight &gt;= 6:   # Alice + Bob = 8
+        execute_transaction()</pre>
+<h2>Conclusion</h2>
+<p>Weighted multisig wallets on PoW blockchains like Bitcoin offer an enhanced security framework by requiring a predefined threshold of weighted approvals for transactions. This approach not only secures the funds against unauthorized access but also embeds flexibility and fairness in financial operations among multiple stakeholders. As blockchain technology continues to mature, such innovations in wallet configurations are pivotal for the widespread adoption and utility of cryptocurrencies in complex transactional environments.</p>
+
+<div class="v37"><span class="tag">V37</span><b>Why V37 does <i>not</i> use a weighted (or any) shared wallet for payouts.</b>
+<p>A weighted multisig is a <b>custodial</b> construct: pooled funds sit in one shared address that a quorum of signers controls. That is precisely the shape a decentralized pool must avoid &mdash; it re-introduces an operator, a trusted signer set, and a key that can be lost or coerced.</p>
+<p>V37 pays a different way and holds <b>no pooled funds at all.</b> The coinbase output set is a deterministic pure function of committed sharechain state &mdash; every node computes the identical outputs, each paying a miner&rsquo;s own payout descriptor directly. There is no shared wallet, no signing quorum, no custody. The notion of &ldquo;weight&rdquo; <i>does</i> live at the heart of V37 &mdash; but as <b>work-weighted accounting</b> (credit by real proof-of-work) and <b>work-weighted version voting</b>, in consensus, not as approval power over a wallet. So this page is a useful Bitcoin-scripting primer for governance/treasury scenarios; it is <i>not</i> how V37 distributes mining rewards. See the <a href="./">Purple Paper</a>, &sect;9 (Paying Many from a Small Coinbase) and &sect;12 (Incentive).</p></div>
+
+<hr style="margin:2.4em 0 1em;border:none;border-top:1px solid #eee"><p class="sub">P2Pool scientific basics — republished and version-controlled. <a href="./">V37 Purple Paper &rarr;</a></p>
+</body></html>
