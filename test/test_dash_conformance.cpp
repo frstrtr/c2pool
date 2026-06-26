@@ -38,6 +38,7 @@
 
 #include <core/hash.hpp>                     // Hash (sha256d)
 #include <core/uint256.hpp>
+#include <core/donation.hpp>                 // cross-coin COMBINED_DONATION_SCRIPT SSOT
 
 #include <cstdint>
 #include <map>
@@ -196,6 +197,30 @@ TEST(DashConformancePayoutScript, MatchesOutOfBandKat) {
 TEST(DashConformancePayoutScript, DonationScriptIsP2PKHOverDonationHash) {
     EXPECT_EQ(dash::pubkey_hash_to_script2(h160(DONATION_H160)),
               dash::DONATION_SCRIPT);
+}
+
+// ── v36 unified P2SH (Bucket-2) cross-coin SSOT lock ─────────────────────────
+// Pillar-4 of the v36-migration-std sweep: DASH's v36+ donation P2SH must be the
+// cross-coin SHARED shape, not a per-coin dialect. Proves (1) DASH's
+// COMBINED_DONATION_SCRIPT is the SSOT core::donation::COMBINED_DONATION_SCRIPT
+// byte-for-byte (so the literal can never drift from btc/bch/dgb/ltc), and
+// (2) it is exactly the 23-byte P2SH a914<8c627262..8e85>87. Pre-v36 donation
+// stays the DASH-specific P2PKH (Bucket-3) and is covered by the tests above.
+TEST(DashConformanceCombinedDonation, MatchesCrossCoinSSOT) {
+    const std::vector<unsigned char> ssot(
+        core::donation::COMBINED_DONATION_SCRIPT.begin(),
+        core::donation::COMBINED_DONATION_SCRIPT.end());
+    EXPECT_EQ(dash::COMBINED_DONATION_SCRIPT, ssot);
+
+    const std::vector<unsigned char> expected = {
+        0xa9, 0x14,
+        0x8c, 0x62, 0x72, 0x62, 0x1d, 0x89, 0xe8, 0xfa,
+        0x52, 0x6d, 0xd8, 0x6a, 0xcf, 0xf6, 0x0c, 0x71,
+        0x36, 0xbe, 0x8e, 0x85,
+        0x87
+    };
+    EXPECT_EQ(dash::COMBINED_DONATION_SCRIPT, expected);
+    EXPECT_EQ(dash::COMBINED_DONATION_SCRIPT.size(), 23u);
 }
 
 // ── Masternode-payment-packing conformance (S6 slice 3) ──────────────────────

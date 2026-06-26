@@ -23,6 +23,7 @@
 #include "version_negotiation.hpp"   // dash::version_negotiation:: accept-path version gate
 
 #include <core/coin_params.hpp>
+#include <core/donation.hpp>          // cross-coin COMBINED_DONATION_SCRIPT SSOT (Bucket-2)
 #include <core/hash.hpp>
 #include <core/pack.hpp>
 #include <core/pack_types.hpp>
@@ -117,18 +118,17 @@ static const std::vector<unsigned char> DONATION_SCRIPT = {
 
 // ── v36 unified cross-coin donation P2SH (Bucket-2 standardization, operator
 //    FLAG6 2026-06-17) ─────────────────────────────────────────────────────
-// Byte-identical to btc/bch/dgb/ltc COMBINED_DONATION_SCRIPT: P2SH wrapping the
-// 1-of-2 (forrestv + c2pool dev key) redeem script. Selected for v36+ shares;
-// pre-v36 shares keep the DASH-specific P2PKH DONATION_SCRIPT above (Bucket-3,
-// per-coin keep-for-soak). This is the cross-coin v36-native shape, NOT a
-// DASH isolation primitive — must match the other coins byte-for-byte.
-static const std::vector<unsigned char> COMBINED_DONATION_SCRIPT = {
-    0xa9, 0x14,
-    0x8c, 0x62, 0x72, 0x62, 0x1d, 0x89, 0xe8, 0xfa,
-    0x52, 0x6d, 0xd8, 0x6a, 0xcf, 0xf6, 0x0c, 0x71,
-    0x36, 0xbe, 0x8e, 0x85,
-    0x87
-};
+// Sourced from the cross-coin SSOT core::donation::COMBINED_DONATION_SCRIPT so
+// DASH cannot drift from btc/bch/dgb/ltc — this is the v36-native SHARED shape
+// (Bucket-2), NOT a DASH isolation primitive, so it must stay byte-identical to
+// the other coins. Was a hand-copied local literal; this rewire is value-
+// invariant (proven by DashConformanceCombinedDonation.MatchesCrossCoinSSOT).
+// P2SH wrapping the 1-of-2 (forrestv + c2pool dev key) redeem script; selected
+// for v36+ shares, while pre-v36 shares keep the DASH-specific P2PKH
+// DONATION_SCRIPT above (Bucket-3, per-coin keep-for-soak).
+static const std::vector<unsigned char> COMBINED_DONATION_SCRIPT(
+    core::donation::COMBINED_DONATION_SCRIPT.begin(),
+    core::donation::COMBINED_DONATION_SCRIPT.end());
 
 // ── compute_gentx_before_refhash (Dash v16) ──────────────────────────────────
 inline std::vector<unsigned char> compute_gentx_before_refhash()
