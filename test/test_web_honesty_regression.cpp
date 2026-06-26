@@ -160,3 +160,87 @@ TEST(WebHonestyRegression, GetPeerInfoEmptyWithoutHooksIsHonest) {
     EXPECT_TRUE(r.empty())
         << "no node + no hook -> empty list (honest absence), not a fake count";
 }
+
+// --- rest_miner_stats: per-worker share-outcome labels, not the inversion lie -
+// Before #467 the per-miner panel reported doa_shares = the stale counter and
+// orphan_shares = 0 -- an inversion: stale-template shares are ORPHANs (stale_info
+// 253), and there is no per-worker daemon-DOA *share* counter at all (DOA is
+// surfaced as dead_hashrate, not a share count). The old labelling told the
+// operator a worker had DOA shares it never had, and hid its real orphan rate.
+// Also: low-diff/invalid submissions (rejected) were never exposed. Pin the
+// corrected mapping so the inversion cannot silently return.
+TEST(WebHonestyRegression, MinerStatsLabelsOrphanNotDoaAndExposesRejected) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+
+    // One stratum worker for address "addr1" (worker suffix ".alpha" stripped):
+    // 100 accepted, 5 rejected (invalid/low-diff), 10 stale (expired template).
+    core::stratum::WorkerInfo w;
+    w.username = "addr1.alpha";
+    w.hashrate = 50e9;
+    w.dead_hashrate = 2e9;   // DOA surfaced as hashrate, not a share count
+    w.difficulty = 1024.0;
+    w.accepted = 100;
+    w.rejected = 5;
+    w.stale = 10;
+    mi.register_stratum_worker("sess-1", w);
+
+    json r = mi.rest_miner_stats("addr1");
+
+    EXPECT_TRUE(r["active"].get<bool>())
+        << "a registered worker for this address must read active";
+    // The corrected #467 mapping: stale -> ORPHAN, DOA share count -> 0.
+    EXPECT_EQ(r["orphan_shares"].get<uint64_t>(), 10u)
+        << "stale-template shares are orphans (stale_info 253), not doa";
+    EXPECT_EQ(r["doa_shares"].get<uint64_t>(), 0u)
+        << "no per-worker DOA share counter -- DOA lives in dead_hashrate, "
+           "never a copy of the stale counter (the pre-#467 inversion lie)";
+    EXPECT_EQ(r["dead_shares"].get<uint64_t>(), 10u)
+        << "dead = orphan + doa; only orphans are counted per-worker here";
+    EXPECT_EQ(r["rejected_shares"].get<uint64_t>(), 5u)
+        << "invalid/low-diff submissions must be exposed, never counted as shares";
+    EXPECT_EQ(r["total_shares"].get<uint64_t>(), 110u)
+        << "total = accepted + stale (rejected are NOT shares)";
+    EXPECT_EQ(r["unstale_shares"].get<uint64_t>(), 100u);
+    EXPECT_DOUBLE_EQ(r["dead_hashrate"].get<double>(), 2e9)
+        << "DOA is surfaced honestly as dead_hashrate";
+    // doa_rate is the stale fraction of submitted work: stale/(accepted+stale).
+    EXPECT_DOUBLE_EQ(r["doa_rate"].get<double>(), 10.0 / 110.0);
+}
+
+// An address with no matching worker reports inactive zeros -- honest absence,
+// never fabricated activity.
+TEST(WebHonestyRegression, MinerStatsUnknownAddressIsHonestlyInactive) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+
+    json r = mi.rest_miner_stats("nobody");
+    EXPECT_FALSE(r["active"].get<bool>());
+    EXPECT_EQ(r["total_shares"].get<uint64_t>(), 0u);
+    EXPECT_EQ(r["orphan_shares"].get<uint64_t>(), 0u);
+    EXPECT_EQ(r["doa_shares"].get<uint64_t>(), 0u);
+    EXPECT_EQ(r["rejected_shares"].get<uint64_t>(), 0u);
+}
+
+// --- rest_stratum_security: signal not-instrumented, never a fake all-clear ---
+// The old body returned fixed zeros (connections_per_second / potential_ddos /
+// blacklisted_ips) so stratum.html painted "0.0 / normal / 0 banned / Normal"
+// FOREVER -- a security widget that can never go red, the founding-charter lie
+// class. #470 replaced it with an explicit not-instrumented signal so the page
+// guard (`secData.error`) trips and the panel shows "-" instead of fake green.
+// Pin: the endpoint must self-declare unavailable and must NOT emit the old
+// fabricated all-clear fields.
+TEST(WebHonestyRegression, StratumSecuritySignalsNotInstrumentedNotFakeGreen) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+
+    json r = mi.rest_stratum_security();
+    ASSERT_TRUE(r.is_object());
+    EXPECT_FALSE(r.value("available", true))
+        << "the panel must learn the metrics are unavailable";
+    EXPECT_EQ(r.value("error", std::string{}), "not_instrumented")
+        << "the page guard keys off error == not_instrumented to show -";
+    // The fabricated all-clear fields that could paint permanent green must be
+    // gone -- their mere presence (even as 0) re-arms the can-never-go-red lie.
+    EXPECT_FALSE(r.contains("connections_per_second"));
+    EXPECT_FALSE(r.contains("potential_ddos"));
+    EXPECT_FALSE(r.contains("blacklisted_ips"));
+    EXPECT_FALSE(r.contains("threat_level"));
+}
