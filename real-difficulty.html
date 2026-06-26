@@ -12,7 +12,7 @@
  a{color:#6c4f9c;} nav{font-family:sans-serif;font-size:.85em;margin:0 0 1.8em;color:#888;} nav a{margin-right:.8em;}
  figure{margin:1.4em 0;text-align:center;} figcaption{font-size:.85em;color:#666;margin-top:.4em;font-style:italic;}
 </style></head><body>
-<nav><a href="./">← Purple Paper</a> · <a href="real-difficulty.html">Real difficulty</a> · <a href="difficulty-adjustment.html">Difficulty adjustment</a> · <a href="taproot-coinbase.html">Taproot coinbase</a></nav><h1>Real difficulty</h1><p class="sub">P2Pool scientific basics</p>
+<nav><a href="./">← Purple Paper</a> · <a href="real-difficulty.html">Real difficulty</a> · <a href="difficulty-adjustment.html">Difficulty adjustment</a> · <a href="taproot-coinbase.html">Taproot coinbase</a> · <a href="bitcoin-leveldb.html">Bitcoin LevelDB</a></nav><h1>Real difficulty</h1><p class="sub">P2Pool scientific basics</p>
 
 <p>The relation between the block hash and the block difficulty target in the Bitcoin blockchain is based on the concept of mining difficulty. The block difficulty target determines the level of computational effort required to mine a block. Here's how the block hash and difficulty target are related:</p>
 
@@ -52,7 +52,7 @@
 </figure>
 <figure>
 <img src="img/real-diff-real.png" alt="achieved difficulty per block, real BTC data" style="max-width:100%;height:auto;border:1px solid #e6e6e6;border-radius:4px">
-<figcaption>The same data on a log scale, recomputed over all 4,032 blocks straight from a full Bitcoin node (difficulty = 1 throughout both epochs, so R = target/hash is each block&rsquo;s own overshoot). The red line is the chain&rsquo;s requirement (R = 1); the dashed line the median (R &asymp; 2). Every block clears R = 1; the protocol asked for none of the height above &mdash; that is pure luck.</figcaption>
+<figcaption>The same data, recomputed over all 4,032 blocks (R = target/hash; difficulty = 1 throughout both epochs, so R is the block&rsquo;s own overshoot). The chain only requires R &ge; 1; the rare spikes are pure luck. Median R &asymp; 2.</figcaption>
 </figure>
 
 <h2>Dividing target by hash</h2>
@@ -79,10 +79,6 @@
 <p>Achieved difficulty is not useless, though: while it cannot <i>weight</i> a payment, the largest achieved difficulties a worker produces can <i>estimate</i> how much total work it did, including work that never met the share target &mdash; so a worker too weak to ever find a share can still be credited for the work it actually performed. <b>Measurement, not payment.</b> This is the foundation of the V37 work-receipt accounting &mdash; see the <a href="./">Purple Paper</a>, &sect;5 (Proof-of-Work as Measurement) and &sect;8 (Recovering Work Below the Order).</p>
 </div>
 
-<figure>
-<img src="img/real-diff-illustrative.png" alt="illustrative overshoot distribution" style="max-width:100%;height:auto;border:1px solid #e6e6e6;border-radius:4px">
-<figcaption>Illustrative (log scale): the overshoot R follows Pr[R &ge; r] = 1/r, whose mean does not converge &mdash; a single lucky hash can dwarf all others. This is why achieved difficulty cannot be a payment weight, only a work estimator.</figcaption>
-</figure>
 <hr style="margin:2.4em 0 1em;border:none;border-top:1px solid #eee">
 <p class="sub">P2Pool scientific basics &mdash; republished and version-controlled. <a href="./">V37 Purple Paper &rarr;</a></p>
 </body></html>

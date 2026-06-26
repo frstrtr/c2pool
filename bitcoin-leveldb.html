@@ -1,0 +1,147 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Bitcoin LevelDB — P2Pool scientific basics</title><style>
+ body{font-family:Georgia,'Times New Roman',serif;max-width:800px;margin:2.2em auto;padding:0 1.2em;color:#1a1a1a;line-height:1.6;font-size:16.5px;background:#fff;}
+ h1{font-size:1.55em;line-height:1.3;margin:0 0 .15em;font-weight:600;} .sub{color:#666;margin:0 0 1.6em;font-size:.92em;}
+ h2{font-size:1.12em;margin:1.7em 0 .45em;font-weight:600;border-bottom:1px solid #e6e6e6;padding-bottom:.2em;}
+ h3{font-size:1.0em;margin:1.2em 0 .35em;font-weight:600;color:#333;}
+ p{margin:0 0 .85em;text-align:justify;} ul{margin:0 0 .85em;padding-left:1.4em;} li{margin:.25em 0;}
+ code{font-family:'SF Mono',Consolas,monospace;font-size:.88em;background:#f4f1f8;padding:.05em .3em;border-radius:3px;}
+ pre{font-family:'SF Mono',Consolas,monospace;font-size:.82em;background:#f7f5fb;border:1px solid #e7e2f0;border-radius:5px;padding:.8em 1em;overflow-x:auto;line-height:1.45;}
+ .v37{background:#faf8fc;border-left:4px solid #6c4f9c;padding:.9em 1.1em;margin:1.5em 0;border-radius:0 4px 4px 0;}
+ .v37 .tag{display:inline-block;background:#6c4f9c;color:#fff;font-family:sans-serif;font-size:.7em;font-weight:700;letter-spacing:.05em;padding:.15em .55em;border-radius:3px;vertical-align:middle;margin-right:.5em;}
+ a{color:#6c4f9c;} nav{font-family:sans-serif;font-size:.85em;margin:0 0 1.8em;color:#888;} nav a{margin-right:.8em;}
+</style></head><body>
+<nav><a href="./">← Purple Paper</a> · <a href="real-difficulty.html">Real difficulty</a> · <a href="difficulty-adjustment.html">Difficulty adjustment</a> · <a href="taproot-coinbase.html">Taproot coinbase</a> · <a href="bitcoin-leveldb.html">Bitcoin LevelDB</a></nav><h1>Bitcoin LevelDB</h1><p class="sub">P2Pool scientific basics — reading block data directly from disk</p>
+
+<p>Bitcoind since 0.8 maintains two databases, the block index (in <code>$DATADIR/blocks/index</code>) and the chainstate (in <code>$DATADIR/chainstate</code>). The block index maintains information for every block, and where it is stored on disk. The chain state maintains information about the resulting state of validation as a result of the currently best known chain.</p>
+
+<h2>Block index key/value pairs</h2>
+<p>Inside the block index, the used key/value pairs are:</p>
+<ul>
+<li><b>'b' + 32-byte block hash</b> &rarr; block index record. Each record stores: the block header; the height; the number of transactions; to what extent this block is validated; in which file, and where in that file, the block data is stored; in which file, and where in that file, the undo data is stored.</li>
+<li><b>'f' + 4-byte file number</b> &rarr; file information record. Each record stores: the number of blocks stored in the block file with that number; the size of the block file (<code>$DATADIR/blocks/blkNNNNN.dat</code>); the size of the undo file (<code>revNNNNN.dat</code>); the lowest and highest height of blocks stored in that file; the lowest and highest timestamp of blocks stored in that file.</li>
+<li><b>'l'</b> &rarr; 4-byte file number: the last block file number used.</li>
+<li><b>'R'</b> &rarr; 1-byte boolean ('1' if true): whether we're in the process of reindexing.</li>
+<li><b>'F' + 1-byte flag name length + flag name string</b> &rarr; 1-byte boolean: various flags. Currently defined flags include <code>'txindex'</code> (whether the transaction index is enabled).</li>
+<li><b>'t' + 32-byte transaction hash</b> &rarr; transaction index record (optional, only if 'txindex' is enabled). Each record stores: which block file number the transaction is stored in; which offset into that file the block is stored at; the offset from the start of that block to where the transaction itself is stored.</li>
+</ul>
+
+<h2>Chain state key/value pairs</h2>
+<ul>
+<li><b>'C' + 32-byte transaction hash + output index length + output index</b> (v0.15 onwards) &rarr; a single UTXO record: whether the transaction was a coinbase; which height block contains it; the scriptPubKey and amount for this unspent output.</li>
+<li><b>'c' + 32-byte transaction hash</b> (pre-v0.14) &rarr; the UTXO record for that transaction (all UTXOs from a single transaction; only present if at least one unspent output remains): the transaction version; whether coinbase; which height block contains it; which outputs are unspent; the scriptPubKey and amount for those unspent outputs.</li>
+<li><b>'B'</b> &rarr; 32-byte block hash: the block hash up to which the database represents the unspent transaction outputs.</li>
+</ul>
+<p>The latest version of bitcoind uses obfuscation of the value in key/value pairs &mdash; you need to XOR with the obfuscation key to get the real value. I won't go into the specific serialization details of the particular records; they're often specially designed to be compact on disk, and not really intended to be easily usable by other applications (LevelDB doesn't support concurrent access from multiple applications anyway). There are several RPC methods for querying data from the databases (<code>getblock</code>, <code>gettxoutsetinfo</code>, <code>gettxout</code>) without needing direct access.</p>
+<p>As you can see, <b>only headers are stored inside this database.</b> The actual blocks and transactions are stored in the block files, which are not databases, but just raw append-only files that contain the blocks in network format. If you just want to access some records, iterate over the keys and stop when you've read enough.</p>
+
+<h2>Parsing a block-index record and its header</h2>
+<pre>import binascii 
+BLOCK_HAVE_DATA = 8 #!&lt; full block available in blk*.dat 
+BLOCK_HAVE_UNDO = 16 #!&lt; undo data available in rev*.dat 
+
+def encode_varint(number):
+    &quot;&quot;&quot;Encodes a non-negative integer using the MSB base-128 scheme.&quot;&quot;&quot;
+    if number &lt; 0:
+        raise ValueError(&quot;Only non-negative integers can be encoded.&quot;)
+    result = []
+    while True:
+        byte = number &amp; 0x7F          # Extract lower 7 bits
+        number &gt;&gt;= 7                  # Shift right by 7
+        if number:
+            byte |= 0x80              # Set high bit for continuation
+        result.append(byte)
+        if number == 0:
+            break
+    return bytes(result)
+
+def decode_varint(stream):
+    &quot;&quot;&quot;Decodes a variable-length integer from the MSB base-128 format.&quot;&quot;&quot;
+    n = 0
+    while True:
+        chData = ord(stream.get(1))
+        n = (n &lt;&lt; 7) | (chData &amp; 0x7F)
+        if chData &amp; 0x80:
+            n += 1
+        else:
+            return n
+
+def read_int(stream, bits):
+    data = stream.get(bits//8)
+    data.reverse()
+    return binascii.b2a_hex(data) if bits &gt; 64 else int(binascii.b2a_hex(data), 16)
+
+class Stream:
+    &quot;&quot;&quot;Class to handle byte stream&quot;&quot;&quot;
+    def __init__(self, hexdata):
+        self.data = bytearray(bytes.fromhex(hexdata))
+        self.data.reverse()
+    def get(self, n):
+        result = self.data[:n]
+        self.data = self.data[n:]
+        return result
+
+class BlockHeader:
+    def __init__(self, stream):
+        self.nVersion       = read_int(stream, 32)
+        self.hashPrev       = read_int(stream, 256)
+        self.hashMerkleRoot = read_int(stream, 256)
+        self.nTime          = read_int(stream, 32)
+        self.nBits          = read_int(stream, 32)
+        self.nNonce         = read_int(stream, 32)
+
+class VarintCBlockIndex:
+    def __init__(self, stream):
+        self.nVer     = decode_varint(stream)
+        self.nHeight  = decode_varint(stream)
+        self.nStatus  = decode_varint(stream)
+        self.nTx      = decode_varint(stream)
+        self.nFile    = decode_varint(stream) if self.nStatus &amp; (BLOCK_HAVE_DATA | BLOCK_HAVE_UNDO) else -1
+        self.nDataPos = decode_varint(stream) if self.nStatus &amp; BLOCK_HAVE_DATA else -1
+        self.nUndoPos = decode_varint(stream) if self.nStatus &amp; BLOCK_HAVE_UNDO else -1
+
+if __name__ == &#x27;__main__&#x27;:
+    data_hex = &#x27;572fe3011b5bede64c91a5338fb300e3fdb6f30a4c67233b997f99fdd518b968b9a3fd65857bfe78b260071900000000001937917bd2caba204bb1aa530ec1de9d0f6736e5d85d96da9c8bba0000000129ffd98136b19a8e00021d00f0833ced8e&#x27;
+    stream = Stream(data_hex)
+    varint_cblockindex = VarintCBlockIndex(stream)
+    block_header = BlockHeader(stream)
+    print(&#x27;varint_cblockindex:&#x27;)
+    print(&#x27;\tnVer = &#x27;,      varint_cblockindex.nVer)
+    print(&#x27;\tnHeight = &#x27;,   varint_cblockindex.nHeight)
+    print(&#x27;\tnStatus = &#x27;,   varint_cblockindex.nStatus)
+    print(&#x27;\tnTx = &#x27;,       varint_cblockindex.nTx)
+    print(&#x27;\tnFile = &#x27;,     varint_cblockindex.nFile)
+    print(&#x27;\tnDataPos = &#x27;,  varint_cblockindex.nDataPos)
+    print(&#x27;\tnUndoPos = &#x27;,  varint_cblockindex.nUndoPos)
+    print(&#x27;block_header:&#x27;)
+    print(&#x27;\tnVersion = &#x27;,       block_header.nVersion)
+    print(&#x27;\thashPrev = &#x27;,       block_header.hashPrev)
+    print(&#x27;\thashMerkleRoot = &#x27;, block_header.hashMerkleRoot)
+    print(&#x27;\tnTime = &#x27;,          block_header.nTime)
+    print(&#x27;\tnBits = &#x27;,          block_header.nBits)
+    print(&#x27;\tnNonce = &#x27;,         block_header.nNonce)</pre>
+<p>I hope this will help...</p>
+
+<h2>Key structure (b + 32-byte block hash)</h2>
+<p>The key for each block index record begins with the letter <b>'b'</b> to distinguish it from other types of entries (e.g. transaction index entries start with 't'). Following the 'b' is the 32-byte (256-bit) hash of the block, a unique identifier. The block hash is typically represented in little-endian byte order in the database.</p>
+
+<h2>Value structure (block index record)</h2>
+<p>Each block index record contains a combination of data:</p>
+<ul>
+<li><b>Block Header</b> &mdash; 80 bytes total: Version (4) · Previous Block Hash (32) · Merkle Root (32) · Timestamp (4) · Bits (difficulty target, 4) · Nonce (4).</li>
+<li><b>Height</b> &mdash; a varint giving the block's height (how many blocks precede it).</li>
+<li><b>Number of Transactions</b> &mdash; a varint for the total transactions in the block.</li>
+<li><b>Validation Status</b> &mdash; a varint of flags: whether block data is fully available (<code>BLOCK_HAVE_DATA</code>), whether undo data is available (<code>BLOCK_HAVE_UNDO</code>).</li>
+<li><b>File Location and Position</b> &mdash; if block data is available: a varint file number (<code>blkXXXXX.dat</code>) and a varint byte offset where the block data starts; if undo data is available: a varint file number (<code>revXXXXX.dat</code>) and a varint byte offset.</li>
+</ul>
+<p><b>Varints:</b> Bitcoin uses varints for space efficiency &mdash; smaller numbers use fewer bytes, so the record size is variable. <b>Data availability:</b> not all block/undo data is in the LevelDB index; the validation-status flags indicate whether the data is present and where to find it in the block files. <b>Endianness:</b> the block hash and the header fields are stored little-endian.</p>
+<p><b>Example (simplified).</b> A record looks like:</p>
+<pre>Key:   b&lt;block_hash&gt;
+Value: &lt;block_header_bytes&gt;&lt;varint_height&gt;&lt;varint_tx_count&gt;&lt;varint_status&gt;
+       &lt;varint_file_num&gt;&lt;varint_data_pos&gt;&lt;varint_undo_file_num&gt;&lt;varint_undo_pos&gt;</pre>
+<p>This record tells you: the block hash; the block header data; the block height; the number of transactions; the block's validation status; and where to find the block data and undo data on disk (if available).</p>
+
+<div class="v37"><span class="tag">V37</span><b>This method, in practice.</b>
+<p>The "only headers in the database; the blocks themselves are raw append-only files" point is exactly what makes direct, daemon-free reads possible. The <a href="real-difficulty.html">Real difficulty</a> chart on this site was sourced precisely this way: rather than query a running node over RPC, we read <code>blocks/blk00000.dat</code> straight off a full node's disk and parsed the 80-byte headers sequentially (magic &rarr; size &rarr; header &rarr; <code>nBits</code> + double-SHA-256 block hash) for the first 4,032 blocks. No RPC, no rate limit, no daemon &mdash; just the raw files this page describes. The same property underpins the V37 work: a node can reconstruct committed state from compact, on-disk records and prove it with log-size Merkle proofs &mdash; see the <a href="./">Purple Paper</a>, &sect;9 (Verifying Payment).</p></div>
+
+<hr style="margin:2.4em 0 1em;border:none;border-top:1px solid #eee"><p class="sub">P2Pool scientific basics — republished and version-controlled. <a href="./">V37 Purple Paper &rarr;</a></p>
+</body></html>
