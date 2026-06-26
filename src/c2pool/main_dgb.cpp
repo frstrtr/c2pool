@@ -305,7 +305,8 @@ int run_node(const core::CoinParams& params, bool testnet,
     }
     std::unique_ptr<dgb::coin::NodeRPC> rpc;
     if (rpc_conf.armed()) {
-        rpc = std::make_unique<dgb::coin::NodeRPC>(&ioc, /*coin=*/nullptr, testnet);
+        rpc = std::make_unique<dgb::coin::NodeRPC>(&ioc, /*coin=*/nullptr, testnet,
+                                                  /*dev_relax_algo_softforks=*/dev_relax_algo_softforks);
         rpc->connect(NetService(rpc_conf.host, rpc_conf.port), rpc_conf.userpass());
         std::cout << "[DGB] external-daemon submit arm ARMED: NodeRPC -> "
                   << rpc_conf.host << ":" << rpc_conf.port
