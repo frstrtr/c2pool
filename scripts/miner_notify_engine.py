@@ -130,8 +130,10 @@ def evaluate(con, sub_for, at=None):
         peak = prev[6] if prev else 0.0
 
         if online:
-            # back-online edge: was known-offline, now producing
-            if p_online == 0:
+            # back-online edge: only after we actually reported the outage.
+            # A sub-threshold blip never fires OFFLINE -> reporting a recovery
+            # from an outage the miner was never told about is a false alert.
+            if p_online == 0 and offline_fired:
                 events.append({"worker": worker, "kind": BACK_ONLINE, "ts": ts,
                                "detail": f"hashrate {hr:.3g} (was offline)"})
             offline_since, offline_fired = None, 0
@@ -386,6 +388,19 @@ def selftest(_args=None):
     e = evaluate(con, sub_for, at=t0 + 41 * 60)
     check([x["kind"] for x in e] == [HASHRATE_DROP], f"expected drop, got {e}")
 
+    # 6b) sub-threshold blip (dark < offline_min so OFFLINE never fired) then
+    #     recovery must stay silent: no false back_online for an unreported outage
+    put(t0 + 50 * 60, "w3", 90.0)
+    evaluate(con, sub_for, at=t0 + 50 * 60)             # w3 first-online: silent
+    put(t0 + 51 * 60, "w3", 0.0)
+    e = evaluate(con, sub_for, at=t0 + 51 * 60)         # 1m dark < 15m threshold
+    check([x for x in e if x["worker"] == "w3"] == [],
+          f"sub-threshold blip should be silent, got {e}")
+    put(t0 + 52 * 60, "w3", 90.0)
+    e = evaluate(con, sub_for, at=t0 + 52 * 60)         # recovered, never alerted
+    check([x for x in e if x["worker"] == "w3"] == [],
+          f"recovery without a prior offline alert must be silent, got {e}")
+
     # 7) quiet-hours suppresses info (back_online) but NOT warn (offline)
     check(in_quiet_hours("22-07", t0) is not None, "quiet parse")
     info_ev = {"worker": "w1", "kind": BACK_ONLINE, "ts": t0, "detail": "d"}
@@ -415,7 +430,7 @@ def selftest(_args=None):
         for f in fails:
             print("  -", f)
         return 1
-    print("SELFTEST OK (9/9)")
+    print("SELFTEST OK (10/10)")
     return 0
 
 
