@@ -29,6 +29,7 @@ inline uint64_t mul128_shift(uint64_t a, uint64_t b, unsigned shift) {
 #include <impl/dgb/coin/desired_version_tally.hpp>  // SSOT: accumulate_version_weights / accumulate_version_counts (#429 follow-on)
 #include "coin/pool_attempts_per_second.hpp"  // SSOT: compute_pool_attempts_per_second (#407 follow-on)
 #include "coin/tail_score_endpoints.hpp"  // SSOT: score_* endpoint arithmetic (ShareTracker::score chain-walk, #411 follow-on)
+#include "coin/chain_walk_window.hpp"  // SSOT: lookbehind clamp (#423 diag follow-on); consensus get_desired_version_weights stays inline
 #include "config_pool.hpp"
 
 #include <core/target_utils.hpp>
@@ -2059,8 +2060,8 @@ public:
     float get_average_stale_prop(const uint256& share_hash, uint64_t lookbehind)
     {
         auto height = chain.get_height(share_hash);
-        auto actual_lookbehind = std::min(static_cast<int32_t>(lookbehind), height);
-        if (actual_lookbehind <= 0)
+        auto actual_lookbehind = dgb::chain_walk_window_count(height, static_cast<int32_t>(lookbehind));
+        if (!dgb::chain_walk_window_active(actual_lookbehind))
             return 0.0f;
 
         float stale_count = 0;
@@ -2081,8 +2082,8 @@ public:
     {
         StaleCounts counts;
         auto height = chain.get_height(share_hash);
-        auto actual_lookbehind = std::min(static_cast<int32_t>(lookbehind), height);
-        if (actual_lookbehind <= 0)
+        auto actual_lookbehind = dgb::chain_walk_window_count(height, static_cast<int32_t>(lookbehind));
+        if (!dgb::chain_walk_window_active(actual_lookbehind))
             return counts;
 
         auto view = chain.get_chain(share_hash, actual_lookbehind);
@@ -2127,8 +2128,8 @@ public:
         if (!chain.contains(share_hash))
             return {};
         auto height = chain.get_height(share_hash);
-        auto actual = std::min(lookbehind, height);
-        if (actual <= 0)
+        auto actual = dgb::chain_walk_window_count(height, lookbehind);
+        if (!dgb::chain_walk_window_active(actual))
             return {};
 
         std::vector<uint64_t> window;
