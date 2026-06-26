@@ -5,8 +5,8 @@
 # TODO(M3): add_library(impl_bch ...) sources, link bitcoin_family shared base,
 # wire embedded BCHN daemon slice under daemon/. Stub only at M2.
 if(COIN_BCH)
-  message(STATUS "c2pool: BCH coin module enabled (skeleton)")
-  # add_subdirectory(coin)
+  message(STATUS "c2pool: BCH coin module enabled")
+  add_subdirectory(coin)
   # add_subdirectory(daemon)
   add_subdirectory(test)
 endif()
