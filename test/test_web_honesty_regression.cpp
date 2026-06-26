@@ -397,3 +397,101 @@ TEST(WebHonestyRegression, VersionSignalingEmptyUntilRealCrossingState) {
     EXPECT_TRUE(mi.rest_version_signaling().empty())
         << "fewer than 10 shares -- no real crossing state, so no banner (honest)";
 }
+
+// ---------------------------------------------------------------------------
+// Charter #2 (per-node truthful topology) regression-lock.
+//
+// rest_node_topology() must reflect THIS node's REAL shape -- config-driven /
+// auto-detected -- never a baked-in coin list, and must NEVER fabricate an
+// embedded-daemon "synced" flag in the auto-detect fallback. The only
+// authoritative sync source is the per-coin StatsProvider hook
+// (m_node_topology_fn): the explorer_chaininfo_fn reports SHARECHAIN height, a
+// different thing, so deriving "synced" from the fallback would re-introduce
+// the founding class of lie (dashboard asserting health it cannot see).
+// ---------------------------------------------------------------------------
+
+// Fallback path (no StatsProvider hook): the primary coin is always present and
+// the object self-labels auto_detected, but it must OMIT "synced" rather than
+// guess it. Omission is honest; a fabricated true/false is the founding lie.
+TEST(WebHonestyRegression, NodeTopologyAutoDetectOmitsSyncedRatherThanGuess) {
+    // Default blockchain is LITECOIN -> node_symbol() == "LTC".
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+    // No node_topology_fn, no coin_peers_fn: the bare auto-detect fallback.
+
+    json t = mi.rest_node_topology();
+
+    EXPECT_EQ(t.value("node_symbol", std::string{}), "LTC")
+        << "primary symbol must come from the node's configured chain, not blank";
+    EXPECT_TRUE(t.value("auto_detected", false))
+        << "fallback must self-label as auto-detected, not silently authoritative";
+    ASSERT_TRUE(t.contains("coins") && t["coins"].is_array());
+
+    bool saw_primary = false;
+    for (const auto& c : t["coins"]) {
+        if (c.value("coin", std::string{}) == "LTC") {
+            saw_primary = true;
+            EXPECT_TRUE(c.value("primary", false));
+            EXPECT_FALSE(c.contains("synced"))
+                << "auto-detect fallback must NOT fabricate an embedded-daemon "
+                   "synced flag -- omit-rather-than-guess (charter #2)";
+        }
+    }
+    EXPECT_TRUE(saw_primary) << "primary chain must always be present";
+}
+
+// The embedded/aux coin set is discovered from the live coin-peer map keys
+// (e.g. an LTC node also running embedded DOGE), uppercased -- the node's REAL
+// shape, never a hardcoded {ltc,doge} assumption.
+TEST(WebHonestyRegression, NodeTopologyAutoDetectsEmbeddedCoinSetFromPeerMap) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+    mi.set_coin_peers_fn([] {
+        return json{
+            {"ltc",  json::array({json{{"addr", "10.0.0.1"}},
+                                    json{{"addr", "10.0.0.2"}}})},
+            {"doge", json::array({json{{"addr", "10.0.0.3"}}})},
+        };
+    });
+
+    json t = mi.rest_node_topology();
+    ASSERT_TRUE(t.contains("coins") && t["coins"].is_array());
+
+    int ltc_peers = -1, doge_peers = -1;
+    bool doge_primary = true;
+    for (const auto& c : t["coins"]) {
+        if (c.value("coin", std::string{}) == "LTC")  ltc_peers = c.value("peers", -1);
+        if (c.value("coin", std::string{}) == "DOGE") {
+            doge_peers = c.value("peers", -1);
+            doge_primary = c.value("primary", false);
+        }
+    }
+    EXPECT_EQ(ltc_peers, 2)  << "primary LTC peer count from the live map, uppercased";
+    EXPECT_EQ(doge_peers, 1) << "embedded DOGE auto-detected from the map, not baked in";
+    EXPECT_FALSE(doge_primary) << "only the configured chain is primary";
+}
+
+// When the wiring layer feeds the per-coin StatsProvider hook, its richer
+// authoritative payload (real per-coin synced/tip) is returned verbatim -- the
+// fallback must not override or strip it.
+TEST(WebHonestyRegression, NodeTopologyPrefersStatsProviderHookWhenWired) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+    mi.set_node_topology_fn([] {
+        return json{
+            {"node_symbol", "LTC"},
+            {"auto_detected", false},
+            {"coins", json::array({
+                json{{"coin", "LTC"}, {"primary", true},
+                     {"peers", 30}, {"synced", true}, {"height", 2710001}},
+            })},
+        };
+    });
+
+    json t = mi.rest_node_topology();
+    EXPECT_FALSE(t.value("auto_detected", true))
+        << "the StatsProvider hook is authoritative, not auto-detected";
+    ASSERT_TRUE(t.contains("coins") && !t["coins"].empty());
+    const auto& ltc = t["coins"][0];
+    EXPECT_TRUE(ltc.contains("synced") && ltc["synced"].get<bool>())
+        << "a real per-coin synced flag from the hook must survive verbatim";
+    EXPECT_EQ(ltc.value("height", 0), 2710001)
+        << "the hook's real embedded-daemon tip must survive verbatim";
+}
