@@ -1,38 +1,80 @@
-<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Real difficulty</title><style>
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Real difficulty &mdash; P2Pool scientific basics</title><style>
  body{font-family:Georgia,'Times New Roman',serif;max-width:780px;margin:2.2em auto;padding:0 1.2em;color:#1a1a1a;line-height:1.6;font-size:17px;background:#fff;}
  h1{font-size:1.55em;line-height:1.3;margin:0 0 .15em;font-weight:600;}
  .sub{color:#666;margin:0 0 1.6em;font-size:.92em;}
  h2{font-size:1.13em;margin:1.7em 0 .45em;font-weight:600;border-bottom:1px solid #e6e6e6;padding-bottom:.2em;}
  h3{font-size:1.0em;margin:1.2em 0 .35em;font-weight:600;color:#333;}
- p{margin:0 0 .9em;text-align:justify;} ul{margin:0 0 .9em;padding-left:1.4em;} li{margin:.2em 0;}
- code,pre{font-family:'SF Mono',Consolas,monospace;font-size:.88em;background:#f4f1f8;border-radius:4px;}
+ p{margin:0 0 .9em;text-align:justify;}
+ code,pre{font-family:'SF Mono',Consolas,monospace;font-size:.9em;background:#f4f1f8;border-radius:4px;}
  code{padding:.05em .3em;} pre{padding:.7em .9em;overflow-x:auto;border:1px solid #e7e2f0;}
  .v37{background:#faf8fc;border-left:4px solid #6c4f9c;padding:.9em 1.1em;margin:1.4em 0;border-radius:0 4px 4px 0;}
  .v37 .tag{display:inline-block;background:#6c4f9c;color:#fff;font-family:sans-serif;font-size:.7em;font-weight:700;letter-spacing:.05em;padding:.15em .55em;border-radius:3px;vertical-align:middle;margin-right:.5em;}
- .imgnote{background:#fff8e6;border:1px dashed #d6b656;padding:.6em .9em;margin:1em 0;font-family:sans-serif;font-size:.85em;color:#7a5d00;border-radius:4px;}
- a{color:#6c4f9c;} nav{font-family:sans-serif;font-size:.85em;margin:0 0 1.8em;color:#888;}
- nav a{margin-right:.8em;}
+ a{color:#6c4f9c;} nav{font-family:sans-serif;font-size:.85em;margin:0 0 1.8em;color:#888;} nav a{margin-right:.8em;}
+ figure{margin:1.4em 0;text-align:center;} figcaption{font-size:.85em;color:#666;margin-top:.4em;font-style:italic;}
 </style></head><body>
 <nav><a href="./">← Purple Paper</a> · <a href="real-difficulty.html">Real difficulty</a> · <a href="difficulty-adjustment.html">Difficulty adjustment</a> · <a href="taproot-coinbase.html">Taproot coinbase</a></nav><h1>Real difficulty</h1><p class="sub">P2Pool scientific basics</p>
 
-<p>A block header carries a compact <b>target</b> in its <code>bits</code> field, expanded as:</p>
-<pre>target = mantissa &times; 2^(8 &times; (exponent &minus; 3))</pre>
-<p>A hash is valid if it is numerically <i>below</i> the target. The <b>achieved</b> (or &ldquo;real&rdquo;) difficulty of a hash is how far below it landed &mdash; the ratio between the maximum target and the hash:</p>
-<pre>R = target &divide; hash</pre>
-<figure style="margin:1.4em 0;text-align:center">
-<img src="img/real-diff-epochs.png" alt="target/real_target across bitcoin epochs" style="max-width:100%;height:auto;border:1px solid #e6e6e6;border-radius:4px">
-<figcaption style="font-size:.85em;color:#666;margin-top:.4em;font-style:italic">target / real_target for epoch_0 (0&ndash;2015) and epoch_1 (2016&ndash;4031) of the Bitcoin blockchain.</figcaption>
-</figure>
-<p>A lower hash gives a higher ratio, indicating a rarer find.</p>
+<p>The relation between the block hash and the block difficulty target in the Bitcoin blockchain is based on the concept of mining difficulty. The block difficulty target determines the level of computational effort required to mine a block. Here's how the block hash and difficulty target are related:</p>
 
-<div class="v37"><span class="tag">V37</span><b>What achieved difficulty is &mdash; and is not &mdash; used for.</b>
-<p>It is tempting to pay miners in proportion to achieved difficulty: &ldquo;you found a rarer hash, you earn more.&rdquo; <b>This is wrong, and provably so.</b></p>
-<p>Achieved difficulty is <b>pure luck</b>. Conditioned on meeting the target, the overshoot <code>R</code> follows a power law, <code>Pr[R &ge; r] = 1/r</code>, whose mean does not converge: a single fortunate hash can exceed the sum of all others by a factor on the order of the whole hash space. Paying by achieved difficulty would let one lucky share take an entire payout window &mdash; re-importing into the pool exactly the variance that pooling exists to remove.</p>
-<p><b>Work is therefore credited by the <i>target</i> a share was required to meet, never by the value its hash happened to reach.</b> Two shares meeting the same target are paid equally. This keeps the accounting <i>luck-neutral</i>.</p>
-<p>Achieved difficulty is not useless &mdash; it carries different information. While it cannot <i>weight</i> a payment, the largest achieved difficulties a worker produces can <i>estimate</i> how much total work it did, including work that never met the share target. So a worker too weak to ever find a share can still be credited in proportion to the work it actually performed. <b>Measurement, not payment.</b></p>
-<p>This is the foundation of the V37 work-receipt accounting &mdash; see the <a href="./">Purple Paper</a>, &sect;5 (Proof-of-Work as Measurement) and &sect;8 (Recovering Work Below the Order).</p>
+<h3>1. Difficulty Target</h3>
+<p>The difficulty target represents a numerical value that determines the difficulty level for mining a block. It is a 256-bit number used to measure the difficulty of finding a block hash that satisfies certain conditions.</p>
+<p>The target difficulty is inversely proportional to the mining difficulty. Higher difficulty values indicate a lower target difficulty, requiring more computational effort to find a valid block hash.</p>
+
+<h3>2. Block Hash</h3>
+<p>The block hash is a 256-bit number obtained by hashing the block header data using the SHA-256 hashing algorithm.</p>
+<p>Miners aim to find a block hash that is below the current difficulty target. In other words, they need to find a hash that is numerically smaller than the target difficulty value.</p>
+
+<h3>3. Mining Difficulty</h3>
+<p>The mining difficulty is calculated based on the target difficulty. It represents the average number of hash calculations required to find a valid block hash.</p>
+<p>Higher difficulty values indicate a lower probability of finding a valid block hash, requiring more computational power and time.</p>
+<p>To check if a block hash satisfies the difficulty target, the hash is compared to the target difficulty value. If the hash is smaller than the target difficulty, it is considered a valid block hash.</p>
+<p>It's important to note that the difficulty target is adjusted periodically (every 2016 blocks in the case of Bitcoin) to maintain the desired block production rate of approximately one block every 10 minutes. The adjustment is made based on the time it took to mine the previous 2016 blocks, as explained in the previous responses.</p>
+<p>The block difficulty target and the block hash are intricately linked in the mining process. Miners continuously generate hashes, searching for a hash that meets the current difficulty target. The search involves adjusting a nonce value in the block header and rehashing the data until a suitable hash is found.</p>
+
+<h2>Target vs. Real Target</h2>
+<p>In the Bitcoin blockchain, the terms &ldquo;target&rdquo; and &ldquo;real target&rdquo; refer to different representations of the difficulty level for mining a block. Here's what each term means:</p>
+
+<h3>1. Target</h3>
+<p>The target, also known as the difficulty target, is a value derived from the &ldquo;bits&rdquo; field in the block header. The &ldquo;bits&rdquo; field encodes the target difficulty as a compact representation.</p>
+<p>The target is a 256-bit number that represents the difficulty level in a compact form. It is used to determine the minimum requirement for a block hash to be considered valid.</p>
+<p>The target difficulty is inversely proportional to the target value. A higher target value represents a lower difficulty level, requiring more computational effort to find a valid block hash.</p>
+
+<h3>2. Real Target</h3>
+<p>The real target, also known as the difficulty target derived from the block hash, is a value calculated from the block hash itself.</p>
+<p>To calculate the real target, the block hash is compared to the maximum target value (2^256 &minus; 1). If the block hash is numerically smaller than the maximum target, the real target is determined as the ratio between the maximum target and the block hash.</p>
+<p>The real target represents the actual difficulty level implied by the block hash. It gives an indication of the relative difficulty of finding that particular block hash.</p>
+<p>The relationship between the target and real target is based on the fact that both represent the difficulty level but in different forms. The target is derived from the block header's &ldquo;bits&rdquo; field, while the real target is calculated from the block hash itself.</p>
+<p>To summarize, the target is the difficulty level encoded in a compact form, while the real target is the difficulty level derived from the actual block hash. The real target is calculated to assess the relative difficulty of finding a particular block hash compared to the maximum target value.</p>
+
+<figure>
+<img src="img/real-diff-epochs.png" alt="target/real_target for epoch_0 and epoch_1 of the bitcoin blockchain" style="max-width:100%;height:auto;border:1px solid #e6e6e6;border-radius:4px">
+<figcaption>target/real_target for epoch_0 (0&ndash;2015) and epoch_1 (2016&ndash;4031) bitcoin blockchain</figcaption>
+</figure>
+
+<h2>Dividing target by hash</h2>
+<p>The division of the block target by the block hash (target/hash) is used to determine the relative difficulty of finding a valid block hash. The target difficulty is represented by a 256-bit number, while the block hash is also a 256-bit number. Here's what the relation between the target and hash represents:</p>
+
+<h3>1. Difficulty Comparison</h3>
+<p>Dividing the target difficulty by the block hash provides a measure of the relative difficulty of finding a valid hash.</p>
+<p>A lower target value will result in a higher difficulty ratio (target/hash), indicating that it is more challenging to find a hash that satisfies the difficulty criteria.</p>
+<p>Conversely, a higher target value will result in a lower difficulty ratio (target/hash), indicating that it is comparatively easier to find a hash that meets the difficulty criteria.</p>
+
+<h3>2. Mining Difficulty</h3>
+<p>The mining difficulty is directly related to the target/hash ratio.</p>
+<p>Higher difficulty ratios indicate higher mining difficulty, requiring more computational effort to find a valid block hash.</p>
+<p>Lower difficulty ratios indicate lower mining difficulty, meaning it requires less computational effort to find a valid block hash.</p>
+<p>The target difficulty is derived from the &ldquo;bits&rdquo; field in the block header, which represents a compact representation of the target. The target is calculated by taking the first three bytes of the bits field as the exponent and the following four bytes as the mantissa. The formula to calculate the target difficulty from the bits field is:</p>
+<pre>target = mantissa * 2^(8 * (exponent - 3))</pre>
+<p>By dividing the target difficulty by the block hash, you get a relative measure of how far the actual block hash is from the target difficulty. A lower value indicates that the block hash is closer to the target, meaning the block was mined with less difficulty. A higher value indicates that the block hash is further from the target, suggesting that more computational effort was required to find a valid block hash.</p>
+<p>This division is useful in understanding the relative efficiency of the mining process and comparing the difficulty of mining between different blocks.</p>
+
+<div class="v37"><span class="tag">V37</span><b>What achieved (&ldquo;real&rdquo;) difficulty is &mdash; and is not &mdash; used for.</b>
+<p>The <i>real target</i> above is the <b>achieved</b> difficulty of a hash &mdash; how far below its target it happened to fall. It is tempting to pay miners in proportion to it: &ldquo;you found a rarer hash, you earn more.&rdquo; <b>This is wrong, and provably so.</b></p>
+<p>Achieved difficulty is <b>pure luck</b>. Conditioned on meeting the target, the overshoot <code>R = target/hash</code> follows a power law, <code>Pr[R &ge; r] = 1/r</code>, whose mean does not converge: a single fortunate hash can exceed the sum of all others by a factor on the order of the whole hash space. Paying by achieved difficulty would let one lucky share take an entire payout window &mdash; re-importing into the pool exactly the variance that pooling exists to remove.</p>
+<p><b>Work is therefore credited by the <i>target</i> a share was required to meet, never by the value its hash happened to reach.</b> Two shares meeting the same target are paid equally &mdash; the accounting stays <i>luck-neutral</i>.</p>
+<p>Achieved difficulty is not useless, though: while it cannot <i>weight</i> a payment, the largest achieved difficulties a worker produces can <i>estimate</i> how much total work it did, including work that never met the share target &mdash; so a worker too weak to ever find a share can still be credited for the work it actually performed. <b>Measurement, not payment.</b> This is the foundation of the V37 work-receipt accounting &mdash; see the <a href="./">Purple Paper</a>, &sect;5 (Proof-of-Work as Measurement) and &sect;8 (Recovering Work Below the Order).</p>
 </div>
 
 <hr style="margin:2.4em 0 1em;border:none;border-top:1px solid #eee">
-<p class="sub">P2Pool scientific basics — republished and version-controlled. <a href="./">V37 Purple Paper &rarr;</a></p>
+<p class="sub">P2Pool scientific basics &mdash; republished and version-controlled. <a href="./">V37 Purple Paper &rarr;</a></p>
 </body></html>
