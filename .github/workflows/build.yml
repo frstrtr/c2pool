@@ -16,7 +16,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   test-allowlist-guard:
     name: Test allowlist drift-guard
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v4
       - name: Check coin test targets vs build.yml --target allowlist
@@ -26,15 +26,16 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   linux:
     name: Linux x86_64
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v6
 
       - name: Install system dependencies
+        if: runner.environment == 'github-hosted'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            g++ cmake make libleveldb-dev libsecp256k1-dev
+            g++ ccache cmake make libleveldb-dev libsecp256k1-dev
 
       - uses: actions/setup-python@v6
         with: { python-version: '3.12' }
@@ -53,14 +54,23 @@ jobs:
           path: ~/.conan2
           key: conan2-ubuntu24-gcc13-${{ hashFiles('conanfile.txt') }}
 
+      # Self-hosted runners reuse the workspace across runs; a stale build_ci/
+      # leaves gtest_discover_tests POST_BUILD artifacts that ctest then
+      # includes as empty/placeholder files ("Unknown CMake command
+      # gtest_discover_tests_impl", ctest exit 8). Wipe it for a clean
+      # configure+discovery. ccache (in ~/.cache/ccache) keeps recompiles fast.
+      - name: Clean stale build dir (self-hosted workspace is reused)
+        if: runner.environment != 'github-hosted'
+        run: rm -rf build_ci
+
       - name: Conan install
         run: conan install . --build=missing --output-folder=build_ci --settings=build_type=Release
 
       - name: Configure
-        run: cmake -S . -B build_ci -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release -DCOIN_DGB=ON
+        run: cmake -S . -B build_ci -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=Release -DCOIN_DGB=ON
 
       - name: Build
-        run: cmake --build build_ci --target c2pool -j$(nproc)
+        run: cmake --build build_ci --target c2pool -j8
 
       - name: Build tests
         run: |
@@ -85,11 +95,11 @@ jobs:
                     dgb_other_tx_assembler_test dgb_reconstruct_won_block_test dgb_reconstruct_closure_test dgb_gentx_unpack_test dgb_work_source_test dgb_template_builder_test dgb_embedded_coin_node_test dgb_embedded_tx_select_test dgb_template_other_txs_test dgb_coinbase_value_parity_test dgb_submit_classify_test dgb_aux_parent_coinbase_parity_test dgb_template_capture_test dgb_aux_doge_db_commitment_bind_test dgb_aux_doge_mm_commitment_test dgb_aux_doge_dc_proof_test dgb_aux_doge_bind_parsers_test dgb_compact_blocks_bip152_parity_test dgb_aux_dual_target_select_test dgb_aux_broadcast_path_election_test \
                     rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test header_chain_test \
                     dgb_coin_node_seam_test dgb_block_broadcast_test dgb_won_block_dispatch_test dgb_forced_won_share_dualpath_test dgb_scrypt_pow_test dgb_nonce_grinder_test dgb_regrind_block_test dgb_won_block_finalize_test dgb_share_target_genesis_test dgb_pool_msg_wire_test dgb_get_shares_walk_test dgb_download_stops_test dgb_think_p1_walk_bounds_test dgb_think_p1_desired_emit_test dgb_think_p6_desired_cutoff_test dgb_think_p4_head_keys_test dgb_think_p3_best_head_test dgb_g1_oracle_byte_parity_test dgb_think_p2_walk_bounds_test dgb_expected_time_to_block_test dgb_tail_score_endpoints_test dgb_pool_attempts_per_second_test dgb_pool_efficiency_test dgb_think_p5_best_share_punish_test dgb_auto_ratchet_tail_guard_test dgb_binomial_conf_interval_test dgb_desired_version_tally_test dgb_get_height_and_last_endpoints_test dgb_chain_walk_window_test dgb_redistribute_delegate_ghal_test dgb_share_weight_decay_test dgb_naughty_propagation_test dgb_hash_format_parity_test v37_test \
-            -j$(nproc)
+            -j8
 
       - name: Run tests
         working-directory: build_ci
-        run: ctest --output-on-failure -j$(nproc) --exclude-regex "LiveTest\."
+        run: ctest --output-on-failure -j8 --exclude-regex "LiveTest\."
 
       - name: Package release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -142,16 +152,17 @@ jobs:
     name: Linux x86_64 (AsAN+UBSan)
     # dash bring-up slices may opt out of sanitizers via dash-skip-sanitizers; KEEP for consensus/payout slices (default = on)
     if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-skip-sanitizers')) }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     continue-on-error: true
     steps:
       - uses: actions/checkout@v6
 
       - name: Install system dependencies
+        if: runner.environment == 'github-hosted'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            g++ cmake make libleveldb-dev libsecp256k1-dev
+            g++ ccache cmake make libleveldb-dev libsecp256k1-dev
 
       - uses: actions/setup-python@v6
         with: { python-version: '3.12' }
@@ -169,6 +180,15 @@ jobs:
         with:
           path: ~/.conan2
           key: conan2-ubuntu24-gcc13-${{ hashFiles('conanfile.txt') }}
+
+      # Self-hosted runners reuse the workspace across runs; a stale build_asan/
+      # leaves gtest_discover_tests POST_BUILD artifacts that ctest then
+      # includes as empty/placeholder files ("Unknown CMake command
+      # gtest_discover_tests_impl", ctest exit 8). Wipe it for a clean
+      # configure+discovery. ccache (in ~/.cache/ccache) keeps recompiles fast.
+      - name: Clean stale build dir (self-hosted workspace is reused)
+        if: runner.environment != 'github-hosted'
+        run: rm -rf build_asan
 
       - name: Conan install
         run: conan install . --build=missing --output-folder=build_asan --settings=build_type=Release
@@ -188,6 +208,7 @@ jobs:
         run: |
           cmake -S . -B build_asan \
             -DCMAKE_TOOLCHAIN_FILE=build_asan/conan_toolchain.cmake \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_BUILD_TYPE=Release \
             -DCOIN_DGB=ON \
             -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize=vptr -fno-omit-frame-pointer -fno-sanitize-recover=undefined -g" \
@@ -218,14 +239,14 @@ jobs:
                     rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test header_chain_test \
                     dgb_coin_node_seam_test dgb_block_broadcast_test dgb_won_block_dispatch_test dgb_forced_won_share_dualpath_test dgb_scrypt_pow_test dgb_nonce_grinder_test dgb_regrind_block_test dgb_won_block_finalize_test dgb_share_target_genesis_test dgb_pool_msg_wire_test dgb_get_shares_walk_test dgb_download_stops_test dgb_think_p1_walk_bounds_test dgb_think_p1_desired_emit_test dgb_think_p6_desired_cutoff_test dgb_think_p4_head_keys_test dgb_think_p3_best_head_test dgb_g1_oracle_byte_parity_test dgb_think_p2_walk_bounds_test dgb_expected_time_to_block_test dgb_tail_score_endpoints_test dgb_pool_attempts_per_second_test dgb_pool_efficiency_test dgb_think_p5_best_share_punish_test dgb_auto_ratchet_tail_guard_test dgb_binomial_conf_interval_test dgb_desired_version_tally_test dgb_get_height_and_last_endpoints_test dgb_chain_walk_window_test dgb_redistribute_delegate_ghal_test dgb_share_weight_decay_test dgb_naughty_propagation_test dgb_hash_format_parity_test test_coin_broadcaster test_multiaddress_pplns test_pplns_stress \
                     v37_test \
-            -j$(nproc)
+            -j8
 
       - name: Run tests under sanitizers
         working-directory: build_asan
         env:
           ASAN_OPTIONS: detect_leaks=0:check_initialization_order=1:strict_string_checks=1:abort_on_error=0
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=0
-        run: ctest --output-on-failure -j$(nproc) --exclude-regex "LiveTest\."
+        run: ctest --output-on-failure -j8 --exclude-regex "LiveTest\."
 
       - name: Upload sanitizer test results on failure
         if: failure()
@@ -249,15 +270,16 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   coin-bch:
     name: COIN_BCH Linux x86_64
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v6
 
       - name: Install system dependencies
+        if: runner.environment == 'github-hosted'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            g++ cmake make libleveldb-dev libsecp256k1-dev
+            g++ ccache cmake make libleveldb-dev libsecp256k1-dev
 
       - uses: actions/setup-python@v6
         with: { python-version: 3.12 }
@@ -276,14 +298,23 @@ jobs:
           path: ~/.conan2
           key: conan2-ubuntu24-gcc13-bch-${{ hashFiles('conanfile.txt') }}
 
+      # Self-hosted runners reuse the workspace across runs; a stale build_bch/
+      # leaves gtest_discover_tests POST_BUILD artifacts that ctest then
+      # includes as empty/placeholder files ("Unknown CMake command
+      # gtest_discover_tests_impl", ctest exit 8). Wipe it for a clean
+      # configure+discovery. ccache (in ~/.cache/ccache) keeps recompiles fast.
+      - name: Clean stale build dir (self-hosted workspace is reused)
+        if: runner.environment != 'github-hosted'
+        run: rm -rf build_bch
+
       - name: Conan install
         run: conan install . --build=missing --output-folder=build_bch --settings=build_type=Release
 
       - name: Configure (-DCOIN_BCH=ON)
-        run: cmake -S . -B build_bch -DCMAKE_TOOLCHAIN_FILE=build_bch/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release -DCOIN_BCH=ON
+        run: cmake -S . -B build_bch -DCMAKE_TOOLCHAIN_FILE=build_bch/conan_toolchain.cmake -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=Release -DCOIN_BCH=ON
 
       - name: Build c2pool-bch binary
-        run: cmake --build build_bch --target c2pool-bch -j$(nproc)
+        run: cmake --build build_bch --target c2pool-bch -j8
 
       - name: Build BCH test targets
         run: |
@@ -302,11 +333,11 @@ jobs:
                     bch_embedded_getwork_test bch_embedded_seam_workview_test \
                     bch_embedded_block_broadcast_test bch_coin_node_seam_test \
                     bch_asert_kat_test \
-            -j$(nproc)
+            -j8
 
       - name: Run BCH tests
         working-directory: build_bch
-        run: ctest --output-on-failure -j$(nproc) -R "^bch_"
+        run: ctest --output-on-failure -j8 -R "^bch_"
 
       - name: Upload test results on failure
         if: failure()
@@ -318,16 +349,17 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   coin-bch-asan:
     name: COIN_BCH Linux x86_64 (AsAN+UBSan)
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     continue-on-error: true
     steps:
       - uses: actions/checkout@v6
 
       - name: Install system dependencies
+        if: runner.environment == 'github-hosted'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            g++ cmake make libleveldb-dev libsecp256k1-dev
+            g++ ccache cmake make libleveldb-dev libsecp256k1-dev
 
       - uses: actions/setup-python@v6
         with: { python-version: 3.12 }
@@ -346,6 +378,15 @@ jobs:
           path: ~/.conan2
           key: conan2-ubuntu24-gcc13-bch-${{ hashFiles('conanfile.txt') }}
 
+      # Self-hosted runners reuse the workspace across runs; a stale build_bch_asan/
+      # leaves gtest_discover_tests POST_BUILD artifacts that ctest then
+      # includes as empty/placeholder files ("Unknown CMake command
+      # gtest_discover_tests_impl", ctest exit 8). Wipe it for a clean
+      # configure+discovery. ccache (in ~/.cache/ccache) keeps recompiles fast.
+      - name: Clean stale build dir (self-hosted workspace is reused)
+        if: runner.environment != 'github-hosted'
+        run: rm -rf build_bch_asan
+
       - name: Conan install
         run: conan install . --build=missing --output-folder=build_bch_asan --settings=build_type=Release
 
@@ -353,6 +394,7 @@ jobs:
         run: |
           cmake -S . -B build_bch_asan \
             -DCMAKE_TOOLCHAIN_FILE=build_bch_asan/conan_toolchain.cmake \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_BUILD_TYPE=Release \
             -DCOIN_BCH=ON \
             -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize=vptr -fno-omit-frame-pointer -fno-sanitize-recover=undefined -g" \
@@ -377,14 +419,14 @@ jobs:
                     bch_embedded_getwork_test bch_embedded_seam_workview_test \
                     bch_embedded_block_broadcast_test bch_coin_node_seam_test \
                     bch_asert_kat_test \
-            -j$(nproc)
+            -j8
 
       - name: Run BCH tests under sanitizers
         working-directory: build_bch_asan
         env:
           ASAN_OPTIONS: detect_leaks=0:check_initialization_order=1:strict_string_checks=1:abort_on_error=0
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=0
-        run: ctest --output-on-failure -j$(nproc) -R "^bch_"
+        run: ctest --output-on-failure -j8 -R "^bch_"
 
       - name: Upload sanitizer test results on failure
         if: failure()
@@ -399,6 +441,9 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   web-static:
     name: Web-static verify
+    # Pin to GitHub-hosted: sub-minute JS job needs no self-hosted compute,
+    # and the puppeteer pixel harness cannot complete page navigation in the
+    # self-hosted runner env (DOMContentLoaded never fires within 15s).
     runs-on: ubuntu-24.04
     defaults:
       run:
@@ -423,17 +468,27 @@ jobs:
 
       - name: Install Chrome for pixel-regression harness
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            google-chrome-stable || \
-          sudo apt-get install -y --no-install-recommends chromium-browser
-          # Export the first one that exists so capture.mjs picks it up.
-          for bin in /usr/bin/google-chrome-stable /usr/bin/google-chrome /usr/bin/chromium /usr/bin/chromium-browser; do
-            if [ -x "$bin" ]; then
-              echo "CHROME_BIN=$bin" >> "$GITHUB_ENV"
-              break
-            fi
-          done
+          # GitHub-hosted: apt google-chrome/chromium is a real .deb and launches.
+          # Self-hosted VM905 only offers snap chromium, which refuses to launch
+          # under the runner systemd cgroup ("not a snap cgroup for tag
+          # snap.chromium.chromium"). Provision a real Chrome-for-Testing build
+          # via @puppeteer/browsers (a puppeteer-core dep, present after npm ci);
+          # it unpacks under ~/.cache/puppeteer with no snap confinement. The
+          # harness already launches with --no-sandbox (tests/visual/capture.mjs).
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            flock /tmp/c2pool-apt.lock bash -e -c '
+              sudo apt-get update -qq
+              sudo apt-get install -y --no-install-recommends google-chrome-stable || \
+              sudo apt-get install -y --no-install-recommends chromium-browser
+            '
+            for bin in /usr/bin/google-chrome-stable /usr/bin/google-chrome /usr/bin/chromium /usr/bin/chromium-browser; do
+              if [ -x "$bin" ]; then echo "CHROME_BIN=$bin" >> "$GITHUB_ENV"; break; fi
+            done
+          else
+            CHROME_BIN="$(npx --yes @puppeteer/browsers install chrome@stable | tail -1 | awk '{print $NF}')"
+            test -x "$CHROME_BIN" || { echo "puppeteer chrome install failed"; exit 1; }
+            echo "CHROME_BIN=$CHROME_BIN" >> "$GITHUB_ENV"
+          fi
 
       - name: Visual pixel-diff harness
         run: npm run visual
@@ -477,7 +532,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   qt-webengine:
     name: Qt WebEngine leak gate
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     # Hard ceiling: orphaned QtWebEngine/Chromium helper children survive
     # the inner `timeout 180`, holding the xvfb pipe open and hanging the
     # job to the 360-min runner default. Cap it so a hung leak gate is
@@ -488,22 +543,24 @@ jobs:
 
       - name: Install Qt6 + WebEngine + xvfb
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            cmake g++ \
-            qt6-base-dev qt6-webengine-dev qt6-webchannel-dev \
-            qt6-tools-dev \
-            libgl1-mesa-dev libegl1-mesa-dev \
-            libxkbcommon-dev libnss3 libxcomposite1 libxdamage1 \
-            libxrandr2 libxtst6 libatk1.0-0 libatk-bridge2.0-0 \
-            libasound2t64 libdrm2 libgbm1 \
-            xvfb
+          flock /tmp/c2pool-apt.lock bash -e -c '
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends \
+              cmake g++ ccache \
+              qt6-base-dev qt6-webengine-dev qt6-webchannel-dev \
+              qt6-tools-dev \
+              libgl1-mesa-dev libegl1-mesa-dev \
+              libxkbcommon-dev libnss3 libxcomposite1 libxdamage1 \
+              libxrandr2 libxtst6 libatk1.0-0 libatk-bridge2.0-0 \
+              libasound2t64 libdrm2 libgbm1 \
+              xvfb
+          '
 
       - name: Configure
-        run: cmake -S ui/c2pool-qt -B build-qt -DC2POOL_QT_BUILD_TESTS=ON
+        run: cmake -S ui/c2pool-qt -B build-qt -DC2POOL_QT_BUILD_TESTS=ON -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build leak harness
-        run: cmake --build build-qt --target c2pool-qt_test_embedded_leak -j$(nproc)
+        run: cmake --build build-qt --target c2pool-qt_test_embedded_leak -j8
 
       - name: Run leak harness under xvfb
         continue-on-error: true
@@ -546,9 +603,10 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
 
   # ════════════════════════════════════════════════════════════════════════════
-  # macOS (matrix: arm64 on GitHub-hosted macos-14, x86_64 on the self-hosted
-  # Intel runner labeled c2pool-mac-intel). The self-hosted lane resolves the
-  # macOS x86_64 CI starvation (#42) — macpro-intel-204 standup 2026-06-16.
+  # macOS (matrix). Both arches self-hosted on push/internal-branch PRs, with
+  # GitHub-hosted fork fallback: arm64 -> Mac-mini-Alonso-227 (c2pool-mac-arm)
+  # else macos-14; x86_64 -> macpro-intel-204 (c2pool-mac-intel). Resolves the
+  # macOS x86_64 CI starvation (#42). sccache caches across self-hosted runs.
   # ════════════════════════════════════════════════════════════════════════════
   macos:
     name: macOS ${{ matrix.arch }}
@@ -560,7 +618,7 @@ jobs:
       matrix:
         include:
           - arch: arm64
-            runner: macos-14
+            runner: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","c2pool-mac-arm"]') || 'macos-14' }}
           - arch: x86_64
             runner: [self-hosted, macOS, X64, c2pool-mac-intel]
     steps:
@@ -583,10 +641,10 @@ jobs:
           fi
 
       - name: Install dependencies
-        run: brew install cmake boost leveldb secp256k1 nlohmann-json yaml-cpp
+        run: brew install cmake boost leveldb secp256k1 nlohmann-json yaml-cpp sccache
 
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
 
       - name: Build
         run: cmake --build build --target c2pool -j$(sysctl -n hw.ncpu)
@@ -636,6 +694,12 @@ jobs:
     name: Windows x86_64
     # dash-slice campaign: skip Windows for PRs carrying the dash-linux-only label (re-enabled at block-viable gate, ~07-01)
     if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-linux-only')) }}
+    # GitHub-hosted windows-2022 (ships cmake + MSVC/VS 2022 + the SDK).
+    # VM217 (c2pool-windows-217) is a bare runner with NO build toolchain yet;
+    # FOLLOW-UP: once vm-fleet installs VS 2022 Build Tools (C++ workload) +
+    # cmake + deps on VM217 and it builds c2pool clean, a follow-up PR flips
+    # this back to the fork-gated self-hosted expr. Linux+macOS already on the
+    # self-hosted fleet on this branch; Windows stays GitHub-hosted meanwhile.
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v6
@@ -716,15 +780,16 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   coin-dgb-auxdoge:
     name: COIN_DGB +AUX_DOGE Linux x86_64
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v6
 
       - name: Install system dependencies
+        if: runner.environment == 'github-hosted'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            g++ cmake make libleveldb-dev libsecp256k1-dev
+            g++ ccache cmake make libleveldb-dev libsecp256k1-dev
 
       - uses: actions/setup-python@v6
         with: { python-version: 3.12 }
@@ -743,14 +808,23 @@ jobs:
           path: ~/.conan2
           key: conan2-ubuntu24-gcc13-dgb-auxdoge-${{ hashFiles('conanfile.txt') }}
 
+      # Self-hosted runners reuse the workspace across runs; a stale build_dgb_auxdoge/
+      # leaves gtest_discover_tests POST_BUILD artifacts that ctest then
+      # includes as empty/placeholder files ("Unknown CMake command
+      # gtest_discover_tests_impl", ctest exit 8). Wipe it for a clean
+      # configure+discovery. ccache (in ~/.cache/ccache) keeps recompiles fast.
+      - name: Clean stale build dir (self-hosted workspace is reused)
+        if: runner.environment != 'github-hosted'
+        run: rm -rf build_dgb_auxdoge
+
       - name: Conan install
         run: conan install . --build=missing --output-folder=build_dgb_auxdoge --settings=build_type=Release
 
       - name: Configure (-DCOIN_DGB=ON -DAUX_DOGE=ON)
-        run: cmake -S . -B build_dgb_auxdoge -DCMAKE_TOOLCHAIN_FILE=build_dgb_auxdoge/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release -DCOIN_DGB=ON -DAUX_DOGE=ON
+        run: cmake -S . -B build_dgb_auxdoge -DCMAKE_TOOLCHAIN_FILE=build_dgb_auxdoge/conan_toolchain.cmake -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=Release -DCOIN_DGB=ON -DAUX_DOGE=ON
 
       - name: Build c2pool-dgb binary (AUX_DOGE seam ON)
-        run: cmake --build build_dgb_auxdoge --target c2pool-dgb -j$(nproc)
+        run: cmake --build build_dgb_auxdoge --target c2pool-dgb -j8
 
       - name: Smoke test (--help)
         run: |
