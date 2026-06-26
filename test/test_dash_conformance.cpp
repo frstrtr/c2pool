@@ -1372,3 +1372,30 @@ TEST(DashConformanceFactory, OverridesNeverTouchConsensusOrIsolation) {
     for (int64_t v : {0, 16, 35, 36})
         EXPECT_EQ(p.donation_script_func(v), ssot.donation_script_func(v));
 }
+
+// ── Threshold-SSOT dedup (dash/version-gate-threshold-ssot) ──────────────────
+// version_negotiation now reads the 60% successor gate and 95% v36-activation
+// signal from NAMED constants instead of bare literals (the #533 dialect-drift
+// fix applied to the version gate). This KAT pins the named constants to their
+// canonical v36-native values so a future edit cannot silently fork the gate,
+// and re-confirms the gates behave byte-identically through the named path.
+TEST(DashVersionGateThresholdSSOT, NamedConstantsArePinned) {
+    using namespace dash::version_negotiation;
+    EXPECT_EQ(UNIFIED_SUCCESSOR_PCT,        60u);  // v36-native successor gate
+    EXPECT_EQ(V36_SIGNAL_ACTIVATION_PCT,    95u);  // v36 weighted-signal activation
+    EXPECT_EQ(CROSSING_SUCCESSOR_FLOOR_PCT, 85u);  // Bucket-3 legacy crossing floor
+}
+
+TEST(DashVersionGateThresholdSSOT, GatesUnchangedThroughNamedPath) {
+    using dash::version_negotiation::successor_switch_allowed;
+    using dash::version_negotiation::v36_active;
+    // 60% successor gate — exact boundary unchanged (uint288 exact-rational).
+    EXPECT_TRUE (successor_switch_allowed({{36u, uint288(60u)}, {16u, uint288(40u)}}, 36u)); // 60/100
+    EXPECT_FALSE(successor_switch_allowed({{36u, uint288(59u)}, {16u, uint288(41u)}}, 36u)); // 59/100
+    // 95% v36 activation signal — exact boundary unchanged.
+    EXPECT_TRUE (v36_active({{36u, uint288(95u)}, {16u, uint288(5u)}}, 36u));  // 95/100
+    EXPECT_FALSE(v36_active({{36u, uint288(94u)}, {16u, uint288(6u)}}, 36u));  // 94/100
+    // 85% crossing floor (3-arg) — unchanged: 84% fails, 85% passes when active.
+    EXPECT_FALSE(successor_switch_allowed({{36u, uint288(84u)}, {16u, uint288(16u)}}, 36u, /*crossing_active=*/true));
+    EXPECT_TRUE (successor_switch_allowed({{36u, uint288(85u)}, {16u, uint288(15u)}}, 36u, /*crossing_active=*/true));
+}

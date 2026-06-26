@@ -36,6 +36,18 @@
 namespace dash::version_negotiation
 {
 
+// -- v36-native consensus thresholds (NAMED, single-sourced within DASH) ------
+// The successor-switch and v36-activation percentages are v36-native SHARED
+// shapes (Bucket-2): semantically identical across btc/dgb/dash. Naming them
+// here lets the gates below read ONE definition instead of re-spelling bare
+// 60 / 95 literals at each call site -- the same dialect-drift #533 removed for
+// the donation script. Hoisting these into core::version_gate as the cross-coin
+// SSOT is a coordinated follow-up (touches btc/dgb call sites); this keeps DASH
+// internally single-sourced now. Values byte-unchanged: 60/95/85 as before.
+inline constexpr unsigned UNIFIED_SUCCESSOR_PCT        = 60; // v36-native successor gate
+inline constexpr unsigned V36_SIGNAL_ACTIVATION_PCT    = 95; // v36 weighted-signal activation
+inline constexpr unsigned CROSSING_SUCCESSOR_FLOOR_PCT = 85; // legacy p2pool-dash crossing floor (Bucket-3)
+
 // PLAIN desired-version tally over the `dist` shares ending at `start_hash`
 // (inclusive, walking back via prev_hash). One vote per share. Mirrors the
 // older p2pool-dash get_desired_version_counts as used by the SUCCESSOR
@@ -104,7 +116,7 @@ successor_switch_allowed(const std::map<uint64_t, uint288>& weights,
     if (total == uint288(0)) return false;
     auto it = weights.find(successor_version);
     const uint288 have = (it == weights.end()) ? uint288(0) : it->second;
-    return have * uint288(100) >= total * uint288(60);
+    return have * uint288(100) >= total * uint288(UNIFIED_SUCCESSOR_PCT);
 }
 
 // -- Bucket-3 crossing FLOOR (PRE-V36 transition-compat; dash-only; REVERSIBLE) --
@@ -119,8 +131,8 @@ successor_switch_allowed(const std::map<uint64_t, uint288>& weights,
 // COMPAT -- per-coin, temporary, dropped after the soak; NOT a standardization
 // target. The unified 60% end state is the 2-arg successor_switch_allowed() above
 // and stays byte-unchanged. integrator ruling (B), 2026-06-26.
-inline constexpr unsigned CROSSING_SUCCESSOR_FLOOR_PCT = 85; // legacy p2pool-dash
-inline constexpr unsigned UNIFIED_SUCCESSOR_PCT        = 60; // v36-native end state
+// (UNIFIED_SUCCESSOR_PCT / CROSSING_SUCCESSOR_FLOOR_PCT are defined once at the
+// top of this namespace -- see the named-threshold block above.)
 
 // Additive overload. When `crossing_active` the successor must hold >= 85% of the
 // weighted tally (lockstep with legacy peers); otherwise it delegates to the
@@ -153,7 +165,7 @@ v36_active(const std::map<uint64_t, uint288>& weights, uint64_t v36_version = 36
     if (total == uint288(0)) return false;
     auto it = weights.find(v36_version);
     uint288 w36 = (it == weights.end()) ? uint288(0) : it->second;
-    return w36 * uint288(100) >= total * uint288(95);
+    return w36 * uint288(100) >= total * uint288(V36_SIGNAL_ACTIVATION_PCT);
 }
 
 // Window helper mirroring Share.check: negotiation looks at the [9/10 .. 10/10]
