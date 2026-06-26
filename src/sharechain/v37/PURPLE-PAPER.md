@@ -1,0 +1,90 @@
+# Work Receipts: A Peer-to-Peer Mining-Reward Accounting System
+
+frstrtr  
+2026
+
+**Abstract.** A purely peer-to-peer mining pool divides a block reward in proportion to recent work without a trusted operator. The accepted solution, a share chain, requires each unit of work to reference the current tip; work that references a stale tip is discarded, though its proof was never false, and only work meeting the share-chain difficulty is counted at all. We propose separating the two functions a share performs, ordering and evidence, so that the chain orders only carriers while work is accounted from self-contained receipts the carriers embed. A receipt is bound, within its own proof of work, to the pool, to the worker who is to be paid, and to a settled block of the underlying chain, so that it cannot be forged, transferred, replayed, or backdated, and it depends on no predecessor. The referenced block acts as a timestamp server, and work is placed in time by when it was performed rather than when it arrived. Time is divided into layered bins — a present that accepts work, a settled past that decays and coarsens, and a reserved future — so that age is at once the order of settlement, the resolution of storage, and the weight of work. The same accounting serves many underlying chains at once, each a lane sharing one set of workers, so a worker mining several chains is one account owed across all. Difficulty achieved beyond a target is unusable as a payment weight but usable as an estimator of work, by which contributions below the consensus difficulty are credited. Accounting is kept separate from payment, so an unbounded number of contributors may be owed while a bounded coinbase pays them in turn. The record is a deterministic function of the underlying chain and is held identically by every node, so participants may join and leave without permission and without loss of owed funds.
+
+## 1. Introduction
+
+Mining pools exist to reduce the variance of mining income. A centralized pool keeps the accounting of recent work on a trusted server, which can misreport, withhold, or fail. A decentralized pool replaces the server with a share chain: a chain of low-difficulty blocks recording who did recent work, among which a found reward is divided. This removes the operator but introduces two problems that have persisted since the share chain was first proposed.
+
+First, a share couples two unrelated functions. It is evidence of work, and it is a position in an order. To take a position it must reference the current tip; if latency causes it to reference a tip no longer current, the share is rejected and its proof of work is discarded with it, although that proof was never false. At low individual hash rate this lost work is a material fraction of the total.
+
+Second, the share-chain difficulty that keeps the chain advancing is also the threshold below which work is not counted. A participant whose hardware rarely meets that threshold is either excluded or paid at a variance that makes participation pointless.
+
+We address both by observing that a unit of work need not be ordered to be counted.
+
+## 2. Receipts
+
+A receipt is a proof of work whose hashed message is bound to the pool and chain, to the worker who is to be paid, and to a settled point of the underlying chain. None of these bindings can be altered without redoing the work, and the receipt is bound to no predecessor: it stands alone, and its order of arrival does not matter.
+
+The chain need not order receipts. We let it order only carriers, which are ordinary shares, and let each carrier embed a bounded number of receipts. A receipt is accounted from inside whatever carrier transmits it. A worker therefore proves work without winning an ordering race. The same receipt presented twice is rejected by a short record of those recently seen; one held back loses its value as its committed block ages; one offered to another pool is invalid there by its binding.
+
+A share that became stale is then simply a receipt whose work met the share target. It is carried in the worker's next share and counted in full. No re-attestation, no branching chain, no per-worker ordering, and no record of orphans is required.
+
+## 3. Time
+
+To account work by when it was performed, a clock is needed that no participant controls. A clock derived from worker-reported time is not such a clock. Each receipt already commits to a block of the underlying chain, which is a distributed timestamp server: its blocks are fixed by proof of work and spaced widely enough that races within the share chain cannot blur them. We account a unit only once its committed block is buried beyond reorganization, and take that block's height as the time of the work. The clock runs a fixed distance behind the present and is the same for every node; no later reorganization moves a time once accounted. Work that arrives late is placed at the time it was done and ages from there, as if it had not been late.
+
+## 4. The Hybrid Evaluation of Time
+
+Time, so taken, is divided into bins. The recent bins are open: the present, accepting on-time work and the receipts that credit work already done. As a bin ages it is settled — frozen into an immutable past — and thereafter held more coarsely the older it grows. The bins not yet reached are the future, kept as a reserved slot and excluded from payment. This layered placement of work in time, on a clock taken from the underlying chain, is the hybrid evaluation: one structure serves at once as the order of settlement, the resolution of storage, and the measure of age. A unit's weight falls with the age of its own bin, so recent work weighs more than old; and because a unit is placed by the time it was performed, late work decays exactly as if it had never been late, which accounting by time of arrival cannot do.
+
+## 5. Proof-of-Work as Measurement
+
+A hash below a target is a proof of expected work. We take the work of a unit to be a function of the target it was required to meet, not of the value its hash reached, so that two units meeting the same target are credited equally and the accounting is neutral to luck. The amount by which a hash falls below its target is information of a different kind. It can be shown that this quantity cannot serve as a payment weight — a single fortunate hash would dominate a reward, defeating the variance reduction that is the purpose of pooling — yet it serves as an unbiased estimator of the total work a worker performed.
+
+## 6. Accounting
+
+We account work in a window of recent time. Each unit contributes its work value, reduced by a decay in the age of its bin, so that a worker who stops contributing fades from the window. The accounting is maintained so that a unit, once recorded, is not recomputed as time passes: adding work takes constant time, and the divided reward is read in time proportional to the number of active workers, not to the length of the window. All arithmetic is integer and truncating, in fixed point, applied in the order the work was performed, so the result is a function of the chain alone and is identical on every node.
+
+The window is denominated in time, not in a count of shares, and it widens as the pool's share of the network's work falls, so that a pool which finds blocks rarely keeps enough work in view to pay steadily, and narrows as that share rises. Its width is set only from the underlying chain's own difficulty and the pool's demonstrated work, quantities no participant can inflate. Value matures with the age of the work that earned it: weight aged across the settled past is full, while a fresh burst is discounted. A worker who contributes steadily is credited in full, while one who mines only briefly, to depart, is not — without any judgement of identity, from the committed times alone.
+
+## 7. Many Chains
+
+A pool need not serve a single chain. One accounting serves many underlying chains at once, each held as a separate lane and all sharing one set of workers. A unit of work is credited against the target of every chain it satisfies, each evaluated against that chain's own difficulty, so a worker who mines several chains at once is credited on each and penalised on none. Work done under unlike proof-of-work functions is made comparable by counting each unit as the work its target expected, so chains of different difficulty and different function meet in one record under one identity. A worker is thus a single account owed across every chain it serves, and a chain may be added or retired without disturbing the others.
+
+## 8. Recovering Work Below the Order
+
+Section 2 recovers work that met the share target but lost its position. We now credit work that never met it. Between shares a worker produces many hashes meeting a low difficulty used to measure its rate, ordinarily discarded. We retain a bounded number of its best and carry them as receipts; by the estimator of Section 5 they measure the worker's total work. We use the estimate only where a worker's shares do not already account for its work: a worker that meets the target often is credited by its shares, and a worker that rarely or never meets it is credited the estimate. No hash is counted twice, and the noisy estimate never displaces an exact account. The threshold below which a worker was invisible is removed for accounting while retained for ordering: carriers still meet the share target, and the chain still advances at a steady rate.
+
+## 9. Paying Many from a Small Coinbase
+
+The reward is paid in the coinbase of a found block, of bounded size, which cannot contain an output for every worker. We separate accounting from payment. The decayed weights of Section 6 give each worker's share of the current reward; a second record holds the amount owed to each worker, which only grows as rewards are divided and only shrinks when a payment is made. It is committed with the rest of the state, held by every node, and may owe any number of workers at no cost in coinbase space. A reward enters the owed record, and a payment leaves it, only once the relevant block is buried beyond reorganization, so a block orphaned before then need never be undone and no amount is paid twice. When a block is found, the coinbase pays the owed amounts above a minimum, largest first and in canonical order so that every node selects the same set, until a fixed budget of outputs is reached; the rest are carried forward. A small balance grows across blocks until it is paid as a single output. No worker is paid in dust, and none is excluded; payment is deferred, not denied.
+
+## 10. Settlement Beyond the Coinbase
+
+Because each unit is accounted as provable work, and the record is identical on every node and committed to the underlying chain, the work a worker has delivered is a quantity any party may verify without trust. A worker may therefore contract to deliver work to another, the delivery measured by the record itself and credited to the other's account, with no operator and no market-maker standing between them. The long tail of balances too small to pay in a block need not only wait in the queue of the previous section; it may settle through such exchange beside the block, so that the coinbase carries the present while accumulated and contracted work settles alongside it.
+
+## 11. Other Uses
+
+The standing work that earns a reward can price other scarce things. A worker may carry a signed message in its own share; its right to be carried, and to remain visible, follows from the work that worker holds in the window, so that the resource which pays for a message is hashing and nothing else, and a message fades as its author's work decays, with no operator to permit or refuse it. Whatever can be priced in standing work may be carried the same way.
+
+## 12. Reclaiming Space
+
+The window of recent work is small, but the complete record would grow without bound. The settled past of Section 4 is held in levels, each covering a span a fixed multiple longer than the level below it. The total work and the per-worker composition of each summary are preserved exactly; only the ability to address a single unit within a summary, and only for old work, is given up. The whole history of a chain is held in a number of summaries that grows with the logarithm of its age, in a few megabytes, while the exact divided reward of any past span remains recoverable.
+
+## 13. Verifying Payment
+
+The committed state is the root of a Merkle tree whose leaves are the workers' balances and the summaries of Section 12, and the root is committed in the coinbase of the underlying chain, fixed by that chain's proof of work. A device holding only the headers of the underlying chain can verify a balance, without holding the share chain, by following the headers to the committed root and the root to the leaf, with a proof whose size grows with the logarithm of the number of workers.
+
+## 14. Network
+
+The record, the window, and the balances are a function of the share chain and nothing else; every node computes the same record, so no node holds anything uniquely. A node that leaves removes one of many identical copies; a node that joins needs no permission and reconstructs the record from the chain, or from its recent part and the committed root. A worker that leaves has its weight in the window decay and evict, while whatever it has earned remains owed and whatever it has done remains in the summarized history. Nothing honest is lost to the coming and going of nodes or of workers.
+
+## 15. Incentive
+
+A worker cannot forge a receipt, for a receipt is itself proof of work; nor transfer one, for the payee is inside the hashed message; nor replay one, for receipts are deduplicated within the window in which they are valid; nor backdate one, for the committed block fixes its time and expires it. It cannot inflate its estimate, for the estimate is read from its own committed hashes. It gains nothing by withholding a good share to report it only as a receipt, for the credit is the same while the share could also have advanced the chain; and it gains nothing by mining briefly to depart, for value matures with age and its fresh weight is discounted. The honest strategy, to work continuously and transmit one's receipts, is the one that maximizes pay.
+
+## 16. Conclusion
+
+We have proposed a system for accounting the work of a decentralized mining pool that does not discard honest work. We separated ordering from evidence, so the chain orders carriers while work is accounted from self-contained receipts; we used the underlying chain as a timestamp server and placed work in layered bins of time, so work is accounted by when it was performed and ages soundly; we let one accounting serve many chains under one identity, and let delivered work be verified and settled beside the block as well as within it; we showed that achieved difficulty cannot weigh a payment but can estimate work, so work below the ordering difficulty is credited; we separated accounting from payment, so an unbounded set of workers is owed while a bounded coinbase pays them in turn; and we made the record a function of the chain, held identically by every node, so participants join and leave without permission and without loss of owed funds. The work that was discarded was never false, and it is kept.
+
+## References
+
+[1] S. Nakamoto, "Bitcoin: A Peer-to-Peer Electronic Cash System," 2008.  
+[2] F. Voight, "p2pool: a peer-to-peer Bitcoin mining pool," 2011.  
+[3] A. Back, "Hashcash — a denial of service counter-measure," 2002.  
+[4] R. C. Merkle, "Protocols for public key cryptosystems," in Proc. IEEE Symposium on Security and Privacy, 1980.  
+[5] M. Rosenfeld, "Analysis of Bitcoin pooled mining reward systems," 2011.

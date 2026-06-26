@@ -16,6 +16,9 @@ products:
 - **Hashrate marketplace + DEX** — spot matching and a settlement venue for hashrate, bound to block
   templates so a delivery is self-proving.
 
+
+> **Purple paper.** A strict, Satoshi-style technical paper stating the architecture and properties of the system is in [`PURPLE-PAPER.md`](PURPLE-PAPER.md). The full formal specification is maintained separately and is not reproduced here.
+
 ## Core principles (the *what*, not the *how*)
 - **Operatorless & deterministic.** All payout-affecting state is consensus-committed in the sharechain and
   bit-reproducible — no central server, no off-chain database.
