@@ -51,7 +51,7 @@ concurrency:
 
 jobs:
   evaluate:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     steps:
       - name: Evaluate gate and merge if green and authorized
         env:
