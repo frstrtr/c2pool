@@ -665,6 +665,19 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_share_target_genesis_test "" AUTO)
 
+    # dgb_share_bits_oracle_pin_test: FENCED Phase-B KAT. Pins the sharechain
+    # `bits` (compact FloatingInteger) encoding against LITERAL goldens from the
+    # oracle reference encoder (data.py from_target_upper_bound), removing the
+    # SUT-vs-SUT circularity in dgb_share_target_genesis_test. MUST also be in
+    # the build.yml --target allowlist (#143).
+    add_executable(dgb_share_bits_oracle_pin_test share_bits_oracle_pin_test.cpp)
+    target_link_libraries(dgb_share_bits_oracle_pin_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_share_bits_oracle_pin_test "" AUTO)
+
     # dgb_g1_oracle_byte_parity_test: FENCED greenlight-gate G1 KAT. Pins the
     # assembled make_coin_params() net/consensus constants AND bucket-1
     # isolation primitives (PREFIX/IDENTIFIER) against oracle-transcribed
