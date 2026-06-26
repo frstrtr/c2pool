@@ -193,3 +193,42 @@ TEST(BTC_AutoRatchetSim, C4_StatePersistsAcrossRestart)
     EXPECT_EQ(vote, 36);
     std::remove(path.c_str());
 }
+
+// ---------------------------------------------------------------------------
+// SSOT step-2 / #1 standardization target — ORACLE FLOOR vs INLINE CEIL.
+//
+// p2pool oracle (data.py share-acceptance) valid threshold is the FLOOR form:
+//     counts.get(VERSION,0) >= sum(counts)*60//100            # floor
+// The BTC inline tail-guard (auto_ratchet.hpp:169, replicated as
+// inline_tail_ok above) is the algebraic CEIL form at the boundary:
+//     target*100 >= total*60   <=>   target >= ceil(total*60/100).
+// When (total*60) % 100 != 0, floor < ceil, so the ORACLE latches up to one
+// share EARLIER than our form. This KAT PINS that divergence at a non-integral
+// boundary (total=101 => total*60 = 6060, 6060 % 100 = 60 != 0):
+//     floor(6060/100) = 60   (oracle: target=60 PASSES)
+//     ceil (6060/100) = 61   (inline: target=60 HOLDS)
+// The EXPECT_FALSE on the inline form is the STANDARDIZATION SEAM: it flips to
+// PASS only when the core-SSOT floor adoption lands (EXCEPTIONAL/operator-tap
+// gated). Until then it locks the gap as PROVEN, not asserted. The integral
+// control (total=100) shows the two forms AGREE when the boundary is exact, so
+// the divergence is the %100 remainder alone. Consensus surface UNCHANGED.
+// ---------------------------------------------------------------------------
+TEST(BTC_AutoRatchetSim, SSOT2_OracleFloorVsInlineCeilBoundary)
+{
+    // Oracle floor predicate: target >= floor(total*60/100).
+    auto oracle_floor_ok = [](const uint288& target, const uint288& total) {
+        return !(target < ((total * static_cast<uint32_t>(60))
+                           / static_cast<uint32_t>(100)));
+    };
+
+    // Integral-boundary control (total=100): floor==ceil==60, forms AGREE.
+    EXPECT_EQ(oracle_floor_ok(uint288(60), uint288(100)),
+              inline_tail_ok (uint288(60), uint288(100)));
+
+    const uint288 total(101);                            // 101*60 = 6060, %100 = 60
+    EXPECT_TRUE (oracle_floor_ok(uint288(60), total));   // oracle: latches at 60
+    EXPECT_FALSE(inline_tail_ok (uint288(60), total));   // inline: holds until 61
+    // One share later the two forms re-converge.
+    EXPECT_TRUE (oracle_floor_ok(uint288(61), total));
+    EXPECT_TRUE (inline_tail_ok (uint288(61), total));
+}
