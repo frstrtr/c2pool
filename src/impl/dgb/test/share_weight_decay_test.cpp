@@ -85,3 +85,87 @@ TEST(DgbWeightDecay, DecayedAttemptsZeroAndIdentity) {
     EXPECT_EQ(wd::decayed_attempts(0, wd::DECAY_SCALE), uint64_t(0));
     EXPECT_EQ(wd::decayed_attempts(12345, wd::DECAY_SCALE), uint64_t(12345)); // x1.0
 }
+
+// ===================================================================
+// #450 VALUE-INVARIANCE KAT -- proves the share_tracker.hpp rewire onto
+// the SSOT is byte-identical to the prior open-coded arithmetic.
+//
+// Each of the three rewired sites (init_decay_table, get_v36_decayed_
+// cumulative_weights, dump_v36_pplns_walk) previously computed:
+//     half_life = max(chain_length / 4, 1)
+//     decay_per = SCALE - (SCALE * 693147) / (1e6 * half_life)
+//     decay_fp_{d+1} = mul128_shift(decay_fp_d, decay_per, 40)
+//     decayed_att   = (att * decay_fp) >> 40
+// inline. The rewire routes half_life/decay_per/constants through the SSOT
+// while leaving the mul128_shift decay_fp walk + the uint288 hot-path
+// widening open-coded (the consensus/wire bytes). This KAT re-evaluates
+// the FULL decayed-cumulative-weight vector via the OLD literal expressions
+// and via the SSOT helpers over a depth + chain-length sweep and asserts
+// equality -- the proof the merge needs.
+//
+// mul128_shift is reproduced verbatim from share_tracker.hpp; it is the
+// SAME function on both arms (unchanged by the rewire), so it cancels and
+// the comparison isolates exactly what moved into the SSOT.
+namespace {
+inline uint64_t mul128_shift_ref(uint64_t a, uint64_t b, unsigned shift) {
+    return static_cast<uint64_t>((static_cast<__uint128_t>(a) * b) >> shift);
+}
+
+// OLD open-coded constants (pre-rewire literals).
+constexpr uint64_t OLD_SCALE = uint64_t(1) << 40;
+constexpr uint64_t OLD_LN2   = 693147;
+inline uint32_t old_half_life(uint32_t cl) { return std::max(cl / 4, uint32_t(1)); }
+inline uint64_t old_decay_per(uint32_t cl) {
+    return OLD_SCALE - (OLD_SCALE * OLD_LN2) / (uint64_t(1000000) * old_half_life(cl));
+}
+} // namespace
+
+TEST(DgbWeightDecay, RewireConstantsValueInvariant) {
+    for (uint32_t cl : {8640u, 2880u, 3600u, 720u, 100u, 8u, 4u, 3u, 1u, 0u}) {
+        EXPECT_EQ(old_half_life(cl), wd::half_life(cl)) << "half_life cl=" << cl;
+        EXPECT_EQ(old_decay_per(cl), wd::decay_per_share(cl)) << "decay_per cl=" << cl;
+        EXPECT_EQ(wd::DECAY_SCALE, OLD_SCALE);
+        EXPECT_EQ(wd::DECAY_PRECISION, 40u);
+    }
+}
+
+// Full decayed-cumulative-weight vector: old expressions vs SSOT helpers.
+TEST(DgbWeightDecay, DecayedCumulativeWeightVectorInvariant) {
+    for (uint32_t cl : {8640u, 2880u, 720u, 4u}) {
+        const uint64_t old_per = old_decay_per(cl);
+        const uint64_t new_per = wd::decay_per_share(cl);
+        ASSERT_EQ(old_per, new_per);
+
+        uint64_t old_fp = OLD_SCALE;
+        uint64_t new_fp = wd::DECAY_SCALE;
+        uint64_t old_cum_addr = 0, new_cum_addr = 0;
+        uint64_t old_cum_total = 0, new_cum_total = 0;
+
+        const int depths = 64;
+        for (int d = 0; d < depths; ++d) {
+            for (uint64_t att : {uint64_t(65535), uint64_t(1000), uint64_t(7), uint64_t(0)}) {
+                for (uint32_t don : {0u, 1u, 100u, 65535u}) {
+                    uint64_t old_dec = (att * old_fp) >> 40;
+                    uint64_t old_addr = old_dec * (65535 - don);
+                    uint64_t old_don  = old_dec * don;
+                    uint64_t new_dec = wd::decayed_attempts(att, new_fp);
+                    uint64_t new_addr = new_dec * (65535 - don);
+                    uint64_t new_don  = new_dec * don;
+
+                    EXPECT_EQ(old_dec, new_dec) << "cl=" << cl << " d=" << d << " att=" << att;
+                    EXPECT_EQ(old_addr, new_addr);
+                    EXPECT_EQ(old_don, new_don);
+
+                    old_cum_addr += old_addr; new_cum_addr += new_addr;
+                    old_cum_total += old_addr + old_don;
+                    new_cum_total += new_addr + new_don;
+                }
+            }
+            old_fp = mul128_shift_ref(old_fp, old_per, 40);
+            new_fp = mul128_shift_ref(new_fp, new_per, 40);
+            ASSERT_EQ(old_fp, new_fp) << "decay_fp drift cl=" << cl << " d=" << d;
+        }
+        EXPECT_EQ(old_cum_addr, new_cum_addr)   << "cumulative addr weight cl=" << cl;
+        EXPECT_EQ(old_cum_total, new_cum_total) << "cumulative total weight cl=" << cl;
+    }
+}
