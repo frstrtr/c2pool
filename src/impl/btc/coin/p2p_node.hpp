@@ -84,6 +84,10 @@ private:
     // Last compact block we SENT — cached to serve getblocktxn requests
     BlockType m_sent_cmpct_block;
     uint256   m_sent_cmpct_hash;
+    // Last full block we RELAYED — cached raw bytes + hash to serve a
+    // follow-up getdata(MSG_BLOCK / MSG_WITNESS_BLOCK) from our single peer.
+    std::vector<unsigned char> m_served_block_bytes;
+    uint256                    m_served_block_hash;
     // External mempool for compact block tx matching
     Mempool* m_mempool{nullptr};
 
@@ -366,6 +370,9 @@ public:
                 // Cache the full block so we can serve getblocktxn requests.
                 m_sent_cmpct_block = std::move(block);
                 m_sent_cmpct_hash  = blockhash;
+                // Also cache raw bytes so a getdata(MSG_BLOCK) fallback (peer
+                // failed compact reconstruction) can be served the full body.
+                cache_served_block(block_bytes);
 
                 LOG_INFO << "[" << m_chain_label << "] Sent compact block "
                          << blockhash.GetHex()
@@ -393,12 +400,34 @@ public:
     bool submit_block_full(const std::vector<unsigned char>& block_bytes)
     {
         if (!m_peer) return false;
+        // Cache before relay so a follow-up getdata for the body can be served
+        // (single-peer bitcoind drops the won block otherwise — no RPC path here).
+        cache_served_block(block_bytes);
         PackStream ps(block_bytes);
         auto rmsg = std::make_unique<RawMessage>("block", std::move(ps));
         m_peer->write(rmsg);
         LOG_INFO << "[" << m_chain_label << "] Sent full block message ("
                  << block_bytes.size() << " bytes) to " << m_target_addr.to_string();
         return true;
+    }
+
+    /// Cache the raw bytes + hash of the block we just relayed, so the getdata
+    /// handler can serve the body on a subsequent MSG_BLOCK / MSG_WITNESS_BLOCK
+    /// request. Additive: no effect on the relay itself.
+    void cache_served_block(const std::vector<unsigned char>& block_bytes)
+    {
+        m_served_block_bytes = block_bytes;
+        m_served_block_hash  = uint256();
+        try {
+            PackStream hp(block_bytes);
+            BlockHeaderType hdr;
+            hp >> hdr;
+            auto packed_hdr = pack(hdr);
+            m_served_block_hash = Hash(packed_hdr.get_span());
+        } catch (const std::exception& e) {
+            LOG_WARNING << "[" << m_chain_label
+                        << "] cache_served_block: header hash failed: " << e.what();
+        }
     }
 
     //[x][x][x] void handle_message_version(std::shared_ptr<coind::messages::message_version> msg, CoindProtocol* protocol); //
@@ -965,8 +994,33 @@ private:
 
     ADD_P2P_HANDLER(getdata)
     {
-        // Peer requesting data from us — we don't serve blocks/txs
-        LOG_DEBUG_COIND << "Peer getdata with " << msg->m_requests.size() << " items (ignored)";
+        // Serve the body of our most-recently-relayed block on demand. After
+        // our inv/compact announcement bitcoind requests it via
+        // getdata(MSG_BLOCK) or getdata(MSG_WITNESS_BLOCK); without serving it
+        // the single c2pool peer never delivers the body and bitcoind drops the
+        // won block ("Timeout downloading block, disconnecting"). Witness and
+        // non-witness requests collapse via base_type(); the cached bytes are
+        // the exact relayed block (hash-identical). Other inv kinds (tx, ...)
+        // remain unserved.
+        size_t served = 0;
+        for (const auto& req : msg->m_requests) {
+            if (req.base_type() != inventory_type::block) continue;
+            if (m_served_block_bytes.empty() || req.m_hash != m_served_block_hash) {
+                LOG_DEBUG_COIND << "[" << m_chain_label << "] getdata(block) for unknown "
+                                << req.m_hash.GetHex() << " — ignoring";
+                continue;
+            }
+            PackStream ps(m_served_block_bytes);
+            auto rmsg = std::make_unique<RawMessage>("block", std::move(ps));
+            m_peer->write(rmsg);
+            ++served;
+            LOG_INFO << "[" << m_chain_label << "] Served full block via getdata "
+                     << req.m_hash.GetHex() << " (" << m_served_block_bytes.size()
+                     << " bytes)";
+        }
+        if (served == 0)
+            LOG_DEBUG_COIND << "[" << m_chain_label << "] Peer getdata with "
+                            << msg->m_requests.size() << " items (none served)";
     }
 
     ADD_P2P_HANDLER(getblocks)
