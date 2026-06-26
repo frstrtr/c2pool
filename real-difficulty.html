@@ -79,6 +79,10 @@
 <p>Achieved difficulty is not useless, though: while it cannot <i>weight</i> a payment, the largest achieved difficulties a worker produces can <i>estimate</i> how much total work it did, including work that never met the share target &mdash; so a worker too weak to ever find a share can still be credited for the work it actually performed. <b>Measurement, not payment.</b> This is the foundation of the V37 work-receipt accounting &mdash; see the <a href="./">Purple Paper</a>, &sect;5 (Proof-of-Work as Measurement) and &sect;8 (Recovering Work Below the Order).</p>
 </div>
 
+<figure>
+<img src="img/real-diff-illustrative.png" alt="illustrative overshoot distribution" style="max-width:100%;height:auto;border:1px solid #e6e6e6;border-radius:4px">
+<figcaption>Illustrative: the overshoot R follows Pr[R &ge; r] = 1/r, whose mean does not converge &mdash; a single lucky hash can dwarf all others. This is why achieved difficulty cannot be a payment weight, only a work estimator.</figcaption>
+</figure>
 <hr style="margin:2.4em 0 1em;border:none;border-top:1px solid #eee">
 <p class="sub">P2Pool scientific basics &mdash; republished and version-controlled. <a href="./">V37 Purple Paper &rarr;</a></p>
 </body></html>
