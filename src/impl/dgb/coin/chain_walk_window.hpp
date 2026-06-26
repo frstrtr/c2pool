@@ -40,11 +40,14 @@
 //
 // Per-coin isolation: dgb/ only. Header-only, additive, free functions over the
 // already-resolved (height, lookbehind) pair -- the get_chain skip-list walk
-// stays in the forest. This slice does NOT rewire share_tracker.hpp; the four
-// call sites keep their inline std::min/(actual<=0) guards. That byte-identity
-// delegation is the follow-on (mirrors #414 redistribute rewire). The lifted
-// body is a verbatim copy of the inline clamp (same int32_t height, same
-// std::min, same <=0 comparison), so the follow-on is provably value-identical.
+// stays in the forest. Delegation follow-on (mirrors #414 redistribute rewire):
+// the two desired_version accessors -- get_desired_version_counts AND the
+// consensus get_desired_version_weights (60%-by-work switch-gate input) -- now
+// route their clamp through these helpers; get_average_stale_prop /
+// get_stale_counts keep their inline std::min/(actual<=0) guards pending their
+// own follow-on. The lifted body is a verbatim copy of the inline clamp (same
+// int32_t height, same std::min, same <=0 comparison), proven value-identical by
+// DgbChainWalkWindow.DelegationMatchesPreDelegationInline over a dense matrix.
 // Consensus-neutral: pure arithmetic, no value semantics changed.
 
 #include <algorithm>
