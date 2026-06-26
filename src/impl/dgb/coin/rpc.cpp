@@ -241,6 +241,23 @@ bool NodeRPC::check()
 	if (blockchaininfo.contains("bip9_softforks"))
 		dgb::coin::collect_softfork_names(blockchaininfo["bip9_softforks"], softforks_supported);
 
+	// DigiByte Core 8.26.2 (Bitcoin Core 26 base) no longer reports softfork
+	// status under getblockchaininfo["softforks"]; it moved to the dedicated
+	// getdeploymentinfo RPC. Read it when the legacy fields are absent so the
+	// readiness gate sees the real deployment set on Core-26 daemons (whose
+	// young chains otherwise expose only csv/segwit via GBT rules).
+	if (softforks_supported.empty())
+	{
+		try
+		{
+			dgb::coin::collect_deployment_names(getdeploymentinfo(), softforks_supported);
+		}
+		catch (const std::exception&)
+		{
+			// Older daemons lack getdeploymentinfo; fall through to GBT rules.
+		}
+	}
+
 	// Fallback for daemons that don't populate getblockchaininfo softfork fields.
 	if (softforks_supported.empty())
 	{
@@ -425,6 +442,11 @@ nlohmann::json NodeRPC::getnetworkinfo()
 nlohmann::json NodeRPC::getblockchaininfo()
 {
 	return CallAPIMethod("getblockchaininfo");
+}
+
+nlohmann::json NodeRPC::getdeploymentinfo()
+{
+	return CallAPIMethod("getdeploymentinfo");
 }
 
 nlohmann::json NodeRPC::getmininginfo()

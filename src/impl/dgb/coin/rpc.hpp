@@ -97,6 +97,7 @@ public:
     nlohmann::json getblocktemplate(std::vector<std::string> rules);
     nlohmann::json getnetworkinfo();
 	nlohmann::json getblockchaininfo();
+	nlohmann::json getdeploymentinfo();
 	nlohmann::json getmininginfo();
 	// verbose: true -- json result, false -- hex-encode result;
 	nlohmann::json getblockheader(uint256 header, bool verbose = true);
