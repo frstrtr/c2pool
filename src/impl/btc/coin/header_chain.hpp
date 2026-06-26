@@ -234,6 +234,11 @@ struct BTCChainParams {
         // Regtest genesis (Bitcoin Core CRegTestParams).
         p.genesis_hash.SetHex("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206");
         p.fast_start_checkpoint = Checkpoint{0, p.genesis_hash};
+        // CRegTestParams nSubsidyHalvingInterval = 150 (Bitcoin Core consensus).
+        // Without this the field inherits the 210,000 mainnet default, so the
+        // embedded TemplateBuilder emits the un-halved 50 BTC at h>=150 and a
+        // won block is rejected bad-cb-amount on ConnectBlock (G3b leg-b).
+        p.subsidy_halving_interval = 150u;
         return p;
     }
 

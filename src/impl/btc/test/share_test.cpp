@@ -99,6 +99,16 @@ TEST(BTC_subsidy, RegtestHalvingIntervalHonored)
 
     // The pre-fix bug would have returned 50 BTC at h=275 (275 < 210000).
     EXPECT_NE(get_block_subsidy(275, 150u), 50 * COIN);
+
+    // INTEGRATION SEAM (the actual G3b leg-b defect): proving the resolver
+    // honors a 150 interval is not enough — the regtest chainparams must
+    // actually CARRY 150 so the embedded TemplateBuilder passes it through.
+    // Pre-fix regtest() inherited the 210,000 default, so the won-block
+    // coinbase at h275 paid the un-halved 50 BTC. These flip RED on the bug.
+    using btc::coin::BTCChainParams;
+    EXPECT_EQ(BTCChainParams::regtest().subsidy_halving_interval, 150u);
+    EXPECT_EQ(get_block_subsidy(275, BTCChainParams::regtest().subsidy_halving_interval),
+              25 * COIN);
 }
 
 // Mainnet/testnet remain consensus-neutral after parameterization: the
