@@ -1808,6 +1808,7 @@
                     <div class="stat-value" id="v36_status_label">-</div>
                     <div class="stat-sub">Vote: <span id="v36_vote_pct">-</span> &nbsp;·&nbsp; Work-weighted: <span id="v36_ww_pct">-</span></div>
                     <div class="stat-detail"><span id="v36_share_label">-</span> &rarr; <span id="v36_target_label">-</span> <span id="v36_msg" style="opacity:0.7;"></span></div>
+                    <div class="stat-detail">Live latch: <span id="v36_active_label" style="font-weight:600;">-</span></div>
                 </div>
                 <!-- Per-node topology: THIS node's REAL coin set from /api/node_topology (charter #2, config-driven/auto-detected -- never a baked-in coin list) -->
                 <div class="stat-card" id="node_topology_card" style="display:none;">
@@ -2938,6 +2939,17 @@
             d3.select('#v36_share_label').text(v.current_share_name || (v.current_share_type != null ? 'V' + v.current_share_type : '-'));
             d3.select('#v36_target_label').text(v.target_version_name || (v.target_version != null ? 'V' + v.target_version : '-'));
             d3.select('#v36_msg').text(v.message ? '\u00b7 ' + v.message : '');
+            // Authoritative live-latch ground truth (m_cached_share_version), distinct from the
+            // re-derived sampling status above -- operators see ACTIVE the instant the chain crosses,
+            // not when sampling catches up. Only rendered when the backend reports it (charter #3).
+            if (typeof v.v36_active === 'boolean') {
+                var lv = (v.live_share_version != null) ? 'V' + v.live_share_version : '-';
+                d3.select('#v36_active_label')
+                    .text(v.v36_active ? ('ACTIVE (' + lv + ')') : ('not active (' + lv + ')'))
+                    .style('color', v.v36_active ? '#22c55e' : '#94a3b8');
+            } else {
+                d3.select('#v36_active_label').text('-').style('color', null);
+            }
         }
 
         // Per-node topology: renders THIS node's real coin set (primary + embedded/aux),
