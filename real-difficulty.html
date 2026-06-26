@@ -15,11 +15,14 @@
 </style></head><body>
 <nav><a href="./">← Purple Paper</a> · <a href="real-difficulty.html">Real difficulty</a> · <a href="difficulty-adjustment.html">Difficulty adjustment</a> · <a href="taproot-coinbase.html">Taproot coinbase</a></nav><h1>Real difficulty</h1><p class="sub">P2Pool scientific basics</p>
 
-<div class="imgnote">IMAGE CHECK: my scrape found no images on this page. If the live page has diagrams, send the files and I'll place them here.</div>
 <p>A block header carries a compact <b>target</b> in its <code>bits</code> field, expanded as:</p>
 <pre>target = mantissa &times; 2^(8 &times; (exponent &minus; 3))</pre>
 <p>A hash is valid if it is numerically <i>below</i> the target. The <b>achieved</b> (or &ldquo;real&rdquo;) difficulty of a hash is how far below it landed &mdash; the ratio between the maximum target and the hash:</p>
 <pre>R = target &divide; hash</pre>
+<figure style="margin:1.4em 0;text-align:center">
+<img src="img/real-diff-epochs.png" alt="target/real_target across bitcoin epochs" style="max-width:100%;height:auto;border:1px solid #e6e6e6;border-radius:4px">
+<figcaption style="font-size:.85em;color:#666;margin-top:.4em;font-style:italic">target / real_target for epoch_0 (0&ndash;2015) and epoch_1 (2016&ndash;4031) of the Bitcoin blockchain.</figcaption>
+</figure>
 <p>A lower hash gives a higher ratio, indicating a rarer find.</p>
 
 <div class="v37"><span class="tag">V37</span><b>What achieved difficulty is &mdash; and is not &mdash; used for.</b>
