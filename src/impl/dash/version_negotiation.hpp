@@ -107,6 +107,41 @@ successor_switch_allowed(const std::map<uint64_t, uint288>& weights,
     return have * uint288(100) >= total * uint288(60);
 }
 
+// -- Bucket-3 crossing FLOOR (PRE-V36 transition-compat; dash-only; REVERSIBLE) --
+// The unified v36-native successor gate above is 60%. During the live G2
+// crossing-soak the pool may admit LEGACY canonical p2pool-dash peers that still
+// gate the successor switch at the older 85% threshold. Flipping c2pool to 60%
+// while a legacy peer holds 85% opens a sharechain fork across the 60-85%
+// weighted-support band. To stay in lockstep we retain 85% as a TEMPORARY,
+// conditional crossing FLOOR and flip to the unified 60% only post-crossing.
+//
+// 3-bucket rule (operator 2026-06-17): this is Bucket-3 PRE-V36 TRANSITION
+// COMPAT -- per-coin, temporary, dropped after the soak; NOT a standardization
+// target. The unified 60% end state is the 2-arg successor_switch_allowed() above
+// and stays byte-unchanged. integrator ruling (B), 2026-06-26.
+inline constexpr unsigned CROSSING_SUCCESSOR_FLOOR_PCT = 85; // legacy p2pool-dash
+inline constexpr unsigned UNIFIED_SUCCESSOR_PCT        = 60; // v36-native end state
+
+// Additive overload. When `crossing_active` the successor must hold >= 85% of the
+// weighted tally (lockstep with legacy peers); otherwise it delegates to the
+// unified 60% gate. Default-gated to the crossing floor so the soak is fork-safe;
+// the post-crossing flip is a single `crossing_active = false`. Same exact-rational
+// uint288 arithmetic (have*100 >= total*pct) -- no IEEE-double, no floor.
+inline bool
+successor_switch_allowed(const std::map<uint64_t, uint288>& weights,
+                         uint64_t successor_version,
+                         bool crossing_active)
+{
+    if (!crossing_active)
+        return successor_switch_allowed(weights, successor_version);
+    uint288 total(0);
+    for (const auto& [v, w] : weights) total += w;
+    if (total == uint288(0)) return false;
+    auto it = weights.find(successor_version);
+    const uint288 have = (it == weights.end()) ? uint288(0) : it->second;
+    return have * uint288(100) >= total * uint288(CROSSING_SUCCESSOR_FLOOR_PCT);
+}
+
 // v36 activation gate (p2pool-merged-v36 work.py): v36 is active once its
 // WEIGHTED signaling reaches >= 95% of total work. Evaluated as the exact
 // rational w36*100 >= total*95 — integer uint288, no IEEE-double fragility.
