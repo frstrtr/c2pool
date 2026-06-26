@@ -678,6 +678,19 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_g1_oracle_byte_parity_test "" AUTO)
 
+    # dgb_g0_baseline_transition_pin_test: FENCED greenlight-gate G0 KAT. Pins
+    # the older-baseline version triple {35,35,SUCCESSOR=None} + the 35->36
+    # transition/ratchet rule (auto_ratchet_wire.hpp SUT) against oracle-
+    # transcribed literals (non-circular). v35-source half of the G0/G1 split.
+    # MUST also be in the build.yml --target allowlist (#143).
+    add_executable(dgb_g0_baseline_transition_pin_test g0_baseline_transition_pin_test.cpp)
+    target_link_libraries(dgb_g0_baseline_transition_pin_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_g0_baseline_transition_pin_test "" AUTO)
+
     # dgb_pool_msg_wire_test: FENCED conformance KAT for the pool P2P wire-message
     # layer (messages.hpp) — command-name parity, scalar LE byte pins, and
     # serialize/read-back field equality vs p2pool-merged-v36 message numbering.
