@@ -244,3 +244,75 @@ TEST(WebHonestyRegression, StratumSecuritySignalsNotInstrumentedNotFakeGreen) {
     EXPECT_FALSE(r.contains("blacklisted_ips"));
     EXPECT_FALSE(r.contains("threat_level"));
 }
+
+// --- charter #3: ratchet / crossing-state honesty ----------------------------
+// The dashboard must tell the truth about the V35->V36 cross. Two founding-class
+// lies are pinned here:
+//   (a) currency_info.share_version was hardcoded 36 -- a node still VOTING
+//       (producing V35 shares) would report 36, making the bundled sharechain-
+//       explorer misclassify live V35 share cells as V36 (#491).
+//   (b) v36_status.auto_ratchet.v36_active was a frozen stub -- it must derive
+//       from the LIVE ratchet latch (m_cached_share_version) so a node that has
+//       latched to V36 cannot be shown as still "voting", nor vice-versa (#499).
+// Both are the same class of lie as the founding 0-stubs: the dashboard claiming
+// one thing while the node is actually doing another, during the very crossing
+// the operator is coordinating live on LTC prod.
+
+// (a) currency_info.share_version reflects the LIVE ratchet output, never a
+// static 36: a VOTING LTC node still mining V35 must report 35.
+TEST(WebHonestyRegression, CurrencyInfoShareVersionIsLiveRatchetNotStatic36) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+
+    mi.set_cached_share_version(35);  // node still VOTING -- producing V35 shares
+    json r = mi.rest_web_currency_info();
+    EXPECT_EQ(r["share_version"].get<int64_t>(), 35)
+        << "share_version must track m_cached_share_version (live ratchet), never "
+           "a hardcoded 36 -- reporting 36 while VOTING lies about the cross";
+}
+
+// currency_info.share_version follows the latch forward once the node crosses.
+TEST(WebHonestyRegression, CurrencyInfoShareVersionFollowsLatchToV36) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+
+    mi.set_cached_share_version(36);  // node has latched to V36
+    json r = mi.rest_web_currency_info();
+    EXPECT_EQ(r["share_version"].get<int64_t>(), 36)
+        << "share_version must follow the live latch to 36 once crossed";
+}
+
+// DASH is non-ratcheting on the LTC AutoRatchet path: its share_version stays
+// the static protocol v16 even if the cached ratchet value is something else --
+// the LTC ratchet cache must never bleed into a Dash dashboard.
+TEST(WebHonestyRegression, CurrencyInfoDashShareVersionStaysStatic16) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::DASH);
+
+    mi.set_cached_share_version(35);  // would be a lie to surface on Dash
+    json r = mi.rest_web_currency_info();
+    EXPECT_EQ(r["share_version"].get<int64_t>(), 16)
+        << "Dash share_version is the static protocol v16, not the LTC ratchet cache";
+}
+
+// (b) v36_status.auto_ratchet.v36_active is derived from the LIVE latch
+// (m_cached_share_version >= 36), not a frozen stub. With no sharechain stats
+// wired, version_signaling returns {} and the chain-derived branch is skipped --
+// isolating the latch derivation, which is exactly what #499 surfaces as ground
+// truth so a transient sampling dip cannot misreport the crossing state.
+TEST(WebHonestyRegression, V36StatusActiveLatchTracksLiveShareVersion) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+
+    // Pre-cross: still on V35.
+    mi.set_cached_share_version(35);
+    json voting = mi.rest_v36_status();
+    ASSERT_TRUE(voting.contains("auto_ratchet"));
+    EXPECT_EQ(voting["auto_ratchet"]["live_share_version"].get<int64_t>(), 35);
+    EXPECT_FALSE(voting["auto_ratchet"]["v36_active"].get<bool>())
+        << "v36_active must be false while the live latch is still V35";
+
+    // Post-cross: latched to V36.
+    mi.set_cached_share_version(36);
+    json active = mi.rest_v36_status();
+    ASSERT_TRUE(active.contains("auto_ratchet"));
+    EXPECT_EQ(active["auto_ratchet"]["live_share_version"].get<int64_t>(), 36);
+    EXPECT_TRUE(active["auto_ratchet"]["v36_active"].get<bool>())
+        << "v36_active must latch true once the live ratchet reaches V36";
+}
