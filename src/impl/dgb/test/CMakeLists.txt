@@ -983,6 +983,23 @@ if (BUILD_TESTING AND GTest_FOUND)
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_auto_ratchet_tail_guard_test "" AUTO)
+
+    # dgb_auto_ratchet_sim_test: FENCED, additive rig-free SIM KAT arming the
+    # G2 staged-migration harness C2/C3/C4 rows WITHOUT a Scrypt rig or a live
+    # digibyted parent -- the C++ counterpart of the harness --sim-votes path.
+    # Exercises the AutoRatchet staged-gate LOGIC (auto_ratchet.hpp) over
+    # hand-derived oracle votes, pinned to DGB's OWN oracle baseline (v35,
+    # SUCCESSOR=None). Drives get_share_version + a verbatim replica of the live
+    # inline 60%-by-WORK tail guard. Links the dgb OBJECT lib like
+    # dgb_auto_ratchet_tail_guard_test (uint288 + share_tracker.hpp). MUST also
+    # be in the build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_auto_ratchet_sim_test auto_ratchet_sim_test.cpp)
+    target_link_libraries(dgb_auto_ratchet_sim_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_auto_ratchet_sim_test "" AUTO)
     # dgb_chain_walk_window_test: FENCED, additive KAT pinning the LOOKBEHIND
     # chain-walk WINDOW clamp in coin/chain_walk_window.hpp vs the
     # p2pool-dgb-scrypt oracle idiom actual = min(lookbehind, height) with the
