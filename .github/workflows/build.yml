@@ -441,7 +441,10 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   web-static:
     name: Web-static verify
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    # Pin to GitHub-hosted: sub-minute JS job needs no self-hosted compute,
+    # and the puppeteer pixel harness cannot complete page navigation in the
+    # self-hosted runner env (DOMContentLoaded never fires within 15s).
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: web-static/sharechain-explorer
