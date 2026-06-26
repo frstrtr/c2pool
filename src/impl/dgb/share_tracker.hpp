@@ -2168,8 +2168,8 @@ public:
         if (!chain.contains(share_hash))
             return {};
         auto height = chain.get_height(share_hash);
-        auto actual = std::min(lookbehind, height);
-        if (actual <= 0)
+        auto actual = dgb::chain_walk_window_count(height, lookbehind);
+        if (!dgb::chain_walk_window_active(actual))
             return {};
 
         std::vector<dgb::VersionWork> window;
