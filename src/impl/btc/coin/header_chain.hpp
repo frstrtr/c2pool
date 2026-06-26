@@ -156,6 +156,13 @@ struct BTCChainParams {
     uint256 pow_limit;
     uint256 genesis_hash;      // SHA256d genesis block hash (for identification)
 
+    // Subsidy halving interval (Bitcoin Core consensus.nSubsidyHalvingInterval).
+    // Mainnet/testnet = 210,000; regtest = 150 (CRegTestParams). The embedded
+    // TemplateBuilder MUST emit coinbasevalue using THIS per-network interval,
+    // else a won block past a regtest halving is rejected bad-cb-amount
+    // (c2pool claims the genesis 50 BTC subsidy the network no longer allows).
+    uint32_t subsidy_halving_interval{210'000u};
+
     // Fast-start checkpoint: skip syncing from genesis, start from a recent height.
     // The header chain seeds this checkpoint as if it were the genesis block.
     // All headers before this height are implicitly trusted.
