@@ -864,6 +864,50 @@ TEST(DashConformanceVersionNeg, SuccessorGuard60PercentWeightedKat) {
     EXPECT_FALSE(successor_switch_allowed({}, 36u));                                          // empty
 }
 
+// Bucket-3 crossing FLOOR (PRE-V36 transition-compat). During the G2 crossing-soak
+// the successor gate holds the legacy 85% floor (lockstep with canonical
+// p2pool-dash peers); it flips to the unified 60% only post-crossing
+// (crossing_active=false). The 60-85% weighted-support band is exactly where a
+// 60%-vs-85% split would fork the sharechain -- the floor closes it. Additive +
+// reversible: the 2-arg unified gate is byte-unchanged and the flip is one bool.
+TEST(DashConformanceVersionNeg, CrossingSuccessorFloor85Kat) {
+    using dash::version_negotiation::successor_switch_allowed;
+    EXPECT_EQ(dash::version_negotiation::CROSSING_SUCCESSOR_FLOOR_PCT, 85u);
+    EXPECT_EQ(dash::version_negotiation::UNIFIED_SUCCESSOR_PCT,        60u);
+
+    const std::map<uint64_t, uint288> w70 = {{36u, uint288(70u)}, {16u, uint288(30u)}}; // 70%
+    const std::map<uint64_t, uint288> w85 = {{36u, uint288(85u)}, {16u, uint288(15u)}}; // 85%
+    const std::map<uint64_t, uint288> w84 = {{36u, uint288(84u)}, {16u, uint288(16u)}}; // 84%
+    const std::map<uint64_t, uint288> w90 = {{36u, uint288(90u)}, {16u, uint288(10u)}}; // 90%
+    const std::map<uint64_t, uint288> w50 = {{36u, uint288(50u)}, {16u, uint288(50u)}}; // 50%
+
+    // In the 60-85% fork band the crossing floor DENIES where the unified gate clears.
+    EXPECT_TRUE (successor_switch_allowed(w70, 36u));        // unified 60%: clears
+    EXPECT_TRUE (successor_switch_allowed(w70, 36u, false)); // post-crossing: clears (delegates)
+    EXPECT_FALSE(successor_switch_allowed(w70, 36u, true));  // crossing: 70 < 85 -> DENY (fork-safe)
+
+    // 85% boundary: exact rational, floor cleared at exactly 85%.
+    EXPECT_TRUE (successor_switch_allowed(w85, 36u, true));  // 8500 >= 8500
+    EXPECT_FALSE(successor_switch_allowed(w84, 36u, true));  // 8400 <  8500 -> deny
+
+    // Above the floor: both gates agree.
+    EXPECT_TRUE (successor_switch_allowed(w90, 36u, true));
+    EXPECT_TRUE (successor_switch_allowed(w90, 36u, false));
+
+    // Below the unified 60%: both paths deny.
+    EXPECT_FALSE(successor_switch_allowed(w50, 36u, true));
+    EXPECT_FALSE(successor_switch_allowed(w50, 36u, false));
+
+    // Empty tally denies on every path.
+    EXPECT_FALSE(successor_switch_allowed({}, 36u, true));
+    EXPECT_FALSE(successor_switch_allowed({}, 36u, false));
+
+    // Delegation identity: crossing_active=false is byte-identical to the 2-arg gate.
+    for (const auto* w : {&w50, &w70, &w85, &w90})
+        EXPECT_EQ(successor_switch_allowed(*w, 36u, false),
+                  successor_switch_allowed(*w, 36u));
+}
+
 // v36 activation gate, exact-rational 95% on the work-weighted tally. KAT
 // booleans from CPython w36*100 >= total*95.
 TEST(DashConformanceVersionNeg, V36GateWeighted95PercentKat) {
