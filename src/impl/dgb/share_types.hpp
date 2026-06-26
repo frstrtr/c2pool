@@ -68,6 +68,12 @@ struct MerkleLink
     {
         UnserializeMerkleLink(is, is.GetParams());
     }
+
+    friend bool operator==(const MerkleLink& l, const MerkleLink& r)
+    {
+        return l.m_branch == r.m_branch && l.m_index == r.m_index;
+    }
+    friend bool operator!=(const MerkleLink& l, const MerkleLink& r) { return !(l == r); }
 };
 
 struct SegwitData
@@ -78,6 +84,13 @@ struct SegwitData
     SegwitData() {}
     SegwitData(MerkleLink txid_merkle_link, uint256 wtxid) : m_txid_merkle_link(txid_merkle_link), m_wtxid_merkle_root(wtxid) { }
 
+    friend bool operator==(const SegwitData& l, const SegwitData& r)
+    {
+        return l.m_txid_merkle_link == r.m_txid_merkle_link
+            && l.m_wtxid_merkle_root == r.m_wtxid_merkle_root;
+    }
+    friend bool operator!=(const SegwitData& l, const SegwitData& r) { return !(l == r); }
+
     C2POOL_SERIALIZE_METHODS(SegwitData) { READWRITE(MERKLE_LINK_SMALL(obj.m_txid_merkle_link), obj.m_wtxid_merkle_root); }
 };
 
@@ -85,11 +98,49 @@ struct SegwitDataDefault
 {
     static SegwitData get()
     {
-        // Sentinel must match p2pool's PossiblyNoneType sentinel:
-        // dict(txid_merkle_link=dict(branch=[], index=0), wtxid_merkle_root=0)
-        // Using all-0xff caused p2pool to interpret "None" as a valid wtxid root,
-        // producing different witness commitment → different coinbase txid.
-        return SegwitData{{}, uint256()}; // zero = None sentinel
+        // p2pool-merged-v36 PossiblyNoneType none_value (oracle @9903aab7
+        // data.py:1680 v36 share_info_type, :702 pre-v36): the None segwit_data
+        // record is dict(txid_merkle_link=dict(branch=[], index=0),
+        // wtxid_merkle_root=2**256-1). The all-0xff wtxid root is the WIRE
+        // sentinel ONLY — the witness-commitment path (data.py:1015/1019)
+        // recomputes segwit_data fresh and non-None, so 0xff never reaches the
+        // commitment calc. Read-side symmetry (sentinel -> nullopt) is restored
+        // by SegwitDataPossiblyNone below, so a deserialized None share has
+        // has_value()==false and the 0xff root is never fed to the commitment.
+        uint256 none_root;
+        none_root.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        return SegwitData{{}, none_root};
+    }
+};
+
+// V36 segwit_data is p2pool's PossiblyNoneType: on the wire, None is the
+// sentinel record from SegwitDataDefault::get() above. The core OptionalType<>
+// only writes the default for a None value; it never maps the sentinel back to
+// None on read, which (pre-fix) left a relayed/reconstructed None share carrying
+// the all-0xff wtxid root and feeding a bogus witness commitment. This
+// dgb-local formatter restores the symmetric round-trip — write default for
+// nullopt, map the sentinel record back to nullopt on read — matching
+// p2pool-merged-v36 @9903aab7. Fenced to src/impl/dgb/ (per-coin isolation).
+struct SegwitDataPossiblyNone
+{
+    template <typename StreamType>
+    static void Write(StreamType& os, const std::optional<SegwitData>& opt)
+    {
+        if (opt)
+            os << *opt;
+        else
+            os << SegwitDataDefault::get();
+    }
+
+    template <typename StreamType>
+    static void Read(StreamType& os, std::optional<SegwitData>& opt)
+    {
+        SegwitData result;
+        os >> result;
+        if (result == SegwitDataDefault::get())
+            opt = std::nullopt;
+        else
+            opt = result;
     }
 };
 

@@ -692,6 +692,22 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_pool_msg_wire_test "" AUTO)
 
+    # dgb_segwit_none_roundtrip_test: FENCED greenlight-gate G1 follow-on KAT.
+    # Pins the v36 segwit_data PossiblyNoneType None-record WIRE bytes (empty
+    # branch + all-0xff wtxid_merkle_root) against the p2pool-merged-v36 oracle
+    # @9903aab7 (data.py:1680/702 none_value = 2**256-1), and proves the
+    # SegwitDataPossiblyNone formatter round-trips nullopt symmetrically so a
+    # deserialized None share has has_value()==false (the 0xff sentinel never
+    # reaches the witness-commitment calc). Same OBJECT-lib link set as
+    # dgb_pool_msg_wire_test. MUST also be in the build.yml --target allowlist.
+    add_executable(dgb_segwit_none_roundtrip_test segwit_none_roundtrip_test.cpp)
+    target_link_libraries(dgb_segwit_none_roundtrip_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_segwit_none_roundtrip_test "" AUTO)
+
     # dgb_get_shares_walk_test: FENCED, additive KAT pinning the pool share-
     # exchange GetShares walk (SHAREREQ -> SHAREREPLY) in get_shares_walk.hpp vs
     # the p2pool node.py handle_get_shares oracle (parents cap, per-hash walk

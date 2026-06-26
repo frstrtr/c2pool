@@ -192,7 +192,7 @@ struct Formatter
 
         if constexpr (is_segwit_activated(version))
         {
-            READWRITE(Optional(obj->m_segwit_data, SegwitDataDefault));
+            READWRITE(Using<SegwitDataPossiblyNone>(obj->m_segwit_data));
         }
 
         // V36: merged_addresses (after segwit_data, before far_share_hash)
