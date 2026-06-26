@@ -316,3 +316,84 @@ TEST(WebHonestyRegression, V36StatusActiveLatchTracksLiveShareVersion) {
     EXPECT_TRUE(active["auto_ratchet"]["v36_active"].get<bool>())
         << "v36_active must latch true once the live ratchet reaches V36";
 }
+
+// --- charter #3: crossing-banner coin coverage (de-allowlist, #496) ----------
+// The V35->V36 crossing banner must surface on EVERY v36-ratcheting coin, not
+// just LTC/DOGE. Before #496 a hardcoded {LITECOIN,DOGECOIN} allowlist gated
+// rest_version_signaling(), so a BTC/DGB/BCH node mid-cross showed NO crossing
+// banner -- the dashboard hid the very state the operator most needs to see
+// during the upgrade. #496 replaced the allowlist with a single DASH (static
+// v16, non-ratcheting) exclusion: every other coin derives the banner from real
+// vote data and falls through to an empty result only when there is no real
+// crossing state yet. These pins lock that in.
+
+// A coin the OLD allowlist would have SUPPRESSED (BTC) must still surface the
+// live crossing state from real vote data.
+TEST(WebHonestyRegression, VersionSignalingSurfacesOnRatchetingBtcNotAllowlistSuppressed) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::BITCOIN);
+
+    // 100 shares: still producing V35, but 70% are VOTING V36.
+    mi.set_sharechain_stats_fn([] {
+        return json{
+            {"total_shares", 100},
+            {"chain_height", 8640},
+            {"chain_length", 8640},
+            {"shares_by_version", {{"35", 100}}},
+            {"shares_by_desired_version", {{"35", 30}, {"36", 70}}},
+        };
+    });
+
+    json r = mi.rest_version_signaling();
+    ASSERT_FALSE(r.empty())
+        << "BTC is v36-ratcheting -- the pre-#496 {LTC,DOGE} allowlist must no "
+           "longer suppress its crossing banner";
+    EXPECT_EQ(r["target_version"].get<int>(), 36);
+    EXPECT_EQ(r["overall_v36_votes"].get<int>(), 70)
+        << "vote tally must come from the live sharechain stats hook";
+    EXPECT_DOUBLE_EQ(r["overall_v36_vote_pct"].get<double>(), 70.0);
+}
+
+// DGB (scrypt, also v36-ratcheting) is likewise no longer suppressed.
+TEST(WebHonestyRegression, VersionSignalingSurfacesOnRatchetingDgb) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::DIGIBYTE);
+    mi.set_sharechain_stats_fn([] {
+        return json{
+            {"total_shares", 50},
+            {"shares_by_version", {{"35", 50}}},
+            {"shares_by_desired_version", {{"36", 50}}},
+        };
+    });
+    json r = mi.rest_version_signaling();
+    ASSERT_FALSE(r.empty()) << "DGB is v36-ratcheting -- banner must not be suppressed";
+    EXPECT_EQ(r["target_version"].get<int>(), 36);
+    EXPECT_DOUBLE_EQ(r["overall_v36_vote_pct"].get<double>(), 100.0);
+}
+
+// DASH is non-ratcheting (static v16) -- the ONE coin #496 keeps excluded. Even
+// with full vote data wired, its crossing banner stays hidden: surfacing a
+// V35->V36 transition on a chain that has no such transition would be a lie.
+TEST(WebHonestyRegression, VersionSignalingSuppressedOnNonRatchetingDash) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::DASH);
+    mi.set_sharechain_stats_fn([] {
+        return json{
+            {"total_shares", 100},
+            {"shares_by_version", {{"35", 100}}},
+            {"shares_by_desired_version", {{"36", 80}}},
+        };
+    });
+    EXPECT_TRUE(mi.rest_version_signaling().empty())
+        << "Dash is static v16 (non-ratcheting) -- no V35->V36 crossing exists, so "
+           "the banner must stay hidden regardless of wired vote data";
+}
+
+// Honest-empty: a ratcheting coin with too little chain (<10 shares) has no real
+// crossing state yet -- the banner stays hidden until there IS truth to show,
+// rather than rendering a misleading transition.
+TEST(WebHonestyRegression, VersionSignalingEmptyUntilRealCrossingState) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::BITCOIN);
+    mi.set_sharechain_stats_fn([] {
+        return json{{"total_shares", 5}, {"shares_by_desired_version", {{"36", 5}}}};
+    });
+    EXPECT_TRUE(mi.rest_version_signaling().empty())
+        << "fewer than 10 shares -- no real crossing state, so no banner (honest)";
+}
