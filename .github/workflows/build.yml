@@ -325,6 +325,7 @@ jobs:
                     bch_genesis_conformance_test bch_abla_growth_soak_test \
                     bch_coinbase_kat_segwit_predicate_test \
                     bch_coinbase_kat_bytevector_test \
+                    bch_coinbase_author_kat_test \
                     bch_cashtokens_transparency_test \
                     bch_block_connector_test bch_block_ordering_test \
                     bch_utxo_connect_test bch_reorg_connect_test bch_reorg_rerequest_test \
@@ -412,6 +413,7 @@ jobs:
                     bch_genesis_conformance_test bch_abla_growth_soak_test \
                     bch_coinbase_kat_segwit_predicate_test \
                     bch_coinbase_kat_bytevector_test \
+                    bch_coinbase_author_kat_test \
                     bch_cashtokens_transparency_test \
                     bch_block_connector_test bch_block_ordering_test \
                     bch_utxo_connect_test bch_reorg_connect_test bch_reorg_rerequest_test \
