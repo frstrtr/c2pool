@@ -7,6 +7,7 @@
 if(COIN_BCH)
   message(STATUS "c2pool: BCH coin module enabled")
   add_subdirectory(coin)
+  add_subdirectory(stratum)
   # add_subdirectory(daemon)
   add_subdirectory(test)
 endif()

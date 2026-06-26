@@ -64,7 +64,7 @@
 namespace bch::coin {
 class HeaderChain;
 class Mempool;
-struct WorkData;
+namespace rpc { struct WorkData; }
 }  // namespace bch::coin
 
 namespace bch::stratum {
@@ -277,6 +277,23 @@ private:
     // shared_ptr instead of re-serializing the mempool.
     mutable uint256                                     tx_data_fp_;
     mutable std::shared_ptr<std::vector<std::string>>   tx_data_memo_;
+
+    // ── Template cache (slice-c) ─────────────────────────────────────────
+    // Single-slot memo of TemplateBuilder::build_template, keyed on
+    // (work_generation_, chain tip block_hash). BCH Mempool exposes no
+    // epoch/seq counter (unlike btc), so cache freshness rides on: a tip
+    // move bumps work_generation_ via the new-headers hook, and an explicit
+    // bump_work_generation() invalidates on a mempool roll. The tip-hash
+    // key is a belt-and-suspenders guard so a tip change always rebuilds
+    // even if a bump was missed. Guarded by template_mutex_.
+    mutable std::shared_ptr<const bch::coin::rpc::WorkData> template_cache_;
+    mutable uint64_t template_cache_gen_{~0ull};
+    mutable uint256  template_cache_tip_{};
+
+    // Build-or-reuse the current BCH work template (read-only over chain_ +
+    // mempool_ via TemplateBuilder). Returns nullptr if the header chain has
+    // no tip yet (pre-IBD / uninitialized).
+    std::shared_ptr<const bch::coin::rpc::WorkData> cached_template() const;
 };
 
 }  // namespace bch::stratum
