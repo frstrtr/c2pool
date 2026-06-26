@@ -89,6 +89,13 @@ public:
     // for bootstrap
     void load(const std::vector<NetService>& addrs);
 
+    // Drop all in-memory addrs WITHOUT touching the persisted file on disk.
+    // Used to start an isolated net (e.g. --regtest) from the bootstrap list
+    // only, so a public-polluted persisted addrs.json never feeds the dialer.
+    // (#506 follow-up: pollution accumulates *within* the regtest namespace via
+    //  addr-exchange, so net-id path namespacing alone cannot prevent it.)
+    void clear() { m_data.clear(); }
+
     std::vector<AddrStorePair> get_all() const
     {
         std::vector<AddrStorePair> all;

@@ -166,6 +166,15 @@ public:
             },
             15)  // p2pool p2p.py:80: timeout=15 for share requests
     {
+        // #506 follow-up: a persisted addrs.json from a prior regtest run
+        // accumulates public peers via addr-exchange; reloading them at startup
+        // re-feeds the outbound dialer (root-caused on the live standup: moving
+        // addrs.json aside -> 0 dials). The store path is already net-namespaced
+        // (config->m_name == "bitcoin_regtest"), but the pollution lives *inside*
+        // that namespace, so namespacing alone cannot prevent it. Under --regtest,
+        // start the dial set from bootstrap ONLY (zeroed) -> zero outbound dials.
+        if (config->m_regtest)
+            m_addrs.clear();
         // Seed addr store with hardcoded bootstrap peers
         m_addrs.load(config->pool()->m_bootstrap_addrs);
         // Randomise our nonce so we detect self-connections
