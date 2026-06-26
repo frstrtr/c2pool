@@ -1,37 +1,73 @@
-<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Difficulty adjustment</title><style>
- body{font-family:Georgia,'Times New Roman',serif;max-width:780px;margin:2.2em auto;padding:0 1.2em;color:#1a1a1a;line-height:1.6;font-size:17px;background:#fff;}
- h1{font-size:1.55em;line-height:1.3;margin:0 0 .15em;font-weight:600;}
- .sub{color:#666;margin:0 0 1.6em;font-size:.92em;}
- h2{font-size:1.13em;margin:1.7em 0 .45em;font-weight:600;border-bottom:1px solid #e6e6e6;padding-bottom:.2em;}
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Difficulty adjustment — P2Pool scientific basics</title><style>
+ body{font-family:Georgia,'Times New Roman',serif;max-width:800px;margin:2.2em auto;padding:0 1.2em;color:#1a1a1a;line-height:1.6;font-size:16.5px;background:#fff;}
+ h1{font-size:1.55em;line-height:1.3;margin:0 0 .15em;font-weight:600;} .sub{color:#666;margin:0 0 1.6em;font-size:.92em;}
+ h2{font-size:1.12em;margin:1.7em 0 .45em;font-weight:600;border-bottom:1px solid #e6e6e6;padding-bottom:.2em;}
  h3{font-size:1.0em;margin:1.2em 0 .35em;font-weight:600;color:#333;}
- p{margin:0 0 .9em;text-align:justify;} ul{margin:0 0 .9em;padding-left:1.4em;} li{margin:.2em 0;}
- code,pre{font-family:'SF Mono',Consolas,monospace;font-size:.88em;background:#f4f1f8;border-radius:4px;}
- code{padding:.05em .3em;} pre{padding:.7em .9em;overflow-x:auto;border:1px solid #e7e2f0;}
- .v37{background:#faf8fc;border-left:4px solid #6c4f9c;padding:.9em 1.1em;margin:1.4em 0;border-radius:0 4px 4px 0;}
+ p{margin:0 0 .85em;text-align:justify;} ul{margin:0 0 .85em;padding-left:1.4em;} li{margin:.25em 0;}
+ code{font-family:'SF Mono',Consolas,monospace;font-size:.88em;background:#f4f1f8;padding:.05em .3em;border-radius:3px;}
+ pre{font-family:'SF Mono',Consolas,monospace;font-size:.82em;background:#f7f5fb;border:1px solid #e7e2f0;border-radius:5px;padding:.8em 1em;overflow-x:auto;line-height:1.45;}
+ .v37{background:#faf8fc;border-left:4px solid #6c4f9c;padding:.9em 1.1em;margin:1.5em 0;border-radius:0 4px 4px 0;}
  .v37 .tag{display:inline-block;background:#6c4f9c;color:#fff;font-family:sans-serif;font-size:.7em;font-weight:700;letter-spacing:.05em;padding:.15em .55em;border-radius:3px;vertical-align:middle;margin-right:.5em;}
- .imgnote{background:#fff8e6;border:1px dashed #d6b656;padding:.6em .9em;margin:1em 0;font-family:sans-serif;font-size:.85em;color:#7a5d00;border-radius:4px;}
- a{color:#6c4f9c;} nav{font-family:sans-serif;font-size:.85em;margin:0 0 1.8em;color:#888;}
- nav a{margin-right:.8em;}
+ a{color:#6c4f9c;} nav{font-family:sans-serif;font-size:.85em;margin:0 0 1.8em;color:#888;} nav a{margin-right:.8em;}
 </style></head><body>
 <nav><a href="./">← Purple Paper</a> · <a href="real-difficulty.html">Real difficulty</a> · <a href="difficulty-adjustment.html">Difficulty adjustment</a> · <a href="taproot-coinbase.html">Taproot coinbase</a></nav><h1>Difficulty adjustment</h1><p class="sub">P2Pool scientific basics</p>
 
-<div class="imgnote">IMAGE CHECK: scrape found no images on this page. Send files if the live page has any.</div>
-<h2>Block mediantime</h2>
-<p>The block mediantime is the median of the timestamps of the last 11 blocks. The median is more robust than a single block&rsquo;s timestamp and mitigates outliers or manipulated times.</p>
-<h2>Retargeting</h2>
-<p>Bitcoin recalculates difficulty every 2016 blocks (~two weeks) to hold an average block time near 10 minutes. If the measured timespan over the window exceeds the target, difficulty falls; if it is shorter, difficulty rises.</p>
-<pre>retargeting_factor = time_diff / (2016 &times; 10 &times; 60)
-new_target          = current_target &times; retargeting_factor      (clamped to &times;4 / &divide;4)
-difficulty          = max_target / new_target</pre>
-<div class="v37"><span class="tag">V37</span><b>Target vs. difficulty &mdash; keep them distinct.</b>
-<p>Difficulty and target are <i>inverses</i> (<code>difficulty = max_target / target</code>). The retarget multiplies the <b>target</b> by the timespan ratio; difficulty then moves the opposite way. Stating it as &ldquo;new difficulty = current difficulty &times; factor&rdquo; inverts the direction &mdash; faster blocks (smaller ratio) must <i>raise</i> difficulty, not lower it. The formula above keeps the target on the left and derives difficulty last.</p>
-<p><b>Two forward-looking points from the V37 work:</b></p>
-<ul>
-<li><b>O(1) absolute retarget.</b> Walking the chain to retarget is expensive at large windows. An <i>absolute</i> (ASERT-style) schedule computes the target directly from an anchor in constant time and is immune to time-warp by construction &mdash; a candidate for the sharechain&rsquo;s own difficulty.</li>
-<li><b>Time-denominated, adaptive window.</b> V37&rsquo;s payout window is measured in <i>time</i> (origin-time bins on the underlying-chain clock), not a fixed share count, and widens when the pool&rsquo;s share of network work is low &mdash; set only from exogenous, committed chain state so no participant can inflate it. See the <a href="./">Purple Paper</a>, &sect;3 (Time) and &sect;6 (Accounting).</li>
-</ul>
-</div>
+<p>In the Bitcoin blockchain, the &ldquo;block mediantime&rdquo; refers to a parameter that represents the median timestamp of a particular block and is used in the difficulty adjustment algorithm. Here's a description of the block mediantime and its significance:</p>
+<p><b>1. Median Timestamp:</b> The block mediantime is calculated by taking the median of the timestamps of the last 11 blocks in the blockchain. Each block includes a timestamp indicating when it was created by a miner. The median timestamp is the middle value when the timestamps are sorted in ascending order.</p>
+<p><b>2. Time Calculation:</b> The median timestamp is a more robust measure compared to using the timestamp of a single block. It helps mitigate the impact of outliers or maliciously manipulated timestamps, providing a more accurate representation of the block creation time within the network.</p>
+<p><b>3. Difficulty Adjustment:</b> The block mediantime plays a crucial role in the difficulty adjustment algorithm of Bitcoin. The difficulty is recalculated every 2016 blocks (approximately every two weeks) to maintain a consistent block generation time of around 10 minutes. The algorithm uses the difference between the current block mediantime and the mediantime of the block 2016 blocks ago to determine if the difficulty needs to be adjusted.</p>
+<p><b>4. Difficulty Retargeting:</b> If the time difference between the current block mediantime and the mediantime of the block 2016 blocks ago is greater than the target time (10 minutes), the difficulty is reduced to make mining easier. Conversely, if the time difference is less than the target time, the difficulty is increased to make mining harder. This adjustment ensures that blocks continue to be created at a relatively constant rate, even as the network's total hash rate fluctuates.</p>
+<p>By using the block mediantime in the difficulty adjustment algorithm, Bitcoin aims to maintain a stable block generation time, thereby balancing the network's security, block issuance rate, and overall stability.</p>
 
-<hr style="margin:2.4em 0 1em;border:none;border-top:1px solid #eee">
-<p class="sub">P2Pool scientific basics — republished and version-controlled. <a href="./">V37 Purple Paper &rarr;</a></p>
+<h2>Calculating the retarget</h2>
+<p>The difficulty retargeting in the Bitcoin blockchain is calculated every 2016 blocks based on the time it took to mine those blocks compared to the target time (10 minutes per block). Here's the detailed math and Python code to calculate the difficulty adjustment:</p>
+<p><b>1. Calculate the Time Difference:</b> Retrieve the block mediantime of the current block (current_mediantime) and the block mediantime of the block 2016 blocks ago (past_mediantime). Calculate the time difference (time_diff) as the current_mediantime &minus; past_mediantime.</p>
+<p><b>2. Calculate the Retargeting Factor:</b> Divide the time difference by the target time (10 minutes) to get the retargeting factor:<br><code>retargeting_factor = time_diff / (2016 * 10 * 60)</code></p>
+<p><b>3. Adjust the Difficulty:</b> If the retargeting factor is greater than 4, set it to 4 (to prevent significant difficulty adjustments caused by extreme time differences). Calculate the new difficulty by multiplying the current difficulty by the retargeting factor:<br><code>new_difficulty = current_difficulty * retargeting_factor</code></p>
+<p><b>4. Convert Difficulty to Target Difficulty:</b> Calculate the target difficulty by dividing the maximum target difficulty by the new difficulty:<br><code>target_difficulty = max_target_difficulty / new_difficulty</code></p>
+<p>Note: The max_target_difficulty is a constant value in the Bitcoin network, representing the highest difficulty possible.</p>
+<p>Here's a Python code snippet that implements the difficulty adjustment calculation:</p>
+<pre>def calculate_difficulty_adjustment(current_mediantime, past_mediantime, current_difficulty):
+    target_time = 10 * 60  # 10 minutes in seconds
+    max_target_difficulty = 0xFFFF * 2 ** (8 * (0x1d - 3))
+    time_diff = current_mediantime - past_mediantime
+    retargeting_factor = time_diff / (2016 * target_time)
+    if retargeting_factor &gt; 4:
+        retargeting_factor = 4
+    new_difficulty = current_difficulty * retargeting_factor
+    target_difficulty = max_target_difficulty / new_difficulty
+    return target_difficulty</pre>
+<p>You can use this function by passing the current mediantime, past mediantime, and current difficulty as arguments. It will return the target difficulty for the next difficulty adjustment period. Please note that this code assumes you have the necessary values for the current mediantime, past mediantime, and current difficulty. Additionally, it assumes the <code>max_target_difficulty</code> value is available as a constant in the code.</p>
+
+<h2>Computing the mediantime</h2>
+<p>The mediantime in the Bitcoin block header represents the median timestamp of the previous 11 blocks. It is calculated as follows: retrieve the timestamps of the previous 11 blocks, starting from the current block; sort the timestamps in ascending order; take the timestamp in the middle of the sorted list, which is the median timestamp.</p>
+<p>Here's an example Python code that demonstrates how to calculate the mediantime:</p>
+<pre>import bitcoin.rpc
+def calculate_mediantime():
+    proxy = bitcoin.rpc.Proxy()  # Establish connection to Bitcoin Core client
+    block_count = proxy.getblockcount()
+    if block_count &gt;= 11:
+        timestamps = []
+        for height in range(block_count, block_count - 11, -1):
+            block_hash = proxy.getblockhash(height)
+            block = proxy.getblock(block_hash)
+            timestamp = block['time']
+            timestamps.append(timestamp)
+        sorted_timestamps = sorted(timestamps)
+        mediantime = sorted_timestamps[5]  # Take the middle timestamp
+        return mediantime
+    return None  # Return None if there are not enough blocks to calculate mediantime
+# Example usage
+mediantime = calculate_mediantime()
+print(mediantime)</pre>
+<p>In the code snippet above, we establish a connection to a running Bitcoin Core client using the bitcoin.rpc.Proxy class. The calculate_mediantime function first retrieves the current block count using getblockcount. If there are at least 11 blocks in the blockchain, it proceeds with the calculation. It iterates over the previous 11 blocks, starting from the current block, and fetches the block timestamp using getblock. The timestamps are stored in the timestamps list. The timestamps list is then sorted in ascending order using the sorted function. Finally, the middle timestamp from the sorted list (at index 5) is taken as the mediantime. The mediantime is returned by the function. If there are not enough blocks to calculate the mediantime, None is returned.</p>
+
+<div class="v37"><span class="tag">V37</span><b>Target vs. difficulty &mdash; and where V37 takes this next.</b>
+<p>Difficulty and target are <i>inverses</i> (<code>difficulty = max_target / target</code>), so the retarget multiplies the <b>target</b> by the timespan ratio and difficulty moves the opposite way &mdash; faster blocks (a smaller ratio) <i>raise</i> difficulty. Two forward-looking points from the V37 work:</p>
+<ul>
+<li><b>O(1) absolute retarget.</b> Walking the chain to retarget is costly at large windows; an <i>absolute</i> (ASERT-style) schedule computes the target directly from an anchor in constant time and is immune to time-warp by construction &mdash; a candidate for the sharechain's own difficulty.</li>
+<li><b>Time-denominated, adaptive window.</b> V37's payout window is measured in <i>time</i> (origin-time bins on the underlying-chain clock), not a fixed share count, and widens when the pool's share of network work is low &mdash; set only from exogenous, committed chain state. See the <a href="./">Purple Paper</a>, &sect;3 (Time) and &sect;6 (Accounting).</li>
+</ul></div>
+
+<hr style="margin:2.4em 0 1em;border:none;border-top:1px solid #eee"><p class="sub">P2Pool scientific basics — republished and version-controlled. <a href="./">V37 Purple Paper &rarr;</a></p>
 </body></html>
