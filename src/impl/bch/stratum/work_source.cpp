@@ -366,17 +366,13 @@ core::stratum::CoinbaseResult BCHWorkSource::build_connection_coinbase(
             payouts[donation_script] += static_cast<double>(dropped_value);
     }
 
-    // v36 finder fee: subsidy/200 to this miner, deducted from donation.
-    if (!payouts.empty() && coinbasevalue > 0 && !payout_script.empty()) {
-        const double finder_fee = static_cast<double>(coinbasevalue) / 200.0;
-        if (!donation_script.empty()) {
-            auto it = payouts.find(donation_script);
-            if (it != payouts.end() && it->second >= finder_fee) {
-                it->second -= finder_fee;
-                payouts[payout_script] += finder_fee;
-            }
-        }
-    }
+    // V36 removes the finder fee -- pure PPLNS accounting. The oracle
+    // (p2pool-merged-v36 data.py ~945) fires the subsidy/200 finder fee ONLY in
+    // the `not v36_active` branch; the v36 gentx pays no finder fee. Byte-parity
+    // to the canonical merged-v36 gentx is the HARD invariant, so the sv>=36
+    // coinbase author deducts NOTHING here (integrator conform ruling 2026-06-27,
+    // same shape as the DASH dust call). The pre-v36 (v35) finder fee lives in
+    // the legacy work source's not-v36 path, not in this v36-only builder.
 
     // Degraded fallback: full subsidy -> miner.
     if (payouts.empty() && !payout_script.empty())
