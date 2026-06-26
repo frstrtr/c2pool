@@ -101,7 +101,8 @@ void print_banner(const char* argv0, const core::CoinParams& p)
         << " [--version] [--help] [--selftest] [--run] [--stratum [H:]P]\n"
         << "       [--coin-daemon H:P] [--coin-magic HEX] [--regtest]\n"
         << "       [--regtest-force-won-share] [--no-p2p-relay]\n"
-        << "       [--redistribute SPEC] [--sharechain-port P]\n\n"
+        << "       [--redistribute SPEC] [--sharechain-port P]\n"
+        << "       [--dev-relax-algo-softforks]\n\n"
         << "Status: pool/sharechain pillars live (Phase B); run-loop up\n"
         << "        (--run: io_context + sharechain peer + Stratum standup).\n"
         << "        --stratum [HOST:]PORT binds a miner-facing TCP listener\n"
@@ -112,6 +113,11 @@ void print_banner(const char* argv0, const core::CoinParams& p)
         << "        --regtest AND --coin-daemon) drives ONE forced won\n"
         << "        share through the live dual-path broadcaster;\n"
         << "        --no-p2p-relay isolates the submitblock arm.\n"
+        << "        --dev-relax-algo-softforks (DEV-ONLY; OFF by default)\n"
+        << "        relaxes the algo-softfork readiness gate (odo/reservealgo/\n"
+        << "        nversionbips) so the node can boot against an isolated\n"
+        << "        tuned testnet. NEVER relaxes mainnet (gate stays absolute\n"
+        << "        when chain==main) and does NOT touch taproot.\n"
         << "Network: " << network_summary(p) << "\n";
 }
 
@@ -165,7 +171,8 @@ int run_node(const core::CoinParams& params, bool testnet,
              const std::string& rpc_conf_path,
              bool regtest = false, bool force_won_share = false,
              bool no_p2p_relay = false,
-             const std::string& redistribute_spec = "")
+             const std::string& redistribute_spec = "",
+             bool dev_relax_algo_softforks = false)
 {
     io::io_context ioc;
 
@@ -186,6 +193,11 @@ int run_node(const core::CoinParams& params, bool testnet,
     dgb::Config config(net_subdir);
     config.pool()->m_prefix = ParseHexBytes(dgb::PoolConfig::DEFAULT_PREFIX_HEX);
     config.m_testnet        = testnet;
+    // Wire the dev-only algo-softfork relax from argv into the coin config so
+    // NodeRPC::check() can see it in --run (Config::init() is skipped above, so
+    // the YAML path never sets it here). OFF by default; the only flip is the
+    // explicit --dev-relax-algo-softforks marker. Mainnet stays fail-closed.
+    config.coin()->m_dev_relax_algo_softforks = dev_relax_algo_softforks;
     // DEFAULT_BOOTSTRAP_HOSTS is empty until DGB p2pool nodes come online, so
     // there are no outbound seeds to dial this slice — the node binds its
     // listener and waits for inbound sharechain peers.
@@ -1118,6 +1130,12 @@ int main(int argc, char** argv)
     bool regtest        = false;            // --regtest (dev/regtest marker; gates the forced seam)
     bool force_won_share = false;           // --regtest-force-won-share (regtest-ONLY won-block live seam)
     bool no_p2p_relay   = false;            // --no-p2p-relay (suppress ARM A to isolate ARM B)
+    // --dev-relax-algo-softforks (DEV-ONLY, OFF by default): the ONLY argv path
+    // that flips CoinConfig::m_dev_relax_algo_softforks. Relaxes the algo-softfork
+    // readiness gate for an isolated tuned-testnet boot; NodeRPC::check() keeps it
+    // FAIL-CLOSED on mainnet (ignored when chain==main) and it does NOT extend to
+    // taproot (a real consensus floor; operator-gated, not relaxed here).
+    bool dev_relax_algo_softforks = false;  // --dev-relax-algo-softforks (dev boot aid)
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
             std::cout << "c2pool-dgb " << C2POOL_VERSION << "\n";
@@ -1156,6 +1174,7 @@ int main(int argc, char** argv)
         if (std::strcmp(argv[i], "--regtest-force-won-share") == 0)
             force_won_share = true;                 // gated below: regtest-ONLY
         if (std::strcmp(argv[i], "--no-p2p-relay") == 0) no_p2p_relay = true;
+        if (std::strcmp(argv[i], "--dev-relax-algo-softforks") == 0) dev_relax_algo_softforks = true;
         if (std::strcmp(argv[i], "--redistribute") == 0 && i + 1 < argc) {
             redistribute_spec = argv[++i];     // pplns|fee|boost|donate or hybrid "boost:70,donate:20"
         }
@@ -1182,7 +1201,7 @@ int main(int argc, char** argv)
                         coin_daemon, coin_magic, coin_genesis,
                         rpc_endpoint, rpc_conf_path,
                         regtest, force_won_share, no_p2p_relay,
-                        redistribute_spec);
+                        redistribute_spec, dev_relax_algo_softforks);
 
     // --selftest, or a bare invocation: drive the live score path so the
     // binary exercises real consensus code, then exit cleanly.
