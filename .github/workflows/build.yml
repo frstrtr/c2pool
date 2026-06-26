@@ -302,6 +302,7 @@ jobs:
                     bch_embedded_getwork_test bch_embedded_seam_workview_test \
                     bch_embedded_block_broadcast_test bch_coin_node_seam_test \
                     bch_asert_kat_test \
+                    bch_g1_oracle_byte_parity_test \
             -j$(nproc)
 
       - name: Run BCH tests
@@ -377,6 +378,7 @@ jobs:
                     bch_embedded_getwork_test bch_embedded_seam_workview_test \
                     bch_embedded_block_broadcast_test bch_coin_node_seam_test \
                     bch_asert_kat_test \
+                    bch_g1_oracle_byte_parity_test \
             -j$(nproc)
 
       - name: Run BCH tests under sanitizers
