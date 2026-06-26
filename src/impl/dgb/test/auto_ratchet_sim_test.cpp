@@ -1,7 +1,7 @@
 // dgb_auto_ratchet_sim_test: FENCED, additive rig-free SIM KAT that arms the
 // DGB G2 staged-migration harness
-// (scripts/dgb_g2_ratchet_staged_migration_harness.sh) C2/C3/C4 rows WITHOUT a
-// Scrypt rig or a live digibyted parent -- the C++ counterpart of that
+// (scripts/dgb_g2_ratchet_staged_migration_harness.sh) C2/C3/C4/C5 rows WITHOUT
+// a Scrypt rig or a live digibyted parent -- the C++ counterpart of that
 // harness's --sim-votes path. It exercises the AutoRatchet staged-gate LOGIC
 // over hand-derived oracle votes:
 //
@@ -10,6 +10,9 @@
 //       outrun it (mint-cannot-outrun-accept) -- the property that keeps a
 //       minted V36 boundary share from being rejected by every peer
 //   C4  ratchet state persists across restart (CONFIRMED survives reconstruct)
+//   C5  SCRYPT-ONLY / 4-algos-by-continuity posture (project_v36_dgb_scrypt_only):
+//       only Scrypt headers are validated; the other algos accept-by-continuity
+//       (work-NEUTRAL) and so cannot move the 60%-by-work ratchet accept gate
 //
 // DGB ORACLE PIN (NOT the LTC v35 transition): DGB conforms to its OWN oracle
 // frstrtr/p2pool-dgb-scrypt @22761e7, which mints share VERSION=35 with
@@ -21,12 +24,15 @@
 // Consensus surface is NOT mutated. C3 pins the live 60%-by-WORK gate via a
 // VERBATIM replica of the inline tail-guard expression in
 // AutoRatchet::get_share_version (auto_ratchet.hpp), localising the gate the
-// same non-circular way dgb_auto_ratchet_tail_guard_test does. Test-only /
+// same non-circular way dgb_auto_ratchet_tail_guard_test does. C5 pins the
+// multi-algo disposition against the consensus SSOT coin/dgb_block_algo.hpp
+// (itself guarded vs upstream DigiByte Core by algo_select_test). Test-only /
 // dgb-tree-local.
 
 #include <gtest/gtest.h>
 
 #include <impl/dgb/auto_ratchet.hpp>   // also pulls share_tracker.hpp + config_pool.hpp
+#include <impl/dgb/coin/dgb_block_algo.hpp> // dgb_header_disposition, is_scrypt_header
 #include <core/uint256.hpp>            // uint288
 
 #include <cstdint>
@@ -38,6 +44,10 @@
 
 using dgb::AutoRatchet;
 using dgb::RatchetState;
+using dgb::coin::DgbAlgo;
+using dgb::coin::HeaderDisposition;
+using dgb::coin::dgb_header_disposition;
+using dgb::coin::is_scrypt_header;
 
 namespace {
 
@@ -78,6 +88,28 @@ bool effective_activation(int votes, int total,
 // One staged-migration sample: after stage k, `votes` of `total` miners signal
 // V36, carrying `w_target` of `w_total` work.
 struct Stage { int votes; int total; uint288 w_target; uint288 w_total; };
+
+// One staged-migration block AS SEEN BY THE CROSSING: which algo mined it (DGB
+// nVersion algo bits), whether it votes V36, and how much PoW work it carries.
+// The G2 work-weighted accept gate credits work ONLY for Scrypt blocks; a
+// non-Scrypt block is accept-by-continuity == work-NEUTRAL (coin/header_chain.hpp
+// THIRD INVARIANT), so its work NEVER enters the ratchet tally however it votes.
+struct AlgoBlock { int32_t n_version; bool votes_v36; uint32_t work; };
+
+// Work this block credits to the V36 accept tally: the Scrypt-only,
+// work-neutral-continuity posture localised for the sim. Mirrors
+// header_credits_work() forwarding to is_scrypt_header().
+uint288 scrypt_v36_work_credit(const AlgoBlock& b)
+{
+    return (is_scrypt_header(b.n_version) && b.votes_v36) ? uint288(b.work)
+                                                          : uint288(0);
+}
+// Work this block credits to the gate denominator: again Scrypt-only, since a
+// continuity header widens neither numerator nor denominator of the tail guard.
+uint288 scrypt_total_work_credit(const AlgoBlock& b)
+{
+    return is_scrypt_header(b.n_version) ? uint288(b.work) : uint288(0);
+}
 
 } // namespace
 
@@ -225,4 +257,97 @@ TEST(DGB_AutoRatchetSim, C4_FreshNodeMintsBaselineOnBootstrap)
     auto [mint, vote] = ar.get_share_version(tracker, uint256{});
     EXPECT_EQ(mint, DGB_BASE_VERSION);
     EXPECT_EQ(vote, DGB_TARGET_VERSION);
+}
+
+// ---------------------------------------------------------------------------
+// C5 — SCRYPT-ONLY POSTURE PIN (project_v36_dgb_scrypt_only). V36 c2pool-dgb
+// validates the SCRYPT path ONLY; the V36-deferred algos accept-by-continuity;
+// unknown algo bits reject. Mirrors the per-header disposition the harness C5
+// row exercises against the consensus SSOT coin/dgb_block_algo.hpp (itself
+// guarded vs upstream DigiByte Core block.h by algo_select_test).
+// ---------------------------------------------------------------------------
+TEST(DGB_AutoRatchetSim, C5_ScryptOnlyPostureDisposition)
+{
+    using dgb::coin::DGB_BLOCK_VERSION_SCRYPT;
+    using dgb::coin::DGB_BLOCK_VERSION_SHA256D;
+    using dgb::coin::DGB_BLOCK_VERSION_GROESTL;
+    using dgb::coin::DGB_BLOCK_VERSION_SKEIN;
+    using dgb::coin::DGB_BLOCK_VERSION_QUBIT;
+    using dgb::coin::DGB_BLOCK_VERSION_ODO;
+
+    // Scrypt is the all-zero algo codepoint -> the ONLY validated PoW lane.
+    EXPECT_TRUE(is_scrypt_header(DGB_BLOCK_VERSION_SCRYPT));
+    EXPECT_EQ(dgb_header_disposition(DGB_BLOCK_VERSION_SCRYPT),
+              HeaderDisposition::VALIDATE_SCRYPT);
+
+    // The four V36-deferred algos (SHA256d, Skein, Qubit, Odocrypt) and legacy
+    // Groestl accept-by-continuity (work-neutral) -- NOT validate, NOT reject.
+    for (int32_t v : { DGB_BLOCK_VERSION_SHA256D, DGB_BLOCK_VERSION_SKEIN,
+                       DGB_BLOCK_VERSION_QUBIT,   DGB_BLOCK_VERSION_ODO,
+                       DGB_BLOCK_VERSION_GROESTL }) {
+        EXPECT_FALSE(is_scrypt_header(v));
+        EXPECT_EQ(dgb_header_disposition(v),
+                  HeaderDisposition::ACCEPT_BY_CONTINUITY) << "version_bits=" << v;
+    }
+
+    // Algo nibbles NOT in the DGB map (1/3/5/7/9/15 << 8) reject. Note 7<<8 is
+    // unknown: ALGO_ODO==7 in the id space but BLOCK_VERSION_ODO encodes 14<<8.
+    for (int32_t sel : { 1, 3, 5, 7, 9, 15 }) {
+        EXPECT_EQ(dgb_header_disposition(sel << 8),
+                  HeaderDisposition::REJECT) << "algo_nibble=" << sel;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C5/work-neutral — the load-bearing G2 intersection of the Scrypt-only
+// posture with the #288 accept gate: accept-by-continuity non-Scrypt blocks are
+// WORK-NEUTRAL, so they cannot move the 60%-by-work ratchet accept gate however
+// they vote. A crossing whose V36 vote MAJORITY (>=95% by head-count) is carried
+// by non-Scrypt algos credits ZERO V36 work; the Scrypt work tally still decides
+// the gate. This is the multi-algo analogue of C3_MintCannotOutrunAccept and is
+// what stops a SHA256d/Skein/Qubit/Odo majority from spoofing a Scrypt-sharechain
+// v35 -> v36 activation.
+// ---------------------------------------------------------------------------
+TEST(DGB_AutoRatchetSim, C5_ContinuityVotesCannotOutrunScryptWorkGate)
+{
+    using dgb::coin::DGB_BLOCK_VERSION_SCRYPT;
+    using dgb::coin::DGB_BLOCK_VERSION_SHA256D;
+    using dgb::coin::DGB_BLOCK_VERSION_SKEIN;
+    using dgb::coin::DGB_BLOCK_VERSION_QUBIT;
+    using dgb::coin::DGB_BLOCK_VERSION_ODO;
+
+    std::vector<AlgoBlock> blocks;
+    blocks.push_back({ DGB_BLOCK_VERSION_SCRYPT, /*votes_v36*/false, 1000 }); // lone Scrypt V35
+    const int32_t non_scrypt[4] = { DGB_BLOCK_VERSION_SHA256D, DGB_BLOCK_VERSION_SKEIN,
+                                    DGB_BLOCK_VERSION_QUBIT,   DGB_BLOCK_VERSION_ODO };
+    for (int i = 0; i < 19; ++i)
+        blocks.push_back({ non_scrypt[i % 4], /*votes_v36*/true, 50 }); // non-Scrypt V36 voters
+
+    uint288 w_target(0), w_total(0);
+    int v36 = 0, total = 0;
+    for (const auto& b : blocks) {
+        w_target = w_target + scrypt_v36_work_credit(b);
+        w_total  = w_total  + scrypt_total_work_credit(b);
+        if (b.votes_v36) ++v36;
+        ++total;
+    }
+    EXPECT_EQ(total, 20);
+    EXPECT_EQ(v36, 19);
+    EXPECT_TRUE(count_activates(v36, total));        // 19/20 = 95% -> count gate WOULD fire
+    EXPECT_TRUE(w_target == uint288(0));             // but every V36 vote is continuity
+    EXPECT_TRUE(w_total  == uint288(1000));          // only the lone Scrypt block credits work
+    EXPECT_FALSE(inline_tail_ok(w_target, w_total));            // work gate holds
+    EXPECT_FALSE(effective_activation(v36, total, w_target, w_total)); // crossing blocked
+
+    // Flip the lone Scrypt miner to V36: now 100% of the CREDITED (Scrypt) work
+    // is V36 and the work gate passes -- only Scrypt votes ever move the gate.
+    blocks[0].votes_v36 = true;
+    uint288 w_t2(0), w_all2(0);
+    for (const auto& b : blocks) {
+        w_t2   = w_t2   + scrypt_v36_work_credit(b);
+        w_all2 = w_all2 + scrypt_total_work_credit(b);
+    }
+    EXPECT_TRUE(w_t2   == uint288(1000));
+    EXPECT_TRUE(w_all2 == uint288(1000));
+    EXPECT_TRUE(inline_tail_ok(w_t2, w_all2));       // Scrypt work now 100% V36 -> gate passes
 }
