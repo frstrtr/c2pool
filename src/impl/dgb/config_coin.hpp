@@ -200,6 +200,15 @@ public:
     std::string m_symbol = "DGB";
     int m_share_period{};
     bool m_testnet{false};
+
+    // Dev-only boot aid — DO NOT set on any real network. When true, relaxes the
+    // DGB algo softfork readiness gate (reservealgo/odo/nversionbips) on
+    // non-regtest, non-main chains so c2pool-dgb can boot against an isolated
+    // tuned testnet for development. Off by default and absent from the
+    // auto-written default config, so a real crossing-soak cannot silently inherit
+    // it; never weakens the gate on mainnet. See
+    // dgb::coin::compute_required_softforks / NodeRPC::check().
+    bool m_dev_relax_algo_softforks{false};
 };
 
 } // namespace dgb

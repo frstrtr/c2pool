@@ -62,4 +62,52 @@ inline void collect_deployment_names(const nlohmann::json& getdeploymentinfo_res
     }
 }
 
+/**
+ * Algo deployments that a regtest digibyted legitimately never signals
+ * (reservealgo, odo are DigiByte-unique) plus nversionbips. These are the only
+ * names the readiness gate is ever permitted to drop from its required set.
+ */
+inline const std::set<std::string>& relaxable_algo_softforks()
+{
+    static const std::set<std::string> kRelaxable = {
+        "reservealgo", "odo", "nversionbips"};
+    return kRelaxable;
+}
+
+/**
+ * Effective required-softfork set for NodeRPC::check(), given the connected
+ * chain and an EXPLICIT, off-by-default developer relaxation flag.
+ *
+ *   - regtest           : always drops the relaxable algo deployments — a
+ *                         regtest daemon cannot carry them and gating on them
+ *                         would make the regtest won-block path unstartable.
+ *   - non-main, non-regtest (e.g. an isolated tuned testnet):
+ *                         drops the relaxable deployments ONLY when
+ *                         dev_relax_algo_softforks is explicitly set. This is a
+ *                         development boot-aid; it is off by default, so a real
+ *                         testnet crossing-soak (which never sets it) keeps the
+ *                         full SSOT requirement set and still demands active
+ *                         forks.
+ *   - main              : NEVER relaxed under any flag value. The dev flag
+ *                         cannot weaken the readiness gate on mainnet.
+ *
+ * Pure (no I/O, no consensus surface) so it is exhaustively unit-testable
+ * without a live daemon.
+ */
+inline std::set<std::string> compute_required_softforks(
+    const std::set<std::string>& base,
+    const std::string& chain,
+    bool dev_relax_algo_softforks)
+{
+    std::set<std::string> required = base;
+    // Hard floor: mainnet is never relaxed, regardless of the dev flag.
+    if (chain == "main")
+        return required;
+    const bool relax = (chain == "regtest") || dev_relax_algo_softforks;
+    if (relax)
+        for (const auto& name : relaxable_algo_softforks())
+            required.erase(name);
+    return required;
+}
+
 } // namespace dgb::coin

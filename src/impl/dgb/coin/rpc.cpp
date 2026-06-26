@@ -17,8 +17,11 @@ namespace coin
 // check() probes getblockheader(dgb_genesis_hash(IS_TESTNET)) to confirm the
 // daemon is a real digibyted on the selected network.
 
-NodeRPC::NodeRPC(io::io_context* context, dgb::interfaces::Node* coin, bool testnet)
-    : m_context(context), IS_TESTNET(testnet), m_resolver(*context), m_stream(*context),
+NodeRPC::NodeRPC(io::io_context* context, dgb::interfaces::Node* coin, bool testnet,
+                 bool dev_relax_algo_softforks)
+    : m_context(context), IS_TESTNET(testnet),
+	  DEV_RELAX_ALGO_SOFTFORKS(dev_relax_algo_softforks),
+	  m_resolver(*context), m_stream(*context),
 	  m_client(*this, RPC_VER), m_coin(coin)
 {
 }
@@ -281,18 +284,26 @@ bool NodeRPC::check()
 		}
 	}
 
-	// Regtest does not deploy the DGB-specific algo softforks (reservealgo, odo)
-	// nor nversionbips — those are mainnet/testnet deployments, so a regtest
-	// digibyted legitimately signals only csv/segwit/taproot. Gating startup on
-	// deployments the connected chain cannot carry would make the regtest
-	// won-block path (and CI against regtest) impossible to start, with no
-	// consensus benefit. Relax ONLY on regtest; mainnet/testnet keep the full
-	// SSOT requirement set. Non-consensus startup readiness gate only.
-	std::set<std::string> required = dgb::PoolConfig::SOFTFORKS_REQUIRED;
-	if (blockchaininfo.value("chain", std::string{}) == "regtest")
+	// Effective required-softfork set. Regtest always drops the DGB-specific
+	// algo deployments (reservealgo/odo) and nversionbips — a regtest daemon
+	// cannot carry them, and gating on them would make the regtest won-block
+	// path unstartable. The EXPLICIT, off-by-default DEV_RELAX_ALGO_SOFTFORKS
+	// flag extends that same relaxation to an isolated tuned testnet for
+	// development boot only; mainnet is never relaxed. Policy lives in the pure,
+	// unit-tested SSOT below. Non-consensus startup readiness gate only.
+	const std::string chain = blockchaininfo.value("chain", std::string{});
+	std::set<std::string> required = dgb::coin::compute_required_softforks(
+		dgb::PoolConfig::SOFTFORKS_REQUIRED, chain, DEV_RELAX_ALGO_SOFTFORKS);
+
+	// Loud, un-suppressable signal when the dev flag actually drops algo
+	// deployments on a non-regtest chain. A node booted this way is NOT a valid
+	// V36 crossing-soak — development only.
+	if (DEV_RELAX_ALGO_SOFTFORKS && chain != "regtest" && chain != "main")
 	{
-		for (const char* algo_fork : {"reservealgo", "odo", "nversionbips"})
-			required.erase(algo_fork);
+		LOG_WARNING << "DEV-ONLY: dev_relax_algo_softforks is set — relaxing the "
+		               "DGB algo softfork gate (reservealgo/odo/nversionbips) on "
+		               "chain '" << chain << "'. This node is NOT a valid "
+		               "crossing-soak; development boot only.";
 	}
 
 	std::vector<std::string> missing;
