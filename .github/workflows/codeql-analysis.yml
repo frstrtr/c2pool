@@ -11,7 +11,7 @@ on:
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     permissions:
       security-events: write
       packages: read
@@ -39,7 +39,7 @@ jobs:
           queries: security-and-quality
 
       # ── C++ build (manual mode only) ─────────────────────────────────────
-      - if: matrix.build-mode == 'manual'
+      - if: matrix.build-mode == 'manual' && runner.environment == 'github-hosted'
         name: Install system dependencies
         run: |
           sudo apt-get update -qq
@@ -70,6 +70,10 @@ jobs:
           # Share cache with build.yml (same Release profile)
           key: conan2-ubuntu24-gcc13-${{ hashFiles('conanfile.txt') }}
           restore-keys: conan2-ubuntu24-gcc13-
+
+      - if: matrix.build-mode == 'manual' && runner.environment != 'github-hosted'
+        name: Clean stale build dir (self-hosted workspace is reused)
+        run: rm -rf build_codeql
 
       - if: matrix.build-mode == 'manual'
         name: Install Conan dependencies

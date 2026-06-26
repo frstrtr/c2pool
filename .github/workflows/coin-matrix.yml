@@ -20,7 +20,7 @@ on:
 jobs:
   coin:
     name: ${{ matrix.coin }} smoke (Linux x86_64)
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     strategy:
       fail-fast: false
       matrix:
@@ -40,7 +40,7 @@ jobs:
           fi
 
       - name: Install system dependencies
-        if: steps.presence.outputs.exists == '1'
+        if: steps.presence.outputs.exists == '1' && runner.environment == 'github-hosted'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
@@ -69,6 +69,10 @@ jobs:
           restore-keys: |
             conan2-ubuntu24-gcc13-${{ matrix.coin }}-
             conan2-ubuntu24-gcc13-
+
+      - name: Clean stale build dir (self-hosted workspace is reused)
+        if: steps.presence.outputs.exists == '1' && runner.environment != 'github-hosted'
+        run: rm -rf build_${{ matrix.coin }}
 
       - name: Conan install
         if: steps.presence.outputs.exists == '1'
