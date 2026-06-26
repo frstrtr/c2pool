@@ -779,9 +779,14 @@ nlohmann::json StratumSession::handle_suggest_difficulty(const nlohmann::json& p
     }
 
     if (suggested > 0.0) {
-        // Miners send Scrypt difficulty (multiplied by 65536).
-        // Convert to internal difficulty for the tracker.
-        double internal_diff = suggested / 65536.0;
+        // Miners send wire difficulty scaled by the per-network multiplier
+        // (p2pool net.DUMB_SCRYPT_DIFF): 2^16 for scrypt nets (LTC/DOGE), 1 for
+        // SHA256d nets (bitcoin). Invert the SAME config-driven factor used by
+        // send_set_difficulty() to recover internal difficulty -- otherwise a
+        // SHA256d miner suggestion is divided by 65536 and collapses to ~0.
+        const double diff_multiplier =
+            mining_interface_->get_stratum_config().set_difficulty_multiplier;
+        double internal_diff = suggested / diff_multiplier;
         suggested_difficulty_ = internal_diff;
         // If already subscribed, apply immediately via VARDIFF hint
         if (subscribed_) {

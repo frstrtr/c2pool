@@ -695,3 +695,32 @@ TEST(StratumSetDifficulty, Sha256dMultiplierAdvertisesTrueDifficulty)
     // ...and that this is 65536x lower than the (wrong-for-SHA256d) scrypt wire diff.
     EXPECT_DOUBLE_EQ(32.768 / (cfg.min_difficulty * cfg.set_difficulty_multiplier), 65536.0);
 }
+
+// ---------------------------------------------------------------------------
+// mining.suggest_difficulty must INVERT the same per-network multiplier that
+// send_set_difficulty applies. A miner advertises wire diff = internal *
+// multiplier; the pool recovers internal = wire / multiplier. If the two
+// paths use different factors, a round-trip of a suggested difficulty does
+// not return the original internal value -- and a SHA256d suggestion divided
+// by the scrypt 65536 collapses to ~0, mis-seeding vardiff.
+// ---------------------------------------------------------------------------
+TEST(StratumSuggestDifficulty, ScryptRoundTripIsIdentity)
+{
+    core::stratum::StratumConfig cfg{};  // default 65536 (scrypt)
+    const double internal = 0.0005;
+    const double wire = internal * cfg.set_difficulty_multiplier;      // set_difficulty path
+    const double recovered = wire / cfg.set_difficulty_multiplier;     // suggest_difficulty path
+    EXPECT_DOUBLE_EQ(recovered, internal);
+}
+
+TEST(StratumSuggestDifficulty, Sha256dRoundTripIsIdentity)
+{
+    core::stratum::StratumConfig cfg{};
+    cfg.set_difficulty_multiplier = 1.0;  // SHA256d override
+    const double internal = 0.0005;
+    const double wire = internal * cfg.set_difficulty_multiplier;
+    const double recovered = wire / cfg.set_difficulty_multiplier;
+    EXPECT_DOUBLE_EQ(recovered, internal);
+    // A SHA256d wire suggestion is NOT collapsed by a stray 65536 divisor.
+    EXPECT_DOUBLE_EQ(wire, 0.0005);
+}
