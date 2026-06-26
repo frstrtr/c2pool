@@ -34,14 +34,15 @@ using btc::RatchetState;
 namespace {
 
 // Verbatim replica of the LIVE inline tail-guard in
-// AutoRatchet::get_share_version:  tail_ok = !(target*100 < total*SWITCH).
+// AutoRatchet::get_share_version:  tail_ok = !(target < total*SWITCH/100).
 // Localises the 60%-by-WORK accept gate so C3 pins it WITHOUT driving the
-// consensus path or importing a lifted SSOT.
+// consensus path or importing a lifted SSOT. FLOOR form, tracking the SSOT
+// step-2 adoption (was the algebraic CEIL target*100 < total*SWITCH).
 bool inline_tail_ok(const uint288& target, const uint288& total,
                     int thr = AutoRatchet::SWITCH_THRESHOLD)
 {
-    return !((target * static_cast<uint32_t>(100)) <
-             (total  * static_cast<uint32_t>(thr)));
+    return !(target < (total * static_cast<uint32_t>(thr))
+                       / static_cast<uint32_t>(100));
 }
 
 // 95%-by-COUNT activation predicate (flat head-count), mirroring the VOTING ->
@@ -199,19 +200,20 @@ TEST(BTC_AutoRatchetSim, C4_StatePersistsAcrossRestart)
 //
 // p2pool oracle (data.py share-acceptance) valid threshold is the FLOOR form:
 //     counts.get(VERSION,0) >= sum(counts)*60//100            # floor
-// The BTC inline tail-guard (auto_ratchet.hpp:169, replicated as
-// inline_tail_ok above) is the algebraic CEIL form at the boundary:
-//     target*100 >= total*60   <=>   target >= ceil(total*60/100).
-// When (total*60) % 100 != 0, floor < ceil, so the ORACLE latches up to one
-// share EARLIER than our form. This KAT PINS that divergence at a non-integral
-// boundary (total=101 => total*60 = 6060, 6060 % 100 = 60 != 0):
-//     floor(6060/100) = 60   (oracle: target=60 PASSES)
-//     ceil (6060/100) = 61   (inline: target=60 HOLDS)
-// The EXPECT_FALSE on the inline form is the STANDARDIZATION SEAM: it flips to
-// PASS only when the core-SSOT floor adoption lands (EXCEPTIONAL/operator-tap
-// gated). Until then it locks the gap as PROVEN, not asserted. The integral
-// control (total=100) shows the two forms AGREE when the boundary is exact, so
-// the divergence is the %100 remainder alone. Consensus surface UNCHANGED.
+// The BTC inline tail-guard (auto_ratchet.hpp, replicated as inline_tail_ok
+// above) has ADOPTED that FLOOR form. Previously it was the algebraic CEIL
+//     target*100 >= total*60   <=>   target >= ceil(total*60/100),
+// which at a non-integral boundary (total*60 % 100 != 0) latched up to one
+// share LATER than the oracle. This KAT now PINS the CONVERGED state: at the
+// same non-integral boundary (total=101 => total*60 = 6060, 6060 % 100 != 0)
+//     floor(6060/100) = 60   (oracle  : target=60 PASSES)
+//     inline (FLOOR)  = 60   (adopted : target=60 PASSES)  <-- seam CLOSED
+// Pre-adoption this line read EXPECT_FALSE on the inline form (CEIL held until
+// 61); the SSOT floor adoption (operator-tap gated) flips it to EXPECT_TRUE.
+// The integral control (total=100) still shows both forms AGREE on the exact
+// boundary, so the only behavioural change is the %100 remainder share, now
+// accepted one unit earlier in lock-step with the network. Consensus surface
+// equals the p2pool oracle EXACTLY.
 // ---------------------------------------------------------------------------
 TEST(BTC_AutoRatchetSim, SSOT2_OracleFloorVsInlineCeilBoundary)
 {
@@ -227,8 +229,8 @@ TEST(BTC_AutoRatchetSim, SSOT2_OracleFloorVsInlineCeilBoundary)
 
     const uint288 total(101);                            // 101*60 = 6060, %100 = 60
     EXPECT_TRUE (oracle_floor_ok(uint288(60), total));   // oracle: latches at 60
-    EXPECT_FALSE(inline_tail_ok (uint288(60), total));   // inline: holds until 61
-    // One share later the two forms re-converge.
+    EXPECT_TRUE (inline_tail_ok (uint288(60), total));   // inline FLOOR: latches at 60 too
+    // Forms are now identical at every point (boundary and beyond).
     EXPECT_TRUE (oracle_floor_ok(uint288(61), total));
     EXPECT_TRUE (inline_tail_ok (uint288(61), total));
 }

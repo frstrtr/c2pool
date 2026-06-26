@@ -166,8 +166,16 @@ public:
                     if (static_cast<int64_t>(ver) >= target_version_)
                         tail_target = tail_target + w;
                 }
-                // Canonical: counts.get(VERSION,0) < sum(counts)*60//100
-                bool tail_ok = !(tail_target * uint32_t(100) < tail_total * uint32_t(SWITCH_THRESHOLD));
+                // Canonical FLOOR (p2pool data.py share-acceptance):
+                //   valid iff target >= floor(total * SWITCH_THRESHOLD / 100)
+                //   i.e. counts.get(VERSION,0) >= sum(counts)*60//100.
+                // The prior cross-multiplied form (target*100 >= total*60) is the
+                // algebraic CEIL: at a non-integral boundary (total*60 % 100 != 0)
+                // it latched up to one work-unit LATER than the network oracle.
+                // Adopting FLOOR removes that c2pool-only late-latch divergence so
+                // our accept gate is byte-identical to every p2pool peer's.
+                bool tail_ok = !(tail_target <
+                                 (tail_total * uint32_t(SWITCH_THRESHOLD)) / uint32_t(100));
 
                 if (!tail_ok) {
                     static int tail_log = 0;
