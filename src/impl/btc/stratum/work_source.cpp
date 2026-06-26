@@ -119,6 +119,13 @@ BTCWorkSource::BTCWorkSource(btc::coin::HeaderChain&       chain,
     , submit_block_fn_(std::move(submit_fn))
     , config_(std::move(config))
 {
+    // BTC is SHA256d: p2pool's net.DUMB_SCRYPT_DIFF == 1 for SHA256d nets
+    // (scrypt nets use 2^16). The shared StratumConfig defaults to the scrypt
+    // 65536, so override here — otherwise mining.set_difficulty advertises a
+    // 65536x-inflated wire diff that starves low-rate SHA256d miners of
+    // acceptable shares. Wire-only; does not touch the share-accept target.
+    config_.set_difficulty_multiplier = 1.0;
+
     LOG_INFO << "[BTC-STRATUM] BTCWorkSource constructed"
              << " (testnet=" << is_testnet_
              << " min_diff=" << config_.min_difficulty
