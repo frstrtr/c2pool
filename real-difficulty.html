@@ -52,7 +52,7 @@
 </figure>
 <figure>
 <img src="img/real-diff-real.png" alt="achieved difficulty per block, real BTC data" style="max-width:100%;height:auto;border:1px solid #e6e6e6;border-radius:4px">
-<figcaption>The same data, recomputed over all 4,032 blocks (R = target/hash; difficulty = 1 throughout both epochs, so R is the block&rsquo;s own overshoot). The chain only requires R &ge; 1; the rare spikes are pure luck. Median R &asymp; 2.</figcaption>
+<figcaption>The same data on a log scale, recomputed over all 4,032 blocks straight from a full Bitcoin node (difficulty = 1 throughout both epochs, so R = target/hash is each block&rsquo;s own overshoot). The red line is the chain&rsquo;s requirement (R = 1); the dashed line the median (R &asymp; 2). Every block clears R = 1; the protocol asked for none of the height above &mdash; that is pure luck.</figcaption>
 </figure>
 
 <h2>Dividing target by hash</h2>
@@ -81,7 +81,7 @@
 
 <figure>
 <img src="img/real-diff-illustrative.png" alt="illustrative overshoot distribution" style="max-width:100%;height:auto;border:1px solid #e6e6e6;border-radius:4px">
-<figcaption>Illustrative: the overshoot R follows Pr[R &ge; r] = 1/r, whose mean does not converge &mdash; a single lucky hash can dwarf all others. This is why achieved difficulty cannot be a payment weight, only a work estimator.</figcaption>
+<figcaption>Illustrative (log scale): the overshoot R follows Pr[R &ge; r] = 1/r, whose mean does not converge &mdash; a single lucky hash can dwarf all others. This is why achieved difficulty cannot be a payment weight, only a work estimator.</figcaption>
 </figure>
 <hr style="margin:2.4em 0 1em;border:none;border-top:1px solid #eee">
 <p class="sub">P2Pool scientific basics &mdash; republished and version-controlled. <a href="./">V37 Purple Paper &rarr;</a></p>
