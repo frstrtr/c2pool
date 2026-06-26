@@ -111,6 +111,36 @@ assert_isolation() {
 # startup-only log this is 0 — "isolation asserts pass WITHOUT a block".
 count_blocks_found() { grep -cF "[BTC-SUBMIT] sending block" "$1" || true; }
 
+# -- connect-past-halving assert: the GENUINE-ACTIVATION gate (unified G3b bar) --
+# A won block only proves G3b PASS if it CONNECTED on a net where REAL consensus
+# is ACTIVE -- for BTC that is the subsidy halving (height-driven + genuine, NOT a
+# regtest default override; the DGB-lane taproot-BIP9 analogue). Given a
+# `getblock <hash> 2` JSON on $1 and the halving interval, returns 0 iff the tip
+# block (a) CONNECTED (confirmations >= 1 = on the active chain), (b) sits at
+# height >= the halving interval, and (c) pays a HALVED coinbase (< 50 BTC). A
+# pre-halving height, an un-connected/orphan block, or a 50-BTC over-claim
+# (the #520/#530 bad-cb-amount defect class) all BITE.
+HALVING_INTERVAL="${HALVING_INTERVAL:-150}"   # regtest CRegTestParams nSubsidyHalvingInterval
+
+assert_connect_past_halving() {
+  local blockjson="$1" interval="$2"
+  python3 - "$blockjson" "$interval" <<'PY'
+import json, sys
+blk = json.load(open(sys.argv[1])); interval = int(sys.argv[2])
+conf = blk.get("confirmations", -1)
+height = blk.get("height", -1)
+cbval = sum(o["value"] for o in blk["tx"][0]["vout"])   # coinbase = first tx
+ok = True
+def chk(p, msg):
+    print(("  PASS  " if p else "  FAIL  ") + msg)
+    return p
+ok &= chk(conf >= 1,          "won block CONNECTED (confirmations >= 1, on active chain)")
+ok &= chk(height >= interval, "height %d >= halving interval %d (genuine consensus active, not pre-halving default)" % (height, interval))
+ok &= chk(cbval < 50.0,       "coinbase %.8f BTC is HALVED (< 50 -- not a bad-cb-amount over-claim)" % cbval)
+sys.exit(0 if ok else 1)
+PY
+}
+
 # ── DRY-RUN: self-contained proof, no host/binary/operator-go ────────────────
 if [ "$MODE" = "dry" ]; then
   tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
@@ -140,22 +170,38 @@ EOF
   echo "== G3b regtest standup — DRY-RUN (self-contained isolation proof) =="
   echo "netid=${ISO_NETID} prefix=${ISO_PREFIX}"
   echo
-  echo "[1/3] golden GOOD regtest startup -> asserts MUST pass"
+  echo "[1/4] golden GOOD regtest startup -> asserts MUST pass"
   if assert_isolation "$good" "$ISO_PREFIX"; then echo "  => PASS (as required)"; else echo "  => UNEXPECTED FAIL"; exit 1; fi
   echo
-  echo "[2/3] NEGATIVE mainnet-shaped startup -> asserts MUST bite"
+  echo "[2/4] NEGATIVE mainnet-shaped startup -> asserts MUST bite"
   if assert_isolation "$bad" "$ISO_PREFIX" >/dev/null 2>&1; then
     echo "  => UNEXPECTED PASS — asserts do not bite, FAIL"; exit 1
   else
     echo "  => correctly REJECTED (asserts bite)"
   fi
   echo
-  echo "[3/3] block-FOUND counter on startup-only log (must be 0 — no block)"
+  echo "[3/4] block-FOUND counter on startup-only log (must be 0 — no block)"
   nfound="$(count_blocks_found "$good")"
   echo "  blocks_found=${nfound}"
   [ "$nfound" = "0" ] || { echo "  => UNEXPECTED block on startup log, FAIL"; exit 1; }
   echo
-  echo "DRY-RUN PASS: isolation asserts pass on GOOD, bite on BAD, 0 blocks."
+  echo
+  echo "[4/4] connect-past-halving GENUINE-ACTIVATION gate -> PASS on connected post-halving halved block, BITE otherwise"
+  cpgh="$tmp/cpgh"; mkdir -p "$cpgh"
+  printf '%s\n' '{"confirmations":1,"height":275,"tx":[{"vout":[{"value":25.0}]}]}'  > "$cpgh/good.json"
+  printf '%s\n' '{"confirmations":-1,"height":275,"tx":[{"vout":[{"value":25.0}]}]}' > "$cpgh/bad_unconnected.json"
+  printf '%s\n' '{"confirmations":1,"height":100,"tx":[{"vout":[{"value":50.0}]}]}'  > "$cpgh/bad_prehalving.json"
+  printf '%s\n' '{"confirmations":1,"height":275,"tx":[{"vout":[{"value":50.0}]}]}'  > "$cpgh/bad_overclaim.json"
+  if assert_connect_past_halving "$cpgh/good.json" "$HALVING_INTERVAL"; then echo "  => PASS (as required)"; else echo "  => UNEXPECTED FAIL"; exit 1; fi
+  for b in bad_unconnected bad_prehalving bad_overclaim; do
+    if assert_connect_past_halving "$cpgh/$b.json" "$HALVING_INTERVAL" >/dev/null 2>&1; then
+      echo "  => UNEXPECTED PASS on $b -- gate does not bite, FAIL"; exit 1
+    else
+      echo "  => $b correctly REJECTED (gate bites)"
+    fi
+  done
+  echo
+  echo "DRY-RUN PASS: isolation asserts pass on GOOD, bite on BAD, 0 blocks; connect-past-halving gate passes on a connected post-halving halved block and bites on un-connected/pre-halving/over-claim."
   echo "block-FOUND step is RIG-GATED (#387/#388 bitaxe or RPC-tuned solve) —"
   echo "the live --go run arms it; no block is mined here."
   exit 0
@@ -215,3 +261,6 @@ echo
 echo "BLOCK-FOUND is RIG-GATED: needs a SHA256d solve over parent target —"
 echo "#387/#388 bitaxe, or an RPC-tuned 'generatetoaddress' on the regtest daemon."
 echo "Until a block crosses target, no [BTC-SUBMIT] line fires; that is expected."
+echo
+echo 'CONNECT-GATE (run post-solve to prove GENUINE past-halving connect, unified G3b bar):'
+echo '  assert_connect_past_halving <(ssh $HOST "bitcoin-cli -regtest getblock \$(bitcoin-cli -regtest getblockhash \$(bitcoin-cli -regtest getblockcount)) 2") $HALVING_INTERVAL'
