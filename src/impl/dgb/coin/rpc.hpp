@@ -56,6 +56,11 @@ class NodeRPC : public jsonrpccxx::IClientConnector
     const jsonrpccxx::version RPC_VER = jsonrpccxx::version::v2;
 
     const bool IS_TESTNET;
+
+    // Dev-only boot aid (off by default): when set, NodeRPC::check() relaxes the
+    // DGB algo softfork gate on non-regtest, non-main chains. Never weakens the
+    // gate on mainnet. See dgb::coin::compute_required_softforks.
+    const bool DEV_RELAX_ALGO_SOFTFORKS;
 private:
     dgb::interfaces::Node* m_coin;
 
@@ -77,7 +82,8 @@ private:
     nlohmann::json CallAPIMethod(const std::string& method, const jsonrpccxx::positional_parameter& params = {});
 
 public:
-    NodeRPC(io::io_context* context, dgb::interfaces::Node* coin, bool testnet);
+    NodeRPC(io::io_context* context, dgb::interfaces::Node* coin, bool testnet,
+            bool dev_relax_algo_softforks = false);
     ~NodeRPC();
 
     void connect(NetService address, std::string userpass);

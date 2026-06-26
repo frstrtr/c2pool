@@ -30,6 +30,14 @@ void CoinConfig::load()
 
     PARSE_CONFIG(node, share_period, int);
     PARSE_CONFIG(node, testnet, bool);
+
+    // Dev-only boot aid (off by default). Optional key — absent in every normal
+    // and production config, so it cannot be silently inherited by a real
+    // crossing-soak. Never weakens the gate on mainnet (see
+    // dgb::coin::compute_required_softforks). Deliberately NOT emitted by
+    // get_default(): you must consciously add it to opt in.
+    if (node["dev_relax_algo_softforks"])
+        m_dev_relax_algo_softforks = node["dev_relax_algo_softforks"].as<bool>();
 }
 
 } // namespace dgb

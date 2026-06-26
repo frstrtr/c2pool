@@ -102,7 +102,8 @@ public:
         // node.hpp; testnet drives the chain-identity genesis probe in
         // NodeRPC::check(). connect() (transport bring-up) is driven by the
         // pool-layer seam once an RPC endpoint is configured.
-        m_rpc = std::make_unique<NodeRPC>(m_context, this, m_config->m_testnet);
+        m_rpc = std::make_unique<NodeRPC>(m_context, this, m_config->m_testnet,
+                                          m_config->m_dev_relax_algo_softforks);
     }
 
     NodeRPC* rpc() { return m_rpc.get(); }

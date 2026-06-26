@@ -185,3 +185,78 @@ TEST(DgbDeploymentInfo, AccumulatesIntoExistingSet)
     collect_deployment_names(json::parse(R"({"deployments":{"segwit":{}}})"), out);
     EXPECT_EQ(out, (std::set<std::string>{"preexisting", "segwit"}));
 }
+
+// ---------------------------------------------------------------------------
+// compute_required_softforks() — the readiness-gate relaxation policy SSOT.
+//
+// Pins the dev-only-flag contract (slice (b)): the EXPLICIT, off-by-default
+// dev_relax_algo_softforks flag may relax the DGB algo deployments
+// (reservealgo/odo/nversionbips) on an isolated dev net, but:
+//   * a real testnet crossing-soak (flag OFF) keeps the FULL requirement set;
+//   * mainnet is NEVER relaxed, regardless of the flag (un-inheritable safety);
+//   * regtest is relaxed unconditionally (pre-existing behaviour);
+//   * the non-relaxable forks (csv/segwit/taproot) always survive.
+// ---------------------------------------------------------------------------
+
+using dgb::coin::compute_required_softforks;
+using dgb::coin::relaxable_algo_softforks;
+
+namespace {
+// Mirrors dgb::PoolConfig::SOFTFORKS_REQUIRED (kept local so this guard links
+// no OBJECT lib). DGB_share_test.OracleSoftforksRequired pins the real SSOT.
+const std::set<std::string> kBaseRequired = {
+    "nversionbips", "csv", "segwit", "reservealgo", "odo", "taproot"};
+const std::set<std::string> kRelaxed = {"csv", "segwit", "taproot"};
+} // namespace
+
+TEST(DgbRequiredSoftforks, RelaxableSetIsExactlyThreeAlgoForks)
+{
+    EXPECT_EQ(relaxable_algo_softforks(),
+              (std::set<std::string>{"reservealgo", "odo", "nversionbips"}));
+}
+
+TEST(DgbRequiredSoftforks, RegtestAlwaysRelaxesRegardlessOfFlag)
+{
+    EXPECT_EQ(compute_required_softforks(kBaseRequired, "regtest", false), kRelaxed);
+    EXPECT_EQ(compute_required_softforks(kBaseRequired, "regtest", true),  kRelaxed);
+}
+
+TEST(DgbRequiredSoftforks, TestnetFlagOffKeepsFullSet)
+{
+    // The real-crossing-soak guard: an honest testnet node (flag off) still
+    // demands every fork, exactly as before this slice.
+    EXPECT_EQ(compute_required_softforks(kBaseRequired, "test", false), kBaseRequired);
+}
+
+TEST(DgbRequiredSoftforks, TestnetFlagOnRelaxesAlgoForks)
+{
+    EXPECT_EQ(compute_required_softforks(kBaseRequired, "test", true), kRelaxed);
+}
+
+TEST(DgbRequiredSoftforks, MainnetNeverRelaxedEvenWithFlag)
+{
+    // Un-inheritable safety: the dev flag cannot weaken the gate on mainnet.
+    EXPECT_EQ(compute_required_softforks(kBaseRequired, "main", true),  kBaseRequired);
+    EXPECT_EQ(compute_required_softforks(kBaseRequired, "main", false), kBaseRequired);
+}
+
+TEST(DgbRequiredSoftforks, NonRelaxableForksAlwaysSurvive)
+{
+    for (bool flag : {false, true})
+        for (const char* chain : {"main", "test", "regtest"})
+        {
+            auto req = compute_required_softforks(kBaseRequired, chain, flag);
+            for (const char* keep : {"csv", "segwit", "taproot"})
+                EXPECT_TRUE(req.count(keep))
+                    << "dropped non-relaxable fork " << keep
+                    << " on chain=" << chain << " flag=" << flag;
+        }
+}
+
+TEST(DgbRequiredSoftforks, UnknownChainFollowsFlag)
+{
+    // Defensive: an unrecognised chain string is treated as non-main/non-regtest
+    // — relaxed only when the explicit flag is set.
+    EXPECT_EQ(compute_required_softforks(kBaseRequired, "", false), kBaseRequired);
+    EXPECT_EQ(compute_required_softforks(kBaseRequired, "", true),  kRelaxed);
+}
