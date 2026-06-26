@@ -85,3 +85,88 @@ TEST(DgbWeightDecay, DecayedAttemptsZeroAndIdentity) {
     EXPECT_EQ(wd::decayed_attempts(0, wd::DECAY_SCALE), uint64_t(0));
     EXPECT_EQ(wd::decayed_attempts(12345, wd::DECAY_SCALE), uint64_t(12345)); // x1.0
 }
+
+// ---- #450 consumer-rewire byte-identity invariance ----------------------
+//
+// Pins the share_tracker.hpp rewire (init_decay_table /
+// get_v36_decayed_cumulative_weights / dump_v36_pplns_walk) onto this SSOT.
+// The OLD path below recomputes decay_per and the iterative decay table with
+// the open-coded literals (1<<40, 693147, 1e6, max(CL/4,1)) exactly as the
+// three sites did before #450; the SSOT path sources the rate from
+// wd::decay_per_share / wd::DECAY_SCALE / wd::DECAY_PRECISION. Both run the
+// SAME unsigned __int128 mul-shift used by the production mul128_shift /
+// uint288 hot path, so this proves the rewire is value-invariant
+// (byte-for-byte) across the full decayed-cumulative-weight vector. The OLD
+// path is independent of the helper under test -> NON-CIRCULAR.
+
+TEST(DgbWeightDecay, DecayedCumulativeWeightVectorInvariance) {
+    using uint128 = unsigned __int128;
+    const uint32_t CL = 8640; // V36 DGB chain length
+
+    // --- OLD open-coded decay_per (literals, pre-#450) ---
+    const uint64_t old_half_life = std::max(CL / 4u, 1u);
+    const uint64_t old_decay_per =
+        (uint64_t(1) << 40)
+      - ((uint64_t(1) << 40) * 693147ull) / (1000000ull * old_half_life);
+
+    // --- SSOT decay_per ---
+    const uint64_t ssot_decay_per = wd::decay_per_share(CL);
+
+    ASSERT_EQ(ssot_decay_per, old_decay_per);
+
+    // Synthetic share window: distinct attempts + donation per depth.
+    const std::vector<uint64_t> att = {
+        1000ull, 999983ull, 2500000ull, 65535ull,
+        1ull, 123456789ull, 42ull, 7777777ull,
+    };
+    const std::vector<uint64_t> don = { 0, 100, 32767, 65535, 1, 12345, 200, 65534 };
+    const size_t N = att.size();
+
+    // --- OLD path: iterative decay table via uint128 mul-shift ---
+    std::vector<uint64_t> old_table(N);
+    old_table[0] = (uint64_t(1) << 40); // DECAY_SCALE
+    for (size_t d = 1; d < N; ++d)
+        old_table[d] =
+            (uint64_t)((uint128(old_table[d-1]) * old_decay_per) >> 40);
+
+    // --- SSOT path: same uint128 mul-shift, SSOT-sourced constants/rate ---
+    std::vector<uint64_t> ssot_table(N);
+    ssot_table[0] = wd::DECAY_SCALE;
+    for (size_t d = 1; d < N; ++d)
+        ssot_table[d] = (uint64_t)(
+            (uint128(ssot_table[d-1]) * ssot_decay_per) >> wd::DECAY_PRECISION);
+
+    // Decay-table vectors must be element-by-element identical.
+    ASSERT_EQ(old_table.size(), ssot_table.size());
+    for (size_t d = 0; d < N; ++d)
+        EXPECT_EQ(old_table[d], ssot_table[d]) << "decay_table depth " << d;
+
+    // Per-depth decayed attempts + addr/donation split + running cumulative
+    // totals, mirroring the consumer's uint288 hot path (replicated with
+    // uint128 here; the SSOT scalar decayed_attempts is uint64-only so it is
+    // intentionally NOT used for the att*table widening).
+    uint128 old_cum_total = 0, old_cum_don = 0;
+    uint128 ssot_cum_total = 0, ssot_cum_don = 0;
+    for (size_t d = 0; d < N; ++d) {
+        const uint128 old_dec = (uint128(att[d]) * old_table[d]) >> 40;
+        const uint128 ssot_dec =
+            (uint128(att[d]) * ssot_table[d]) >> wd::DECAY_PRECISION;
+        EXPECT_EQ((uint64_t)old_dec, (uint64_t)ssot_dec) << "decayed_att depth " << d;
+
+        const uint128 old_addr = old_dec * uint128(65535 - don[d]);
+        const uint128 old_donw = old_dec * uint128(don[d]);
+        const uint128 ssot_addr = ssot_dec * uint128(65535 - don[d]);
+        const uint128 ssot_donw = ssot_dec * uint128(don[d]);
+        EXPECT_EQ((uint64_t)old_addr, (uint64_t)ssot_addr) << "addr_w depth " << d;
+        EXPECT_EQ((uint64_t)old_donw, (uint64_t)ssot_donw) << "don_w depth " << d;
+
+        old_cum_total  += old_addr + old_donw;
+        old_cum_don    += old_donw;
+        ssot_cum_total += ssot_addr + ssot_donw;
+        ssot_cum_don   += ssot_donw;
+        EXPECT_EQ((uint64_t)old_cum_total, (uint64_t)ssot_cum_total)
+            << "cum_total depth " << d;
+        EXPECT_EQ((uint64_t)old_cum_don, (uint64_t)ssot_cum_don)
+            << "cum_don depth " << d;
+    }
+}

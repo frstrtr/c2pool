@@ -27,6 +27,7 @@ inline uint64_t mul128_shift(uint64_t a, uint64_t b, unsigned shift) {
 #include "think_p1_walk_bounds.hpp"  // SSOT: think_p1_walk_count / think_p1_in_pruning_zone
 #include "coin/naughty_propagation.hpp"  // SSOT: propagate_naughty_from_parent (data.py:543-549)
 #include <impl/dgb/coin/desired_version_tally.hpp>  // SSOT: accumulate_version_weights / accumulate_version_counts (#429 follow-on)
+#include <impl/dgb/coin/share_weight_decay.hpp>  // SSOT: weight-decay constants/half_life/decay_per_share (#450 rewire)
 #include "coin/pool_attempts_per_second.hpp"  // SSOT: compute_pool_attempts_per_second (#407 follow-on)
 #include "coin/tail_score_endpoints.hpp"  // SSOT: score_* endpoint arithmetic (ShareTracker::score chain-walk, #411 follow-on)
 #include "coin/chain_walk_window.hpp"  // SSOT: lookbehind clamp (#423 diag follow-on); consensus get_desired_version_weights stays inline
@@ -159,9 +160,9 @@ struct PPLNSEntry {
 
 class DensePPLNSWindow {
 public:
-    static constexpr uint64_t DECAY_PRECISION = 40;
-    static constexpr uint64_t DECAY_SCALE = uint64_t(1) << DECAY_PRECISION;
-    static constexpr uint64_t LN2_MICRO = 693147;
+    static constexpr uint64_t DECAY_PRECISION = dgb::coin::weight_decay::DECAY_PRECISION;
+    static constexpr uint64_t DECAY_SCALE     = dgb::coin::weight_decay::DECAY_SCALE;
+    static constexpr uint64_t LN2_MICRO       = dgb::coin::weight_decay::LN2_MICRO;
 
     // Precomputed decay table: decay_table[d] = iterative decay factor at depth d.
     // Computed once, reused for every PPLNS walk. Thread-safe after init.
@@ -172,8 +173,7 @@ public:
     static void init_decay_table(uint32_t chain_len) {
         if (s_table_initialized && s_decay_table.size() == chain_len)
             return;
-        uint32_t half_life = std::max(chain_len / 4, uint32_t(1));
-        s_decay_per = DECAY_SCALE - (DECAY_SCALE * LN2_MICRO) / (uint64_t(1000000) * half_life);
+        s_decay_per = dgb::coin::weight_decay::decay_per_share(chain_len);
         s_decay_table.resize(chain_len);
         s_decay_table[0] = DECAY_SCALE;
         for (uint32_t d = 1; d < chain_len; ++d)
@@ -1729,12 +1729,8 @@ public:
             && m_decayed_cache_desired == desired_weight)
             return m_decayed_cache_result;
 
-        static constexpr uint64_t DECAY_PRECISION = 40;
-        static constexpr uint64_t DECAY_SCALE = uint64_t(1) << DECAY_PRECISION;
-        static constexpr uint64_t LN2_MICRO = 693147;
-
-        uint32_t half_life = std::max(PoolConfig::chain_length() / 4, uint32_t(1));
-        uint64_t decay_per = DECAY_SCALE - (DECAY_SCALE * LN2_MICRO) / (uint64_t(1000000) * half_life);
+        using namespace dgb::coin::weight_decay; // SSOT decay constants + helpers (#450)
+        uint64_t decay_per = decay_per_share(PoolConfig::chain_length());
 
         CumulativeWeights result;
         int32_t share_count = 0;
@@ -1804,12 +1800,9 @@ public:
             return;
         }
 
-        static constexpr uint64_t DECAY_PRECISION = 40;
-        static constexpr uint64_t DECAY_SCALE = uint64_t(1) << DECAY_PRECISION;
-        static constexpr uint64_t LN2_MICRO = 693147;
-
-        uint32_t half_life = std::max(PoolConfig::chain_length() / 4, uint32_t(1));
-        uint64_t decay_per = DECAY_SCALE - (DECAY_SCALE * LN2_MICRO) / (uint64_t(1000000) * half_life);
+        using namespace dgb::coin::weight_decay; // SSOT decay constants + helpers (#450)
+        uint32_t half_life = dgb::coin::weight_decay::half_life(PoolConfig::chain_length());
+        uint64_t decay_per = decay_per_share(PoolConfig::chain_length());
 
         int32_t share_count = 0;
         uint64_t decay_fp = DECAY_SCALE;
