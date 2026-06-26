@@ -1,0 +1,35 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Real difficulty</title><style>
+ body{font-family:Georgia,'Times New Roman',serif;max-width:780px;margin:2.2em auto;padding:0 1.2em;color:#1a1a1a;line-height:1.6;font-size:17px;background:#fff;}
+ h1{font-size:1.55em;line-height:1.3;margin:0 0 .15em;font-weight:600;}
+ .sub{color:#666;margin:0 0 1.6em;font-size:.92em;}
+ h2{font-size:1.13em;margin:1.7em 0 .45em;font-weight:600;border-bottom:1px solid #e6e6e6;padding-bottom:.2em;}
+ h3{font-size:1.0em;margin:1.2em 0 .35em;font-weight:600;color:#333;}
+ p{margin:0 0 .9em;text-align:justify;} ul{margin:0 0 .9em;padding-left:1.4em;} li{margin:.2em 0;}
+ code,pre{font-family:'SF Mono',Consolas,monospace;font-size:.88em;background:#f4f1f8;border-radius:4px;}
+ code{padding:.05em .3em;} pre{padding:.7em .9em;overflow-x:auto;border:1px solid #e7e2f0;}
+ .v37{background:#faf8fc;border-left:4px solid #6c4f9c;padding:.9em 1.1em;margin:1.4em 0;border-radius:0 4px 4px 0;}
+ .v37 .tag{display:inline-block;background:#6c4f9c;color:#fff;font-family:sans-serif;font-size:.7em;font-weight:700;letter-spacing:.05em;padding:.15em .55em;border-radius:3px;vertical-align:middle;margin-right:.5em;}
+ .imgnote{background:#fff8e6;border:1px dashed #d6b656;padding:.6em .9em;margin:1em 0;font-family:sans-serif;font-size:.85em;color:#7a5d00;border-radius:4px;}
+ a{color:#6c4f9c;} nav{font-family:sans-serif;font-size:.85em;margin:0 0 1.8em;color:#888;}
+ nav a{margin-right:.8em;}
+</style></head><body>
+<nav><a href="./">← Purple Paper</a> · <a href="real-difficulty.html">Real difficulty</a> · <a href="difficulty-adjustment.html">Difficulty adjustment</a> · <a href="taproot-coinbase.html">Taproot coinbase</a></nav><h1>Real difficulty</h1><p class="sub">P2Pool scientific basics</p>
+
+<div class="imgnote">IMAGE CHECK: my scrape found no images on this page. If the live page has diagrams, send the files and I'll place them here.</div>
+<p>A block header carries a compact <b>target</b> in its <code>bits</code> field, expanded as:</p>
+<pre>target = mantissa &times; 2^(8 &times; (exponent &minus; 3))</pre>
+<p>A hash is valid if it is numerically <i>below</i> the target. The <b>achieved</b> (or &ldquo;real&rdquo;) difficulty of a hash is how far below it landed &mdash; the ratio between the maximum target and the hash:</p>
+<pre>R = target &divide; hash</pre>
+<p>A lower hash gives a higher ratio, indicating a rarer find.</p>
+
+<div class="v37"><span class="tag">V37</span><b>What achieved difficulty is &mdash; and is not &mdash; used for.</b>
+<p>It is tempting to pay miners in proportion to achieved difficulty: &ldquo;you found a rarer hash, you earn more.&rdquo; <b>This is wrong, and provably so.</b></p>
+<p>Achieved difficulty is <b>pure luck</b>. Conditioned on meeting the target, the overshoot <code>R</code> follows a power law, <code>Pr[R &ge; r] = 1/r</code>, whose mean does not converge: a single fortunate hash can exceed the sum of all others by a factor on the order of the whole hash space. Paying by achieved difficulty would let one lucky share take an entire payout window &mdash; re-importing into the pool exactly the variance that pooling exists to remove.</p>
+<p><b>Work is therefore credited by the <i>target</i> a share was required to meet, never by the value its hash happened to reach.</b> Two shares meeting the same target are paid equally. This keeps the accounting <i>luck-neutral</i>.</p>
+<p>Achieved difficulty is not useless &mdash; it carries different information. While it cannot <i>weight</i> a payment, the largest achieved difficulties a worker produces can <i>estimate</i> how much total work it did, including work that never met the share target. So a worker too weak to ever find a share can still be credited in proportion to the work it actually performed. <b>Measurement, not payment.</b></p>
+<p>This is the foundation of the V37 work-receipt accounting &mdash; see the <a href="./">Purple Paper</a>, &sect;5 (Proof-of-Work as Measurement) and &sect;8 (Recovering Work Below the Order).</p>
+</div>
+
+<hr style="margin:2.4em 0 1em;border:none;border-top:1px solid #eee">
+<p class="sub">P2Pool scientific basics — republished and version-controlled. <a href="./">V37 Purple Paper &rarr;</a></p>
+</body></html>
