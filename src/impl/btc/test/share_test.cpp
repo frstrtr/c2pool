@@ -6,6 +6,8 @@
 #include <core/uint256.hpp>
 #include <sharechain/sharechain.hpp>
 #include <impl/btc/share.hpp>
+#include <impl/btc/coin/template_builder.hpp>
+#include <impl/btc/coin/header_chain.hpp>
 
 // struct FakeBlock
 // {
@@ -67,4 +69,53 @@ TEST(BTC_version_gate, SegwitNotFoldedIntoV36Gate)
     static_assert(33u < core::version_gate::V36_ACTIVATION_VERSION,
                   "BTC segwit version must remain below the v36 gate");
     EXPECT_FALSE(core::version_gate::is_v36_active(33));
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Coinbase subsidy MUST honor the per-network halving interval.
+//
+// Regression for the G3b won-block "bad-cb-amount" reject: the embedded
+// TemplateBuilder computes coinbasevalue from get_block_subsidy(height) and
+// previously hardcoded the 210,000-block mainnet halving interval. On regtest
+// (CRegTestParams nSubsidyHalvingInterval = 150) a won block at height 275 is
+// one halving past 150, so consensus allows only 25 BTC — but c2pool emitted
+// the genesis 50 BTC and bitcoind rejected the block on ConnectBlock, silently
+// losing the won subsidy. get_block_subsidy must scale by the passed interval.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST(BTC_subsidy, RegtestHalvingIntervalHonored)
+{
+    using btc::coin::get_block_subsidy;
+    constexpr uint64_t COIN = 100'000'000ULL;
+
+    // Regtest interval = 150. This is the exact won-block scenario.
+    EXPECT_EQ(get_block_subsidy(0,   150u), 50 * COIN);   // genesis epoch
+    EXPECT_EQ(get_block_subsidy(149, 150u), 50 * COIN);   // last of epoch 0
+    EXPECT_EQ(get_block_subsidy(150, 150u), 25 * COIN);   // first halving
+    EXPECT_EQ(get_block_subsidy(274, 150u), 25 * COIN);   // still epoch 1
+    EXPECT_EQ(get_block_subsidy(275, 150u), 25 * COIN);   // the rejected height: 25, NOT 50
+    EXPECT_EQ(get_block_subsidy(299, 150u), 25 * COIN);   // last of epoch 1
+    EXPECT_EQ(get_block_subsidy(300, 150u), 1'250'000'000ULL); // 12.5 BTC, epoch 2
+
+    // The pre-fix bug would have returned 50 BTC at h=275 (275 < 210000).
+    EXPECT_NE(get_block_subsidy(275, 150u), 50 * COIN);
+}
+
+// Mainnet/testnet remain consensus-neutral after parameterization: the
+// chainparams field defaults to 210,000 and the single-arg default path is
+// unchanged.
+TEST(BTC_subsidy, MainnetIntervalUnchanged)
+{
+    using btc::coin::get_block_subsidy;
+    using btc::coin::BTCChainParams;
+    constexpr uint64_t COIN = 100'000'000ULL;
+
+    EXPECT_EQ(BTCChainParams::mainnet().subsidy_halving_interval, 210'000u);
+    EXPECT_EQ(BTCChainParams::testnet().subsidy_halving_interval, 210'000u);
+    EXPECT_EQ(BTCChainParams::testnet4().subsidy_halving_interval, 210'000u);
+
+    // Default-arg (single-arg) call still yields mainnet halving values.
+    EXPECT_EQ(get_block_subsidy(209'999),       50 * COIN);
+    EXPECT_EQ(get_block_subsidy(210'000),       25 * COIN);
+    EXPECT_EQ(get_block_subsidy(210'000, 210'000u), 25 * COIN);
 }

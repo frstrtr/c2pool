@@ -6,7 +6,7 @@
 /// removing the getblocktemplate RPC dependency for LTC.
 ///
 /// Provides:
-///   get_block_subsidy()   — BTC halving schedule (50 BTC, halving every 210,000 blocks)
+///   get_block_subsidy()   — BTC halving schedule (50 BTC, per-network halving interval)
 ///   compute_merkle_root() — SHA256d-based Merkle tree (Bitcoin/Litecoin compatible)
 ///   TemplateBuilder       — static build_template() → WorkData
 ///   CoinNodeInterface     — abstract interface (getwork / submit_block / getblockchaininfo)
@@ -43,15 +43,18 @@ namespace coin {
 
 /// BTC block subsidy (miner reward) in satoshis at a given block height.
 /// Initial subsidy: 50 BTC = 5,000,000,000 satoshis.
-/// Halving: every 210,000 blocks (BTC original halving schedule).
+/// Halving: every halving_interval blocks (210,000 mainnet/testnet, 150 regtest).
 /// Subsidy drops to 0 after 64 halvings (never in practice — block ~13.4 M).
 /// Reference: ref/bitcoin/src/validation.cpp GetBlockSubsidy().
-inline uint64_t get_block_subsidy(uint32_t height) {
+inline uint64_t get_block_subsidy(uint32_t height,
+                                  uint32_t halving_interval = 210'000u) {
     static constexpr uint64_t COIN            = 100'000'000ULL;   // satoshis per BTC
     static constexpr uint64_t INITIAL_SUBSIDY = 50ULL * COIN;     // 50 BTC
-    static constexpr uint32_t HALVING_INTERVAL = 210'000u;
+    // halving_interval is per-network (Bitcoin Core consensus.nSubsidyHalvingInterval):
+    // mainnet/testnet 210,000, regtest 150. Default keeps single-arg callers on mainnet.
+    if (halving_interval == 0) return INITIAL_SUBSIDY;  // guard div-by-zero
 
-    int halvings = static_cast<int>(height / HALVING_INTERVAL);
+    int halvings = static_cast<int>(height / halving_interval);
     if (halvings >= 64) return 0;
     return INITIAL_SUBSIDY >> halvings;
 }
@@ -199,7 +202,7 @@ public:
             block_version = BIP9_BASE_VERSION;
 
         // ── Subsidy ────────────────────────────────────────────────────────
-        uint64_t subsidy = get_block_subsidy(next_h);
+        uint64_t subsidy = get_block_subsidy(next_h, chain.params().subsidy_halving_interval);
 
         // ── Transactions from mempool (fee-sorted when UTXO available) ────
         auto [selected_txs, total_fees] =
