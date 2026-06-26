@@ -18,7 +18,8 @@
 
 #include "config_pool.hpp"
 #include "crypto/hash_x11.hpp"
-#include "share_check.hpp"  // dash::DONATION_SCRIPT (consensus-critical SSOT)
+#include "share_check.hpp"
+#include <core/version_gate.hpp>  // dash::DONATION_SCRIPT (consensus-critical SSOT)
 
 #include <core/coin_params.hpp>
 #include <core/pow.hpp>
@@ -115,9 +116,15 @@ inline core::CoinParams make_coin_params(bool testnet, const PoolOverrides& over
     p.testnet_identifier_hex = PoolConfig::TESTNET_IDENTIFIER_HEX;
     p.testnet_prefix_hex     = PoolConfig::TESTNET_PREFIX_HEX;
 
-    // Donation script (consensus-critical) — DASH is ALWAYS P2PKH (no segwit, no
-    // v36 combined-P2SH on the older baseline). Single SSOT = dash::DONATION_SCRIPT.
-    p.donation_script_func = [](int64_t /*share_version*/) -> std::vector<unsigned char> {
+    // Donation script (consensus-critical) — version-keyed (operator FLAG6
+    // 2026-06-17, 3-bucket rule). Pre-v36 shares use the DASH-specific P2PKH
+    // DONATION_SCRIPT (Bucket-3, per-coin keep-for-soak); v36+ shares use the
+    // unified cross-coin COMBINED_DONATION_SCRIPT P2SH (Bucket-2, byte-identical
+    // to btc/bch/dgb/ltc). Activation height/version is gated by the G2 ratchet;
+    // current_share_version stays 16 so no live share changes shape here.
+    p.donation_script_func = [](int64_t share_version) -> std::vector<unsigned char> {
+        if (core::version_gate::is_v36_active(static_cast<uint64_t>(share_version)))
+            return COMBINED_DONATION_SCRIPT;
         return DONATION_SCRIPT;
     };
 
