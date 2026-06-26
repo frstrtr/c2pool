@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 #include <c2pool/hashrate/tracker.hpp>
+#include <core/stratum_types.hpp>
 #include <string>
 #include <sstream>
 #include <cstdint>
@@ -657,4 +658,40 @@ TEST(StratumExtensions, Extranonce1Uniqueness)
         EXPECT_TRUE(result.second);  // no duplicates
     }
     EXPECT_EQ(seen.size(), 1000u);
+}
+
+
+// ---------------------------------------------------------------------------
+// mining.set_difficulty wire multiplier (p2pool net.DUMB_SCRYPT_DIFF)
+//
+// send_set_difficulty() advertises `internal * StratumConfig.set_difficulty_
+// multiplier`. That multiplier is per-network and tracks the PoW algorithm:
+// 2^16 (65536) for scrypt nets (LTC/DOGE), 1 for SHA256d nets (bitcoin). The
+// shared default MUST stay 65536 so scrypt coins keep advertising the diff
+// their miners expect; SHA256d work sources (BTCWorkSource) override to 1.0.
+// Regression lock: a refactor that drops/changes the default silently breaks
+// every scrypt miner; one that drops the SHA256d=1 convention re-inflates the
+// BTC wire diff 65536x and starves low-rate SHA256d miners of shares.
+// ---------------------------------------------------------------------------
+TEST(StratumSetDifficulty, ScryptDefaultMultiplierPreserved)
+{
+    core::stratum::StratumConfig cfg{};
+    // Default = scrypt convention (LTC/DOGE). Do NOT "standardize" this away.
+    EXPECT_DOUBLE_EQ(cfg.set_difficulty_multiplier, 65536.0);
+
+    // Scrypt wire diff for the p2pool min-difficulty floor (0.0005 internal):
+    EXPECT_DOUBLE_EQ(cfg.min_difficulty * cfg.set_difficulty_multiplier, 32.768);
+}
+
+TEST(StratumSetDifficulty, Sha256dMultiplierAdvertisesTrueDifficulty)
+{
+    // A SHA256d work source (BTCWorkSource) overrides the multiplier to 1.0 so
+    // the wire diff equals the true share difficulty. Lock the formula and the
+    // value a low-rate SHA256d miner must see at the 0.0005 floor.
+    core::stratum::StratumConfig cfg{};
+    cfg.set_difficulty_multiplier = 1.0;  // SHA256d override (bitcoin.py: DUMB_SCRYPT_DIFF = 1)
+
+    EXPECT_DOUBLE_EQ(cfg.min_difficulty * cfg.set_difficulty_multiplier, 0.0005);
+    // ...and that this is 65536x lower than the (wrong-for-SHA256d) scrypt wire diff.
+    EXPECT_DOUBLE_EQ(32.768 / (cfg.min_difficulty * cfg.set_difficulty_multiplier), 65536.0);
 }

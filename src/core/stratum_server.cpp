@@ -1178,20 +1178,26 @@ void StratumSession::send_error(int code, const std::string& message, const nloh
 
 void StratumSession::send_set_difficulty(double difficulty)
 {
-    // Scrypt pools must multiply by DUMB_SCRYPT_DIFF (2^16 = 65536) when
-    // sending mining.set_difficulty. Without this, Scrypt miners interpret
-    // the difficulty as near-zero and submit all solutions indiscriminately.
+    // p2pool sends mining.set_difficulty as target_to_difficulty(target) *
+    // net.DUMB_SCRYPT_DIFF. That multiplier is PER-NETWORK and tracks the PoW
+    // algorithm: 2^16 (65536) for scrypt nets (LTC/DOGE), but 1 for SHA256d
+    // nets (p2pool bitcoin.py: DUMB_SCRYPT_DIFF = 1). Applying the scrypt 2^16
+    // to a SHA256d coin inflates the advertised diff 65536x, so a low-rate
+    // SHA256d miner self-throttles and never submits an acceptable share. The
+    // multiplier is therefore config-driven: StratumConfig defaults to the
+    // scrypt 65536; BTC's SHA256d work source overrides it to 1.0.
     // Reference: p2pool stratum.py line 465:
     //   target_to_difficulty(self.target) * self.wb.net.DUMB_SCRYPT_DIFF
-    static constexpr double DUMB_SCRYPT_DIFF = 65536.0;
+    const double diff_multiplier =
+        mining_interface_->get_stratum_config().set_difficulty_multiplier;
 
     nlohmann::json notification;
     notification["id"] = nullptr;
     notification["method"] = "mining.set_difficulty";
-    notification["params"] = nlohmann::json::array({difficulty * DUMB_SCRYPT_DIFF});
+    notification["params"] = nlohmann::json::array({difficulty * diff_multiplier});
 
     LOG_INFO << "[Stratum] set_difficulty: internal=" << difficulty
-             << " wire=" << (difficulty * DUMB_SCRYPT_DIFF);
+             << " wire=" << (difficulty * diff_multiplier);
     send_response(notification);
 }
 

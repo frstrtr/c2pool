@@ -39,6 +39,10 @@ struct StratumConfig {
     double target_time          = 3.0;      // seconds between pseudoshares (p2pool default: 3)
     bool   vardiff_enabled      = true;     // auto-adjust per-connection difficulty
     size_t max_coinbase_outputs = 4000;     // Python p2pool's [-4000:] cap; no consensus limit
+    // Per-network mining.set_difficulty multiplier (p2pool net.DUMB_SCRYPT_DIFF):
+    // 2^16 (65536) for scrypt nets (LTC/DOGE), 1 for SHA256d nets (bitcoin).
+    // Default preserves the scrypt convention; SHA256d work sources override to 1.0.
+    double set_difficulty_multiplier = 65536.0;
 };
 
 /// Frozen share-construction fields returned by ref_hash_fn. These
