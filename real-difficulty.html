@@ -47,8 +47,12 @@
 <p>To summarize, the target is the difficulty level encoded in a compact form, while the real target is the difficulty level derived from the actual block hash. The real target is calculated to assess the relative difficulty of finding a particular block hash compared to the maximum target value.</p>
 
 <figure>
-<img src="img/real-diff-epochs.png" alt="target/real_target for epoch_0 and epoch_1 of the bitcoin blockchain" style="max-width:100%;height:auto;border:1px solid #e6e6e6;border-radius:4px">
-<figcaption>target/real_target for epoch_0 (0&ndash;2015) and epoch_1 (2016&ndash;4031) bitcoin blockchain</figcaption>
+<img src="img/real-diff-epochs.png" alt="original factor chart" style="max-width:100%;height:auto;border:1px solid #e6e6e6;border-radius:4px">
+<figcaption>Original chart (as published): target/real_target per block for epoch_0 (0&ndash;2015) and epoch_1 (2016&ndash;4031) of the Bitcoin blockchain. Preserved here for reference.</figcaption>
+</figure>
+<figure>
+<img src="img/real-diff-real.png" alt="achieved difficulty per block, real BTC data" style="max-width:100%;height:auto;border:1px solid #e6e6e6;border-radius:4px">
+<figcaption>The same data, recomputed over all 4,032 blocks (R = target/hash; difficulty = 1 throughout both epochs, so R is the block&rsquo;s own overshoot). The chain only requires R &ge; 1; the rare spikes are pure luck. Median R &asymp; 2.</figcaption>
 </figure>
 
 <h2>Dividing target by hash</h2>
