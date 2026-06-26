@@ -807,8 +807,12 @@ int main(int argc, char* argv[])
         }
         LOG_INFO << "[BTC-SUBMIT] sending block " << block_hash.GetHex().substr(0, 16)
                  << " height=" << height << " (via stratum)";
-        // FALLBACK: P2P relay primary, submitblock RPC if P2P unavailable/failed.
-        return coin_node.submit_block_with_fallback(block_bytes);
+        // CONNECT-AUTHORITATIVE: P2P relay (fast propagation) + submitblock RPC
+        // fired UNCONDITIONALLY so the won block actually connects. A P2P
+        // cmpctblock announce-success alone does NOT connect the tip (daemon
+        // requests the body via getblocktxn, which we do not serve) - the
+        // silent-loss this path closes. BTC-fenced; cross-coin fallback intact.
+        return coin_node.submit_block_for_connect(block_bytes);
     };
 
     // Construct the work source. Holds non-owning refs to chain + mempool;

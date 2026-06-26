@@ -32,5 +32,29 @@ inline bool broadcast_block_with_fallback(
     return core::broadcast_block_with_fallback(relay_p2p, submit_rpc);
 }
 
+// CONNECT-AUTHORITATIVE broadcast (BTC lane ONLY). Distinct policy from the
+// cross-coin FALLBACK orchestration above: a P2P relay "success" only means
+// the block was ANNOUNCED to a peer (a cmpctblock header). Under compact-block
+// relay the daemon then requests the body via getblocktxn, which the c2pool
+// broadcaster does NOT serve, so the daemon never ConnectBlock()s the block and
+// the full subsidy is silently lost even though relay_p2p() returned true. The
+// submitblock RPC, by contrast, delivers the FULL block and is therefore
+// connect-authoritative. So the connect path ALWAYS fires the RPC leg, in
+// ADDITION to the P2P relay (kept for best-effort fast propagation). Returns
+// true iff the block reached at least one sink.
+//
+// This is BTC-lane-fenced and deliberately does NOT alter the cross-coin
+// core::broadcast_block_with_fallback contract: the give-submitblock-primacy /
+// always-fire convergence is the v37 broadcaster-convergence shape held on HOLD
+// (#500/#498). Only the BTC won-block connect path opts into it here.
+inline bool broadcast_block_for_connect(
+    const std::function<bool()>& relay_p2p,
+    const std::function<bool()>& submit_rpc)
+{
+    bool relayed   = relay_p2p  ? relay_p2p()  : false;  // best-effort fast propagation
+    bool connected = submit_rpc ? submit_rpc() : false;  // ALWAYS - connect-authoritative
+    return relayed || connected;
+}
+
 } // namespace coin
 } // namespace btc

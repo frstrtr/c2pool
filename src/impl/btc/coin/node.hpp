@@ -125,6 +125,21 @@ public:
             [&]{ return submit_block_hex(block_bytes); });
     }
 
+    /// Broadcast a WON block for ACTUAL CONNECT (BTC lane). Unlike
+    /// submit_block_with_fallback (P2P-primary, RPC only on relay-fail), the
+    /// connect path fires the submitblock RPC UNCONDITIONALLY because a P2P
+    /// cmpctblock announce-success does NOT guarantee the daemon connects the
+    /// block (it requests the body via getblocktxn, which we do not serve).
+    /// submitblock is connect-authoritative; P2P relay still fires for fast
+    /// propagation. BTC-fenced - does not change the cross-coin fallback
+    /// contract. Returns true iff the block reached at least one sink.
+    bool submit_block_for_connect(const std::vector<unsigned char>& block_bytes)
+    {
+        return broadcast_block_for_connect(
+            [&]{ return submit_block_p2p_raw(block_bytes); },
+            [&]{ return submit_block_hex(block_bytes); });
+    }
+
     bool has_p2p() const { return m_p2p != nullptr; }
 
     /// Send getheaders to drive header sync (BIP 31).
