@@ -533,6 +533,15 @@ int main(int argc, char* argv[])
     LOG_INFO << "[BTC] Connecting to bitcoind...";
     coin_node.start_p2p(NetService(bitcoind_host, bitcoind_port));
 
+    // Phase 10c: pull the peer mempool on connect (BIP 35) so TemplateBuilder
+    // produces POPULATED blocks. Without this the new_tx subscription above only
+    // sees txs announced via inv AFTER connect; txs already resident in the
+    // bitcoind mempool at connect time (e.g. a seeded regtest mempool) are never
+    // requested, leaving coinbase-only templates. Mirrors main_dgb. Peer must
+    // advertise NODE_BLOOM (regtest: -peerbloomfilters=1) or the request is
+    // skipped (logged) to avoid a disconnect; normal inv relay still applies.
+    coin_node.enable_mempool_request();
+
     // Drive initial header sync. Per BTC protocol, NodeP2P's verack handler
     // sends sendheaders/sendcmpct/feefilter but NOT getheaders — header sync
     // is the consumer's responsibility (LTC drives this from the broadcaster).
