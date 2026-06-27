@@ -55,6 +55,27 @@ a strict Pareto improvement — whole-set liveness AND bounded-W/K DoS AND uncon
 safety, together. Reproduce: `t12_sticky_shard_assembly.py`; numbers in
 `out/FINDINGS-t12-sticky-shard.md`.
 
+## CHECKPOINT MUST LAG FINALITY (T13 feed) — the M4 ⟂ M1 seam
+
+The T9/T12 serving-layer safety proof ("stateless verifier canonical-rebuilds the served
+live-set and checks it vs the committed root → server need not be honest") has a hidden
+premise: **the committed root must itself be canonical.** T13 closes it. If consensus commits
+a checkpoint over a reorg-able tip, the committed root describes an orphaned live-set, and a
+trustless cold-start anchoring to it lands on a dead branch — the serving-layer proof does not
+cover this, because the *commitment* is wrong, not the server.
+
+T13 sweeps reorg depth `d` × checkpoint lag `L` against the real forest and finds a clean
+safety diagonal: the committed height stays canonical **iff `L ≥ d`** (10 orphan events = the
+exact lower triangle, no grey zone). **Rule: commit only finalized prefixes, `L ≥ D_f`** — the
+SAME finality depth M1's overlay settles on (`BlockFinalized→OwedSettled`,
+`BlockOrphaned→OverlayReverted`). A checkpoint is just the finalized-side read of the
+settlement overlay, so an orphan never touches a committed checkpoint. The cost is **additive,
+not asymptotic**: delta tail = `(C+L)` rounds, cold-start stays `O(W·(1+f·(C+L)))`; at f=10%,
+C=5, L=D_f=8 the safety premium is +0.8× the W-leaf-floor egress, one-time per cold-start.
+Pick `C ≤ (k−1)/f − D_f` to keep total delta ≤ k·W. Net: checkpoint =
+`{≤8 forest roots + 1 shard-root} committed at depth ≥ D_f behind the tip`. Reproduce:
+`t13_checkpoint_finality_lag.py`; numbers in `out/FINDINGS-t13-finality-lag.md`.
+
 ## Still NOT answered locally — explicit M5-integration carry-forward (no silent caps)
 
 - Real share/PoW/signature verification cost in the build path — synthetic sha256
