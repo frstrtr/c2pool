@@ -1528,19 +1528,23 @@ public:
                 auto excess = time_since_share - emergency_threshold;
                 auto halvings = excess / half_life;
                 auto remainder = excess % half_life;
-                // 2^halvings with linear interpolation for fractional part
-                uint256 eased = prev_max_target;
-                if (halvings < 256)
-                    eased <<= halvings;
-                else
-                    eased = MAX_TARGET;
-                // Linear interpolation: eased = eased * (half_life + remainder) / half_life
+                // Step 3 (emergency ease): 2^halvings with linear interpolation.
+                // Shift in the wider uint288 accumulator, saturating at
+                // MAX_TARGET as we go so no uint256- OR uint288-representable
+                // wrap can occur. The old uint256 `eased <<= halvings` wrapped
+                // mod 2^256, collapsing the eased target to a hard value and
+                // stalling the DAA stall-path (~50-68min death-spiral hole).
                 uint288 eased_288;
-                eased_288.SetHex(eased.GetHex());
-                eased_288 = eased_288 * static_cast<uint32_t>(half_life + remainder);
-                eased_288 = eased_288 / static_cast<uint32_t>(half_life);
+                eased_288.SetHex(prev_max_target.GetHex());
                 uint288 max_288;
                 max_288.SetHex(MAX_TARGET.GetHex());
+                for (uint64_t i = 0; i < static_cast<uint64_t>(halvings) && i < 288 && eased_288 <= max_288; ++i)
+                    eased_288 <<= 1;
+                if (eased_288 > max_288)
+                    eased_288 = max_288;
+                // Linear interpolation: eased = eased * (half_life + remainder) / half_life
+                eased_288 = eased_288 * static_cast<uint32_t>(half_life + remainder);
+                eased_288 = eased_288 / static_cast<uint32_t>(half_life);
                 if (eased_288 > max_288)
                     clamp_ref_target = MAX_TARGET;
                 else
