@@ -67,8 +67,33 @@ T8 committed-checkpoint root-check, separating SAFETY from LIVENESS:
   Net design feed for the superlight synthesis: checkpoint = {<=8 forest roots + 1 shard-
   root}; safety needs ZERO honest servers, honest-server count is purely a liveness knob,
   and per-shard commitment converts whole-W DoS amplification into a bounded W/K one.
-NEXT (local): T10 cadence-vs-finality interaction (the checkpoint must lag finality depth
-so a checkpoint is never committed over a reorg-able tip); then multi-bridge + checkpoint-
-lag combined model.
-Deep analysis of v37-superlight-chain-synthesis.md still gated behind the single
-shared-inference slot (M1 lanes -> payment-hardening). No production code; proto repo only.
+T13 checkpoint cadence-vs-FINALITY-LAG DONE (harness/t13_checkpoint_finality_lag.py,
+out/t13-finality-lag-w50k.txt, out/FINDINGS-t13-finality-lag.md). Closes the seam where M4
+touches M1's finality gate: the T9/T12 serving-layer safety proof assumes the COMMITTED root
+is canonical; a checkpoint committed over a reorg-able tip commits an orphaned live-set and a
+trustless cold-start anchoring to it lands on a dead branch. Sweeping reorg-depth d x lag L
+against the real forest gives a clean safety diagonal -- canonical iff L >= d (10 orphan
+events = the exact lower triangle, no grey zone). RULE: commit only finalized prefixes,
+L >= D_f -- the SAME depth M1's overlay settles on; a checkpoint is the BlockFinalized/
+OwedSettled-side read of the settlement overlay, so BlockOrphaned never touches a committed
+checkpoint. Cost is ADDITIVE not asymptotic: delta tail = (C+L) rounds, cold-start stays
+O(W*(1+f*(C+L))); +0.8x W-floor egress premium at f=10%/C=5/L=D_f=8, one-time per cold-start.
+Pick C <= (k-1)/f - D_f for total delta <= k*W. Net checkpoint = {<=8 forest roots +
+1 shard-root} committed at depth >= D_f behind the tip.
+T14 END-TO-END combined cold-start DONE (harness/t14_e2e_coldstart.py,
+out/t14-e2e-coldstart-w300k.txt, out/FINDINGS-t14-e2e-coldstart.md). Wires the three
+load-bearing tracks into the single procedure a new sovereign validator runs: T13 finality-
+lagged checkpoint (L>=D_f) -> T12 sticky-shard serve from an adversarial bridge pool -> T7
+PoW-anchored delta tail to the finalized head, accept iff rebuilt head reproduces the
+committed finalized-head roots. They COMPOSE: end-to-end @300K = 14.4MB egress (1.5x the
+9.6MB W-leaf floor) / 1.04s rebuild, cost O(W*(1+f*(C+L-D_f))) ADDITIVE not asymptotic;
+0 wrong-head accepts across the full sweep (incl h=0 eclipse), h>0 finalizes canonical at
+every reorg depth<=D_f, h=0 stalls (liveness only). KEY RESULT: the spec is TWO independent
+on-chain anchors {checkpoint at depth>=D_f} + {finalized-head roots} -- the VIOLATION arm
+proves an under-lagged commit (L<D_f) orphaned by a deep reorg is SERVED faithfully yet
+CAUGHT by the second anchor (finalized=0, wrong=0), so a bad checkpoint costs liveness not
+safety. Sync-model open problem now CLOSED in prototype.
+NEXT (local): real-share-format build cost is the only residual M4 item, an M5 testbed item
+(synthetic 32B leaves here). Deep write-up into v37-superlight-chain-synthesis.md still gated
+behind the single shared-inference slot (M1 lanes -> payment-hardening). No production code;
+proto repo only.
