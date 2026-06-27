@@ -625,11 +625,17 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
             }
         }
 
-        // If merged addresses were parsed (or auto-generated), resend work notification so the
-        // coinbase ref_hash includes them.  The initial job sent right after
-        // subscribe had empty merged_addresses because authorize hadn't run yet.
-        if (!merged_addresses_.empty() && mining_interface_) {
-            send_notify_work(true);  // force clean_jobs so miner drops old job without merged_addrs
+        // Resend work after a successful authorize. The job sent right after
+        // subscribe was built before authorize ran, so it carried neither the
+        // miner's primary payout address (username_ was empty -> empty
+        // payout_script -> degenerate value-0 OP_RETURN coinbase) nor any merged
+        // addresses. Standalone parent coins (BCH/BTC, no merged chains) never
+        // populate merged_addresses_, so gating the resend on that alone left
+        // them mining a payout-less coinbase -> BCHN bad-txns/BIP30 on a won
+        // block. Resend whenever the now-known username_ or merged addrs can
+        // change the coinbase. force_clean so the miner drops the stale job.
+        if (mining_interface_ && (!username_.empty() || !merged_addresses_.empty())) {
+            send_notify_work(true);
         }
         
         // Start periodic work push (every SHARE_PERIOD) to keep miner on fresh work
