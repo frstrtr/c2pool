@@ -93,7 +93,18 @@ on-chain anchors {checkpoint at depth>=D_f} + {finalized-head roots} -- the VIOL
 proves an under-lagged commit (L<D_f) orphaned by a deep reorg is SERVED faithfully yet
 CAUGHT by the second anchor (finalized=0, wrong=0), so a bad checkpoint costs liveness not
 safety. Sync-model open problem now CLOSED in prototype.
-NEXT (local): real-share-format build cost is the only residual M4 item, an M5 testbed item
-(synthetic 32B leaves here). Deep write-up into v37-superlight-chain-synthesis.md still gated
-behind the single shared-inference slot (M1 lanes -> payment-hardening). No production code;
+T15 real-share-format build cost DONE (harness/t15_real_share_format.py,
+out/t15-real-share-format-w300k.txt, out/FINDINGS-t15-real-share-format.md). Closes the last
+residual local M4 item: builds the real forest over REAL V37 share-format preimages (receipt
+env 244B / full carrier share 1364B per share-format.md) vs the 32B synthetic floor @300K.
+Result: O(W) bootstrap STANDS -- real preimage size inflates only the cold raw-ingest hashing
+leg by a bounded constant factor: full-share ~15-16s @300K absolute (~21x the snapshot floor,
+x_snap) -- NEVER the O(W) asymptote (the x_synth ratio vs the noisy 32B raw-ingest baseline
+swings ~7.5-13x run-to-run, so it is not used as the headline). 8 roots invariant to preimage
+size; snapshot path (32B leaf hashes, T14) pays zero preimage cost (0.72s/9.6MB). Raw-share
+egress 409MB vs 9.6MB snapshot = 43x -> confirms the T9/T12/T14 call: serve 32B-leaf snapshots,
+never raw shares, for cold-start. M4 LOCAL feasibility track now COMPLETE.
+NEXT (local): none -- residual real-share build over genuine serialized shares is an M5 testbed
+item. Deep write-up into v37-superlight-chain-synthesis.md still gated behind the single
+shared-inference slot (currently payment-hardening GLM cross-check). No production code;
 proto repo only.
