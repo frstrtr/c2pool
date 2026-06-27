@@ -1,0 +1,34 @@
+# T9 multi-bridge availability  W=8000  servers=20  shards=16  trials=120  seed=1337
+# checkpoint: 6 forest roots (192B) + 1 shard-root (32B) over 16 sub-roots; setup 0.08s
+# shard-root = 33f1a3de57ec6dcc...   (binds the 16 per-shard sub-roots)
+
+# SANITY: honest set verifies; all 4 sybil whole-sets fail root check -> OK
+
+    h | whole live%  avg_q  wasteKB | shard live%  avg_q  wasteKB | pred 1-(1-h)^q
+--------------------------------------------------------------------------------------------
+ 0.00 |        0.0%  20.00   3642.7 |        0.0%  20.00    231.2 |         0.0000
+ 0.05 |      100.0%  10.09   1699.8 |      100.0% 166.05   1761.4 |         0.6415
+ 0.10 |      100.0%   7.38   1167.1 |      100.0% 110.92   1134.7 |         0.8784
+ 0.20 |      100.0%   3.88    522.0 |      100.0%  68.08    617.6 |         0.9885
+ 0.30 |      100.0%   2.85    339.8 |      100.0%  45.97    359.0 |         0.9992
+ 0.50 |      100.0%   1.91    176.7 |      100.0%  31.77    188.9 |         1.0000
+
+# SAFETY: wrong-head acceptances across all 720 trials (incl. h=0): 0  -> PASS
+
+# Reading:
+# - SAFETY is unconditional: 0 wrong-head acceptances even at h=0. A sybil
+#   pool that fully owns the serving layer can DENY progress, never CORRUPT it.
+# - WHOLE-SET liveness tracks 1-(1-h)^q exactly: one honest server in the
+#   sample suffices. At h=0.1, maxq=20 => ~88% per cold-start; the residual
+#   is the no-honest-server-sampled case = retry/widen-peers, not a fork.
+# - SHARDED+per-shard-commitment caps WASTED EGRESS per lie at W/K leaves
+#   instead of W, and lets the validator accept good shards from DIFFERENT
+#   honest servers (union coverage) -- but it needs an honest server PER
+#   shard, so its all-shards success is lower at tiny h unless shards are
+#   re-requestable (they are: bad shard -> next server). The lever: per-shard
+#   commitment converts a whole-W DoS amplification into a bounded W/K one.
+# DESIGN FEED (superlight synthesis): the checkpoint should commit a 32B
+#   shard-root over K per-range sub-roots (still O(1) on-chain) so the
+#   serving layer is INCREMENTALLY VERIFIABLE -> liveness degrades gracefully
+#   under sybil churn instead of all-or-nothing. Honest-server requirement
+#   is the design knob; safety needs none.

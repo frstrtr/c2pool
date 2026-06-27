@@ -1,0 +1,27 @@
+=== T5 in-place swap-delete: W=100000 rounds=20 churn=10000/round (10%) ===
+bootstrap: W=100000 build=405ms nodes=199994 mem~6.4MB roots=6
+  rnd  1: live=100000 ever=110000 del=  72.1us/leaf (721.2ms/10000) worst=16h(512B) roots=6 mem~6.4MB verify=300/300
+  rnd  2: live=100000 ever=120000 del=  68.2us/leaf (682.1ms/10000) worst=16h(512B) roots=6 mem~6.4MB verify=300/300
+  rnd  3: live=100000 ever=130000 del=  70.0us/leaf (700.1ms/10000) worst=16h(512B) roots=6 mem~6.4MB verify=300/300
+  rnd  4: live=100000 ever=140000 del=  69.6us/leaf (696.1ms/10000) worst=16h(512B) roots=6 mem~6.4MB verify=300/300
+  rnd  5: live=100000 ever=150000 del=  69.1us/leaf (690.8ms/10000) worst=16h(512B) roots=6 mem~6.4MB verify=300/300
+  rnd  6: live=100000 ever=160000 del=  69.1us/leaf (691.4ms/10000) worst=16h(512B) roots=6 mem~6.4MB verify=300/300
+  rnd  7: live=100000 ever=170000 del=  67.9us/leaf (679.0ms/10000) worst=16h(512B) roots=6 mem~6.4MB verify=300/300
+  rnd  8: live=100000 ever=180000 del=  65.8us/leaf (658.3ms/10000) worst=16h(512B) roots=6 mem~6.4MB verify=300/300
+  rnd  9: live=100000 ever=190000 del=  63.8us/leaf (638.4ms/10000) worst=16h(512B) roots=6 mem~6.4MB verify=300/300
+  rnd 10: live=100000 ever=200000 del=  68.4us/leaf (683.6ms/10000) worst=16h(512B) roots=6 mem~6.4MB verify=300/300
+  rnd 11: live=100000 ever=210000 del=  68.4us/leaf (683.5ms/10000) worst=16h(512B) roots=6 mem~6.4MB verify=300/300
+  rnd 12: live=100000 ever=220000 del=  68.9us/leaf (688.8ms/10000) worst=16h(512B) roots=6 mem~6.4MB verify=300/300
+  rnd 13: live=100000 ever=230000 del=  69.0us/leaf (689.7ms/10000) worst=16h(512B) roots=6 mem~6.4MB verify=300/300
+  rnd 14: live=100000 ever=240000 del=  68.8us/leaf (687.9ms/10000) worst=16h(512B) roots=6 mem~6.4MB verify=300/300
+  rnd 15: live=100000 ever=250000 del=  68.8us/leaf (688.0ms/10000) worst=16h(512B) roots=6 mem~6.4MB verify=300/300
+  rnd 16: live=100000 ever=260000 del=  68.0us/leaf (679.8ms/10000) worst=16h(512B) roots=6 mem~6.4MB verify=300/300
+  rnd 17: live=100000 ever=270000 del=  66.4us/leaf (664.2ms/10000) worst=16h(512B) roots=6 mem~6.4MB verify=300/300
+  rnd 18: live=100000 ever=280000 del=  65.6us/leaf (655.9ms/10000) worst=16h(512B) roots=6 mem~6.4MB verify=300/300
+  rnd 19: live=100000 ever=290000 del=  69.6us/leaf (695.8ms/10000) worst=16h(512B) roots=6 mem~6.4MB verify=300/300
+  rnd 20: live=100000 ever=300000 del=  68.8us/leaf (688.1ms/10000) worst=16h(512B) roots=6 mem~6.4MB verify=300/300
+=== VERDICT ===
+  in-place swap-delete: 68.3 us/leaf avg (683.1ms per 10% round)
+  T4 bracket was REPACK ~353ms vs LAZY ~41ms per round at this W; in-place lands at 683.1ms
+  storage: steady 6.4MB = O(W) (no LAZY O(total-ever) growth -- swap-delete reclaims in place)
+  correctness: incremental forest == full re-fold every round; all sampled proofs stateless-verified. PASS

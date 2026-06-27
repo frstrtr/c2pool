@@ -1,0 +1,25 @@
+=== M4 T1 bootstrap-cost ===
+  n: 300000
+  build_s: 1.27
+  nodes: 599992
+  forest_mem_mb: 18.31
+  roots: 8
+  us_per_share: 4.23
+=== M4 T2 proof-serving ===
+  samples: 300
+  verified_ok: 300
+  proof_hashes_min: 12
+  proof_hashes_max: 18
+  proof_hashes_avg: 17.58
+  proof_bytes_max: 576
+  log2_n: 18.19
+  us_per_proof: 36.99
+=== M4 T3 churn-inflation ===
+  rounds=5 inflation_ratio=1.06
+    {'total_n': 110000, 'oldest_proof_hashes': 16, 'log2_n': 16.75}
+    {'total_n': 120000, 'oldest_proof_hashes': 16, 'log2_n': 16.87}
+    {'total_n': 130000, 'oldest_proof_hashes': 16, 'log2_n': 16.99}
+    {'total_n': 140000, 'oldest_proof_hashes': 17, 'log2_n': 17.1}
+    {'total_n': 150000, 'oldest_proof_hashes': 17, 'log2_n': 17.19}
+=== VERDICT ===
+  bridge_forest_mem_mb=18.31  worst_proof_bytes=576  proof_churn_resistant=True
