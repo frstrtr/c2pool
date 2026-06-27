@@ -130,8 +130,10 @@ def evaluate(con, sub_for, at=None):
         peak = prev[6] if prev else 0.0
 
         if online:
-            # back-online edge: was known-offline, now producing
-            if p_online == 0:
+            # back-online edge: only after we actually reported the outage.
+            # A sub-threshold blip never fires OFFLINE -> reporting a recovery
+            # from an outage the miner was never told about is a false alert.
+            if p_online == 0 and offline_fired:
                 events.append({"worker": worker, "kind": BACK_ONLINE, "ts": ts,
                                "detail": f"hashrate {hr:.3g} (was offline)"})
             offline_since, offline_fired = None, 0
@@ -386,6 +388,40 @@ def selftest(_args=None):
     e = evaluate(con, sub_for, at=t0 + 41 * 60)
     check([x["kind"] for x in e] == [HASHRATE_DROP], f"expected drop, got {e}")
 
+    # 6b) sub-threshold blip (dark < offline_min so OFFLINE never fired) then
+    #     recovery must stay silent: no false back_online for an unreported outage
+    put(t0 + 50 * 60, "w3", 90.0)
+    evaluate(con, sub_for, at=t0 + 50 * 60)             # w3 first-online: silent
+    put(t0 + 51 * 60, "w3", 0.0)
+    e = evaluate(con, sub_for, at=t0 + 51 * 60)         # 1m dark < 15m threshold
+    check([x for x in e if x["worker"] == "w3"] == [],
+          f"sub-threshold blip should be silent, got {e}")
+    put(t0 + 52 * 60, "w3", 90.0)
+    e = evaluate(con, sub_for, at=t0 + 52 * 60)         # recovered, never alerted
+    check([x for x in e if x["worker"] == "w3"] == [],
+          f"recovery without a prior offline alert must be silent, got {e}")
+
+    # 6c) hashrate_drop honesty: a brand-new worker (no observed prior peak)
+    #     must NEVER emit a drop on its first sample -- a drop without real
+    #     history is a fabricated alert (mirrors the back_online gate of #558).
+    put(t0 + 60 * 60, "w4", 30.0)
+    e = evaluate(con, sub_for, at=t0 + 60 * 60)
+    check([x for x in e if x["worker"] == "w4"] == [],
+          f"first-online must never fire hashrate_drop, got {e}")
+
+    # 6d) only AFTER a real peak is observed does a halving fire exactly one drop
+    put(t0 + 61 * 60, "w4", 12.0)                       # 12 < 50% of peak 30
+    e = evaluate(con, sub_for, at=t0 + 61 * 60)
+    check([x["kind"] for x in e if x["worker"] == "w4"] == [HASHRATE_DROP],
+          f"expected one drop vs observed peak, got {e}")
+
+    # 6e) a drop is never evaluated while the worker is dark (online branch only):
+    #     going to 0 is an OFFLINE concern, not a fabricated -100% drop alert.
+    put(t0 + 62 * 60, "w4", 0.0)
+    e = evaluate(con, sub_for, at=t0 + 62 * 60)
+    check([x["kind"] for x in e if x["worker"] == "w4"] == [],
+          f"dark sample must not fire hashrate_drop, got {e}")
+
     # 7) quiet-hours suppresses info (back_online) but NOT warn (offline)
     check(in_quiet_hours("22-07", t0) is not None, "quiet parse")
     info_ev = {"worker": "w1", "kind": BACK_ONLINE, "ts": t0, "detail": "d"}
@@ -415,7 +451,7 @@ def selftest(_args=None):
         for f in fails:
             print("  -", f)
         return 1
-    print("SELFTEST OK (9/9)")
+    print("SELFTEST OK (13/13)")
     return 0
 
 
