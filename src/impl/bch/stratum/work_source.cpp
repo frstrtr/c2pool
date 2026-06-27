@@ -380,6 +380,22 @@ core::stratum::CoinbaseResult BCHWorkSource::build_connection_coinbase(
     if (payouts.empty() && !payout_script.empty())
         payouts[payout_script] = static_cast<double>(coinbasevalue);
 
+    // G3b safety net: a coinbase with NO value output (payouts empty AND the
+    // miner supplied no decodable payout script -- e.g. the generic core stratum
+    // address_to_script() could not decode a BCH CashAddr username) forfeits the
+    // subsidy and serves a degenerate, byte-identical placeholder coinbase across
+    // shares (only the value-0 OP_RETURN extranonce carrier). A won block then
+    // loses to consensus (bad-txns / BIP30 duplicate-coinbase). NEVER emit a
+    // payout-less coinbase: route the full subsidy to the always-present v36
+    // donation script as residual recipient so the block stays valid. LAST
+    // RESORT -- a real miner address must still be resolved upstream; flag loudly.
+    if (payouts.empty() && !donation_script.empty()) {
+        LOG_WARNING << "[BCH-STRATUM] no PPLNS payouts and miner payout_script "
+                       "unresolved -- routing full subsidy to donation script "
+                       "(degraded; check miner CashAddr decode upstream)";
+        payouts[donation_script] = static_cast<double>(coinbasevalue);
+    }
+
     // === Oracle-conforming output assembly (p2pool-merged-v36 data.py gentx) ===
     // The donation/marker output is forced LAST (immediately before the
     // OP_RETURN), EXCLUDED from the (amount asc, script asc) sort, and obeys the
