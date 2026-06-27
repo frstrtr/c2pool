@@ -1,9 +1,11 @@
 # M4 superlight-chain — local-feasibility synthesis (PR feed for `v37-superlight-chain-synthesis.md`)
 
-Status: **local feasibility GREEN.** Folds T1–T10 (real Utreexo forest; deterministic
-synthetic shares = sha256(i)) into the open-problem doc. Each claim is reproducible:
-`cd proto/m4-sync/harness && python3 t<NN>_*.py`. Raw per-track results in `out/t<NN>-*.txt`,
-narrative in `FINDINGS-t1t2t3.md` + `FINDINGS-t4t10.md`.
+Status: **local feasibility GREEN — closed end-to-end (T1–T15).** Folds the real Utreexo
+forest tracks (deterministic synthetic shares = sha256(i); real V37 share-format preimages
+at T15) into the open-problem doc, capped by the **T14 e2e composition** below. Each claim is
+reproducible: `cd proto/m4-sync/harness && python3 t<NN>_*.py`. Raw per-track results in
+`out/t<NN>-*.txt`, narrative in `FINDINGS-t1t2t3.md`, `FINDINGS-t4t10.md`, `FINDINGS-t12-*`,
+`FINDINGS-t13-*`, `FINDINGS-t14-*`, `FINDINGS-t15-*`, scale at `FINDINGS-t11-scale-w1m.md`.
 
 ## What the open problem asked vs what the harness now answers
 
@@ -76,6 +78,38 @@ Pick `C ≤ (k−1)/f − D_f` to keep total delta ≤ k·W. Net: checkpoint =
 `{≤8 forest roots + 1 shard-root} committed at depth ≥ D_f behind the tip`. Reproduce:
 `t13_checkpoint_finality_lag.py`; numbers in `out/FINDINGS-t13-finality-lag.md`.
 
+## THE CAPSTONE — three load-bearing tracks COMPOSE into one cold-start (T14)
+
+T1–T13 each closed ONE property in isolation; T14 wires the three load-bearing ones into the
+single procedure a brand-new sovereign validator actually runs and checks no seam re-opens a
+closed hole. The validator trusts only **two** on-chain commitments: (1) the checkpoint
+`{≤8 forest roots + 1 32 B shard-root}` committed at depth `≥ D_f`; (2) the finalized-head
+roots at `tip−D_f` (the M1 `BlockFinalized` read). It anchors to the nearest checkpoint,
+sticky-shard-serves the live-set from an adversarial bridge pool (T12/T9), applies the
+PoW-anchored delta tail to the finalized head (T7/T8), and **accepts iff** the rebuilt head
+reproduces the committed finalized-head roots — else STALLS and re-anchors.
+
+Result @W=300K, f=0.10, D_f=8, C=5, 20 servers, 16 shards, worst-case staleness with a reorg
+in flight: **~14.4 MB egress / ~1.0 s rebuild = 1.5× the bare W-leaf floor.** Cold-start stays
+`O(W·(1 + f·(C+L−D_f)))` — the finality lag and cadence are a **bounded additive** staleness
+tax, never a new asymptotic. Across the full sweep (`reorg_d × L × h`, incl. h=0 eclipse):
+**0 wrong-head acceptances**; `h>0` always finalizes the canonical head; `h=0` STALLS (liveness
+loss only, never a fork).
+
+**Decisive composition result — TWO independent anchors fail safe.** Force a protocol bug:
+commit an under-lagged checkpoint (`L = D_f−2`) and let a depth-`D_f` reorg orphan it. The
+serving layer faithfully serves the **orphan** live-set (it matches its own committed sub-roots,
+so serving "succeeds", 20/20). Safety is saved **only** by the second anchor: the orphan delta
+cannot reproduce the canonical `tip−D_f` roots, so the validator detects the mismatch and stalls
+(`finalized=0, wrong=0`). A bad checkpoint commitment can cause **only liveness loss, never a
+safety violation**, because the finalized-head roots are an independent canonical check. The
+cold-start spec is therefore `{checkpoint at depth ≥ D_f} + {finalized-head roots}` — two
+on-chain anchors, and the redundancy is what makes serving-layer and checkpoint bugs fail safe.
+`L ≥ D_f` ties the checkpoint lag to the **same** finality depth M1's overlay settles on, so a
+checkpoint is literally the `BlockFinalized/OwedSettled`-side read of the settlement overlay and
+`BlockOrphaned` never touches a committed checkpoint. Reproduce: `t14_e2e_coldstart.py`;
+numbers in `out/FINDINGS-t14-e2e-coldstart.md`.
+
 ## Still NOT answered locally — explicit M5-integration carry-forward (no silent caps)
 
 - ~~Real share-format preimage cost in the build path — synthetic sha256 understates it.~~
@@ -85,7 +119,14 @@ Pick `C ≤ (k−1)/f − D_f` to keep total delta ≤ k·W. Net: checkpoint =
   ~15–16s @300K, ~21× the snapshot floor), and the snapshot/checkpoint cold-start (32B leaf
   hashes) pays zero preimage cost. STILL M5: real PoW/signature *verification* cost (T15
   hashes preimages, it does not verify PoW or signatures).
-- Proof-cache memory on a bridge under a realistic request distribution.
+- ~~Proof-cache memory on a bridge under a realistic request distribution.~~
+  **CLOSED (T16, out/FINDINGS-t16-proofcache.md):** under a Zipf(1.1) head-hot
+  request stream + steady-state churn, proof-cache benefit SATURATES at ~13 MB
+  (84% hit @ C=20K; 54 MB adds nothing), and the faithful (root-bucket) hit rate
+  is churn-INVARIANT (76.7% @ C=5K under both 1/50 and 1/10 churn). Residual
+  ~16% misses are CPU-bound O(log W)=19-hash proof-gen, not RAM. A bridge is a
+  modest-RAM, CPU-sized proof server; proof-cache memory is NOT an M4 scaling
+  blocker. STILL M5: proof-cache under a *measured* production request trace.
 - ~~W beyond 300K — all numbers above are at W=300K.~~ **CLOSED (T11, out/FINDINGS-t11-scale-w1m.md):**
   re-ran T1/T2/T3 + T6 at W=1,000,000 (3.3×). Asymptotics confirmed: build/mem linear
   O(W) (61 MB / 3.6 s), worst proof O(log W) (576 B → 608 B = +1 log2 step, not linear),
