@@ -441,6 +441,20 @@ def selftest(_args=None):
                             "detail": "d"}, sub)
     check(thr and thr["status"] == "throttled", f"expected throttled, got {thr}")
 
+    # 8b) honesty: a prior *undelivered* row must NOT throttle the retry — an
+    #     alert that never reached the miner has to be reattempted, not silently
+    #     suppressed (a failed send must never masquerade as handled). Guards the
+    #     status='delivered' filter in recently_sent against a throttle-all-rows
+    #     regression that would turn a dropped alert into a permanent health-lie.
+    con.execute("INSERT INTO notifications(ts,worker,kind,severity,route,status)"
+                " VALUES(?,?,?,?,?,?)",
+                (t0, "w5", OFFLINE, "warn", "x", "undelivered"))
+    con.commit()
+    rt = route_event(con, {"worker": "w5", "kind": OFFLINE, "ts": t0 + 10,
+                           "detail": "d"}, sub)
+    check(rt and rt["status"] == "deliver",
+          f"undelivered must not throttle retry, got {rt}")
+
     # 9) no subscription -> route_event returns None (logged undelivered, not dropped)
     nosub = dict(sub, enabled=0, channels=[])
     check(route_event(con, info_ev, nosub) is None, "unsub should route to None")
@@ -451,7 +465,7 @@ def selftest(_args=None):
         for f in fails:
             print("  -", f)
         return 1
-    print("SELFTEST OK (13/13)")
+    print("SELFTEST OK (14/14)")
     return 0
 
 
