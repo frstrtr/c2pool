@@ -91,7 +91,7 @@ public:
           m_embedded(m_chain, m_pool, config->m_testnet),
           m_node(context, config),
           m_abla(config->m_testnet, anchor_height, m_chain),
-          m_connector(m_chain, m_pool) {}
+          m_connector(m_chain, m_pool) { m_regtest = is_regtest; }
 
     EmbeddedDaemon(const EmbeddedDaemon&) = delete;
     EmbeddedDaemon& operator=(const EmbeddedDaemon&) = delete;
@@ -107,10 +107,56 @@ public:
         wire_chain_ingest();          // new_headers --> HeaderChain (advances synced height)
         pin_cold_start_anchor();      // operator-APPROVED VM300 anchor (decisions@ 2026-06-18); floor-equivalent
         const bool p2p_up = maybe_start_p2p(); // arm won-block P2P relay leg + connector re-request sink (gated on configured peer)
+        sync_mempool_from_rpc();      // RPC-fallback: BCHN loose-mempool txs never reach embedded P2P -> fill m_pool so populated templates (nTx>1) are built
         LOG_INFO << "[EMB-BCH] embedded daemon up: embedded-primary work source,"
                  << " external BCHN-RPC fallback retained, ABLA loop closed"
                  << " (cold-start anchor pinned @" << BchnAnchorRecord::height << "),"
                  << " P2P relay leg " << (p2p_up ? "LIVE" : "OFF (no peer configured -> RPC-only)") << ".";
+    }
+
+    /// Populate the embedded mempool from the external BCHN GBT (RPC-fallback
+    /// path). On regtest -- and any RPC-primary deploy -- loose transactions
+    /// live in BCHN's mempool and never reach the embedded P2P relay, so the
+    /// template builder selects from an empty m_pool and every won block is
+    /// coinbase-only (nTx=1). BCHN GBT already returns the CTOR-ordered,
+    /// fee-annotated, consensus-valid tx set -- the SAME set NodeRPC::getwork()
+    /// consumes for the external-RPC work path -- so we hand those to m_pool and
+    /// build_template selects them unchanged. No-op when no external RPC is bound
+    /// (a pure embedded-P2P deploy keeps its own relayed mempool).
+    /// KNOWN LIMITATION: one-shot at run()-startup; per-tip/periodic refresh is a
+    /// tracked production-standup follow-up (fenced, non-blocking for G3a).
+    /// p2pool-merged-v36 surface: NONE -- local mempool population only.
+    std::size_t sync_mempool_from_rpc() {
+        auto* r = m_node.rpc();
+        if (!r) return 0;             // pure embedded-P2P deploy -> no RPC fill
+        std::size_t added = 0;
+        try {
+            auto wd = r->getwork();   // GBT-derived; m_txs unpacked, witness-free
+            const auto& jtx = (wd.m_data.is_object() && wd.m_data.contains("transactions")
+                               && wd.m_data["transactions"].is_array())
+                                  ? wd.m_data["transactions"]
+                                  : nlohmann::json::array();
+            for (std::size_t i = 0; i < wd.m_txs.size(); ++i) {
+                MutableTransaction mtx(wd.m_txs[i]);
+                bool ok = false;
+                if (i < jtx.size() && jtx[i].is_object()
+                        && jtx[i].contains("fee") && jtx[i]["fee"].is_number()) {
+                    // Authoritative per-tx fee from BCHN GBT -> fee_known=true so
+                    // get_sorted_txs_with_fees() selects it into the template.
+                    ok = m_pool.add_tx_with_known_fee(
+                             mtx, static_cast<uint64_t>(jtx[i]["fee"].template get<int64_t>()));
+                } else {
+                    ok = m_pool.add_tx(mtx);  // no fee field -> UTXO/feeless fallback
+                }
+                if (ok) ++added;
+            }
+            LOG_INFO << "[EMB-BCH] mempool RPC-sync: +" << added
+                     << " txs from BCHN GBT (m_pool size=" << m_pool.size() << ")";
+        } catch (const std::exception& e) {
+            LOG_WARNING << "[EMB-BCH] mempool RPC-sync skipped (RPC fallback): "
+                        << e.what();
+        }
+        return added;
     }
 
     /// READ-ONLY IBD evidence harness entry (drives the --ibd run-loop in
@@ -369,6 +415,13 @@ public:
     /// p2pool-merged-v36 surface (ABLA is BCH embedded-internal).
     void pin_cold_start_anchor() {
         using Rec = BchnAnchorRecord;
+        if (m_regtest) {
+            // Regtest has no mainnet/testnet BCHN anchor; the @955700 record is
+            // meaningless here. ABLA stays at its floor anchor; the chain syncs
+            // from the regtest genesis. Skipping the pin keeps regtest correct.
+            LOG_INFO << "[EMB-BCH] cold-start anchor SKIPPED (regtest: floor ABLA, genesis-rooted chain).";
+            return;
+        }
         apply_bchn_anchor(Rec::height, Rec::state(m_config->m_testnet));
         const uint64_t pinned = m_abla.tracker().budget_for_tip(Rec::height);
         if (Rec::is_floor())
@@ -496,6 +549,7 @@ public:
     }
 
 private:
+    bool             m_regtest = false; // regtest 3rd-net: skip mainnet/testnet anchor + drive RPC mempool sync
     config_t*        m_config;   // not owned (binary entrypoint owns it)
     HeaderChain      m_chain;    // before m_embedded + m_abla: their refs bind here
     Mempool          m_pool;     // before m_embedded
