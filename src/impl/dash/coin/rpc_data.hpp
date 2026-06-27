@@ -25,6 +25,33 @@ struct PackedPayment {
     uint64_t    amount{0};
 };
 
+// Normalize ONE masternode / superblock / platform payment entry from a dashd
+// getblocktemplate/getwork response into a PackedPayment.
+//
+// bad-cb-payee TRAP: dashd surfaces the platform credit-pool OP_RETURN burn as
+// a masternode[] entry shaped {"payee":"", "script":"6a", "amount":N} -- the
+// payee field is PRESENT but an EMPTY string. The empty string must NOT win the
+// address branch: a "" payee flows into the base58 decode path downstream, fails
+// to decode, and the whole burn output is silently dropped -> missing-payee /
+// bad-cb-payee on submit. Require a NON-EMPTY payee before treating it as a
+// base58 address; otherwise fall through to the raw "!"+script form so the burn
+// output is preserved byte-for-byte.
+inline PackedPayment normalize_payment(const nlohmann::json& entry)
+{
+    PackedPayment pp;
+    if (entry.is_object())
+    {
+        if (entry.contains("payee") && entry["payee"].is_string()
+            && !entry["payee"].get<std::string>().empty())
+            pp.payee = entry["payee"].get<std::string>();
+        else if (entry.contains("script") && entry["script"].is_string())
+            pp.payee = "!" + entry["script"].get<std::string>();
+        if (entry.contains("amount"))
+            pp.amount = entry["amount"].get<uint64_t>();
+    }
+    return pp;
+}
+
 struct DashWorkData {
     // Raw getblocktemplate JSON response (kept for fallback access to fields
     // we haven't promoted to members yet).
