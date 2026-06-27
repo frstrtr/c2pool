@@ -275,12 +275,22 @@ std::vector<std::string> BTCWorkSource::get_stratum_merkle_branches() const
     auto wd = cached_template();
     if (!wd || wd->m_hashes.empty()) return {};
 
-    // wd->m_hashes[0] is the coinbase placeholder — the actual coinbase
-    // hash doesn't matter for branch computation since the miner provides
-    // their own coinbase. We only need the structure.
-    std::vector<uint256> level = wd->m_hashes;
+    // PRODUCER/CONSUMER CONTRACT: wd->m_hashes is the pure tx-hash list
+    // [tx1..txN] with NO coinbase slot (filled by rpc.cpp / template_builder.hpp
+    // straight from GBT transactions[]). The stratum merkle tree, however, has
+    // the coinbase as leaf 0. Prepend a placeholder leaf for it before folding
+    // — the actual coinbase hash doesn't matter for branch computation since
+    // the miner provides their own coinbase; we only need the leaf STRUCTURE.
+    // Without this prepend, level[1] below would be tx2 (not tx1), tx1 would be
+    // dropped, and the header merkle root would diverge from the serialized
+    // body → bad-txnmrklroot rejection on any populated (>=1 tx) won block.
+    // SSOT: branch sibling structure lives in btc::coin::stratum_merkle_siblings
+    // (template_builder.hpp) so the merkle self-check in mining_submit and any
+    // KAT exercise the SAME fold as the wire path. We only hex-encode here.
+    std::vector<uint256> level = btc::coin::stratum_merkle_siblings(wd->m_hashes);
     std::vector<std::string> branches;
-    while (level.size() > 1) {
+    branches.reserve(level.size());
+    for (const auto& sib : level) {
         // Right-sibling of the left-most node = level[1].
         // Wire encoding: hex of LE-internal bytes (NOT GetHex() which is
         // BE display). Matches cgminer convention + LTC's working
@@ -289,19 +299,7 @@ std::vector<std::string> BTCWorkSource::get_stratum_merkle_branches() const
         // the bytes on the wire MUST be the same LE-internal bytes the
         // pool used to build the merkle tree. GetHex() reverses them and
         // produces a totally different merkle root in the miner's view.
-        branches.push_back(HexStr(std::span<const unsigned char>(level[1].data(), 32)));
-
-        // Ascend: place a placeholder for the next-level coinbase combo,
-        // then hash subsequent pairs (duplicate last on odd count).
-        std::vector<uint256> next;
-        next.reserve((level.size() + 2) / 2);
-        next.push_back(uint256::ZERO);  // placeholder for combo of (cb, level[1])
-        for (size_t i = 2; i < level.size(); i += 2) {
-            const uint256& l = level[i];
-            const uint256& r = (i + 1 < level.size()) ? level[i + 1] : level[i];
-            next.push_back(btc::coin::merkle_hash_pair(l, r));
-        }
-        level = std::move(next);
+        branches.push_back(HexStr(std::span<const unsigned char>(sib.data(), 32)));
     }
     return branches;
 }
@@ -760,6 +758,34 @@ nlohmann::json BTCWorkSource::mining_submit(
     push_u32_le(header, parse_be_hex_u32(nonce));
 
     uint256 pow_hash = Hash(std::span<const uint8_t>(header.data(), header.size()));
+
+    // ── Non-fatal merkle self-check (producer/consumer contract guard) ──
+    // Recompute the body merkle root over the full leaf set
+    // [coinbase_txid, tx1..txN] and compare it to the branch-folded header
+    // root above. If get_stratum_merkle_branches and the serialized body ever
+    // disagree on the leaf structure (the latent bad-txnmrklroot class), this
+    // logs a loud DIVERGENCE BEFORE the block is submitted and rejected. Uses
+    // the current cached template's leaf set; a template roll between job
+    // freeze and submit can produce a benign mismatch, so this is advisory
+    // only and never rejects the share.
+    if (auto wd_chk = cached_template()) {
+        std::vector<uint256> body_leaves;
+        body_leaves.reserve(wd_chk->m_hashes.size() + 1);
+        body_leaves.push_back(coinbase_txid);
+        body_leaves.insert(body_leaves.end(), wd_chk->m_hashes.begin(), wd_chk->m_hashes.end());
+        uint256 body_root = btc::coin::compute_merkle_root(body_leaves);
+        if (body_root == merkle_root) {
+            LOG_DEBUG_OTHER << "[BTC-STRATUM] merkle self-check OK: body root matches header"
+                            << " (" << body_leaves.size() << " leaves)";
+        } else {
+            LOG_WARNING << "[BTC-STRATUM] merkle self-check DIVERGENCE: header root="
+                        << HexStr(std::span<const uint8_t>(merkle_root.data(), 32))
+                        << " body root="
+                        << HexStr(std::span<const uint8_t>(body_root.data(), 32))
+                        << " over " << body_leaves.size() << " leaves"
+                        << " — block would be rejected bad-txnmrklroot (template roll or leaf-set bug)";
+        }
+    }
 
     // Decode share target (separate from block target — pre-this-fix we
     // were comparing pow_hash against block target which is network
