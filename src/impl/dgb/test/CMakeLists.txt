@@ -678,6 +678,21 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_share_bits_oracle_pin_test "" AUTO)
 
+    # dgb_share_target_retarget_test: FENCED non-circular KAT pinning the
+    # NON-genesis (deep-chain, acc_height >= TARGET_LOOKBEHIND) branch of
+    # ShareTracker::compute_share_target -- Step-3 emergency time-based decay +
+    # Step-4 +/-10% clamp -- to goldens derived from an INDEPENDENT Python
+    # reference of the oracle formula (not from the SUT). Companion to
+    # dgb_share_target_genesis_test (which covers the genesis branch); links the
+    # same proven set. MUST also be in the build.yml --target allowlist (#143).
+    add_executable(dgb_share_target_retarget_test share_target_retarget_test.cpp)
+    target_link_libraries(dgb_share_target_retarget_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_share_target_retarget_test "" AUTO)
+
     # dgb_g1_oracle_byte_parity_test: FENCED greenlight-gate G1 KAT. Pins the
     # assembled make_coin_params() net/consensus constants AND bucket-1
     # isolation primitives (PREFIX/IDENTIFIER) against oracle-transcribed
