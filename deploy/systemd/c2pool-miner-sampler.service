@@ -1,0 +1,15 @@
+[Unit]
+Description=c2pool D-MINER.1 presence sampler (poll /local_stats -> miner_presence.db)
+Documentation=https://github.com/frstrtr/c2pool/blob/master/docs/design/d-miner-5-notify-engine.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/c2pool/miner.env
+ExecStart=/usr/bin/env python3 ${C2POOL_MINER_SCRIPTS}/miner_presence_sampler.py sample --db ${C2POOL_MINER_DB} --url ${C2POOL_LOCAL_STATS_URL} --interval ${C2POOL_SAMPLE_INTERVAL}
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target

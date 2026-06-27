@@ -1,0 +1,10 @@
+[Unit]
+Description=c2pool D-MINER.5 daily-summary schedule
+
+[Timer]
+# After nightly rollup (00:10) has populated the daily table.
+OnCalendar=*-*-* 08:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
