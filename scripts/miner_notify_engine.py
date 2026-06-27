@@ -455,6 +455,22 @@ def selftest(_args=None):
     check(rt and rt["status"] == "deliver",
           f"undelivered must not throttle retry, got {rt}")
 
+    # 8c) throttle honesty (the partner of #8/#8b): once the window has
+    #     ELAPSED, a still-true condition must re-fire. A throttle that never
+    #     releases would let a single stale alert masquerade as permanent
+    #     coverage of an ongoing outage -- the miner is warned once and never
+    #     again though the rig is still down. Guards the `< window` bound in
+    #     recently_sent() against a >=/off-by-one regression that swallows
+    #     every later real alert.
+    con.execute("INSERT INTO notifications(ts,worker,kind,severity,route,status)"
+                " VALUES(?,?,?,?,?,?)",
+                (t0, "w6", OFFLINE, "warn", "x", "delivered"))
+    con.commit()
+    refire = route_event(con, {"worker": "w6", "kind": OFFLINE,
+                               "ts": t0 + sub["throttle_s"] + 1, "detail": "d"}, sub)
+    check(refire and refire["status"] == "deliver",
+          f"condition must re-fire after throttle window elapses, got {refire}")
+
     # 9) no subscription -> route_event returns None (logged undelivered, not dropped)
     nosub = dict(sub, enabled=0, channels=[])
     check(route_event(con, info_ev, nosub) is None, "unsub should route to None")
@@ -465,7 +481,7 @@ def selftest(_args=None):
         for f in fails:
             print("  -", f)
         return 1
-    print("SELFTEST OK (14/14)")
+    print("SELFTEST OK (15/15)")
     return 0
 
 
