@@ -475,13 +475,56 @@ def selftest(_args=None):
     nosub = dict(sub, enabled=0, channels=[])
     check(route_event(con, info_ev, nosub) is None, "unsub should route to None")
 
+    # --- daily-summary path (the `daily` subcommand, P1) ----------------
+    # the sampler owns the `daily` rollup; build it here for the KAT
+    dcon = connect(":memory:")
+    dcon.execute("CREATE TABLE IF NOT EXISTS daily (day TEXT NOT NULL, "
+                 "worker TEXT NOT NULL, hours_online REAL NOT NULL, "
+                 "avg_hashrate REAL NOT NULL, shares INTEGER NOT NULL DEFAULT 0, "
+                 "stale_pct REAL NOT NULL DEFAULT 0, PRIMARY KEY(day,worker))")
+    dcon.commit()
+    dargs = argparse.Namespace(dry_run=True, smtp_host="x", smtp_port=0, sender="x")
+
+    # 10) no rollups yet -> daily() emits nothing (no fabricated summary)
+    daily(dcon, dargs)
+    nd = dcon.execute("SELECT COUNT(*) FROM notifications WHERE kind=?",
+                      (DAILY_SUMMARY,)).fetchone()[0]
+    check(nd == 0, f"empty rollup must emit no summary, got {nd}")
+
+    for day, w, hrs, hr, stale in [
+            ("2026-06-25", "w1", 20.0, 90.0, 1.0),
+            ("2026-06-26", "w1", 23.5, 110.0, 0.5),
+            ("2026-06-26", "w2", 4.0, 5.0, 9.0),
+            ("2026-06-26", "__pool__", 24.0, 999.0, 0.0)]:
+        dcon.execute("INSERT INTO daily(day,worker,hours_online,avg_hashrate,"
+                     "shares,stale_pct) VALUES(?,?,?,?,0,?)",
+                     (day, w, hrs, hr, stale))
+    dcon.execute("INSERT INTO subscriptions(worker,channels,route,enabled) "
+                 "VALUES('w1','logonly','w1@route',1)")
+    dcon.commit()
+
+    # 11) newest day only, __pool__ aggregate excluded -> w1,w2 summarized
+    daily(dcon, dargs)
+    drows = dcon.execute("SELECT worker,status FROM notifications WHERE kind=? "
+                         "ORDER BY worker", (DAILY_SUMMARY,)).fetchall()
+    dworkers = sorted({r[0] for r in drows})
+    check(dworkers == ["w1", "w2"],
+          f"newest-day summary covers w1,w2 only (no __pool__/old day), got {dworkers}")
+
+    # 12) subscribed -> delivered; unsubscribed -> undelivered (honest, not dropped)
+    dstat = dict(drows)
+    check(dstat.get("w1") == "delivered", f"subscribed delivered, got {dstat.get('w1')}")
+    check(dstat.get("w2") == "undelivered", f"unsubscribed undelivered, got {dstat.get('w2')}")
+    dcon.close()
+
+
     con.close()
     if fails:
         print("SELFTEST FAILED:")
         for f in fails:
             print("  -", f)
         return 1
-    print("SELFTEST OK (15/15)")
+    print("SELFTEST OK (18/18)")
     return 0
 
 
