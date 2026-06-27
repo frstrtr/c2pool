@@ -284,12 +284,13 @@ std::vector<std::string> BTCWorkSource::get_stratum_merkle_branches() const
     // Without this prepend, level[1] below would be tx2 (not tx1), tx1 would be
     // dropped, and the header merkle root would diverge from the serialized
     // body → bad-txnmrklroot rejection on any populated (>=1 tx) won block.
-    std::vector<uint256> level;
-    level.reserve(wd->m_hashes.size() + 1);
-    level.push_back(uint256::ZERO);  // coinbase placeholder leaf (leaf 0)
-    level.insert(level.end(), wd->m_hashes.begin(), wd->m_hashes.end());
+    // SSOT: branch sibling structure lives in btc::coin::stratum_merkle_siblings
+    // (template_builder.hpp) so the merkle self-check in mining_submit and any
+    // KAT exercise the SAME fold as the wire path. We only hex-encode here.
+    std::vector<uint256> level = btc::coin::stratum_merkle_siblings(wd->m_hashes);
     std::vector<std::string> branches;
-    while (level.size() > 1) {
+    branches.reserve(level.size());
+    for (const auto& sib : level) {
         // Right-sibling of the left-most node = level[1].
         // Wire encoding: hex of LE-internal bytes (NOT GetHex() which is
         // BE display). Matches cgminer convention + LTC's working
@@ -298,19 +299,7 @@ std::vector<std::string> BTCWorkSource::get_stratum_merkle_branches() const
         // the bytes on the wire MUST be the same LE-internal bytes the
         // pool used to build the merkle tree. GetHex() reverses them and
         // produces a totally different merkle root in the miner's view.
-        branches.push_back(HexStr(std::span<const unsigned char>(level[1].data(), 32)));
-
-        // Ascend: place a placeholder for the next-level coinbase combo,
-        // then hash subsequent pairs (duplicate last on odd count).
-        std::vector<uint256> next;
-        next.reserve((level.size() + 2) / 2);
-        next.push_back(uint256::ZERO);  // placeholder for combo of (cb, level[1])
-        for (size_t i = 2; i < level.size(); i += 2) {
-            const uint256& l = level[i];
-            const uint256& r = (i + 1 < level.size()) ? level[i + 1] : level[i];
-            next.push_back(btc::coin::merkle_hash_pair(l, r));
-        }
-        level = std::move(next);
+        branches.push_back(HexStr(std::span<const unsigned char>(sib.data(), 32)));
     }
     return branches;
 }
