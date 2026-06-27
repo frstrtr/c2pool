@@ -91,6 +91,27 @@ struct PoolConfig
         }();
         return is_testnet ? TESTNET_MAX : MAINNET_MAX;
     }
+
+    // SANE_TARGET_RANGE = (min_target/hardest, max_target/easiest) — the parent-coin
+    // sane vardiff bounds the stratum get_work() pseudoshare target is clipped into
+    // (p2pool work.py:380-393, math.clip). SOURCE: oracle networks/dash.py:33 +
+    // dash_testnet.py:27.
+    //   mainnet min = (0xFFFF*2**208)//10000        max = 0xFFFF*2**208
+    //   testnet min = 2**256//2**32//1000000 - 1    max = 2**256//2**20 - 1
+    // sane_target_max() mainnet == max_target() (both = _DIFF1_TARGET); kept as its
+    // own accessor so the clip reads the oracle SANE pair, not the share-diff floor.
+    static uint256 sane_target_min()
+    {
+        static const uint256 MAINNET_MIN = [] {
+            uint256 t; t.SetHex("0000000000068db22d0e5604189374bc6a7ef9db22d0e5604189374bc6a7ef9d"); return t;
+        }();
+        static const uint256 TESTNET_MIN = [] {
+            uint256 t; t.SetHex("00000000000010c6f7a0b5ed8d36b4c7f34938583621fafc8b0079a2834d26f9"); return t;
+        }();
+        return is_testnet ? TESTNET_MIN : MAINNET_MIN;
+    }
+
+    static uint256 sane_target_max() { return max_target(); }
 };
 
 } // namespace dash
