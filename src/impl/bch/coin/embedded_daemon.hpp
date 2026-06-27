@@ -81,10 +81,12 @@ public:
     /// Cold-start ctor: floor-anchored ABLA at `anchor_height` (safe default
     /// when no VM300 BCHN pin is available yet). `context`/`config` outlive the
     /// daemon (owned by the binary entrypoint, same contract as coin::Node).
-    EmbeddedDaemon(auto* context, config_t* config, uint32_t anchor_height)
+    EmbeddedDaemon(auto* context, config_t* config, uint32_t anchor_height,
+                   bool is_regtest = false)
         : m_config(config),
-          m_chain(config->m_testnet ? BCHChainParams::testnet()
-                                    : BCHChainParams::mainnet()),
+          m_chain(is_regtest ? BCHChainParams::regtest()
+                             : (config->m_testnet ? BCHChainParams::testnet()
+                                                  : BCHChainParams::mainnet())),
           m_pool(),
           m_embedded(m_chain, m_pool, config->m_testnet),
           m_node(context, config),
