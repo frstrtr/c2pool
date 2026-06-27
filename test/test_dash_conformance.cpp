@@ -1016,11 +1016,13 @@ TEST(DashConformanceVersionNeg, SwitchClassifier5CaseKat) {
                                  successor_switch_allowed(clears, 36u)));
 }
 
-// === verify_version_transition: the WIRED accept-path gate (not the isolated
-// primitives above). Proves dash::verify_version_transition composes the
-// version_negotiation primitives into admit/reject enforcement at a version
-// boundary -- the mint<->accept coupling that was previously ZERO-consumer on
-// dash. CHAIN_LENGTH (CL) is small (20) so the [9/10..10/10] tail window is
+// === dash::verify_share: the WIRED accept-path entry (not the isolated
+// primitives above, and not the orphan verify_version_transition the S8-prep
+// KAT used). Proves the version-boundary gate fires through the SAME combined
+// entry a node calls -- closing the enforcement hole where the gate had ZERO
+// accept-path consumers. verify_init=false because Phase 1 (X11 PoW/hash_link)
+// runs in the node thread pool; these cases lock the Phase-2 chain-context
+// WIRING. The init-composition case below proves Phase 1 is wired too. CHAIN_LENGTH (CL) is small (20) so the [9/10..10/10] tail window is
 // reachable in a synthetic chain; the exact 60%/95% floors are pinned by the
 // isolation KATs above, so these lock the WIRING, not the thresholds.
 namespace {
@@ -1034,6 +1036,7 @@ uint256 build_uniform(SyntheticChain& sc, int count, uint64_t version,
     return prev;
 }
 constexpr uint64_t CL = 20;  // synthetic CHAIN_LENGTH for the gate window
+core::CoinParams kVgParams;  // accept-entry param (unused when verify_init=false)
 }  // namespace
 
 // Same-version share is never a boundary -> always admitted (data.py:382).
@@ -1042,7 +1045,7 @@ TEST(DashConformanceVersionWiring, SameVersionAdmitted) {
     const uint160 A = miner_h160(0x10);
     uint256 tip = build_uniform(sc, 22, 36, BITS_DIFF1, A);
     add_versioned(sc, 0x80, tip, 36, BITS_DIFF1, A);
-    EXPECT_NO_THROW(dash::verify_version_transition(*sc.pool.back(), sc.chain, CL));
+    EXPECT_NO_THROW(dash::verify_share(*sc.pool.back(), sc.chain, CL, kVgParams, /*verify_init=*/false));
 }
 
 // Upgrade boundary with fewer than CHAIN_LENGTH ancestors -> rejected
@@ -1053,7 +1056,7 @@ TEST(DashConformanceVersionWiring, UpgradeWithoutHistoryRejected) {
     uint256 tip = build_uniform(sc, 5, 16, BITS_DIFF1, A);  // < CL ancestors
     add_versioned(sc, 0x81, tip, 36, BITS_DIFF1, A);        // v16 -> v36 upgrade
     try {
-        dash::verify_version_transition(*sc.pool.back(), sc.chain, CL);
+        dash::verify_share(*sc.pool.back(), sc.chain, CL, kVgParams, /*verify_init=*/false);
         FAIL() << "expected throw on upgrade without enough history";
     } catch (const std::invalid_argument& e) {
         EXPECT_NE(std::string(e.what()).find("enough history"), std::string::npos);
@@ -1068,7 +1071,7 @@ TEST(DashConformanceVersionWiring, UpgradeWithSuccessorMajorityAdmitted) {
     uint256 tip = build_uniform(sc, 22, 36, BITS_DIFF1, A);   // tail window = v36
     uint256 prev = add_versioned(sc, 0x82, tip, 16, BITS_DIFF1, A);  // a lone v16 prev
     add_versioned(sc, 0x83, prev, 36, BITS_DIFF1, A);         // v16 -> v36 upgrade
-    EXPECT_NO_THROW(dash::verify_version_transition(*sc.pool.back(), sc.chain, CL));
+    EXPECT_NO_THROW(dash::verify_share(*sc.pool.back(), sc.chain, CL, kVgParams, /*verify_init=*/false));
 }
 
 // Upgrade boundary, history present, but the tail window has NO successor votes
@@ -1079,7 +1082,7 @@ TEST(DashConformanceVersionWiring, UpgradeWithoutSuccessorVotesRejected) {
     uint256 tip = build_uniform(sc, 22, 16, BITS_DIFF1, A);   // tail window = all v16
     add_versioned(sc, 0x84, tip, 36, BITS_DIFF1, A);          // v16 -> v36 upgrade
     try {
-        dash::verify_version_transition(*sc.pool.back(), sc.chain, CL);
+        dash::verify_share(*sc.pool.back(), sc.chain, CL, kVgParams, /*verify_init=*/false);
         FAIL() << "expected throw on upgrade without successor votes";
     } catch (const std::invalid_argument& e) {
         EXPECT_NE(std::string(e.what()).find("hash power upgraded"),
@@ -1096,7 +1099,7 @@ TEST(DashConformanceVersionWiring, StalePreV36ShareRejected) {
     uint256 tip = build_uniform(sc, 22, 36, BITS_DIFF1, A);   // lookbehind = all v36
     add_versioned(sc, 0x85, tip, 16, BITS_DIFF1, A);          // stale v16 on v36 tip
     try {
-        dash::verify_version_transition(*sc.pool.back(), sc.chain, CL);
+        dash::verify_share(*sc.pool.back(), sc.chain, CL, kVgParams, /*verify_init=*/false);
         FAIL() << "expected throw on stale pre-v36 share";
     } catch (const std::invalid_argument& e) {
         EXPECT_NE(std::string(e.what()).find("too old"), std::string::npos);
@@ -1108,7 +1111,25 @@ TEST(DashConformanceVersionWiring, GenesisShareAdmitted) {
     SyntheticChain sc;
     const uint160 A = miner_h160(0x15);
     add_versioned(sc, 0x86, uint256(), 36, BITS_DIFF1, A);    // null prev_hash
-    EXPECT_NO_THROW(dash::verify_version_transition(*sc.pool.back(), sc.chain, CL));
+    EXPECT_NO_THROW(dash::verify_share(*sc.pool.back(), sc.chain, CL, kVgParams, /*verify_init=*/false));
+}
+
+// Phase-1 composition: with verify_init=true the combined entry runs
+// share_init_verify FIRST, so a structurally invalid share (empty coinbase) is
+// rejected by verify_share BEFORE the version gate is ever consulted. Proves
+// Phase 1 is wired into the accept entry, not bypassed.
+TEST(DashConformanceVersionWiring, InitPhaseComposedAndRejectsBeforeGate) {
+    SyntheticChain sc;
+    const uint160 A = miner_h160(0x16);
+    add_versioned(sc, 0x87, uint256(), 36, BITS_DIFF1, A);  // genesis: gate is a no-op
+    // Synthetic shares carry an empty coinbase -> share_init_verify rejects on
+    // the size guard. verify_init=true must surface that, proving init runs.
+    try {
+        dash::verify_share(*sc.pool.back(), sc.chain, CL, kVgParams, /*verify_init=*/true);
+        FAIL() << "expected Phase-1 init to reject the empty-coinbase share";
+    } catch (const std::invalid_argument& e) {
+        EXPECT_NE(std::string(e.what()).find("coinbase"), std::string::npos);
+    }
 }
 
 // ── DIP4 special-tx coinbase payload (CCbTx) wire-encoding conformance ──────
