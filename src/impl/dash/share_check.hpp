@@ -706,4 +706,36 @@ inline void verify_version_transition(const DashShare& share, ChainT& chain,
     // obsolete) is permitted, matching btc validate_version_switch. No gate.
 }
 
+
+// === verify_share (Dash accept-path COMBINED entry) ==========================
+// The single entry a Dash node runs on every incoming share, mirroring
+// src/impl/btc/share_check.hpp::verify_share. Composes the two accept phases:
+//   Phase 1 (init): share_init_verify -- PoW (X11), hash_link, merkle, target.
+//                   CPU-heavy, so a node offloads it to a thread pool (cf.
+//                   src/impl/dgb/node.cpp:356 two-phase split) and passes
+//                   verify_init=false here when Phase 1 already ran.
+//   Phase 2 (chain-context gate): verify_version_transition -- the share-
+//                   VERSION boundary admit/reject gate. THIS closes the
+//                   enforcement hole: verify_version_transition was KAT-proven
+//                   in isolation but had ZERO accept-path consumers, so the v36
+//                   obsolescence (95% weighted) + successor (60% weighted)
+//                   guards never ran on a real admission path. verify_share is
+//                   that consumer; the wired KAT drives the 7 boundary cases
+//                   through HERE, not the orphan primitive.
+// Bucket-2 structural standardization: same compose shape as btc verify_share,
+// so the v37 unification is a clean migration, not a per-coin v36 dialect.
+// Returns the Phase-1 share hash (null when verify_init=false). The dashd-RPC
+// submitblock fallback is unaffected -- this gates SHARE admission, not block
+// submission.
+template <typename ChainT>
+inline uint256 verify_share(const DashShare& share, ChainT& chain,
+                            uint64_t chain_length, const core::CoinParams& params,
+                            bool verify_init = true, bool check_pow = true)
+{
+    uint256 hash;
+    if (verify_init)
+        hash = share_init_verify(share, params, check_pow);   // Phase 1
+    verify_version_transition(share, chain, chain_length);    // Phase 2 (wired gate)
+    return hash;
+}
 } // namespace dash
