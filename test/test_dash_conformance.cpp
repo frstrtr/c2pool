@@ -29,6 +29,7 @@
 
 #include <impl/dash/coinbase_builder.hpp>   // dash::coinbase::merkle_branches_raw, HexStr
 #include <impl/dash/share_check.hpp>        // dash::check_merkle_link
+#include <impl/dash/chain_admit.hpp>        // dash::admit_chain_relative (accept-path seam)
 #include <impl/dash/share_types.hpp>        // dash::MerkleLink
 #include <impl/dash/pplns.hpp>           // dash::pplns::compute_payouts, dash::ShareChain, DashShare
 #include <impl/dash/version_negotiation.hpp> // dash::version_negotiation::get_desired_version_counts/weights
@@ -1109,6 +1110,70 @@ TEST(DashConformanceVersionWiring, GenesisShareAdmitted) {
     const uint160 A = miner_h160(0x15);
     add_versioned(sc, 0x86, uint256(), 36, BITS_DIFF1, A);    // null prev_hash
     EXPECT_NO_THROW(dash::verify_version_transition(*sc.pool.back(), sc.chain, CL));
+}
+
+// ── Accept-path SEAM: dash::admit_chain_relative (chain_admit.hpp) ───────────
+// The DashConformanceVersionWiring group above proves the gate primitive
+// (verify_version_transition). These prove the FIRST src/ CONSUMER seam routes
+// through to that gate: dash::admit_chain_relative — the single call the S8 node
+// run-loop / launcher --run share-receive path makes after share_init_verify.
+// Before chain_admit.hpp the gate had ZERO src/ consumers (test-only). These
+// lock the consumer boundary; the 60%/95% floors stay pinned by the KATs above.
+TEST(DashChainAdmitSeam, AdmitsSameVersionThroughSeam) {
+    SyntheticChain sc;
+    const uint160 A = miner_h160(0x16);
+    uint256 tip = build_uniform(sc, 22, 36, BITS_DIFF1, A);
+    add_versioned(sc, 0x90, tip, 36, BITS_DIFF1, A);
+    EXPECT_NO_THROW(dash::admit_chain_relative(*sc.pool.back(), sc.chain, CL));
+}
+
+// Seam rejects a stale pre-v36 share once the lookbehind is >=95% weighted v36
+// (routes to the obsolescence arm of the gate).
+TEST(DashChainAdmitSeam, RejectsStalePreV36ThroughSeam) {
+    SyntheticChain sc;
+    const uint160 A = miner_h160(0x17);
+    uint256 tip = build_uniform(sc, 22, 36, BITS_DIFF1, A);
+    add_versioned(sc, 0x91, tip, 16, BITS_DIFF1, A);  // stale v16 on v36 tip
+    try {
+        dash::admit_chain_relative(*sc.pool.back(), sc.chain, CL);
+        FAIL() << "expected seam to reject stale pre-v36 share";
+    } catch (const std::invalid_argument& e) {
+        EXPECT_NE(std::string(e.what()).find("too old"), std::string::npos);
+    }
+}
+
+// Seam rejects an upgrade boundary lacking CHAIN_LENGTH history (routes to the
+// successor-guard arm; no-history short-circuit throws "enough history").
+TEST(DashChainAdmitSeam, RejectsUpgradeWithoutHistoryThroughSeam) {
+    SyntheticChain sc;
+    const uint160 A = miner_h160(0x18);
+    uint256 tip = build_uniform(sc, 5, 16, BITS_DIFF1, A);  // < CL ancestors
+    add_versioned(sc, 0x92, tip, 36, BITS_DIFF1, A);        // v16 -> v36 upgrade
+    try {
+        dash::admit_chain_relative(*sc.pool.back(), sc.chain, CL);
+        FAIL() << "expected seam to reject upgrade without enough history";
+    } catch (const std::invalid_argument& e) {
+        EXPECT_NE(std::string(e.what()).find("enough history"), std::string::npos);
+    }
+}
+
+// Seam admits an upgrade boundary whose tail window already carries the
+// successor version (>=60% successor votes) — the gate's admit path.
+TEST(DashChainAdmitSeam, AdmitsSuccessorMajorityThroughSeam) {
+    SyntheticChain sc;
+    const uint160 A = miner_h160(0x19);
+    uint256 tip = build_uniform(sc, 22, 36, BITS_DIFF1, A);          // tail = v36
+    uint256 prev = add_versioned(sc, 0x93, tip, 16, BITS_DIFF1, A);  // lone v16 prev
+    add_versioned(sc, 0x94, prev, 36, BITS_DIFF1, A);                // v16 -> v36 upgrade
+    EXPECT_NO_THROW(dash::admit_chain_relative(*sc.pool.back(), sc.chain, CL));
+}
+
+// Genesis / no-parent share is admitted unconditionally through the seam.
+TEST(DashChainAdmitSeam, AdmitsGenesisThroughSeam) {
+    SyntheticChain sc;
+    const uint160 A = miner_h160(0x1a);
+    add_versioned(sc, 0x95, uint256(), 36, BITS_DIFF1, A);  // null prev_hash
+    EXPECT_NO_THROW(dash::admit_chain_relative(*sc.pool.back(), sc.chain, CL));
 }
 
 // ── DIP4 special-tx coinbase payload (CCbTx) wire-encoding conformance ──────
