@@ -826,6 +826,21 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(dgb_share_weight_decay_test PRIVATE
         GTest::gtest_main GTest::gtest)
     gtest_add_tests(dgb_share_weight_decay_test "" AUTO)
+    # dgb_emergency_decay_saturation_test: FENCED, additive KAT pinning the
+    # share_tracker.hpp Step-3 emergency time-based decay (death-spiral
+    # prevention) eased target == min(prev_max_target * 2^halvings, MAX_TARGET)
+    # against an arbitrary-precision oracle (right-shift threshold form, no wrap
+    # at 2^256 OR 2^288). Proves (a) the load-bearing h=21/57.5min fails-now/
+    # passes-after boundary vector and (b) full-sweep NEW==ORACLE identity. Uses
+    # core uint256/uint288 -> links core only (no OBJECT lib). MUST also be in
+    # the build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_emergency_decay_saturation_test emergency_decay_saturation_test.cpp)
+    target_link_libraries(dgb_emergency_decay_saturation_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_emergency_decay_saturation_test "" AUTO)
     # dgb_binomial_conf_interval_test: FENCED, additive KAT pinning the pure
     # Wilson-score confidence-interval arithmetic of p2pool util/math.py:133
     # binomial_conf_interval (+ ierf/erf A&S-7.1.26 helpers) lifted into
