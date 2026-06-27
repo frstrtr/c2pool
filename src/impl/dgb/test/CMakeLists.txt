@@ -582,6 +582,23 @@ if (BUILD_TESTING AND GTest_FOUND)
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
     gtest_add_tests(dgb_aux_doge_mm_commitment_test "" AUTO)
 
+    # --- DGB+DOGE (phase DB) -- AuxPoW commitment-IN-COINBASE locate+validity --
+    # Verifier-side round-trip: scan a won DGB coinbase scriptSig, recover
+    # (root,size,nonce) bit-for-bit, and enforce the canonical CheckAuxPow
+    # coinbase rules (exactly-once magic + complete 40-byte commitment).
+    # Closes the consumer gap left by the mm_commitment (layout) and
+    # connection_coinbase (embed) producer KATs. Links the DGB OBJECT-lib set
+    # like dgb_connection_coinbase_test (build_connection_coinbase_from_pplns).
+    # MUST appear in BOTH this registration AND the build.yml --target
+    # allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_aux_commitment_coinbase_locate_test aux_commitment_coinbase_locate_test.cpp)
+    target_link_libraries(dgb_aux_commitment_coinbase_locate_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_aux_commitment_coinbase_locate_test "" AUTO)
+
     # --- DGB+DOGE (phase DC) -- DGB-as-parent AuxPoW PROOF byte-parity + dual ---
     # Proves the neutral producer build_auxpow_proof (c2pool/merged) is byte-
     # identical to the typed doge::coin::CAuxPow<dgb::coin::MutableTransaction>
