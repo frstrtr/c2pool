@@ -1,0 +1,48 @@
+=== M4 T4 deletion-churn  (W=100000 live, 10%/round, 20 rounds, log2(W)=16.61) ===
+--- REPACK bridge (rebuild live set each round) ---
+  live=100000 worst=16 avg=15.59 roots=6 mem=6.1MB verified=300/300 rebuild=369ms
+  live=100000 worst=16 avg=15.59 roots=6 mem=6.1MB verified=300/300 rebuild=340ms
+  live=100000 worst=16 avg=15.59 roots=6 mem=6.1MB verified=300/300 rebuild=346ms
+  live=100000 worst=16 avg=15.59 roots=6 mem=6.1MB verified=300/300 rebuild=374ms
+  live=100000 worst=16 avg=15.59 roots=6 mem=6.1MB verified=300/300 rebuild=332ms
+  live=100000 worst=16 avg=15.59 roots=6 mem=6.1MB verified=300/300 rebuild=331ms
+  live=100000 worst=16 avg=15.59 roots=6 mem=6.1MB verified=300/300 rebuild=337ms
+  live=100000 worst=16 avg=15.59 roots=6 mem=6.1MB verified=300/300 rebuild=346ms
+  live=100000 worst=16 avg=15.59 roots=6 mem=6.1MB verified=300/300 rebuild=336ms
+  live=100000 worst=16 avg=15.59 roots=6 mem=6.1MB verified=300/300 rebuild=328ms
+  live=100000 worst=16 avg=15.59 roots=6 mem=6.1MB verified=300/300 rebuild=333ms
+  live=100000 worst=16 avg=15.59 roots=6 mem=6.1MB verified=300/300 rebuild=337ms
+  live=100000 worst=16 avg=15.59 roots=6 mem=6.1MB verified=300/300 rebuild=335ms
+  live=100000 worst=16 avg=15.59 roots=6 mem=6.1MB verified=300/300 rebuild=340ms
+  live=100000 worst=16 avg=15.59 roots=6 mem=6.1MB verified=300/300 rebuild=335ms
+  live=100000 worst=16 avg=15.59 roots=6 mem=6.1MB verified=300/300 rebuild=375ms
+  live=100000 worst=16 avg=15.59 roots=6 mem=6.1MB verified=300/300 rebuild=438ms
+  live=100000 worst=16 avg=15.59 roots=6 mem=6.1MB verified=300/300 rebuild=373ms
+  live=100000 worst=16 avg=15.59 roots=6 mem=6.1MB verified=300/300 rebuild=417ms
+  live=100000 worst=16 avg=15.59 roots=6 mem=6.1MB verified=300/300 rebuild=335ms
+--- LAZY bridge (tombstone + append, never re-pack) ---
+  live=100000 ever=110000 worst=16 avg=15.25 roots=9 mem=6.71MB verified=300/300 append=33.6ms
+  live=100000 ever=120000 worst=16 avg=15.12 roots=7 mem=7.32MB verified=300/300 append=33.4ms
+  live=100000 ever=130000 worst=16 avg=14.78 roots=11 mem=7.93MB verified=300/300 append=32.6ms
+  live=100000 ever=140000 worst=17 avg=16.64 roots=6 mem=8.54MB verified=300/300 append=33.6ms
+  live=100000 ever=150000 worst=17 avg=16.36 roots=8 mem=9.16MB verified=300/300 append=33.6ms
+  live=100000 ever=160000 worst=17 avg=15.98 roots=5 mem=9.77MB verified=300/300 append=33.7ms
+  live=100000 ever=170000 worst=17 avg=16.03 roots=5 mem=10.38MB verified=300/300 append=33.3ms
+  live=100000 ever=180000 worst=17 avg=15.57 roots=9 mem=10.99MB verified=300/300 append=44.2ms
+  live=100000 ever=190000 worst=17 avg=15.43 roots=8 mem=11.6MB verified=300/300 append=33.2ms
+  live=100000 ever=200000 worst=17 avg=16.15 roots=6 mem=12.21MB verified=300/300 append=33.3ms
+  live=100000 ever=210000 worst=17 avg=15.75 roots=7 mem=12.82MB verified=300/300 append=33.5ms
+  live=100000 ever=220000 worst=17 avg=15.48 roots=9 mem=13.43MB verified=300/300 append=80.2ms
+  live=100000 ever=230000 worst=17 avg=15.66 roots=7 mem=14.04MB verified=300/300 append=94.0ms
+  live=100000 ever=240000 worst=16 avg=15.31 roots=7 mem=14.65MB verified=300/300 append=39.3ms
+  live=100000 ever=250000 worst=16 avg=15.18 roots=7 mem=15.26MB verified=300/300 append=38.7ms
+  live=100000 ever=260000 worst=16 avg=14.83 roots=11 mem=15.87MB verified=300/300 append=40.0ms
+  live=100000 ever=270000 worst=18 avg=17.49 roots=8 mem=16.48MB verified=300/300 append=38.0ms
+  live=100000 ever=280000 worst=18 avg=17.23 roots=6 mem=17.09MB verified=300/300 append=37.9ms
+  live=100000 ever=290000 worst=18 avg=16.71 roots=8 mem=17.7MB verified=300/300 append=38.9ms
+  live=100000 ever=300000 worst=18 avg=16.71 roots=8 mem=18.31MB verified=300/300 append=38.5ms
+=== VERDICT ===
+  REPACK: worst-proof inflation=1.0x  root inflation=1.0x  avg rebuild=353ms/round  -> proofs BOUNDED, recurring O(W) CPU
+  LAZY:   worst-proof inflation=1.12x  root inflation=0.89x  avg append=41.2ms/round  -> cheap updates, proofs+peaks INFLATE
+  worst-proof bound this run: repack<=ceil(log2 W)=17 hashes (544B); lazy reached 18 hashes (576B) at 300000 ever-appended
+  bridge storage: repack steady 6.1MB (~O(W)); lazy 6.71->18.31MB (O(total-ever), 2.73x) <- the real lazy cost is STORAGE, not proof depth (both grow only ~log/linear-in-n)
