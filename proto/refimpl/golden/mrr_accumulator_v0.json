@@ -1,0 +1,91 @@
+{
+  "P1_determinism_bitidentical": true,
+  "P2_epoch_boundaries": [
+    {
+      "B": 4096,
+      "acc_entries": 1,
+      "acc_total": 1,
+      "head": 4096
+    },
+    {
+      "B": 8192,
+      "acc_entries": 1,
+      "acc_total": 275,
+      "head": 8192
+    },
+    {
+      "B": 12288,
+      "acc_entries": 1,
+      "acc_total": 516,
+      "head": 12288
+    }
+  ],
+  "P3_renorm_vs_rebuild_max_residual_q62": "158134",
+  "P3_residual_relative_to_one": 3.428984526876455e-14,
+  "geometry": {
+    "E": 4096,
+    "frac_bits": 62,
+    "half_life": 2160,
+    "nminers": 8,
+    "npush": 14336
+  },
+  "sampled_decayed_payouts": {
+    "0": {
+      "0": 0,
+      "1": 0,
+      "2": 0,
+      "3": 118,
+      "4": 0,
+      "5": 0,
+      "6": 0,
+      "7": 0
+    },
+    "12288": {
+      "0": 0,
+      "1": 0,
+      "2": 0,
+      "3": 516,
+      "4": 0,
+      "5": 0,
+      "6": 0,
+      "7": 0
+    },
+    "14335": {
+      "0": 84857,
+      "1": 102562,
+      "2": 87056,
+      "3": 91790,
+      "4": 98827,
+      "5": 99275,
+      "6": 83805,
+      "7": 90936
+    },
+    "4096": {
+      "0": 0,
+      "1": 0,
+      "2": 0,
+      "3": 1,
+      "4": 0,
+      "5": 0,
+      "6": 0,
+      "7": 0
+    },
+    "8192": {
+      "0": 0,
+      "1": 0,
+      "2": 0,
+      "3": 275,
+      "4": 0,
+      "5": 0,
+      "6": 0,
+      "7": 0
+    }
+  },
+  "spec": "c2pool-v37-mrr-roundabout-buffer.md",
+  "table": {
+    "InvD_E_q62": "17167292113050711282",
+    "base_inv_q62": "4613166152737261409",
+    "decay_E_q62": "1238846976710486550",
+    "note": "table base is a CANDIDATE integer construction; canonical generation procedure to be pinned in M3 spec-consolidation"
+  }
+}
