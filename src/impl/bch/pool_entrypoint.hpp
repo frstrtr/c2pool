@@ -85,11 +85,12 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
                              uint32_t anchor_height,
                              const std::string& stratum_addr = "0.0.0.0",
                              uint16_t stratum_port = 0,
-                             bool is_testnet = false)
+                             bool is_testnet = false,
+                             bool is_regtest = false)
 {
     // 1+2: embedded daemon up first -- it owns the work source + RPC fallback
     // the pool node consumes, and is the broadcast sink the node wires into.
-    coin::EmbeddedDaemon<Config> daemon(&ioc, &config, anchor_height);
+    coin::EmbeddedDaemon<Config> daemon(&ioc, &config, anchor_height, is_regtest);
     daemon.run();
 
     // 3: the pool node (sharechain, LevelDB, P2P, Stratum).
