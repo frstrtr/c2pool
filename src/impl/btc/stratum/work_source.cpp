@@ -275,10 +275,19 @@ std::vector<std::string> BTCWorkSource::get_stratum_merkle_branches() const
     auto wd = cached_template();
     if (!wd || wd->m_hashes.empty()) return {};
 
-    // wd->m_hashes[0] is the coinbase placeholder — the actual coinbase
-    // hash doesn't matter for branch computation since the miner provides
-    // their own coinbase. We only need the structure.
-    std::vector<uint256> level = wd->m_hashes;
+    // PRODUCER/CONSUMER CONTRACT: wd->m_hashes is the pure tx-hash list
+    // [tx1..txN] with NO coinbase slot (filled by rpc.cpp / template_builder.hpp
+    // straight from GBT transactions[]). The stratum merkle tree, however, has
+    // the coinbase as leaf 0. Prepend a placeholder leaf for it before folding
+    // — the actual coinbase hash doesn't matter for branch computation since
+    // the miner provides their own coinbase; we only need the leaf STRUCTURE.
+    // Without this prepend, level[1] below would be tx2 (not tx1), tx1 would be
+    // dropped, and the header merkle root would diverge from the serialized
+    // body → bad-txnmrklroot rejection on any populated (>=1 tx) won block.
+    std::vector<uint256> level;
+    level.reserve(wd->m_hashes.size() + 1);
+    level.push_back(uint256::ZERO);  // coinbase placeholder leaf (leaf 0)
+    level.insert(level.end(), wd->m_hashes.begin(), wd->m_hashes.end());
     std::vector<std::string> branches;
     while (level.size() > 1) {
         // Right-sibling of the left-most node = level[1].
@@ -760,6 +769,34 @@ nlohmann::json BTCWorkSource::mining_submit(
     push_u32_le(header, parse_be_hex_u32(nonce));
 
     uint256 pow_hash = Hash(std::span<const uint8_t>(header.data(), header.size()));
+
+    // ── Non-fatal merkle self-check (producer/consumer contract guard) ──
+    // Recompute the body merkle root over the full leaf set
+    // [coinbase_txid, tx1..txN] and compare it to the branch-folded header
+    // root above. If get_stratum_merkle_branches and the serialized body ever
+    // disagree on the leaf structure (the latent bad-txnmrklroot class), this
+    // logs a loud DIVERGENCE BEFORE the block is submitted and rejected. Uses
+    // the current cached template's leaf set; a template roll between job
+    // freeze and submit can produce a benign mismatch, so this is advisory
+    // only and never rejects the share.
+    if (auto wd_chk = cached_template()) {
+        std::vector<uint256> body_leaves;
+        body_leaves.reserve(wd_chk->m_hashes.size() + 1);
+        body_leaves.push_back(coinbase_txid);
+        body_leaves.insert(body_leaves.end(), wd_chk->m_hashes.begin(), wd_chk->m_hashes.end());
+        uint256 body_root = btc::coin::compute_merkle_root(body_leaves);
+        if (body_root == merkle_root) {
+            LOG_DEBUG_OTHER << "[BTC-STRATUM] merkle self-check OK: body root matches header"
+                            << " (" << body_leaves.size() << " leaves)";
+        } else {
+            LOG_WARNING << "[BTC-STRATUM] merkle self-check DIVERGENCE: header root="
+                        << HexStr(std::span<const uint8_t>(merkle_root.data(), 32))
+                        << " body root="
+                        << HexStr(std::span<const uint8_t>(body_root.data(), 32))
+                        << " over " << body_leaves.size() << " leaves"
+                        << " — block would be rejected bad-txnmrklroot (template roll or leaf-set bug)";
+        }
+    }
 
     // Decode share target (separate from block target — pre-this-fix we
     // were comparing pow_hash against block target which is network
