@@ -642,7 +642,7 @@ int run_pool(const std::string& peer_host, uint16_t peer_port, bool testnet,
 
     try {
         bch::standup_pool_run(ioc, config, anchor_height,
-                              stratum_addr, stratum_port, testnet || regtest);
+                              stratum_addr, stratum_port, testnet || regtest, regtest);
     } catch (const std::exception& e) {
         std::cout << "[pool] FATAL: " << e.what() << "\n";
         return 1;
