@@ -629,11 +629,20 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         // subscribe was built before authorize ran, so it carried neither the
         // miner's primary payout address (username_ was empty -> empty
         // payout_script -> degenerate value-0 OP_RETURN coinbase) nor any merged
-        // addresses. Standalone parent coins (BCH/BTC, no merged chains) never
-        // populate merged_addresses_, so gating the resend on that alone left
-        // them mining a payout-less coinbase -> BCHN bad-txns/BIP30 on a won
-        // block. Resend whenever the now-known username_ or merged addrs can
-        // change the coinbase. force_clean so the miner drops the stale job.
+        // addresses. Two distinct primary classes need this resend, and NEITHER
+        // populates merged_addresses_:
+        //   (1) Standalone parent coins (BCH/BTC, no merged chains) never
+        //       populate merged_addresses_ at all.
+        //   (2) A P2WSH/P2TR primary (Cases 7-9) carries a 32-byte witness
+        //       program that cannot reduce to a 20-byte hash160, so the
+        //       auto-derive above is skipped and merged_addresses_ stays empty
+        //       even for a merged coin (LTC/DOGE) whose username_ IS set.
+        // Gating the resend on merged_addresses_ alone left BOTH classes mining
+        // the payout-less coinbase -> BCHN bad-txns/BIP30 on a won block. Resend
+        // whenever the now-known username_ or merged addrs can change the
+        // coinbase: address_to_script(username_) yields the real witness/script
+        // payout for (2) exactly as it yields the P2PKH payout for (1).
+        // force_clean so the miner drops the stale job.
         if (mining_interface_ && (!username_.empty() || !merged_addresses_.empty())) {
             send_notify_work(true);
         }
