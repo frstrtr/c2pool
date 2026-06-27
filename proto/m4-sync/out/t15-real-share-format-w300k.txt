@@ -1,0 +1,19 @@
+# M4 T15 real-share-format build cost @W=300000
+# sizes(B): header=80 receipt_env=244 full_share=1364 (R_MAX=4x256B)
+
+snapshot_path   leaf=32B(hash)  build_s=0.737  roots=8  rss_mb=93.5
+
+raw_ingest[synthetic32] leaf_preimage=   32B  build_s=1.337  x_snap=  1.8  x_synth~1.0(noisy)  roots=8  raw_egress_mb=9.6
+raw_ingest[receipt_min] leaf_preimage=  244B  build_s=3.931  x_snap=  5.3  x_synth~2.9(noisy)  roots=8  raw_egress_mb=73.2
+raw_ingest[full_share ] leaf_preimage= 1364B  build_s=15.571  x_snap= 21.1  x_synth~11.6(noisy)  roots=8  raw_egress_mb=409.2
+
+# verdict:
+# - forest leaves are 32B regardless of preimage size: roots match, storage = O(W) 32B leaves.
+# - real preimage size inflates ONLY the cold raw-ingest hashing leg by a bounded
+#   CONSTANT FACTOR, NOT the O(W) asymptote. ABSOLUTE: full_share ~15-16s @300K (stable);
+#   vs the snapshot cold-start floor (~0.7s) that is x_snap ~22x -- still seconds-scale,
+#   and it is an AUDIT-ONLY path: the snapshot/checkpoint cold-start (32B leaf hashes,
+#   T14) ships 0.7s/9.6MB and pays ZERO preimage-hashing cost.
+# - raw-share egress is the real cost lever: full_share = 409.2MB
+#   vs 32B-leaf snapshot 9.6MB (43x) ->
+#   confirms T9/T12: serve 32B-leaf snapshots, never raw shares, for cold-start.

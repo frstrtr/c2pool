@@ -78,8 +78,13 @@ Pick `C ≤ (k−1)/f − D_f` to keep total delta ≤ k·W. Net: checkpoint =
 
 ## Still NOT answered locally — explicit M5-integration carry-forward (no silent caps)
 
-- Real share/PoW/signature verification cost in the build path — synthetic sha256
-  understates it.
+- ~~Real share-format preimage cost in the build path — synthetic sha256 understates it.~~
+  **PARTLY CLOSED (T15, out/FINDINGS-t15-real-share-format.md):** building over real V37
+  share-format preimages (receipt 244B / full carrier share 1364B) keeps O(W) — preimage
+  size is a bounded constant factor on the cold raw-ingest hashing leg only (full_share
+  ~15–16s @300K, ~21× the snapshot floor), and the snapshot/checkpoint cold-start (32B leaf
+  hashes) pays zero preimage cost. STILL M5: real PoW/signature *verification* cost (T15
+  hashes preimages, it does not verify PoW or signatures).
 - Proof-cache memory on a bridge under a realistic request distribution.
 - ~~W beyond 300K — all numbers above are at W=300K.~~ **CLOSED (T11, out/FINDINGS-t11-scale-w1m.md):**
   re-ran T1/T2/T3 + T6 at W=1,000,000 (3.3×). Asymptotics confirmed: build/mem linear
