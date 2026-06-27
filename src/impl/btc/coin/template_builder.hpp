@@ -130,6 +130,25 @@ inline std::vector<uint256> stratum_merkle_siblings(const std::vector<uint256>& 
     return siblings;
 }
 
+/// Compute the BIP141 segwit witness-commitment merkle root.
+///
+/// The coinbase transaction's own wtxid is DEFINED as 32 zero bytes and MUST
+/// occupy leaf 0 of the witness merkle tree; the remaining leaves are the
+/// other transactions' wtxids IN BLOCK ORDER. This helper is the single source
+/// of truth for that leaf-0 placeholder contract -- the witness-tree analogue
+/// of the txid-merkle coinbase leaf-0 fix (PR #570). Keeping it in one place
+/// means a populated segwit block cannot silently drop the first tx's wtxid
+/// (which bitcoind rejects as bad-witness-merkle-match).
+///
+/// other_wtxids: wtxids of every tx EXCEPT the coinbase, in block order.
+inline uint256 witness_merkle_root(const std::vector<uint256>& other_wtxids) {
+    std::vector<uint256> leaves;
+    leaves.reserve(1 + other_wtxids.size());
+    leaves.push_back(uint256::ZERO);  // coinbase wtxid placeholder (BIP141)
+    leaves.insert(leaves.end(), other_wtxids.begin(), other_wtxids.end());
+    return compute_merkle_root(std::move(leaves));
+}
+
 // ─── CoinNodeInterface ────────────────────────────────────────────────────────
 
 /// Abstract interface for obtaining work and submitting blocks.

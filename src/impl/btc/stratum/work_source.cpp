@@ -525,9 +525,12 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
     std::vector<uint8_t> witness_commitment_script;  // empty if segwit not active
     uint256 witness_root_uint;
     if (segwit_active) {
-        std::vector<uint256> wtxids;
-        wtxids.reserve(1 + (wd->m_txs.size()));
-        wtxids.push_back(uint256::ZERO);  // coinbase wtxid placeholder
+        // Collect the OTHER txs' wtxids (template "hash" field); the coinbase
+        // wtxid placeholder (BIP141 = 32 zero bytes) at leaf 0 is prepended by
+        // the shared witness_merkle_root() SSOT helper, so the leaf-0 contract
+        // lives in ONE place (mirrors the txid-merkle leaf-0 fix, PR #570).
+        std::vector<uint256> other_wtxids;
+        other_wtxids.reserve(wd->m_txs.size());
         if (auto txs_field = wd->m_data.find("transactions");
             txs_field != wd->m_data.end() && txs_field->is_array())
         {
@@ -535,23 +538,11 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
                 if (!t.is_object()) continue;
                 if (auto h = t.find("hash"); h != t.end() && h->is_string()) {
                     uint256 wt; wt.SetHex(h->get<std::string>().c_str());
-                    wtxids.push_back(wt);
+                    other_wtxids.push_back(wt);
                 }
             }
         }
-        // Bitcoin Core merkle: pad odd levels by duplicating last.
-        std::vector<uint256> level = std::move(wtxids);
-        while (level.size() > 1) {
-            std::vector<uint256> next;
-            next.reserve((level.size() + 1) / 2);
-            for (size_t i = 0; i < level.size(); i += 2) {
-                const uint256& l = level[i];
-                const uint256& r = (i + 1 < level.size()) ? level[i + 1] : level[i];
-                next.push_back(btc::coin::merkle_hash_pair(l, r));
-            }
-            level = std::move(next);
-        }
-        witness_root_uint = level.empty() ? uint256::ZERO : level[0];
+        witness_root_uint = btc::coin::witness_merkle_root(other_wtxids);
 
         // commitment_hash = SHA256d(witness_root || witness_reserved_value)
         std::array<uint8_t, 64> commit_in;
