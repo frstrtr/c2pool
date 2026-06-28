@@ -42,8 +42,12 @@ jobs:
 
       - name: Install Conan 2
         run: |
-          pip install "conan>=2.0,<3.0"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
+          fi
 
       - name: Detect Conan profile
         run: |
@@ -171,8 +175,12 @@ jobs:
 
       - name: Install Conan 2
         run: |
-          pip install "conan>=2.0,<3.0"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
+          fi
 
       - name: Detect Conan profile
         run: |
@@ -290,8 +298,12 @@ jobs:
 
       - name: Install Conan 2
         run: |
-          pip install "conan>=2.0,<3.0"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
+          fi
 
       - name: Detect Conan profile
         run: |
@@ -373,8 +385,12 @@ jobs:
 
       - name: Install Conan 2
         run: |
-          pip install "conan>=2.0,<3.0"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
+          fi
 
       - name: Detect Conan profile
         run: |
@@ -718,7 +734,12 @@ jobs:
         with: { python-version: '3.12' }
 
       - name: Install Conan 2
-        run: pip install "conan>=2.0,<3.0"
+        run: |
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+          else
+            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
+          fi
 
       - name: Detect Conan profile
         run: |
@@ -806,8 +827,12 @@ jobs:
 
       - name: Install Conan 2
         run: |
-          pip install "conan>=2.0,<3.0"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
+          fi
 
       - name: Detect Conan profile
         run: |
