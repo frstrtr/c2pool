@@ -262,6 +262,38 @@ def _selftest():
         "SELECT 1 FROM daily WHERE day=? AND worker=?", (old_day, "A")).fetchone()
     check("daily kept forever (pruned-day summary survives)", has_old_daily is not None)
 
+    # 7) per-worker isolation: two workers in the SAME UTC day -> independent
+    #    rows; one miner's downtime/stale must never bleed into another's report
+    con = fresh()
+    for k in range(4):
+        add_raw(con, base + k * 3600, "A", 6000.0, 2000.0)   # A: 4 online, 25% stale
+    add_raw(con, base, "B", 9000.0, 0.0)                     # B: 1 online, 0% stale
+    add_raw(con, base + 3600, "B", 0.0, 0.0)                 # B: 1 offline
+    rollup(con, 3600)
+    d = daily(con)
+    iday = list({k[0] for k in d if k[1] == "A"})[0]
+    aho, aah, an, ash, ast = d[(iday, "A")]
+    bho, bah, bn, bsh, bst = d[(iday, "B")]
+    check("isolation: A hours independent of B", abs(aho - 4.0) < 1e-9)
+    check("isolation: B hours independent of A", abs(bho - 1.0) < 1e-9)
+    check("isolation: A stale% unmixed [25]", abs(ast - 25.0) < 1e-9)
+    check("isolation: B stale% unmixed [0]", abs(bst - 0.0) < 1e-9)
+    check("isolation: B avg over its own online sample [9000]", abs(bah - 9000.0) < 1e-9)
+
+    # 8) all-offline worker: live==0 throughout -> NO phantom presence; a worker
+    #    still emitting dead_hashrate reads stale=100 (its work was all dead), not 0
+    con = fresh()
+    add_raw(con, base, "C", 0.0, 0.0)
+    add_raw(con, base + 3600, "C", 0.0, 1500.0)             # offline but dead work reported
+    rollup(con, 3600)
+    d = daily(con)
+    cday = list({k[0] for k in d if k[1] == "C"})[0]
+    cho, cah, cn, csh, cst = d[(cday, "C")]
+    check("all-offline: hours_online == 0 (no phantom presence)", cho == 0.0)
+    check("all-offline: avg_hashrate == 0 (no phantom rate)", cah == 0.0)
+    check("all-offline: samples still counted (worker not vanished)", cn == 2)
+    check("all-offline: stale=100 when only dead work reported", abs(cst - 100.0) < 1e-9)
+
     print("\nSELFTEST PASS" if not fails else "\nSELFTEST FAIL: " + ", ".join(fails))
     return 1 if fails else 0
 
