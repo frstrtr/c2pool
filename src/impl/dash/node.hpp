@@ -1,0 +1,296 @@
+#pragma once
+
+// Dash p2pool sharechain pool-node — S8 pool-node leaf 5 (FINAL), slice A.
+//
+// SLICE A SCOPE: class skeleton + accessors + KAT ONLY. This is one slice of a
+// 4-slice plan (A=skeleton+accessors+KAT, B=reception, C=broadcast/persist,
+// D=think-loop). Reception (message handlers / Legacy / Actual / NodeBridge),
+// broadcast/persist, and the think() compute-loop bodies are DEFERRED to the
+// later slices and are intentionally NOT declared here.
+//
+// Namespace-ported from the btc::NodeImpl prod reference (src/impl/btc/node.hpp),
+// reconciled against DASH's actual headers (dash::Config, dash::ShareChain,
+// dash::ShareTracker, dash::Peer, dash::coin::Transaction). DASH is X11 but the
+// pool-node layer is consensus-agnostic; the slice-A surface (lifecycle fields,
+// async-compute pipeline scaffold, lock-free snapshot, tracker accessors) is
+// byte-for-byte the same shape as btc/dgb.
+
+#include "config.hpp"
+#include "share.hpp"
+#include "share_chain.hpp"
+#include "share_tracker.hpp"
+#include "peer.hpp"
+#include "coin/transaction.hpp"
+
+#include <pool/node.hpp>
+#include <core/reply_matcher.hpp>
+#include <c2pool/storage/sharechain_storage.hpp>
+
+#include <boost/asio/thread_pool.hpp>
+#include <boost/asio/steady_timer.hpp>
+
+#include <atomic>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <random>
+#include <shared_mutex>
+#include <thread>
+#include <vector>
+
+namespace dash
+{
+
+// Batch of received shares (+ their raw bytes and needed txs) awaiting tracker
+// insertion. Slice A defines the complete shell so m_pending_adds's
+// unique_ptr<HandleSharesData> has a complete type at destruction; the reception
+// slice (B) drives add()/drain. Mirrors btc::HandleSharesData.
+struct HandleSharesData
+{
+    std::vector<ShareType> m_items;
+    std::vector<chain::RawShare> m_raw_items; // original raw bytes, parallel with m_items
+    std::map<uint256, std::vector<coin::MutableTransaction>> m_txs;
+
+    void add(const ShareType& share, std::vector<coin::MutableTransaction> txs)
+    {
+        m_items.push_back(share);
+        m_raw_items.emplace_back(); // no cached raw bytes
+        m_txs[share.hash()] = std::move(txs);
+    }
+
+    void add(const ShareType& share, std::vector<coin::MutableTransaction> txs,
+             const chain::RawShare& raw)
+    {
+        m_items.push_back(share);
+        m_raw_items.push_back(raw);
+        m_txs[share.hash()] = std::move(txs);
+    }
+};
+
+// Response payload delivered to a pending async share request when a sharereply
+// arrives. Parsed shares plus their original raw payloads (so relay re-sends the
+// exact bytes received). Wired into the reply_matcher typedef below.
+struct ShareReplyData
+{
+    std::vector<ShareType> m_items;
+    std::vector<chain::RawShare> m_raw_items;
+};
+
+class NodeImpl : public pool::BaseNode<dash::Config, dash::ShareChain, dash::Peer>
+{
+    // Async share downloader:
+    //   ID       = uint256 (matches sharereq id to sharereply id)
+    //   RESPONSE = parsed shares plus their original raw payloads
+    //   REQUEST  = req_id, peer, hashes, parents, stops
+    using share_getter_t = ReplyMatcher::ID<uint256>
+        ::RESPONSE<dash::ShareReplyData>
+        ::REQUEST<uint256, peer_ptr, std::vector<uint256>, uint64_t, std::vector<uint256>>;
+
+protected:
+    share_getter_t m_share_getter;
+    ShareTracker m_tracker;
+    std::unique_ptr<c2pool::storage::SharechainStorage> m_storage;
+
+    // Global pool of known transactions, populated by remember_tx and the coin
+    // daemon. Reception-slice protocol handlers look up tx hashes here.
+    std::map<uint256, coin::Transaction> m_known_txs;
+
+    // Thread pool for parallel share_init_verify (X11 CPU work). Keeps the
+    // expensive crypto off the io_context thread.
+    boost::asio::thread_pool m_verify_pool{4};
+
+    // ── Async compute pipeline ──────────────────────────────────────────
+    // think() (slice D) runs on m_think_pool (1 thread) holding m_tracker_mutex
+    // exclusively. The IO thread NEVER calls lock() — only try_to_lock(). If the
+    // mutex is held by the compute thread, the IO thread defers the operation and
+    // continues processing network I/O. Synchronization contract:
+    //   Compute thread:   unique_lock(m_tracker_mutex)  — exclusive, blocking
+    //   IO thread reads:  shared_lock(try_to_lock)      — non-blocking, skip if busy
+    //   IO thread writes: unique_lock(try_to_lock)      — non-blocking, queue if busy
+    boost::asio::thread_pool m_think_pool{1};
+    std::atomic<bool> m_think_running{false};
+    std::atomic<bool> m_clean_running{false};
+    mutable std::shared_mutex m_tracker_mutex;
+
+    // ── Lock-free stats snapshot ─────────────────────────────────────────
+    // Published by think() on the compute thread under m_tracker_mutex. Read by
+    // ALL consumers (sync_status, loading page, global_stats, graph data, …)
+    // WITHOUT needing the tracker lock — the c2pool equivalent of p2pool's
+    // reactor-thread stats variables.
+    struct TrackerSnapshot {
+        int chain_count{0};
+        int verified_count{0};
+        int head_count{0};
+        int orphan_shares{0};
+        int dead_shares{0};
+        int fork_count{0};
+        double pool_hashrate{0};
+    };
+    void publish_snapshot() {
+        TrackerSnapshot s;
+        s.chain_count = static_cast<int>(m_tracker.chain.size());
+        s.verified_count = static_cast<int>(m_tracker.verified.size());
+        s.head_count = static_cast<int>(m_tracker.chain.get_heads().size());
+        s.fork_count = s.head_count;
+        std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+        m_snapshot = s;
+    }
+    mutable std::mutex m_snapshot_mutex;
+    TrackerSnapshot m_snapshot;
+
+    // Identity of the compute thread (m_think_pool's single thread). Used by
+    // TrackerReadGuard to skip shared_lock when the caller is already on the
+    // compute thread (which holds the exclusive lock).
+    std::atomic<std::thread::id> m_compute_thread_id{};
+
+    // Pending share batches queued while think() holds the mutex; drained on the
+    // IO thread after think() releases the lock. unique_ptr because
+    // HandleSharesData is forward-declared here (defined in the reception slice).
+    struct PendingShareBatch {
+        std::unique_ptr<HandleSharesData> data;
+        NetService addr;
+    };
+    std::vector<PendingShareBatch> m_pending_adds;
+
+    // ── think() watchdog + backpressure (livelock defense-in-depth) ──
+    // If a think() cycle exceeds THINK_WATCHDOG_SECONDS the watchdog (slice D)
+    // logs compute-thread state, flags the cycle, and resets m_think_running so
+    // the pipeline recovers instead of wedging. The watchdog NEVER touches
+    // m_tracker_mutex. MAX_PENDING_ADDS caps the deferred queue.
+    static constexpr int THINK_WATCHDOG_SECONDS = 30;
+    static constexpr size_t MAX_PENDING_ADDS = 256;
+    std::atomic<int64_t> m_think_deadline_ns{0};
+    std::atomic<uint64_t> m_think_generation{0};
+    std::unique_ptr<boost::asio::steady_timer> m_watchdog_timer;
+
+    // Top-5 scored heads from last think() — used by clean_tracker() (slice D)
+    // to protect the best chains from head pruning.
+    std::vector<uint256> m_last_top5_heads;
+
+    // Buffer of newly verified share hashes, flushed to LevelDB periodically.
+    std::vector<uint256> m_verified_flush_buf;
+    // Buffer of pruned share hashes, batch-deleted from LevelDB after clean.
+    std::vector<uint256> m_removal_flush_buf;
+
+public:
+    // Default (rig-free) construction for tests/standalone: no io_context, the
+    // share-getter requester is a no-op (reception slice supplies the real
+    // sharereq writer). Routes m_chain at the tracker's main chain so any
+    // BaseNode path that reads m_chain is valid.
+    NodeImpl()
+        : m_share_getter(nullptr,
+            [](uint256, peer_ptr, std::vector<uint256>, uint64_t, std::vector<uint256>){})
+    {
+        m_chain = &m_tracker.chain;
+        std::mt19937_64 rng(std::random_device{}());
+        m_nonce = rng();
+    }
+
+    NodeImpl(boost::asio::io_context* ctx, config_t* config)
+        : base_t(ctx, config),
+          // Slice A keeps the share-getter wired with a no-op requester; the
+          // reception slice (B) replaces this with the real sharereq writer.
+          m_share_getter(ctx,
+            [](uint256, peer_ptr, std::vector<uint256>, uint64_t, std::vector<uint256>){},
+            15)  // p2pool p2p.py:80 — 15s timeout for share requests
+    {
+        // Seed addr store with hardcoded bootstrap peers.
+        m_addrs.load(config->pool()->m_bootstrap_addrs);
+        // Randomise our nonce so we detect self-connections.
+        std::mt19937_64 rng(std::random_device{}());
+        m_nonce = rng();
+        // Route m_chain (used by BaseNode) at the tracker's main chain.
+        m_chain = &m_tracker.chain;
+    }
+
+    // INetwork: a pool node does not initiate disconnect; the reception slice
+    // overrides connected(). Slice A only needs disconnect() to satisfy the
+    // pure-virtual INetwork contract.
+    void disconnect() override { }
+
+    // ICommunicator: the message-dispatch entry point. Slice A drops inbound
+    // messages (no-op) to satisfy the pure-virtual contract; the reception slice
+    // (B) replaces this with the real Legacy/Actual protocol routing.
+    void handle(std::unique_ptr<RawMessage> /*rmsg*/, const NetService& /*service*/) override { }
+
+    // BaseNode pure-virtuals. Slice A provides minimal stubs so NodeImpl is a
+    // concrete, instantiable type for the KAT; the reception/handshake slice (B)
+    // replaces these with the real ping + version handshake.
+    void send_ping(peer_ptr /*peer*/) override { }
+    std::optional<pool::PeerConnectionType>
+    handle_version(std::unique_ptr<RawMessage> /*rmsg*/, peer_ptr /*peer*/) override
+    {
+        return std::nullopt;
+    }
+
+    // ── Tracker accessors ───────────────────────────────────────────────
+
+    /// Direct tracker access — compute-thread-only (already holds the exclusive
+    /// lock) or startup code (before the compute thread exists). IO-thread code
+    /// MUST use read_tracker() instead.
+    ShareTracker& tracker() { return m_tracker; }
+
+    /// RAII guard for IO-thread tracker reads.
+    /// - IO thread:      acquires shared_lock(try_to_lock); falsy if busy.
+    /// - Compute thread: skips locking (exclusive already held); always truthy.
+    class TrackerReadGuard {
+        std::shared_lock<std::shared_mutex> lock_;
+        ShareTracker& tracker_;
+        bool ok_;
+    public:
+        TrackerReadGuard(std::shared_mutex& mtx, ShareTracker& t, bool on_compute)
+            : lock_(mtx, std::defer_lock), tracker_(t)
+        {
+            if (on_compute) ok_ = true;          // exclusive lock already held
+            else            ok_ = lock_.try_lock();
+        }
+        TrackerReadGuard(TrackerReadGuard&&) = default;
+        TrackerReadGuard(const TrackerReadGuard&) = delete;
+        TrackerReadGuard& operator=(const TrackerReadGuard&) = delete;
+        TrackerReadGuard& operator=(TrackerReadGuard&&) = default;
+
+        explicit operator bool() const { return ok_; }
+        ShareTracker& operator*()  { return tracker_; }
+        ShareTracker* operator->() { return &tracker_; }
+    };
+
+    /// True if the calling thread is the compute thread (m_think_pool).
+    bool is_compute_thread() const {
+        return std::this_thread::get_id() == m_compute_thread_id.load(std::memory_order_relaxed);
+    }
+
+    /// Preferred tracker accessor for IO-thread callbacks. On the IO thread it
+    /// acquires shared_lock(try_to_lock) (check `if (!guard)`); on the compute
+    /// thread it skips locking (exclusive already held).
+    TrackerReadGuard read_tracker() {
+        return TrackerReadGuard(m_tracker_mutex, m_tracker, is_compute_thread());
+    }
+
+    /// Acquire shared (reader) lock on the tracker mutex — BLOCKING. Only for
+    /// consensus-critical paths (share creation) where skipping is unacceptable.
+    std::shared_lock<std::shared_mutex> tracker_shared_lock() {
+        return std::shared_lock<std::shared_mutex>(m_tracker_mutex);
+    }
+
+    /// Expose the tracker mutex for IO-thread callbacks. Callers MUST use
+    /// shared_lock(try_to_lock) — NEVER a blocking lock().
+    std::shared_mutex& tracker_mutex() { return m_tracker_mutex; }
+
+    // ── Lock-free snapshot getters ──────────────────────────────────────
+    // Inline (defined in this header) since slice A has no node.cpp. Never
+    // fail, never need the tracker lock.
+    TrackerSnapshot get_tracker_snapshot() const {
+        std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+        return m_snapshot;
+    }
+    int get_chain_count() const {
+        std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+        return m_snapshot.chain_count;
+    }
+    int get_verified_count() const {
+        std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+        return m_snapshot.verified_count;
+    }
+};
+
+} // namespace dash
