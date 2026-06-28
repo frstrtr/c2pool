@@ -100,7 +100,7 @@ public:
     /// EmbeddedCoinNode::getwork() is the live in-process work source.
     void run() {
         m_chain.init();               // load genesis / fast-start checkpoint (network-free)
-        m_node.run();                 // init_rpc(): external BCHN-RPC fallback retained
+        m_node.run(/*embedded_primary=*/true); // init_rpc(): eager external GBT non-fatal (embedded-primary); RPC fallback retained
         assemble();                   // network-free seam + ABLA wiring (see below)
         wire_chain_ingest();          // new_headers --> HeaderChain (advances synced height)
         pin_cold_start_anchor();      // operator-APPROVED VM300 anchor (decisions@ 2026-06-18); floor-equivalent

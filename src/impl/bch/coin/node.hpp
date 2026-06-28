@@ -55,13 +55,30 @@ class Node : public bch::interfaces::Node
         m_p2p->connect(m_config->coin()->m_p2p.address);
     }
 
-    void init_rpc()
+    // embedded_primary: when the in-process embedded daemon is the PRIMARY work
+    // source (v36 external_fallback invariant), a dead / 0-peer external BCHN that
+    // cannot yet answer getblocktemplate must NOT abort bring-up -- the embedded
+    // source provides work and the external RPC is only the fallback sink. When the
+    // external RPC IS the work source (embedded_primary == false), a failure here
+    // stays fatal exactly as before.
+    void init_rpc(bool embedded_primary)
     {
         m_rpc = std::make_unique<NodeRPC>(m_context, this, m_config->m_testnet);
         m_rpc->connect(m_config->m_rpc.address, m_config->m_rpc.userpass);
 
-        // work
-        work.set(m_rpc->getwork());
+        // work (eager prime from external RPC)
+        if (embedded_primary) {
+            try {
+                work.set(m_rpc->getwork());
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[EMB-BCH] init_rpc: external BCHN getwork() unavailable"
+                               " at bring-up (" << e.what() << "); embedded-primary ->"
+                               " deferring to embedded work source, RPC retained as"
+                               " fallback sink.";
+            }
+        } else {
+            work.set(m_rpc->getwork());
+        }
     }
 
 public:
@@ -70,10 +87,12 @@ public:
     {
     }
 
-    void run()
+    // embedded_primary defaults false: an external-RPC-as-work-source config still
+    // hard-fails on a dead RPC at bring-up. The embedded daemon passes true.
+    void run(bool embedded_primary = false)
     {
         // RPC
-        init_rpc();
+        init_rpc(embedded_primary);
     }
 
     /// Start P2P connection to coin daemon for fast block relay.

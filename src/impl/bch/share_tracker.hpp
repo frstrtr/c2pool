@@ -55,6 +55,7 @@ inline uint64_t mul128_shift(uint64_t a, uint64_t b, unsigned shift) {
 #include "share_check.hpp"
 #include "config_pool.hpp"
 
+#include <core/version_gate.hpp>   // SSOT: core::version_gate::is_v36_active
 #include <core/target_utils.hpp>
 #include <core/coin_params.hpp>
 #include <core/uint256.hpp>
@@ -66,12 +67,14 @@ inline uint64_t mul128_shift(uint64_t a, uint64_t b, unsigned shift) {
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <deque>
 #include <functional>
 #include <iomanip>
 #include <map>
 #include <optional>
 #include <set>
+#include <unordered_map>
 #include <vector>
 
 namespace bch
@@ -270,6 +273,83 @@ public:
     const DensePPLNSWindow& ring() const { return m_ring; }
 };
 
+// --- Scoring types (coin-independent; mirror of btc SSOT) ---
+// These carry NO merged-mining / segwit surface. BCH is a standalone SHA256d
+// parent — the score math is the same family as btc (the only BCH divergence
+// is the 600s BLOCK_PERIOD applied in ShareTracker::score()).
+
+struct TailScore
+{
+    int32_t chain_len{};
+    uint288 hashrate;
+    uint288 best_head_work;  // tiebreak: raw chain work of best head
+
+    friend bool operator<(const TailScore& a, const TailScore& b)
+    {
+        return std::tie(a.chain_len, a.hashrate, a.best_head_work)
+             < std::tie(b.chain_len, b.hashrate, b.best_head_work);
+    }
+};
+
+struct HeadScore
+{
+    // p2pool: (work - min(punish,1)*ata(target), -reason, -time_seen)
+    // Sorted ascending, .back() = best.
+    uint288 adjusted_work;   // work - punishment_deduction
+    int32_t neg_reason{};    // -reason (higher = less punished = better)
+    int64_t neg_time_seen{}; // -time_seen (higher = seen earlier = better)
+
+    friend bool operator<(const HeadScore& a, const HeadScore& b)
+    {
+        if (a.adjusted_work < b.adjusted_work) return true;
+        if (b.adjusted_work < a.adjusted_work) return false;
+        return std::tie(a.neg_reason, a.neg_time_seen) < std::tie(b.neg_reason, b.neg_time_seen);
+    }
+};
+
+struct TraditionalScore
+{
+    // p2pool: (work, -time_seen, -reason). No is_local. Sorted ascending.
+    uint288 work;
+    int64_t neg_time_seen{};
+    int32_t neg_reason{};
+
+    friend bool operator<(const TraditionalScore& a, const TraditionalScore& b)
+    {
+        if (a.work < b.work) return true;
+        if (b.work < a.work) return false;
+        return std::tie(a.neg_time_seen, a.neg_reason) < std::tie(b.neg_time_seen, b.neg_reason);
+    }
+};
+
+template <typename ScoreT>
+struct DecoratedData
+{
+    ScoreT score;
+    uint256 hash;
+
+    friend bool operator<(const DecoratedData& a, const DecoratedData& b)
+    {
+        return a.score < b.score;
+    }
+};
+
+// -- think() result (mirror of btc TrackerThinkResult; SSOT for the field set) --
+// Produced by think() and consumed by the node-layer run_think() loop:
+//   best                = new best verified head (null when nothing verified)
+//   desired             = (peer, hash) shares to download from peers
+//   bad_peer_addresses  = peers that served unverifiable shares (ban targets)
+//   top5_heads          = best-scored heads protected from head-pruning
+// The s1 link-skeleton think() returns this EMPTY; s2 populates it.
+struct TrackerThinkResult
+{
+    uint256 best;
+    std::vector<std::pair<NetService, uint256>> desired;
+    std::set<NetService> bad_peer_addresses;
+    bool punish_aggressively{false};
+    std::vector<uint256> top5_heads;
+};
+
 // --- ShareTracker (M3 slice 16: PPLNS / expected-payouts surface only) ---
 // Subsequent M3 slices extend this class with verify_share(), think(),
 // head-scoring, version counting and block scanning.
@@ -283,6 +363,27 @@ public:
     // block scanning run against this sub-chain, never the raw "chain" buffer.
     ShareChain verified;
 
+    // -- ctor/dtor: wire the verified SubsetTracker (mirror btc SSOT) --
+    // p2pool SubsetTracker pattern: the verified mirror navigates through the
+    // MAIN tracker's skip list (verified.get_nth_parent_hash delegates to
+    // subset_of.get_nth_parent_hash). WeightsSkipList subscribes to the raw
+    // chain's removed signal so pruned shares leave no stale weight entries.
+    // (data.py SubsetTracker; node.py clean_tracker prune path.)
+    ShareTracker()
+    {
+        verified.set_parent_chain(&chain);
+        chain.on_removed([this](const uint256& hash) {
+            invalidate_weight_caches(hash);
+            m_verify_fail_count.erase(hash);
+        });
+    }
+    ~ShareTracker()
+    {
+        // verified borrows raw share pointers from chain — free its indexes
+        // only, then let chain's destructor free the share data.
+        verified.clear_unowned();
+    }
+
     // -- Node-layer callback hooks (wired by the pool node in node.hpp) --
     // BCH is a SHA256d standalone-parent chain: NO merged-mining / AuxPoW, so
     // there is no m_on_merged_block_check (present in btc for the DOGE aux leg).
@@ -293,6 +394,659 @@ public:
     // Fired for every verified share with its difficulty + miner script
     // (best-share difficulty tracking for the dashboard).
     std::function<void(double difficulty, const std::string& miner)> m_on_share_difficulty;
+
+    // -- V36 think() lock-yield continuation flags (mirror p2pool reactor) --
+    // Set by think() when its cooperative-yield budget is exhausted so the
+    // node-layer run_think() schedules a deferred continuation. The s1 link-
+    // stub think() returns immediately and never yields, so these stay false.
+    bool m_think_needs_continue{false};
+    bool m_think_walk_needs_continue{false};
+
+    // -- Share ingest: add() = RAW chain buffering only (NOT consensus) --
+    // A received share enters the PPLNS / payout / block-found path ONLY once
+    // attempt_verify() promotes it into `verified`. add() merely buffers it in
+    // the raw `chain`. BCH is a SHA256d standalone parent: no merged-mining, so
+    // (unlike btc) there is no try_register_merged_addr() leg here.
+    void add(ShareType share)
+    {
+        auto h = share.hash();
+        if (!chain.contains(h))
+            chain.add(share);
+    }
+
+    // -- s0 CONSENSUS THINK-ENGINE (M5): full verify + reorg/score + PPLNS --
+    // Ports the p2pool BCH consensus core (attempt_verify / score / think
+    // Phase 1-6) from the btc SSOT, conformed against the p2poolBCH @6603b79
+    // oracle (p2pool/data.py attempt_verify:716-728, think:731-845, score:866-878;
+    // p2pool/node.py clean_tracker head-protection:348-373).
+    //
+    // BCH divergences from the btc donor (oracle-driven):
+    //   * NO merged-mining: BCH is a SHA256d standalone parent. There is no
+    //     m_on_merged_block_check / try_register_merged_addr / DOGE aux leg.
+    //   * score() uses BCH PARENT.BLOCK_PERIOD = 600s (oracle
+    //     p2pool/bitcoin/networks/bitcoincash.py:24), NOT the btc/LTC 150s.
+    //   * NO SegWit: the share/template witness path does not exist on BCH; the
+    //     think-engine never touches witness data (share_check.hpp gates segwit
+    //     OFF for BCH via is_segwit_activated()==false).
+    //   * ASERT DAA / CashTokens transparency are handled in verify_share()
+    //     (share_check.hpp), not in the think-engine — no special handling here.
+    // The PPLNS budget walk (get_v36_decayed_cumulative_weights) is byte-identical
+    // to the oracle weight split decayed_att*(65535-don)/decayed_att*don
+    // (p2poolBCH/p2pool/data.py:673-674, get_decayed_cumulative_weights).
+
+    // -- Attempt to verify a share (oracle data.py:716-728) --
+    // Returns true if the share is verified (already, or newly promoted into the
+    // `verified` SubsetTracker). p2pool has NO permanently-unverifiable concept;
+    // it retries share.check() every think() — a share that failed on a transient
+    // fork may succeed once the fork resolves. (data.py: attempt_verify is called
+    // unconditionally in the think() walk every cycle.)
+    bool attempt_verify(const uint256& share_hash)
+    {
+        if (verified.contains(share_hash))
+            return true;
+
+        // oracle: height, last = self.get_height_and_last(share.hash)
+        //         if height < self.net.CHAIN_LENGTH + 1 and last is not None:
+        //             raise AssertionError()
+        // Chain too short and unrooted: cannot verify yet. The share isn't bad;
+        // its parents haven't arrived. generate_share_transaction needs
+        // CHAIN_LENGTH ancestors for correct PPLNS — verifying with a truncated
+        // window produces a wrong coinbase (GENTX-MISMATCH). Phase 2 naturally
+        // extends verification once parents arrive.
+        auto acc_height = chain.get_acc_height(share_hash);
+        auto last = chain.get_last(share_hash);
+        if (acc_height < static_cast<int32_t>(PoolConfig::chain_length()) + 1 && !last.IsNull())
+            return false;
+
+        // oracle: share.gentx = share.check(self, known_txs, ...)
+        // verify_share (share_check.hpp) runs init-phase (hash-link, merkle,
+        // SHA256d PoW, ASERT context) + check-phase (gentx/coinbase comparison).
+        // It throws on any failure. BCH-faithful: no segwit, no merged leg.
+        try
+        {
+            auto& share_var = chain.get_share(share_hash);
+            share_var.ACTION({
+                auto computed_hash = verify_share(*obj, *this);
+                (void)computed_hash;
+            });
+        }
+        catch (const std::exception& e)
+        {
+            // Counter for log throttling only — p2pool retries every think().
+            auto& cnt = m_verify_fail_count[share_hash];
+            ++cnt;
+            if (cnt <= 3 || cnt % 10 == 0)
+                LOG_WARNING << "attempt_verify FAILED (" << cnt
+                            << ") for " << share_hash.ToString().substr(0,16)
+                            << " acc_height=" << acc_height
+                            << " last=" << (last.IsNull() ? "null" : last.ToString().substr(0,16))
+                            << " error: " << e.what();
+            return false;
+        }
+
+        // Success — clear any previous fail count.
+        m_verify_fail_count.erase(share_hash);
+
+        // Cache the SHA256d pow_hash on the index (restart block-scan reuse —
+        // avoids recomputing SHA256d). g_last_pow_hash is set by share_init_verify
+        // (share_check.hpp). BCH PoW is SHA256d (same family as btc).
+        if (!g_last_pow_hash.IsNull()) {
+            auto* idx = chain.get_index(share_hash);
+            if (idx) idx->pow_hash = g_last_pow_hash;
+        }
+
+        // Promote into the verified SubsetTracker.
+        auto& share_var = chain.get_share(share_hash);
+        if (!verified.contains(share_hash))
+            verified.add(share_var);
+
+        // Notify LevelDB known_verified persistence layer.
+        if (m_on_share_verified)
+            m_on_share_verified(share_hash);
+
+        // Block detection: share_init_verify flags a block solution when the
+        // share's SHA256d pow meets the BCH parent block target. Mirrors p2pool
+        // tracker.verified.added watcher (node.py). BCH standalone-parent: NO
+        // merged DOGE-target leg here.
+        if (m_on_block_found && g_last_init_is_block) {
+            g_last_init_is_block = false;
+            auto* idx = chain.get_index(share_hash);
+            if (idx) idx->is_block_solution = true;
+            m_on_block_found(share_hash);
+        }
+
+        // Report share difficulty for the best-share dashboard tracking.
+        if (m_on_share_difficulty) {
+            share_var.invoke([&](auto* s) {
+                double diff = chain::target_to_difficulty(chain::bits_to_target(s->m_bits));
+                std::string miner;
+                if constexpr (requires { s->m_pubkey_hash; })
+                    miner = s->m_pubkey_hash.GetHex();
+                else if constexpr (requires { s->m_address; })
+                    miner = HexStr(s->m_address.m_data);
+                m_on_share_difficulty(diff, miner);
+            });
+        }
+
+        // Naughty propagation: if the parent is naughty, increment up to 6
+        // generations (data.py ancestor punishment for invalid-block shares).
+        {
+            uint256 prev_hash;
+            share_var.invoke([&](auto* obj) { prev_hash = obj->m_prev_hash; });
+            if (!prev_hash.IsNull() && chain.contains(prev_hash)) {
+                auto* parent_idx = chain.get_index(prev_hash);
+                if (parent_idx && parent_idx->naughty > 0) {
+                    auto* my_idx = chain.get_index(share_hash);
+                    if (my_idx) {
+                        my_idx->naughty = parent_idx->naughty + 1;
+                        if (my_idx->naughty > 6) my_idx->naughty = 0;
+                    }
+                }
+            }
+        }
+
+        // V34+ (incl. V36) shares carry transaction_hash_refs, not embedded txs,
+        // so other_txs is always None → p2pool SKIPS the block weight/size check
+        // (data.py). Coinbase correctness is already enforced by verify_share's
+        // generate_share_transaction comparison. CashTokens carry transparently.
+        return true;
+    }
+
+    // -- Score a verified chain (oracle data.py:866-878) --
+    // Returns (chain_len, hashrate) — higher is better. Uses self.verified for
+    // ALL operations (using the raw chain inflates height with unverified shares
+    // and breaks tie-breaking). BCH divergence: PARENT.BLOCK_PERIOD = 600s.
+    TailScore score(const uint256& share_hash,
+                    const std::function<int32_t(uint256)>& block_rel_height_func)
+    {
+        uint288 score_res;
+
+        // oracle: head_height = self.verified.get_height(share_hash)
+        //         if head_height < self.net.CHAIN_LENGTH: return head_height, None
+        auto head_height = verified.get_acc_height(share_hash);
+        if (head_height < static_cast<int32_t>(PoolConfig::chain_length()))
+            return {head_height, score_res};
+
+        // oracle: end_point = self.verified.get_nth_parent_hash(
+        //             share_hash, self.net.CHAIN_LENGTH*15//16)
+        auto end_point = verified.get_nth_parent_via_skip(share_hash,
+            (PoolConfig::chain_length() * 15) / 16);
+
+        // oracle: block_height = max(block_rel_height_func(share.header['previous_block'])
+        //             for share in self.verified.get_chain(end_point, CHAIN_LENGTH//16))
+        std::optional<int32_t> block_height;
+        auto tail_count = std::min(
+            static_cast<int32_t>(PoolConfig::chain_length() / 16),
+            verified.get_acc_height(end_point));
+        if (tail_count <= 0)
+            return {static_cast<int32_t>(PoolConfig::chain_length()), score_res};
+
+        auto tail_view = verified.get_chain(end_point, tail_count);
+        for (auto [hash, data] : tail_view)
+        {
+            uint256 prev_block;
+            data.share.invoke([&](auto* obj) {
+                prev_block = obj->m_min_header.m_previous_block;
+            });
+            auto bh = block_rel_height_func(prev_block);
+            if (!block_height.has_value() || bh > block_height.value())
+                block_height = bh;
+        }
+
+        // c2pool returns confirmations (1=tip, 0=unknown, -1=off-main-chain);
+        // p2pool returns relative height. When the block can't be resolved,
+        // p2pool computes work/(1e9*BLOCK_PERIOD) — tiny but non-zero, so the
+        // higher-work chain wins (stable, no oscillation). Match it.
+        if (!block_height.has_value() || block_height.value() <= 0)
+            block_height = 1000000;
+
+        // oracle: self.verified.get_delta(share_hash, end_point).work
+        auto total_work = verified.get_delta_work(share_hash, end_point);
+
+        // oracle: ((0 - block_height + 1) * self.net.PARENT.BLOCK_PERIOD)
+        // BCH PARENT.BLOCK_PERIOD = 600s (bitcoincash.py:24), NOT LTC's 150s.
+        auto time_span = block_height.value() * 600;
+        if (time_span <= 0)
+            time_span = 1;
+
+        score_res = total_work / static_cast<uint32_t>(time_span);
+        return {static_cast<int32_t>(PoolConfig::chain_length()), score_res};
+    }
+
+    // -- Best-chain selection with verification + punishment (oracle think) --
+    // bootstrap_mode: removes the per-call verification budget so the entire
+    // chain is verified in one pass (initial sync, no IO needs the lock).
+    // Oracle: p2pool/data.py:731-845 (Tracker.think); p2pool runs think()
+    // synchronously on the reactor. The known_txs/feecache/block_abs_height
+    // args fold into verify_share via share_check.hpp.
+    TrackerThinkResult think(const std::function<int32_t(uint256)>& block_rel_height_func,
+                             const uint256& /*previous_block*/,
+                             uint32_t /*bits*/,
+                             bool bootstrap_mode = false)
+    {
+        // oracle: desired is a set of (peer_addr, hash, max_timestamp, min_target).
+        // The timestamp filters stale requests at return time.
+        struct DesiredEntry {
+            NetService peer;
+            uint256 hash;
+            uint32_t max_timestamp{0};
+        };
+        std::vector<DesiredEntry> desired;
+        std::set<uint256> desired_hashes;   // oracle: desired = set() — dedup by hash
+        std::set<NetService> bad_peer_addresses;
+
+        // ── Phase 1: verify unverified heads; collect bad shares ───────────
+        // oracle data.py:740-755. For each raw head not yet verified, walk back
+        // and attempt_verify; the first success breaks; failing shares -> bads;
+        // a for/else with no success on a rooted chain requests the parent.
+        std::vector<uint256> bads;
+        {
+            auto heads_snapshot = chain.get_heads();
+            for (auto& [head_hash, tail_hash] : heads_snapshot)
+            {
+                if (verified.get_heads().contains(head_hash))
+                    continue;
+                if (!chain.contains(head_hash)) continue;
+
+                auto [head_height, last] = chain.get_height_and_last(head_hash);
+
+                // oracle: get_chain(head, head_height if last is None
+                //                   else min(5, max(0, head_height - CHAIN_LENGTH)))
+                auto walk_count = last.IsNull()
+                    ? head_height
+                    : std::min(5, std::max(0, head_height - static_cast<int32_t>(PoolConfig::chain_length())));
+
+                if (walk_count <= 0) {
+                    // oracle for/else: walk produced nothing → request parent.
+                    // Skip parent requests for chains already in the pruning zone
+                    // (>= 2*CHAIN_LENGTH+10) — clean_tracker would re-prune them.
+                    if (!last.IsNull()) {
+                        auto CL_prune = static_cast<int32_t>(PoolConfig::chain_length());
+                        if (head_height < 2 * CL_prune + 10 && !desired_hashes.count(last)) {
+                            NetService peer;
+                            uint32_t head_ts = 0;
+                            chain.get_share(head_hash).invoke([&](auto* obj) {
+                                peer = obj->peer_addr;
+                                head_ts = obj->m_timestamp;
+                            });
+                            desired_hashes.insert(last);
+                            desired.push_back({peer, last, head_ts});
+                        }
+                    }
+                    continue;
+                }
+
+                bool verified_one = false;
+                try {
+                    auto chain_view = chain.get_chain(head_hash, walk_count);
+                    for (auto [hash, data] : chain_view)
+                    {
+                        if (attempt_verify(hash)) { verified_one = true; break; }
+                        // oracle data.py: bads.append(share.hash) — ALL failing
+                        // shares go to bads; p2pool has no unverifiable filter.
+                        bads.push_back(hash);
+                    }
+                } catch (const std::exception& ex) {
+                    LOG_WARNING << "[think-P1] exception walking head "
+                                << head_hash.GetHex().substr(0,16)
+                                << " height=" << head_height << " walk=" << walk_count
+                                << ": " << ex.what();
+                    continue;
+                }
+
+                // oracle for/else: loop completed without break AND unrooted.
+                if (!verified_one && !last.IsNull())
+                {
+                    auto CL_prune = static_cast<int32_t>(PoolConfig::chain_length());
+                    if (head_height < 2 * CL_prune + 10 && !desired_hashes.count(last)) {
+                        NetService peer;
+                        uint32_t head_ts = 0;
+                        chain.get_share(head_hash).invoke([&](auto* obj) {
+                            peer = obj->peer_addr;
+                            head_ts = obj->m_timestamp;
+                        });
+                        desired_hashes.insert(last);
+                        desired.push_back({peer, last, head_ts});
+                    }
+                }
+            }
+        }
+
+        // ── Remove bad shares (oracle data.py:756-768) ─────────────────────
+        // p2pool tries self.remove(bad) for ALL bads; catches NotImplementedError
+        // for mid-chain shares (have dependents). chain.remove() returns false
+        // in that case (equivalent). NO leaf-only filter — p2pool has none.
+        {
+            int removed_count = 0;
+            for (const auto& bad : bads)
+            {
+                if (verified.contains(bad)) continue;   // oracle: assert bad not in verified
+                if (!chain.contains(bad)) continue;
+
+                NetService bad_peer;
+                try {
+                    chain.get_share(bad).invoke([&](auto* obj) { bad_peer = obj->peer_addr; });
+                } catch (...) {}
+                if (bad_peer.port() != 0)
+                    bad_peer_addresses.insert(bad_peer);
+
+                try {
+                    invalidate_weight_caches(bad);
+                    if (verified.contains(bad)) verified.remove(bad);
+                    if (chain.remove(bad)) ++removed_count;
+                } catch (...) {}
+            }
+            if (removed_count > 0)
+                LOG_INFO << "[think-P1] removed " << removed_count
+                         << " shares (bads=" << bads.size() << " + descendants)";
+        }
+
+        // ── Phase 2: extend verification from verified heads ───────────────
+        // oracle data.py:769-788. Budget-limited per call (cooperative yield) to
+        // avoid pinning the compute lock; remainder picked up next run_think().
+        constexpr int THINK_VERIFY_BUDGET = 100;
+        int budget_remaining = bootstrap_mode ? INT_MAX : THINK_VERIFY_BUDGET;
+        m_think_needs_continue = false;
+
+        // V36 livelock mirror: cooperative-yield budget for the scoring walk.
+        // Sized FAR above a normal full-window pass so it NEVER trips on healthy
+        // load (semantics unchanged); a pure starvation circuit breaker.
+        constexpr int THINK_WALK_YIELD_BUDGET = 1000000;
+        int walk_budget_remaining = bootstrap_mode ? INT_MAX : THINK_WALK_YIELD_BUDGET;
+        m_think_walk_needs_continue = false;
+
+        // Sort verified heads by work (descending) so the best chain gets budget
+        // priority. p2pool iterates in arbitrary order but has no budget; with a
+        // budget, a low-work side chain going first could starve the best chain.
+        std::vector<std::pair<uint256, uint256>> sorted_vheads(
+            verified.get_heads().begin(), verified.get_heads().end());
+        std::sort(sorted_vheads.begin(), sorted_vheads.end(),
+            [this](const auto& a, const auto& b) {
+                auto wa = verified.contains(a.first) ? verified.get_work(a.first) : uint288{};
+                auto wb = verified.contains(b.first) ? verified.get_work(b.first) : uint288{};
+                return wa > wb;
+            });
+
+        for (auto& [head_hash, tail_hash] : sorted_vheads)
+        {
+            if (budget_remaining <= 0) { m_think_needs_continue = true; break; }
+            if (!chain.contains(head_hash)) continue;
+
+            auto [head_height, last_hash] = verified.get_height_and_last(head_hash);
+            if (!chain.contains(last_hash)) continue;
+
+            auto [last_height, last_last_hash] = chain.get_height_and_last(last_hash);
+
+            // oracle data.py:774-776 EXACTLY:
+            //   want = max(CHAIN_LENGTH - head_height, 0)
+            //   can  = max(last_height - 1 - CHAIN_LENGTH, 0) if last_last_hash
+            //          is not None else last_height
+            //   get  = min(want, can)
+            auto CL = static_cast<int32_t>(PoolConfig::chain_length());
+            auto want = std::max(CL - head_height, 0);
+            auto can = last_last_hash.IsNull()
+                ? last_height
+                : std::max(last_height - 1 - CL, 0);
+            auto to_get = std::min(want, can);
+
+            if (to_get > 0)
+            {
+                // Carry-forward PPLNS ring: build once at the first share's
+                // prev_hash, slide backward thereafter, and prime the decayed
+                // cache so verify_share's get_v36_decayed_cumulative_weights hits
+                // O(1). The ring uses the precomputed decay table — BIT-EXACT
+                // with the iterative walk (same per-step truncation). The weight
+                // split is the oracle's (p2poolBCH/p2pool/data.py:673-674).
+                HeadPPLNS head_pplns;
+                bool pplns_active = false;
+                auto CL_i32 = static_cast<int32_t>(PoolConfig::chain_length());
+
+                auto chain_view = chain.get_chain(last_hash, to_get);
+                int p2_verified_count = 0;
+                for (auto [hash, data] : chain_view)
+                {
+                    if (budget_remaining <= 0) { m_think_needs_continue = true; break; }
+
+                    uint256 prev_hash;
+                    int share_ver = 0;
+                    data.share.invoke([&](auto* obj) {
+                        prev_hash = obj->m_prev_hash;
+                        share_ver = obj->version;
+                    });
+                    if (core::version_gate::is_v36_active(share_ver))
+                    {
+                        if (!prev_hash.IsNull() && chain.contains(prev_hash)) {
+                            if (!pplns_active) {
+                                head_pplns.rebuild(chain, prev_hash, CL_i32);
+                                pplns_active = true;
+                            } else {
+                                auto ring_depth = head_pplns.window_size();
+                                if (ring_depth > 0) {
+                                    // deep_hash IS the new tail entry (depth
+                                    // chain_len-1 from the new start). Taking its
+                                    // .tail would shift one step too deep → an
+                                    // off-by-one PPLNS error → GENTX mismatch.
+                                    auto deep_hash = chain.get_nth_parent_via_skip(
+                                        prev_hash, std::min(ring_depth - 1, CL_i32 - 1));
+                                    if (!deep_hash.IsNull() && chain.contains(deep_hash))
+                                        head_pplns.extend_backward(chain, deep_hash);
+                                    else
+                                        head_pplns.rebuild(chain, prev_hash, CL_i32);
+                                }
+                            }
+                            if (pplns_active && head_pplns.valid()) {
+                                auto& w = const_cast<HeadPPLNS&>(head_pplns).weights();
+                                prime_pplns_cache(prev_hash, CL_i32, w);
+                            }
+                        }
+                    }
+
+                    // p2pool has no budget — already-verified shares are free
+                    // (a head walking through another head's verified territory).
+                    bool was_already_verified = verified.contains(hash);
+                    if (!attempt_verify(hash)) break;
+                    ++p2_verified_count;
+                    if (!was_already_verified) --budget_remaining;
+                }
+            }
+
+            // oracle data.py:781-788: request more shares if the verified chain
+            // is still short. Skip if the MAIN chain is already in the pruning
+            // zone (the unverified shares exist — they just need verification).
+            if (head_height < static_cast<int32_t>(PoolConfig::chain_length()) && !last_last_hash.IsNull())
+            {
+                auto main_ht = chain.get_height(head_hash);
+                auto CL_prune = static_cast<int32_t>(PoolConfig::chain_length());
+                if (main_ht < 2 * CL_prune + 10 && !desired_hashes.count(last_last_hash)) {
+                    NetService peer;
+                    uint32_t head_ts = 0;
+                    chain.get_share(head_hash).invoke([&](auto* obj) {
+                        peer = obj->peer_addr;
+                        head_ts = obj->m_timestamp;
+                    });
+                    desired_hashes.insert(last_last_hash);
+                    desired.push_back({peer, last_last_hash, head_ts});
+                }
+            }
+        }
+
+        // ── Phase 3: score tails — pick the best tail (oracle data.py:790) ──
+        // decorated_tails = sorted(score(max(verified.tails[t], key=verified.get_work), ...)
+        //                          for t in verified.tails); best = decorated_tails[-1].
+        std::vector<DecoratedData<TailScore>> decorated_tails;
+        for (auto& [tail_hash, head_hashes] : verified.get_tails())
+        {
+            // COARSE walk-yield boundary: checked once per scored head (not in the
+            // inner decay loop). Trips only on a degenerate window.
+            if (walk_budget_remaining <= 0) {
+                m_think_walk_needs_continue = true;
+                LOG_WARNING << "[think-WALK-YIELD] scoring-walk budget exhausted; "
+                               "deferring remaining tails to continuation";
+                break;
+            }
+
+            uint256 best_head;
+            uint288 best_work;
+            bool first = true;
+            for (const auto& hh : head_hashes)
+            {
+                if (!verified.contains(hh)) continue;
+                auto w = verified.get_work(hh);
+                if (first || w > best_work) { best_work = w; best_head = hh; first = false; }
+            }
+
+            if (!best_head.IsNull())
+            {
+                try {
+                    auto s = score(best_head, block_rel_height_func);
+                    s.best_head_work = best_work;   // tiebreak by total work
+                    decorated_tails.push_back({s, tail_hash});
+                    walk_budget_remaining -= std::max(s.chain_len, 1);
+                } catch (const std::exception&) {
+                    // Chain concurrently modified — skip; scored next cycle.
+                }
+            }
+        }
+        std::sort(decorated_tails.begin(), decorated_tails.end());
+
+        uint256 best_tail;
+        TailScore best_tail_score{};
+        if (!decorated_tails.empty()) {
+            best_tail = decorated_tails.back().hash;
+            best_tail_score = decorated_tails.back().score;
+        }
+        (void)best_tail_score;
+
+        // ── Phase 4: score heads within the best tail (oracle data.py:793-810) ──
+        // decorated_heads sort key = (work_of_5th_ancestor - min(punish,1)*ata(target),
+        //                             -reason, -time_seen). traditional_sort drops the
+        //                             punishment deduction. BCH head-scoring punishes
+        //                             only naughty (invalid-block) heads — the canonical
+        //                             60% weighted version-switch is the check() gate
+        //                             (share_check), NOT head-scoring.
+        std::vector<DecoratedData<HeadScore>> decorated_heads;
+        std::vector<DecoratedData<TraditionalScore>> traditional_sort;
+
+        if (verified.get_tails().contains(best_tail))
+        {
+            const auto& head_hashes = verified.get_tails().at(best_tail);
+            for (const auto& hh : head_hashes)
+            {
+                if (!verified.contains(hh)) continue;
+                try {
+                    // oracle: verified.get_work(verified.get_nth_parent_hash(
+                    //             h, min(5, verified.get_height(h))))
+                    auto v_height = verified.get_acc_height(hh);
+                    auto recent_ancestor = verified.get_nth_parent_via_skip(hh, std::min(5, v_height));
+                    uint288 work_score = verified.get_work(recent_ancestor);
+
+                    auto* head_idx = chain.get_index(hh);
+                    if (!head_idx) continue;
+                    int64_t ts = head_idx->time_seen;
+
+                    int32_t reason = 0;
+                    if (head_idx->naughty > 0)
+                        reason = head_idx->naughty;
+
+                    uint288 adjusted_work = work_score;
+                    if (reason > 0)
+                        adjusted_work = adjusted_work - head_idx->work; // min(reason,1)*ata(target)
+
+                    decorated_heads.push_back({{adjusted_work, -reason, -ts}, hh});
+                    traditional_sort.push_back({{work_score, -ts, -reason}, hh});
+                } catch (const std::exception&) {
+                    // Chain concurrently modified — skip; retried next cycle.
+                }
+            }
+            std::sort(decorated_heads.begin(), decorated_heads.end());
+            std::sort(traditional_sort.begin(), traditional_sort.end());
+        }
+
+        // oracle: punish_aggressively = traditional_sort[-1][0][2]
+        bool punish_aggressively = !traditional_sort.empty()
+            && traditional_sort.back().score.neg_reason != 0;
+
+        // ── Phase 5: determine best share (oracle data.py:812-836) ─────────
+        // Walk back through punished (naughty) shares, then find the best
+        // non-naughty descendent.
+        uint256 best;
+        if (!decorated_heads.empty())
+            best = decorated_heads.back().hash;
+
+        if (!best.IsNull() && chain.contains(best))
+        {
+            auto* best_idx = chain.get_index(best);
+            if (best_idx && best_idx->naughty > 0)
+            {
+                while (best_idx && best_idx->naughty > 0)
+                {
+                    uint256 prev;
+                    chain.get_share(best).invoke([&](auto* obj) { prev = obj->m_prev_hash; });
+                    if (prev.IsNull() || !chain.contains(prev)) break;
+                    best = prev;
+                    best_idx = chain.get_index(best);
+
+                    if (best_idx && best_idx->naughty == 0)
+                    {
+                        // oracle best_descendent: deepest non-naughty child.
+                        std::function<std::pair<int,uint256>(const uint256&, int)> best_desc;
+                        best_desc = [&](const uint256& h, int limit) -> std::pair<int,uint256> {
+                            if (limit < 0) return {0, h};
+                            auto& rev = chain.get_reverse();
+                            auto rit = rev.find(h);
+                            if (rit == rev.end() || rit->second.empty())
+                                return {0, h};
+                            std::pair<int,uint256> best_kid = {-1, h};
+                            for (const auto& child : rit->second) {
+                                auto* cidx = chain.get_index(child);
+                                if (cidx && cidx->naughty > 0) continue;
+                                auto [gen, hash] = best_desc(child, limit - 1);
+                                if (gen + 1 > best_kid.first)
+                                    best_kid = {gen + 1, hash};
+                            }
+                            return best_kid.first >= 0 ? best_kid : std::pair<int,uint256>{0, h};
+                        };
+                        auto [gens, desc_hash] = best_desc(best, 20);
+                        (void)gens;
+                        best = desc_hash;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // ── Phase 6: timestamp cutoff + desired filter (oracle data.py:838-844) ──
+        // timestamp_cutoff = min(now, best.timestamp) - 3600 (or now - 24h if no best).
+        // return best, [(peer, hash) for ... in desired if ts >= timestamp_cutoff]
+        uint32_t timestamp_cutoff;
+        if (!best.IsNull() && chain.contains(best))
+        {
+            uint32_t best_ts = 0;
+            chain.get_share(best).invoke([&](auto* obj) { best_ts = obj->m_timestamp; });
+            timestamp_cutoff = std::min(static_cast<uint32_t>(now_seconds()), best_ts) - 3600;
+        }
+        else
+        {
+            timestamp_cutoff = static_cast<uint32_t>(now_seconds()) - 24 * 60 * 60;
+        }
+
+        std::vector<std::pair<NetService, uint256>> desired_result;
+        for (auto& d : desired) {
+            if (d.max_timestamp >= timestamp_cutoff)
+                desired_result.emplace_back(d.peer, d.hash);
+        }
+
+        // Top-5 scored heads for clean_tracker head-protection
+        // (oracle p2pool/node.py:356 — decorated_heads[-5:]).
+        std::vector<uint256> top5;
+        {
+            size_t start = decorated_heads.size() > 5 ? decorated_heads.size() - 5 : 0;
+            for (size_t i = start; i < decorated_heads.size(); ++i)
+                top5.push_back(decorated_heads[i].hash);
+        }
+
+        return {best, desired_result, bad_peer_addresses, punish_aggressively, std::move(top5)};
+    }
 
     // -- PPLNS cumulative weights computation (O(log n) via skip list) --
     CumulativeWeights get_cumulative_weights(const uint256& start, int32_t max_shares, const uint288& desired_weight)
@@ -419,7 +1173,13 @@ public:
             if (pow.IsNull()) { pos = idx->tail; continue; }
 
             chain.get_share(pos).invoke([&](auto* obj) {
-                const uint256 block_target = chain::bits_to_target(obj->m_bits);
+                // BCH block solution test: SHA256d pow vs the PARENT block
+                // target carried in the share's m_min_header.m_bits (NOT the
+                // share-difficulty m_bits). Conforms to verify_share's block
+                // detection (share_check.hpp:745) and the btc donor scan
+                // (m_min_header.m_bits). BCH is a standalone SHA256d parent —
+                // no merged DOGE-target leg.
+                const uint256 block_target = chain::bits_to_target(obj->m_min_header.m_bits);
                 if (!block_target.IsNull() && pow <= block_target) {
                     idx->is_block_solution = true;
                     if (m_on_block_found) { m_on_block_found(pos); ++found; }
@@ -587,6 +1347,42 @@ public:
     }
 
 private:
+    // -- think-engine support state (mirror btc SSOT) --
+    // Retry counter for log throttling only — p2pool retries every think() with
+    // no limit. Cleared on successful verification or on the chain removed signal.
+    std::unordered_map<uint256, int, ShareHasher> m_verify_fail_count;
+
+    static int64_t now_seconds()
+    {
+        return std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+
+    // Invalidate all weight caches for a hash (chain mutated). BCH carries only
+    // the flat-weights skiplist + the decayed result cache — NO merged-mining
+    // skiplists (standalone SHA256d parent). Wired to chain.on_removed in ctor.
+    void invalidate_weight_caches(const uint256& hash)
+    {
+        if (m_weights_skiplist) m_weights_skiplist->forget(hash);
+        m_decayed_cache_valid = false; // chain changed — decayed cache stale
+    }
+
+    // Pre-populate the decayed-weights cache from a HeadPPLNS ring buffer so
+    // verify_share -> get_v36_decayed_cumulative_weights() hits O(1). The ring
+    // uses the precomputed decay table which is BIT-EXACT with the iterative
+    // walk (identical per-step truncation) — NOT an approximation.
+    void prime_pplns_cache(const uint256& start, int32_t max_shares,
+                           const CumulativeWeights& weights)
+    {
+        m_decayed_cache_start = start;
+        m_decayed_cache_shares = max_shares;
+        // Verification always uses an unlimited desired_weight.
+        m_decayed_cache_desired.SetHex(
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        m_decayed_cache_result = weights;
+        m_decayed_cache_valid = true;
+    }
+
     // Previous-share lambda for RAW chain (work templates, general PPLNS)
     auto make_previous_fn()
     {
@@ -621,6 +1417,10 @@ private:
 
     // -- Skip list caches for O(log n) weight queries --
     std::optional<chain::WeightsSkipList> m_weights_skiplist;
+    // -- Per-aux-chain merged skip lists (s0 port, btc SSOT share_tracker.hpp:2699/2815) --
+    // BCH is a standalone parent so m_merged_coinbase_info is empty at runtime and these
+    // never get a real chain_id; carried so verify_merged_coinbase_commitment compiles.
+    std::unordered_map<uint32_t, chain::WeightsSkipList> m_merged_skiplists;
 
     // -- Decayed weights result cache --
     // Avoids recomputing the O(chain_length) walk when the same
@@ -687,6 +1487,286 @@ public:
         return attempts / uint288(time_span);
     }
 
+    // -- Share target computation (p2pool generate_transaction Phase 1) --
+    // Computes {max_bits, bits} for a new/received share, matching p2pool-v36
+    // BaseShare.generate_transaction():
+    //   1. Derive pre_target from the pool hashrate estimate
+    //   2. Clamp to ±10% of the previous share's max_target
+    //   3. Apply emergency time-based decay (death-spiral prevention)
+    //   4. Clamp to [MIN_TARGET, MAX_TARGET]
+    // BCH-faithful: SHA256d work/target math (same family as btc), no scrypt,
+    // no merged-mining divergence — coin-independent. The BCH ASERT DAA governs
+    // the PARENT block header (verify_share/share_check), NOT this share-diff
+    // retarget, which is the p2pool sharechain retarget shared by all coins.
+    // verify_share (share_check.hpp) calls this to cross-check the share's bits.
+    struct ShareTarget {
+        uint32_t max_bits;
+        uint32_t bits;
+    };
+
+    ShareTarget compute_share_target(
+        const uint256& prev_share_hash,
+        uint32_t desired_timestamp,
+        const uint256& desired_target)
+    {
+        // MAX_TARGET: BCH share difficulty floor (PoolConfig::max_target()).
+        const uint256 MAX_TARGET = PoolConfig::max_target();
+
+        if (prev_share_hash.IsNull() || !chain.contains(prev_share_hash))
+        {
+            // Genesis or unknown prev: MAX_TARGET for max_bits; clip
+            // desired_target to [MAX_TARGET/30, MAX_TARGET] for bits.
+            auto pre_target3 = MAX_TARGET;
+            auto max_bits = chain::target_to_bits_upper_bound(pre_target3);
+            uint256 bits_lo = pre_target3 / 30;
+            if (bits_lo.IsNull()) bits_lo = uint256(1);
+            uint256 bits_target = desired_target;
+            if (bits_target < bits_lo) bits_target = bits_lo;
+            if (bits_target > pre_target3) bits_target = pre_target3;
+            auto bits = chain::target_to_bits_upper_bound(bits_target);
+            return {max_bits, bits};
+        }
+
+        // Accumulated height from the skip-list cache — O(1) and correct after
+        // pruning (a raw get_height stops at a pruned tail and under-counts).
+        auto acc_height = chain.get_acc_height(prev_share_hash);
+
+        // Not enough chain depth for proper difficulty calculation.
+        if (acc_height < static_cast<int32_t>(PoolConfig::TARGET_LOOKBEHIND))
+        {
+            auto pre_target3 = MAX_TARGET;
+            auto max_bits = chain::target_to_bits_upper_bound(pre_target3);
+            uint256 bits_lo = pre_target3 / 30;
+            if (bits_lo.IsNull()) bits_lo = uint256(1);
+            uint256 bits_target = desired_target;
+            if (bits_target < bits_lo) bits_target = bits_lo;
+            if (bits_target > pre_target3) bits_target = pre_target3;
+            auto bits = chain::target_to_bits_upper_bound(bits_target);
+            return {max_bits, bits};
+        }
+
+        // Step 1: derive target from pool hashrate (min_work APS, all shares).
+        auto aps = get_pool_attempts_per_second(prev_share_hash,
+            PoolConfig::TARGET_LOOKBEHIND, /*min_work=*/true);
+
+        uint256 pre_target;
+        if (aps.IsNull())
+        {
+            pre_target = MAX_TARGET;
+        }
+        else
+        {
+            // pre_target = 2^256 / (SHARE_PERIOD * aps) - 1
+            uint288 two_256;
+            two_256.SetHex("10000000000000000000000000000000000000000000000000000000000000000");
+            uint288 divisor = aps * static_cast<uint32_t>(PoolConfig::share_period());
+            if (divisor.IsNull())
+                divisor = uint288(1);
+            uint288 result = two_256 / divisor;
+            if (result > uint288(1))
+                result = result - uint288(1);
+            uint288 max_288;
+            max_288.SetHex(MAX_TARGET.GetHex());
+            if (result > max_288)
+                pre_target = MAX_TARGET;
+            else
+                pre_target.SetHex(result.GetHex());
+        }
+
+        // Step 2: previous share's max_target.
+        uint256 prev_max_target;
+        chain.get_share(prev_share_hash).invoke([&](auto* obj) {
+            prev_max_target = chain::bits_to_target(obj->m_max_bits);
+        });
+
+        // Step 3: emergency time-based decay (death-spiral prevention).
+        // Doubles the target every SHARE_PERIOD*10s past a SHARE_PERIOD*20s
+        // since-last-share threshold.
+        uint256 clamp_ref_target = prev_max_target;
+        uint32_t prev_ts = 0;
+        chain.get_share(prev_share_hash).invoke([&](auto* obj) {
+            prev_ts = obj->m_timestamp;
+        });
+
+        if (prev_ts > 0 && desired_timestamp > prev_ts)
+        {
+            auto time_since_share = desired_timestamp - prev_ts;
+            auto emergency_threshold = PoolConfig::share_period() * 20;
+            if (time_since_share > emergency_threshold)
+            {
+                auto half_life = PoolConfig::share_period() * 10;
+                auto excess = time_since_share - emergency_threshold;
+                auto halvings = excess / half_life;
+                auto remainder = excess % half_life;
+                uint256 eased = prev_max_target;
+                if (halvings < 256)
+                    eased <<= halvings;
+                else
+                    eased = MAX_TARGET;
+                uint288 eased_288;
+                eased_288.SetHex(eased.GetHex());
+                eased_288 = eased_288 * static_cast<uint32_t>(half_life + remainder);
+                eased_288 = eased_288 / static_cast<uint32_t>(half_life);
+                uint288 max_288;
+                max_288.SetHex(MAX_TARGET.GetHex());
+                if (eased_288 > max_288)
+                    clamp_ref_target = MAX_TARGET;
+                else
+                    clamp_ref_target.SetHex(eased_288.GetHex());
+            }
+        }
+
+        // Step 4: clamp pre_target to ±10% of clamp_ref_target.
+        uint256 lo;
+        {
+            uint288 lo_288;
+            lo_288.SetHex(clamp_ref_target.GetHex());
+            lo_288 = lo_288 * 9 / 10;
+            uint288 max_288;
+            max_288.SetHex(MAX_TARGET.GetHex());
+            if (lo_288 > max_288) lo = MAX_TARGET;
+            else lo.SetHex(lo_288.GetHex());
+        }
+        uint256 hi;
+        {
+            uint288 hi_288;
+            hi_288.SetHex(clamp_ref_target.GetHex());
+            hi_288 = hi_288 * 11;
+            hi_288 = hi_288 / 10;
+            uint288 max_288;
+            max_288.SetHex(MAX_TARGET.GetHex());
+            if (hi_288 > max_288) hi = MAX_TARGET;
+            else hi.SetHex(hi_288.GetHex());
+        }
+
+        uint256 pre_target2 = pre_target;
+        if (pre_target2 < lo) pre_target2 = lo;
+        if (pre_target2 > hi) pre_target2 = hi;
+
+        // Step 5: clamp to network limits; never zero (bits=0 is invalid).
+        uint256 pre_target3 = pre_target2;
+        if (pre_target3.IsNull()) pre_target3 = uint256(1);
+        if (pre_target3 > MAX_TARGET) pre_target3 = MAX_TARGET;
+
+        auto max_bits = chain::target_to_bits_upper_bound(pre_target3);
+
+        // bits = from_target_upper_bound(clip(desired_target, (pre_target3/30, pre_target3)))
+        uint256 bits_lo = pre_target3 / 30;
+        if (bits_lo.IsNull()) bits_lo = uint256(1);
+        uint256 bits_target = desired_target;
+        if (bits_target < bits_lo) bits_target = bits_lo;
+        if (bits_target > pre_target3) bits_target = pre_target3;
+        auto bits = chain::target_to_bits_upper_bound(bits_target);
+
+        return {max_bits, bits};
+    }
+
+    // -- V36 PPLNS walk dump (diagnostic; called by verify_share on mismatch) --
+    // Per-share decayed-weight trace for cross-impl comparison against p2pool's
+    // [PARENT-PPLNS] output. Uses the SAME weight split as the oracle
+    // (p2poolBCH/p2pool/data.py:673-674): decayed_att*(65535-don) to the miner
+    // script, decayed_att*don to donation. Read-only — no consensus mutation.
+    void dump_v36_pplns_walk(const uint256& start_hash, int32_t max_shares)
+    {
+        if (start_hash.IsNull() || !chain.contains(start_hash))
+        {
+            LOG_WARNING << "[PPLNS-WALK] start=" << start_hash.GetHex().substr(0,16)
+                        << " NOT IN CHAIN — walk aborted";
+            return;
+        }
+
+        static constexpr uint64_t DECAY_PRECISION = 40;
+        static constexpr uint64_t DECAY_SCALE = uint64_t(1) << DECAY_PRECISION;
+        static constexpr uint64_t LN2_MICRO = 693147;
+
+        uint32_t half_life = std::max(PoolConfig::chain_length() / 4, uint32_t(1));
+        uint64_t decay_per = DECAY_SCALE - (DECAY_SCALE * LN2_MICRO) / (uint64_t(1000000) * half_life);
+
+        int32_t share_count = 0;
+        uint64_t decay_fp = DECAY_SCALE;
+        uint288 running_total;
+        uint288 running_donation;
+        std::map<std::vector<unsigned char>, uint288> per_addr_weight;
+
+        auto height = chain.get_height(start_hash);
+        auto last = chain.get_last(start_hash);
+
+        LOG_WARNING << "[PPLNS-WALK] start=" << start_hash.GetHex().substr(0, 16)
+                    << " max_shares=" << max_shares
+                    << " height=" << height
+                    << " last=" << (last.IsNull() ? "null" : last.GetHex().substr(0, 16))
+                    << " half_life=" << half_life
+                    << " decay_per=" << decay_per;
+
+        auto cur = start_hash;
+        while (!cur.IsNull() && chain.contains(cur) && share_count < max_shares)
+        {
+            chain.get_share(cur).invoke([&](auto* obj) {
+                auto target = chain::bits_to_target(obj->m_bits);
+                auto att = chain::target_to_average_attempts(target);
+                uint32_t don = obj->m_donation;
+
+                uint288 decayed_att = (att * uint288(decay_fp)) >> DECAY_PRECISION;
+                auto addr_w = decayed_att * static_cast<uint32_t>(65535 - don);
+                auto don_w  = decayed_att * don;
+
+                auto script = get_share_script(obj);
+                per_addr_weight[script] += addr_w;
+                running_total += addr_w + don_w;
+                running_donation += don_w;
+
+                static const char* HX = "0123456789abcdef";
+                std::string sh;
+                for (size_t i = 0; i < std::min(script.size(), size_t(20)); ++i) {
+                    sh += HX[script[i] >> 4];
+                    sh += HX[script[i] & 0xf];
+                }
+
+                LOG_WARNING << "[PPLNS-WALK]   #" << share_count
+                            << " hash=" << cur.GetHex().substr(0, 16)
+                            << " script=" << sh
+                            << " bits=0x" << std::hex << obj->m_bits << std::dec
+                            << " don=" << don
+                            << " att=" << att.GetLow64()
+                            << " decay_fp=" << decay_fp
+                            << " decayed=" << decayed_att.GetLow64()
+                            << " addr_w=" << addr_w.GetLow64()
+                            << " running=" << running_total.GetLow64();
+            });
+
+            ++share_count;
+            decay_fp = mul128_shift(decay_fp, decay_per, DECAY_PRECISION);
+            auto* idx = chain.get_index(cur);
+            cur = idx ? idx->tail : uint256();
+        }
+
+        LOG_WARNING << "[PPLNS-WALK] SUMMARY: shares=" << share_count
+                    << " addrs=" << per_addr_weight.size()
+                    << " total_w=" << running_total.GetLow64()
+                    << " don_w=" << running_donation.GetLow64();
+        for (const auto& [script, weight] : per_addr_weight)
+        {
+            static const char* HX = "0123456789abcdef";
+            std::string sh;
+            for (size_t i = 0; i < std::min(script.size(), size_t(20)); ++i) {
+                sh += HX[script[i] >> 4];
+                sh += HX[script[i] & 0xf];
+            }
+            double pct = running_total.IsNull() ? 0.0 :
+                static_cast<double>(weight.GetLow64()) / static_cast<double>(running_total.GetLow64()) * 100.0;
+            LOG_WARNING << "[PPLNS-WALK]   " << sh
+                        << " w=" << weight.GetLow64()
+                        << " pct=" << std::fixed << std::setprecision(2) << pct << "%";
+        }
+
+        if (share_count < max_shares && !cur.IsNull()) {
+            LOG_WARNING << "[PPLNS-WALK] CHAIN GAP: walk stopped at share #" << share_count
+                        << " — next hash " << cur.GetHex().substr(0, 16)
+                        << " is " << (chain.contains(cur) ? "IN chain (walk bug)" : "NOT IN chain (missing share)")
+                        << ". Expected " << max_shares << " shares.";
+        }
+    }
+
     // -- AutoRatchet: PPLNS-weighted desired-version tally (canonical) --
     // Mirrors p2pool get_desired_version_counts (data.py:2651): walk `lookbehind`
     // shares back from share_hash and accumulate per-desired-version WORK weight
@@ -713,6 +1793,230 @@ public:
                 weights[dv] = weights[dv] + idx->work;
         }
         return weights;
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // V36 merged-payout-hash machinery  (s0 port from btc::ShareTracker SSOT)
+    //
+    // BCH is a STANDALONE SHA256d parent (oracle bitcoincash.py has NO merged /
+    // aux config), so at RUNTIME the share_check guard
+    // `!share.m_merged_payout_hash.IsNull()` keeps these bodies dead.  They must
+    // still COMPILE because share_check.hpp std::visit-instantiates over every
+    // ShareVariant incl MergedMiningShare = BaseShare<36>.  Ported structurally
+    // from src/impl/btc/share_tracker.hpp (SSOT carries the full v36 machinery
+    // because BTC is also a standalone v36 parent) and conformed to
+    // p2pool-merged-v36 p2pool/data.py.  No SegWit (BCH has none); SHA256d
+    // coinbase/merkle preserved.  The DOGE/NMC aux-payout diagnostic block of
+    // the btc donor is DROPPED here (no aux chains for a standalone parent).
+    // ───────────────────────────────────────────────────────────────────────
+
+    // -- merged_weights_delta (no-chain_id / v36 path) --
+    // SSOT: btc::ShareTracker::merged_weights_delta (share_tracker.hpp:2311-2375).
+    // Oracle: MergedWeightsSkipList.get_delta (data.py:1864-1900) and
+    // get_v36_merged_weights (data.py invoked from compute_merged_payout_hash).
+    // Pre-V36 shares count toward window sizing (share_count=1) but contribute
+    // ZERO weight (p2pool returns (1, {}, 0, 0)).  Default address key is the RAW
+    // parent script (share.new_script), hex-encoded by compute_merged_payout_hash.
+    // BCH carries no explicit merged_addresses / m_miner_merged_addr, so the
+    // per-chain (chain_id) resolution tiers of the SSOT are structurally absent
+    // here; the standalone-parent path only ever calls with chain_id == nullopt.
+    template <class ShareT>
+    chain::WeightsDelta merged_weights_delta(ShareT* obj, std::optional<uint32_t> chain_id)
+    {
+        (void)chain_id;  // standalone parent: only the nullopt / v36 path is live
+        chain::WeightsDelta delta;
+        delta.share_count = 1;
+        if (obj->m_desired_version < 36)
+            return delta;   // pre-V36: window-sizing only, zero weight (data.py:1870)
+
+        auto target = chain::bits_to_target(obj->m_bits);
+        auto att = chain::target_to_average_attempts(target);
+        auto parent_script = get_share_script(obj);   // raw scriptPubKey = new_script
+        if (parent_script.empty())
+            return delta;
+
+        // Default key: RAW parent script, matching p2pool address_key =
+        // share.new_script (data.py:1877).
+        delta.total_weight = att * 65535;
+        delta.total_donation_weight = att * static_cast<uint32_t>(obj->m_donation);
+        delta.weights[parent_script] = att * static_cast<uint32_t>(65535 - obj->m_donation);
+        return delta;
+    }
+
+    // Per-hash wrapper: bounds-check the raw chain, dispatch to merged_weights_delta.
+    // SSOT: btc::ShareTracker::merged_weights_delta_for_hash (share_tracker.hpp:2378-2387).
+    chain::WeightsDelta merged_weights_delta_for_hash(
+        const uint256& hash, std::optional<uint32_t> chain_id)
+    {
+        chain::WeightsDelta delta;
+        if (!chain.contains(hash)) return delta;
+        chain.get_share(hash).invoke([&](auto* obj) {
+            delta = merged_weights_delta(obj, chain_id);
+        });
+        return delta;
+    }
+
+
+    // -- Merged mining: per-chain PPLNS weights --
+    // SSOT: btc::ShareTracker::get_merged_cumulative_weights (share_tracker.hpp:2205-2274).
+    // For a specific aux chain_id, walk the share chain via the per-chain skip
+    // list and accumulate PPLNS weights for V36-signaling shares.  Standalone
+    // BCH never receives a real chain_id (m_merged_coinbase_info empty); carried
+    // so verify_merged_coinbase_commitment instantiates/compiles.  The btc
+    // [DOGE-PPLNS] per-address diagnostic block is DROPPED (no aux chains).
+    CumulativeWeights get_merged_cumulative_weights(
+        const uint256& start, int32_t max_shares,
+        const uint288& desired_weight, uint32_t target_chain_id)
+    {
+        if (start.IsNull())
+            return {};
+
+        auto& sl = ensure_merged_skiplist(target_chain_id);
+        auto result = sl.query(start, max_shares, desired_weight);
+        return {std::move(result.weights), result.total_weight, result.total_donation_weight};
+    }
+
+    // SSOT: btc::ShareTracker::ensure_merged_skiplist (share_tracker.hpp:2815-2833).
+    // Lazily builds a per-chain_id WeightsSkipList whose delta fn dispatches to
+    // merged_weights_delta_for_hash with the chain_id (the per-chain path, which
+    // for BCH collapses to the default raw-script key since no merged_addresses).
+    chain::WeightsSkipList& ensure_merged_skiplist(uint32_t chain_id)
+    {
+        auto it = m_merged_skiplists.find(chain_id);
+        if (it != m_merged_skiplists.end())
+            return it->second;
+
+        auto [new_it, _] = m_merged_skiplists.emplace(
+            chain_id,
+            chain::WeightsSkipList(
+                [this, chain_id](const uint256& hash) -> chain::WeightsDelta {
+                    return merged_weights_delta_for_hash(hash, chain_id);
+                },
+                make_previous_fn()
+            )
+        );
+        return new_it->second;
+    }
+
+    // -- compute_merged_payout_hash --
+    // SSOT: btc::ShareTracker::compute_merged_payout_hash (share_tracker.hpp:2398-2573).
+    // Oracle: p2pool/data.py compute_merged_payout_hash (data.py:2782-2840).
+    // Deterministic hash of V36-only PPLNS weight distribution; committed into
+    // V36 shares so peers can verify merged payouts.  Walks the RAW chain (not
+    // verified) matching p2pool (tracker, not tracker.verified).  Format:
+    // "script_hex:weight|...|T:total|D:donation" -> SHA256d (bitcoin_data.hash256).
+    // Returns zero uint256 when no V36 shares in window / no share history.
+    uint256 compute_merged_payout_hash(
+        const uint256& prev_share_hash, const uint256& block_target)
+    {
+        (void)block_target;  // V36 uses unlimited desired_weight (decay windows)
+        if (prev_share_hash.IsNull())
+            return uint256{};
+
+        // RAW chain, matching p2pool compute_merged_payout_hash (data.py:2807).
+        if (!chain.contains(prev_share_hash))
+            return uint256{};
+
+        auto height = chain.get_height(prev_share_hash);
+        if (height == 0)
+            return uint256{};   // data.py:2808-2809
+
+        // Unlimited desired_weight -- V36 exponential decay handles windowing
+        // (data.py:2814 uses 2**288 - 1).
+        uint288 unlimited_weight;
+        unlimited_weight.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        // chain_length = min(height, REAL_CHAIN_LENGTH)  (data.py:2812).
+        auto chain_len = std::min(static_cast<int32_t>(height),
+                                  static_cast<int32_t>(PoolConfig::real_chain_length()));
+
+        // Walk RAW chain via WeightsSkipList; prev fn = raw chain tail (data.py:2807).
+        auto raw_prev_fn = [this](const uint256& hash) -> uint256 {
+            if (!chain.contains(hash)) return uint256{};
+            return chain.get_index(hash)->tail;
+        };
+        chain::WeightsSkipList raw_sl(
+            [this](const uint256& hash) -> chain::WeightsDelta {
+                return merged_weights_delta_for_hash(hash, std::nullopt);
+            },
+            std::move(raw_prev_fn)
+        );
+        auto result = raw_sl.query(prev_share_hash, chain_len, unlimited_weight);
+        auto weights = std::move(result.weights);
+        auto total_weight = result.total_weight;
+        auto donation_weight = result.total_donation_weight;
+
+        if (weights.empty() || total_weight.IsNull())
+            return uint256{};   // data.py:2818-2819
+
+        // Decimal stringify (Python '%d' formatting).
+        auto to_decimal = [](const uint288& val) -> std::string {
+            if (val.IsNull()) return "0";
+            uint288 tmp = val;
+            std::string out;
+            while (!tmp.IsNull()) {
+                uint32_t rem = 0;
+                for (int i = uint288::WIDTH - 1; i >= 0; --i) {
+                    uint64_t cur = (static_cast<uint64_t>(rem) << 32) | tmp.pn[i];
+                    tmp.pn[i] = static_cast<uint32_t>(cur / 10);
+                    rem = static_cast<uint32_t>(cur % 10);
+                }
+                out.push_back('0' + static_cast<char>(rem));
+            }
+            std::reverse(out.begin(), out.end());
+            return out;
+        };
+
+        // Script bytes -> hex (p2pool key.encode('hex'), data.py:2830).
+        auto script_to_hex = [](const std::vector<unsigned char>& script) -> std::string {
+            static const char digits[] = "0123456789abcdef";
+            std::string hex;
+            hex.reserve(script.size() * 2);
+            for (unsigned char c : script) {
+                hex.push_back(digits[c >> 4]);
+                hex.push_back(digits[c & 0xf]);
+            }
+            return hex;
+        };
+
+        // Deterministic serialization: sorted by script hex (V36 consensus,
+        // data.py:2826-2833).
+        std::map<std::string, uint288> sorted_by_script;
+        for (const auto& [script, w] : weights)
+            sorted_by_script[script_to_hex(script)] += w;
+
+        std::string payload;
+        for (const auto& [script_hex, w] : sorted_by_script)
+        {
+            if (!payload.empty())
+                payload.push_back('|');
+            payload += script_hex;
+            payload.push_back(':');
+            payload += to_decimal(w);
+        }
+        payload += "|T:";
+        payload += to_decimal(total_weight);
+        payload += "|D:";
+        payload += to_decimal(donation_weight);
+
+        // SHA256d (bitcoin_data.hash256, data.py:2834).
+        auto span = std::span<const unsigned char>(
+            reinterpret_cast<const unsigned char*>(payload.data()), payload.size());
+        auto hash_result = Hash(span);
+
+        {
+            static int32_t s_last_log_height = -1;
+            if (static_cast<int32_t>(height) != s_last_log_height) {
+                s_last_log_height = static_cast<int32_t>(height);
+                LOG_INFO << "[MERGED-PPLNS] height=" << height
+                         << " chain_len=" << chain_len
+                         << " addrs=" << sorted_by_script.size()
+                         << " total_w=" << to_decimal(total_weight)
+                         << " don_w=" << to_decimal(donation_weight)
+                         << " hash=" << hash_result.GetHex();
+            }
+        }
+
+        return hash_result;
     }
 };
 
