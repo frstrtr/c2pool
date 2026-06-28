@@ -901,6 +901,20 @@ if (BUILD_TESTING AND GTest_FOUND)
         core
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
     gtest_add_tests(dgb_desired_version_tally_test "" AUTO)
+    # dgb_min_protocol_ratchet_test: FENCED, additive KAT pinning the runtime
+    # P2P accept-floor ratchet dgb::ratchet_min_protocol_version (coin/
+    # desired_version_tally.hpp) vs the p2pool-dgb-scrypt update_min_protocol_version
+    # oracle (data.py:857-863): best-VERSION work-weight >= floor(total*95/100) lifts
+    # MINIMUM_PROTOCOL_VERSION 1400->3500. Same work-weighted map / window as the 60%
+    # switch gate; floor-div boundary case pins the oracle math (not cross-multiply).
+    # Pure header -> links core only. MUST also be in the build.yml --target allowlist
+    # (#143 NOT_BUILT trap).
+    add_executable(dgb_min_protocol_ratchet_test min_protocol_ratchet_test.cpp)
+    target_link_libraries(dgb_min_protocol_ratchet_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
+    gtest_add_tests(dgb_min_protocol_ratchet_test "" AUTO)
     # dgb_naughty_propagation_test: FENCED, additive KAT pinning the
     # NAUGHTY-PROPAGATION ancestor-punishment generation arithmetic in
     # coin/naughty_propagation.hpp vs the p2pool-dgb-scrypt data.py:543-549
