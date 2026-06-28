@@ -569,6 +569,22 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_aux_doge_dc_proof_test "" AUTO)
 
+    # --- DGB+DOGE (phase DC) -- SUBMIT-half KAT ((b) ruling, UID:3130) ---------
+    # Companion to dgb_aux_doge_dc_proof_test: pins that a won DOGE-aux block is
+    # submitted FROM DGBS OWN dispatch, RPC-only, through a DGB-owned dogecoind
+    # seam DISTINCT from the digibyted parent seam, consuming the shared doge
+    # module read-side-only. Header-only under test (aux_doge_submit.hpp), so it
+    # needs no doge/merged link -- only core (ICoinNode/WorkView) + dgb. The header
+    # is #ifdef AUX_DOGE-gated (parity with coin/node.hpp), so this TU defines
+    # AUX_DOGE locally to stay build-verifiable in the normal test leg. MUST appear
+    # in BOTH this registration AND the build.yml --target allowlist (#143 trap).
+    add_executable(dgb_aux_doge_submit_test aux_doge_submit_test.cpp)
+    target_compile_definitions(dgb_aux_doge_submit_test PRIVATE AUX_DOGE)
+    target_link_libraries(dgb_aux_doge_submit_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb)
+    gtest_add_tests(dgb_aux_doge_submit_test "" AUTO)
+
     # dgb_share_target_genesis_test: FENCED KAT pinning ShareTracker::compute_
     # share_target genesis/unknown-prev clamp to [MAX_TARGET/30, MAX_TARGET] vs
     # the DGB oracle data.py generate_transaction. Links the same proven set as
