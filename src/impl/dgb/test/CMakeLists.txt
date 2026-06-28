@@ -585,6 +585,23 @@ if (BUILD_TESTING AND GTest_FOUND)
         core dgb)
     gtest_add_tests(dgb_aux_doge_submit_test "" AUTO)
 
+    # --- DGB+DOGE (phase DC) -- EMBED LIVE-WIRE KAT ((b) ruling, UID:3134) ------
+    # Closes the embed<->submit seam: pins that the auxpow_hex the submit half
+    # frames is the PARENT-SIDE build_auxpow_proof derivation over the MINTED,
+    # DOGE-commitment-carrying coinbase (the runtime getauxblock-seam image), not
+    # a hand-fixtured parallel. Includes the AUX_DOGE-gated submit header, so it
+    # defines AUX_DOGE locally and links the merged producer + ltc_coin like the
+    # dc_proof sibling. MUST appear in BOTH this registration AND the build.yml
+    # --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_aux_doge_embed_livewire_test aux_doge_embed_livewire_test.cpp)
+    target_compile_definitions(dgb_aux_doge_embed_livewire_test PRIVATE AUX_DOGE)
+    target_link_libraries(dgb_aux_doge_embed_livewire_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb ltc_coin
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_aux_doge_embed_livewire_test "" AUTO)
+
     # dgb_share_target_genesis_test: FENCED KAT pinning ShareTracker::compute_
     # share_target genesis/unknown-prev clamp to [MAX_TARGET/30, MAX_TARGET] vs
     # the DGB oracle data.py generate_transaction. Links the same proven set as
