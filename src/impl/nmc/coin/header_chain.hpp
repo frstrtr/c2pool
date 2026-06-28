@@ -37,10 +37,11 @@
 ///     (factory) path; the -1 activation-height default is a deliberate
 ///     fail-closed sentinel for hand-built Params only.
 /// STILL DEFERRED (scoped later, NOT a P0 fence):
-///   * The header-STORAGE / chain-connection path — a proof that passes the
-///     gate is verified but NOT yet persisted (see add_auxpow_header()).
 ///   * Live cross-check of the pinned constants vs a running .140 namecoind,
 ///     deferred to the PE item4 soak.
+/// (The header-STORAGE / connect / LevelDB-persist path is WIRED -- see
+///  connect_locked() + persist_entry_locked(); the prior "not yet persisted"
+///  note was retired once P1e/P1f landed.)
 /// ==========================================================================
 
 #include "block.hpp"
@@ -940,10 +941,11 @@ inline uint32_t get_next_work_required(
 
 // ─── HeaderChain ─────────────────────────────────────────────────────────────
 
-/// Header-only chain skeleton for embedded NMC. Mirrors the public surface of
-/// btc::coin::HeaderChain. P0: the validation internals (difficulty checks,
-/// AuxPow checks, LevelDB persistence) are intentionally NOT implemented — the
-/// methods below are structural skeletons so call sites compile.
+/// Header-only chain for embedded NMC. Mirrors the public surface of
+/// btc::coin::HeaderChain. The validation internals are WIRED: AuxPow gate
+/// (P1d), in-memory connect / cumulative-work / fork-choice (P1e) and LevelDB
+/// persistence (P1f). The only deferred leg is the live-node constant
+/// cross-check (PE item4 soak); see the STATUS banner above.
 class HeaderChain {
 public:
     explicit HeaderChain(const NMCChainParams& params, const std::string& db_path = "")
@@ -958,9 +960,9 @@ public:
     HeaderChain(const HeaderChain&) = delete;
     HeaderChain& operator=(const HeaderChain&) = delete;
 
-    /// Initialize the chain.
-    /// P0-DEFER: no LevelDB open, no persisted-state load, no checkpoint seed.
-    /// Returns true (structural success) so wiring smoke-tests pass.
+    /// Initialize the chain. Opens LevelDB at m_db_path (when set) and reloads
+    /// persisted state via load_from_db(); degrades to in-memory on open
+    /// failure (mirror of btc). Returns true.
     bool init() {
         LOG_INFO << "[EMB-NMC] HeaderChain::init() db_path="
                  << (m_db_path.empty() ? "(in-memory)" : m_db_path);
@@ -983,7 +985,7 @@ public:
         return true;
     }
 
-    /// Current chain tip (best header). P0: empty until add path is built.
+    /// Current chain tip (best header); std::nullopt on an empty chain.
     std::optional<IndexEntry> tip() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_tip.IsNull()) return std::nullopt;
@@ -1059,9 +1061,6 @@ public:
         return locator;
     }
 
-    /// Add a single plain header.
-    /// P0-DEFER: NO difficulty validation, NO PoW check, NO connection check,
-    /// NO persistence. Structural skeleton only — returns false.
     /// Add a single plain (non-merge-mined) header.
     /// P1e storage leg: in-memory connect path. On an empty chain the header
     /// seeds the chain root (height 0, checkpoint anchor); otherwise it must
@@ -1138,11 +1137,20 @@ public:
         return connect_locked(header, auxpow);
     }
 
-    /// Add a batch of plain headers. P0-DEFER: returns 0 (none accepted).
+    /// Add a batch of plain (non-merge-mined) headers, as delivered by a
+    /// getheaders response during SPV header-sync. Each header is run through
+    /// the same connect path as add_header() under a single lock. Headers are
+    /// expected in ascending (parent-before-child) order; out-of-order or
+    /// gapped entries simply fail to connect and are skipped without aborting
+    /// the batch. Returns the number of headers newly connected.
     int add_headers(const std::vector<BlockHeaderType>& headers) {
-        (void)headers;
-        // P0-DEFER: batch header path not implemented.
-        return 0;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        int accepted = 0;
+        for (const auto& h : headers) {
+            if (connect_locked(h, std::nullopt))
+                ++accepted;
+        }
+        return accepted;
     }
 
     /// P1 PC: look up a header by absolute height by walking the tip's ancestry
