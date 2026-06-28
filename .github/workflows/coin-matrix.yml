@@ -52,7 +52,9 @@ jobs:
 
       - name: Install Conan 2
         if: steps.presence.outputs.exists == '1'
-        run: pip install "conan>=2.0,<3.0"
+        run: |
+          pip install "conan>=2.0,<3.0"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Detect Conan profile
         if: steps.presence.outputs.exists == '1'

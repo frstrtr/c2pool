@@ -58,6 +58,8 @@ jobs:
         name: Install Conan 2
         run: |
           pip install "conan>=2.0,<3.0"
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           conan profile detect --force
           sed -i 's/compiler.cppstd=.*/compiler.cppstd=20/' \
             "$(conan profile path default)"
