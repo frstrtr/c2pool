@@ -519,7 +519,7 @@ cd build && ctest --output-on-failure -j$(nproc)
 ## V37 development
 
 - Github pages: <[https://t.me/c2pooldev](https://frstrtr.github.io/c2pool/)>
-- V37 dev branch primitives: <[https://discord.gg/yb6ujsPRsv](https://github.com/frstrtr/c2pool/compare/master...v37-dev)>
+- V37 dev branch primitives: <[https://github.com/frstrtr/c2pool/compare/master...v37-dev](https://github.com/frstrtr/c2pool/compare/master...v37-dev)>
 
 ---
 
