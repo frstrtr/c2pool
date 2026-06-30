@@ -16,6 +16,7 @@ Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 > **Sharechain Transparency Explorer** (2026-04-07) — defragmenter-style sharechain visualization with interactive PPLNS treemaps, animated hover effects, per-miner LTC+DOGE payout breakdown, V36 upgrade pressure for V35 miners
 > 
 > **Recent Bitcoin Block Mined by P2pool** (2026-06-27 05:34:44 UTC) BTC [#955609](https://blockchair.com/bitcoin/block/955609)
+> 
 > **Recent Bitcoin Block Mined by P2pool** (2025-03-07 06:08:22 UTC) BTC [#886688](https://blockchair.com/bitcoin/block/886688)
 
 ---
