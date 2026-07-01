@@ -63,6 +63,21 @@ protected:
     WhaleDepartureDetector m_whale_departure;
     // Lock-free publication of the detector verdict (see local_desired_target).
     std::atomic<bool> m_whale_departure_active{false};
+
+    // Runtime P2P accept-floor, ratcheted 1400 -> 3500 by the desired-version
+    // tally (oracle net.MINIMUM_PROTOCOL_VERSION, mutated at main.py:216). Seeded
+    // from the cold config floor (PoolConfig::MINIMUM_PROTOCOL_VERSION) and lifted
+    // by apply_min_protocol_ratchet() on the compute thread under m_tracker_mutex;
+    // read lock-free by handle_version() on the IO thread. Latching (never lowers).
+    std::atomic<uint32_t> m_runtime_min_protocol_version{
+        PoolConfig::MINIMUM_PROTOCOL_VERSION};
+
+    // Runtime sibling of the 60% version-switch gate (share_check step 2): on each
+    // best-share advance, lift m_runtime_min_protocol_version once >=95% of the
+    // window work behind the best share's parent desires the best share's VERSION.
+    // Mirrors oracle main.py:213-216 + data.py:857. MUST be called under the
+    // exclusive m_tracker_mutex (reads tracker chain + desired-version weights).
+    void apply_min_protocol_ratchet();
     // Phase 3L non-consensus log-based pool monitor (attack/anomaly detection).
     // Driven from run_think() under the exclusive tracker lock on a ~30s cadence;
     // emits [MONITOR-*] log lines only — no consensus / sharechain effect.
