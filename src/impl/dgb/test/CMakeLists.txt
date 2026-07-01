@@ -678,6 +678,21 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_share_bits_oracle_pin_test "" AUTO)
 
+    # dgb_share_target_retarget_test: FENCED non-circular KAT pinning the
+    # NON-genesis (deep-chain, acc_height >= TARGET_LOOKBEHIND) branch of
+    # ShareTracker::compute_share_target -- Step-3 emergency time-based decay +
+    # Step-4 +/-10% clamp -- to goldens derived from an INDEPENDENT Python
+    # reference of the oracle formula (not from the SUT). Companion to
+    # dgb_share_target_genesis_test (which covers the genesis branch); links the
+    # same proven set. MUST also be in the build.yml --target allowlist (#143).
+    add_executable(dgb_share_target_retarget_test share_target_retarget_test.cpp)
+    target_link_libraries(dgb_share_target_retarget_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_share_target_retarget_test "" AUTO)
+
     # dgb_g1_oracle_byte_parity_test: FENCED greenlight-gate G1 KAT. Pins the
     # assembled make_coin_params() net/consensus constants AND bucket-1
     # isolation primitives (PREFIX/IDENTIFIER) against oracle-transcribed
@@ -886,6 +901,20 @@ if (BUILD_TESTING AND GTest_FOUND)
         core
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
     gtest_add_tests(dgb_desired_version_tally_test "" AUTO)
+    # dgb_min_protocol_ratchet_test: FENCED, additive KAT pinning the runtime
+    # P2P accept-floor ratchet dgb::ratchet_min_protocol_version (coin/
+    # desired_version_tally.hpp) vs the p2pool-dgb-scrypt update_min_protocol_version
+    # oracle (data.py:857-863): best-VERSION work-weight >= floor(total*95/100) lifts
+    # MINIMUM_PROTOCOL_VERSION 1400->3500. Same work-weighted map / window as the 60%
+    # switch gate; floor-div boundary case pins the oracle math (not cross-multiply).
+    # Pure header -> links core only. MUST also be in the build.yml --target allowlist
+    # (#143 NOT_BUILT trap).
+    add_executable(dgb_min_protocol_ratchet_test min_protocol_ratchet_test.cpp)
+    target_link_libraries(dgb_min_protocol_ratchet_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
+    gtest_add_tests(dgb_min_protocol_ratchet_test "" AUTO)
     # dgb_naughty_propagation_test: FENCED, additive KAT pinning the
     # NAUGHTY-PROPAGATION ancestor-punishment generation arithmetic in
     # coin/naughty_propagation.hpp vs the p2pool-dgb-scrypt data.py:543-549

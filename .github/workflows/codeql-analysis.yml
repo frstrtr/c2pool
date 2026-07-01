@@ -57,7 +57,13 @@ jobs:
       - if: matrix.build-mode == 'manual'
         name: Install Conan 2
         run: |
-          pip install "conan>=2.0,<3.0"
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+            export PATH="$HOME/.local/bin:$PATH"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
+          fi
           conan profile detect --force
           sed -i 's/compiler.cppstd=.*/compiler.cppstd=20/' \
             "$(conan profile path default)"

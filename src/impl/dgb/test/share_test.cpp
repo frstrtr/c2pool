@@ -47,7 +47,7 @@ TEST(DGB_share_test, OracleConsensusParams)
 {
     EXPECT_EQ(dgb::PoolConfig::P2P_PORT,                   5024u);
     EXPECT_EQ(dgb::PoolConfig::SEGWIT_ACTIVATION_VERSION,  35u);
-    EXPECT_EQ(dgb::PoolConfig::MINIMUM_PROTOCOL_VERSION,   1700u);
+    EXPECT_EQ(dgb::PoolConfig::MINIMUM_PROTOCOL_VERSION,   1400u);
     EXPECT_EQ(dgb::PoolConfig::ADVERTISED_PROTOCOL_VERSION, 3501u);  // oracle p2p.py:28 Protocol.VERSION (was wrongly 3301)
     EXPECT_EQ(dgb::PoolConfig::SHARE_PERIOD,               15u);
     EXPECT_EQ(dgb::PoolConfig::CHAIN_LENGTH,               2880u);
@@ -55,17 +55,17 @@ TEST(DGB_share_test, OracleConsensusParams)
 
 // G1 version-semantics guard: the OUTBOUND version handshake must ADVERTISE our
 // capability (oracle frstrtr/p2pool-dgb-scrypt p2p.py:28 Protocol.VERSION = 3501),
-// NOT the accept-floor. The accept-floor (digibyte.py NEW_MIN = 1700) stays the
+// NOT the accept-floor. The cold accept-floor (oracle p2p.py:153 getattr fallback = 1400) stays the
 // inbound reject threshold (node.cpp handle_version). These are two distinct
 // fields per p2pool: send_version(version=self.VERSION); reject if version<NEW_MIN.
-// Regression caught: send_version previously fed minimum_protocol_version (1700)
+// Regression caught: send_version previously fed minimum_protocol_version (accept-floor)
 // into the version field, so a mature oracle network (MINIMUM_PROTOCOL_VERSION
 // ratcheted to 3500) would reject us as "peer too old".
 TEST(DGB_share_test, OracleAdvertisedVsAcceptFloorProtocolVersion)
 {
     const core::CoinParams main = dgb::make_coin_params(/*testnet=*/false);
     EXPECT_EQ(main.advertised_protocol_version, 3501u);  // oracle p2p.py VERSION (what we SEND)
-    EXPECT_EQ(main.minimum_protocol_version,    1700u);  // digibyte.py NEW_MIN (inbound accept-floor)
+    EXPECT_EQ(main.minimum_protocol_version,    1400u);  // oracle cold floor 1400 (p2p.py:153 getattr fallback)
     // We must advertise ABOVE the floor so a mature oracle net (floor->3500) accepts us.
     EXPECT_GT(main.advertised_protocol_version, main.minimum_protocol_version);
     EXPECT_GE(main.advertised_protocol_version, 3500u);
@@ -75,7 +75,7 @@ TEST(DGB_share_test, OracleAdvertisedVsAcceptFloorProtocolVersion)
     // leaks a global max_target that corrupts later mainnet-expecting tests if
     // it runs mid-suite (harmless in prod: one net is built per process).
     EXPECT_EQ(dgb::PoolConfig::ADVERTISED_PROTOCOL_VERSION, 3501u);
-    EXPECT_EQ(dgb::PoolConfig::MINIMUM_PROTOCOL_VERSION,    1700u);
+    EXPECT_EQ(dgb::PoolConfig::MINIMUM_PROTOCOL_VERSION,    1400u);
 }
 
 // Pool/share layer timing + bound params — audited CONFORM to the DGB oracle
