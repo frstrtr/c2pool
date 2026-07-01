@@ -14,6 +14,10 @@ Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 > **First V36 Twin Block:** LTC [#3085349](https://blockchair.com/litecoin/block/3085349) + DOGE [#6154761](https://blockchair.com/dogecoin/block/6154761) (2026-04-05) — simultaneous LTC+DOGE block found by v36-signalling nodes running p2pool v36 producing V35 shares with `desired_version=36`; detected and displayed by c2pool's embedded block scanner
 >
 > **Sharechain Transparency Explorer** (2026-04-07) — defragmenter-style sharechain visualization with interactive PPLNS treemaps, animated hover effects, per-miner LTC+DOGE payout breakdown, V36 upgrade pressure for V35 miners
+> 
+> **Recent Bitcoin Block Mined by P2pool** (2026-06-27 05:34:44 UTC) BTC [#955609](https://blockchair.com/bitcoin/block/955609)
+> 
+> **Recent Bitcoin Block Mined by P2pool** (2025-03-07 06:08:22 UTC) BTC [#886688](https://blockchair.com/bitcoin/block/886688)
 
 ---
 
@@ -511,6 +515,13 @@ cd build && ctest --output-on-failure -j$(nproc)
 
 - Telegram: <https://t.me/c2pooldev>
 - Discord: <https://discord.gg/yb6ujsPRsv>
+
+---
+
+## V37 development
+
+- Github pages: <[https://t.me/c2pooldev](https://frstrtr.github.io/c2pool/)>
+- V37 dev branch primitives: <[https://github.com/frstrtr/c2pool/compare/master...v37-dev](https://github.com/frstrtr/c2pool/compare/master...v37-dev)>
 
 ---
 

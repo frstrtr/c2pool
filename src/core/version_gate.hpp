@@ -32,6 +32,9 @@
 //
 
 #include <cstdint>
+#include <map>
+#include <stdexcept>
+#include <string>
 
 namespace core::version_gate
 {
@@ -45,6 +48,75 @@ inline constexpr uint64_t V36_ACTIVATION_VERSION = 36;
 constexpr bool is_v36_active(uint64_t version)
 {
     return version >= V36_ACTIVATION_VERSION;
+}
+
+
+// Canonical v36-native share-version-transition rule (cross-coin SSOT).
+// Applies the boundary admit/reject decision to an ALREADY-EXTRACTED
+// (parent_version, share_version) pair using a PRECOMPUTED PPLNS-WEIGHTED
+// desired-version tally for the [CHAIN_LENGTH*9/10, CHAIN_LENGTH] window behind
+// the parent, plus a flag for whether CHAIN_LENGTH history exists behind the
+// parent. Throws std::invalid_argument on a disallowed switch; returns on an
+// admissible one.
+//
+// Rule (p2pool data.py check()): same-version always valid; +1 upgrade needs
+// >= 60% PPLNS-WEIGHTED desired-version support for the new version in the
+// window AND CHAIN_LENGTH history; -1 (AutoRatchet deactivation) valid; any
+// other jump throws when history exists. With insufficient history only a +1
+// upgrade is rejected ("switch without enough history") and other shapes pass,
+// matching the BTC inline gate exactly.
+//
+// `floor` is the per-coin v36 activation version (e.g. BTC 35->36, DASH 16->36).
+// It is bucket-3 transition-compat carried as a PARAMETER (never hardcoded) so a
+// coin whose seam also runs an obsolescence branch (DASH) can thread its own
+// floor when it migrates onto this SSOT; the canonical boundary rule itself does
+// not reference it. Defaulted to V36_ACTIVATION_VERSION.
+template <typename WeightT>
+inline void verify_version_transition(
+    int64_t parent_version,
+    int64_t share_version,
+    const std::map<uint64_t, WeightT>& window_weights,
+    bool have_history,
+    uint64_t floor = V36_ACTIVATION_VERSION)
+{
+    (void)floor;
+    // same version — always valid (it was correct when minted), regardless of history.
+    if (share_version == parent_version)
+        return;
+
+    if (have_history)
+    {
+        if (share_version == parent_version + 1)
+        {
+            // Upgrade by one: needs >= 60% weighted support for the new version.
+            WeightT new_ver_weight{};
+            WeightT total_weight{};
+            for (const auto& [ver, w] : window_weights)
+            {
+                total_weight = total_weight + w;
+                if (static_cast<int64_t>(ver) == share_version)
+                    new_ver_weight = new_ver_weight + w;
+            }
+            // canonical: counts.get(VERSION,0) < sum(counts)*60//100
+            if (new_ver_weight * uint32_t(100) < total_weight * uint32_t(60))
+                throw std::invalid_argument("switch without enough hash power upgraded");
+        }
+        else if (parent_version == share_version + 1)
+        {
+            // downgrade by one (AutoRatchet deactivation: V35 may follow V36)
+        }
+        else
+        {
+            throw std::invalid_argument("invalid version jump from "
+                + std::to_string(parent_version) + " to " + std::to_string(share_version));
+        }
+    }
+    else if (share_version == parent_version + 1)
+    {
+        // Not enough history for an upgrade boundary.
+        throw std::invalid_argument("switch without enough history");
+    }
+    // else (downgrade / multi-jump with insufficient history): admitted, matching BTC.
 }
 
 } // namespace core::version_gate
