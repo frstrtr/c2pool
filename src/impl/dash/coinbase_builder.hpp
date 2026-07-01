@@ -47,6 +47,7 @@
 
 #include <core/pack.hpp>
 #include <core/uint256.hpp>
+#include <core/version_gate.hpp>   // SSOT: core::version_gate::is_v36_active (DASH 16->36)
 #include <core/hash.hpp>
 #include <core/coin_params.hpp>
 #include <core/log.hpp>
@@ -107,31 +108,64 @@ inline std::vector<MinerPayout> compute_dash_payouts(
     // 2. worker_payout = subsidy - Σpayment_amounts
     uint64_t worker_payout = (subsidy > total_payments) ? (subsidy - total_payments) : 0;
 
-    // 3. amounts[script] = worker_payout * 49 * weight / (50 * total_weight)
-    //    (skipped for genesis where total_weight==0; populated for
-    //    non-genesis shares via walk_cumulative_weights).
+    // 3-4. PPLNS split. Two consensus arms, gated on the minted share version
+    //      (core::version_gate SSOT; DASH transition 16 -> 36):
+    //
+    //   pre-v36 (bucket-3 per-coin compat, UNCHANGED p2pool-dash shape):
+    //       amounts[script]      = worker_payout * 49 * weight / (50 * total_weight)
+    //       amounts[this_script] += worker_payout / 50            (2% block-finder)
+    //
+    //   v36 (bucket-2 standardize-toward-merged-v36; mirrors DGB
+    //        share_tracker::get_expected_payouts):
+    //       amounts[script] = worker_payout * weight / total_weight  (FULL weight)
+    //       NO block-finder fee.
+    //   total_weight is the GRAND total (includes donation_weight), so the
+    //   donation absorbs its decayed-weight share via the step-5 remainder.
+    const bool v36 =
+        core::version_gate::is_v36_active(params.current_share_version);
     std::map<Script, uint64_t> amounts;
     if (total_weight > 0) {
-        // uint128-ish: worker_payout < 2^50, 49 < 2^6, weight < ~2^80 for a few
-        // shares; use explicit 128-bit to avoid silent overflow.
-        __uint128_t den = static_cast<__uint128_t>(total_weight) * 50;
+        // weights/total_weight fit uint64 at the DASH layer; __uint128_t covers
+        // the products (worker_payout < 2^50, 49 < 2^6, weight < 2^64).
+        __uint128_t den = v36
+            ? static_cast<__uint128_t>(total_weight)
+            : static_cast<__uint128_t>(total_weight) * 50;
         for (const auto& [script, w] : weights) {
             __uint128_t num = static_cast<__uint128_t>(w)
-                            * static_cast<__uint128_t>(worker_payout)
-                            * 49;
+                            * static_cast<__uint128_t>(worker_payout);
+            if (!v36) num *= 49;
             amounts[script] = static_cast<uint64_t>(num / den);
         }
     }
 
-    // 4. amounts[this_script] += worker_payout // 50  (2 % block-finder).
+    // 4. (pre-v36 only) 2% block-finder fee to the share creator.
     auto this_script = dash::pubkey_hash_to_script2(miner_pubkey_hash);
-    amounts[this_script] = amounts[this_script] + (worker_payout / 50);
+    if (!v36)
+        amounts[this_script] = amounts[this_script] + (worker_payout / 50);
 
     // 5. amounts[DONATION] += worker_payout - Σamounts  (remainder incl. rounding).
     uint64_t current_sum = 0;
     for (const auto& [s, a] : amounts) current_sum += a;
     uint64_t donation_remainder = (worker_payout > current_sum)
         ? (worker_payout - current_sum) : 0;
+
+    // v36 consensus (a60f7f7f): the donation output MUST carry >= 1 satoshi.
+    // If the remainder rounds to 0, deduct 1 sat from the largest miner
+    // (deterministic tiebreak: (amount, script)); the sum invariant holds.
+    if (v36 && donation_remainder < 1 && worker_payout > 0 && !amounts.empty()) {
+        auto largest = std::max_element(amounts.begin(), amounts.end(),
+            [&](const auto& a, const auto& b) {
+                if (a.first == donation_script) return true;   // never pick donation
+                if (b.first == donation_script) return false;
+                if (a.second != b.second) return a.second < b.second;
+                return a.first < b.first;
+            });
+        if (largest != amounts.end() && largest->first != donation_script
+            && largest->second >= 1) {
+            largest->second -= 1;
+            donation_remainder += 1;
+        }
+    }
     amounts[donation_script] = amounts[donation_script] + donation_remainder;
 
     // Sanity: Σ(amounts) == worker_payout (matches p2pool-dash assertion).

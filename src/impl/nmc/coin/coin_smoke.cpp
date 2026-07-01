@@ -24,6 +24,7 @@ void nmc_coin_p0_smoke()
     (void)chain.init();
     (void)chain.height();
     (void)chain.size();
+    (void)chain.add_headers(std::vector<BlockHeaderType>{});
 
     BlockHeaderType header;
     header.SetNull();
