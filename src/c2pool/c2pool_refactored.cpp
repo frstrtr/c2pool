@@ -262,6 +262,10 @@ static void segfault_handler(int sig) {
 #include <impl/doge/coin/auxpow_header.hpp>
 // 2b-ii: embedded NMC merged-mining backend (host activation)
 #include <impl/nmc/coin/aux_chain_embedded.hpp>
+// DGB's own embedded merged-mining backend (DC seam, -DAUX_DOGE=ON).
+// Header is fully wrapped in #ifdef AUX_DOGE -> compiles to nothing when off.
+#include <impl/dgb/coin/aux_chain_embedded.hpp>
+#include <impl/dgb/params.hpp>  // dgb::make_coin_params (SubsidyFunc), dgb::AUXPOW_CHAIN_ID
 
 // V36-compatible operational features
 #include <impl/ltc/pool_monitor.hpp>
@@ -5040,6 +5044,13 @@ int main(int argc, char* argv[]) {
             std::unique_ptr<nmc::coin::HeaderChain>     nmc_chain;
             std::unique_ptr<nmc::coin::Mempool>         nmc_pool;
             std::unique_ptr<nmc::coin::NMCChainParams>  nmc_params_ptr;
+#ifdef AUX_DOGE
+            // DGB's own embedded aux chain objects (DC seam; mirror DOGE/NMC).
+            // Guarded: the DGB HeaderChain/Mempool types are only visible via
+            // the self-guarded aux_chain_embedded.hpp include under AUX_DOGE.
+            std::unique_ptr<c2pool::dgb::HeaderChain>   dgb_aux_chain;
+            std::unique_ptr<dgb::coin::Mempool>         dgb_aux_pool;
+#endif // AUX_DOGE
             // DOGE UTXO set for fee computation (no segwit/MWEB — simplified)
             std::unique_ptr<core::coin::UTXOViewDB>    doge_utxo_db;
             std::unique_ptr<core::coin::UTXOViewCache> doge_utxo_cache;
@@ -5310,6 +5321,45 @@ int main(int argc, char* argv[]) {
                                          << cfg.rpc_host << ":" << cfg.rpc_port;
                             }
                         }
+                    } else if (cfg.symbol == "DGB") {
+#ifdef AUX_DOGE
+                        // DGB's OWN embedded merged-mining backend (DC seam).
+                        // Mirrors the NMC embedded block: lazily build a DGB
+                        // HeaderChain + Mempool, register AuxChainEmbedded as
+                        // primary, wire the embedded P2P relay, and keep an
+                        // AuxChainRPC (digibyted) fallback.
+                        if (!dgb_aux_chain)
+                            dgb_aux_chain = std::make_unique<c2pool::dgb::HeaderChain>();
+                        if (!dgb_aux_pool)
+                            dgb_aux_pool = std::make_unique<dgb::coin::Mempool>();
+                        {
+                            // DGB subsidy schedule (config_coin.hpp SSOT) feeds
+                            // the embedded coinbasevalue via the #207 resolver.
+                            auto dgb_cp = dgb::make_coin_params(settings->m_testnet);
+                            auto backend = std::make_unique<dgb::coin::AuxChainEmbedded>(
+                                *dgb_aux_chain, *dgb_aux_pool, dgb_cp.subsidy_func, cfg);
+                            // Embedded P2P relay for DGB flows through the
+                            // manager-level set_block_relay_fn wired below
+                            // (same route the DOGE embedded backend uses);
+                            // submit_block() is log+cache, the network write
+                            // is that relay via the CoinBroadcaster.
+                            mm_manager->add_chain(cfg, std::move(backend));
+                            LOG_INFO << "Merged mining: DGB embedded (primary) chain_id=" << cfg.chain_id;
+                            // digibyted RPC fallback (embedded primary persists).
+                            if (cfg.rpc_port > 0 && !cfg.rpc_userpass.empty()) {
+                                auto rpc_fallback = std::make_unique<c2pool::merged::AuxChainRPC>(ioc, cfg);
+                                mm_manager->set_fallback_backend(cfg.chain_id, std::move(rpc_fallback));
+                                LOG_INFO << "Merged mining: DGB RPC fallback at "
+                                         << cfg.rpc_host << ":" << cfg.rpc_port;
+                            }
+                        }
+#else
+                        // Without -DAUX_DOGE the DGB embedded backend is absent;
+                        // fall through to the standard RPC path so the seam is a
+                        // no-op rather than a broken reference.
+                        mm_manager->add_chain(cfg);
+                        LOG_INFO << "Merged mining: added DGB via RPC (AUX_DOGE off) chain_id=" << cfg.chain_id;
+#endif // AUX_DOGE
                     } else {
                         // Non-DOGE chain or no P2P — standard RPC path
                         mm_manager->add_chain(cfg);
