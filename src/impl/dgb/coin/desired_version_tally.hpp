@@ -128,4 +128,33 @@ inline uint32_t ratchet_min_protocol_version(
     return current_floor;
 }
 
+// Runtime WIRING decision -- the call-site guard the pure ratchet above deliberately
+// omits. ratchet_min_protocol_version mirrors ONLY the oracle dict-branch
+// (data.py:861): over an empty/partial window it ratchets (0 >= 0), because the
+// oracle's None / full-window guard lives at the CALL SITE (main.py:212):
+//     if len(shares) > CHAIN_LENGTH:
+//         counts = get_desired_version_counts(tracker,
+//             get_nth_parent_hash(previous_share.hash, CHAIN_LENGTH*9//10), CHAIN_LENGTH//10)
+//         update_min_protocol_version(counts, best_share)
+// Without this guard a fresh node (parent_height < CHAIN_LENGTH -> empty window) would
+// spuriously lift the floor to 3500 and reject every legitimate peer. This function is
+// that guard: no lift until a FULL window exists behind the best share's parent, then
+// delegate to the pure ratchet over the [CHAIN_LENGTH*9/10, CHAIN_LENGTH] window the
+// caller sampled (the SAME window as the 60% version-switch gate, share_check step 2).
+inline uint32_t apply_min_protocol_ratchet_decision(
+    int32_t  parent_height,
+    int32_t  chain_length,
+    const std::map<uint64_t, uint288>& window_weights,
+    int64_t  best_version,
+    uint32_t current_floor,
+    uint32_t target_floor)
+{
+    if (current_floor >= target_floor)      // oracle guard: minpver < newminpver
+        return current_floor;
+    if (parent_height < chain_length)       // oracle main.py:212: len(shares) > CHAIN_LENGTH
+        return current_floor;               // no full window yet -> never lift
+    return ratchet_min_protocol_version(
+        window_weights, best_version, current_floor, target_floor);
+}
+
 }  // namespace dgb

@@ -110,3 +110,55 @@ TEST(DgbMinProtocolRatchet, ConsensusMagnitudeNoOverflow) {
     auto w = std::map<uint64_t, uint288>{{36, best}, {35, rest}};
     EXPECT_EQ(dgb::ratchet_min_protocol_version(w, 36, COLD, TARGET), TARGET);
 }
+
+// ============================================================================
+// apply_min_protocol_ratchet_decision -- the RUNTIME WIRING guard (follow-on to
+// the pure ratchet above). Adds the oracle main.py:212 full-window guard
+// (len(shares) > CHAIN_LENGTH) the pure function deliberately omits. CL below is
+// a stand-in CHAIN_LENGTH; parent_height is the height of the best share's parent.
+// ============================================================================
+
+constexpr int32_t CL = 100;  // stand-in CHAIN_LENGTH for the window guard
+
+// --- FULL-WINDOW GUARD: parent_height < CHAIN_LENGTH -> NEVER lift, even when the
+//     (partial) window is unanimous. This is the fresh-node bug the wiring exists to
+//     prevent: without it a young chain would lock the floor to 3500 and reject every
+//     legitimate peer. Contrast EmptyWindowMirrorsOracleDictBranch: the PURE fn
+//     ratchets on the same weights; the DECISION fn must NOT (no full window yet).
+TEST(DgbMinProtocolRatchetWiring, ShortChainNeverLifts) {
+    auto w = std::map<uint64_t, uint288>{{36, u(100)}};  // unanimous
+    // pure fn would ratchet...
+    EXPECT_EQ(dgb::ratchet_min_protocol_version(w, 36, COLD, TARGET), TARGET);
+    // ...but the decision guard holds it cold while parent_height < CL.
+    EXPECT_EQ(dgb::apply_min_protocol_ratchet_decision(CL - 1, CL, w, 36, COLD, TARGET), COLD);
+    // exactly one short of a full window still holds.
+    EXPECT_EQ(dgb::apply_min_protocol_ratchet_decision(0, CL, w, 36, COLD, TARGET), COLD);
+}
+
+// --- empty window + short chain -> no lift (guards the EmptyWindowMirrorsOracle
+//     dict-branch behaviour behind the full-window precondition).
+TEST(DgbMinProtocolRatchetWiring, ShortChainEmptyWindowNoLift) {
+    EXPECT_EQ(dgb::apply_min_protocol_ratchet_decision(CL - 1, CL, {}, 36, COLD, TARGET), COLD);
+}
+
+// --- FULL WINDOW present (parent_height >= CHAIN_LENGTH) + unanimous -> lift.
+TEST(DgbMinProtocolRatchetWiring, FullWindowUnanimousLifts) {
+    auto w = std::map<uint64_t, uint288>{{36, u(100)}};
+    EXPECT_EQ(dgb::apply_min_protocol_ratchet_decision(CL, CL, w, 36, COLD, TARGET), TARGET);
+    EXPECT_EQ(dgb::apply_min_protocol_ratchet_decision(CL * 5, CL, w, 36, COLD, TARGET), TARGET);
+}
+
+// --- FULL WINDOW present but best < 95% -> stays cold (delegates to pure fn).
+TEST(DgbMinProtocolRatchetWiring, FullWindowBelow95StaysCold) {
+    auto w = std::map<uint64_t, uint288>{{36, u(94)}, {35, u(6)}};  // sum=100, 94<95
+    EXPECT_EQ(dgb::apply_min_protocol_ratchet_decision(CL, CL, w, 36, COLD, TARGET), COLD);
+}
+
+// --- already at/above target short-circuits regardless of window/height.
+TEST(DgbMinProtocolRatchetWiring, AlreadyAtTargetShortCircuits) {
+    auto w = std::map<uint64_t, uint288>{{36, u(100)}};
+    EXPECT_EQ(dgb::apply_min_protocol_ratchet_decision(CL, CL, w, 36, TARGET, TARGET), TARGET);
+    // even with a short chain the latch holds at target (never lowers).
+    EXPECT_EQ(dgb::apply_min_protocol_ratchet_decision(0, CL, w, 36, TARGET, TARGET), TARGET);
+}
+

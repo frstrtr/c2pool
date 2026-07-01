@@ -309,12 +309,17 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
             peer->write(std::move(getaddrs_msg));
         }
 
-        // Reject peers running too-old protocol
-        if (msg->m_version < m_tracker.m_params->minimum_protocol_version)
+        // Reject peers running too-old protocol. The floor is the RUNTIME
+        // ratcheted value (cold 1400, lifted to 3500 once >=95% of window work
+        // desires the best share's version -- apply_min_protocol_ratchet), NOT the
+        // immutable config floor. Read lock-free; compute thread publishes via store.
+        const uint32_t min_proto =
+            m_runtime_min_protocol_version.load(std::memory_order_relaxed);
+        if (msg->m_version < min_proto)
         {
             LOG_WARNING << "Peer " << msg->m_addr_from.m_endpoint.to_string()
                         << " protocol " << msg->m_version
-                        << " < minimum " << m_tracker.m_params->minimum_protocol_version
+                        << " < minimum " << min_proto
                         << ", disconnecting";
             throw std::runtime_error("peer protocol too old");
         }
@@ -804,6 +809,58 @@ void NodeImpl::notify_local_share(const uint256& share_hash)
 
     // Trigger async think() — will pick up the local share through scoring.
     run_think();
+}
+
+void NodeImpl::apply_min_protocol_ratchet()
+{
+    // Runtime wiring of the accept-floor ratchet #602 landed as a pure function.
+    // Mirrors oracle main.py:213-216 (run on each best-share advance) + data.py:857
+    // update_min_protocol_version: over the window [CHAIN_LENGTH*9/10, CHAIN_LENGTH]
+    // behind the best share's PARENT, lift the inbound P2P accept-floor 1400 -> 3500
+    // once the best share's VERSION holds >=95% of the work-weighted desired-version
+    // tally. Runtime sibling of the 60% version-switch gate (share_check.hpp step 2),
+    // reading the SAME window. MUST be called under exclusive m_tracker_mutex.
+    const uint32_t target  = PoolConfig::SHARE_MINIMUM_PROTOCOL_VERSION;  // 3500
+    const uint32_t current =
+        m_runtime_min_protocol_version.load(std::memory_order_relaxed);
+    if (current >= target)                    // already ratcheted -> latched, no-op
+        return;
+    if (m_best_share_hash.IsNull() || !m_tracker.chain.contains(m_best_share_hash))
+        return;
+
+    // best share's VERSION (share TYPE version) + its parent hash
+    // (oracle: previous_share = shares[best_share.previous_share_hash]).
+    int64_t best_version = 0;
+    uint256 prev_hash;
+    m_tracker.chain.get_share(m_best_share_hash).invoke([&](auto* obj) {
+        best_version = std::remove_pointer_t<decltype(obj)>::version;
+        prev_hash    = obj->m_prev_hash;
+    });
+    if (prev_hash.IsNull() || !m_tracker.chain.contains(prev_hash))
+        return;
+
+    const int32_t CL            = static_cast<int32_t>(m_tracker.m_params->chain_length);
+    const int32_t parent_height = m_tracker.chain.get_height(prev_hash);
+
+    // Sample the SAME window the 60% switch gate reads (share_check.hpp:1610):
+    // anchor = nth_parent(parent, CHAIN_LENGTH*9/10), size = CHAIN_LENGTH/10.
+    const uint32_t window_start = (static_cast<uint32_t>(CL) * 9) / 10;
+    const uint32_t window_size  =  static_cast<uint32_t>(CL) / 10;
+    auto anchor  = m_tracker.chain.get_nth_parent_key(prev_hash, window_start);
+    auto weights = m_tracker.get_desired_version_weights(
+        anchor, static_cast<int32_t>(window_size));
+
+    // apply_min_protocol_ratchet_decision applies the main.py:212 full-window
+    // guard (parent_height >= CHAIN_LENGTH) the pure ratchet omits, then delegates.
+    const uint32_t lifted = dgb::apply_min_protocol_ratchet_decision(
+        parent_height, CL, weights, best_version, current, target);
+    if (lifted != current) {
+        m_runtime_min_protocol_version.store(lifted, std::memory_order_relaxed);
+        LOG_INFO << "[min-proto-ratchet] MINIMUM_PROTOCOL_VERSION " << current
+                 << " -> " << lifted << " (>=95% window work desires v"
+                 << best_version << ", best="
+                 << m_best_share_hash.GetHex().substr(0, 16) << ")";
+    }
 }
 
 uint256 NodeImpl::best_share_hash()
@@ -1465,6 +1522,7 @@ void NodeImpl::run_think()
         if (!result.best.IsNull()) {
             best_changed = (m_best_share_hash != result.best);
             m_best_share_hash = result.best;
+            apply_min_protocol_ratchet();  // oracle main.py:216 (per best-share advance)
         }
 
         // Phase 1c: drive the whale-departure detector with the fresh best
@@ -1843,6 +1901,7 @@ void NodeImpl::clean_tracker()
 
             if (!result.best.IsNull()) {
                 m_best_share_hash = result.best;
+                apply_min_protocol_ratchet();  // oracle main.py:216 (per best-share advance)
             }
 
             flush_verified_to_leveldb();
@@ -2014,6 +2073,7 @@ void NodeImpl::clean_tracker()
         if (!result.best.IsNull()) {
             clean_best_changed = (m_best_share_hash != result.best);
             m_best_share_hash = result.best;
+            apply_min_protocol_ratchet();  // oracle main.py:216 (per best-share advance)
         }
         publish_snapshot();
         flush_verified_to_leveldb();
