@@ -166,14 +166,148 @@ def rollup(con, interval):
     print(f"rolled up {n_rows} per-worker/day rows; pruned raw < {RAW_RETENTION_DAYS}d")
 
 
+def _selftest():
+    """SAFE-ADDITIVE regression KAT for D-MINER.1 rollup math (rig-free, in-memory).
+
+    Pins the honesty-critical accounting so a future refactor cannot silently
+    re-stub it: presence rule, hours/avg/stale derivation, pool shares-delta,
+    rollup idempotency (restart-safe), and raw retention pruning.
+    """
+    DAY = 86400
+    fails = []
+
+    def check(name, cond):
+        print(("ok   " if cond else "FAIL ") + name)
+        if not cond:
+            fails.append(name)
+
+    def fresh():
+        return connect(":memory:")
+
+    def add_raw(con, ts, worker, hr, dr):
+        con.execute(
+            "INSERT INTO samples(ts,worker,hashrate,dead_hashrate,online) VALUES(?,?,?,?,?)",
+            (ts, worker, hr, dr, 1 if hr > 0 else 0))
+
+    def daily(con):
+        return {(d, w): (ho, ah, n, sh, st) for d, w, ho, ah, n, sh, st in
+                con.execute("SELECT day,worker,hours_online,avg_hashrate,samples,shares,stale_pct FROM daily")}
+
+    # 1) presence rule: hashrate>0 -> online=1, zero -> online=0 (via record_sample)
+    con = fresh()
+    record_sample(con, {"miner_hash_rates": {"A": 5000.0, "B": 0.0},
+                        "miner_dead_hash_rates": {"A": 100.0}, "shares": {}})
+    on = dict(con.execute("SELECT worker,online FROM samples"))
+    check("presence: live>0 online", on.get("A") == 1)
+    check("presence: live==0 offline", on.get("B") == 0)
+
+    # 2) accounting: hours_online, avg over online-only, per-worker stale%
+    con = fresh()
+    base = 100 * DAY  # fixed epoch day; no wall-clock dependence
+    for k in range(3):
+        add_raw(con, base + k * 3600, "A", 6000.0, 2000.0)   # 3 online samples
+    add_raw(con, base + 3 * 3600, "A", 0.0, 0.0)             # 1 offline sample
+    rollup(con, 3600)                                         # interval=1h/sample
+    d = daily(con)
+    day = list({k[0] for k in d})[0]
+    ho, ah, n, sh, st = d[(day, "A")]
+    check("hours_online = online_samples * interval", abs(ho - 3.0) < 1e-9)
+    check("avg_hashrate over ONLINE samples only", abs(ah - 6000.0) < 1e-9)
+    check("samples counts ALL rows (online+offline)", n == 4)
+    check("stale% = dead/(live+dead) [6000/24000=25]", abs(st - 25.0) < 1e-9)
+
+    # 3) pool __pool__ row: shares DELTA (max-min), clamped >=0, not absolute
+    con = fresh()
+    add_raw(con, base, "A", 6000.0, 0.0)  # rollup gates on worker samples; shares imply workers
+    con.execute("INSERT OR REPLACE INTO pool_samples VALUES(?,?,?,?)", (base, 1000, 0, 10))
+    con.execute("INSERT OR REPLACE INTO pool_samples VALUES(?,?,?,?)", (base + 7200, 1500, 0, 40))
+    rollup(con, 3600)
+    d = daily(con)
+    pday = list({k[0] for k in d if k[1] == "__pool__"})[0]
+    ho, ah, n, sh, st = d[(pday, "__pool__")]
+    check("pool shares = delta(max-min) not absolute", sh == 500)
+    check("pool stale% from delta [30/500=6]", abs(st - 6.0) < 1e-9)
+    check("pool row carries no per-worker hours", ho == 0.0)
+
+    # 4) restart/idempotency: re-running rollup REPLACEs, never double-counts
+    con = fresh()
+    for k in range(2):
+        add_raw(con, base + k * 3600, "A", 6000.0, 0.0)
+    rollup(con, 3600)
+    first = daily(con)
+    rollup(con, 3600)   # simulate a restarted rollup over the same raw rows
+    second = daily(con)
+    check("rollup idempotent (restart-safe, no doubling)", first == second)
+
+    # 5) multi-day grouping: samples in distinct date buckets -> distinct rows
+    con = fresh()
+    add_raw(con, base, "A", 6000.0, 0.0)
+    add_raw(con, base + DAY, "A", 6000.0, 0.0)
+    rollup(con, 3600)
+    days = {k[0] for k in daily(con) if k[1] == "A"}
+    check("rollup groups per UTC day", len(days) == 2)
+
+    # 6) retention: raw >90d pruned, but its daily row kept forever
+    con = fresh()
+    old = now_ts() - (RAW_RETENTION_DAYS + 5) * DAY
+    recent = now_ts() - DAY
+    add_raw(con, old, "A", 6000.0, 0.0)
+    add_raw(con, recent, "A", 6000.0, 0.0)
+    rollup(con, 3600)
+    raw_ts = [r[0] for r in con.execute("SELECT ts FROM samples")]
+    check("raw >90d pruned", old not in raw_ts)
+    check("raw <90d retained", recent in raw_ts)
+    old_day = datetime.fromtimestamp(old, timezone.utc).strftime("%Y-%m-%d")
+    has_old_daily = con.execute(
+        "SELECT 1 FROM daily WHERE day=? AND worker=?", (old_day, "A")).fetchone()
+    check("daily kept forever (pruned-day summary survives)", has_old_daily is not None)
+
+    # 7) per-worker isolation: two workers in the SAME UTC day -> independent
+    #    rows; one miner's downtime/stale must never bleed into another's report
+    con = fresh()
+    for k in range(4):
+        add_raw(con, base + k * 3600, "A", 6000.0, 2000.0)   # A: 4 online, 25% stale
+    add_raw(con, base, "B", 9000.0, 0.0)                     # B: 1 online, 0% stale
+    add_raw(con, base + 3600, "B", 0.0, 0.0)                 # B: 1 offline
+    rollup(con, 3600)
+    d = daily(con)
+    iday = list({k[0] for k in d if k[1] == "A"})[0]
+    aho, aah, an, ash, ast = d[(iday, "A")]
+    bho, bah, bn, bsh, bst = d[(iday, "B")]
+    check("isolation: A hours independent of B", abs(aho - 4.0) < 1e-9)
+    check("isolation: B hours independent of A", abs(bho - 1.0) < 1e-9)
+    check("isolation: A stale% unmixed [25]", abs(ast - 25.0) < 1e-9)
+    check("isolation: B stale% unmixed [0]", abs(bst - 0.0) < 1e-9)
+    check("isolation: B avg over its own online sample [9000]", abs(bah - 9000.0) < 1e-9)
+
+    # 8) all-offline worker: live==0 throughout -> NO phantom presence; a worker
+    #    still emitting dead_hashrate reads stale=100 (its work was all dead), not 0
+    con = fresh()
+    add_raw(con, base, "C", 0.0, 0.0)
+    add_raw(con, base + 3600, "C", 0.0, 1500.0)             # offline but dead work reported
+    rollup(con, 3600)
+    d = daily(con)
+    cday = list({k[0] for k in d if k[1] == "C"})[0]
+    cho, cah, cn, csh, cst = d[(cday, "C")]
+    check("all-offline: hours_online == 0 (no phantom presence)", cho == 0.0)
+    check("all-offline: avg_hashrate == 0 (no phantom rate)", cah == 0.0)
+    check("all-offline: samples still counted (worker not vanished)", cn == 2)
+    check("all-offline: stale=100 when only dead work reported", abs(cst - 100.0) < 1e-9)
+
+    print("\nSELFTEST PASS" if not fails else "\nSELFTEST FAIL: " + ", ".join(fails))
+    return 1 if fails else 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="c2pool miner presence sampler + rollup (D-MINER.1)")
-    ap.add_argument("mode", choices=["sample", "rollup"])
+    ap.add_argument("mode", choices=["sample", "rollup", "selftest"])
     ap.add_argument("--db", default="miner_presence.db")
     ap.add_argument("--url", default=DEFAULT_URL, help="dashboard /local_stats URL")
     ap.add_argument("--interval", type=int, default=60, help="sample interval seconds")
     ap.add_argument("--once", action="store_true", help="sample: take one sample and exit")
     args = ap.parse_args()
+    if args.mode == "selftest":
+        sys.exit(_selftest())
     con = connect(args.db)
     try:
         if args.mode == "sample":

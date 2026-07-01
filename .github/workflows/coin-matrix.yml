@@ -52,7 +52,13 @@ jobs:
 
       - name: Install Conan 2
         if: steps.presence.outputs.exists == '1'
-        run: pip install "conan>=2.0,<3.0"
+        run: |
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
+          fi
 
       - name: Detect Conan profile
         if: steps.presence.outputs.exists == '1'
