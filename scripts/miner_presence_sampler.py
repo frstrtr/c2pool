@@ -294,6 +294,38 @@ def _selftest():
     check("all-offline: samples still counted (worker not vanished)", cn == 2)
     check("all-offline: stale=100 when only dead work reported", abs(cst - 100.0) < 1e-9)
 
+    # 9) ingest seam (record_sample): the poll path that feeds every rollup.
+    #    KATs 2-8 add_raw() directly, bypassing record_sample; this pins its own
+    #    live|dead union + JSON-null resilience so a refactor cannot silently drop
+    #    workers or fabricate presence from dead-only work.
+    con = fresh()
+    # a rig emitting ONLY dead/DOA work is present in the dead map but absent
+    # from live -> must record OFFLINE, never phantom-online
+    record_sample(con, {"miner_hash_rates": {"X": 7000.0},
+                        "miner_dead_hash_rates": {"X": 500.0, "Y": 300.0},
+                        "shares": {"total": 10, "orphan": 1, "dead": 2}})
+    r = {w: (hr, dr, on) for w, hr, dr, on in
+         con.execute("SELECT worker,hashrate,dead_hashrate,online FROM samples")}
+    check("ingest: live>0 worker online with its dead carried", r.get("X") == (7000.0, 500.0, 1))
+    check("ingest: dead-only worker recorded OFFLINE (no phantom presence)", r.get("Y") == (0.0, 300.0, 0))
+    check("ingest: shares snapshot captured from payload",
+          con.execute("SELECT shares_total FROM pool_samples").fetchone()[0] == 10)
+
+    # the real API can emit JSON null (not merely omit a key); the `or {}` guard
+    # is honesty-critical -> must not crash and must not fabricate rows
+    con = fresh()
+    n = record_sample(con, {"miner_hash_rates": None, "miner_dead_hash_rates": None, "shares": None})
+    check("ingest: JSON-null maps -> zero worker rows (no crash)", n == 0)
+    check("ingest: JSON-null shares -> zeroed pool row (no crash)",
+          con.execute("SELECT shares_total,shares_orphan,shares_dead FROM pool_samples").fetchone() == (0, 0, 0))
+
+    # wholly empty payload -> no worker rows, pool row still written zeroed
+    con = fresh()
+    n = record_sample(con, {})
+    check("ingest: empty payload -> no worker rows", n == 0)
+    check("ingest: empty payload -> pool row still written zeroed",
+          con.execute("SELECT COUNT(*) FROM pool_samples").fetchone()[0] == 1)
+
     print("\nSELFTEST PASS" if not fails else "\nSELFTEST FAIL: " + ", ".join(fails))
     return 1 if fails else 0
 
