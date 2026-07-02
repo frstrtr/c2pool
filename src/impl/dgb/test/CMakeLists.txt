@@ -684,6 +684,25 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_aux_doge_embed_livewire_test "" AUTO)
 
+    # --- DGB+DOGE (phase DC) -- ASSEMBLED-BLOCK LAYOUT VERIFIER KAT ------------
+    # ltc-doge un-fence contract (2026-07-02): pins the DC verifier to the
+    # AUTHORITATIVE assembled DOGE-submit-block layout (header80||auxpow||varint
+    # ||coinbase||tmpl_txs), the auxpow field order vs the build_auxpow_proof
+    # SSOT, AUXPOW_CHAIN_ID 0x0062, and the UNCONDITIONAL primary-path relay
+    # semantic -- so the deferred /tmp/c2pool_doge_block_<h>.hex capture matches
+    # by construction. Consume-only: neutral producer + shared chain param, no
+    # merged_mining.*/doge edits. Defines AUX_DOGE locally + links the merged
+    # producer & ltc_coin like the dc_proof sibling. MUST appear in BOTH this
+    # registration AND the build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_aux_doge_dc_layout_verifier_test aux_doge_dc_layout_verifier_test.cpp)
+    target_compile_definitions(dgb_aux_doge_dc_layout_verifier_test PRIVATE AUX_DOGE)
+    target_link_libraries(dgb_aux_doge_dc_layout_verifier_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb ltc_coin
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_aux_doge_dc_layout_verifier_test "" AUTO)
+
     # dgb_share_target_genesis_test: FENCED KAT pinning ShareTracker::compute_
     # share_target genesis/unknown-prev clamp to [MAX_TARGET/30, MAX_TARGET] vs
     # the DGB oracle data.py generate_transaction. Links the same proven set as
