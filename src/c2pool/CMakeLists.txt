@@ -238,6 +238,15 @@ add_executable(c2pool-bch
     ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/p2p_node.cpp
     ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/coin_node.cpp
     ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/rpc.cpp
+    # M5 pool-node body TUs: NodeImpl out-of-line methods (node.cpp) + the two
+    # p2pool p2p protocol dispatchers (Legacy/Actual handle_message_* family) +
+    # the stratum work source. These define the previously-undefined NodeImpl::
+    # and protocol symbols so the --pool path LINKS. Per-coin isolation holds
+    # (src/impl/bch only); compiled directly into the target like the coin TUs.
+    ${CMAKE_SOURCE_DIR}/src/impl/bch/node.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bch/protocol_actual.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bch/protocol_legacy.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bch/stratum/work_source.cpp
 )
 target_compile_definitions(c2pool-bch PRIVATE C2POOL_VERSION="${C2POOL_GIT_VERSION}")
 # --ibd RUN-LOOP slice (integrator 2026-06-18): the read-only headers-first IBD
