@@ -317,6 +317,54 @@ TEST(WebHonestyRegression, V36StatusActiveLatchTracksLiveShareVersion) {
         << "v36_active must latch true once the live ratchet reaches V36";
 }
 
+// (c) v36_status.share_chain.{v35_shares,v36_shares,v36_percentage} must reflect
+// the DESIRED-version tally the AutoRatchet keys on (get_desired_version_weights),
+// NOT the per-share FORMAT flag. During the graded g2 ratchet the .157 seed relays
+// V35-FORMAT shares over p2p even while their miners vote V36, so a format-flag
+// count reads 0 v36 straight through a real crossing -- the founding 0-stub class
+// of lie, in the exact fields the operator curls to watch the vote climb. This pins
+// the #288-style swap: build a sharechain-stats snapshot whose FORMAT is 100% V35
+// yet whose DESIRED-version tally is ~33% V36 (one rig flipped), and assert the
+// crossing counter tracks the vote, never the frozen format zero.
+TEST(WebHonestyRegression, V36StatusShareChainTracksDesiredVersionNotFormatFlag) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::LITECOIN);
+
+    // Snapshot mirroring rig #1 (.37) flipped to V36 while .38/.39 stay V35 and the
+    // seed relays V35-format shares: FORMAT all V35, DESIRED-version ~1/3 V36, and a
+    // work-weighted sampling signal of ~33.33%.
+    mi.set_sharechain_stats_fn([]() {
+        nlohmann::json sc = nlohmann::json::object();
+        sc["total_shares"] = 400;
+        sc["chain_height"] = 400;
+        sc["chain_length"] = 400;
+        sc["shares_by_version"]         = {{"35", 400}};            // FORMAT: 100% V35
+        sc["shares_by_desired_version"] = {{"35", 268}, {"36", 132}}; // VOTE: 132/400 = 33%
+        sc["sampling_desired_version"]  = {{"35", 2.0}, {"36", 1.0}};  // work-weighted: 33.33%
+        return sc;
+    });
+
+    nlohmann::json v = mi.rest_v36_status();
+    ASSERT_TRUE(v.contains("share_chain"));
+    const auto& scj = v["share_chain"];
+
+    // The format-flag count IS zero here -- that is the pre-fix stub value the
+    // crossing counter used to echo. Pin it on the parent version_signaling object
+    // (its true source) so a refactor that reverts share_chain to the format tally
+    // is caught: the bug is real precisely because format says 0 while vote says 33.
+    nlohmann::json sig = mi.rest_version_signaling();
+    EXPECT_EQ(sig.value("overall_v36_shares", -1), 0)
+        << "guard: this snapshot is the crossing where FORMAT is still 100% V35";
+
+    EXPECT_EQ(scj["v36_shares"].get<int>(), 132)
+        << "v36_shares must be the desired-version vote count (132), not the "
+           "format-flag count (0) that lies through the crossing";
+    EXPECT_EQ(scj["v35_shares"].get<int>(), 268)
+        << "v35_shares is the desired-version remainder (400-132), not 400";
+    EXPECT_NEAR(scj["v36_percentage"].get<double>(), 33.33, 0.01)
+        << "v36_percentage must be the work-weighted sampling signal (the journal "
+           "N% old version complement the integrator reads), never 0";
+}
+
 // --- charter #3: crossing-banner coin coverage (de-allowlist, #496) ----------
 // The V35->V36 crossing banner must surface on EVERY v36-ratcheting coin, not
 // just LTC/DOGE. Before #496 a hardcoded {LITECOIN,DOGECOIN} allowlist gated
