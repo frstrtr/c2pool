@@ -7,7 +7,7 @@
 // networks/dash_testnet.py (operator 2026-06-17 per-coin re-scope: DASH conforms
 // to its OWN older-than-v35 oracle, NOT a v35-uniform baseline).
 //
-// POOL-LEVEL FIELDS are sourced exclusively from dash::PoolConfig
+// POOL-LEVEL FIELDS are sourced exclusively from dash::SharechainConfig
 // (config_pool.hpp) — the sharechain SSOT shipped in PR #146 — so there is
 // exactly one place a DASH sharechain constant can drift. COIN-LEVEL fields are
 // inlined here with oracle citations (mirroring ltc/params.hpp; DASH carries no
@@ -36,7 +36,7 @@ namespace dash
 // overridden by an operator pool.yaml. Consensus-critical fields (share version,
 // max_target, donation script, X11 pow/block identity) and the network ISOLATION
 // PRIMITIVES (prefix/identifier) are deliberately ABSENT from this struct and are
-// therefore NEVER overridable: they stay pinned to the dash::PoolConfig SSOT
+// therefore NEVER overridable: they stay pinned to the dash::SharechainConfig SSOT
 // regardless of any override file, so a mis-edited pool.yaml can retune
 // ports/peers but can NEVER fork the sharechain off its oracle-conformant
 // identity. The YAML file-load half lands when DASH gains its config_pool.cpp
@@ -87,34 +87,34 @@ inline core::CoinParams make_coin_params(bool testnet, const PoolOverrides& over
     // Dust: payout-dust floor from the SSOT (config_pool.hpp). Was 5460 (dashd
     // relay-policy floor, wrong semantic for the PPLNS payout path) -- reconciled
     // to the oracle payout-dust value 100000 per V36 Option-A conform-to-p2pool.
-    p.dust_threshold = PoolConfig::dust_threshold();
+    p.dust_threshold = SharechainConfig::dust_threshold();
 
     // Softforks: DASH older baseline has NO segwit (segwit_activation_version=0).
     p.softforks_required        = {};
     p.segwit_activation_version = 0;
 
-    // ===== Pool-level (net) — from dash::PoolConfig (config_pool.hpp SSOT) =====
-    PoolConfig::is_testnet = testnet;
-    p.p2p_port    = PoolConfig::p2p_port();
-    p.worker_port = PoolConfig::worker_port();
+    // ===== Pool-level (net) — from dash::SharechainConfig (config_pool.hpp SSOT) =====
+    SharechainConfig::is_testnet = testnet;
+    p.p2p_port    = SharechainConfig::p2p_port();
+    p.worker_port = SharechainConfig::worker_port();
 
-    p.share_period      = PoolConfig::share_period();
-    p.chain_length      = PoolConfig::chain_length();
-    p.real_chain_length = PoolConfig::real_chain_length();
+    p.share_period      = SharechainConfig::share_period();
+    p.chain_length      = SharechainConfig::chain_length();
+    p.real_chain_length = SharechainConfig::real_chain_length();
 
-    p.target_lookbehind        = PoolConfig::TARGET_LOOKBEHIND;
-    p.spread                   = PoolConfig::SPREAD;
-    p.minimum_protocol_version = PoolConfig::MINIMUM_PROTOCOL_VERSION;
+    p.target_lookbehind        = SharechainConfig::TARGET_LOOKBEHIND;
+    p.spread                   = SharechainConfig::SPREAD;
+    p.minimum_protocol_version = SharechainConfig::MINIMUM_PROTOCOL_VERSION;
     p.block_max_size           = 0;  // DASH: no segwit weight accounting
     p.block_max_weight         = 0;
 
-    p.max_target = PoolConfig::max_target();
+    p.max_target = SharechainConfig::max_target();
 
     // Network identification — DASH oracle (isolation primitives, never unified).
-    p.identifier_hex         = PoolConfig::IDENTIFIER_HEX;
-    p.prefix_hex             = PoolConfig::PREFIX_HEX;
-    p.testnet_identifier_hex = PoolConfig::TESTNET_IDENTIFIER_HEX;
-    p.testnet_prefix_hex     = PoolConfig::TESTNET_PREFIX_HEX;
+    p.identifier_hex         = SharechainConfig::IDENTIFIER_HEX;
+    p.prefix_hex             = SharechainConfig::PREFIX_HEX;
+    p.testnet_identifier_hex = SharechainConfig::TESTNET_IDENTIFIER_HEX;
+    p.testnet_prefix_hex     = SharechainConfig::TESTNET_PREFIX_HEX;
 
     // Donation script (consensus-critical) — version-keyed (operator FLAG6
     // 2026-06-17, 3-bucket rule). Pre-v36 shares use the DASH-specific P2PKH

@@ -113,5 +113,5 @@ TEST(DashVersionActivationLatch, JsonRoundTrips)
 TEST(DashVersionActivationLatch, DefaultSpanIsTwoChainLen)
 {
     ActivationLatch l;
-    EXPECT_EQ(l.confirm_span, 2ull * dash::PoolConfig::CHAIN_LENGTH);
+    EXPECT_EQ(l.confirm_span, 2ull * dash::SharechainConfig::CHAIN_LENGTH);
 }

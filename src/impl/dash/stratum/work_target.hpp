@@ -28,7 +28,7 @@
 //   DASHWorkSource the way the legacy LTC path inlines it inside the
 //   ref_hash_fn lambda at c2pool_refactored.cpp:4449-4500).
 //   The INPUTS it reads — SHARE_PERIOD / SPREAD / DUST_THRESHOLD / subsidy /
-//   block target — stay per-coin config SSOT (dash::PoolConfig,
+//   block target — stay per-coin config SSOT (dash::SharechainConfig,
 //   config_pool.hpp). They are tuning inputs, not isolation primitives, so
 //   no cross-coin entanglement is introduced.
 //
@@ -136,9 +136,9 @@ inline uint256 cap_dust_threshold(uint256 desired_target,
 // (future) DASHWorkSource from template + share-tracker state at job time.
 struct WorkTargetInputs {
     double   local_hash_rate         = 0.0;   ///< H/s for this miner's payout addr (0 = unknown)
-    uint32_t share_period            = 0;     ///< dash::PoolConfig::share_period()
-    uint32_t spread                  = 0;     ///< dash::PoolConfig::SPREAD
-    uint64_t dust_threshold          = 0;     ///< dash::PoolConfig::dust_threshold()
+    uint32_t share_period            = 0;     ///< dash::SharechainConfig::share_period()
+    uint32_t spread                  = 0;     ///< dash::SharechainConfig::SPREAD
+    uint64_t dust_threshold          = 0;     ///< dash::SharechainConfig::dust_threshold()
     bool     dust_gate               = false; ///< sharechain height > 3600/SHARE_PERIOD lookbehind
     double   pool_attempts_per_second = 0.0;  ///< pool aps over the lookbehind (0 if ungated)
     uint64_t subsidy                 = 0;     ///< block subsidy (coinbasevalue)

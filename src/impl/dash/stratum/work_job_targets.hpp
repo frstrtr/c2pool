@@ -29,7 +29,7 @@
 //   Same as work_target.hpp — the pseudoshare modulation + clip ALGORITHM is the
 //   protocol-universal shape that folds to a v37 unified work-source, so it is a
 //   pure reusable accessor. The INPUTS it reads — SANE_TARGET_RANGE — stay
-//   per-coin config SSOT (dash::PoolConfig::sane_target_min/max, config_pool.hpp);
+//   per-coin config SSOT (dash::SharechainConfig::sane_target_min/max, config_pool.hpp);
 //   tuning bounds, not isolation primitives, so no cross-coin entanglement.
 //
 // PURITY: header-only, socket-free, node-free — every function is a pure
@@ -75,8 +75,8 @@ inline uint256 modulate_desired_pseudoshare_target(double local_hash_rate)
 // bits target, and per-miner vardiff state at job time.
 struct WorkJobTargetInputs {
     uint256 share_info_bits_target;          ///< share_info[bits].target from generate_transaction
-    uint256 sane_target_min;                 ///< PoolConfig::sane_target_min() (SANE_TARGET_RANGE[0])
-    uint256 sane_target_max;                 ///< PoolConfig::sane_target_max() (SANE_TARGET_RANGE[1])
+    uint256 sane_target_min;                 ///< SharechainConfig::sane_target_min() (SANE_TARGET_RANGE[0])
+    uint256 sane_target_max;                 ///< SharechainConfig::sane_target_max() (SANE_TARGET_RANGE[1])
     bool    have_desired_pseudoshare = false;///< client supplied desired_pseudoshare_target?
     uint256 desired_pseudoshare_target;      ///< client-supplied target (when have_... = true)
     double  local_hash_rate          = 0.0;  ///< for the None-path *1 cap
