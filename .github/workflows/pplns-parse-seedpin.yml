@@ -24,7 +24,9 @@ on:
 jobs:
   seedpin:
     name: PPLNS parse seed-pin replay
-    runs-on: ubuntu-24.04
+    # Route to self-hosted for trusted events; fork PRs fall back to
+    # GitHub-hosted ubuntu-24.04 (never run untrusted fork code self-hosted).
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     defaults:
       run:
         working-directory: web-static/sharechain-explorer

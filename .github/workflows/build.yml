@@ -469,10 +469,9 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   web-static:
     name: Web-static verify
-    # Pin to GitHub-hosted: sub-minute JS job needs no self-hosted compute,
-    # and the puppeteer pixel harness cannot complete page navigation in the
-    # self-hosted runner env (DOMContentLoaded never fires within 15s).
-    runs-on: ubuntu-24.04
+    # Route to self-hosted for trusted events; fork PRs fall back to
+    # GitHub-hosted ubuntu-24.04 (never run untrusted fork code self-hosted).
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     defaults:
       run:
         working-directory: web-static/sharechain-explorer
@@ -723,11 +722,12 @@ jobs:
     # dash-slice campaign: skip Windows for PRs carrying the dash-linux-only label (re-enabled at block-viable gate, ~07-01)
     if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-linux-only')) }}
     # GitHub-hosted windows-2022 (ships cmake + MSVC/VS 2022 + the SDK).
-    # VM217 (c2pool-windows-217) is a bare runner with NO build toolchain yet;
-    # FOLLOW-UP: once vm-fleet installs VS 2022 Build Tools (C++ workload) +
-    # cmake + deps on VM217 and it builds c2pool clean, a follow-up PR flips
-    # this back to the fork-gated self-hosted expr. Linux+macOS already on the
-    # self-hosted fleet on this branch; Windows stays GitHub-hosted meanwhile.
+    # VM217 (c2pool-windows-217) is still a bare runner: the self-hosted flip
+    # failed at actions/setup-python@v6 (cannot provision Python on VM217) and
+    # no VS 2022 Build Tools are installed yet. FOLLOW-UP: once vm-fleet installs
+    # VS 2022 Build Tools (C++ workload) + cmake + python on VM217 and it builds
+    # c2pool clean, a follow-up PR flips this to the fork-gated self-hosted expr.
+    # web-static + pplns self-hosted routes on this branch are proven green.
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v6
