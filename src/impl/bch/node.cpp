@@ -5,11 +5,6 @@
 #include <core/random.hpp>
 #include <core/target_utils.hpp>
 #include <sharechain/prepared_list.hpp>
-#include <impl/dgb/get_shares_walk.hpp>
-#include <impl/dgb/download_stops.hpp>
-#include <impl/dgb/pool_efficiency.hpp>
-#include <impl/dgb/expected_time_to_block.hpp>
-#include <impl/dgb/coin/binomial_conf_interval.hpp>
 
 #include <algorithm>
 #include <filesystem>
@@ -17,10 +12,14 @@
 #include <iomanip>
 #include <random>
 
+#ifndef _WIN32
+#include <execinfo.h>  // backtrace() for think() watchdog stack dump (glibc-only)
+#endif
+
 // Static members for DensePPLNSWindow precomputed decay table
-std::vector<uint64_t> dgb::DensePPLNSWindow::s_decay_table;
-uint64_t dgb::DensePPLNSWindow::s_decay_per = 0;
-bool dgb::DensePPLNSWindow::s_table_initialized = false;
+std::vector<uint64_t> bch::DensePPLNSWindow::s_decay_table;
+uint64_t bch::DensePPLNSWindow::s_decay_per = 0;
+bool bch::DensePPLNSWindow::s_table_initialized = false;
 
 // Helper: read current RSS from /proc/self/status (Linux only)
 static long get_rss_mb() {
@@ -72,35 +71,34 @@ static std::string format_duration(double secs) {
 // Returns "~X.Y% (lo-hi%)" string for binomial proportion x/n at 95% confidence.
 static std::string format_binomial_conf(int x, int n, double conf = 0.95) {
     if (n == 0) return "???";
-    // Oracle-faithful Wilson score interval via the dgb::coin SSOT
-    // (coin/binomial_conf_interval.hpp; p2pool util/math.py:133). This delegates
-    // the prior inline z=1.96 + plain-[0,1]-clip approximation onto the SSOT,
-    // which uses z = sqrt(2)*ierf(conf) and add_to_range bracketing. Output is
-    // oracle-faithful and NOT byte-identical to the old literal-z form; diag
-    // display only (heartbeat log), zero consensus surface.
-    const std::array<double, 2> ci = dgb::coin::binomial_conf_interval(
-        static_cast<double>(x), static_cast<double>(n), conf);
-    const double p = static_cast<double>(x) / n;
+    // z for 95% ≈ 1.96 (inverse error function approximation)
+    double z = 1.96;
+    double p = static_cast<double>(x) / n;
+    double topa = p + z * z / (2.0 * n);
+    double topb = z * std::sqrt(p * (1.0 - p) / n + z * z / (4.0 * n * n));
+    double bottom = 1.0 + z * z / n;
+    double lo = std::max(0.0, (topa - topb) / bottom);
+    double hi = std::min(1.0, (topa + topb) / bottom);
     std::ostringstream os;
     os << "~" << std::fixed << std::setprecision(1) << (100.0 * p) << "% ("
-       << static_cast<int>(std::floor(100.0 * ci[0])) << "-"
-       << static_cast<int>(std::ceil(100.0 * ci[1])) << "%)";
+       << static_cast<int>(std::floor(100.0 * lo)) << "-"
+       << static_cast<int>(std::ceil(100.0 * hi)) << "%)";
     return os.str();
 }
 
 // Wilson score confidence interval for efficiency: 1 - stale_rate, scaled
 static std::string format_binomial_conf_efficiency(int stale, int n, double stale_prop) {
     if (n == 0) return "???";
-    // Stale-rate CI via the oracle-faithful SSOT, then mapped to efficiency.
-    // See format_binomial_conf note: oracle-faithful, NOT byte-identical to the
-    // prior inline z=1.96 form; diag display only.
-    const std::array<double, 2> ci = dgb::coin::binomial_conf_interval(
-        static_cast<double>(stale), static_cast<double>(n), 0.95);
-    const double p = static_cast<double>(stale) / n;
-    const double lo_stale = ci[0];
-    const double hi_stale = ci[1];
-    const double denom = (stale_prop < 0.999) ? (1.0 - stale_prop) : 1.0;
-    const double eff = (1.0 - p) / denom;
+    double z = 1.96;
+    double p = static_cast<double>(stale) / n;
+    double topa = p + z * z / (2.0 * n);
+    double topb = z * std::sqrt(p * (1.0 - p) / n + z * z / (4.0 * n * n));
+    double bottom = 1.0 + z * z / n;
+    double lo_stale = std::max(0.0, (topa - topb) / bottom);
+    double hi_stale = std::min(1.0, (topa + topb) / bottom);
+    // Efficiency = (1 - stale_rate) / (1 - stale_prop)
+    double denom = (stale_prop < 0.999) ? (1.0 - stale_prop) : 1.0;
+    double eff = (1.0 - p) / denom;
     double eff_lo = (1.0 - hi_stale) / denom;
     double eff_hi = (1.0 - lo_stale) / denom;
     eff_lo = std::max(0.0, eff_lo);
@@ -112,7 +110,7 @@ static std::string format_binomial_conf_efficiency(int stale, int n, double stal
     return os.str();
 }
 
-namespace dgb
+namespace bch
 {
 
 static uint64_t make_random_nonce()
@@ -123,7 +121,7 @@ static uint64_t make_random_nonce()
 
 void NodeImpl::send_ping(peer_ptr peer)
 {
-        auto rmsg = dgb::message_ping::make_raw();
+        auto rmsg = bch::message_ping::make_raw();
         peer->write(std::move(rmsg));
 };
 
@@ -252,11 +250,11 @@ int NodeImpl::get_verified_count() const { return get_tracker_snapshot().verifie
 
 void NodeImpl::send_version(peer_ptr peer)
 {
-    auto rmsg = dgb::message_version::make_raw(
-        m_tracker.m_params->advertised_protocol_version,  // advertise our capability (oracle p2p.py VERSION 3501), NOT the accept-floor (handle_version keeps minimum_protocol_version as the reject floor)
+    auto rmsg = bch::message_version::make_raw(
+        bch::PoolConfig::ADVERTISED_PROTOCOL_VERSION,
         1,                                    // services
         addr_t{1, peer->addr()},              // addr_to (the remote)
-        addr_t{1, NetService{"0.0.0.0", m_tracker.m_params->p2p_port}}, // addr_from (us)
+        addr_t{1, NetService{"0.0.0.0", bch::PoolConfig::P2P_PORT}}, // addr_from (us)
         m_nonce,
         m_software_version,
         1,                                    // mode (always 1 for legacy compat)
@@ -268,8 +266,8 @@ void NodeImpl::send_version(peer_ptr peer)
 std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer)
 {
     LOG_DEBUG_POOL << "handle message_version";
-        std::unique_ptr<dgb::message_version> msg;
-        msg = dgb::message_version::make(rmsg->m_data);
+        std::unique_ptr<bch::message_version> msg;
+        msg = bch::message_version::make(rmsg->m_data);
 
         LOG_INFO << "[Pool] Peer "
                  << msg->m_addr_from.m_endpoint.to_string()
@@ -305,21 +303,16 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
 
         // Request peers from the newly established connection
         {
-            auto getaddrs_msg = dgb::message_getaddrs::make_raw(8);
+            auto getaddrs_msg = bch::message_getaddrs::make_raw(8);
             peer->write(std::move(getaddrs_msg));
         }
 
-        // Reject peers running too-old protocol. The floor is the RUNTIME
-        // ratcheted value (cold 1400, lifted to 3500 once >=95% of window work
-        // desires the best share's version -- apply_min_protocol_ratchet), NOT the
-        // immutable config floor. Read lock-free; compute thread publishes via store.
-        const uint32_t min_proto =
-            m_runtime_min_protocol_version.load(std::memory_order_relaxed);
-        if (msg->m_version < min_proto)
+        // Reject peers running too-old protocol
+        if (msg->m_version < bch::PoolConfig::MINIMUM_PROTOCOL_VERSION)
         {
             LOG_WARNING << "Peer " << msg->m_addr_from.m_endpoint.to_string()
                         << " protocol " << msg->m_version
-                        << " < minimum " << min_proto
+                        << " < minimum " << bch::PoolConfig::MINIMUM_PROTOCOL_VERSION
                         << ", disconnecting";
             throw std::runtime_error("peer protocol too old");
         }
@@ -344,7 +337,7 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
         // Advertise ourselves to the peer (matching Python p2pool sendAdvertisement)
         {
             auto port = core::Server::listen_port();
-            auto addrme_msg = dgb::message_addrme::make_raw(port);
+            auto addrme_msg = bch::message_addrme::make_raw(port);
             peer->write(std::move(addrme_msg));
         }
 
@@ -359,7 +352,7 @@ void NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
     if (n == 0) return;
 
     // Phase 1 (thread pool, parallel): run share_init_verify() for each share.
-    // share_init_verify() does scrypt-1024 (~20ms each) — must NOT block io_context.
+    // share_init_verify() does SHA256d share PoW (BCH, NOT scrypt) — must NOT block io_context.
     // Each share's hash computation is independent, so we can fully parallelize.
     auto remaining = std::make_shared<std::atomic<int>>(static_cast<int>(n));
     for (size_t i = 0; i < n; i++)
@@ -373,7 +366,7 @@ void NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
                     try
                     {
                         share.ACTION({
-                            obj->m_hash = share_init_verify(*obj, *m_tracker.m_params, true);
+                            obj->m_hash = share_init_verify(*obj, true);
                         });
                     }
                     catch (const std::exception&)
@@ -402,21 +395,38 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
     // Non-blocking mutex: if think() holds the exclusive lock on the compute
     // thread, queue this batch for processing after think() releases. The IO
     // thread never blocks — keepalive timers and network I/O continue.
-    {
-        std::unique_lock lock(m_tracker_mutex, std::try_to_lock);
-        if (!lock.owns_lock()) {
-            LOG_INFO << "[ASYNC-DEFER] processing_shares_phase2: mutex busy, queuing "
-                     << data.m_items.size() << " shares from " << addr.to_string()
-                     << " (pending=" << m_pending_adds.size() + 1 << ")";
-            m_pending_adds.push_back(PendingShareBatch{
-                std::make_unique<HandleSharesData>(std::move(data)), addr});
+    //
+    // HOLD this lock across the entire mutation body below (mirrors LTC f445db8e).
+    // try_to_lock keeps the IO thread non-blocking — busy => queue + return. Once
+    // acquired we must NOT release until all m_tracker.chain mutations are done:
+    // the prior code released here and ran the body lock-free, letting the
+    // compute-thread clean_tracker() exclusive prune (drop_tails) free chain nodes
+    // mid-mutation -> SIGSEGV (kr1z1s LTC/DGB). Released just before run_think().
+    std::unique_lock lock(m_tracker_mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        // ── Backpressure (V36 livelock defense-in-depth) ──────────────
+        // If think() is wedged/slow the deferred queue could grow without
+        // bound and blow memory. Cap it: over MAX_PENDING_ADDS we DROP the
+        // new batch (peers re-advertise their best share, so dropped shares
+        // are re-requested later) and warn instead of growing unbounded.
+        if (m_pending_adds.size() >= MAX_PENDING_ADDS) {
+            LOG_WARNING << "[ASYNC-DEFER] BACKPRESSURE: pending_adds at cap ("
+                        << m_pending_adds.size() << "/" << MAX_PENDING_ADDS
+                        << "), dropping batch of " << data.m_items.size()
+                        << " shares from " << addr.to_string()
+                        << " — think() may be wedged";
             return;
         }
+        LOG_INFO << "[ASYNC-DEFER] processing_shares_phase2: mutex busy, queuing "
+                 << data.m_items.size() << " shares from " << addr.to_string()
+                 << " (pending=" << m_pending_adds.size() + 1 << ")";
+        m_pending_adds.push_back(PendingShareBatch{
+            std::make_unique<HandleSharesData>(std::move(data)), addr});
+        return;
     }
-    // Lock released — proceed with normal processing.
-    // No lock needed for the rest: we only enter here when think() is NOT
-    // running (m_tracker_mutex was available), and ASIO single-thread
-    // guarantees no other IO handler overlaps.
+    // Lock acquired and HELD across the mutation body below; released just before
+    // the async run_think() trigger so the compute thread can take the exclusive
+    // lock. ASIO single-thread still guarantees no overlapping IO handler.
 
     // Step 1: collect verified shares (skip any that failed verification, hash still null)
     std::vector<ShareType> valid_shares;
@@ -460,7 +470,10 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
         {
             for (auto& new_tx : new_txs)
             {
-                PackStream packed_tx = pack(coin::TX_WITH_WITNESS(new_tx));
+                // BCH divergence: plain pack(tx) -- no TX_WITH_WITNESS (no
+                // witness on BCH). Matches protocol_actual.cpp/protocol_legacy.cpp
+                // remember_tx hashing (plain pack(tx) -> Hash(span)).
+                PackStream packed_tx = pack(new_tx);
                 all_new_txs[Hash(packed_tx.get_span())] = new_tx;
             }
         }
@@ -577,6 +590,11 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
                  << " chain=" << m_tracker.chain.size() << ")";
     }
 
+    // Release the tracker lock before triggering think(): run_think() posts the
+    // think+prune job to the compute thread, which needs the exclusive lock. All
+    // chain mutations above are complete at this point.
+    lock.unlock();
+
     // Trigger think() after every share batch (p2pool: set_best_share after handle_shares).
     // p2pool calls set_best_share() after EVERY batch with new_count > 0 — no size gate.
     // think() scores heads and updates best_share + desired set for download_shares.
@@ -585,7 +603,7 @@ void NodeImpl::processing_shares_phase2(HandleSharesData& data, NetService addr)
     }
 }
 
-std::vector<dgb::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr)
+std::vector<bch::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hashes, uint64_t parents, std::vector<uint256> stops, NetService peer_addr)
 {
     // try_to_lock per the architectural rule (node.hpp:67) — IO thread MUST
     // never block on m_tracker_mutex.  A blocking shared_lock here was the
@@ -610,25 +628,30 @@ std::vector<dgb::ShareType> NodeImpl::handle_get_share(std::vector<uint256> hash
         return {};
     }
 
-    // Delegate the walk to the SSOT (get_shares_walk.hpp) so the parents cap,
-    // the per-hash walk bound, the stop-hash break, and the missing/rejected
-    // skips stay byte-identical to the p2pool node.py oracle and are pinned by
-    // the get_shares_walk conformance KAT. The try_to_lock guard above and the
-    // node-local logging stay here; only the pure walk moves to the SSOT.
-    auto shares = dgb::collect_get_shares<dgb::ShareType>(
-        *m_chain,
-        hashes,
-        parents,
-        stops,
-        [this](const uint256& h) { return m_rejected_share_hashes.count(h) != 0; },
-        [this](const uint256& handle_hash) {
-            static int miss_log = 0;
-            if (miss_log++ < 5)
-                LOG_WARNING << "[handle_get_share] hash NOT in chain: "
-                            << handle_hash.ToString().substr(0, 16)
-                            << " chain_size=" << m_chain->size()
-                            << " tracker_chain_size=" << m_tracker.chain.size();
-        });
+    parents = std::min(parents, (uint64_t)1000/hashes.size());
+	std::vector<bch::ShareType> shares;
+	for (const auto& handle_hash : hashes)
+	{
+		if (!m_chain->contains(handle_hash))
+		{
+			static int miss_log = 0;
+			if (miss_log++ < 5)
+				LOG_WARNING << "[handle_get_share] hash NOT in chain: "
+				            << handle_hash.ToString().substr(0, 16)
+				            << " chain_size=" << m_chain->size()
+				            << " tracker_chain_size=" << m_tracker.chain.size();
+			continue;
+		}
+		uint64_t n = std::min(parents+1, (uint64_t) m_chain->get_height(handle_hash));
+		for (auto [hash, data] : m_chain->get_chain(handle_hash, n))
+        {
+			if (std::find(stops.begin(), stops.end(), hash) != stops.end())
+				break;
+			if (m_rejected_share_hashes.count(hash))
+				continue;
+			shares.push_back(data.share);
+		}
+	}
 
 	if (!shares.empty())
 	{
@@ -796,71 +819,23 @@ void NodeImpl::notify_local_share(const uint256& share_hash)
 {
     // p2pool: set_best_share() → think() synchronously on the reactor thread.
     // Use think() for ALL best_share decisions, matching p2pool exactly.
-    if (share_hash.IsNull() || !m_tracker.chain.contains(share_hash))
+    if (share_hash.IsNull())
         return;
 
-    // Try inline verify — if think() holds the mutex, defer to next think() cycle.
-    // The share is already in the chain; think() will verify + score it.
+    // Both the chain.contains() read AND attempt_verify() run UNDER the tracker
+    // lock (mirrors LTC f445db8e). A bare m_tracker.chain.contains() here (the
+    // prior code) raced the compute-thread clean_tracker() exclusive prune freeing
+    // chain nodes -> SIGSEGV (kr1z1s LTC/DGB). try_to_lock keeps the IO thread
+    // non-blocking; if think()/clean holds the lock we skip the inline verify —
+    // the share is already in-chain and run_think() below will score it next cycle.
     {
         std::unique_lock lock(m_tracker_mutex, std::try_to_lock);
-        if (lock.owns_lock())
+        if (lock.owns_lock() && m_tracker.chain.contains(share_hash))
             m_tracker.attempt_verify(share_hash);
     }
 
     // Trigger async think() — will pick up the local share through scoring.
     run_think();
-}
-
-void NodeImpl::apply_min_protocol_ratchet()
-{
-    // Runtime wiring of the accept-floor ratchet #602 landed as a pure function.
-    // Mirrors oracle main.py:213-216 (run on each best-share advance) + data.py:857
-    // update_min_protocol_version: over the window [CHAIN_LENGTH*9/10, CHAIN_LENGTH]
-    // behind the best share's PARENT, lift the inbound P2P accept-floor 1400 -> 3500
-    // once the best share's VERSION holds >=95% of the work-weighted desired-version
-    // tally. Runtime sibling of the 60% version-switch gate (share_check.hpp step 2),
-    // reading the SAME window. MUST be called under exclusive m_tracker_mutex.
-    const uint32_t target  = PoolConfig::SHARE_MINIMUM_PROTOCOL_VERSION;  // 3500
-    const uint32_t current =
-        m_runtime_min_protocol_version.load(std::memory_order_relaxed);
-    if (current >= target)                    // already ratcheted -> latched, no-op
-        return;
-    if (m_best_share_hash.IsNull() || !m_tracker.chain.contains(m_best_share_hash))
-        return;
-
-    // best share's VERSION (share TYPE version) + its parent hash
-    // (oracle: previous_share = shares[best_share.previous_share_hash]).
-    int64_t best_version = 0;
-    uint256 prev_hash;
-    m_tracker.chain.get_share(m_best_share_hash).invoke([&](auto* obj) {
-        best_version = std::remove_pointer_t<decltype(obj)>::version;
-        prev_hash    = obj->m_prev_hash;
-    });
-    if (prev_hash.IsNull() || !m_tracker.chain.contains(prev_hash))
-        return;
-
-    const int32_t CL            = static_cast<int32_t>(m_tracker.m_params->chain_length);
-    const int32_t parent_height = m_tracker.chain.get_height(prev_hash);
-
-    // Sample the SAME window the 60% switch gate reads (share_check.hpp:1610):
-    // anchor = nth_parent(parent, CHAIN_LENGTH*9/10), size = CHAIN_LENGTH/10.
-    const uint32_t window_start = (static_cast<uint32_t>(CL) * 9) / 10;
-    const uint32_t window_size  =  static_cast<uint32_t>(CL) / 10;
-    auto anchor  = m_tracker.chain.get_nth_parent_key(prev_hash, window_start);
-    auto weights = m_tracker.get_desired_version_weights(
-        anchor, static_cast<int32_t>(window_size));
-
-    // apply_min_protocol_ratchet_decision applies the main.py:212 full-window
-    // guard (parent_height >= CHAIN_LENGTH) the pure ratchet omits, then delegates.
-    const uint32_t lifted = dgb::apply_min_protocol_ratchet_decision(
-        parent_height, CL, weights, best_version, current, target);
-    if (lifted != current) {
-        m_runtime_min_protocol_version.store(lifted, std::memory_order_relaxed);
-        LOG_INFO << "[min-proto-ratchet] MINIMUM_PROTOCOL_VERSION " << current
-                 << " -> " << lifted << " (>=95% window work desires v"
-                 << best_version << ", best="
-                 << m_best_share_hash.GetHex().substr(0, 16) << ")";
-    }
 }
 
 uint256 NodeImpl::best_share_hash()
@@ -944,23 +919,21 @@ uint256 NodeImpl::best_share_hash()
     return best;
 }
 
+// Head advertised to peers in the version handshake and re-advertisement ONLY.
+// Unlike best_share_hash() -- which is verified-only and collapses to ZERO once
+// peers exist so work/template never builds on a MAX_TARGET head -- this returns
+// our tallest RAW chain head.  Root-2: on a fresh (--genesis) node the verified
+// set is empty at handshake, so best_share_hash() advertised ZERO and the peer
+// never issued download_shares() for our shares.  Advertising the raw head makes
+// a connecting peer always learn we have a chain and pull it, while work/template
+// stays on the verified head via best_share_hash().
 uint256 NodeImpl::advertised_best_share()
 {
-    // Peer-facing advertisement ONLY (version handshake + timer re-announce).
-    // NEVER used for work/share creation — best_share_hash() owns that and
-    // deliberately returns a VERIFIED head (or NULL) so we never build local
-    // work on an unagreed chain.  For ADVERTISEMENT the opposite is right: a
-    // peer must learn our tallest head to call download_shares() and pull our
-    // chain.  ROOT-2 (Option-A net-id soak): a --genesis node whose verified
-    // chain is still empty at handshake advertises NULL via best_share_hash();
-    // the peer never downloads and broadcast can't backfill (head shares are
-    // already de-dup-marked).  Advertising the raw head breaks that deadlock
-    // without touching work creation.
-    uint256 v = best_share_hash();
-    if (!v.IsNull())
-        return v;
+    // Prefer think()s current best (verified or not) -- our canonical head.
+    if (!m_best_share_hash.IsNull())
+        return m_best_share_hash;
 
-    // Verified chain still empty — advertise our tallest RAW head instead.
+    // Otherwise the tallest raw chain head (mirrors the genesis fallback above).
     if (m_chain && m_chain->size() > 0) {
         uint256 best;
         int32_t best_height = -1;
@@ -971,52 +944,22 @@ uint256 NodeImpl::advertised_best_share()
                 best_height = h;
             }
         }
-        return best;
+        if (!best.IsNull())
+            return best;
     }
+
+    // True genesis: no shares at all yet -- advertise ZERO exactly as before.
     return uint256::ZERO;
 }
 
-void NodeImpl::readvertise_best_share()
+void NodeImpl::readvertise_best()
 {
-    // ROOT-2 re-advertisement.  A peer that finished its version handshake
-    // while our verified chain was empty got a NULL best_share and never
-    // called download_shares(); broadcast_share() can't wake it either because
-    // our head shares are already in m_shared_share_hashes (de-dup-marked at
-    // creation) so its walk breaks immediately.  Here we re-push the tip walk
-    // to every peer WITHOUT consulting the de-dup set.  Advertise-only: never
-    // affects local work creation.
-    uint256 head = advertised_best_share();
-    if (head.IsNull())
+    if (m_peers.empty())
         return;
-
-    // Same try_to_lock discipline as broadcast_share (node.hpp:67): never block
-    // the IO thread on the tracker mutex.  If think() holds it now, the next
-    // trigger (best-change or the timer) retries.
-    std::shared_lock<std::shared_mutex> lock(m_tracker_mutex, std::try_to_lock);
-    if (!lock.owns_lock())
+    uint256 adv = advertised_best_share();
+    if (adv.IsNull() || adv == uint256::ZERO)
         return;
-
-    if (!m_chain->contains(head))
-        return;
-
-    std::vector<uint256> to_send;
-    int32_t height = m_chain->get_height(head);
-    int32_t walk = std::min(height, 5);
-    for (auto [hash, data] : m_chain->get_chain(head, walk)) {
-        if (m_rejected_share_hashes.count(hash))
-            continue; // never re-broadcast peer-rejected shares
-        to_send.push_back(hash);
-    }
-    if (to_send.empty())
-        return;
-
-    auto now = std::chrono::steady_clock::now();
-    for (auto& [nonce, peer] : m_peers) {
-        send_shares(peer, to_send);
-        m_last_broadcast_to[peer->addr()] = {to_send, now};
-    }
-    LOG_INFO << "[readvertise] re-pushed " << to_send.size()
-             << " head share(s) to " << m_peers.size() << " peer(s) (ROOT-2)";
+    broadcast_share(adv);
 }
 
 void NodeImpl::download_shares(peer_ptr /*unused_peer*/, const uint256& target_hash)
@@ -1073,25 +1016,25 @@ void NodeImpl::download_shares(peer_ptr /*unused_peer*/, const uint256& target_h
     // parents=random(500), the chain grows along one lineage until it
     // crosses 2*CHAIN_LENGTH+10, at which point clean_tracker drop-tails
     // collapses the whole branch and verified resets to 0.
-    //
-    // Delegate the stops construction to the SSOT (download_stops.hpp) so the
-    // per-head nth-parent depth min(max(0,height-1),10), the head-inclusion,
-    // the null-parent skip, and the 100-cap stay byte-identical to the p2pool
-    // node.py download_shares oracle and are pinned by the download_stops
-    // conformance KAT (#348). Only the pure stops computation moves; the
-    // duplicate-request / fail-count / random-peer / random-parents node-local
-    // logic above stays here. The std::set<uint256> ordering inside the SSOT
-    // reproduces this region's prior inline std::set insert + ordered-iteration
-    // (and 100-cap survivor selection) exactly.
-    std::vector<uint256> heads;
-    for (auto& [head_hash, tail_hash] : m_tracker.chain.get_heads())
-        heads.push_back(head_hash);
-    std::vector<uint256> stops = dgb::compute_download_stops(
-        heads,
-        [this](const uint256& h) { return m_tracker.chain.get_acc_height(h); },
-        [this](const uint256& h, int nth) {
-            return m_tracker.chain.get_nth_parent_via_skip(h, nth);
-        });
+    std::vector<uint256> stops;
+    {
+        std::set<uint256> stop_set;
+        for (auto& [head_hash, tail_hash] : m_tracker.chain.get_heads()) {
+            stop_set.insert(head_hash);
+            auto h = m_tracker.chain.get_acc_height(head_hash);
+            auto nth = std::min(std::max(0, h - 1), 10);
+            if (nth > 0) {
+                auto parent = m_tracker.chain.get_nth_parent_via_skip(head_hash, nth);
+                if (!parent.IsNull())
+                    stop_set.insert(parent);
+            }
+        }
+        int count = 0;
+        for (auto& s : stop_set) {
+            if (count++ >= 100) break;
+            stops.push_back(s);
+        }
+    }
 
     auto req_id = core::random::random_uint256();
     std::vector<uint256> hashes = { target_hash };
@@ -1106,11 +1049,11 @@ void NodeImpl::download_shares(peer_ptr /*unused_peer*/, const uint256& target_h
              << " (parents=" << parents << " stops=" << stops.size() << ")";
 
     // weak_ptr prevents use-after-free if peer disconnects before reply
-    std::weak_ptr<pool::Peer<dgb::Peer>> weak_peer = peer;
+    std::weak_ptr<pool::Peer<bch::Peer>> weak_peer = peer;
     auto peer_addr_for_log = peer->addr();
 
     request_shares(req_id, peer, hashes, parents, stops,
-        [this, weak_peer, target_hash, peer_addr_for_log, req_id](dgb::ShareReplyData reply)
+        [this, weak_peer, target_hash, peer_addr_for_log, req_id](bch::ShareReplyData reply)
         {
             m_downloading_shares.erase(target_hash);
             m_pending_share_reqs.erase(req_id);
@@ -1182,7 +1125,7 @@ void NodeImpl::load_persisted_shares()
         return;
     }
 
-    const size_t keep_per_head = m_tracker.m_params->chain_length * 2 + 10;
+    const size_t keep_per_head = PoolConfig::chain_length() * 2 + 10;
     const size_t total_in_db = all_hashes.size();
 
     // Only load the most recent shares (highest height = end of vector)
@@ -1221,7 +1164,7 @@ void NodeImpl::load_persisted_shares()
             std::vector<unsigned char> share_bytes(data.begin() + 8, data.end());
             PackStream ps(share_bytes);
 
-            auto share = dgb::load_share(static_cast<int64_t>(ver), ps, NetService{"database", 0});
+            auto share = bch::load_share(static_cast<int64_t>(ver), ps, NetService{"database", 0});
             // m_hash is not part of the serialized format — it's computed
             // during share_check validation.  Restore it from the LevelDB key.
             share.ACTION({ obj->m_hash = hash; });
@@ -1232,19 +1175,19 @@ void NodeImpl::load_persisted_shares()
 
                 // Restore or compute pow_hash on the index.
                 // p2pool recomputes pow_hash on every load (data.py:1362).
-                // We cache it in LevelDB to avoid scrypt, but recompute if missing.
+                // We cache it in LevelDB to avoid recompute, but recompute if missing.
                 {
                     auto* idx = m_tracker.chain.get_index(share.hash());
                     if (idx) {
                         if (!meta.pow_hash.IsNull()) {
                             idx->pow_hash = meta.pow_hash;
                         } else {
-                            // Recompute scrypt pow_hash (matching p2pool's __init__ behavior)
+                            // Recompute SHA256d pow_hash (matching p2pool's __init__ behavior)
                             try {
                                 g_last_pow_hash = uint256();
                                 g_last_init_is_block = false;
                                 uint256 computed_hash;
-                                share.ACTION({ computed_hash = share_init_verify(*obj, *m_tracker.m_params, true); });
+                                share.ACTION({ computed_hash = share_init_verify(*obj, true); });
                                 if (!g_last_pow_hash.IsNull())
                                     idx->pow_hash = g_last_pow_hash;
                                 if (!computed_hash.IsNull() && computed_hash != hash) {
@@ -1387,7 +1330,7 @@ void NodeImpl::prune_shares(const uint256& /*best_share*/)
     // - Remove ONE child of qualifying tail per iteration
     // - Loop up to 1000 times (gradual, not bulk)
     // - Also cascade removal to verified
-    const auto CL = static_cast<int32_t>(m_tracker.m_params->chain_length);
+    const auto CL = static_cast<int32_t>(PoolConfig::chain_length());
     const int32_t min_depth = 2 * CL + 10;
 
     for (int iter = 0; iter < 1000; ++iter)
@@ -1446,6 +1389,87 @@ void NodeImpl::prune_shares(const uint256& /*best_share*/)
 
 // (old phases 5-7 removed — replaced by p2pool-style pruning above)
 
+// ── think() watchdog (V36 livelock defense-in-depth) ────────────────────
+// Best-effort recovery if a think() cycle wedges. Runs ENTIRELY on the IO
+// thread and NEVER acquires m_tracker_mutex — so it stays responsive even
+// while the compute thread holds the exclusive lock. Uses an atomic deadline
+// + generation counter rather than a per-dispatch timer object lifetime so a
+// late fire cannot act on a newer cycle.
+void NodeImpl::arm_think_watchdog()
+{
+    if (!m_context)
+        return;
+    auto deadline = std::chrono::steady_clock::now()
+                  + std::chrono::seconds(THINK_WATCHDOG_SECONDS);
+    m_think_deadline_ns.store(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            deadline.time_since_epoch()).count(),
+        std::memory_order_relaxed);
+    uint64_t gen = m_think_generation.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    if (!m_watchdog_timer)
+        m_watchdog_timer = std::make_unique<boost::asio::steady_timer>(*m_context);
+    m_watchdog_timer->expires_after(std::chrono::seconds(THINK_WATCHDOG_SECONDS));
+    m_watchdog_timer->async_wait([this, gen](const boost::system::error_code& ec) {
+        if (ec) return;  // cancelled by disarm (normal completion)
+        // Only act if this is still the cycle we armed for and it has not
+        // already completed (deadline cleared to 0 by disarm).
+        if (m_think_generation.load(std::memory_order_relaxed) != gen)
+            return;
+        int64_t dl = m_think_deadline_ns.load(std::memory_order_relaxed);
+        if (dl == 0)
+            return;  // cycle completed in the gap before this fire
+        auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (now_ns < dl)
+            return;  // not actually overdue (spurious) — let next arm handle it
+
+        // (1) Log + best-effort backtrace dump of the current (IO) thread.
+        // We CANNOT safely unwind the compute thread's stack from here, but
+        // a backtrace of the watchdog firing plus the timing is enough to
+        // confirm the wedge and correlate with the last [ASYNC-THINK] logs.
+        LOG_ERROR << "[THINK-WATCHDOG] think() cycle exceeded "
+                  << THINK_WATCHDOG_SECONDS << "s (gen=" << gen
+                  << ", pending_adds=" << m_pending_adds.size()
+                  << ") — compute thread appears wedged; recovering pipeline";
+#ifndef _WIN32
+        {
+            void* frames[64];
+            int n = ::backtrace(frames, 64);
+            char** syms = ::backtrace_symbols(frames, n);
+            if (syms) {
+                for (int i = 0; i < n; ++i)
+                    LOG_ERROR << "[THINK-WATCHDOG] bt[" << i << "] " << syms[i];
+                ::free(syms);
+            }
+        }
+#else
+        // Native backtrace is glibc-only (execinfo.h); on MSVC the timeout log
+        // above plus pending_adds is the diagnostic. Recovery below is identical.
+#endif
+
+        // (2)+(3) Flag the cycle aborted and reset the running flag so the
+        // pipeline recovers. NOTE: this does NOT forcibly unwind the compute
+        // thread (unsafe); it lets a fresh think() be scheduled. The stuck
+        // think(), if it ever returns, will find m_think_running already false
+        // and its IO-phase still runs harmlessly (idempotent drain + reset).
+        m_think_deadline_ns.store(0, std::memory_order_relaxed);
+        m_think_running.store(false, std::memory_order_relaxed);
+        LOG_WARNING << "[THINK-WATCHDOG] m_think_running reset to false; "
+                       "a new think() cycle may now be scheduled";
+    });
+}
+
+void NodeImpl::disarm_think_watchdog()
+{
+    // Mark cycle complete: clears the deadline so a racing watchdog fire is a
+    // no-op, and cancels the pending timer.
+    m_think_deadline_ns.store(0, std::memory_order_relaxed);
+    if (m_watchdog_timer) {
+        m_watchdog_timer->cancel();
+    }
+}
+
 void NodeImpl::run_think()
 {
     // Skip if a think() is already running on the compute thread.
@@ -1459,6 +1483,10 @@ void NodeImpl::run_think()
     LOG_INFO << "[ASYNC-THINK] dispatching to compute thread"
              << " pending_adds=" << m_pending_adds.size()
              << " peers=" << m_peers.size();
+
+    // Arm the think() watchdog (IO-thread timer; never touches the tracker
+    // mutex). Disarmed in the IO-phase below on normal completion.
+    arm_think_watchdog();
 
     // Capture block_rel_height fn by value for thread safety
     auto block_rel_height = m_block_rel_height_fn
@@ -1522,31 +1550,17 @@ void NodeImpl::run_think()
         if (!result.best.IsNull()) {
             best_changed = (m_best_share_hash != result.best);
             m_best_share_hash = result.best;
-            apply_min_protocol_ratchet();  // oracle main.py:216 (per best-share advance)
-        }
-
-        // Phase 1c: drive the whale-departure detector with the fresh best
-        // share while we still hold the tracker lock exclusively (race-free).
-        // detect() emits [WHALE-DEPARTURE]/[WHALE-RECOVERY] log lines itself;
-        // we publish its verdict for the local work path (local_desired_target).
-        m_whale_departure_active.store(
-            m_whale_departure.detect(m_tracker, m_best_share_hash),
-            std::memory_order_relaxed);
-
-        // Phase 3L: log-based pool monitor on a ~30s cadence (same exclusive
-        // tracker lock). Consensus-neutral — emits [MONITOR-*] lines only.
-        {
-            auto mon_now = static_cast<uint32_t>(std::time(nullptr));
-            if (mon_now - m_last_monitor_ts >= MONITOR_INTERVAL_S) {
-                m_last_monitor_ts = mon_now;
-                m_pool_monitor.run_cycle(m_tracker, m_best_share_hash);
-            }
         }
 
         // Publish lock-free snapshot for all IO-thread consumers
         publish_snapshot();
 
-        needs_continue = m_tracker.m_think_needs_continue;
+        // Continue if EITHER the Phase 2 verification budget OR the V36
+        // scoring-walk lock-yield budget was exhausted. Both reuse the same
+        // run_think() re-post: lock released here, drain_pending_adds() runs,
+        // continuation scheduled below.
+        needs_continue = m_tracker.m_think_needs_continue
+                      || m_tracker.m_think_walk_needs_continue;
 
         // Flush verified hashes to LevelDB while lock is held
         flush_verified_to_leveldb();
@@ -1623,25 +1637,27 @@ void NodeImpl::run_think()
                 auto wr_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - wr_t0).count();
                 LOG_INFO << "[ASYNC-THINK] IO-phase: work refresh done in " << wr_ms << "ms";
+                // Root-2: re-advertise our new head.  A peer that handshook
+                // before we had a chain saw a ZERO advert and never issued
+                // download_shares -- re-announce so it pulls our shares now.
+                readvertise_best();
             } else if (result.best.IsNull()) {
                 LOG_WARNING << "[ASYNC-THINK] IO-phase: result.best is NULL — verified_tails="
                             << m_tracker.verified.get_tails().size()
                             << " verified_heads=" << m_tracker.verified.get_heads().size();
             }
 
-            // ROOT-2: re-advertise our head so a peer that handshook while our
-            // verified chain was empty can finally download it.  On best-change
-            // push immediately; additionally fire ONE delayed re-advert when the
-            // verified chain first becomes non-empty (covers peers that connected
-            // during the empty window and never see a best-change event).
-            if (best_changed && !m_peers.empty()) {
-                readvertise_best_share();
-            }
+            // ROOT-2: fire ONE think-independent delayed re-advert when the
+            // verified chain first becomes non-empty.  Covers peers that
+            // handshook during the empty window and so never see a best-change
+            // event.  The one-shot timer runs on the IO thread, so it still
+            // fires even if a later think() cycle wedges (composes with the
+            // #97 think-watchdog).  Pure reads; broadcast stays try_to_lock.
             if (m_verified_was_empty && m_tracker.verified.size() > 0) {
                 m_verified_was_empty = false;
                 if (!m_readvert_timer)
                     m_readvert_timer = std::make_unique<core::Timer>(m_context, false);
-                m_readvert_timer->start(10, [this]() { readvertise_best_share(); });
+                m_readvert_timer->start(10, [this]() { readvertise_best(); });
                 LOG_INFO << "[readvertise] verified chain populated — scheduled "
                             "10s re-advert (ROOT-2)";
             }
@@ -1650,6 +1666,10 @@ void NodeImpl::run_think()
             LOG_INFO << "[ASYNC-THINK] IO-phase: draining " << m_pending_adds.size()
                      << " pending batches, peers=" << m_peers.size();
             drain_pending_adds();
+
+            // Cycle completed normally — disarm the watchdog first so it
+            // cannot fire on this (now-finished) generation.
+            disarm_think_watchdog();
 
             // Clear flag AFTER drain — prevents new think() from starting
             // while deferred shares are still being added to the tracker.
@@ -1663,9 +1683,11 @@ void NodeImpl::run_think()
             }
         } catch (const std::exception& e) {
             LOG_ERROR << "run_think() IO phase failed: " << e.what();
+            disarm_think_watchdog();
             m_think_running.store(false);
         } catch (...) {
             LOG_ERROR << "run_think() IO phase failed: unknown error";
+            disarm_think_watchdog();
             m_think_running.store(false);
         }
       });
@@ -1762,7 +1784,7 @@ void NodeImpl::heartbeat_log()
     }
     if (!walk_start.IsNull() && m_tracker.chain.contains(walk_start)) {
         int window = std::min(height, static_cast<int>(
-            std::min(size_t(3600) / m_tracker.m_params->share_period, size_t(height))));
+            std::min(size_t(3600) / PoolConfig::share_period(), size_t(height))));
         if (window > 0) {
             auto walkable = m_tracker.chain.get_height(walk_start);
             auto walk_n = std::min(window, walkable);
@@ -1771,8 +1793,8 @@ void NodeImpl::heartbeat_log()
                     auto view = m_tracker.chain.get_chain(walk_start, walk_n);
                     for (auto [hash, data] : view) {
                         data.share.invoke([&](auto* s) {
-                            if (s->m_stale_info == dgb::StaleInfo::orphan) ++orphan_count;
-                            else if (s->m_stale_info == dgb::StaleInfo::doa) ++doa_count;
+                            if (s->m_stale_info == bch::StaleInfo::orphan) ++orphan_count;
+                            else if (s->m_stale_info == bch::StaleInfo::doa) ++doa_count;
                         });
                         ++total_recent;
                     }
@@ -1780,7 +1802,8 @@ void NodeImpl::heartbeat_log()
             }
         }
     }
-    double stale_prop = dgb::compute_stale_prop(orphan_count, doa_count, total_recent);
+    double stale_prop = total_recent > 0
+        ? static_cast<double>(orphan_count + doa_count) / total_recent : 0.0;
 
     {
         std::ostringstream shares_line;
@@ -1806,7 +1829,7 @@ void NodeImpl::heartbeat_log()
             if (my_payout > 0) {
                 double coins = static_cast<double>(my_payout) / 1e8;
                 shares_line << " Current payout: (" << std::fixed << std::setprecision(4)
-                            << coins << ")=" << coins << " tDGB";
+                            << coins << ")=" << coins << " BCH";
             }
         }
 
@@ -1821,10 +1844,11 @@ void NodeImpl::heartbeat_log()
         try {
             auto aps = m_tracker.get_pool_attempts_per_second(
                 m_best_share_hash,
-                std::min(height - 1, static_cast<int>(m_tracker.m_params->target_lookbehind)),
+                std::min(height - 1, static_cast<int>(PoolConfig::TARGET_LOOKBEHIND)),
                 /*min_work=*/false);
             double pool_hs = static_cast<double>(aps.GetLow64());
-            double real_pool_hs = dgb::compute_real_pool_hashrate(pool_hs, stale_prop);
+            double real_pool_hs = (stale_prop < 0.999 && pool_hs > 0)
+                ? pool_hs / (1.0 - stale_prop) : pool_hs;
             double etb_secs = 0;
             uint32_t block_bits = 0;
             if (!m_best_share_hash.IsNull() && m_tracker.chain.contains(m_best_share_hash)) {
@@ -1835,10 +1859,9 @@ void NodeImpl::heartbeat_log()
             if (real_pool_hs > 0 && block_bits != 0) {
                 auto block_target = chain::bits_to_target(block_bits);
                 auto block_aps = chain::target_to_average_attempts(block_target);
-                etb_secs = dgb::compute_expected_time_to_block(
-                    static_cast<double>(block_aps.GetLow64()), real_pool_hs,
-                    /*average_attempts_overflowed=*/block_aps.IsNull(),
-                    /*block_target_nonzero=*/!block_target.IsNull());
+                etb_secs = static_cast<double>(block_aps.GetLow64()) / real_pool_hs;
+                if (block_aps.IsNull() && !block_target.IsNull())
+                    etb_secs = 1e18;
             }
             LOG_INFO << " Pool: " << format_hashrate(real_pool_hs)
                      << " Stale rate: " << std::fixed << std::setprecision(1)
@@ -1901,7 +1924,6 @@ void NodeImpl::clean_tracker()
 
             if (!result.best.IsNull()) {
                 m_best_share_hash = result.best;
-                apply_min_protocol_ratchet();  // oracle main.py:216 (per best-share advance)
             }
 
             flush_verified_to_leveldb();
@@ -1910,7 +1932,7 @@ void NodeImpl::clean_tracker()
 
         // Steps 2-3: Prune (still holding exclusive lock)
         auto now_sec = static_cast<int64_t>(std::time(nullptr));
-        auto CL = static_cast<int32_t>(m_tracker.m_params->chain_length);
+        auto CL = static_cast<int32_t>(bch::PoolConfig::chain_length());
 
     // Step 2: Eat stale heads (p2pool node.py:358-378)
     // Three guards protect useful heads:
@@ -2073,7 +2095,6 @@ void NodeImpl::clean_tracker()
         if (!result.best.IsNull()) {
             clean_best_changed = (m_best_share_hash != result.best);
             m_best_share_hash = result.best;
-            apply_min_protocol_ratchet();  // oracle main.py:216 (per best-share advance)
         }
         publish_snapshot();
         flush_verified_to_leveldb();
@@ -2144,6 +2165,7 @@ void NodeImpl::clean_tracker()
         if (clean_best_changed && m_on_best_share_changed) {
             LOG_INFO << "[CLEAN] IO-phase: work refresh (best changed)";
             m_on_best_share_changed();
+            readvertise_best();   // root-2: re-announce new head to peers
         }
         drain_pending_adds();
         m_think_running.store(false);
@@ -2397,4 +2419,4 @@ void NodeImpl::set_rss_limit_mb(long mb)
     g_rss_limit_mb = mb;
 }
 
-} // namespace dgb
+} // namespace bch
