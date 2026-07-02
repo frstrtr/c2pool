@@ -866,6 +866,13 @@ jobs:
       - name: Build c2pool-dgb binary (AUX_DOGE seam ON)
         run: cmake --build build_dgb_auxdoge --target c2pool-dgb -j8
 
+      # Link-level companion to the compile-time aux_doge_isolation_guard.hpp:
+      # fail the build if the DGB parent (AUX_DOGE seam ON) ODR-uses any LTC
+      # per-coin consensus symbol (make_ltc_chain_params / ltc::coin::HeaderChain
+      # / ltc::coin::ChainParams). Positive control asserts dgb::coin:: present.
+      - name: Link-isolation guard (no LTC consensus surface in DGB parent)
+        run: bash scripts/ci/dgb_aux_doge_link_isolation_guard.sh build_dgb_auxdoge/src/c2pool/c2pool-dgb
+
       - name: Smoke test (--help)
         run: |
           BIN=build_dgb_auxdoge/src/c2pool/c2pool-dgb
