@@ -498,3 +498,60 @@ TEST(DashEmbeddedGbt, G1GoldenDeterministicTemplateViaCurtimeSeam) {
     EXPECT_GE(live.m_curtime, 1'700'000'000u)
         << "default curtime must still read std::time(nullptr)";
 }
+
+// ========================================================================
+// G1 golden: injectable block-version seam (companion to the curtime seam).
+//
+// build_embedded_workdata hardcoded m_version = 0x20000000 (BIP9 "no
+// signaling" baseline). With the trailing defaulted `version` param a
+// fixed-input call yields a byte-for-byte reproducible version projection,
+// and a real BIP9-deployment-aware value can later be threaded through
+// without disturbing the default. curtime is pinned here because the
+// version seam sits AFTER curtime in the signature.
+// ========================================================================
+TEST(DashEmbeddedGbt, G1GoldenVersionSeamEchoesInjectedVersion) {
+    UTXOViewCache utxo(nullptr);
+    uint256 prev = mint_hash(88);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, {}, /*height=*/1, /*cb=*/false));
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    auto tx = make_spend(prev, 0, 90'000, /*salt=*/9);   // fee = 10'000
+    ASSERT_TRUE(mp.add_tx(tx));
+
+    auto payout   = p2pkh_script(0x55);
+    auto mnstates = single_mn(payout);
+
+    uint256 prev_hash = raw256(0xD4);
+    const uint32_t bits           = 0x1b104be3u;   // pinned oracle GBT nBits
+    const uint32_t mtp            = 1'700'000'000u;
+    const uint32_t PINNED_CURTIME = 1'700'000'123u; // pinned: sits before version in sig
+    const uint32_t PINNED_VERSION = 0x20000004u;   // BIP9 baseline + bit 2 set
+
+    // Injected version is echoed byte-for-byte -- the seam adds no arithmetic.
+    auto injected = build_embedded_workdata(
+        H - 1, prev_hash, mnstates, mp,
+        bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER, PINNED_CURTIME, PINNED_VERSION);
+    EXPECT_EQ(injected.m_version, PINNED_VERSION);
+
+    // Deterministic: same fixed inputs -> identical version projection.
+    auto injected2 = build_embedded_workdata(
+        H - 1, prev_hash, mnstates, mp,
+        bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER, PINNED_CURTIME, PINNED_VERSION);
+    EXPECT_EQ(injected.m_version, injected2.m_version);
+
+    // Default arg preserves the prior hardcoded projection: omitting version
+    // still yields the BIP9 "no signaling" baseline, so no caller is changed.
+    auto baseline = build_embedded_workdata(
+        H - 1, prev_hash, mnstates, mp,
+        bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER, PINNED_CURTIME);
+    EXPECT_EQ(baseline.m_version, 0x20000000u);
+
+    // The version seam is orthogonal to every other header field: injecting a
+    // non-default version changes ONLY m_version, nothing else drifts.
+    EXPECT_EQ(injected.m_height,         baseline.m_height);
+    EXPECT_EQ(injected.m_previous_block, baseline.m_previous_block);
+    EXPECT_EQ(injected.m_bits,           baseline.m_bits);
+    EXPECT_EQ(injected.m_mintime,        baseline.m_mintime);
+    EXPECT_EQ(injected.m_coinbase_value, baseline.m_coinbase_value);
+    EXPECT_EQ(injected.m_payment_amount, baseline.m_payment_amount);
+}
