@@ -66,6 +66,7 @@ int failures = 0;
 // which this offline test never calls.
 struct TestConfig {
     bool m_testnet = false;
+    bool m_testnet4 = false;  // mirror config_coin.hpp: BCH testnet4 selector
     struct P2P { std::vector<std::byte> prefix; };
     struct Coin { P2P m_p2p; };
     Coin m_coin;

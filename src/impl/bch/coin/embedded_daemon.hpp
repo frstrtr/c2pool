@@ -85,8 +85,9 @@ public:
                    bool is_regtest = false)
         : m_config(config),
           m_chain(is_regtest ? BCHChainParams::regtest()
-                             : (config->m_testnet ? BCHChainParams::testnet()
-                                                  : BCHChainParams::mainnet())),
+                             : (config->m_testnet4 ? BCHChainParams::testnet4()
+                                : (config->m_testnet ? BCHChainParams::testnet()
+                                                     : BCHChainParams::mainnet()))),
           m_pool(),
           m_embedded(m_chain, m_pool, config->m_testnet),
           m_node(context, config),

@@ -53,6 +53,7 @@ int failures = 0;
 // Node::run()/init_rpc(), which this offline test never calls.
 struct TestConfig {
     bool m_testnet = false;
+    bool m_testnet4 = false;  // mirror config_coin.hpp: BCH testnet4 selector
     // Duck-typed coin()->m_p2p.prefix: NodeP2P<Config>::get_prefix() is a virtual
     // override (eagerly instantiated via the vtable) and reads it. Empty here --
     // assemble() never sends a P2P message, so the value is inert.

@@ -74,7 +74,7 @@ void print_banner(const char* argv0)
         << "       " << argv0 << " --with-peer-verify [--testnet] [--peer HOST:PORT] [--max-seconds N]\n"
         << "       " << argv0 << " --leg-c-capture [--rpc-conf PATH]\n"
         << "       " << argv0 << " --leg-c-capture-p2p [--rpc-conf PATH] [--p2p-port N]\n"
-        << "       " << argv0 << " --pool [--testnet|--regtest] [--stratum [HOST:]PORT] [--peer HOST:PORT] [--anchor N] [--rpc-conf PATH]\n\n"
+        << "       " << argv0 << " --pool [--testnet|--testnet4|--regtest] [--stratum [HOST:]PORT] [--peer HOST:PORT] [--anchor N] [--rpc-conf PATH]\n\n"
         << "Status: M5 pool/sharechain + embedded-daemon assembly live.\n"
         << "        The embedded daemon (coin/embedded_daemon.hpp) is the primary\n"
         << "        work source; external BCHN-RPC stays as the fallback.\n"
@@ -603,8 +603,21 @@ int run_leg_c_capture_p2p(const std::string& conf_path, uint16_t p2p_port)
 //
 // p2pool-merged-v36 surface: NONE -- run-loop bring-up + block dispatch, not
 // share/PPLNS/coinbase/PoW bytes. PER-COIN ISOLATION: src/impl/bch only.
+// BCH wire-protocol magic bytes per network (pchMessageStart).
+// Source: BCHN chainparams.cpp, verified vs staged bchn29 bitcoind rodata:
+// mainnet e3e1f3e8, testnet3 f4e5f3f4, testnet4 e2b7daaf, regtest dab5bffa.
+static std::vector<std::byte> bch_magic_bytes(bool testnet, bool testnet4, bool regtest)
+{
+    std::string hex;
+    if      (regtest)  hex = "dab5bffa";   // CRegTestParams
+    else if (testnet4) hex = "e2b7daaf";   // CTestNet4Params
+    else if (testnet)  hex = "f4e5f3f4";   // CTestNetParams (testnet3)
+    else               hex = "e3e1f3e8";   // CMainParams
+    return ParseHexBytes(hex);
+}
+
 int run_pool(const std::string& peer_host, uint16_t peer_port, bool testnet,
-             bool regtest, uint32_t anchor_height,
+             bool testnet4, bool regtest, uint32_t anchor_height,
              const std::string& stratum_addr, uint16_t stratum_port,
              const std::string& rpc_conf)
 {
@@ -615,17 +628,14 @@ int run_pool(const std::string& peer_host, uint16_t peer_port, bool testnet,
     bch::Config config("bch");
     // Skip Config::init() (no on-disk pool.yaml/coin.yaml); set only the fields
     // the run-loop touches, from BCH chainparams.
-    config.coin()->m_testnet = testnet || regtest;
+    config.coin()->m_testnet = testnet || testnet4 || regtest;
+    config.coin()->m_testnet4 = testnet4;            // -> BCHChainParams::testnet4() (own genesis 000000001dd4.., magic e2b7daaf)
     config.coin()->m_symbol  = "BCH";
     config.coin()->m_p2p.address = NetService(peer_host, peer_port);
     // BCH P2P network magic (pchMessageStart, BCHN chainparams.cpp): mainnet
     // e3e1f3e8, testnet3 f4e5f3f4, regtest dab5bffa. Wrong magic == BCHN drops
     // the peer with EOF right after connect.
-    config.coin()->m_p2p.prefix = regtest
-        ? std::vector<std::byte>{ std::byte{0xda}, std::byte{0xb5}, std::byte{0xbf}, std::byte{0xfa} }
-        : (testnet
-            ? std::vector<std::byte>{ std::byte{0xf4}, std::byte{0xe5}, std::byte{0xf3}, std::byte{0xf4} }
-            : std::vector<std::byte>{ std::byte{0xe3}, std::byte{0xe1}, std::byte{0xf3}, std::byte{0xe8} });
+    config.coin()->m_p2p.prefix = bch_magic_bytes(testnet, testnet4, regtest);
     // Sharechain identity: BCH p2pool PREFIX namespaces the sharechain P2P
     // framing. standup_pool_run's Node reads pool()->m_prefix.
     config.pool()->m_prefix = ParseHexBytes(bch::PoolConfig::prefix_hex());
@@ -651,7 +661,7 @@ int run_pool(const std::string& peer_host, uint16_t peer_port, bool testnet,
 
     std::cout
         << "[pool] c2pool-bch pool run-loop"
-        << (regtest ? " (regtest)" : (testnet ? " (testnet)" : " (mainnet)"))
+        << (regtest ? " (regtest)" : (testnet4 ? " (testnet4)" : (testnet ? " (testnet)" : " (mainnet)")))
         << " -- BCHN peer " << peer_host << ":" << peer_port
         << ", cold-start anchor=" << anchor_height;
     if (stratum_port)
@@ -662,7 +672,7 @@ int run_pool(const std::string& peer_host, uint16_t peer_port, bool testnet,
 
     try {
         bch::standup_pool_run(ioc, config, anchor_height,
-                              stratum_addr, stratum_port, testnet || regtest, regtest);
+                              stratum_addr, stratum_port, testnet || testnet4 || regtest, regtest);
     } catch (const std::exception& e) {
         std::cout << "[pool] FATAL: " << e.what() << "\n";
         return 1;
@@ -687,6 +697,7 @@ int main(int argc, char** argv)
     uint16_t leg_c_p2p_port = 18444;  // BCHN regtest P2P default
     std::string rpc_conf;
     bool testnet = false;
+    bool testnet4 = false;
     bool near_tip = false;
     bool auto_kick = false;
     std::string host = "192.168.86.110";   // VM300 bchn-bch
@@ -721,6 +732,7 @@ int main(int argc, char** argv)
             leg_c_p2p_port = static_cast<uint16_t>(std::stoul(argv[++i]));
         if (std::strcmp(argv[i], "--rpc-conf") == 0 && i + 1 < argc) rpc_conf = argv[++i];
         if (std::strcmp(argv[i], "--testnet") == 0) { testnet = true; port = 18333; }
+        if (std::strcmp(argv[i], "--testnet4") == 0) { testnet4 = true; port = 28333; }
         if (std::strcmp(argv[i], "--near-tip") == 0) near_tip = true;
         if (std::strcmp(argv[i], "--auto-kick") == 0) auto_kick = true;
         if (std::strcmp(argv[i], "--peer") == 0 && i + 1 < argc) {
@@ -758,7 +770,7 @@ int main(int argc, char** argv)
     }
 
     if (want_pool)
-        return run_pool(host, port, testnet, regtest, anchor_height, stratum_addr, stratum_port, rpc_conf);
+        return run_pool(host, port, testnet, testnet4, regtest, anchor_height, stratum_addr, stratum_port, rpc_conf);
 
     if (want_with_peer_verify)
         return run_with_peer_verify(host, port, testnet, max_seconds);
