@@ -1,0 +1,43 @@
+# VM217 Windows self-hosted readiness probe (ci-steward)
+# Purpose: manual-dispatch-only check of whether c2pool-windows-217 has the
+# toolchain the build.yml `windows` job needs (python + cmake + VS 2022 C++).
+# Gates the follow-up PR that flips build.yml windows: windows-2022 -> VM217.
+# #607 (419ea4cc) reverted that flip because VM217 was bare. This probe tells
+# us if vm-fleet has since provisioned it. NOT wired to push/PR events.
+name: VM217 readiness probe
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    name: VM217 toolchain probe
+    runs-on: [self-hosted, Windows, X64, c2pool-build]
+    steps:
+      - name: Runner + OS
+        shell: pwsh
+        run: |
+          Write-Host "runner.name=${{ runner.name }} env=${{ runner.environment }}"
+          [System.Environment]::OSVersion.VersionString
+      - name: Python
+        shell: pwsh
+        continue-on-error: true
+        run: python --version; pip --version
+      - name: Conan
+        shell: pwsh
+        continue-on-error: true
+        run: conan --version
+      - name: CMake
+        shell: pwsh
+        continue-on-error: true
+        run: cmake --version
+      - name: Git
+        shell: pwsh
+        continue-on-error: true
+        run: git --version
+      - name: MSVC / VS 2022 C++ build tools
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vswhere) {
+            & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          } else { Write-Host "vswhere NOT present -> no VS installer" }
