@@ -1,16 +1,24 @@
 name: DASH gate G3a — populated-regtest block-production
 
-# SCAFFOLD (ci-steward 2026-07-04). Required-gate stub for DASH G3a:
-# spin a populated regtest, drive block production, assert blocks advance and
-# validate. CI plumbing only — NO consensus knowledge here. The actual test
-# lives behind $TEST_ENTRYPOINT, a DOCUMENTED TODO owned by the dash lane.
+# ci-steward 2026-07-04. Required-gate for DASH G3a: assert DASH block
+# assembly + production. CI plumbing only — NO consensus knowledge here. The
+# dash lane owns the harness + the gtest companions.
 #
-# HANDOFF to the dash lane: when the regtest block-production target exists,
-# (1) point TEST_ENTRYPOINT at the real runner, (2) delete
-# `continue-on-error: true` below, and (3) register
-# "DASH gate G3a — populated-regtest block-production" as a required check in
-# the master ruleset. Until then this job is non-required and allow-fail by
-# design: absence of the entrypoint is a neutral skip, never a red.
+# WIRED 2026-07-04 from dash lane HEAD f7c25b43 (targets verified on master
+# 2530888a), two arms:
+#   * CI-only arm (default ON): builds + runs the pure-build gtest companions
+#     test_dash_g3_assembled and test_dash_block_producer via ctest. Keeps the
+#     gate meaningful on runners with no regtest dashd. HOLLOW-PASS GUARD
+#     asserts a nonzero test count (a zero-test ctest run exits 0).
+#   * Populated-regtest arm (default OFF): scripts/${COIN}_g3a_populated_block_regtest.sh
+#     (siblings btc_*/dgb_* already exist — parameterized by COIN=dash). Needs a
+#     regtest dashd standing up on the runner. Flip RUN_G3A_REGTEST=1 once the
+#     runner has a dashd; until then it is a documented, skipped arm.
+#
+# Neutral-skip: if the gtest companions are absent on the branch all steps are
+# skipped and the job is a green no-op. continue-on-error was removed now the
+# entrypoints are real; the job is still NOT a registered required check —
+# that final master-ruleset step stays with the operator.
 
 on:
   push:
@@ -18,25 +26,128 @@ on:
   pull_request:
     branches: [master, dash-spv-embedded]
 
+env:
+  COIN: dash
+  # Flip to '1' once the self-hosted runner has a regtest dashd (dash lane owns
+  # provisioning). Until then the populated-regtest arm is a documented skip and
+  # the CI-only gtest arm carries the gate.
+  RUN_G3A_REGTEST: '0'
+
 jobs:
   g3a-regtest-block-production:
     name: DASH gate G3a — populated-regtest block-production
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
-    continue-on-error: true   # TODO(dash-lane): remove when TEST_ENTRYPOINT lands + gate goes required
-    env:
-      # TODO(dash-lane): repoint at the real regtest block-production runner.
-      TEST_ENTRYPOINT: tests/gates/g3a_regtest_block_production.sh
     steps:
       - uses: actions/checkout@v6
 
-      - name: Run G3a populated-regtest block-production
+      - name: Check G3a companion presence
+        id: presence
         run: |
-          if [ -x "$TEST_ENTRYPOINT" ]; then
-            echo "::notice::G3a entrypoint present ($TEST_ENTRYPOINT) — running regtest block-production."
-            "$TEST_ENTRYPOINT"
-          elif [ -f "$TEST_ENTRYPOINT" ]; then
-            echo "::notice::G3a entrypoint present but not executable ($TEST_ENTRYPOINT) — running via sh."
-            sh "$TEST_ENTRYPOINT"
+          if [ -f "test/test_dash_g3_assembled.cpp" ] && [ -f "test/test_dash_block_producer.cpp" ]; then
+            echo "exists=1" >> "$GITHUB_OUTPUT"
+            echo "::notice::DASH G3a gtest companions present — building + running CI-only arm."
           else
-            echo "::notice::G3a regtest entrypoint not present ($TEST_ENTRYPOINT) — scaffold no-op. Dash lane fills this in; see workflow header."
+            echo "exists=0" >> "$GITHUB_OUTPUT"
+            echo "::notice::DASH G3a companions not on this branch — neutral skip (expected until they land)."
           fi
+
+      - name: Install system dependencies
+        if: steps.presence.outputs.exists == '1' && runner.environment == 'github-hosted'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            g++ cmake make libleveldb-dev libsecp256k1-dev
+
+      - uses: actions/setup-python@v6
+        if: steps.presence.outputs.exists == '1' && runner.environment == 'github-hosted'
+        with: { python-version: '3.12' }
+
+      - name: Install Conan 2
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
+          fi
+
+      - name: Detect Conan profile
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          conan profile detect --force
+          sed -i 's/compiler.cppstd=.*/compiler.cppstd=20/' "$(conan profile path default)"
+
+      - name: Restore Conan cache
+        if: steps.presence.outputs.exists == '1'
+        uses: actions/cache@v5
+        with:
+          path: ~/.conan2
+          key: conan2-ubuntu24-gcc13-dash-g3a-${{ hashFiles('conanfile.txt') }}
+          restore-keys: |
+            conan2-ubuntu24-gcc13-dash-g3a-
+            conan2-ubuntu24-gcc13-
+
+      - name: Clean stale build dir (self-hosted workspace is reused)
+        if: steps.presence.outputs.exists == '1' && runner.environment != 'github-hosted'
+        run: rm -rf build_g3a
+
+      - name: Conan install
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          conan install . \
+            --build=missing \
+            --output-folder=build_g3a \
+            --settings=build_type=Release
+
+      - name: Configure
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          cmake -S . -B build_g3a \
+            -DCMAKE_TOOLCHAIN_FILE=build_g3a/conan_toolchain.cmake \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build G3a gtest companions
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          cmake --build build_g3a --target test_dash_g3_assembled -j$(nproc)
+          cmake --build build_g3a --target test_dash_block_producer -j$(nproc)
+
+      - name: Run G3a CI-only arm (ctest + hollow-pass guard)
+        if: steps.presence.outputs.exists == '1'
+        working-directory: build_g3a
+        run: |
+          # CI-only companions (dash lane f7c25b43): pure-build, no regtest dashd.
+          set +e
+          OUT="$(ctest -R '^(test_dash_g3_assembled|test_dash_block_producer)$' --output-on-failure 2>&1)"
+          RC=$?
+          set -e
+          printf '%s\n' "$OUT"
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::G3a CI-only arm reported test failures (ctest rc=$RC)."
+            exit 1
+          fi
+          # HOLLOW-PASS GUARD: a zero-test ctest run exits 0 — require nonzero N.
+          N="$(printf '%s\n' "$OUT" | sed -n 's/.*out of \([0-9][0-9]*\).*/\1/p' | tail -1)"
+          if [ -z "$N" ] || [ "$N" -eq 0 ]; then
+            echo "::error::G3a HOLLOW-PASS GUARD tripped — ctest matched 0 companion tests. Refusing green on a zero-test run."
+            exit 1
+          fi
+          echo "::notice::G3a CI-only arm green — $N companion test(s) executed and passed."
+
+      - name: Run G3a populated-regtest arm (COIN=${{ env.COIN }})
+        if: steps.presence.outputs.exists == '1' && env.RUN_G3A_REGTEST == '1'
+        run: |
+          # TEST_ENTRYPOINT (dash lane f7c25b43): scripts/${COIN}_g3a_populated_block_regtest.sh
+          HARNESS="scripts/${COIN}_g3a_populated_block_regtest.sh"
+          if [ ! -f "$HARNESS" ]; then
+            echo "::error::G3a regtest arm ON but harness missing: $HARNESS"
+            exit 1
+          fi
+          echo "::notice::G3a populated-regtest arm — running $HARNESS (needs a regtest ${COIN}d)."
+          chmod +x "$HARNESS" || true
+          "./$HARNESS"
+
+      - name: Note skipped regtest arm
+        if: steps.presence.outputs.exists == '1' && env.RUN_G3A_REGTEST != '1'
+        run: echo "::notice::G3a populated-regtest arm is OFF (RUN_G3A_REGTEST=0) — no regtest ${COIN}d provisioned yet. CI-only gtest arm carried the gate. Dash lane flips this ON when a dashd is available."
