@@ -25,7 +25,9 @@
 #include <core/uint256.hpp>
 #include <core/coin/utxo_view_cache.hpp>
 
+#include <algorithm>
 #include <cstdint>
+#include <vector>
 
 using dash::coin::Mempool;
 using dash::coin::MutableTransaction;
@@ -253,4 +255,64 @@ TEST(DashMempool, SortedSelectionHighestFeerateFirst)
         << "highest feerate must come first";
     EXPECT_EQ(dash_txid(selected[1].tx), dash_txid(tx_lo));
     EXPECT_EQ(total_fees, 11'000u);
+}
+
+// ─── G1 byte-parity: equal-feerate selection is deterministic ────────────────
+//
+// The embedded GBT template builder serializes txs in the order
+// get_sorted_txs_with_fees() returns them. For txs sharing the SAME
+// feerate the old std::multimap<double,uint256> kept them in mempool
+// INSERTION order, so two nodes with the same mempool contents but a
+// different arrival order produced different template bytes — a
+// non-deterministic seam that breaks G1 byte-parity against the
+// p2pool-dash / dashcore oracle. FeeKey now breaks feerate ties by txid
+// ascending (matches dashcore CompareTxMemPoolEntryByAncestorFee's
+// GetHash() tiebreak), so the projection is byte-reproducible.
+//
+// This KAT pins that: identical equal-feerate sets added in OPPOSITE
+// orders must yield the SAME selection, ordered by txid ascending.
+static std::vector<uint256> equal_feerate_selection(bool reverse_insertion)
+{
+    UTXOViewCache utxo(nullptr);
+    // 5 distinct prevouts, identical value ⇒ identical fee & base_size
+    // ⇒ identical feerate for every spend below.
+    constexpr int N = 5;
+    std::vector<MutableTransaction> txs;
+    for (int i = 0; i < N; ++i) {
+        uint256 prev = mint_hash(200 + i);
+        utxo.add_coin(Outpoint(prev, 0), Coin(100'000, {}, 1, false));
+        txs.push_back(make_spend(prev, 0, /*out=*/95'000, /*salt=*/300 + i)); // fee 5000
+    }
+
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    if (reverse_insertion)
+        for (auto it = txs.rbegin(); it != txs.rend(); ++it) EXPECT_TRUE(mp.add_tx(*it));
+    else
+        for (auto& t : txs) EXPECT_TRUE(mp.add_tx(t));
+
+    auto [selected, total_fees] = mp.get_sorted_txs_with_fees(/*max_bytes=*/1u << 20);
+    EXPECT_EQ(total_fees, static_cast<uint64_t>(N) * 5'000u);
+    std::vector<uint256> out;
+    for (auto& s : selected) out.push_back(dash_txid(s.tx));
+    return out;
+}
+
+TEST(DashMempool, EqualFeerateSelectionIsTxidAscendingAndInsertionOrderIndependent)
+{
+    auto forward = equal_feerate_selection(/*reverse_insertion=*/false);
+    auto reverse = equal_feerate_selection(/*reverse_insertion=*/true);
+
+    ASSERT_EQ(forward.size(), 5u);
+    ASSERT_EQ(reverse.size(), 5u);
+
+    // Insertion order must not affect the projected order.
+    EXPECT_EQ(forward, reverse)
+        << "equal-feerate tx order must be independent of mempool arrival order";
+
+    // And that stable order is txid ascending (dashcore GetHash() tiebreak).
+    auto sorted = forward;
+    std::sort(sorted.begin(), sorted.end());
+    EXPECT_EQ(forward, sorted)
+        << "equal-feerate ties must resolve to txid-ascending, oracle-conformant order";
 }

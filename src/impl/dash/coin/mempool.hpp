@@ -49,6 +49,7 @@
 #include <cstdint>
 #include <ctime>
 #include <map>
+#include <set>
 #include <mutex>
 #include <optional>
 #include <utility>
@@ -69,6 +70,21 @@ struct MempoolEntry {
         return (fee_known && base_size > 0)
             ? static_cast<double>(fee) / base_size
             : 0.0;
+    }
+};
+
+/// Deterministic block-template selection key. Sorts highest-feerate
+/// first; ties broken by txid ascending. This makes
+/// get_sorted_txs_with_fees byte-reproducible across nodes/runs
+/// (equal-feerate txs no longer depend on mempool insertion order) and
+/// matches dashcore BlockAssembler ordering
+/// (CompareTxMemPoolEntryByAncestorFee breaks feerate ties by GetHash()).
+struct FeeKey {
+    double  feerate;
+    uint256 txid;
+    bool operator<(const FeeKey& o) const {
+        if (feerate != o.feerate) return feerate > o.feerate; // higher feerate first
+        return txid < o.txid;                                 // txid asc tiebreak (oracle-conformant)
     }
 };
 
@@ -139,7 +155,7 @@ public:
         // recompute_unknown_fees() resolves them after a UTXO update.
         // Uses negative feerate as the multimap key so begin() = best.
         if (stored.fee_known) {
-            m_feerate_index.emplace(stored.feerate_satvb(), txid);
+            m_feerate_index.insert(FeeKey{stored.feerate_satvb(), txid});
         }
 
         // Periodic stats — every 100 entries + first 5 + every eviction.
@@ -243,7 +259,7 @@ public:
         for (auto& [txid, entry] : m_pool) {
             if (entry.fee_known) continue;
             if (compute_fee_locked(entry, utxo)) {
-                m_feerate_index.emplace(entry.feerate_satvb(), txid);
+                m_feerate_index.insert(FeeKey{entry.feerate_satvb(), txid});
                 resolved_fees += entry.fee;
                 ++resolved;
             } else {
@@ -346,8 +362,8 @@ public:
         uint32_t total_bytes = 0;
         auto* utxo = m_utxo.load();
 
-        for (const auto& [feerate, txid] : m_feerate_index) {
-            (void)feerate;
+        for (const auto& fk : m_feerate_index) {
+            const uint256& txid = fk.txid;
             auto pit = m_pool.find(txid);
             if (pit == m_pool.end()) continue;
             const auto& entry = pit->second;
@@ -388,7 +404,7 @@ private:
     std::map<std::pair<uint256, uint32_t>, uint256>    m_spent_outputs;
     // Step 2: feerate-sorted index. greater<double> means begin() =
     // highest feerate, so iteration is best-first.
-    std::multimap<double, uint256, std::greater<double>> m_feerate_index;
+    std::set<FeeKey>                                   m_feerate_index;
     size_t                                             m_total_bytes{0};
     size_t                                             m_max_bytes;
     time_t                                             m_expiry_sec;
@@ -415,13 +431,7 @@ private:
 
         // Drop from feerate index (only present if fee was known).
         if (it->second.fee_known) {
-            auto frng = m_feerate_index.equal_range(it->second.feerate_satvb());
-            for (auto rit = frng.first; rit != frng.second; ++rit) {
-                if (rit->second == txid) {
-                    m_feerate_index.erase(rit);
-                    break;
-                }
-            }
+            m_feerate_index.erase(FeeKey{it->second.feerate_satvb(), txid});
         }
 
         // Drop from spent-outputs index.
