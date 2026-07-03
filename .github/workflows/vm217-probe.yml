@@ -7,6 +7,9 @@
 name: VM217 readiness probe
 on:
   workflow_dispatch:
+  push:
+    branches: [ci-steward/vm217-readiness-probe]
+    paths: [.github/workflows/vm217-probe.yml]
 jobs:
   probe:
     name: VM217 toolchain probe
