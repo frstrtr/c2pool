@@ -644,6 +644,35 @@ int run_node(const core::CoinParams& params, bool testnet,
         header_chain, mempool, testnet, std::move(stratum_submit_fn),
         params.subsidy_func);
 
+    // -- Stage 4b/4c GBT-forward bind: daemon getblocktemplate -> work template
+    // When --coin-rpc arms `rpc` (isolated testnet / mainnet), forward
+    // digibyted's AUTHORITATIVE getblocktemplate into the work source:
+    // select_work_template() then serves the daemon's real
+    // bits/version/previousblockhash AND its mempool transactions[] (a POPULATED
+    // block), with coinbasevalue reconciled through the one #207 SSOT. Unbound
+    // (no --coin-rpc) -> nullopt -> byte-identical pre-wire embedded path. The
+    // submit_block_hex RPC fallback is untouched and MUST PERSIST. rpc.get() is a
+    // non-owning raw ptr; rpc, work_source and the StratumServer share this scope
+    // and tear down together (same lifetime as the coin_node rpc.get() capture).
+    if (rpc) {
+        auto* rpc_raw = rpc.get();
+        work_source->set_external_gbt_fn(
+            [rpc_raw]() -> std::optional<nlohmann::json> {
+                try {
+                    return rpc_raw->getblocktemplate({"segwit"});
+                } catch (const std::exception& e) {
+                    std::cout << "[DGB] 4b/4c GBT-forward: getblocktemplate FAILED ("
+                              << e.what()
+                              << ") - serving embedded template this round"
+                              << std::endl;
+                    return std::nullopt;
+                }
+            });
+        std::cout << "[DGB] 4b/4c GBT-forward: bound digibyted getblocktemplate "
+                     "into stratum work template (populated-block path)"
+                  << std::endl;
+    }
+
     // -- Phase-B producer bind: per-connection coinbase PPLNS inputs ----------
     // Bind DGBWorkSource::set_pplns_inputs_fn -- the SOLE empty-jobs seam. While
     // unbound, build_connection_coinbase() returns an empty job (pre-wire stub);
