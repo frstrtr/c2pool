@@ -737,13 +737,18 @@ jobs:
         with: { python-version: '3.12' }
 
       - name: Install Conan 2
-        shell: bash
+        # VM217 self-hosted has no bash on the runner-service PATH (git.exe is
+        # present but Git-bash is not) -> shell:bash gave "bash: command not
+        # found". Conan 2 IS provisioned on VM217 (probe run 28679257030).
+        # PowerShell works on both lanes (VM217 has Windows PowerShell; the
+        # fork-fallback windows-2022 has it too).
+        shell: powershell
         run: |
-          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+          if ("${{ runner.environment }}" -eq "github-hosted") {
             pip install "conan>=2.0,<3.0"
-          else
-            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
-          fi
+          } else {
+            conan --version   # pre-provisioned on VM217 self-hosted
+          }
 
       - name: Detect Conan profile
         run: |
