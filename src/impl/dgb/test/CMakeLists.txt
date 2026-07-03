@@ -664,7 +664,9 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_compile_definitions(dgb_aux_doge_submit_test PRIVATE AUX_DOGE)
     target_link_libraries(dgb_aux_doge_submit_test PRIVATE
         GTest::gtest_main GTest::gtest
-        core dgb)
+        core dgb ltc_coin
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
     gtest_add_tests(dgb_aux_doge_submit_test "" AUTO)
 
     # --- DGB+DOGE (phase DC) -- EMBED LIVE-WIRE KAT ((b) ruling, UID:3134) ------
