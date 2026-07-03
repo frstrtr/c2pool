@@ -1,0 +1,42 @@
+name: DASH gate G3a — populated-regtest block-production
+
+# SCAFFOLD (ci-steward 2026-07-04). Required-gate stub for DASH G3a:
+# spin a populated regtest, drive block production, assert blocks advance and
+# validate. CI plumbing only — NO consensus knowledge here. The actual test
+# lives behind $TEST_ENTRYPOINT, a DOCUMENTED TODO owned by the dash lane.
+#
+# HANDOFF to the dash lane: when the regtest block-production target exists,
+# (1) point TEST_ENTRYPOINT at the real runner, (2) delete
+# `continue-on-error: true` below, and (3) register
+# "DASH gate G3a — populated-regtest block-production" as a required check in
+# the master ruleset. Until then this job is non-required and allow-fail by
+# design: absence of the entrypoint is a neutral skip, never a red.
+
+on:
+  push:
+    branches: [master, dash-spv-embedded]
+  pull_request:
+    branches: [master, dash-spv-embedded]
+
+jobs:
+  g3a-regtest-block-production:
+    name: DASH gate G3a — populated-regtest block-production
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    continue-on-error: true   # TODO(dash-lane): remove when TEST_ENTRYPOINT lands + gate goes required
+    env:
+      # TODO(dash-lane): repoint at the real regtest block-production runner.
+      TEST_ENTRYPOINT: tests/gates/g3a_regtest_block_production.sh
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Run G3a populated-regtest block-production
+        run: |
+          if [ -x "$TEST_ENTRYPOINT" ]; then
+            echo "::notice::G3a entrypoint present ($TEST_ENTRYPOINT) — running regtest block-production."
+            "$TEST_ENTRYPOINT"
+          elif [ -f "$TEST_ENTRYPOINT" ]; then
+            echo "::notice::G3a entrypoint present but not executable ($TEST_ENTRYPOINT) — running via sh."
+            sh "$TEST_ENTRYPOINT"
+          else
+            echo "::notice::G3a regtest entrypoint not present ($TEST_ENTRYPOINT) — scaffold no-op. Dash lane fills this in; see workflow header."
+          fi

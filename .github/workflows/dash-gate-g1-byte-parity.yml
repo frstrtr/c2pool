@@ -1,0 +1,46 @@
+name: DASH gate G1 — byte-parity KAT
+
+# SCAFFOLD (ci-steward 2026-07-04). Required-gate stub for DASH G1:
+# byte-for-byte Known-Answer-Test parity of consensus-serialized structures
+# against the reference vectors. This is CI plumbing only — it carries NO
+# consensus knowledge. The actual test lives behind $TEST_ENTRYPOINT, which
+# is a DOCUMENTED TODO owned by the dash lane.
+#
+# HANDOFF to the dash lane: when the KAT target exists, (1) point
+# TEST_ENTRYPOINT at the real runner (script or built binary), (2) delete
+# `continue-on-error: true` below, and (3) register
+# "DASH gate G1 — byte-parity KAT" as a required check in the master ruleset.
+# Until (1)-(3), this job is non-required and allow-fail by design: absence of
+# the entrypoint is a neutral skip, never a red.
+
+on:
+  push:
+    branches: [master, dash-spv-embedded]
+  pull_request:
+    branches: [master, dash-spv-embedded]
+
+jobs:
+  g1-byte-parity-kat:
+    name: DASH gate G1 — byte-parity KAT
+    # Same fork-gate as coin-matrix: internal PRs/pushes use the self-hosted
+    # pool; forks fall back to github-hosted so external contributors are not
+    # blocked on self-hosted capacity.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    continue-on-error: true   # TODO(dash-lane): remove when TEST_ENTRYPOINT lands + gate goes required
+    env:
+      # TODO(dash-lane): repoint at the real KAT runner once the target exists.
+      TEST_ENTRYPOINT: tests/gates/g1_byte_parity_kat.sh
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Run G1 byte-parity KAT
+        run: |
+          if [ -x "$TEST_ENTRYPOINT" ]; then
+            echo "::notice::G1 entrypoint present ($TEST_ENTRYPOINT) — running byte-parity KAT."
+            "$TEST_ENTRYPOINT"
+          elif [ -f "$TEST_ENTRYPOINT" ]; then
+            echo "::notice::G1 entrypoint present but not executable ($TEST_ENTRYPOINT) — running via sh."
+            sh "$TEST_ENTRYPOINT"
+          else
+            echo "::notice::G1 KAT entrypoint not present ($TEST_ENTRYPOINT) — scaffold no-op. Dash lane fills this in; see workflow header."
+          fi
