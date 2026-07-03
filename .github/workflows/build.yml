@@ -733,6 +733,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: actions/setup-python@v6
+        if: ${{ runner.environment == 'github-hosted' }}
         with: { python-version: '3.12' }
 
       - name: Install Conan 2
