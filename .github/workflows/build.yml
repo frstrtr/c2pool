@@ -756,7 +756,7 @@ jobs:
           # CommandNotFoundException even though Python 3.12 is present. Install
           # unconditionally and export the pip Scripts dir(s) via GITHUB_PATH so
           # this step and later steps (Detect profile / Conan install) resolve it.
-          pip install "conan>=2.0,<3.0"
+          python -m pip install "conan>=2.0,<3.0"
           $scripts = & python -c "import sysconfig; print(sysconfig.get_path(scripts))"
           $userScripts = & python -c "import sysconfig; print(sysconfig.get_path(scripts,nt_user))"
           $env:PATH = "$scripts;$userScripts;$env:PATH"
