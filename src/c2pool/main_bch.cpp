@@ -74,7 +74,7 @@ void print_banner(const char* argv0)
         << "       " << argv0 << " --with-peer-verify [--testnet] [--peer HOST:PORT] [--max-seconds N]\n"
         << "       " << argv0 << " --leg-c-capture [--rpc-conf PATH]\n"
         << "       " << argv0 << " --leg-c-capture-p2p [--rpc-conf PATH] [--p2p-port N]\n"
-        << "       " << argv0 << " --pool [--testnet|--regtest] [--stratum [HOST:]PORT] [--peer HOST:PORT] [--anchor N]\n\n"
+        << "       " << argv0 << " --pool [--testnet|--regtest] [--stratum [HOST:]PORT] [--peer HOST:PORT] [--anchor N] [--rpc-conf PATH]\n\n"
         << "Status: M5 pool/sharechain + embedded-daemon assembly live.\n"
         << "        The embedded daemon (coin/embedded_daemon.hpp) is the primary\n"
         << "        work source; external BCHN-RPC stays as the fallback.\n"
@@ -605,7 +605,8 @@ int run_leg_c_capture_p2p(const std::string& conf_path, uint16_t p2p_port)
 // share/PPLNS/coinbase/PoW bytes. PER-COIN ISOLATION: src/impl/bch only.
 int run_pool(const std::string& peer_host, uint16_t peer_port, bool testnet,
              bool regtest, uint32_t anchor_height,
-             const std::string& stratum_addr, uint16_t stratum_port)
+             const std::string& stratum_addr, uint16_t stratum_port,
+             const std::string& rpc_conf)
 {
     boost::asio::io_context ioc;
 
@@ -628,6 +629,25 @@ int run_pool(const std::string& peer_host, uint16_t peer_port, bool testnet,
     // Sharechain identity: BCH p2pool PREFIX namespaces the sharechain P2P
     // framing. standup_pool_run's Node reads pool()->m_prefix.
     config.pool()->m_prefix = ParseHexBytes(bch::PoolConfig::prefix_hex());
+
+    // External BCHN-RPC fallback endpoint (v36 external_fallback invariant): the
+    // embedded daemon is the PRIMARY work source, but coin::Node::init_rpc still
+    // binds the external RPC as the fallback sink + eager getwork prime. run_pool
+    // builds config by hand (no YAML load), so m_rpc stays unset -- and an unset
+    // endpoint yields "Connection refused", leaving only the embedded leg. Load
+    // host:port + creds from --rpc-conf (operator node, e.g. testnet4 :28332).
+    if (!rpc_conf.empty()) {
+        RegtestRpcConf rc;
+        if (load_rpc_conf(rpc_conf, rc)) {
+            config.coin()->m_rpc.address  = NetService(std::string("127.0.0.1"), rc.port);
+            config.coin()->m_rpc.userpass = rc.user + ":" + rc.pass;
+            std::cout << "[pool] external BCHN-RPC fallback -> 127.0.0.1:" << rc.port
+                      << " (from " << rpc_conf << ")\n";
+        } else {
+            std::cout << "[pool] WARN: --rpc-conf " << rpc_conf
+                      << " has no rpcuser/rpcpassword; RPC fallback endpoint unset\n";
+        }
+    }
 
     std::cout
         << "[pool] c2pool-bch pool run-loop"
@@ -738,7 +758,7 @@ int main(int argc, char** argv)
     }
 
     if (want_pool)
-        return run_pool(host, port, testnet, regtest, anchor_height, stratum_addr, stratum_port);
+        return run_pool(host, port, testnet, regtest, anchor_height, stratum_addr, stratum_port, rpc_conf);
 
     if (want_with_peer_verify)
         return run_with_peer_verify(host, port, testnet, max_seconds);
