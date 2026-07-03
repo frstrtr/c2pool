@@ -746,16 +746,23 @@ jobs:
       - name: Install Conan 2
         # VM217 self-hosted has no bash on the runner-service PATH (git.exe is
         # present but Git-bash is not) -> shell:bash gave "bash: command not
-        # found". Conan 2 IS provisioned on VM217 (probe run 28679257030).
+        # found". Conan 2 is pip-installed here (VM217 does not expose it on
         # PowerShell works on both lanes (VM217 has Windows PowerShell; the
         # fork-fallback windows-2022 has it too). Inherits the job-level
         # ExecutionPolicy-Bypass shell (see defaults above).
         run: |
-          if ("${{ runner.environment }}" -eq "github-hosted") {
-            pip install "conan>=2.0,<3.0"
-          } else {
-            conan --version   # pre-provisioned on VM217 self-hosted
-          }
+          # VM217 runner-service PATH does NOT include conan: pip drops it in a
+          # Scripts dir that is not on PATH, so "conan --version" hit
+          # CommandNotFoundException even though Python 3.12 is present. Install
+          # unconditionally and export the pip Scripts dir(s) via GITHUB_PATH so
+          # this step and later steps (Detect profile / Conan install) resolve it.
+          pip install "conan>=2.0,<3.0"
+          $scripts = & python -c "import sysconfig; print(sysconfig.get_path(scripts))"
+          $userScripts = & python -c "import sysconfig; print(sysconfig.get_path(scripts,nt_user))"
+          $env:PATH = "$scripts;$userScripts;$env:PATH"
+          Add-Content -Path $env:GITHUB_PATH -Value $scripts
+          Add-Content -Path $env:GITHUB_PATH -Value $userScripts
+          conan --version
 
       - name: Detect Conan profile
         run: |
