@@ -16,28 +16,28 @@ jobs:
     runs-on: [self-hosted, Windows, X64, c2pool-build]
     steps:
       - name: Runner + OS
-        shell: pwsh
+        shell: powershell
         run: |
           Write-Host "runner.name=${{ runner.name }} env=${{ runner.environment }}"
           [System.Environment]::OSVersion.VersionString
       - name: Python
-        shell: pwsh
+        shell: powershell
         continue-on-error: true
         run: python --version; pip --version
       - name: Conan
-        shell: pwsh
+        shell: powershell
         continue-on-error: true
         run: conan --version
       - name: CMake
-        shell: pwsh
+        shell: powershell
         continue-on-error: true
         run: cmake --version
       - name: Git
-        shell: pwsh
+        shell: powershell
         continue-on-error: true
         run: git --version
       - name: MSVC / VS 2022 C++ build tools
-        shell: pwsh
+        shell: powershell
         continue-on-error: true
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
