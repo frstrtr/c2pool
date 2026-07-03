@@ -15,7 +15,7 @@
 //   * NO merged-mining / AuxPoW — BCH is a SHA256d standalone-parent chain.
 //     The header carries no aux paths; nothing BTC-specific to omit.
 //   * verify_pool runs SHA256d share PoW verification (NOT scrypt).
-//   * LevelDB storage net name: "bitcoincash" / "bitcoincash_testnet".
+//   * LevelDB storage net name: "bitcoincash" / "bitcoincash_testnet" / "bitcoincash_testnet4".
 //
 // This is a header-only slice (declarations only); node.cpp body lands later.
 
@@ -359,7 +359,12 @@ public:
         m_chain = &m_tracker.chain;
 
         // Open LevelDB storage and load any persisted shares
-        std::string net_name = config->m_testnet ? "bitcoincash_testnet" : "bitcoincash";
+        // testnet4 gets its OWN LevelDB namespace so its sharechain never collides
+        // with testnet3 under the shared m_testnet flag (main_bch.cpp sets m_testnet
+        // true for testnet3|testnet4|regtest). Isolation-primitive: keep per-net.
+        std::string net_name = config->m_testnet4 ? "bitcoincash_testnet4"
+                             : config->m_testnet  ? "bitcoincash_testnet"
+                                                  : "bitcoincash";
         m_storage = std::make_unique<c2pool::storage::SharechainStorage>(net_name);
         load_persisted_shares();
 
