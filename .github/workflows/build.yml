@@ -729,6 +729,13 @@ jobs:
     # windows-2022 (ships cmake + MSVC/VS 2022 + SDK). Completes the #439
     # self-hosted migration -- Windows was the last GitHub-hosted C++ lane.
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Windows","X64","c2pool-build"]') || 'windows-2022' }}
+    defaults:
+      run:
+        # VM217 Windows PowerShell runs at ExecutionPolicy=Restricted, so the
+        # runner cannot source its temp .ps1 command files (PSSecurityException
+        # / UnauthorizedAccess). Bypass shell proven green by probe 28679257030.
+        # Applies to every PowerShell run step below; cmd steps override locally.
+        shell: powershell -ExecutionPolicy Bypass -Command ". '{0}'"
     steps:
       - uses: actions/checkout@v6
 
@@ -741,8 +748,8 @@ jobs:
         # present but Git-bash is not) -> shell:bash gave "bash: command not
         # found". Conan 2 IS provisioned on VM217 (probe run 28679257030).
         # PowerShell works on both lanes (VM217 has Windows PowerShell; the
-        # fork-fallback windows-2022 has it too).
-        shell: powershell
+        # fork-fallback windows-2022 has it too). Inherits the job-level
+        # ExecutionPolicy-Bypass shell (see defaults above).
         run: |
           if ("${{ runner.environment }}" -eq "github-hosted") {
             pip install "conan>=2.0,<3.0"
