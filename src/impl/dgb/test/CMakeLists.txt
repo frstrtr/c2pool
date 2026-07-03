@@ -651,6 +651,59 @@ if (BUILD_TESTING AND GTest_FOUND)
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_aux_broadcast_path_election_test "" AUTO)
+    # --- DGB+DOGE (phase DC) -- SUBMIT-half KAT ((b) ruling, UID:3130) ---------
+    # Companion to dgb_aux_doge_dc_proof_test: pins that a won DOGE-aux block is
+    # submitted FROM DGBS OWN dispatch, RPC-only, through a DGB-owned dogecoind
+    # seam DISTINCT from the digibyted parent seam, consuming the shared doge
+    # module read-side-only. Header-only under test (aux_doge_submit.hpp), so it
+    # needs no doge/merged link -- only core (ICoinNode/WorkView) + dgb. The header
+    # is #ifdef AUX_DOGE-gated (parity with coin/node.hpp), so this TU defines
+    # AUX_DOGE locally to stay build-verifiable in the normal test leg. MUST appear
+    # in BOTH this registration AND the build.yml --target allowlist (#143 trap).
+    add_executable(dgb_aux_doge_submit_test aux_doge_submit_test.cpp)
+    target_compile_definitions(dgb_aux_doge_submit_test PRIVATE AUX_DOGE)
+    target_link_libraries(dgb_aux_doge_submit_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb ltc_coin
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_aux_doge_submit_test "" AUTO)
+
+    # --- DGB+DOGE (phase DC) -- EMBED LIVE-WIRE KAT ((b) ruling, UID:3134) ------
+    # Closes the embed<->submit seam: pins that the auxpow_hex the submit half
+    # frames is the PARENT-SIDE build_auxpow_proof derivation over the MINTED,
+    # DOGE-commitment-carrying coinbase (the runtime getauxblock-seam image), not
+    # a hand-fixtured parallel. Includes the AUX_DOGE-gated submit header, so it
+    # defines AUX_DOGE locally and links the merged producer + ltc_coin like the
+    # dc_proof sibling. MUST appear in BOTH this registration AND the build.yml
+    # --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_aux_doge_embed_livewire_test aux_doge_embed_livewire_test.cpp)
+    target_compile_definitions(dgb_aux_doge_embed_livewire_test PRIVATE AUX_DOGE)
+    target_link_libraries(dgb_aux_doge_embed_livewire_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb ltc_coin
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_aux_doge_embed_livewire_test "" AUTO)
+
+    # --- DGB+DOGE (phase DC) -- ASSEMBLED-BLOCK LAYOUT VERIFIER KAT ------------
+    # ltc-doge un-fence contract (2026-07-02): pins the DC verifier to the
+    # AUTHORITATIVE assembled DOGE-submit-block layout (header80||auxpow||varint
+    # ||coinbase||tmpl_txs), the auxpow field order vs the build_auxpow_proof
+    # SSOT, AUXPOW_CHAIN_ID 0x0062, and the UNCONDITIONAL primary-path relay
+    # semantic -- so the deferred /tmp/c2pool_doge_block_<h>.hex capture matches
+    # by construction. Consume-only: neutral producer + shared chain param, no
+    # merged_mining.*/doge edits. Defines AUX_DOGE locally + links the merged
+    # producer & ltc_coin like the dc_proof sibling. MUST appear in BOTH this
+    # registration AND the build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_aux_doge_dc_layout_verifier_test aux_doge_dc_layout_verifier_test.cpp)
+    target_compile_definitions(dgb_aux_doge_dc_layout_verifier_test PRIVATE AUX_DOGE)
+    target_link_libraries(dgb_aux_doge_dc_layout_verifier_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb ltc_coin
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_aux_doge_dc_layout_verifier_test "" AUTO)
 
     # dgb_share_target_genesis_test: FENCED KAT pinning ShareTracker::compute_
     # share_target genesis/unknown-prev clamp to [MAX_TARGET/30, MAX_TARGET] vs
