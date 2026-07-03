@@ -88,7 +88,7 @@ jobs:
                     test_threading test_weights \
                     test_header_chain test_mempool test_template_builder \
                     test_doge_chain test_compact_blocks test_dash_x11_kat \
-                    test_dash_header_chain test_dash_block_replay test_dash_conformance test_dash_subsidy test_dash_mempool test_dash_simplifiedmns test_dash_quorum test_dash_quorum_root test_dash_mn_state test_dash_embedded_gbt test_dash_smldiff test_dash_p2p_messages test_dash_p2p_connection test_dash_p2p_node test_dash_node_interface test_dash_config test_dash_broadcaster test_dash_broadcaster_full test_dash_share_hash_link test_dash_block_relay test_dash_rpc_request test_dash_rpc_conf test_dash_block_producer test_dash_embedded_relay_e2e test_dash_block_relay_plan test_dash_version_activation_latch test_dash_block_relay_binding test_dash_block_relay_dual_arm test_dash_coinbase_parity test_dash_donation_combined test_dash_g3_assembled test_dash_work_target test_dash_work_job_targets test_dash_cb_payee test_dash_poolnode_messages test_dash_share_tracker test_dash_node \
+                    test_dash_header_chain test_dash_block_replay test_dash_conformance test_dash_subsidy test_dash_mempool test_dash_simplifiedmns test_dash_quorum test_dash_quorum_root test_dash_mn_state test_dash_embedded_gbt test_dash_smldiff test_dash_p2p_messages test_dash_p2p_connection test_dash_p2p_node test_dash_node_interface test_dash_config test_dash_broadcaster test_dash_broadcaster_full test_dash_share_hash_link test_dash_block_relay test_dash_rpc_request test_dash_rpc_conf test_dash_block_producer test_dash_embedded_relay_e2e test_dash_block_relay_plan test_dash_version_activation_latch test_dash_block_relay_binding test_dash_block_relay_dual_arm test_dash_coinbase_parity test_dash_donation_combined test_dash_g3_assembled test_dash_work_target test_dash_work_job_targets test_dash_cb_payee test_dash_poolnode_messages test_dash_peer test_dash_share_tracker test_dash_node \
                     test_multiaddress_pplns test_pplns_stress \
                     test_hash_link test_decay_pplns \
                     test_pplns_consensus \
@@ -238,7 +238,7 @@ jobs:
                     test_threading test_weights \
                     test_header_chain test_mempool test_template_builder \
                     test_doge_chain test_compact_blocks test_dash_x11_kat \
-                    test_dash_header_chain test_dash_block_replay test_dash_conformance test_dash_subsidy test_dash_mempool test_dash_simplifiedmns test_dash_quorum test_dash_quorum_root test_dash_mn_state test_dash_embedded_gbt test_dash_smldiff test_dash_p2p_messages test_dash_p2p_connection test_dash_p2p_node test_dash_node_interface test_dash_config test_dash_broadcaster test_dash_broadcaster_full test_dash_share_hash_link test_dash_block_relay test_dash_rpc_request test_dash_rpc_conf test_dash_block_producer test_dash_embedded_relay_e2e test_dash_block_relay_plan test_dash_version_activation_latch test_dash_block_relay_binding test_dash_block_relay_dual_arm test_dash_coinbase_parity test_dash_donation_combined test_dash_g3_assembled test_dash_work_target test_dash_work_job_targets test_dash_cb_payee test_dash_poolnode_messages test_dash_share_tracker test_dash_node \
+                    test_dash_header_chain test_dash_block_replay test_dash_conformance test_dash_subsidy test_dash_mempool test_dash_simplifiedmns test_dash_quorum test_dash_quorum_root test_dash_mn_state test_dash_embedded_gbt test_dash_smldiff test_dash_p2p_messages test_dash_p2p_connection test_dash_p2p_node test_dash_node_interface test_dash_config test_dash_broadcaster test_dash_broadcaster_full test_dash_share_hash_link test_dash_block_relay test_dash_rpc_request test_dash_rpc_conf test_dash_block_producer test_dash_embedded_relay_e2e test_dash_block_relay_plan test_dash_version_activation_latch test_dash_block_relay_binding test_dash_block_relay_dual_arm test_dash_coinbase_parity test_dash_donation_combined test_dash_g3_assembled test_dash_work_target test_dash_work_job_targets test_dash_cb_payee test_dash_poolnode_messages test_dash_peer test_dash_share_tracker test_dash_node \
                     test_hash_link test_decay_pplns \
                     test_pplns_consensus \
                     test_v36_script_sorting test_v36_cross_impl_refhash \
@@ -343,6 +343,7 @@ jobs:
                     bch_genesis_conformance_test bch_abla_growth_soak_test \
                     bch_coinbase_kat_segwit_predicate_test \
                     bch_coinbase_kat_bytevector_test \
+                    bch_coinbase_author_kat_test \
                     bch_cashtokens_transparency_test \
                     bch_block_connector_test bch_block_ordering_test \
                     bch_utxo_connect_test bch_reorg_connect_test bch_reorg_rerequest_test \
@@ -436,6 +437,7 @@ jobs:
                     bch_genesis_conformance_test bch_abla_growth_soak_test \
                     bch_coinbase_kat_segwit_predicate_test \
                     bch_coinbase_kat_bytevector_test \
+                    bch_coinbase_author_kat_test \
                     bch_cashtokens_transparency_test \
                     bch_block_connector_test bch_block_ordering_test \
                     bch_utxo_connect_test bch_reorg_connect_test bch_reorg_rerequest_test \
@@ -467,10 +469,9 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   web-static:
     name: Web-static verify
-    # Pin to GitHub-hosted: sub-minute JS job needs no self-hosted compute,
-    # and the puppeteer pixel harness cannot complete page navigation in the
-    # self-hosted runner env (DOMContentLoaded never fires within 15s).
-    runs-on: ubuntu-24.04
+    # Route to self-hosted for trusted events; fork PRs fall back to
+    # GitHub-hosted ubuntu-24.04 (never run untrusted fork code self-hosted).
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     defaults:
       run:
         working-directory: web-static/sharechain-explorer
@@ -721,11 +722,12 @@ jobs:
     # dash-slice campaign: skip Windows for PRs carrying the dash-linux-only label (re-enabled at block-viable gate, ~07-01)
     if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-linux-only')) }}
     # GitHub-hosted windows-2022 (ships cmake + MSVC/VS 2022 + the SDK).
-    # VM217 (c2pool-windows-217) is a bare runner with NO build toolchain yet;
-    # FOLLOW-UP: once vm-fleet installs VS 2022 Build Tools (C++ workload) +
-    # cmake + deps on VM217 and it builds c2pool clean, a follow-up PR flips
-    # this back to the fork-gated self-hosted expr. Linux+macOS already on the
-    # self-hosted fleet on this branch; Windows stays GitHub-hosted meanwhile.
+    # VM217 (c2pool-windows-217) is still a bare runner: the self-hosted flip
+    # failed at actions/setup-python@v6 (cannot provision Python on VM217) and
+    # no VS 2022 Build Tools are installed yet. FOLLOW-UP: once vm-fleet installs
+    # VS 2022 Build Tools (C++ workload) + cmake + python on VM217 and it builds
+    # c2pool clean, a follow-up PR flips this to the fork-gated self-hosted expr.
+    # web-static + pplns self-hosted routes on this branch are proven green.
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v6
@@ -863,6 +865,13 @@ jobs:
 
       - name: Build c2pool-dgb binary (AUX_DOGE seam ON)
         run: cmake --build build_dgb_auxdoge --target c2pool-dgb -j8
+
+      # Link-level companion to the compile-time aux_doge_isolation_guard.hpp:
+      # fail the build if the DGB parent (AUX_DOGE seam ON) ODR-uses any LTC
+      # per-coin consensus symbol (make_ltc_chain_params / ltc::coin::HeaderChain
+      # / ltc::coin::ChainParams). Positive control asserts dgb::coin:: present.
+      - name: Link-isolation guard (no LTC consensus surface in DGB parent)
+        run: bash scripts/ci/dgb_aux_doge_link_isolation_guard.sh build_dgb_auxdoge/src/c2pool/c2pool-dgb
 
       - name: Smoke test (--help)
         run: |

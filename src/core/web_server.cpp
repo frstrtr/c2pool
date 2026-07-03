@@ -6158,9 +6158,22 @@ nlohmann::json MiningInterface::rest_v36_status()
     };
 
     int sample_size = vs.value("overall_total", 0);
-    int v36_shares  = vs.value("overall_v36_shares", 0);
+    // Crossing counter must reflect the DESIRED-version tally the AutoRatchet
+    // keys on (get_desired_version_weights), NOT the per-share FORMAT flag.
+    // p2p-received shares relayed from the V35 seed carry format V35 even while
+    // their miners are voting V36, so overall_v36_shares (a format-flag count)
+    // stays 0 straight through a real crossing -- the founding-charter class of
+    // lie, here in the very fields the operator curls to watch the ratchet.
+    // Re-source from the desired-version data (the same swap #288 made for the
+    // ratchet mint gate): the headline percentage is the work-weighted sampling
+    // signal -- the exact "N% old version" figure the journal logs and the
+    // integrator reads to fire the crossing-event ping -- and the counts are the
+    // flat desired-version vote counts over the chain. Both climb with the cross;
+    // neither is the format-flag stub. (overall_v36_shares stays available on the
+    // parent version_signaling object for anyone who wants the format breakdown.)
+    int v36_shares  = vs.value("overall_v36_votes", 0);
     int v35_shares  = std::max(0, sample_size - v36_shares);
-    double v36_pct  = vs.value("overall_v36_share_pct", 0.0);
+    double v36_pct  = vs.value("sampling_signaling", 0.0);
 
     int height = 0;
     if (m_sharechain_stats_fn) {

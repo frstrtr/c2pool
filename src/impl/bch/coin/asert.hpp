@@ -74,6 +74,31 @@ inline ASERTParams asert_testnet3() {
     };
 }
 
+inline uint256 bch_pow_limit_regtest() {
+    // BCH regtest powLimit (BCHN CRegTestParams). NOTE: top byte 0x7f does NOT
+    // satisfy CalculateASERT's 32-leading-zero-bits invariant -- which is why
+    // regtest runs with fPowNoRetargeting (ASERT is never invoked on regtest).
+    uint256 v;
+    v.SetHex("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    return v;
+}
+
+/// BCH regtest difficulty params (BCHN CRegTestParams). fPowNoRetargeting=true,
+/// so the required target is fixed at the powLimit nBits (0x207fffff) for every
+/// block -- ASERT is bypassed (header_chain honours BCHChainParams::no_retargeting).
+/// The anchor here is nominal (genesis) and never feeds CalculateASERT.
+/// allow_min_difficulty mirrors BCHN regtest. (FINDING3: regtest must be its own
+/// net so --pool --regtest serves diff-1 0x207fffff, not the testnet anchor.)
+inline ASERTParams asert_regtest() {
+    return ASERTParams{
+        ASERTAnchor{0, 0x207fffff, 1296688602},  // genesis nBits/time (nominal)
+        2 * 24 * 60 * 60,
+        BCH_TARGET_SPACING,
+        true,
+        bch_pow_limit_regtest(),
+    };
+}
+
 inline ASERTParams asert_testnet4() {
     return ASERTParams{
         ASERTAnchor{16844, 0x1d00ffff, 1605451779},
