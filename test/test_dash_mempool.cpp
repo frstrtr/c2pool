@@ -27,12 +27,14 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <set>
 #include <vector>
 
 using dash::coin::Mempool;
 using dash::coin::MutableTransaction;
 using dash::coin::dash_txid;
 using dash::coin::BlockType;
+using dash::coin::FeeKey;
 using ::core::coin::UTXOViewCache;
 using ::core::coin::Outpoint;
 using ::core::coin::Coin;
@@ -315,4 +317,87 @@ TEST(DashMempool, EqualFeerateSelectionIsTxidAscendingAndInsertionOrderIndepende
     std::sort(sorted.begin(), sorted.end());
     EXPECT_EQ(forward, sorted)
         << "equal-feerate ties must resolve to txid-ascending, oracle-conformant order";
+}
+
+
+// --- G1 byte-parity: feerate compare is dashcore division-free cross-multiply
+//
+// dashcore CompareTxMemPoolEntryByAncestorFee compares two entries by
+// cross-multiplication -- f1 = a.fee * b.size vs f2 = b.fee * a.size --
+// explicitly to "avoid division by rewriting (a/b > c/d) as (a*d > c*b)".
+// c2pool previously keyed the sorted index on a PRE-DIVIDED double
+// (fee / base_size). That division rounds, so it can collapse a strict
+// dashcore order into a tie -- or split a dashcore tie into a strict
+// order -- making the two representations disagree on the selection
+// order of certain (fee, size) pairs. A different selection order is a
+// different template byte-serialization: a latent G1 byte-parity seam
+// against the p2pool-dash / dashcore oracle. FeeKey now carries
+// (fee, base_size) and reproduces the exact double cross-multiply.
+//
+// Divergence vector (found by exhaustive search). The disagreement only
+// manifests at fee magnitudes >~1e14 sat, where the fee/size division
+// loses ULPs the cross-multiply keeps -- for realistic magnitudes the
+// two representations agree, so this fix is exact-oracle-conformance
+// hardening, not a realistic-value bug:
+//   A = (fee 182912374030878, size 3535)
+//   B = (fee 4415613369921651, size 85337)
+// Pre-divided doubles: A -> 51743245836.174819946 < B -> 51743245836.174827576,
+//   i.e. the OLD code ranks B strictly ABOVE A.
+// Cross-multiply: A.fee*B.size == B.fee*A.size exactly -> a genuine
+//   feerate TIE, resolved by txid ascending (dashcore GetHash()).
+TEST(DashMempool, FeerateCompareIsDivisionFreeCrossMultiplyNotPreDividedDouble)
+{
+    // Independent dashcore-style reference (division-free cross-multiply).
+    auto oracle_less = [](uint64_t fa, uint32_t sa, const uint256& ta,
+                          uint64_t fb, uint32_t sb, const uint256& tb) {
+        const double f1 = static_cast<double>(fa) * sb;
+        const double f2 = static_cast<double>(fb) * sa;
+        if (f1 != f2) return f1 > f2;   // higher feerate first
+        return ta < tb;                 // txid ascending
+    };
+
+    // Two distinct txids; assign the SMALLER to A so a correct
+    // (cross-multiply => tie => txid-asc) key orders A before B, whereas
+    // the old pre-divide code would have put B first ("B higher feerate").
+    const uint256 t0 = mint_hash(9001);
+    const uint256 t1 = mint_hash(9002);
+    const uint256 ta = std::min(t0, t1);
+    const uint256 tb = std::max(t0, t1);
+    ASSERT_TRUE(ta < tb);
+
+    const uint64_t fa = 182912374030878ULL;
+    const uint32_t sa = 3535u;
+    const uint64_t fb = 4415613369921651ULL;
+    const uint32_t sb = 85337u;
+
+    // Precondition on the vector: a genuine cross-multiply tie that the
+    // buggy pre-divide would (wrongly) have seen as a strict order.
+    EXPECT_EQ(static_cast<double>(fa) * sb, static_cast<double>(fb) * sa)
+        << "vector must be a genuine cross-multiply feerate tie";
+    EXPECT_LT(static_cast<double>(fa) / sa, static_cast<double>(fb) / sb)
+        << "vector must be a strict (wrong) order under the old pre-divide";
+
+    const FeeKey A{fa, sa, ta};
+    const FeeKey B{fb, sb, tb};
+
+    // FeeKey resolves the cross-multiply tie by txid ascending => A first.
+    EXPECT_TRUE(A < B) << "cross-multiply tie must fall to txid-ascending (A<B)";
+    EXPECT_FALSE(B < A);
+
+    // FeeKey ordering must agree with the independent oracle on this pair.
+    EXPECT_EQ(A < B, oracle_less(fa, sa, ta, fb, sb, tb));
+    EXPECT_EQ(B < A, oracle_less(fb, sb, tb, fa, sa, ta));
+
+    // The real index type (std::set<FeeKey>) must iterate A best-first.
+    std::set<FeeKey> idx{B, A};
+    ASSERT_EQ(idx.size(), 2u);
+    EXPECT_EQ(idx.begin()->txid, ta)
+        << "best-first iteration must yield A (smaller txid) on the tie";
+
+    // Sanity: the feerate arm still dominates. Strictly higher feerate
+    // must precede regardless of a smaller-txid competitor.
+    const FeeKey hi{20000u, 250u, tb};   // 80 sat/byte
+    const FeeKey lo{10000u, 250u, ta};   // 40 sat/byte, but smaller txid
+    EXPECT_TRUE(hi < lo) << "higher feerate must precede regardless of txid";
+    EXPECT_FALSE(lo < hi);
 }

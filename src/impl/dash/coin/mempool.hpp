@@ -74,17 +74,28 @@ struct MempoolEntry {
 };
 
 /// Deterministic block-template selection key. Sorts highest-feerate
-/// first; ties broken by txid ascending. This makes
-/// get_sorted_txs_with_fees byte-reproducible across nodes/runs
-/// (equal-feerate txs no longer depend on mempool insertion order) and
-/// matches dashcore BlockAssembler ordering
-/// (CompareTxMemPoolEntryByAncestorFee breaks feerate ties by GetHash()).
+/// first; ties broken by txid ascending. Byte-reproducible across
+/// nodes/runs AND bit-for-bit conformant with dashcore BlockAssembler
+/// ordering. dashcore CompareTxMemPoolEntryByAncestorFee compares two
+/// entries by cross-multiplication of (fee, size) as doubles --
+/// f1 = a.fee * b.size vs f2 = b.fee * a.size -- explicitly "avoid
+/// division by rewriting (a/b > c/d) as (a*d > c*b)". A pre-divided
+/// fee/base_size double rounds where the cross-multiply does not, so the
+/// two representations can order a tie-pair differently. We therefore
+/// carry (fee, base_size) and reproduce the exact double cross-multiply;
+/// equal feerate is broken by GetHash()/txid ascending, as the oracle
+/// does. (No ancestor packages in this simplified mempool, so
+/// GetModFeeAndSize reduces to the entry's own (fee, base_size).)
 struct FeeKey {
-    double  feerate;
-    uint256 txid;
+    uint64_t fee;        // satoshi
+    uint32_t base_size;  // serialized bytes (>0 for every indexed entry)
+    uint256  txid;
     bool operator<(const FeeKey& o) const {
-        if (feerate != o.feerate) return feerate > o.feerate; // higher feerate first
-        return txid < o.txid;                                 // txid asc tiebreak (oracle-conformant)
+        // dashcore CompareTxMemPoolEntryByAncestorFee, division-free form.
+        const double f1 = static_cast<double>(fee)   * o.base_size;
+        const double f2 = static_cast<double>(o.fee) * base_size;
+        if (f1 != f2) return f1 > f2;   // higher feerate first
+        return txid < o.txid;           // txid asc tiebreak (oracle-conformant)
     }
 };
 
@@ -155,7 +166,7 @@ public:
         // recompute_unknown_fees() resolves them after a UTXO update.
         // Uses negative feerate as the multimap key so begin() = best.
         if (stored.fee_known) {
-            m_feerate_index.insert(FeeKey{stored.feerate_satvb(), txid});
+            m_feerate_index.insert(FeeKey{stored.fee, stored.base_size, txid});
         }
 
         // Periodic stats — every 100 entries + first 5 + every eviction.
@@ -259,7 +270,7 @@ public:
         for (auto& [txid, entry] : m_pool) {
             if (entry.fee_known) continue;
             if (compute_fee_locked(entry, utxo)) {
-                m_feerate_index.insert(FeeKey{entry.feerate_satvb(), txid});
+                m_feerate_index.insert(FeeKey{entry.fee, entry.base_size, txid});
                 resolved_fees += entry.fee;
                 ++resolved;
             } else {
@@ -431,7 +442,7 @@ private:
 
         // Drop from feerate index (only present if fee was known).
         if (it->second.fee_known) {
-            m_feerate_index.erase(FeeKey{it->second.feerate_satvb(), txid});
+            m_feerate_index.erase(FeeKey{it->second.fee, it->second.base_size, txid});
         }
 
         // Drop from spent-outputs index.
