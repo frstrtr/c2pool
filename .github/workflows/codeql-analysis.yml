@@ -8,6 +8,15 @@ on:
   schedule:
     - cron: '30 1 * * 1'   # Weekly on Monday 01:30 UTC
 
+# Concurrency: a newer run on the same ref cancels the stale in-progress
+# one, cutting concurrent load on the shared self-hosted pool (the OOM/
+# oversubscription root cause, not just queue depth). Per-ref group so
+# distinct PRs/branches never cancel each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
