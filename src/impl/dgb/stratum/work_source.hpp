@@ -40,6 +40,7 @@
 // (the next stacked slice) before implementing the substantive logic.
 
 #include <core/stratum_work_source.hpp>
+#include <nlohmann/json_fwd.hpp>
 #include <core/uint256.hpp>
 #include <core/pow.hpp>       // core::SubsidyFunc — embedded coinbasevalue SSOT feed
 #include <impl/dgb/coin/connection_coinbase.hpp>  // ConnCoinbasePplnsInputs (PPLNS->coinbase SSOT)
@@ -230,6 +231,18 @@ public:
         const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs)>;
     void set_pplns_inputs_fn(PplnsInputsFn fn);
 
+    /// External digibyted getblocktemplate source (Stage 4b/4c GBT-forward).
+    /// Returns the daemon GBT (nlohmann::json) when an RPC sink is connected
+    /// (isolated testnet / mainnet), or std::nullopt on the pure-embedded path.
+    /// When bound and returning a value, get_current_work_template() forwards
+    /// the daemon template (authoritative bits/version/previousblockhash the
+    /// embedded Scrypt-only walk holds back) with coinbasevalue reconciled
+    /// through the #207 SSOT (dgb::coin::select_work_template). Empty until
+    /// bound in main_dgb.cpp; while empty the served template is byte-identical
+    /// to the pre-wire embedded path. digibyted RPC fallback MUST PERSIST.
+    using ExternalGbtFn = std::function<std::optional<nlohmann::json>()>;
+    void set_external_gbt_fn(ExternalGbtFn fn);
+
     /// Dispatch one share-difficulty submission to the bound mint callback.
     /// The stage-4d mining_submit classify branch calls this on the
     /// "pow_hash <= share target" outcome. Returns the minted share hash, or a
@@ -295,6 +308,12 @@ private:
     // per-connection coinbase path returns an empty job (pre-wire behavior).
     mutable std::mutex          pplns_inputs_mutex_;
     PplnsInputsFn               pplns_inputs_fn_;
+
+    // External digibyted GBT source (Stage 4b/4c). Empty until bound in
+    // main_dgb; while empty get_current_work_template() serves the embedded
+    // Scrypt-only template unchanged (digibyted RPC fallback MUST PERSIST).
+    mutable std::mutex          external_gbt_mutex_;
+    ExternalGbtFn               external_gbt_fn_;
 
     // Template cache (filled lazily; invalidated when work_generation_ bumps)
     // Stage 4c populates these.

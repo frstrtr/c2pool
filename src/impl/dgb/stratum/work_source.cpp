@@ -21,6 +21,7 @@
 #include <impl/dgb/coin/dgb_block_algo.hpp>
 #include <impl/dgb/coin/template_builder.hpp>
 #include <impl/dgb/coin/embedded_tx_select.hpp>  // make_mempool_tx_source (mempool -> GBT transactions[])
+#include <impl/dgb/coin/gbt_forward.hpp>        // select_work_template (Stage 4b/4c daemon-GBT-forward SSOT)
 #include <impl/dgb/config_pool.hpp>              // dgb::PoolConfig::BLOCK_MAX_WEIGHT
 #include <impl/dgb/coin/hash_format.hpp>
 #include <impl/dgb/coin/scrypt_pow.hpp>        // scrypt_pow_hash (DGB-Scrypt PoW SSOT)
@@ -318,7 +319,26 @@ nlohmann::json DGBWorkSource::get_current_work_template() const
     if (auto th = chain_.tip_hash())
         in.previousblockhash = u256_be_display_hex(*th);
 
-    return dgb::coin::build_work_template(in);
+    // Stage 4b/4c GBT-forward: when an external digibyted getblocktemplate
+    // source is bound (RPC-connected isolated testnet / mainnet), it is the
+    // AUTHORITATIVE template -- its real bits/version/previousblockhash are the
+    // consensus values the embedded Scrypt-only walk deliberately holds back.
+    // select_work_template forwards it with coinbasevalue reconciled through the
+    // one #207 SSOT; unbound / nullopt -> the embedded template above passes
+    // through byte-identical (digibyted RPC fallback MUST PERSIST).
+    ExternalGbtFn gbt_fn;
+    {
+        std::lock_guard<std::mutex> lk(external_gbt_mutex_);
+        gbt_fn = external_gbt_fn_;  // copy under lock; a concurrent
+                                    // set_external_gbt_fn() cannot tear it out.
+    }
+    std::optional<nlohmann::json> daemon_gbt;
+    if (gbt_fn)
+        daemon_gbt = gbt_fn();
+
+    return dgb::coin::select_work_template(subsidy_func_, next_h,
+                                           dgb::coin::build_work_template(in),
+                                           daemon_gbt);
 }
 
 std::vector<std::string> DGBWorkSource::get_stratum_merkle_branches() const
@@ -648,6 +668,12 @@ void DGBWorkSource::set_pplns_inputs_fn(PplnsInputsFn fn)
 {
     std::lock_guard<std::mutex> lk(pplns_inputs_mutex_);
     pplns_inputs_fn_ = std::move(fn);
+}
+
+void DGBWorkSource::set_external_gbt_fn(ExternalGbtFn fn)
+{
+    std::lock_guard<std::mutex> lk(external_gbt_mutex_);
+    external_gbt_fn_ = std::move(fn);
 }
 
 uint256 DGBWorkSource::try_mint_share(const MintShareInputs& in) const

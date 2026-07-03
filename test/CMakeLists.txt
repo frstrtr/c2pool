@@ -35,6 +35,21 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     gtest_discover_tests(test_dgb_coinbase_value DISCOVERY_MODE PRE_TEST)
 
+    # Stage 4b/4c GBT-forward selector SSOT: dgb::coin::select_work_template
+    # chooses the authoritative digibyted GBT over the embedded Scrypt-only
+    # template, reconciling coinbasevalue through the #207 SSOT. Header-only
+    # like test_dgb_coinbase_value; no dgb runtime link. MUST also be in the
+    # build.yml --target allowlist (#143).
+    add_executable(test_dgb_gbt_forward test_dgb_gbt_forward.cpp)
+    target_link_libraries(test_dgb_gbt_forward PRIVATE
+        GTest::gtest_main GTest::gtest
+        btclibs
+        yaml-cpp::yaml-cpp
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    gtest_discover_tests(test_dgb_gbt_forward DISCOVERY_MODE PRE_TEST)
+
     add_executable(test_coin_broadcaster test_coin_broadcaster.cpp)
     target_link_libraries(test_coin_broadcaster PRIVATE
         GTest::gtest_main GTest::gtest
