@@ -106,6 +106,7 @@ public:
     std::string m_symbol;
     int m_share_period{};
     bool m_testnet {false};
+    bool m_testnet4 {false};  // BCH testnet4: OWN genesis (000000001dd4..) + magic e2b7daaf; testnet-class for ABLA/ASERT
 };
 
 } // namespace bch
