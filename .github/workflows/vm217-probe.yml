@@ -4,6 +4,8 @@
 # Gates the follow-up PR that flips build.yml windows: windows-2022 -> VM217.
 # #607 (419ea4cc) reverted that flip because VM217 was bare. This probe tells
 # us if vm-fleet has since provisioned it. NOT wired to push/PR events.
+# VM217 box has Restricted PS execution policy -> use -ExecutionPolicy Bypass
+# custom shell so the runner can source its temp .ps1 command files.
 name: VM217 readiness probe
 on:
   workflow_dispatch:
@@ -16,28 +18,28 @@ jobs:
     runs-on: [self-hosted, Windows, X64, c2pool-build]
     steps:
       - name: Runner + OS
-        shell: powershell
+        shell: powershell -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           Write-Host "runner.name=${{ runner.name }} env=${{ runner.environment }}"
           [System.Environment]::OSVersion.VersionString
       - name: Python
-        shell: powershell
+        shell: powershell -ExecutionPolicy Bypass -Command ". '{0}'"
         continue-on-error: true
         run: python --version; pip --version
       - name: Conan
-        shell: powershell
+        shell: powershell -ExecutionPolicy Bypass -Command ". '{0}'"
         continue-on-error: true
         run: conan --version
       - name: CMake
-        shell: powershell
+        shell: powershell -ExecutionPolicy Bypass -Command ". '{0}'"
         continue-on-error: true
         run: cmake --version
       - name: Git
-        shell: powershell
+        shell: powershell -ExecutionPolicy Bypass -Command ". '{0}'"
         continue-on-error: true
         run: git --version
       - name: MSVC / VS 2022 C++ build tools
-        shell: powershell
+        shell: powershell -ExecutionPolicy Bypass -Command ". '{0}'"
         continue-on-error: true
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
