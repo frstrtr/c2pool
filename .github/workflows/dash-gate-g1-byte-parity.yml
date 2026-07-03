@@ -2,21 +2,21 @@ name: DASH gate G1 — byte-parity KAT
 
 # ci-steward 2026-07-04. Required-gate for DASH G1: byte-for-byte Known-Answer
 # -Test parity of consensus-serialized structures against the reference
-# testnet3 X11 vectors (refreshed in #596). CI plumbing only — carries NO
-# consensus knowledge. The dash lane owns the vectors + the test binary
-# (test/test_dash_x11_kat.cpp; add_executable at test/CMakeLists.txt:214).
+# testnet3 X11 vectors (#596). CI plumbing only — carries NO consensus
+# knowledge. The dash lane owns the vectors, the test binary
+# (test/test_dash_x11_kat.cpp), and the gate entrypoint script.
 #
-# WIRED 2026-07-04 from dash lane HEAD f7c25b43 (targets verified on master
-# 2530888a): TEST_ENTRYPOINT is `ctest -R '^test_dash_x11_kat'` run against a
-# fresh build of the test_dash_x11_kat target. A HOLLOW-PASS GUARD asserts a
-# nonzero test count so a zero-test ctest run (which exits 0) can never
-# masquerade as green.
+# WIRED 2026-07-04 to the canonical dash-lane entrypoint from PR #620
+# (dash/ci-gate-entrypoints): TEST_ENTRYPOINT is tests/gates/g1_byte_parity_kat.sh.
+# The script self-locates, cold-build self-configures (conan + cmake, override
+# via BUILD_DIR), runs the real gtest suite by NAME (ctest -R '^DashX11Kat\.')
+# — not by executable name / bare -R regex — and hard-fails the empty-suite
+# trap by demanding a parsed positive test count. continue-on-error stays
+# removed now the entrypoint is real.
 #
-# Neutral-skip: if test_dash_x11_kat.cpp is absent on the branch every build
-# step is skipped and the job is a green no-op (forward-compat with branches
-# predating the KAT). continue-on-error was removed now the entrypoint is
-# real; the job is still NOT registered as a required check — that final
-# master-ruleset step stays with the operator.
+# Neutral-skip: on branches predating #620 the entrypoint is absent and the job
+# is a green no-op (forward/backward-compat). Registered as a required check
+# only after a confirmed non-hollow green rollup on the runner.
 
 on:
   push:
@@ -31,15 +31,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Check KAT target presence
+      - name: Check gate entrypoint presence
         id: presence
         run: |
-          if [ -f "test/test_dash_x11_kat.cpp" ]; then
+          if [ -f "tests/gates/g1_byte_parity_kat.sh" ]; then
             echo "exists=1" >> "$GITHUB_OUTPUT"
-            echo "::notice::test_dash_x11_kat present — building + running byte-parity KAT."
+            echo "::notice::G1 entrypoint present — running byte-parity KAT gate."
           else
             echo "exists=0" >> "$GITHUB_OUTPUT"
-            echo "::notice::test_dash_x11_kat not on this branch — neutral skip (expected until the DASH KAT lands)."
+            echo "::notice::tests/gates/g1_byte_parity_kat.sh not on this branch — neutral skip (expected until #620 lands)."
           fi
 
       - name: Install system dependencies
@@ -83,44 +83,8 @@ jobs:
         if: steps.presence.outputs.exists == '1' && runner.environment != 'github-hosted'
         run: rm -rf build_g1
 
-      - name: Conan install
+      - name: Run G1 byte-parity KAT gate (dash-lane TEST_ENTRYPOINT)
         if: steps.presence.outputs.exists == '1'
-        run: |
-          conan install . \
-            --build=missing \
-            --output-folder=build_g1 \
-            --settings=build_type=Release
-
-      - name: Configure
-        if: steps.presence.outputs.exists == '1'
-        run: |
-          cmake -S . -B build_g1 \
-            -DCMAKE_TOOLCHAIN_FILE=build_g1/conan_toolchain.cmake \
-            -DCMAKE_BUILD_TYPE=Release
-
-      - name: Build test_dash_x11_kat
-        if: steps.presence.outputs.exists == '1'
-        run: cmake --build build_g1 --target test_dash_x11_kat -j$(nproc)
-
-      - name: Run G1 byte-parity KAT (ctest + hollow-pass guard)
-        if: steps.presence.outputs.exists == '1'
-        working-directory: build_g1
-        run: |
-          # TEST_ENTRYPOINT (dash lane f7c25b43): ctest -R '^test_dash_x11_kat'
-          set +e
-          OUT="$(ctest -R '^test_dash_x11_kat' --output-on-failure 2>&1)"
-          RC=$?
-          set -e
-          printf '%s\n' "$OUT"
-          if [ "$RC" -ne 0 ]; then
-            echo "::error::G1 byte-parity KAT reported test failures (ctest rc=$RC)."
-            exit 1
-          fi
-          # HOLLOW-PASS GUARD: a zero-test ctest run exits 0 — never trust the
-          # exit code alone. Require a nonzero "out of N" test count.
-          N="$(printf '%s\n' "$OUT" | sed -n 's/.*out of \([0-9][0-9]*\).*/\1/p' | tail -1)"
-          if [ -z "$N" ] || [ "$N" -eq 0 ]; then
-            echo "::error::G1 HOLLOW-PASS GUARD tripped — ctest matched 0 tests for ^test_dash_x11_kat. Refusing to report green on a zero-test run."
-            exit 1
-          fi
-          echo "::notice::G1 byte-parity KAT green — $N test(s) executed and passed."
+        env:
+          BUILD_DIR: ${{ github.workspace }}/build_g1
+        run: bash tests/gates/g1_byte_parity_kat.sh
