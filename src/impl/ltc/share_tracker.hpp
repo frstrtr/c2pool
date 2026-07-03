@@ -1367,6 +1367,27 @@ public:
         return attempts / uint288(time_span);
     }
 
+    // Saturating left-shift of a share target, used by the death-spiral
+    // emergency decay (Step 3 of compute_share_target).
+    //
+    // BUG GUARDED: a bare `prev << shift` overflows the 256-bit target and
+    // WRAPS to a tiny value (= HARDER difficulty), which accelerates the very
+    // death spiral the emergency decay exists to arrest. The old `halvings <
+    // 256` guard only bounded the shift width, not whether the shifted value
+    // stayed <= max_target (MAX_TARGET is 2^236-1 on mainnet, so even modest
+    // halvings overflow). We saturate to max_target whenever the shift would
+    // exceed it; otherwise the result is provably <= max_target < 2^256.
+    static uint256 emergency_decay_shl(const uint256& prev, unsigned int shift,
+                                       const uint256& max_target)
+    {
+        // prev << shift > max_target  <=>  prev > (max_target >> shift)
+        if (shift >= 256 || prev > (max_target >> shift))
+            return max_target;
+        uint256 r = prev;
+        r <<= shift;            // result <= max_target < 2^256: no overflow
+        return r;
+    }
+
     // -- Share target computation --
     // Computes max_bits and bits for a new share, matching p2pool-v36
     // BaseShare.generate_transaction():
@@ -1539,11 +1560,10 @@ public:
                 auto halvings = excess / half_life;
                 auto remainder = excess % half_life;
                 // 2^halvings with linear interpolation for fractional part
-                uint256 eased = prev_max_target;
-                if (halvings < 256)
-                    eased <<= halvings;
-                else
-                    eased = MAX_TARGET;
+                // Saturating shift: guards against uint256 overflow that
+                // would otherwise wrap the eased target to a tiny value.
+                uint256 eased = emergency_decay_shl(
+                    prev_max_target, static_cast<unsigned int>(halvings), MAX_TARGET);
                 // Linear interpolation: eased = eased * (half_life + remainder) / half_life
                 uint288 eased_288;
                 eased_288.SetHex(eased.GetHex());

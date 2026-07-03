@@ -263,6 +263,35 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_conformance PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
     gtest_add_tests(test_dash_conformance "" AUTO)
 
+    # DASH S8 pool-node leaf 4 — share_tracker.hpp KAT: DensePPLNSWindow decayed
+    # weight ring buffer (compute_v36_weights), decay table, donation split,
+    # window slides. PoW-independent consensus core; socket-free, chain-free.
+    # Mirrors the test_dash_conformance link set.
+    add_executable(test_dash_share_tracker test_dash_share_tracker.cpp)
+    target_link_libraries(test_dash_share_tracker PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_share_tracker PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
+    gtest_add_tests(test_dash_share_tracker "" AUTO)
+
+    # DASH S8 pool-node leaf 5 (FINAL) slice A — node.hpp skeleton KAT: NodeImpl
+    # default-constructible/concrete, empty fresh tracker, lock-free snapshot
+    # publish/getters, tracker()/read_tracker()/tracker_shared_lock() accessors.
+    # Rig-free (no io_context/sockets). Needs pool (BaseNode) + c2pool_storage
+    # (SharechainStorage) on top of the dash_x11 + core link set.
+    add_executable(test_dash_node test_dash_node.cpp)
+    target_link_libraries(test_dash_node PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_node PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining c2pool_storage pool)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_node "" AUTO)
+
     # DASH S8 per-miner work-target MODULATION KAT (work.py:308-326 oracle pin):
     # pool-share cap (1.67%) + dust-threshold ease + average_attempts_to_target.
     # Header-only (stratum/work_target.hpp over core/target_utils + config_pool);
@@ -446,6 +475,15 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_dash_p2p_messages PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_p2p_messages "" AUTO)
+    add_executable(test_dash_poolnode_messages test_dash_poolnode_messages.cpp)
+    target_link_libraries(test_dash_poolnode_messages PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_poolnode_messages PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_poolnode_messages "" AUTO)
 
     add_executable(test_dash_p2p_connection test_dash_p2p_connection.cpp)
     target_link_libraries(test_dash_p2p_connection PRIVATE
@@ -490,6 +528,16 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_dash_config PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_config "" AUTO)
+
+    add_executable(test_dash_peer test_dash_peer.cpp)
+    target_link_libraries(test_dash_peer PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_peer PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_peer "" AUTO)
 
     # additive: pure persisted activation-latch (header-only version_activation_latch.hpp);
     # mirrors the test_dash_config link set (nlohmann_json + core), no ltc/pool SCC dependency.
@@ -627,6 +675,16 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_dash_coinbase_parity PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_coinbase_parity "" AUTO)
+
+    add_executable(test_dash_cb_payee test_dash_cb_payee.cpp)
+    target_link_libraries(test_dash_cb_payee PRIVATE
+        GTest::gtest_main GTest::gtest
+        core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_cb_payee PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_cb_payee "" AUTO)
 
     add_executable(test_compact_blocks test_compact_blocks.cpp)
     target_link_libraries(test_compact_blocks PRIVATE

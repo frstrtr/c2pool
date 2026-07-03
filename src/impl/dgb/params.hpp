@@ -24,6 +24,18 @@
 namespace dgb
 {
 
+// --- Merged-mining aux chain identity (bucket-1 isolation primitive) ---------
+// DGB's OWN AuxPoW chain id, consumed when DGB registers an embedded backend
+// against c2pool::merged::IAuxChainBackend (the DC merged-mining seam, -DAUX_DOGE).
+//
+// Derivation: the low 16 bits of DGB's network IDENTIFIER 0x4B62545B1A631AFE
+// (PoolConfig::IDENTIFIER_HEX, the "switch-oracle" DGB SSOT) -> 0x1AFE (6910).
+// This is a DGB-native value with no shared derivation with any other coin, so
+// it CANNOT collide: DOGE = 0x0062 (98), NMC = 0x0001 -- both distinct from
+// 0x1AFE. Kept per-coin (bucket-1) exactly like DOGEChainParams::AUXPOW_CHAIN_ID
+// and nmc::coin::NMC_AUXPOW_CHAIN_ID; NEVER reuse DOGE's 98.
+inline constexpr uint32_t AUXPOW_CHAIN_ID = 0x1AFE;  // 6910 = low16(IDENTIFIER)
+
 inline core::CoinParams make_coin_params(bool testnet)
 {
     core::CoinParams p;
@@ -85,7 +97,7 @@ inline core::CoinParams make_coin_params(bool testnet)
 
     p.target_lookbehind        = PoolConfig::TARGET_LOOKBEHIND;          // 100
     p.spread                   = PoolConfig::SPREAD;                     // 24
-    p.minimum_protocol_version = PoolConfig::MINIMUM_PROTOCOL_VERSION;   // 1700 floor (digibyte.py NEW_MIN; accept-floor only)
+    p.minimum_protocol_version = PoolConfig::MINIMUM_PROTOCOL_VERSION;   // 1400 cold accept-floor (oracle p2p.py:153 getattr fallback); ratchets ->3500 (follow-up)
     p.advertised_protocol_version = PoolConfig::ADVERTISED_PROTOCOL_VERSION; // 3501 (oracle p2p.py VERSION) -- what we ADVERTISE, not the accept-floor
     p.block_max_size           = PoolConfig::BLOCK_MAX_SIZE;
     p.block_max_weight         = PoolConfig::BLOCK_MAX_WEIGHT;

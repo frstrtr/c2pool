@@ -190,6 +190,13 @@ inline void check_share_target_valid(const uint256& target, const core::CoinPara
         throw std::invalid_argument("share target invalid");
 }
 
+// Per-verify scratch globals (btc::share_check parity — additive, dash-fenced).
+// share_init_verify caches the share header X11 hash and whether it also met the
+// block target, so attempt_verify / the tracker can fire block callbacks without
+// recomputing X11. thread_local: each verify thread keeps its own last-result.
+inline thread_local bool g_last_init_is_block = false;
+inline thread_local uint256 g_last_pow_hash;  // X11 hash of the share header
+
 // ── share_init_verify (Dash v16) ─────────────────────────────────────────────
 // Verifies PoW, hash_link, merkle_link. Returns share hash (SHA256d of header).
 inline uint256 share_init_verify(const DashShare& share,
@@ -312,6 +319,16 @@ inline uint256 share_init_verify(const DashShare& share,
     auto hdr_span = std::span<const unsigned char>(
         reinterpret_cast<const unsigned char*>(header_stream.data()), header_stream.size());
     uint256 share_hash = params.pow_func(hdr_span);
+    g_last_pow_hash = share_hash;  // cache for attempt_verify merged/block check
+
+    // Block detection: a share whose X11 hash also meets the BLOCK target
+    // (min_header.m_bits, from GBT — far harder than the share target) IS a
+    // solved block. Mirrors btc::share_check. Computed even when check_pow is
+    // off so the tracker can still fire the won-block path in tests.
+    {
+        uint256 block_target = chain::bits_to_target(share.m_min_header.m_bits);
+        g_last_init_is_block = (!block_target.IsNull() && share_hash <= block_target);
+    }
 
     // ── X11 PoW check ──
     if (check_pow)
@@ -381,6 +398,106 @@ inline std::vector<unsigned char> pubkey_hash_to_script2(const uint160& hash)
     script.push_back(0x88); // OP_EQUALVERIFY
     script.push_back(0xac); // OP_CHECKSIG
     return script;
+}
+// ============================================================================
+// Normalize a parent chain script to merged chain P2PKH script.
+//
+// P2WPKH (00 14 <hash>) → P2PKH (76 a9 14 <hash> 88 ac)  [same pubkey_hash]
+// P2PKH  (76 a9 14 <hash> 88 ac) → passed through
+// P2SH   (a9 14 <hash> 87)       → P2SH (passed through)
+// P2WSH  (00 20 <hash>)          → empty (unconvertible)
+// P2TR   (51 20 <key>)           → empty (unconvertible)
+//
+// Returns empty vector for unconvertible scripts (Tier 3: redistributed).
+// Matches Python data.py:build_canonical_merged_coinbase() conversion logic.
+// ============================================================================
+inline std::vector<unsigned char> normalize_script_for_merged(
+    const std::vector<unsigned char>& script)
+{
+    // P2PKH (25 bytes: 76 a9 14 <20> 88 ac) — already correct
+    if (script.size() == 25 && script[0] == 0x76 && script[1] == 0xa9 &&
+        script[2] == 0x14 && script[23] == 0x88 && script[24] == 0xac)
+        return script;
+
+    // P2WPKH (22 bytes: 00 14 <20>) — convert to P2PKH using same hash
+    if (script.size() == 22 && script[0] == 0x00 && script[1] == 0x14)
+    {
+        std::vector<unsigned char> p2pkh;
+        p2pkh.reserve(25);
+        p2pkh.push_back(0x76); // OP_DUP
+        p2pkh.push_back(0xa9); // OP_HASH160
+        p2pkh.push_back(0x14); // PUSH 20
+        p2pkh.insert(p2pkh.end(), script.begin() + 2, script.end()); // <hash160>
+        p2pkh.push_back(0x88); // OP_EQUALVERIFY
+        p2pkh.push_back(0xac); // OP_CHECKSIG
+        return p2pkh;
+    }
+
+    // P2SH (23 bytes: a9 14 <20> 87) — pass through (DOGE supports P2SH)
+    if (script.size() == 23 && script[0] == 0xa9 && script[1] == 0x14 &&
+        script[22] == 0x87)
+        return script;
+
+    // P2WSH (34 bytes: 00 20 <32>) or P2TR (34 bytes: 51 20 <32>) — unconvertible
+    return {};
+}
+
+// MERGED: prefix for weight map keys — matches p2pool's 'MERGED:' + hex string.
+// Keeps Tier 1/1.5 (explicit DOGE script) keys separate from raw LTC script keys
+// in the same weight map, preventing V35+V36 weight collapse for the same miner.
+// 7 bytes: 0x4d 0x45 0x52 0x47 0x45 0x44 0x3a = "MERGED:"
+inline constexpr std::array<unsigned char, 7> MERGED_KEY_PREFIX = {
+    0x4d, 0x45, 0x52, 0x47, 0x45, 0x44, 0x3a
+};
+
+// Prepend MERGED: prefix to a script for use as a weight map key.
+inline std::vector<unsigned char> make_merged_key(
+    const std::vector<unsigned char>& script)
+{
+    std::vector<unsigned char> key;
+    key.reserve(MERGED_KEY_PREFIX.size() + script.size());
+    key.insert(key.end(), MERGED_KEY_PREFIX.begin(), MERGED_KEY_PREFIX.end());
+    key.insert(key.end(), script.begin(), script.end());
+    return key;
+}
+
+// Check if a weight key has the MERGED: prefix.
+inline bool is_merged_key(const std::vector<unsigned char>& key)
+{
+    return key.size() > MERGED_KEY_PREFIX.size() &&
+           std::equal(MERGED_KEY_PREFIX.begin(), MERGED_KEY_PREFIX.end(),
+                      key.begin());
+}
+
+// Strip MERGED: prefix, returning the raw script bytes.
+// Caller must check is_merged_key() first.
+inline std::vector<unsigned char> strip_merged_key(
+    const std::vector<unsigned char>& key)
+{
+    return std::vector<unsigned char>(
+        key.begin() + MERGED_KEY_PREFIX.size(), key.end());
+}
+
+// Resolve a weight map key to a DOGE-compatible scriptPubKey.
+// MERGED:-prefixed keys: strip prefix, use directly (already a DOGE script).
+// Raw keys: autoconvert (P2WPKH→P2PKH, P2PKH/P2SH pass through).
+// Returns empty if unconvertible (P2WSH, P2TR, etc.).
+inline std::vector<unsigned char> resolve_merged_payout_script(
+    const std::vector<unsigned char>& key)
+{
+    if (is_merged_key(key))
+        return strip_merged_key(key);
+    return normalize_script_for_merged(key);
+}
+
+
+// ── get_share_script: full scriptPubKey from a share variant ─────────────────
+// DASH is always-P2PKH (no segwit, no v34/v35 address-string form): the payout
+// script is pubkey_hash_to_script2(m_pubkey_hash). Mirrors btc::get_share_script
+// (share_check.hpp) as the share-layer helper the ShareTracker PPLNS walk needs.
+inline std::vector<unsigned char> get_share_script(const auto* obj)
+{
+    return pubkey_hash_to_script2(obj->m_pubkey_hash);
 }
 
 // ── generate_share_transaction (Dash v16 PPLNS) ─────────────────────────────
@@ -706,4 +823,36 @@ inline void verify_version_transition(const DashShare& share, ChainT& chain,
     // obsolete) is permitted, matching btc validate_version_switch. No gate.
 }
 
+
+// === verify_share (Dash accept-path COMBINED entry) ==========================
+// The single entry a Dash node runs on every incoming share, mirroring
+// src/impl/btc/share_check.hpp::verify_share. Composes the two accept phases:
+//   Phase 1 (init): share_init_verify -- PoW (X11), hash_link, merkle, target.
+//                   CPU-heavy, so a node offloads it to a thread pool (cf.
+//                   src/impl/dgb/node.cpp:356 two-phase split) and passes
+//                   verify_init=false here when Phase 1 already ran.
+//   Phase 2 (chain-context gate): verify_version_transition -- the share-
+//                   VERSION boundary admit/reject gate. THIS closes the
+//                   enforcement hole: verify_version_transition was KAT-proven
+//                   in isolation but had ZERO accept-path consumers, so the v36
+//                   obsolescence (95% weighted) + successor (60% weighted)
+//                   guards never ran on a real admission path. verify_share is
+//                   that consumer; the wired KAT drives the 7 boundary cases
+//                   through HERE, not the orphan primitive.
+// Bucket-2 structural standardization: same compose shape as btc verify_share,
+// so the v37 unification is a clean migration, not a per-coin v36 dialect.
+// Returns the Phase-1 share hash (null when verify_init=false). The dashd-RPC
+// submitblock fallback is unaffected -- this gates SHARE admission, not block
+// submission.
+template <typename ChainT>
+inline uint256 verify_share(const DashShare& share, ChainT& chain,
+                            uint64_t chain_length, const core::CoinParams& params,
+                            bool verify_init = true, bool check_pow = true)
+{
+    uint256 hash;
+    if (verify_init)
+        hash = share_init_verify(share, params, check_pow);   // Phase 1
+    verify_version_transition(share, chain, chain_length);    // Phase 2 (wired gate)
+    return hash;
+}
 } // namespace dash

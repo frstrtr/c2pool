@@ -678,6 +678,21 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_share_bits_oracle_pin_test "" AUTO)
 
+    # dgb_share_target_retarget_test: FENCED non-circular KAT pinning the
+    # NON-genesis (deep-chain, acc_height >= TARGET_LOOKBEHIND) branch of
+    # ShareTracker::compute_share_target -- Step-3 emergency time-based decay +
+    # Step-4 +/-10% clamp -- to goldens derived from an INDEPENDENT Python
+    # reference of the oracle formula (not from the SUT). Companion to
+    # dgb_share_target_genesis_test (which covers the genesis branch); links the
+    # same proven set. MUST also be in the build.yml --target allowlist (#143).
+    add_executable(dgb_share_target_retarget_test share_target_retarget_test.cpp)
+    target_link_libraries(dgb_share_target_retarget_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_share_target_retarget_test "" AUTO)
+
     # dgb_g1_oracle_byte_parity_test: FENCED greenlight-gate G1 KAT. Pins the
     # assembled make_coin_params() net/consensus constants AND bucket-1
     # isolation primitives (PREFIX/IDENTIFIER) against oracle-transcribed
@@ -826,6 +841,21 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(dgb_share_weight_decay_test PRIVATE
         GTest::gtest_main GTest::gtest)
     gtest_add_tests(dgb_share_weight_decay_test "" AUTO)
+    # dgb_emergency_decay_saturation_test: FENCED, additive KAT pinning the
+    # share_tracker.hpp Step-3 emergency time-based decay (death-spiral
+    # prevention) eased target == min(prev_max_target * 2^halvings, MAX_TARGET)
+    # against an arbitrary-precision oracle (right-shift threshold form, no wrap
+    # at 2^256 OR 2^288). Proves (a) the load-bearing h=21/57.5min fails-now/
+    # passes-after boundary vector and (b) full-sweep NEW==ORACLE identity. Uses
+    # core uint256/uint288 -> links core only (no OBJECT lib). MUST also be in
+    # the build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_emergency_decay_saturation_test emergency_decay_saturation_test.cpp)
+    target_link_libraries(dgb_emergency_decay_saturation_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_emergency_decay_saturation_test "" AUTO)
     # dgb_binomial_conf_interval_test: FENCED, additive KAT pinning the pure
     # Wilson-score confidence-interval arithmetic of p2pool util/math.py:133
     # binomial_conf_interval (+ ierf/erf A&S-7.1.26 helpers) lifted into
@@ -871,6 +901,20 @@ if (BUILD_TESTING AND GTest_FOUND)
         core
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
     gtest_add_tests(dgb_desired_version_tally_test "" AUTO)
+    # dgb_min_protocol_ratchet_test: FENCED, additive KAT pinning the runtime
+    # P2P accept-floor ratchet dgb::ratchet_min_protocol_version (coin/
+    # desired_version_tally.hpp) vs the p2pool-dgb-scrypt update_min_protocol_version
+    # oracle (data.py:857-863): best-VERSION work-weight >= floor(total*95/100) lifts
+    # MINIMUM_PROTOCOL_VERSION 1400->3500. Same work-weighted map / window as the 60%
+    # switch gate; floor-div boundary case pins the oracle math (not cross-multiply).
+    # Pure header -> links core only. MUST also be in the build.yml --target allowlist
+    # (#143 NOT_BUILT trap).
+    add_executable(dgb_min_protocol_ratchet_test min_protocol_ratchet_test.cpp)
+    target_link_libraries(dgb_min_protocol_ratchet_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
+    gtest_add_tests(dgb_min_protocol_ratchet_test "" AUTO)
     # dgb_naughty_propagation_test: FENCED, additive KAT pinning the
     # NAUGHTY-PROPAGATION ancestor-punishment generation arithmetic in
     # coin/naughty_propagation.hpp vs the p2pool-dgb-scrypt data.py:543-549
@@ -939,6 +983,23 @@ if (BUILD_TESTING AND GTest_FOUND)
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_auto_ratchet_tail_guard_test "" AUTO)
+
+    # dgb_auto_ratchet_sim_test: FENCED, additive rig-free SIM KAT arming the
+    # G2 staged-migration harness C2/C3/C4 rows WITHOUT a Scrypt rig or a live
+    # digibyted parent -- the C++ counterpart of the harness --sim-votes path.
+    # Exercises the AutoRatchet staged-gate LOGIC (auto_ratchet.hpp) over
+    # hand-derived oracle votes, pinned to DGB's OWN oracle baseline (v35,
+    # SUCCESSOR=None). Drives get_share_version + a verbatim replica of the live
+    # inline 60%-by-WORK tail guard. Links the dgb OBJECT lib like
+    # dgb_auto_ratchet_tail_guard_test (uint288 + share_tracker.hpp). MUST also
+    # be in the build.yml --target allowlist (#143 NOT_BUILT trap).
+    add_executable(dgb_auto_ratchet_sim_test auto_ratchet_sim_test.cpp)
+    target_link_libraries(dgb_auto_ratchet_sim_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_auto_ratchet_sim_test "" AUTO)
     # dgb_chain_walk_window_test: FENCED, additive KAT pinning the LOOKBEHIND
     # chain-walk WINDOW clamp in coin/chain_walk_window.hpp vs the
     # p2pool-dgb-scrypt oracle idiom actual = min(lookbehind, height) with the

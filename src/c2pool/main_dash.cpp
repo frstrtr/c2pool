@@ -66,12 +66,83 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <vector>
 
 #ifndef C2POOL_VERSION
 #define C2POOL_VERSION "dev"
 #endif
 
 namespace {
+
+// -- Sharechain (pool-to-pool) peering CONTRACT (launcher-peering-cli slice) --
+// The DASH dual-pool G2 ratchet (LIVE rows C1-C4) needs main_dash to accept the
+// peering argv the way main_btc does (--sharechain-port + bootstrap). This slice
+// lands the argv CONTRACT + validation those rows invoke. The LIVE bind/dial is
+// driven by DASH's sharechain pool Node (the pool::NodeBridge analog of btc::Node
+// / dgb::Node = node.hpp + peer/messages/share_tracker), which is NOT yet on
+// master and is the next S8 leaf; this surface wires straight into it when it
+// lands. No shared-base / other-coin edit; dashd-RPC fallback untouched.
+struct PeeringConfig {
+    std::string listen_host = "0.0.0.0";   // --listen [HOST:]PORT bind interface
+    uint16_t    listen_port = 0;           // 0 => sharechain SSOT default (8999/18999)
+    bool        listen_set  = false;
+    std::vector<NetService> addnodes;      // --addnode HOST:PORT (persistent outbound)
+    std::vector<NetService> connects;      // --connect HOST:PORT (connect-only; no listen/discovery)
+};
+
+// Parse "HOST:PORT" (PORT mandatory; IPv4/hostname single-colon form).
+bool parse_hostport(const std::string& str, NetService& out)
+{
+    const auto colon = str.rfind(':');
+    if (colon == std::string::npos || colon == 0 || colon + 1 >= str.size())
+        return false;
+    const std::string host = str.substr(0, colon);
+    const std::string pstr = str.substr(colon + 1);
+    if (pstr.find_first_not_of("0123456789") != std::string::npos) return false;
+    const long p = std::strtol(pstr.c_str(), nullptr, 10);
+    if (p <= 0 || p > 65535) return false;
+    out = NetService(host, static_cast<uint16_t>(p));
+    return true;
+}
+
+// Parse "[HOST:]PORT". Bare PORT keeps the caller-supplied default host.
+bool parse_listen(const std::string& str, std::string& host, uint16_t& port)
+{
+    const auto colon = str.rfind(':');
+    std::string pstr = (colon == std::string::npos) ? str : str.substr(colon + 1);
+    if (colon != std::string::npos) {
+        if (colon == 0) return false;
+        host = str.substr(0, colon);
+    }
+    if (pstr.empty() || pstr.find_first_not_of("0123456789") != std::string::npos) return false;
+    const long p = std::strtol(pstr.c_str(), nullptr, 10);
+    if (p <= 0 || p > 65535) return false;
+    port = static_cast<uint16_t>(p);
+    return true;
+}
+
+// Report the requested sharechain peering topology at run-loop bring-up. Honest
+// about the deferred live bind: a won/seen share does NOT yet cross the wire
+// until the sharechain pool-node leaf lands.
+void report_peering(const PeeringConfig& peer, bool testnet)
+{
+    const uint16_t ssot = testnet ? 18999 : 8999;
+    const uint16_t bind = peer.listen_port ? peer.listen_port : ssot;
+    if (!peer.connects.empty() && !peer.listen_set) {
+        std::cout << "[run] sharechain peering: --connect mode ("
+                  << peer.connects.size() << " peer[s]); listen + discovery suppressed\n";
+    } else {
+        std::cout << "[run] sharechain peering: listen " << peer.listen_host << ":" << bind
+                  << (peer.listen_set ? " (--listen)\n" : " (sharechain SSOT default)\n");
+    }
+    for (const auto& a : peer.addnodes)
+        std::cout << "[run]   addnode (persistent outbound) -> " << a.to_string() << "\n";
+    for (const auto& c : peer.connects)
+        std::cout << "[run]   connect (connect-only)        -> " << c.to_string() << "\n";
+    std::cout << "[run] NOTE: peering argv contract + validation are LIVE; the bind/dial\n"
+                 "[run]       wires when the DASH sharechain pool Node (node.hpp/peer/\n"
+                 "[run]       messages/share_tracker, mirror btc::Node) lands -- next S8 leaf.\n";
+}
 
 using dash::coin::compute_dash_block_reward_post_v20;
 using dash::coin::compute_dash_mn_payment_post_v20;
@@ -83,6 +154,7 @@ void print_banner(const char* argv0)
         << "Usage: " << argv0 << " [--version] [--help] [--selftest]\n"
         << "       " << argv0 << " --run [--coin-rpc H:P] [--coin-rpc-auth PATH]\n"
         << "           [--testnet] [--submit-block HEX | --submit-block-file PATH]\n"
+        << "           [--listen [HOST:]PORT] [--addnode HOST:PORT]... [--connect HOST:PORT]...\n"
         << "       " << argv0 << " --mine-block [--coin-rpc H:P] [--coin-rpc-auth PATH]\n"
         << "           [--testnet] [--payout-pubkey-hash HEX] [--max-nonce N]\n\n"
         << "Status: consensus layer live (X11 PoW, subsidy, oracle CoinParams).\n"
@@ -229,7 +301,8 @@ int run_selftest()
 // A synthetic-only pass does NOT earn block-viable; the live dashd-reached run is
 // the gate.
 int run_node(bool testnet, const std::string& rpc_endpoint,
-             const std::string& rpc_conf_path, const std::string& submit_hex)
+             const std::string& rpc_conf_path, const std::string& submit_hex,
+             const PeeringConfig& peer)
 {
     namespace io = boost::asio;
 
@@ -278,6 +351,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         return accepted ? 0 : 1;
     }
 
+    report_peering(peer, testnet);
     std::cout << "[run] run-loop up (Ctrl-C to stop); won blocks relay via the\n"
                  "[run] dashd-RPC submitblock fallback. Embedded P2P relay = S8.\n";
     ioc.run();
@@ -403,6 +477,9 @@ int main(int argc, char** argv)
     std::string rpc_conf_path;    // --coin-rpc-auth PATH (creds; default ~/.dashcore/dash.conf)
     std::string submit_hex;       // --submit-block HEX (one-shot won-block submit)
     std::string submit_file;      // --submit-block-file PATH
+    std::string listen_raw;                    // --listen [HOST:]PORT (sharechain bind)
+    std::vector<std::string> addnode_raw;      // --addnode HOST:PORT (persistent outbound)
+    std::vector<std::string> connect_raw;      // --connect HOST:PORT (connect-only)
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
             std::cout << "c2pool-dash " << C2POOL_VERSION << "\n";
@@ -426,6 +503,12 @@ int main(int argc, char** argv)
             submit_hex = argv[++i];
         else if (std::strcmp(argv[i], "--submit-block-file") == 0 && i + 1 < argc)
             submit_file = argv[++i];
+        else if (std::strcmp(argv[i], "--listen") == 0 && i + 1 < argc)
+            listen_raw = argv[++i];
+        else if (std::strcmp(argv[i], "--addnode") == 0 && i + 1 < argc)
+            addnode_raw.emplace_back(argv[++i]);
+        else if (std::strcmp(argv[i], "--connect") == 0 && i + 1 < argc)
+            connect_raw.emplace_back(argv[++i]);
         // --selftest is the default; accepted explicitly for symmetry.
     }
 
@@ -448,7 +531,31 @@ int main(int argc, char** argv)
                     submit_hex.back() == ' '  || submit_hex.back() == '\t'))
                 submit_hex.pop_back();
         }
-        return run_node(testnet, rpc_endpoint, rpc_conf_path, submit_hex);
+        PeeringConfig peer;
+        for (const auto& raw : addnode_raw) {
+            NetService ns;
+            if (!parse_hostport(raw, ns)) {
+                std::cout << "[run] --addnode malformed (want HOST:PORT): " << raw << "\n";
+                return 2;
+            }
+            peer.addnodes.push_back(ns);
+        }
+        for (const auto& raw : connect_raw) {
+            NetService ns;
+            if (!parse_hostport(raw, ns)) {
+                std::cout << "[run] --connect malformed (want HOST:PORT): " << raw << "\n";
+                return 2;
+            }
+            peer.connects.push_back(ns);
+        }
+        if (!listen_raw.empty()) {
+            if (!parse_listen(listen_raw, peer.listen_host, peer.listen_port)) {
+                std::cout << "[run] --listen malformed (want [HOST:]PORT): " << listen_raw << "\n";
+                return 2;
+            }
+            peer.listen_set = true;
+        }
+        return run_node(testnet, rpc_endpoint, rpc_conf_path, submit_hex, peer);
     }
     return run_selftest();
 }

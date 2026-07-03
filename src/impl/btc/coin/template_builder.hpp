@@ -88,6 +88,67 @@ inline uint256 compute_merkle_root(std::vector<uint256> hashes) {
     return hashes[0];
 }
 
+/// Stratum coinbase merkle branch siblings for a populated template.
+///
+/// PRODUCER/CONSUMER CONTRACT: `tx_hashes` is the pure tx-hash list
+/// [tx1..txN] with NO coinbase slot (template_builder / GBT transactions[]).
+/// The stratum merkle tree has the coinbase as leaf 0, so we prepend a
+/// placeholder leaf before folding. At each level we emit the SIBLING of the
+/// left-most (coinbase-descended) node -- exactly the branch list a miner
+/// folds against its own coinbase txid to rebuild the header merkle root:
+///     acc = coinbase_txid
+///     for b in siblings: acc = merkle_hash_pair(acc, b)
+///     acc == compute_merkle_root([coinbase_txid, tx1..txN])
+///
+/// SSOT for both BTCWorkSource::get_stratum_merkle_branches() (which hex-
+/// encodes these for the wire) and the merkle self-check in mining_submit.
+/// Without the leaf-0 prepend, tx1 is dropped and the folded root diverges
+/// from the serialized body -> bad-txnmrklroot on any populated won block.
+/// Returns {} for an empty (coinbase-only) template.
+inline std::vector<uint256> stratum_merkle_siblings(const std::vector<uint256>& tx_hashes) {
+    if (tx_hashes.empty()) return {};
+
+    std::vector<uint256> level;
+    level.reserve(tx_hashes.size() + 1);
+    level.push_back(uint256::ZERO);  // coinbase placeholder leaf (leaf 0)
+    level.insert(level.end(), tx_hashes.begin(), tx_hashes.end());
+
+    std::vector<uint256> siblings;
+    while (level.size() > 1) {
+        siblings.push_back(level[1]);  // right-sibling of the coinbase node
+
+        std::vector<uint256> next;
+        next.reserve((level.size() + 2) / 2);
+        next.push_back(uint256::ZERO);  // placeholder for combo of (cb, level[1])
+        for (size_t i = 2; i < level.size(); i += 2) {
+            const uint256& l = level[i];
+            const uint256& r = (i + 1 < level.size()) ? level[i + 1] : level[i];
+            next.push_back(merkle_hash_pair(l, r));
+        }
+        level = std::move(next);
+    }
+    return siblings;
+}
+
+/// Compute the BIP141 segwit witness-commitment merkle root.
+///
+/// The coinbase transaction's own wtxid is DEFINED as 32 zero bytes and MUST
+/// occupy leaf 0 of the witness merkle tree; the remaining leaves are the
+/// other transactions' wtxids IN BLOCK ORDER. This helper is the single source
+/// of truth for that leaf-0 placeholder contract -- the witness-tree analogue
+/// of the txid-merkle coinbase leaf-0 fix (PR #570). Keeping it in one place
+/// means a populated segwit block cannot silently drop the first tx's wtxid
+/// (which bitcoind rejects as bad-witness-merkle-match).
+///
+/// other_wtxids: wtxids of every tx EXCEPT the coinbase, in block order.
+inline uint256 witness_merkle_root(const std::vector<uint256>& other_wtxids) {
+    std::vector<uint256> leaves;
+    leaves.reserve(1 + other_wtxids.size());
+    leaves.push_back(uint256::ZERO);  // coinbase wtxid placeholder (BIP141)
+    leaves.insert(leaves.end(), other_wtxids.begin(), other_wtxids.end());
+    return compute_merkle_root(std::move(leaves));
+}
+
 // ─── CoinNodeInterface ────────────────────────────────────────────────────────
 
 /// Abstract interface for obtaining work and submitting blocks.

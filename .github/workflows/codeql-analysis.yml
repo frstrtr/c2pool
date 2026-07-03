@@ -57,7 +57,13 @@ jobs:
       - if: matrix.build-mode == 'manual'
         name: Install Conan 2
         run: |
-          pip install "conan>=2.0,<3.0"
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+            export PATH="$HOME/.local/bin:$PATH"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
+          fi
           conan profile detect --force
           sed -i 's/compiler.cppstd=.*/compiler.cppstd=20/' \
             "$(conan profile path default)"
@@ -89,10 +95,24 @@ jobs:
           cmake -S . -B build_codeql \
             -DCMAKE_TOOLCHAIN_FILE=build_codeql/conan_toolchain.cmake \
             -DCMAKE_BUILD_TYPE=Release
-          cmake --build build_codeql --target c2pool -j$(nproc)
+          # Cap build parallelism on the shared self-hosted 905 box so the
+          # CodeQL build does not co-OOM with a concurrent ASan job.
+          # github-hosted (fork) runs keep full parallelism.
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            JOBS=$(nproc)
+          else
+            JOBS=8
+          fi
+          cmake --build build_codeql --target c2pool -j"$JOBS"
 
       # ── Analysis ──────────────────────────────────────────────────────────
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4
         with:
           category: "/language:${{ matrix.language }}"
+          # Cap the run-queries footprint on the shared self-hosted 905 box so
+          # CodeQL does not co-OOM with a concurrent ASan job (was auto-sizing
+          # to --ram=60466 --threads=32, nearly the whole box). 0 = action
+          # auto-default, kept for github-hosted (fork) runs.
+          threads: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '12' || '0' }}
+          ram: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '20000' || '0' }}

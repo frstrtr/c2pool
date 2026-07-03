@@ -130,8 +130,10 @@ def evaluate(con, sub_for, at=None):
         peak = prev[6] if prev else 0.0
 
         if online:
-            # back-online edge: was known-offline, now producing
-            if p_online == 0:
+            # back-online edge: only after we actually reported the outage.
+            # A sub-threshold blip never fires OFFLINE -> reporting a recovery
+            # from an outage the miner was never told about is a false alert.
+            if p_online == 0 and offline_fired:
                 events.append({"worker": worker, "kind": BACK_ONLINE, "ts": ts,
                                "detail": f"hashrate {hr:.3g} (was offline)"})
             offline_since, offline_fired = None, 0
@@ -386,6 +388,40 @@ def selftest(_args=None):
     e = evaluate(con, sub_for, at=t0 + 41 * 60)
     check([x["kind"] for x in e] == [HASHRATE_DROP], f"expected drop, got {e}")
 
+    # 6b) sub-threshold blip (dark < offline_min so OFFLINE never fired) then
+    #     recovery must stay silent: no false back_online for an unreported outage
+    put(t0 + 50 * 60, "w3", 90.0)
+    evaluate(con, sub_for, at=t0 + 50 * 60)             # w3 first-online: silent
+    put(t0 + 51 * 60, "w3", 0.0)
+    e = evaluate(con, sub_for, at=t0 + 51 * 60)         # 1m dark < 15m threshold
+    check([x for x in e if x["worker"] == "w3"] == [],
+          f"sub-threshold blip should be silent, got {e}")
+    put(t0 + 52 * 60, "w3", 90.0)
+    e = evaluate(con, sub_for, at=t0 + 52 * 60)         # recovered, never alerted
+    check([x for x in e if x["worker"] == "w3"] == [],
+          f"recovery without a prior offline alert must be silent, got {e}")
+
+    # 6c) hashrate_drop honesty: a brand-new worker (no observed prior peak)
+    #     must NEVER emit a drop on its first sample -- a drop without real
+    #     history is a fabricated alert (mirrors the back_online gate of #558).
+    put(t0 + 60 * 60, "w4", 30.0)
+    e = evaluate(con, sub_for, at=t0 + 60 * 60)
+    check([x for x in e if x["worker"] == "w4"] == [],
+          f"first-online must never fire hashrate_drop, got {e}")
+
+    # 6d) only AFTER a real peak is observed does a halving fire exactly one drop
+    put(t0 + 61 * 60, "w4", 12.0)                       # 12 < 50% of peak 30
+    e = evaluate(con, sub_for, at=t0 + 61 * 60)
+    check([x["kind"] for x in e if x["worker"] == "w4"] == [HASHRATE_DROP],
+          f"expected one drop vs observed peak, got {e}")
+
+    # 6e) a drop is never evaluated while the worker is dark (online branch only):
+    #     going to 0 is an OFFLINE concern, not a fabricated -100% drop alert.
+    put(t0 + 62 * 60, "w4", 0.0)
+    e = evaluate(con, sub_for, at=t0 + 62 * 60)
+    check([x["kind"] for x in e if x["worker"] == "w4"] == [],
+          f"dark sample must not fire hashrate_drop, got {e}")
+
     # 7) quiet-hours suppresses info (back_online) but NOT warn (offline)
     check(in_quiet_hours("22-07", t0) is not None, "quiet parse")
     info_ev = {"worker": "w1", "kind": BACK_ONLINE, "ts": t0, "detail": "d"}
@@ -405,9 +441,82 @@ def selftest(_args=None):
                             "detail": "d"}, sub)
     check(thr and thr["status"] == "throttled", f"expected throttled, got {thr}")
 
+    # 8b) honesty: a prior *undelivered* row must NOT throttle the retry — an
+    #     alert that never reached the miner has to be reattempted, not silently
+    #     suppressed (a failed send must never masquerade as handled). Guards the
+    #     status='delivered' filter in recently_sent against a throttle-all-rows
+    #     regression that would turn a dropped alert into a permanent health-lie.
+    con.execute("INSERT INTO notifications(ts,worker,kind,severity,route,status)"
+                " VALUES(?,?,?,?,?,?)",
+                (t0, "w5", OFFLINE, "warn", "x", "undelivered"))
+    con.commit()
+    rt = route_event(con, {"worker": "w5", "kind": OFFLINE, "ts": t0 + 10,
+                           "detail": "d"}, sub)
+    check(rt and rt["status"] == "deliver",
+          f"undelivered must not throttle retry, got {rt}")
+
+    # 8c) throttle honesty (the partner of #8/#8b): once the window has
+    #     ELAPSED, a still-true condition must re-fire. A throttle that never
+    #     releases would let a single stale alert masquerade as permanent
+    #     coverage of an ongoing outage -- the miner is warned once and never
+    #     again though the rig is still down. Guards the `< window` bound in
+    #     recently_sent() against a >=/off-by-one regression that swallows
+    #     every later real alert.
+    con.execute("INSERT INTO notifications(ts,worker,kind,severity,route,status)"
+                " VALUES(?,?,?,?,?,?)",
+                (t0, "w6", OFFLINE, "warn", "x", "delivered"))
+    con.commit()
+    refire = route_event(con, {"worker": "w6", "kind": OFFLINE,
+                               "ts": t0 + sub["throttle_s"] + 1, "detail": "d"}, sub)
+    check(refire and refire["status"] == "deliver",
+          f"condition must re-fire after throttle window elapses, got {refire}")
+
     # 9) no subscription -> route_event returns None (logged undelivered, not dropped)
     nosub = dict(sub, enabled=0, channels=[])
     check(route_event(con, info_ev, nosub) is None, "unsub should route to None")
+
+    # --- daily-summary path (the `daily` subcommand, P1) ----------------
+    # the sampler owns the `daily` rollup; build it here for the KAT
+    dcon = connect(":memory:")
+    dcon.execute("CREATE TABLE IF NOT EXISTS daily (day TEXT NOT NULL, "
+                 "worker TEXT NOT NULL, hours_online REAL NOT NULL, "
+                 "avg_hashrate REAL NOT NULL, shares INTEGER NOT NULL DEFAULT 0, "
+                 "stale_pct REAL NOT NULL DEFAULT 0, PRIMARY KEY(day,worker))")
+    dcon.commit()
+    dargs = argparse.Namespace(dry_run=True, smtp_host="x", smtp_port=0, sender="x")
+
+    # 10) no rollups yet -> daily() emits nothing (no fabricated summary)
+    daily(dcon, dargs)
+    nd = dcon.execute("SELECT COUNT(*) FROM notifications WHERE kind=?",
+                      (DAILY_SUMMARY,)).fetchone()[0]
+    check(nd == 0, f"empty rollup must emit no summary, got {nd}")
+
+    for day, w, hrs, hr, stale in [
+            ("2026-06-25", "w1", 20.0, 90.0, 1.0),
+            ("2026-06-26", "w1", 23.5, 110.0, 0.5),
+            ("2026-06-26", "w2", 4.0, 5.0, 9.0),
+            ("2026-06-26", "__pool__", 24.0, 999.0, 0.0)]:
+        dcon.execute("INSERT INTO daily(day,worker,hours_online,avg_hashrate,"
+                     "shares,stale_pct) VALUES(?,?,?,?,0,?)",
+                     (day, w, hrs, hr, stale))
+    dcon.execute("INSERT INTO subscriptions(worker,channels,route,enabled) "
+                 "VALUES('w1','logonly','w1@route',1)")
+    dcon.commit()
+
+    # 11) newest day only, __pool__ aggregate excluded -> w1,w2 summarized
+    daily(dcon, dargs)
+    drows = dcon.execute("SELECT worker,status FROM notifications WHERE kind=? "
+                         "ORDER BY worker", (DAILY_SUMMARY,)).fetchall()
+    dworkers = sorted({r[0] for r in drows})
+    check(dworkers == ["w1", "w2"],
+          f"newest-day summary covers w1,w2 only (no __pool__/old day), got {dworkers}")
+
+    # 12) subscribed -> delivered; unsubscribed -> undelivered (honest, not dropped)
+    dstat = dict(drows)
+    check(dstat.get("w1") == "delivered", f"subscribed delivered, got {dstat.get('w1')}")
+    check(dstat.get("w2") == "undelivered", f"unsubscribed undelivered, got {dstat.get('w2')}")
+    dcon.close()
+
 
     con.close()
     if fails:
@@ -415,7 +524,7 @@ def selftest(_args=None):
         for f in fails:
             print("  -", f)
         return 1
-    print("SELFTEST OK (9/9)")
+    print("SELFTEST OK (18/18)")
     return 0
 
 

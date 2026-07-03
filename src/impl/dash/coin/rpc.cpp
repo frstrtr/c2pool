@@ -337,16 +337,9 @@ DashWorkData NodeRPC::getwork()
     // We accept both shapes. Platform credit-pool OP_RETURN burns surface as a
     // payee with an empty/"6a" script -> normalized to "!6a".
     auto push_payment = [&w](const nlohmann::json& entry) {
-        PackedPayment pp;
-        if (entry.is_object())
-        {
-            if (entry.contains("payee") && entry["payee"].is_string())
-                pp.payee = entry["payee"].get<std::string>();
-            else if (entry.contains("script") && entry["script"].is_string())
-                pp.payee = "!" + entry["script"].get<std::string>();
-            if (entry.contains("amount"))
-                pp.amount = entry["amount"].get<uint64_t>();
-        }
+        // bad-cb-payee fix: empty payee strings normalize to the raw "!"+script
+        // form (see rpc_data.hpp::normalize_payment) instead of being dropped.
+        PackedPayment pp = normalize_payment(entry);
         if (pp.amount == 0)
             return;
         w.m_packed_payments.push_back(std::move(pp));

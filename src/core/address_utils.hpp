@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <functional>
 
 namespace core {
 
@@ -51,6 +52,14 @@ bool is_address_for_chain(const std::string& address,
 /// Build a scriptPubKey from either a Base58Check or Bech32 address.
 /// Returns empty vector on failure.
 std::vector<unsigned char> address_to_script(const std::string& address);
+
+// -- Generic coin-registered fallback decoders --------------------------------
+// A coin module may register an opaque address decoder that address_to_script
+// consults AFTER its built-in bech32/base58 formats fail. Core holds NO
+// coin-specific address knowledge -- the decoder is a plain functor mapping an
+// address string to a scriptPubKey ({} == "not my format, try the next one").
+using AddressDecoderFn = std::function<std::vector<unsigned char>(const std::string&)>;
+void register_address_decoder(AddressDecoderFn fn);
 
 /// Convert a raw scriptPubKey to a human-readable address string.
 /// Supports P2PKH, P2SH, P2WPKH, P2WSH. Returns "" on unrecognised script.

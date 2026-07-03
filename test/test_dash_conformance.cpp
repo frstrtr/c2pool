@@ -34,7 +34,7 @@
 #include <impl/dash/pplns.hpp>           // dash::pplns::compute_payouts, dash::ShareChain, DashShare
 #include <impl/dash/version_negotiation.hpp> // dash::version_negotiation::get_desired_version_counts/weights
 #include <impl/dash/coin/vendor/cbtx.hpp> // dash::coin::vendor::CCbTx, parse_cbtx
-#include <impl/dash/config_pool.hpp>     // dash::PoolConfig (sharechain SSOT)
+#include <impl/dash/config_pool.hpp>     // dash::SharechainConfig (sharechain SSOT)
 #include <impl/bitcoin_family/coin/base_block.hpp>  // bitcoin_family::coin::SmallBlockHeaderType
 
 #include <core/hash.hpp>                     // Hash (sha256d)
@@ -400,7 +400,7 @@ TEST(DashConformanceDifficulty, BitsToDifficultyMatchesP2poolDash) {
 // restored guard against the mainnet floor (params.max_target == 0xFFFF*2**208).
 TEST(DashConformanceShareTarget, RejectsTargetEasierThanFloorAndZero) {
     core::CoinParams params;
-    params.max_target = dash::PoolConfig::max_target();   // 00000000ffff00..00
+    params.max_target = dash::SharechainConfig::max_target();   // 00000000ffff00..00
 
     const uint256 floor = params.max_target;
 
@@ -606,7 +606,7 @@ TEST(DashConformancePplns, ColdChainFallsBackToSingleRecipient) {
 // are dropped (oracle `if amounts[script]`). The always-emitted DONATION line
 // carries ONLY the rounding remainder (miner_value - Σworkers), which may be 0.
 //
-// dash::PoolConfig::dust_threshold() (100000 duff) survives as the vardiff /
+// dash::SharechainConfig::dust_threshold() (100000 duff) survives as the vardiff /
 // share-difficulty floor (c2pool_refactored.cpp mirror of work.py:326); it is
 // NO LONGER consulted in the payout path. These KATs pin the oracle behaviour:
 // a sub-dust-but-nonzero worker is PAID, not swept to donation. Amounts are
@@ -1017,11 +1017,13 @@ TEST(DashConformanceVersionNeg, SwitchClassifier5CaseKat) {
                                  successor_switch_allowed(clears, 36u)));
 }
 
-// === verify_version_transition: the WIRED accept-path gate (not the isolated
-// primitives above). Proves dash::verify_version_transition composes the
-// version_negotiation primitives into admit/reject enforcement at a version
-// boundary -- the mint<->accept coupling that was previously ZERO-consumer on
-// dash. CHAIN_LENGTH (CL) is small (20) so the [9/10..10/10] tail window is
+// === dash::verify_share: the WIRED accept-path entry (not the isolated
+// primitives above, and not the orphan verify_version_transition the S8-prep
+// KAT used). Proves the version-boundary gate fires through the SAME combined
+// entry a node calls -- closing the enforcement hole where the gate had ZERO
+// accept-path consumers. verify_init=false because Phase 1 (X11 PoW/hash_link)
+// runs in the node thread pool; these cases lock the Phase-2 chain-context
+// WIRING. The init-composition case below proves Phase 1 is wired too. CHAIN_LENGTH (CL) is small (20) so the [9/10..10/10] tail window is
 // reachable in a synthetic chain; the exact 60%/95% floors are pinned by the
 // isolation KATs above, so these lock the WIRING, not the thresholds.
 namespace {
@@ -1035,6 +1037,7 @@ uint256 build_uniform(SyntheticChain& sc, int count, uint64_t version,
     return prev;
 }
 constexpr uint64_t CL = 20;  // synthetic CHAIN_LENGTH for the gate window
+core::CoinParams kVgParams;  // accept-entry param (unused when verify_init=false)
 }  // namespace
 
 // Same-version share is never a boundary -> always admitted (data.py:382).
@@ -1043,7 +1046,7 @@ TEST(DashConformanceVersionWiring, SameVersionAdmitted) {
     const uint160 A = miner_h160(0x10);
     uint256 tip = build_uniform(sc, 22, 36, BITS_DIFF1, A);
     add_versioned(sc, 0x80, tip, 36, BITS_DIFF1, A);
-    EXPECT_NO_THROW(dash::verify_version_transition(*sc.pool.back(), sc.chain, CL));
+    EXPECT_NO_THROW(dash::verify_share(*sc.pool.back(), sc.chain, CL, kVgParams, /*verify_init=*/false));
 }
 
 // Upgrade boundary with fewer than CHAIN_LENGTH ancestors -> rejected
@@ -1054,7 +1057,7 @@ TEST(DashConformanceVersionWiring, UpgradeWithoutHistoryRejected) {
     uint256 tip = build_uniform(sc, 5, 16, BITS_DIFF1, A);  // < CL ancestors
     add_versioned(sc, 0x81, tip, 36, BITS_DIFF1, A);        // v16 -> v36 upgrade
     try {
-        dash::verify_version_transition(*sc.pool.back(), sc.chain, CL);
+        dash::verify_share(*sc.pool.back(), sc.chain, CL, kVgParams, /*verify_init=*/false);
         FAIL() << "expected throw on upgrade without enough history";
     } catch (const std::invalid_argument& e) {
         EXPECT_NE(std::string(e.what()).find("enough history"), std::string::npos);
@@ -1069,7 +1072,7 @@ TEST(DashConformanceVersionWiring, UpgradeWithSuccessorMajorityAdmitted) {
     uint256 tip = build_uniform(sc, 22, 36, BITS_DIFF1, A);   // tail window = v36
     uint256 prev = add_versioned(sc, 0x82, tip, 16, BITS_DIFF1, A);  // a lone v16 prev
     add_versioned(sc, 0x83, prev, 36, BITS_DIFF1, A);         // v16 -> v36 upgrade
-    EXPECT_NO_THROW(dash::verify_version_transition(*sc.pool.back(), sc.chain, CL));
+    EXPECT_NO_THROW(dash::verify_share(*sc.pool.back(), sc.chain, CL, kVgParams, /*verify_init=*/false));
 }
 
 // Upgrade boundary, history present, but the tail window has NO successor votes
@@ -1080,7 +1083,7 @@ TEST(DashConformanceVersionWiring, UpgradeWithoutSuccessorVotesRejected) {
     uint256 tip = build_uniform(sc, 22, 16, BITS_DIFF1, A);   // tail window = all v16
     add_versioned(sc, 0x84, tip, 36, BITS_DIFF1, A);          // v16 -> v36 upgrade
     try {
-        dash::verify_version_transition(*sc.pool.back(), sc.chain, CL);
+        dash::verify_share(*sc.pool.back(), sc.chain, CL, kVgParams, /*verify_init=*/false);
         FAIL() << "expected throw on upgrade without successor votes";
     } catch (const std::invalid_argument& e) {
         EXPECT_NE(std::string(e.what()).find("hash power upgraded"),
@@ -1097,7 +1100,7 @@ TEST(DashConformanceVersionWiring, StalePreV36ShareRejected) {
     uint256 tip = build_uniform(sc, 22, 36, BITS_DIFF1, A);   // lookbehind = all v36
     add_versioned(sc, 0x85, tip, 16, BITS_DIFF1, A);          // stale v16 on v36 tip
     try {
-        dash::verify_version_transition(*sc.pool.back(), sc.chain, CL);
+        dash::verify_share(*sc.pool.back(), sc.chain, CL, kVgParams, /*verify_init=*/false);
         FAIL() << "expected throw on stale pre-v36 share";
     } catch (const std::invalid_argument& e) {
         EXPECT_NE(std::string(e.what()).find("too old"), std::string::npos);
@@ -1109,7 +1112,25 @@ TEST(DashConformanceVersionWiring, GenesisShareAdmitted) {
     SyntheticChain sc;
     const uint160 A = miner_h160(0x15);
     add_versioned(sc, 0x86, uint256(), 36, BITS_DIFF1, A);    // null prev_hash
-    EXPECT_NO_THROW(dash::verify_version_transition(*sc.pool.back(), sc.chain, CL));
+    EXPECT_NO_THROW(dash::verify_share(*sc.pool.back(), sc.chain, CL, kVgParams, /*verify_init=*/false));
+}
+
+// Phase-1 composition: with verify_init=true the combined entry runs
+// share_init_verify FIRST, so a structurally invalid share (empty coinbase) is
+// rejected by verify_share BEFORE the version gate is ever consulted. Proves
+// Phase 1 is wired into the accept entry, not bypassed.
+TEST(DashConformanceVersionWiring, InitPhaseComposedAndRejectsBeforeGate) {
+    SyntheticChain sc;
+    const uint160 A = miner_h160(0x16);
+    add_versioned(sc, 0x87, uint256(), 36, BITS_DIFF1, A);  // genesis: gate is a no-op
+    // Synthetic shares carry an empty coinbase -> share_init_verify rejects on
+    // the size guard. verify_init=true must surface that, proving init runs.
+    try {
+        dash::verify_share(*sc.pool.back(), sc.chain, CL, kVgParams, /*verify_init=*/true);
+        FAIL() << "expected Phase-1 init to reject the empty-coinbase share";
+    } catch (const std::invalid_argument& e) {
+        EXPECT_NE(std::string(e.what()).find("coinbase"), std::string::npos);
+    }
 }
 
 // ── Accept-path SEAM: dash::admit_chain_relative (chain_admit.hpp) ───────────
@@ -1277,45 +1298,45 @@ TEST(DashConformanceCbtx, ParseCbtxIsExactInverseOfKat) {
 // Pin DASH's p2pool sharechain framing constants against its OWN older-than-v35
 // oracle (frstrtr/p2pool-dash networks/dash.py + dash_testnet.py). The expected
 // values below are an INDEPENDENT transcription of the oracle, NOT a re-export of
-// dash::PoolConfig, so the assertions catch a drift in either copy -- the same
+// dash::SharechainConfig, so the assertions catch a drift in either copy -- the same
 // anti-circularity design used by the merkle/payout KATs above.
 //
 // PREFIX/IDENTIFIER are isolation primitives: pinned per-coin here, never to be
 // unified cross-coin (operator v36_standardization_goal 2026-06-17).
 TEST(DashConformanceNetworkParams, MainnetMatchesP2poolDashOracle) {
-    dash::PoolConfig::is_testnet = false;
-    EXPECT_EQ(dash::PoolConfig::p2p_port(), 8999);
-    EXPECT_EQ(dash::PoolConfig::worker_port(), 7903);
-    EXPECT_EQ(dash::PoolConfig::share_period(), 20u);
-    EXPECT_EQ(dash::PoolConfig::chain_length(), 4320u);       // 24*60*60//20
-    EXPECT_EQ(dash::PoolConfig::real_chain_length(), 4320u);
-    EXPECT_EQ(dash::PoolConfig::TARGET_LOOKBEHIND, 100u);
-    EXPECT_EQ(dash::PoolConfig::SPREAD, 10u);
-    EXPECT_EQ(dash::PoolConfig::MINIMUM_PROTOCOL_VERSION, 1700u);
-    EXPECT_EQ(dash::PoolConfig::identifier_hex(), std::string("7242ef345e1bed6b"));
-    EXPECT_EQ(dash::PoolConfig::prefix_hex(),     std::string("3b3e1286f446b891"));
+    dash::SharechainConfig::is_testnet = false;
+    EXPECT_EQ(dash::SharechainConfig::p2p_port(), 8999);
+    EXPECT_EQ(dash::SharechainConfig::worker_port(), 7903);
+    EXPECT_EQ(dash::SharechainConfig::share_period(), 20u);
+    EXPECT_EQ(dash::SharechainConfig::chain_length(), 4320u);       // 24*60*60//20
+    EXPECT_EQ(dash::SharechainConfig::real_chain_length(), 4320u);
+    EXPECT_EQ(dash::SharechainConfig::TARGET_LOOKBEHIND, 100u);
+    EXPECT_EQ(dash::SharechainConfig::SPREAD, 10u);
+    EXPECT_EQ(dash::SharechainConfig::MINIMUM_PROTOCOL_VERSION, 1700u);
+    EXPECT_EQ(dash::SharechainConfig::identifier_hex(), std::string("7242ef345e1bed6b"));
+    EXPECT_EQ(dash::SharechainConfig::prefix_hex(),     std::string("3b3e1286f446b891"));
     uint256 expect_max;
     expect_max.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
-    EXPECT_EQ(dash::PoolConfig::max_target(), expect_max);    // 0xFFFF * 2**208
+    EXPECT_EQ(dash::SharechainConfig::max_target(), expect_max);    // 0xFFFF * 2**208
 }
 
 TEST(DashConformanceNetworkParams, TestnetMatchesP2poolDashOracle) {
-    dash::PoolConfig::is_testnet = true;
-    EXPECT_EQ(dash::PoolConfig::p2p_port(), 18999);
-    EXPECT_EQ(dash::PoolConfig::worker_port(), 17903);
-    EXPECT_EQ(dash::PoolConfig::share_period(), 20u);
-    EXPECT_EQ(dash::PoolConfig::chain_length(), 4320u);
-    EXPECT_EQ(dash::PoolConfig::identifier_hex(), std::string("b6deb1e543fe2427"));
-    EXPECT_EQ(dash::PoolConfig::prefix_hex(),     std::string("198b644f6821e3b3"));
+    dash::SharechainConfig::is_testnet = true;
+    EXPECT_EQ(dash::SharechainConfig::p2p_port(), 18999);
+    EXPECT_EQ(dash::SharechainConfig::worker_port(), 17903);
+    EXPECT_EQ(dash::SharechainConfig::share_period(), 20u);
+    EXPECT_EQ(dash::SharechainConfig::chain_length(), 4320u);
+    EXPECT_EQ(dash::SharechainConfig::identifier_hex(), std::string("b6deb1e543fe2427"));
+    EXPECT_EQ(dash::SharechainConfig::prefix_hex(),     std::string("198b644f6821e3b3"));
     uint256 expect_max;
     expect_max.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-    EXPECT_EQ(dash::PoolConfig::max_target(), expect_max);    // 2**256 // 2**20 - 1
-    dash::PoolConfig::is_testnet = false;  // restore global for any later tests
+    EXPECT_EQ(dash::SharechainConfig::max_target(), expect_max);    // 2**256 // 2**20 - 1
+    dash::SharechainConfig::is_testnet = false;  // restore global for any later tests
 }
 
 // ── Factory↔SSOT conformance (S6 slice: make_coin_params wiring) ─────────────
 // The dash::make_coin_params factory MUST populate core::CoinParams pool-level
-// fields from the dash::PoolConfig SSOT (config_pool.hpp) and the coin-level
+// fields from the dash::SharechainConfig SSOT (config_pool.hpp) and the coin-level
 // fields from the DASH oracle, so share_check/coinbase_builder — which consume a
 // const core::CoinParams& — never run on an unpopulated or drifted struct. This
 // pins the factory output WITHOUT a node dependency: it is the node-free half of
@@ -1324,22 +1345,22 @@ TEST(DashConformanceNetworkParams, TestnetMatchesP2poolDashOracle) {
 
 TEST(DashConformanceFactory, PoolFieldsSourcedFromSSOT) {
     for (bool testnet : {false, true}) {
-        dash::PoolConfig::is_testnet = testnet;
+        dash::SharechainConfig::is_testnet = testnet;
         auto p = dash::make_coin_params(testnet);
-        EXPECT_EQ(p.p2p_port,                 dash::PoolConfig::p2p_port());
-        EXPECT_EQ(p.worker_port,              dash::PoolConfig::worker_port());
-        EXPECT_EQ(p.share_period,             dash::PoolConfig::share_period());
-        EXPECT_EQ(p.chain_length,             dash::PoolConfig::chain_length());
-        EXPECT_EQ(p.real_chain_length,        dash::PoolConfig::real_chain_length());
-        EXPECT_EQ(p.target_lookbehind,        dash::PoolConfig::TARGET_LOOKBEHIND);
-        EXPECT_EQ(p.spread,                   dash::PoolConfig::SPREAD);
-        EXPECT_EQ(p.minimum_protocol_version, dash::PoolConfig::MINIMUM_PROTOCOL_VERSION);
-        EXPECT_EQ(p.identifier_hex,           dash::PoolConfig::IDENTIFIER_HEX);
-        EXPECT_EQ(p.prefix_hex,               dash::PoolConfig::PREFIX_HEX);
-        EXPECT_EQ(p.testnet_identifier_hex,   dash::PoolConfig::TESTNET_IDENTIFIER_HEX);
-        EXPECT_EQ(p.testnet_prefix_hex,       dash::PoolConfig::TESTNET_PREFIX_HEX);
-        dash::PoolConfig::is_testnet = testnet;
-        EXPECT_EQ(p.max_target,               dash::PoolConfig::max_target());
+        EXPECT_EQ(p.p2p_port,                 dash::SharechainConfig::p2p_port());
+        EXPECT_EQ(p.worker_port,              dash::SharechainConfig::worker_port());
+        EXPECT_EQ(p.share_period,             dash::SharechainConfig::share_period());
+        EXPECT_EQ(p.chain_length,             dash::SharechainConfig::chain_length());
+        EXPECT_EQ(p.real_chain_length,        dash::SharechainConfig::real_chain_length());
+        EXPECT_EQ(p.target_lookbehind,        dash::SharechainConfig::TARGET_LOOKBEHIND);
+        EXPECT_EQ(p.spread,                   dash::SharechainConfig::SPREAD);
+        EXPECT_EQ(p.minimum_protocol_version, dash::SharechainConfig::MINIMUM_PROTOCOL_VERSION);
+        EXPECT_EQ(p.identifier_hex,           dash::SharechainConfig::IDENTIFIER_HEX);
+        EXPECT_EQ(p.prefix_hex,               dash::SharechainConfig::PREFIX_HEX);
+        EXPECT_EQ(p.testnet_identifier_hex,   dash::SharechainConfig::TESTNET_IDENTIFIER_HEX);
+        EXPECT_EQ(p.testnet_prefix_hex,       dash::SharechainConfig::TESTNET_PREFIX_HEX);
+        dash::SharechainConfig::is_testnet = testnet;
+        EXPECT_EQ(p.max_target,               dash::SharechainConfig::max_target());
         EXPECT_EQ(p.is_testnet,               testnet);
     }
 }

@@ -905,11 +905,13 @@ private:
         const std::string& ref_hash_hex = {},
         const uint256& the_state_root = uint256(),
         const std::string& coinbase_text = {});
+    public:  // pure, stateless stratum-merkle utilities (contract-pinned in core_merkle_branches_test)
     // Compute Stratum merkle branches from a list of tx hashes (excl. coinbase)
     static std::vector<std::string> compute_merkle_branches(std::vector<std::string> tx_hashes);
     // Reconstruct merkle root from coinbase hex + Stratum merkle branches
     static uint256 reconstruct_merkle_root(const std::string& coinbase_hex,
                                            const std::vector<std::string>& merkle_branches);
+    private:
     // Build full block hex from Stratum submit parameters.
     // When job is provided, uses its frozen template data instead of the live m_cached_template.
     std::string build_block_from_stratum(const std::string& extranonce1,

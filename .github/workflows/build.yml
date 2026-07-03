@@ -41,7 +41,13 @@ jobs:
         with: { python-version: '3.12' }
 
       - name: Install Conan 2
-        run: pip install "conan>=2.0,<3.0"
+        run: |
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
+          fi
 
       - name: Detect Conan profile
         run: |
@@ -82,7 +88,7 @@ jobs:
                     test_threading test_weights \
                     test_header_chain test_mempool test_template_builder \
                     test_doge_chain test_compact_blocks test_dash_x11_kat \
-                    test_dash_header_chain test_dash_block_replay test_dash_conformance test_dash_subsidy test_dash_mempool test_dash_simplifiedmns test_dash_quorum test_dash_quorum_root test_dash_mn_state test_dash_embedded_gbt test_dash_smldiff test_dash_p2p_messages test_dash_p2p_connection test_dash_p2p_node test_dash_node_interface test_dash_config test_dash_broadcaster test_dash_broadcaster_full test_dash_share_hash_link test_dash_block_relay test_dash_rpc_request test_dash_rpc_conf test_dash_block_producer test_dash_embedded_relay_e2e test_dash_block_relay_plan test_dash_version_activation_latch test_dash_block_relay_binding test_dash_block_relay_dual_arm test_dash_coinbase_parity test_dash_donation_combined test_dash_g3_assembled test_dash_work_target test_dash_work_job_targets \
+                    test_dash_header_chain test_dash_block_replay test_dash_conformance test_dash_subsidy test_dash_mempool test_dash_simplifiedmns test_dash_quorum test_dash_quorum_root test_dash_mn_state test_dash_embedded_gbt test_dash_smldiff test_dash_p2p_messages test_dash_p2p_connection test_dash_p2p_node test_dash_node_interface test_dash_config test_dash_broadcaster test_dash_broadcaster_full test_dash_share_hash_link test_dash_block_relay test_dash_rpc_request test_dash_rpc_conf test_dash_block_producer test_dash_embedded_relay_e2e test_dash_block_relay_plan test_dash_version_activation_latch test_dash_block_relay_binding test_dash_block_relay_dual_arm test_dash_coinbase_parity test_dash_donation_combined test_dash_g3_assembled test_dash_work_target test_dash_work_job_targets test_dash_cb_payee test_dash_poolnode_messages test_dash_peer test_dash_share_tracker test_dash_node \
                     test_multiaddress_pplns test_pplns_stress \
                     test_hash_link test_decay_pplns \
                     test_pplns_consensus \
@@ -94,7 +100,7 @@ jobs:
                     dgb_gentx_coinbase_test dgb_connection_coinbase_test dgb_pplns_payout_split_test nmc_auxpow_merkle_test nmc_template_builder_test nmc_auxpow_wire_test nmc_reconstruct_won_block_test nmc_mempool_name_test nmc_block_broadcast_test nmc_host_dualpath_test nmc_fallback_path_conformance_test dgb_gentx_share_path_test dgb_conn_pplns_producer_test dgb_other_tx_resolver_test \
                     dgb_other_tx_assembler_test dgb_reconstruct_won_block_test dgb_reconstruct_closure_test dgb_gentx_unpack_test dgb_work_source_test dgb_template_builder_test dgb_embedded_coin_node_test dgb_embedded_tx_select_test dgb_template_other_txs_test dgb_coinbase_value_parity_test dgb_submit_classify_test dgb_aux_parent_coinbase_parity_test dgb_template_capture_test dgb_aux_doge_db_commitment_bind_test dgb_aux_doge_mm_commitment_test dgb_aux_doge_dc_proof_test dgb_aux_doge_bind_parsers_test dgb_compact_blocks_bip152_parity_test dgb_aux_dual_target_select_test dgb_aux_broadcast_path_election_test \
                     rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test header_chain_test \
-                    dgb_coin_node_seam_test dgb_block_broadcast_test dgb_won_block_dispatch_test dgb_forced_won_share_dualpath_test dgb_scrypt_pow_test dgb_nonce_grinder_test dgb_regrind_block_test dgb_won_block_finalize_test dgb_share_target_genesis_test dgb_share_bits_oracle_pin_test dgb_pool_msg_wire_test dgb_get_shares_walk_test dgb_download_stops_test dgb_think_p1_walk_bounds_test dgb_think_p1_desired_emit_test dgb_think_p6_desired_cutoff_test dgb_think_p4_head_keys_test dgb_think_p3_best_head_test dgb_g1_oracle_byte_parity_test dgb_think_p2_walk_bounds_test dgb_expected_time_to_block_test dgb_tail_score_endpoints_test dgb_pool_attempts_per_second_test dgb_pool_efficiency_test dgb_think_p5_best_share_punish_test dgb_auto_ratchet_tail_guard_test dgb_binomial_conf_interval_test dgb_desired_version_tally_test dgb_get_height_and_last_endpoints_test dgb_chain_walk_window_test dgb_redistribute_delegate_ghal_test dgb_share_weight_decay_test dgb_naughty_propagation_test dgb_hash_format_parity_test v37_test \
+                    dgb_coin_node_seam_test dgb_block_broadcast_test dgb_won_block_dispatch_test dgb_forced_won_share_dualpath_test dgb_scrypt_pow_test dgb_nonce_grinder_test dgb_regrind_block_test dgb_won_block_finalize_test dgb_share_target_genesis_test dgb_share_target_retarget_test dgb_share_bits_oracle_pin_test dgb_pool_msg_wire_test dgb_get_shares_walk_test dgb_download_stops_test dgb_think_p1_walk_bounds_test dgb_think_p1_desired_emit_test dgb_think_p6_desired_cutoff_test dgb_think_p4_head_keys_test dgb_think_p3_best_head_test dgb_g1_oracle_byte_parity_test dgb_think_p2_walk_bounds_test dgb_expected_time_to_block_test dgb_tail_score_endpoints_test dgb_pool_attempts_per_second_test dgb_pool_efficiency_test dgb_think_p5_best_share_punish_test dgb_auto_ratchet_tail_guard_test dgb_auto_ratchet_sim_test dgb_binomial_conf_interval_test dgb_desired_version_tally_test dgb_min_protocol_ratchet_test dgb_get_height_and_last_endpoints_test dgb_chain_walk_window_test dgb_redistribute_delegate_ghal_test dgb_share_weight_decay_test dgb_naughty_propagation_test dgb_hash_format_parity_test dgb_emergency_decay_saturation_test v37_test \
             -j8
 
       - name: Run tests
@@ -168,7 +174,13 @@ jobs:
         with: { python-version: '3.12' }
 
       - name: Install Conan 2
-        run: pip install "conan>=2.0,<3.0"
+        run: |
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
+          fi
 
       - name: Detect Conan profile
         run: |
@@ -226,7 +238,7 @@ jobs:
                     test_threading test_weights \
                     test_header_chain test_mempool test_template_builder \
                     test_doge_chain test_compact_blocks test_dash_x11_kat \
-                    test_dash_header_chain test_dash_block_replay test_dash_conformance test_dash_subsidy test_dash_mempool test_dash_simplifiedmns test_dash_quorum test_dash_quorum_root test_dash_mn_state test_dash_embedded_gbt test_dash_smldiff test_dash_p2p_messages test_dash_p2p_connection test_dash_p2p_node test_dash_node_interface test_dash_config test_dash_broadcaster test_dash_broadcaster_full test_dash_share_hash_link test_dash_block_relay test_dash_rpc_request test_dash_rpc_conf test_dash_block_producer test_dash_embedded_relay_e2e test_dash_block_relay_plan test_dash_version_activation_latch test_dash_block_relay_binding test_dash_block_relay_dual_arm test_dash_coinbase_parity test_dash_donation_combined test_dash_g3_assembled test_dash_work_target test_dash_work_job_targets \
+                    test_dash_header_chain test_dash_block_replay test_dash_conformance test_dash_subsidy test_dash_mempool test_dash_simplifiedmns test_dash_quorum test_dash_quorum_root test_dash_mn_state test_dash_embedded_gbt test_dash_smldiff test_dash_p2p_messages test_dash_p2p_connection test_dash_p2p_node test_dash_node_interface test_dash_config test_dash_broadcaster test_dash_broadcaster_full test_dash_share_hash_link test_dash_block_relay test_dash_rpc_request test_dash_rpc_conf test_dash_block_producer test_dash_embedded_relay_e2e test_dash_block_relay_plan test_dash_version_activation_latch test_dash_block_relay_binding test_dash_block_relay_dual_arm test_dash_coinbase_parity test_dash_donation_combined test_dash_g3_assembled test_dash_work_target test_dash_work_job_targets test_dash_cb_payee test_dash_poolnode_messages test_dash_peer test_dash_share_tracker test_dash_node \
                     test_hash_link test_decay_pplns \
                     test_pplns_consensus \
                     test_v36_script_sorting test_v36_cross_impl_refhash \
@@ -237,7 +249,7 @@ jobs:
                     dgb_gentx_coinbase_test dgb_connection_coinbase_test dgb_pplns_payout_split_test nmc_auxpow_merkle_test nmc_template_builder_test nmc_auxpow_wire_test nmc_reconstruct_won_block_test nmc_mempool_name_test nmc_block_broadcast_test nmc_host_dualpath_test nmc_fallback_path_conformance_test dgb_gentx_share_path_test dgb_conn_pplns_producer_test dgb_other_tx_resolver_test \
                     dgb_other_tx_assembler_test dgb_reconstruct_won_block_test dgb_reconstruct_closure_test dgb_gentx_unpack_test dgb_work_source_test dgb_template_builder_test dgb_embedded_coin_node_test dgb_embedded_tx_select_test dgb_template_other_txs_test dgb_coinbase_value_parity_test dgb_submit_classify_test dgb_aux_parent_coinbase_parity_test dgb_template_capture_test dgb_aux_doge_db_commitment_bind_test dgb_aux_doge_mm_commitment_test dgb_aux_doge_dc_proof_test dgb_aux_doge_bind_parsers_test dgb_compact_blocks_bip152_parity_test dgb_aux_dual_target_select_test dgb_aux_broadcast_path_election_test \
                     rpc_request_test softfork_check_test genesis_check_test algo_select_test digishield_walk_test header_chain_test \
-                    dgb_coin_node_seam_test dgb_block_broadcast_test dgb_won_block_dispatch_test dgb_forced_won_share_dualpath_test dgb_scrypt_pow_test dgb_nonce_grinder_test dgb_regrind_block_test dgb_won_block_finalize_test dgb_share_target_genesis_test dgb_share_bits_oracle_pin_test dgb_pool_msg_wire_test dgb_get_shares_walk_test dgb_download_stops_test dgb_think_p1_walk_bounds_test dgb_think_p1_desired_emit_test dgb_think_p6_desired_cutoff_test dgb_think_p4_head_keys_test dgb_think_p3_best_head_test dgb_g1_oracle_byte_parity_test dgb_think_p2_walk_bounds_test dgb_expected_time_to_block_test dgb_tail_score_endpoints_test dgb_pool_attempts_per_second_test dgb_pool_efficiency_test dgb_think_p5_best_share_punish_test dgb_auto_ratchet_tail_guard_test dgb_binomial_conf_interval_test dgb_desired_version_tally_test dgb_get_height_and_last_endpoints_test dgb_chain_walk_window_test dgb_redistribute_delegate_ghal_test dgb_share_weight_decay_test dgb_naughty_propagation_test dgb_hash_format_parity_test test_coin_broadcaster test_multiaddress_pplns test_pplns_stress \
+                    dgb_coin_node_seam_test dgb_block_broadcast_test dgb_won_block_dispatch_test dgb_forced_won_share_dualpath_test dgb_scrypt_pow_test dgb_nonce_grinder_test dgb_regrind_block_test dgb_won_block_finalize_test dgb_share_target_genesis_test dgb_share_target_retarget_test dgb_share_bits_oracle_pin_test dgb_pool_msg_wire_test dgb_get_shares_walk_test dgb_download_stops_test dgb_think_p1_walk_bounds_test dgb_think_p1_desired_emit_test dgb_think_p6_desired_cutoff_test dgb_think_p4_head_keys_test dgb_think_p3_best_head_test dgb_g1_oracle_byte_parity_test dgb_think_p2_walk_bounds_test dgb_expected_time_to_block_test dgb_tail_score_endpoints_test dgb_pool_attempts_per_second_test dgb_pool_efficiency_test dgb_think_p5_best_share_punish_test dgb_auto_ratchet_tail_guard_test dgb_auto_ratchet_sim_test dgb_binomial_conf_interval_test dgb_desired_version_tally_test dgb_min_protocol_ratchet_test dgb_get_height_and_last_endpoints_test dgb_chain_walk_window_test dgb_redistribute_delegate_ghal_test dgb_share_weight_decay_test dgb_naughty_propagation_test dgb_hash_format_parity_test dgb_emergency_decay_saturation_test test_coin_broadcaster test_multiaddress_pplns test_pplns_stress \
                     v37_test \
             -j8
 
@@ -285,7 +297,13 @@ jobs:
         with: { python-version: 3.12 }
 
       - name: Install Conan 2
-        run: pip install "conan>=2.0,<3.0"
+        run: |
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
+          fi
 
       - name: Detect Conan profile
         run: |
@@ -325,6 +343,7 @@ jobs:
                     bch_genesis_conformance_test bch_abla_growth_soak_test \
                     bch_coinbase_kat_segwit_predicate_test \
                     bch_coinbase_kat_bytevector_test \
+                    bch_coinbase_author_kat_test \
                     bch_cashtokens_transparency_test \
                     bch_block_connector_test bch_block_ordering_test \
                     bch_utxo_connect_test bch_reorg_connect_test bch_reorg_rerequest_test \
@@ -333,7 +352,7 @@ jobs:
                     bch_embedded_getwork_test bch_embedded_seam_workview_test \
                     bch_embedded_block_broadcast_test bch_coin_node_seam_test \
                     bch_asert_kat_test \
-                    bch_g1_oracle_byte_parity_test bch_g0_canonical_pin_test \
+                    bch_g1_oracle_byte_parity_test bch_g0_canonical_pin_test bch_g2_ratchet_gate_kat_test \
             -j8
 
       - name: Run BCH tests
@@ -366,7 +385,13 @@ jobs:
         with: { python-version: 3.12 }
 
       - name: Install Conan 2
-        run: pip install "conan>=2.0,<3.0"
+        run: |
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
+          fi
 
       - name: Detect Conan profile
         run: |
@@ -412,6 +437,7 @@ jobs:
                     bch_genesis_conformance_test bch_abla_growth_soak_test \
                     bch_coinbase_kat_segwit_predicate_test \
                     bch_coinbase_kat_bytevector_test \
+                    bch_coinbase_author_kat_test \
                     bch_cashtokens_transparency_test \
                     bch_block_connector_test bch_block_ordering_test \
                     bch_utxo_connect_test bch_reorg_connect_test bch_reorg_rerequest_test \
@@ -420,7 +446,7 @@ jobs:
                     bch_embedded_getwork_test bch_embedded_seam_workview_test \
                     bch_embedded_block_broadcast_test bch_coin_node_seam_test \
                     bch_asert_kat_test \
-                    bch_g1_oracle_byte_parity_test bch_g0_canonical_pin_test \
+                    bch_g1_oracle_byte_parity_test bch_g0_canonical_pin_test bch_g2_ratchet_gate_kat_test \
             -j8
 
       - name: Run BCH tests under sanitizers
@@ -443,10 +469,9 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   web-static:
     name: Web-static verify
-    # Pin to GitHub-hosted: sub-minute JS job needs no self-hosted compute,
-    # and the puppeteer pixel harness cannot complete page navigation in the
-    # self-hosted runner env (DOMContentLoaded never fires within 15s).
-    runs-on: ubuntu-24.04
+    # Route to self-hosted for trusted events; fork PRs fall back to
+    # GitHub-hosted ubuntu-24.04 (never run untrusted fork code self-hosted).
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     defaults:
       run:
         working-directory: web-static/sharechain-explorer
@@ -697,11 +722,12 @@ jobs:
     # dash-slice campaign: skip Windows for PRs carrying the dash-linux-only label (re-enabled at block-viable gate, ~07-01)
     if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-linux-only')) }}
     # GitHub-hosted windows-2022 (ships cmake + MSVC/VS 2022 + the SDK).
-    # VM217 (c2pool-windows-217) is a bare runner with NO build toolchain yet;
-    # FOLLOW-UP: once vm-fleet installs VS 2022 Build Tools (C++ workload) +
-    # cmake + deps on VM217 and it builds c2pool clean, a follow-up PR flips
-    # this back to the fork-gated self-hosted expr. Linux+macOS already on the
-    # self-hosted fleet on this branch; Windows stays GitHub-hosted meanwhile.
+    # VM217 (c2pool-windows-217) is still a bare runner: the self-hosted flip
+    # failed at actions/setup-python@v6 (cannot provision Python on VM217) and
+    # no VS 2022 Build Tools are installed yet. FOLLOW-UP: once vm-fleet installs
+    # VS 2022 Build Tools (C++ workload) + cmake + python on VM217 and it builds
+    # c2pool clean, a follow-up PR flips this to the fork-gated self-hosted expr.
+    # web-static + pplns self-hosted routes on this branch are proven green.
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v6
@@ -710,7 +736,13 @@ jobs:
         with: { python-version: '3.12' }
 
       - name: Install Conan 2
-        run: pip install "conan>=2.0,<3.0"
+        shell: bash
+        run: |
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+          else
+            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
+          fi
 
       - name: Detect Conan profile
         run: |
@@ -797,7 +829,13 @@ jobs:
         with: { python-version: 3.12 }
 
       - name: Install Conan 2
-        run: pip install "conan>=2.0,<3.0"
+        run: |
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
+          fi
 
       - name: Detect Conan profile
         run: |
@@ -827,6 +865,13 @@ jobs:
 
       - name: Build c2pool-dgb binary (AUX_DOGE seam ON)
         run: cmake --build build_dgb_auxdoge --target c2pool-dgb -j8
+
+      # Link-level companion to the compile-time aux_doge_isolation_guard.hpp:
+      # fail the build if the DGB parent (AUX_DOGE seam ON) ODR-uses any LTC
+      # per-coin consensus symbol (make_ltc_chain_params / ltc::coin::HeaderChain
+      # / ltc::coin::ChainParams). Positive control asserts dgb::coin:: present.
+      - name: Link-isolation guard (no LTC consensus surface in DGB parent)
+        run: bash scripts/ci/dgb_aux_doge_link_isolation_guard.sh build_dgb_auxdoge/src/c2pool/c2pool-dgb
 
       - name: Smoke test (--help)
         run: |

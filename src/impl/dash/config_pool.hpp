@@ -27,7 +27,7 @@ namespace dash
 
 // DASH sharechain p2pool constants. Source of truth: p2pool-dash oracle
 // networks/dash.py (mainnet) + networks/dash_testnet.py (testnet).
-struct PoolConfig
+struct SharechainConfig
 {
     // ---- mainnet (networks/dash.py) ----
     static constexpr uint16_t P2P_PORT                  = 8999;

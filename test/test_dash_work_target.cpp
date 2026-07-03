@@ -11,7 +11,7 @@
 // accessor is a pure transform of frozen per-job inputs, so the KAT runs on
 // every Linux x86_64 ctest.
 //
-// Inputs read from dash::PoolConfig SSOT (config_pool.hpp): SHARE_PERIOD=20,
+// Inputs read from dash::SharechainConfig SSOT (config_pool.hpp): SHARE_PERIOD=20,
 // SPREAD=10, DUST_THRESHOLD=100000 (mainnet).
 
 #include <gtest/gtest.h>
@@ -48,7 +48,7 @@ TEST(DashWorkTarget, Cap1PoolShareExact)
 {
     uint256 start; start.SetHex(MAX_TARGET_HEX);
     uint256 capped = cap_pool_share(start, /*local_hash_rate=*/1e9,
-                                    dash::PoolConfig::SHARE_PERIOD);
+                                    dash::SharechainConfig::SHARE_PERIOD);
     EXPECT_EQ(capped.GetHex(),
         "0000000000eb08174d325a04e29e57c52c14f6dcfc48f79979535e202dcecf3d");
     // Cap must be strictly tighter than the unconstrained start.
@@ -60,7 +60,7 @@ TEST(DashWorkTarget, Cap1PoolShareExact)
 TEST(DashWorkTarget, Cap1NoHashrateNoOp)
 {
     uint256 start; start.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
-    EXPECT_EQ(cap_pool_share(start, 0.0, dash::PoolConfig::SHARE_PERIOD).GetHex(),
+    EXPECT_EQ(cap_pool_share(start, 0.0, dash::SharechainConfig::SHARE_PERIOD).GetHex(),
               start.GetHex());
 }
 
@@ -79,8 +79,8 @@ TEST(DashWorkTarget, Cap2DustEaseExact)
     uint256 start; start.SetHex(MAX_TARGET_HEX);
     uint256 eased = cap_dust_threshold(start,
         /*local_hash_rate=*/1.0, /*pool_aps=*/1e15, /*subsidy=*/500000000ULL,
-        /*block_bits=*/0x1b00ffffu, dash::PoolConfig::SPREAD,
-        dash::PoolConfig::DUST_THRESHOLD, /*donation=*/0.0);
+        /*block_bits=*/0x1b00ffffu, dash::SharechainConfig::SPREAD,
+        dash::SharechainConfig::DUST_THRESHOLD, /*donation=*/0.0);
     EXPECT_EQ(eased.GetHex(),
         "0000000001f3fe0c0003bb0c8bcfc04043da7febb6bb21dd00bc321f5a6dda31");
 }
@@ -91,8 +91,8 @@ TEST(DashWorkTarget, Cap2AboveDustNoOp)
     uint256 start; start.SetHex("00000000ffff0000000000000000000000000000000000000000000000000000");
     uint256 r = cap_dust_threshold(start,
         /*local_hash_rate=*/1e9, /*pool_aps=*/1e9, /*subsidy=*/500000000ULL,
-        /*block_bits=*/0x1b00ffffu, dash::PoolConfig::SPREAD,
-        dash::PoolConfig::DUST_THRESHOLD, /*donation=*/0.0);
+        /*block_bits=*/0x1b00ffffu, dash::SharechainConfig::SPREAD,
+        dash::SharechainConfig::DUST_THRESHOLD, /*donation=*/0.0);
     EXPECT_EQ(r.GetHex(), start.GetHex());
 }
 
@@ -101,8 +101,8 @@ TEST(DashWorkTarget, Cap2UngatedNoOp)
 {
     uint256 start; start.SetHex(MAX_TARGET_HEX);
     EXPECT_EQ(cap_dust_threshold(start, 1.0, /*pool_aps=*/0.0, 500000000ULL,
-                  0x1b00ffffu, dash::PoolConfig::SPREAD,
-                  dash::PoolConfig::DUST_THRESHOLD, 0.0).GetHex(),
+                  0x1b00ffffu, dash::SharechainConfig::SPREAD,
+                  dash::SharechainConfig::DUST_THRESHOLD, 0.0).GetHex(),
               start.GetHex());
 }
 
@@ -111,7 +111,7 @@ TEST(DashWorkTarget, ModulateCap1OnlyPath)
 {
     WorkTargetInputs in;
     in.local_hash_rate = 1e9;
-    in.share_period    = dash::PoolConfig::SHARE_PERIOD;
+    in.share_period    = dash::SharechainConfig::SHARE_PERIOD;
     in.dust_gate       = false;
     EXPECT_EQ(modulate_desired_share_target(in).GetHex(),
         "0000000000eb08174d325a04e29e57c52c14f6dcfc48f79979535e202dcecf3d");
@@ -123,9 +123,9 @@ TEST(DashWorkTarget, ModulateBothGatesPoolShareDominates)
 {
     WorkTargetInputs in;
     in.local_hash_rate          = 1e9;
-    in.share_period             = dash::PoolConfig::SHARE_PERIOD;
-    in.spread                   = dash::PoolConfig::SPREAD;
-    in.dust_threshold           = dash::PoolConfig::DUST_THRESHOLD;
+    in.share_period             = dash::SharechainConfig::SHARE_PERIOD;
+    in.spread                   = dash::SharechainConfig::SPREAD;
+    in.dust_threshold           = dash::SharechainConfig::DUST_THRESHOLD;
     in.dust_gate                = true;
     in.pool_attempts_per_second = 1e15;   // -> tiny expected payout -> ease armed
     in.subsidy                  = 500000000ULL;
