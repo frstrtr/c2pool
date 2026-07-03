@@ -228,6 +228,22 @@ def deliver_email(subject, body, route, smtp_host, smtp_port, sender):
     return True
 
 
+def deliver_v36relay(subject, body, route, args):
+    """D-MINER.6 P2 seam: hand an alert to the local V36 P2P relay stub. `route`
+    is an OPAQUE token owned by the P2P steward's addressing model -- never parsed
+    here (passthrough). Fails CLOSED: when the handoff stub is absent the alert is
+    NOT routed and this RAISES, so the caller records 'undelivered' -- never a
+    fabricated success. A successful enqueue (handoff-to-mesh) counts as sent.
+    See docs/design/d-miner-6-v36-relay-adapter.md."""
+    handoff = getattr(args, "v36relay_handoff", None)
+    if not handoff:
+        raise RuntimeError("v36relay handoff stub absent; alert not routed")
+    with open(handoff, "a") as fh:
+        fh.write(json.dumps({"route": route, "subject": subject,
+                             "body": body}) + "\n")
+    return True
+
+
 def make_transport(args):
     """Return deliver(channel, subject, body, route) -> bool. logonly never
     raises; email raises on failure so the caller records 'undelivered'."""
@@ -238,6 +254,8 @@ def make_transport(args):
         if channel == "email":
             return deliver_email(subject, body, route,
                                  args.smtp_host, args.smtp_port, args.sender)
+        if channel == "v36relay":
+            return deliver_v36relay(subject, body, route, args)
         raise ValueError(f"unknown channel '{channel}'")
     return deliver
 
@@ -518,13 +536,50 @@ def selftest(_args=None):
     dcon.close()
 
 
+    # 13) D-MINER.6 v36relay transport honesty (contract:
+    #     docs/design/d-miner-6-v36-relay-adapter.md). The P2P transport lands
+    #     cross-steward; until its local handoff stub exists the channel MUST
+    #     fail closed -- an alert with no reachable next hop RAISES so the caller
+    #     records 'undelivered', NEVER a fabricated True. Locks the contract
+    #     before the mesh adapter is wired.
+    import tempfile, os
+    absent = argparse.Namespace(dry_run=False, smtp_host="x", smtp_port=0,
+                                sender="x", v36relay_handoff=None)
+    raised = False
+    try:
+        make_transport(absent)("v36relay", "s", "b", "opaque-route-token")
+    except Exception:
+        raised = True
+    check(raised, "v36relay with no handoff stub must raise (fail closed)")
+
+    # 13b) opaque-route passthrough + handoff-to-mesh == sent: with a handoff
+    #      spool present the alert enqueues (returns True) and the route token is
+    #      written through UNPARSED (the P2P steward owns its addressing model).
+    fd, spool = tempfile.mkstemp()
+    os.close(fd)
+    present = argparse.Namespace(dry_run=False, smtp_host="x", smtp_port=0,
+                                 sender="x", v36relay_handoff=spool)
+    ok = make_transport(present)("v36relay", "s", "b", "opaque-route-token")
+    lines = open(spool).read().splitlines()
+    os.unlink(spool)
+    check(ok is True, f"v36relay enqueue must return True (sent), got {ok}")
+    check(len(lines) == 1 and json.loads(lines[0])["route"] == "opaque-route-token",
+          f"opaque route must pass through unparsed, got {lines}")
+
+    # 13c) dry-run masks the mesh: --dry-run forces logonly for EVERY channel so
+    #      operators can rehearse without touching the P2P layer (never raises).
+    dry = argparse.Namespace(dry_run=True, smtp_host="x", smtp_port=0,
+                             sender="x", v36relay_handoff=None)
+    check(make_transport(dry)("v36relay", "s", "b", "r") is True,
+          "dry-run must short-circuit v36relay to logonly (no mesh, no raise)")
+
     con.close()
     if fails:
         print("SELFTEST FAILED:")
         for f in fails:
             print("  -", f)
         return 1
-    print("SELFTEST OK (18/18)")
+    print("SELFTEST OK (21/21)")
     return 0
 
 
@@ -538,6 +593,9 @@ def main():
     common.add_argument("--smtp-host", default="127.0.0.1")
     common.add_argument("--smtp-port", type=int, default=25)
     common.add_argument("--sender", default="dashboard-steward@morisguide.com")
+    common.add_argument("--v36relay-handoff", default=None,
+                        help="path to local V36 P2P relay handoff spool "
+                             "(absent = fail closed, alerts recorded undelivered)")
 
     sp.add_parser("run", parents=[common])
     sp.add_parser("daily", parents=[common])
