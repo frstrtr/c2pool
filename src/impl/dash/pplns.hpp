@@ -139,7 +139,7 @@ inline Result compute_payouts(
     // get_expected_payouts): every NONZERO worker allocation is paid to its
     // own script; only EXACTLY-zero outputs are dropped (oracle `if
     // amounts[script]`). There is NO payout dust floor — a sub-dust but
-    // nonzero worker is paid, not swept to donation. (PoolConfig::
+    // nonzero worker is paid, not swept to donation. (SharechainConfig::
     // dust_threshold() survives only as the vardiff / share-difficulty floor
     // in c2pool_refactored.cpp; it is not consulted here.)
     std::vector<Payout> tentative;

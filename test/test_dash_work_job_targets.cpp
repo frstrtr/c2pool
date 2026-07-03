@@ -10,7 +10,7 @@
 //
 // Pure / socket-free / node-free: no VM200/201 dashd, no live sharechain.
 //
-// SANE_TARGET_RANGE inputs read from dash::PoolConfig SSOT (config_pool.hpp).
+// SANE_TARGET_RANGE inputs read from dash::SharechainConfig SSOT (config_pool.hpp).
 
 #include <gtest/gtest.h>
 
@@ -65,22 +65,22 @@ TEST(DashWorkJobTargets, ClipInRangeUnchanged)
     EXPECT_EQ(clip_to_sane(U(MID), U(SMIN_HEX), U(SMAX_HEX)).GetHex(), MID);
 }
 
-// dash::PoolConfig SANE_TARGET_RANGE SSOT == oracle networks/dash.py:33 +
+// dash::SharechainConfig SANE_TARGET_RANGE SSOT == oracle networks/dash.py:33 +
 // dash_testnet.py:27.
 TEST(DashWorkJobTargets, PoolConfigSaneMatchesOracleMainnet)
 {
-    dash::PoolConfig::is_testnet = false;
-    EXPECT_EQ(dash::PoolConfig::sane_target_min().GetHex(), SMIN_HEX);
-    EXPECT_EQ(dash::PoolConfig::sane_target_max().GetHex(), SMAX_HEX);
+    dash::SharechainConfig::is_testnet = false;
+    EXPECT_EQ(dash::SharechainConfig::sane_target_min().GetHex(), SMIN_HEX);
+    EXPECT_EQ(dash::SharechainConfig::sane_target_max().GetHex(), SMAX_HEX);
 }
 TEST(DashWorkJobTargets, PoolConfigSaneMatchesOracleTestnet)
 {
-    dash::PoolConfig::is_testnet = true;
-    EXPECT_EQ(dash::PoolConfig::sane_target_min().GetHex(),
+    dash::SharechainConfig::is_testnet = true;
+    EXPECT_EQ(dash::SharechainConfig::sane_target_min().GetHex(),
         "00000000000010c6f7a0b5ed8d36b4c7f34938583621fafc8b0079a2834d26f9");
-    EXPECT_EQ(dash::PoolConfig::sane_target_max().GetHex(),
+    EXPECT_EQ(dash::SharechainConfig::sane_target_max().GetHex(),
         "00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-    dash::PoolConfig::is_testnet = false;  // restore SSOT default
+    dash::SharechainConfig::is_testnet = false;  // restore SSOT default
 }
 
 // assemble: None-path, modulated pseudoshare in SANE range -> share_target is the
