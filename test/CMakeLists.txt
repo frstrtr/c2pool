@@ -221,6 +221,19 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_x11_kat PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
     gtest_add_tests(test_dash_x11_kat "" AUTO)
 
+    # DASH G1 difficulty/vardiff parity KAT (byte-parity vs oracle networks/dash.py).
+    # Links the same additive dash_x11 + core set as test_dash_x11_kat; pulls
+    # impl/dash/params.hpp + config_pool.hpp (sharechain SSOT); no ltc/pool SCC dep.
+    add_executable(test_dash_g1_difficulty_parity test_dash_g1_difficulty_parity.cpp)
+    target_link_libraries(test_dash_g1_difficulty_parity PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_g1_difficulty_parity PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_g1_difficulty_parity "" AUTO)
+
     # DASH consensus known-answer test (PR-0 foundation, S3 slice): SPV
     # HeaderChain + DarkGravityWave v3 retarget. header_chain.hpp pulls in the
     # additive dash_x11 primitive (hash_x11.hpp) + core (uint256/leveldb/pack/log);
