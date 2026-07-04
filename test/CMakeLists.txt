@@ -320,6 +320,8 @@ if (BUILD_TESTING AND GTest_FOUND)
 
     add_executable(test_dash_share_messages test_dash_share_messages.cpp)
     target_link_libraries(test_dash_share_messages PRIVATE
+    add_executable(test_dash_stratum_binding test_dash_stratum_binding.cpp)
+    target_link_libraries(test_dash_stratum_binding PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
         nlohmann_json::nlohmann_json
@@ -327,6 +329,8 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_dash_share_messages PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_share_messages "" AUTO)
+    target_link_libraries(test_dash_stratum_binding PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_stratum_binding "" AUTO)
 
     # share_init_verify gentx hash_link byte-parity vs oracle (coinbase_payload
     # VarStr prefix). Header-only over the dash_x11 + core link set; mirrors the
