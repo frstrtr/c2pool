@@ -25,12 +25,16 @@
 #include <core/uint256.hpp>
 #include <core/coin/utxo_view_cache.hpp>
 
+#include <algorithm>
 #include <cstdint>
+#include <set>
+#include <vector>
 
 using dash::coin::Mempool;
 using dash::coin::MutableTransaction;
 using dash::coin::dash_txid;
 using dash::coin::BlockType;
+using dash::coin::FeeKey;
 using ::core::coin::UTXOViewCache;
 using ::core::coin::Outpoint;
 using ::core::coin::Coin;
@@ -253,4 +257,147 @@ TEST(DashMempool, SortedSelectionHighestFeerateFirst)
         << "highest feerate must come first";
     EXPECT_EQ(dash_txid(selected[1].tx), dash_txid(tx_lo));
     EXPECT_EQ(total_fees, 11'000u);
+}
+
+// ─── G1 byte-parity: equal-feerate selection is deterministic ────────────────
+//
+// The embedded GBT template builder serializes txs in the order
+// get_sorted_txs_with_fees() returns them. For txs sharing the SAME
+// feerate the old std::multimap<double,uint256> kept them in mempool
+// INSERTION order, so two nodes with the same mempool contents but a
+// different arrival order produced different template bytes — a
+// non-deterministic seam that breaks G1 byte-parity against the
+// p2pool-dash / dashcore oracle. FeeKey now breaks feerate ties by txid
+// ascending (matches dashcore CompareTxMemPoolEntryByAncestorFee's
+// GetHash() tiebreak), so the projection is byte-reproducible.
+//
+// This KAT pins that: identical equal-feerate sets added in OPPOSITE
+// orders must yield the SAME selection, ordered by txid ascending.
+static std::vector<uint256> equal_feerate_selection(bool reverse_insertion)
+{
+    UTXOViewCache utxo(nullptr);
+    // 5 distinct prevouts, identical value ⇒ identical fee & base_size
+    // ⇒ identical feerate for every spend below.
+    constexpr int N = 5;
+    std::vector<MutableTransaction> txs;
+    for (int i = 0; i < N; ++i) {
+        uint256 prev = mint_hash(200 + i);
+        utxo.add_coin(Outpoint(prev, 0), Coin(100'000, {}, 1, false));
+        txs.push_back(make_spend(prev, 0, /*out=*/95'000, /*salt=*/300 + i)); // fee 5000
+    }
+
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    if (reverse_insertion)
+        for (auto it = txs.rbegin(); it != txs.rend(); ++it) EXPECT_TRUE(mp.add_tx(*it));
+    else
+        for (auto& t : txs) EXPECT_TRUE(mp.add_tx(t));
+
+    auto [selected, total_fees] = mp.get_sorted_txs_with_fees(/*max_bytes=*/1u << 20);
+    EXPECT_EQ(total_fees, static_cast<uint64_t>(N) * 5'000u);
+    std::vector<uint256> out;
+    for (auto& s : selected) out.push_back(dash_txid(s.tx));
+    return out;
+}
+
+TEST(DashMempool, EqualFeerateSelectionIsTxidAscendingAndInsertionOrderIndependent)
+{
+    auto forward = equal_feerate_selection(/*reverse_insertion=*/false);
+    auto reverse = equal_feerate_selection(/*reverse_insertion=*/true);
+
+    ASSERT_EQ(forward.size(), 5u);
+    ASSERT_EQ(reverse.size(), 5u);
+
+    // Insertion order must not affect the projected order.
+    EXPECT_EQ(forward, reverse)
+        << "equal-feerate tx order must be independent of mempool arrival order";
+
+    // And that stable order is txid ascending (dashcore GetHash() tiebreak).
+    auto sorted = forward;
+    std::sort(sorted.begin(), sorted.end());
+    EXPECT_EQ(forward, sorted)
+        << "equal-feerate ties must resolve to txid-ascending, oracle-conformant order";
+}
+
+
+// --- G1 byte-parity: feerate compare is dashcore division-free cross-multiply
+//
+// dashcore CompareTxMemPoolEntryByAncestorFee compares two entries by
+// cross-multiplication -- f1 = a.fee * b.size vs f2 = b.fee * a.size --
+// explicitly to "avoid division by rewriting (a/b > c/d) as (a*d > c*b)".
+// c2pool previously keyed the sorted index on a PRE-DIVIDED double
+// (fee / base_size). That division rounds, so it can collapse a strict
+// dashcore order into a tie -- or split a dashcore tie into a strict
+// order -- making the two representations disagree on the selection
+// order of certain (fee, size) pairs. A different selection order is a
+// different template byte-serialization: a latent G1 byte-parity seam
+// against the p2pool-dash / dashcore oracle. FeeKey now carries
+// (fee, base_size) and reproduces the exact double cross-multiply.
+//
+// Divergence vector (found by exhaustive search). The disagreement only
+// manifests at fee magnitudes >~1e14 sat, where the fee/size division
+// loses ULPs the cross-multiply keeps -- for realistic magnitudes the
+// two representations agree, so this fix is exact-oracle-conformance
+// hardening, not a realistic-value bug:
+//   A = (fee 182912374030878, size 3535)
+//   B = (fee 4415613369921651, size 85337)
+// Pre-divided doubles: A -> 51743245836.174819946 < B -> 51743245836.174827576,
+//   i.e. the OLD code ranks B strictly ABOVE A.
+// Cross-multiply: A.fee*B.size == B.fee*A.size exactly -> a genuine
+//   feerate TIE, resolved by txid ascending (dashcore GetHash()).
+TEST(DashMempool, FeerateCompareIsDivisionFreeCrossMultiplyNotPreDividedDouble)
+{
+    // Independent dashcore-style reference (division-free cross-multiply).
+    auto oracle_less = [](uint64_t fa, uint32_t sa, const uint256& ta,
+                          uint64_t fb, uint32_t sb, const uint256& tb) {
+        const double f1 = static_cast<double>(fa) * sb;
+        const double f2 = static_cast<double>(fb) * sa;
+        if (f1 != f2) return f1 > f2;   // higher feerate first
+        return ta < tb;                 // txid ascending
+    };
+
+    // Two distinct txids; assign the SMALLER to A so a correct
+    // (cross-multiply => tie => txid-asc) key orders A before B, whereas
+    // the old pre-divide code would have put B first ("B higher feerate").
+    const uint256 t0 = mint_hash(9001);
+    const uint256 t1 = mint_hash(9002);
+    const uint256 ta = std::min(t0, t1);
+    const uint256 tb = std::max(t0, t1);
+    ASSERT_TRUE(ta < tb);
+
+    const uint64_t fa = 182912374030878ULL;
+    const uint32_t sa = 3535u;
+    const uint64_t fb = 4415613369921651ULL;
+    const uint32_t sb = 85337u;
+
+    // Precondition on the vector: a genuine cross-multiply tie that the
+    // buggy pre-divide would (wrongly) have seen as a strict order.
+    EXPECT_EQ(static_cast<double>(fa) * sb, static_cast<double>(fb) * sa)
+        << "vector must be a genuine cross-multiply feerate tie";
+    EXPECT_LT(static_cast<double>(fa) / sa, static_cast<double>(fb) / sb)
+        << "vector must be a strict (wrong) order under the old pre-divide";
+
+    const FeeKey A{fa, sa, ta};
+    const FeeKey B{fb, sb, tb};
+
+    // FeeKey resolves the cross-multiply tie by txid ascending => A first.
+    EXPECT_TRUE(A < B) << "cross-multiply tie must fall to txid-ascending (A<B)";
+    EXPECT_FALSE(B < A);
+
+    // FeeKey ordering must agree with the independent oracle on this pair.
+    EXPECT_EQ(A < B, oracle_less(fa, sa, ta, fb, sb, tb));
+    EXPECT_EQ(B < A, oracle_less(fb, sb, tb, fa, sa, ta));
+
+    // The real index type (std::set<FeeKey>) must iterate A best-first.
+    std::set<FeeKey> idx{B, A};
+    ASSERT_EQ(idx.size(), 2u);
+    EXPECT_EQ(idx.begin()->txid, ta)
+        << "best-first iteration must yield A (smaller txid) on the tie";
+
+    // Sanity: the feerate arm still dominates. Strictly higher feerate
+    // must precede regardless of a smaller-txid competitor.
+    const FeeKey hi{20000u, 250u, tb};   // 80 sat/byte
+    const FeeKey lo{10000u, 250u, ta};   // 40 sat/byte, but smaller txid
+    EXPECT_TRUE(hi < lo) << "higher feerate must precede regardless of txid";
+    EXPECT_FALSE(lo < hi);
 }
