@@ -17,6 +17,15 @@ on:
   pull_request:
     branches: [master, btc-embedded, dash-spv-embedded, dgb/slice4-skeleton, dgb/pool-pillars-port]
 
+# Concurrency: a newer run on the same ref cancels the stale in-progress
+# one, cutting concurrent load on the shared self-hosted pool (the OOM/
+# oversubscription root cause, not just queue depth). Per-ref group so
+# distinct PRs/branches never cancel each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+
 jobs:
   coin:
     name: ${{ matrix.coin }} smoke (Linux x86_64)
