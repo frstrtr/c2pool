@@ -66,7 +66,13 @@ inline DashWorkData build_embedded_workdata(
     // Step 8 seam: injectable block time. Defaults to std::time(nullptr) so
     // every existing caller is byte-for-byte unchanged (SAFE-ADDITIVE); the
     // G1 golden KAT pins it for a deterministic template+coinbase vector.
-    uint32_t curtime = static_cast<uint32_t>(std::time(nullptr)))
+    uint32_t curtime = static_cast<uint32_t>(std::time(nullptr)),
+    // Seam: injectable block version. Defaults to 0x20000000 (BIP9 "no
+    // signaling" baseline) so every existing caller is byte-for-byte
+    // unchanged (SAFE-ADDITIVE); the G1 golden KAT pins it, and a real
+    // BIP9-deployment-aware value can later be threaded in without touching
+    // the default header projection.
+    uint32_t version = 0x20000000u)
 {
     DashWorkData w;
     w.m_height          = prev_height + 1;
@@ -78,7 +84,7 @@ inline DashWorkData build_embedded_workdata(
     // GBT returns MTP+1 as mintime so miners don't accidentally
     // produce stale-time blocks.
     w.m_mintime         = mtp_at_tip + 1;
-    w.m_version         = 0x20000000;           // TODO: real BIP9 bits
+    w.m_version         = version;              // seam: default 0x20000000 (BIP9 baseline)
 
     // Subsidy + tx selection.
     int64_t reward = compute_dash_block_reward_post_v20(w.m_height);
