@@ -62,13 +62,17 @@ inline DashWorkData build_embedded_workdata(
     uint32_t bits_for_next,
     uint32_t mtp_at_tip,
     uint8_t  address_version,
-    uint8_t  address_p2sh_version)
+    uint8_t  address_p2sh_version,
+    // Step 8 seam: injectable block time. Defaults to std::time(nullptr) so
+    // every existing caller is byte-for-byte unchanged (SAFE-ADDITIVE); the
+    // G1 golden KAT pins it for a deterministic template+coinbase vector.
+    uint32_t curtime = static_cast<uint32_t>(std::time(nullptr)))
 {
     DashWorkData w;
     w.m_height          = prev_height + 1;
     w.m_previous_block  = prev_hash;
     w.m_bits            = bits_for_next;
-    w.m_curtime         = static_cast<uint32_t>(std::time(nullptr));
+    w.m_curtime         = curtime;
     // Step 8: real median-time-past from header_chain. dashcore
     // requires curtime > MTP for the candidate block to be valid;
     // GBT returns MTP+1 as mintime so miners don't accidentally

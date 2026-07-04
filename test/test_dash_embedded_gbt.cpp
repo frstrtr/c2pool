@@ -408,3 +408,93 @@ TEST(DashEmbeddedGbt, GbtXcheckMatchesIdenticalDetectsFieldDrift) {
     rpc_count.m_packed_payments.pop_back();
     EXPECT_FALSE(gbt_xcheck(w, rpc_count));
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// G1 golden: deterministic template+coinbase vector via the curtime seam.
+//
+// The sole non-determinism in build_embedded_workdata was the live
+// std::time(nullptr) read for m_curtime. With the trailing defaulted curtime
+// param, a fixed-input call yields a byte-for-byte reproducible header
+// projection — the G1 deliverable (fixed-input template+coinbase golden) in
+// the per-coin block-production gate.
+//
+// Oracle discipline (non-circular, mirrors the params KAT): bits is pinned to
+// the oracle GBT nBits and passed through; every value/split number is
+// re-derived here from the SAME closed-form dashcore formulas, not copied from
+// a build_embedded_workdata run. Only curtime is a pinned input we assert the
+// seam faithfully echoes.
+// ════════════════════════════════════════════════════════════════════════
+
+TEST(DashEmbeddedGbt, G1GoldenDeterministicTemplateViaCurtimeSeam) {
+    UTXOViewCache utxo(nullptr);
+    uint256 prev = mint_hash(77);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, {}, /*height=*/1, /*cb=*/false));
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    auto tx = make_spend(prev, 0, 90'000, /*salt=*/7);   // fee = 10'000
+    ASSERT_TRUE(mp.add_tx(tx));
+
+    auto payout   = p2pkh_script(0x55);
+    auto mnstates = single_mn(payout);
+
+    uint256 prev_hash = raw256(0xC3);
+    const uint32_t bits           = 0x1b104be3u;   // pinned oracle GBT nBits
+    const uint32_t mtp            = 1'700'000'000u;
+    const uint32_t PINNED_CURTIME = 1'700'000'123u;  // fixed block time
+
+    // Same fixed inputs → identical WorkData every run (the golden property).
+    auto a = build_embedded_workdata(
+        H - 1, prev_hash, mnstates, mp,
+        bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER, PINNED_CURTIME);
+    auto b = build_embedded_workdata(
+        H - 1, prev_hash, mnstates, mp,
+        bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER, PINNED_CURTIME);
+
+    // The seam echoes the pinned time exactly — no wall-clock leak.
+    EXPECT_EQ(a.m_curtime, PINNED_CURTIME);
+    EXPECT_EQ(b.m_curtime, PINNED_CURTIME);
+
+    // Full header projection is deterministic field-for-field.
+    EXPECT_EQ(a.m_height,          b.m_height);
+    EXPECT_EQ(a.m_previous_block,  b.m_previous_block);
+    EXPECT_EQ(a.m_bits,            b.m_bits);
+    EXPECT_EQ(a.m_mintime,         b.m_mintime);
+    EXPECT_EQ(a.m_version,         b.m_version);
+    EXPECT_EQ(a.m_coinbase_value,  b.m_coinbase_value);
+    EXPECT_EQ(a.m_payment_amount,  b.m_payment_amount);
+
+    // Independent re-derivation of the golden values (non-circular oracle).
+    int64_t reward          = compute_dash_block_reward_post_v20(H);
+    int64_t total_fees      = 10'000;
+    int64_t block_value     = reward + total_fees;
+    int64_t platform_reward = compute_dash_platform_reward_post_v20_mn_rr(H);
+    int64_t mn_payment      = compute_dash_mn_payment_post_v20(block_value)
+                              - platform_reward;
+
+    EXPECT_EQ(a.m_height,         H);
+    EXPECT_EQ(a.m_previous_block, prev_hash);
+    EXPECT_EQ(a.m_bits,           bits);            // oracle nBits passthrough
+    EXPECT_EQ(a.m_mintime,        mtp + 1u);        // GBT returns MTP+1
+    EXPECT_EQ(a.m_version,        0x20000000u);
+    EXPECT_EQ(a.m_coinbase_value, static_cast<uint64_t>(block_value));
+    EXPECT_EQ(a.m_payment_amount, static_cast<uint64_t>(mn_payment));
+
+    // Coinbase payee side is deterministic: platform OP_RETURN burn FIRST,
+    // then the MN base58 payee — same ordering the shadow path asserts.
+    ASSERT_EQ(a.m_packed_payments.size(), 2u);
+    EXPECT_EQ(a.m_packed_payments[0].payee, "!6a");   // DIP-0027 burn
+    EXPECT_EQ(a.m_packed_payments[0].amount,
+              static_cast<uint64_t>(platform_reward));
+    EXPECT_EQ(a.m_packed_payments[1].amount,
+              static_cast<uint64_t>(mn_payment));
+    EXPECT_FALSE(a.m_packed_payments[1].payee.empty());
+    EXPECT_NE(a.m_packed_payments[1].payee.front(), '!');  // base58, not !hex
+
+    // The default arg preserves the prior live-read behavior: omitting curtime
+    // still reads the wall clock (post-2023 epoch), so no caller is changed.
+    auto live = build_embedded_workdata(
+        H - 1, prev_hash, mnstates, mp,
+        bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER);
+    EXPECT_GE(live.m_curtime, 1'700'000'000u)
+        << "default curtime must still read std::time(nullptr)";
+}
