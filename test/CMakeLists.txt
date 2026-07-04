@@ -318,6 +318,20 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_work_job_targets PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
     gtest_add_tests(test_dash_work_job_targets "" AUTO)
 
+    # DASH S8 STRATUM-BINDING contract harness: assembled job target -> wire
+    # mining.set_difficulty binding (X11 DUMB_SCRYPT_DIFF=1, NOT scrypt 2**16).
+    # Header-only over work_job_targets.hpp + core/target_utils + stratum_types;
+    # pure, socket-free. Mirrors the work_job_targets link set.
+    add_executable(test_dash_stratum_binding test_dash_stratum_binding.cpp)
+    target_link_libraries(test_dash_stratum_binding PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_stratum_binding PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
+    gtest_add_tests(test_dash_stratum_binding "" AUTO)
+
     add_executable(test_dash_share_messages test_dash_share_messages.cpp)
     target_link_libraries(test_dash_share_messages PRIVATE
         GTest::gtest_main GTest::gtest
