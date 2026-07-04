@@ -297,9 +297,13 @@ nlohmann::json DGBWorkSource::get_current_work_template() const
     //                  a digishield_next_target()-derived bits would be a
     //                  KNOWN-WRONG value -- the same fabrication the empty
     //                  transactions[] and total_fees=0 avoid. The authoritative
-    //                  bits is the external-daemon GBT value, which is not
-    //                  plumbed into this embedded template path yet; bits stays
-    //                  absent until then. [decision-needed] surfaced to integrator.
+    //                  bits is the external-daemon GBT value. WorkTemplateInputs
+    //                  now carries an optional bits field (template_builder.hpp),
+    //                  so the plumb EXISTS: a daemon-GBT caller or the G1 replay
+    //                  harness sets in.bits and the builder emits it. This
+    //                  embedded Scrypt-only path still supplies none -- truthful
+    //                  absence, identical to previousblockhash -- so bits stays
+    //                  absent here until a daemon source is wired into this path.
     // and the per-connection coinbase (gentx + ShareTracker ref_hash + PPLNS
     // payout map) assembles in build_connection_coinbase() — that output is
     // consensus-bearing and surfaces for an operator tap, not in this field wire.

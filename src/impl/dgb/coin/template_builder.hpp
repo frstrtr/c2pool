@@ -77,11 +77,14 @@ public:
 // absence, never a fabricated tx; the fee total is folded into coinbasevalue
 // UPSTREAM via resolve_coinbase_value, not here), previousblockhash
 // is emitted ONLY when the caller supplies a real tip hash (truthful absence,
-// never a fabricated id), and `bits` is held back entirely -- DGB Core's live
-// next-target is MultiShield V4 (a global 5-algo window == V37), so a
-// Scrypt-only walk would emit a known-wrong difficulty (the same fabrication
-// the empty transactions[] deliberately avoids). bits becomes a GBT
-// pass-through once the external-daemon path is plumbed in.
+// never a fabricated id), and `bits` is likewise a caller-supplied conditional
+// pass-through: emitted ONLY when the caller hands in the authoritative
+// external-daemon GBT bits. The embedded Scrypt-only path supplies none -- DGB
+// Core's live next-target is MultiShield V4 (a global 5-algo window == V37), so
+// a Scrypt-only walk would emit a known-wrong difficulty (the same fabrication
+// the empty transactions[] deliberately avoids); it leaves bits unset and the
+// field is held back for that caller, never fabricated. The G1 replay harness
+// and any future daemon-GBT caller set in.bits from the oracle value.
 struct WorkTemplateInputs {
     // Absolute height of the NEXT block (#209 next_block_height()).
     uint32_t next_height = 0;
@@ -108,6 +111,13 @@ struct WorkTemplateInputs {
     // coinbasevalue UPSTREAM via resolve_coinbase_value(total_fees) (#207 SSOT);
     // the builder never derives the reward, so this field is display-only shape.
     nlohmann::json transactions = nlohmann::json::array();
+    // GBT nBits (compact difficulty) as the daemon emits it -- the authoritative
+    // external-daemon GBT value, supplied by the caller. nullopt -> bits omitted
+    // from the template (truthful absence: the embedded Scrypt-only path can only
+    // reconstruct MultiShield V4 with a full 5-algo window (== V37), so it never
+    // fabricates a Scrypt-only value and leaves this unset). The identical
+    // conditional-emit discipline as previousblockhash.
+    std::optional<std::string> bits;
 };
 
 inline nlohmann::json build_work_template(const WorkTemplateInputs& in)
@@ -139,6 +149,11 @@ inline nlohmann::json build_work_template(const WorkTemplateInputs& in)
     // previousblockhash: truthful conditional emit (see struct notes).
     if (in.previousblockhash)
         tmpl["previousblockhash"] = *in.previousblockhash;
+
+    // bits: truthful conditional emit -- present only when the caller supplies
+    // the authoritative external-daemon GBT value (see struct notes).
+    if (in.bits)
+        tmpl["bits"] = *in.bits;
 
     return tmpl;
 }
