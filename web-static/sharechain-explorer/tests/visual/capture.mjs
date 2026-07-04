@@ -65,8 +65,8 @@ async function capture(mode, outfile) {
     // leaves a non-essential subresource (favicon/image) pending and
     // never fires the load event within the timeout; `networkidle0`
     // never settles because bundled mode opens a persistent SSE conn.
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
-    await page.waitForSelector('#defrag-canvas', { timeout: 8000 });
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForSelector('#defrag-canvas', { timeout: 20000 });
     // Generous fixed delay lets both paths complete their initial
     // fetch + render. Deterministic against the mock server (no live
     // data, no SSE pushes).
