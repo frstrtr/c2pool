@@ -194,7 +194,18 @@ if(BUILD_TESTING)
             ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/coin_node.cpp
             ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/p2p_connection.cpp
             ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/p2p_node.cpp
-            ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/rpc.cpp)
+            ${CMAKE_SOURCE_DIR}/src/impl/bch/coin/rpc.cpp
+            # M5 pool-node body TUs: NodeImpl out-of-line methods (node.cpp) +
+            # the two p2pool p2p protocol dispatchers (Legacy/Actual
+            # handle_message_* family) + the stratum work source. These define
+            # the NodeImpl::/protocol/BCHWorkSource symbols an embedded body test
+            # references when it constructs the real pool node graph. Mirrors the
+            # shipping c2pool-bch target (src/c2pool/CMakeLists.txt) so the link
+            # set stays consistent; additive, src/impl/bch only, isolation holds.
+            ${CMAKE_SOURCE_DIR}/src/impl/bch/node.cpp
+            ${CMAKE_SOURCE_DIR}/src/impl/bch/protocol_actual.cpp
+            ${CMAKE_SOURCE_DIR}/src/impl/bch/protocol_legacy.cpp
+            ${CMAKE_SOURCE_DIR}/src/impl/bch/stratum/work_source.cpp)
         target_include_directories(bch_${t} PRIVATE ${CMAKE_SOURCE_DIR}/src)
         target_link_libraries(bch_${t} PRIVATE
             core pool sharechain
