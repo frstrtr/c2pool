@@ -1,0 +1,98 @@
+name: DASH gate G3a — populated-regtest block-production
+
+# ci-steward 2026-07-04. Required-gate for DASH G3a: assert DASH populated
+# block assembly + production. CI plumbing only — NO consensus knowledge here.
+# The dash lane owns the harness, the gtest companions, and the gate script.
+#
+# WIRED 2026-07-04 to the canonical dash-lane entrypoint from PR #620
+# (dash/ci-gate-entrypoints): TEST_ENTRYPOINT is
+# tests/gates/g3a_regtest_block_production.sh, which self-configures (conan +
+# cmake, override via BUILD_DIR) and runs two arms:
+#   * CI arm (network-free, always on): the real gtest suites by NAME
+#     (ctest -R '^(DashG3Assembled|DashBlockProducer)\.') — not by executable
+#     name / bare -R regex — with an empty-suite guard demanding a parsed
+#     positive test count.
+#   * Live regtest arm (opt-in): runs only when DASH_RPC_PASS + DASH_RPC_AUTH
+#     are exported (an isolated regtest dashd on the runner). Absent creds it is
+#     a documented, deterministic skip — the CI arm still carries the gate.
+# continue-on-error stays removed now the entrypoint is real.
+#
+# Neutral-skip: on branches predating #620 the entrypoint is absent and the job
+# is a green no-op. Registered as a required check only after a confirmed
+# non-hollow green rollup on the runner.
+
+on:
+  push:
+    branches: [master, dash-spv-embedded]
+  pull_request:
+    branches: [master, dash-spv-embedded]
+
+jobs:
+  g3a-regtest-block-production:
+    name: DASH gate G3a — populated-regtest block-production
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check gate entrypoint presence
+        id: presence
+        run: |
+          if [ -f "tests/gates/g3a_regtest_block_production.sh" ]; then
+            echo "exists=1" >> "$GITHUB_OUTPUT"
+            echo "::notice::G3a entrypoint present — running populated block-production gate."
+          else
+            echo "exists=0" >> "$GITHUB_OUTPUT"
+            echo "::notice::tests/gates/g3a_regtest_block_production.sh not on this branch — neutral skip (expected until #620 lands)."
+          fi
+
+      - name: Install system dependencies
+        if: steps.presence.outputs.exists == '1' && runner.environment == 'github-hosted'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            g++ cmake make libleveldb-dev libsecp256k1-dev
+
+      - uses: actions/setup-python@v6
+        if: steps.presence.outputs.exists == '1' && runner.environment == 'github-hosted'
+        with: { python-version: '3.12' }
+
+      - name: Install Conan 2
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
+          fi
+
+      - name: Detect Conan profile
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          conan profile detect --force
+          sed -i 's/compiler.cppstd=.*/compiler.cppstd=20/' "$(conan profile path default)"
+
+      - name: Restore Conan cache
+        if: steps.presence.outputs.exists == '1'
+        uses: actions/cache@v5
+        with:
+          path: ~/.conan2
+          key: conan2-ubuntu24-gcc13-dash-g3a-${{ hashFiles('conanfile.txt') }}
+          restore-keys: |
+            conan2-ubuntu24-gcc13-dash-g3a-
+            conan2-ubuntu24-gcc13-
+
+      - name: Clean stale build dir (self-hosted workspace is reused)
+        if: steps.presence.outputs.exists == '1' && runner.environment != 'github-hosted'
+        run: rm -rf build_g3a
+
+      - name: Run G3a populated block-production gate (dash-lane TEST_ENTRYPOINT)
+        if: steps.presence.outputs.exists == '1'
+        env:
+          BUILD_DIR: ${{ github.workspace }}/build_g3a
+          # Live regtest arm stays opt-in: the script runs it only when both are
+          # set. Left unset here — the network-free CI arm carries the gate until
+          # the dash lane wires a regtest dashd + secrets into the runner.
+          DASH_RPC_PASS: ${{ secrets.DASH_RPC_PASS }}
+          DASH_RPC_AUTH: ${{ secrets.DASH_RPC_AUTH }}
+        run: bash tests/gates/g3a_regtest_block_production.sh
