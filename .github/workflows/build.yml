@@ -46,7 +46,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             g++ ccache cmake make libleveldb-dev libsecp256k1-dev
 
+      # Python is pre-provisioned on VM217; only provision on GitHub-hosted forks.
       - uses: actions/setup-python@v6
+        if: ${{ runner.environment == 'github-hosted' }}
         with: { python-version: '3.12' }
 
       - name: Install Conan 2
@@ -730,28 +732,58 @@ jobs:
     name: Windows x86_64
     # dash-slice campaign: skip Windows for PRs carrying the dash-linux-only label (re-enabled at block-viable gate, ~07-01)
     if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-linux-only')) }}
-    # GitHub-hosted windows-2022 (ships cmake + MSVC/VS 2022 + the SDK).
-    # VM217 (c2pool-windows-217) is still a bare runner: the self-hosted flip
-    # failed at actions/setup-python@v6 (cannot provision Python on VM217) and
-    # no VS 2022 Build Tools are installed yet. FOLLOW-UP: once vm-fleet installs
-    # VS 2022 Build Tools (C++ workload) + cmake + python on VM217 and it builds
-    # c2pool clean, a follow-up PR flips this to the fork-gated self-hosted expr.
-    # web-static + pplns self-hosted routes on this branch are proven green.
-    runs-on: windows-2022
+    # Internal PRs / pushes -> self-hosted c2pool-windows-217 (VM217): toolchain
+    # probe run 28679257030 green (Python 3.12, Conan 2, CMake, Git, MSVC/VS 2022
+    # C++ build tools all provisioned). Fork PRs fall back to GitHub-hosted
+    # windows-2022 (ships cmake + MSVC/VS 2022 + SDK). Completes the #439
+    # self-hosted migration -- Windows was the last GitHub-hosted C++ lane.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Windows","X64","c2pool-build"]') || 'windows-2022' }}
+    defaults:
+      run:
+        # VM217 Windows PowerShell runs at ExecutionPolicy=Restricted, so the
+        # runner cannot source its temp .ps1 command files (PSSecurityException
+        # / UnauthorizedAccess). Bypass shell proven green by probe 28679257030.
+        # Applies to every PowerShell run step below; cmd steps override locally.
+        shell: powershell -ExecutionPolicy Bypass -Command ". '{0}'"
     steps:
       - uses: actions/checkout@v6
 
       - uses: actions/setup-python@v6
+        if: ${{ runner.environment == 'github-hosted' }}
         with: { python-version: '3.12' }
 
       - name: Install Conan 2
-        shell: bash
+        # VM217 self-hosted has no bash on the runner-service PATH (git.exe is
+        # present but Git-bash is not) -> shell:bash gave "bash: command not
+        # found". Conan 2 is pip-installed here (VM217 does not expose it on
+        # PowerShell works on both lanes (VM217 has Windows PowerShell; the
+        # fork-fallback windows-2022 has it too). Inherits the job-level
+        # ExecutionPolicy-Bypass shell (see defaults above).
         run: |
-          if [ "${{ runner.environment }}" = "github-hosted" ]; then
-            pip install "conan>=2.0,<3.0"
-          else
-            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
-          fi
+          # VM217 runner-service PATH exposes neither conan nor a bare python:
+          # setup-python is gated off for self-hosted, so resolve an interpreter
+          # ourselves. The Windows py launcher (C:\Windows, on PATH for all
+          # users) is the reliable entry point; fall back py -> python3 -> python
+          # and dump where.exe diagnostics if none resolve. Then pip-install conan
+          # and export its Scripts dir(s) via GITHUB_PATH for later steps.
+          $py = $null
+          foreach ($cand in @('py','python3','python')) {
+            if (Get-Command $cand -ErrorAction SilentlyContinue) { $py = $cand; break }
+          }
+          if (-not $py) {
+            Write-Host "No Python interpreter on PATH. Diagnostics:"
+            & where.exe python 2>&1; & where.exe py 2>&1; & where.exe python3 2>&1
+            Write-Host "PATH=$env:PATH"
+            throw "VM217 has no Python interpreter on the runner-service PATH"
+          }
+          Write-Host "Using interpreter: $py"
+          & $py -m pip install "conan>=2.0,<3.0"
+          $scripts = & $py -c "import sysconfig; print(sysconfig.get_path('scripts'))"
+          $userScripts = & $py -c "import sysconfig; print(sysconfig.get_path('scripts','nt_user'))"
+          $env:PATH = "$scripts;$userScripts;$env:PATH"
+          Add-Content -Path $env:GITHUB_PATH -Value $scripts
+          Add-Content -Path $env:GITHUB_PATH -Value $userScripts
+          conan --version
 
       - name: Detect Conan profile
         run: |
