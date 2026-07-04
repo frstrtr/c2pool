@@ -13,7 +13,11 @@ on:
 # distinct PRs/branches never cancel each other.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Only cancel superseded PR runs; NEVER cancel a push (master/release/tag)
+  # run - back-to-back merges to master share this ref-group, so cancel-on-push
+  # would kill a merged SHA in-flight rollup before it verifies green (#626
+  # bit the #617 web-static lane exactly this way). PR churn still de-dupes.
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 
 jobs:
