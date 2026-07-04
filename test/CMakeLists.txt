@@ -696,6 +696,20 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_cb_payee PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_cb_payee "" AUTO)
 
+    # S8 stratum job-notify round-trip: the mining.notify merkle_branch folds an
+    # extranonce2-substituted coinbase (index 0) to the header merkle_root. Same
+    # link set as the other dash_x11 header-only KATs. Fenced/non-consensus;
+    # binds real merkle_branches_raw(); oracle work.py:474/493, dash_data.py:189/216.
+    add_executable(test_dash_stratum_notify_roundtrip test_dash_stratum_notify_roundtrip.cpp)
+    target_link_libraries(test_dash_stratum_notify_roundtrip PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_stratum_notify_roundtrip PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_stratum_notify_roundtrip "" AUTO)
+
     add_executable(test_compact_blocks test_compact_blocks.cpp)
     target_link_libraries(test_compact_blocks PRIVATE
         GTest::gtest_main GTest::gtest
