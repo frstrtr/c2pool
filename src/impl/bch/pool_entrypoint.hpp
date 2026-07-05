@@ -167,6 +167,166 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
     // follow-up slice as pplns_fn/ref_hash_fn.
     work_source->set_donation_script(PoolConfig::get_donation_script(35));
 
+    // -- ref_hash_fn: peer-verifiable share commitment (G2 conform) --------
+    // Without this the local-author coinbase carries NO p2pool OP_RETURN
+    // ref_hash (build_connection_coinbase gates the OP_RETURN on ref_hash_fn
+    // being set) and create_local_share runs has_frozen=false -- so every
+    // share we author is systematically non-peer-verifiable: the recomputed
+    // ref_hash never equals the stored one (100% verify_share mismatch).
+    // This lambda produces the ref_hash AND the chain-walked snapshot
+    // (bits/max_bits from compute_share_target, absheight/abswork/
+    // far_share_hash off the prev walk, clipped timestamp) that populates
+    // snap.frozen_ref; mining_submit threads it back into create_local_share
+    // (has_frozen=true) so the create-side reconstruction is byte-exact.
+    // Mirrors main_btc.cpp:920 and the chain-position math of
+    // create_local_share_v35 (share_check.hpp:2724); BCH is standalone
+    // SHA256d -- no segwit, no merged dimension.
+    work_source->set_ref_hash_fn(
+        [&node](const uint256& prev_share_hash,
+                const std::vector<unsigned char>& scriptSig,
+                const std::vector<unsigned char>& payout_script,
+                uint64_t subsidy, uint32_t block_bits, uint32_t timestamp)
+        -> core::stratum::RefHashResult
+        {
+            core::stratum::RefHashResult result;
+            result.share_version   = 35;
+            result.desired_version = 36;
+
+            bch::RefHashParams p;
+            p.share_version      = 35;
+            p.prev_share         = prev_share_hash;
+            p.coinbase_scriptSig = scriptSig;
+            p.share_nonce        = 0;
+            p.subsidy            = subsidy;
+            p.donation           = 50;      // 0.5% finder fee (matches create side)
+            p.stale_info         = 0;
+            p.desired_version    = 36;
+            p.has_segwit         = false;   // BCH: never segwit
+            p.timestamp          = timestamp;
+
+            // Pubkey extract mirrors create_local_share_v35 (share_check.hpp
+            // ~2600): P2PKH / P2SH / P2WPKH, so p.pubkey_hash + p.pubkey_type
+            // feed the ref-stream identically on both sides.
+            if (payout_script.size() == 25 && payout_script[0] == 0x76 &&
+                payout_script[1] == 0xa9 && payout_script[2] == 0x14 &&
+                payout_script[23] == 0x88 && payout_script[24] == 0xac) {
+                std::memcpy(p.pubkey_hash.begin(), payout_script.data() + 3, 20);
+                p.pubkey_type = 0;
+            } else if (payout_script.size() == 23 && payout_script[0] == 0xa9 &&
+                       payout_script[1] == 0x14 && payout_script[22] == 0x87) {
+                std::memcpy(p.pubkey_hash.begin(), payout_script.data() + 2, 20);
+                p.pubkey_type = 2;
+            } else if (payout_script.size() == 22 && payout_script[0] == 0x00 &&
+                       payout_script[1] == 0x14) {
+                std::memcpy(p.pubkey_hash.begin(), payout_script.data() + 2, 20);
+                p.pubkey_type = 1;
+            }
+
+            auto block_bits_fallback = [&] {
+                p.bits = block_bits;  p.max_bits = block_bits;
+            };
+
+            // Read-only chain walk (shared lock; the compute thread holds the
+            // exclusive lock and never runs on this stratum thread).
+            {
+                std::shared_lock<std::shared_mutex> lk(node.tracker_mutex());
+                auto& tracker = node.tracker();
+
+                const bool have_prev = !prev_share_hash.IsNull() &&
+                                       tracker.chain.contains(prev_share_hash);
+
+                // share_version off the prev tip (matches create_ver); cold
+                // start stays v35 voting v36.
+                if (have_prev) {
+                    tracker.chain.get(prev_share_hash).share.invoke([&](auto* s) {
+                        using ST = std::remove_pointer_t<decltype(s)>;
+                        p.share_version = ST::version;
+                    });
+                }
+
+                // absheight + clipped timestamp off prev.
+                if (have_prev) {
+                    tracker.chain.get(prev_share_hash).share.invoke([&](auto* prev) {
+                        p.absheight = prev->m_absheight + 1;
+                        if (p.timestamp <= prev->m_timestamp)
+                            p.timestamp = prev->m_timestamp + 1;
+                    });
+                } else {
+                    p.absheight = 1;   // genesis
+                }
+
+                // share_target with the clipped timestamp (same call
+                // create_local_share_v35 makes).
+                try {
+                    auto st = tracker.compute_share_target(
+                        prev_share_hash, p.timestamp,
+                        chain::bits_to_target(block_bits));
+                    p.bits = st.bits;  p.max_bits = st.max_bits;
+                } catch (const std::exception&) {
+                    block_bits_fallback();
+                }
+                // Cold start: compute_share_target's genesis branch yields
+                // bits==0 while max_bits carries the MAX_TARGET floor. Pin
+                // p.bits to the floor so the ref_hash, the frozen field, and
+                // share_bits_ all agree (else recomputed != stored).
+                if (p.bits == 0 && p.max_bits != 0)
+                    p.bits = p.max_bits;
+
+                // abswork = prev_abswork + attempts(this share's bits).
+                {
+                    auto att = chain::target_to_average_attempts(
+                        chain::bits_to_target(p.bits));
+                    if (have_prev) {
+                        uint128 prev_abswork;
+                        tracker.chain.get(prev_share_hash).share.invoke(
+                            [&](auto* prev) { prev_abswork = prev->m_abswork; });
+                        p.abswork = prev_abswork + uint128(att.GetLow64());
+                    } else {
+                        p.abswork = uint128(att.GetLow64());
+                    }
+                }
+
+                // far_share_hash: 99th ancestor, mirroring create_local_share
+                // _v35's get_height_and_last rule exactly.
+                if (have_prev) {
+                    auto [prev_height, last] =
+                        tracker.chain.get_height_and_last(prev_share_hash);
+                    if (last.IsNull() && prev_height < 99)
+                        p.far_share_hash = uint256();
+                    else
+                        p.far_share_hash =
+                            tracker.chain.get_nth_parent_key(prev_share_hash, 99);
+                } else {
+                    p.far_share_hash = uint256();
+                }
+            }
+
+            // Mirror the walked values into the result for snap.frozen_ref.
+            result.share_version   = p.share_version;
+            result.desired_version = p.desired_version;
+            result.bits            = p.bits;
+            result.max_bits        = p.max_bits;
+            result.timestamp       = p.timestamp;
+            result.absheight       = p.absheight;
+            result.abswork         = p.abswork;
+            result.far_share_hash  = p.far_share_hash;
+
+            try {
+                auto [rh, nn] = bch::compute_ref_hash_for_work(p);
+                result.ref_hash         = rh;
+                result.last_txout_nonce = nn;
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[BCH-STRATUM] compute_ref_hash_for_work threw: "
+                            << e.what() << " -- coinbase will lack OP_RETURN";
+            }
+            return result;
+        });
+
+    LOG_INFO << "[BCH-STRATUM] ref_hash_fn wired (walks share tracker for"
+             << " share_target/absheight/abswork/far_share; emits p2pool"
+             << " OP_RETURN ref_hash + freezes the snapshot for byte-exact"
+             << " create-side reconstruction).";
+
     work_source->set_create_share_fn(
         [&node](const std::vector<unsigned char>& full_coinbase,
                 const std::vector<uint8_t>&        header_80b,
@@ -217,8 +377,15 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
             // Author at the current tip's version (35 on an empty chain), voting
             // desired=36. Same-version authoring never trips the 60%-by-work
             // accept gate; the ratchet-driven upgrade to v36 is a follow-up slice.
+            // Author at the frozen share_version the ref_hash was computed
+            // under (job.frozen_ref.share_version) so the create-side ref
+            // reconstruction is byte-exact; fall back to the prev-tip version
+            // (cold start: v35 voting v36) when ref_hash_fn produced no frozen
+            // data (bits == 0).
             int64_t create_ver = 35;
-            if (!job.prev_share_hash.IsNull() &&
+            if (job.frozen_ref.bits != 0) {
+                create_ver = job.frozen_ref.share_version;
+            } else if (!job.prev_share_hash.IsNull() &&
                 node.tracker().chain.contains(job.prev_share_hash)) {
                 node.tracker().chain.get_share(job.prev_share_hash).invoke(
                     [&](auto* s) {
@@ -244,15 +411,15 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
                     /* witness_root */          uint256(),
                     /* override_max_bits */     job.share_max_bits,  // pin share target to
                     /* override_bits */         job.share_bits,      // what the miner was issued
-                    /* frozen_absheight */      0,
-                    /* frozen_abswork */        uint128(),
-                    /* frozen_far_share_hash */ uint256(),
-                    /* frozen_timestamp */      0,
-                    /* frozen_merged_payout */  uint256(),
-                    /* has_frozen */            false,
-                    /* frozen_merkle_branches*/ {},
-                    /* frozen_witness_root */   uint256(),
-                    /* frozen_merged_cb_info */ {},
+                    /* frozen_absheight */      job.frozen_ref.absheight,
+                    /* frozen_abswork */        job.frozen_ref.abswork,
+                    /* frozen_far_share_hash */ job.frozen_ref.far_share_hash,
+                    /* frozen_timestamp */      job.frozen_ref.timestamp,
+                    /* frozen_merged_payout */  job.frozen_ref.merged_payout_hash,
+                    /* has_frozen */            (job.frozen_ref.bits != 0),
+                    /* frozen_merkle_branches*/ job.frozen_ref.frozen_merkle_branches,
+                    /* frozen_witness_root */   uint256(),   // BCH: never segwit
+                    /* frozen_merged_cb_info */ {},          // BCH: standalone, no merged
                     /* share_version */         create_ver,
                     /* desired_version */       36);
             } catch (const std::exception& e) {
