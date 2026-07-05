@@ -31,6 +31,7 @@
 #include <impl/bch/coin/mempool.hpp>
 #include <impl/bch/coin/merkle.hpp>            // merkle_hash_pair (CTOR SHA256d)
 #include <impl/bch/coin/template_builder.hpp>  // build_template + rpc::WorkData
+#include <impl/bch/config_pool.hpp>            // PoolConfig::max_target (G2 cold-start floor)
 
 #include <core/log.hpp>
 #include <btclibs/util/strencodings.h>         // HexStr
@@ -221,6 +222,26 @@ BCHWorkSource::cached_template() const
     // never active on normal or mainnet runs. BCH-local (no shared-core edit).
     if (const char* e = std::getenv("BCH_DEMO_BLOCK_BITS"); e && *e)
         built->m_data["bits"] = std::string(e);
+
+    // [G2 cold-start] Seed the pool share-target floor on the WORK-GEN path.
+    // build_connection_coinbase() also seeds share_bits_ from ref_hash_fn's
+    // genesis max_bits, but that path runs only AFTER a share is created --
+    // which core::StratumServer gates on pool_difficulty>0, itself derived
+    // from share_bits_. On an empty sharechain share_bits_==0 => pool
+    // difficulty==0 => the is_pool_share gate never fires => no share is
+    // created => share_bits_ can never advance: a cold-start deadlock the
+    // share-create seed cannot break because it sits behind the very gate it
+    // needs to open. cached_template() runs on every work poll, BEFORE and
+    // INDEPENDENT of share creation, so seeding the floor here bootstraps
+    // pool_difficulty and lets the first real submission cross the gate.
+    // Idempotent (fires only while unseeded); uses the exact floor
+    // compute_share_target's genesis branch emits for max_bits.
+    if (share_bits_.load(std::memory_order_relaxed) == 0) {
+        const uint32_t floor_bits =
+            chain::target_to_bits_upper_bound(bch::PoolConfig::max_target());
+        share_bits_.store(floor_bits, std::memory_order_relaxed);
+        share_max_bits_.store(floor_bits, std::memory_order_relaxed);
+    }
 
     auto sp = std::make_shared<const bch::coin::rpc::WorkData>(std::move(*built));
     std::lock_guard<std::mutex> lk(template_mutex_);
