@@ -36,6 +36,7 @@
 #include <btclibs/util/strencodings.h>         // HexStr
 
 #include <ctime>
+#include <cstdlib>   // std::getenv (BCH_DEMO_BLOCK_BITS isolated-net pin)
 #include <span>
 #include <utility>
 
@@ -544,8 +545,18 @@ nlohmann::json BCHWorkSource::mining_submit(
     else share_target.SetCompact(/*diff 1*/ 0x1d00ffff);
 
     uint256 block_target;
-    block_target.SetCompact(parse_be_hex_u32(
-        job->block_nbits.empty() ? job->nbits : job->block_nbits));
+    {
+        // [ISOLATED-NET DEMO / G2] Env-gated static block-target pin. When
+        // BCH_DEMO_BLOCK_BITS is set, classify block-founds against a fixed,
+        // harder compact-bits target so pseudoshares stop trivially clearing
+        // block on a genesis-difficulty isolated net (substrate at diff 1 =>
+        // GBT bits 1d00ffff), letting the p2pool sharechain counter increment
+        // distinct from block-founds. OFF unless the env var is set -- never
+        // active on normal or mainnet runs; BCH-local, no shared-core edit.
+        std::string bt_bits = job->block_nbits.empty() ? job->nbits : job->block_nbits;
+        if (const char* e = std::getenv("BCH_DEMO_BLOCK_BITS"); e && *e) bt_bits = e;
+        block_target.SetCompact(parse_be_hex_u32(bt_bits));
+    }
 
     auto pow_hex_short = pow_hash.GetHex().substr(0, 16);
 
