@@ -31,11 +31,13 @@
 #include <impl/bch/coin/mempool.hpp>
 #include <impl/bch/coin/merkle.hpp>            // merkle_hash_pair (CTOR SHA256d)
 #include <impl/bch/coin/template_builder.hpp>  // build_template + rpc::WorkData
+#include <impl/bch/config_pool.hpp>            // PoolConfig::max_target (G2 cold-start floor)
 
 #include <core/log.hpp>
 #include <btclibs/util/strencodings.h>         // HexStr
 
 #include <ctime>
+#include <cstdlib>   // std::getenv (BCH_DEMO_BLOCK_BITS isolated-net pin)
 #include <span>
 #include <utility>
 
@@ -207,6 +209,55 @@ BCHWorkSource::cached_template() const
     auto built = bch::coin::TemplateBuilder::build_template(chain_, mempool_, is_testnet_);
     if (!built) return nullptr;  // chain has no tip yet
 
+    // [ISOLATED-NET DEMO / G2] Env-gated block-target pin (single source).
+    // On a genesis-difficulty isolated net the substrate hands GBT bits =
+    // powLimit (regtest 0x207fffff), so every pseudoshare trivially clears
+    // block and the p2pool sharechain counter cannot move distinct from
+    // block-founds. When BCH_DEMO_BLOCK_BITS is set, pin the template block
+    // bits to a fixed harder compact target here -- on the mutable build
+    // result before it is frozen into the shared cache -- so the coinbase,
+    // the header nBits, and core stratum_server gbt_block_nbits all read one
+    // consistent value; the bulk of accepted shares then land as STORED
+    // shares and block-founds stay rare. OFF unless the env var is set;
+    // never active on normal or mainnet runs. BCH-local (no shared-core edit).
+    if (const char* e = std::getenv("BCH_DEMO_BLOCK_BITS"); e && *e)
+        built->m_data["bits"] = std::string(e);
+
+    // [G2 cold-start] Seed the pool share-target floor on the WORK-GEN path.
+    // build_connection_coinbase() also seeds share_bits_ from ref_hash_fn's
+    // genesis max_bits, but that path runs only AFTER a share is created --
+    // which core::StratumServer gates on pool_difficulty>0, itself derived
+    // from share_bits_. On an empty sharechain share_bits_==0 => pool
+    // difficulty==0 => the is_pool_share gate never fires => no share is
+    // created => share_bits_ can never advance: a cold-start deadlock the
+    // share-create seed cannot break because it sits behind the very gate it
+    // needs to open. cached_template() runs on every work poll, BEFORE and
+    // INDEPENDENT of share creation, so seeding the floor here bootstraps
+    // pool_difficulty and lets the first real submission cross the gate.
+    // Idempotent (fires only while unseeded); uses the exact floor
+    // compute_share_target's genesis branch emits for max_bits.
+    if (share_bits_.load(std::memory_order_relaxed) == 0) {
+        // [ISOLATED-NET DEMO / G2] Symmetric to BCH_DEMO_BLOCK_BITS above: on a
+        // genesis-difficulty isolated net PoolConfig::max_target() (the p2pool
+        // network share floor, ~diff-1 / 0x1d00ffff) is far too hard for a CPU
+        // grinder to clear at a useful rate, so the sharechain STORED counter
+        // never advances independently of block-founds even after the
+        // cold-start deadlock fix. BCH_DEMO_SHARE_BITS pins this cold-start
+        // share floor to a CPU-clearable compact target (e.g. regtest powLimit
+        // 0x207fffff) so a grinder promotes real STORED shares while
+        // BCH_DEMO_BLOCK_BITS keeps block-founds rare -- proving 0->N sharechain
+        // accumulation without ASIC hashrate. OFF unless set; never active on
+        // normal or mainnet runs. BCH-local (no shared-core edit).
+        uint32_t floor_bits;
+        if (const char* e = std::getenv("BCH_DEMO_SHARE_BITS"); e && *e)
+            floor_bits = static_cast<uint32_t>(std::strtoul(e, nullptr, 16));
+        else
+            floor_bits =
+                chain::target_to_bits_upper_bound(bch::PoolConfig::max_target());
+        share_bits_.store(floor_bits, std::memory_order_relaxed);
+        share_max_bits_.store(floor_bits, std::memory_order_relaxed);
+    }
+
     auto sp = std::make_shared<const bch::coin::rpc::WorkData>(std::move(*built));
     std::lock_guard<std::mutex> lk(template_mutex_);
     template_cache_     = sp;
@@ -270,6 +321,12 @@ std::pair<std::string, std::string> BCHWorkSource::get_coinbase_parts() const
 }
 
 // -- IWorkSource: setters (callback wiring from main_bch.cpp) ------------------
+
+void BCHWorkSource::set_best_share_hash_fn(std::function<uint256()> fn)
+{
+    std::lock_guard<std::mutex> lk(best_share_mutex_);
+    best_share_hash_fn_ = std::move(fn);
+}
 
 void BCHWorkSource::set_pplns_fn(PplnsFn fn)
 {
@@ -401,6 +458,18 @@ core::stratum::CoinbaseResult BCHWorkSource::build_connection_coinbase(
                                     coinbasevalue, block_bits, curtime);
             if (rh_result.bits != 0) {
                 share_bits_.store(rh_result.bits, std::memory_order_relaxed);
+                share_max_bits_.store(rh_result.max_bits, std::memory_order_relaxed);
+            } else if (share_bits_.load(std::memory_order_relaxed) == 0 &&
+                       rh_result.max_bits != 0) {
+                // Cold-start seed (empty sharechain): compute_share_target's
+                // genesis branch yields bits==0 while max_bits carries the
+                // MAX_TARGET floor (easiest share target). Without a nonzero
+                // share_bits_, StratumServer derives pool_difficulty==0, its
+                // is_pool_share gate never fires, no share is ever created, and
+                // share_bits_ can never advance past 0 -> cold-start deadlock.
+                // Seed both atomics to the max_bits floor so the first real
+                // submission clears the gate and bootstraps the sharechain.
+                share_bits_.store(rh_result.max_bits, std::memory_order_relaxed);
                 share_max_bits_.store(rh_result.max_bits, std::memory_order_relaxed);
             }
         } catch (const std::exception& e) {

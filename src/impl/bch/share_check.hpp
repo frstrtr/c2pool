@@ -2202,6 +2202,18 @@ uint256 create_local_share_v35(
         prev_share, share.m_timestamp, desired_target);
     share.m_max_bits   = share_max_bits;
     share.m_bits       = share_bits;
+
+    // -- Share-target pin (independent of has_frozen) --
+    // Pin m_bits/m_max_bits to the target the miner was actually ISSUED and
+    // hashed against (caller passes job.share_bits/share_max_bits) BEFORE
+    // abswork is derived from m_bits below. Without this, create_local_share
+    // re-derives the target via compute_share_target, which on cold-start /
+    // isolated-net (and under the BCH_DEMO_SHARE_BITS floor) differs from the
+    // target the stratum gate accepted -- so the internal PoW recheck rejects
+    // an otherwise-valid local share and Stored stays 0. The has_frozen block
+    // below re-applies the same values, so this is a no-op on that path.
+    if (override_max_bits) share.m_max_bits = override_max_bits;
+    if (override_bits)     share.m_bits     = override_bits;
     share.m_nonce      = 0;
 
     // V35: address as string (VarStr), convert from payout_script
@@ -2634,6 +2646,18 @@ uint256 create_local_share(
         prev_share, share.m_timestamp, desired_target);
     share.m_max_bits   = share_max_bits;
     share.m_bits       = share_bits;
+
+    // -- Share-target pin (independent of has_frozen) --
+    // Pin m_bits/m_max_bits to the target the miner was actually ISSUED and
+    // hashed against (caller passes job.share_bits/share_max_bits) BEFORE
+    // abswork is derived from m_bits below. Without this, create_local_share
+    // re-derives the target via compute_share_target, which on cold-start /
+    // isolated-net (and under the BCH_DEMO_SHARE_BITS floor) differs from the
+    // target the stratum gate accepted -- so the internal PoW recheck rejects
+    // an otherwise-valid local share and Stored stays 0. The has_frozen block
+    // below re-applies the same values, so this is a no-op on that path.
+    if (override_max_bits) share.m_max_bits = override_max_bits;
+    if (override_bits)     share.m_bits     = override_bits;
 
     share.m_nonce      = 0; // share commitment nonce (not block nonce)
     share.m_merged_addresses = merged_addrs;
