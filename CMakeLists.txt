@@ -85,7 +85,12 @@ include_directories(src)
 # handler_invoke_helpers shim ahead of every C++ TU so a legacy system Boost
 # leaking boost/asio/impl/system_executor.hpp cannot break the conan-pinned
 # build on any coin, regardless of ccache eviction. See core/boost_asio_compat.hpp.
-add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-include;core/boost_asio_compat.hpp>")
+# MSVC/Windows carries no legacy *system* Boost under /usr/include, so it has
+# nothing to leak and does not need (or resolve) this force-include. Gating to
+# non-MSVC avoids C1083 on the MSVC path while keeping the Linux/macOS fix.
+if(NOT MSVC)
+  add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-include;core/boost_asio_compat.hpp>")
+endif()
 
 # Make secp256k1 headers available globally (needed by btclibs, impl/)
 if(SECP256K1_INCLUDE_DIRS)
