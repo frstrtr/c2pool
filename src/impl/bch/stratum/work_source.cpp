@@ -237,8 +237,23 @@ BCHWorkSource::cached_template() const
     // Idempotent (fires only while unseeded); uses the exact floor
     // compute_share_target's genesis branch emits for max_bits.
     if (share_bits_.load(std::memory_order_relaxed) == 0) {
-        const uint32_t floor_bits =
-            chain::target_to_bits_upper_bound(bch::PoolConfig::max_target());
+        // [ISOLATED-NET DEMO / G2] Symmetric to BCH_DEMO_BLOCK_BITS above: on a
+        // genesis-difficulty isolated net PoolConfig::max_target() (the p2pool
+        // network share floor, ~diff-1 / 0x1d00ffff) is far too hard for a CPU
+        // grinder to clear at a useful rate, so the sharechain STORED counter
+        // never advances independently of block-founds even after the
+        // cold-start deadlock fix. BCH_DEMO_SHARE_BITS pins this cold-start
+        // share floor to a CPU-clearable compact target (e.g. regtest powLimit
+        // 0x207fffff) so a grinder promotes real STORED shares while
+        // BCH_DEMO_BLOCK_BITS keeps block-founds rare -- proving 0->N sharechain
+        // accumulation without ASIC hashrate. OFF unless set; never active on
+        // normal or mainnet runs. BCH-local (no shared-core edit).
+        uint32_t floor_bits;
+        if (const char* e = std::getenv("BCH_DEMO_SHARE_BITS"); e && *e)
+            floor_bits = static_cast<uint32_t>(std::strtoul(e, nullptr, 16));
+        else
+            floor_bits =
+                chain::target_to_bits_upper_bound(bch::PoolConfig::max_target());
         share_bits_.store(floor_bits, std::memory_order_relaxed);
         share_max_bits_.store(floor_bits, std::memory_order_relaxed);
     }
