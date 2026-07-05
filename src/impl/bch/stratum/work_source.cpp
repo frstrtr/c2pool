@@ -322,6 +322,12 @@ std::pair<std::string, std::string> BCHWorkSource::get_coinbase_parts() const
 
 // -- IWorkSource: setters (callback wiring from main_bch.cpp) ------------------
 
+void BCHWorkSource::set_best_share_hash_fn(std::function<uint256()> fn)
+{
+    std::lock_guard<std::mutex> lk(best_share_mutex_);
+    best_share_hash_fn_ = std::move(fn);
+}
+
 void BCHWorkSource::set_pplns_fn(PplnsFn fn)
 {
     std::lock_guard<std::mutex> lk(callback_mutex_);

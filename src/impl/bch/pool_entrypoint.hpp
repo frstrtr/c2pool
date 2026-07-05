@@ -53,6 +53,12 @@
 #include "pool_standup.hpp"
 #include "coin/embedded_daemon.hpp"
 #include "stratum/work_source.hpp"
+#include "config_pool.hpp"      // bch::PoolConfig::get_donation_script
+#include "share_check.hpp"      // bch::create_local_share (transitive via node.hpp)
+#include "share_types.hpp"      // bch::StaleInfo
+#include "coin/block.hpp"       // bch::coin::SmallBlockHeaderType
+
+#include <core/pack_types.hpp>    // BaseScript
 
 #include <core/log.hpp>
 #include <core/stratum_server.hpp>
@@ -62,6 +68,9 @@
 #include <boost/asio/io_context.hpp>
 
 #include <cstdint>
+#include <cstring>
+#include <shared_mutex>
+#include <type_traits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -131,6 +140,141 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
                 daemon.broadcast_won_block(block_bytes, HexStr(block_bytes));
             return r.any();
         });
+
+    // ── Sharechain WRITE path: local-share author wiring ─────────────────
+    // Without these callbacks BCHWorkSource accepts miner submissions that
+    // clear the sharechain target but DROPS them ("accepted (no-tracker)",
+    // work_source.cpp:686) because create_share_fn_ is null -- c2pool-bch runs
+    // as a bare stratum proxy and Stored shares stay stuck at 0. This block
+    // closes that gap (mirrors main_btc.cpp:863/1118), wiring the three
+    // callbacks the local-author path needs:
+    //   - best_share_hash_fn : new-job prev_share = our sharechain tip
+    //   - donation_script    : version-gated coinbase residual recipient
+    //   - create_share_fn    : mining_submit -> bch::create_local_share ->
+    //                          tracker.add -> broadcast_share + notify_local_share
+    // BCH is a STANDALONE SHA256d parent: no segwit, no merged/aux dimension
+    // (merged_addrs = {}, segwit_active=false, witness_* empty). ref_hash_fn /
+    // pplns_fn are a FOLLOW-UP slice -- they gate peer-verifiable ref_hash +
+    // PPLNS payout distribution, NOT local Stored accumulation; until wired,
+    // build_connection_coinbase falls back to a single-output coinbase and
+    // create_local_share computes its own share target via
+    // tracker.compute_share_target (has_frozen=false).
+    work_source->set_best_share_hash_fn(
+        [&node]() -> uint256 { return node.best_share_hash(); });
+
+    // Initial donation matches the cold-start create version (35 -> P2PK). A
+    // ratchet-driven refresh to the COMBINED P2SH on v36 activation is the same
+    // follow-up slice as pplns_fn/ref_hash_fn.
+    work_source->set_donation_script(PoolConfig::get_donation_script(35));
+
+    work_source->set_create_share_fn(
+        [&node](const std::vector<unsigned char>& full_coinbase,
+                const std::vector<uint8_t>&        header_80b,
+                const core::stratum::JobSnapshot&  job,
+                const std::vector<unsigned char>& payout_script) -> uint256
+        {
+            if (header_80b.size() != 80) {
+                LOG_WARNING << "[BCH-CREATE-SHARE] bad header size=" << header_80b.size();
+                return uint256::ZERO;
+            }
+
+            // Parse the 80-byte BCH block header -> SmallBlockHeaderType. The
+            // merkle_root (bytes 36..67) is reconstructible from coinbase +
+            // frozen branches, so it is not stored in min_header.
+            auto read_le32 = [](const uint8_t* p) -> uint32_t {
+                return uint32_t(p[0]) | (uint32_t(p[1]) << 8)
+                     | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
+            };
+            coin::SmallBlockHeaderType min_header;
+            min_header.m_version = read_le32(header_80b.data() + 0);
+            std::memcpy(min_header.m_previous_block.data(), header_80b.data() + 4, 32);
+            min_header.m_timestamp = read_le32(header_80b.data() + 68);
+            min_header.m_bits      = read_le32(header_80b.data() + 72);
+            min_header.m_nonce     = read_le32(header_80b.data() + 76);
+
+            BaseScript coinbase_bs(std::vector<unsigned char>(
+                full_coinbase.begin(), full_coinbase.end()));
+
+            // Stratum branches are hex of LE-internal bytes -> ParseHex+memcpy
+            // (SetHex would byte-reverse and break the merkle root the miner used).
+            std::vector<uint256> merkle_branches;
+            merkle_branches.reserve(job.merkle_branches.size());
+            for (const auto& bhex : job.merkle_branches) {
+                uint256 b;
+                auto bb = ParseHex(bhex);
+                if (bb.size() == 32) std::memcpy(b.begin(), bb.data(), 32);
+                merkle_branches.push_back(b);
+            }
+
+            // Exclusive tracker lock (non-blocking): defer to the next submit if
+            // the compute thread is mid-think rather than freezing the io_context.
+            std::unique_lock<std::shared_mutex> lk(node.tracker_mutex(), std::try_to_lock);
+            if (!lk.owns_lock()) {
+                LOG_INFO << "[BCH-CREATE-SHARE] tracker busy -- share deferred";
+                return uint256::ZERO;
+            }
+
+            // Author at the current tip's version (35 on an empty chain), voting
+            // desired=36. Same-version authoring never trips the 60%-by-work
+            // accept gate; the ratchet-driven upgrade to v36 is a follow-up slice.
+            int64_t create_ver = 35;
+            if (!job.prev_share_hash.IsNull() &&
+                node.tracker().chain.contains(job.prev_share_hash)) {
+                node.tracker().chain.get_share(job.prev_share_hash).invoke(
+                    [&](auto* s) {
+                        using ST = std::remove_pointer_t<decltype(s)>;
+                        create_ver = ST::version;
+                    });
+            }
+
+            uint256 share_hash;
+            try {
+                share_hash = bch::create_local_share(
+                    node.tracker(), min_header, coinbase_bs,
+                    /* subsidy */               job.subsidy,
+                    /* prev_share */            job.prev_share_hash,
+                    merkle_branches, payout_script,
+                    /* donation bps */          50,
+                    /* merged_addrs */          {},
+                    /* stale_info */            StaleInfo::none,
+                    /* segwit_active */         false,        // BCH: no segwit
+                    /* witness_commitment */    {},
+                    /* message_data */          {},
+                    /* actual_coinbase_bytes */ full_coinbase,
+                    /* witness_root */          uint256(),
+                    /* override_max_bits */     job.share_max_bits,  // pin share target to
+                    /* override_bits */         job.share_bits,      // what the miner was issued
+                    /* frozen_absheight */      0,
+                    /* frozen_abswork */        uint128(),
+                    /* frozen_far_share_hash */ uint256(),
+                    /* frozen_timestamp */      0,
+                    /* frozen_merged_payout */  uint256(),
+                    /* has_frozen */            false,
+                    /* frozen_merkle_branches*/ {},
+                    /* frozen_witness_root */   uint256(),
+                    /* frozen_merged_cb_info */ {},
+                    /* share_version */         create_ver,
+                    /* desired_version */       36);
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[BCH-CREATE-SHARE] threw: " << e.what();
+                return uint256::ZERO;
+            }
+
+            // Drop the exclusive lock BEFORE broadcast/notify (they take their
+            // own locks / post to the io_context).
+            lk.unlock();
+            if (!share_hash.IsNull()) {
+                node.broadcast_share(share_hash);
+                node.notify_local_share(share_hash);
+                LOG_INFO << "[BCH-CREATE-SHARE] OK + broadcast v" << create_ver
+                         << " hash=" << share_hash.GetHex().substr(0, 16);
+            }
+            return share_hash;
+        });
+
+    LOG_INFO << "[BCH-POOL] sharechain WRITE path wired (mining_submit ->"
+             << " create_local_share -> broadcast_share + notify_local_share);"
+             << " ref_hash/pplns are a follow-up slice.";
 
     std::unique_ptr<core::StratumServer> stratum_server;
     if (stratum_port != 0) {

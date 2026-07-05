@@ -407,6 +407,20 @@ public:
     // attempt_verify() promotes it into `verified`. add() merely buffers it in
     // the raw `chain`. BCH is a SHA256d standalone parent: no merged-mining, so
     // (unlike btc) there is no try_register_merged_addr() leg here.
+    // -- Add share to the main chain (raw-pointer form) --
+    // Mirrors btc::ShareTracker::add(ShareT*) (SSOT) so create_local_share()
+    // can hand off a freshly heap-allocated concrete share (PaddingBugfixShare /
+    // MergedMiningShare) without the caller wrapping it into the ShareType
+    // variant. This overload was missing on BCH -- create_local_share is the
+    // first caller, so its instantiation surfaced the gap. BCH is a SHA256d
+    // standalone parent: no try_register_merged_addr leg (see add(ShareType)).
+    template <typename ShareT>
+    void add(ShareT* share)
+    {
+        if (!chain.contains(share->m_hash))
+            chain.add(share);
+    }
+
     void add(ShareType share)
     {
         auto h = share.hash();
