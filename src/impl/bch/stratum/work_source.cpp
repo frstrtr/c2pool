@@ -403,6 +403,18 @@ core::stratum::CoinbaseResult BCHWorkSource::build_connection_coinbase(
             if (rh_result.bits != 0) {
                 share_bits_.store(rh_result.bits, std::memory_order_relaxed);
                 share_max_bits_.store(rh_result.max_bits, std::memory_order_relaxed);
+            } else if (share_bits_.load(std::memory_order_relaxed) == 0 &&
+                       rh_result.max_bits != 0) {
+                // Cold-start seed (empty sharechain): compute_share_target's
+                // genesis branch yields bits==0 while max_bits carries the
+                // MAX_TARGET floor (easiest share target). Without a nonzero
+                // share_bits_, StratumServer derives pool_difficulty==0, its
+                // is_pool_share gate never fires, no share is ever created, and
+                // share_bits_ can never advance past 0 -> cold-start deadlock.
+                // Seed both atomics to the max_bits floor so the first real
+                // submission clears the gate and bootstraps the sharechain.
+                share_bits_.store(rh_result.max_bits, std::memory_order_relaxed);
+                share_max_bits_.store(rh_result.max_bits, std::memory_order_relaxed);
             }
         } catch (const std::exception& e) {
             LOG_WARNING << "[BCH-STRATUM] ref_hash_fn threw: " << e.what()
