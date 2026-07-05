@@ -81,6 +81,12 @@ endif()
 include_directories(include)
 include_directories(src)
 
+# Boost.Asio build compat (build-only, no behaviour change): force-include the
+# handler_invoke_helpers shim ahead of every C++ TU so a legacy system Boost
+# leaking boost/asio/impl/system_executor.hpp cannot break the conan-pinned
+# build on any coin, regardless of ccache eviction. See core/boost_asio_compat.hpp.
+add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-include;core/boost_asio_compat.hpp>")
+
 # Make secp256k1 headers available globally (needed by btclibs, impl/)
 if(SECP256K1_INCLUDE_DIRS)
     include_directories(${SECP256K1_INCLUDE_DIRS})
