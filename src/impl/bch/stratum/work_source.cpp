@@ -208,6 +208,20 @@ BCHWorkSource::cached_template() const
     auto built = bch::coin::TemplateBuilder::build_template(chain_, mempool_, is_testnet_);
     if (!built) return nullptr;  // chain has no tip yet
 
+    // [ISOLATED-NET DEMO / G2] Env-gated block-target pin (single source).
+    // On a genesis-difficulty isolated net the substrate hands GBT bits =
+    // powLimit (regtest 0x207fffff), so every pseudoshare trivially clears
+    // block and the p2pool sharechain counter cannot move distinct from
+    // block-founds. When BCH_DEMO_BLOCK_BITS is set, pin the template block
+    // bits to a fixed harder compact target here -- on the mutable build
+    // result before it is frozen into the shared cache -- so the coinbase,
+    // the header nBits, and core stratum_server gbt_block_nbits all read one
+    // consistent value; the bulk of accepted shares then land as STORED
+    // shares and block-founds stay rare. OFF unless the env var is set;
+    // never active on normal or mainnet runs. BCH-local (no shared-core edit).
+    if (const char* e = std::getenv("BCH_DEMO_BLOCK_BITS"); e && *e)
+        built->m_data["bits"] = std::string(e);
+
     auto sp = std::make_shared<const bch::coin::rpc::WorkData>(std::move(*built));
     std::lock_guard<std::mutex> lk(template_mutex_);
     template_cache_     = sp;
@@ -557,18 +571,8 @@ nlohmann::json BCHWorkSource::mining_submit(
     else share_target.SetCompact(/*diff 1*/ 0x1d00ffff);
 
     uint256 block_target;
-    {
-        // [ISOLATED-NET DEMO / G2] Env-gated static block-target pin. When
-        // BCH_DEMO_BLOCK_BITS is set, classify block-founds against a fixed,
-        // harder compact-bits target so pseudoshares stop trivially clearing
-        // block on a genesis-difficulty isolated net (substrate at diff 1 =>
-        // GBT bits 1d00ffff), letting the p2pool sharechain counter increment
-        // distinct from block-founds. OFF unless the env var is set -- never
-        // active on normal or mainnet runs; BCH-local, no shared-core edit.
-        std::string bt_bits = job->block_nbits.empty() ? job->nbits : job->block_nbits;
-        if (const char* e = std::getenv("BCH_DEMO_BLOCK_BITS"); e && *e) bt_bits = e;
-        block_target.SetCompact(parse_be_hex_u32(bt_bits));
-    }
+    block_target.SetCompact(parse_be_hex_u32(
+        job->block_nbits.empty() ? job->nbits : job->block_nbits));
 
     auto pow_hex_short = pow_hash.GetHex().substr(0, 16);
 
