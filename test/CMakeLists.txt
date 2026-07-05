@@ -572,6 +572,21 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_config PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_config "" AUTO)
 
+    # DASH v36-native MINT-side accept-floor auto-ratchet (#357 gap-closer, FENCED/
+    # UNWIRED). Pins the pure dash::ratchet_min_protocol_version + the full-window
+    # apply_min_protocol_ratchet_decision guard, and the weighted-vs-plain-count
+    # divergence assert. Header-only over core (uint288); mirrors the test_dash_config
+    # link set.
+    add_executable(test_dash_auto_ratchet test_dash_auto_ratchet.cpp)
+    target_link_libraries(test_dash_auto_ratchet PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_auto_ratchet PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_auto_ratchet "" AUTO)
+
     add_executable(test_dash_peer test_dash_peer.cpp)
     target_link_libraries(test_dash_peer PRIVATE
         GTest::gtest_main GTest::gtest
