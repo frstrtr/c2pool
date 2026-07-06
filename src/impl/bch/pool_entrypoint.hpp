@@ -307,11 +307,19 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
                 if (have_prev) {
                     auto [prev_height, last] =
                         tracker.chain.get_height_and_last(prev_share_hash);
-                    if (last.IsNull() && prev_height < 99)
+                    if (last.IsNull() && prev_height < 99) {
                         p.far_share_hash = uint256();
-                    else
-                        p.far_share_hash =
-                            tracker.chain.get_nth_parent_key(prev_share_hash, 99);
+                    } else {
+                        try {
+                            p.far_share_hash =
+                                tracker.chain.get_nth_parent_key(prev_share_hash, 99);
+                        } catch (const std::exception&) {
+                            // Bootstrap short chain: degrade to far=None instead of
+                            // throwing out of ref_hash_fn (which would zero frozen_ref
+                            // and force the create-side into its own unguarded walk).
+                            p.far_share_hash = uint256();
+                        }
+                    }
                 } else {
                     p.far_share_hash = uint256();
                 }

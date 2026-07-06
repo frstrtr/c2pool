@@ -2744,7 +2744,14 @@ uint256 create_local_share(
             // Chain is complete and shorter than 99 → None (zero)
             share.m_far_share_hash = uint256();
         } else {
-            share.m_far_share_hash = tracker.chain.get_nth_parent_key(prev_share, 99);
+            try {
+                share.m_far_share_hash = tracker.chain.get_nth_parent_key(prev_share, 99);
+            } catch (const std::exception&) {
+                // Bootstrap: chain shorter than the 99-deep lookback even though
+                // get_height_and_last reported a non-null last → far=None, mirroring
+                // the guarded _v35 author and p2pool's get_nth_parent_hash(prev,99).
+                share.m_far_share_hash = uint256();
+            }
         }
     } else {
         // Genesis: p2pool always does (prev_absheight + 1), (prev_abswork + aps)
