@@ -89,6 +89,15 @@ jobs:
         if: steps.presence.outputs.exists == '1' && runner.environment != 'github-hosted'
         run: rm -rf build_${{ matrix.coin }}
 
+      - name: Clear orphaned Conan download tempfiles (self-hosted cache is reused)
+        if: steps.presence.outputs.exists == '1' && runner.environment != 'github-hosted'
+        # An interrupted or racing conan download can leave a partial conan_package.tgz
+        # in ~/.conan2 that makes the next `conan install` abort with
+        # "the file to download already exists". Delete these staging archives so a
+        # missing binary package can be re-fetched cleanly; extracted packages are untouched.
+        run: |
+          find ~/.conan2/p -type f \( -name 'conan_package.tgz' -o -name 'conan_sources.tgz' \) -delete 2>/dev/null || true
+
       - name: Conan install
         if: steps.presence.outputs.exists == '1'
         run: |
