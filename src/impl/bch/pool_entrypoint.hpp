@@ -69,6 +69,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>   // std::getenv (BCH_DEMO_SHARE_BITS demo floor)
 #include <shared_mutex>
 #include <type_traits>
 #include <memory>
@@ -271,6 +272,20 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
                 // share_bits_ all agree (else recomputed != stored).
                 if (p.bits == 0 && p.max_bits != 0)
                     p.bits = p.max_bits;
+
+                // [ISOLATED-NET DEMO / G2] Mirror work_source's
+                // BCH_DEMO_SHARE_BITS floor here so the ref_hash, the frozen
+                // field, and the core pool_difficulty gate all read ONE share
+                // target on a CPU-grind isolated net. Without it ref_hash_fn
+                // reports compute_share_target's ~diff-1 floor -- unclearable
+                // by a CPU grinder -- so no submission is ever promoted to a
+                // STORED share and recomputed==stored can't be observed.
+                // OFF unless the env var is set; never active on normal or
+                // mainnet runs. BCH-local (fenced to the BCH tree).
+                if (const char* e = std::getenv("BCH_DEMO_SHARE_BITS"); e && *e) {
+                    uint32_t demo = static_cast<uint32_t>(std::strtoul(e, nullptr, 16));
+                    if (demo) { p.bits = demo; p.max_bits = demo; }
+                }
 
                 // abswork = prev_abswork + attempts(this share's bits).
                 {
