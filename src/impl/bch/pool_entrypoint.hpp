@@ -385,8 +385,45 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
             min_header.m_bits      = read_le32(header_80b.data() + 72);
             min_header.m_nonce     = read_le32(header_80b.data() + 76);
 
-            BaseScript coinbase_bs(std::vector<unsigned char>(
-                full_coinbase.begin(), full_coinbase.end()));
+            // full_coinbase is the fully serialized coinbase TRANSACTION, but a
+            // share's m_coinbase field must be ONLY the coinbase INPUT scriptSig
+            // (BIP34 height + pool marker) -- share_init_verify enforces the
+            // consensus 2..100 byte bound. Feeding the whole tx tripped
+            // "bad coinbase size" and left every G2 share unverified. Extract the
+            // input scriptSig here; the full tx still rides via actual_coinbase_bytes
+            // for gentx byte-parity (extranonce lives in an OP_RETURN output, not
+            // the scriptSig, so this slice is complete on its own).
+            std::vector<unsigned char> coinbase_scriptSig;
+            {
+                size_t p = 0;
+                bool ok = true;
+                auto need = [&](size_t n) { return p + n <= full_coinbase.size(); };
+                auto rd_varint = [&](uint64_t& out) -> bool {
+                    if (!need(1)) return false;
+                    uint8_t ch = full_coinbase[p++];
+                    if (ch < 253) { out = ch; return true; }
+                    size_t n = (ch == 253) ? 2 : (ch == 254) ? 4 : 8;
+                    if (!need(n)) return false;
+                    out = 0;
+                    for (size_t i = 0; i < n; ++i)
+                        out |= uint64_t(full_coinbase[p++]) << (8 * i);
+                    return true;
+                };
+                uint64_t vin = 0, slen = 0;
+                if (need(4)) p += 4; else ok = false;            // version
+                ok = ok && rd_varint(vin) && vin >= 1;           // tx_in count
+                if (ok && need(36)) p += 36; else ok = false;    // prevout (32+4)
+                ok = ok && rd_varint(slen);                      // scriptSig length
+                if (ok && need(slen)) {
+                    coinbase_scriptSig.assign(full_coinbase.begin() + p,
+                                              full_coinbase.begin() + p + slen);
+                } else {
+                    LOG_WARNING << "[BCH-CREATE-SHARE] cannot parse coinbase scriptSig from "
+                                << full_coinbase.size() << "B tx -- share skipped";
+                    return uint256::ZERO;
+                }
+            }
+            BaseScript coinbase_bs(coinbase_scriptSig);
 
             // Stratum branches are hex of LE-internal bytes -> ParseHex+memcpy
             // (SetHex would byte-reverse and break the merkle root the miner used).
