@@ -62,6 +62,7 @@
 
 #include <core/log.hpp>
 #include <core/stratum_server.hpp>
+#include <functional>
 
 #include <btclibs/util/strencodings.h>   // HexStr
 
@@ -342,8 +343,17 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
              << " OP_RETURN ref_hash + freezes the snapshot for byte-exact"
              << " create-side reconstruction).";
 
+    // Local-share -> stratum work-refresh bridge (BCH-side wiring; the refresh
+    // mechanism itself lives unchanged in core StratumServer::notify_all(),
+    // which re-polls best_share_hash_fn and pushes a clean mining.notify with
+    // the NEW sharechain tip as prev_share). Without ringing it after each
+    // authored share, every miner keeps grinding the job frozen at pool start
+    // (prev=genesis), so shares bootstrap off 0000... as orphan siblings and
+    // the chain never links past height 1.
+    auto stratum_notify = std::make_shared<std::function<void()>>();
+
     work_source->set_create_share_fn(
-        [&node](const std::vector<unsigned char>& full_coinbase,
+        [&node, stratum_notify](const std::vector<unsigned char>& full_coinbase,
                 const std::vector<uint8_t>&        header_80b,
                 const core::stratum::JobSnapshot&  job,
                 const std::vector<unsigned char>& payout_script) -> uint256
@@ -448,6 +458,9 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
             if (!share_hash.IsNull()) {
                 node.broadcast_share(share_hash);
                 node.notify_local_share(share_hash);
+                // Ring the stratum work-refresh so the next mining.notify carries
+                // the new sharechain tip as prev_share (chain links past height 1).
+                if (*stratum_notify) (*stratum_notify)();
                 LOG_INFO << "[BCH-CREATE-SHARE] OK + broadcast v" << create_ver
                          << " hash=" << share_hash.GetHex().substr(0, 16);
             }
@@ -463,6 +476,8 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
         stratum_server = std::make_unique<core::StratumServer>(
             ioc, stratum_addr, stratum_port, work_source);
         if (stratum_server->start()) {
+            // Wire the local-share bridge to the now-constructed stratum server.
+            *stratum_notify = [srv = stratum_server.get()]() { srv->notify_all(); };
             LOG_INFO << "[BCH-POOL] stratum listening on " << stratum_addr << ":"
                      << stratum_port << " (BCHWorkSource: SHA256d, no-segwit,"
                      << " CashTokens transparent-carry; hit block routes the"
