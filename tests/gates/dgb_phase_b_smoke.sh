@@ -27,7 +27,8 @@ if [ ! -f "$BUILD_DIR/CMakeCache.txt" ]; then
   cmake -S "$REPO_ROOT" -B "$BUILD_DIR" \
     -DCMAKE_TOOLCHAIN_FILE="$BUILD_DIR/conan_toolchain.cmake" \
     -DCMAKE_BUILD_TYPE=Release \
-    -DBUILD_TESTING=ON
+    -DBUILD_TESTING=ON \
+    -DCOIN_DGB=ON
 fi
 cmake --build "$BUILD_DIR" --target "${TARGETS[@]}" -j"$(nproc)"
 
