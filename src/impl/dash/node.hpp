@@ -20,6 +20,8 @@
 #include "share_chain.hpp"
 #include "share_tracker.hpp"
 #include "peer.hpp"
+#include "min_protocol_gate.hpp"
+#include "messages.hpp"
 #include "coin/transaction.hpp"
 
 #include <pool/node.hpp>
@@ -217,10 +219,58 @@ public:
     // concrete, instantiable type for the KAT; the reception/handshake slice (B)
     // replaces these with the real ping + version handshake.
     void send_ping(peer_ptr /*peer*/) override { }
+
+    // #646 min-protocol ratchet gate -- LIVE per-instance floor. Default-
+    // constructed it holds the oracle accept-all floor (1700), so at the default
+    // this gate is a no-op; the operator lifts min_version at G2-migration time
+    // and this reception then rejects any peer advertising a sub-floor protocol.
+    dash::MinProtocolGate m_min_protocol_gate;
+
+    // Slice B: real version-handshake reception. Mirrors the ltc::NodeImpl
+    // reference (src/impl/ltc/node.cpp:265) reconciled to DASH's header-only
+    // node and message set. Parses message_version, guards self- and duplicate
+    // connections, fires the #646 min-protocol discrimination, registers the
+    // peer, and returns the negotiated connection type. The share-download /
+    // getaddrs machinery LTC drives here is not yet present on the DASH node and
+    // rides a later slice; this reception is what flips G2 dual-pool from a
+    // dormant seam to a live cross-peer.
     std::optional<pool::PeerConnectionType>
-    handle_version(std::unique_ptr<RawMessage> /*rmsg*/, peer_ptr /*peer*/) override
+    handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer) override
     {
-        return std::nullopt;
+        auto msg = dash::message_version::make(rmsg->m_data);
+
+        if (peer->m_other_version.has_value())
+            throw std::runtime_error("more than one version message");
+
+        peer->m_other_version = msg->m_version;
+        peer->m_other_subversion = msg->m_subversion;
+
+        // Self-connection guard: we dialled our own advertised nonce.
+        if (m_nonce == msg->m_nonce)
+            return std::nullopt;
+
+        // Duplicate-connection guard: already peered with this nonce.
+        if (m_peers.contains(msg->m_nonce))
+            return std::nullopt;
+
+        // #646 min-protocol ratchet -- LIVE discrimination. Throwing here makes
+        // the NodeBridge close the connection (pool/node.hpp handle()). At the
+        // default floor (1700) every real DASH peer is admitted (accept-all).
+        if (m_min_protocol_gate.rejects(msg->m_version))
+            throw std::runtime_error("peer protocol below min-protocol floor");
+
+        peer->m_nonce = msg->m_nonce;
+        m_peers[peer->m_nonce] = peer;
+
+        // Legacy/actual split for the G2 dual-pool: only once the operator has
+        // ratcheted the floor above the oracle baseline do at-or-above-floor
+        // peers negotiate the actual (v36) protocol; otherwise legacy (parity
+        // with the ltc reference, which returns legacy unconditionally).
+        const bool ratcheted =
+            m_min_protocol_gate.min_version > SharechainConfig::MINIMUM_PROTOCOL_VERSION;
+        return (ratcheted && msg->m_version >= m_min_protocol_gate.min_version)
+                   ? pool::PeerConnectionType::actual
+                   : pool::PeerConnectionType::legacy;
     }
 
     // ── Tracker accessors ───────────────────────────────────────────────
