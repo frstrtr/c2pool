@@ -210,10 +210,46 @@ public:
     // pure-virtual INetwork contract.
     void disconnect() override { }
 
-    // ICommunicator: the message-dispatch entry point. Slice A drops inbound
-    // messages (no-op) to satisfy the pure-virtual contract; the reception slice
-    // (B) replaces this with the real Legacy/Actual protocol routing.
-    void handle(std::unique_ptr<RawMessage> /*rmsg*/, const NetService& /*service*/) override { }
+    // ICommunicator: the message-dispatch entry point. Slice B wires the real
+    // version-handshake routing so handle_version() (and its live #646 gate) is
+    // actually reachable -- mirrors the pool::NodeBridge unknown-peer branch
+    // (src/pool/node.hpp). Full Legacy/Actual established-peer message dispatch
+    // (shares, txs, getaddrs) rides a later slice; until then, post-handshake
+    // messages are dropped. The handshake + min-protocol discrimination is live.
+    void handle(std::unique_ptr<RawMessage> rmsg, const NetService& service) override
+    {
+        // Guard: the peer may have been removed by a prior error/timeout while an
+        // async_read callback was still in-flight for the same socket.
+        if (!m_connections.contains(service))
+            return;
+        auto peer = m_connections[service];
+        peer->m_timeout->restart();
+
+        if (peer->type() == pool::PeerConnectionType::unknown)
+        {
+            // The first message from an unknown peer MUST be `version`.
+            if (rmsg->m_command.compare(0, 7, "version") != 0)
+                return error("expected version message", service);
+
+            std::optional<pool::PeerConnectionType> peer_type;
+            try {
+                peer_type = handle_version(std::move(rmsg), peer);
+            } catch (const std::exception& ex) {
+                error(ex.what(), service);
+                return;
+            }
+            if (!peer_type.has_value()) {
+                // self- or duplicate-connection: graceful close.
+                close_connection(service);
+                return;
+            }
+            peer->stable(*peer_type, PEER_TIMEOUT_TIME);
+            return;
+        }
+
+        // Established peer: full Legacy/Actual message dispatch rides a later
+        // slice; post-handshake messages are dropped for now.
+    }
 
     // BaseNode pure-virtuals. Slice A provides minimal stubs so NodeImpl is a
     // concrete, instantiable type for the KAT; the reception/handshake slice (B)
