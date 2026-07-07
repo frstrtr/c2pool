@@ -334,6 +334,12 @@ void BCHWorkSource::set_pplns_fn(PplnsFn fn)
     pplns_fn_ = std::move(fn);
 }
 
+void BCHWorkSource::set_author_version_fn(std::function<int64_t()> fn)
+{
+    std::lock_guard<std::mutex> lk(callback_mutex_);
+    author_version_fn_ = std::move(fn);
+}
+
 void BCHWorkSource::set_ref_hash_fn(RefHashFn fn)
 {
     std::lock_guard<std::mutex> lk(callback_mutex_);
@@ -384,10 +390,16 @@ core::stratum::CoinbaseResult BCHWorkSource::build_connection_coinbase(
 
     PplnsFn pplns_fn; RefHashFn ref_hash_fn;
     std::vector<unsigned char> donation_script;
+    std::function<int64_t()> author_version_fn;
     {
         std::lock_guard<std::mutex> lk(callback_mutex_);
         pplns_fn = pplns_fn_; ref_hash_fn = ref_hash_fn_; donation_script = donation_script_;
+        author_version_fn = author_version_fn_;
     }
+    // Author version gates the pre-v36 finder-fee shape (applied below, needs
+    // this connection\x27s payout_script). Unset => 35 (safe: fresh chains author
+    // at v35). sv>=36 => pure PPLNS, no finder fee.
+    const int64_t author_version = author_version_fn ? author_version_fn() : 35;
 
     // scriptSig (deterministic): BIP34 height + pool tag.
     auto bip34 = bip34_height_push(height);
@@ -424,6 +436,13 @@ core::stratum::CoinbaseResult BCHWorkSource::build_connection_coinbase(
         if (dropped_n > 0 && !donation_script.empty())
             payouts[donation_script] += static_cast<double>(dropped_value);
     }
+
+    // Pre-v36 finder fee: sub-36 authors owe generate_share_transaction\x27s v35
+    // credit of subsidy/200 to the (creator==finder==) miner\x27s own payout_script,
+    // deducted from the donation residual. Header-only apply_v35_finder_fee keeps
+    // this byte-identical to the KAT-pinned math; sv>=36 skips it entirely.
+    if (author_version < 36)
+        apply_v35_finder_fee(payouts, payout_script, donation_script, coinbasevalue);
 
     // V36 removes the finder fee -- pure PPLNS accounting. The oracle
     // (p2pool-merged-v36 data.py ~945) fires the subsidy/200 finder fee ONLY in

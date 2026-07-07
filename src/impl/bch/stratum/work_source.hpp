@@ -234,6 +234,12 @@ public:
     /// appears as an output.
     void set_donation_script(std::vector<unsigned char> script);
 
+    /// Wire the author-version producer: returns the sharechain-tip version the
+    /// next locally-authored share is stamped at (mirrors pool_entrypoint\x27s
+    /// create_ver derivation off the tip). build_connection_coinbase uses it to
+    /// gate the pre-v36 finder-fee shape. Left unset => v36-pure (no finder fee).
+    void set_author_version_fn(std::function<int64_t()> fn);
+
 private:
     // External dependencies (non-owning references)
     bch::coin::HeaderChain&     chain_;
@@ -267,6 +273,7 @@ private:
     RefHashFn                   ref_hash_fn_;
     CreateShareFn               create_share_fn_;
     std::vector<unsigned char>  donation_script_;
+    std::function<int64_t()>    author_version_fn_;
 
     // Template cache (filled lazily; invalidated when work_generation_ bumps)
     // Stage c populates these.

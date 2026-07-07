@@ -9,7 +9,7 @@
 // ORACLE packer (scripts/gen_g2_oracle.py, a verbatim transcription of the
 // data.py v36 amounts/dests/payouts block), NOT authored against this builder.
 //
-// Three cases:
+// Four cases (dual-version finder-fee bar in 3+4):
 //   CASE 1 -- ORDERING: four PPLNS dests with an amount TIE (B==C) exercises the
 //             (amount asc, THEN script asc) sort; donation marker forced LAST;
 //             the marker <1-sat rule decrements the largest (D) by one satoshi.
@@ -41,6 +41,7 @@
 using Script  = std::vector<unsigned char>;
 using Outputs = std::vector<std::pair<Script, uint64_t>>;
 using bch::stratum::assemble_v36_coinbase_outputs;
+using bch::stratum::apply_v35_finder_fee;
 
 static const uint64_t SUBSIDY = 1000000000ULL;
 
@@ -112,6 +113,26 @@ static std::map<Script,double> pplns(std::vector<std::pair<Script,uint64_t>> wei
     return amounts;
 }
 
+// V35 pre-marker PPLNS amounts = subsidy*199*weight//(200*total_weight) (the
+// 199/200 haircut get_v35_expected_payouts emits), donation entry = subsidy -
+// sum(pplns) BEFORE the finder fee is carved out. apply_v35_finder_fee then
+// moves subsidy/200 from DON onto the creator==finder script. Mirrors
+// share_tracker.hpp get_v35_expected_payouts + share_check.hpp v35 verify.
+static std::map<Script,double> pplns_v35(std::vector<std::pair<Script,uint64_t>> weights,
+                                         uint64_t donation_weight) {
+    uint64_t total_weight = donation_weight;
+    for (auto& [s,w] : weights) total_weight += w;
+    std::map<Script,double> amounts;
+    uint64_t sum = 0;
+    for (auto& [s,w] : weights) {
+        uint64_t amt = SUBSIDY * 199 * w / (200 * total_weight);
+        amounts[s] = static_cast<double>(amt);
+        sum += amt;
+    }
+    amounts[DON] = static_cast<double>(SUBSIDY - sum);   // pre-finder donation
+    return amounts;
+}
+
 int main() {
     // ----- CASE 1: ordering + amount-tie script tiebreak + marker decrement ---
     {
@@ -174,6 +195,29 @@ int main() {
         assert(got != ORACLE_WITH_FINDERFEE);      // PROVES finder fee removed
         assert(ORACLE_V36 != ORACLE_WITH_FINDERFEE);
         std::cout << "[KAT] case3 finder-fee-removal byte-diff -- PASS\n";
+    }
+
+    // ----- CASE 4: sub-36 AUTHOR path == fee-present oracle vector ------------
+    // v35 author path: get_v35 199/200 shape -> apply_v35_finder_fee -> assemble.
+    // Same {A:60,B:40} inputs as CASE 3 but authored at sv<36: subsidy/200 moves
+    // from the donation residual onto the creator==finder script (A). Assembled
+    // bytes MUST equal CASE 3's ORACLE_WITH_FINDERFEE -- the very vector a v36
+    // author is forbidden to emit. Dual-version bar: v36 => fee-LESS, v35 =>
+    // fee-PRESENT, from the SAME production helpers.
+    {
+        auto payouts = pplns_v35({{A,60},{B,40}}, 0);
+        apply_v35_finder_fee(payouts, /*creator==finder==*/A, DON, SUBSIDY);
+        auto outs = assemble_v36_coinbase_outputs(payouts, DON, SUBSIDY);
+        assert(outs.size() == 3);
+        assert(outs[0].first == B && outs[0].second == 398000000ULL);
+        assert(outs[1].first == A && outs[1].second == 601999999ULL);  // 199/200 + fee, -1 marker
+        assert(outs[2].first == DON && outs[2].second == 1ULL);
+        const std::string ORACLE_WITH_FINDERFEE =
+            "80ffb817000000001976a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac"
+            "7fcae123000000001976a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+            "010000000000000017a9148c6272621d89e8fa526dd86acff60c7136be8e8587";
+        assert(serialize_outsection(outs) == ORACLE_WITH_FINDERFEE);
+        std::cout << "[KAT] case4 sub-36 finder-fee author byte-parity -- PASS\n";
     }
 
     std::cout << "[KAT] bch G2 coinbase-author KAT -- ALL CASES PASS\n";
