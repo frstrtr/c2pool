@@ -1,0 +1,97 @@
+name: BCH gate G3a — populated-regtest block production
+
+# ci-steward 2026-07-07. CI plumbing only — NO consensus knowledge here. The BCH
+# lane owns the harness, the CHECK-companions, and the gate script; this workflow
+# just runs the canonical entrypoint tests/gates/bch_g3a_regtest_block_production.sh,
+# which self-configures (conan + cmake -DCOIN_BCH=ON, override via BUILD_DIR) and
+# runs two arms:
+#   * CI arm (network-free, always on): the in-process CHECK-harnesses that prove
+#     POPULATED-block production without a live BCHN — bch_embedded_daemon_assembly,
+#     bch_embedded_block_broadcast, bch_block_ordering (CTOR), bch_cashtokens_
+#     transparency, bch_coinbase_kat_bytevector — with a false-green guard demanding
+#     the full expected test count ran.
+#   * Live regtest arm (opt-in): runs only when BCH_RPC_PASS + BCH_RPC_AUTH point at
+#     an isolated regtest BCHN (v29.0.0, --disable-wallet). Left unset here — the
+#     network-free CI arm carries the gate until the BCH lane wires a regtest BCHN
+#     + secrets into the runner.
+#
+# Mirrors bch-gate-g3b-genuine-activation.yml / dash-gate-g3a-regtest-block-production.yml.
+# Neutral-skip: on branches predating the G3a entrypoint the job is a green no-op.
+# Register as a required check only after a confirmed non-hollow green rollup
+# (operator-side ruleset).
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  g3a-regtest-block-production:
+    name: BCH gate G3a — populated-regtest block production
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check gate entrypoint presence
+        id: presence
+        run: |
+          if [ -f "tests/gates/bch_g3a_regtest_block_production.sh" ]; then
+            echo "exists=1" >> "$GITHUB_OUTPUT"
+            echo "::notice::G3a entrypoint present — running populated block-production gate."
+          else
+            echo "exists=0" >> "$GITHUB_OUTPUT"
+            echo "::notice::tests/gates/bch_g3a_regtest_block_production.sh not on this branch — neutral skip."
+          fi
+
+      - name: Install system dependencies
+        if: steps.presence.outputs.exists == '1' && runner.environment == 'github-hosted'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            g++ cmake make libleveldb-dev libsecp256k1-dev
+
+      - uses: actions/setup-python@v6
+        if: steps.presence.outputs.exists == '1' && runner.environment == 'github-hosted'
+        with: { python-version: '3.12' }
+
+      - name: Install Conan 2
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            pip install "conan>=2.0,<3.0"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
+          fi
+
+      - name: Detect Conan profile
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          conan profile detect --force
+          sed -i 's/compiler.cppstd=.*/compiler.cppstd=20/' "$(conan profile path default)"
+
+      - name: Restore Conan cache
+        if: steps.presence.outputs.exists == '1'
+        uses: actions/cache@v5
+        with:
+          path: ~/.conan2
+          key: conan2-ubuntu24-gcc13-bch-g3a-${{ hashFiles('conanfile.txt') }}
+          restore-keys: |
+            conan2-ubuntu24-gcc13-bch-g3a-
+            conan2-ubuntu24-gcc13-
+
+      - name: Clean stale build dir (self-hosted workspace is reused)
+        if: steps.presence.outputs.exists == '1' && runner.environment != 'github-hosted'
+        run: rm -rf build_bch_g3a
+
+      - name: Run G3a populated block-production gate (bch-lane TEST_ENTRYPOINT)
+        if: steps.presence.outputs.exists == '1'
+        env:
+          BUILD_DIR: ${{ github.workspace }}/build_bch_g3a
+          # Live regtest arm stays opt-in: the script runs it only when both are set.
+          # Left unset here — the network-free CI arm carries the gate until the BCH
+          # lane wires a regtest BCHN + secrets into the runner.
+          BCH_RPC_PASS: ${{ secrets.BCH_RPC_PASS }}
+          BCH_RPC_AUTH: ${{ secrets.BCH_RPC_AUTH }}
+        run: bash tests/gates/bch_g3a_regtest_block_production.sh
