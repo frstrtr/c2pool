@@ -710,6 +710,26 @@ uint256 share_init_verify(const ShareT& share, bool check_pow = true)
         reinterpret_cast<const unsigned char*>(header_stream.data()), header_stream.size());
     uint256 share_hash = Hash(hdr_span);
 
+    // [verify-preimage-diag] Non-fatal author-vs-verify divergence localiser.
+    // When a locally-stored identity is present and the recomputed hash differs,
+    // dump the preimage components. The header scalars are carried verbatim, so a
+    // mismatch here isolates to gentx_hash / merkle_root (coinbase+PPLNS author
+    // path). The chain keys off share.m_hash, so this is diagnostic only.
+    if (!share.m_hash.IsNull() && share_hash != share.m_hash) {
+        static int preimage_diag = 0;
+        if (preimage_diag++ < 10) {
+            LOG_WARNING << "[verify-preimage] recomputed=" << share_hash.GetHex().substr(0, 16)
+                        << " stored=" << share.m_hash.GetHex().substr(0, 16);
+            LOG_WARNING << "[verify-preimage] gentx_hash=" << gentx_hash.GetHex()
+                        << " merkle_root=" << merkle_root.GetHex();
+            LOG_WARNING << "[verify-preimage] hdr ver=" << share.m_min_header.m_version
+                        << " prev=" << share.m_min_header.m_previous_block.GetHex().substr(0, 16)
+                        << " time=" << share.m_min_header.m_timestamp
+                        << " bits=0x" << std::hex << share.m_min_header.m_bits << std::dec
+                        << " nonce=" << share.m_min_header.m_nonce;
+        }
+    }
+
     // --- PoW check (SHA256d) ---
     // For Bitcoin POW_FUNC is SHA256d, identical to the block identity hash.
     // (LTC was scrypt(1024,1,1,256); BTC's pow_hash == share_hash via Hash(hdr_span).)
