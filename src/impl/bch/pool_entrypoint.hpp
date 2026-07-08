@@ -360,6 +360,59 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
     // the chain never links past height 1.
     auto stratum_notify = std::make_shared<std::function<void()>>();
 
+    // --- Version-aware PPLNS payout + author-version wiring (finder-fee gate) ---
+    // The height-2 verified-tip stall was a share-version vs coinbase-author
+    // mismatch: shares stamp at the tip version (35 through a short grind, the
+    // ratchet never flips) while the coinbase author produced a v36-pure,
+    // finder-fee-less gentx -- so generate_share_transaction (v35 verify path)
+    // rejected every non-genesis share. Fix: select the PPLNS shape at the tip
+    // version and (in build_connection_coinbase) apply the sub-36 finder fee.
+    // The v35 walk (flat weights, grandparent start, 199/200) and the v36 walk
+    // (decayed, exponential window, pure) yield DIFFERENT integer amounts
+    // (division order), so shape must be chosen at weight->amount time, never
+    // haircut afterward. Ref: share_check.hpp use_v36_pplns.
+    auto derive_author_version = [&node]() -> int64_t {
+        int64_t ver = 35;
+        uint256 tip = node.best_share_hash();
+        std::shared_lock<std::shared_mutex> lk(node.tracker_mutex());
+        if (!tip.IsNull() && node.tracker().chain.contains(tip)) {
+            node.tracker().chain.get_share(tip).invoke(
+                [&](auto* s) {
+                    using ST = std::remove_pointer_t<decltype(s)>;
+                    ver = ST::version;
+                });
+        }
+        return ver;
+    };
+    work_source->set_author_version_fn(derive_author_version);
+
+    work_source->set_pplns_fn(
+        [&node](const uint256& best_share_hash,
+                const uint256& block_target,
+                uint64_t subsidy,
+                const std::vector<unsigned char>& donation_script)
+            -> std::map<std::vector<unsigned char>, double>
+        {
+            // Single read guard: derive the tip version AND walk under the same
+            // lock (do NOT call derive_author_version here -- that would take a
+            // second shared_lock on the same thread == UB under a waiting writer).
+            std::shared_lock<std::shared_mutex> lk(node.tracker_mutex());
+            int64_t ver = 35;
+            uint256 tip = node.best_share_hash();
+            if (!tip.IsNull() && node.tracker().chain.contains(tip)) {
+                node.tracker().chain.get_share(tip).invoke(
+                    [&](auto* s) {
+                        using ST = std::remove_pointer_t<decltype(s)>;
+                        ver = ST::version;
+                    });
+            }
+            if (ver < 36)
+                return node.tracker().get_v35_expected_payouts(
+                    best_share_hash, block_target, subsidy, donation_script);
+            return node.tracker().get_expected_payouts(
+                best_share_hash, block_target, subsidy, donation_script);
+        });
+
     work_source->set_create_share_fn(
         [&node, stratum_notify](const std::vector<unsigned char>& full_coinbase,
                 const std::vector<uint8_t>&        header_80b,

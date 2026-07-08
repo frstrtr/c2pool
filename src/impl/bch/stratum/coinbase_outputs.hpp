@@ -94,4 +94,82 @@ assemble_v36_coinbase_outputs(
     return outputs;
 }
 
+// apply_v35_finder_fee: pre-v36 (sub-36) finder fee. generate_share_transaction
+// (share_check.hpp, use_v36_pplns==false branch) credits subsidy/200 to the
+// share creator\x27s own script and shrinks the donation residual by the same
+// amount. For a LOCALLY-authored share creator==finder==this connection\x27s
+// payout_script, so mirror it exactly here: move subsidy/200 from the donation
+// entry (get_v35_expected_payouts folds the ~0.5% into donation) onto
+// payout_script. Total stays == subsidy. No-op when `payouts` is empty (cold
+// start -> degraded single-output fallback owns that) or the fee rounds to 0.
+// Pure/header-only so the production TU and the fenced dual-version KAT consume
+// the IDENTICAL implementation. sv>=36 authors never call this (pure PPLNS).
+// canonical_finder_script: reconstruct the finder's coinbase script EXACTLY as
+// the verifier's generate_share_transaction sees it, i.e. get_share_script() =
+// pubkey_hash_to_script(m_pubkey_hash, m_pubkey_type), where create_local_share
+// derives (m_pubkey_hash, m_pubkey_type) from payout_script. Standard P2PKH /
+// P2SH / P2WPKH scripts are returned verbatim (identity -- no behaviour change).
+// A payout_script the share author cannot store as a 20-byte pubkey_hash maps as
+// create_local_share does: size >= 20 -> P2PKH of the first 20 bytes; size < 20
+// (incl. EMPTY) -> P2PKH(all-zeros) -- the SAME degenerate creator script the
+// stored share carries. This keeps the sub-36 finder-fee target byte-identical
+// author<->verifier so the gentx hash matches. Without it, an author whose miner
+// authorised with a non-decodable address paid NO finder fee while the verifier
+// credited subsidy/200 to P2PKH(zeros): a one-output GENTX-MISMATCH on every
+// non-genesis share (the height>=2 verified-tip stall).
+inline std::vector<unsigned char> canonical_finder_script(
+    const std::vector<unsigned char>& payout_script)
+{
+    // P2PKH: 76 a9 14 <20> 88 ac  (identity)
+    if (payout_script.size() == 25 && payout_script[0] == 0x76 &&
+        payout_script[1] == 0xa9 && payout_script[2] == 0x14 &&
+        payout_script[23] == 0x88 && payout_script[24] == 0xac)
+        return payout_script;
+    // P2SH: a9 14 <20> 87  (identity)
+    if (payout_script.size() == 23 && payout_script[0] == 0xa9 &&
+        payout_script[1] == 0x14 && payout_script[22] == 0x87)
+        return payout_script;
+    // P2WPKH: 00 14 <20>  (identity -- pubkey_hash_to_script(type=1) is the same)
+    if (payout_script.size() == 22 && payout_script[0] == 0x00 &&
+        payout_script[1] == 0x14)
+        return payout_script;
+    // Non-standard: mirror create_local_share's m_pubkey_hash derivation, which
+    // only writes the hash when payout_script.size() >= 20 (else it stays zero).
+    unsigned char h[20] = {0};
+    if (payout_script.size() >= 20)
+        for (size_t i = 0; i < 20; ++i) h[i] = payout_script[i];
+    std::vector<unsigned char> script;
+    script.reserve(25);
+    script.push_back(0x76);
+    script.push_back(0xa9);
+    script.push_back(0x14);
+    script.insert(script.end(), h, h + 20);
+    script.push_back(0x88);
+    script.push_back(0xac);
+    return script;
+}
+
+inline void apply_v35_finder_fee(
+    std::map<std::vector<unsigned char>, double>& payouts,
+    const std::vector<unsigned char>& payout_script,
+    const std::vector<unsigned char>& donation_script,
+    uint64_t subsidy)
+{
+    if (payouts.empty()) return;
+    const double finder_fee = static_cast<double>(subsidy / 200);
+    if (finder_fee <= 0.0) return;
+    // Credit the finder fee to the CANONICAL creator script the verifier
+    // reconstructs from the stored share, NOT the raw connection payout_script.
+    // These differ only when payout_script is non-standard/empty -- exactly the
+    // case that left author (no fee) and verifier (fee to P2PKH-zeros) one
+    // output apart. See canonical_finder_script().
+    const auto finder_script = canonical_finder_script(payout_script);
+    payouts[finder_script] += finder_fee;
+    if (!donation_script.empty()) {
+        auto dit = payouts.find(donation_script);
+        if (dit != payouts.end() && dit->second >= finder_fee)
+            dit->second -= finder_fee;
+    }
+}
+
 }  // namespace bch::stratum
