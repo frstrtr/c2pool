@@ -366,7 +366,7 @@ jobs:
                     bch_embedded_getwork_test bch_embedded_seam_workview_test \
                     bch_embedded_block_broadcast_test bch_coin_node_seam_test \
                     bch_asert_kat_test \
-                    bch_g1_oracle_byte_parity_test bch_g0_canonical_pin_test bch_g2_ratchet_gate_kat_test \
+                    bch_g1_oracle_byte_parity_test bch_g1_share_serialization_parity_test bch_g0_canonical_pin_test bch_g2_ratchet_gate_kat_test \
             -j8
 
       - name: Run BCH tests
@@ -460,7 +460,7 @@ jobs:
                     bch_embedded_getwork_test bch_embedded_seam_workview_test \
                     bch_embedded_block_broadcast_test bch_coin_node_seam_test \
                     bch_asert_kat_test \
-                    bch_g1_oracle_byte_parity_test bch_g0_canonical_pin_test bch_g2_ratchet_gate_kat_test \
+                    bch_g1_oracle_byte_parity_test bch_g1_share_serialization_parity_test bch_g0_canonical_pin_test bch_g2_ratchet_gate_kat_test \
             -j8
 
       - name: Run BCH tests under sanitizers
