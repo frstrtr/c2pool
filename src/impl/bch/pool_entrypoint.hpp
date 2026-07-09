@@ -191,11 +191,11 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
         -> core::stratum::RefHashResult
         {
             core::stratum::RefHashResult result;
-            result.share_version   = 35;
+            result.share_version   = 36;   // v36-native BCH sharechain (was 35, verify-preimage fix)
             result.desired_version = 36;
 
             bch::RefHashParams p;
-            p.share_version      = 35;
+            p.share_version      = 36;   // v36-native genesis default (was 35)
             p.prev_share         = prev_share_hash;
             p.coinbase_scriptSig = scriptSig;
             p.share_nonce        = 0;
@@ -505,7 +505,7 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
             // reconstruction is byte-exact; fall back to the prev-tip version
             // (cold start: v35 voting v36) when ref_hash_fn produced no frozen
             // data (bits == 0).
-            int64_t create_ver = 35;
+            int64_t create_ver = 36;   // author V36 from genesis (was 35): empty-chain V35 hash_link cannot carry this coinbase
             if (job.frozen_ref.bits != 0) {
                 create_ver = job.frozen_ref.share_version;
             } else if (!job.prev_share_hash.IsNull() &&

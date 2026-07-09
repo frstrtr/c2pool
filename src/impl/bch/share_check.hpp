@@ -170,6 +170,19 @@ inline HashLinkType prefix_to_hash_link_v35(
     const std::vector<unsigned char>& const_ending)
 {
     auto v36_link = prefix_to_hash_link(prefix, const_ending);
+    // FAIL-LOUD (v36 verify-preimage): a V35 HashLinkType (FixedStrType(0)) has
+    // NO extra_data field, so any coinbase whose trailing partial SHA-256 block
+    // exceeds the const_ending tail (bufsize > len(const_ending)) leaves residual
+    // bytes a V35 hash_link cannot carry. Silently dropping them makes
+    // check_hash_link recompute a DIFFERENT coinbase txid than the author
+    // committed, so the share fails verify against a v36 peer. This is exactly
+    // the case the oracle's V36 hash_link (variable-length extra_data) exists
+    // for: such a coinbase MUST be authored at V36. Refuse to forge an
+    // unrepresentable V35 hash_link rather than emit a mismatching preimage.
+    if (!v36_link.m_extra_data.m_data.empty())
+        throw std::runtime_error(
+            "prefix_to_hash_link_v35: coinbase requires V36 hash_link "
+            "(extra_data non-empty; V35 FixedStrType(0) cannot represent it)");
     HashLinkType result;
     result.m_state = v36_link.m_state;
     result.m_length = v36_link.m_length;
