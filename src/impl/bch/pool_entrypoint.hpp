@@ -164,16 +164,16 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
     work_source->set_best_share_hash_fn(
         [&node]() -> uint256 { return node.best_share_hash(); });
 
-    // Work-source donation MUST match the authored share version. Shares are
-    // authored v36-native (result.share_version = 36 above, verify-preimage
-    // fix), and generate_share_transaction rebuilds the coinbase donation with
-    // get_donation_script(36) -> COMBINED P2SH. Serving the v35 P2PK here made
-    // the miner-hashed template coinbase carry a 67-byte P2PK donation while
-    // verify rebuilt a 23-byte P2SH donation -> the donation output diverged at
-    // byte offset 104 on every non-genesis share -> 100% recompute/GENTX
-    // mismatch. Gate on 36 to match. (Dynamic ratchet-tracking generalises this
-    // once the staged v35+v36 dual-pool migration lands.)
-    work_source->set_donation_script(PoolConfig::get_donation_script(36));
+    // Work-source donation MUST match the authored share version, and both must
+    // match the LIVE jtoomim-BCH net -- BCH is a CROSSING coin. Shares author at
+    // CROSSING_FLOOR_VERSION (what the live net mints), and the donation served
+    // in the miner-hashed template is the floor script (sub-36 -> forrestv P2PK).
+    // generate_share_transaction rebuilds the coinbase donation under the SAME
+    // authored version, so template-donation and verify-rebuild are byte-identical
+    // -- closing the byte-offset-104 recompute/GENTX divergence WITHOUT forking
+    // off the live net (authoring v36 from genesis would). The 60%-by-work auto-
+    // ratchet (#326/#577) advances author + donation together once the tip>=36.
+    work_source->set_donation_script(PoolConfig::get_donation_script(PoolConfig::CROSSING_FLOOR_VERSION));
 
     // -- ref_hash_fn: peer-verifiable share commitment (G2 conform) --------
     // Without this the local-author coinbase carries NO p2pool OP_RETURN
@@ -197,18 +197,18 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
         -> core::stratum::RefHashResult
         {
             core::stratum::RefHashResult result;
-            result.share_version   = 36;   // v36-native BCH sharechain (was 35, verify-preimage fix)
-            result.desired_version = 36;
+            result.share_version   = PoolConfig::CROSSING_FLOOR_VERSION;   // crossing-floor SSOT (ratchet-current genesis default)
+            result.desired_version = core::version_gate::V36_ACTIVATION_VERSION;   // vote to ratchet toward v36
 
             bch::RefHashParams p;
-            p.share_version      = 36;   // v36-native genesis default (was 35)
+            p.share_version      = PoolConfig::CROSSING_FLOOR_VERSION;   // crossing-floor author version (SSOT)
             p.prev_share         = prev_share_hash;
             p.coinbase_scriptSig = scriptSig;
             p.share_nonce        = 0;
             p.subsidy            = subsidy;
             p.donation           = 50;      // 0.5% finder fee (matches create side)
             p.stale_info         = 0;
-            p.desired_version    = 36;
+            p.desired_version    = core::version_gate::V36_ACTIVATION_VERSION;   // vote to ratchet toward v36
             p.has_segwit         = false;   // BCH: never segwit
             p.timestamp          = timestamp;
 
@@ -511,7 +511,7 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
             // reconstruction is byte-exact; fall back to the prev-tip version
             // (cold start: v35 voting v36) when ref_hash_fn produced no frozen
             // data (bits == 0).
-            int64_t create_ver = 36;   // author V36 from genesis (was 35): empty-chain V35 hash_link cannot carry this coinbase
+            int64_t create_ver = PoolConfig::CROSSING_FLOOR_VERSION;   // crossing-floor default; tip version overrides below (ratchet-current)
             if (job.frozen_ref.bits != 0) {
                 create_ver = job.frozen_ref.share_version;
             } else if (!job.prev_share_hash.IsNull() &&
