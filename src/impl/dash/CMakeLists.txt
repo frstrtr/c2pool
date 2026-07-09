@@ -50,7 +50,7 @@ add_library(dash OBJECT
     peer.hpp
     messages.hpp
     share.hpp
-    protocol_actual.cpp protocol_legacy.cpp
+    protocol_actual.cpp protocol_legacy.cpp node.cpp
 )
 target_include_directories(dash PRIVATE
     ${CMAKE_SOURCE_DIR}/src
