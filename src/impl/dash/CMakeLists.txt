@@ -35,3 +35,25 @@ target_include_directories(dash_rpc PRIVATE
     ${CMAKE_SOURCE_DIR}/src/btclibs
     ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(dash_rpc PRIVATE core nlohmann_json::nlohmann_json ${Boost_LIBRARIES})
+
+# S8 sharechain-p2p dispatch layer (slice S8-p2p.2). Mirrors the dgb pool OBJECT
+# lib (src/impl/dgb/CMakeLists.txt add_library(dgb OBJECT ...)): compiles the
+# Legacy/Actual established-peer protocol handlers so the 12-message dispatch
+# surface is a real compiled TU. node.cpp (the NodeImpl reception/think TU) is
+# slice .4 and does NOT exist yet, so this OBJECT lib is intentionally NOT linked
+# into any executable here -- processing_shares()/handle_get_share() are declared
+# in node.hpp and their definitions are link-deferred to slice .4. Object-compile
+# only; SAFE-ADDITIVE (no existing target links `dash`, so ltc/btc/doge/dgb build
+# + ctest surfaces are untouched). Per-coin isolation held: src/impl/dash only.
+add_library(dash OBJECT
+    node.hpp
+    peer.hpp
+    messages.hpp
+    share.hpp
+    protocol_actual.cpp protocol_legacy.cpp
+)
+target_include_directories(dash PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/btclibs
+    ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(dash core pool sharechain c2pool_storage dash_x11 btclibs nlohmann_json::nlohmann_json ${Boost_LIBRARIES} ${SECP256K1_LIBRARIES})
