@@ -1,0 +1,14 @@
+G3b activation-boundary populated block — captured fixture (deterministic CI replay).
+
+Provenance: BCHN v29.0.0 (89a591f7) regtest, -upgrade9activationheight=230.
+Won-block 306850ff596b4c87b6eeb0b662545813afdeff6462147efdcdfa68e3c564ee69 @ height 231.
+Contents: coinbase + 1 CashToken FT tx (category 024cd0937a4146eb.., amount 1000000),
+i.e. the post-Upgrade9 activation block from the G3b genuine-activation capture
+(pre-tip HARD-REJECT txn-tokens-before-activation up to h229 -> ACCEPT at h230 ->
+tokenData survives at h231). See scripts/bch_g3b_genuine_activation_regtest.py.
+
+The live harness key is RANDOM per run, so the block SHA is not bit-reproducible;
+this captured serialization is the fixture the ctest leg replay-asserts against
+(populated / no-segwit-commitment / merkle-recompute / CashToken tokenData survives).
+The node regtest chain is ephemeral and has been reset before (it already lost the
+G3a 8-tx block) — this file is the durable capture.
