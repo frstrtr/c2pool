@@ -25,6 +25,7 @@
 #include "coin/transaction.hpp"
 
 #include <pool/node.hpp>
+#include <pool/protocol.hpp>
 #include <core/reply_matcher.hpp>
 #include <c2pool/storage/sharechain_storage.hpp>
 
@@ -32,6 +33,7 @@
 #include <boost/asio/steady_timer.hpp>
 
 #include <atomic>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -96,6 +98,14 @@ protected:
     // Global pool of known transactions, populated by remember_tx and the coin
     // daemon. Reception-slice protocol handlers look up tx hashes here.
     std::map<uint256, coin::Transaction> m_known_txs;
+
+    // Wire-message parser used by the Legacy/Actual dispatch protocols to turn
+    // a RawMessage into a typed message variant. Mirrors dgb::NodeImpl::m_handler.
+    dash::Handler m_handler;
+
+    // Callback fired when a bestblock message is received from a peer; wired by
+    // the work layer (slice .4) to trigger a work refresh. Mirrors dgb.
+    std::function<void(const uint256&)> m_on_bestblock;
 
     // Thread pool for parallel share_init_verify (X11 CPU work). Keeps the
     // expensive crypto off the io_context thread.
@@ -309,6 +319,27 @@ public:
                    : pool::PeerConnectionType::legacy;
     }
 
+    // ── Reception-slice (B) dispatch surface ───────────────────
+    // Declarations consumed by the Legacy/Actual protocol handlers
+    // (protocol_legacy.cpp / protocol_actual.cpp). The bodies of
+    // processing_shares() and handle_get_share() live in the node.cpp
+    // translation unit (slice .4) and are intentionally link-deferred here;
+    // the dispatch layer object-compiles against these declarations.
+    void processing_shares(HandleSharesData& data, NetService addr);
+    std::vector<dash::ShareType> handle_get_share(std::vector<uint256> hashes,
+        uint64_t parents, std::vector<uint256> stops, NetService peer_addr);
+
+    // Completes a pending async share request when a sharereply arrives.
+    // Inline (mirrors dgb) so the reply-matcher plumbing needs no node.cpp.
+    void got_share_reply(uint256 id, dash::ShareReplyData shares)
+    {
+        try { m_share_getter.got_response(id, shares); }
+        catch (const std::invalid_argument&) { /* request already timed out */ }
+    }
+
+    // Register a callback fired when a bestblock message is received from a peer.
+    void set_on_bestblock(std::function<void(const uint256&)> fn) { m_on_bestblock = std::move(fn); }
+
     // ── Tracker accessors ───────────────────────────────────────────────
 
     /// Direct tracker access — compute-thread-only (already holds the exclusive
@@ -378,5 +409,54 @@ public:
         return m_snapshot.verified_count;
     }
 };
+
+// ── Sharechain-p2p dispatch layer (slice S8-p2p.2) ──────────────────
+// Namespace-only port of the dgb reference (src/impl/dgb/node.hpp:647). The
+// version-handshake reception rides NodeImpl::handle_version above; the two
+// established-peer protocols below dispatch the 12 post-handshake messages.
+// Both Legacy and Actual register the identical handler set; the divergence
+// between them lives in the handler BODIES (protocol_legacy.cpp vs
+// protocol_actual.cpp), byte-parity with dgb. handle_message() bodies + the
+// 12 HANDLER() bodies are defined in those two .cpp translation units.
+
+class Legacy : public pool::Protocol<NodeImpl>
+{
+public:
+    void handle_message(std::unique_ptr<RawMessage> rmsg, NodeImpl::peer_ptr peer) override;
+
+    ADD_HANDLER(addrs, dash::message_addrs);
+    ADD_HANDLER(addrme, dash::message_addrme);
+    ADD_HANDLER(ping, dash::message_ping);
+    ADD_HANDLER(getaddrs, dash::message_getaddrs);
+    ADD_HANDLER(shares, dash::message_shares);
+    ADD_HANDLER(sharereq, dash::message_sharereq);
+    ADD_HANDLER(sharereply, dash::message_sharereply);
+    ADD_HANDLER(bestblock, dash::message_bestblock);
+    ADD_HANDLER(have_tx, dash::message_have_tx);
+    ADD_HANDLER(losing_tx, dash::message_losing_tx);
+    ADD_HANDLER(remember_tx, dash::message_remember_tx);
+    ADD_HANDLER(forget_tx, dash::message_forget_tx);
+};
+
+class Actual : public pool::Protocol<NodeImpl>
+{
+public:
+    void handle_message(std::unique_ptr<RawMessage> rmsg, NodeImpl::peer_ptr peer) override;
+
+    ADD_HANDLER(addrs, dash::message_addrs);
+    ADD_HANDLER(addrme, dash::message_addrme);
+    ADD_HANDLER(ping, dash::message_ping);
+    ADD_HANDLER(getaddrs, dash::message_getaddrs);
+    ADD_HANDLER(shares, dash::message_shares);
+    ADD_HANDLER(sharereq, dash::message_sharereq);
+    ADD_HANDLER(sharereply, dash::message_sharereply);
+    ADD_HANDLER(bestblock, dash::message_bestblock);
+    ADD_HANDLER(have_tx, dash::message_have_tx);
+    ADD_HANDLER(losing_tx, dash::message_losing_tx);
+    ADD_HANDLER(remember_tx, dash::message_remember_tx);
+    ADD_HANDLER(forget_tx, dash::message_forget_tx);
+};
+
+using Node = pool::NodeBridge<NodeImpl, Legacy, Actual>;
 
 } // namespace dash
