@@ -164,10 +164,16 @@ inline void standup_pool_run(boost::asio::io_context& ioc,
     work_source->set_best_share_hash_fn(
         [&node]() -> uint256 { return node.best_share_hash(); });
 
-    // Initial donation matches the cold-start create version (35 -> P2PK). A
-    // ratchet-driven refresh to the COMBINED P2SH on v36 activation is the same
-    // follow-up slice as pplns_fn/ref_hash_fn.
-    work_source->set_donation_script(PoolConfig::get_donation_script(35));
+    // Work-source donation MUST match the authored share version. Shares are
+    // authored v36-native (result.share_version = 36 above, verify-preimage
+    // fix), and generate_share_transaction rebuilds the coinbase donation with
+    // get_donation_script(36) -> COMBINED P2SH. Serving the v35 P2PK here made
+    // the miner-hashed template coinbase carry a 67-byte P2PK donation while
+    // verify rebuilt a 23-byte P2SH donation -> the donation output diverged at
+    // byte offset 104 on every non-genesis share -> 100% recompute/GENTX
+    // mismatch. Gate on 36 to match. (Dynamic ratchet-tracking generalises this
+    // once the staged v35+v36 dual-pool migration lands.)
+    work_source->set_donation_script(PoolConfig::get_donation_script(36));
 
     // -- ref_hash_fn: peer-verifiable share commitment (G2 conform) --------
     // Without this the local-author coinbase carries NO p2pool OP_RETURN
