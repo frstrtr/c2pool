@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /* $Id: sph_simd.h 154 2010-04-26 17:00:24Z tp $ */
 /**
  * SIMD interface. SIMD is a family of functions which differ by

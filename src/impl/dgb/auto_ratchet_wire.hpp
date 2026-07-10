@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // auto_ratchet_wire.hpp — DGB production wire-in for the AutoRatchet mint-side

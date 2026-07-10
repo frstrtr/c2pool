@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #include "rpc.hpp"
 
 #include <impl/dash/coin/rpc_request.hpp>

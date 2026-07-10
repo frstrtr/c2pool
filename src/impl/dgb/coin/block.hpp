@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // DGB block/header types. 1:1 mirror of src/impl/btc/coin/block.hpp (NON-MWEB).

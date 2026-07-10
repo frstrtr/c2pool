@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // bch coinbase KAT -- full-coinbase byte-vector vs oracle ground-truth
 // (DGB<->BCH pairing, slice 2; the byte-vector half promised by slice 1s

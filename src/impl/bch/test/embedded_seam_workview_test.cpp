@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // bch::coin::EmbeddedDaemon production-seam WorkView test (M5 -- embedded body).
 //

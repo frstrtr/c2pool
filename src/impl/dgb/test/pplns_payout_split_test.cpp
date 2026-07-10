@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // DGB Phase B — PPLNS weights -> consensus-sorted payout outputs KAT.
 //
 // Locks dgb::coin::compute_pplns_payout_split() (coin/pplns_payout_split.hpp)

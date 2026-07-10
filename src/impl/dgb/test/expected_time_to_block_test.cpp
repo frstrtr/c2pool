@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // dgb::compute_expected_time_to_block — expected-time-to-block KAT.
 //
 // FENCED conformance test (no production code touched). Pins the

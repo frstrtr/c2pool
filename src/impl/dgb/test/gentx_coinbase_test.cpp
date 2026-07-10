@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // DGB #82 — SSOT non-witness coinbase (gentx) assembler KAT.
 //
 // Locks dgb::coin::assemble_gentx_coinbase() (coin/gentx_coinbase.hpp) — the

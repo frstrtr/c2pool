@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Known-answer tests for DASH consensus: DarkGravityWave v3 per-block retarget
 // (PR-0 foundation, S3 slice) and the SPV HeaderChain primitives.
 //

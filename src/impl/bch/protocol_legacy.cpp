@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // BCH legacy-protocol dispatch router (broadcaster-gate / pool p2p ingress).
 //
 // Mirror of btc::Legacy::handle_message with the namespace swapped to bch.

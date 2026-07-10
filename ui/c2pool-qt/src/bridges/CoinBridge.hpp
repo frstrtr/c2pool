@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // CoinBridge — exposes a CoinDescriptor-shaped JSON object to JS over
 // QtWebChannel so the embedded Explorer / PPLNS View bundles pull
 // coin params from c2pool authoritatively instead of reading

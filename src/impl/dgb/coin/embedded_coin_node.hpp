@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ===========================================================================
 // dgb::coin::EmbeddedCoinNode -- embedded (no external digibyted) work source.

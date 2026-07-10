@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Forward-only TODO (integrator 2026-06-18): wire CoinParams::subsidy_func into
 // the embedded coinbase builder + a 4-era boundary conformance test, with the
 // external-daemon GBT fallback preserved.

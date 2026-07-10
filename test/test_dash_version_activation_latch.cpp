@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase v36-migration-std — DASH Component A persisted activation LATCH KATs.
 ///
 /// Exercises src/impl/dash/version_activation_latch.hpp — the persisted

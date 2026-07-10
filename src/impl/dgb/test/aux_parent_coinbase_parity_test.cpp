@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // DGB+DOGE merged-mining (D0) — aux-pow parent-coinbase serialization PARITY
 // BASELINE KAT.  Fenced / test-only — consumes the shared aux module, modifies

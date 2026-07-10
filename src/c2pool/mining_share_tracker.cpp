@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #include "mining_share_tracker.hpp"
 
 namespace c2pool {

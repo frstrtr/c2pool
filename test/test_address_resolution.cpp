@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /**
  * Tests for merged mining address resolution:
  *   - Cases 2a-2c: Auto-derivation (LTC P2PKH/P2WPKH/P2SH → merged chain script)

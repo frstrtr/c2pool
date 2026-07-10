@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ---------------------------------------------------------------------------
 // bch::coin::header_sync -- M5 full-block body. Headers-first IBD continuation

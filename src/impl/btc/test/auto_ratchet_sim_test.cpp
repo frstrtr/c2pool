@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // btc_auto_ratchet_sim_test: FENCED, additive rig-free SIM KAT that arms the
 // BTC G2 staged-migration harness (scripts/btc_g2_ratchet_staged_migration_harness.sh)
 // C2/C3/C4 rows WITHOUT a SHA256d rig — the mirror of DGB #427's --sim-votes.

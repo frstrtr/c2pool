@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 /// Async DNS seed resolver for Bitcoin-derived coin P2P networks.

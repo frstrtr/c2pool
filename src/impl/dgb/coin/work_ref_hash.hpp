@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ============================================================================
 // work_ref_hash.hpp — prospective-work RefHashParams assembler (SSOT).

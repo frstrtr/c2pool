@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // dgb tail-hashrate-score endpoints — chain-walk endpoint arithmetic KAT.
 //
 // FENCED, additive (no production code touched this slice). Pins

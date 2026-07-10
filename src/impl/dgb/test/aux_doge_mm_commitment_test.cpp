@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // DGB+DOGE merged-mining (phase DB) — KAT for the DGB-side AuxPoW coinbase
 // merged-mining commitment builder.  Fenced / test-only.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // dgb::coin::broadcast_won_block dual-path dispatcher test (#82 broadcaster-
 // gate, dispatcher half).

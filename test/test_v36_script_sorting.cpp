@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // test_v36_script_sorting.cpp — Cross-implementation V36 output sorting tests.
 //
 // V36 consensus: PPLNS outputs are sorted by (amount, script_bytes) ascending.

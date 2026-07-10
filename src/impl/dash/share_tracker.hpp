@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // Portable 128-bit multiply-shift: (a * b) >> shift

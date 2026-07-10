@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ---------------------------------------------------------------------------
 // nmc::coin::broadcast_won_aux_block -- the NMC (Namecoin) dual-path won-block

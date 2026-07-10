@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase S8 — Dash coin-daemon P2P wire-message KATs
 ///
 /// Exercises the Dash-specific messages in

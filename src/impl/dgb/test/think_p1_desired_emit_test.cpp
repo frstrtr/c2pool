@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // dgb think() Phase-1 DESIRED-EMIT decision conformance KAT.
 //
 // FENCED, additive (no production code touched this slice). Pins

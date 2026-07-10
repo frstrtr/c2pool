@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ---------------------------------------------------------------------------
 // DGB multi-algo block-version classifier  (M3 §7b — SCRYPT-ONLY VALIDATION).

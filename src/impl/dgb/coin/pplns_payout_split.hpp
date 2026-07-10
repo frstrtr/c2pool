@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ============================================================================
 // pplns_payout_split.hpp — SSOT: PPLNS weights -> consensus-sorted payout outputs.

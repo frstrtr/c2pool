@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // share_messages.hpp — V36 share-embedded messaging: decryption + validation
 //
 // Port of p2pool/share_messages.py (consensus-critical portions).

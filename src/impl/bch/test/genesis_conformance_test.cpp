@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // bch::coin::BCHChainParams -- genesis-hash conformance vs Bitcoin Cash Node.
 //

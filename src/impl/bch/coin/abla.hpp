@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // BCH ABLA (Adaptive Blocksize-Limit Algorithm, CHIP-2023-01) -- net-new
 // BCH-specific code. Activated at the May 2024 upgrade; it replaces the static

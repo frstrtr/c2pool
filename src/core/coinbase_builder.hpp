@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // coinbase_builder.hpp — Coinbase scriptSig layout, THE metadata, space budget
 //

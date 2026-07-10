@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // dgb_template_other_txs_test -- pins coin/template_other_txs.hpp, the producer
 // bridge that decodes the embedded work template's transactions[] (the GBT data

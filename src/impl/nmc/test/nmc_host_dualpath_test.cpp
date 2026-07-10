@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // nmc host-level dual-path won-aux broadcaster regression-lock (PE item 3,
 // HOST-wiring half). NET-NEW vs the helper-level nmc_block_broadcast_test:

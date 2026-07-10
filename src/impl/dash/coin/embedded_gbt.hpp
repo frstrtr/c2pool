@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 /// Phase C-TEMPLATE step 5: embedded GBT skeleton (S7 capstone).

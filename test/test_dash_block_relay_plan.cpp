@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase S8 — WonBlockRelay live-slots reply-path KATs.
 ///
 /// Exercises src/impl/dash/block_relay_plan.hpp — the planner that binds the

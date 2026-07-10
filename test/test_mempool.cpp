@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase 2 — Mempool unit tests
 ///
 /// Tests the LTC mempool implementation:

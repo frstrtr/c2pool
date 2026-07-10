@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // IWorkSource — abstract interface that decouples `core::StratumServer`

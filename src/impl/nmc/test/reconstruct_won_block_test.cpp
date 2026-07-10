@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // nmc_reconstruct_won_block_test -- pins coin/reconstruct_won_block.hpp +
 // coin/block_assembly.hpp, the PE-2e (#251) won-block reconstructor.  Mirrors

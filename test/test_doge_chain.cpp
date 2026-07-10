@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// DOGE chain unit tests — embedded SPV node components
 ///
 /// Tests:

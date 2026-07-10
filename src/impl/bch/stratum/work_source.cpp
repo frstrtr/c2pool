@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // bch::stratum::BCHWorkSource — slice-c implementation.
 //
 // Implements the read-only state accessors, per-connection worker

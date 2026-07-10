@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // DGB gbt-data -> txid cache. 1:1 mirror of src/impl/btc/coin/txidcache.hpp.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // template_other_txs.hpp -- the producer bridge between the embedded work
 // template's transactions[] (make_mempool_tx_source / embedded_tx_select.cpp)

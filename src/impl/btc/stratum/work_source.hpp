@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // btc::stratum::BTCWorkSource — concrete `core::stratum::IWorkSource`

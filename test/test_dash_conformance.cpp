@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // DASH V36 conformance — merkle-root-equality precondition (S6 slice).
 //
 // Before any share/block can be conformance-checked against DASH's own

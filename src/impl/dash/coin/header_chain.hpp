@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 /// Dash Header Chain — SPV header-only chain with X11 PoW validation.

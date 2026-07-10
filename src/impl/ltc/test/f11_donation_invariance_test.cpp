@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // F11 value-invariance KAT — guards the canonical exclude-then-append donation
 // handling in the LTC v36 payout sort (src/impl/ltc/share_check.hpp,
 // build_payout_outputs_excluding_donation).

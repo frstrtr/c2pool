@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // DASH S8 get_work() JOB-TARGET assembly KAT.
 //
 // Pins dash::stratum::{modulate_desired_pseudoshare_target, clip_to_sane,

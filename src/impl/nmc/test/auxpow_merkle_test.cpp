@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // nmc::coin::aux_merkle_root KAT (P1 — AuxPow merkle-proof walk).
 //

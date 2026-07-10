@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 /// DNS seed hostnames and hardcoded fallback IPs for Bitcoin Cash P2P networks.

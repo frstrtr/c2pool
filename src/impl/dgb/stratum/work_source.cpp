@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // dgb::stratum::DGBWorkSource — Stage 4a skeleton.
 //
 // All IWorkSource methods are stubbed to safe defaults. Subsequent

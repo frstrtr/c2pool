@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #include "stratum_server.hpp"
 #include "web_server.hpp"       // MiningInterface
 #include "address_utils.hpp"    // address utilities
@@ -1576,4 +1577,3 @@ std::string StratumSession::generate_extranonce1()
 }
 
 } // namespace core
-

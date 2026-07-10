@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // Vendored from dashcore/src/evo/assetlocktx.h @ develop cfad414

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // dgb::coin::CoinNode seam-contract test (#82 broadcaster-gate, RPC-fallback
 // half).

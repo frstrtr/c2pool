@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 /// DOGE AuxPoW Header Parser — Phase 5.8 (M3: structured parser)

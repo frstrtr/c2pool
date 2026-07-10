@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // Dash p2pool sharechain pool-node — S8 pool-node leaf 5 (FINAL), slice A.

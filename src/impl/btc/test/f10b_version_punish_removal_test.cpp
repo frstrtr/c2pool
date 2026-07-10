@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // F10/(b) version-punish-removal KAT — guards the #288 tip-selection axis.
 //
 // This branch deletes should_punish_version() (the non-canonical 95%-flat-count

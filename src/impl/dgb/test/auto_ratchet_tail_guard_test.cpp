@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // dgb_auto_ratchet_tail_guard_test: FENCED, additive conformance KAT for the
 // AutoRatchet WORK-WEIGHTED 60% tail guard SSOT (auto_ratchet_tail_guard.hpp).
 //

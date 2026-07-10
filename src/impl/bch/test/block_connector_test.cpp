@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // bch::coin BlockConnector test (M5 full-block body, slice 1: block-connect).
 //

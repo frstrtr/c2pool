@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ===========================================================================
 // dgb::coin::AuxChainEmbedded -- DGB's OWN embedded merged-mining backend.

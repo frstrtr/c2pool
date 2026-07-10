@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // DGB+DOGE merged-mining (phase DC) -- SUBMIT-half KAT, -DAUX_DOGE=ON only.
 // Author-only companion to aux_doge_dc_proof_test (the proof/dual-target half).

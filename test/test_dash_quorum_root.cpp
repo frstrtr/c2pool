@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase C-TEMPLATE step 4c — Dash merkleRootQuorums computation leaf unit tests
 ///
 /// Exercises the vendored CalcCbTxMerkleRootQuorums mirror:

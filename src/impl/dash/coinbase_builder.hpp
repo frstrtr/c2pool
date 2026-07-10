@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // Dash coinbase TX assembly for p2pool-dash v16 compatible Stratum mining.

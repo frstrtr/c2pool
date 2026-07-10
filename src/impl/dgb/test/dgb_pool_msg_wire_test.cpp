@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // dgb pool wire-message layer — serialization conformance KAT.
 //
 // FENCED conformance test (no production code touched). src/impl/dgb/messages.hpp

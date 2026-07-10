@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // DASH S8 work-target MODULATION KAT.
 //
 // Pins dash::stratum::modulate_desired_share_target (+ its two caps) to

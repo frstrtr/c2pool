@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 /// NMC (Namecoin) Mempool — embedded merge-mined tx pool (P1 PB).

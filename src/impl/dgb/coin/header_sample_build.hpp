@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ---------------------------------------------------------------------------
 // c2pool::dgb::make_header_sample -- embedded-ingest SSOT that builds a

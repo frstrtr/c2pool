@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // dgb_coinbase_value_parity_test -- END-TO-END GBT-parity KAT for the embedded
 // coinbasevalue.

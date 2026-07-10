@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #include "config_coin.hpp"
 
 #include <btclibs/util/strencodings.h>

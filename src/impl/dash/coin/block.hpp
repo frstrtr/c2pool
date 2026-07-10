@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // Dash block types: standard Bitcoin 80-byte header, no MWEB.

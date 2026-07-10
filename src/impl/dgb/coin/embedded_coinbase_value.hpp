@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ============================================================================
 // embedded_coinbase_value.hpp — SSOT for the embedded-path coinbase value.

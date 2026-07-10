@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // DGB+DOGE merged-mining (phase DC) -- EMBED LIVE-WIRE KAT, -DAUX_DOGE=ON only.
 // Author-only; runs the instant the build host (.178/VM905) returns. Closes the

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // V36 Dash-X11 sharechain pool wire-message layer — namespace-only divergence

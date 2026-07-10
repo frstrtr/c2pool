@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // dgb_compact_blocks_bip152_parity_test -- FENCED, additive KAT pinning the
 // BIP 152 compact-block RELAY wire primitives in coin/compact_blocks.hpp:

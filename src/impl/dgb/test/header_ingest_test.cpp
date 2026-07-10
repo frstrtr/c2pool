@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // dgb_header_ingest_test -- guards c2pool::dgb::wire_header_ingest, the
 // connector that feeds the embedded P2P header-download feed

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // dgb sharechain `bits` (compact FloatingInteger) encoding — oracle-LITERAL pin.
 //
 // FENCED conformance KAT (Phase B, pool/share layer; no production code touched).

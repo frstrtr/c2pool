@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // BCH p2p Connection (M3 slice 11) — per-peer request/reply matcher + socket

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 //
 // donation_consensus.hpp -- Consensus-level donation script validation for BCH

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ---------------------------------------------------------------------------
 // nmc::coin::reconstruct_won_block_from_template -- the CORRECT won-block

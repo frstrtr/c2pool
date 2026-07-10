@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // DASH block PRODUCER KAT (launcher slice 5) — NETWORK-FREE.
 //
 // Pins the producer primitives that turn an embedded/dashd block template into

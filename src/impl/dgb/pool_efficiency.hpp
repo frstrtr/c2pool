@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // SSOT for the DGB pool EFFICIENCY / REAL-HASHRATE diagnostics — the two pure

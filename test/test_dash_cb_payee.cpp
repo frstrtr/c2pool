@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase G3b regression KAT — bad-cb-payee / empty-payee normalization.
 ///
 /// Root cause (2026-06-27): on REAL testnet3 (fork-active) dashd surfaces the

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // bch::coin::EmbeddedDaemon::broadcast_won_block dual-path contract test
 // (M5 -- embedded body; broadcaster-gate A+B).

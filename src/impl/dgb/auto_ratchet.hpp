@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // AutoRatchet: autonomous share version transition state machine (DGB port).

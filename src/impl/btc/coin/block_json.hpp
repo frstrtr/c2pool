@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 /// block_to_explorer_json(): Convert a BlockType into litecoind-compatible

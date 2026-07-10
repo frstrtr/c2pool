@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ─────────────────────────────────────────────────────────────────────────────
 // SSOT: PPLNS weight walk — step 1 of generate_share_transaction(), lifted so the

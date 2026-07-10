@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // Phase S8 — WonBlockRelay: embedded-P2P won-block relay framer (LEAF).

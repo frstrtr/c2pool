@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // G1 greenlight-gate KAT — DGB net/consensus byte-parity vs the oracle.
 //
 // FENCED conformance test (no production code touched). This is the test-form

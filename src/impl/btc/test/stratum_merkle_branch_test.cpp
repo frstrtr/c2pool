@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Producer/consumer merkle-branch contract KAT for the BTC stratum work source.
 //
 // Regression guard for the latent bad-txnmrklroot defect fixed in PR #570.

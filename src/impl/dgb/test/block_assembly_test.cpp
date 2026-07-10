@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // dgb::coin::assemble_won_block / reconstruct_block_header test (#82
 // broadcaster-gate, faithful as_block FRAMING half).

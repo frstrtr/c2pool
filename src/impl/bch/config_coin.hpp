@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // bch::CoinConfig -- BCH coin parameters (V36). Ported from
 // src/impl/btc/config_coin.hpp (M3 slice 14). Namespace bch (was the M2

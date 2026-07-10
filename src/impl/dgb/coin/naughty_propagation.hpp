@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // SSOT for DGB NAUGHTY-PROPAGATION ancestor punishment -- the pure-integer

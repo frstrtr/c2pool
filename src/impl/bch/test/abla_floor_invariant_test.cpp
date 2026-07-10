@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // bch::abla AblaTracker floor-invariant test (M5 cold-start safety).
 //

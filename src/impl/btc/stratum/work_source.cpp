@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // btc::stratum::BTCWorkSource — Stage 4a skeleton.
 //
 // All IWorkSource methods are stubbed to safe defaults. Subsequent

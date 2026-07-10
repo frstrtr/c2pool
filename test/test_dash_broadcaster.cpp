@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase S8 — DashBroadcaster peer-pool + discovery scaffold KATs.
 ///
 /// Exercises src/impl/dash/broadcaster.hpp — the PURE peer-pool + discovery +

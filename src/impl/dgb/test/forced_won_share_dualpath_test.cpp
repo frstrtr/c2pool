@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // dgb_forced_won_share_dualpath_test -- the #82 broadcaster-gate BINDING KAT.
 //

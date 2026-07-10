@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // PageSettings — dedicated settings tab per §9 of
 // c2pool-qt-desktop-settings-module.md.
 //
