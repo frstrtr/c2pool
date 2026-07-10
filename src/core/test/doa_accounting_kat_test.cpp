@@ -84,6 +84,7 @@ TEST(DoaAccounting, LockstepCacheNeverAccumulatesDoa) {
     EXPECT_EQ(acct.job_stale_info, 0);
 }
 
-// NOTE: the DOA underfill-half threshold constant (owned by btc-heap-opt lane,
-// [task] 2026-07-10) grafts a further assertion axis here once its canonical
-// name + default land; the freshness contract above is independent of it.
+// NOTE: the underfill near-empty axis (constant UNDERFILL_MIN_FILL_BYTES=50000,
+// integrator [task] 2026-07-10) landed as a sibling SSOT KAT --
+// underfill_guard_kat_test.cpp against core::underfill::is_underfill(); the DOA
+// freshness contract above is independent of it (DOA is stats-only, unthresholded).

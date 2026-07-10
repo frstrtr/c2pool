@@ -24,6 +24,7 @@
 #include <core/hash.hpp>
 #include <core/pack.hpp>
 #include <core/log.hpp>
+#include <core/underfill_guard.hpp>  // core::underfill SSOT (bucket-2 shared thresholds)
 
 #include <btclibs/util/strencodings.h>
 
@@ -165,8 +166,8 @@ public:
     // mempool holds a substantial fee-paying backlog. c2pool-side template-fill
     // safety net — NOT the byte-parity KAT axis; thresholds pinned from the
     // legacy p2pool near-empty floor (~50 kB) and reviewable by btc-heap-opt.
-    static constexpr uint64_t UNDERFILL_MIN_FILL_BYTES = 50'000ull; // < this = near-empty block
-    static constexpr uint64_t UNDERFILL_BACKLOG_SLACK  = 50'000ull; // unselected fee-paying material that should have filled it
+    static constexpr uint64_t UNDERFILL_MIN_FILL_BYTES = core::underfill::MIN_FILL_BYTES; // < this = near-empty block
+    static constexpr uint64_t UNDERFILL_BACKLOG_SLACK  = core::underfill::BACKLOG_SLACK; // unselected fee-paying material that should have filled it
 
     /// Build a WorkData template from the current chain tip + mempool.
     /// When mweb_tracker is provided and has state, the template includes
@@ -268,10 +269,10 @@ public:
         {
             const uint64_t mempool_bytes = static_cast<uint64_t>(pool.byte_size());
             const uint64_t mempool_fees  = pool.total_fees();
-            const bool near_empty  = selected_bytes < UNDERFILL_MIN_FILL_BYTES;
-            const bool has_backlog = mempool_fees > 0
-                                  && mempool_bytes > selected_bytes + UNDERFILL_BACKLOG_SLACK;
-            if (near_empty && has_backlog) {
+            const bool tripped = core::underfill::is_underfill(
+                selected_bytes, mempool_bytes, mempool_fees,
+                UNDERFILL_MIN_FILL_BYTES, UNDERFILL_BACKLOG_SLACK);
+            if (tripped) {
                 LOG_WARNING << "[EMB-LTC] TemplateBuilder UNDERFILL: selected "
                             << selected_txs.size() << " tx / " << selected_bytes
                             << "B into template while mempool holds " << pool.size()
