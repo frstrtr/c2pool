@@ -5,6 +5,7 @@
 
 #include <core/hash.hpp>
 #include <core/target_utils.hpp>
+#include <core/doa_accounting.hpp>
 #include <btclibs/util/strencodings.h>
 #include <crypto/scrypt.h>
 
@@ -929,8 +930,7 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     // p2pool computes stale_info at get_work() time (job creation), not at submit.
     {
         auto current_prevhash = mining_interface_->get_current_gbt_prevhash();
-        if (!current_prevhash.empty() && !job_it->second.gbt_prevhash.empty()
-            && current_prevhash != job_it->second.gbt_prevhash)
+        if (core::doa::is_doa_share(current_prevhash, job_it->second.gbt_prevhash))
         {
             LOG_INFO << "[Stratum] DOA share from " << username_
                      << ": block template changed (job=" << job_id
