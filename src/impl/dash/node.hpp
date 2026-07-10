@@ -329,6 +329,11 @@ public:
     std::vector<dash::ShareType> handle_get_share(std::vector<uint256> hashes,
         uint64_t parents, std::vector<uint256> stops, NetService peer_addr);
 
+    // Slice .4 helper: io_context-thread tracker insertion for a phase-1-
+    // verified batch (non-blocking lock; defers to m_pending_adds if the
+    // compute thread holds the exclusive lock). Body in node.cpp.
+    void add_verified_shares(HandleSharesData& data, NetService addr);
+
     // Completes a pending async share request when a sharereply arrives.
     // Inline (mirrors dgb) so the reply-matcher plumbing needs no node.cpp.
     void got_share_reply(uint256 id, dash::ShareReplyData shares)

@@ -114,7 +114,7 @@ void Legacy::HANDLER(shares)
             share.ACTION
             ({
                 if constexpr (share_t::version >= 13 && share_t::version < 34)
-                for (auto tx_hash : obj->m_tx_info.m_new_transaction_hashes)
+                for (auto tx_hash : obj->m_new_transaction_hashes)
                 {
                     auto it = m_known_txs.find(tx_hash);
                     if (it != m_known_txs.end())

@@ -27,6 +27,8 @@ using bitcoin_family::coin::TxOut;
 
 // Dash transaction type field (nType in serialization)
 // type=0: standard, type=5: CBTX (coinbase with DIP3/DIP4 payload)
+class Transaction; // fwd — for the symmetric MutableTransaction(const Transaction&) below
+
 struct MutableTransaction
 {
     std::vector<TxIn> vin;
@@ -37,6 +39,12 @@ struct MutableTransaction
     std::vector<unsigned char> extra_payload; // DIP3/DIP4 payload (for type=5 CBTX)
 
     MutableTransaction() = default;
+    // Rebuild the mutable form from an (immutable) Transaction. Symmetric to
+    // the explicit Transaction(const MutableTransaction&) below; used by the
+    // p2p dispatch path (protocol_{legacy,actual}.cpp) when staging peer-
+    // referenced txs for share admission. Defined out-of-line once Transaction
+    // is complete.
+    explicit MutableTransaction(const Transaction& tx);
 
     bool HasWitness() const { return false; } // Dash has no segwit
 
@@ -102,6 +110,10 @@ public:
 
     bool HasWitness() const { return false; }
 };
+
+inline MutableTransaction::MutableTransaction(const Transaction& tx)
+    : vin(tx.vin), vout(tx.vout), version(tx.version),
+      type(tx.type), locktime(tx.locktime), extra_payload(tx.extra_payload) {}
 
 } // namespace coin
 } // namespace dash
