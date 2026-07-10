@@ -474,7 +474,8 @@ void print_help() {
     std::cout << "  --cors-origin ORIGIN      CORS Access-Control-Allow-Origin (default: disabled)\n";
     std::cout << "  --payout-window N         PPLNS payout window in seconds (default: 86400)\n";
     std::cout << "  --storage-save-interval N Periodic sharechain save interval in seconds (default: 300)\n";
-    std::cout << "  --dashboard-dir PATH      Dashboard static files directory (default: web-static)\n\n";
+    std::cout << "  --dashboard-dir PATH      Dashboard static files directory (default: web-static)\n";
+    std::cout << "  --analytics-id ID         Google Analytics measurement ID (e.g. G-XXXXXXXXXX)\n\n";
 
     std::cout << "BLOCKCHAIN SUPPORT:\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
@@ -1086,6 +1087,10 @@ int main(int argc, char* argv[]) {
             dashboard_dir = argv[++i];
             cli_explicit.insert("dashboard_dir");
         }
+        else if (arg == "--analytics-id" && i + 1 < argc) {
+            analytics_id = argv[++i];
+            cli_explicit.insert("analytics_id");
+        }
         // Seed node: -n HOST:PORT (p2pool compat)
         else if (arg == "-n" && i + 1 < argc) {
             seed_nodes.push_back(argv[++i]);
@@ -1228,6 +1233,14 @@ int main(int argc, char* argv[]) {
             if (!cli_explicit.count("message_blob_hex") && cfg["message_blob_hex"])
                 operator_message_blob_hex = cfg["message_blob_hex"].as<std::string>();
 
+            // Custom coinbase scriptSig text (CLI --coinbase-text takes precedence)
+            if (!cli_explicit.count("coinbase_text") && cfg["coinbase_text"])
+                coinbase_text = cfg["coinbase_text"].as<std::string>();
+
+            // Private sharechain identifier, hex (CLI --network-id/--chain-id takes precedence)
+            if (!cli_explicit.count("network_id") && cfg["network_id"])
+                network_id = std::stoull(cfg["network_id"].as<std::string>(), nullptr, 16);
+
             // Stratum tuning
             if (!cli_explicit.count("stratum_min_diff") && cfg["min_difficulty"])
                 stratum_config.min_difficulty = cfg["min_difficulty"].as<double>();
@@ -1263,7 +1276,7 @@ int main(int argc, char* argv[]) {
                 storage_save_interval = cfg["storage_save_interval"].as<int>();
             if (!cli_explicit.count("dashboard_dir") && cfg["dashboard_dir"])
                 dashboard_dir = cfg["dashboard_dir"].as<std::string>();
-            if (cfg["analytics_id"])
+            if (!cli_explicit.count("analytics_id") && cfg["analytics_id"])
                 analytics_id = cfg["analytics_id"].as<std::string>();
             if (cfg["explorer"])
                 explorer_enabled = cfg["explorer"].as<bool>();
