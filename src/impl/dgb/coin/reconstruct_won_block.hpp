@@ -4,7 +4,7 @@
 // dgb::coin::reconstruct_won_block -- the won-block reconstructor's (#82) BODY:
 // the single composition that the dispatch handler (won_block_dispatch.hpp,
 // make_on_block_found) injects as its WonBlockReconstructor.  It ties the three
-// previously-landed sub-slices into one faithful port of p2pool data.py
+// previously-landed sub-slices into one C++ implementation of the p2pool data.py
 // Share.as_block(tracker, known_txs):
 //
 //     gentx     = self.check(tracker, known_txs)                 # coinbase tx

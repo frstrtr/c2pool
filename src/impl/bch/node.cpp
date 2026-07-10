@@ -819,7 +819,7 @@ void NodeImpl::broadcast_share(const uint256& share_hash)
 void NodeImpl::notify_local_share(const uint256& share_hash)
 {
     // p2pool: set_best_share() → think() synchronously on the reactor thread.
-    // Use think() for ALL best_share decisions, matching p2pool exactly.
+    // Use think() for ALL best_share decisions, as p2pool does.
     if (share_hash.IsNull())
         return;
 
@@ -965,7 +965,7 @@ void NodeImpl::readvertise_best()
 
 void NodeImpl::download_shares(peer_ptr /*unused_peer*/, const uint256& target_hash)
 {
-    // p2pool node.py:108-141 download_shares() — exact translation.
+    // download_shares(): C++ implementation of the p2pool share-download loop.
     //
     // Key differences from old c2pool implementation:
     // 1. RANDOM peer selection (not the reporting peer)
@@ -1326,7 +1326,7 @@ void NodeImpl::start_outbound_connections()
 
 void NodeImpl::prune_shares(const uint256& /*best_share*/)
 {
-    // Matches p2pool node.py:381-398 tail-dropping exactly:
+    // Tail-dropping (as in p2pool's clean_tracker):
     // - Check each tail: if min(height(head) for heads) < 2*CL+10 → skip
     // - Remove ONE child of qualifying tail per iteration
     // - Loop up to 1000 times (gradual, not bulk)
@@ -1873,7 +1873,7 @@ void NodeImpl::heartbeat_log()
 }
 
 // Periodic maintenance: eat stale heads, drop tails.
-// Direct translation of p2pool node.py:355-402 clean_tracker().
+// C++ implementation of the p2pool clean_tracker() design (stale-head eating + tail dropping).
 //
 // Runs on the compute thread under exclusive lock — matching p2pool where
 // clean_tracker + think() execute on the same reactor thread. Chain
@@ -2007,7 +2007,7 @@ void NodeImpl::clean_tracker()
     }
 
     // Step 3: Drop tails — remove ALL children of qualifying tails.
-    // Exact translation of p2pool node.py:382-398.
+    // C++ implementation of the p2pool tail-dropping step.
     // p2pool has NO best-chain protection — the 2*CHAIN_LENGTH+10 threshold
     // ensures only shares far beyond the PPLNS window are removed.
     {

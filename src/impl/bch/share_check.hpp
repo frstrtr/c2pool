@@ -950,7 +950,7 @@ inline std::vector<unsigned char> get_share_script(const auto* obj)
 // the PPLNS weights computed from the share chain.  Returns the expected
 // gentx txid (double-SHA256 of the non-witness serialised transaction).
 //
-// This is the C++ port of p2pool v36's generate_transaction() / check().
+// C++ implementation of the p2pool v36 generate_transaction() / check() design.
 //
 // The coinbase structure is:
 //   tx_ins:  [ { prev_output: 0...0:ffffffff, script: coinbase } ]

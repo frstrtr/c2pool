@@ -214,7 +214,7 @@ TEST(BTC_AutoRatchetSim, C4_StatePersistsAcrossRestart)
 // The integral control (total=100) still shows both forms AGREE on the exact
 // boundary, so the only behavioural change is the %100 remainder share, now
 // accepted one unit earlier in lock-step with the network. Consensus surface
-// equals the p2pool oracle EXACTLY.
+// equals the p2pool oracle value.
 // ---------------------------------------------------------------------------
 TEST(BTC_AutoRatchetSim, SSOT2_OracleFloorVsInlineCeilBoundary)
 {

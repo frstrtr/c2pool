@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 /**
- * TrackerView — C++ implementation of p2pool forest.py TrackerView.
+ * TrackerView — C++ implementation of the p2pool sharechain tracker-view
+ * design (ref-based delta caching). Protocol/algorithm originally by
+ * forrestv (github.com/forrestv/p2pool). Independent C++ implementation;
+ * not derived from p2pool source code.
  *
- * Full ref-based delta caching matching p2pool EXACTLY.
- * Stores deltas in two parts: (item→ref, ref→chain_end).
- * Selective invalidation on share removal — no full cache clear.
+ * Ref-based delta caching: stores deltas in two parts, (item→ref) and
+ * (ref→chain_end), with selective invalidation on share removal — no full
+ * cache clear.
  *
  * Thread safety: p2pool is single-threaded (Twisted reactor), but c2pool
  * calls TrackerView from multiple stratum connections concurrently.
- * A mutable mutex serializes all cache access, preserving p2pool's
+ * A mutable mutex serializes all cache access, preserving those
  * single-threaded semantics in a multi-threaded C++ environment.
  *
- * p2pool source: forest.py lines 96-222
  * Part of the c2pool project — licensed AGPL-3.0-or-later (see LICENSE).
  */
 
@@ -76,9 +78,9 @@ struct AttributeDelta
 };
 
 /**
- * TrackerView — ref-based delta caching (p2pool forest.py:96-222).
+ * TrackerView — ref-based delta caching.
  *
- * Cache structure (matching p2pool exactly):
+ * Cache structure:
  *   _deltas[item_hash] = (delta_from_item_to_ref, ref_id)
  *   _delta_refs[ref_id] = delta_from_ref_to_chain_end
  *   _reverse_deltas[ref_id] = set of item_hashes using this ref
@@ -113,7 +115,7 @@ class TrackerView
     // p2pool: self._ref_generator = itertools.count()
     mutable std::atomic<ref_t> m_ref_gen{0};
 
-    // Serializes all cache access. p2pool's forest.py TrackerView is only
+    // Serializes all cache access. p2pool's TrackerView is only
     // ever accessed from the single Twisted reactor thread. In c2pool,
     // multiple stratum connections call into TrackerView concurrently via
     // build_connection_cb → ref_hash_fn → compute_share_target →
@@ -131,7 +133,7 @@ class TrackerView
         return d;
     }
 
-    // p2pool: _get_delta (forest.py:175-183)
+    // _get_delta: item-to-chain-end delta via the ref cache.
     // Caller MUST hold m_cache_mutex.
     delta_t _get_delta_locked(const hash_t& item_hash) const {
         auto it = m_deltas.find(item_hash);
@@ -144,7 +146,7 @@ class TrackerView
         return make_element_delta(item_hash);
     }
 
-    // p2pool: _set_delta (forest.py:185-206)
+    // _set_delta: store an item's delta under a shared ref group.
     // Caller MUST hold m_cache_mutex.
     void _set_delta_locked(const hash_t& item_hash, const delta_t& delta) const {
         auto other_item_hash = delta.tail;
@@ -192,7 +194,7 @@ public:
         m_get_min_work_fn = std::move(get_min_work_fn);
     }
 
-    // p2pool: get_delta_to_last (forest.py:208-218)
+    // get_delta_to_last: accumulate the delta from item to the chain end.
     delta_t get_delta_to_last(const hash_t& item_hash) const
     {
         std::lock_guard<std::mutex> lock(m_cache_mutex);
@@ -266,7 +268,7 @@ public:
         return d1 - d2;
     }
 
-    // p2pool: _handle_removed (forest.py:149-159)
+    // handle_removed: drop cache entries for a removed share.
     void handle_removed(const hash_t& hash) {
         std::lock_guard<std::mutex> lock(m_cache_mutex);
         auto delta = make_element_delta(hash);
@@ -287,13 +289,13 @@ public:
         }
     }
 
-    // p2pool: _handle_remove_special (forest.py:112-135)
+    // handle_remove_special: invalidate refs when a special tail is removed.
     void handle_remove_special(const hash_t& hash) {
         std::lock_guard<std::mutex> lock(m_cache_mutex);
         _handle_remove_special_locked(hash);
     }
 
-    // p2pool: _handle_remove_special2 (forest.py:137-147)
+    // handle_remove_special2: invalidate refs when a special tail with >1 child is removed.
     void handle_remove_special2(const hash_t& hash) {
         std::lock_guard<std::mutex> lock(m_cache_mutex);
 

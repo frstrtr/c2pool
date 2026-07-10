@@ -61,7 +61,7 @@ class ShareChain
 public:
     ShareChain()
     {
-        // Subscribe to ALL 3 removal signals (p2pool forest.py:108-110).
+        // Subscribe to ALL 3 removal signals.
         // TrackerView uses all 3 for precise delta cache invalidation.
         // SkipList only needs 'removed'.
         on_removed([this](const hash_t& hash) {
@@ -126,7 +126,7 @@ public:
 
 public:
     // Reverse map: prev_hash → set of children hashes.
-    // Matches p2pool's tracker.reverse (forest.py).
+    // Equivalent to p2pool's tracker.reverse child map.
     // Enables O(1) child lookup instead of O(N) scan.
     const auto& get_reverse() const { return m_reverse; }
 
@@ -138,11 +138,10 @@ private:
     std::unordered_map<hash_t, std::set<hash_t>, hasher_t> m_tails;
 
     // ─── Signal system (matches p2pool Twisted Event pattern) ──────────
-    // Three signals matching p2pool forest.py Tracker:
-    //   removed         — fired for ALL removals (line 330)
-    //   remove_special  — tail with ≤1 child removed (line 310)
-    //   remove_special2 — tail with >1 child removed (line 321)
-    // p2pool: tracker.removed = variable.Event()
+    // Three removal signals (as in p2pool's Tracker):
+    //   removed         — fired for ALL removals
+    //   remove_special  — tail with ≤1 child removed
+    //   remove_special2 — tail with >1 child removed
     //         TrackerSkipList subscribes: removed.watch_weakref(self, lambda self, item: self.forget_item(item.hash))
     //         On remove: removed.happened(item) → forget_item clears only that hash from skips{}
     //
@@ -195,17 +194,17 @@ private:
     chain::DistanceSkipList<hash_t, hasher_t> m_skip_list;
     // Pointer to parent chain's skip list (SubsetTracker pattern).
     // If set, get_nth_parent uses parent's skip list (shared navigation).
-    // p2pool: SubsetTracker.get_nth_parent_hash = subset_of.get_nth_parent_hash
+    // get_nth_parent_hash is delegated to the parent skip list (p2pool SubsetTracker design).
     chain::DistanceSkipList<hash_t, hasher_t>* m_parent_skip_list{nullptr};
 
     // ─── TrackerView for cached get_height/get_work/get_last ──────────
-    // Matches p2pool forest.py TrackerView: caches forward-walk deltas.
+    // TrackerView: caches forward-walk deltas (p2pool tracker-view design).
     // Height is MUTABLE — cache updated when shares are removed.
     chain::TrackerView<hash_t, uint288, hasher_t> m_view;
 
     void calculate_head_tail(hash_t head, hash_t tail, index_t* /*index*/)
     {
-        // Exact translation of p2pool forest.py add() lines 250-277.
+        // C++ implementation of the p2pool sharechain add() logic.
         // Two independent resolutions + uniform map update.
         // The old 4-case if/elif pattern failed when tail (prev_hash) was a
         // mid-chain share (not a head): it fell to NEW_FORK, creating a
@@ -277,7 +276,7 @@ public:
         calculate_head_tail(share->m_hash, share->m_prev_hash, index);
         m_shares[share->m_hash] = chain_data{index, share_var};
         // Maintain reverse map (prev → children).
-        // p2pool forest.py adds unconditionally (including None/null prev_hash).
+        // p2pool adds unconditionally (including None/null prev_hash).
         // The null key is needed for tail pruning: clean_tracker Step 3 calls
         // reverse.find(tail) where tail may be the genesis share's null prev_hash.
         m_reverse[share->m_prev_hash].insert(share->m_hash);
@@ -406,7 +405,7 @@ public:
 
     /// Current chain depth — O(n) walk from hash to chain end.
     // ─── Navigation via TrackerView + Skip List ──────────────────────
-    // TrackerView: cached get_height/get_work/get_last (p2pool forest.py)
+    // TrackerView: cached get_height/get_work/get_last.
     // Skip list: O(log n) get_nth_parent (Bitcoin Core chain.cpp)
 
     /// Height via TrackerView — cached, MUTABLE after pruning.
@@ -664,8 +663,8 @@ public:
     }
 
     /// Remove a single share from the chain.
-    /// Line-by-line translation of p2pool forest.py:279-330.
-    /// 4-branch structure with signals firing at exact p2pool locations.
+    /// C++ implementation of the p2pool sharechain remove() logic:
+    /// a 4-branch structure with removal signals fired at the branch points.
     bool remove(const hash_t& hash, bool owns_data = true)
     {
         // ── DIAG: bucket-chain capture at entry ──
@@ -702,7 +701,7 @@ public:
         bool is_head = m_heads.contains(hash);
         bool tail_in_tails = m_tails.contains(share_tail);
 
-        // ── 4-branch logic (p2pool forest.py:291-323) ──
+        // ── 4-branch logic ──
         // Reverse map is NOT modified yet — sibling counts are accurate.
         static int remove_log = 0;
         int branch = 0;
@@ -814,9 +813,8 @@ public:
                          hash.GetHex().c_str(), branch, heads_sz, tails_sz, items_sz);
         }
 
-        // ── Cleanup (p2pool forest.py:325-330) ──
+        // ── Cleanup ──
 
-        // p2pool line 326-328: self.reverse[delta.tail].remove(delta.head)
         // Remove hash from parent's reverse entry — AFTER branch logic.
         {
             auto pr = m_reverse.find(share_tail);

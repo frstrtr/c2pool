@@ -13,7 +13,7 @@
 //   [MONITOR-DIFF]        — difficulty anomaly detection
 //   [MONITOR-SUMMARY]     — one-line health summary
 //
-// Port of p2pool-v36 p2pool/monitor.py (commit d831a045).
+// C++ implementation of the p2pool-v36 monitor.py design (ref commit d831a045).
 
 #include "config_pool.hpp"
 #include "share_tracker.hpp"

@@ -792,11 +792,9 @@ public:
 
             auto [last_height, last_last_hash] = chain.get_height_and_last(last_hash);
 
-            // oracle data.py:774-776 EXACTLY:
-            //   want = max(CHAIN_LENGTH - head_height, 0)
-            //   can  = max(last_height - 1 - CHAIN_LENGTH, 0) if last_last_hash
-            //          is not None else last_height
-            //   get  = min(want, can)
+            // Bounded backfill window: request as many shares as the chain is
+            // short of CHAIN_LENGTH (want), capped by how many the rooted peer
+            // can actually supply (can); to_get = min(want, can).
             auto CL = static_cast<int32_t>(PoolConfig::chain_length());
             auto want = std::max(CL - head_height, 0);
             auto can = last_last_hash.IsNull()
@@ -1928,7 +1926,7 @@ public:
         if (prev_share_hash.IsNull())
             return uint256{};
 
-        // RAW chain, matching p2pool compute_merged_payout_hash (data.py:2807).
+        // RAW chain, matching p2pool's compute_merged_payout_hash.
         if (!chain.contains(prev_share_hash))
             return uint256{};
 
