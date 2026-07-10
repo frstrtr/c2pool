@@ -338,7 +338,7 @@ complete examples with all options documented.
 | `--rpcuser` | `ltc_rpc_user` | -- | RPC username |
 | `--rpcpassword` | `ltc_rpc_password` | -- | RPC password |
 | `--max-conns` | -- | 8 | Target outbound P2P peers |
-| `--stratum-min-diff` | `min_difficulty` | 0.001 | Vardiff floor |
+| `--stratum-min-diff` | `min_difficulty` | 0.0005 | Vardiff floor |
 | `--stratum-max-diff` | `max_difficulty` | 65536 | Vardiff ceiling |
 | `--stratum-target-time` | `target_time` | 10 | Seconds between pseudoshares |
 | `--no-vardiff` | `vardiff_enabled` | true | Disable auto-difficulty |
@@ -347,7 +347,7 @@ complete examples with all options documented.
 | `--log-level` | `log_level` | INFO | trace/debug/info/warning/error |
 | `--log-file` | `log_file` | debug.log | Log filename |
 | `--log-rotation-mb` | `log_rotation_size_mb` | 100 | Log rotation threshold (MB) |
-| `--log-max-mb` | `log_max_total_mb` | 50 | Max rotated log space (MB) |
+| `--log-max-mb` | `log_max_total_mb` | 1000 | Total size cap across all rotated log files (MB) |
 | `--p2p-max-peers` | `p2p_max_peers` | 30 | Max total P2P peers |
 | `--ban-duration` | `ban_duration` | 300 | P2P ban duration (seconds) |
 | `--rss-limit-mb` | `rss_limit_mb` | 4000 | RSS memory abort limit (MB) |
@@ -379,7 +379,7 @@ complete examples with all options documented.
 | `/recent_blocks` | Recently found blocks |
 | `/connected_miners` | Connected stratum workers |
 | `/stratum_stats` | Per-worker stratum statistics (hashrate, difficulty, accepted/rejected) |
-| `/sharechain_stats` | Share chain state |
+| `/sharechain/stats` | Share chain state |
 | `/miner_thresholds` | Minimum viable hashrate, dust range |
 | `/merged_stats` | Merged mining block statistics |
 | `/current_merged_payouts` | Current merged mining payouts |
