@@ -33,14 +33,14 @@
 //   - the share wire FORMAT is bucket-2 v36-native shared structure -> pinned
 //     toward the canonical jtoomim layout (this KAT).
 //
-// STANDARDIZATION GAP (surfaced authoring this KAT, routed to decisions@):
+// STANDARDIZATION GAP (surfaced authoring this KAT, routed to decisions@) - CLOSED:
 //   bch/btc/dgb/dash expose a named crossing-floor SSOT constant
 //   PoolConfig::CROSSING_FLOOR_VERSION (bch config_pool.hpp:81 == 35); LTC's
-//   ltc::PoolConfig has NO such constant (only MINIMUM/ADVERTISED_PROTOCOL_
-//   VERSION). The "-- 0. pinned live share version" section of the bch KAT
-//   therefore has no LTC SSOT to bind against and is DEFERRED here. This is a
-//   bucket-2 divergence: LTC should grow the same CROSSING_FLOOR_VERSION
-//   constant so v37 sees one uniform accept-floor shape across all coins.
+//   ltc::PoolConfig previously had NO such constant. It now grows the same
+//   int64_t CROSSING_FLOOR_VERSION == 35 (config_pool.hpp), so v37 sees one
+//   uniform accept-floor SHAPE across all coins (bucket-3 value stays per-coin).
+//   The "-- 0. pinned live share version" section (deferred in the first cut)
+//   is now present below, binding the LTC SSOT the way the bch KAT does.
 //
 // MUST appear in BOTH the ctest registration (this dir CMakeLists.txt) AND the
 // build.yml COIN_LTC --target allowlist, or it becomes a #143-style NOT_BUILT
@@ -87,6 +87,19 @@ std::string state_raw()
 }
 
 } // namespace
+
+// -- ST-0. pinned live share version (accept-both crossing floor) ------------
+// CROSSING_FLOOR_VERSION == 35 is the version the live jtoomim LTC (+DOGE aux)
+// net mints and the accept-both floor until the 60%-by-work auto-ratchet flips
+// to v36. Pinned so a silent bump of the crossing floor - which would fork the
+// live sharechain out from under the v35 tier - reddens ctest. Bucket-3
+// transition value (per-coin); this pins its VALUE, not standardizes it away.
+TEST(LTC_g1_share_parity, crossing_floor_version_pinned)
+{
+    EXPECT_EQ(static_cast<int>(ltc::PoolConfig::CROSSING_FLOOR_VERSION), 35)
+        << "CROSSING_FLOOR_VERSION drifted from the live jtoomim mint / v35 accept "
+           "floor - a silent bump forks the live LTC/DOGE sharechain";
+}
 
 // -- ST-1. hash_link_type (v35): state(32) + FixedStr(0) empty + VarInt(len) --
 // Oracle wire = <32-byte state> || <length VarInt>. extra_data FixedStr(0)

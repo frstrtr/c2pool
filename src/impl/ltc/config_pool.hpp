@@ -37,6 +37,14 @@ public:
     static constexpr uint32_t TARGET_LOOKBEHIND         = 200;
     static constexpr uint32_t MINIMUM_PROTOCOL_VERSION  = 3301;  // accept v35 (3502) and v36 (3600) peers
     static constexpr uint32_t ADVERTISED_PROTOCOL_VERSION = 3600; // our capability (V36 shares)
+    // Crossing floor: the live share VERSION the jtoomim v35 net mints, and the
+    // accept-both floor until the 60%-by-work auto-ratchet flips to v36. Bucket-3
+    // transition value (per-coin, TEMPORARY) — named here as the cross-coin SSOT so
+    // v37 sees one uniform accept-floor shape across coins (bch/btc/dgb/dash
+    // config_pool.hpp already expose it). NOT wired into live accept logic; pinned
+    // by g1_share_serialization_parity_test.cpp so a silent bump (which would fork
+    // the live sharechain) reddens ctest.
+    static constexpr int64_t  CROSSING_FLOOR_VERSION    = 35;
     static constexpr uint32_t SEGWIT_ACTIVATION_VERSION = 17;
     static constexpr uint32_t BLOCK_MAX_SIZE            = 1000000;
     static constexpr uint32_t BLOCK_MAX_WEIGHT          = 4000000;
