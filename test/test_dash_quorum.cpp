@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase C-QUO — Dash LLMQ quorum-tail verification leaf unit tests
 ///
 /// Exercises the vendored CFinalCommitment / QuorumTail parser and the

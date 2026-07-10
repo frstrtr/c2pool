@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ---------------------------------------------------------------------------
 // DGB DigiShield retarget arithmetic at TRUE 256-bit width  (M3 §7b).

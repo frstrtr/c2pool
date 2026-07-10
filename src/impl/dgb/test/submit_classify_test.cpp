@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // submit_classify_test.cpp -- KAT for the Stage 4d mining_submit decision SSOT
 // (coin/submit_classify.hpp). Pins the three-way ladder + BOTH inclusive

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // P2: Share verification — check_hash_link, check_merkle_link, share init/check

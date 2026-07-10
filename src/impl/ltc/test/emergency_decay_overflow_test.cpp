@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Conformance KAT — death-spiral emergency-decay uint256 overflow.
 //
 // Guards ltc::ShareTracker::emergency_decay_shl (Step 3 of

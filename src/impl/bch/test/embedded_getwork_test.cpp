@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // bch::coin::EmbeddedCoinNode::getwork() contract test (M5 -- embedded body).
 //

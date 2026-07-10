@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // c2pool-bch — Bitcoin Cash (BCH, SHA256d standalone parent, V36) p2pool node
 // entry point.
 //

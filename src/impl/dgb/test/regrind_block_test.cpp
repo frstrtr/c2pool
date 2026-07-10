@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // dgb_regrind_block_test -- the grind -> reconstruct -> submit INTEGRATION
 // seam guard (coin/regrind_block.hpp), #82 Stage 4b/4c.

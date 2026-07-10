@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /**
  * Tests for Stratum protocol extensions:
  *   1. mining.configure — BIP 310 version-rolling + subscribe-extranonce

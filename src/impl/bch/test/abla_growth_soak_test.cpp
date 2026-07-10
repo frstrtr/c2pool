@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // bch::abla AblaTracker budget-GROWTH soak test (M5 dynamic-sizing proof).
 //

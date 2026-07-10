@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // DASH S8 STRATUM-BINDING contract KAT -- job-notify ROUND-TRIP leaf.
 //
 // The final leaf of the S8 stratum-binding suite. Where test_dash_stratum_binding

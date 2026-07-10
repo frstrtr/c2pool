@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // dgb_other_tx_assembler_test -- pins coin/other_tx_assembler.hpp, the won-block
 // reconstructor's (#82 sub-slice 2) bridge from the ordered other_tx hash list

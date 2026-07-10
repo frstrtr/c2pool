@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ---------------------------------------------------------------------------
 // bch::coin::AblaRuntime -- M5: the CLOSING assembly of the embedded-daemon

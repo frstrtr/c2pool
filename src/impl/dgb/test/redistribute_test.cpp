@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // DGB Scrypt-only coin module — Redistribute V2 conformance fixtures (Phase B).
 // Mirrors src/impl/dgb/redistribute.hpp, ported byte-for-byte from
 // src/impl/ltc/redistribute.hpp (namespace flip only). Pins the deterministic

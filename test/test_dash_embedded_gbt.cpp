@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase C-TEMPLATE step 5 (S7 embedded_gbt capstone) — Dash embedded
 /// getblocktemplate bit-parity unit tests.
 ///

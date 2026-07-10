@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // bch::coin AblaBlockFeed test (M5 -- the full-block -> ABLA wiring layer).
 //

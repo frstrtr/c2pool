@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // DGB Scrypt-only coin module — share / consensus-identity fixtures (M3).
 // Mirrors src/impl/btc/test + src/impl/ltc/test. Locks the oracle-conformed
 // consensus + sharechain-identity params against frstrtr/p2pool-dgb-scrypt

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // KAT for the DASH min-protocol-version ratchet gate (#643, option a).
 //
 // Pins the two invariants integrator required for the SAFE-ADDITIVE leaf:

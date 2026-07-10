@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // dgb desired-version tally -- version->work / version->count accumulation KAT.
 //
 // FENCED, additive (no production code touched this slice). Pins

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // BCH pool run-loop ENTRYPOINT standup -- broadcaster-gate leg C, pool side

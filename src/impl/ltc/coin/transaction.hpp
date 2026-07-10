@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // LTC transaction types: import generic primitives from bitcoin_family,

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2016-2020 The Bitcoin Core developers
 // Copyright (c) 2020-2026 The Dash Core developers
 // Distributed under the MIT software license, see the accompanying

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // DASH CoinParams factory: builds a fully populated core::CoinParams for the

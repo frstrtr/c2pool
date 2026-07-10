@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ---------------------------------------------------------------------------
 // dgb::coin -- DOGE-aux won-block SUBMIT half (phase DC, -DAUX_DOGE=ON only).

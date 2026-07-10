@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // DASH S8 STRATUM-BINDING contract KAT.
 //
 // Pins the get_work() -> stratum job binding contract: the extranonce2

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // c2pool-dash — DASH (X11 standalone parent, older-than-v35 -> V36) p2pool node
 // entry point.
 //

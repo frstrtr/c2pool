@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // DGB block-template builder. Mirrors src/impl/btc/coin/template_builder.hpp.
 // Must emit p2pool-merged-v36-compatible templates (V36 master compat).

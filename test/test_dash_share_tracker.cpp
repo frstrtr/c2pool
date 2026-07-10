@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // DASH S8 pool-node leaf 4 — share_tracker.hpp KAT.
 //
 // Exercises the consensus-bearing, PoW-independent core of the DASH ShareTracker

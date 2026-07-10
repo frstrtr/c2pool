@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // PageEmbedded — generic QWebEngineView host.
 //
 // One C++ class serves every embedded-web page; configuration differs

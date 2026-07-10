@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase 1 — HeaderChain unit tests
 ///
 /// Tests the LTC header chain implementation:

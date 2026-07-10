@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // dgb::coin::make_on_block_found won-block dispatch wiring test (#82
 // broadcaster-gate, dispatch half).

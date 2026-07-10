@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // DASH sharechain minimum-protocol-version gate (v36 min-proto ratchet, #643).

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // DASH v36-native MINT-side auto-ratchet of the P2P accept floor.

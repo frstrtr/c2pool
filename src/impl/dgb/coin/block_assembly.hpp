@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ---------------------------------------------------------------------------
 // dgb::coin::assemble_won_block -- the share->block "as_block" reassembly that

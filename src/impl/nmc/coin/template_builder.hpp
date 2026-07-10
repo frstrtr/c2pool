@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 /// P1 PC: NMC (Namecoin) Template Builder

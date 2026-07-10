@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ---------------------------------------------------------------------------
 // bch::coin::EmbeddedDaemon<Config> -- M5: the embedded-daemon ENTRYPOINT

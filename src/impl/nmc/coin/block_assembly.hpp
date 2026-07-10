@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ---------------------------------------------------------------------------
 // nmc::coin::assemble_won_block -- the won-share->parent-block "as_block"

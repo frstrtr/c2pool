@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // DGB won-block finalize joint (coin/won_block_finalize.hpp) -- #82 gate.
 //
 // Pins finalize_won_block_pow: the grind->reconstruct->submit composition that

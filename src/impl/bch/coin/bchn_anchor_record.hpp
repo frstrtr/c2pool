@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // BCHN cold-start anchor record (VM300 bchn-bch, operator-approved read-only

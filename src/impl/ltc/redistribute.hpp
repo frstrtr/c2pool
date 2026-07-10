@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // Redistribute V2: advanced redistribution policy for shares from miners

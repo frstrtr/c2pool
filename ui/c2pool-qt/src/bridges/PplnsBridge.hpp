@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // PplnsBridge — QtWebChannel transport for the embedded JS PPLNS View
 // bundle. Mirrors SharechainBridge, but scoped to the two PPLNS-specific
 // Transport operations (spec §4.2) + cancelRequest.

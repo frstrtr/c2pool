@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // V36 DGB-Scrypt pool wire-message layer — namespace-only divergence from
 // src/impl/ltc/messages.hpp; message format byte-parity with p2pool-merged-v36.

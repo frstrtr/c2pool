@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ---------------------------------------------------------------------------
 // submit_classify.hpp -- the Stage 4d mining_submit decision SSOT.

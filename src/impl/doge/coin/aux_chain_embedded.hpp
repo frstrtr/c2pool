@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 /// Phase 5.5: Embedded DOGE backend for merged mining

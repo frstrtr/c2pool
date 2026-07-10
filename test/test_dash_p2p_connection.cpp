@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase S8 — Dash coin-daemon P2P connection KATs
 ///
 /// Exercises src/impl/dash/coin/p2p_connection.hpp — the per-peer

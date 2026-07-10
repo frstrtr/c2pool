@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase S8 — DashBroadcasterFull won-block KEYSTONE KATs (dual-path #83).
 ///
 /// Exercises src/impl/dash/broadcaster_full.hpp — the keystone that routes a

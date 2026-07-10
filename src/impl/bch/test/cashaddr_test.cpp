@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // bch::coin::cashaddr KAT + roundtrip test (M4 CashAddr port validation).
 //

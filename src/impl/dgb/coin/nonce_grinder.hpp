@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ---------------------------------------------------------------------------
 // dgb::coin::grind_won_nonce -- the embedded real work-gen nonce grinder

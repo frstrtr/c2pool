@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // dgb_auto_ratchet_sim_test: FENCED, additive rig-free SIM KAT that arms the
 // DGB G2 staged-migration harness
 // (scripts/dgb_g2_ratchet_staged_migration_harness.sh) C2/C3/C4/C5 rows WITHOUT

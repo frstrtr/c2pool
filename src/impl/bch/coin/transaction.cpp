@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #include "transaction.hpp"
 
 // bch::coin transaction ctors -- ported from src/impl/btc/coin/transaction.cpp.

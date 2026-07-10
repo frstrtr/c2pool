@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // bch::PoolConfig G1 oracle byte-parity KAT (greenlight gate G1).
 //

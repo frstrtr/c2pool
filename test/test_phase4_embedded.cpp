@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase 4 — Embedded Coin Node unit tests
 ///
 /// Tests the EmbeddedCoinNode / CoinNodeInterface wiring for the

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // dgb::ShareTracker::compute_share_target — NON-genesis (seeded sharechain)
 // branch KAT: Step-3 emergency time-based decay + Step-4 ±10% clamp.
 //

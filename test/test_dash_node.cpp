@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // DASH S8 pool-node leaf 5 (FINAL) slice A — node.hpp skeleton KAT.
 //
 // Slice A is the class SKELETON + accessors only (reception/broadcast/think are

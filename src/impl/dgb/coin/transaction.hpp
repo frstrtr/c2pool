@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // DGB coin tx types. 1:1 mirror of src/impl/btc/coin/transaction.hpp

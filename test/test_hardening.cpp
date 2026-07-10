@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /**
  * Regression tests for the hardening changes introduced in
  * "Harden coin RPC/P2P safety checks" (commit 2e7fadba).

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // G3 block-production harness (pin-independent scaffolding).
 //
 // Proves the WON-BLOCK production path FOUND -> ASSEMBLED -> ACCEPTED behaves

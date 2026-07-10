@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase G1 byte-parity — DASH coinbase/payee serialization conformance vs the
 /// canonical oracle frstrtr/p2pool-dash (older-than-v35).
 ///

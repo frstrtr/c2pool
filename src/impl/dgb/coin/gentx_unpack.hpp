@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ---------------------------------------------------------------------------
 // dgb::coin::unpack_gentx_coinbase -- the INVERSE of #173's GentxCoinbase

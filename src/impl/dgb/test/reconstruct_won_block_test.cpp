@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // dgb_reconstruct_won_block_test -- pins coin/reconstruct_won_block.hpp, the
 // won-block reconstructor's (#82) BODY: the single composition the dispatch
@@ -402,4 +403,3 @@ TEST(DgbReconstructWonBlock, WonShareInputsDrivesTemplateReconstructIdentically)
     EXPECT_EQ(blk.m_txs[0].vin[0].prevout.index, 0xffffffffu);
 }
 } // namespace
-

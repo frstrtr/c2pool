@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /* $Id: sph_types.h 260 2011-07-21 01:02:38Z tp $ */
 /**
  * Basic type definitions.

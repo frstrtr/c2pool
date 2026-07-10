@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // dgb_binomial_conf_interval_test -- FENCED, additive KAT pinning the pure
 // arithmetic core of the p2pool util/math.py binomial_conf_interval (Wilson

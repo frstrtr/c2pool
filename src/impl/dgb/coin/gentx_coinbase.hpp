@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // ============================================================================
 // gentx_coinbase.hpp — SSOT non-witness coinbase (gentx) assembler.

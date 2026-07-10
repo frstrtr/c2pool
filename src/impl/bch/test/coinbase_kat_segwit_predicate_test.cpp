@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // bch coinbase KAT -- gated-segwit predicate pin (DGB<->BCH pairing, slice 1).
 //

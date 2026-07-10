@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Broadcaster-gate verify test (path 3): proves the WON-BLOCK broadcast obeys
 // FALLBACK semantics and NEVER silent-drops. Standalone harness in the style
 // of tx_data_memo_test.cpp -- no btc/test CMake plumbing required.

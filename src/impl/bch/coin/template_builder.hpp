@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // BCH block-template builder. Mirrors src/impl/btc/coin/template_builder.hpp,
 // diverging where BCH consensus requires (M1 §4):

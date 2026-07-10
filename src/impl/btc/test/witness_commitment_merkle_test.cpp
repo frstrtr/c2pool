@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // KAT: BIP141 witness-commitment merkle-root leaf-0 contract.
 //
 // The coinbase transaction's wtxid is DEFINED as 32 zero bytes and MUST occupy

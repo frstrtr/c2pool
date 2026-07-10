@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // BCH share/pool p2p node (NodeImpl / pool::BaseNode declaration).

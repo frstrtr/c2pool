@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 /// Phase C-TEMPLATE step 13: DIP-0027 credit-pool state machine.

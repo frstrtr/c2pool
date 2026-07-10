@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // DGB+DOGE merged-mining (phase DB) — DGB-as-PARENT AuxPoW commitment binding
 // KAT.  Fenced / test-only — consumes the shared aux module, modifies nothing.

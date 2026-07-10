@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // weights_skiplist.hpp — O(log n) PPLNS weight computation via skip list
 //
 // Faithful port of:

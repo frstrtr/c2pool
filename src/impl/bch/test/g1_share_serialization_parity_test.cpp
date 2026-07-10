@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // bch G1 share-serialization byte-parity KAT (greenlight gate G1, share layer).
 //

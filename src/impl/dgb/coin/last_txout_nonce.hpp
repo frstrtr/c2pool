@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // SSOT: last_txout_nonce generation for the OP_RETURN extranonce slot.

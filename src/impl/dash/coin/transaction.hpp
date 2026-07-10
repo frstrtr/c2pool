@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // Dash transaction types: standard Bitcoin transactions + DIP3/DIP4 CBTX support.

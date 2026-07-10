@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // test_v36_cross_impl_refhash.cpp — Cross-implementation ref_hash + gentx_hash test.
 //
 // Computes V36 ref_stream → ref_hash → coinbase → gentx_hash using the same

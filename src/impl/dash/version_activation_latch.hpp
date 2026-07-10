@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // Dash v36 activation LATCH — the persisted VOTING -> ACTIVATED -> CONFIRMED

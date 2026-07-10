@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // SSOT for the DGB LOOKBEHIND chain-walk WINDOW clamp -- the pure integer guard

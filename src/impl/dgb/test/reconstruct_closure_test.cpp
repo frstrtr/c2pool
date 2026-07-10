@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // dgb_reconstruct_closure_test -- pins coin/reconstruct_closure.hpp, the run-
 // loop's faithful WonBlockReconstructor (#82) that main_dgb.cpp binds into

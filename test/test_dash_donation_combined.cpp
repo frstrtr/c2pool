@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase v36-migration-std — DASH unified v36 donation-P2SH standardization KATs.
 ///
 /// Closes the Bucket-2 gap (operator FLAG6, 2026-06-17 3-bucket rule): DASH was

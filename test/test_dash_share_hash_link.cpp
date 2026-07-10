@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // DASH share hash_link / gentx_hash byte-parity vs oracle (frstrtr/p2pool-dash).
 //
 // Pins the coinbase_payload encoding inside the gentx hash_link_data assembly.

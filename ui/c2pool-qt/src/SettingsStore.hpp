@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // SettingsStore — typed façade over QSettings (+ QKeychain in step 4).
 //
 // Public interface per

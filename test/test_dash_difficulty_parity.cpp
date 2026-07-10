@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // DASH G1 difficulty / vardiff PARITY KAT.
 //
 // Pins the DASH sharechain difficulty floor and its per-share work accounting

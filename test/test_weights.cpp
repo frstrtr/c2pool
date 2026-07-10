@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // test_weights.cpp — Unit tests for PPLNS weight computation
 //
 // Tests the WeightsSkipList (O(log n) cumulative weights) and the

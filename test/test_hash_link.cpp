@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /**
  * Unit tests for the hash_link round-trip:
  *   prefix_to_hash_link(prefix, const_ending) → hash_link

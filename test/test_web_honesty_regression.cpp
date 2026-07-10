@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Web honesty-regression KAT (SAFE-ADDITIVE characterization test).
 //
 // Charter: "A dashboard must never lie about prod health." (founding bug

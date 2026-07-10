@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // DGB nonce grinder guard (coin/nonce_grinder.hpp) -- #82 Stage 4b/4c.
 //
 // Proves the embedded real work-gen primitive: grind_won_nonce increments the

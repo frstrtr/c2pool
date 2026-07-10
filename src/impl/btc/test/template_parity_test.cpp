@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // B6 template parity check: c2pool-btc algorithmic functions vs Bitcoin
 // Core consensus oracles. This is a standalone smoke-style harness — not
 // a full gtest fixture — so it can be built and run without restoring the

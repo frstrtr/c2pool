@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // dgb_embedded_tx_select_test -- pins make_mempool_tx_source (embedded_tx_select.cpp),
 // the production shaper that turns the embedded Mempool's fee-sorted selection

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase S8 — Dash sharechain pool-node leaf 1: per-peer state (src/impl/dash/peer.hpp).
 ///
 /// dash::Peer is the analog of btc::Peer / dgb::Peer: the state a pool Node holds

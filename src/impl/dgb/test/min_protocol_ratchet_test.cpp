@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // dgb runtime P2P accept-floor RATCHET KAT.
 //
 // FENCED, additive (no production code touched -- pins the pure free function
@@ -161,4 +162,3 @@ TEST(DgbMinProtocolRatchetWiring, AlreadyAtTargetShortCircuits) {
     // even with a short chain the latch holds at target (never lowers).
     EXPECT_EQ(dgb::apply_min_protocol_ratchet_decision(0, CL, w, 36, TARGET, TARGET), TARGET);
 }
-

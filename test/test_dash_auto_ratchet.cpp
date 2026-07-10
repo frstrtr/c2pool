@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // DASH v36-native MINT-side accept-floor auto-ratchet KAT.
 //
 // FENCED, additive (no production call site touched -- pins the pure free functions

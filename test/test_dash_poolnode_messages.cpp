@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // KAT for the Dash sharechain pool-node wire layer (src/impl/dash/messages.hpp).
 // Proves each pool-node BEGIN_MESSAGE round-trips byte-for-byte and the type-list
 // instantiates — the btc/dgb/ltc analog ported namespace-only to dash.
@@ -139,4 +140,3 @@ TEST(DashPoolNodeMessages, Handler_TypeList_Compiles) {
     using HandlerResult = Handler::result_t;
     EXPECT_GT(sizeof(HandlerResult), 0u);
 }
-

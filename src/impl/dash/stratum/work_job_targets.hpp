@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // dash::stratum::* — get_work() JOB-TARGET assembly (S8 get_work() wiring).

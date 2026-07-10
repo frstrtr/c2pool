@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase C-MEMPOOL step 1+2 — Dash in-memory mempool unit tests
 ///
 /// Exercises the storage layer, UTXO-fee computation, LRU size-cap

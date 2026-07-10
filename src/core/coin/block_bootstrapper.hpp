@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 /// BlockBootstrapState: Ordered block download pipeline for UTXO cold-start sync.

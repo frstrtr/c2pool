@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // dgb NAUGHTY-PROPAGATION ancestor-punishment KAT.
 //
 // FENCED, additive (no production code touched this slice). Pins

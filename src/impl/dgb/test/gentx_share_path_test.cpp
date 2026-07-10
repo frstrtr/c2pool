@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // DGB #82 / #172 — share-path gentx KAT.
 //
 // The helper-level KAT (gentx_coinbase_test) pins dgb::coin::assemble_gentx_coinbase

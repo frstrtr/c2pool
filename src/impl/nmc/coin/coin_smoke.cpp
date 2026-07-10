@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // NMC coin P0 structural-leaf smoke translation unit.
 //
 // Header-only NMC coin types (block.hpp, header_chain.hpp) are otherwise never

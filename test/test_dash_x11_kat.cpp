@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Known-answer test for the DASH X11 PoW primitive (PR-0 foundation, S2 slice).
 //
 // Vector: the DASH mainnet genesis block. Hashing its 80-byte header with X11

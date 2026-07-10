@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // DGB header-chain validation. Mirrors src/impl/btc/coin/header_chain.hpp,
 // shares the Scrypt PoW path with src/impl/ltc (identical Scrypt to LTC).

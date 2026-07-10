@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // bch::coin BlockConnector -- REORG / DISCONNECT leg (M5 full-block body).
 //

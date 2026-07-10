@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // DGB+DOGE merged-mining (phase DC) — ASSEMBLED-BLOCK LAYOUT VERIFIER KAT.
 // Fenced (-DAUX_DOGE), test-only. Consumes the parent-neutral producer

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 // dgb_embedded_coin_node_test -- guards dgb::coin::EmbeddedCoinNode, the
 // SECOND caller of the build_work_template SSOT (the stratum DGBWorkSource is

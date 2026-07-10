@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 /// Phase C-TEMPLATE step 1 — Dash subsidy formula unit tests
 ///
 /// Validates compute_dash_block_reward_post_v20 + compute_dash_mn_payment_post_v20

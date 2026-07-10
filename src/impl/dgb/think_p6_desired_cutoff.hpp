@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
 // SSOT for the think() Phase-6 desired-shares TIMESTAMP CUTOFF — the two pure

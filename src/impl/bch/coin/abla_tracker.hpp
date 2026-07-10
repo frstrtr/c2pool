@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // BCH ABLA size-feed tracker (CHIP-2023-01) -- M5 slice C.
 //

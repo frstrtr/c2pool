@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // test_pplns_stress.cpp — Stress tests for PPLNS consensus verification
 // on both parent (LTC) and merged (DOGE) chains.
 //

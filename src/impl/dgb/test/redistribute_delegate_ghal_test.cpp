@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // dgb redistribute -> get_height_and_last SSOT byte-identity DELEGATION KAT.
 //
 // FENCED, additive. Pins the runtime rewire of redistribute.hpp:454-455
