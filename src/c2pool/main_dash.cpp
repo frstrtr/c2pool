@@ -51,6 +51,13 @@
 #include <impl/dash/coin/rpc.hpp>          // dash::coin::NodeRPC — external-dashd submitblock arm (slice 3)
 #include <impl/dash/coin/rpc_conf.hpp>     // dash.conf creds resolution (rpcpassword off argv)
 #include <impl/dash/coin/node_interface.hpp>
+#include <impl/dash/node.hpp>          // dash::Node — sharechain pool-node (NodeBridge<NodeImpl,Legacy,Actual>)
+#include <impl/dash/config.hpp>        // dash::Config (PoolConfig/CoinConfig)
+#include <impl/dash/config_pool.hpp>   // dash::SharechainConfig — P2P_PORT / PREFIX / min-proto SSOT
+#include <core/filesystem.hpp>         // core::filesystem::config_path()
+#include <btclibs/util/strencodings.h> // ParseHexBytes (prefix isolation primitive)
+#include <filesystem>
+#include <system_error>
 #include <impl/dash/coin/block_producer.hpp>  // dash::coin::mine_block / serialize_full_block_hex (slice 5)
 #include <impl/dash/coinbase_builder.hpp>      // dash::coinbase::build / compute_dash_payouts (slice 5)
 #include <impl/dash/params.hpp>                // dash::make_coin_params (already via top include)
@@ -139,9 +146,9 @@ void report_peering(const PeeringConfig& peer, bool testnet)
         std::cout << "[run]   addnode (persistent outbound) -> " << a.to_string() << "\n";
     for (const auto& c : peer.connects)
         std::cout << "[run]   connect (connect-only)        -> " << c.to_string() << "\n";
-    std::cout << "[run] NOTE: peering argv contract + validation are LIVE; the bind/dial\n"
-                 "[run]       wires when the DASH sharechain pool Node (node.hpp/peer/\n"
-                 "[run]       messages/share_tracker, mirror btc::Node) lands -- next S8 leaf.\n";
+    std::cout << "[run] peering argv contract is LIVE and the sharechain pool Node\n"
+                 "[run]       (node.hpp: NodeBridge<NodeImpl,Legacy,Actual>) binds the listener\n"
+                 "[run]       below (S8-p2p.3); reception rides #656/#657.\n";
 }
 
 using dash::coin::compute_dash_block_reward_post_v20;
@@ -352,8 +359,53 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     }
 
     report_peering(peer, testnet);
+
+    // ── S8-p2p.3: bind the REAL sharechain P2P listener ───────────────────
+    // node.cpp reception bodies landed (#656/#657), so dash::Node is now fully
+    // linkable and --run opens an actual socket instead of only echoing the
+    // topology. Mirrors the dgb::Node bring-up (src/c2pool/main_dgb.cpp).
+    dash::SharechainConfig::is_testnet = testnet;
+
+    // Bucket-1 ISOLATION PRIMITIVE: DASH keeps its own net subdir + PREFIX,
+    // per-coin AND per-pool-instance, in v36 and v37 — never standardised.
+    const std::string net_subdir = testnet ? "dash_testnet" : "dash";
+    std::error_code mkdir_ec;
+    std::filesystem::create_directories(
+        core::filesystem::config_path() / net_subdir, mkdir_ec);  // best effort
+
+    dash::Config config(net_subdir);
+    // PREFIX sourced from the frstrtr/p2pool-dash oracle constants (SharechainConfig).
+    config.pool()->m_prefix = ParseHexBytes(dash::SharechainConfig::prefix_hex());
+    config.m_testnet        = testnet;
+    // --addnode (persistent outbound) + --connect (connect-only) both seed the
+    // bootstrap addr store the NodeImpl ctor dials via start_outbound_connections().
+    for (const auto& a : peer.addnodes)  config.pool()->m_bootstrap_addrs.push_back(a);
+    for (const auto& c : peer.connects)  config.pool()->m_bootstrap_addrs.push_back(c);
+
+    dash::Node p2p_node(&ioc, &config);
+
+    // --connect (connect-only, no --listen) suppresses the inbound listener,
+    // matching report_peering() above.
+    const bool connect_only = !peer.connects.empty() && !peer.listen_set;
+    const uint16_t bind_port =
+        peer.listen_port ? peer.listen_port : dash::SharechainConfig::p2p_port();
+    if (!connect_only) {
+        p2p_node.core::Server::listen(bind_port);
+        std::cout << "[run] sharechain peer LISTENING on " << peer.listen_host << ":"
+                  << bind_port
+                  << " — min-proto=" << dash::SharechainConfig::MINIMUM_PROTOCOL_VERSION
+                  << " prefix=" << dash::SharechainConfig::prefix_hex() << "\n";
+    } else {
+        std::cout << "[run] --connect mode: inbound listener suppressed\n";
+    }
+    // addnode/connect targets are registered in the addr store by the NodeImpl
+    // ctor, but ACTIVE outbound dialing rides the download/outbound slice
+    // (dash::NodeImpl carries no start_outbound_connections yet). Inbound
+    // reception — version handshake + the #646 min-proto gate — is live now
+    // via node.cpp (#656/#657).
+
     std::cout << "[run] run-loop up (Ctrl-C to stop); won blocks relay via the\n"
-                 "[run] dashd-RPC submitblock fallback. Embedded P2P relay = S8.\n";
+                 "[run] dashd-RPC submitblock fallback + the embedded sharechain P2P leg.\n";
     ioc.run();
     std::cout << "[run] run-loop stopped cleanly\n";
     return 0;
