@@ -159,6 +159,15 @@ public:
     static constexpr uint32_t MAX_BLOCK_WEIGHT  = 4'000'000u;
     static constexpr uint32_t COINBASE_RESERVE  = 2'000u;   // weight reserved for coinbase tx
 
+    // ── Underfill guard (v36 cutover deploy path) ──────────────────────────
+    // Detects the "near-empty template on a non-empty mempool" regression:
+    // the tx selector returns almost no transactions even though the local
+    // mempool holds a substantial fee-paying backlog. c2pool-side template-fill
+    // safety net — NOT the byte-parity KAT axis; thresholds pinned from the
+    // legacy p2pool near-empty floor (~50 kB) and reviewable by btc-heap-opt.
+    static constexpr uint64_t UNDERFILL_MIN_FILL_BYTES = 50'000ull; // < this = near-empty block
+    static constexpr uint64_t UNDERFILL_BACKLOG_SLACK  = 50'000ull; // unselected fee-paying material that should have filled it
+
     /// Build a WorkData template from the current chain tip + mempool.
     /// When mweb_tracker is provided and has state, the template includes
     /// a HogEx transaction (last tx) and MWEB block data.
@@ -224,9 +233,11 @@ public:
         std::vector<Transaction> tx_objects;
         std::vector<uint256>     tx_hashes;
 
+        uint64_t selected_bytes = 0;  // wire bytes packed into this template (underfill guard)
         for (const auto& stx : selected_txs) {
             uint256     txid     = compute_txid(stx.tx);
             auto        packed   = pack(TX_WITH_WITNESS(stx.tx));
+            selected_bytes += packed.get_span().size();
             std::string hex_data = HexStr(packed.get_span());
             // wtxid = SHA256d of witness serialization (for witness merkle tree)
             uint256     wtxid    = Hash(packed.get_span());
@@ -246,6 +257,28 @@ public:
 
             tx_objects.push_back(Transaction(stx.tx));
             tx_hashes.push_back(txid);
+        }
+
+        // ── Underfill guard ────────────────────────────────────────────────
+        // Do not silently treat a near-empty template as healthy when the
+        // mempool held fee-paying backlog that should have filled it. We cannot
+        // fabricate transactions, so we surface loudly (WARNING) for
+        // contabo-prod-watch / the operator rather than shipping a false-empty
+        // block as normal. Genuinely empty mempools never trip this.
+        {
+            const uint64_t mempool_bytes = static_cast<uint64_t>(pool.byte_size());
+            const uint64_t mempool_fees  = pool.total_fees();
+            const bool near_empty  = selected_bytes < UNDERFILL_MIN_FILL_BYTES;
+            const bool has_backlog = mempool_fees > 0
+                                  && mempool_bytes > selected_bytes + UNDERFILL_BACKLOG_SLACK;
+            if (near_empty && has_backlog) {
+                LOG_WARNING << "[EMB-LTC] TemplateBuilder UNDERFILL: selected "
+                            << selected_txs.size() << " tx / " << selected_bytes
+                            << "B into template while mempool holds " << pool.size()
+                            << " tx / " << mempool_bytes << "B (" << mempool_fees
+                            << " sat fees) — near-empty block on a non-empty "
+                            << "mempool; template-fill regression, gates cutover.";
+            }
         }
 
         // ── MWEB: HogEx transaction + empty MWEB block ────────────────────
