@@ -1,4 +1,12 @@
-<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Bitcoin LevelDB — P2Pool scientific basics</title><style>
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Bitcoin LevelDB — P2Pool scientific basics</title>
+<meta name="description" content="P2Pool scientific basics: how to read Bitcoin block data directly from LevelDB on disk.">
+<meta name="robots" content="index,follow">
+<link rel="canonical" href="https://frstrtr.github.io/c2pool/bitcoin-leveldb.html">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Bitcoin LevelDB — P2Pool scientific basics">
+<meta property="og:description" content="P2Pool scientific basics: how to read Bitcoin block data directly from LevelDB on disk.">
+<meta property="og:url" content="https://frstrtr.github.io/c2pool/bitcoin-leveldb.html">
+<meta name="twitter:card" content="summary"><style>
  body{font-family:Georgia,'Times New Roman',serif;max-width:800px;margin:2.2em auto;padding:0 1.2em;color:#1a1a1a;line-height:1.6;font-size:16.5px;background:#fff;}
  h1{font-size:1.55em;line-height:1.3;margin:0 0 .15em;font-weight:600;} .sub{color:#666;margin:0 0 1.6em;font-size:.92em;}
  h2{font-size:1.12em;margin:1.7em 0 .45em;font-weight:600;border-bottom:1px solid #e6e6e6;padding-bottom:.2em;}
@@ -144,4 +152,5 @@ Value: &lt;block_header_bytes&gt;&lt;varint_height&gt;&lt;varint_tx_count&gt;&lt
 <p>The "only headers in the database; the blocks themselves are raw append-only files" point is exactly what makes direct, daemon-free reads possible. The <a href="real-difficulty.html">Real difficulty</a> chart on this site was sourced precisely this way: rather than query a running node over RPC, we read <code>blocks/blk00000.dat</code> straight off a full node's disk and parsed the 80-byte headers sequentially (magic &rarr; size &rarr; header &rarr; <code>nBits</code> + double-SHA-256 block hash) for the first 4,032 blocks. No RPC, no rate limit, no daemon &mdash; just the raw files this page describes. The same property underpins the V37 work: a node can reconstruct committed state from compact, on-disk records and prove it with log-size Merkle proofs &mdash; see the <a href="./">Purple Paper</a>, &sect;9 (Verifying Payment).</p></div>
 
 <hr style="margin:2.4em 0 1em;border:none;border-top:1px solid #eee"><p class="sub">P2Pool scientific basics — republished and version-controlled. <a href="./">V37 Purple Paper &rarr;</a></p>
+<footer style="margin-top:3em;border-top:1px solid #ccc;padding-top:1em;font-size:0.9em"><p>© 2026 technocore.one — all rights reserved.</p></footer>
 </body></html>
