@@ -39,12 +39,12 @@ target_link_libraries(dash_rpc PRIVATE core nlohmann_json::nlohmann_json ${Boost
 # S8 sharechain-p2p dispatch layer (slice S8-p2p.2). Mirrors the dgb pool OBJECT
 # lib (src/impl/dgb/CMakeLists.txt add_library(dgb OBJECT ...)): compiles the
 # Legacy/Actual established-peer protocol handlers so the 12-message dispatch
-# surface is a real compiled TU. node.cpp (the NodeImpl reception/think TU) is
-# slice .4 and does NOT exist yet, so this OBJECT lib is intentionally NOT linked
-# into any executable here -- processing_shares()/handle_get_share() are declared
-# in node.hpp and their definitions are link-deferred to slice .4. Object-compile
-# only; SAFE-ADDITIVE (no existing target links `dash`, so ltc/btc/doge/dgb build
-# + ctest surfaces are untouched). Per-coin isolation held: src/impl/dash only.
+# surface is a real compiled TU. node.cpp (the NodeImpl reception/think TU) landed
+# with slice .4 (#656/#657: processing_shares()/handle_get_share() bodies), so this
+# OBJECT lib is now fully linkable and slice .3 LINKS it into c2pool-dash to bind a
+# real sharechain P2P listener (src/c2pool/main_dash.cpp run_node). SAFE-ADDITIVE:
+# the ONLY executable linking `dash` is c2pool-dash, so ltc/btc/doge/dgb build +
+# ctest surfaces are untouched. Per-coin isolation held: src/impl/dash only.
 add_library(dash OBJECT
     node.hpp
     peer.hpp

@@ -288,6 +288,7 @@ add_executable(c2pool-dash main_dash.cpp)
 target_compile_definitions(c2pool-dash PRIVATE C2POOL_VERSION="${C2POOL_GIT_VERSION}")
 target_link_libraries(c2pool-dash
     core pool sharechain
+    dash       # S8-p2p: sharechain pool-node OBJECT lib (NodeImpl + Legacy/Actual dispatch, node.cpp)
     c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage c2pool_difficulty
     dash_x11   # DASH X11 PoW sph reference (BLAKE->...->ECHO), additive static lib
     dash_rpc   # launcher slice-3: external-dashd-RPC client (submitblock fallback)
