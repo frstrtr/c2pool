@@ -340,7 +340,7 @@ complete examples with all options documented.
 | `--max-conns` | -- | 8 | Target outbound P2P peers |
 | `--stratum-min-diff` | `min_difficulty` | 0.0005 | Vardiff floor |
 | `--stratum-max-diff` | `max_difficulty` | 65536 | Vardiff ceiling |
-| `--stratum-target-time` | `target_time` | 10 | Seconds between pseudoshares |
+| `--stratum-target-time` | `target_time` | 3.0 | Seconds between pseudoshares |
 | `--no-vardiff` | `vardiff_enabled` | true | Disable auto-difficulty |
 | `--max-coinbase-outputs` | `max_coinbase_outputs` | 4000 | Max coinbase outputs |
 | `--network-id` | `network_id` | 0 | Private chain identifier (hex) |

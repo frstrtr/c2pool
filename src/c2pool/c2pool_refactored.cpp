@@ -614,7 +614,7 @@ int main(int argc, char* argv[]) {
     std::string redistribute_mode_str = "pplns";
 
     // Stratum tuning (configurable via CLI or YAML)
-    core::StratumConfig stratum_config;  // defaults: min=0.001, max=65536, target=10s, vardiff=true
+    core::StratumConfig stratum_config;  // defaults: min=0.0005, max=65536, target=3.0s, vardiff=true
 
     // Operational tuning (configurable via CLI or YAML)
     std::string log_file;                        // empty = default "debug.log"
