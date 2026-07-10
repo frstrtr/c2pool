@@ -10,3 +10,9 @@ if (BUILD_TESTING AND GTest_FOUND)
     include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
     gtest_add_tests(share_test "" AUTO)
 endif()
+if (BUILD_TESTING)
+    # G2 fill-budget KAT: self-contained header-only unit (no gtest/core
+    # deps) -- faithful port of p2pool test_g2_fillbudget.py, own main().
+    add_executable(fill_budget_kat_test fill_budget_kat_test.cpp)
+    add_test(NAME fill_budget_kat COMMAND fill_budget_kat_test)
+endif()
