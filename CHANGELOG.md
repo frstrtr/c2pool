@@ -295,8 +295,8 @@
   eliminates silent payout truncation on busy pools
 - `MINIMUM_PAYOUT_SATOSHIS` fixed from 100 000 to 1 — coinbase outputs are
   exempt from the dust limit
-- P2P default ports corrected: mainnet 9326 → 9338
-- YAML testnet ports corrected: p2p 9333 → 19338, stratum 8084 → 19327
+- P2P default port: mainnet 9326 (matches p2pool-merged-v36 sharechain)
+- YAML testnet ports corrected: p2p 9333 → 19326, stratum 8084 → 19327
 - Ghost share tracker silenced via `vardiff_enabled_` flag
 - Stale sharechain view crash on missing shares
 

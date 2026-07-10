@@ -60,7 +60,7 @@ Get-FileHash c2pool-*-setup.exe -Algorithm SHA256
 
 All release binaries are built from the tagged git commit. To verify a binary matches the source:
 
-1. Check the git tag: `git log v0.1.1-alpha --oneline -1`
+1. Check the git tag: `git log v0.14.0-v36-ltc-doge --oneline -1`
 2. Build from that tag following the platform-specific guide
 3. Compare the SHA256 of your binary with the release `SHA256SUMS`
 

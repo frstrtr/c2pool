@@ -1360,8 +1360,12 @@ int main(int argc, char* argv[]) {
             "THIS IS EXPERIMENTAL SOFTWARE -- USE AT YOUR OWN RISK",
             "THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY",
             "OF ANY KIND, EXPRESS OR IMPLIED.",
-            "Distributed under the MIT/X11 software license",
-            "See http://www.opensource.org/licenses/mit-license.php",
+            "Distributed under the GNU AGPL-3.0-or-later license.",
+            "This is free software; see the source for copying terms.",
+            "AGPL section 13: if you run a modified version and let",
+            "users interact with it over a network, you must offer",
+            "them the corresponding source code.",
+            "Source: https://github.com/frstrtr/c2pool",
         }, rows);
         for (const auto& r : rows) LOG_WARNING << r;
     }
