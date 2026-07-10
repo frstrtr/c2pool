@@ -147,3 +147,55 @@ TEST(LTC_g1_share_parity, share_type_wrapper_v36)
     EXPECT_EQ(to_hex(ss.get_span()), want)
         << "share_type wrapper v36 (VarInt type || VarStr contents) drifted";
 }
+
+// -- ST-4. desired_version vote is a legacy-visible VarInt --------------------
+// The v36 vote rides the share_info `desired_version` field (share.hpp:63/190,
+// Formatter `VarInt(obj->m_desired_version)`), a plain CompactSize the jtoomim
+// v35 tier deserializes via get_desired_version_counts (data.py:2651) and tallies
+// WITHOUT understanding any v36 feature. Pin the encoding of the crossing-relevant
+// vote values against literal oracle CompactSize bytes — the SAME primitive ST-3
+// pins for the share_type tag, here proving the *vote* transports identically. A
+// silent switch to a fixed-width or version-gated encoding (which would make the
+// vote invisible to the v35 tier and fork the ratchet tally) reddens HERE.
+TEST(LTC_g1_share_parity, desired_version_vote_is_legacy_varint)
+{
+    struct Case { uint64_t dv; const char* want; };
+    const Case cases[] = {
+        {35,  "23"},        // pre-crossing floor the live jtoomim net mints
+        {36,  "24"},        // the ratchet target (the v36 vote)
+        {300, "fd2c01"},    // multi-byte -> proves general CompactSize, not fixed width
+    };
+    for (const auto& c : cases) {
+        uint64_t dv = c.dv;
+        PackStream ss;
+        ss << VarInt(dv);
+        EXPECT_EQ(to_hex(ss.get_span()), std::string(c.want))
+            << "desired_version=" << dv << " must encode as the CompactSize VarInt "
+               "the oracle get_desired_version_counts (data.py:2651) tallies";
+    }
+}
+
+// -- ST-5. vote sits at a version-independent legacy offset -------------------
+// share_info Formatter emits, contiguously and BEFORE any `if constexpr (version
+// >= 36)` gate:  donation(uint16 LE, 2B) || stale_info(enum8, 1B) || VarInt(dv).
+// So a jtoomim v35 reader locates desired_version at a FIXED 3-byte offset from
+// the donation block regardless of the vote value or the miner share version, and
+// zero v36-gated bytes precede it (no v36 leak into the pre-vote wire). Hand-
+// transcribed field order (non-circular): donation=0 -> "0000", stale none=0 ->
+// "00", dv=36 -> "24".
+TEST(LTC_g1_share_parity, desired_version_vote_at_legacy_offset)
+{
+    uint16_t donation = 0;
+    ltc::StaleInfo stale = ltc::none;
+    uint64_t dv = 36;
+
+    PackStream ss;
+    ss << Using<IntType<16>>(donation)
+       << Using<EnumType<IntType<8>>>(stale)
+       << VarInt(dv);
+    const std::string wire = to_hex(ss.get_span());
+    EXPECT_EQ(wire, std::string("0000") + "00" + "24")
+        << "donation||stale_info||desired_version wire drifted from oracle field order";
+    EXPECT_EQ(wire.substr(6), std::string("24"))
+        << "v36 vote (24) not at the legacy 3-byte offset a jtoomim v35 reader tallies";
+}
