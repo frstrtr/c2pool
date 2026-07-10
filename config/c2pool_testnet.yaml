@@ -1,11 +1,11 @@
 # C2Pool Litecoin Testnet Configuration
-# P2P: 19338, Stratum: 19327, HTTP: 8080
+# P2P: 19326, Stratum: 19327, HTTP: 8080
 #
 # All keys below are optional. CLI arguments always take priority over YAML values.
 # Unrecognized keys are silently ignored.
 
 # ─── Network ────────────────────────────────────────────────────────────────
-port: 19338                    # P2P p2pool sharechain port (testnet)
+port: 19326                    # P2P p2pool sharechain port (testnet)
 stratum_port: 19327            # Stratum mining port (testnet)
 http_port: 18080               # HTTP/JSON-RPC API port (testnet)
 http_host: "0.0.0.0"          # HTTP bind address
