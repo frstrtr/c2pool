@@ -520,10 +520,18 @@ cd build && ctest --output-on-failure -j$(nproc)
 
 ## V37 development
 
-- Github pages: <[https://t.me/c2pooldev](https://frstrtr.github.io/c2pool/)>
-- V37 dev branch primitives: <[https://github.com/frstrtr/c2pool/compare/master...v37-dev](https://github.com/frstrtr/c2pool/compare/master...v37-dev)>
+- **V37 Purple Paper** (Work Receipts design): https://frstrtr.github.io/c2pool/purple-paper.html
+- Dev chat (Telegram): https://t.me/c2pooldev
+- V37 dev-branch primitives (diff): https://github.com/frstrtr/c2pool/compare/master...v37-dev
 
 ---
+
+## License
+
+- **c2pool daemon** (this repository): [AGPL-3.0-or-later](LICENSE). Network use triggers the AGPL source-provision obligation.
+- **c2pool-core-engine** (extracted primitive layer): Apache-2.0, in the separate [c2pool-core-engine](https://github.com/frstrtr/c2pool-core-engine) repository.
+- **Bundled `src/btclibs/` and third-party crypto**: retain their original MIT licenses (notices preserved in-file).
+- **V37 Purple Paper** (frstrtr.github.io/c2pool): MIT License (as with the Bitcoin whitepaper). The remaining site articles are © technocore.one, all rights reserved.
 
 ### Install guides
 - [Ubuntu / Debian / Linux](doc/build-unix.md)

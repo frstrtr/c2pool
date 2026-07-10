@@ -13,7 +13,7 @@
  * single-threaded semantics in a multi-threaded C++ environment.
  *
  * p2pool source: forest.py lines 96-222
- * MIT License (c2pool project)
+ * Part of the c2pool project — licensed AGPL-3.0-or-later (see LICENSE).
  */
 
 #include <unordered_map>
