@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://frstrtr.github.io/c2pool/sitemap.xml
