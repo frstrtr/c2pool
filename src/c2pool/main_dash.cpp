@@ -50,6 +50,7 @@
 #include <core/netaddress.hpp>             // NetService (dashd RPC endpoint)
 
 #include <impl/dash/coin/rpc.hpp>          // dash::coin::NodeRPC — external-dashd submitblock arm (slice 3)
+#include <impl/dash/coin/work_source.hpp>   // dash::coin::select_dash_work -- embedded-gbt live-wire + dashd fallback (S8 capstone)
 #include <impl/dash/coin/rpc_conf.hpp>     // dash.conf creds resolution (rpcpassword off argv)
 #include <impl/dash/coin/node_interface.hpp>
 #include <impl/dash/node.hpp>          // dash::Node — sharechain pool-node (NodeBridge<NodeImpl,Legacy,Actual>)
@@ -457,7 +458,25 @@ int run_mine_block(bool testnet, const std::string& rpc_endpoint,
 
     // 1) Pull the template.
     std::cout << "[mine] fetching block template (getblocktemplate)...\n";
-    dash::coin::DashWorkData work = rpc.getwork();
+    // Work source (S8 embedded_gbt live-wire capstone): PREFER the locally
+    // assembled embedded template via build_embedded_workdata, fall back to
+    // dashd getblocktemplate. The dashd arm is RETAINED as fallback + the
+    // [GBT-XCHECK] cross-check -- never removed.
+    //
+    // NOTE: NodeImpl does not yet hold the embedded coin-state (masternode
+    // list + mempool + header tip) that build_embedded_workdata consumes, so
+    // emb.has_state stays false here and the selector routes to the dashd
+    // fallback today. Populating that in-process state is the flagged next
+    // sub-slice; once it lands, set emb.has_state=true and the embedded arm
+    // goes live with zero change to this call site.
+    dash::coin::EmbeddedWorkInputs emb;   // has_state=false until node-held coin-state lands
+    dash::coin::WorkSelection sel =
+        dash::coin::select_dash_work(emb, [&]{ return rpc.getwork(); });
+    dash::coin::DashWorkData work = std::move(sel.work);
+    std::cout << "[mine] work source: "
+              << (sel.source == dash::coin::WorkSource::Embedded
+                      ? "EMBEDDED (build_embedded_workdata)"
+                      : "dashd getblocktemplate (fallback)") << "\n";
     std::cout << "[mine] template: height=" << work.m_height
               << " bits=0x" << std::hex << work.m_bits << std::dec
               << " prev=" << work.m_previous_block.GetHex().substr(0, 16) << "..."
