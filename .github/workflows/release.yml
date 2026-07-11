@@ -406,6 +406,7 @@ jobs:
 
       - name: Install Conan 2
         if: steps.presence.outputs.exists == '1'
+        shell: bash
         run: |
           if [ "${{ runner.environment }}" = "github-hosted" ]; then
             pip install "conan>=2.0,<3.0"
