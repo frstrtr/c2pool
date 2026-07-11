@@ -1,27 +1,71 @@
 #!/bin/bash
 # c2pool macOS DMG builder
 #
-# Usage:
-#   ./create-dmg.sh <binary> <arch>
+# Two modes:
 #
-# Examples:
-#   ./create-dmg.sh ~/c2pool-build/build/src/c2pool/c2pool x86_64
-#   ./create-dmg.sh ~/c2pool-build/build-arm64/src/c2pool/c2pool arm64
+# 1. Staged mode (used by release.yml — wraps an already-assembled universal
+#    package directory into a .dmg):
+#      ./create-dmg.sh --staged <pkgdir> --name c2pool-ltc --version 0.2.0 --arch universal
+#    <pkgdir> must already contain the binary, lib/, web-static/, config/,
+#    start.sh — i.e. the exact tree the release matrix stages/lipo-merges.
+#    No asset copying or dylib rewriting is done here; the staged tree
+#    (which already has @executable_path-fixed dylibs) is shipped verbatim.
+#    Output: <name>-<version>-macos-<arch>.dmg
 #
-# The script expects web-static/, explorer/, config/, start.sh in the
-# repo root (same level as src/).  Output: c2pool-VERSION-macos-ARCH.dmg
+# 2. Legacy single-binary mode (per-arch, alpha compatible):
+#      ./create-dmg.sh <binary> <arch>
 
 set -e
 
-BINARY="$1"
-ARCH="${2:-$(uname -m)}"
-VERSION="0.1.1-alpha"
+STAGED=""
+NAME=""
+VERSION=""
+ARCH=""
+BINARY=""
+
+# Flag parsing (staged mode) with positional fallback (legacy mode)
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --staged)  STAGED="$2"; shift 2 ;;
+        --name)    NAME="$2"; shift 2 ;;
+        --version) VERSION="$2"; shift 2 ;;
+        --arch)    ARCH="$2"; shift 2 ;;
+        *)
+            if [ -z "$BINARY" ]; then BINARY="$1"; else ARCH="$1"; fi
+            shift ;;
+    esac
+done
+
+# ── Staged mode ─────────────────────────────────────────────────────────────
+if [ -n "$STAGED" ]; then
+    [ -n "$NAME" ]    || { echo "ERROR: --name required with --staged"; exit 1; }
+    [ -n "$VERSION" ] || { echo "ERROR: --version required with --staged"; exit 1; }
+    ARCH="${ARCH:-universal}"
+    [ -d "$STAGED" ]  || { echo "ERROR: staged dir not found: $STAGED"; exit 1; }
+    VOLNAME="${NAME}-${VERSION}"
+    DMG_NAME="${NAME}-${VERSION}-macos-${ARCH}.dmg"
+    echo "Building $DMG_NAME from staged tree $STAGED"
+    rm -f "$DMG_NAME"
+    hdiutil create -volname "$VOLNAME" \
+        -srcfolder "$STAGED" \
+        -ov -format UDZO \
+        "$DMG_NAME"
+    echo ""
+    echo "Created: $DMG_NAME"
+    echo "Size: $(du -h "$DMG_NAME" | cut -f1)"
+    echo "SHA256: $(shasum -a 256 "$DMG_NAME" | cut -d' ' -f1)"
+    exit 0
+fi
+
+# ── Legacy single-binary mode (unchanged alpha behaviour) ───────────────────
+ARCH="${ARCH:-$(uname -m)}"
+VERSION="${VERSION:-0.1.1-alpha}"
 VOLNAME="c2pool-${VERSION}"
 DMG_NAME="c2pool-${VERSION}-macos-${ARCH}.dmg"
 
 if [ -z "$BINARY" ] || [ ! -f "$BINARY" ]; then
     echo "Usage: $0 <path-to-c2pool-binary> [arch]"
-    echo "  arch: x86_64 or arm64 (default: native)"
+    echo "   or: $0 --staged <pkgdir> --name <name> --version <ver> [--arch <arch>]"
     exit 1
 fi
 
@@ -83,8 +127,6 @@ STARTEOF
 fi
 
 # Copy secp256k1 dylib and fix load path
-# Detect the actual linked path from the binary (Homebrew may use Cellar paths
-# like /usr/local/opt/secp256k1/lib/ instead of /usr/local/lib/)
 LINKED_SECP=$(otool -L "$APP_DIR/c2pool" | grep secp256k1 | awk '{print $1}')
 if [ -n "$LINKED_SECP" ] && [ -f "$LINKED_SECP" ]; then
     SECP_REAL=$(realpath "$LINKED_SECP")
@@ -93,7 +135,6 @@ if [ -n "$LINKED_SECP" ] && [ -f "$LINKED_SECP" ]; then
     install_name_tool -change "$LINKED_SECP" "@executable_path/lib/libsecp256k1.6.dylib" "$APP_DIR/c2pool"
     echo "  secp256k1: $LINKED_SECP -> @executable_path/lib/libsecp256k1.6.dylib"
 else
-    # Fallback: try known paths
     if [ "$ARCH" = "arm64" ]; then
         SECP_SEARCH="/Users/user0/arm64-deps/lib /opt/homebrew/lib"
     else
@@ -103,7 +144,6 @@ else
         if [ -f "$DIR/libsecp256k1.6.dylib" ]; then
             cp "$DIR/libsecp256k1.6.dylib" "$APP_DIR/lib/libsecp256k1.6.dylib"
             ln -sf libsecp256k1.6.dylib "$APP_DIR/lib/libsecp256k1.dylib"
-            # Try all possible linked names
             for CANDIDATE in "$DIR/libsecp256k1.dylib" "$DIR/libsecp256k1.6.dylib"; do
                 install_name_tool -change "$CANDIDATE" "@executable_path/lib/libsecp256k1.6.dylib" "$APP_DIR/c2pool" 2>/dev/null || true
             done
