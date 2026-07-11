@@ -1,12 +1,17 @@
 ; c2pool Windows Installer — Inno Setup Script
 ;
 ; Usage:
-;   1. Build c2pool.exe and prepare the package directory (see PACKAGE_DIR below)
-;   2. Set PACKAGE_DIR and VCREDIST_PATH below to match your build environment
-;   3. Compile: "C:\...\Inno Setup 6\ISCC.exe" c2pool-setup.iss
+;   1. Build c2pool-<coin>.exe and prepare the package directory (PACKAGE_DIR)
+;   2. Compile, overriding the per-package defines on the ISCC command line:
+;        ISCC.exe c2pool-setup.iss ^
+;          /DPACKAGE_DIR=C:\path\to\c2pool-ltc-0.2.0-windows-x86_64 ^
+;          /DVCREDIST_PATH=C:\...\vc_redist.x64.exe ^
+;          /DMyAppName=c2pool-ltc /DMyAppVersion=0.2.0 ^
+;          /DMyAppExeName=c2pool-ltc.exe ^
+;          /DOutputBase=c2pool-ltc-0.2.0-windows-x86_64-setup
 ;
 ; The package directory should contain:
-;   c2pool.exe, start.bat, lib\*, web-static\*, explorer\*, config\*
+;   <exe>, start.bat, lib\*, web-static\*, explorer\*, config\*
 
 ; ── Configurable paths ──────────────────────────────────────────────────────
 ; Override on ISCC command line: /DPACKAGE_DIR=C:\path\to\package
@@ -17,12 +22,21 @@
   #define VCREDIST_PATH "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Redist\MSVC\v143\vc_redist.x64.exe"
 #endif
 
-; ── App metadata ────────────────────────────────────────────────────────────
-#define MyAppName "c2pool"
-#define MyAppVersion "0.1.1-alpha"
+; ── App metadata (all overridable via /D for per-coin packages) ─────────────
+#ifndef MyAppName
+  #define MyAppName "c2pool"
+#endif
+#ifndef MyAppVersion
+  #define MyAppVersion "0.1.1-alpha"
+#endif
+#ifndef MyAppExeName
+  #define MyAppExeName "c2pool.exe"
+#endif
+#ifndef OutputBase
+  #define OutputBase "c2pool-" + MyAppVersion + "-windows-x86_64-setup"
+#endif
 #define MyAppPublisher "frstrtr"
 #define MyAppURL "https://github.com/frstrtr/c2pool"
-#define MyAppExeName "c2pool.exe"
 
 [Setup]
 AppId={{C2POOL-MINING-POOL}
@@ -30,9 +44,9 @@ AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
-DefaultDirName={autopf}\c2pool
-DefaultGroupName=c2pool
-OutputBaseFilename=c2pool-{#MyAppVersion}-windows-x86_64-setup
+DefaultDirName={autopf}\{#MyAppName}
+DefaultGroupName={#MyAppName}
+OutputBaseFilename={#OutputBase}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -44,8 +58,8 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
 ; Main binary
-Source: "{#PACKAGE_DIR}\c2pool.exe"; DestDir: "{app}"; Flags: ignoreversion
-; DLLs (secp256k1, etc.) — must be next to c2pool.exe for Windows DLL search
+Source: "{#PACKAGE_DIR}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+; DLLs (secp256k1, etc.) — must be next to the exe for Windows DLL search
 Source: "{#PACKAGE_DIR}\lib\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; Web dashboard
 Source: "{#PACKAGE_DIR}\web-static\*"; DestDir: "{app}\web-static"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -58,19 +72,19 @@ Source: "{#PACKAGE_DIR}\start.bat"; DestDir: "{app}"; Flags: ignoreversion
 ; Transition message blobs (authority-signed V36 upgrade signal)
 Source: "{#PACKAGE_DIR}\transition_messages\*"; DestDir: "{app}\transition_messages"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 ; VC++ Redistributable (installed silently, deleted after)
-Source: "{#VCREDIST_PATH}"; DestDir: "{tmp}"; Flags: deleteafterinstall
+Source: "{#VCREDIST_PATH}"; DestDir: "{tmp}"; Flags: deleteafterinstall skipifsourcedoesntexist
 
 [Icons]
-Name: "{group}\c2pool"; Filename: "{app}\c2pool.exe"; Parameters: "--integrated --net litecoin --dashboard-dir ""{app}\web-static"""; WorkingDir: "{app}"
-Name: "{group}\c2pool (start.bat)"; Filename: "{app}\start.bat"; WorkingDir: "{app}"
-Name: "{group}\Uninstall c2pool"; Filename: "{uninstallexe}"
-Name: "{commondesktop}\c2pool"; Filename: "{app}\c2pool.exe"; Parameters: "--integrated --net litecoin --dashboard-dir ""{app}\web-static"""; WorkingDir: "{app}"
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--integrated --net litecoin --dashboard-dir ""{app}\web-static"""; WorkingDir: "{app}"
+Name: "{group}\{#MyAppName} (start.bat)"; Filename: "{app}\start.bat"; WorkingDir: "{app}"
+Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
+Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--integrated --net litecoin --dashboard-dir ""{app}\web-static"""; WorkingDir: "{app}"
 
 [Run]
 ; Install VC++ Runtime (skip if already present)
-Filename: "{tmp}\vc_redist.x64.exe"; Parameters: "/install /quiet /norestart"; StatusMsg: "Installing Visual C++ Runtime..."; Flags: waituntilterminated
+Filename: "{tmp}\vc_redist.x64.exe"; Parameters: "/install /quiet /norestart"; StatusMsg: "Installing Visual C++ Runtime..."; Flags: waituntilterminated skipifdoesntexist
 ; Offer to launch after install
-Filename: "{app}\c2pool.exe"; Description: "Launch c2pool"; Flags: nowait postinstall skipifsilent; Parameters: "--integrated --net litecoin --dashboard-dir ""{app}\web-static"""
+Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent; Parameters: "--integrated --net litecoin --dashboard-dir ""{app}\web-static"""
 
 [Code]
 var

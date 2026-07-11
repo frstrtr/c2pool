@@ -32,6 +32,15 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version string for package names (e.g. 0.2.0). Blank = derive from ref."
+        required: false
+        default: ""
+      coins:
+        description: "JSON array of coins to build (e.g. [\"ltc\"]). Blank = all five."
+        required: false
+        default: ""
 
 concurrency:
   group: release-${{ github.ref }}
@@ -50,14 +59,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        coin: [btc, ltc, dgb, dash, bch]
+        coin: ${{ fromJSON(github.event.inputs.coins || '["btc","ltc","dgb","dash","bch"]') }}
     steps:
       - uses: actions/checkout@v6
 
       - name: Resolve version
         id: ver
         run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           else
             echo "version=0.0.0-${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
@@ -186,7 +197,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        coin: [btc, ltc, dgb, dash, bch]
+        coin: ${{ fromJSON(github.event.inputs.coins || '["btc","ltc","dgb","dash","bch"]') }}
         arch: [arm64, x86_64]
         include:
           - arch: arm64
@@ -199,7 +210,9 @@ jobs:
       - name: Resolve version
         id: ver
         run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           else
             echo "version=0.0.0-${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
@@ -299,14 +312,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        coin: [btc, ltc, dgb, dash, bch]
+        coin: ${{ fromJSON(github.event.inputs.coins || '["btc","ltc","dgb","dash","bch"]') }}
     steps:
       - uses: actions/checkout@v6
 
       - name: Resolve version
         id: ver
         run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           else
             echo "version=0.0.0-${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
@@ -374,6 +389,24 @@ jobs:
           name: pkg-macos-${{ matrix.coin }}
           path: c2pool-*-macos-universal.zip
 
+      - name: Build DMG installer
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          COIN="${{ matrix.coin }}"
+          bash installer/macos/create-dmg.sh \
+            --staged "c2pool-${COIN}-${VERSION}-macos-universal" \
+            --name "c2pool-${COIN}" \
+            --version "${VERSION}" \
+            --arch universal
+
+      - name: Upload DMG installer
+        if: steps.presence.outputs.exists == '1'
+        uses: actions/upload-artifact@v7
+        with:
+          name: pkg-macos-dmg-${{ matrix.coin }}
+          path: c2pool-*-macos-universal.dmg
+
   # ════════════════════════════════════════════════════════════════════════════
   # Windows x86_64 (MSVC 2022, Conan)
   # ════════════════════════════════════════════════════════════════════════════
@@ -383,7 +416,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        coin: [btc, ltc, dgb, dash, bch]
+        coin: ${{ fromJSON(github.event.inputs.coins || '["btc","ltc","dgb","dash","bch"]') }}
     steps:
       - uses: actions/checkout@v6
 
@@ -391,7 +424,9 @@ jobs:
         id: ver
         shell: bash
         run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           else
             echo "version=0.0.0-${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
@@ -489,6 +524,29 @@ jobs:
         with:
           name: pkg-windows-${{ matrix.coin }}
           path: c2pool-*-windows-x86_64.zip
+
+      - name: Build setup.exe installer (Inno Setup)
+        if: steps.presence.outputs.exists == '1'
+        shell: cmd
+        run: |
+          choco install innosetup -y --no-progress
+          set "PKG=c2pool-${{ matrix.coin }}-${{ steps.ver.outputs.version }}-windows-x86_64"
+          for /f "delims=" %%i in ('powershell -NoProfile -Command "(Get-ChildItem -Path 'C:\Program Files\Microsoft Visual Studio\2022' -Recurse -Filter vc_redist.x64.exe -ErrorAction SilentlyContinue | Select-Object -First 1).FullName"') do set "VCREDIST=%%i"
+          "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\windows\c2pool-setup.iss ^
+            /DPACKAGE_DIR="%CD%\%PKG%" ^
+            /DVCREDIST_PATH="%VCREDIST%" ^
+            /DMyAppName=c2pool-${{ matrix.coin }} ^
+            /DMyAppVersion=${{ steps.ver.outputs.version }} ^
+            /DMyAppExeName=c2pool-${{ matrix.coin }}.exe ^
+            /DOutputBase=%PKG%-setup
+          copy "installer\windows\Output\%PKG%-setup.exe" .
+
+      - name: Upload setup.exe installer
+        if: steps.presence.outputs.exists == '1'
+        uses: actions/upload-artifact@v7
+        with:
+          name: pkg-windows-setup-${{ matrix.coin }}
+          path: c2pool-*-windows-x86_64-setup.exe
 
   # ════════════════════════════════════════════════════════════════════════════
   # Aggregate: single SHA256SUMS over every produced package; on tags,
