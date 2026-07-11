@@ -18,7 +18,7 @@
 //
 // Consensus-safe: only affects pubkey_hash stamped into shares on this node.
 //
-// Port of p2pool-v36 work.py --redistribute (commit de76224a) + FUTURE.md V2 spec.
+// C++ implementation of the p2pool-v36 work.py --redistribute design (ref commit de76224a) + FUTURE.md V2 spec.
 
 #include "config_pool.hpp"
 #include "share_tracker.hpp"

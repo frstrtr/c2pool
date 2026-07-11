@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 /**
- * p2pool DistanceSkipList — O(log n) amortized ancestor lookups.
+ * DistanceSkipList — O(log n) amortized ancestor lookups.
  *
- * Direct translation of p2pool util/skiplist.py + util/forest.py DistanceSkipList.
+ * C++ implementation of the p2pool DistanceSkipList design.
+ * Protocol/algorithm originally by forrestv (github.com/forrestv/p2pool).
+ * Independent C++ implementation; not derived from p2pool source code.
  * Uses relative distance jumps (no absolute heights) and geometric random
  * skip distances. Builds skip pointers lazily during traversal.
- *
- * p2pool source: util/skiplist.py (SkipList base), util/forest.py:21-48 (DistanceSkipList)
  *
  * Key differences from Bitcoin Core skip list:
  *   - No stored heights (safe after pruning)
@@ -35,7 +35,7 @@ namespace chain {
  * Level 0 = direct parent (always present).
  * Higher levels built lazily during traversal.
  *
- * p2pool ref: util/forest.py:21-48, util/skiplist.py:3-59
+ * Implements p2pool's get_nth_parent skip-list algorithm.
  */
 template <typename HashType, typename HasherType>
 class DistanceSkipList
@@ -95,7 +95,7 @@ public:
      * Get the nth ancestor of start.
      * Matches p2pool: tracker.get_nth_parent_hash(start, n)
      *
-     * Translation of util/skiplist.py SkipList.__call__(start, n) with
+     * C++ implementation of the p2pool SkipList.__call__(start, n) query, with
      * DistanceSkipList's get_delta/combine_deltas/initial_solution/apply_delta/judge/finalize.
      *
      * On first traversal, builds skip pointers lazily → O(n).

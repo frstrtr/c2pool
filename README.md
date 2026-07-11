@@ -7,6 +7,10 @@ C++ reimplementation of [forrestv/p2pool](https://github.com/p2pool/p2pool) targ
 Bitcoin wiki: <https://en.bitcoin.it/wiki/P2Pool>
 Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 
+## Credits
+
+c2pool is an independent C++ implementation of the P2Pool sharechain concept originally created by Forrest Voight (forrestv, <https://github.com/forrestv/p2pool>).
+
 > **First merged-mined DOGE block:** [#6135703](https://blockchair.com/dogecoin/block/f84500c25a4cce2a08887f29763726bd5ecec7b66fed65a88b181fb0b0ab2383) (2026-03-23) — decentralized LTC+DOGE merged mining via P2Pool V36, cross-validated with c2pool on shared share chain
 >
 > **First daemonless DOGE block:** (2026-03-27) — DOGE block accepted on testnet4alpha via embedded SPV P2P, no dogecoind RPC needed
@@ -60,7 +64,7 @@ Get-FileHash c2pool-*-setup.exe -Algorithm SHA256
 
 All release binaries are built from the tagged git commit. To verify a binary matches the source:
 
-1. Check the git tag: `git log v0.1.1-alpha --oneline -1`
+1. Check the git tag: `git log v0.14.0-v36-ltc-doge --oneline -1`
 2. Build from that tag following the platform-specific guide
 3. Compare the SHA256 of your binary with the release `SHA256SUMS`
 
@@ -334,16 +338,16 @@ complete examples with all options documented.
 | `--rpcuser` | `ltc_rpc_user` | -- | RPC username |
 | `--rpcpassword` | `ltc_rpc_password` | -- | RPC password |
 | `--max-conns` | -- | 8 | Target outbound P2P peers |
-| `--stratum-min-diff` | `min_difficulty` | 0.001 | Vardiff floor |
+| `--stratum-min-diff` | `min_difficulty` | 0.0005 | Vardiff floor |
 | `--stratum-max-diff` | `max_difficulty` | 65536 | Vardiff ceiling |
-| `--stratum-target-time` | `target_time` | 10 | Seconds between pseudoshares |
+| `--stratum-target-time` | `target_time` | 3.0 | Seconds between pseudoshares |
 | `--no-vardiff` | `vardiff_enabled` | true | Disable auto-difficulty |
 | `--max-coinbase-outputs` | `max_coinbase_outputs` | 4000 | Max coinbase outputs |
 | `--network-id` | `network_id` | 0 | Private chain identifier (hex) |
 | `--log-level` | `log_level` | INFO | trace/debug/info/warning/error |
 | `--log-file` | `log_file` | debug.log | Log filename |
 | `--log-rotation-mb` | `log_rotation_size_mb` | 100 | Log rotation threshold (MB) |
-| `--log-max-mb` | `log_max_total_mb` | 50 | Max rotated log space (MB) |
+| `--log-max-mb` | `log_max_total_mb` | 1000 | Total size cap across all rotated log files (MB) |
 | `--p2p-max-peers` | `p2p_max_peers` | 30 | Max total P2P peers |
 | `--ban-duration` | `ban_duration` | 300 | P2P ban duration (seconds) |
 | `--rss-limit-mb` | `rss_limit_mb` | 4000 | RSS memory abort limit (MB) |
@@ -375,7 +379,7 @@ complete examples with all options documented.
 | `/recent_blocks` | Recently found blocks |
 | `/connected_miners` | Connected stratum workers |
 | `/stratum_stats` | Per-worker stratum statistics (hashrate, difficulty, accepted/rejected) |
-| `/sharechain_stats` | Share chain state |
+| `/sharechain/stats` | Share chain state |
 | `/miner_thresholds` | Minimum viable hashrate, dust range |
 | `/merged_stats` | Merged mining block statistics |
 | `/current_merged_payouts` | Current merged mining payouts |
@@ -520,10 +524,18 @@ cd build && ctest --output-on-failure -j$(nproc)
 
 ## V37 development
 
-- Github pages: <[https://t.me/c2pooldev](https://frstrtr.github.io/c2pool/)>
-- V37 dev branch primitives: <[https://github.com/frstrtr/c2pool/compare/master...v37-dev](https://github.com/frstrtr/c2pool/compare/master...v37-dev)>
+- **V37 Purple Paper** (Work Receipts design): https://frstrtr.github.io/c2pool/purple-paper.html
+- Dev chat (Telegram): https://t.me/c2pooldev
+- V37 dev-branch primitives (diff): https://github.com/frstrtr/c2pool/compare/master...v37-dev
 
 ---
+
+## License
+
+- **c2pool daemon** (this repository): [AGPL-3.0-or-later](LICENSE). Network use triggers the AGPL source-provision obligation.
+- **c2pool-core-engine** (extracted primitive layer): Apache-2.0, in the separate [c2pool-core-engine](https://github.com/frstrtr/c2pool-core-engine) repository.
+- **Bundled `src/btclibs/` and third-party crypto**: retain their original MIT licenses (notices preserved in-file).
+- **V37 Purple Paper** (frstrtr.github.io/c2pool): MIT License (as with the Bitcoin whitepaper). The remaining site articles are © technocore.one, all rights reserved.
 
 ### Install guides
 - [Ubuntu / Debian / Linux](doc/build-unix.md)

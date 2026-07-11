@@ -474,7 +474,8 @@ void print_help() {
     std::cout << "  --cors-origin ORIGIN      CORS Access-Control-Allow-Origin (default: disabled)\n";
     std::cout << "  --payout-window N         PPLNS payout window in seconds (default: 86400)\n";
     std::cout << "  --storage-save-interval N Periodic sharechain save interval in seconds (default: 300)\n";
-    std::cout << "  --dashboard-dir PATH      Dashboard static files directory (default: web-static)\n\n";
+    std::cout << "  --dashboard-dir PATH      Dashboard static files directory (default: web-static)\n";
+    std::cout << "  --analytics-id ID         Google Analytics measurement ID (e.g. G-XXXXXXXXXX)\n\n";
 
     std::cout << "BLOCKCHAIN SUPPORT:\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
@@ -613,7 +614,7 @@ int main(int argc, char* argv[]) {
     std::string redistribute_mode_str = "pplns";
 
     // Stratum tuning (configurable via CLI or YAML)
-    core::StratumConfig stratum_config;  // defaults: min=0.001, max=65536, target=10s, vardiff=true
+    core::StratumConfig stratum_config;  // defaults: min=0.0005, max=65536, target=3.0s, vardiff=true
 
     // Operational tuning (configurable via CLI or YAML)
     std::string log_file;                        // empty = default "debug.log"
@@ -1086,6 +1087,10 @@ int main(int argc, char* argv[]) {
             dashboard_dir = argv[++i];
             cli_explicit.insert("dashboard_dir");
         }
+        else if (arg == "--analytics-id" && i + 1 < argc) {
+            analytics_id = argv[++i];
+            cli_explicit.insert("analytics_id");
+        }
         // Seed node: -n HOST:PORT (p2pool compat)
         else if (arg == "-n" && i + 1 < argc) {
             seed_nodes.push_back(argv[++i]);
@@ -1228,6 +1233,14 @@ int main(int argc, char* argv[]) {
             if (!cli_explicit.count("message_blob_hex") && cfg["message_blob_hex"])
                 operator_message_blob_hex = cfg["message_blob_hex"].as<std::string>();
 
+            // Custom coinbase scriptSig text (CLI --coinbase-text takes precedence)
+            if (!cli_explicit.count("coinbase_text") && cfg["coinbase_text"])
+                coinbase_text = cfg["coinbase_text"].as<std::string>();
+
+            // Private sharechain identifier, hex (CLI --network-id/--chain-id takes precedence)
+            if (!cli_explicit.count("network_id") && cfg["network_id"])
+                network_id = std::stoull(cfg["network_id"].as<std::string>(), nullptr, 16);
+
             // Stratum tuning
             if (!cli_explicit.count("stratum_min_diff") && cfg["min_difficulty"])
                 stratum_config.min_difficulty = cfg["min_difficulty"].as<double>();
@@ -1263,7 +1276,7 @@ int main(int argc, char* argv[]) {
                 storage_save_interval = cfg["storage_save_interval"].as<int>();
             if (!cli_explicit.count("dashboard_dir") && cfg["dashboard_dir"])
                 dashboard_dir = cfg["dashboard_dir"].as<std::string>();
-            if (cfg["analytics_id"])
+            if (!cli_explicit.count("analytics_id") && cfg["analytics_id"])
                 analytics_id = cfg["analytics_id"].as<std::string>();
             if (cfg["explorer"])
                 explorer_enabled = cfg["explorer"].as<bool>();
@@ -1360,8 +1373,12 @@ int main(int argc, char* argv[]) {
             "THIS IS EXPERIMENTAL SOFTWARE -- USE AT YOUR OWN RISK",
             "THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY",
             "OF ANY KIND, EXPRESS OR IMPLIED.",
-            "Distributed under the MIT/X11 software license",
-            "See http://www.opensource.org/licenses/mit-license.php",
+            "Distributed under the GNU AGPL-3.0-or-later license.",
+            "This is free software; see the source for copying terms.",
+            "AGPL section 13: if you run a modified version and let",
+            "users interact with it over a network, you must offer",
+            "them the corresponding source code.",
+            "Source: https://github.com/frstrtr/c2pool",
         }, rows);
         for (const auto& r : rows) LOG_WARNING << r;
     }

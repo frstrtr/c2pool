@@ -133,7 +133,7 @@ void HashrateTracker::set_difficulty_hint(double hint) {
 // Matches p2pool's stratum vardiff algorithm (stratum.py:546-573).
 // Adjusts difficulty to target ~target_time_per_mining_share_ seconds per pseudoshare.
 //
-// Two triggers (matching p2pool exactly):
+// Two triggers (as in p2pool's vardiff):
 //   1) Normal: after VARDIFF_TRIGGER shares accumulated.
 //   2) Timeout: elapsed time exceeds TIMEOUT_MULT * N * target_time.
 //

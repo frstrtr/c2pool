@@ -65,7 +65,7 @@ struct MinerPayout {
     uint64_t                   amount{0};
 };
 
-// Replica of p2pool-dash/p2pool/data.py:181-231 generate_transaction
+// C++ implementation of the p2pool-dash generate_transaction design
 // tx_outs construction. Returns tx_outs in the exact on-wire order:
 //     worker_tx (sorted by script bytes, excluding DONATION) ||
 //     payments_tx (packed_payments in GBT order)             ||
@@ -75,7 +75,7 @@ struct MinerPayout {
 // For genesis (no previous shares on the chain), pass an empty weights
 // map and total_weight == 0. For non-genesis shares the caller supplies
 // tracker-derived PPLNS weights from share_builder::walk_cumulative_weights
-// (a linear port of p2pool-dash's WeightsSkipList — O(N) per call rather
+// (a linear C++ implementation of p2pool-dash's WeightsSkipList — O(N) per call rather
 // than the Python upstream's O(log N), but consensus-equivalent since
 // chain_length=4320 makes the walk cheap).
 inline std::vector<MinerPayout> compute_dash_payouts(
