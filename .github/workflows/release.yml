@@ -76,7 +76,15 @@ jobs:
 
       - name: Install system dependencies
         if: steps.presence.outputs.exists == '1'
+        # Serialize apt across the concurrent coin package jobs sharing the one
+        # c2pool-build self-hosted host. Without this, the 5 Linux matrix cells
+        # race on /var/lib/apt/lists/lock (and corrupt srcpkgcache.bin), and the
+        # loser fails before the build starts (e.g. LTC on v0.2.0, run
+        # 29148852306). flock on a host-wide lock makes apt atomic; on
+        # github-hosted runners the lock is per-VM and uncontended, so no-op.
         run: |
+          exec {lockfd}>/tmp/c2pool-apt.lock
+          flock "$lockfd"
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             g++ cmake make libleveldb-dev libsecp256k1-dev
