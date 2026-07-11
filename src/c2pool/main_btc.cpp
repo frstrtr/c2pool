@@ -1145,9 +1145,44 @@ int main(int argc, char* argv[])
             min_header.m_bits      = read_le32(header_80b.data() + 72);
             min_header.m_nonce     = read_le32(header_80b.data() + 76);
 
-            // ── Wrap coinbase + convert merkle branches ──
-            BaseScript coinbase_bs(std::vector<unsigned char>(
-                full_coinbase.begin(), full_coinbase.end()));
+            // ── Extract coinbase INPUT scriptSig (NOT the full tx) ──
+            // A share's m_coinbase field must be ONLY the coinbase input
+            // scriptSig (BIP34 height + pool marker); share_init_verify enforces
+            // the consensus 2..100 byte bound. Wrapping the whole serialized
+            // coinbase tx here tripped "bad coinbase size" and left every V35
+            // share unverified. The full tx still rides via actual_coinbase_bytes
+            // for gentx byte-parity. Mirrors the BCH fix in bch/pool_entrypoint.hpp.
+            std::vector<unsigned char> coinbase_scriptSig;
+            {
+                size_t p = 0;
+                bool ok = true;
+                auto need = [&](size_t n) { return p + n <= full_coinbase.size(); };
+                auto rd_varint = [&](uint64_t& out) -> bool {
+                    if (!need(1)) return false;
+                    uint8_t ch = full_coinbase[p++];
+                    if (ch < 253) { out = ch; return true; }
+                    size_t n = (ch == 253) ? 2 : (ch == 254) ? 4 : 8;
+                    if (!need(n)) return false;
+                    out = 0;
+                    for (size_t i = 0; i < n; ++i)
+                        out |= uint64_t(full_coinbase[p++]) << (8 * i);
+                    return true;
+                };
+                uint64_t vin = 0, slen = 0;
+                if (need(4)) p += 4; else ok = false;            // version
+                ok = ok && rd_varint(vin) && vin >= 1;           // tx_in count
+                if (ok && need(36)) p += 36; else ok = false;    // prevout (32+4)
+                ok = ok && rd_varint(slen);                      // scriptSig length
+                if (ok && need(slen)) {
+                    coinbase_scriptSig.assign(full_coinbase.begin() + p,
+                                              full_coinbase.begin() + p + slen);
+                } else {
+                    LOG_WARNING << "[BTC-CREATE-SHARE] cannot parse coinbase scriptSig from "
+                                << full_coinbase.size() << "B tx -- share skipped";
+                    return uint256::ZERO;
+                }
+            }
+            BaseScript coinbase_bs(coinbase_scriptSig);
 
             // Wire format for stratum branches is hex of LE-internal bytes
             // (see get_stratum_merkle_branches).  Parse via ParseHex+memcpy
