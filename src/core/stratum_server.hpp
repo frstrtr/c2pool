@@ -154,6 +154,7 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
     uint64_t accepted_shares_ = 0;
     uint64_t rejected_shares_ = 0;
     uint64_t stale_shares_    = 0;
+    uint64_t doa_shares_      = 0;  // block-template changed at submit (live-vs-frozen prevhash mismatch); accounting only, share still broadcasts
     std::chrono::steady_clock::time_point connected_at_;
     std::string session_id_;
 

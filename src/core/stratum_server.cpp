@@ -936,6 +936,7 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
                      << ": block template changed (job=" << job_id
                      << " job_prev=" << job_it->second.gbt_prevhash.substr(0, 16)
                      << " current_prev=" << current_prevhash.substr(0, 16) << ")";
+            ++doa_shares_;
             // DON'T set job.stale_info here — it would break ref_hash.
             // The share is still created and broadcast (matches p2pool behavior).
             // DOA tracking is for statistics/dashboard only.
