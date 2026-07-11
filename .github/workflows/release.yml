@@ -521,6 +521,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
+            --repo "${{ github.repository }}" \
             --draft \
             --title "c2pool ${GITHUB_REF_NAME}" \
             --notes "Draft assembled by release.yml — operator reviews and publishes manually." \
