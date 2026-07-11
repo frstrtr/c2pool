@@ -504,6 +504,23 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_embedded_gbt PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_embedded_gbt "" AUTO)
 
+    # DASH embedded-vs-dashd work-source selector (S8 embedded_gbt live-wire
+    # capstone): select_dash_work() prefers the locally-assembled embedded
+    # template (build_embedded_workdata) and falls back to dashd
+    # getblocktemplate when the coin-state bundle is not viable. Routing +
+    # retained-fallback KAT; harness-free (embedded builder injected as a stub,
+    # oracle-parity already pinned by test_dash_embedded_gbt). Same link set as
+    # the embedded_gbt capstone (work_source.hpp includes embedded_gbt.hpp).
+    add_executable(test_dash_work_source test_dash_work_source.cpp)
+    target_link_libraries(test_dash_work_source PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_work_source PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_work_source "" AUTO)
+
     # DASH CSimplifiedMNListDiff (mnlistdiff wire, S8.1 leaf): vendored diff
     # round-trip + dashcore field-layout pin + apply_diff semantics. Header-only
     # over the SimplifiedMNList leaf + coin/transaction; no ltc/pool SCC dep.
