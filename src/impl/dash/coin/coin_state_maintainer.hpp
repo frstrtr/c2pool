@@ -29,6 +29,7 @@
 
 #include <impl/dash/coin/node_coin_state.hpp>    // NodeCoinState
 #include <impl/dash/coin/mn_state_machine.hpp>   // MNState
+#include <impl/dash/coin/block.hpp>            // BlockType
 #include <impl/dash/coin/transaction.hpp>        // MutableTransaction
 
 #include <core/uint256.hpp>
@@ -91,6 +92,26 @@ public:
         m_version              = version;
         m_have_tip             = true;
         republish();
+    }
+
+    /// Header / think path (block connect): fold a newly-connected block's
+    /// special txs into the DMN list incrementally, mirroring dashcore's
+    /// RebuildListFromBlock (MnStateMachine::apply_block). This is the LIVE
+    /// driver that keeps the masternode set the embedded coinbase pays current
+    /// BETWEEN full mnlistdiff snapshots -- on_mn_list_update() stays the
+    /// authoritative resync and is UNCHANGED. MN-readiness is refreshed from
+    /// the post-apply list size: a block that empties the set (all collateral
+    /// spent) drops the bundle to the dashd fallback rather than backing a
+    /// template with a phantom payee. Returns apply_block's ApplyResult.
+    MnStateMachine::ApplyResult
+    on_block_connected(const dash::coin::BlockType& block, uint32_t height) {
+        auto r    = m_state.mnstates().apply_block(block, height);
+        m_have_mn = m_state.mnstates().size() != 0;
+        if (!m_have_mn)
+            demote();
+        else
+            republish();
+        return r;
     }
 
     /// Reorg / MN-list gap / mempool flush: invalidate the live bundle so the
