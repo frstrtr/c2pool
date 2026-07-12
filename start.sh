@@ -7,13 +7,23 @@ CONFIG="${1:-$DIR/config/c2pool_mainnet.yaml}"
 EXPLORER_PORT=9090
 WEB_PORT=8080
 
+# Locate the packaged coin binary. release.yml packages it per-coin as
+# c2pool-<coin> (c2pool-ltc, c2pool-btc, ...), so resolve by glob rather
+# than a hard-coded name; fall back to a plain c2pool for source builds.
+BIN=$(find "$DIR" -maxdepth 1 -type f -name "c2pool-*" -perm -u+x 2>/dev/null | head -1)
+[ -z "$BIN" ] && [ -x "$DIR/c2pool" ] && BIN="$DIR/c2pool"
+if [ -z "$BIN" ]; then
+    echo "ERROR: no c2pool binary found in $DIR" >&2
+    exit 1
+fi
+
 # Parse web_port from config if present
 if [ -f "$CONFIG" ]; then
-    WP=$(grep -E "^web_port:" "$CONFIG" 2>/dev/null | awk '{print $2}')
+    WP=$(grep -E "^web_port:" "$CONFIG" 2>/dev/null | awk "{print \$2}")
     [ -n "$WP" ] && WEB_PORT="$WP"
 fi
 
-echo "=== c2pool v0.1.1-alpha ==="
+echo "=== $(basename "$BIN") ==="
 echo "Config:   $CONFIG"
 echo "Web:      http://0.0.0.0:${WEB_PORT}"
 echo "Explorer: http://0.0.0.0:${EXPLORER_PORT}"
@@ -21,14 +31,14 @@ echo ""
 
 # Start c2pool with bundled libs
 export LD_LIBRARY_PATH="$DIR/lib:${LD_LIBRARY_PATH:-}"
-"$DIR/c2pool" --config "$CONFIG" --dashboard-dir "$DIR/web-static" &
+"$BIN" --config "$CONFIG" --dashboard-dir "$DIR/web-static" &
 C2POOL_PID=$!
 
 # Wait for the explorer API to be ready (callbacks wired after full init)
 echo "Waiting for c2pool to initialize..."
 for i in $(seq 1 120); do
     RESP=$(curl -s "http://127.0.0.1:${WEB_PORT}/api/explorer/getblockchaininfo" 2>/dev/null || true)
-    if echo "$RESP" | grep -q '"blocks"'; then
+    if echo "$RESP" | grep -q "\"blocks\""; then
         echo "c2pool explorer API ready."
         break
     fi
