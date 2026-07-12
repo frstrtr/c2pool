@@ -31,20 +31,19 @@ c2pool is an independent C++ implementation of the P2Pool sharechain concept ori
 |----|---------|----------|-------|------|--------|
 | Ubuntu | 24.04.4 LTS | GCC 13.3 | 1.90 (Conan) | x86_64 | Working |
 | macOS | 26.3.1 (Tahoe) | Apple Clang 21.0 | 1.90 (Homebrew) | x86_64 Intel | Working |
-| macOS | — | Apple Clang | 1.90 (Homebrew) | arm64 (M-series) | Supported, untested |
+| macOS | 26.3.1 (Tahoe) | Apple Clang 21.0 | 1.90 (Homebrew) | arm64 (M-series) | Working |
 | Windows | 11 (26100) | MSVC 2022 | 1.90 (Conan) | x86_64 | Working |
 
 ---
 
 ## Download
 
-Pre-built binaries are available on the [Releases page](https://github.com/frstrtr/c2pool/releases).
+Pre-built binaries are available on the [Releases page](https://github.com/frstrtr/c2pool/releases). The current release is **v0.2.0** (LTC + DOGE v36); packages are named `c2pool-ltc-<version>-<platform>`.
 
 | Platform | Package | Notes |
 |----------|---------|-------|
 | Linux x86_64 | `.tar.gz` | Extract and run `./start.sh` |
-| macOS Intel | `.zip` | Bundled dylibs, no Homebrew needed |
-| macOS Apple Silicon | `.zip` | Native arm64 binary |
+| macOS (universal) | `.dmg` or `.zip` | Single universal arm64 + x86_64 build (lipo-merged); bundled dylibs, no Homebrew needed |
 | Windows x86_64 | `.zip` or `setup.exe` | Installer bundles VC++ Runtime + firewall rules |
 
 ### Verify downloads
@@ -64,7 +63,7 @@ Get-FileHash c2pool-*-setup.exe -Algorithm SHA256
 
 All release binaries are built from the tagged git commit. To verify a binary matches the source:
 
-1. Check the git tag: `git log v0.14.0-v36-ltc-doge --oneline -1`
+1. Check the git tag: `git log v0.2.0 --oneline -1`
 2. Build from that tag following the platform-specific guide
 3. Compare the SHA256 of your binary with the release `SHA256SUMS`
 
@@ -104,7 +103,7 @@ cmake --build . --target c2pool -j$(sysctl -n hw.ncpu)
 
 **Windows (setup.exe or build from source)**
 
-Download `c2pool-VERSION-windows-x86_64-setup.exe` from [Releases](https://github.com/frstrtr/c2pool/releases) and run the installer. Or build from source — see [doc/build-windows.md](doc/build-windows.md).
+Download `c2pool-ltc-VERSION-windows-x86_64-setup.exe` from [Releases](https://github.com/frstrtr/c2pool/releases) and run the installer. Or build from source — see [doc/build-windows.md](doc/build-windows.md).
 
 That's it. No litecoind, no dogecoind, no config file. The node starts in
 **integrated P2P pool mode** with embedded LTC and DOGE SPV nodes, connects
@@ -317,7 +316,7 @@ complete examples with all options documented.
 | `--no-embedded-ltc` | | | Disable embedded LTC, use RPC daemon |
 | `--embedded-doge` | `embedded_doge` | **true** | Embedded DOGE SPV for merged mining |
 | `--no-embedded-doge` | | | Disable embedded DOGE |
-| `--net` | -- | litecoin | Blockchain: `litecoin`, `bitcoin`, `dogecoin` |
+| `--net` | -- | litecoin | Blockchain: `litecoin`, `digibyte`, `bitcoin`, `dogecoin` |
 | `--testnet` | `testnet` | false | Enable testnet mode |
 | `--config FILE` | -- | -- | YAML config file path |
 | `--address` | `solo_address` | -- | Node operator payout address (optional) |
@@ -392,7 +391,8 @@ complete examples with all options documented.
 | `/api/explorer/getblock` | Full block JSON by hash or height (loopback-only) |
 
 See [docs/DASHBOARD_INTEGRATION.md](docs/DASHBOARD_INTEGRATION.md) for the
-complete API reference.
+complete REST API reference and dashboard/explorer integration guide (and
+[docs/FAQ.md](docs/FAQ.md) for common questions).
 
 **Web dashboard** — served from `web-static/` by default:
 
@@ -484,7 +484,7 @@ See [above](#configuration-reference) for details.
 
 | Target | Description |
 |--------|-------------|
-| `c2pool` | Primary binary |
+| `c2pool-ltc` | Primary binary — release packages ship this per-coin name (`c2pool` is the dev-build alias) |
 | `test_hardening` | Softfork gate + reply-matcher regression tests |
 | `test_share_messages` | V36 authority message decrypt/verify tests |
 | `test_coin_broadcaster` | Coin peer-manager and broadcaster tests |
