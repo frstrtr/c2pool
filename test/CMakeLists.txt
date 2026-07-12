@@ -534,6 +534,19 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_node_coin_state PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_node_coin_state "" AUTO)
 
+    # CoinStateMaintainer: drives NodeCoinState off async tip/MN/mempool update
+    # events (readiness gate: MN+tip required before publish). Same link set as
+    # test_dash_node_coin_state -- header-only over the work_source selector set.
+    add_executable(test_dash_coin_state_maintainer test_dash_coin_state_maintainer.cpp)
+    target_link_libraries(test_dash_coin_state_maintainer PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_coin_state_maintainer PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_coin_state_maintainer "" AUTO)
+
     # DASH CSimplifiedMNListDiff (mnlistdiff wire, S8.1 leaf): vendored diff
     # round-trip + dashcore field-layout pin + apply_diff semantics. Header-only
     # over the SimplifiedMNList leaf + coin/transaction; no ltc/pool SCC dep.
