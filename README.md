@@ -499,7 +499,7 @@ cd build && ctest --output-on-failure -j$(nproc)
 
 | Area | Status |
 |---|---|
-| V36 share format (LTC parent chain) | Active development |
+| V36 share format (LTC parent chain) | Released (v0.2.0); prod cutover gated on crossing soak |
 | V36 share format (DGB Scrypt parent chain) | In development |
 | Merged mining (DOGE, PEP, BELLS, LKY, JKC, SHIC) | Working |
 | Embedded LTC SPV node | Working |
