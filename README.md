@@ -116,6 +116,8 @@ Miners connect to stratum and set their LTC payout address as the username
 
 Full step-by-step guides: [Linux](doc/build-unix.md) | [macOS](doc/build-macos.md) | [Windows](doc/build-windows.md)
 
+Common operator questions (merged coins, payouts, dashboard): [docs/FAQ.md](docs/FAQ.md)
+
 ---
 
 ## Operating modes
