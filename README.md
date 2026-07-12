@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/frstrtr/c2pool/actions/workflows/build.yml/badge.svg)](https://github.com/frstrtr/c2pool/actions/workflows/build.yml)
 
-C++ reimplementation of [forrestv/p2pool](https://github.com/p2pool/p2pool) targeting the **V36 share format** with Litecoin + multi-chain merged mining (DOGE, PEP, BELLS, LKY, JKC, SHIC). DigiByte Scrypt support planned as an additional parent chain.
+C++ reimplementation of [forrestv/p2pool](https://github.com/p2pool/p2pool) targeting the **V36 share format** with Litecoin + multi-chain merged mining (DOGE, PEP, BELLS, LKY, JKC, SHIC). DigiByte Scrypt support in development as an additional parent chain.
 
 Bitcoin wiki: <https://en.bitcoin.it/wiki/P2Pool>
 Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
@@ -209,8 +209,8 @@ Running `c2pool` with no arguments is equivalent to:
 
 ```
 --integrated --embedded-ltc --embedded-doge --wait-for-peers
---header-checkpoint 3079000:862daf...
---doge-header-checkpoint 6140000:743b7e...
+--header-checkpoint 3088000:4a7fc8d4...
+--doge-header-checkpoint 6160000:51efd04d...
 ```
 
 | Setting | Default | Override |
@@ -218,8 +218,8 @@ Running `c2pool` with no arguments is equivalent to:
 | Operating mode | Integrated P2P pool | `--solo`, `--custodial`, `--sharechain`, `--standalone` |
 | LTC backend | Embedded SPV (DNS seeds) | `--no-embedded-ltc` (requires RPC daemon) |
 | DOGE backend | Embedded SPV | `--no-embedded-doge` (disables merged mining) |
-| LTC bootstrap | Block 3,079,000 | `--header-checkpoint HEIGHT:HASH` |
-| DOGE bootstrap | Block 6,140,000 | `--doge-header-checkpoint HEIGHT:HASH` |
+| LTC bootstrap | Block 3,088,000 | `--header-checkpoint HEIGHT:HASH` |
+| DOGE bootstrap | Block 6,160,000 | `--doge-header-checkpoint HEIGHT:HASH` |
 | Startup mode | Wait for peers (persist=true) | `--genesis` or `--startup-mode auto` |
 | Coin daemon | Not required | `--coind-address` / `--coind-rpc-port` |
 | `--address` | Optional (miners use stratum username) | Required only for `--custodial` |
@@ -346,7 +346,7 @@ complete examples with all options documented.
 | `--no-vardiff` | `vardiff_enabled` | true | Disable auto-difficulty |
 | `--max-coinbase-outputs` | `max_coinbase_outputs` | 4000 | Max coinbase outputs |
 | `--network-id` | `network_id` | 0 | Private chain identifier (hex) |
-| `--log-level` | `log_level` | INFO | trace/debug/info/warning/error |
+| `--log-level` | `log_level` | trace | trace/debug/info/warning/error |
 | `--log-file` | `log_file` | debug.log | Log filename |
 | `--log-rotation-mb` | `log_rotation_size_mb` | 100 | Log rotation threshold (MB) |
 | `--log-max-mb` | `log_max_total_mb` | 1000 | Total size cap across all rotated log files (MB) |
@@ -367,7 +367,7 @@ complete examples with all options documented.
 | -- | `explorer_depth_doge` | 1440 | DOGE blocks to keep in explorer store |
 | `--coinbase-text` | `coinbase_text` | /c2pool/ | Custom coinbase scriptSig text |
 | `--message-blob-hex` | -- | -- | V36 authority message blob |
-| `--doge-testnet4alpha` | -- | false | Use DOGE testnet4alpha |
+| `--doge-testnet4alpha` | `doge_testnet4alpha` | false | Use DOGE testnet4alpha |
 
 ---
 
@@ -500,7 +500,7 @@ cd build && ctest --output-on-failure -j$(nproc)
 | Area | Status |
 |---|---|
 | V36 share format (LTC parent chain) | Active development |
-| V36 share format (DGB Scrypt parent chain) | Planned |
+| V36 share format (DGB Scrypt parent chain) | In development |
 | Merged mining (DOGE, PEP, BELLS, LKY, JKC, SHIC) | Working |
 | Embedded LTC SPV node | Working |
 | Embedded DOGE SPV node | Working |
@@ -510,7 +510,7 @@ cd build && ctest --output-on-failure -j$(nproc)
 | Payout / PPLNS | Working |
 | Authority message blobs (V36) | Working |
 | Solo / Custodial modes | Working |
-| Test suite | 501 tests passing |
+| Test suite | 1,875 test cases across 194 suites |
 
 > **Need a pool running today?**
 > [frstrtr/p2pool-merged-v36](https://github.com/frstrtr/p2pool-merged-v36) — production Python V36 pool (LTC + DGB + DOGE, Docker, dashboard).
