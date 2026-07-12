@@ -1,16 +1,28 @@
 @echo off
-setlocal
+setlocal enabledelayedexpansion
 set DIR=%~dp0
 set CONFIG=%1
 if "%CONFIG%"=="" set CONFIG=%DIR%config\c2pool_mainnet.yaml
 
-echo === c2pool ===
+:: Locate the packaged coin binary. release.yml packages it per-coin as
+:: c2pool-<coin>.exe, so resolve by glob rather than a hard-coded name;
+:: fall back to a plain c2pool.exe for source builds.
+set BIN=
+for %%f in ("%DIR%c2pool-*.exe") do set BIN=%%f
+if "!BIN!"=="" if exist "%DIR%c2pool.exe" set BIN=%DIR%c2pool.exe
+if "!BIN!"=="" (
+    echo ERROR: no c2pool binary found in %DIR%
+    exit /b 1
+)
+for %%f in ("!BIN!") do set BINNAME=%%~nxf
+
+echo === !BINNAME! ===
 echo Config:   %CONFIG%
 echo Web:      http://0.0.0.0:8080
 echo Explorer: http://0.0.0.0:9090
 
 :: Start c2pool
-start /B "" "%DIR%c2pool.exe" --config "%CONFIG%" --dashboard-dir "%DIR%web-static"
+start /B "" "!BIN!" --config "%CONFIG%" --dashboard-dir "%DIR%web-static"
 
 :: Wait for API
 :wait_loop
