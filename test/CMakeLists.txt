@@ -547,6 +547,19 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_coin_state_maintainer PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_coin_state_maintainer "" AUTO)
 
+    # NodeImpl embedded coin-state HOLD KAT -- constructs a real NodeImpl, so
+    # it links the full node object set (pool + storage), NOT just the
+    # header-only coin-state libs the two suites above use.
+    add_executable(test_dash_node_embedded_wire test_dash_node_embedded_wire.cpp)
+    target_link_libraries(test_dash_node_embedded_wire PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_node_embedded_wire PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining c2pool_storage pool)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_node_embedded_wire "" AUTO)
+
     # DASH CSimplifiedMNListDiff (mnlistdiff wire, S8.1 leaf): vendored diff
     # round-trip + dashcore field-layout pin + apply_diff semantics. Header-only
     # over the SimplifiedMNList leaf + coin/transaction; no ltc/pool SCC dep.
