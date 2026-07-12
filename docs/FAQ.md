@@ -44,32 +44,24 @@ needs its own full node running locally with AuxPoW RPC
 
 ### Can I merge-mine DigiByte (DGB)? Is DigiByte "SPV" now?
 
-DGB has **two separate roles** — don't confuse them:
+**No — DGB cannot be merge-mined as a child of LTC, and it is not an embedded
+SPV coin today.**
 
-1. **DGB-Scrypt as a merged child under an LTC parent — supported today, via a
-   daemon (not SPV).** DGB-Scrypt shares Litecoin's Scrypt proof-of-work, so it
-   merge-mines cleanly under the LTC parent using the same generic merged
-   engine as the coins above. You run a `digibyted` node with AuxPoW RPC
-   enabled and wire it in:
+DigiByte does **not** support AuxPoW (auxiliary proof-of-work) and has **no
+AuxPoW chain ID**. Unlike Dogecoin (chain_id 98) or Namecoin (chain_id 1),
+which are child chains that inherit security from a parent's hashrate, DigiByte
+secures its own chain directly through a **MultiAlgo** consensus: five
+independent proof-of-work algorithms — **Scrypt, SHA-256d, Qubit, Skein, and
+Odocrypt** — each mined directly on the DGB main chain with its own independent
+difficulty adjustment. Because DGB is a primary chain with no aux-chain role, it
+is **not** a valid `--merged` target. The `--merged` flag is only for true
+AuxPoW coins (DOGE, PEP, BELLS, LKY, JKC, SHIC).
 
-   ```bash
-   ./c2pool --merged DGB:<dgb_auxpow_chain_id>:127.0.0.1:14022:rpcuser:rpcpass
-   ```
-
-   Use the AuxPoW chain id your `digibyted` reports. Because DGB is not yet in
-   the stratum address auto-detection table (see the payout question below),
-   set your DGB payout address **explicitly** — either with the slash form in
-   your stratum username (`LTCADDR/<chain_id>:DGBADDR`) or via the
-   `mining.set_merged_addresses` stratum method.
-
-2. **DGB-Scrypt as its own parent chain (`--net digibyte`) — planned.** A
-   standalone DGB-Scrypt P2Pool node with an *embedded* SPV backend (its own
-   sharechain, like the LTC/DOGE embedded nodes) is in development, not yet in
-   the stable release. Until it ships, DGB is **not** an embedded-SPV coin —
-   reach it via the merged-child path (1) with an external daemon.
-
-So: **DGB is not embedded SPV today.** It can be merge-mined under LTC with a
-DGB daemon now; a native embedded-SPV DGB parent is planned.
+In c2pool, DGB-Scrypt is therefore handled as its **own parent chain** — a
+standalone DGB-Scrypt P2Pool node running its own sharechain (Scrypt-only in
+V36; the other four DGB algos are out of scope for now). That parent-chain
+support is **in development** (`--net digibyte`), not yet in the stable LTC
+release. Until it ships there is no LTC-side path to mine DGB through c2pool.
 
 ---
 
