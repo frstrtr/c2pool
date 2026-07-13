@@ -24,6 +24,8 @@
 #include "min_protocol_gate.hpp"
 #include "messages.hpp"
 #include "coin/transaction.hpp"
+#include "coin/node_coin_state.hpp"       // dash::coin::NodeCoinState (node-held embedded bundle)
+#include "coin/coin_state_maintainer.hpp" // dash::coin::CoinStateMaintainer (reception/think driver)
 
 #include <pool/node.hpp>
 #include <pool/protocol.hpp>
@@ -99,6 +101,18 @@ protected:
     // Global pool of known transactions, populated by remember_tx and the coin
     // daemon. Reception-slice protocol handlers look up tx hashes here.
     std::map<uint256, coin::Transaction> m_known_txs;
+
+    // Embedded coin-state (S8 embedded_gbt live-wire capstone). The node-held
+    // bundle build_embedded_workdata() consumes (MN list + mempool + tip
+    // params) plus the maintainer that keeps it current off the async
+    // reception/think update path. Until the maintainer publishes (both a
+    // non-empty MN list AND a tip have arrived), populated() stays false and
+    // select_work() routes to the RETAINED dashd getblocktemplate fallback --
+    // the always-reachable safety path + [GBT-XCHECK] cross-check, never
+    // removed. Declaration order matters: the maintainer holds a reference to
+    // m_coin_state, so the bundle must be declared first.
+    coin::NodeCoinState       m_coin_state;
+    coin::CoinStateMaintainer m_coin_state_maintainer{m_coin_state};
 
     // Wire-message parser used by the Legacy/Actual dispatch protocols to turn
     // a RawMessage into a typed message variant. Mirrors dgb::NodeImpl::m_handler.
@@ -398,6 +412,28 @@ public:
     /// Expose the tracker mutex for IO-thread callbacks. Callers MUST use
     /// shared_lock(try_to_lock) — NEVER a blocking lock().
     std::shared_mutex& tracker_mutex() { return m_tracker_mutex; }
+
+    // Embedded coin-state accessors (S8 embedded_gbt live-wire).
+    /// The node-held embedded coin-state bundle (MN list + mempool + tip).
+    coin::NodeCoinState&       coin_state()       { return m_coin_state; }
+    const coin::NodeCoinState& coin_state() const { return m_coin_state; }
+
+    /// The maintainer the reception/think slices drive as their updates land
+    /// (on_mn_list_update / on_mempool_tx / on_new_tip / on_block_connected /
+    /// on_invalidate). It republishes m_coin_state only once both a tip and a
+    /// non-empty MN list are present.
+    coin::CoinStateMaintainer& coin_state_maintainer() { return m_coin_state_maintainer; }
+
+    /// Live get_work entry point: prefer the locally-assembled embedded
+    /// template when the node-held bundle is populated, else the supplied
+    /// dashd getblocktemplate fallback (REQUIRED -- always-reachable safety
+    /// path + [GBT-XCHECK] cross-check). One-liner over NodeCoinState so the
+    /// node call site (main_dash run path) is select_work(fallback).
+    coin::WorkSelection select_work(
+        const std::function<coin::DashWorkData()>& dashd_fallback)
+    {
+        return m_coin_state.select_work(dashd_fallback);
+    }
 
     // ── Lock-free snapshot getters ──────────────────────────────────────
     // Inline (defined in this header) since slice A has no node.cpp. Never
