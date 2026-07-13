@@ -141,9 +141,13 @@ jobs:
       - name: Configure
         if: steps.presence.outputs.exists == '1'
         run: |
+          # DGB ships the -DAUX_DOGE=ON build: DGB parent + embedded DOGE aux as ONE
+          # binary, the direct parallel to c2pool-ltc carrying DOGE. Gated to the dgb
+          # cell; inert for the other coins. Merged-mining path per #603/#614/#589/#395.
           cmake -S . -B build_${{ matrix.coin }} \
             -DCMAKE_TOOLCHAIN_FILE=build_${{ matrix.coin }}/conan_toolchain.cmake \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release \
+            ${{ matrix.coin == 'dgb' && '-DAUX_DOGE=ON' || '' }}
 
       - name: Build c2pool-${{ matrix.coin }}
         if: steps.presence.outputs.exists == '1'
@@ -249,7 +253,8 @@ jobs:
 
       - name: Configure
         if: steps.presence.outputs.exists == '1'
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        # DGB: -DAUX_DOGE=ON -> DGB parent + embedded DOGE (mirrors c2pool-ltc). Inert for other coins.
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.coin == 'dgb' && '-DAUX_DOGE=ON' || '' }}
 
       - name: Build c2pool-${{ matrix.coin }}
         if: steps.presence.outputs.exists == '1'
@@ -486,7 +491,8 @@ jobs:
       - name: Configure
         if: steps.presence.outputs.exists == '1'
         shell: cmd
-        run: cmake -S . -B build_ci -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake -DCMAKE_PREFIX_PATH="%GITHUB_WORKSPACE%/secp256k1" -DCMAKE_CXX_FLAGS="/D_WIN32_WINNT=0x0A00"
+        # DGB: -DAUX_DOGE=ON -> DGB parent + embedded DOGE (mirrors c2pool-ltc). Inert for other coins.
+        run: cmake -S . -B build_ci -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake -DCMAKE_PREFIX_PATH="%GITHUB_WORKSPACE%/secp256k1" -DCMAKE_CXX_FLAGS="/D_WIN32_WINNT=0x0A00" ${{ matrix.coin == 'dgb' && '-DAUX_DOGE=ON' || '' }}
 
       - name: Build c2pool-${{ matrix.coin }}
         if: steps.presence.outputs.exists == '1'
