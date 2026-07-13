@@ -3,12 +3,14 @@
 
 #include "block.hpp"
 #include "transaction.hpp"
+#include "mn_state_machine.hpp"
 
 #include <core/uint256.hpp>
 #include <core/events.hpp>
 
 #include <cstdint>
 #include <map>
+#include <utility>
 #include <vector>
 
 namespace dash
@@ -40,12 +42,29 @@ struct TipAdvance
 /// special-tx height is a chain-position input apply_block cannot recover from
 /// the block alone). block_connected pairs the two so the reception wire feeds
 /// apply_block the exact (block, height) apply_block expects -- purely additive,
-/// dash interface only (leg 2's new_tip added TipAdvance for the same reason a
+/// dash interface only (leg 2s new_tip added TipAdvance for the same reason a
 /// bare best_block_hash was insufficient).
 struct BlockConnected
 {
     coin::BlockType block;
     uint32_t        height{0};
+};
+
+/// Reception path payload (mnlistdiff): the AUTHORITATIVE masternode-set
+/// snapshot the embedded coinbase pays. dashd (protx diff / the qdata
+/// mnlistdiff message) yields the full projected DMN set as
+/// (proTxHash -> MNState) pairs; CoinStateMaintainer::on_mn_list_update()
+/// takes exactly that vector. This is the bulk RESYNC feed -- distinct from
+/// leg 3s block_connected, which folds per-block special txs INCREMENTALLY
+/// between snapshots. An empty vector is a set-gap signal (see on_mn_list_
+/// update): it cannot back a payee, so it demotes the bundle to the dashd
+/// fallback rather than publishing a template with a phantom payment. Purely
+/// additive, dash interface only -- carries dash::coin::MNState, so this
+/// header now pulls mn_state_machine.hpp (dash-coin scoped, no cross-coin
+/// reach), matching the codec weight it already takes from block.hpp.
+struct MnListUpdate
+{
+    std::vector<std::pair<uint256, coin::MNState>> mnstates;
 };
 
 struct Node
@@ -69,6 +88,14 @@ struct Node
     // mnlistdiff snapshots -- a block that empties the set demotes to the dashd
     // fallback rather than backing a template with a phantom payee.
     Event<BlockConnected> block_connected;
+
+    // Reception path: fires when dashd delivers a full mnlistdiff snapshot,
+    // carrying the authoritative projected DMN set (see MnListUpdate). The
+    // reception wire subscribes CoinStateMaintainer::on_mn_list_update to this
+    // so the masternode set the embedded coinbase pays is bulk-RESYNCED off the
+    // real feed (block_connected only folds per-block deltas between snapshots);
+    // an empty snapshot demotes the bundle to the dashd fallback.
+    Event<MnListUpdate> mn_list_update;
 
     // SPV A1 (parity audit): fires when dashd announces a ChainLock has
     // been aggregated for a block. Carries {block_hash, height}.
