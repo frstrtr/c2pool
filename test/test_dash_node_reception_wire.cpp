@@ -32,6 +32,7 @@
 #include <impl/dash/coin/mempool_ingest.hpp>       // c2pool::dash::wire_mempool_ingest
 #include <impl/dash/coin/tip_ingest.hpp>         // c2pool::dash::wire_tip_ingest
 #include <impl/dash/coin/block_connect_ingest.hpp> // c2pool::dash::wire_block_connect_ingest
+#include <impl/dash/coin/mn_list_ingest.hpp>      // c2pool::dash::wire_mn_list_ingest
 #include <impl/dash/coin/coin_state_maintainer.hpp>
 #include <impl/dash/coin/node_coin_state.hpp>
 #include <impl/dash/coin/embedded_gbt.hpp>
@@ -55,6 +56,7 @@
 using c2pool::dash::wire_mempool_ingest;
 using c2pool::dash::wire_tip_ingest;
 using c2pool::dash::wire_block_connect_ingest;
+using c2pool::dash::wire_mn_list_ingest;
 using dash::coin::CoinStateMaintainer;
 using dash::coin::NodeCoinState;
 using dash::coin::WorkSource;
@@ -376,4 +378,97 @@ TEST(DashReceptionWire, DisposeStopsBlockConnectIngest) {
 
     EXPECT_EQ(st.mnstates().size(), 1u) << "after dispose, a connected block must not be applied";
     EXPECT_TRUE(m.live()) << "after dispose, the armed bundle must stay live";
+}
+
+// ========================================================================
+// Leg 4: an mn_list_update snapshot fired on the interface RESYNCS the DMN set
+// THROUGH THE WIRE -- no direct on_mn_list_update() poke. With a tip already
+// present, the wired mnlistdiff snapshot arms MN-readiness and select_work
+// flips to the embedded arm. This is the authoritative bulk feed (leg 3's
+// block_connected only folds per-block deltas between these snapshots).
+// ========================================================================
+TEST(DashReceptionWire, MnListUpdateRelaySeedsMnSetThroughWire) {
+    UTXOViewCache utxo(nullptr);
+    dash::interfaces::Node node;
+    NodeCoinState st;
+    st.mempool().set_utxo(&utxo);
+    CoinStateMaintainer m(st);
+
+    auto sub = wire_mn_list_ingest(node, m);
+    ASSERT_TRUE(sub) << "wire must return a live subscription handle";
+
+    // Tip arrives first (reception is async); the MN list is the gating event.
+    m.on_new_tip(H - 1, PREV_HASH, BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER, CURTIME, VERSION);
+    EXPECT_FALSE(m.live()) << "tip alone must not arm the bundle -- MN list absent";
+    ASSERT_EQ(st.mnstates().size(), 0u);
+
+    // mnlistdiff snapshot fired on the interface (NOT a direct maintainer poke).
+    dash::interfaces::MnListUpdate u;
+    u.mnstates = single_mn(p2pkh_script(0x30));
+    node.mn_list_update.happened(u);
+
+    EXPECT_EQ(st.mnstates().size(), 1u) << "mnlistdiff relay (via wire) must seed the DMN set";
+    ASSERT_TRUE(m.live()) << "tip + MN (via wire) must arm the embedded bundle";
+
+    bool fb = false;
+    WorkSelection sel = st.select_work([&]() { fb = true; return dash::coin::DashWorkData{}; });
+    EXPECT_EQ(sel.source, WorkSource::Embedded);
+    EXPECT_FALSE(fb) << "embedded arm must not invoke the dashd fallback";
+}
+
+// ========================================================================
+// An EMPTY mnlistdiff snapshot fired on the wire is a set-gap: on_mn_list_update
+// clears MN-readiness and demotes an armed bundle to the retained dashd
+// fallback rather than backing a template with no masternode payee.
+// ========================================================================
+TEST(DashReceptionWire, EmptyMnListRelayDemotesThroughWire) {
+    UTXOViewCache utxo(nullptr);
+    dash::interfaces::Node node;
+    NodeCoinState st;
+    st.mempool().set_utxo(&utxo);
+    CoinStateMaintainer m(st);
+
+    auto sub = wire_mn_list_ingest(node, m);
+
+    // Arm the bundle: tip + a non-empty snapshot delivered on the wire.
+    m.on_new_tip(H - 1, PREV_HASH, BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER, CURTIME, VERSION);
+    dash::interfaces::MnListUpdate seed;
+    seed.mnstates = single_mn(p2pkh_script(0x30));
+    node.mn_list_update.happened(seed);
+    ASSERT_TRUE(m.live());
+    ASSERT_EQ(st.mnstates().size(), 1u);
+
+    // An empty snapshot fired on the wire -> set-gap -> demote.
+    dash::interfaces::MnListUpdate empty;  // empty.mnstates == {}
+    node.mn_list_update.happened(empty);
+
+    EXPECT_EQ(st.mnstates().size(), 0u) << "empty snapshot must clear the DMN set";
+    EXPECT_FALSE(m.live()) << "empty mnlistdiff (set-gap) must demote the live bundle";
+
+    bool fb = false;
+    WorkSelection sel = st.select_work([&]() { fb = true; return dash::coin::DashWorkData{}; });
+    EXPECT_EQ(sel.source, WorkSource::DashdFallback);
+    EXPECT_TRUE(fb) << "after an empty snapshot, get_work must fall back to dashd";
+}
+
+// ========================================================================
+// Disposing the mn-list handle tears the subscription down: a later snapshot is
+// not applied, so a stale mnlistdiff feed cannot silently re-seed the DMN set.
+// ========================================================================
+TEST(DashReceptionWire, DisposeStopsMnListIngest) {
+    UTXOViewCache utxo(nullptr);
+    dash::interfaces::Node node;
+    NodeCoinState st;
+    st.mempool().set_utxo(&utxo);
+    CoinStateMaintainer m(st);
+
+    auto sub = wire_mn_list_ingest(node, m);
+    sub->dispose();
+
+    dash::interfaces::MnListUpdate u;
+    u.mnstates = single_mn(p2pkh_script(0x30));
+    node.mn_list_update.happened(u);
+
+    EXPECT_EQ(st.mnstates().size(), 0u)
+        << "after dispose, an mnlistdiff snapshot must not seed the set";
 }
