@@ -175,6 +175,7 @@ target_link_libraries(c2pool-btc
     ltc_coin  # ltc OBJECT lib pulls in protocol handlers needing ltc::coin::{Mutable,}Transaction ctors
     btc
     btc_stratum
+    nmc_coin   # NMC coin-layer: embedded merged-mining (2b-ii) — supplies nmc::coin Transaction/MutableTransaction ctors for the aux commitment path wired into main_btc
     nlohmann_json::nlohmann_json
     ${Boost_LIBRARIES}
 )
