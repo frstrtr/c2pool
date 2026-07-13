@@ -9,7 +9,11 @@ description: >
 runs:
   using: composite
   steps:
-    - name: Verify boost conan package integrity (auto-purge if corrupt)
+    # VM217 (Windows self-hosted) has no bash on the service PATH — same reason
+    # build.yml Windows conan steps run under pwsh. Split by runner.os so the
+    # guard runs on every lane incl. win-217.
+    - name: Verify boost conan package integrity (auto-purge if corrupt) [posix]
+      if: runner.os != 'Windows'
       shell: bash
       run: |
         if conan cache check-integrity "boost/*"; then
@@ -18,3 +22,15 @@ runs:
           echo "::warning title=conan-cache-guard::boost package integrity check FAILED — purging so conan install rebuilds it clean"
           conan remove "boost/*" -c || true
         fi
+    - name: Verify boost conan package integrity (auto-purge if corrupt) [windows]
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        conan cache check-integrity "boost/*"
+        if ($LASTEXITCODE -ne 0) {
+          Write-Output "::warning title=conan-cache-guard::boost package integrity check FAILED — purging so conan install rebuilds it clean"
+          conan remove "boost/*" -c
+        } else {
+          Write-Output "conan-cache-guard: boost cache integrity OK"
+        }
+        exit 0
