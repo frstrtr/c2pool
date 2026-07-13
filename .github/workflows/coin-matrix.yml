@@ -98,6 +98,9 @@ jobs:
         run: |
           find ~/.conan2/p -type f \( -name 'conan_package.tgz' -o -name 'conan_sources.tgz' \) -delete 2>/dev/null || true
 
+      - name: Conan cache guard (auto-heal corrupt boost)
+        if: steps.presence.outputs.exists == '1'
+        uses: ./.github/actions/conan-cache-guard
       - name: Conan install
         if: steps.presence.outputs.exists == '1'
         run: |

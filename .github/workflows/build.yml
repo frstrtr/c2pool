@@ -84,6 +84,8 @@ jobs:
         if: runner.environment != 'github-hosted'
         run: rm -rf build_ci
 
+      - name: Conan cache guard (auto-heal corrupt boost)
+        uses: ./.github/actions/conan-cache-guard
       - name: Conan install
         run: conan install . --build=missing --output-folder=build_ci --settings=build_type=Release
 
@@ -216,6 +218,8 @@ jobs:
         if: runner.environment != 'github-hosted'
         run: rm -rf build_asan
 
+      - name: Conan cache guard (auto-heal corrupt boost)
+        uses: ./.github/actions/conan-cache-guard
       - name: Conan install
         run: conan install . --build=missing --output-folder=build_asan --settings=build_type=Release
 
@@ -339,6 +343,8 @@ jobs:
         if: runner.environment != 'github-hosted'
         run: rm -rf build_bch
 
+      - name: Conan cache guard (auto-heal corrupt boost)
+        uses: ./.github/actions/conan-cache-guard
       - name: Conan install
         run: conan install . --build=missing --output-folder=build_bch --settings=build_type=Release
 
@@ -428,6 +434,8 @@ jobs:
         if: runner.environment != 'github-hosted'
         run: rm -rf build_bch_asan
 
+      - name: Conan cache guard (auto-heal corrupt boost)
+        uses: ./.github/actions/conan-cache-guard
       - name: Conan install
         run: conan install . --build=missing --output-folder=build_bch_asan --settings=build_type=Release
 
@@ -802,6 +810,8 @@ jobs:
           path: ~/.conan2
           key: conan2-windows-msvc194-${{ hashFiles('conanfile.txt') }}
 
+      - name: Conan cache guard (auto-heal corrupt boost)
+        uses: ./.github/actions/conan-cache-guard
       - name: Conan install
         run: conan install . --build=missing --output-folder=build_ci
 
@@ -903,6 +913,8 @@ jobs:
         if: runner.environment != 'github-hosted'
         run: rm -rf build_dgb_auxdoge
 
+      - name: Conan cache guard (auto-heal corrupt boost)
+        uses: ./.github/actions/conan-cache-guard
       - name: Conan install
         run: conan install . --build=missing --output-folder=build_dgb_auxdoge --settings=build_type=Release
 

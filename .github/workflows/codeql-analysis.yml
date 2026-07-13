@@ -91,6 +91,9 @@ jobs:
         run: rm -rf build_codeql
 
       - if: matrix.build-mode == 'manual'
+        name: Conan cache guard (auto-heal corrupt boost)
+        uses: ./.github/actions/conan-cache-guard
+      - if: matrix.build-mode == 'manual'
         name: Install Conan dependencies
         run: |
           conan install . \

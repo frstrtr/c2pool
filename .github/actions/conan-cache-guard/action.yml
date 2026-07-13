@@ -1,0 +1,20 @@
+name: "Conan cache integrity guard"
+description: >
+  Auto-heal a corrupt/incomplete cached boost package on self-hosted runners.
+  The self-hosted runners reuse ~/.conan2 across jobs; a partially-failed conan
+  build can leave an incomplete boost package (missing headers/libs) that
+  persists and reddens later jobs intermittently. This verifies the cached
+  boost package against its manifest and purges it on any mismatch so the
+  following `conan install` rebuilds it clean. No-op on a healthy/empty cache.
+runs:
+  using: composite
+  steps:
+    - name: Verify boost conan package integrity (auto-purge if corrupt)
+      shell: bash
+      run: |
+        if conan cache check-integrity "boost/*"; then
+          echo "conan-cache-guard: boost cache integrity OK"
+        else
+          echo "::warning title=conan-cache-guard::boost package integrity check FAILED — purging so conan install rebuilds it clean"
+          conan remove "boost/*" -c || true
+        fi

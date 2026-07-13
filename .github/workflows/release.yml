@@ -130,6 +130,9 @@ jobs:
             conan2-ubuntu24-gcc13-${{ matrix.coin }}-
             conan2-ubuntu24-gcc13-
 
+      - name: Conan cache guard (auto-heal corrupt boost)
+        if: steps.presence.outputs.exists == '1'
+        uses: ./.github/actions/conan-cache-guard
       - name: Conan install
         if: steps.presence.outputs.exists == '1'
         run: |
@@ -476,6 +479,9 @@ jobs:
           path: ~/.conan2
           key: conan2-windows-msvc194-${{ hashFiles('conanfile.txt') }}
 
+      - name: Conan cache guard (auto-heal corrupt boost)
+        if: steps.presence.outputs.exists == '1'
+        uses: ./.github/actions/conan-cache-guard
       - name: Conan install
         if: steps.presence.outputs.exists == '1'
         run: conan install . --build=missing --output-folder=build_ci
