@@ -357,6 +357,20 @@ if (BUILD_TESTING AND GTest_FOUND)
             GTest::gtest_main GTest::gtest nlohmann_json::nlohmann_json)
         gtest_add_tests(${dgb_guard} "" AUTO)
     endforeach()
+
+    # dgb_arith256_muldiv_kat_test: FENCED, additive KAT for #690 -- PROVES the
+    # DigiShield 256-bit retarget primitives (detail mul_add_u128 / div_u128 /
+    # add_u128, and u256 mul_u64 / div_u64 / operator+=) are BIT-IDENTICAL on the
+    # native __int128 path vs the portable-forced software path
+    # (detail::*_portable / u256_portable) that certifies the MSVC
+    # _umul128/_udiv128 branch we cannot compile or run on Linux. Special
+    # coverage of the _udiv128 hi<d running-remainder boundary. Pure header math
+    # (<cstdint> only) -> links only GTest, like the foreach guards above. MUST
+    # also be in BOTH build.yml --target allowlists (#143 NOT_BUILT trap).
+    add_executable(dgb_arith256_muldiv_kat_test arith256_muldiv_kat_test.cpp)
+    target_link_libraries(dgb_arith256_muldiv_kat_test PRIVATE
+        GTest::gtest_main GTest::gtest)
+    gtest_add_tests(dgb_arith256_muldiv_kat_test "" AUTO)
     # --- #82 broadcaster-gate: CoinNode submit/seam contract -----------------
     # Links the dgb OBJECT lib (coin_node.cpp) like dgb_share_test so the live
     # CoinNode::submit_block_hex !m_rpc guard + embedded WorkView slice are
