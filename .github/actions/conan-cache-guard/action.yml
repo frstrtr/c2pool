@@ -24,7 +24,7 @@ runs:
         fi
     - name: Verify boost conan package integrity (auto-purge if corrupt) [windows]
       if: runner.os == 'Windows'
-      shell: pwsh
+      shell: powershell
       run: |
         conan cache check-integrity "boost/*"
         if ($LASTEXITCODE -ne 0) {
