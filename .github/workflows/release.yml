@@ -205,7 +205,7 @@ jobs:
         arch: [arm64, x86_64]
         include:
           - arch: arm64
-            runner: macos-14
+            runner: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","c2pool-mac-arm"]') || 'macos-14' }}
           - arch: x86_64
             runner: [self-hosted, macOS, X64, c2pool-mac-intel]
     steps:
@@ -313,7 +313,7 @@ jobs:
     name: ${{ matrix.coin }} package (macOS universal)
     needs: macos
     if: always()
-    runs-on: macos-14
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","c2pool-mac-arm"]') || 'macos-14' }}
     strategy:
       fail-fast: false
       matrix:
@@ -417,7 +417,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   windows:
     name: ${{ matrix.coin }} package (Windows x86_64)
-    runs-on: windows-2022
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Windows","X64","c2pool-build"]') || 'windows-2022' }}
     strategy:
       fail-fast: false
       matrix:
@@ -562,7 +562,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   checksums:
     name: SHA256SUMS + draft release
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
     needs: [linux, macos-universal, windows]
     if: always()
     permissions:
