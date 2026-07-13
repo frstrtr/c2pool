@@ -936,5 +936,86 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  # ════════════════════════════════════════════════════════════════════════════
+  # COIN_DGB + AUX_DOGE=ON — Windows/MSVC arith256 KAT leg (#690). The dgb_arith256
+  # 128-bit primitives carry an MSVC-only branch (x64 _umul128/_udiv128, gated on
+  # _MSC_VER) that NO other job compiles: the linux/asan KATs exercise the gcc
+  # __int128 path, and the plain `windows:` job builds only --target c2pool. This
+  # leg configures -DCOIN_DGB=ON -DAUX_DOGE=ON on VM217 (MSVC 2022) and builds +
+  # runs dgb_arith256_muldiv_kat_test so the native==portable KAT certifies the
+  # _umul128/_udiv128 branch on the compiler that actually takes it.
+  # ════════════════════════════════════════════════════════════════════════════
+  windows-dgb-auxdoge-kat:
+    name: COIN_DGB +AUX_DOGE Windows x86_64 (MSVC arith256 KAT)
+    if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'dash-linux-only')) }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Windows","X64","c2pool-build"]') || 'windows-2022' }}
+    defaults:
+      run:
+        shell: powershell -ExecutionPolicy Bypass -Command ". '{0}'"
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        if: ${{ runner.environment == 'github-hosted' }}
+        with: { python-version: '3.12' }
+
+      - name: Install Conan 2
+        run: |
+          $py = $null
+          foreach ($cand in @('py','python3','python')) {
+            if (Get-Command $cand -ErrorAction SilentlyContinue) { $py = $cand; break }
+          }
+          if (-not $py) {
+            Write-Host "No Python interpreter on PATH. Diagnostics:"
+            & where.exe python 2>&1; & where.exe py 2>&1; & where.exe python3 2>&1
+            Write-Host "PATH=$env:PATH"
+            throw "VM217 has no Python interpreter on the runner-service PATH"
+          }
+          Write-Host "Using interpreter: $py"
+          & $py -m pip install "conan>=2.0,<3.0"
+          $scripts = & $py -c "import sysconfig; print(sysconfig.get_path('scripts'))"
+          $userScripts = & $py -c "import sysconfig; print(sysconfig.get_path('scripts','nt_user'))"
+          $env:PATH = "$scripts;$userScripts;$env:PATH"
+          Add-Content -Path $env:GITHUB_PATH -Value $scripts
+          Add-Content -Path $env:GITHUB_PATH -Value $userScripts
+          conan --version
+
+      - name: Detect Conan profile
+        run: |
+          conan profile detect --force
+          $profile = conan profile path default
+          (Get-Content $profile) -replace 'compiler.cppstd=14','compiler.cppstd=20' | Set-Content $profile
+
+      - name: Restore Conan cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.conan2
+          key: conan2-windows-msvc194-dgb-auxdoge-${{ hashFiles('conanfile.txt') }}
+
+      - name: Clean stale build dir (self-hosted workspace is reused)
+        if: runner.environment != 'github-hosted'
+        run: if (Test-Path build_dgb_auxdoge) { Remove-Item -Recurse -Force build_dgb_auxdoge }
+
+      - name: Conan install
+        run: conan install . --build=missing --output-folder=build_dgb_auxdoge
+
+      - name: Build secp256k1
+        run: |
+          git clone https://github.com/bitcoin-core/secp256k1 secp256k1-src
+          cmake -B secp256k1-src/build -S secp256k1-src -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="${env:GITHUB_WORKSPACE}/secp256k1" -DSECP256K1_BUILD_TESTS=OFF -DSECP256K1_BUILD_EXHAUSTIVE_TESTS=OFF -DSECP256K1_BUILD_BENCHMARK=OFF -DSECP256K1_BUILD_EXAMPLES=OFF
+          cmake --build secp256k1-src/build --config Release
+          cmake --install secp256k1-src/build --config Release
+
+      - name: Configure (-DCOIN_DGB=ON -DAUX_DOGE=ON)
+        shell: cmd
+        run: cmake -S . -B build_dgb_auxdoge -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=build_dgb_auxdoge/conan_toolchain.cmake -DCMAKE_PREFIX_PATH="%GITHUB_WORKSPACE%/secp256k1" -DCMAKE_CXX_FLAGS="/D_WIN32_WINNT=0x0A00" -DCOIN_DGB=ON -DAUX_DOGE=ON
+
+      - name: Build arith256 muldiv KAT (MSVC _umul128/_udiv128 branch)
+        shell: cmd
+        run: cmake --build build_dgb_auxdoge --target dgb_arith256_muldiv_kat_test --config Release -j %NUMBER_OF_PROCESSORS%
+
+      - name: Run arith256 muldiv KAT (native==portable, non-vacuous)
+        run: ctest --test-dir build_dgb_auxdoge -C Release -R Arith256Muldiv --output-on-failure --no-tests=error
+
   # Releases are built and published manually (not via CI).
   # See installer/ for packaging scripts (DMG, ZIP, Inno Setup).
