@@ -87,6 +87,76 @@ inline uint64_t add_u128(uint64_t a, uint64_t b, uint64_t carry_in, uint64_t& ca
 #endif
 }
 
+
+// ---------------------------------------------------------------------------
+// PORTABLE-FORCED reference primitives (the #690 native==portable KAT oracle).
+//
+// The MSVC branches above route through _umul128 / _udiv128 -- x64 hardware
+// instructions that CANNOT be compiled or run on the Linux/macOS CI, so the
+// "both branches bit-identical" claim can't be diffed directly there. These
+// twins reproduce the SAME two operations (64x64->128 multiply, 128/64 divide)
+// in pure 32-bit-limb software -- NO __int128, NO intrinsic -- a genuinely
+// INDEPENDENT computation. If the software path equals the native __int128
+// path across the DigiShield operand domain on Linux, and the x64
+// _umul128/_udiv128 are (by ISA definition) exactly the 64x64->128 product and
+// 128/64 quotient this software reproduces, then the MSVC path we cannot run
+// here is equal too. Compiled unconditionally on every platform; NEVER
+// referenced by the shipping u256 / mul_div_u256 (those stay byte-identical).
+// ---------------------------------------------------------------------------
+
+// software 64x64 -> 128 multiply (what _umul128 does in hardware).
+inline uint64_t umul128_soft(uint64_t a, uint64_t b, uint64_t& hi) {
+    const uint64_t a_lo = (uint32_t)a, a_hi = a >> 32;
+    const uint64_t b_lo = (uint32_t)b, b_hi = b >> 32;
+    const uint64_t p0 = a_lo * b_lo;
+    const uint64_t p1 = a_lo * b_hi;
+    const uint64_t p2 = a_hi * b_lo;
+    const uint64_t p3 = a_hi * b_hi;
+    const uint64_t mid = (p0 >> 32) + (uint32_t)p1 + (uint32_t)p2;
+    hi = p3 + (p1 >> 32) + (p2 >> 32) + (mid >> 32);
+    return (p0 & 0xffffffffULL) | (mid << 32);
+}
+
+// software 128/64 -> 64 divide (what _udiv128 does in hardware). Requires
+// hi < d so the 64-bit quotient never overflows -- the SAME precondition the
+// _udiv128 intrinsic imposes. Binary long division from the top bit down; the
+// running remainder r is kept < d, and (top:r) is the conceptual 65-bit value
+// so d up to 2^64-1 is handled without a wider type.
+inline uint64_t udiv128_soft(uint64_t hi, uint64_t lo, uint64_t d, uint64_t& rem) {
+    uint64_t q = 0, r = hi;                 // r < d on entry (precondition)
+    for (int i = 63; i >= 0; --i) {
+        const uint64_t top = r >> 63;       // bit shifted out of the 64-bit r
+        r = (r << 1) | ((lo >> i) & 1ULL);  // conceptual 65-bit value == (top:r)
+        if (top || r >= d) {                // (top:r) >= d -> subtract, set bit
+            r -= d;                         // uint64 wrap yields the true low64
+            q |= 1ULL << i;
+        }
+    }
+    rem = r;
+    return q;
+}
+
+// Portable-forced twins of the three primitives the shipping u256 uses; each
+// mirrors the corresponding MSVC branch above with the intrinsic swapped for
+// the software op (add_u128's MSVC branch is already intrinsic-free).
+inline uint64_t mul_add_u128_portable(uint64_t a, uint64_t b, uint64_t add, uint64_t& hi) {
+    uint64_t lo = umul128_soft(a, b, hi);
+    lo += add;
+    hi += (lo < add) ? 1u : 0u;
+    return lo;
+}
+inline uint64_t div_u128_portable(uint64_t hi, uint64_t lo, uint64_t d, uint64_t& rem) {
+    return udiv128_soft(hi, lo, d, rem);
+}
+inline uint64_t add_u128_portable(uint64_t a, uint64_t b, uint64_t carry_in, uint64_t& carry_out) {
+    uint64_t s = a + b;
+    uint64_t c = (s < a) ? 1u : 0u;
+    s += carry_in;
+    c += (s < carry_in) ? 1u : 0u;
+    carry_out = c;
+    return s;
+}
+
 } // namespace detail
 
 // 256-bit unsigned, little-endian limbs (limb[0] least significant). Only the
@@ -182,6 +252,54 @@ struct u256 {
 // FIRST (overflow truncates at 256 bits), THEN divide. Reordering to divide
 // first would lose low-order precision and is NOT what consensus computes.
 inline u256 mul_div_u256(const u256& avg, uint64_t mul, uint64_t div) {
+    return avg.mul_u64(mul).div_u64(div);
+}
+
+
+// ---------------------------------------------------------------------------
+// PORTABLE-FORCED twin of u256 -- the #690 KAT oracle. Same little-endian limb
+// layout and 256-bit truncation discipline, but mul_u64 / div_u64 / operator+=
+// route through the software detail::*_portable primitives instead of the
+// native __int128 (or MSVC intrinsic) ones. The native==portable guard diffs
+// this against u256 on Linux. NOT used by any shipping code path.
+// ---------------------------------------------------------------------------
+struct u256_portable {
+    uint64_t limb[4] = {0, 0, 0, 0};
+
+    u256_portable() = default;
+    explicit u256_portable(const u256& s) { for (int i = 0; i < 4; ++i) limb[i] = s.limb[i]; }
+
+    u256_portable mul_u64(uint64_t m) const {
+        u256_portable r;
+        uint64_t carry = 0;
+        for (int i = 0; i < 4; ++i) {
+            uint64_t hi;
+            r.limb[i] = detail::mul_add_u128_portable(limb[i], m, carry, hi);
+            carry     = hi;
+        }
+        return r;
+    }
+    u256_portable div_u64(uint64_t d) const {
+        u256_portable r;
+        uint64_t rem = 0;
+        for (int i = 3; i >= 0; --i)
+            r.limb[i] = detail::div_u128_portable(rem, limb[i], d, rem);
+        return r;
+    }
+    u256_portable& operator+=(const u256_portable& o) {
+        uint64_t carry = 0;
+        for (int i = 0; i < 4; ++i)
+            limb[i] = detail::add_u128_portable(limb[i], o.limb[i], carry, carry);
+        return *this;
+    }
+    // BIT-IDENTICAL check against a native u256 (all four limbs).
+    bool equals(const u256& s) const {
+        return limb[0] == s.limb[0] && limb[1] == s.limb[1]
+            && limb[2] == s.limb[2] && limb[3] == s.limb[3];
+    }
+};
+
+inline u256_portable mul_div_u256_portable(const u256_portable& avg, uint64_t mul, uint64_t div) {
     return avg.mul_u64(mul).div_u64(div);
 }
 
