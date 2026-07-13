@@ -28,6 +28,7 @@ protected:
 
 public:
     bool m_testnet;
+    bool m_regtest = false;
     std::vector<std::string> m_networks;
     float m_fee;
 

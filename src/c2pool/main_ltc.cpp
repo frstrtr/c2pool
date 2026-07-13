@@ -368,6 +368,7 @@ void print_help() {
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
     std::cout << "  --help, -h                Show this help message and exit\n";
     std::cout << "  --testnet                 Use testnet instead of mainnet\n";
+    std::cout << "  --regtest                 Use isolated local regtest net (no public seeds)\n";
     std::cout << "  --integrated              Full P2P pool with sharechain (DEFAULT)\n";
     std::cout << "  --solo                    Solo pool mode (no P2P sharechain, local payouts)\n";
     std::cout << "  --custodial               Custodial pool (coinbase to --address, stratum for accounting)\n";
@@ -544,6 +545,7 @@ int main(int argc, char* argv[]) {
     // Default settings
     auto settings = std::make_unique<core::Settings>();
     settings->m_testnet = false;
+    settings->m_regtest = false;
     
     // Port configuration with p2pool-compatible defaults
     int p2p_port = 9326;           // P2Pool P2P sharechain port (p2pool LTC mainnet default)
@@ -761,6 +763,12 @@ int main(int argc, char* argv[]) {
         else if (arg == "--testnet") {
             settings->m_testnet = true;
             cli_explicit.insert("testnet");
+        }
+        else if (arg == "--regtest") {
+            // Isolated local regtest net (litecoind/dogecoind -regtest).
+            // Distinct from testnet; consensus from make_ltc_chain_params_regtest().
+            settings->m_regtest = true;
+            cli_explicit.insert("regtest");
         }
         // Log level (p2pool: --debug; c2pool extends with standard levels)
         else if (arg == "--loglevel-trace")    { cli_log_level = "trace"; cli_explicit.insert("log_level"); }
@@ -1390,7 +1398,7 @@ int main(int argc, char* argv[]) {
     // Auto-detect RPC port from chain type if not set
     if (rpc_port == 0) {
         if (blockchain == Blockchain::LITECOIN)
-            rpc_port = settings->m_testnet ? 19332 : 9332;
+            rpc_port = settings->m_regtest ? 19443 : settings->m_testnet ? 19332 : 9332;
         else if (blockchain == Blockchain::BITCOIN)
             rpc_port = settings->m_testnet ? 18332 : 8332;
         else if (blockchain == Blockchain::DOGECOIN)
@@ -1626,14 +1634,16 @@ int main(int argc, char* argv[]) {
                 LOG_INFO << "║  No litecoind RPC required — SPV header chain + P2P sync     ║";
                 LOG_INFO << "╚══════════════════════════════════════════════════════════════╝";
 
-                auto ltc_params = settings->m_testnet
-                    ? ltc::coin::make_ltc_chain_params_testnet()
-                    : ltc::coin::make_ltc_chain_params_mainnet();
+                auto ltc_params = settings->m_regtest
+                    ? ltc::coin::make_ltc_chain_params_regtest()
+                    : settings->m_testnet
+                        ? ltc::coin::make_ltc_chain_params_testnet()
+                        : ltc::coin::make_ltc_chain_params_mainnet();
 
                 // LevelDB-backed header chain for persistence across restarts
                 // Use absolute path under ~/.c2pool/ (matches sharechain + found_blocks)
                 std::string chain_db_path = (core::filesystem::config_path()
-                    / (settings->m_testnet ? "litecoin_testnet" : "litecoin")
+                    / (settings->m_regtest ? "litecoin_regtest" : settings->m_testnet ? "litecoin_testnet" : "litecoin")
                     / "embedded_headers").string();
                 LOG_INFO << "[EMB-LTC] Creating HeaderChain with DB at " << chain_db_path;
                 embedded_chain = std::make_unique<ltc::coin::HeaderChain>(ltc_params, chain_db_path);
@@ -1719,7 +1729,7 @@ int main(int argc, char* argv[]) {
                 // UTXO set for transaction fee computation
                 {
                     auto utxo_path = (core::filesystem::config_path()
-                        / (settings->m_testnet ? "litecoin_testnet" : "litecoin")
+                        / (settings->m_regtest ? "litecoin_regtest" : settings->m_testnet ? "litecoin_testnet" : "litecoin")
                         / "utxo_leveldb").string();
                     core::LevelDBOptions utxo_opts;
                     utxo_opts.block_cache_size = 32 * 1024 * 1024;  // 32 MB cache
@@ -1780,7 +1790,7 @@ int main(int argc, char* argv[]) {
                 // Determine if user specified a local daemon peer
                 bool has_local_daemon = !coind_p2p_address.empty() || coind_p2p_port > 0;
                 std::string pm_data_dir = (core::filesystem::config_path()
-                    / (settings->m_testnet ? "litecoin_testnet" : "litecoin")
+                    / (settings->m_regtest ? "litecoin_regtest" : settings->m_testnet ? "litecoin_testnet" : "litecoin")
                     / "embedded_peers").string();
 
                 // Validate local daemon address via PeerEndpoint (same pattern as DOGE).
@@ -1807,8 +1817,14 @@ int main(int argc, char* argv[]) {
 
                 // Wire DNS seeds + fixed seed fallback into peer manager
                 auto& pm = embedded_broadcaster->peer_manager();
-                pm.set_dns_seeds(ltc::coin::ltc_dns_seeds(settings->m_testnet));
-                pm.set_fixed_seeds(ltc::coin::ltc_fixed_seeds(settings->m_testnet));
+                if (settings->m_regtest) {
+                    // Isolated regtest: no public DNS/fixed seeds.
+                    pm.set_dns_seeds({});
+                    pm.set_fixed_seeds({});
+                } else {
+                    pm.set_dns_seeds(ltc::coin::ltc_dns_seeds(settings->m_testnet));
+                    pm.set_fixed_seeds(ltc::coin::ltc_fixed_seeds(settings->m_testnet));
+                }
                 // HTTP peer fallback: fetch from known c2pool nodes if DNS seeds fail
                 pm.set_http_peer_seeds({{"voidbind.com", 8080}});
 
