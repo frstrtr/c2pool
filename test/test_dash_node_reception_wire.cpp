@@ -31,10 +31,12 @@
 #include <impl/dash/coin/node_interface.hpp>       // dash::interfaces::Node
 #include <impl/dash/coin/mempool_ingest.hpp>       // c2pool::dash::wire_mempool_ingest
 #include <impl/dash/coin/tip_ingest.hpp>         // c2pool::dash::wire_tip_ingest
+#include <impl/dash/coin/block_connect_ingest.hpp> // c2pool::dash::wire_block_connect_ingest
 #include <impl/dash/coin/coin_state_maintainer.hpp>
 #include <impl/dash/coin/node_coin_state.hpp>
 #include <impl/dash/coin/embedded_gbt.hpp>
 #include <impl/dash/coin/mn_state_machine.hpp>
+#include <impl/dash/coin/block.hpp>
 #include <impl/dash/coin/mempool.hpp>
 #include <impl/dash/coin/utxo_adapter.hpp>
 #include <impl/dash/coin/rpc_data.hpp>
@@ -52,11 +54,13 @@
 
 using c2pool::dash::wire_mempool_ingest;
 using c2pool::dash::wire_tip_ingest;
+using c2pool::dash::wire_block_connect_ingest;
 using dash::coin::CoinStateMaintainer;
 using dash::coin::NodeCoinState;
 using dash::coin::WorkSource;
 using dash::coin::WorkSelection;
 using dash::coin::MNState;
+using dash::coin::BlockType;
 using dash::coin::MutableTransaction;
 using dash::coin::Transaction;
 using ::core::coin::UTXOViewCache;
@@ -102,6 +106,21 @@ static std::vector<std::pair<uint256, MNState>> single_mn(const std::vector<unsi
     s.nRegisteredHeight = 2'300'000;
     s.nLastPaidHeight = 0;
     s.scriptPayout.m_data = payout;
+    return std::vector<std::pair<uint256, MNState>>{{raw256(0x01), s}};
+}
+
+// Same as single_mn but records the MN's collateral outpoint, so a block that
+// spends it via apply_block (pass 2) removes the record (leg-3 demote KAT).
+static std::vector<std::pair<uint256, MNState>>
+single_mn_coll(const std::vector<unsigned char>& payout,
+               const uint256& coll_hash, uint32_t coll_idx) {
+    MNState s;
+    s.isValid = true;
+    s.nRegisteredHeight = 2'300'000;
+    s.nLastPaidHeight = 0;
+    s.scriptPayout.m_data = payout;
+    s.collateralOutpoint.hash  = coll_hash;
+    s.collateralOutpoint.index = coll_idx;
     return std::vector<std::pair<uint256, MNState>>{{raw256(0x01), s}};
 }
 
@@ -258,4 +277,103 @@ TEST(DashReceptionWire, DisposeStopsTipIngest) {
     t.address_p2sh_version = DASH_P2SH_VER; t.curtime = CURTIME; t.version = VERSION;
     node.new_tip.happened(t);
     EXPECT_FALSE(m.live()) << "after dispose, a tip advance must not arm the bundle";
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Leg 3: a block_connected relay fired on the interface drives the maintainer's
+// incremental MnStateMachine::apply_block THROUGH THE WIRE -- no direct
+// on_block_connected() poke. A connected block whose non-coinbase tx spends the
+// sole MN's collateral empties the DMN set; the now-unbacked payee demotes the
+// live bundle to the retained dashd fallback, and select_work routes get_work
+// there. Proves the block-connect leg mutates coin-state off the real Event.
+// ════════════════════════════════════════════════════════════════════════
+TEST(DashReceptionWire, BlockConnectRelayDrivesApplyBlockThenDemotes) {
+    UTXOViewCache utxo(nullptr);
+    dash::interfaces::Node node;
+    NodeCoinState st;
+    st.mempool().set_utxo(&utxo);
+    CoinStateMaintainer m(st);
+
+    auto sub = wire_block_connect_ingest(node, m);
+    ASSERT_TRUE(sub) << "wire must return a live subscription handle";
+
+    // Arm the bundle: MN (with a known collateral) + tip both present.
+    const uint256 coll = raw256(0x55);
+    m.on_mn_list_update(single_mn_coll(p2pkh_script(0x30), coll, 3));
+    m.on_new_tip(H - 1, PREV_HASH, BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER, CURTIME, VERSION);
+    ASSERT_TRUE(m.live());
+    ASSERT_EQ(st.mnstates().size(), 1u);
+
+    // A connected block spends the sole MN's collateral -- fired on the wire,
+    // NOT a direct maintainer poke.
+    dash::interfaces::BlockConnected bc;
+    bc.height = H;
+    bc.block.m_txs.push_back(make_spend(raw256(0x90), 0, 500'000'000, 1));  // cb (idx 0, skipped)
+    bc.block.m_txs.push_back(make_spend(coll, 3, 400'000'000, 2));          // spends MN collateral
+    node.block_connected.happened(bc);
+
+    EXPECT_EQ(st.mnstates().size(), 0u) << "apply_block (via wire) must remove the MN";
+    EXPECT_FALSE(m.live()) << "emptied DMN set must drop the live bundle";
+
+    bool fb = false;
+    WorkSelection sel = st.select_work([&]() { fb = true; return dash::coin::DashWorkData{}; });
+    EXPECT_EQ(sel.source, WorkSource::DashdFallback);
+    EXPECT_TRUE(fb) << "after the collateral-spend block, get_work must fall back to dashd";
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// A block with no special txs touches no DMN record: apply_block registers
+// nothing, the set is unchanged, and the armed bundle stays live -- the wire
+// routes the event but a no-op block must not disturb readiness.
+// ════════════════════════════════════════════════════════════════════════
+TEST(DashReceptionWire, BlockConnectRelayNoSpecialTxPreservesReadiness) {
+    UTXOViewCache utxo(nullptr);
+    dash::interfaces::Node node;
+    NodeCoinState st;
+    st.mempool().set_utxo(&utxo);
+    CoinStateMaintainer m(st);
+
+    auto sub = wire_block_connect_ingest(node, m);
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)));
+    m.on_new_tip(H - 1, PREV_HASH, BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER, CURTIME, VERSION);
+    ASSERT_TRUE(m.live());
+
+    dash::interfaces::BlockConnected bc;
+    bc.height = H;
+    bc.block.m_txs.push_back(make_spend(raw256(0x90), 0, 500'000'000, 1));  // cb (idx 0, skipped)
+    bc.block.m_txs.push_back(make_spend(raw256(0x91), 0, 400'000'000, 2));  // plain spend, no collateral
+    node.block_connected.happened(bc);
+
+    EXPECT_EQ(st.mnstates().size(), 1u) << "no-special-tx block must not touch the DMN set";
+    EXPECT_TRUE(m.live()) << "no-op block via wire must not drop the live bundle";
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Disposing the block-connect handle tears the subscription down: a later
+// connected block is not applied, so a collateral spend cannot silently demote
+// an armed bundle off a stale feed.
+// ════════════════════════════════════════════════════════════════════════
+TEST(DashReceptionWire, DisposeStopsBlockConnectIngest) {
+    UTXOViewCache utxo(nullptr);
+    dash::interfaces::Node node;
+    NodeCoinState st;
+    st.mempool().set_utxo(&utxo);
+    CoinStateMaintainer m(st);
+
+    const uint256 coll = raw256(0x55);
+    m.on_mn_list_update(single_mn_coll(p2pkh_script(0x30), coll, 3));
+    m.on_new_tip(H - 1, PREV_HASH, BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER, CURTIME, VERSION);
+    ASSERT_TRUE(m.live());
+
+    auto sub = wire_block_connect_ingest(node, m);
+    sub->dispose();
+
+    dash::interfaces::BlockConnected bc;
+    bc.height = H;
+    bc.block.m_txs.push_back(make_spend(raw256(0x90), 0, 500'000'000, 1));  // cb (idx 0, skipped)
+    bc.block.m_txs.push_back(make_spend(coll, 3, 400'000'000, 2));          // would spend MN collateral
+    node.block_connected.happened(bc);
+
+    EXPECT_EQ(st.mnstates().size(), 1u) << "after dispose, a connected block must not be applied";
+    EXPECT_TRUE(m.live()) << "after dispose, the armed bundle must stay live";
 }

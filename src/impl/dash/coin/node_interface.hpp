@@ -34,6 +34,20 @@ struct TipAdvance
     uint32_t version{0};
 };
 
+/// Header/think path payload: a block was connected to the active chain. The
+/// bare full_block carries the block body but NOT the height CoinStateMaintainer
+/// ::on_block_connected needs to drive MnStateMachine::apply_block (the DIP3
+/// special-tx height is a chain-position input apply_block cannot recover from
+/// the block alone). block_connected pairs the two so the reception wire feeds
+/// apply_block the exact (block, height) apply_block expects -- purely additive,
+/// dash interface only (leg 2's new_tip added TipAdvance for the same reason a
+/// bare best_block_hash was insufficient).
+struct BlockConnected
+{
+    coin::BlockType block;
+    uint32_t        height{0};
+};
+
 struct Node
 {
     Variable<uint256> best_block_hash;
@@ -47,6 +61,14 @@ struct Node
     // CoinStateMaintainer::on_new_tip to this so the node-held bundle arms its
     // tip-readiness prerequisite without a direct poke.
     Event<TipAdvance> new_tip;
+
+    // Header/think path: fires when a block is connected to the active chain,
+    // carrying (block, height) (see BlockConnected). The reception wire
+    // subscribes CoinStateMaintainer::on_block_connected to this so the DMN set
+    // the embedded coinbase pays auto-maintains incrementally between full
+    // mnlistdiff snapshots -- a block that empties the set demotes to the dashd
+    // fallback rather than backing a template with a phantom payee.
+    Event<BlockConnected> block_connected;
 
     // SPV A1 (parity audit): fires when dashd announces a ChainLock has
     // been aggregated for a block. Carries {block_hash, height}.
