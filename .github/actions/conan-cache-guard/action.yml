@@ -1,29 +1,33 @@
 name: "Conan cache integrity guard"
 description: >
   Auto-heal a corrupt/incomplete OR wrong-config cached boost package on
-  self-hosted runners. The self-hosted runners reuse ~/.conan2 across jobs.
-  A partially-failed conan build can leave an incomplete boost package
-  (missing headers/libs), and an out-of-band/manual `conan install` can leave
-  an intact-but-wrong-std boost (compiler.cppstd=gnu17) that PASSES an integrity
-  check yet is ABI-incompatible with the cppstd=20 c2pool TUs. Conan's
-  compatibility fallback then re-selects that gnu17 boost instead of rebuilding,
-  reddening later jobs intermittently (the per-job profile cppstd=20 pin cannot
-  prevent this; it only sets what is *requested*, not what is *selected*). This
-  purges boost on integrity mismatch OR on any cached cppstd != 20 so the
-  following `conan install` rebuilds it clean. No-op on a healthy cppstd=20 or
-  empty cache.
+  self-hosted runners. The self-hosted Linux runners (VM905) reuse ONE
+  ~/.conan2 across up to 8 concurrent jobs. A partially-failed conan build
+  can leave an incomplete boost package (missing headers/libs), and an
+  out-of-band/manual `conan install` can leave an intact-but-wrong-std boost
+  (compiler.cppstd=gnu17) that PASSES an integrity check yet is ABI-incompatible
+  with the cppstd=20 c2pool TUs. Conan compatibility fallback then re-selects
+  that gnu17 boost instead of rebuilding, reddening later jobs intermittently
+  (the per-job profile cppstd=20 pin only sets what is *requested*, not what is
+  *selected*). This purges boost on integrity mismatch OR on any cached
+  cppstd != 20 and rebuilds a clean cppstd=20 boost. On the shared Linux cache
+  the whole check+purge+rebuild is serialized under an flock so exactly ONE
+  cold-cache job rebuilds boost while the rest wait and then cache-hit -- without
+  the lock, every concurrent job purges+rebuilds into the same cache at once and
+  races ("Reference ... already exists" / boost headers deleted mid-build).
+  No-op (fast, unlocked-fast) on a healthy cppstd=20 cache.
 runs:
   using: composite
   steps:
-    # VM217 (Windows self-hosted) has no bash on the service PATH. Split by
-    # runner.os so the guard runs on every lane incl. win-217. The Windows leg
-    # uses shell: cmd (not powershell) because VM217 execution-policy blocks
-    # unsigned script bodies; cmd has no execution-policy gate, matching what
-    # the windows-2022 fork-fallback already does.
-    - name: Verify boost integrity + cppstd (auto-purge if corrupt or wrong-std) [posix]
+    - name: Verify boost integrity + cppstd, rebuild-once under lock (shared cache) [posix]
       if: runner.os != 'Windows'
       shell: bash
       run: |
+        # Serialize check+purge+rebuild across all jobs sharing ~/.conan2 on
+        # this self-hosted host (mirrors the apt-get flock guard, PR #670).
+        lock="${HOME}/.conan2/.c2pool-boost-guard.lock"
+        exec 9>"$lock" 2>/dev/null || exec 9>/tmp/.c2pool-boost-guard.lock
+        flock 9
         purge=""
         if ! conan cache check-integrity "boost/*"; then
           purge="integrity check FAILED"
@@ -33,15 +37,27 @@ runs:
           purge="a cached binary was built with compiler.cppstd != 20 (wrong-std; Conan compatibility fallback would re-select it)"
         fi
         if [ -n "$purge" ]; then
-          echo "::warning title=conan-cache-guard::boost $purge -- purging so conan install rebuilds it clean"
+          echo "::warning title=conan-cache-guard::boost $purge -- purging + rebuilding cppstd=20 boost from source under lock"
           conan remove "boost/*" -c || true
+          # Rebuild boost NOW, while holding the lock, using the job's already
+          # cppstd=20-pinned default profile, so every subsequent (unlocked)
+          # `conan install` is a clean cache hit and no job ever installs against
+          # a boost another job is deleting. Log is intentionally not suppressed
+          # so the from-source rebuild is visible as evidence.
+          conan install . --build="boost/*" --settings=build_type=Release \
+            --output-folder="${RUNNER_TEMP:-/tmp}/conan-boost-warm"
         else
           echo "conan-cache-guard: boost cache OK (integrity + cppstd=20)"
         fi
+        flock -u 9
     - name: Verify boost integrity + cppstd (auto-purge if corrupt or wrong-std) [windows]
       if: runner.os == 'Windows'
       shell: cmd
       run: |
+        rem VM217 is a single Windows runner -- no concurrent siblings share its
+        rem cache, so no thundering-herd race; a purge here is healed by this
+        rem job's own following conan install. cmd (not powershell) because
+        rem VM217 execution-policy blocks unsigned script bodies.
         set purge=
         conan cache check-integrity "boost/*"
         if errorlevel 1 set purge=integrity check FAILED
