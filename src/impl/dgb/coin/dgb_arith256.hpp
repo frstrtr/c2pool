@@ -28,7 +28,66 @@
 
 #include <cstdint>
 
+#ifdef _MSC_VER
+#include <intrin.h>   // _umul128 / _udiv128 -- MSVC has no __int128 keyword
+#endif
+
 namespace dgb::coin {
+
+// ---------------------------------------------------------------------------
+// Portable 128-bit primitives. GCC/Clang express the 64x64->128 multiply,
+// 128/64 divide and 64+64 add through unsigned __int128; MSVC has no such
+// type, so it uses the x64 intrinsics (_umul128 / _udiv128) that lower to the
+// SAME mul/div/add-with-carry instructions. Both branches are bit-identical,
+// so the DigiShield boundary vectors are unchanged. Mirrors the portable
+// mul128_shift precedent in dgb/share_tracker.hpp.
+// ---------------------------------------------------------------------------
+namespace detail {
+
+// low 64 of (a*b + add); high 64 written to hi. a*b+add always fits 128 bits.
+inline uint64_t mul_add_u128(uint64_t a, uint64_t b, uint64_t add, uint64_t& hi) {
+#ifdef _MSC_VER
+    uint64_t lo = _umul128(a, b, &hi);
+    lo += add;
+    hi += (lo < add) ? 1u : 0u;     // carry out of the low limb
+    return lo;
+#else
+    unsigned __int128 p = (unsigned __int128)a * b + add;
+    hi = (uint64_t)(p >> 64);
+    return (uint64_t)p;
+#endif
+}
+
+// quotient of (hi:lo)/d; remainder written to rem. Requires hi < d (holds for
+// schoolbook long division where hi is the running remainder), so the 64-bit
+// quotient never overflows.
+inline uint64_t div_u128(uint64_t hi, uint64_t lo, uint64_t d, uint64_t& rem) {
+#ifdef _MSC_VER
+    return _udiv128(hi, lo, d, &rem);
+#else
+    unsigned __int128 cur = ((unsigned __int128)hi << 64) | lo;
+    rem = (uint64_t)(cur % d);
+    return (uint64_t)(cur / d);
+#endif
+}
+
+// low 64 of (a + b + carry_in); carry out (0/1) written to carry_out.
+inline uint64_t add_u128(uint64_t a, uint64_t b, uint64_t carry_in, uint64_t& carry_out) {
+#ifdef _MSC_VER
+    uint64_t s = a + b;
+    uint64_t c = (s < a) ? 1u : 0u;
+    s += carry_in;
+    c += (s < carry_in) ? 1u : 0u;
+    carry_out = c;
+    return s;
+#else
+    unsigned __int128 s = (unsigned __int128)a + b + carry_in;
+    carry_out = (uint64_t)(s >> 64);
+    return (uint64_t)s;
+#endif
+}
+
+} // namespace detail
 
 // 256-bit unsigned, little-endian limbs (limb[0] least significant). Only the
 // operations the DigiShield damped multiply needs: scale-by-u64 (truncating at
@@ -75,11 +134,11 @@ struct u256 {
     // does. This is the divergence point vs a 128/wider proxy.
     u256 mul_u64(uint64_t m) const {
         u256 r;
-        unsigned __int128 carry = 0;
+        uint64_t carry = 0;
         for (int i = 0; i < 4; ++i) {
-            unsigned __int128 prod = (unsigned __int128)limb[i] * m + carry;
-            r.limb[i] = (uint64_t)prod;
-            carry     = prod >> 64;
+            uint64_t hi;
+            r.limb[i] = detail::mul_add_u128(limb[i], m, carry, hi);
+            carry     = hi;
         }
         // carry beyond limb[3] dropped -> 256-bit truncation (consensus).
         return r;
@@ -89,11 +148,9 @@ struct u256 {
     // Schoolbook long division from the most-significant limb down.
     u256 div_u64(uint64_t d) const {
         u256 r;
-        unsigned __int128 rem = 0;
+        uint64_t rem = 0;
         for (int i = 3; i >= 0; --i) {
-            unsigned __int128 cur = (rem << 64) | limb[i];
-            r.limb[i] = (uint64_t)(cur / d);
-            rem       = cur % d;
+            r.limb[i] = detail::div_u128(rem, limb[i], d, rem);
         }
         return r;
     }
@@ -102,11 +159,9 @@ struct u256 {
     // same width discipline as mul_u64). Accumulates the retarget window's
     // target sum before the divide-by-count average.
     u256& operator+=(const u256& o) {
-        unsigned __int128 carry = 0;
+        uint64_t carry = 0;
         for (int i = 0; i < 4; ++i) {
-            unsigned __int128 s = (unsigned __int128)limb[i] + o.limb[i] + carry;
-            limb[i] = (uint64_t)s;
-            carry   = s >> 64;
+            limb[i] = detail::add_u128(limb[i], o.limb[i], carry, carry);
         }
         return *this;
     }
