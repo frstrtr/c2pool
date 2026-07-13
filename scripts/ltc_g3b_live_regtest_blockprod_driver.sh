@@ -54,9 +54,22 @@ mkdir -p "$WORKDIR"/{ltc,doge}
 log "preflight OK; workdir=$WORKDIR floor=$FLOOR window=$CHAIN_LENGTH"
 
 # ---- 1. daemons up (regtest, self-provisioned rpc creds) ---------------------
-gen_creds(){ printf "rpcuser=g3b\nrpcpassword=%s\n" "$(head -c16 /dev/urandom | od -An -tx1 | tr -d " \n")"; }
-gen_creds > "$WORKDIR/ltc/litecoin.conf";  printf "regtest=1\nserver=1\nrpcport=19443\n"   >> "$WORKDIR/ltc/litecoin.conf"
-gen_creds > "$WORKDIR/doge/dogecoin.conf"; printf "regtest=1\nserver=1\nrpcport=19444\n" >> "$WORKDIR/doge/dogecoin.conf"
+gen_pass(){ head -c16 /dev/urandom | od -An -tx1 | tr -d " \n"; }
+LTC_RPCPASS="$(gen_pass)"; DOGE_RPCPASS="$(gen_pass)"   # captured: c2pool + daemons must share creds
+cat > "$WORKDIR/ltc/litecoin.conf" <<EOF
+regtest=1
+server=1
+rpcport=19443
+rpcuser=g3b
+rpcpassword=$LTC_RPCPASS
+EOF
+cat > "$WORKDIR/doge/dogecoin.conf" <<EOF
+regtest=1
+server=1
+rpcport=19444
+rpcuser=g3b
+rpcpassword=$DOGE_RPCPASS
+EOF
 "$LTC_DAEMON"  -regtest -datadir="$WORKDIR/ltc"  -conf="$WORKDIR/ltc/litecoin.conf"   -daemon
 "$DOGE_DAEMON" -regtest -datadir="$WORKDIR/doge" -conf="$WORKDIR/doge/dogecoin.conf" -daemon
 sleep "$SETTLE"
@@ -76,9 +89,12 @@ log "primed: LTC+DOGE matured; mempools populated ($(LC getmempoolinfo | grep -o
 
 # ---- 3. c2pool up (embedded LTC + embedded DOGE aux), VOTING ------------------
 "$C2POOL_BIN" --ltc --regtest \
-  --litecoind-rpc 127.0.0.1:19443 --dogecoind-rpc 127.0.0.1:19444 \
-  --min-protocol "$FLOOR" --stratum-port "$STRATUM_PORT" \
-  --datadir "$WORKDIR/c2pool" >"$WORKDIR/c2pool.log" 2>&1 &
+  --rpchost 127.0.0.1 --rpcport 19443 --rpcuser g3b --rpcpassword "$LTC_RPCPASS" \
+  --merged-coind-address 127.0.0.1 --merged-coind-rpc-port 19444 \
+  --merged-coind-rpc-user g3b --merged-coind-rpc-password "$DOGE_RPCPASS" \
+  --stratum-port "$STRATUM_PORT" \
+  >"$WORKDIR/c2pool.log" 2>&1 &
+  # NB: 3301 min-proto floor is compile-time (PR#111), no CLI flag; c2pool uses internal data dir
 C2POOL_PID=$!
 sleep "$SETTLE"
 kill -0 "$C2POOL_PID" 2>/dev/null || fail "c2pool did not stay up (see $WORKDIR/c2pool.log)"
