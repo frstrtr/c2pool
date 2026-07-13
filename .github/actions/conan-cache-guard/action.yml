@@ -1,11 +1,17 @@
 name: "Conan cache integrity guard"
 description: >
-  Auto-heal a corrupt/incomplete cached boost package on self-hosted runners.
-  The self-hosted runners reuse ~/.conan2 across jobs; a partially-failed conan
-  build can leave an incomplete boost package (missing headers/libs) that
-  persists and reddens later jobs intermittently. This verifies the cached
-  boost package against its manifest and purges it on any mismatch so the
-  following `conan install` rebuilds it clean. No-op on a healthy/empty cache.
+  Auto-heal a corrupt/incomplete OR wrong-config cached boost package on
+  self-hosted runners. The self-hosted runners reuse ~/.conan2 across jobs.
+  A partially-failed conan build can leave an incomplete boost package
+  (missing headers/libs), and an out-of-band/manual `conan install` can leave
+  an intact-but-wrong-std boost (compiler.cppstd=gnu17) that PASSES an integrity
+  check yet is ABI-incompatible with the cppstd=20 c2pool TUs. Conan's
+  compatibility fallback then re-selects that gnu17 boost instead of rebuilding,
+  reddening later jobs intermittently (the per-job profile cppstd=20 pin cannot
+  prevent this; it only sets what is *requested*, not what is *selected*). This
+  purges boost on integrity mismatch OR on any cached cppstd != 20 so the
+  following `conan install` rebuilds it clean. No-op on a healthy cppstd=20 or
+  empty cache.
 runs:
   using: composite
   steps:
@@ -14,25 +20,40 @@ runs:
     # uses shell: cmd (not powershell) because VM217 execution-policy blocks
     # unsigned script bodies; cmd has no execution-policy gate, matching what
     # the windows-2022 fork-fallback already does.
-    - name: Verify boost conan package integrity (auto-purge if corrupt) [posix]
+    - name: Verify boost integrity + cppstd (auto-purge if corrupt or wrong-std) [posix]
       if: runner.os != 'Windows'
       shell: bash
       run: |
-        if conan cache check-integrity "boost/*"; then
-          echo "conan-cache-guard: boost cache integrity OK"
-        else
-          echo "::warning title=conan-cache-guard::boost package integrity check FAILED — purging so conan install rebuilds it clean"
-          conan remove "boost/*" -c || true
+        purge=""
+        if ! conan cache check-integrity "boost/*"; then
+          purge="integrity check FAILED"
+        elif conan list "boost/*:*" -f json 2>/dev/null \
+               | grep -oE '"compiler.cppstd": "[^"]*"' \
+               | grep -qv '"compiler.cppstd": "20"'; then
+          purge="a cached binary was built with compiler.cppstd != 20 (wrong-std; Conan compatibility fallback would re-select it)"
         fi
-    - name: Verify boost conan package integrity (auto-purge if corrupt) [windows]
+        if [ -n "$purge" ]; then
+          echo "::warning title=conan-cache-guard::boost $purge -- purging so conan install rebuilds it clean"
+          conan remove "boost/*" -c || true
+        else
+          echo "conan-cache-guard: boost cache OK (integrity + cppstd=20)"
+        fi
+    - name: Verify boost integrity + cppstd (auto-purge if corrupt or wrong-std) [windows]
       if: runner.os == 'Windows'
       shell: cmd
       run: |
+        set purge=
         conan cache check-integrity "boost/*"
-        if errorlevel 1 (
-          echo ::warning title=conan-cache-guard::boost package integrity check FAILED -- purging so conan install rebuilds it clean
+        if errorlevel 1 set purge=integrity check FAILED
+        if not defined purge (
+          conan list "boost/*:*" -f json > "%TEMP%\cg_boost.json" 2>nul
+          findstr /C:"compiler.cppstd" "%TEMP%\cg_boost.json" | findstr /V /C:": \"20\"" >nul
+          if not errorlevel 1 set purge=a cached binary was built with compiler.cppstd ^!= 20
+        )
+        if defined purge (
+          echo ::warning title=conan-cache-guard::boost %purge% -- purging so conan install rebuilds it clean
           conan remove "boost/*" -c
         ) else (
-          echo conan-cache-guard: boost cache integrity OK
+          echo conan-cache-guard: boost cache OK ^(integrity + cppstd=20^)
         )
         exit /b 0
