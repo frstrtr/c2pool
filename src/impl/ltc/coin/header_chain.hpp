@@ -115,6 +115,31 @@ inline LTCChainParams make_ltc_chain_params_testnet() {
     return p;
 }
 
+// LTC regtest params (litecoind -regtest, RPC 19443 / P2P 19444). Consensus
+// values verified against Litecoin Core v0.21.4 CRegTestParams on a live
+// -regtest node: genesis hash 530827f3...c416f9, nBits 0x207fffff (powLimit
+// 7fffff00...), min-difficulty + no-retargeting so a single scrypt rig
+// (or generate) produces blocks immediately for the G3b genuine-block leg.
+inline LTCChainParams make_ltc_chain_params_regtest() {
+    LTCChainParams p;
+    p.target_timespan = 302400;     // inherited; moot under no_retargeting
+    p.target_spacing  = 150;
+    p.allow_min_difficulty = true;
+    p.no_retargeting = true;
+    // Regtest powLimit expanded from nBits 0x207fffff (CRegTestParams).
+    p.pow_limit.SetHex("7fffff0000000000000000000000000000000000000000000000000000000000");
+    // Regtest genesis, read from litecoind -regtest getblockhash 0 (v0.21.4).
+    p.genesis_hash.SetHex("530827f38f93b43ed12af0b3ad25a288dc02ed74d6d7857862df51fc56c416f9");
+    // CRegTestParams nSubsidyHalvingInterval = 150; without this the embedded
+    // TemplateBuilder emits the un-halved 50 LTC past h>=150 and a won block is
+    // rejected bad-cb-amount on ConnectBlock (mirrors BTC regtest leg-b fix).
+    p.halving_interval = 150;
+    p.initial_subsidy = 5000000000ULL;
+    p.pow_func = core::pow::scrypt;
+    p.block_hash_func = core::pow::sha256d;
+    return p;
+}
+
 // ─── PoW Functions ──────────────────────────────────────────────────────────
 
 /// Compute PoW hash of an 80-byte block header using the coin's PoW function.
