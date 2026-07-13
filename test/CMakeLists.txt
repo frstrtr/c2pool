@@ -559,6 +559,17 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_dash_node_embedded_wire PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining c2pool_storage pool)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_node_embedded_wire "" AUTO)
+    # get_work() consumer capstone: fuses NodeCoinState::select_work() (embedded
+    # template source) with assemble_work_job_targets(); same OBJECT-lib SCC.
+    add_executable(test_dash_get_work test_dash_get_work.cpp)
+    target_link_libraries(test_dash_get_work PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_get_work PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining c2pool_storage pool)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_get_work "" AUTO)
 
     # Reception wire (legs 1-3): interfaces::Node reception Events ->
     # CoinStateMaintainer. Proves the wire_*_ingest() subscriptions fold off the
