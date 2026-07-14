@@ -1,0 +1,20 @@
+{
+    "version": "0.5",
+    "requires": [
+        "zlib/1.3.2#1cb806da49011867778ffb6ac7190fcb%1777558780.503",
+        "yaml-cpp/0.8.0#1aa371213f0307605d88ad5445581aff%1773246038.815",
+        "snappy/1.1.10#9cff2aa2cf616aa98532b1872ef44dcf%1743607712.928",
+        "nlohmann_json/3.12.0#2d634ab0ec8d9f56353e5ccef6d6612c%1744735883.94",
+        "libbacktrace/cci.20210118#a7691bfccd8caaf66309df196790a5a1%1722218217.276",
+        "leveldb/1.23#4e79f90a895472fbdf61064efa0ad95b%1707750968.355",
+        "gtest/1.14.0#f8f0757a574a8dd747d16af62d6eb1b7%1743410807.169",
+        "crc32c/1.1.2#e12fa67962640dc0412ffb28f47d206f%1759090994.248",
+        "bzip2/1.0.8#c470882369c2d95c5c77e970c0c7e321%1762886692.465",
+        "boost/1.90.0#cd8d6667856c182d561afc841f1a8252%1783338727.082"
+    ],
+    "build_requires": [
+        "b2/5.5.1#64d533c0c55f96a91011f77fd2900b45%1783557339.429"
+    ],
+    "python_requires": [],
+    "config_requires": []
+}
