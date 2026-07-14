@@ -160,7 +160,16 @@ void Logger::init(const std::string& log_file_name, int rotation_size_mb, int ma
         if (!fec && sz > static_cast<uintmax_t>(rotation_size_mb) * 1024 * 1024) {
             std::time_t t = std::time(nullptr);
             char ts[32];
-            std::strftime(ts, sizeof(ts), "%Y%m%d-%H%M%S", std::gmtime(&t));
+            // Thread-safe gmtime: std::gmtime returns a pointer into a shared
+            // static tm and is not reentrant (CodeQL cpp/potentially-dangerous-
+            // function). Use the reentrant per-platform variant into a local tm.
+            std::tm tmv{};
+#ifdef _WIN32
+            gmtime_s(&tmv, &t);   // MSVC secure-CRT: (tm*, time_t*)
+#else
+            gmtime_r(&t, &tmv);   // POSIX GCC/Clang: (time_t*, tm*)
+#endif
+            std::strftime(ts, sizeof(ts), "%Y%m%d-%H%M%S", &tmv);
             std::filesystem::path rotated =
                 rotated_dir / (debug_log.filename().string() + std::string(".") + ts);
             std::filesystem::rename(debug_log, rotated, fec);
