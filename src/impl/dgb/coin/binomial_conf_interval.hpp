@@ -28,6 +28,10 @@
 namespace dgb {
 namespace coin {
 
+// MSVC does not define M_PI (non-standard POSIX macro) without _USE_MATH_DEFINES;
+// use a portable constexpr to keep the Windows/MSVC release lane building.
+constexpr double kPi = 3.14159265358979323846;
+
 // Oracle erf -- Abramowitz & Stegun formula 7.1.26 (util/math.py:100).
 // erf(-x) = -erf(x) handled via sign capture, exactly as the oracle.
 inline double erf_as7126(double x)
@@ -57,7 +61,7 @@ inline double ierf(double z)
 {
     double guess = 0.0;
     for (int i = 0; i < 10; ++i) {
-        const double dy = 2.0 * std::exp(-guess * guess) / std::sqrt(M_PI);
+        const double dy = 2.0 * std::exp(-guess * guess) / std::sqrt(kPi);
         const double y_over_dy = (erf_as7126(guess) - z) / dy;
         const double prev = guess;
         guess = guess - y_over_dy;
