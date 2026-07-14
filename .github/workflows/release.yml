@@ -450,7 +450,7 @@ jobs:
             "exists=1" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           } else {
             "exists=0" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-            Write-Host "::warning::c2pool-${{ matrix.coin }} source not on this ref — no ${{ matrix.coin }} Windows package will be produced."
+            Write-Host "::warning::c2pool-${{ matrix.coin }} source not on this ref -- no ${{ matrix.coin }} Windows package will be produced."
           }
 
       - uses: actions/setup-python@v6
