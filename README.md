@@ -2,10 +2,24 @@
 
 [![CI](https://github.com/frstrtr/c2pool/actions/workflows/build.yml/badge.svg)](https://github.com/frstrtr/c2pool/actions/workflows/build.yml)
 
-C++ reimplementation of [forrestv/p2pool](https://github.com/p2pool/p2pool) targeting the **V36 share format** with Litecoin + multi-chain merged mining (DOGE, PEP, BELLS, LKY, JKC, SHIC). DigiByte Scrypt support in development as an additional parent chain.
+C++ reimplementation of [forrestv/p2pool](https://github.com/p2pool/p2pool) targeting the **V36 share format**, with **per-coin binaries** for five parent chains and their merged-mining children: **Litecoin** (flagship — LTC + DOGE, PEP, BELLS, LKY, JKC, SHIC), **Bitcoin** (+ Namecoin), **DigiByte** (Scrypt), **Bitcoin Cash**, and **Dash**. See [Supported chains](#supported-chains) for the full matrix and status.
 
 Bitcoin wiki: <https://en.bitcoin.it/wiki/P2Pool>
 Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
+
+## Supported chains
+
+c2pool builds one binary per **parent chain** (`c2pool-<coin>`). Several parents also merge-mine **AuxPoW child chains** in the same coinbase.
+
+| Parent chain | Algorithm | Merged-mining children | Status |
+|---|---|---|---|
+| **Litecoin** (LTC) | Scrypt | DOGE, PEP, BELLS, LKY, JKC, SHIC — external daemons | **Production** (V36; live LTC+DOGE blocks) |
+| **Bitcoin** (BTC) | SHA256d | Namecoin (NMC) | Supported; NMC embedded merged mining in development |
+| **DigiByte** (DGB) | Scrypt¹ | DOGE (embedded, `-DAUX_DOGE`) | In development |
+| **Bitcoin Cash** (BCH) | SHA256d | — | In development |
+| **Dash** (DASH) | X11 | — | In development (embedded coin-state) |
+
+¹ DigiByte is a MultiAlgo chain; c2pool runs its **Scrypt** algorithm as a standalone parent — it is **not** an AuxPoW child of Litecoin.
 
 ## Credits
 
@@ -38,7 +52,7 @@ c2pool is an independent C++ implementation of the P2Pool sharechain concept ori
 
 ## Download
 
-Pre-built binaries are available on the [Releases page](https://github.com/frstrtr/c2pool/releases). The current release is **v0.2.0** (LTC + DOGE v36); packages are named `c2pool-ltc-<version>-<platform>`.
+Pre-built binaries are available on the [Releases page](https://github.com/frstrtr/c2pool/releases). The current release line is **v0.2.x** (V36). Packages are built **per parent chain** and named `c2pool-<coin>-<version>-<platform>` (`ltc`, `btc`, `dgb`, `dash`, `bch`).
 
 | Platform | Package | Notes |
 |----------|---------|-------|
