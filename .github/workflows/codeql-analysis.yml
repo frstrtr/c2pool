@@ -47,6 +47,10 @@ jobs:
           build-mode: ${{ matrix.build-mode }}
           queries: security-and-quality
 
+      - if: matrix.build-mode == 'manual'
+        name: Set per-job Conan home
+        run: echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+
       # ── C++ build (manual mode only) ─────────────────────────────────────
       - if: matrix.build-mode == 'manual' && runner.environment == 'github-hosted'
         name: Install system dependencies
@@ -73,17 +77,14 @@ jobs:
           else
             conan --version   # pre-provisioned at /usr/local/bin on self-hosted
           fi
-          conan profile detect --force
-          sed -i 's/compiler.cppstd=.*/compiler.cppstd=20/' \
-            "$(conan profile path default)"
 
       - if: matrix.build-mode == 'manual'
         name: Restore Conan package cache
         uses: actions/cache@v5
         with:
-          path: ~/.conan2
-          # Share cache with build.yml (same Release profile)
-          key: conan2-ubuntu24-gcc13-${{ hashFiles('conanfile.txt') }}
+          path: ${{ runner.temp }}/conan2
+          # Isolated per-job Conan home; keyed by profile + lockfile.
+          key: conan2-ubuntu24-gcc13-${{ hashFiles('conanfile.txt', 'ci/conan/linux-gcc13.profile', 'conan.lock') }}
           restore-keys: conan2-ubuntu24-gcc13-
 
       - if: matrix.build-mode == 'manual' && runner.environment != 'github-hosted'
@@ -94,6 +95,8 @@ jobs:
         name: Install Conan dependencies
         run: |
           conan install . \
+            -pr:a=ci/conan/linux-gcc13.profile \
+            --lockfile=conan.lock \
             --build=missing \
             --output-folder=build_codeql \
             --settings=build_type=Release

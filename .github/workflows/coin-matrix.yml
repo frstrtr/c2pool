@@ -37,6 +37,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Set per-job Conan home
+        run: echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+
       - name: Check source presence
         id: presence
         run: |
@@ -69,18 +72,16 @@ jobs:
             conan --version   # pre-provisioned at /usr/local/bin on self-hosted
           fi
 
-      - name: Detect Conan profile
+      - name: Show committed Conan profile
         if: steps.presence.outputs.exists == '1'
-        run: |
-          conan profile detect --force
-          sed -i 's/compiler.cppstd=.*/compiler.cppstd=20/' "$(conan profile path default)"
+        run: conan profile show -pr:a=ci/conan/linux-gcc13.profile
 
       - name: Restore Conan cache
         if: steps.presence.outputs.exists == '1'
         uses: actions/cache@v5
         with:
-          path: ~/.conan2
-          key: conan2-ubuntu24-gcc13-${{ matrix.coin }}-${{ hashFiles('conanfile.txt') }}
+          path: ${{ runner.temp }}/conan2
+          key: conan2-ubuntu24-gcc13-${{ matrix.coin }}-${{ hashFiles('conanfile.txt', 'ci/conan/linux-gcc13.profile', 'conan.lock') }}
           restore-keys: |
             conan2-ubuntu24-gcc13-${{ matrix.coin }}-
             conan2-ubuntu24-gcc13-
@@ -102,6 +103,8 @@ jobs:
         if: steps.presence.outputs.exists == '1'
         run: |
           conan install . \
+            -pr:a=ci/conan/linux-gcc13.profile \
+            --lockfile=conan.lock \
             --build=missing \
             --output-folder=build_${{ matrix.coin }} \
             --settings=build_type=Release

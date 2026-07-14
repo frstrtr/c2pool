@@ -56,12 +56,6 @@ jobs:
   linux:
     name: ${{ matrix.coin }} package (Linux x86_64)
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
-    # Private per-job Conan home: each coin cell builds Boost into an ISOLATED
-    # cache, so the concurrent cells sharing the one c2pool-build self-hosted
-    # host can never tear each other's ~/.conan2 (root cause of the 1.90.0
-    # torn-header flakes). Mirrors build.yml. See ci-boost-stream.md.
-    env:
-      CONAN_HOME: ${{ runner.temp }}/conan2
     strategy:
       fail-fast: false
       matrix:
@@ -90,6 +84,11 @@ jobs:
             echo "exists=0" >> "$GITHUB_OUTPUT"
             echo "::warning::c2pool-${{ matrix.coin }} source not on this ref — no ${{ matrix.coin }} Linux package will be produced."
           fi
+
+      # Per-coin-cell Conan home; RUNNER_TEMP is step-scope only, so export via
+      # $GITHUB_ENV (job-level `env: runner.temp` fails to parse). See build.yml.
+      - name: Set per-job Conan home
+        run: echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
 
       - name: Install system dependencies
         if: steps.presence.outputs.exists == '1'
@@ -432,9 +431,6 @@ jobs:
   windows:
     name: ${{ matrix.coin }} package (Windows x86_64)
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Windows","X64","c2pool-build"]') || 'windows-2022' }}
-    # Private per-job Conan home (isolated per coin cell) — see the Linux lane.
-    env:
-      CONAN_HOME: ${{ runner.temp }}/conan2
     defaults:
       run:
         # VM217 Windows PowerShell runs at ExecutionPolicy=Restricted and has no
@@ -448,6 +444,11 @@ jobs:
         coin: ${{ fromJSON(github.event.inputs.coins || '["btc","ltc","dgb","dash","bch"]') }}
     steps:
       - uses: actions/checkout@v6
+
+      # Per-coin-cell Conan home; RUNNER_TEMP is step-scope only, so export via
+      # $GITHUB_ENV (job-level `env: runner.temp` fails to parse). PowerShell form.
+      - name: Set per-job Conan home
+        run: echo "CONAN_HOME=$env:RUNNER_TEMP/conan2" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Resolve version
         id: ver
