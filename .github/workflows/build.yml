@@ -40,13 +40,15 @@ jobs:
   linux:
     name: Linux x86_64
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
-    # Private per-job Conan home: each job builds Boost into an ISOLATED cache,
-    # so concurrent jobs can never tear each other's ~/.conan2 (root cause of the
-    # 1.90.0 torn-header flakes). See ci-boost-stream.md.
-    env:
-      CONAN_HOME: ${{ runner.temp }}/conan2
     steps:
       - uses: actions/checkout@v6
+
+      # Private per-job Conan home: each job builds Boost into an ISOLATED cache,
+      # so concurrent jobs can never tear each other's ~/.conan2 (root cause of the
+      # 1.90.0 torn-header flakes). RUNNER_TEMP is only valid at step scope, so
+      # export it via $GITHUB_ENV -- a job-level `env: runner.temp` fails to parse.
+      - name: Set per-job Conan home
+        run: echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
 
       - name: Install system dependencies
         if: runner.environment == 'github-hosted'
