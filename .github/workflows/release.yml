@@ -418,6 +418,13 @@ jobs:
   windows:
     name: ${{ matrix.coin }} package (Windows x86_64)
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Windows","X64","c2pool-build"]') || 'windows-2022' }}
+    defaults:
+      run:
+        # VM217 Windows PowerShell runs at ExecutionPolicy=Restricted and has no
+        # Git-bash on the runner-service PATH (shell:bash -> "bash: command not
+        # found"). Use the ExecutionPolicy-Bypass PowerShell shell proven green
+        # by build.yml's Windows lane (probe 28679257030). cmd steps override.
+        shell: powershell -ExecutionPolicy Bypass -Command ". '{0}'"
     strategy:
       fail-fast: false
       matrix:
@@ -427,40 +434,55 @@ jobs:
 
       - name: Resolve version
         id: ver
-        shell: bash
         run: |
-          if [ -n "${{ github.event.inputs.version }}" ]; then
-            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
-          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-          else
-            echo "version=0.0.0-${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
-          fi
+          if ("${{ github.event.inputs.version }}") {
+            "version=${{ github.event.inputs.version }}" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } elseif ("${env:GITHUB_REF}" -like "refs/tags/v*") {
+            "version=$("${env:GITHUB_REF_NAME}".TrimStart('v'))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            "version=0.0.0-$("${env:GITHUB_SHA}".Substring(0,8))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
 
       - name: Check source presence
         id: presence
-        shell: bash
         run: |
-          if [ -f "src/c2pool/main_${{ matrix.coin }}.cpp" ] && [ -d "src/impl/${{ matrix.coin }}" ]; then
-            echo "exists=1" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=0" >> "$GITHUB_OUTPUT"
-            echo "::warning::c2pool-${{ matrix.coin }} source not on this ref — no ${{ matrix.coin }} Windows package will be produced."
-          fi
+          if ((Test-Path "src/c2pool/main_${{ matrix.coin }}.cpp") -and (Test-Path "src/impl/${{ matrix.coin }}")) {
+            "exists=1" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            "exists=0" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host "::warning::c2pool-${{ matrix.coin }} source not on this ref -- no ${{ matrix.coin }} Windows package will be produced."
+          }
 
       - uses: actions/setup-python@v6
-        if: steps.presence.outputs.exists == '1'
+        if: steps.presence.outputs.exists == '1' && runner.environment == 'github-hosted'
         with: { python-version: '3.12' }
 
       - name: Install Conan 2
         if: steps.presence.outputs.exists == '1'
-        shell: bash
         run: |
-          if [ "${{ runner.environment }}" = "github-hosted" ]; then
-            pip install "conan>=2.0,<3.0"
-          else
-            conan --version   # pre-provisioned at /usr/local/bin on self-hosted
-          fi
+          # VM217 exposes neither conan nor a bare python on the runner-service
+          # PATH (setup-python is gated off self-hosted); resolve an interpreter
+          # via the Windows py launcher (py -> python3 -> python), pip-install
+          # conan, and export its Scripts dir(s) through GITHUB_PATH. On the
+          # github-hosted fork fallback py/python resolve normally.
+          $py = $null
+          foreach ($cand in @('py','python3','python')) {
+            if (Get-Command $cand -ErrorAction SilentlyContinue) { $py = $cand; break }
+          }
+          if (-not $py) {
+            Write-Host "No Python interpreter on PATH. Diagnostics:"
+            & where.exe python 2>&1; & where.exe py 2>&1; & where.exe python3 2>&1
+            Write-Host "PATH=$env:PATH"
+            throw "VM217 has no Python interpreter on the runner-service PATH"
+          }
+          Write-Host "Using interpreter: $py"
+          & $py -m pip install "conan>=2.0,<3.0"
+          $scripts = & $py -c "import sysconfig; print(sysconfig.get_path('scripts'))"
+          $userScripts = & $py -c "import sysconfig; print(sysconfig.get_path('scripts','nt_user'))"
+          $env:PATH = "$scripts;$userScripts;$env:PATH"
+          Add-Content -Path $env:GITHUB_PATH -Value $scripts
+          Add-Content -Path $env:GITHUB_PATH -Value $userScripts
+          conan --version
 
       - name: Detect Conan profile
         if: steps.presence.outputs.exists == '1'
