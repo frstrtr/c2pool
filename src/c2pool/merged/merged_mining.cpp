@@ -574,6 +574,16 @@ IAuxChainBackend* MergedMiningManager::get_chain_rpc(uint32_t chain_id)
     return nullptr;
 }
 
+bool MergedMiningManager::has_chain(uint32_t chain_id) const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    for (const auto& chain : m_chains) {
+        if (chain.config.chain_id == chain_id)
+            return true;
+    }
+    return false;
+}
+
 void MergedMiningManager::start()
 {
     if (m_running) return;

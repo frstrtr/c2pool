@@ -19,6 +19,7 @@
 #include <impl/btc/coin/mempool.hpp>
 #include <impl/btc/coin/template_builder.hpp>  // build_template + merkle_hash_pair
 #include <impl/btc/coin/transaction.hpp>
+#include <c2pool/merged/merged_mining.hpp>   // MergedMiningManager::has_chain (PR-2a)
 
 #include <core/address_utils.hpp>               // address_to_script (for share write path)
 #include <core/hash.hpp>
@@ -170,10 +171,11 @@ uint64_t BTCWorkSource::get_work_generation() const
     return work_generation_.load(std::memory_order_relaxed);
 }
 
-bool BTCWorkSource::has_merged_chain(uint32_t /*chain_id*/) const
+bool BTCWorkSource::has_merged_chain(uint32_t chain_id) const
 {
-    // BTC MVP: no merged mining (the LTC MM rig is DOGE — none for BTC currently).
-    return false;
+    // Wired in PR-2a: consult the merged-mining manager if main_btc set one
+    // (--merged NMC:...). No manager or unknown chain_id => false.
+    return mm_manager_ != nullptr && mm_manager_->has_chain(chain_id);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
