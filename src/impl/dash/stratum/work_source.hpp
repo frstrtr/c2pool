@@ -85,6 +85,20 @@ public:
     using SubmitBlockFn = std::function<bool(const std::vector<unsigned char>& block_bytes,
                                              uint32_t height)>;
 
+    /// Construct the DASH work source. Holds a NON-OWNING reference to the
+    /// node-held coin-state (the embedded arm) and captures the REQUIRED dashd
+    /// getblocktemplate fallback closure -- the always-reachable safety path +
+    /// [GBT-XCHECK] cross-check, NEVER removed -- plus the dual-path won-block
+    /// submit callback. main_dash.cpp owns coin_state for the process lifetime
+    /// and constructs this after it (see the Lifetime note above); the fallback
+    /// and submit closures capture the dashd RPC client + won-block dispatcher.
+    DASHWorkSource(const coin::NodeCoinState& coin_state,
+                   std::function<coin::DashWorkData()> dashd_fallback,
+                   SubmitBlockFn submit_fn = {},
+                   core::stratum::StratumConfig config = {});
+
+    ~DASHWorkSource();
+
     /// Fused DASH work source: source the base template off the node-held
     /// coin-state (embedded when populated, retained dashd fallback on a
     /// set-gap) and assemble the per-miner job targets. This is the concrete
