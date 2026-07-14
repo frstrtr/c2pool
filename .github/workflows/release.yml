@@ -56,6 +56,12 @@ jobs:
   linux:
     name: ${{ matrix.coin }} package (Linux x86_64)
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    # Private per-job Conan home: each coin cell builds Boost into an ISOLATED
+    # cache, so the concurrent cells sharing the one c2pool-build self-hosted
+    # host can never tear each other's ~/.conan2 (root cause of the 1.90.0
+    # torn-header flakes). Mirrors build.yml. See ci-boost-stream.md.
+    env:
+      CONAN_HOME: ${{ runner.temp }}/conan2
     strategy:
       fail-fast: false
       matrix:
@@ -114,18 +120,16 @@ jobs:
             conan --version   # pre-provisioned at /usr/local/bin on self-hosted
           fi
 
-      - name: Detect Conan profile
+      - name: Show committed Conan profile
         if: steps.presence.outputs.exists == '1'
-        run: |
-          conan profile detect --force
-          sed -i 's/compiler.cppstd=.*/compiler.cppstd=20/' "$(conan profile path default)"
+        run: conan profile show -pr:a=ci/conan/linux-gcc13.profile
 
       - name: Restore Conan cache
         if: steps.presence.outputs.exists == '1'
         uses: actions/cache@v5
         with:
-          path: ~/.conan2
-          key: conan2-ubuntu24-gcc13-${{ matrix.coin }}-${{ hashFiles('conanfile.txt') }}
+          path: ${{ runner.temp }}/conan2
+          key: conan2-ubuntu24-gcc13-${{ matrix.coin }}-${{ hashFiles('conanfile.txt', 'ci/conan/linux-gcc13.profile', 'conan.lock') }}
           restore-keys: |
             conan2-ubuntu24-gcc13-${{ matrix.coin }}-
             conan2-ubuntu24-gcc13-
@@ -134,9 +138,10 @@ jobs:
         if: steps.presence.outputs.exists == '1'
         run: |
           conan install . \
+            -pr:a=ci/conan/linux-gcc13.profile \
+            --lockfile=conan.lock \
             --build=missing \
-            --output-folder=build_${{ matrix.coin }} \
-            --settings=build_type=Release
+            --output-folder=build_${{ matrix.coin }}
 
       - name: Configure
         if: steps.presence.outputs.exists == '1'
@@ -148,6 +153,15 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE=build_${{ matrix.coin }}/conan_toolchain.cmake \
             -DCMAKE_BUILD_TYPE=Release \
             ${{ matrix.coin == 'dgb' && '-DAUX_DOGE=ON' || '' }}
+
+      # Boost header-integrity + version gate: a torn/mixed Boost tree or an
+      # apt-Boost fallback fails HERE (fast, one TU), not deep in the coin
+      # packaging build. Same gate build.yml runs. See ci-boost-stream.md.
+      - name: Boost sentinel
+        if: steps.presence.outputs.exists == '1'
+        run: |
+          cmake --build build_${{ matrix.coin }} --target boost_sentinel -j$(nproc)
+          ctest --test-dir build_${{ matrix.coin }} -R '^boost_sentinel$' --output-on-failure
 
       - name: Build c2pool-${{ matrix.coin }}
         if: steps.presence.outputs.exists == '1'
@@ -418,6 +432,9 @@ jobs:
   windows:
     name: ${{ matrix.coin }} package (Windows x86_64)
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Windows","X64","c2pool-build"]') || 'windows-2022' }}
+    # Private per-job Conan home (isolated per coin cell) — see the Linux lane.
+    env:
+      CONAN_HOME: ${{ runner.temp }}/conan2
     defaults:
       run:
         # VM217 Windows PowerShell runs at ExecutionPolicy=Restricted and has no
@@ -484,23 +501,20 @@ jobs:
           Add-Content -Path $env:GITHUB_PATH -Value $userScripts
           conan --version
 
-      - name: Detect Conan profile
+      - name: Show committed Conan profile
         if: steps.presence.outputs.exists == '1'
-        run: |
-          conan profile detect --force
-          $profile = conan profile path default
-          (Get-Content $profile) -replace 'compiler.cppstd=14','compiler.cppstd=20' | Set-Content $profile
+        run: conan profile show -pr:a=ci/conan/windows-msvc.profile
 
       - name: Restore Conan cache
         if: steps.presence.outputs.exists == '1'
         uses: actions/cache@v5
         with:
-          path: ~/.conan2
-          key: conan2-windows-msvc194-${{ hashFiles('conanfile.txt') }}
+          path: ${{ runner.temp }}/conan2
+          key: conan2-windows-msvc194-${{ hashFiles('conanfile.txt', 'ci/conan/windows-msvc.profile', 'conan.lock') }}
 
       - name: Conan install
         if: steps.presence.outputs.exists == '1'
-        run: conan install . --build=missing --output-folder=build_ci
+        run: conan install . -pr:a=ci/conan/windows-msvc.profile --lockfile=conan.lock --build=missing --output-folder=build_ci
 
       - name: Build secp256k1
         if: steps.presence.outputs.exists == '1'
@@ -515,6 +529,15 @@ jobs:
         shell: cmd
         # DGB: -DAUX_DOGE=ON -> DGB parent + embedded DOGE (mirrors c2pool-ltc). Inert for other coins.
         run: cmake -S . -B build_ci -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake -DCMAKE_PREFIX_PATH="%GITHUB_WORKSPACE%/secp256k1" -DCMAKE_CXX_FLAGS="/D_WIN32_WINNT=0x0A00" ${{ matrix.coin == 'dgb' && '-DAUX_DOGE=ON' || '' }}
+
+      # Boost header-integrity + version gate (VS multi-config -> --config/-C Release).
+      # A torn/mixed Boost tree fails HERE, before the coin packaging build.
+      - name: Boost sentinel
+        if: steps.presence.outputs.exists == '1'
+        shell: cmd
+        run: |
+          cmake --build build_ci --target boost_sentinel --config Release -j %NUMBER_OF_PROCESSORS%
+          ctest --test-dir build_ci -R "^boost_sentinel$" -C Release --output-on-failure
 
       - name: Build c2pool-${{ matrix.coin }}
         if: steps.presence.outputs.exists == '1'
