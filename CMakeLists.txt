@@ -99,5 +99,9 @@ endif()
 
 add_subdirectory(src)
 add_subdirectory(test)
+# Boost header-integrity + version sentinel (CI compile-gate; testing-only).
+if(GTest_FOUND OR GTEST_FOUND)
+    add_subdirectory(ci/sentinel)
+endif()
 # add_subdirectory(benchmark)
 # add_subdirectory(temp)
