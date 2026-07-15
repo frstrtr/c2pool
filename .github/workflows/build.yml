@@ -264,6 +264,7 @@ jobs:
         run: |
           cmake --build build_asan \
             --target c2pool \
+                    boost_sentinel \
                     test_hardening test_share_messages \
                     test_redistribute_address test_redistribute test_auto_ratchet \
                     test_stratum_extensions \
