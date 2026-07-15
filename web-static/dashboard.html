@@ -1799,7 +1799,7 @@
                 <div class="stat-card">
                     <h3><span class="icon">🌐</span> c2pool Hash Rate</h3>
                     <div class="stat-value primary" id="pool_rate">-</div>
-                    <div class="stat-sub">DOA+Orphan: <span id="pool_stale">-</span></div>
+                    <div class="stat-sub" title="Pool sharechain stale-share rate (orphan + dead shares). High at low share-difficulty and does NOT reduce miner reward -- true lost work is the hashrate DOA meter. Sourced from share counts.">Stale shares: <span id="pool_stale">-</span></div>
                     <div class="stat-detail">Share Difficulty: <span id="difficulty">-</span></div>
                 </div>
                 <!-- V36 crossing-state: truthful ratchet visibility from /v36_status (charter #3) -->
@@ -1825,7 +1825,7 @@
                     <div class="stat-card">
                         <h3><span class="icon">⛏️</span> Local Hash Rate</h3>
                         <div class="stat-value success" id="local_rate">-</div>
-                        <div class="stat-sub">DOA: <span id="local_doa">-</span></div>
+                        <div class="stat-sub" title="Dead-on-arrival = local dead_hashrate / local hashrate -- the true lost-work / unrewarded fraction. Sourced from live hashrate, not share counts.">DOA: <span id="local_doa">-</span></div>
                         <div class="stat-detail">Expected Share: <span id="time_to_share">-</span></div>
                     </div>
                     
@@ -1833,7 +1833,7 @@
                         <h3><span class="icon">📊</span> Shares</h3>
                         <div class="stat-value" style="display: flex; align-items: baseline; justify-content: flex-start; gap: 6px;"><span id="shares_total">-</span><span id="share_versions_line" style="font-size: 0.4em; font-weight: 400; opacity: 0.7;"></span></div>
                         <div class="stat-sub">Orphan: <span id="shares_orphan">-</span> | Dead: <span id="shares_dead">-</span></div>
-                        <div class="stat-detail">Efficiency: <span id="efficiency">-</span></div>
+                        <div class="stat-detail" title="Share efficiency = unstale / total sharechain shares. At low share-difficulty, orphan churn lowers this without reducing payout -- PPLNS rewards accepted work.">Efficiency: <span id="efficiency">-</span></div>
                     </div>
                     
                     <div class="stat-card">
