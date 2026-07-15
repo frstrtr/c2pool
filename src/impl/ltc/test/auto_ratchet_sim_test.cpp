@@ -236,3 +236,99 @@ TEST(LTC_AutoRatchetSim, C4_FreshNodeMintsBaselineOnBootstrap)
     EXPECT_EQ(mint, LTC_BASE_VERSION);
     EXPECT_EQ(vote, LTC_TARGET_VERSION);
 }
+
+// ---------------------------------------------------------------------------
+// C7/lock-once-buried — REGRESSION for the 2026-07-14 contabo PROD ratchet
+// incident (LTC pool). This is the acceptance gate for the persist-activation /
+// lock-once-buried fix; DISABLED_ so it does not red CI before that fix lands —
+// flip the prefix off in the SAME commit as the fix.
+//
+// PROD FACTS: v36 activated 2026-07-11 12:30:44 (95%-by-count) and ran ~3.7d
+// with the confirmation depth buried far past the 2x lock window
+// (confirm_count=47331 >= confirmation_window=17280, ~2.7x); DOA ~0% and zero
+// invalid-version / bad-parent rejects the whole window — the network had
+// genuinely crossed. It then reverted IN-PROCESS 2026-07-14 12:23:38 on a
+// single full-window tick whose desired_version tally dipped to 49% (< the 50%
+// DEACTIVATION_THRESHOLD), which reset confirm_count_ to 0 and re-minted v35.
+//
+// ROOT CAUSE (auto_ratchet.hpp, ACTIVATED branch): the deactivation test
+//     if (full_window && vote_pct < DEACTIVATION_THRESHOLD) -> revert to VOTING
+// is evaluated BEFORE the buried-promotion test (which lives in the trailing
+// `else if (activated_height_ > 0)` arm). So a buried activation — one whose
+// confirm_count_ has already passed confirmation_window and is thus eligible to
+// become permanent CONFIRMED — is still reverted by a transient sub-50% *vote*
+// dip, even though the actual *share format* (share_pct) is ~100%. Activation
+// is therefore not monotone: it can regress after being buried. That is the
+// GLM section-C monotonicity violation.
+//
+// INVARIANT this KAT pins (lock-once-buried): once confirm_count_ >=
+// confirmation_window AND the window is still >= ACTIVATION_THRESHOLD in ACTUAL
+// v36-format shares (share_pct), the ratchet is buried and MUST lock to
+// CONFIRMED — a vote-only dip below 50% cannot revert it.
+//
+// This drives the REAL AutoRatchet state machine over a REAL ShareTracker (no
+// replica of the branch under test), so it flips from failing to passing
+// exactly when the buried-promotion is ordered ahead of the deactivation
+// revert. FIX ownership = v37-dev-steward. Production code is NOT touched here.
+// ---------------------------------------------------------------------------
+TEST(LTC_AutoRatchetSim, DISABLED_C7_BuriedActivationLocksDespiteVoteDip)
+{
+    // Lighter fixture: testnet chain_length = 400 (vs 8640 mainnet), same logic.
+    const bool saved_testnet = ltc::PoolConfig::is_testnet;
+    ltc::PoolConfig::is_testnet = true;
+    struct RestoreNet {
+        bool v;
+        ~RestoreNet() { ltc::PoolConfig::is_testnet = v; }
+    } restore_net{saved_testnet};
+
+    const uint32_t CL = ltc::PoolConfig::chain_length();                     // 400
+    const uint32_t confirmation_window =
+        CL * static_cast<uint32_t>(AutoRatchet::CONFIRMATION_MULTIPLIER);    // 800
+
+    // Persisted ACTIVATED state, buried ~2.7x past the lock window (the prod
+    // 47331/17280 ratio), mirroring the incident's on-disk ratchet state.
+    const std::string path = std::string("/tmp/ltc_autoratchet_c7_kat_") +
+                             std::to_string(::getpid()) + ".json";
+    std::remove(path.c_str());
+    {
+        nlohmann::json j;
+        j["state"] = "activated";
+        j["activated_at"] = int64_t(1);
+        j["activated_height"] = int32_t(1);
+        j["confirm_count"] = int32_t(confirmation_window * 27 / 10);         // ~2.7x buried
+        j["target_version"] = LTC_TARGET_VERSION;
+        std::ofstream(path) << j.dump();
+    }
+
+    AutoRatchet ar(path, LTC_TARGET_VERSION);
+    ASSERT_EQ(ar.state(), RatchetState::ACTIVATED) << "state file did not load as ACTIVATED";
+
+    // A full window (>= chain_length) of REAL v36-format shares whose
+    // *desired_version* has dipped to exactly 49% (any contiguous 400-window is
+    // 4x the mod-100 cycle => 49% vote V36 < the 50% deactivation gate), while
+    // every share is ACTUALLY v36 format (static version 36 => share_pct = 100%
+    // >= ACTIVATION_THRESHOLD, so the buried-promotion precondition holds).
+    ltc::ShareTracker tracker;
+    std::vector<In> shares;
+    const uint32_t N = CL + 5;
+    for (uint32_t i = 0; i < N; ++i) {
+        const uint64_t dv = ((i % 100u) < 49u) ? uint64_t(LTC_TARGET_VERSION)
+                                               : uint64_t(LTC_BASE_VERSION);
+        shares.push_back(In{ dv, 0x1d00ffff });
+    }
+    const uint256 tip = seed_tracker(tracker, shares);
+
+    auto [mint, vote] = ar.get_share_version(tracker, tip);
+    EXPECT_EQ(vote, LTC_TARGET_VERSION);   // still votes the target regardless
+
+    // INVARIANT: a buried activation locks to CONFIRMED and keeps minting v36.
+    // CURRENT (buggy) behaviour reverts to VOTING and re-mints v35 (the prod
+    // incident); both EXPECTs below fail until lock-once-buried lands.
+    EXPECT_EQ(ar.state(), RatchetState::CONFIRMED)
+        << "buried activation (confirm_count >= " << confirmation_window
+        << ") regressed to VOTING on a vote-only sub-50% dip — prod incident 2026-07-14";
+    EXPECT_EQ(mint, LTC_TARGET_VERSION)
+        << "reverted node re-minted the v35 baseline after burial";
+
+    std::remove(path.c_str());
+}
