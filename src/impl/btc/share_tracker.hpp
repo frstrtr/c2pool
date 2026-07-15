@@ -548,7 +548,9 @@ public:
                 if constexpr (requires { s->m_pubkey_hash; })
                     miner = s->m_pubkey_hash.GetHex();
                 else if constexpr (requires { s->m_address; })
-                    miner = HexStr(s->m_address.m_data);
+                    // MSVC: disambiguate HexStr overload (std::vector<unsigned char> is viable
+                    // for all span overloads). Feed the exact byte span the uint8_t overload wants.
+                    miner = HexStr(Span<const uint8_t>(s->m_address.m_data.data(), s->m_address.m_data.size()));
                 m_on_share_difficulty(diff, miner);
             });
         }
