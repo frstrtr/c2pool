@@ -577,14 +577,28 @@ jobs:
           name: pkg-windows-${{ matrix.coin }}
           path: c2pool-*-windows-x86_64.zip
 
+      # Installer is a NICE-TO-HAVE: the portable .zip (uploaded above) is the
+      # must-have deliverable. If Inno Setup is unavailable on the runner (e.g.
+      # VM217 where choco cannot write C:\ProgramData\chocolatey\lib-bad), warn
+      # and skip so the job still succeeds and the .zip ships. Durable fix is a
+      # persistent Inno Setup 6 install on the runner (ISCC on PATH).
       - name: Build setup.exe installer (Inno Setup)
         if: steps.presence.outputs.exists == '1'
         shell: cmd
+        continue-on-error: true
         run: |
-          choco install innosetup -y --no-progress
+          set "ISCC=C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if not exist "%ISCC%" (
+            echo Inno Setup not found; attempting install via chocolatey...
+            choco install innosetup -y --no-progress || echo WARNING: choco install innosetup failed
+          )
+          if not exist "%ISCC%" (
+            echo ::warning::Inno Setup unavailable on this runner; skipping setup.exe. Portable .zip already uploaded.
+            exit /b 0
+          )
           set "PKG=c2pool-${{ matrix.coin }}-${{ steps.ver.outputs.version }}-windows-x86_64"
           for /f "delims=" %%i in ('powershell -NoProfile -Command "(Get-ChildItem -Path 'C:\Program Files\Microsoft Visual Studio\2022' -Recurse -Filter vc_redist.x64.exe -ErrorAction SilentlyContinue | Select-Object -First 1).FullName"') do set "VCREDIST=%%i"
-          "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\windows\c2pool-setup.iss ^
+          "%ISCC%" installer\windows\c2pool-setup.iss ^
             /DPACKAGE_DIR="%CD%\%PKG%" ^
             /DVCREDIST_PATH="%VCREDIST%" ^
             /DMyAppName=c2pool-${{ matrix.coin }} ^
@@ -599,6 +613,7 @@ jobs:
         with:
           name: pkg-windows-setup-${{ matrix.coin }}
           path: c2pool-*-windows-x86_64-setup.exe
+          if-no-files-found: ignore
 
   # ════════════════════════════════════════════════════════════════════════════
   # Aggregate: single SHA256SUMS over every produced package; on tags,
