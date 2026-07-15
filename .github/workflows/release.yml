@@ -613,7 +613,10 @@ jobs:
         with:
           name: pkg-windows-setup-${{ matrix.coin }}
           path: c2pool-*-windows-x86_64-setup.exe
-          if-no-files-found: ignore
+          # warn (not ignore): if ISCC ran but produced no .exe, surface it as a
+          # run annotation instead of silently shipping a draft with no installer.
+          # Still non-fatal — the portable .zip remains the must-have deliverable.
+          if-no-files-found: warn
 
   # ════════════════════════════════════════════════════════════════════════════
   # Aggregate: single SHA256SUMS over every produced package; on tags,
@@ -649,14 +652,27 @@ jobs:
           name: SHA256SUMS
           path: dist/SHA256SUMS
 
-      - name: Create draft release
+      # Idempotent draft assembly: a v-tag draft may already exist from a prior
+      # re-run of this job. gh release create is NOT idempotent -- it spawns a
+      # SECOND draft with the same tag_name, so repeated runs pile up duplicate
+      # "vX.Y.Z" drafts. Refresh ONE canonical draft instead: upload --clobber
+      # if the release exists, else create it fresh.
+      - name: Assemble draft release (idempotent)
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            --repo "${{ github.repository }}" \
-            --draft \
-            --title "c2pool ${GITHUB_REF_NAME}" \
-            --notes "Draft assembled by release.yml — operator reviews and publishes manually." \
-            dist/*
+          TAG="${GITHUB_REF_NAME}"
+          REPO="${{ github.repository }}"
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Draft $TAG already exists -- refreshing assets in place (--clobber)."
+            gh release upload "$TAG" dist/* --clobber --repo "$REPO"
+          else
+            echo "No release for $TAG -- creating fresh draft."
+            gh release create "$TAG" \
+              --repo "$REPO" \
+              --draft \
+              --title "c2pool $TAG" \
+              --notes "Draft assembled by release.yml -- operator reviews and publishes manually." \
+              dist/*
+          fi
