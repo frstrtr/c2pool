@@ -52,6 +52,9 @@ class Mempool;
 namespace rpc { struct WorkData; }
 }  // namespace btc::coin
 
+// Merged-mining manager (embedded NMC etc.) — heavy header lives in the .cpp.
+namespace c2pool { namespace merged { class MergedMiningManager; } }
+
 namespace btc::stratum {
 
 class BTCWorkSource : public core::stratum::IWorkSource
@@ -227,6 +230,11 @@ public:
     /// a stratum proxy without sharechain participation.
     void set_create_share_fn(CreateShareFn fn);
 
+    /// Wire the merged-mining manager (embedded NMC etc.). Called once at
+    /// startup from main_btc.cpp when --merged is passed. null => no
+    /// merged chains, has_merged_chain() returns false.
+    void set_merged_mining_manager(c2pool::merged::MergedMiningManager* mm) { mm_manager_ = mm; }
+
     /// Set the donation script (bytes of the c2pool donation
     /// scriptPubKey — typically a P2PKH or P2WPKH for the c2pool donation
     /// address). Used by build_connection_coinbase as the residual
@@ -267,6 +275,10 @@ private:
     RefHashFn                   ref_hash_fn_;
     CreateShareFn               create_share_fn_;
     std::vector<unsigned char>  donation_script_;
+
+    // Merged-mining manager (embedded NMC etc.); non-owning, set by
+    // main_btc.cpp. null => no merged chains configured.
+    c2pool::merged::MergedMiningManager* mm_manager_ = nullptr;
 
     // Template cache (filled lazily; invalidated when work_generation_ bumps)
     // Stage 4c populates these.
