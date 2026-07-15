@@ -828,6 +828,19 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_coinbase_parity PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_coinbase_parity "" AUTO)
 
+    # PPLNS coinbase payout muldiv: native(__int128) == portable(boost uint128)
+    # byte-parity -- MSVC-portability guard for coinbase_builder.hpp step 3-4
+    # (fixes c2pool-dash Windows v0.2.1 build). Pure header math; consensus.
+    add_executable(test_dash_coinbase_muldiv test_dash_coinbase_muldiv.cpp)
+    target_link_libraries(test_dash_coinbase_muldiv PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_coinbase_muldiv PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_coinbase_muldiv "" AUTO)
+
     add_executable(test_dash_cb_payee test_dash_cb_payee.cpp)
     target_link_libraries(test_dash_cb_payee PRIVATE
         GTest::gtest_main GTest::gtest

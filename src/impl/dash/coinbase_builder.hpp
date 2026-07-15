@@ -38,6 +38,7 @@
 #include "coin/transaction.hpp"
 #include "coin/rpc_data.hpp"
 #include "share_check.hpp"                 // decode_payee_script, pubkey_hash_to_script2, DONATION_SCRIPT
+#include "payout_muldiv.hpp"               // dash::payout::payout_share (MSVC-portable 128-bit muldiv)
 
 #include <algorithm>
 #include <cstdint>
@@ -126,16 +127,14 @@ inline std::vector<MinerPayout> compute_dash_payouts(
         core::version_gate::is_v36_active(params.current_share_version);
     std::map<Script, uint64_t> amounts;
     if (total_weight > 0) {
-        // weights/total_weight fit uint64 at the DASH layer; __uint128_t covers
-        // the products (worker_payout < 2^50, 49 < 2^6, weight < 2^64).
-        __uint128_t den = v36
-            ? static_cast<__uint128_t>(total_weight)
-            : static_cast<__uint128_t>(total_weight) * 50;
+        // weights/total_weight fit uint64 at the DASH layer, but the muldiv
+        // intermediate (worker_payout*weight*49 ~ 2^120, pre-v36 den > 2^64)
+        // needs a true 128-bit type. dash::payout::payout_share uses native
+        // __uint128_t on GCC/Clang and boost uint128 on MSVC (no __int128);
+        // the two are pinned bit-identical by test_dash_coinbase_muldiv.
         for (const auto& [script, w] : weights) {
-            __uint128_t num = static_cast<__uint128_t>(w)
-                            * static_cast<__uint128_t>(worker_payout);
-            if (!v36) num *= 49;
-            amounts[script] = static_cast<uint64_t>(num / den);
+            amounts[script] =
+                dash::payout::payout_share(w, worker_payout, total_weight, v36);
         }
     }
 
