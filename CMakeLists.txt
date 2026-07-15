@@ -10,6 +10,12 @@ endif()
 if(MSVC)
     # Suppress common MSVC warnings for POSIX names and unsafe CRT functions
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS _WINSOCK_DEPRECATED_NO_WARNINGS)
+    # Enable C++ unwind semantics (/EHsc). Boost headers (asio, log, signals2)
+    # reference the inline boost::throw_exception, which links as an unresolved
+    # external (LNK2019) unless exceptions are enabled. The pinned Conan MSVC
+    # toolchain does not guarantee CMake's default /EHsc, so set it explicitly
+    # for every MSVC target — the coin binaries and the CI boost_sentinel alike.
+    add_compile_options(/EHsc)
 endif()
 
 # Handle CMake 3.30+ policy for FindBoost removal
