@@ -189,6 +189,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Per-job Conan home under $RUNNER_TEMP so concurrent jobs on the shared
+      # self-hosted host never tear each other's cache (root of the boost
+      # torn-cache reds). Export via $GITHUB_ENV -- a job-level `env: runner.temp`
+      # fails to parse.
+      - name: Set per-job Conan home
+        run: echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+
       - name: Install system dependencies
         if: runner.environment == 'github-hosted'
         run: |
@@ -216,8 +223,8 @@ jobs:
       - name: Restore Conan cache
         uses: actions/cache@v5
         with:
-          path: ~/.conan2
-          key: conan2-ubuntu24-gcc13-${{ hashFiles('conanfile.txt') }}
+          path: ${{ runner.temp }}/conan2
+          key: conan2-ubuntu24-gcc13-asan-${{ hashFiles('conanfile.txt') }}
 
       # Self-hosted runners reuse the workspace across runs; a stale build_asan/
       # leaves gtest_discover_tests POST_BUILD artifacts that ctest then
@@ -312,6 +319,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Per-job Conan home under $RUNNER_TEMP so concurrent jobs on the shared
+      # self-hosted host never tear each other's cache (root of the boost
+      # torn-cache reds). Export via $GITHUB_ENV -- a job-level `env: runner.temp`
+      # fails to parse.
+      - name: Set per-job Conan home
+        run: echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+
       - name: Install system dependencies
         if: runner.environment == 'github-hosted'
         run: |
@@ -339,7 +353,7 @@ jobs:
       - name: Restore Conan cache
         uses: actions/cache@v5
         with:
-          path: ~/.conan2
+          path: ${{ runner.temp }}/conan2
           key: conan2-ubuntu24-gcc13-bch-${{ hashFiles('conanfile.txt') }}
 
       # Self-hosted runners reuse the workspace across runs; a stale build_bch/
@@ -401,6 +415,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Per-job Conan home under $RUNNER_TEMP so concurrent jobs on the shared
+      # self-hosted host never tear each other's cache (root of the boost
+      # torn-cache reds). Export via $GITHUB_ENV -- a job-level `env: runner.temp`
+      # fails to parse.
+      - name: Set per-job Conan home
+        run: echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+
       - name: Install system dependencies
         if: runner.environment == 'github-hosted'
         run: |
@@ -428,8 +449,8 @@ jobs:
       - name: Restore Conan cache
         uses: actions/cache@v5
         with:
-          path: ~/.conan2
-          key: conan2-ubuntu24-gcc13-bch-${{ hashFiles('conanfile.txt') }}
+          path: ${{ runner.temp }}/conan2
+          key: conan2-ubuntu24-gcc13-bch-asan-${{ hashFiles('conanfile.txt') }}
 
       # Self-hosted runners reuse the workspace across runs; a stale build_bch_asan/
       # leaves gtest_discover_tests POST_BUILD artifacts that ctest then
@@ -765,6 +786,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Per-job Conan home under $RUNNER_TEMP so concurrent jobs never tear each
+      # other's cache. Export via $GITHUB_ENV (job-level env fails to parse).
+      # PowerShell form (inherits the job's ExecutionPolicy-Bypass shell).
+      - name: Set per-job Conan home
+        run: echo "CONAN_HOME=$env:RUNNER_TEMP/conan2" | Out-File -FilePath $env:GITHUB_ENV -Append
+
       - uses: actions/setup-python@v6
         if: ${{ runner.environment == 'github-hosted' }}
         with: { python-version: '3.12' }
@@ -811,7 +838,7 @@ jobs:
       - name: Restore Conan cache
         uses: actions/cache@v5
         with:
-          path: ~/.conan2
+          path: ${{ runner.temp }}/conan2
           key: conan2-windows-msvc194-${{ hashFiles('conanfile.txt') }}
 
       - name: Conan install
@@ -876,6 +903,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Per-job Conan home under $RUNNER_TEMP so concurrent jobs on the shared
+      # self-hosted host never tear each other's cache (root of the boost
+      # torn-cache reds). Export via $GITHUB_ENV -- a job-level `env: runner.temp`
+      # fails to parse.
+      - name: Set per-job Conan home
+        run: echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+
       - name: Install system dependencies
         if: runner.environment == 'github-hosted'
         run: |
@@ -903,7 +937,7 @@ jobs:
       - name: Restore Conan cache
         uses: actions/cache@v5
         with:
-          path: ~/.conan2
+          path: ${{ runner.temp }}/conan2
           key: conan2-ubuntu24-gcc13-dgb-auxdoge-${{ hashFiles('conanfile.txt') }}
 
       # Self-hosted runners reuse the workspace across runs; a stale build_dgb_auxdoge/
