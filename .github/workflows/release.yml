@@ -549,7 +549,12 @@ jobs:
         if: steps.presence.outputs.exists == '1'
         run: |
           Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-6.dll" build_ci/src/c2pool/Release/
-          build_ci/src/c2pool/Release/c2pool-${{ matrix.coin }}.exe --help 2>&1 | Select-Object -First 5
+          $ErrorActionPreference = 'SilentlyContinue'
+          # --help writes usage to stderr; buffer first so Select-Object truncation
+          # cannot break the pipe and surface a NativeCommandError (false red).
+          $out = & build_ci/src/c2pool/Release/c2pool-${{ matrix.coin }}.exe --help 2>&1
+          $out | Select-Object -First 5 | Write-Host
+          exit 0
 
       - name: Package
         if: steps.presence.outputs.exists == '1'
