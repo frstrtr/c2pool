@@ -543,7 +543,13 @@ jobs:
       - name: Build c2pool-${{ matrix.coin }}
         if: steps.presence.outputs.exists == '1'
         shell: cmd
-        run: cmake --build build_ci --target c2pool-${{ matrix.coin }} --config Release -j %NUMBER_OF_PROCESSORS%
+        # VM217 has a fixed 2GB pagefile; a 16-way MSVC parallel build of the
+        # heavy btc+NMC (and dgb+DOGE) TU set drives commit charge past the
+        # 32GB+2GB wall. The failure surfaces as an orphaned MSBuild with NO
+        # C####/LNK diagnostic. Cap MSBuild /maxcpucount (cmake -j -> /maxcpucount
+        # on the VS generator) to bound concurrent cl.exe and keep committed
+        # memory under the wall. Conservative 8; tune up only if headroom allows.
+        run: cmake --build build_ci --target c2pool-${{ matrix.coin }} --config Release -j 8
 
       - name: Smoke test (--help)
         if: steps.presence.outputs.exists == '1'
