@@ -8,6 +8,11 @@
 # dash_x11, so ltc/btc/doge/dgb build + ctest surfaces are untouched.
 add_subdirectory(crypto)
 
+# S8 stratum work-source module (dash::stratum::DASHWorkSource, the concrete
+# core::stratum::IWorkSource). OBJECT lib compiled here; linked by c2pool-dash +
+# the test_dash_stratum_work_source KAT only. SAFE-ADDITIVE, src/impl/dash only.
+add_subdirectory(stratum)
+
 # S5 block-replay slice (PR-0 foundation decomposition): compact-block
 # reconstruction primitives (BIP-152 short-tx-id / PartiallyDownloadedBlock),
 # vendored from dashcore with the C2POOL_SERIALIZE_METHODS idiom. SAFE-ADDITIVE:

@@ -534,6 +534,19 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_node_coin_state PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_node_coin_state "" AUTO)
 
+    # DASHWorkSource (dash::stratum): concrete core::stratum::IWorkSource for
+    # DASH X11 -- 4b construction + contract KAT. Links the dash_stratum OBJECT
+    # lib (work_source.cpp) on top of the header-only coin selector link set.
+    add_executable(test_dash_stratum_work_source test_dash_stratum_work_source.cpp)
+    target_link_libraries(test_dash_stratum_work_source PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_stratum dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_stratum_work_source PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_stratum_work_source "" AUTO)
+
     # CoinStateMaintainer: drives NodeCoinState off async tip/MN/mempool update
     # events (readiness gate: MN+tip required before publish). Same link set as
     # test_dash_node_coin_state -- header-only over the work_source selector set.
