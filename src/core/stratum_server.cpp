@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <boost/algorithm/string.hpp>
 
 namespace core {
@@ -1055,7 +1056,23 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     snapshot.frozen_ref.frozen_witness_root = job.frozen_witness_root;
     snapshot.frozen_ref.frozen_merged_coinbase_info = job.frozen_merged_coinbase_info;
     snapshot.frozen_ref.share_version = job.share_version;
-    snapshot.frozen_ref.desired_version = job.desired_version;
+    // TESTBED SOAK-PLUMBING (#97 crossing): C2POOL_DESIRED_VERSION lets a
+    // controlled counterweight peer emit a v35 desired-version vote (dv=35)
+    // without a per-value rebuild, so a self-stood-up v35 node lands real
+    // dv<36 shares in a v36 node sample (v35_shares = sample - overall_v36_votes)
+    // before the eebf1da9 vote-report redeploy -- prevents an all-dv36 chain
+    // from reading 100%-by-work and force-activating the ratchet. Unset in prod
+    // => falls through to job.desired_version (36). Read once, per-process.
+    static const uint64_t s_dv_override = []() -> uint64_t {
+        if (const char* e = std::getenv("C2POOL_DESIRED_VERSION")) {
+            char* end = nullptr;
+            unsigned long v = std::strtoul(e, &end, 10);
+            if (end != e && v > 0) return static_cast<uint64_t>(v);
+        }
+        return 0;
+    }();
+    snapshot.frozen_ref.desired_version =
+        s_dv_override ? s_dv_override : job.desired_version;
     // NOTE: stale_info is NOT propagated here. It must match what ref_hash_fn
     // used at job creation time (always 0 for now). Changing it at submit
     // time would break ref_hash consistency. Future: compute stale_info
