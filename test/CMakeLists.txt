@@ -938,6 +938,24 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_stratum_extensions PRIVATE c2pool_payout ltc_coin c2pool_storage c2pool_merged_mining pool)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_stratum_extensions "" AUTO)
 
+    # Mining-hotel interim fix KATs: strict per-node miner cap (refused
+    # connections + counter), FIFO+TTL job eviction under a 600-notify stale
+    # storm, and the flat-RSS shared-payload pointer-identity scaffold.
+    # Loopback-only (synthetic IWorkSource, ephemeral test port) — no daemon /
+    # RPC / sharechain. DASH byte-parity note: the notify/coinbase/share BYTE
+    # checks live in the dash lane against the frstrtr/p2pool-dash oracle
+    # (share version 16→36), not here.
+    add_executable(test_stratum_hotel_interim test_stratum_hotel_interim.cpp)
+    target_link_libraries(test_stratum_hotel_interim PRIVATE
+        GTest::gtest_main GTest::gtest
+        c2pool_hashrate
+        core ltc
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_stratum_hotel_interim PRIVATE c2pool_payout ltc_coin c2pool_storage c2pool_merged_mining pool)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_stratum_hotel_interim "" AUTO)
+
     add_executable(test_multiaddress_pplns test_multiaddress_pplns.cpp)
     target_link_libraries(test_multiaddress_pplns PRIVATE
         GTest::gtest_main GTest::gtest
