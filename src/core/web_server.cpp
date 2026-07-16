@@ -8488,7 +8488,7 @@ void WebServer::trigger_work_refresh()
         stratum_server_->notify_all();
 }
 
-void WebServer::trigger_work_refresh_debounced()
+void WebServer::execute_debounced_work_refresh()
 {
     // Capture previous tip hash BEFORE refresh updates it — needed for delta precompute.
     // Absent tip (fresh bootstrap, no shares yet) → empty prev_tip_hash, precompute_delta
@@ -8501,7 +8501,6 @@ void WebServer::trigger_work_refresh_debounced()
     if (auto* mm = mining_interface_->get_mm_manager())
         mm->mark_pplns_dirty();
 
-    // No debounce — call refresh immediately.
     trigger_work_refresh();
 
     // Invalidate sharechain window cache (new share changed the tip)
@@ -8519,6 +8518,61 @@ void WebServer::trigger_work_refresh_debounced()
     if (mining_interface_->sse_subscriber_count() > 0) {
         mining_interface_->sse_push(to_json(mining_interface_->get_sharechain_tip()).dump());
     }
+
+    // Record execution for the debounce window + trailing-edge event gate.
+    m_last_work_refresh = std::chrono::steady_clock::now();
+    auto refreshed_tip = mining_interface_->get_sharechain_tip();
+    m_last_refresh_tip_hash = refreshed_tip ? refreshed_tip->hash : std::string{};
+}
+
+void WebServer::trigger_work_refresh_debounced()
+{
+    // ── Notify debounce (hotel interim fix #3) ──
+    // Share-arrival storms used to fan out into one full refresh_work() +
+    // notify_all() per share (the old body here was a no-op stub that called
+    // refresh immediately). Semantics now:
+    //   * Leading edge: a call outside the debounce window refreshes
+    //     IMMEDIATELY (first share after quiet keeps p2pool-grade latency).
+    //   * Trailing coalesce: calls inside the window collapse into ONE
+    //     deferred refresh ~300 ms after the leading edge, event-gated on a
+    //     REAL work change (sharechain tip differs from the last executed
+    //     refresh) so a redundant burst costs nothing.
+    // The new-block path is untouched: trigger_work_refresh() stays immediate.
+    // Timing/coalescing only — the bytes of any notify that IS sent are
+    // unchanged. Single-threaded: callers + timer run on the main ioc_.
+    using namespace std::chrono;
+    static constexpr auto DEBOUNCE_WINDOW = milliseconds(300);
+
+    const auto now = steady_clock::now();
+    const bool in_window = (m_last_work_refresh.time_since_epoch().count() != 0)
+                           && (now - m_last_work_refresh < DEBOUNCE_WINDOW);
+
+    if (!in_window && !m_work_refresh_pending) {
+        execute_debounced_work_refresh();  // leading edge — immediate
+        return;
+    }
+
+    if (m_work_refresh_pending)
+        return;  // trailing refresh already scheduled — this call coalesces
+
+    m_work_refresh_pending = true;
+    if (!m_work_refresh_timer)
+        m_work_refresh_timer = std::make_shared<net::steady_timer>(ioc_);
+    // Fire at the end of the window that opened with the leading-edge refresh.
+    const auto remaining = DEBOUNCE_WINDOW - duration_cast<milliseconds>(now - m_last_work_refresh);
+    m_work_refresh_timer->expires_after(remaining > milliseconds(1) ? remaining : milliseconds(1));
+    m_work_refresh_timer->async_wait([this](beast::error_code ec) {
+        m_work_refresh_pending = false;
+        if (ec || !running_) return;
+        // Event gate: only refresh on a real work change. If the sharechain
+        // tip is still what the last executed refresh saw, the coalesced
+        // calls were redundant (already covered by the leading edge).
+        auto tip = mining_interface_->get_sharechain_tip();
+        std::string tip_hash = tip ? tip->hash : std::string{};
+        if (tip_hash == m_last_refresh_tip_hash)
+            return;
+        execute_debounced_work_refresh();
+    });
 }
 
 void WebServer::set_coin_node(core::coin::ICoinNode* node)

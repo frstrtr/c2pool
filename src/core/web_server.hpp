@@ -1498,9 +1498,15 @@ class WebServer
     bool solo_mode_;
     std::string solo_address_;
 
-    // Debounce timer for trigger_work_refresh_debounced()
+    // Debounce state for trigger_work_refresh_debounced() (hotel interim fix
+    // #3). Leading-edge-immediate + ~300 ms trailing-coalesce; the trailing
+    // refresh is event-gated on a REAL work change (sharechain tip moved since
+    // the last executed refresh). All state is touched only from the main
+    // ioc_ thread (callers + timer handler run there) — no extra locking.
     std::shared_ptr<net::steady_timer> m_work_refresh_timer;
     bool m_work_refresh_pending = false;
+    std::chrono::steady_clock::time_point m_last_work_refresh{};  // last executed refresh
+    std::string m_last_refresh_tip_hash;  // sharechain tip at last executed refresh
 
     // Payout system integration
     c2pool::payout::PayoutManager* payout_manager_ptr_ = nullptr;
@@ -1574,6 +1580,9 @@ public:
 private:
     void accept_connections();
     void handle_accept(beast::error_code ec, tcp::socket socket);
+    // Body of a debounced work refresh (capture prev tip → refresh → caches →
+    // SSE). Runs on the leading edge and on the trailing coalesced timer.
+    void execute_debounced_work_refresh();
 };
 
 // StratumSession and StratumServer — see stratum_server.hpp

@@ -113,14 +113,26 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
 
     // Active jobs for stale detection (job_id → prevhash at time of issue)
     struct JobEntry {
+        // Heavyweight per-generation template data, refcounted and SHARED
+        // across all jobs a session issues for one work generation (hotel
+        // interim fix #2 — de-dup of the per-job memory bomb). coinb2 carries
+        // the PPLNS payout outputs, the dominant per-job allocation. Contents
+        // are immutable after construction; a new payload is only allocated
+        // when any byte differs from the previous job's payload (byte-identical
+        // reuse ⇒ provably no wire change).
+        struct SharedJobPayload {
+            std::string coinb1;
+            std::string coinb2;                          // includes PPLNS outputs
+            std::vector<std::string> merkle_branches;
+            std::vector<uint256> frozen_merkle_branches; // segwit txid_merkle_link at template time
+            std::vector<unsigned char> frozen_merged_coinbase_info;  // pre-serialized
+        };
         std::string prevhash;      // Stratum-format (swapped) for stale detection
         std::string gbt_prevhash;  // Raw GBT previousblockhash (BE display hex) for header reconstruction
         std::string nbits;         // share target bits (used in header the miner hashes)
         uint32_t    ntime{};
-        std::string coinb1;
-        std::string coinb2;
+        std::shared_ptr<const SharedJobPayload> payload;  // coinb1/coinb2/branches (shared per work generation)
         uint32_t    version{};
-        std::vector<std::string> merkle_branches;
         std::shared_ptr<const std::vector<std::string>> tx_data;     // raw tx hex from GBT template (a1: shared/lazy)
         std::string mweb;                      // MWEB extension data
         bool        segwit_active{false};
@@ -137,18 +149,33 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
         uint32_t frozen_bits{0};
         uint32_t frozen_timestamp{0};
         uint256  frozen_merged_payout_hash;
-        std::vector<uint256> frozen_merkle_branches;  // segwit txid_merkle_link at template time
         uint256  frozen_witness_root;                  // wtxid_merkle_root at template time
-        std::vector<unsigned char> frozen_merged_coinbase_info;  // pre-serialized
         bool     has_frozen{false};
         int64_t  share_version{36};    // AutoRatchet-determined share version at template time
         uint64_t desired_version{36};  // Version vote
         int      stale_info{0};  // 0=none, 253=orphan (block template changed), 254=doa
+        // Creation stamp for TTL eviction (steady clock — immune to wall-clock
+        // jumps; the wire ntime field above is unchanged and stays wall-clock).
+        std::chrono::steady_clock::time_point created_at{};
     };
     std::unordered_map<std::string, JobEntry> active_jobs_;
+    // Insertion-order companion to active_jobs_ (hotel interim fix #1).
+    // unordered_map::begin() is ARBITRARY, so the old
+    // `erase(active_jobs_.begin())` capacity eviction could drop the job the
+    // miner is CURRENTLY hashing — the nondeterministic stale-reject bug.
+    // This deque records job issue order so eviction is genuinely oldest-first
+    // (FIFO), and a 300 s TTL sweep on insert mirrors p2pool's ExpiringDict.
+    // The most recently issued job (back of the deque) is never evicted.
+    std::deque<std::string> job_order_;
+    // Per-generation payload cache: reuse the previous job's SharedJobPayload
+    // when the freshly built bytes are identical (same work generation, same
+    // coinbase, same branches). Byte-compare gate ⇒ wire-identical by design.
+    std::shared_ptr<const JobEntry::SharedJobPayload> payload_cache_;
+    uint64_t payload_cache_generation_ = 0;
     std::string last_prevhash_;  // track prevhash for clean_jobs detection
     uint64_t last_pushed_generation_ = 0;  // work generation at last push (for safety timer)
     static constexpr size_t MAX_ACTIVE_JOBS = 256; // p2pool keeps all jobs from current block
+    static constexpr std::chrono::seconds JOB_TTL{300}; // p2pool ExpiringDict expiry for jobs
 
     // Per-worker statistics
     uint64_t accepted_shares_ = 0;
@@ -184,6 +211,10 @@ public:
 
     bool is_connected() const { return socket_.is_open(); }
     bool is_subscribed() const { return subscribed_; }
+    // Diagnostics / test introspection (read-only; call quiesced or from the
+    // session's io_context thread — active_jobs_ mutates on notify/submit).
+    size_t active_job_count() const { return active_jobs_.size(); }
+    size_t distinct_job_payloads() const;  // distinct SharedJobPayload blocks retained
     double get_hashrate() const { return hashrate_tracker_.get_current_hashrate(); }
     const std::array<uint8_t, 20>& get_pubkey_hash() const { return pubkey_hash_; }
     const std::map<uint32_t, std::string>& get_merged_addresses() const { return merged_addresses_; }
@@ -241,6 +272,10 @@ class StratumServer
     mutable std::mutex sessions_mutex_;
     std::set<std::shared_ptr<StratumSession>> sessions_;
 
+    // STRICT per-node miner cap (hotel interim fix #5): connections refused
+    // because sessions_.size() >= StratumConfig::max_stratum_connections.
+    std::atomic<uint64_t> refused_connections_{0};
+
     // p2pool RateMonitor pair (work.py:223-226):
     //   local_rate_monitor: per-user hashrate (for get_local_rates)
     //   local_addr_rate_monitor: per-address hashrate (for get_local_addr_rates)
@@ -296,6 +331,16 @@ public:
     /// Register/unregister sessions for broadcast
     void register_session(std::shared_ptr<StratumSession> s);
     void unregister_session(std::shared_ptr<StratumSession> s);
+
+    /// Connections refused by the strict per-node miner cap (fix #5).
+    uint64_t get_refused_connections() const { return refused_connections_.load(); }
+    /// Live session count (dead sessions pruned lazily — see notify_all()).
+    size_t get_session_count() const;
+    /// Diagnostics: {distinct SharedJobPayload blocks, total active jobs}
+    /// summed across all sessions. Bounded-memory evidence: distinct payloads
+    /// track retained work GENERATIONS, not sessions × jobs. Test/diag hook —
+    /// call quiesced (sessions mutate their job maps on the io thread).
+    std::pair<size_t, size_t> get_job_payload_stats() const;
 
     std::string get_bind_address() const { return bind_address_; }
     uint16_t get_port() const { return port_; }
