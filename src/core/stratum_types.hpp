@@ -44,6 +44,14 @@ struct StratumConfig {
     // 2^16 (65536) for scrypt nets (LTC/DOGE), 1 for SHA256d nets (bitcoin).
     // Default preserves the scrypt convention; SHA256d work sources override to 1.0.
     double set_difficulty_multiplier = 65536.0;
+    // STRICT per-node miner cap (mining-hotel interim fix): maximum number of
+    // concurrent stratum TCP sessions this node accepts. When the cap is hit
+    // the excess socket is closed cleanly, a WARN is logged, the
+    // refused_connections counter increments, and the accept loop keeps
+    // running. 0 = unlimited (legacy behavior). Wire-through:
+    // max_stratum_connections (YAML) / --max-stratum-connections (CLI).
+    // Admission control only — zero wire-byte change for admitted sessions.
+    size_t max_stratum_connections = 100;
 };
 
 /// Frozen share-construction fields returned by ref_hash_fn. These

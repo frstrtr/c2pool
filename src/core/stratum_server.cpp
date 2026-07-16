@@ -153,10 +153,46 @@ void StratumServer::accept_connections()
 void StratumServer::handle_accept(boost::system::error_code ec, tcp::socket socket)
 {
     if (!ec) {
-        // Create, register, and start Stratum session
-        auto session = std::make_shared<StratumSession>(std::move(socket), mining_interface_, this);
-        register_session(session);
-        session->start();
+        // ── STRICT per-node miner cap (hotel interim fix #5) ──
+        // Admission control BEFORE register_session: if the node already holds
+        // max_stratum_connections live sessions, close the new socket cleanly,
+        // WARN, bump the refused counter, and keep accepting. 0 = unlimited.
+        // Dead sessions are normally pruned lazily in notify_all(); prune here
+        // too when at cap so lingering closed sockets never starve real miners.
+        const size_t cap = mining_interface_
+            ? mining_interface_->get_stratum_config().max_stratum_connections
+            : 0;
+        size_t live = 0;
+        if (cap > 0) {
+            std::lock_guard<std::mutex> lock(sessions_mutex_);
+            if (sessions_.size() >= cap) {
+                for (auto it = sessions_.begin(); it != sessions_.end(); ) {
+                    if (!(*it)->is_connected())
+                        it = sessions_.erase(it);
+                    else
+                        ++it;
+                }
+            }
+            live = sessions_.size();
+        }
+        if (cap > 0 && live >= cap) {
+            refused_connections_.fetch_add(1);
+            boost::system::error_code ep_ec;
+            const auto ep = socket.remote_endpoint(ep_ec);
+            LOG_WARNING << "Stratum connection refused: node at miner cap "
+                        << live << "/" << cap << " (max_stratum_connections)"
+                        << (ep_ec ? std::string{} : " peer=" + ep.address().to_string()
+                                        + ":" + std::to_string(ep.port()))
+                        << " refused_total=" << refused_connections_.load();
+            boost::system::error_code ignore;
+            socket.shutdown(tcp::socket::shutdown_both, ignore);
+            socket.close(ignore);
+        } else {
+            // Create, register, and start Stratum session
+            auto session = std::make_shared<StratumSession>(std::move(socket), mining_interface_, this);
+            register_session(session);
+            session->start();
+        }
     } else {
         LOG_ERROR << "Stratum accept error: " << ec.message();
     }
@@ -177,6 +213,29 @@ void StratumServer::unregister_session(std::shared_ptr<StratumSession> s)
 {
     std::lock_guard<std::mutex> lock(sessions_mutex_);
     sessions_.erase(s);
+}
+
+size_t StratumServer::get_session_count() const
+{
+    std::lock_guard<std::mutex> lock(sessions_mutex_);
+    return sessions_.size();
+}
+
+std::pair<size_t, size_t> StratumServer::get_job_payload_stats() const
+{
+    // Snapshot sessions under the mutex, count outside it (session job maps
+    // are io-thread state — see header comment: call quiesced).
+    std::vector<std::shared_ptr<StratumSession>> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        snapshot.assign(sessions_.begin(), sessions_.end());
+    }
+    size_t distinct = 0, total = 0;
+    for (const auto& s : snapshot) {
+        distinct += s->distinct_job_payloads();
+        total    += s->active_job_count();
+    }
+    return {distinct, total};
 }
 
 double StratumServer::get_total_hashrate() const
@@ -947,6 +1006,9 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     // CRITICAL: copy the job snapshot — do NOT hold a reference.
     // handle_submit() may trigger notify_all() → send_notify_work() → new job
     // added to active_jobs_ → map rebalance → reference invalidated → SIGSEGV.
+    // (The heavyweight template data is behind job.payload, a shared_ptr, so
+    // this copy is cheap and the payload stays alive even if the entry is
+    // evicted mid-processing.)
     const auto job = job_it->second;
 
     // ASICBoost: apply version rolling bits to the job version
@@ -993,9 +1055,9 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     // every BTC stratum submission gets a garbage scrypt-based diff and
     // rejects at the vardiff gate.
     double share_difficulty = mining_interface_->compute_share_difficulty(
-        job.coinb1, job.coinb2,
+        job.payload->coinb1, job.payload->coinb2,
         extranonce1_, extranonce2, ntime, nonce,
-        effective_version, job.gbt_prevhash, job.nbits, job.merkle_branches);
+        effective_version, job.gbt_prevhash, job.nbits, job.payload->merkle_branches);
     // VARDIFF: acceptance threshold is the per-connection adaptive difficulty.
     // p2pool accepts ALL pseudoshares meeting effective_target (VARDIFF level),
     // not just those meeting pool share_bits. This gives smooth hashrate data.
@@ -1027,13 +1089,13 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     }
 
     MiningInterface::JobSnapshot snapshot;
-    snapshot.coinb1          = job.coinb1;
-    snapshot.coinb2          = job.coinb2;
+    snapshot.coinb1          = job.payload->coinb1;
+    snapshot.coinb2          = job.payload->coinb2;
     snapshot.gbt_prevhash    = job.gbt_prevhash;
     snapshot.nbits           = job.nbits;           // share target bits (for header construction)
     snapshot.block_nbits     = job.gbt_block_nbits; // original GBT block bits (for block target check)
     snapshot.version         = effective_version;  // use rolled version for block construction
-    snapshot.merkle_branches = job.merkle_branches;
+    snapshot.merkle_branches = job.payload->merkle_branches;
     snapshot.tx_data         = job.tx_data;
     snapshot.mweb            = job.mweb;
     snapshot.segwit_active   = job.segwit_active;
@@ -1051,9 +1113,9 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     snapshot.frozen_ref.bits = job.frozen_bits;
     snapshot.frozen_ref.timestamp = job.frozen_timestamp;
     snapshot.frozen_ref.merged_payout_hash = job.frozen_merged_payout_hash;
-    snapshot.frozen_ref.frozen_merkle_branches = job.frozen_merkle_branches;
+    snapshot.frozen_ref.frozen_merkle_branches = job.payload->frozen_merkle_branches;
     snapshot.frozen_ref.frozen_witness_root = job.frozen_witness_root;
-    snapshot.frozen_ref.frozen_merged_coinbase_info = job.frozen_merged_coinbase_info;
+    snapshot.frozen_ref.frozen_merged_coinbase_info = job.payload->frozen_merged_coinbase_info;
     snapshot.frozen_ref.share_version = job.share_version;
     snapshot.frozen_ref.desired_version = job.desired_version;
     // NOTE: stale_info is NOT propagated here. It must match what ref_hash_fn
@@ -1399,9 +1461,61 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
     bool clean_jobs = force_clean || (prevhash != last_prevhash_);
     last_prevhash_ = prevhash;
 
-    // Track this job — evict oldest if at capacity (keep MAX_ACTIVE_JOBS for late shares)
-    while (active_jobs_.size() >= MAX_ACTIVE_JOBS) {
-        active_jobs_.erase(active_jobs_.begin());
+    // ── Shared per-generation payload (hotel interim fix #2) ──
+    // coinb1/coinb2 (coinb2 carries the PPLNS outputs) + the merkle branch
+    // vectors are the dominant per-job allocations. Within one work generation
+    // a session rebuilds byte-identical copies on every notify (VARDIFF pushes,
+    // safety timer, best-share-unchanged refreshes) — fold them into ONE
+    // refcounted block shared by all jobs of that generation. Reuse is gated
+    // on a full byte-compare, so any change (new template, new tip, rolled
+    // extranonce, changed payout set) allocates a fresh payload: the bytes a
+    // miner receives are IDENTICAL to the pre-fix per-job copies.
+    const uint64_t work_generation = mining_interface_->get_work_generation();
+    std::shared_ptr<const JobEntry::SharedJobPayload> payload;
+    if (payload_cache_ && payload_cache_generation_ == work_generation
+        && payload_cache_->coinb1 == coinb1
+        && payload_cache_->coinb2 == coinb2
+        && payload_cache_->merkle_branches == merkle_branches_vec
+        && payload_cache_->frozen_merkle_branches == cbr.snapshot.frozen_ref.frozen_merkle_branches
+        && payload_cache_->frozen_merged_coinbase_info == cbr.snapshot.frozen_ref.frozen_merged_coinbase_info) {
+        payload = payload_cache_;  // byte-identical → share the block
+    } else {
+        auto p = std::make_shared<JobEntry::SharedJobPayload>();
+        p->coinb1 = coinb1;
+        p->coinb2 = coinb2;
+        p->merkle_branches = std::move(merkle_branches_vec);
+        p->frozen_merkle_branches = cbr.snapshot.frozen_ref.frozen_merkle_branches;
+        p->frozen_merged_coinbase_info = cbr.snapshot.frozen_ref.frozen_merged_coinbase_info;
+        payload = std::move(p);
+        payload_cache_ = payload;
+        payload_cache_generation_ = work_generation;
+    }
+
+    // ── Job tracking: FIFO + 300 s TTL eviction (hotel interim fix #1) ──
+    // active_jobs_ is an unordered_map: erase(begin()) removed an ARBITRARY
+    // entry — possibly the job the miner is hashing right now — producing
+    // nondeterministic stale-rejects under notify storms. job_order_ records
+    // insertion order so we evict the genuinely-OLDEST job first, and a TTL
+    // sweep expires entries older than JOB_TTL (300 s), mirroring p2pool's
+    // ExpiringDict semantics. The most recently issued job (deque back) is
+    // never evicted — it is the job the miner is currently on.
+    const auto now_steady = std::chrono::steady_clock::now();
+    // TTL sweep (oldest-first; stop at the first young entry).
+    while (job_order_.size() > 1) {
+        auto oldest = active_jobs_.find(job_order_.front());
+        if (oldest == active_jobs_.end()) {  // defensive: desynced id
+            job_order_.pop_front();
+            continue;
+        }
+        if (now_steady - oldest->second.created_at < JOB_TTL)
+            break;
+        active_jobs_.erase(oldest);
+        job_order_.pop_front();
+    }
+    // FIFO capacity eviction (keep MAX_ACTIVE_JOBS for late shares).
+    while (active_jobs_.size() >= MAX_ACTIVE_JOBS && job_order_.size() > 1) {
+        active_jobs_.erase(job_order_.front());
+        job_order_.pop_front();
     }
     {
         JobEntry je;
@@ -1409,12 +1523,12 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         je.gbt_prevhash = gbt_prevhash;
         je.nbits = nbits;
         je.ntime = curtime;
-        je.coinb1 = coinb1;
-        je.coinb2 = coinb2;
+        je.payload = payload;
         je.version = version_u32;
-        je.merkle_branches = std::move(merkle_branches_vec);
         je.gbt_block_nbits = gbt_block_nbits;
+        je.created_at = now_steady;
         active_jobs_[job_id] = std::move(je);
+        job_order_.push_back(job_id);
     }
 
     // Store the SAME frozen prev_share_hash that was used for ref_hash computation
@@ -1441,9 +1555,9 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         je.frozen_bits = cbr.snapshot.frozen_ref.bits;
         je.frozen_timestamp = cbr.snapshot.frozen_ref.timestamp;
         je.frozen_merged_payout_hash = cbr.snapshot.frozen_ref.merged_payout_hash;
-        je.frozen_merkle_branches = cbr.snapshot.frozen_ref.frozen_merkle_branches;
+        // frozen_merkle_branches + frozen_merged_coinbase_info live in the
+        // shared payload (je.payload) — see fix #2 above.
         je.frozen_witness_root = cbr.snapshot.frozen_ref.frozen_witness_root;
-        je.frozen_merged_coinbase_info = cbr.snapshot.frozen_ref.frozen_merged_coinbase_info;
         je.share_version = cbr.snapshot.frozen_ref.share_version;
         je.desired_version = cbr.snapshot.frozen_ref.desired_version;
         je.has_frozen = true;
@@ -1504,6 +1618,20 @@ void StratumSession::schedule_work_push_timer()
             LOG_WARNING << "[STRATUM] Work push error: " << e.what();
         }
     });
+}
+
+size_t StratumSession::distinct_job_payloads() const
+{
+    // Pointer-identity census of the shared per-generation payloads (fix #2).
+    // Bounded-memory evidence for the flat-RSS KAT: with N active jobs of one
+    // work generation this returns 1, not N.
+    std::set<const void*> ptrs;
+    for (const auto& [id, je] : active_jobs_) {
+        (void)id;
+        if (je.payload)
+            ptrs.insert(static_cast<const void*>(je.payload.get()));
+    }
+    return ptrs.size();
 }
 
 void StratumSession::cancel_timers()
