@@ -65,6 +65,9 @@
 #include <impl/dash/params.hpp>                // dash::make_coin_params (already via top include)
 #include <core/uint256.hpp>                    // uint160 payout pubkey hash
 
+#include <core/stratum_server.hpp>             // core::StratumServer — miner-facing accept-loop (run-path caller)
+#include <impl/dash/stratum/work_source.hpp>   // dash::stratum::DASHWorkSource — concrete core::stratum::IWorkSource
+
 #include <boost/asio.hpp>
 
 #include <cstdint>
@@ -164,11 +167,16 @@ void print_banner(const char* argv0)
         << "       " << argv0 << " --run [--coin-rpc H:P] [--coin-rpc-auth PATH]\n"
         << "           [--testnet] [--submit-block HEX | --submit-block-file PATH]\n"
         << "           [--listen [HOST:]PORT] [--addnode HOST:PORT]... [--connect HOST:PORT]...\n"
+        << "           [--stratum [HOST:]PORT]\n"
         << "       " << argv0 << " --mine-block [--coin-rpc H:P] [--coin-rpc-auth PATH]\n"
         << "           [--testnet] [--payout-pubkey-hash HEX] [--max-nonce N]\n\n"
         << "Status: consensus layer live (X11 PoW, subsidy, oracle CoinParams).\n"
         << "        --run stands up the run-loop and ARMS the external-dashd\n"
         << "        submitblock fallback (creds from dash.conf, never on argv).\n"
+        << "        --stratum [HOST:]PORT binds the miner-facing Stratum accept-\n"
+        << "        loop (DASHWorkSource seam; e.g. --stratum 3333 or\n"
+        << "        --stratum 127.0.0.1:3333); omit to disable. Won X11 blocks\n"
+        << "        dispatch via the retained dashd-RPC submitblock arm.\n"
         << "        --submit-block[-file] drives ONE real submitblock then exits\n"
         << "        (the won-block-reaches-network leg); embedded P2P relay = S8.\n"
         << "Consensus: X11 PoW + block identity; 2.5 min spacing; 5 DASH post-V20\n"
@@ -311,7 +319,8 @@ int run_selftest()
 // the gate.
 int run_node(bool testnet, const std::string& rpc_endpoint,
              const std::string& rpc_conf_path, const std::string& submit_hex,
-             const PeeringConfig& peer)
+             const PeeringConfig& peer,
+             const std::string& stratum_host, uint16_t stratum_port)
 {
     namespace io = boost::asio;
 
@@ -327,9 +336,19 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         conf.port = testnet ? 19998 : 9998;   // dashd default RPC ports
 
     io::io_context ioc;
+
+    // Miner-facing Stratum acceptor handle, declared BEFORE the signal_set so
+    // the shutdown callback can stop it (cancel acceptor + close sessions)
+    // ahead of ioc.stop(). Populated below once the DASHWorkSource is built.
+    std::unique_ptr<core::StratumServer> stratum_server;
+
     io::signal_set signals(ioc, SIGINT, SIGTERM);
-    signals.async_wait([&ioc](const boost::system::error_code&, int) {
+    signals.async_wait([&ioc, &stratum_server](const boost::system::error_code&, int) {
         std::cout << "[run] shutdown signal -- stopping run-loop\n";
+        // Stop stratum BEFORE ioc.stop() so the acceptor cancels and live miner
+        // sessions close cleanly (their pending async ops unwind on the loop).
+        if (stratum_server)
+            stratum_server->stop();
         ioc.stop();
     });
 
@@ -406,9 +425,84 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // reception — version handshake + the #646 min-proto gate — is live now
     // via node.cpp (#656/#657).
 
+    // ── S8 miner-facing Stratum accept-loop standup (run-path caller) ─────
+    // This is the production caller the DASHWorkSource 4a/4b skeleton (#706)
+    // and the subscribe->notify->submit KATs (#630-634) were built for: a real
+    // main constructs the work source and binds a core::StratumServer to it.
+    //
+    // node_coin_state MUST outlive work_source and stratum_server (DASHWorkSource
+    // holds a non-owning const ref to it). It is declared here, in run_node's
+    // scope, BEFORE work_source; the explicit stratum_server.reset() after
+    // ioc.run() tears the acceptor down while node_coin_state is still alive.
+    // Default (unpopulated) bundle: populated()==false, so get_work() takes the
+    // retained dashd-fallback arm -- correct + documented for the 4a standup.
+    dash::coin::NodeCoinState node_coin_state;
+
+    // REQUIRED always-reachable dashd-RPC fallback arm -- the safety +
+    // [GBT-XCHECK] cross-check path, NEVER removed (operator standing rule). For
+    // this skeleton standup it returns the documented set-gap default; wiring it
+    // from NodeRPC getblocktemplate -> DashWorkData is a deferred sub-slice.
+    std::function<dash::coin::DashWorkData()> dashd_fallback =
+        []() -> dash::coin::DashWorkData { return dash::coin::DashWorkData{}; };
+
+    // Won-block dispatch: mirrors the DGB stratum_submit_fn. On a won X11 block,
+    // HexStr the bytes, log a [DASH-STRATUM-BLOCK] line, and dispatch via the
+    // EXISTING external-dashd submitblock-RPC arm (rpc->submit_block_hex). If the
+    // RPC arm is UNARMED (no dash.conf creds), no sink is reached (the embedded
+    // P2P relay arm is S8) -- log loudly and return false; never a silent drop.
+    dash::stratum::DASHWorkSource::SubmitBlockFn stratum_submit_fn =
+        [&rpc](const std::vector<unsigned char>& block_bytes,
+               uint32_t height) -> bool {
+            const std::string block_hex = HexStr(block_bytes);
+            std::cout << "[DASH-STRATUM-BLOCK] won block height=" << height
+                      << " bytes=" << block_bytes.size()
+                      << " -- dispatching via submitblock-RPC arm\n";
+            if (!rpc) {
+                std::cout << "[DASH-STRATUM-BLOCK] submit arm UNARMED -- reached NO "
+                             "sink (no dashd RPC creds; embedded P2P relay is S8) -- "
+                             "won block NOT broadcast\n";
+                return false;
+            }
+            const bool ok = rpc->submit_block_hex(block_hex, /*ignore_failure=*/false);
+            if (!ok)
+                std::cout << "[DASH-STRATUM-BLOCK] dashd submitblock REJECTED the "
+                             "won block\n";
+            return ok;
+        };
+
+    // DASHWorkSource holds a non-owning ref to node_coin_state (declared above,
+    // same scope). The StratumServer co-owns the work source via shared_ptr.
+    auto work_source = std::make_shared<dash::stratum::DASHWorkSource>(
+        node_coin_state, std::move(dashd_fallback), std::move(stratum_submit_fn),
+        core::stratum::StratumConfig{});
+
+    if (stratum_port != 0) {
+        stratum_server = std::make_unique<core::StratumServer>(
+            ioc, stratum_host, stratum_port, work_source);
+        if (stratum_server->start()) {
+            std::cout << "[run] stratum listening on " << stratum_host << ":"
+                      << stratum_port
+                      << " (work source: DASHWorkSource 4a/4b skeleton -- X11;"
+                      << " get_work routes to the dashd-RPC fallback until the"
+                      << " node-held coin-state is seeded)\n";
+        } else {
+            std::cout << "[run] stratum FAILED to bind " << stratum_host << ":"
+                      << stratum_port << " -- stratum disabled\n";
+            stratum_server.reset();
+        }
+    } else {
+        std::cout << "[run] stratum disabled (no --stratum flag)\n";
+    }
+
     std::cout << "[run] run-loop up (Ctrl-C to stop); won blocks relay via the\n"
                  "[run] dashd-RPC submitblock fallback + the embedded sharechain P2P leg.\n";
     ioc.run();
+
+    // Tear the acceptor + sessions down while the work source and node_coin_state
+    // it references are still alive -- explicit reset keeps destruction order safe
+    // (stratum_server was declared before them, so it would otherwise outlive them).
+    stratum_server.reset();
+
     std::cout << "[run] run-loop stopped cleanly\n";
     return 0;
 }
@@ -552,6 +646,8 @@ int main(int argc, char** argv)
     std::string listen_raw;                    // --listen [HOST:]PORT (sharechain bind)
     std::vector<std::string> addnode_raw;      // --addnode HOST:PORT (persistent outbound)
     std::vector<std::string> connect_raw;      // --connect HOST:PORT (connect-only)
+    std::string stratum_host = "0.0.0.0";      // --stratum [HOST:]PORT bind interface (default all)
+    uint16_t    stratum_port = 0;              // 0 disables the Stratum accept-loop; --stratum sets it
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
             std::cout << "c2pool-dash " << C2POOL_VERSION << "\n";
@@ -581,6 +677,15 @@ int main(int argc, char** argv)
             addnode_raw.emplace_back(argv[++i]);
         else if (std::strcmp(argv[i], "--connect") == 0 && i + 1 < argc)
             connect_raw.emplace_back(argv[++i]);
+        else if (std::strcmp(argv[i], "--stratum") == 0 && i + 1 < argc) {
+            // --stratum [HOST:]PORT -- bind a Stratum TCP listener for miners.
+            // Bare PORT keeps the default 0.0.0.0 bind host (parse_listen SSOT).
+            if (!parse_listen(argv[++i], stratum_host, stratum_port)) {
+                std::cout << "[run] --stratum malformed (want [HOST:]PORT): "
+                          << argv[i] << "\n";
+                return 2;
+            }
+        }
         // --selftest is the default; accepted explicitly for symmetry.
     }
 
@@ -627,7 +732,8 @@ int main(int argc, char** argv)
             }
             peer.listen_set = true;
         }
-        return run_node(testnet, rpc_endpoint, rpc_conf_path, submit_hex, peer);
+        return run_node(testnet, rpc_endpoint, rpc_conf_path, submit_hex, peer,
+                        stratum_host, stratum_port);
     }
     return run_selftest();
 }
