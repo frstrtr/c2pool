@@ -22,6 +22,7 @@
 // Core includes
 #include <core/settings.hpp>
 #include <core/fileconfig.hpp>
+#include <core/core_util.hpp>
 #include <core/coinbase_builder.hpp>
 #include <c2pool/storage/the_checkpoint.hpp>
 #include <core/pack.hpp>
@@ -427,7 +428,8 @@ void print_help() {
     std::cout << "  --stratum-max-diff N      Maximum per-connection difficulty (default: 65536)\n";
     std::cout << "  --stratum-target-time N   Target seconds per pseudoshare (default: 3)\n";
     std::cout << "  --no-vardiff              Disable automatic difficulty adjustment\n";
-    std::cout << "  --max-coinbase-outputs N  Max coinbase outputs per block (default: 4000, matches p2pool)\n\n";
+    std::cout << "  --max-coinbase-outputs N  Max coinbase outputs per block (default: 4000, matches p2pool)\n";
+    std::cout << "  --max-stratum-connections N  Max concurrent miners on this node (default: 100, 0 = unlimited)\n\n";
 
     std::cout << "EMBEDDED NODE OPTIONS:\n";
     std::cout << "  --embedded-ltc            Use embedded LTC SPV node (no daemon needed)\n";
@@ -536,7 +538,22 @@ int main(int argc, char* argv[]) {
 
     // Initialize logging
     core::log::Logger::init();
-    
+
+    // Mining-hotel interim fix #4: raise RLIMIT_NOFILE to 65536 at startup.
+    // One fd per stratum session + HTTP + RPC + P2P + LevelDB — distro-default
+    // 1024 starves the accept loop under miner churn. Log the effective limit.
+    {
+        const uint64_t nofile = core::raise_nofile_limit(65536);
+        if (nofile == 0)
+            LOG_WARNING << "RLIMIT_NOFILE: unsupported on this platform (or query failed)";
+        else if (nofile < 65536)
+            LOG_WARNING << "RLIMIT_NOFILE soft limit is " << nofile
+                        << " (< 65536; hard limit too low — raise with ulimit -Hn / limits.conf)";
+        else
+            LOG_INFO << "RLIMIT_NOFILE soft limit: " << nofile;
+    }
+
+
     // Banner intentionally deferred — only the bordered log-file banner is
     // emitted (see post-parse section below). Printing an unbordered copy
     // here too cluttered journalctl output with duplicate headers.
@@ -1042,6 +1059,10 @@ int main(int argc, char* argv[]) {
             stratum_config.max_coinbase_outputs = static_cast<size_t>(std::stoul(argv[++i]));
             cli_explicit.insert("max_coinbase_outputs");
         }
+        else if (arg == "--max-stratum-connections" && i + 1 < argc) {
+            stratum_config.max_stratum_connections = static_cast<size_t>(std::stoul(argv[++i]));
+            cli_explicit.insert("max_stratum_connections");
+        }
         // Operational tuning
         else if (arg == "--log-file" && i + 1 < argc) {
             log_file = argv[++i];
@@ -1252,6 +1273,8 @@ int main(int argc, char* argv[]) {
                 stratum_config.vardiff_enabled = cfg["vardiff_enabled"].as<bool>();
             if (!cli_explicit.count("max_coinbase_outputs") && cfg["max_coinbase_outputs"])
                 stratum_config.max_coinbase_outputs = cfg["max_coinbase_outputs"].as<size_t>();
+            if (!cli_explicit.count("max_stratum_connections") && cfg["max_stratum_connections"])
+                stratum_config.max_stratum_connections = cfg["max_stratum_connections"].as<size_t>();
 
             // Operational tuning
             if (!cli_explicit.count("log_file") && cfg["log_file"])
@@ -1890,7 +1913,8 @@ int main(int argc, char* argv[]) {
                      << " max_diff=" << stratum_config.max_difficulty
                      << " target_time=" << stratum_config.target_time << "s"
                      << " vardiff=" << (stratum_config.vardiff_enabled ? "on" : "off")
-                     << " max_cb_outputs=" << stratum_config.max_coinbase_outputs;
+                     << " max_cb_outputs=" << stratum_config.max_coinbase_outputs
+                     << " max_stratum_connections=" << stratum_config.max_stratum_connections;
             LOG_INFO << "Operational config: p2p_max_peers=" << p2p_max_peers
                      << " ban_duration=" << p2p_ban_duration << "s"
                      << " rss_limit=" << rss_limit_mb << "MB"

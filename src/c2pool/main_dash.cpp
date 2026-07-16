@@ -46,6 +46,7 @@
 #include <impl/dash/coin/subsidy.hpp>
 
 #include <core/coin_params.hpp>
+#include <core/core_util.hpp>              // raise_nofile_limit (hotel interim fix #4)
 #include <core/uint256.hpp>
 #include <core/netaddress.hpp>             // NetService (dashd RPC endpoint)
 
@@ -539,6 +540,18 @@ int run_mine_block(bool testnet, const std::string& rpc_endpoint,
 
 int main(int argc, char** argv)
 {
+    // Mining-hotel interim fix #4: raise RLIMIT_NOFILE to 65536 at startup
+    // (one fd per stratum/miner session + RPC + sharechain P2P; distro-default
+    // 1024 starves the accept loop). Report the effective soft limit.
+    {
+        const uint64_t nofile = core::raise_nofile_limit(65536);
+        if (nofile == 0)
+            std::cout << "[init] RLIMIT_NOFILE: unsupported on this platform (or query failed)\n";
+        else
+            std::cout << "[init] RLIMIT_NOFILE soft limit: " << nofile
+                      << (nofile < 65536 ? " (< 65536; hard limit too low)" : "") << "\n";
+    }
+
     bool want_help = false;
     bool want_run  = false;
     bool want_mine = false;
