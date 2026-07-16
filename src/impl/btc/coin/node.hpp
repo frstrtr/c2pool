@@ -128,7 +128,7 @@ public:
     {
         if (!m_rpc)
             return false;
-        return m_rpc->submit_block_hex(HexStr(block_bytes), /*ignore_failure=*/true);
+        return m_rpc->submit_block_hex(HexStr(Span<const unsigned char>(block_bytes.data(), block_bytes.size())), /*ignore_failure=*/true);
     }
 
     /// Broadcast a WON block with FALLBACK semantics: P2P relay is primary,
