@@ -27,7 +27,18 @@ if (BUILD_TESTING AND GTest_FOUND)
     # P1 PC: embedded template builder KATs. Header-only builder
     # (template_builder.hpp / rpc_data.hpp); links the same SCC the sibling
     # merkle test does (core + nmc_coin for the out-of-line transaction ctor).
-    add_executable(nmc_template_builder_test nmc_template_builder_test.cpp)
+    #
+    # nmc_underfill_guard_test.cpp: port of the LTC/DOGE "near-empty template
+    # on a non-empty mempool" template-builder guard to the NMC embedded
+    # template path (coin/template_builder.hpp), matching the BTC port
+    # (test/test_btc_underfill_guard.cpp). Predicate KATs at the pinned 50 kB
+    # floor/slack + build_template wiring via the SAFE-ADDITIVE
+    # underfill_tripped seam (log-only guard; GBT projection asserted
+    # unchanged). Compiled INTO this already-allowlisted target (second
+    # source; gtest_add_tests AUTO scans all target sources) so no build.yml
+    # --target allowlist edit is needed — a NEW target absent from that
+    # allowlist reds master as a NOT_BUILT sentinel (the #724/#728 lesson).
+    add_executable(nmc_template_builder_test nmc_template_builder_test.cpp nmc_underfill_guard_test.cpp)
     target_link_libraries(nmc_template_builder_test PRIVATE
         GTest::gtest_main GTest::gtest
         core nlohmann_json::nlohmann_json)
