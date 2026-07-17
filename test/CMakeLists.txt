@@ -521,6 +521,64 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_underfill_guard PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_underfill_guard "" AUTO)
 
+    # BTC underfill guard: port of the LTC/DOGE "near-empty template on a
+    # non-empty mempool" template-builder guard to the BTC embedded template
+    # path (src/impl/btc/coin/template_builder.hpp). Predicate KATs at the
+    # pinned 50 kB floor/slack + build_template wiring via the SAFE-ADDITIVE
+    # underfill_tripped seam (log-only guard; GBT projection asserted
+    # unchanged). Chain fixture = in-memory fast-start checkpoint (the BCH
+    # embedded_getwork_test shape). Link set mirrors test_template_builder
+    # (the LTC twin) with the btc OBJECT libs. MUST also be in the build.yml
+    # --target allowlist or CTest reports a NOT_BUILT sentinel.
+    add_executable(test_btc_underfill_guard test_btc_underfill_guard.cpp)
+    target_link_libraries(test_btc_underfill_guard PRIVATE
+        GTest::gtest_main GTest::gtest
+        core btc
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_btc_underfill_guard PRIVATE c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage btc_coin btclibs pool sharechain ${SECP256K1_LIBRARIES})  # OBJECT-lib SCC direct-naming (#22/#39), btc twin
+    gtest_add_tests(test_btc_underfill_guard "" AUTO)
+
+    # DGB underfill guard: same LTC/DOGE guard ported to the DGB embedded
+    # template path. DGB's build_work_template() is a pure shaper with no
+    # mempool access, so the guard evaluates in make_mempool_tx_source()
+    # (coin/embedded_tx_select.cpp) — the one mempool-visible point feeding
+    # BOTH template callers (stratum work source + EmbeddedCoinNode);
+    # predicate/thresholds pinned in coin/template_builder.hpp. Compiles the
+    # tx serialization codec, so it links the same proven SCC set as
+    # dgb_embedded_tx_select_test. MUST also be in the build.yml --target
+    # allowlist or CTest reports a NOT_BUILT sentinel.
+    add_executable(test_dgb_underfill_guard test_dgb_underfill_guard.cpp)
+    target_link_libraries(test_dgb_underfill_guard PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb dgb_stratum
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    gtest_add_tests(test_dgb_underfill_guard "" AUTO)
+
+    # BCH underfill guard: same LTC/DOGE guard ported to the BCH embedded
+    # template path (src/impl/bch/coin/template_builder.hpp; ABLA floor
+    # sizelimit + CTOR body asserted unchanged when the guard trips). Gated on
+    # COIN_BCH exactly like the bch_coin library it links (src/impl/bch is a
+    # -DCOIN_BCH=ON leg; the target cannot exist outside it). MUST also be in
+    # the build.yml BCH-leg --target allowlist or CTest reports a NOT_BUILT
+    # sentinel.
+    if(COIN_BCH)
+        add_executable(test_bch_underfill_guard test_bch_underfill_guard.cpp)
+        target_link_libraries(test_bch_underfill_guard PRIVATE
+            GTest::gtest_main GTest::gtest
+            core bch_coin
+            nlohmann_json::nlohmann_json
+            ${Boost_LIBRARIES}
+        )
+        target_link_libraries(test_bch_underfill_guard PRIVATE c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage btclibs pool sharechain)  # OBJECT-lib SCC direct-naming (#22/#39)
+        gtest_add_tests(test_bch_underfill_guard "" AUTO)
+    endif()
+
     # DASH embedded-vs-dashd work-source selector (S8 embedded_gbt live-wire
     # capstone): select_dash_work() prefers the locally-assembled embedded
     # template (build_embedded_workdata) and falls back to dashd
