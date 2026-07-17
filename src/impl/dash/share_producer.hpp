@@ -266,9 +266,13 @@ inline uint32_t clip_timestamp(uint32_t desired, bool has_prev, uint32_t prev_ts
 {
     if (!has_prev)
         return desired;
-    const uint32_t lo = prev_ts + 1;
-    const uint32_t hi = prev_ts + 2 * share_period - 1;
-    return clip(desired, lo, hi);
+    // Widen to 64-bit and saturate at 2^32-1: the oracle computes the bounds
+    // with unbounded ints (a prev_ts near 2^32 could not serialize there
+    // either), so a wrapped uint32 window here would be a silent divergence.
+    const uint64_t lo64 = static_cast<uint64_t>(prev_ts) + 1;
+    const uint64_t hi64 = static_cast<uint64_t>(prev_ts) + 2ull * share_period - 1;
+    const uint64_t clipped = clip<uint64_t>(desired, lo64, hi64);
+    return clipped > 0xffffffffull ? 0xffffffffu : static_cast<uint32_t>(clipped);
 }
 
 // ── 1c. far_share_hash (data.py:235) ─────────────────────────────────────────
@@ -863,6 +867,15 @@ inline MerkleLink calculate_merkle_link_index0(const std::vector<uint256>& other
 // header reconstruction, X11) and the producer-side gentx txid is
 // cross-checked against the verifier's check_hash_link fold. Any mismatch
 // throws — a share that fails here must never reach the wire.
+// SCOPE of the guarantee: these checks prove serialization SELF-CONSISTENCY
+// (the committed hash_link/ref_hash/merkle fold reproduces exactly what a
+// receiving verifier recomputes from the share bytes). They cannot prove the
+// PPLNS amounts/window are oracle-correct — no in-tree component reconstructs
+// the coinbase from chain state on the accept path (generate_share_transaction
+// is currently uncalled and carries known divergences from the oracle; see the
+// header notes). Amount-level oracle parity is carried by the KAT layer
+// (test_dash_share_producer.cpp) and the oracle-replay confirmation of the
+// PROVISIONAL goldens.
 struct BuiltShare
 {
     DashShare share;      // fully populated, m_hash set to the X11 share hash
