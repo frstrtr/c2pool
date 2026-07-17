@@ -54,7 +54,11 @@ struct DashShare : chain::BaseShare<uint256, 16>
     uint64_t m_last_txout_nonce{0};
     HashLinkType m_hash_link;
     MerkleLink m_merkle_link;
-    BaseScript m_coinbase_payload_outer; // PossiblyNone('', VarStr) — outer coinbase_payload
+    // Outer coinbase_payload — PossiblyNone('', VarStr) on the wire. The VALUE
+    // is the oracle's coinbase_payload_data = VarStrType().pack(raw_payload)
+    // (data.py:277-289), i.e. m_data holds [compactsize(len raw)][raw], NOT the
+    // bare payload; Share.__init__ appends it verbatim to the hash_link data.
+    BaseScript m_coinbase_payload_outer;
 
     // Identity hash (computed, not serialized)
     uint256 m_hash;
