@@ -486,7 +486,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // same scope). The StratumServer co-owns the work source via shared_ptr.
     auto work_source = std::make_shared<dash::stratum::DASHWorkSource>(
         node_coin_state, std::move(dashd_fallback), std::move(stratum_submit_fn),
-        core::stratum::StratumConfig{});
+        core::stratum::StratumConfig{}, testnet);
 
     if (stratum_port != 0) {
         stratum_server = std::make_unique<core::StratumServer>(
@@ -494,9 +494,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         if (stratum_server->start()) {
             std::cout << "[run] stratum listening on " << stratum_host << ":"
                       << stratum_port
-                      << " (work source: DASHWorkSource 4a/4b skeleton -- X11;"
-                      << " get_work routes to the dashd-RPC fallback until the"
-                      << " node-held coin-state is seeded)\n";
+                      << " (work source: DASHWorkSource 4c/4d -- X11 template"
+                      << " serving + submit scoring; templates source from the"
+                      << " embedded coin-state when seeded, else the retained"
+                      << " dashd-RPC GBT fallback)\n";
         } else {
             std::cout << "[run] stratum FAILED to bind " << stratum_host << ":"
                       << stratum_port << " -- stratum disabled\n";
