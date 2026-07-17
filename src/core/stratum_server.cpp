@@ -1322,8 +1322,16 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         auto now = std::chrono::steady_clock::now().time_since_epoch().count();
         auto prev = s_last_warn.load();
         if (now - prev > 30'000'000'000LL) { // 30 seconds
-            if (s_last_warn.compare_exchange_strong(prev, now))
-                LOG_WARNING << "[LTC] Waiting for block template (header sync in progress)...";
+            if (s_last_warn.compare_exchange_strong(prev, now)) {
+                // Runtime coin tag from the work-source config — this core is
+                // coin-agnostic and must never hardcode a coin (issue #732:
+                // a DASH binary logging "[LTC]" sent the operator diagnosing
+                // the wrong coin). Neutral fallback when unset.
+                const std::string& sym =
+                    mining_interface_->get_stratum_config().coin_symbol;
+                LOG_WARNING << "[" << (sym.empty() ? "Stratum" : sym)
+                            << "] Waiting for block template (header sync in progress)...";
+            }
         }
         auto timer = std::make_shared<boost::asio::steady_timer>(socket_.get_executor());
         timer->expires_after(std::chrono::seconds(1));

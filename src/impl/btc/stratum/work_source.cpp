@@ -127,6 +127,9 @@ BTCWorkSource::BTCWorkSource(btc::coin::HeaderChain&       chain,
     // 65536x-inflated wire diff that starves low-rate SHA256d miners of
     // acceptable shares. Wire-only; does not touch the share-accept target.
     config_.set_difficulty_multiplier = 1.0;
+    // Runtime coin tag for coin-agnostic core log lines (#732).
+    if (config_.coin_symbol.empty())
+        config_.coin_symbol = "BTC";
 
     LOG_INFO << "[BTC-STRATUM] BTCWorkSource constructed"
              << " (testnet=" << is_testnet_
