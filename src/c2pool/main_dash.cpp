@@ -440,11 +440,22 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     dash::coin::NodeCoinState node_coin_state;
 
     // REQUIRED always-reachable dashd-RPC fallback arm -- the safety +
-    // [GBT-XCHECK] cross-check path, NEVER removed (operator standing rule). For
-    // this skeleton standup it returns the documented set-gap default; wiring it
-    // from NodeRPC getblocktemplate -> DashWorkData is a deferred sub-slice.
+    // [GBT-XCHECK] cross-check path, NEVER removed (operator standing rule).
+    // Wired to NodeRPC::getwork() (dashd getblocktemplate -> rich DashWorkData,
+    // the same seam run_mine_block uses). When the RPC arm is UNARMED (no
+    // dash.conf creds) it returns the documented empty set-gap default and logs
+    // loudly -- never a silent drop. &rpc is lifetime-safe: rpc is declared
+    // above work_source in this scope, so work_source (which owns this lambda)
+    // is destroyed BEFORE rpc at scope exit.
     std::function<dash::coin::DashWorkData()> dashd_fallback =
-        []() -> dash::coin::DashWorkData { return dash::coin::DashWorkData{}; };
+        [&rpc]() -> dash::coin::DashWorkData {
+            if (!rpc) {
+                std::cout << "[DASH-STRATUM-GBT] fallback arm UNARMED (no dashd "
+                             "RPC creds) -- serving empty set-gap template\n";
+                return dash::coin::DashWorkData{};
+            }
+            return rpc->getwork();
+        };
 
     // Won-block dispatch: mirrors the DGB stratum_submit_fn. On a won X11 block,
     // HexStr the bytes, log a [DASH-STRATUM-BLOCK] line, and dispatch via the
