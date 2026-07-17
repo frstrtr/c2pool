@@ -169,6 +169,14 @@ std::string DGBWorkSource::get_current_gbt_prevhash() const
     // embedded P2P header ingest) -- a truthful absence, never a fabricated id.
     if (auto th = chain_.tip_hash())
         return u256_be_display_hex(*th);
+    // Embedded chain unfed -> external-daemon GBT fallback (the mining.notify
+    // prevhash path: stratum_server.cpp get_current_gbt_prevhash caller). Drawn
+    // from the SAME single GBT source as get_current_work_template()'s
+    // previousblockhash, so the dedicated getter and the assembled template can
+    // never diverge. Empty on unbound / no-creds / RPC-failure -- the server
+    // then falls back to the best-share hash (its documented empty-prevhash path).
+    if (auto tip = resolve_gbt_tip_fallback())
+        return tip->previousblockhash;
     return {};
 }
 
@@ -320,8 +328,19 @@ nlohmann::json DGBWorkSource::get_current_work_template() const
     in.median_time_past  = chain_.median_time_past();
     in.curtime           = static_cast<int64_t>(std::time(nullptr));
     in.transactions      = tx_sel.transactions;
-    if (auto th = chain_.tip_hash())
+    if (auto th = chain_.tip_hash()) {
+        // Embedded chain carries a real tip -> source previousblockhash from it.
+        // bits stays absent here: the Scrypt-only walk cannot reconstruct the
+        // MultiShield-V4 5-algo window (== V37) -- unchanged truthful absence.
         in.previousblockhash = u256_be_display_hex(*th);
+    } else if (auto tip = resolve_gbt_tip_fallback()) {
+        // Embedded HeaderChain unfed -> external-daemon GBT fallback (persist per
+        // V36). Sources BOTH previousblockhash and the daemon-authoritative bits
+        // from ONE getblocktemplate snapshot (consistent height). Unbound / no
+        // creds / RPC failure -> both stay absent, byte-identical to before.
+        in.previousblockhash = tip->previousblockhash;
+        in.bits              = tip->bits;
+    }
 
     return dgb::coin::build_work_template(in);
 }
@@ -653,6 +672,40 @@ void DGBWorkSource::set_pplns_inputs_fn(PplnsInputsFn fn)
 {
     std::lock_guard<std::mutex> lk(pplns_inputs_mutex_);
     pplns_inputs_fn_ = std::move(fn);
+}
+
+void DGBWorkSource::set_gbt_tip_fn(GbtTipFn fn)
+{
+    std::lock_guard<std::mutex> lk(gbt_tip_mutex_);
+    gbt_tip_fn_ = std::move(fn);
+    gbt_tip_cache_.reset();     // drop any stale cache when the seam is (re)bound
+    gbt_tip_cache_time_ = 0;
+}
+
+std::optional<DGBWorkSource::GbtTip> DGBWorkSource::resolve_gbt_tip_fallback() const
+{
+    // Copy the seam + serve a fresh-enough cache under the lock; run the blocking
+    // RPC round-trip OUTSIDE the lock (single io_context thread today, but never
+    // hold a lock across network IO). TTL-bound so per-heartbeat template/prevhash
+    // polls do not each trigger a getblocktemplate round-trip.
+    GbtTipFn fn;
+    const int64_t now = static_cast<int64_t>(std::time(nullptr));
+    {
+        std::lock_guard<std::mutex> lk(gbt_tip_mutex_);
+        if (gbt_tip_cache_ && (now - gbt_tip_cache_time_) < GBT_TIP_TTL_SECONDS)
+            return gbt_tip_cache_;
+        fn = gbt_tip_fn_;  // copy so a concurrent set_gbt_tip_fn() cannot tear it out
+    }
+    if (!fn)
+        return std::nullopt;   // unbound (no digibyted creds armed) -> truthful absence
+
+    std::optional<GbtTip> tip = fn();   // blocking getblocktemplate; nullopt on RPC failure
+    if (tip) {
+        std::lock_guard<std::mutex> lk(gbt_tip_mutex_);
+        gbt_tip_cache_      = tip;
+        gbt_tip_cache_time_ = now;
+    }
+    return tip;
 }
 
 uint256 DGBWorkSource::try_mint_share(const MintShareInputs& in) const
