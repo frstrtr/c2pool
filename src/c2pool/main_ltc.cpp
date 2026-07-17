@@ -632,6 +632,7 @@ int main(int argc, char* argv[]) {
 
     // Stratum tuning (configurable via CLI or YAML)
     core::StratumConfig stratum_config;  // defaults: min=0.0005, max=65536, target=3.0s, vardiff=true
+    stratum_config.coin_symbol = "LTC";  // runtime coin tag for coin-agnostic core log lines
 
     // Operational tuning (configurable via CLI or YAML)
     std::string log_file;                        // empty = default "debug.log"

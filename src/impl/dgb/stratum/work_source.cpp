@@ -115,6 +115,9 @@ DGBWorkSource::DGBWorkSource(c2pool::dgb::HeaderChain&     chain,
     , subsidy_func_(std::move(subsidy_func))
     , config_(std::move(config))
 {
+    // Runtime coin tag for coin-agnostic core log lines (#732).
+    if (config_.coin_symbol.empty())
+        config_.coin_symbol = "DGB";
     LOG_INFO << "[DGB-STRATUM] DGBWorkSource constructed"
              << " (testnet=" << is_testnet_
              << " min_diff=" << config_.min_difficulty
