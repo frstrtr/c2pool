@@ -52,6 +52,36 @@
 namespace dash {
 namespace coin {
 
+// ── Underfill guard (v36 cutover deploy path) ───────────────────────────────
+// Port of the LTC/DOGE template-builder guard (src/impl/ltc/coin/
+// template_builder.hpp, src/impl/doge/coin/template_builder.hpp) to the DASH
+// embedded GBT path. Detects the "near-empty template on a non-empty mempool"
+// regression: the tx selector returns almost no transactions even though the
+// local mempool holds a substantial fee-paying backlog. c2pool-side
+// template-fill safety net — NOT the byte-parity KAT axis; thresholds are the
+// v36-native shared structure (bucket-2, standardize cross-coin) pinned to
+// the legacy p2pool near-empty floor (~50 kB), identical to LTC/DOGE.
+// DASH counts base_size bytes (no segwit), so "bytes" here are the same
+// serialized-tx bytes the mempool byte cap and dashcore's 2 MB limit count.
+inline constexpr uint64_t UNDERFILL_MIN_FILL_BYTES = 50'000ull; // < this = near-empty block
+inline constexpr uint64_t UNDERFILL_BACKLOG_SLACK  = 50'000ull; // unselected fee-paying material that should have filled it
+
+/// Pure trip predicate — the exact boolean the LTC/DOGE guards evaluate.
+/// Factored out so the KAT can pin it without a log scraper:
+///   near_empty  : template packed fewer bytes than the near-empty floor
+///   has_backlog : the mempool holds fee-paying material (known fees > 0)
+///                 well beyond what was selected (> selected + slack)
+/// Genuinely empty (or fee-unknown-only) mempools never trip.
+inline bool underfill_guard_trips(uint64_t selected_bytes,
+                                  uint64_t mempool_bytes,
+                                  uint64_t mempool_known_fees)
+{
+    const bool near_empty  = selected_bytes < UNDERFILL_MIN_FILL_BYTES;
+    const bool has_backlog = mempool_known_fees > 0
+                          && mempool_bytes > selected_bytes + UNDERFILL_BACKLOG_SLACK;
+    return near_empty && has_backlog;
+}
+
 /// Build the GBT-equivalent fields we currently know how to compute
 /// for a block at height (prev_height+1). Returns a partially-filled
 /// DashWorkData; missing fields documented above.
@@ -73,7 +103,13 @@ inline DashWorkData build_embedded_workdata(
     // unchanged (SAFE-ADDITIVE); the G1 golden KAT pins it, and a real
     // BIP9-deployment-aware value can later be threaded in without touching
     // the default header projection.
-    uint32_t version = 0x20000000u)
+    uint32_t version = 0x20000000u,
+    // Seam: optional underfill-guard observation point. Defaults to nullptr so
+    // every existing caller is byte-for-byte unchanged (SAFE-ADDITIVE); the
+    // guard KAT passes a bool to pin the wiring without a log scraper. The
+    // guard itself is log-only (WARNING), exactly like LTC/DOGE — it never
+    // alters the template.
+    bool* underfill_tripped = nullptr)
 {
     DashWorkData w;
     w.m_height          = prev_height + 1;
@@ -104,10 +140,37 @@ inline DashWorkData build_embedded_workdata(
     w.m_txs.reserve(selected.size());
     w.m_tx_hashes.reserve(selected.size());
     w.m_tx_fees.reserve(selected.size());
+    uint64_t selected_bytes = 0;  // wire bytes packed into this template (underfill guard)
     for (auto& s : selected) {
+        selected_bytes += s.base_size;
         w.m_txs.emplace_back(s.tx);
         w.m_tx_hashes.push_back(dash::coin::dash_txid(s.tx));
         w.m_tx_fees.push_back(s.fee);
+    }
+
+    // ── Underfill guard ─────────────────────────────────────────────
+    // Do not silently treat a near-empty DASH template as healthy when the
+    // DASH mempool held fee-paying backlog that should have filled it. We
+    // cannot fabricate transactions, so surface loudly (WARNING) for
+    // contabo-prod-watch / the operator rather than shipping a false-empty
+    // block as normal. Genuinely empty mempools never trip. Mirrors the
+    // LTC/DOGE TemplateBuilder guard; additive only — masternode payment /
+    // CbTx / superblock projection below is untouched either way.
+    {
+        const uint64_t mempool_bytes = static_cast<uint64_t>(mempool.byte_size());
+        const uint64_t mempool_fees  = mempool.total_known_fees();
+        const bool tripped = underfill_guard_trips(selected_bytes,
+                                                   mempool_bytes,
+                                                   mempool_fees);
+        if (underfill_tripped) *underfill_tripped = tripped;
+        if (tripped) {
+            LOG_WARNING << "[GBT-EMB] UNDERFILL: selected "
+                        << selected.size() << " tx / " << selected_bytes
+                        << "B into template while mempool holds " << mempool.size()
+                        << " tx / " << mempool_bytes << "B (" << mempool_fees
+                        << " sat fees) — near-empty block on a non-empty "
+                        << "mempool; template-fill regression, gates cutover.";
+        }
     }
 
     // Platform Credit Pool burn (DIP-0027): emit OP_RETURN payment

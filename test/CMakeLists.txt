@@ -504,6 +504,23 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_embedded_gbt PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_embedded_gbt "" AUTO)
 
+    # DASH underfill guard: port of the LTC/DOGE "near-empty template on a
+    # non-empty mempool" template-builder guard to the DASH embedded GBT path
+    # (embedded_gbt.hpp), for the mining-hotel deployment. Predicate KATs at
+    # the pinned 50 kB floor/slack + build_embedded_workdata wiring via the
+    # SAFE-ADDITIVE underfill_tripped seam (log-only guard; masternode
+    # burn/payee projection asserted unchanged). Same link set as the
+    # embedded_gbt capstone.
+    add_executable(test_dash_underfill_guard test_dash_underfill_guard.cpp)
+    target_link_libraries(test_dash_underfill_guard PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_underfill_guard PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_underfill_guard "" AUTO)
+
     # DASH embedded-vs-dashd work-source selector (S8 embedded_gbt live-wire
     # capstone): select_dash_work() prefers the locally-assembled embedded
     # template (build_embedded_workdata) and falls back to dashd
