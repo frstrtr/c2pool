@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+#include <cmath>
 // dgb::stratum::DGBWorkSource — Stage 4a skeleton construction + contract test.
 //
 // Proves the work source instantiates against the live coin types
@@ -353,6 +354,25 @@ TEST(DgbWorkSource, ComputeShareDifficultyReturnsNotYetSentinel)
         /*version=*/0x20000000u, "prevhash", "1e0ffff0",
         /*merkle_branches=*/{});
     EXPECT_DOUBLE_EQ(diff, 0.0);
+}
+
+// Stage 4b/4c live: a well-formed reconstruct (valid hex, header == 80B) is now
+// SCORED -- scrypt_1024_1_1_256(header) bridged to core uint256 via the
+// u256_be_display_hex SSOT and returned as chain::target_to_difficulty(pow),
+// the SAME unit the coin-agnostic StratumServer vardiff/pool gate compares. A
+// positive score is exactly what lets a real share clear the gate and reach
+// mining_submit (the 0.0 stub silently rejected every share pre-fix).
+TEST(DgbWorkSource, ComputeShareDifficultyScoresValidHeader)
+{
+    Fixture fx;
+    auto ws = fx.make();
+    const std::string prevhash(64, '0');  // 32 zero bytes (BE display hex)
+    double diff = ws->compute_share_difficulty(
+        "01000000", "00000000", "00", "00", "5f5e1000", "0000abcd",
+        /*version=*/0x20000000u, prevhash, "1e0ffff0",
+        /*merkle_branches=*/{});
+    EXPECT_GT(diff, 0.0);
+    EXPECT_TRUE(std::isfinite(diff));
 }
 
 // Stage 4c coinbasevalue wire: the work template surfaces the NEXT-block
