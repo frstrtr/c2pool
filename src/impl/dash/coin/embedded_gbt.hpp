@@ -52,6 +52,16 @@
 namespace dash {
 namespace coin {
 
+// ── Underfill guard thresholds (v36 cutover deploy path) ──────────────
+// Byte-identical to the LTC parent guard (9e06ef6) and the DOGE embedded-GBT
+// mirror (3af519f4, PR #663). DASH runs its OWN embedded GBT template and
+// selects its OWN transactions, so it can produce a near-empty block on a
+// non-empty DASH mempool independently — the guard must live in this builder
+// directly. Thresholds are a v36-native shared structure (bucket-2, standardize
+// cross-coin) pinned to the legacy p2pool near-empty floor (~50 kB).
+static constexpr uint64_t UNDERFILL_MIN_FILL_BYTES = 50'000ull; // < this = near-empty block
+static constexpr uint64_t UNDERFILL_BACKLOG_SLACK  = 50'000ull; // unselected fee-paying material that should have filled it
+
 /// Build the GBT-equivalent fields we currently know how to compute
 /// for a block at height (prev_height+1). Returns a partially-filled
 /// DashWorkData; missing fields documented above.
@@ -104,10 +114,33 @@ inline DashWorkData build_embedded_workdata(
     w.m_txs.reserve(selected.size());
     w.m_tx_hashes.reserve(selected.size());
     w.m_tx_fees.reserve(selected.size());
+    uint64_t selected_bytes = 0;  // wire bytes packed into this template (underfill guard)
     for (auto& s : selected) {
         w.m_txs.emplace_back(s.tx);
         w.m_tx_hashes.push_back(dash::coin::dash_txid(s.tx));
         w.m_tx_fees.push_back(s.fee);
+        selected_bytes += s.base_size;
+    }
+
+    // ── Underfill guard ───────────────────────────────
+    // Do not silently treat a near-empty DASH template as healthy when the DASH
+    // mempool held fee-paying backlog that should have filled it. We cannot
+    // fabricate transactions, so surface loudly (WARNING) for contabo-prod-watch
+    // / the operator. Genuinely empty mempools never trip.
+    {
+        const uint64_t mempool_bytes = static_cast<uint64_t>(mempool.byte_size());
+        const uint64_t mempool_fees  = mempool.total_known_fees();
+        const bool near_empty  = selected_bytes < UNDERFILL_MIN_FILL_BYTES;
+        const bool has_backlog = mempool_fees > 0
+                              && mempool_bytes > selected_bytes + UNDERFILL_BACKLOG_SLACK;
+        if (near_empty && has_backlog) {
+            LOG_WARNING << "[EMB-DASH] build_embedded_workdata UNDERFILL: selected "
+                        << selected.size() << " tx / " << selected_bytes
+                        << "B into template while mempool holds " << mempool.size()
+                        << " tx / " << mempool_bytes << "B (" << mempool_fees
+                        << " sat fees) — near-empty block on a non-empty "
+                        << "mempool; template-fill regression, gates cutover.";
+        }
     }
 
     // Platform Credit Pool burn (DIP-0027): emit OP_RETURN payment
