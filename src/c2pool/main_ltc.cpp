@@ -545,7 +545,14 @@ int main(int argc, char* argv[]) {
     {
         const uint64_t nofile = core::raise_nofile_limit(65536);
         if (nofile == 0)
+#ifdef _WIN32
+            // Windows has no RLIMIT_NOFILE; emit on stdout so the --help smoke
+            // (pwsh `2>&1 | Select-Object -First N`) never surfaces a stderr
+            // NativeCommandError from this benign startup notice.
+            std::cout << "[init] RLIMIT_NOFILE: not applicable on this platform\n";
+#else
             LOG_WARNING << "RLIMIT_NOFILE: unsupported on this platform (or query failed)";
+#endif
         else if (nofile < 65536)
             LOG_WARNING << "RLIMIT_NOFILE soft limit is " << nofile
                         << " (< 65536; hard limit too low — raise with ulimit -Hn / limits.conf)";
