@@ -382,7 +382,8 @@ if (BUILD_TESTING AND GTest_FOUND)
     # target so the CI build.yml allowlist stays untouched (proven pattern).
     add_executable(test_dash_share_hash_link
         test_dash_share_hash_link.cpp
-        test_dash_share_producer.cpp)
+        test_dash_share_producer.cpp
+        test_dash_share_producer_bind.cpp)
     target_link_libraries(test_dash_share_hash_link PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
