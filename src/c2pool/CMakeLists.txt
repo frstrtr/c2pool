@@ -316,6 +316,9 @@ target_link_libraries(c2pool-dash
     dash_x11   # DASH X11 PoW sph reference (BLAKE->...->ECHO), additive static lib
     dash_rpc   # launcher slice-3: external-dashd-RPC client (submitblock fallback)
     dash_stratum  # S8: DASHWorkSource IWorkSource bodies (stratum accept-loop caller)
+    dash_block_replay  # E1: coin/vendor/blockencodings.cpp — the coin-network P2P Handler
+                       # (cmpctblock codec) the opt-in CoinClient instantiates ODR-uses
+                       # CBlockHeaderAndShortTxIDs::FillShortTxIDSelector()
     btclibs
     yaml-cpp::yaml-cpp
     nlohmann_json::nlohmann_json

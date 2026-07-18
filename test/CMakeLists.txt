@@ -730,9 +730,16 @@ if (BUILD_TESTING AND GTest_FOUND)
     # lifecycle (attach/teardown), the outbound-request->inbound-reply exchange
     # through Connection, and the real-timer idle-timeout path. Header-only over
     # the dash_x11 + core link set; same set as the p2p_connection leaf.
-    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp)
+    # Second TU (E1): test_dash_coin_p2p_client.cpp — the OPT-IN outbound-dial
+    # client (p2p_client.hpp): handshake state machine, dial-plan rotation, and
+    # the byte-exact version/verack handshake drive. Same target, no new
+    # allowlist entry needed.
+    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp)
     target_link_libraries(test_dash_p2p_node PRIVATE
         GTest::gtest_main GTest::gtest
+        dash_block_replay   # E1: coin/vendor/blockencodings.cpp — the full p2p Handler
+                            # (cmpctblock codec) the CoinClient instantiates ODR-uses
+                            # CBlockHeaderAndShortTxIDs::FillShortTxIDSelector().
         dash_x11 core
         nlohmann_json::nlohmann_json
         ${Boost_LIBRARIES}
