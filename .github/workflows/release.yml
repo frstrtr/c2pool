@@ -182,13 +182,23 @@ jobs:
           mkdir -p "${PKG}/lib" "${PKG}/config" "${PKG}/web-static" "${PKG}/explorer"
           cp "build_${COIN}/src/c2pool/c2pool-${COIN}" "${PKG}/"
           strip "${PKG}/c2pool-${COIN}"
-          for lib in libleveldb.so.1 libsecp256k1.so.2 libsnappy.so.1; do
-            found=$(find /usr/lib -name "${lib}*" -type f 2>/dev/null | head -1)
-            [ -n "$found" ] && cp "$found" "${PKG}/lib/"
+          # Bundle the real runtime shared-library closure resolved from the freshly
+          # built binary via ldd (SONAME-agnostic). v0.2.3 shipped every Linux tarball
+          # DOA: this step hardcoded libsecp256k1.so.2 while the runner's
+          # libsecp256k1-dev provides .so.1 — find matched nothing and the binary's
+          # only dynamic non-glibc dependency went unbundled. Resolve, don't guess.
+          ldd "${PKG}/c2pool-${COIN}" | awk '/=> \//{print $3}' | while read -r so; do
+            case "$(basename "$so")" in
+              libc.so*|libm.so*|libdl.so*|librt.so*|libpthread.so*|ld-linux*|libstdc++.so*|libgcc_s.so*|libresolv.so*) continue ;;
+            esac
+            cp -Lv "$so" "${PKG}/lib/"
           done
           cp start.sh "${PKG}/" && chmod +x "${PKG}/start.sh"
-          cp config/c2pool_mainnet.yaml "${PKG}/config/c2pool_mainnet.yaml.example" || true
-          cp config/c2pool_testnet.yaml "${PKG}/config/" || true
+          cp "config/${COIN}/c2pool_mainnet.yaml" "${PKG}/config/c2pool_mainnet.yaml.example"
+          cp "config/${COIN}/c2pool_testnet.yaml" "${PKG}/config/c2pool_testnet.yaml"
+          # Fail-fast packaging tripwires (BUG A / BUG B regression guards):
+          ls "${PKG}/lib/" | grep -q '^libsecp256k1\.so' || { echo "PKG-ASSERT FAIL: libsecp256k1 not bundled in ${PKG}/lib"; exit 1; }
+          head -1 "${PKG}/config/c2pool_mainnet.yaml.example" | grep -qi "${COIN}" || { echo "PKG-ASSERT FAIL: ${PKG} config header does not identify ${COIN}"; exit 1; }
           cp -r web-static/* "${PKG}/web-static/"
           cp explorer/explorer.py "${PKG}/explorer/"
           tar czf "${PKG}.tar.gz" "${PKG}/"
@@ -304,7 +314,8 @@ jobs:
             install_name_tool -id "@executable_path/lib/$(basename $lib)" "$lib"
           done
           cp start.sh "${PKG}/" && chmod +x "${PKG}/start.sh"
-          cp config/c2pool_mainnet.yaml "${PKG}/config/c2pool_mainnet.yaml.example" || true
+          cp "config/${COIN}/c2pool_mainnet.yaml" "${PKG}/config/c2pool_mainnet.yaml.example"
+          cp "config/${COIN}/c2pool_testnet.yaml" "${PKG}/config/c2pool_testnet.yaml"
           cp -r web-static/* "${PKG}/web-static/"
           cp explorer/explorer.py "${PKG}/explorer/"
 
@@ -577,8 +588,8 @@ jobs:
           Copy-Item start.bat "${PKG}/"
           Copy-Item -Recurse web-static/* "${PKG}/web-static/"
           Copy-Item explorer/explorer.py "${PKG}/explorer/"
-          Copy-Item config/c2pool_mainnet.yaml "${PKG}/config/c2pool_mainnet.yaml.example"
-          Copy-Item config/c2pool_testnet.yaml "${PKG}/config/" -ErrorAction SilentlyContinue
+          Copy-Item "config/${COIN}/c2pool_mainnet.yaml" "${PKG}/config/c2pool_mainnet.yaml.example"
+          Copy-Item "config/${COIN}/c2pool_testnet.yaml" "${PKG}/config/c2pool_testnet.yaml"
           Compress-Archive -Path "${PKG}" -DestinationPath "${PKG}.zip"
 
       - name: Upload package

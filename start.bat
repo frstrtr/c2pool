@@ -16,6 +16,19 @@ if "!BIN!"=="" (
 )
 for %%f in ("!BIN!") do set BINNAME=%%~nxf
 
+:: Coin-guard: refuse a binary/config coin mismatch (see start.sh).
+for /f "tokens=2 delims=-." %%c in ("!BINNAME!") do set BINCOIN=%%c
+if exist "%CONFIG%" (
+    set /p CFGHDR=<"%CONFIG%"
+    echo !CFGHDR! | findstr /I "!BINCOIN!" >nul
+    if errorlevel 1 (
+        echo ERROR: config/coin mismatch - binary is c2pool-!BINCOIN! but config header reads:
+        echo          !CFGHDR!
+        echo Launch with the coin-correct config, e.g.: %~nx0 config\c2pool_mainnet.yaml
+        exit /b 1
+    )
+)
+
 echo === !BINNAME! ===
 echo Config:   %CONFIG%
 echo Web:      http://0.0.0.0:8080
