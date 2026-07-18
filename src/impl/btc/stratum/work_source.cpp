@@ -13,6 +13,7 @@
 
 #include <impl/btc/stratum/work_source.hpp>
 #include <impl/btc/stratum/tx_data_memo.hpp>   // H5 tx_data memo seam (work_source.cpp:634 churn fix)
+#include <impl/btc/stratum/finder_fee.hpp>  // D2 v35_finder_fee_split integer-exact SSOT
 #include <memory>
 
 #include <impl/btc/coin/header_chain.hpp>
@@ -446,23 +447,24 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
         }
     }
 
-    // v35 finder fee: 0.5% of subsidy goes to the share-finder (this miner),
-    // deducted from donation. Reference: c2pool_refactored.cpp wiring +
-    // share_tracker.hpp v35 PPLNS docs ("amounts WITHOUT finder fee — caller
-    // adds subsidy/200 to the share creator's script"). Conditional on having
-    // a non-empty payout_script — otherwise we'd reintroduce the empty-output
-    // bug we just filtered. And the deduction-from-donation must succeed
-    // (donation must hold ≥ finder_fee), else we'd inflate total > subsidy.
-    if (!payouts.empty() && coinbasevalue > 0 && !payout_script.empty()) {
-        const double finder_fee = static_cast<double>(coinbasevalue) / 200.0;
-        if (!donation_script.empty()) {
-            auto it = payouts.find(donation_script);
-            if (it != payouts.end() && it->second >= finder_fee) {
-                it->second   -= finder_fee;
-                payouts[payout_script] += finder_fee;
-            }
-            // else: donation can't cover the fee — skip silently. Total stays
-            // at subsidy (per get_v35_expected_payouts post-condition).
+    // v35 finder fee: 0.5% of the coinbase value goes to the share-finder
+    // (this miner), moved from the donation residual to the finder's output.
+    // Integer floor division (subsidy//200) via the v35_finder_fee_split SSOT —
+    // NO float on the money path (see finder_fee.hpp). Matches the p2pool
+    // reference (data.py generate_transaction: amounts[finder] += subsidy//200,
+    // unconditional) and the core/web_server.cpp preview path. The split is
+    // capped at the donation available, so it is applied unconditionally
+    // (never all-or-nothing skipped) while total stays == subsidy and no output
+    // goes negative. The map holds doubles, but the moved value is an exact
+    // integer satoshi count (<= 2^53, exact in double).
+    if (!payouts.empty() && coinbasevalue > 0 && !payout_script.empty()
+        && !donation_script.empty()) {
+        auto it = payouts.find(donation_script);
+        if (it != payouts.end()) {
+            const uint64_t donation_sats = static_cast<uint64_t>(it->second);
+            const uint64_t taken = v35_finder_fee_split(coinbasevalue, donation_sats);
+            it->second             -= static_cast<double>(taken);
+            payouts[payout_script] += static_cast<double>(taken);
         }
     }
 
