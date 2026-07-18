@@ -402,3 +402,302 @@ TEST(DashMempool, FeerateCompareIsDivisionFreeCrossMultiplyNotPreDividedDouble)
     EXPECT_TRUE(hi < lo) << "higher feerate must precede regardless of txid";
     EXPECT_FALSE(lo < hi);
 }
+// ═══ E2b (#738) — the live UTXO/fee lane KATs ════════════════════════════════
+//
+// utxo_lane.hpp is the Phase U capstone: the transliterated LTC wiring
+// (main_ltc.cpp UTXOViewDB/UTXOViewCache construction + set_utxo + block-
+// connect leg + 288-window cold-start) that finally gives the dash mempool a
+// live UTXO view. These KATs feed SYNTHETIC blocks through the exact seam the
+// E1/E2a live feed will fire (on_block_connected == Node::block_connected)
+// and pin:
+//   (a) connect_block resolves fee_known and makes txs selectable
+//   (b) coinbasevalue = subsidy + summed REAL fees (hand oracle; never over)
+//   (c) a DIP-0027 type-9 asset-unlock is priced from payload.fee
+//   (d) an unknown-fee ordinary tx stays EXCLUDED (guard untouched)
+//   (e) recompute_unknown_fees after a block-connect flips unknown -> known
+// plus the 288-window bootstrap request plan and the 106-deep maturity gate.
+
+#include <impl/dash/coin/utxo_lane.hpp>
+#include <impl/dash/coin/vendor/assetlock.hpp>
+#include <impl/dash/coin/subsidy.hpp>
+
+using dash::coin::UtxoLane;
+using dash::coin::DASH_MIN_BLOCKS_TO_KEEP;
+using dash::coin::DASH_MINING_GATE_DEPTH;
+
+// Synthetic coinbase: no inputs, the given output values, salt-distinct txid.
+static MutableTransaction make_coinbase(std::vector<int64_t> values,
+                                        uint32_t salt) {
+    MutableTransaction tx;
+    tx.version = 1;
+    tx.type = 0;
+    tx.locktime = 0x0cb00000u ^ salt;
+    for (int64_t v : values) tx.vout.push_back(make_output(v));
+    return tx;
+}
+
+// Synthetic block: header salted for a distinct block hash, txs[0] = coinbase.
+static dash::coin::BlockType make_block(
+    std::vector<MutableTransaction> txs, uint32_t salt) {
+    dash::coin::BlockType b;
+    b.m_nonce = salt;
+    b.m_previous_block = mint_hash(0xb10c0000u ^ salt);
+    b.m_txs = std::move(txs);
+    return b;
+}
+
+// Wire-serialize a CAssetUnlockPayload into extra_payload bytes.
+static std::vector<unsigned char> pack_unlock_payload(
+    const dash::coin::vendor::CAssetUnlockPayload& pl) {
+    auto ps = ::pack(pl);
+    auto span = ps.get_span();
+    return std::vector<unsigned char>(
+        reinterpret_cast<const unsigned char*>(span.data()),
+        reinterpret_cast<const unsigned char*>(span.data()) + span.size());
+}
+
+// Type-9 asset-unlock: NO inputs; outputs mint from the credit pool; the
+// miner fee lives ONLY in the payload.
+static MutableTransaction make_asset_unlock(int64_t out_value, uint32_t fee,
+                                            uint32_t salt) {
+    dash::coin::vendor::CAssetUnlockPayload pl;
+    pl.index = salt;
+    pl.fee = fee;
+    pl.requestedHeight = 1000 + salt;
+    MutableTransaction tx;
+    tx.version = 1;
+    tx.type = dash::coin::vendor::CAssetUnlockPayload::SPECIALTX_TYPE;  // 9
+    tx.locktime = 0;
+    tx.vout.push_back(make_output(out_value));
+    tx.extra_payload = pack_unlock_payload(pl);
+    return tx;
+}
+
+// (a) A UTXOViewCache fed a known UTXO set (via a connected block) resolves
+//     fee_known=true and the tx becomes selectable.
+TEST(DashUtxoLane, ConnectBlockResolvesFeeAndMakesSelectable)
+{
+    UtxoLane lane;
+    ASSERT_TRUE(lane.open(""));   // ephemeral cache-only (synthetic-block mode)
+    Mempool mp;
+    lane.attach(mp);              // the set_utxo call the dash arm never made
+
+    auto cb = make_coinbase({100'000, 60'000}, /*salt=*/1);
+    lane.on_block_connected(make_block({cb}, /*salt=*/1), /*height=*/1);
+    EXPECT_EQ(lane.cache()->blocks_connected(), 1u);
+
+    // Spend the coinbase output: 100000 in - 90000 out = 10000 fee, priced
+    // IMMEDIATELY at add_tx because the mempool now holds a live UTXO view.
+    auto spend = make_spend(dash_txid(cb), 0, 90'000, /*salt=*/11);
+    EXPECT_TRUE(mp.add_tx(spend));
+    auto entry = mp.get_entry(dash_txid(spend));
+    ASSERT_TRUE(entry.has_value());
+    EXPECT_TRUE(entry->fee_known)
+        << "with the lane attached, add_tx must price from UTXO";
+    EXPECT_EQ(entry->fee, 10'000u);
+
+    auto [sel, fees] = mp.get_sorted_txs_with_fees(1'000'000);
+    ASSERT_EQ(sel.size(), 1u) << "the priced tx must be selectable";
+    EXPECT_EQ(fees, 10'000u);
+    EXPECT_EQ(dash_txid(sel[0].tx), dash_txid(spend));
+}
+
+// (c) A type-9 asset-unlock tx is priced from payload.fee and selected —
+//     no UTXO view needed (the fee is explicit in the payload, exactly what
+//     dashd's GBT reports). Malformed payloads and input-carrying type-9
+//     bodies stay on the conservative unknown-fee path.
+TEST(DashMempool, AssetUnlockType9PricedFromPayloadFee)
+{
+    Mempool mp;                    // deliberately NO set_utxo
+    auto t9 = make_asset_unlock(500'000, /*fee=*/7'000, /*salt=*/1);
+    EXPECT_TRUE(mp.add_tx(t9));
+    auto entry = mp.get_entry(dash_txid(t9));
+    ASSERT_TRUE(entry.has_value());
+    EXPECT_TRUE(entry->fee_known)
+        << "type-9 fee comes from payload.fee, independent of UTXO";
+    EXPECT_EQ(entry->fee, 7'000u);
+
+    auto [sel, fees] = mp.get_sorted_txs_with_fees(1'000'000);
+    ASSERT_EQ(sel.size(), 1u) << "the asset-unlock must be selectable";
+    EXPECT_EQ(fees, 7'000u);
+
+    // Malformed payload: conservative — stays unknown, stays excluded.
+    MutableTransaction bad;
+    bad.version = 1;
+    bad.type = 9;
+    bad.vout.push_back(make_output(1'000));
+    bad.extra_payload = {0x01};   // truncated
+    EXPECT_TRUE(mp.add_tx(bad));
+    EXPECT_FALSE(mp.get_entry(dash_txid(bad))->fee_known);
+
+    // Type-9 WITH inputs is not an asset-unlock shape: generic path
+    // (which, with no UTXO view here, stays conservatively unknown).
+    auto odd = make_asset_unlock(2'000, 500, /*salt=*/2);
+    odd.vin.push_back(make_input(mint_hash(40), 0));
+    EXPECT_TRUE(mp.add_tx(odd));
+    EXPECT_FALSE(mp.get_entry(dash_txid(odd))->fee_known);
+
+    auto [sel2, fees2] = mp.get_sorted_txs_with_fees(1'000'000);
+    EXPECT_EQ(sel2.size(), 1u);
+    EXPECT_EQ(fees2, 7'000u) << "only the well-formed unlock is priced";
+}
+
+// (b)+(d) coinbasevalue = subsidy + summed real fees, matching a hand-
+//     computed oracle; unknown-fee ordinary txs contribute NOTHING, so the
+//     value can never overstate what dashd's GBT would report.
+TEST(DashUtxoLane, CoinbasevalueConservativeOracle)
+{
+    UtxoLane lane;
+    ASSERT_TRUE(lane.open(""));
+    Mempool mp;
+    lane.attach(mp);
+
+    auto cb = make_coinbase({100'000, 60'000}, /*salt=*/2);
+    lane.on_block_connected(make_block({cb}, /*salt=*/2), /*height=*/1);
+
+    // Priced ordinary spend: fee 10000.
+    auto spend = make_spend(dash_txid(cb), 0, 90'000, /*salt=*/21);
+    EXPECT_TRUE(mp.add_tx(spend));
+    // Priced type-9 unlock: fee 7000 from payload.
+    auto t9 = make_asset_unlock(400'000, 7'000, /*salt=*/22);
+    EXPECT_TRUE(mp.add_tx(t9));
+    // (d) Unknown-fee ordinary tx (input never in UTXO): must stay excluded.
+    auto unknown = make_spend(mint_hash(50), 0, 30'000, /*salt=*/23);
+    EXPECT_TRUE(mp.add_tx(unknown));
+    ASSERT_FALSE(mp.get_entry(dash_txid(unknown))->fee_known);
+
+    auto [sel, fees] = mp.get_sorted_txs_with_fees(1'000'000);
+    ASSERT_EQ(sel.size(), 2u)
+        << "exactly the two priced txs — the unknown-fee tx is EXCLUDED";
+    EXPECT_EQ(fees, 17'000u) << "hand oracle: 10000 + 7000";
+    for (const auto& s : sel)
+        EXPECT_NE(dash_txid(s.tx), dash_txid(unknown));
+
+    // coinbasevalue oracle at the live-validated subsidy pin (h=2459985,
+    // test_dash_subsidy.cpp): 177022505 sat subsidy + 17000 sat real fees.
+    const int64_t subsidy =
+        dash::coin::compute_dash_block_reward_post_v20(2459985);
+    ASSERT_EQ(subsidy, 177'022'505LL);
+    EXPECT_EQ(subsidy + static_cast<int64_t>(fees), 177'039'505LL)
+        << "coinbasevalue = subsidy + summed REAL fees, never inflated by "
+           "unknown-fee entries";
+}
+
+// (e) recompute_unknown_fees after a block-connect flips previously-unknown
+//     fees to known — the lane drives it automatically on the connect leg.
+TEST(DashUtxoLane, BlockConnectFlipsPreviouslyUnknownFees)
+{
+    UtxoLane lane;
+    ASSERT_TRUE(lane.open(""));
+    Mempool mp;
+    lane.attach(mp);
+
+    auto cb1 = make_coinbase({100'000}, /*salt=*/3);
+    lane.on_block_connected(make_block({cb1}, /*salt=*/3), /*height=*/1);
+
+    // Funding tx F confirms in block 2 (it is never in the mempool);
+    // spender S rides the mempool and references F's output.
+    auto funding = make_spend(dash_txid(cb1), 0, 95'000, /*salt=*/31);
+    auto spender = make_spend(dash_txid(funding), 0, 90'000, /*salt=*/32);
+    EXPECT_TRUE(mp.add_tx(spender));
+    ASSERT_FALSE(mp.get_entry(dash_txid(spender))->fee_known)
+        << "F is neither in UTXO nor in the mempool yet";
+    EXPECT_EQ(mp.get_sorted_txs_with_fees(1'000'000).first.size(), 0u)
+        << "unknown-fee tx must not be selectable";
+
+    auto cb2 = make_coinbase({50'000}, /*salt=*/4);
+    lane.on_block_connected(make_block({cb2, funding}, /*salt=*/4),
+                            /*height=*/2);
+
+    auto entry = mp.get_entry(dash_txid(spender));
+    ASSERT_TRUE(entry.has_value()) << "S must survive remove_for_block";
+    EXPECT_TRUE(entry->fee_known)
+        << "the connect leg must run recompute_unknown_fees";
+    EXPECT_EQ(entry->fee, 5'000u);  // 95000 - 90000
+    auto [sel, fees] = mp.get_sorted_txs_with_fees(1'000'000);
+    ASSERT_EQ(sel.size(), 1u);
+    EXPECT_EQ(fees, 5'000u);
+}
+
+// Confirmed txs leave the mempool on the connect leg (remove_for_block).
+TEST(DashUtxoLane, ConnectLegEvictsConfirmedTxs)
+{
+    UtxoLane lane;
+    ASSERT_TRUE(lane.open(""));
+    Mempool mp;
+    lane.attach(mp);
+
+    auto cb = make_coinbase({100'000}, /*salt=*/5);
+    lane.on_block_connected(make_block({cb}, /*salt=*/5), /*height=*/1);
+
+    auto spend = make_spend(dash_txid(cb), 0, 90'000, /*salt=*/51);
+    EXPECT_TRUE(mp.add_tx(spend));
+    ASSERT_EQ(mp.size(), 1u);
+
+    auto cb2 = make_coinbase({50'000}, /*salt=*/6);
+    lane.on_block_connected(make_block({cb2, spend}, /*salt=*/6),
+                            /*height=*/2);
+    EXPECT_EQ(mp.size(), 0u) << "confirmed tx must be evicted";
+}
+
+// Cold start: the first connected block above the 288 window triggers the
+// ordered-download bootstrap (block_bootstrapper.hpp) instead of connecting
+// the tip out of order, and requests exactly the 16-wide sliding window from
+// tip-288 upward through the E1/E2a request seam.
+TEST(DashUtxoLane, ColdStartBootstrapWindowPlan)
+{
+    UtxoLane lane;
+    ASSERT_TRUE(lane.open(""));
+    Mempool mp;
+    lane.attach(mp);
+
+    std::vector<uint32_t> requested;
+    lane.set_request_block_fn(
+        [&requested](uint32_t h) { requested.push_back(h); });
+
+    const uint32_t tip = 500;
+    auto cbt = make_coinbase({100'000}, /*salt=*/7);
+    lane.on_block_connected(make_block({cbt}, /*salt=*/7), tip);
+
+    // 500 > 288 => bootstrap: start = 500 - 288 = 212, window 212..227.
+    const uint32_t start = tip - DASH_MIN_BLOCKS_TO_KEEP;
+    ASSERT_EQ(start, 212u);
+    ASSERT_EQ(requested.size(), 16u) << "initial sliding window = 16";
+    for (uint32_t i = 0; i < 16; ++i)
+        EXPECT_EQ(requested[i], start + i);
+    EXPECT_EQ(lane.cache()->blocks_connected(), 0u)
+        << "the tip must NOT connect out of order";
+
+    // Drain in strict height order: 212 connects, the window refills.
+    auto cb212 = make_coinbase({70'000}, /*salt=*/8);
+    lane.on_block_connected(make_block({cb212}, /*salt=*/8), start);
+    EXPECT_EQ(lane.cache()->blocks_connected(), 1u);
+    ASSERT_GT(requested.size(), 16u) << "window must refill after a drain";
+    EXPECT_EQ(requested.back(), start + 16);
+
+    // Out-of-order arrival buffers without connecting.
+    auto cb214 = make_coinbase({70'000}, /*salt=*/9);
+    lane.on_block_connected(make_block({cb214}, /*salt=*/9), start + 2);
+    EXPECT_EQ(lane.cache()->blocks_connected(), 1u)
+        << "height-order drain must stall on the missing block";
+}
+
+// The 106-deep coinbase-maturity mining gate (100 + 6, utxo_adapter.hpp).
+TEST(DashUtxoLane, MiningMaturityGateAt106)
+{
+    ASSERT_EQ(DASH_MINING_GATE_DEPTH, 106u);
+    UtxoLane lane;
+    ASSERT_TRUE(lane.open(""));
+    EXPECT_FALSE(lane.mining_utxo_ready());
+
+    for (uint32_t h = 1; h <= DASH_MINING_GATE_DEPTH; ++h) {
+        auto cb = make_coinbase({10'000}, /*salt=*/1000 + h);
+        lane.on_block_connected(make_block({cb}, /*salt=*/1000 + h), h);
+        if (h < DASH_MINING_GATE_DEPTH)
+            EXPECT_FALSE(lane.mining_utxo_ready())
+                << "gate must hold below " << DASH_MINING_GATE_DEPTH
+                << " (h=" << h << ")";
+    }
+    EXPECT_TRUE(lane.mining_utxo_ready())
+        << "gate must open at exactly " << DASH_MINING_GATE_DEPTH;
+}
