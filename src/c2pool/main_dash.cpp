@@ -54,6 +54,7 @@
 #include <impl/dash/coin/work_source.hpp>   // dash::coin::select_dash_work -- embedded-gbt live-wire + dashd fallback (S8 capstone)
 #include <impl/dash/coin/rpc_conf.hpp>     // dash.conf creds resolution (rpcpassword off argv)
 #include <impl/dash/coin/node_interface.hpp>
+#include <impl/dash/coin/p2p_client.hpp>   // dash::coin::p2p::CoinClient — OPT-IN coin-network dial (E1, --coin-p2p-connect)
 #include <impl/dash/node.hpp>          // dash::Node — sharechain pool-node (NodeBridge<NodeImpl,Legacy,Actual>)
 #include <impl/dash/config.hpp>        // dash::Config (PoolConfig/CoinConfig)
 #include <impl/dash/config_pool.hpp>   // dash::SharechainConfig — P2P_PORT / PREFIX / min-proto SSOT
@@ -168,7 +169,7 @@ void print_banner(const char* argv0)
         << "       " << argv0 << " --run [--coin-rpc H:P] [--coin-rpc-auth PATH]\n"
         << "           [--testnet] [--submit-block HEX | --submit-block-file PATH]\n"
         << "           [--listen [HOST:]PORT] [--addnode HOST:PORT]... [--connect HOST:PORT]...\n"
-        << "           [--stratum [HOST:]PORT]\n"
+        << "           [--stratum [HOST:]PORT] [--coin-p2p-connect HOST:PORT]...\n"
         << "       " << argv0 << " --mine-block [--coin-rpc H:P] [--coin-rpc-auth PATH]\n"
         << "           [--testnet] [--payout-pubkey-hash HEX] [--max-nonce N]\n\n"
         << "Status: consensus layer live (X11 PoW, subsidy, oracle CoinParams).\n"
@@ -180,6 +181,9 @@ void print_banner(const char* argv0)
         << "        dispatch via the retained dashd-RPC submitblock arm.\n"
         << "        --submit-block[-file] drives ONE real submitblock then exits\n"
         << "        (the won-block-reaches-network leg); embedded P2P relay = S8.\n"
+        << "        --coin-p2p-connect HOST:PORT (repeatable) OPT-IN dials the DASH\n"
+        << "        coin network directly (version/verack + keep-alive + reconnect);\n"
+        << "        absent => no coin P2P client, dashd-RPC fallback path unchanged.\n"
         << "Consensus: X11 PoW + block identity; 2.5 min spacing; 5 DASH post-V20\n"
         << "        base, -1/14 per 210240; masternode payment 3/4 of block value.\n";
 }
@@ -318,10 +322,21 @@ int run_selftest()
 // blocking sync_reconnect fallback, so the submit self-connects -- no async race.
 // A synthetic-only pass does NOT earn block-viable; the live dashd-reached run is
 // the gate.
+//
+// --coin-p2p-connect HOST:PORT (repeatable) — E1 OPT-IN embedded coin-network
+// dial. ABSENT (the released/prod path): no coin P2P client is instantiated,
+// NodeCoinState stays default-unpopulated, and get_work() keeps taking the
+// retained dashd-RPC fallback — byte-identical run_node behavior. PRESENT:
+// a dash::coin::p2p::CoinClient dials the given dashd P2P endpoint(s)
+// (version/verack handshake, ping keep-alive, 30s reconnect rotating over
+// repeated targets). E1 establishes + maintains the connection only; the
+// ingest legs that would populate NodeCoinState are later slices, so the
+// fallback arm still serves templates even WITH the flag.
 int run_node(bool testnet, const std::string& rpc_endpoint,
              const std::string& rpc_conf_path, const std::string& submit_hex,
              const PeeringConfig& peer,
-             const std::string& stratum_host, uint16_t stratum_port)
+             const std::string& stratum_host, uint16_t stratum_port,
+             const std::vector<NetService>& coin_p2p_targets)
 {
     namespace io = boost::asio;
 
@@ -425,6 +440,38 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // (dash::NodeImpl carries no start_outbound_connections yet). Inbound
     // reception — version handshake + the #646 min-proto gate — is live now
     // via node.cpp (#656/#657).
+
+    // ── E1: OPT-IN embedded coin-network P2P dial (--coin-p2p-connect) ────
+    // GUARANTEE: with no --coin-p2p-connect on argv, coin_p2p stays null and
+    // this block is a no-op — the run path is unchanged and the mining-hotel
+    // prod posture (NodeCoinState unpopulated -> dashd-RPC fallback) is
+    // untouched. The coin-network wire MAGIC (dashd pchMessageStart: mainnet
+    // bf0c6bbd / testnet cee2caff, same constants as the slice-1 launcher
+    // dispatch) is DISTINCT from the sharechain PREFIX set above — different
+    // layers, never conflated. The client rides the SAME ioc as the
+    // sharechain node and stratum; declared after config/coin_state (both of
+    // which it borrows), so it is destroyed before them at scope exit.
+    std::unique_ptr<dash::coin::p2p::CoinClient<dash::Config>> coin_p2p;
+    if (!coin_p2p_targets.empty()) {
+        config.coin()->m_testnet = testnet;
+        config.coin()->m_p2p.prefix =
+            ParseHexBytes(testnet ? "cee2caff" : "bf0c6bbd");
+        config.coin()->m_p2p.address = coin_p2p_targets.front();
+
+        coin_p2p = std::make_unique<dash::coin::p2p::CoinClient<dash::Config>>(
+            &ioc, &coin_state, &config, "COIN-P2P");
+        coin_p2p->connect(coin_p2p_targets);
+        std::cout << "[run] coin-network P2P client dialing "
+                  << coin_p2p_targets.front().to_string()
+                  << (coin_p2p_targets.size() > 1
+                          ? " (+" + std::to_string(coin_p2p_targets.size() - 1)
+                                + " alternate[s], reconnect rotates)"
+                          : "")
+                  << " magic=" << (testnet ? "cee2caff" : "bf0c6bbd")
+                  << " proto=70230 (E1: dial+handshake+keep-alive only;\n"
+                     "[run]       ingest legs are later slices — templates still source from\n"
+                     "[run]       the dashd-RPC fallback until NodeCoinState is fed)\n";
+    }
 
     // ── S8 miner-facing Stratum accept-loop standup (run-path caller) ─────
     // This is the production caller the DASHWorkSource 4a/4b skeleton (#706)
@@ -671,6 +718,7 @@ int main(int argc, char** argv)
     std::string listen_raw;                    // --listen [HOST:]PORT (sharechain bind)
     std::vector<std::string> addnode_raw;      // --addnode HOST:PORT (persistent outbound)
     std::vector<std::string> connect_raw;      // --connect HOST:PORT (connect-only)
+    std::vector<std::string> coin_p2p_raw;     // --coin-p2p-connect HOST:PORT (repeatable; E1 opt-in coin-network dial)
     std::string stratum_host = "0.0.0.0";      // --stratum [HOST:]PORT bind interface (default all)
     uint16_t    stratum_port = 0;              // 0 disables the Stratum accept-loop; --stratum sets it
     for (int i = 1; i < argc; ++i) {
@@ -702,6 +750,8 @@ int main(int argc, char** argv)
             addnode_raw.emplace_back(argv[++i]);
         else if (std::strcmp(argv[i], "--connect") == 0 && i + 1 < argc)
             connect_raw.emplace_back(argv[++i]);
+        else if (std::strcmp(argv[i], "--coin-p2p-connect") == 0 && i + 1 < argc)
+            coin_p2p_raw.emplace_back(argv[++i]);
         else if (std::strcmp(argv[i], "--stratum") == 0 && i + 1 < argc) {
             // --stratum [HOST:]PORT -- bind a Stratum TCP listener for miners.
             // Bare PORT keeps the default 0.0.0.0 bind host (parse_listen SSOT).
@@ -757,8 +807,18 @@ int main(int argc, char** argv)
             }
             peer.listen_set = true;
         }
+        std::vector<NetService> coin_p2p_targets;
+        for (const auto& raw : coin_p2p_raw) {
+            NetService ns;
+            if (!parse_hostport(raw, ns)) {
+                std::cout << "[run] --coin-p2p-connect malformed (want HOST:PORT): "
+                          << raw << "\n";
+                return 2;
+            }
+            coin_p2p_targets.push_back(ns);
+        }
         return run_node(testnet, rpc_endpoint, rpc_conf_path, submit_hex, peer,
-                        stratum_host, stratum_port);
+                        stratum_host, stratum_port, coin_p2p_targets);
     }
     return run_selftest();
 }
