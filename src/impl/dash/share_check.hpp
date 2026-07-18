@@ -276,23 +276,26 @@ inline uint256 share_init_verify(const DashShare& share,
         hash_link_data.insert(hash_link_data.end(), p, p + 4);
     }
     // Append outer coinbase_payload (coinbase_payload_data in Python).
-    // Oracle data.py:278,346-348: coinbase_payload_data = pack.VarStrType().pack(payload)
-    // = [compactsize(len)][payload]; check_hash_link appends THAT (or b"" when None).
-    // BaseScript C2POOL_SERIALIZE_METHODS does READWRITE(m_data) over a byte vector,
-    // which strips one VarStr layer on read (so m_data holds the RAW payload) and
-    // re-adds the compactsize prefix on write. Serialize via the stream rather than
-    // appending m_data raw — the raw append dropped the prefix, diverging gentx_hash
-    // from the oracle on any non-empty (DIP4 CbTx) payload. PRESERVE the empty branch:
-    // the oracle appends nothing (b"") when the payload is None/empty, NOT a 0x00.
+    // Oracle data.py:277-289: the outer contents['coinbase_payload'] VALUE is
+    // coinbase_payload_data = pack.VarStrType().pack(raw_payload) — i.e. the
+    // VarStr-PACKED payload ([compactsize(len)][payload]) — and Share.__init__
+    // (data.py:346-348) appends that value VERBATIM to the check_hash_link
+    // data (b"" when None). On the wire the PossiblyNone(b'', VarStr) outer
+    // layer adds one MORE compactsize prefix around the value, so
+    // DashFormatter's single READWRITE(m_data) strip leaves m_data holding
+    // exactly the oracle field value: [compactsize(len raw)][raw]. Append it
+    // RAW. (#412 correctly established that the compactsize prefix belongs in
+    // this data — but re-serializing m_data as a VarStr added a SECOND prefix
+    // on top of the one m_data already carries, diverging gentx_hash from the
+    // oracle on every real DIP4 CbTx share. The share-producer slice pins the
+    // corrected framing: producer KATs in test_dash_share_producer.cpp,
+    // updated oracle anchors in test_dash_share_hash_link.cpp.)
+    // PRESERVE the empty branch: the oracle appends nothing (b"") when the
+    // payload is None/empty, NOT a 0x00.
     {
         auto& cpd = share.m_coinbase_payload_outer.m_data;
         if (!cpd.empty())
-        {
-            PackStream cpd_stream;
-            cpd_stream << share.m_coinbase_payload_outer;   // VarStr-pack: [compactsize][payload]
-            auto* cp = reinterpret_cast<const unsigned char*>(cpd_stream.data());
-            hash_link_data.insert(hash_link_data.end(), cp, cp + cpd_stream.size());
-        }
+            hash_link_data.insert(hash_link_data.end(), cpd.begin(), cpd.end());
     }
 
     auto gentx_before_refhash = compute_gentx_before_refhash();
