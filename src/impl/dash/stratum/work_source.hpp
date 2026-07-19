@@ -102,6 +102,19 @@ public:
         std::vector<uint256>       merkle_branches; ///< parsed LE-internal branch hashes
         std::vector<unsigned char> payout_script;   ///< miner payout script (from username)
         uint256                    pow_hash;        ///< X11 PoW hash of header_bytes
+        // ── slice 3/3 (run-loop mint) additions ──────────────────────────
+        /// The PPLNS OP_RETURN commitment of the job's coinbase — recovered
+        /// from the coinb1 tail (the coinb1/coinb2 split sits immediately
+        /// after the 32-byte ref_hash, before the 8-byte nonce64 slot). The
+        /// run-loop keys its frozen-job registry on this; ZERO (non-producer
+        /// coinbase) can never match a frozen job -> mint declines fail-closed.
+        uint256                    ref_hash;
+        /// nonce64 the miner filled into the OP_RETURN slot: LE u64 of
+        /// extranonce1 || extranonce2 (4+4 bytes).
+        uint64_t                   last_txout_nonce{0};
+        /// Template tx hex frozen with the job (shared, may be null) — the
+        /// run-loop registers these for share relay (remember_tx serving).
+        std::shared_ptr<const std::vector<std::string>> tx_data;
     };
     /// Returns the minted share hash, or null-uint256 when the mint was
     /// declined/deferred (reason logged by the callee).
@@ -122,6 +135,30 @@ public:
     };
     using PplnsWeightsFn =
         std::function<std::optional<PplnsWeights>(const uint256& prev_share_hash)>;
+
+    /// Producer-built share gentx for a connection's job (slice 3/3). When the
+    /// run-loop binds set_producer_job_fn, build_connection_coinbase serves the
+    /// producer share gentx VERBATIM as the stratum coinbase (split around the
+    /// 8-byte nonce64 slot), so the bytes a miner hashes are byte-identical to
+    /// what the mint-time rebuild (build_mint_share) reproduces — the mint's
+    /// X11 identity gate then passes by construction. share_bits/max_bits are
+    /// the oracle-retargeted share target committed in the share_info; the
+    /// work source publishes them via set_share_target so the mining_submit
+    /// classification gate matches the share's own target.
+    struct ProducerJob {
+        std::vector<unsigned char> gentx_bytes;    ///< full share gentx, nonce64 slot zeroed
+        size_t                     nonce64_offset{0}; ///< first byte of the 8B nonce64 slot
+        uint256                    ref_hash;       ///< PPLNS OP_RETURN commitment (registry key)
+        uint32_t                   share_bits{0};  ///< share_info.bits (oracle retarget)
+        uint32_t                   share_max_bits{0}; ///< share_info.max_bits
+    };
+    /// Returns nullopt when no producer job can be built right now (tracker
+    /// busy, non-P2PKH payout, no template) — the coinbase then degrades to
+    /// the non-producer path (block-valid, mint declines fail-closed).
+    using ProducerJobFn = std::function<std::optional<ProducerJob>(
+        const uint256& prev_share_hash,
+        const std::vector<unsigned char>& payout_script,
+        const coin::DashWorkData& wd)>;
 
     /// Construct the DASH work source. Holds a NON-OWNING reference to the
     /// node-held coin-state (the embedded arm) and captures the REQUIRED dashd
@@ -227,6 +264,11 @@ public:
     /// While unbound, the coinbase uses the genesis single-miner split.
     void set_pplns_weights_fn(PplnsWeightsFn fn);
 
+    /// Wire the run-loop producer-job builder (slice 3/3). While unbound the
+    /// coinbase path is byte-unchanged (compute_dash_payouts + coinbase::build)
+    /// and share-target submissions cannot mint (loud fail-closed decline).
+    void set_producer_job_fn(ProducerJobFn fn);
+
 private:
     /// Template cache resolve: return the cached DashWorkData snapshot when it
     /// is still fresh (same work_generation AND younger than the staleness
@@ -270,6 +312,10 @@ private:
     // PPLNS weight walk (stage 4c multi-output path). Empty until wired.
     mutable std::mutex          pplns_mutex_;
     PplnsWeightsFn              pplns_weights_fn_;
+
+    // Producer-job builder (slice 3/3 run-loop mint). Empty until wired.
+    mutable std::mutex          producer_job_mutex_;
+    ProducerJobFn               producer_job_fn_;
 
     // Template cache (stage 4c): the last DashWorkData sourced through the
     // embedded/fallback selector, keyed on work_generation_ + a staleness TTL

@@ -348,6 +348,80 @@ core::stratum::CoinbaseResult DASHWorkSource::build_connection_coinbase(
     auto wd = cached_work();
     if (!wd) return {};   // no template -> no job (session retries)
 
+    // Shared frozen-snapshot tail: branches + tx set from the SAME wd the
+    // coinbase was built over, so the session's job merkle always matches the
+    // block body assembled at submit time. Used by BOTH coinbase paths below.
+    auto freeze_snapshot = [&](core::stratum::CoinbaseResult& out,
+                               const uint256& ref_hash) {
+        out.snapshot.subsidy             = wd->m_coinbase_value;
+        out.snapshot.frozen_ref.ref_hash = ref_hash;
+        if (!wd->m_tx_hashes.empty()) {
+            std::vector<uint256> leaves;
+            leaves.reserve(1 + wd->m_tx_hashes.size());
+            leaves.push_back(uint256::ZERO);
+            leaves.insert(leaves.end(), wd->m_tx_hashes.begin(), wd->m_tx_hashes.end());
+            auto raw = dash::coinbase::merkle_branches_raw(leaves);
+            out.snapshot.frozen_ref.frozen_merkle_branches = raw;
+            out.snapshot.merkle_branches = dash::coinbase::merkle_branches_hex(raw);
+        }
+        out.snapshot.tx_data = std::make_shared<const std::vector<std::string>>(
+            wd->m_tx_data_hex);
+    };
+
+    // ── Producer path (slice 3/3, run-loop mint) ─────────────────────────
+    // When bound, the stratum coinbase IS the producer share gentx: split
+    // verbatim around the zeroed nonce64 slot. Byte-parity with the mint-time
+    // rebuild holds by construction — there is exactly ONE gentx serializer
+    // on this path (producer::build_gentx). On nullopt/throw the non-producer
+    // path below serves a block-valid coinbase (mint declines fail-closed).
+    {
+        ProducerJobFn pfn;
+        {
+            std::lock_guard<std::mutex> lk(producer_job_mutex_);
+            pfn = producer_job_fn_;
+        }
+        if (pfn) {
+            try {
+                if (auto pj = pfn(prev_share_hash, payout_script, *wd)) {
+                    if (pj->nonce64_offset + 8 <= pj->gentx_bytes.size()) {
+                        core::stratum::CoinbaseResult out;
+                        std::span<const unsigned char> b1(
+                            pj->gentx_bytes.data(), pj->nonce64_offset);
+                        std::span<const unsigned char> b2(
+                            pj->gentx_bytes.data() + pj->nonce64_offset + 8,
+                            pj->gentx_bytes.size() - pj->nonce64_offset - 8);
+                        out.coinb1 = HexStr(b1);
+                        out.coinb2 = HexStr(b2);
+                        freeze_snapshot(out, pj->ref_hash);
+                        // Publish the share_info-committed target so the
+                        // mining_submit share gate matches the minted share's
+                        // own m_bits (the ban-safety alignment).
+                        // set_share_target only stores atomics; const_cast is
+                        // safe here (build_connection_coinbase is const by
+                        // interface contract, the target publish is a relaxed
+                        // atomic store).
+                        if (pj->share_bits != 0)
+                            const_cast<DASHWorkSource*>(this)->set_share_target(
+                                pj->share_bits, pj->share_max_bits);
+                        return out;
+                    }
+                    LOG_ERROR << "[DASH-STRATUM] producer job nonce64 offset out of "
+                                 "range -- falling back to non-producer coinbase";
+                } else {
+                    static int degrade_log = 0;
+                    if (degrade_log++ % 50 == 0)
+                        LOG_INFO << "[DASH-STRATUM] producer job unavailable "
+                                    "(tracker busy / non-P2PKH payout / no template) "
+                                    "-- serving non-producer coinbase (mint disabled "
+                                    "for this job)";
+                }
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[DASH-STRATUM] producer job threw: " << e.what()
+                            << " -- serving non-producer coinbase";
+            }
+        }
+    }
+
     try {
         const core::CoinParams params = dash::make_coin_params(is_testnet_);
 
@@ -399,22 +473,8 @@ core::stratum::CoinbaseResult DASHWorkSource::build_connection_coinbase(
         out.coinb1 = std::move(split.coinb1_hex);
         out.coinb2 = std::move(split.coinb2_hex);
 
-        // Freeze the snapshot ATOMICALLY with the coinbase: branches + tx set
-        // come from the SAME wd the coinbase was built over, so the session's
-        // job merkle always matches the block body assembled at submit time.
-        out.snapshot.subsidy             = wd->m_coinbase_value;
-        out.snapshot.frozen_ref.ref_hash = ref_hash;
-        if (!wd->m_tx_hashes.empty()) {
-            std::vector<uint256> leaves;
-            leaves.reserve(1 + wd->m_tx_hashes.size());
-            leaves.push_back(uint256::ZERO);
-            leaves.insert(leaves.end(), wd->m_tx_hashes.begin(), wd->m_tx_hashes.end());
-            auto raw = dash::coinbase::merkle_branches_raw(leaves);
-            out.snapshot.frozen_ref.frozen_merkle_branches = raw;
-            out.snapshot.merkle_branches = dash::coinbase::merkle_branches_hex(raw);
-        }
-        out.snapshot.tx_data = std::make_shared<const std::vector<std::string>>(
-            wd->m_tx_data_hex);
+        // Freeze the snapshot ATOMICALLY with the coinbase (shared helper).
+        freeze_snapshot(out, ref_hash);
         return out;
     } catch (const std::exception& e) {
         // Builder invariant tripped (logged): serve no job rather than a
@@ -587,12 +647,29 @@ nlohmann::json DASHWorkSource::mining_submit(
         if (mint_fn) {
             MintShareInputs in;
             in.header_bytes.assign(header, header + 80);
-            in.coinbase_bytes  = std::move(coinbase);
             in.subsidy         = job->subsidy;
             in.prev_share_hash = job->prev_share_hash;
             in.merkle_branches = std::move(branch_hashes);
             in.payout_script   = core::address_to_script(username);
             in.pow_hash        = pow_hash;
+            // ref_hash: the coinb1/coinb2 split sits immediately after the
+            // 32-byte OP_RETURN ref_hash (before the 8B nonce64 slot), so the
+            // commitment is the coinb1 tail. Raw LE-internal bytes — embedded
+            // via ref_hash.data() at build time, recovered the same way.
+            if (coinb1_bytes.size() >= 32)
+                std::memcpy(in.ref_hash.begin(),
+                            coinb1_bytes.data() + coinb1_bytes.size() - 32, 32);
+            // nonce64 = LE u64 of extranonce1 || extranonce2 (4+4 bytes).
+            if (en1_bytes.size() + en2_bytes.size() == 8) {
+                unsigned char n64[8];
+                std::memcpy(n64, en1_bytes.data(), en1_bytes.size());
+                std::memcpy(n64 + en1_bytes.size(), en2_bytes.data(), en2_bytes.size());
+                uint64_t v = 0;
+                for (int i = 7; i >= 0; --i) v = (v << 8) | n64[i];
+                in.last_txout_nonce = v;
+            }
+            in.tx_data         = job->tx_data;
+            in.coinbase_bytes  = std::move(coinbase);
             try {
                 share_hash = mint_fn(in);
             } catch (const std::exception& e) {
@@ -693,6 +770,12 @@ void DASHWorkSource::set_pplns_weights_fn(PplnsWeightsFn fn)
 {
     std::lock_guard<std::mutex> lk(pplns_mutex_);
     pplns_weights_fn_ = std::move(fn);
+}
+
+void DASHWorkSource::set_producer_job_fn(ProducerJobFn fn)
+{
+    std::lock_guard<std::mutex> lk(producer_job_mutex_);
+    producer_job_fn_ = std::move(fn);
 }
 
 }  // namespace dash::stratum

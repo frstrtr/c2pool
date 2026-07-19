@@ -71,6 +71,13 @@
 
 #include <core/stratum_server.hpp>             // core::StratumServer — miner-facing accept-loop (run-path caller)
 #include <impl/dash/stratum/work_source.hpp>   // dash::stratum::DASHWorkSource — concrete core::stratum::IWorkSource
+#include <impl/dash/mint_runloop.hpp>          // dash::mint — run-loop share minting (slice 3/3)
+#include <core/log.hpp>
+
+#include <chrono>
+#include <ctime>
+#include <optional>
+#include <random>
 
 #include <boost/asio.hpp>
 
@@ -173,6 +180,8 @@ void print_banner(const char* argv0)
         << "           [--listen [HOST:]PORT] [--addnode HOST:PORT]... [--connect HOST:PORT]...\n"
         << "           [--stratum [HOST:]PORT] [--coin-p2p-connect HOST:PORT]...\n"
         << "           [--embedded-utxo]\n"
+        << "           [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n"
+        << "           [--redistribute pplns|fee|boost|donate]\n"
         << "       " << argv0 << " --mine-block [--coin-rpc H:P] [--coin-rpc-auth PATH]\n"
         << "           [--testnet] [--payout-pubkey-hash HEX] [--max-nonce N]\n\n"
         << "Status: consensus layer live (X11 PoW, subsidy, oracle CoinParams).\n"
@@ -335,12 +344,20 @@ int run_selftest()
 // repeated targets). E1 establishes + maintains the connection only; the
 // ingest legs that would populate NodeCoinState are later slices, so the
 // fallback arm still serves templates even WITH the flag.
+// Fee/donation flags (README design, LTC-path port — see the mint wiring):
+//   dev_donation        --give-author (donation_percentage), default 0.1%
+//   node_owner_fee      -f/--fee (node_owner_fee), default 0
+//   node_owner_address  --node-owner-address (fee destination, P2PKH)
+//   redistribute_mode   --redistribute (pplns/fee/boost/donate)
 int run_node(bool testnet, const std::string& rpc_endpoint,
              const std::string& rpc_conf_path, const std::string& submit_hex,
              const PeeringConfig& peer,
              const std::string& stratum_host, uint16_t stratum_port,
              const std::vector<NetService>& coin_p2p_targets,
-             bool embedded_utxo)
+             bool embedded_utxo,
+             double dev_donation, double node_owner_fee,
+             const std::string& node_owner_address,
+             const std::string& redistribute_mode)
 {
     namespace io = boost::asio;
 
@@ -424,6 +441,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     for (const auto& c : peer.connects)  config.pool()->m_bootstrap_addrs.push_back(c);
 
     dash::Node p2p_node(&ioc, &config);
+
+    // ── Mint slice 3/3: consensus params + sharechain persistence ────────
+    // The tracker's CoinParams carry the X11 pow_func + targets every
+    // reception/mint verify consumes — MUST be set before any share is
+    // processed (an empty pow_func fails every share_init_verify).
+    const core::CoinParams mint_params = dash::make_coin_params(testnet);
+    p2p_node.tracker().m_coin_params = mint_params;
+    // LevelDB sharechain store under the SAME per-net subdir as the rest of
+    // the node state (bucket-1 isolation), loading any persisted shares.
+    p2p_node.init_storage(net_subdir);
 
     // --connect (connect-only, no --listen) suppresses the inbound listener,
     // matching report_peering() above.
@@ -590,6 +617,228 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         node_coin_state, std::move(dashd_fallback), std::move(stratum_submit_fn),
         core::stratum::StratumConfig{}, testnet);
 
+    // ── Mint slice 3/3: run-loop share minting wiring ─────────────────────
+    // ShareAccept -> build_mint_share -> tracker insert -> peer broadcast.
+    // All callbacks below run on THIS ioc (StratumServer shares it), so the
+    // node's IO-thread invariants (try_to_lock tracker access) hold.
+    {
+        dash::Node* node_ptr = &p2p_node;
+        auto mint_registry = std::make_shared<dash::mint::FrozenJobRegistry>();
+
+        // ── Fee policy (README flags, LTC sharechain-lane port) ───────────
+        // --give-author -> the share's donation field (oracle dev-fee channel;
+        // the donation output itself is ALWAYS emitted by the gentx, even at
+        // 0% — the dust-marker semantic is preserved by construction).
+        // --fee/--node-owner-address -> probabilistic identity substitution
+        // (consensus-safe). --redistribute -> broken-credential policy.
+        dash::mint::MintFeePolicy fee_policy;
+        fee_policy.donation_u16       = dash::mint::donation_percent_to_u16(dev_donation);
+        fee_policy.node_owner_fee_pct = node_owner_fee;
+        fee_policy.redistribute =
+            dash::mint::MintFeePolicy::parse_redistribute(redistribute_mode);
+        if (!node_owner_address.empty()) {
+            auto owner_script = core::address_to_script(node_owner_address);
+            if (dash::stratum::pubkey_hash_from_p2pkh(owner_script)) {
+                fee_policy.node_owner_script = std::move(owner_script);
+            } else {
+                std::cout << "[run] --node-owner-address is not a P2PKH DASH "
+                             "address -- node-owner fee/redistribute-to-owner "
+                             "DISABLED (shares are pubkey_hash-keyed)\n";
+            }
+        }
+        if (fee_policy.node_owner_fee_pct > 0.0 && fee_policy.node_owner_script.empty())
+            std::cout << "[run] --fee " << node_owner_fee << " set but no usable "
+                         "--node-owner-address -- node-owner fee DISABLED\n";
+        std::cout << "[run] fee policy: give-author=" << dev_donation
+                  << "% (donation_u16=" << fee_policy.donation_u16
+                  << ") node-owner-fee=" << node_owner_fee
+                  << "% (owner=" << (fee_policy.node_owner_script.empty() ? "unset" : node_owner_address)
+                  << ") redistribute=" << redistribute_mode << "\n";
+
+        // Best-share election: prev_share_hash for new jobs = the live tip
+        // think() elected (verified-work-first; ZERO with peers-but-no-
+        // verified-chain so we never mint on an unverified foreign chain).
+        work_source->set_best_share_hash_fn(
+            [node_ptr]() -> uint256 { return node_ptr->best_share_hash(); });
+
+        // Producer job: the stratum coinbase IS the producer share gentx
+        // (byte-parity with the mint-time rebuild by construction). The
+        // frozen per-job context is registered under its ref_hash.
+        //
+        // Per-(prev, payout, template) CACHE: sessions re-notify every ~1 s;
+        // a fresh random share_nonce per notify would make every job's bytes
+        // unique — defeating the session's shared-payload reuse AND churning
+        // the frozen-job registry past its eviction window. Rebuilding is
+        // deterministic given the same inputs, so within a 30 s TTL (the
+        // template staleness window) the SAME job is served.
+        struct ProducerJobCacheEntry {
+            dash::mint::ProducerJobBuild build;
+            uint256 coin_tip;
+            uint32_t height{0};
+            std::chrono::steady_clock::time_point at;
+        };
+        using ProducerJobKey = std::pair<uint256, std::vector<unsigned char>>;
+        auto job_cache = std::make_shared<
+            std::map<ProducerJobKey, ProducerJobCacheEntry>>();
+
+        work_source->set_producer_job_fn(
+            [node_ptr, mint_params, mint_registry, job_cache, fee_policy](
+                const uint256& prev_share_hash,
+                const std::vector<unsigned char>& payout_script,
+                const dash::coin::DashWorkData& wd)
+                -> std::optional<dash::stratum::DASHWorkSource::ProducerJob>
+            {
+                const auto now = std::chrono::steady_clock::now();
+                const ProducerJobKey key{prev_share_hash, payout_script};
+
+                // Cache hit: same sharechain tip, same coin template, fresh.
+                if (auto it = job_cache->find(key); it != job_cache->end()) {
+                    auto& e = it->second;
+                    if (e.coin_tip == wd.m_previous_block && e.height == wd.m_height
+                        && now - e.at < std::chrono::seconds(30)) {
+                        mint_registry->put(e.build.job.ref_hash, e.build.frozen);
+                        return e.build.job;
+                    }
+                    job_cache->erase(it);
+                }
+                // Lazy TTL sweep keeps the cache bounded across miner churn.
+                if (job_cache->size() > 128) {
+                    for (auto it = job_cache->begin(); it != job_cache->end();) {
+                        if (now - it->second.at > std::chrono::seconds(60))
+                            it = job_cache->erase(it);
+                        else
+                            ++it;
+                    }
+                }
+
+                auto guard = node_ptr->read_tracker();
+                if (!guard)
+                    return std::nullopt;   // compute thread busy — degrade this job
+
+                static std::mt19937 nonce_rng{std::random_device{}()};
+                const uint32_t share_nonce = static_cast<uint32_t>(nonce_rng());
+
+                // Fee policy: one roll per job build (p2pool's per-get_work
+                // fee roll); resolve the share identity + donation.
+                const uint32_t roll_x100 = static_cast<uint32_t>(nonce_rng() % 10000u);
+                auto identity = dash::mint::resolve_mint_identity(
+                    fee_policy, payout_script, roll_x100);
+                if (!identity) {
+                    static int redist_log = 0;
+                    if (redist_log++ % 50 == 0)
+                        LOG_WARNING << "[MINT] no usable share identity for this "
+                                       "miner (non-P2PKH credentials; redistribute="
+                                    << "policy declined) -- job degrades to the "
+                                       "non-producer coinbase";
+                    return std::nullopt;
+                }
+                if (identity->substituted) {
+                    static int fee_log = 0;
+                    if (fee_log++ % 50 == 0)
+                        LOG_INFO << "[MINT] share identity substituted by fee/"
+                                    "redistribute policy (node-owner)";
+                }
+
+                auto built = dash::mint::build_producer_job(
+                    guard->chain, mint_params, prev_share_hash,
+                    identity->payout_script, wd,
+                    static_cast<uint32_t>(std::time(nullptr)), share_nonce,
+                    identity->donation_u16, /*pool_tag=*/"c2pool");
+                if (!built)
+                    return std::nullopt;
+
+                mint_registry->put(built->job.ref_hash, built->frozen);
+                // Template txs -> m_known_txs so share relay can serve
+                // remember_tx for the share's new_transaction_hashes.
+                node_ptr->register_template_txs(wd.m_txs, wd.m_tx_hashes);
+
+                auto job = built->job;
+                (*job_cache)[key] = ProducerJobCacheEntry{
+                    std::move(*built), wd.m_previous_block, wd.m_height, now};
+                return job;
+            });
+
+        // The mint itself: registry lookup by the coinbase's OP_RETURN
+        // commitment, deterministic producer rebuild (X11 identity gate +
+        // pow<=target ban-safety gate inside), tracker insert + broadcast.
+        work_source->set_mint_share_fn(
+            [node_ptr, mint_params, mint_registry](
+                const dash::stratum::DASHWorkSource::MintShareInputs& in) -> uint256
+            {
+                if (in.ref_hash.IsNull()) {
+                    LOG_WARNING << "[MINT] solve on a non-producer job (zero ref) — "
+                                   "no sharechain credit (fail-closed)";
+                    return uint256();
+                }
+                auto frozen = mint_registry->get(in.ref_hash);
+                if (!frozen) {
+                    LOG_WARNING << "[MINT] no frozen job for ref="
+                                << in.ref_hash.GetHex().substr(0, 16)
+                                << " (evicted/foreign) — declined";
+                    return uint256();
+                }
+
+                std::optional<dash::producer::BuiltShare> built;
+                {
+                    auto guard = node_ptr->read_tracker();
+                    if (!guard) {
+                        LOG_WARNING << "[MINT] tracker busy — solve declined "
+                                       "(retry on next share)";
+                        return uint256();
+                    }
+                    built = dash::mint::mint_from_inputs(
+                        guard->chain, mint_params, in, *frozen);
+                }
+                if (!built) {
+                    LOG_WARNING << "[MINT] producer rebuild declined the solve "
+                                   "(identity/target gate) — NOT minted";
+                    return uint256();
+                }
+
+                dash::ShareType share;
+                share = new dash::DashShare(std::move(built->share));
+                const uint256 minted = node_ptr->add_local_share(share);
+                if (minted.IsNull()) {
+                    // Not inserted (busy/duplicate) — reclaim the allocation.
+                    share.invoke([](auto* obj) { delete obj; });
+                    return uint256();
+                }
+                LOG_INFO << "[MINT] share " << minted.GetHex().substr(0, 16)
+                         << " minted onto the sharechain (prev="
+                         << in.prev_share_hash.GetHex().substr(0, 16) << ")";
+                return minted;
+            });
+
+        // PPLNS fallback-coinbase weights (non-producer path): oracle-window
+        // tracker walk so even a degraded job pays the live PPLNS window.
+        // block_bits from the prev share's own header (same difficulty epoch);
+        // ref stays ZERO — a solve on this path can never mint (fail-closed).
+        work_source->set_pplns_weights_fn(
+            [node_ptr, mint_params](const uint256& prev_share_hash)
+                -> std::optional<dash::stratum::DASHWorkSource::PplnsWeights>
+            {
+                auto guard = node_ptr->read_tracker();
+                if (!guard)
+                    return std::nullopt;
+                if (prev_share_hash.IsNull() || !guard->chain.contains(prev_share_hash))
+                    return std::nullopt;
+                uint32_t block_bits = 0;
+                guard->chain.get_share(prev_share_hash).invoke([&](auto* obj) {
+                    block_bits = obj->m_min_header.m_bits;
+                });
+                return dash::mint::pplns_weights_for(
+                    guard->chain, mint_params, prev_share_hash, block_bits);
+            });
+
+        // New best share -> stratum work refresh (sessions re-notify).
+        p2p_node.set_on_best_share_changed(
+            [ws = work_source.get()]() { ws->bump_work_generation(); });
+
+        std::cout << "[run] mint wiring LIVE: ShareAccept -> producer rebuild -> "
+                     "tracker insert + broadcast (legacy v16 shares; PPLNS window "
+                     "walk bound)\n";
+    }
+
     if (stratum_port != 0) {
         stratum_server = std::make_unique<core::StratumServer>(
             ioc, stratum_host, stratum_port, work_source);
@@ -609,6 +858,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         std::cout << "[run] stratum disabled (no --stratum flag)\n";
     }
 
+    // ── Think loop: initial election + 15 s keep-fresh tick ───────────────
+    // Share arrivals trigger run_think() themselves (add_verified_shares);
+    // the periodic tick covers quiet stretches (retries deferred broadcasts,
+    // re-elects after verify continuations). Serialized by m_think_running.
+    boost::asio::post(ioc, [&p2p_node]() { p2p_node.run_think(); });
+    auto think_timer = std::make_shared<io::steady_timer>(ioc);
+    auto think_tick =
+        std::make_shared<std::function<void(const boost::system::error_code&)>>();
+    *think_tick = [&p2p_node, think_timer, think_tick](
+                      const boost::system::error_code& ec) {
+        if (ec) return;   // cancelled at shutdown
+        p2p_node.run_think();
+        think_timer->expires_after(std::chrono::seconds(15));
+        think_timer->async_wait(*think_tick);
+    };
+    think_timer->expires_after(std::chrono::seconds(15));
+    think_timer->async_wait(*think_tick);
+
     std::cout << "[run] run-loop up (Ctrl-C to stop); won blocks relay via the\n"
                  "[run] dashd-RPC submitblock fallback + the embedded sharechain P2P leg.\n";
     ioc.run();
@@ -617,6 +884,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // it references are still alive -- explicit reset keeps destruction order safe
     // (stratum_server was declared before them, so it would otherwise outlive them).
     stratum_server.reset();
+
+    // Flush pending sharechain persistence buffers (verified marks + removals).
+    p2p_node.shutdown_persistence();
 
     std::cout << "[run] run-loop stopped cleanly\n";
     return 0;
@@ -777,6 +1047,10 @@ int main(int argc, char** argv)
     std::string stratum_host = "0.0.0.0";      // --stratum [HOST:]PORT bind interface (default all)
     uint16_t    stratum_port = 0;              // 0 disables the Stratum accept-loop; --stratum sets it
     bool embedded_utxo = false;                // --embedded-utxo: arm the E2b UTXO/fee lane (opt-in)
+    double dev_donation = 0.1;                 // --give-author (donation_percentage; README default 0.1%)
+    double node_owner_fee = 0.0;               // -f / --fee (node_owner_fee; default 0)
+    std::string node_owner_address;            // --node-owner-address (fee destination)
+    std::string redistribute_mode = "pplns";   // --redistribute pplns|fee|boost|donate
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
             std::cout << "c2pool-dash " << C2POOL_VERSION << "\n";
@@ -810,6 +1084,16 @@ int main(int argc, char** argv)
             coin_p2p_raw.emplace_back(argv[++i]);
         else if (std::strcmp(argv[i], "--embedded-utxo") == 0)
             embedded_utxo = true;
+        else if ((std::strcmp(argv[i], "--give-author") == 0 ||
+                  std::strcmp(argv[i], "--dev-donation") == 0) && i + 1 < argc)
+            dev_donation = std::strtod(argv[++i], nullptr);
+        else if ((std::strcmp(argv[i], "-f") == 0 ||
+                  std::strcmp(argv[i], "--fee") == 0) && i + 1 < argc)
+            node_owner_fee = std::strtod(argv[++i], nullptr);
+        else if (std::strcmp(argv[i], "--node-owner-address") == 0 && i + 1 < argc)
+            node_owner_address = argv[++i];
+        else if (std::strcmp(argv[i], "--redistribute") == 0 && i + 1 < argc)
+            redistribute_mode = argv[++i];
         else if (std::strcmp(argv[i], "--stratum") == 0 && i + 1 < argc) {
             // --stratum [HOST:]PORT -- bind a Stratum TCP listener for miners.
             // Bare PORT keeps the default 0.0.0.0 bind host (parse_listen SSOT).
@@ -877,7 +1161,8 @@ int main(int argc, char** argv)
         }
         return run_node(testnet, rpc_endpoint, rpc_conf_path, submit_hex, peer,
                         stratum_host, stratum_port, coin_p2p_targets,
-                        embedded_utxo);
+                        embedded_utxo, dev_donation, node_owner_fee,
+                        node_owner_address, redistribute_mode);
     }
     return run_selftest();
 }
