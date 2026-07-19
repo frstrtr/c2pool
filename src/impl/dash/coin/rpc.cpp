@@ -115,12 +115,23 @@ void NodeRPC::reconnect()
     m_connected = false;
     LOG_WARNING << "RPC connection lost — reconnecting in 15 seconds...";
     m_stream.close();
+    // Stale-payee fix: the connection churned — anything cached from before
+    // this point (template / masternode payee) must not be served or
+    // submitted. Notify the observer (DASHWorkSource cache invalidation).
+    if (m_on_reconnect)
+        m_on_reconnect();
     m_reconnect_timer = std::make_unique<core::Timer>(m_context, false);
     m_reconnect_timer->start(15, [this]() { connect(m_address, m_userpass); });
 }
 
 void NodeRPC::sync_reconnect()
 {
+    // Stale-payee fix: fire the churn observer FIRST — the caller (Send) is
+    // about to retry against a fresh connection; any template cached from the
+    // dead connection's era is suspect and must be invalidated.
+    if (m_on_reconnect)
+        m_on_reconnect();
+
     beast::error_code ec;
     m_stream.socket().shutdown(io::ip::tcp::socket::shutdown_both, ec);
     m_stream.close();

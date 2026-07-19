@@ -1451,13 +1451,82 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         }
     }
 
+    // ── ATOMIC SNAPSHOT: header fields (stale-payee fix) ──
+    // When the work source froze the header fields WITH the coinbase
+    // (snapshot.has_header — DASH does; the masternode payee rotates every
+    // block), they OVERRIDE the tmpl values fetched separately at the top of
+    // this function. tmpl and the coinbase are otherwise two independent
+    // fetches that can straddle a template refresh (TTL expiry / tip move /
+    // RPC-reconnect churn): the issued job would then carry the NEW tip's
+    // prevhash with a coinbase built for the OLD height's masternode payee —
+    // hex-confirmed on DASH testnet as a submit-time bad-cb-payee reject of a
+    // byte-correct-at-build coinbase (a lost block reward). With the override,
+    // header + coinbase + branches + tx set are ONE frozen template unit.
+    // Work sources that leave has_header false are byte-unchanged.
+    if (cbr.snapshot.has_header) {
+        gbt_prevhash = cbr.snapshot.gbt_prevhash;
+        prevhash     = gbt_to_stratum_prevhash(gbt_prevhash);
+        version_u32  = cbr.snapshot.header_version;
+        {
+            std::ostringstream ss;
+            ss << std::hex << std::setw(8) << std::setfill('0') << version_u32;
+            version = ss.str();
+        }
+        if (!cbr.snapshot.block_nbits_hex.empty()) {
+            gbt_block_nbits = cbr.snapshot.block_nbits_hex;
+            nbits           = gbt_block_nbits;
+        }
+        if (cbr.snapshot.curtime) {
+            curtime = cbr.snapshot.curtime;
+            std::ostringstream ts;
+            ts << std::hex << std::setw(8) << std::setfill('0') << curtime;
+            ntime = ts.str();
+        }
+    }
+
+    // ── Unmineable-job gate (stale-payee fix, defect 2) ──
+    // Refuse to register/serve a job that is not real mineable work:
+    //   (a) require_job_snapshot set (DASH) but the per-connection builder did
+    //       NOT return an atomic snapshot — assembling a job from the separate
+    //       tmpl fetch + the stub/global coinbase would be exactly the MIXED
+    //       template unit the atomic binding above exists to prevent;
+    //   (b) an empty / all-zero prevhash (the observed pre-auth zero-hash
+    //       job_0 defect): a zeroed prev is not work on any chain.
+    // Same retry posture as the no-template path at the top: skip + 1 s timer.
+    if (mining_interface_->get_stratum_config().require_job_snapshot) {
+        const bool snapshot_missing = !cbr.snapshot.has_header;
+        const bool zero_prev = gbt_prevhash.empty()
+            || gbt_prevhash.find_first_not_of('0') == std::string::npos;
+        if (snapshot_missing || zero_prev) {
+            const std::string& sym =
+                mining_interface_->get_stratum_config().coin_symbol;
+            LOG_WARNING << "[" << (sym.empty() ? "Stratum" : sym)
+                        << "] job suppressed ("
+                        << (snapshot_missing ? "no atomic header+coinbase snapshot"
+                                             : "empty/zero prevhash")
+                        << ") — not serving unmineable/mixed work; retrying in 1s";
+            auto timer = std::make_shared<boost::asio::steady_timer>(socket_.get_executor());
+            timer->expires_after(std::chrono::seconds(1));
+            timer->async_wait([weak_self = weak_from_this(), timer](boost::system::error_code ec) {
+                if (ec) return;
+                auto self = weak_self.lock();
+                if (!self || !self->is_connected()) return;
+                self->send_notify_work();
+            });
+            return;
+        }
+    }
+
     // ── ATOMIC SNAPSHOT: merkle branches ──
     // Override merkle branches with snapshot captured atomically with coinbase.
     // This ensures the merkle tree matches the witness commitment in coinb1.
-    // NOTE: Header fields (prevhash, version, bits, ntime) are NOT overridden —
-    // they come from the current daemon state and are independent of the
-    // coinbase/tx_data consistency. Overriding them caused GENTX validation
-    // failures on p2pool nodes (absheight, bits mismatch).
+    // NOTE: For work sources without has_header, the header fields (prevhash,
+    // version, bits, ntime) are NOT overridden — they come from the current
+    // daemon state and are independent of the coinbase/tx_data consistency.
+    // Overriding them from a DIFFERENT fetch caused GENTX validation failures
+    // on p2pool nodes (absheight, bits mismatch); the has_header override
+    // above is safe because its fields come from the SAME snapshot as the
+    // coinbase itself.
     if (!cbr.snapshot.merkle_branches.empty()) {
         merkle_branches_vec = std::move(cbr.snapshot.merkle_branches);
         merkle_branches = nlohmann::json::array();

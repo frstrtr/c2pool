@@ -40,6 +40,7 @@
 #include "rpc_data.hpp"
 #include "node_interface.hpp"
 
+#include <functional>
 #include <iostream>
 
 #include <core/uint256.hpp>
@@ -84,6 +85,13 @@ private:
     std::string m_userpass;
     bool m_connected = false;
     std::unique_ptr<core::Timer> m_reconnect_timer;
+    // Reconnect-churn observer (stale-payee fix): fired whenever the RPC
+    // connection is torn down / re-established (reconnect(), sync_reconnect()).
+    // main_dash.cpp wires this to DASHWorkSource::invalidate_template_cache()
+    // so no stratum job is ever served or submitted from a template/masternode
+    // payee cached from BEFORE the churn window. Assigned once at startup,
+    // before the io loop runs.
+    std::function<void()> m_on_reconnect;
 
     std::string Send(const std::string &request) override;
     nlohmann::json CallAPIMethod(const std::string& method, const jsonrpccxx::positional_parameter& params = {});
@@ -95,6 +103,9 @@ public:
     void connect(NetService address, std::string userpass);
     void reconnect();
     void sync_reconnect();
+    /// Register the reconnect-churn observer (see m_on_reconnect). Call once
+    /// at startup before the io loop runs.
+    void set_on_reconnect(std::function<void()> fn) { m_on_reconnect = std::move(fn); }
     bool check();
     bool check_blockheader(uint256 header);
 

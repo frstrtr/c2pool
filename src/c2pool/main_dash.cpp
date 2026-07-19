@@ -839,6 +839,22 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                      "walk bound)\n";
     }
 
+    // Stale-payee fix (defect 3): bind the CoindRPC reconnect-churn observer.
+    // A "CoindRPC reconnecting" window means any cached template — and the
+    // masternode payee frozen inside it — may predate the reconnect; the
+    // observer drops the DASHWorkSource template cache and bumps the work
+    // generation so every stratum session re-pulls FRESH work instead of
+    // mining (and later submitting) a payee from before the churn. weak_ptr:
+    // rpc outlives work_source in this scope (declared earlier), so the
+    // callback must not extend or assume the work source's lifetime.
+    if (rpc) {
+        std::weak_ptr<dash::stratum::DASHWorkSource> ws_weak = work_source;
+        rpc->set_on_reconnect([ws_weak]() {
+            if (auto ws = ws_weak.lock())
+                ws->invalidate_template_cache("CoindRPC reconnect churn");
+        });
+    }
+
     if (stratum_port != 0) {
         stratum_server = std::make_unique<core::StratumServer>(
             ioc, stratum_host, stratum_port, work_source);

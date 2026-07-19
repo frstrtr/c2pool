@@ -57,6 +57,15 @@ struct StratumConfig {
     // a DASH binary never logs "[LTC]" (issue #732 secondary defect). Empty
     // -> the core falls back to the neutral "[Stratum]" tag.
     std::string coin_symbol;
+    // Coins whose coinbase validity is bound to the template height (DASH:
+    // the masternode payee rotates EVERY block -> a coinbase built from one
+    // template combined with the header of another is rejected bad-cb-payee)
+    // set this true. The session then refuses to assemble a job unless
+    // build_connection_coinbase() returned an atomic header+coinbase snapshot
+    // (WorkSnapshot::has_header): no job is ever served from MIXED template
+    // fetches, and the legacy stub-coinbase fallback is unreachable.
+    // Default false: LTC/BTC/DGB behavior is byte-unchanged.
+    bool require_job_snapshot{false};
 };
 
 /// Frozen share-construction fields returned by ref_hash_fn. These
@@ -125,6 +134,21 @@ struct WorkSnapshot {
     // prevent merkle root mismatch when refresh_work() updates the template.
     std::shared_ptr<const std::vector<std::string>> tx_data;          // raw tx hex from template (a1: shared/lazy)
     std::vector<std::string> merkle_branches;  // stratum merkle branches
+    // ── Atomic header binding (stale-payee fix) ──────────────────────────
+    // Header fields frozen from the SAME template snapshot the coinbase was
+    // built over. When has_header is true the stratum session OVERRIDES the
+    // header fields it fetched separately via get_current_work_template()
+    // with these, so the issued job (prevhash/version/nbits/ntime + coinbase
+    // + merkle branches + tx set) is ONE frozen unit from ONE template — a
+    // job can never carry the new tip's header with the old height's
+    // masternode payee (dashd bad-cb-payee, a lost block reward). Work
+    // sources that leave has_header false (LTC/BTC/DGB) are byte-unchanged.
+    bool        has_header{false};
+    std::string gbt_prevhash;        // BE display hex (template previousblockhash)
+    uint32_t    header_version{0};   // block header version
+    std::string block_nbits_hex;     // 8-char BE hex GBT block bits
+    uint32_t    curtime{0};          // template curtime (0 = leave session value)
+    uint32_t    height{0};           // template height (diagnostics/logging)
 };
 
 /// Result of build_connection_coinbase(): the two coinbase fragments
