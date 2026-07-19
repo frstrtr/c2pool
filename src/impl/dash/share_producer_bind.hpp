@@ -108,6 +108,14 @@ struct FrozenMintJob
     uint256  desired_target;                         // vardiff target (pre-clip)
     uint64_t last_txout_nonce{0};                    // per-connection coinbase nonce
     dash::StaleInfo stale_info{dash::StaleInfo::none};
+    // Share identity frozen at job time (slice 3/3 node-fee port). When
+    // non-empty this P2PKH script REPLACES MintShareInputs.payout_script in
+    // the rebuild -- the mechanism behind the consensus-safe --fee
+    // (probabilistic node-owner substitution) and --redistribute: the job's
+    // coinbase was built with THIS identity, so the mint must rebuild with
+    // the same one or the X11 identity gate would decline every
+    // fee-substituted solve. Empty -> identity from the submit's username.
+    std::vector<unsigned char> payout_script_override;
 };
 
 // -- build_mint_share --------------------------------------------------------
@@ -126,7 +134,10 @@ build_mint_share(ChainT& chain,
     if (!min_header)
         return std::nullopt;  // malformed 80-byte header
 
-    auto pubkey_hash = pubkey_hash_from_p2pkh(in.payout_script);
+    const std::vector<unsigned char>& identity_script =
+        job.payout_script_override.empty() ? in.payout_script
+                                           : job.payout_script_override;
+    auto pubkey_hash = pubkey_hash_from_p2pkh(identity_script);
     if (!pubkey_hash)
         return std::nullopt;  // non-canonical payout script
 
