@@ -458,7 +458,20 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     const uint16_t bind_port =
         peer.listen_port ? peer.listen_port : dash::SharechainConfig::p2p_port();
     if (!connect_only) {
-        p2p_node.core::Server::listen(bind_port);
+        // #755: an uncaught bind failure (EADDRINUSE from a lingering prior
+        // instance) here threw boost::system::system_error straight through
+        // main -> terminate -> Exit 134 core dump. The log made it LOOK like
+        // a share-load crash (the throw lands right after the "Loaded N
+        // persisted shares" lines). Fail CLEANLY with the actual reason.
+        try {
+            p2p_node.core::Server::listen(bind_port);
+        } catch (const std::exception& e) {
+            std::cerr << "[run] FATAL: cannot bind sharechain P2P port "
+                      << bind_port << ": " << e.what()
+                      << "\n[run] (another c2pool-dash instance running? "
+                         "stop it or pass a different --listen port)\n";
+            return 1;
+        }
         std::cout << "[run] sharechain peer LISTENING on " << peer.listen_host << ":"
                   << bind_port
                   << " — min-proto=" << dash::SharechainConfig::MINIMUM_PROTOCOL_VERSION
@@ -466,11 +479,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     } else {
         std::cout << "[run] --connect mode: inbound listener suppressed\n";
     }
-    // addnode/connect targets are registered in the addr store by the NodeImpl
-    // ctor, but ACTIVE outbound dialing rides the download/outbound slice
-    // (dash::NodeImpl carries no start_outbound_connections yet). Inbound
-    // reception — version handshake + the #646 min-proto gate — is live now
-    // via node.cpp (#656/#657).
+    // #754 download/outbound slice: ACTIVE outbound dialing from the addr
+    // store (--addnode/--connect seeds registered by the NodeImpl ctor) plus
+    // the share-download pumps (handshake best-share advert drain here;
+    // think()'s desired-set dispatch rides run_think). This is what lets an
+    // EMPTY node JOIN an established p2pool-dash chain instead of only
+    // serving inbound peers.
+    p2p_node.start_outbound_connections();
+    if (!config.pool()->m_bootstrap_addrs.empty())
+        std::cout << "[run] outbound dialing started ("
+                  << config.pool()->m_bootstrap_addrs.size()
+                  << " seed peer[s]); share-download leg ARMED\n";
 
     // ── E1: OPT-IN embedded coin-network P2P dial (--coin-p2p-connect) ────
     // GUARANTEE: with no --coin-p2p-connect on argv, coin_p2p stays null and
@@ -877,7 +896,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // ── Think loop: initial election + 15 s keep-fresh tick ───────────────
     // Share arrivals trigger run_think() themselves (add_verified_shares);
     // the periodic tick covers quiet stretches (retries deferred broadcasts,
-    // re-elects after verify continuations). Serialized by m_think_running.
+    // re-elects after verify continuations) and now runs clean_tracker()
+    // (btc/ltc parity: think + stale-head eat + drop-tails beyond
+    // 2*CHAIN_LENGTH+10 + LevelDB prune — without it the raw chain grows
+    // unbounded). clean_tracker runs think inline, so the tick still keeps
+    // the election fresh; it no-ops (defers) when a think is in flight.
     boost::asio::post(ioc, [&p2p_node]() { p2p_node.run_think(); });
     auto think_timer = std::make_shared<io::steady_timer>(ioc);
     auto think_tick =
@@ -885,7 +908,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     *think_tick = [&p2p_node, think_timer, think_tick](
                       const boost::system::error_code& ec) {
         if (ec) return;   // cancelled at shutdown
-        p2p_node.run_think();
+        p2p_node.clean_tracker();
         think_timer->expires_after(std::chrono::seconds(15));
         think_timer->async_wait(*think_tick);
     };
@@ -894,7 +917,26 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
 
     std::cout << "[run] run-loop up (Ctrl-C to stop); won blocks relay via the\n"
                  "[run] dashd-RPC submitblock fallback + the embedded sharechain P2P leg.\n";
-    ioc.run();
+    // #755 guard (btc main_btc.cpp:1309-1315 parity): an exception escaping an
+    // io handler must NOT terminate the node (Exit 134 core-dump — e.g. a
+    // chain-walk throw over unrooted persisted shares after a partial join).
+    // Log + resume; after an escaped exception the io_context is NOT stopped,
+    // so run() continues with the remaining handlers. Ctrl-C still exits via
+    // the signal handler's ioc.stop() → run() returns normally → break.
+    for (;;) {
+        try {
+            ioc.run();
+            break;
+        } catch (const std::exception& e) {
+            LOG_ERROR << "[run] io handler exception (non-fatal, #755 guard): "
+                      << e.what();
+            std::cout << "[run] io handler exception (non-fatal): " << e.what()
+                      << "\n";
+        } catch (...) {
+            LOG_ERROR << "[run] io handler exception (non-fatal, #755 guard): "
+                         "unknown error";
+        }
+    }
 
     // Tear the acceptor + sessions down while the work source and node_coin_state
     // it references are still alive -- explicit reset keeps destruction order safe
