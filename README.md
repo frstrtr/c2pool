@@ -1,6 +1,7 @@
 # c2pool — P2Pool rebirth in C++
 
 [![CI](https://github.com/frstrtr/c2pool/actions/workflows/build.yml/badge.svg)](https://github.com/frstrtr/c2pool/actions/workflows/build.yml)
+[![Claude for Open Source](https://img.shields.io/badge/Claude%20for%20Open%20Source-supported-D97757?logo=claude&logoColor=white)](https://claude.com/contact-sales/claude-for-oss)
 
 C++ reimplementation of [forrestv/p2pool](https://github.com/p2pool/p2pool) targeting the **V36 share format**, with **per-coin binaries** for five parent chains and their merged-mining children: **Litecoin** (flagship — LTC + DOGE, PEP, BELLS, LKY, JKC, SHIC), **Bitcoin** (+ Namecoin), **DigiByte** (Scrypt), **Bitcoin Cash**, and **Dash**. See [Supported chains](#supported-chains) for the full matrix and status.
 
@@ -24,6 +25,8 @@ c2pool builds one binary per **parent chain** (`c2pool-<coin>`). Several parents
 ## Credits
 
 c2pool is an independent C++ implementation of the P2Pool sharechain concept originally created by Forrest Voight (forrestv, <https://github.com/forrestv/p2pool>).
+
+Development is supported by Anthropic's [Claude for Open Source](https://claude.com/contact-sales/claude-for-oss) program (2026). The design, the consensus rules, and responsibility for every byte shipped remain with the maintainers.
 
 > **First merged-mined DOGE block:** [#6135703](https://blockchair.com/dogecoin/block/f84500c25a4cce2a08887f29763726bd5ecec7b66fed65a88b181fb0b0ab2383) (2026-03-23) — decentralized LTC+DOGE merged mining via P2Pool V36, cross-validated with c2pool on shared share chain
 >

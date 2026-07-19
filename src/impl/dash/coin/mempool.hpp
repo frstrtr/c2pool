@@ -39,6 +39,7 @@
 #include "block.hpp"
 #include "transaction.hpp"
 #include "utxo_adapter.hpp"
+#include "vendor/assetlock.hpp"   // DIP-0027 CAssetUnlockPayload (type-9 fee source)
 
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
@@ -466,6 +467,34 @@ private:
     bool compute_fee_locked(MempoolEntry& entry,
                             ::core::coin::UTXOViewCache* utxo)
     {
+        // DIP-0027 asset-UNLOCK special case (type 9, E2b/#738). An
+        // asset-unlock tx mints UTXO from the credit pool and carries NO
+        // regular inputs, so the generic in-minus-out path below yields
+        // in_sum(0) < out_sum -> permanently fee_known=false, and the
+        // conservative selection guard would exclude it forever. Its miner
+        // fee is EXPLICIT in the payload (CAssetUnlockPayload.fee — the
+        // amount deducted from the unlock total for the miner's coinbase;
+        // vendor/assetlock.hpp), exactly what dashd's GBT reports for it.
+        // Pricing from the payload needs no UTXO view, so this branch sits
+        // ahead of the null-utxo bail-out. TARGETED: only an input-free
+        // type-9 body with a well-formed payload qualifies; anything else
+        // (including a malformed type-9) falls through to / stays on the
+        // conservative unknown-fee path. The general unknown-fee exclusion
+        // for every other tx class is untouched.
+        if (entry.tx.type == vendor::CAssetUnlockPayload::SPECIALTX_TYPE
+            && entry.tx.vin.empty()) {
+            vendor::CAssetUnlockPayload payload;
+            if (vendor::parse_assetunlock_payload(entry.tx.extra_payload,
+                                                  payload)) {
+                entry.fee = payload.fee;
+                entry.fee_known = true;
+                return true;
+            }
+            entry.fee_known = false;
+            entry.fee = 0;
+            return false;
+        }
+
         if (!utxo) {
             entry.fee_known = false;
             return false;

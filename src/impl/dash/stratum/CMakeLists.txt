@@ -10,8 +10,8 @@
 # capstone; only c2pool-dash (and the test_dash_stratum_work_source KAT) link the
 # objects in, so ltc/btc/doge/dgb build + ctest surfaces stay untouched.
 # SAFE-ADDITIVE, per-coin isolation held: src/impl/dash only, dashd RPC fallback
-# preserved. Stage 4b: bodies landed (getters + registry + get_work adapter real;
-# X11 work-assembly + share-validation held at safe defaults for 4c/4d).
+# preserved. Stage 4c/4d (#732): template trio served off the cached
+# embedded/fallback DashWorkData + X11 submit scoring live.
 add_library(dash_stratum OBJECT
     work_source.hpp work_source.cpp
 )

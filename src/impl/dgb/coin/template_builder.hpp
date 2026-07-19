@@ -34,6 +34,44 @@ namespace dgb
 namespace coin
 {
 
+// ── Underfill guard (v36 cutover deploy path) ───────────────────────────────
+// Port of the LTC/DOGE template-builder guard (src/impl/ltc/coin/
+// template_builder.hpp, src/impl/doge/coin/template_builder.hpp) to the DGB
+// embedded template path, in the DASH free-predicate form
+// (src/impl/dash/coin/embedded_gbt.hpp). Detects the "near-empty template on a
+// non-empty mempool" regression: the tx selector returns almost no
+// transactions even though the local mempool holds a substantial fee-paying
+// backlog. c2pool-side template-fill safety net — NOT the byte-parity KAT
+// axis; thresholds are the v36-native shared structure (standardize
+// cross-coin) pinned to the legacy p2pool near-empty floor (~50 kB),
+// identical to LTC/DOGE/DASH.
+//
+// DGB placement note: build_work_template() below is a pure SHAPING function
+// with no mempool access (transactions[] is a caller-supplied pass-through),
+// so the guard cannot evaluate here. It evaluates in the ONE place with
+// mempool visibility that feeds BOTH build_work_template callers (the stratum
+// DGBWorkSource and the embedded CoinNodeInterface path):
+// make_mempool_tx_source() in embedded_tx_select.cpp. Only the predicate +
+// thresholds live in this header (guard-weight TU safe: <cstdint> only).
+inline constexpr uint64_t UNDERFILL_MIN_FILL_BYTES = 50'000ull; // < this = near-empty block
+inline constexpr uint64_t UNDERFILL_BACKLOG_SLACK  = 50'000ull; // unselected fee-paying material that should have filled it
+
+/// Pure trip predicate — the exact boolean the LTC/DOGE guards evaluate.
+/// Factored out so the KAT can pin it without a log scraper:
+///   near_empty  : template packed fewer bytes than the near-empty floor
+///   has_backlog : the mempool holds fee-paying material (known fees > 0)
+///                 well beyond what was selected (> selected + slack)
+/// Genuinely empty (or fee-unknown-only) mempools never trip.
+inline bool underfill_guard_trips(uint64_t selected_bytes,
+                                  uint64_t mempool_bytes,
+                                  uint64_t mempool_known_fees)
+{
+    const bool near_empty  = selected_bytes < UNDERFILL_MIN_FILL_BYTES;
+    const bool has_backlog = mempool_known_fees > 0
+                          && mempool_bytes > selected_bytes + UNDERFILL_BACKLOG_SLACK;
+    return near_empty && has_backlog;
+}
+
 // --- CoinNodeInterface ------------------------------------------------------
 // Abstract interface for obtaining work and submitting blocks; lets the
 // concrete CoinNode swap between RPC (legacy), embedded, or hybrid sources

@@ -23,6 +23,20 @@ if [ -f "$CONFIG" ]; then
     [ -n "$WP" ] && WEB_PORT="$WP"
 fi
 
+# --- Coin-guard --------------------------------------------------------------
+# v0.2.3 shipped the Litecoin config in every coin tarball, so a DASH pool
+# silently bound LTC ports and logged LTC. Refuse to launch a binary against a
+# config whose coin header does not match the binary's coin.
+BIN_COIN=$(basename "$BIN" | sed -n "s/^c2pool-\([a-z][a-z]*\).*/\1/p")
+if [ -n "$BIN_COIN" ] && [ -f "$CONFIG" ]; then
+    if ! head -1 "$CONFIG" | grep -qi "$BIN_COIN"; then
+        echo "ERROR: config/coin mismatch — binary is c2pool-$BIN_COIN but config header reads:" >&2
+        echo "         $(head -1 "$CONFIG")" >&2
+        echo "       Launch with the coin-correct config, e.g.:  $0 $DIR/config/c2pool_mainnet.yaml" >&2
+        exit 1
+    fi
+fi
+
 echo "=== $(basename "$BIN") ==="
 echo "Config:   $CONFIG"
 echo "Web:      http://0.0.0.0:${WEB_PORT}"

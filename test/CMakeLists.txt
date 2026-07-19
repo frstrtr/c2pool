@@ -376,7 +376,20 @@ if (BUILD_TESTING AND GTest_FOUND)
     # share_init_verify gentx hash_link byte-parity vs oracle (coinbase_payload
     # VarStr prefix). Header-only over the dash_x11 + core link set; mirrors the
     # test_dash_conformance link set.
-    add_executable(test_dash_share_hash_link test_dash_share_hash_link.cpp)
+    # test_dash_share_producer.cpp (mint campaign slice 1): producer-side
+    # prospective share_info assembly, ref_hash/hash_link producers, oracle
+    # retarget + gentx byte goldens. Compiled into this EXISTING allowlisted
+    # target so the CI build.yml allowlist stays untouched (proven pattern).
+    # test_dash_mint_runloop.cpp (mint campaign slice 3): the run-loop mint
+    # pipeline -- producer job -> coinb1/coinb2 split -> real X11 solve ->
+    # mint_from_inputs -> tracker insert -> wire round-trip -> best-share
+    # election -> PPLNS oracle-window pin. Same allowlisted target (proven
+    # pattern), no build.yml change.
+    add_executable(test_dash_share_hash_link
+        test_dash_share_hash_link.cpp
+        test_dash_share_producer.cpp
+        test_dash_share_producer_bind.cpp
+        test_dash_mint_runloop.cpp)
     target_link_libraries(test_dash_share_hash_link PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -520,6 +533,64 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_dash_underfill_guard PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_underfill_guard "" AUTO)
+
+    # BTC underfill guard: port of the LTC/DOGE "near-empty template on a
+    # non-empty mempool" template-builder guard to the BTC embedded template
+    # path (src/impl/btc/coin/template_builder.hpp). Predicate KATs at the
+    # pinned 50 kB floor/slack + build_template wiring via the SAFE-ADDITIVE
+    # underfill_tripped seam (log-only guard; GBT projection asserted
+    # unchanged). Chain fixture = in-memory fast-start checkpoint (the BCH
+    # embedded_getwork_test shape). Link set mirrors test_template_builder
+    # (the LTC twin) with the btc OBJECT libs. MUST also be in the build.yml
+    # --target allowlist or CTest reports a NOT_BUILT sentinel.
+    add_executable(test_btc_underfill_guard test_btc_underfill_guard.cpp)
+    target_link_libraries(test_btc_underfill_guard PRIVATE
+        GTest::gtest_main GTest::gtest
+        core btc
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_btc_underfill_guard PRIVATE c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage btc_coin btclibs pool sharechain ${SECP256K1_LIBRARIES})  # OBJECT-lib SCC direct-naming (#22/#39), btc twin
+    gtest_add_tests(test_btc_underfill_guard "" AUTO)
+
+    # DGB underfill guard: same LTC/DOGE guard ported to the DGB embedded
+    # template path. DGB's build_work_template() is a pure shaper with no
+    # mempool access, so the guard evaluates in make_mempool_tx_source()
+    # (coin/embedded_tx_select.cpp) — the one mempool-visible point feeding
+    # BOTH template callers (stratum work source + EmbeddedCoinNode);
+    # predicate/thresholds pinned in coin/template_builder.hpp. Compiles the
+    # tx serialization codec, so it links the same proven SCC set as
+    # dgb_embedded_tx_select_test. MUST also be in the build.yml --target
+    # allowlist or CTest reports a NOT_BUILT sentinel.
+    add_executable(test_dgb_underfill_guard test_dgb_underfill_guard.cpp)
+    target_link_libraries(test_dgb_underfill_guard PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb dgb_stratum
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    gtest_add_tests(test_dgb_underfill_guard "" AUTO)
+
+    # BCH underfill guard: same LTC/DOGE guard ported to the BCH embedded
+    # template path (src/impl/bch/coin/template_builder.hpp; ABLA floor
+    # sizelimit + CTOR body asserted unchanged when the guard trips). Gated on
+    # COIN_BCH exactly like the bch_coin library it links (src/impl/bch is a
+    # -DCOIN_BCH=ON leg; the target cannot exist outside it). MUST also be in
+    # the build.yml BCH-leg --target allowlist or CTest reports a NOT_BUILT
+    # sentinel.
+    if(COIN_BCH)
+        add_executable(test_bch_underfill_guard test_bch_underfill_guard.cpp)
+        target_link_libraries(test_bch_underfill_guard PRIVATE
+            GTest::gtest_main GTest::gtest
+            core bch_coin
+            nlohmann_json::nlohmann_json
+            ${Boost_LIBRARIES}
+        )
+        target_link_libraries(test_bch_underfill_guard PRIVATE c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage btclibs pool sharechain)  # OBJECT-lib SCC direct-naming (#22/#39)
+        gtest_add_tests(test_bch_underfill_guard "" AUTO)
+    endif()
 
     # DASH embedded-vs-dashd work-source selector (S8 embedded_gbt live-wire
     # capstone): select_dash_work() prefers the locally-assembled embedded
@@ -666,9 +737,16 @@ if (BUILD_TESTING AND GTest_FOUND)
     # lifecycle (attach/teardown), the outbound-request->inbound-reply exchange
     # through Connection, and the real-timer idle-timeout path. Header-only over
     # the dash_x11 + core link set; same set as the p2p_connection leaf.
-    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp)
+    # Second TU (E1): test_dash_coin_p2p_client.cpp — the OPT-IN outbound-dial
+    # client (p2p_client.hpp): handshake state machine, dial-plan rotation, and
+    # the byte-exact version/verack handshake drive. Same target, no new
+    # allowlist entry needed.
+    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp)
     target_link_libraries(test_dash_p2p_node PRIVATE
         GTest::gtest_main GTest::gtest
+        dash_block_replay   # E1: coin/vendor/blockencodings.cpp — the full p2p Handler
+                            # (cmpctblock codec) the CoinClient instantiates ODR-uses
+                            # CBlockHeaderAndShortTxIDs::FillShortTxIDSelector().
         dash_x11 core
         nlohmann_json::nlohmann_json
         ${Boost_LIBRARIES}

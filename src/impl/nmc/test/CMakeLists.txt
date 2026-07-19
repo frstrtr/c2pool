@@ -27,6 +27,8 @@ if (BUILD_TESTING AND GTest_FOUND)
     # P1 PC: embedded template builder KATs. Header-only builder
     # (template_builder.hpp / rpc_data.hpp); links the same SCC the sibling
     # merkle test does (core + nmc_coin for the out-of-line transaction ctor).
+    # The underfill guard KAT that used to be compiled into this target now
+    # lives in its own nmc_underfill_guard_test target below (btc/dash/dgb symmetry).
     add_executable(nmc_template_builder_test nmc_template_builder_test.cpp)
     target_link_libraries(nmc_template_builder_test PRIVATE
         GTest::gtest_main GTest::gtest
@@ -34,6 +36,24 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(nmc_template_builder_test PRIVATE
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
     target_link_libraries(nmc_template_builder_test PRIVATE nmc_coin)
+
+    # nmc_underfill_guard_test: port of the LTC/DOGE "near-empty template on a
+    # non-empty mempool" template-builder guard to the NMC embedded template
+    # path (coin/template_builder.hpp), matching the BTC/DGB/DASH ports. Predicate
+    # KATs at the pinned 50 kB floor/slack + build_template wiring via the
+    # SAFE-ADDITIVE underfill_tripped seam (log-only guard; GBT projection asserted
+    # unchanged). Standalone target mirroring btc/dash/dgb *_underfill_guard_test
+    # for symmetry; same SCC as the sibling template_builder test (core + nmc_coin
+    # for the out-of-line transaction ctor). MUST be listed in the build.yml
+    # --target allowlist below (a registered target absent from that allowlist
+    # reds master as a NOT_BUILT sentinel: the #724/#728 lesson).
+    add_executable(nmc_underfill_guard_test nmc_underfill_guard_test.cpp)
+    target_link_libraries(nmc_underfill_guard_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core nlohmann_json::nlohmann_json)
+    target_link_libraries(nmc_underfill_guard_test PRIVATE
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage)
+    target_link_libraries(nmc_underfill_guard_test PRIVATE nmc_coin)
 
     # P1 card 237: wire-vector KAT. Round-trips the canonical CAuxPow layout
     # against a REAL Namecoin mainnet block (757000). Same SCC as the sibling
@@ -110,6 +130,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
     gtest_add_tests(nmc_auxpow_merkle_test "" AUTO)
     gtest_add_tests(nmc_template_builder_test "" AUTO)
+    gtest_add_tests(nmc_underfill_guard_test "" AUTO)
     gtest_add_tests(nmc_auxpow_wire_test "" AUTO)
     gtest_add_tests(nmc_reconstruct_won_block_test "" AUTO)
     gtest_add_tests(nmc_mempool_name_test "" AUTO)

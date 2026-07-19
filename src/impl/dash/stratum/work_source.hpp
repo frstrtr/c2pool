@@ -54,11 +54,13 @@
 #include <impl/dash/stratum/get_work.hpp>       // dash::stratum::get_work() fused capstone
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -85,6 +87,79 @@ public:
     using SubmitBlockFn = std::function<bool(const std::vector<unsigned char>& block_bytes,
                                              uint32_t height)>;
 
+    /// Found-share fields handed to the sharechain mint dispatch when a
+    /// stratum submission meets the share target (stage 4d). Mirrors the
+    /// dgb::stratum::DGBWorkSource MintShareInputs seam: the run-loop binds
+    /// the actual mint (ShareTracker add + peer broadcast) via
+    /// set_mint_share_fn once the DASH node-side share-creation seam exists;
+    /// until then submissions are accepted for vardiff and LOUDLY logged as
+    /// earning no sharechain credit (never a silent drop).
+    struct MintShareInputs {
+        std::vector<unsigned char> header_bytes;    ///< the 80-byte solved header
+        std::vector<unsigned char> coinbase_bytes;  ///< full reassembled coinbase tx
+        uint64_t                   subsidy{0};      ///< coinbasevalue frozen at job time
+        uint256                    prev_share_hash; ///< sharechain tip frozen at job time
+        std::vector<uint256>       merkle_branches; ///< parsed LE-internal branch hashes
+        std::vector<unsigned char> payout_script;   ///< miner payout script (from username)
+        uint256                    pow_hash;        ///< X11 PoW hash of header_bytes
+        // ── slice 3/3 (run-loop mint) additions ──────────────────────────
+        /// The PPLNS OP_RETURN commitment of the job's coinbase — recovered
+        /// from the coinb1 tail (the coinb1/coinb2 split sits immediately
+        /// after the 32-byte ref_hash, before the 8-byte nonce64 slot). The
+        /// run-loop keys its frozen-job registry on this; ZERO (non-producer
+        /// coinbase) can never match a frozen job -> mint declines fail-closed.
+        uint256                    ref_hash;
+        /// nonce64 the miner filled into the OP_RETURN slot: LE u64 of
+        /// extranonce1 || extranonce2 (4+4 bytes).
+        uint64_t                   last_txout_nonce{0};
+        /// Template tx hex frozen with the job (shared, may be null) — the
+        /// run-loop registers these for share relay (remember_tx serving).
+        std::shared_ptr<const std::vector<std::string>> tx_data;
+    };
+    /// Returns the minted share hash, or null-uint256 when the mint was
+    /// declined/deferred (reason logged by the callee).
+    using MintShareFn = std::function<uint256(const MintShareInputs&)>;
+
+    /// PPLNS payout inputs for the per-connection coinbase (stage 4c). The
+    /// run-loop walks the ShareTracker (walk_cumulative_weights) for the
+    /// weight map + the ref-hash commitment and binds the walk here; the work
+    /// source itself never reaches into the tracker. While UNBOUND (or when
+    /// the producer returns nullopt) the coinbase degrades to the documented
+    /// genesis form: the connecting miner's script carries the full
+    /// worker_payout (fresh pool, empty sharechain) + the GBT-mandated
+    /// masternode/superblock outputs + the donation tail.
+    struct PplnsWeights {
+        std::map<std::vector<unsigned char>, uint64_t> weights;  ///< script -> weight
+        uint64_t total_weight{0};                                ///< grand total (incl. donation weight)
+        uint256  ref_hash;                                       ///< PPLNS OP_RETURN commitment
+    };
+    using PplnsWeightsFn =
+        std::function<std::optional<PplnsWeights>(const uint256& prev_share_hash)>;
+
+    /// Producer-built share gentx for a connection's job (slice 3/3). When the
+    /// run-loop binds set_producer_job_fn, build_connection_coinbase serves the
+    /// producer share gentx VERBATIM as the stratum coinbase (split around the
+    /// 8-byte nonce64 slot), so the bytes a miner hashes are byte-identical to
+    /// what the mint-time rebuild (build_mint_share) reproduces — the mint's
+    /// X11 identity gate then passes by construction. share_bits/max_bits are
+    /// the oracle-retargeted share target committed in the share_info; the
+    /// work source publishes them via set_share_target so the mining_submit
+    /// classification gate matches the share's own target.
+    struct ProducerJob {
+        std::vector<unsigned char> gentx_bytes;    ///< full share gentx, nonce64 slot zeroed
+        size_t                     nonce64_offset{0}; ///< first byte of the 8B nonce64 slot
+        uint256                    ref_hash;       ///< PPLNS OP_RETURN commitment (registry key)
+        uint32_t                   share_bits{0};  ///< share_info.bits (oracle retarget)
+        uint32_t                   share_max_bits{0}; ///< share_info.max_bits
+    };
+    /// Returns nullopt when no producer job can be built right now (tracker
+    /// busy, non-P2PKH payout, no template) — the coinbase then degrades to
+    /// the non-producer path (block-valid, mint declines fail-closed).
+    using ProducerJobFn = std::function<std::optional<ProducerJob>(
+        const uint256& prev_share_hash,
+        const std::vector<unsigned char>& payout_script,
+        const coin::DashWorkData& wd)>;
+
     /// Construct the DASH work source. Holds a NON-OWNING reference to the
     /// node-held coin-state (the embedded arm) and captures the REQUIRED dashd
     /// getblocktemplate fallback closure -- the always-reachable safety path +
@@ -92,10 +167,13 @@ public:
     /// submit callback. main_dash.cpp owns coin_state for the process lifetime
     /// and constructs this after it (see the Lifetime note above); the fallback
     /// and submit closures capture the dashd RPC client + won-block dispatcher.
+    /// `is_testnet` selects the coin params (address versions for GBT payee
+    /// decode + the v36 version gate) the coinbase builder consumes.
     DASHWorkSource(const coin::NodeCoinState& coin_state,
                    std::function<coin::DashWorkData()> dashd_fallback,
                    SubmitBlockFn submit_fn = {},
-                   core::stratum::StratumConfig config = {});
+                   core::stratum::StratumConfig config = {},
+                   bool is_testnet = false);
 
     ~DASHWorkSource();
 
@@ -178,7 +256,28 @@ public:
     /// ShareTracker is constructed.
     void set_best_share_hash_fn(std::function<uint256()> fn);
 
+    /// Wire the sharechain mint dispatch (stage 4d follow-up). While unbound,
+    /// share-target submissions are accepted for vardiff + loudly logged.
+    void set_mint_share_fn(MintShareFn fn);
+
+    /// Wire the ShareTracker PPLNS weight walk (stage 4c multi-output path).
+    /// While unbound, the coinbase uses the genesis single-miner split.
+    void set_pplns_weights_fn(PplnsWeightsFn fn);
+
+    /// Wire the run-loop producer-job builder (slice 3/3). While unbound the
+    /// coinbase path is byte-unchanged (compute_dash_payouts + coinbase::build)
+    /// and share-target submissions cannot mint (loud fail-closed decline).
+    void set_producer_job_fn(ProducerJobFn fn);
+
 private:
+    /// Template cache resolve: return the cached DashWorkData snapshot when it
+    /// is still fresh (same work_generation AND younger than the staleness
+    /// TTL), else re-source it through the embedded/fallback selector
+    /// (coin_state_.select_work). Returns nullptr on an honest set-gap (no
+    /// template source armed / empty template) -- never a fabricated one.
+    /// Bumps work_generation_ when a refresh observes a moved coin tip so
+    /// stratum sessions re-push work on their next heartbeat.
+    std::shared_ptr<const coin::DashWorkData> cached_work() const;
     // External dependencies (non-owning references) -- see Lifetime note.
     const coin::NodeCoinState&  coin_state_;    ///< embedded work arm (populated -> Embedded)
     std::function<coin::DashWorkData()> dashd_fallback_;  ///< always-reachable dashd GBT RPC arm (never removed)
@@ -189,8 +288,12 @@ private:
     // Config (held by value; const after construction in MVP).
     core::stratum::StratumConfig config_;
 
-    // Atomic state.
-    std::atomic<uint64_t>       work_generation_{0};
+    // Network selector for coin-params resolution (address versions + v36 gate).
+    bool is_testnet_{false};
+
+    // Atomic state. work_generation_ is mutable: the const template-cache
+    // resolve (cached_work) bumps it when a refresh observes a moved tip.
+    mutable std::atomic<uint64_t> work_generation_{0};
     std::atomic<uint32_t>       share_bits_{0};
     std::atomic<uint32_t>       share_max_bits_{0};
 
@@ -202,10 +305,27 @@ private:
     mutable std::mutex          best_share_mutex_;
     std::function<uint256()>    best_share_hash_fn_;
 
-    // Template cache (filled lazily; invalidated when work_generation_ bumps).
-    // Stage 4c populates these.
+    // Sharechain mint dispatch (stage 4d). Empty until wired.
+    mutable std::mutex          mint_share_mutex_;
+    MintShareFn                 mint_share_fn_;
+
+    // PPLNS weight walk (stage 4c multi-output path). Empty until wired.
+    mutable std::mutex          pplns_mutex_;
+    PplnsWeightsFn              pplns_weights_fn_;
+
+    // Producer-job builder (slice 3/3 run-loop mint). Empty until wired.
+    mutable std::mutex          producer_job_mutex_;
+    ProducerJobFn               producer_job_fn_;
+
+    // Template cache (stage 4c): the last DashWorkData sourced through the
+    // embedded/fallback selector, keyed on work_generation_ + a staleness TTL
+    // (kStaleAfter). A failed fetch is negative-cached for kRetryAfter so a
+    // down dashd is not hammered by every session's 1 s notify retry timer.
     mutable std::mutex          template_mutex_;
-    // ... cache fields land here in stage 4c
+    mutable std::shared_ptr<const coin::DashWorkData> template_cache_;
+    mutable uint64_t            template_cache_gen_{0};
+    mutable std::chrono::steady_clock::time_point template_cache_at_{};
+    mutable std::chrono::steady_clock::time_point template_last_fail_at_{};
 };
 
 }  // namespace dash::stratum

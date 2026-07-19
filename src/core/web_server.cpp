@@ -8425,6 +8425,43 @@ bool WebServer::start()
             });
         }
 
+        // ── No-embedded RPC mode: recurring getblocktemplate poll ─────────────
+        // The one-shot fetch above is the ONLY template refresh in --no-embedded
+        // mode: there is no embedded header-sync on_new_headers callback and no
+        // ZMQ/longpoll subscription to fire "bestblock" events (embedded mode drives
+        // refresh via on_new_headers → trigger_work_refresh). If the daemon was still
+        // in IBD at the 500ms one-shot, m_work_valid stayed false and never recovered
+        // because nothing polls again. Add a recurring poll that (a) bootstraps the
+        // cache once the daemon leaves IBD and (b) re-notifies miners when the network
+        // tip advances — replacing the event source embedded mode gets for free.
+        if (m_coin_node_ && m_coin_node_->has_rpc() && !m_coin_node_->is_embedded()) {
+            auto poll = std::make_shared<net::steady_timer>(ioc_);
+            auto prev_hash = std::make_shared<std::string>();
+            auto poll_fn = std::make_shared<std::function<void(beast::error_code)>>();
+            *poll_fn = [this, poll, prev_hash, poll_fn](beast::error_code ec) {
+                if (ec || !running_) return;
+                poll->expires_after(std::chrono::seconds(2));
+                poll->async_wait(*poll_fn);
+                try {
+                    mining_interface_->refresh_work();
+                    std::string tip = mining_interface_->get_current_gbt_prevhash();
+                    if (!tip.empty() && tip != *prev_hash) {
+                        bool first = prev_hash->empty();
+                        *prev_hash = tip;
+                        if (stratum_server_) stratum_server_->notify_all();
+                        LOG_INFO << "[LTC] no-embed GBT poll: "
+                                 << (first ? "first template " : "new tip ")
+                                 << tip.substr(0, 16) << "... — miners notified";
+                    }
+                } catch (const std::exception& e) {
+                    LOG_WARNING << "[LTC] no-embed GBT poll failed: " << e.what();
+                }
+            };
+            poll->expires_after(std::chrono::seconds(2));
+            poll->async_wait(*poll_fn);
+            LOG_INFO << "[LTC] no-embedded RPC mode: recurring GBT poll scheduled (2s)";
+        }
+
         // Schedule stat_log timer (every 60 seconds for graph data)
         {
             auto stat_timer = std::make_shared<net::steady_timer>(ioc_);

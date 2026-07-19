@@ -52,6 +52,11 @@ struct StratumConfig {
     // max_stratum_connections (YAML) / --max-stratum-connections (CLI).
     // Admission control only — zero wire-byte change for admitted sessions.
     size_t max_stratum_connections = 100;
+    // Runtime coin tag for coin-agnostic core log lines (e.g. the "waiting
+    // for block template" warning). Set by each coin's work source / main so
+    // a DASH binary never logs "[LTC]" (issue #732 secondary defect). Empty
+    // -> the core falls back to the neutral "[Stratum]" tag.
+    std::string coin_symbol;
 };
 
 /// Frozen share-construction fields returned by ref_hash_fn. These
