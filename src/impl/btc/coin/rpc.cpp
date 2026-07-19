@@ -393,12 +393,19 @@ void NodeRPC::submit_block(BlockType& block, bool ignore_failure)
 
 bool NodeRPC::submit_block_hex(const std::string& block_hex, bool ignore_failure)
 {
+	(void)ignore_failure;
 	auto result = m_client.CallMethod<nlohmann::json>(ID, "submitblock", {block_hex});
 	bool success = result.is_null();
-	if (!success && !ignore_failure)
-		LOG_ERROR << "submit_block_hex result: " << result.dump();
-	else if (success)
+	if (success)
 		LOG_INFO << "submit_block_hex accepted";
+	else
+		// A won block rejection reason is load-bearing diagnostic data: the
+		// daemon returns a verdict string ("bad-witness-merkle-match",
+		// "high-hash", "Superfluous witness record", ...). Surface it ALWAYS.
+		// ignore_failure governs fatality (never throw out of the won-block
+		// path), NOT log visibility -- a swallowed reason blinds block-prod
+		// debugging (G3b submits went pending -> rejected with no cause).
+		LOG_ERROR << "submit_block_hex REJECTED by daemon: " << result.dump();
 	return success;
 }
 
