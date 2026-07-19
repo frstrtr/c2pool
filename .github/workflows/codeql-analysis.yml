@@ -48,8 +48,22 @@ jobs:
           queries: security-and-quality
 
       - if: matrix.build-mode == 'manual'
-        name: Set per-job Conan home
-        run: echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+        name: Set Conan home
+        run: |
+          # github-hosted: ephemeral per-job home, warmed by actions/cache below.
+          # self-hosted:   PERSISTENT home dedicated to this workflow. Restoring a
+          # multi-hundred-MB conan2 tree from the GH cache service onto VM905 is
+          # the flake ("Failed to restore: The operation cannot be completed in
+          # timeout"), and on a miss it forced a from-source boost rebuild too.
+          # A local persistent home takes the network off the hot path.
+          # Keyed on the runner instance (NOT the shared ~/.conan2): a runner runs
+          # one job at a time, so this home is never contended even across refs,
+          # preserving the torn-cache isolation of #704/#710.
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+          else
+            echo "CONAN_HOME=$HOME/.conan2-ci/$RUNNER_NAME" >> "$GITHUB_ENV"
+          fi
 
       # ── C++ build (manual mode only) ─────────────────────────────────────
       - if: matrix.build-mode == 'manual' && runner.environment == 'github-hosted'
@@ -78,8 +92,8 @@ jobs:
             conan --version   # pre-provisioned at /usr/local/bin on self-hosted
           fi
 
-      - if: matrix.build-mode == 'manual'
-        name: Restore Conan package cache
+      - if: matrix.build-mode == 'manual' && runner.environment == 'github-hosted'
+        name: Restore Conan package cache (github-hosted only)
         uses: actions/cache@v5
         with:
           path: ${{ runner.temp }}/conan2
@@ -93,13 +107,24 @@ jobs:
 
       - if: matrix.build-mode == 'manual'
         name: Install Conan dependencies
+        # Bounded retry: remote package downloads are the only network step left
+        # here, and a transient remote/CDN hiccup should not red a verified-good
+        # release PR.
         run: |
-          conan install . \
-            -pr:a=ci/conan/linux-gcc13.profile \
-            --lockfile=conan.lock \
-            --build=missing \
-            --output-folder=build_codeql \
-            --settings=build_type=Release
+          for attempt in 1 2 3; do
+            if conan install . \
+                 -pr:a=ci/conan/linux-gcc13.profile \
+                 --lockfile=conan.lock \
+                 --build=missing \
+                 --output-folder=build_codeql \
+                 --settings=build_type=Release; then
+              exit 0
+            fi
+            echo "conan install failed (attempt $attempt/3); retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          echo "conan install failed after 3 attempts" >&2
+          exit 1
 
       - if: matrix.build-mode == 'manual'
         name: Build for CodeQL analysis
