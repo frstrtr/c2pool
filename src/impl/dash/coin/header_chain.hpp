@@ -15,6 +15,7 @@
 #include <core/pack.hpp>
 #include <core/hash.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -315,6 +316,31 @@ public:
     size_t size() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_headers.size();
+    }
+
+    // Median-time-past of the tip: median of the last 11 block timestamps
+    // (dashcore GetMedianTimePast / BIP113). build_embedded_workdata() uses
+    // mtp_at_tip+1 as the template mintime, so the embedded arm needs a real
+    // MTP off the header chain to match dashd's GBT. Falls back to the tip
+    // timestamp when fewer than 11 headers are indexed (cold start).
+    uint32_t median_time_past() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_tip.IsNull()) return 0;
+        static constexpr int MEDIAN_SPAN = 11;
+        std::vector<uint32_t> times;
+        times.reserve(MEDIAN_SPAN);
+        int64_t h = static_cast<int64_t>(m_tip_height);
+        for (int i = 0; i < MEDIAN_SPAN && h >= 0; ++i, --h) {
+            auto e = get_header_by_height_internal(static_cast<uint32_t>(h));
+            if (!e) break;
+            times.push_back(e->header.m_timestamp);
+        }
+        if (times.empty()) {
+            auto it = m_headers.find(m_tip);
+            return it != m_headers.end() ? it->second.header.m_timestamp : 0;
+        }
+        std::sort(times.begin(), times.end());
+        return times[times.size() / 2];
     }
 
     bool has_header(const uint256& hash) const {

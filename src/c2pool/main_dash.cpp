@@ -57,6 +57,13 @@
 #include <impl/dash/coin/p2p_client.hpp>   // dash::coin::p2p::CoinClient — OPT-IN coin-network dial (E1, --coin-p2p-connect)
 #include <impl/dash/coin/node_coin_state.hpp>  // dash::coin::NodeCoinState (embedded work bundle)
 #include <impl/dash/coin/utxo_lane.hpp>    // dash::coin::UtxoLane — embedded UTXO/fee lane (E2b, #738)
+#include <impl/dash/coin/header_chain.hpp>       // dash::coin::HeaderChain — SPV header/tip authority (E2a)
+#include <impl/dash/coin/coin_state_maintainer.hpp>  // dash::coin::CoinStateMaintainer — populate ordering gate (E2a)
+#include <impl/dash/coin/live_feed.hpp>          // E2a live-feed bridge (raw wire events -> derived ingest events)
+#include <impl/dash/coin/mempool_ingest.hpp>     // wire_mempool_ingest (leg 1)
+#include <impl/dash/coin/tip_ingest.hpp>         // wire_tip_ingest (leg 2)
+#include <impl/dash/coin/block_connect_ingest.hpp>   // wire_block_connect_ingest (leg 3)
+#include <impl/dash/coin/mn_list_ingest.hpp>     // wire_mn_list_ingest (leg 4)
 #include <impl/dash/node.hpp>          // dash::Node — sharechain pool-node (NodeBridge<NodeImpl,Legacy,Actual>)
 #include <impl/dash/config.hpp>        // dash::Config (PoolConfig/CoinConfig)
 #include <impl/dash/config_pool.hpp>   // dash::SharechainConfig — P2P_PORT / PREFIX / min-proto SSOT
@@ -914,6 +921,156 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     };
     think_timer->expires_after(std::chrono::seconds(15));
     think_timer->async_wait(*think_tick);
+
+    // ── E2a: wire the LIVE coin-P2P feed into the maintainer -> populate ──
+    // GUARANTEE: this whole block is gated on `coin_p2p` (i.e. --coin-p2p-connect
+    // was supplied). With NO flag, coin_p2p is null, none of the header chain /
+    // maintainer / ingest legs below are constructed, and run_node is byte-
+    // identical to the released dashd-fallback prod path. The subscriptions are
+    // REGISTERED here (before ioc.run()); no wire event can fire until the loop
+    // below pumps the socket I/O, so wiring after the E1 connect() is race-free.
+    //
+    // These locals are declared LAST in run_node's scope so they are destroyed
+    // FIRST at return (after ioc.run() has stopped and no further events fire):
+    // subscription handles -> maintainer -> header_chain, all torn down before
+    // node_coin_state / coin_state (declared earlier) they reference.
+    std::unique_ptr<dash::coin::HeaderChain> header_chain;
+    std::unique_ptr<dash::coin::CoinStateMaintainer> maintainer;
+    std::vector<std::shared_ptr<EventDisposable>> coin_feed_subs;
+    if (coin_p2p) {
+        const auto dash_params = testnet
+            ? dash::coin::make_dash_chain_params_testnet()
+            : dash::coin::make_dash_chain_params_mainnet();
+        const auto hdr_db = (core::filesystem::config_path()
+            / net_subdir / "dash_headers").string();
+        header_chain = std::make_unique<dash::coin::HeaderChain>(dash_params, hdr_db);
+        header_chain->init();
+
+        maintainer = std::make_unique<dash::coin::CoinStateMaintainer>(node_coin_state);
+
+        // Coin address versions for the embedded coinbase-payee encoding (the
+        // TipAdvance carries them so build_embedded_workdata can encode the MN
+        // payee); sourced from the oracle CoinParams, testnet/mainnet-aware.
+        const core::CoinParams coin_params = dash::make_coin_params(testnet);
+        const uint8_t addr_ver  = coin_params.address_version;
+        const uint8_t p2sh_ver  = coin_params.address_p2sh_version;
+
+        // Leg 1 (mempool relay): new_tx -> maintainer.on_mempool_tx. Optional
+        // for viability; enriches the assembled template.
+        coin_feed_subs.push_back(
+            c2pool::dash::wire_mempool_ingest(coin_state, *maintainer));
+        // Leg 2 (tip advance): Node::new_tip -> maintainer.on_new_tip. The
+        // new_tip event is FIRED by the tip-changed callback below (off the
+        // header chain), NOT the raw wire.
+        coin_feed_subs.push_back(
+            c2pool::dash::wire_tip_ingest(coin_state, *maintainer));
+        // Leg 3 (block connect): Node::block_connected -> maintainer
+        // .on_block_connected (MnStateMachine::apply_block, folds DIP3 special
+        // txs into the DMN set). block_connected is fired by the live-feed
+        // bridge (full_block -> height lookup). The E2b UTXO lane is ALSO
+        // subscribed to the same event (its connect_block + fee recompute).
+        coin_feed_subs.push_back(
+            c2pool::dash::wire_block_connect_ingest(coin_state, *maintainer));
+        // Leg 4 (mnlistdiff RESYNC): Node::mn_list_update -> maintainer
+        // .on_mn_list_update. Wired for completeness; a payee-complete DMN-set
+        // source over P2P is the known follow-on (see PR — Dash's Simplified MN
+        // List omits scriptPayout, so the authoritative payout-bearing set is
+        // built by leg 3's apply_block over connected block bodies).
+        coin_feed_subs.push_back(
+            c2pool::dash::wire_mn_list_ingest(coin_state, *maintainer));
+
+        // Bridge: new_headers -> HeaderChain::add_headers (X11 PoW + DGW
+        // validated). The tip authority for the embedded template.
+        coin_feed_subs.push_back(
+            dash::coin::wire_header_ingest(coin_state, *header_chain));
+        // Bridge: full_block -> (X11 hash -> header-chain height) ->
+        // Node::block_connected, driving leg 3 + the E2b UTXO lane.
+        coin_feed_subs.push_back(
+            dash::coin::wire_full_block_ingest(coin_state, *header_chain));
+
+        // new_block(inv hash) -> pull the full block from the peer (getdata).
+        // Closes the loop so live tip blocks arrive as full_block -> connect.
+        coin_feed_subs.push_back(
+            coin_state.new_block.subscribe(
+                [cp = coin_p2p.get()](const uint256& hash) {
+                    cp->request_block(hash);
+                }));
+
+        // new_chainlock -> record into the best-chainlock tracker (finalization
+        // signal the block-find submit path can consult).
+        coin_feed_subs.push_back(
+            coin_state.new_chainlock.subscribe(
+                [&coin_state](const std::pair<uint256, int32_t>& cl) {
+                    coin_state.chainlocked_blocks[cl.first] = cl.second;
+                }));
+
+        // Header self-propel: after each accepted headers batch, request the
+        // next batch off the updated locator so the chain catches up to tip.
+        // Registered AFTER wire_header_ingest so add_headers runs first and the
+        // locator reflects the new tip.
+        coin_feed_subs.push_back(
+            coin_state.new_headers.subscribe(
+                [cp = coin_p2p.get(), hc = header_chain.get()]
+                (const std::vector<dash::coin::BlockHeaderType>& batch) {
+                    if (batch.empty()) return;
+                    cp->send_getheaders(70230, hc->get_locator(), uint256::ZERO);
+                }));
+
+        // Tip-changed callback: (a) fire Node::new_tip (leg 2 arms tip-readiness
+        // -> the maintainer republishes once the MN list is ALSO seeded ->
+        // populated() flips), and (b) #739 idle-notify: bump work-generation +
+        // notify sessions on a real tip change so idle miners are not wedged on
+        // stale work between job-push timer firings (event-driven notify).
+        header_chain->set_on_tip_changed(
+            [&coin_state, &stratum_server, hc = header_chain.get(),
+             addr_ver, p2sh_ver, ws = work_source.get()]
+            (const uint256&, uint32_t, const uint256& new_tip, uint32_t new_height) {
+                auto ta = dash::coin::tip_advance_from_chain(
+                    *hc, addr_ver, p2sh_ver);
+                if (ta) {
+                    coin_state.new_tip.happened(*ta);
+                    LOG_INFO << "[EMB-DASH] tip advanced h=" << new_height
+                             << " " << new_tip.GetHex().substr(0, 16)
+                             << " bits=0x" << std::hex << ta->bits_for_next << std::dec
+                             << " -> new_tip fired (maintainer arm)";
+                }
+                // #739: event-driven stale-work notify.
+                if (ws) ws->bump_work_generation();
+                if (stratum_server) stratum_server->notify_all();
+            });
+
+        // E2b UTXO bootstrap window-refill seam: request historical block
+        // bodies BY HEIGHT (header-chain hash lookup) so the UTXO view + the
+        // MnStateMachine (apply_block) fill forward from the live feed.
+        if (embedded_utxo && utxo_lane.live()) {
+            utxo_lane.set_request_block_fn(
+                [cp = coin_p2p.get(), hc = header_chain.get()](uint32_t h) {
+                    auto e = hc->get_header_by_height(h);
+                    if (e) cp->request_block(e->hash);
+                });
+        }
+
+        // Peer's reported chain height -> header-chain sync-progress gauge.
+        coin_p2p->set_on_peer_height(
+            [hc = header_chain.get()](uint32_t h) { hc->set_peer_tip_height(h); });
+
+        // Kick the initial sync once the version/verack handshake completes:
+        // getheaders off our current locator + a mempool prime.
+        coin_p2p->set_on_handshake_complete(
+            [cp = coin_p2p.get(), hc = header_chain.get()]() {
+                LOG_INFO << "[EMB-DASH] handshake complete -> initial sync:"
+                            " getheaders + mempool";
+                cp->send_getheaders(70230, hc->get_locator(), uint256::ZERO);
+                cp->send_mempool();
+            });
+
+        std::cout << "[run] E2a live-feed wired: header-chain(" << hdr_db
+                  << ") + CoinStateMaintainer + 6 ingest subscriptions;"
+                     " populate flips get_work to the EMBEDDED arm once the tip"
+                     " (headers) AND the DMN set (block-connect apply_block) are"
+                     " present" << (embedded_utxo ? " + UTXO maturity>=106" : "")
+                  << "\n";
+    }
 
     std::cout << "[run] run-loop up (Ctrl-C to stop); won blocks relay via the\n"
                  "[run] dashd-RPC submitblock fallback + the embedded sharechain P2P leg.\n";
