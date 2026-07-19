@@ -130,6 +130,13 @@ public:
     nlohmann::json getblockheader(uint256 header, bool verbose = true);
     // verbosity: 0 for hex-encoded data, 1 for a json object, and 2 for json object with transaction data
     nlohmann::json getblock(uint256 blockhash, int verbosity = 1);
+    // E2c (#738): `protx list valid true` -- the full valid deterministic-MN
+    // set at the current tip in the DETAILED shape (state.payoutAddress +
+    // lastPaidHeight + registeredHeight + PoSe heights). This is the
+    // payout-bearing MN-set SEED source for the embedded arm; the P2P
+    // Simplified MN List omits scriptPayout/lastPaidHeight so it can never
+    // back this. See coin/mn_seed.hpp (parse_protx_list_seed).
+    nlohmann::json protx_list_valid_detailed();
 };
 
 struct RPCAuthData

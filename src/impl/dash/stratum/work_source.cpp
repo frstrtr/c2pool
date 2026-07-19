@@ -259,7 +259,21 @@ std::shared_ptr<const coin::DashWorkData> DASHWorkSource::cached_work() const
     coin::DashWorkData work;
     if (coin_state_.populated() || dashd_fallback_) {
         try {
-            work = coin_state_.select_work(dashd_fallback_).work;
+            coin::WorkSelection sel = coin_state_.select_work(dashd_fallback_);
+            // E2c observability: WHICH arm served this template + the MN payee
+            // it carries (the payee-correctness axis of the embedded arm). One
+            // line per re-source (cache-TTL cadence), INFO -- the field-
+            // checkable "embedded arm is live and paying the right MN" signal
+            // the E2c smoke gate and prod diagnosis both read.
+            std::string mn_payee = "(none)";
+            for (const auto& pp : sel.work.m_packed_payments)
+                if (pp.payee != "!6a") { mn_payee = pp.payee; break; }
+            LOG_INFO << "[DASH-STRATUM-GBT] template sourced: arm="
+                     << (sel.source == coin::WorkSource::Embedded
+                             ? "EMBEDDED" : "dashd-fallback")
+                     << " h=" << sel.work.m_height
+                     << " mn_payee=" << mn_payee;
+            work = std::move(sel.work);
         } catch (const std::exception& e) {
             LOG_WARNING << "[DASH-STRATUM] template sourcing threw: " << e.what();
             work = coin::DashWorkData{};

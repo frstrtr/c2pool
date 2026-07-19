@@ -64,6 +64,7 @@
 #include <impl/dash/coin/tip_ingest.hpp>         // wire_tip_ingest (leg 2)
 #include <impl/dash/coin/block_connect_ingest.hpp>   // wire_block_connect_ingest (leg 3)
 #include <impl/dash/coin/mn_list_ingest.hpp>     // wire_mn_list_ingest (leg 4)
+#include <impl/dash/coin/mn_seed.hpp>            // E2c: RPC protx-list MN-set seed (parse_protx_list_seed)
 #include <impl/dash/node.hpp>          // dash::Node — sharechain pool-node (NodeBridge<NodeImpl,Legacy,Actual>)
 #include <impl/dash/config.hpp>        // dash::Config (PoolConfig/CoinConfig)
 #include <impl/dash/config_pool.hpp>   // dash::SharechainConfig — P2P_PORT / PREFIX / min-proto SSOT
@@ -971,11 +972,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // subscribed to the same event (its connect_block + fee recompute).
         coin_feed_subs.push_back(
             c2pool::dash::wire_block_connect_ingest(coin_state, *maintainer));
-        // Leg 4 (mnlistdiff RESYNC): Node::mn_list_update -> maintainer
-        // .on_mn_list_update. Wired for completeness; a payee-complete DMN-set
-        // source over P2P is the known follow-on (see PR — Dash's Simplified MN
-        // List omits scriptPayout, so the authoritative payout-bearing set is
-        // built by leg 3's apply_block over connected block bodies).
+        // Leg 4 (MN-set RESYNC): Node::mn_list_update -> maintainer
+        // .on_mn_list_update. Dash's P2P Simplified MN List omits scriptPayout,
+        // so the payout-bearing feed for this leg is the E2c RPC seed below
+        // (startup baseline) + leg 3's apply_block folding special txs on top.
         coin_feed_subs.push_back(
             c2pool::dash::wire_mn_list_ingest(coin_state, *maintainer));
 
@@ -1070,6 +1070,65 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                      " (headers) AND the DMN set (block-connect apply_block) are"
                      " present" << (embedded_utxo ? " + UTXO maturity>=106" : "")
                   << "\n";
+
+        // ── E2c (#738): RPC MN-set SEED — flip the DMN half of populated() ──
+        // E2a proved the TIP half populates live, but populated() ALSO needs a
+        // payout-bearing DMN set, and no live leg can cold-start one: the P2P
+        // Simplified MN List (leg 4's wire form) omits scriptPayout +
+        // nLastPaidHeight, and leg 3's apply_block only folds special txs from
+        // blocks we actually connect (a full DIP3-height replay = E2d). So when
+        // the dashd-RPC arm is ARMED, fetch the full valid DMN set ONCE via
+        // `protx list valid true` (payoutAddress + lastPaidHeight — everything
+        // GetMNPayee ordering needs) and publish it through the EXISTING leg-4
+        // event, so the maintainer takes it exactly like any other resync. The
+        // parse FAILS CLOSED (mn_seed.hpp): any undecodable payoutAddress
+        // aborts the whole seed rather than minting a wrong payee (the
+        // bad-cb-payee class #746 fixed). Synchronous-before-ioc.run() is safe:
+        // NodeRPC::Send self-connects via the blocking sync_reconnect fallback
+        // (the same property --submit-block relies on).
+        if (rpc) {
+            try {
+                dash::coin::MnSeedStats seed_stats;
+                auto seed = dash::coin::parse_protx_list_seed(
+                    rpc->protx_list_valid_detailed(), addr_ver, p2sh_ver,
+                    &seed_stats);
+                if (!seed.empty()) {
+                    dash::interfaces::MnListUpdate up;
+                    up.mnstates = std::move(seed);
+                    coin_state.mn_list_update.happened(up);
+                    std::cout << "[run] E2c MN-set seed LOADED: "
+                              << seed_stats.seeded << "/" << seed_stats.total
+                              << " valid MNs (" << seed_stats.evo << " Evo) from"
+                                 " dashd `protx list valid true` -> maintainer"
+                                 " DMN half ARMED; populated() flips once the"
+                                 " header tip syncs\n";
+                } else {
+                    std::cout << "[run] E2c MN-set seed EMPTY/ABORTED (total="
+                              << seed_stats.total << " decode_failed="
+                              << seed_stats.payout_decode_failed
+                              << " malformed=" << seed_stats.malformed
+                              << ") -- populated() waits for the special-tx"
+                                 " replay path; dashd fallback keeps serving\n";
+                }
+            } catch (const std::exception& e) {
+                std::cout << "[run] E2c MN-set seed FAILED (protx list RPC: "
+                          << e.what() << ") -- populated() waits for the"
+                             " special-tx replay path; dashd fallback keeps"
+                             " serving\n";
+            }
+        } else {
+            // Pure daemonless: no dashd RPC to seed from. The DMN set must
+            // come from a DIP3-height special-tx replay (sync block bodies
+            // from DIP3 activation, replay ProRegTx/ProUpRegTx/... through
+            // MnStateMachine::apply_block) — the flagged E2d follow-up slice.
+            // Flag loudly, don't fail: the run-loop stands up, the tip half
+            // still syncs, and get_work stays on the (unarmed) fallback.
+            std::cout << "[run] E2c MN-set seed UNAVAILABLE (embedded arm"
+                         " enabled but NO coin-RPC configured): populated()"
+                         " will wait for the DIP3 special-tx replay path"
+                         " (E2d follow-up) -- templates keep routing to the"
+                         " fallback arm\n";
+        }
     }
 
     std::cout << "[run] run-loop up (Ctrl-C to stop); won blocks relay via the\n"

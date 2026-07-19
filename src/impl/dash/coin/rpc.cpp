@@ -456,6 +456,18 @@ nlohmann::json NodeRPC::getblock(uint256 blockhash, int verbosity)
     return CallAPIMethod("getblock", {blockhash, verbosity});
 }
 
+// E2c (#738): the MN-set seed fetch. `protx list valid true` returns every
+// registered, non-PoSe-banned masternode at the current tip with the detailed
+// per-MN state (payoutAddress, lastPaidHeight, registeredHeight, PoSe
+// heights, pubKeyOperator, ...). Chosen over `protx diff`: the diff (even
+// extended) carries payoutAddress but NOT lastPaidHeight/registeredHeight, so
+// a diff-seeded set would rank every MN equal in GetMNPayee ordering and
+// project the WRONG payee (the bad-cb-payee class #746 fixed).
+nlohmann::json NodeRPC::protx_list_valid_detailed()
+{
+    return CallAPIMethod("protx", {"list", "valid", true});
+}
+
 } // namespace coin
 
 } // namespace dash
