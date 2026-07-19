@@ -57,6 +57,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -131,6 +132,20 @@ parse_bls_pubkey_hex(const std::string& hex)
     return out;
 }
 
+// Strict 64-lowercase/uppercase-hex check for RPC hash strings. uint256S is
+// TOLERANT of short/garbage input (parses what it can), which would key a
+// seeded MN under a wrong/zero hash that later apply_block updates never
+// match — a silent drift instead of the contracted fail-closed abort.
+inline bool is_hex256(const std::string& s)
+{
+    if (s.size() != 64) return false;
+    for (char c : s)
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
+              || (c >= 'A' && c <= 'F')))
+            return false;
+    return true;
+}
+
 } // namespace detail
 
 /// Convert a dashd `protx list valid true` (detailed) JSON array into the
@@ -153,13 +168,27 @@ inline std::vector<std::pair<uint256, MNState>> parse_protx_list_seed(
     }
     out.reserve(list.size());
 
+    // Duplicate-collateral guard: MnStateMachine::load() keys a collateral
+    // index by outpoint, so two seeded MNs sharing one would silently shadow
+    // each other there. Real dashd output cannot contain duplicates (DIP3
+    // consensus enforces unique collaterals); seeing one means the input is
+    // not a real protx list — fail closed.
+    std::set<std::pair<uint256, uint32_t>> seen_collateral;
+
     for (const auto& e : list) {
         ++st.total;
+        bool entry_malformed = false;
+        try {
         if (!e.is_object() || !e.contains("proTxHash")
+            || !e["proTxHash"].is_string()
+            || !detail::is_hex256(e["proTxHash"].get<std::string>())
             || !e.contains("state") || !e["state"].is_object()) {
+            entry_malformed = true;
+        }
+        if (entry_malformed) {
             ++st.malformed;
             LOG_WARNING << "[MN-SEED] malformed protx entry (#" << st.total
-                        << ": no proTxHash/state) -- seed aborted";
+                        << ": bad proTxHash/state) -- seed aborted";
             if (stats) *stats = st;
             return {};
         }
@@ -169,11 +198,21 @@ inline std::vector<std::pair<uint256, MNState>> parse_protx_list_seed(
 
         // Identity / registration facets.
         const uint256 proTxHash = uint256S(e["proTxHash"].get<std::string>());
-        if (e.contains("collateralHash"))
+        if (e.contains("collateralHash") && e["collateralHash"].is_string()
+            && detail::is_hex256(e["collateralHash"].get<std::string>()))
             mn.collateralOutpoint.hash =
                 uint256S(e["collateralHash"].get<std::string>());
         if (e.contains("collateralIndex") && e["collateralIndex"].is_number())
             mn.collateralOutpoint.index = e["collateralIndex"].get<uint32_t>();
+        if (!seen_collateral.emplace(mn.collateralOutpoint.hash,
+                                     mn.collateralOutpoint.index).second) {
+            ++st.malformed;
+            LOG_WARNING << "[MN-SEED] duplicate collateral outpoint in protx"
+                           " list (proTx " << proTxHash.GetHex().substr(0, 16)
+                        << ") -- seed aborted (not a real DIP3 set)";
+            if (stats) *stats = st;
+            return {};
+        }
         // JSON reports operatorReward as a percentage double (dashd ToJson:
         // nOperatorReward / 100.0); recover the internal 0..10000 fixed-point.
         if (e.contains("operatorReward") && e["operatorReward"].is_number())
@@ -232,6 +271,17 @@ inline std::vector<std::pair<uint256, MNState>> parse_protx_list_seed(
 
         out.emplace_back(proTxHash, std::move(mn));
         ++st.seeded;
+        } catch (const nlohmann::json::exception& ex) {
+            // Type mismatch anywhere in the entry (numeric proTxHash,
+            // non-numeric height, ...): the parser's contract is a FAIL-CLOSED
+            // empty return, never an escaping throw.
+            ++st.malformed;
+            LOG_WARNING << "[MN-SEED] protx entry #" << st.total
+                        << " JSON type error (" << ex.what()
+                        << ") -- seed aborted";
+            if (stats) *stats = st;
+            return {};
+        }
     }
 
     if (stats) *stats = st;

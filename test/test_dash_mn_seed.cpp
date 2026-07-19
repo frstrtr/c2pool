@@ -30,6 +30,7 @@
 #include <impl/dash/coin/node_interface.hpp>       // dash::interfaces::Node
 #include <impl/dash/coin/mn_list_ingest.hpp>       // wire_mn_list_ingest (leg 4)
 #include <impl/dash/coin/tip_ingest.hpp>           // wire_tip_ingest (leg 2)
+#include <impl/dash/coin/block_connect_ingest.hpp> // wire_block_connect_ingest (leg 3)
 #include <impl/dash/coin/coin_state_maintainer.hpp>
 #include <impl/dash/coin/node_coin_state.hpp>
 #include <impl/dash/coin/rpc_data.hpp>
@@ -78,7 +79,10 @@ static json protx_entry(uint8_t idbyte, const std::string& payout_addr,
                         const std::string& type = "Regular") {
     std::string protx(64, '0');
     protx[0] = static_cast<char>('0' + (idbyte % 10));
+    // Unique per-entry collateral: DIP3 consensus enforces unique collateral
+    // outpoints, and the parser fail-closes on duplicates.
     std::string coll(64, 'a');
+    coll[0] = static_cast<char>('0' + (idbyte % 10));
     return json{
         {"type", type},
         {"proTxHash", protx},
@@ -177,6 +181,63 @@ TEST(DashMnSeed, EmptyOrNonArrayYieldsEmptySeed)
                                       DASH_P2SH_VER, &st).empty());
 }
 
+// ── malformed entries fail closed, never throw ─────────────────────────────
+TEST(DashMnSeed, MalformedEntriesFailClosedWithoutThrowing)
+{
+    const std::string good_addr = addr_of(p2pkh_script(0x11));
+
+    // Numeric proTxHash (type mismatch) -> empty, no escaping throw.
+    auto bad_type = protx_entry(1, good_addr, 1, 1);
+    bad_type["proTxHash"] = 12345;
+    MnSeedStats st1;
+    EXPECT_TRUE(parse_protx_list_seed(json::array({bad_type}),
+                                      DASH_PUBKEY_VER, DASH_P2SH_VER,
+                                      &st1).empty());
+    EXPECT_EQ(st1.malformed, 1u);
+
+    // Short/garbage proTxHash hex (uint256S would tolerate it and key the MN
+    // under a wrong hash) -> empty.
+    auto bad_hex = protx_entry(1, good_addr, 1, 1);
+    bad_hex["proTxHash"] = "deadbeef";
+    MnSeedStats st2;
+    EXPECT_TRUE(parse_protx_list_seed(json::array({bad_hex}),
+                                      DASH_PUBKEY_VER, DASH_P2SH_VER,
+                                      &st2).empty());
+    EXPECT_EQ(st2.malformed, 1u);
+
+    // Type-guarded numeric fields degrade gracefully (no throw, no abort):
+    // a string lastPaidHeight parses as 0 via the is_number guard.
+    auto odd_height = protx_entry(1, good_addr, 1, 1);
+    odd_height["state"]["lastPaidHeight"] = "not-a-number";
+    MnSeedStats st3;
+    auto seed3 = parse_protx_list_seed(json::array({odd_height}),
+                                       DASH_PUBKEY_VER, DASH_P2SH_VER, &st3);
+    ASSERT_EQ(seed3.size(), 1u);
+    EXPECT_EQ(seed3[0].second.nLastPaidHeight, 0u);
+
+    // A json type error on an unguarded .value() path (non-string "type")
+    // is caught INSIDE the parser -> fail-closed empty, no escaping throw.
+    auto bad_type_field = protx_entry(1, good_addr, 1, 1);
+    bad_type_field["type"] = 5;
+    MnSeedStats st5;
+    EXPECT_TRUE(parse_protx_list_seed(json::array({bad_type_field}),
+                                      DASH_PUBKEY_VER, DASH_P2SH_VER,
+                                      &st5).empty());
+    EXPECT_EQ(st5.malformed, 1u);
+
+    // Duplicate collateral outpoint (impossible in a real DIP3 set; would
+    // silently shadow in MnStateMachine::load's collateral index) -> empty.
+    auto a = protx_entry(1, good_addr, 1, 1);
+    auto b = protx_entry(2, addr_of(p2pkh_script(0x22)), 2, 2);
+    b["collateralHash"]  = a["collateralHash"];
+    b["collateralIndex"] = a["collateralIndex"];
+    MnSeedStats st4;
+    EXPECT_TRUE(parse_protx_list_seed(json::array({a, b}),
+                                      DASH_PUBKEY_VER, DASH_P2SH_VER,
+                                      &st4).empty());
+    EXPECT_EQ(st4.malformed, 1u);
+}
+
 // ── end-to-end: seed -> leg-4 event -> populated() flips -> EMBEDDED
 //    template pays the CORRECT (lowest-lastPaid) seeded MN ──────────────────
 TEST(DashMnSeed, SeedFlipsPopulatedAndEmbeddedTemplatePaysSeededPayee)
@@ -242,4 +303,60 @@ TEST(DashMnSeed, SeedFlipsPopulatedAndEmbeddedTemplatePaysSeededPayee)
     // An EMPTY resync (set-gap) demotes back to the fallback.
     node.mn_list_update.happened(dash::interfaces::MnListUpdate{});
     EXPECT_FALSE(state.populated());
+}
+
+// ── snapshot as-of fence: blocks the seed already reflects must NOT
+//    re-attribute their coinbase payments (the shared-payoutAddress queue
+//    scramble observed live with the E2b 288-block bootstrap replay) ───────
+TEST(DashMnSeed, SnapshotHeightFencesReplayedBlocks)
+{
+    dash::interfaces::Node node;
+    NodeCoinState state;
+    CoinStateMaintainer maint(state);
+    auto sub_mn  = c2pool::dash::wire_mn_list_ingest(node, maint);
+    auto sub_blk = c2pool::dash::wire_block_connect_ingest(node, maint);
+
+    // Two MNs SHARING one payout script (the testnet reality that exposed
+    // the bug), lastPaid current at the snapshot height 2'399'901.
+    const auto shared = p2pkh_script(0x44);
+    const std::string shared_addr = addr_of(shared);
+    json list = json::array({
+        protx_entry(1, shared_addr, 2'399'900, 2'300'000),
+        protx_entry(2, shared_addr, 2'399'901, 2'300'100),
+    });
+    auto seed = parse_protx_list_seed(list, DASH_PUBKEY_VER, DASH_P2SH_VER);
+    ASSERT_EQ(seed.size(), 2u);
+    const uint256 mn_a = seed[0].first;   // lastPaid 2'399'900 (queue front)
+
+    dash::interfaces::MnListUpdate up;
+    up.mnstates     = std::move(seed);
+    up.as_of_height = 2'399'901;
+    node.mn_list_update.happened(up);
+
+    // A REPLAYED block at height <= as_of (its payment is already reflected
+    // in the seed's lastPaid values) must not re-bump the queue front.
+    auto paying_block = [&](uint32_t /*h*/) {
+        dash::interfaces::BlockConnected bc;
+        dash::coin::MutableTransaction cb;
+        cb.version = 1; cb.type = 0;
+        bitcoin_family::coin::TxOut o;
+        o.value = 100'000'000;
+        o.scriptPubKey.m_data = shared;
+        cb.vout.push_back(o);
+        bc.block.m_txs.push_back(cb);
+        return bc;
+    };
+    auto bc_old = paying_block(2'399'901);
+    bc_old.height = 2'399'901;
+    node.block_connected.happened(bc_old);
+    EXPECT_EQ(state.mnstates().entries().at(mn_a).nLastPaidHeight, 2'399'900u)
+        << "replayed (<= as_of) block must not re-attribute its payment";
+
+    // A NEW block above the snapshot height applies normally: the queue-front
+    // MN (lowest lastPaid) is attributed the payment.
+    auto bc_new = paying_block(2'399'902);
+    bc_new.height = 2'399'902;
+    node.block_connected.happened(bc_new);
+    EXPECT_EQ(state.mnstates().entries().at(mn_a).nLastPaidHeight, 2'399'902u)
+        << "post-snapshot block must fold normally";
 }

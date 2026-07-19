@@ -56,7 +56,9 @@ wire_mn_list_ingest(::dash::interfaces::Node& node,
     return node.mn_list_update.subscribe(
         [&maint](const ::dash::interfaces::MnListUpdate& u)
         {
-            maint.on_mn_list_update(u.mnstates);
+            // as_of_height rides along (E2c): the maintainer uses it to fence
+            // off re-application of blocks the snapshot already reflects.
+            maint.on_mn_list_update(u.mnstates, u.as_of_height);
         });
 }
 
