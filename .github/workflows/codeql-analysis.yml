@@ -56,13 +56,13 @@ jobs:
           # the flake ("Failed to restore: The operation cannot be completed in
           # timeout"), and on a miss it forced a from-source boost rebuild too.
           # A local persistent home takes the network off the hot path.
-          # Dedicated path (NOT the shared ~/.conan2) preserves the torn-cache
-          # isolation from #704/#710; this workflow's concurrency group
-          # serialises CodeQL per ref, so nothing else writes this home.
+          # Keyed on the runner instance (NOT the shared ~/.conan2): a runner runs
+          # one job at a time, so this home is never contended even across refs,
+          # preserving the torn-cache isolation of #704/#710.
           if [ "${{ runner.environment }}" = "github-hosted" ]; then
             echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
           else
-            echo "CONAN_HOME=$HOME/.conan2-codeql" >> "$GITHUB_ENV"
+            echo "CONAN_HOME=$HOME/.conan2-ci/$RUNNER_NAME" >> "$GITHUB_ENV"
           fi
 
       # ── C++ build (manual mode only) ─────────────────────────────────────

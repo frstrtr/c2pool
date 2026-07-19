@@ -48,7 +48,21 @@ jobs:
       # 1.90.0 torn-header flakes). RUNNER_TEMP is only valid at step scope, so
       # export it via $GITHUB_ENV -- a job-level `env: runner.temp` fails to parse.
       - name: Set per-job Conan home
-        run: echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+        run: |
+          # github-hosted: ephemeral per-job home, warmed by actions/cache below.
+          # self-hosted:   PERSISTENT home keyed on the runner instance. A runner
+          # executes one job at a time, so this home is never contended (no
+          # sqlite "failed to acquire database lock in 20s") while still keeping
+          # the per-job isolation of #704/#710 -- no two concurrent jobs share it.
+          # Being persistent, it also takes the GH cache-service restore off the
+          # hot path: that restore times out on VM905 ("Failed to restore: The
+          # operation cannot be completed in timeout") and its miss cascaded into
+          # a cold from-source Boost rebuild on all 8 runners at once.
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+          else
+            echo "CONAN_HOME=$HOME/.conan2-ci/$RUNNER_NAME" >> "$GITHUB_ENV"
+          fi
 
       - name: Install system dependencies
         if: runner.environment == 'github-hosted'
@@ -74,7 +88,8 @@ jobs:
       - name: Show committed Conan profile
         run: conan profile show -pr:a=ci/conan/linux-gcc13.profile
 
-      - name: Restore Conan cache
+      - name: Restore Conan cache (github-hosted only)
+        if: runner.environment == 'github-hosted'
         uses: actions/cache@v5
         with:
           path: ${{ runner.temp }}/conan2
@@ -90,7 +105,16 @@ jobs:
         run: rm -rf build_ci
 
       - name: Conan install
-        run: conan install . -pr:a=ci/conan/linux-gcc13.profile --build=missing --output-folder=build_ci
+        run: |
+          # Bounded retry: remote package downloads are the only network step
+          # left here; a transient CDN/remote hiccup must not red a good PR.
+          for attempt in 1 2 3; do
+            if conan install . -pr:a=ci/conan/linux-gcc13.profile --build=missing --output-folder=build_ci; then exit 0; fi
+            echo "conan install failed (attempt $attempt/3); retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          echo "conan install failed after 3 attempts" >&2
+          exit 1
 
       - name: Configure
         run: cmake -S . -B build_ci -DCMAKE_TOOLCHAIN_FILE=build_ci/conan_toolchain.cmake -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=Release -DCOIN_DGB=ON
@@ -194,7 +218,21 @@ jobs:
       # torn-cache reds). Export via $GITHUB_ENV -- a job-level `env: runner.temp`
       # fails to parse.
       - name: Set per-job Conan home
-        run: echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+        run: |
+          # github-hosted: ephemeral per-job home, warmed by actions/cache below.
+          # self-hosted:   PERSISTENT home keyed on the runner instance. A runner
+          # executes one job at a time, so this home is never contended (no
+          # sqlite "failed to acquire database lock in 20s") while still keeping
+          # the per-job isolation of #704/#710 -- no two concurrent jobs share it.
+          # Being persistent, it also takes the GH cache-service restore off the
+          # hot path: that restore times out on VM905 ("Failed to restore: The
+          # operation cannot be completed in timeout") and its miss cascaded into
+          # a cold from-source Boost rebuild on all 8 runners at once.
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+          else
+            echo "CONAN_HOME=$HOME/.conan2-ci/$RUNNER_NAME" >> "$GITHUB_ENV"
+          fi
 
       - name: Install system dependencies
         if: runner.environment == 'github-hosted'
@@ -220,7 +258,8 @@ jobs:
           conan profile detect --force
           sed -i 's/compiler.cppstd=.*/compiler.cppstd=20/' "$(conan profile path default)"
 
-      - name: Restore Conan cache
+      - name: Restore Conan cache (github-hosted only)
+        if: runner.environment == 'github-hosted'
         uses: actions/cache@v5
         with:
           path: ${{ runner.temp }}/conan2
@@ -236,7 +275,16 @@ jobs:
         run: rm -rf build_asan
 
       - name: Conan install
-        run: conan install . --build=missing --output-folder=build_asan --settings=build_type=Release
+        run: |
+          # Bounded retry: remote package downloads are the only network step
+          # left here; a transient CDN/remote hiccup must not red a good PR.
+          for attempt in 1 2 3; do
+            if conan install . --build=missing --output-folder=build_asan --settings=build_type=Release; then exit 0; fi
+            echo "conan install failed (attempt $attempt/3); retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          echo "conan install failed after 3 attempts" >&2
+          exit 1
 
       - name: Configure (Release + AsAN + UBSan)
         # NOTE 1: must match the build_type passed to `conan install` (Release).
@@ -325,7 +373,21 @@ jobs:
       # torn-cache reds). Export via $GITHUB_ENV -- a job-level `env: runner.temp`
       # fails to parse.
       - name: Set per-job Conan home
-        run: echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+        run: |
+          # github-hosted: ephemeral per-job home, warmed by actions/cache below.
+          # self-hosted:   PERSISTENT home keyed on the runner instance. A runner
+          # executes one job at a time, so this home is never contended (no
+          # sqlite "failed to acquire database lock in 20s") while still keeping
+          # the per-job isolation of #704/#710 -- no two concurrent jobs share it.
+          # Being persistent, it also takes the GH cache-service restore off the
+          # hot path: that restore times out on VM905 ("Failed to restore: The
+          # operation cannot be completed in timeout") and its miss cascaded into
+          # a cold from-source Boost rebuild on all 8 runners at once.
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+          else
+            echo "CONAN_HOME=$HOME/.conan2-ci/$RUNNER_NAME" >> "$GITHUB_ENV"
+          fi
 
       - name: Install system dependencies
         if: runner.environment == 'github-hosted'
@@ -351,7 +413,8 @@ jobs:
           conan profile detect --force
           sed -i 's/compiler.cppstd=.*/compiler.cppstd=20/' "$(conan profile path default)"
 
-      - name: Restore Conan cache
+      - name: Restore Conan cache (github-hosted only)
+        if: runner.environment == 'github-hosted'
         uses: actions/cache@v5
         with:
           path: ${{ runner.temp }}/conan2
@@ -367,7 +430,16 @@ jobs:
         run: rm -rf build_bch
 
       - name: Conan install
-        run: conan install . --build=missing --output-folder=build_bch --settings=build_type=Release
+        run: |
+          # Bounded retry: remote package downloads are the only network step
+          # left here; a transient CDN/remote hiccup must not red a good PR.
+          for attempt in 1 2 3; do
+            if conan install . --build=missing --output-folder=build_bch --settings=build_type=Release; then exit 0; fi
+            echo "conan install failed (attempt $attempt/3); retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          echo "conan install failed after 3 attempts" >&2
+          exit 1
 
       - name: Configure (-DCOIN_BCH=ON)
         run: cmake -S . -B build_bch -DCMAKE_TOOLCHAIN_FILE=build_bch/conan_toolchain.cmake -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=Release -DCOIN_BCH=ON
@@ -421,7 +493,21 @@ jobs:
       # torn-cache reds). Export via $GITHUB_ENV -- a job-level `env: runner.temp`
       # fails to parse.
       - name: Set per-job Conan home
-        run: echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+        run: |
+          # github-hosted: ephemeral per-job home, warmed by actions/cache below.
+          # self-hosted:   PERSISTENT home keyed on the runner instance. A runner
+          # executes one job at a time, so this home is never contended (no
+          # sqlite "failed to acquire database lock in 20s") while still keeping
+          # the per-job isolation of #704/#710 -- no two concurrent jobs share it.
+          # Being persistent, it also takes the GH cache-service restore off the
+          # hot path: that restore times out on VM905 ("Failed to restore: The
+          # operation cannot be completed in timeout") and its miss cascaded into
+          # a cold from-source Boost rebuild on all 8 runners at once.
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+          else
+            echo "CONAN_HOME=$HOME/.conan2-ci/$RUNNER_NAME" >> "$GITHUB_ENV"
+          fi
 
       - name: Install system dependencies
         if: runner.environment == 'github-hosted'
@@ -447,7 +533,8 @@ jobs:
           conan profile detect --force
           sed -i 's/compiler.cppstd=.*/compiler.cppstd=20/' "$(conan profile path default)"
 
-      - name: Restore Conan cache
+      - name: Restore Conan cache (github-hosted only)
+        if: runner.environment == 'github-hosted'
         uses: actions/cache@v5
         with:
           path: ${{ runner.temp }}/conan2
@@ -463,7 +550,16 @@ jobs:
         run: rm -rf build_bch_asan
 
       - name: Conan install
-        run: conan install . --build=missing --output-folder=build_bch_asan --settings=build_type=Release
+        run: |
+          # Bounded retry: remote package downloads are the only network step
+          # left here; a transient CDN/remote hiccup must not red a good PR.
+          for attempt in 1 2 3; do
+            if conan install . --build=missing --output-folder=build_bch_asan --settings=build_type=Release; then exit 0; fi
+            echo "conan install failed (attempt $attempt/3); retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          echo "conan install failed after 3 attempts" >&2
+          exit 1
 
       - name: Configure (Release + AsAN + UBSan, -DCOIN_BCH=ON)
         run: |

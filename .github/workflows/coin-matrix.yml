@@ -38,7 +38,21 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Set per-job Conan home
-        run: echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+        run: |
+          # github-hosted: ephemeral per-job home, warmed by actions/cache below.
+          # self-hosted:   PERSISTENT home keyed on the runner instance. A runner
+          # executes one job at a time, so this home is never contended (no
+          # sqlite "failed to acquire database lock in 20s") while still keeping
+          # the per-job isolation of #704/#710 -- no two concurrent jobs share it.
+          # Being persistent, it also takes the GH cache-service restore off the
+          # hot path: that restore times out on VM905 ("Failed to restore: The
+          # operation cannot be completed in timeout") and its miss cascaded into
+          # a cold from-source Boost rebuild on all 8 runners at once.
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            echo "CONAN_HOME=$RUNNER_TEMP/conan2" >> "$GITHUB_ENV"
+          else
+            echo "CONAN_HOME=$HOME/.conan2-ci/$RUNNER_NAME" >> "$GITHUB_ENV"
+          fi
 
       - name: Check source presence
         id: presence
@@ -76,7 +90,8 @@ jobs:
         if: steps.presence.outputs.exists == '1'
         run: conan profile show -pr:a=ci/conan/linux-gcc13.profile
 
-      - name: Restore Conan cache
+      - name: Restore Conan cache (github-hosted only)
+        if: runner.environment == 'github-hosted'
         if: steps.presence.outputs.exists == '1'
         uses: actions/cache@v5
         with:
@@ -93,21 +108,31 @@ jobs:
       - name: Clear orphaned Conan download tempfiles (self-hosted cache is reused)
         if: steps.presence.outputs.exists == '1' && runner.environment != 'github-hosted'
         # An interrupted or racing conan download can leave a partial conan_package.tgz
-        # in ~/.conan2 that makes the next `conan install` abort with
+        # in $CONAN_HOME that makes the next `conan install` abort with
         # "the file to download already exists". Delete these staging archives so a
         # missing binary package can be re-fetched cleanly; extracted packages are untouched.
         run: |
-          find ~/.conan2/p -type f \( -name 'conan_package.tgz' -o -name 'conan_sources.tgz' \) -delete 2>/dev/null || true
+          find "$CONAN_HOME/p" -type f \( -name 'conan_package.tgz' -o -name 'conan_sources.tgz' \) -delete 2>/dev/null || true
 
       - name: Conan install
         if: steps.presence.outputs.exists == '1'
         run: |
-          conan install . \
-            -pr:a=ci/conan/linux-gcc13.profile \
-            --lockfile=conan.lock \
-            --build=missing \
-            --output-folder=build_${{ matrix.coin }} \
-            --settings=build_type=Release
+          # Bounded retry: remote package downloads are the only network step
+          # left here; a transient CDN/remote hiccup must not red a good PR.
+          for attempt in 1 2 3; do
+            if \
+            conan install . \
+              -pr:a=ci/conan/linux-gcc13.profile \
+              --lockfile=conan.lock \
+              --build=missing \
+              --output-folder=build_${{ matrix.coin }} \
+              --settings=build_type=Release
+            then exit 0; fi
+            echo "conan install failed (attempt $attempt/3); retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          echo "conan install failed after 3 attempts" >&2
+          exit 1
 
       - name: Configure
         if: steps.presence.outputs.exists == '1'
