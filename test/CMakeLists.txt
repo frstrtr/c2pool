@@ -385,11 +385,18 @@ if (BUILD_TESTING AND GTest_FOUND)
     # mint_from_inputs -> tracker insert -> wire round-trip -> best-share
     # election -> PPLNS oracle-window pin. Same allowlisted target (proven
     # pattern), no build.yml change.
+    # test_dash_share_download.cpp (#754 share-download leg): sharereq wire
+    # byte-parity vs the python oracle layout, DownloadGate de-dup/retry/
+    # cycle-reset, build_stops, and the download-gate proof -- a mocked
+    # sharereply's shares (RawShare round-trip, child->parent order) insert +
+    # verify and ROOT a previously-unrooted live-pushed tip. Same allowlisted
+    # target (proven pattern), no build.yml change.
     add_executable(test_dash_share_hash_link
         test_dash_share_hash_link.cpp
         test_dash_share_producer.cpp
         test_dash_share_producer_bind.cpp
-        test_dash_mint_runloop.cpp)
+        test_dash_mint_runloop.cpp
+        test_dash_share_download.cpp)
     target_link_libraries(test_dash_share_hash_link PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core

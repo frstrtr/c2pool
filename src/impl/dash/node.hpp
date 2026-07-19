@@ -29,6 +29,7 @@
 
 #include <pool/node.hpp>
 #include <pool/protocol.hpp>
+#include <pool/share_download.hpp>  // shared downloader helpers (#754)
 #include <core/reply_matcher.hpp>
 #include <c2pool/storage/sharechain_storage.hpp>
 
@@ -36,6 +37,7 @@
 #include <boost/asio/steady_timer.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <map>
 #include <memory>
@@ -43,6 +45,7 @@
 #include <random>
 #include <set>
 #include <shared_mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -216,11 +219,52 @@ protected:
     // Chain-relative block height for think() scoring; unbound -> zero fn.
     std::function<int32_t(uint256)> m_block_rel_height_fn;
 
+    // ── Share-download leg (#754) state — IO-thread only ────────────────
+    // De-dup + per-cycle retry gate for in-flight sharereq targets (shared
+    // pool/share_download.hpp; ltc m_downloading_shares/m_download_fail_count).
+    pool::download::DownloadGate m_download_gate;
+    // req_id → peer addr for selective cancellation on disconnect. p2pool has
+    // per-peer get_shares deferrers (connectionLost → respond_all on just that
+    // peer); c2pool's m_share_getter is shared, so the ownership is tracked
+    // here (ltc node.hpp:511 parity).
+    std::map<uint256, NetService> m_pending_share_reqs;
+    // Best-share adverts learned in handle_version, awaiting download. The
+    // inline (vtable) handle_version body must stay link-free for the
+    // rig-free KAT targets (they build NodeImpl WITHOUT the node.cpp TU), so
+    // it QUEUES here; run_think()'s IO phase + the advert timer started by
+    // start_outbound_connections() (both node.cpp) drain the queue into
+    // download_shares — the oracle p2p.py handle_version →
+    // node.handle_share_hashes join trigger, one hop later.
+    std::vector<std::pair<std::weak_ptr<peer_t>, uint256>> m_peer_best_adverts;
+
+    // ── Outbound dialing (btc/ltc start_outbound_connections port) ──────
+    static constexpr size_t DEFAULT_TARGET_OUTBOUND_PEERS = 8;
+    size_t m_max_peers = 30;
+    size_t m_target_outbound_peers = DEFAULT_TARGET_OUTBOUND_PEERS;
+    std::unique_ptr<core::Timer> m_connect_timer;   // 30s dial maintenance
+    std::unique_ptr<core::Timer> m_advert_timer;    // 2s best-advert drain
+    std::set<NetService> m_pending_outbound;  // addresses currently being dialed
+    std::set<NetService> m_outbound_addrs;    // established outbound peers
+
+    // ── P2P ban list (btc node.hpp:533-545 port) ────────────────────────
+    // Peers that fed unverifiable shares (think()'s bad_peer_addresses) are
+    // banned for m_ban_duration; expired entries are swept each think cycle.
+    std::map<NetService, std::chrono::steady_clock::time_point> m_ban_list;
+    std::chrono::seconds m_ban_duration{300};   // 5 minutes (configurable)
+    std::map<std::string, std::chrono::steady_clock::time_point> m_ip_ban_list;
+    // Whitelist: permanent dial targets (--addnode/--connect bootstrap seeds)
+    // are immune to bans — banning the only seed of a small mesh would lock
+    // the node out of its own pool (btc is_banned whitelist-bypass parity;
+    // populated from the config bootstrap list in the ctor).
+    std::set<std::string> m_whitelist_ips;
+    std::set<NetService> m_whitelist_hosts;
+
 public:
     // Default (rig-free) construction for tests/standalone: no io_context, the
-    // share-getter requester is a no-op (reception slice supplies the real
-    // sharereq writer). Routes m_chain at the tracker's main chain so any
-    // BaseNode path that reads m_chain is valid.
+    // share-getter requester is a no-op (there are no peers to write a
+    // sharereq to; the ctx ctor below wires the real writer). Routes m_chain
+    // at the tracker's main chain so any BaseNode path that reads m_chain is
+    // valid.
     NodeImpl()
         : m_share_getter(nullptr,
             [](uint256, peer_ptr, std::vector<uint256>, uint64_t, std::vector<uint256>){})
@@ -232,14 +276,28 @@ public:
 
     NodeImpl(boost::asio::io_context* ctx, config_t* config)
         : base_t(ctx, config),
-          // Slice A keeps the share-getter wired with a no-op requester; the
-          // reception slice (B) replaces this with the real sharereq writer.
+          // #754 share-download leg: the REAL sharereq writer (ltc
+          // node.hpp:162-170 parity) — packs the request through the
+          // message_sharereq wire codec and writes it to the chosen peer.
           m_share_getter(ctx,
-            [](uint256, peer_ptr, std::vector<uint256>, uint64_t, std::vector<uint256>){},
+            [](uint256 req_id, peer_ptr to_peer,
+               std::vector<uint256> hashes, uint64_t parents,
+               std::vector<uint256> stops)
+            {
+                auto rmsg = dash::message_sharereq::make_raw(
+                    req_id, hashes, parents, stops);
+                to_peer->write(std::move(rmsg));
+            },
             15)  // p2pool p2p.py:80 — 15s timeout for share requests
     {
         // Seed addr store with hardcoded bootstrap peers.
         m_addrs.load(config->pool()->m_bootstrap_addrs);
+        // Bootstrap seeds are whitelisted: permanent dial targets are immune
+        // to bans (btc is_banned whitelist-bypass parity).
+        for (const auto& seed : config->pool()->m_bootstrap_addrs) {
+            m_whitelist_ips.insert(seed.address());
+            m_whitelist_hosts.insert(seed);
+        }
         // Randomise our nonce so we detect self-connections.
         std::mt19937_64 rng(std::random_device{}());
         m_nonce = rng();
@@ -308,15 +366,100 @@ public:
     // INLINE (not node.cpp): connected() is virtual, so its body must be
     // visible to every TU that emits the NodeImpl vtable — the link-deferred
     // KAT targets instantiate NodeImpl without the node.cpp TU.
+    // ── P2P ban check (btc node.cpp:2183-2196 port, inline for the vtable-
+    // complete KAT targets). Whitelisted permanent dial targets bypass bans.
+    bool is_whitelisted(const NetService& addr) const
+    {
+        return m_whitelist_ips.contains(addr.address())
+            || m_whitelist_hosts.contains(addr);
+    }
+    bool is_banned(const NetService& addr) const
+    {
+        if (is_whitelisted(addr)) return false;
+        const auto now = std::chrono::steady_clock::now();
+        auto it = m_ban_list.find(addr);
+        if (it != m_ban_list.end() && it->second > now) return true;
+        auto ip_it = m_ip_ban_list.find(addr.address());
+        if (ip_it != m_ip_ban_list.end() && ip_it->second > now) return true;
+        return false;
+    }
+    void set_ban_duration(int seconds) { m_ban_duration = std::chrono::seconds(seconds); }
+
     void connected(std::shared_ptr<core::Socket> socket) override
     {
+        // Reject banned peers (btc node.cpp:133-139).
+        if (is_banned(socket->get_addr()))
+        {
+            LOG_INFO << "[Pool] Rejecting connection from banned peer "
+                     << socket->get_addr().to_string();
+            socket->close();
+            return;
+        }
+
+        // Outbound lifecycle tracking (#754, ltc node.cpp:128-149): a dial we
+        // initiated graduates from pending to established.
+        const bool is_outbound = m_pending_outbound.erase(socket->get_addr()) > 0;
+
         // BaseNode creates the peer + timeout timer; then OPEN the handshake.
         // p2pool sends version from both sides on connectionMade — a silent
         // side gets dropped by the remote's handshake timeout.
         base_t::connected(socket);
         auto it = m_connections.find(socket->get_addr());
         if (it != m_connections.end())
+        {
+            if (is_outbound)
+                m_outbound_addrs.insert(socket->get_addr());
             send_version(it->second);
+        }
+    }
+
+    // ── Disconnect cleanup (#754, ltc node.cpp:151-241 reduced) ─────────
+    // Cancel this peer's pending share requests (invokes their callbacks with
+    // an empty reply so the download gate releases the hashes immediately
+    // instead of waiting out the 15s ReplyMatcher timeout — p2pool p2p.py:595
+    // get_shares.respond_all on connectionLost), drop its stale nonce entry
+    // from m_peers (without this, reconnects are rejected as false
+    // duplicates), and clear the outbound tracking. INLINE (vtable bodies must
+    // stay link-free for the rig-free KAT targets).
+    using base_t::error;   // keep the error_code overload visible
+    void error(const message_error_type& err, const NetService& service,
+               const std::source_location where =
+                   std::source_location::current()) override
+    {
+        cancel_peer_share_requests(service);
+        for (auto it = m_peers.begin(); it != m_peers.end(); )
+        {
+            if (it->second && it->second->addr() == service)
+                it = m_peers.erase(it);
+            else
+                ++it;
+        }
+        m_pending_outbound.erase(service);
+        m_outbound_addrs.erase(service);
+        base_t::error(err, service, where);
+    }
+
+    void close_connection(const NetService& service) override
+    {
+        cancel_peer_share_requests(service);
+        m_pending_outbound.erase(service);
+        m_outbound_addrs.erase(service);
+        base_t::close_connection(service);
+    }
+
+    void cancel_peer_share_requests(const NetService& service)
+    {
+        std::vector<uint256> to_cancel;
+        for (const auto& [req_id, peer_addr] : m_pending_share_reqs)
+        {
+            if (peer_addr == service)
+                to_cancel.push_back(req_id);
+        }
+        for (const auto& req_id : to_cancel)
+        {
+            m_pending_share_reqs.erase(req_id);
+            m_share_getter.cancel(req_id);  // fires callback with empty reply
+        }
     }
 
     void send_version(peer_ptr peer)
@@ -395,6 +538,23 @@ public:
         peer->m_nonce = msg->m_nonce;
         m_peers[peer->m_nonce] = peer;
 
+        // #754 join trigger (oracle p2p.py handle_version → node.py
+        // handle_share_hashes): a peer advertising a best share we don't have
+        // is THE download entry point for an empty node joining an
+        // established chain. QUEUED, not called directly — download_shares
+        // lives in node.cpp and this inline vtable body must stay link-free
+        // for the rig-free KAT targets; run_think()'s IO phase and the
+        // 2s advert timer (start_outbound_connections) drain the queue.
+        if (!msg->m_best_share.IsNull())
+        {
+            LOG_INFO << "[Pool] Peer " << peer->addr().to_string()
+                     << " advertises best share "
+                     << msg->m_best_share.ToString().substr(0, 16)
+                     << (m_chain->contains(msg->m_best_share)
+                             ? " (known)" : " (unknown — queued for download)");
+            m_peer_best_adverts.emplace_back(peer, msg->m_best_share);
+        }
+
         // Legacy/actual split for the G2 dual-pool: only once the operator has
         // ratcheted the floor above the oracle baseline do at-or-above-floor
         // peers negotiate the actual (v36) protocol; otherwise legacy (parity
@@ -446,6 +606,13 @@ public:
     void run_think();
     void drain_pending_adds();
 
+    /// Periodic maintenance (btc node.cpp:1878-2173 / p2pool node.py:355-402
+    /// clean_tracker port): think + eat stale heads + drop tails beyond
+    /// 2*CHAIN_LENGTH+10 + LevelDB prune flush, all on the compute thread
+    /// under the exclusive lock. Body in node.cpp; scheduled by the run
+    /// loop's periodic tick. Without it the raw chain grows unbounded.
+    void clean_tracker();
+
     /// Verified-work-first best share (mint_runloop.hpp elect_best_share
     /// policy — btc parity). ZERO with peers but no verified chain (never
     /// mint on an unverified foreign chain); raw-head bootstrap on genesis.
@@ -473,6 +640,37 @@ public:
 
     void set_on_best_share_changed(std::function<void()> fn) { m_on_best_share_changed = std::move(fn); }
     void set_block_rel_height_fn(std::function<int32_t(uint256)> fn) { m_block_rel_height_fn = std::move(fn); }
+
+    // ── #754 share-download leg surface ─────────────────────────────────
+
+    /// Async share download: register the reply callback + dispatch the
+    /// sharereq through the ctor's writer (ltc node.hpp:275-281 parity).
+    void request_shares(uint256 id, peer_ptr peer,
+                        std::vector<uint256> hashes, uint64_t parents,
+                        std::vector<uint256> stops,
+                        std::function<void(dash::ShareReplyData)> callback)
+    {
+        m_share_getter.request(id, callback, id, peer, hashes, parents, stops);
+    }
+
+    /// Request `target_hash` (+ a random 0..499-parent chunk, stops-bounded)
+    /// from a peer; on reply, feed the shares into processing_shares and
+    /// continue backfilling from the oldest parent. Body in node.cpp (ltc
+    /// node.cpp:968-1105 port).
+    void download_shares(peer_ptr peer, const uint256& target_hash);
+
+    /// Drain the handle_version best-share advert queue into
+    /// download_shares (unknown) / run_think (known). Body in node.cpp.
+    void drain_peer_best_adverts();
+
+    /// Dial outbound peers from the AddrStore (--addnode/--connect seeds) and
+    /// start the 30s dial-maintenance + 2s advert-drain timers. Call once
+    /// from the run loop after listen(). Body in node.cpp (ltc
+    /// node.cpp:1289-1327 port).
+    void start_outbound_connections();
+
+    void set_target_outbound_peers(size_t count) { m_target_outbound_peers = count; }
+    void set_max_peers(size_t count) { m_max_peers = count; }
 
     // Completes a pending async share request when a sharereply arrives.
     // Inline (mirrors dgb) so the reply-matcher plumbing needs no node.cpp.
