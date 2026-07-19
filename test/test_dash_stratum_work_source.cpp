@@ -17,6 +17,7 @@
 
 #include <impl/dash/stratum/work_source.hpp>
 
+#include <impl/dash/stratum/submit_payee_guard.hpp>  // check_submit_payee (stale-payee fix)
 #include <impl/dash/coinbase_builder.hpp>     // compute_dash_payouts, build, split_coinb, be_hex_u32
 #include <impl/dash/coin/block_producer.hpp>  // coinbase_txid, compute_merkle_root, serialize_header80, target_from_nbits
 #include <impl/dash/crypto/hash_x11.hpp>
@@ -606,6 +607,260 @@ TEST(DashStratumWorkSource, MiningSubmitRoutesShareIntoMintSeam)
               reassemble(rig.job.coinb1, rig.en1, rig.en2, rig.job.coinb2));
     EXPECT_EQ(seen.subsidy, kCoinbaseValue);
     EXPECT_EQ(seen.pow_hash, rig.pow_for(nonce));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Stale-payee fix KATs (bad-cb-payee root cause; hex-confirmed @h1517420).
+// DASH rotates the masternode payee EVERY block: a job must be ONE frozen
+// template unit (header + coinbase + branches + txs), the template cache must
+// die on RPC-reconnect churn, and a won block whose coinbase no longer matches
+// the current height's payee set must be rejected LOUDLY, never submitted.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// A rotated sibling of rich_work(): the NEXT height, new prev, and — the DASH
+// property under test — a DIFFERENT masternode payee (pkh 0x33, new amount).
+const char* const kRotatedPrevHashHex =
+    "00000000000000c4d5e6f708192a3b4c5d6e2f8c9e5a1d4b3c6e7f8091a2b3c4";
+
+std::string rotated_mn_payee()
+{
+    std::vector<unsigned char> s = {0x76, 0xa9, 0x14};
+    s.insert(s.end(), 20, 0x33);
+    s.push_back(0x88);
+    s.push_back(0xac);
+    return "!" + HexStr(std::span<const unsigned char>(s.data(), s.size()));
+}
+
+dash::coin::DashWorkData rotated_work()
+{
+    dash::coin::DashWorkData w = rich_work();
+    w.m_previous_block.SetHex(kRotatedPrevHashHex);
+    w.m_height += 1;
+    w.m_packed_payments.clear();
+    dash::coin::PackedPayment mn;
+    mn.payee  = rotated_mn_payee();
+    mn.amount = kMnAmount + 12345;   // rotation also changes the mandated amount
+    w.m_packed_payments.push_back(mn);
+    w.m_payment_amount = mn.amount;
+    return w;
+}
+
+// Fix 1 pin: build_connection_coinbase freezes the header fields ATOMICALLY
+// with the coinbase (WorkSnapshot::has_header) — the fields the stratum
+// session must use INSTEAD of its separately-fetched template.
+TEST(DashStratumWorkSource, SnapshotFreezesHeaderAtomicallyWithCoinbase)
+{
+    Fixture fx(true);
+    auto ws = fx.make();
+    auto cbr = ws->build_connection_coinbase(uint256::ZERO, "00000000",
+                                             fixture_miner_script(), {});
+    ASSERT_FALSE(cbr.coinb1.empty());
+    EXPECT_TRUE(cbr.snapshot.has_header);
+    EXPECT_EQ(cbr.snapshot.gbt_prevhash, std::string(kPrevHashHex));
+    EXPECT_EQ(cbr.snapshot.header_version, static_cast<uint32_t>(kVersion));
+    EXPECT_EQ(cbr.snapshot.block_nbits_hex, "1e0ffff0");
+    EXPECT_EQ(cbr.snapshot.curtime, kCurtime);
+    EXPECT_EQ(cbr.snapshot.height, 424242u);
+    // require_job_snapshot is set: the core session refuses mixed jobs.
+    EXPECT_TRUE(ws->get_stratum_config().require_job_snapshot);
+}
+
+// Fix 1 pin — THE double-fetch race. The core session fetches the template
+// and the coinbase in two separate work-source calls; a rotation in between
+// previously produced a MIXED job: tmpl A's header + a coinbase carrying
+// height B's masternode payee -> deterministic dashd bad-cb-payee at submit.
+// Pin (a) the hazard witness: the pre-rotation tmpl header differs from the
+// post-rotation snapshot header, so a session composing tmpl(A)+coinbase(B)
+// WOULD have mixed template generations; and (b) the fix invariant: the
+// snapshot the coinbase ships with is self-consistent — its header AND its
+// payee both come from the SAME (post-rotation) template.
+TEST(DashStratumWorkSource, TemplateRotationBetweenFetchesYieldsSelfConsistentSnapshot)
+{
+    Fixture fx(true);
+    auto ws = fx.make();
+
+    // Fetch #1: the template, as StratumSession::send_notify_work does first.
+    auto tmpl_a = ws->get_current_work_template();
+    ASSERT_EQ(tmpl_a.value("previousblockhash", ""), std::string(kPrevHashHex));
+
+    // The tip moves between the two fetches (new block -> payee ROTATES).
+    fx.fallback_work = rotated_work();
+    ws->bump_work_generation();   // the tip signal that refreshes the cache
+
+    // Fetch #2: the per-connection coinbase.
+    auto cbr = ws->build_connection_coinbase(uint256::ZERO, "00000000",
+                                             fixture_miner_script(), {});
+    ASSERT_FALSE(cbr.coinb1.empty());
+    ASSERT_TRUE(cbr.snapshot.has_header);
+
+    // (a) hazard witness: tmpl(A) + this coinbase(B) would be a MIXED job.
+    EXPECT_NE(cbr.snapshot.gbt_prevhash, tmpl_a.value("previousblockhash", ""));
+
+    // (b) fix invariant: snapshot header and coinbase payee are BOTH from the
+    // rotated template — the new payee script is in the coinbase, the old one
+    // is gone, and the frozen header names the rotated tip/height.
+    EXPECT_EQ(cbr.snapshot.gbt_prevhash, std::string(kRotatedPrevHashHex));
+    EXPECT_EQ(cbr.snapshot.height, 424243u);
+    const std::string new_payee_hex = rotated_mn_payee().substr(1);
+    const std::string old_payee_hex = fixture_mn_payee().substr(1);
+    const std::string cb_hex = cbr.coinb1 + cbr.coinb2;
+    EXPECT_NE(cb_hex.find(new_payee_hex), std::string::npos);
+    EXPECT_EQ(cb_hex.find(old_payee_hex), std::string::npos);
+}
+
+// Fix 2 pin: a CoindRPC reconnect (the churn window) invalidates the cached
+// template + bumps the work generation, so no job is served from a payee
+// snapshot predating the reconnect.
+TEST(DashStratumWorkSource, InvalidateTemplateCacheForcesRefetchAndBumpsGeneration)
+{
+    dash::coin::NodeCoinState cs;   // unpopulated -> fallback arm
+    int fallback_calls = 0;
+    auto ws = std::make_unique<dash::stratum::DASHWorkSource>(
+        cs,
+        [&fallback_calls]() {
+            ++fallback_calls;
+            return rich_work();
+        });
+
+    ASSERT_FALSE(ws->get_current_work_template().empty());
+    EXPECT_EQ(fallback_calls, 1);
+    // Same generation, inside the TTL: served from cache, no re-fetch.
+    ASSERT_FALSE(ws->get_current_work_template().empty());
+    EXPECT_EQ(fallback_calls, 1);
+
+    const uint64_t gen_before = ws->get_work_generation();
+    ws->invalidate_template_cache("kat: simulated CoindRPC reconnect");
+    EXPECT_EQ(ws->get_work_generation(), gen_before + 1);
+
+    // Next serve re-sources through the fallback — the stale snapshot is gone.
+    ASSERT_FALSE(ws->get_current_work_template().empty());
+    EXPECT_EQ(fallback_calls, 2);
+}
+
+// Fix 3 pin (work-source side of the zero-hash pre-auth job_0 defect): a
+// template with a zeroed prev is NOT mineable work — honest set-gap, never a
+// zero-prev job.
+TEST(DashStratumWorkSource, ZeroPrevhashTemplateIsAnHonestSetGap)
+{
+    Fixture fx(true);
+    fx.fallback_work.m_previous_block = uint256::ZERO;   // bits stay non-zero
+    auto ws = fx.make();
+    EXPECT_TRUE(ws->get_current_work_template().empty());
+    EXPECT_TRUE(ws->get_current_gbt_prevhash().empty());
+    auto cbr = ws->build_connection_coinbase(uint256::ZERO, "00000000",
+                                             fixture_miner_script(), {});
+    EXPECT_TRUE(cbr.coinb1.empty());
+    EXPECT_FALSE(cbr.snapshot.has_header);
+}
+
+// ── Fix 4: the submit-time payee guard (pure-function KATs) ─────────────────
+
+std::vector<unsigned char> fixture_coinbase_bytes()
+{
+    Fixture fx(true);
+    auto ws = fx.make();
+    auto cbr = ws->build_connection_coinbase(uint256::ZERO, "00000001",
+                                             fixture_miner_script(), {});
+    return reassemble(cbr.coinb1, "00000001", "00000002", cbr.coinb2);
+}
+
+TEST(DashSubmitPayeeGuard, OkWhenAllMandatedPaymentsPresent)
+{
+    const auto cb = fixture_coinbase_bytes();
+    const auto r = dash::stratum::check_submit_payee(
+        cb, kPrevHashHex, rich_work(), dash::make_coin_params(false));
+    EXPECT_EQ(r.verdict, dash::stratum::PayeeGuardVerdict::Ok);
+}
+
+TEST(DashSubmitPayeeGuard, StalePayeeWhenPayeeRotatedAtSameHeight)
+{
+    // Same prev (same height context) but the current template now mandates a
+    // ROTATED masternode payee the frozen coinbase does not pay: the exact
+    // hex-confirmed bad-cb-payee class. The guard must forbid the submit.
+    const auto cb = fixture_coinbase_bytes();
+    dash::coin::DashWorkData current = rotated_work();
+    current.m_previous_block.SetHex(kPrevHashHex);   // same height, new payee
+    const auto r = dash::stratum::check_submit_payee(
+        cb, kPrevHashHex, current, dash::make_coin_params(false));
+    EXPECT_EQ(r.verdict, dash::stratum::PayeeGuardVerdict::StalePayee);
+    EXPECT_NE(r.detail.find("bad-cb-payee"), std::string::npos);
+}
+
+TEST(DashSubmitPayeeGuard, StalePayeeWhenMandatedAmountChanged)
+{
+    const auto cb = fixture_coinbase_bytes();
+    dash::coin::DashWorkData current = rich_work();
+    current.m_packed_payments[0].amount += 1;   // same script, wrong amount
+    const auto r = dash::stratum::check_submit_payee(
+        cb, kPrevHashHex, current, dash::make_coin_params(false));
+    EXPECT_EQ(r.verdict, dash::stratum::PayeeGuardVerdict::StalePayee);
+}
+
+TEST(DashSubmitPayeeGuard, TipMovedWhenPrevDiffers)
+{
+    // A moved tip is an orphan-race candidate, NOT a doomed bad-cb-payee: the
+    // block stays self-consistent for its own height and must still submit.
+    const auto cb = fixture_coinbase_bytes();
+    const auto r = dash::stratum::check_submit_payee(
+        cb, kPrevHashHex, rotated_work(), dash::make_coin_params(false));
+    EXPECT_EQ(r.verdict, dash::stratum::PayeeGuardVerdict::TipMoved);
+}
+
+TEST(DashSubmitPayeeGuard, UnverifiableOnGarbageCoinbaseNeverBlocks)
+{
+    const std::vector<unsigned char> garbage = {0x01, 0x02, 0x03};
+    const auto r = dash::stratum::check_submit_payee(
+        garbage, kPrevHashHex, rich_work(), dash::make_coin_params(false));
+    EXPECT_EQ(r.verdict, dash::stratum::PayeeGuardVerdict::Unverifiable);
+}
+
+// ── Fix 4 wired into the hot path: mining_submit ────────────────────────────
+
+// A won block whose payee rotated at the SAME height between job issue and
+// submit is locally rejected LOUDLY — the broadcaster must NOT fire (never
+// submit a doomed bad-cb-payee block; steward-ruled posture).
+TEST(DashStratumWorkSource, WonBlockWithStalePayeeIsLocallyRejectedNotSubmitted)
+{
+    SubmitRig rig;
+    rig.job.share_bits  = 0x207fffffu;
+    rig.job.block_nbits = "207fffff";
+    const uint256 block_target = dash::coin::target_from_nbits(0x207fffffu);
+    const uint32_t nonce = rig.find_nonce([&](const uint256& pow) {
+        return pow <= block_target;
+    });
+
+    // Between job issue and submit: the payee ROTATES at the same height
+    // (the churn/staleness window). The re-sourced current template now
+    // mandates a payee the frozen job coinbase does not pay.
+    rig.fx.fallback_work = rotated_work();
+    rig.fx.fallback_work.m_previous_block.SetHex(kPrevHashHex);  // same prev
+    rig.ws->bump_work_generation();   // submit-side cached_work re-sources
+
+    auto result = rig.submit(nonce);
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());          // the miner's work was honest
+    EXPECT_FALSE(rig.fx.submit_called);       // ...but NOTHING was dispatched
+}
+
+// A won block across a MOVED tip is an orphan-race candidate and still
+// dispatches (self-consistent for its own height — never guard-blocked).
+TEST(DashStratumWorkSource, WonBlockAcrossTipMoveStillSubmits)
+{
+    SubmitRig rig;
+    rig.job.share_bits  = 0x207fffffu;
+    rig.job.block_nbits = "207fffff";
+    const uint256 block_target = dash::coin::target_from_nbits(0x207fffffu);
+    const uint32_t nonce = rig.find_nonce([&](const uint256& pow) {
+        return pow <= block_target;
+    });
+
+    rig.fx.fallback_work = rotated_work();    // new prev AND new payee
+    rig.ws->bump_work_generation();
+
+    auto result = rig.submit(nonce);
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());
+    EXPECT_TRUE(rig.fx.submit_called);        // orphan race: still dispatched
 }
 
 }  // namespace

@@ -269,6 +269,14 @@ public:
     /// and share-target submissions cannot mint (loud fail-closed decline).
     void set_producer_job_fn(ProducerJobFn fn);
 
+    /// Drop the cached template snapshot + bump work_generation. Wired to the
+    /// NodeRPC reconnect hook in main_dash.cpp (stale-payee fix, defect 3):
+    /// a "CoindRPC reconnecting" churn means any cached template — and the
+    /// masternode payee frozen inside it — may predate the reconnect, so no
+    /// further job may be served from it. The generation bump makes every
+    /// stratum session re-pull a FRESH template on its next heartbeat.
+    void invalidate_template_cache(const char* reason = "reconnect");
+
 private:
     /// Template cache resolve: return the cached DashWorkData snapshot when it
     /// is still fresh (same work_generation AND younger than the staleness

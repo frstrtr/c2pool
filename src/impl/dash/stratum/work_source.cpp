@@ -35,6 +35,7 @@
 
 #include <impl/dash/stratum/work_source.hpp>
 
+#include <impl/dash/stratum/submit_payee_guard.hpp>  // check_submit_payee (won-block stale-payee gate)
 #include <impl/dash/coinbase_builder.hpp>     // compute_dash_payouts, build, split_coinb, merkle helpers
 #include <impl/dash/coin/block_producer.hpp>  // compute_merkle_root, append_compact_size, target_from_nbits
 #include <impl/dash/crypto/hash_x11.hpp>      // dash::crypto::hash_x11 (X11 PoW SSOT)
@@ -119,6 +120,13 @@ DASHWorkSource::DASHWorkSource(const coin::NodeCoinState& coin_state,
     // defect: the core hardcoded "[LTC]" and a DASH binary logged LTC).
     if (config_.coin_symbol.empty())
         config_.coin_symbol = "DASH";
+    // Stale-payee fix: DASH's coinbase validity is height-bound (the
+    // masternode payee rotates EVERY block), so the stratum session must
+    // NEVER assemble a job from mixed template fetches — it requires the
+    // atomic header+coinbase snapshot build_connection_coinbase() returns
+    // (WorkSnapshot::has_header) and suppresses the job otherwise. This also
+    // makes the core's legacy stub-coinbase fallback unreachable for DASH.
+    config_.require_job_snapshot = true;
     LOG_INFO << "[DASH-STRATUM] DASHWorkSource constructed"
              << " (min_diff=" << config_.min_difficulty
              << " max_diff=" << config_.max_difficulty
@@ -259,9 +267,11 @@ std::shared_ptr<const coin::DashWorkData> DASHWorkSource::cached_work() const
     }
 
     std::lock_guard<std::mutex> lk(template_mutex_);
-    if (work.m_bits == 0) {
-        // Set-gap (unarmed fallback / empty GBT): an honest absence. Keep any
-        // previous cache DROPPED -- serving a stale tip is worse than waiting.
+    if (work.m_bits == 0 || work.m_previous_block.IsNull()) {
+        // Set-gap (unarmed fallback / empty GBT) OR a zero-prev template (the
+        // pre-auth zero-hash job_0 defect: a zeroed prev is not mineable work
+        // on any chain): an honest absence. Keep any previous cache DROPPED --
+        // serving a stale tip is worse than waiting.
         template_cache_.reset();
         template_last_fail_at_ = now;
         return nullptr;
@@ -353,6 +363,21 @@ core::stratum::CoinbaseResult DASHWorkSource::build_connection_coinbase(
     // block body assembled at submit time. Used by BOTH coinbase paths below.
     auto freeze_snapshot = [&](core::stratum::CoinbaseResult& out,
                                const uint256& ref_hash) {
+        // Freeze the header fields ATOMICALLY with the coinbase: prevhash /
+        // version / nbits / ntime come from the SAME wd the coinbase was
+        // built over, so the session's issued job and the block body
+        // assembled at submit time can never mix template generations. This
+        // is the stale-payee root-cause fix: the masternode payee inside
+        // THIS coinbase is only valid at THIS wd's height — a job carrying a
+        // different fetch's prevhash with this coinbase is a guaranteed
+        // dashd bad-cb-payee reject (hex-confirmed @h1517420).
+        out.snapshot.has_header      = true;
+        out.snapshot.gbt_prevhash    = wd->m_previous_block.GetHex();
+        out.snapshot.header_version  = static_cast<uint32_t>(wd->m_version);
+        out.snapshot.block_nbits_hex = dash::coinbase::be_hex_u32(wd->m_bits);
+        out.snapshot.curtime         = wd->m_curtime
+            ? wd->m_curtime : static_cast<uint32_t>(std::time(nullptr));
+        out.snapshot.height          = wd->m_height;
         out.snapshot.subsidy             = wd->m_coinbase_value;
         out.snapshot.frozen_ref.ref_hash = ref_hash;
         if (!wd->m_tx_hashes.empty()) {
@@ -473,7 +498,8 @@ core::stratum::CoinbaseResult DASHWorkSource::build_connection_coinbase(
         out.coinb1 = std::move(split.coinb1_hex);
         out.coinb2 = std::move(split.coinb2_hex);
 
-        // Freeze the snapshot ATOMICALLY with the coinbase (shared helper).
+        // Freeze the snapshot ATOMICALLY with the coinbase (shared helper:
+        // header fields + branches + tx set from the SAME wd).
         freeze_snapshot(out, ref_hash);
         return out;
     } catch (const std::exception& e) {
@@ -607,12 +633,57 @@ nlohmann::json DASHWorkSource::mining_submit(
             block_bytes.insert(block_bytes.end(), tx_bytes.begin(), tx_bytes.end());
         }
 
+        // ── SUBMIT-TIME PAYEE GUARD (stale-payee fix, defect 4) ──────────
+        // Last line of defense: validate the job's frozen coinbase against
+        // the CURRENT template's GBT-mandated payments before dispatch. A
+        // same-height payee mismatch is a deterministic dashd bad-cb-payee
+        // reject (the hex-confirmed h1517420 class) — reject LOUDLY here
+        // instead of submitting a doomed block (steward-ruled posture). A
+        // moved tip is an orphan-race candidate and still submits; a guard-
+        // side parse failure never blocks a submission.
+        bool payee_guard_reject = false;
+        if (wd) {
+            const auto guard = check_submit_payee(
+                coinbase, job->gbt_prevhash, *wd,
+                dash::make_coin_params(is_testnet_));
+            switch (guard.verdict) {
+            case PayeeGuardVerdict::StalePayee:
+                payee_guard_reject = true;
+                LOG_ERROR << "[DASH-STRATUM-PAYEE-GUARD] WON BLOCK LOCALLY "
+                             "REJECTED, NOT submitted: " << guard.detail
+                          << " user=" << username << " job=" << job_id
+                          << " -- a stale-payee coinbase is a guaranteed "
+                             "bad-cb-payee network reject; the job/template "
+                             "pipeline served stale work (investigate!)";
+                break;
+            case PayeeGuardVerdict::TipMoved:
+                LOG_WARNING << "[DASH-STRATUM-PAYEE-GUARD] " << guard.detail
+                            << " -- submitting anyway (block is self-"
+                               "consistent for its own height)";
+                break;
+            case PayeeGuardVerdict::Unverifiable:
+                LOG_WARNING << "[DASH-STRATUM-PAYEE-GUARD] guard could not "
+                               "verify (" << guard.detail
+                            << ") -- submitting unblocked";
+                break;
+            case PayeeGuardVerdict::Ok:
+                LOG_INFO << "[DASH-STRATUM-PAYEE-GUARD] coinbase payee set "
+                            "verified against current template ("
+                         << guard.detail << ")";
+                break;
+            }
+        }
+
         // Dual-path won-block dispatch: submit_block_fn_ (bound in
         // main_dash.cpp) relays via the dashd submitblock RPC arm + the
         // embedded P2P relay leg when armed; true iff >=1 sink reached. A won
         // block reaching NEITHER is a lost subsidy -- scream, never drop.
         bool reached_network = false;
-        if (submit_block_fn_) {
+        if (payee_guard_reject) {
+            // Loud local reject: nothing dispatched. The share still counts
+            // for the miner below — the miner's work was honest; the stale
+            // template was ours.
+        } else if (submit_block_fn_) {
             try {
                 reached_network = submit_block_fn_(block_bytes, height);
             } catch (const std::exception& e) {
@@ -776,6 +847,26 @@ void DASHWorkSource::set_producer_job_fn(ProducerJobFn fn)
 {
     std::lock_guard<std::mutex> lk(producer_job_mutex_);
     producer_job_fn_ = std::move(fn);
+}
+
+void DASHWorkSource::invalidate_template_cache(const char* reason)
+{
+    // Stale-payee fix (defect 3): a CoindRPC reconnect churn means the cached
+    // template — and the masternode payee frozen inside it — may predate the
+    // reconnect. Drop the cache (next cached_work() re-sources through the
+    // embedded/fallback selector) and bump work_generation so EVERY stratum
+    // session re-pushes fresh work on its next heartbeat instead of letting
+    // miners keep hashing jobs whose payee may already have rotated.
+    {
+        std::lock_guard<std::mutex> lk(template_mutex_);
+        template_cache_.reset();
+        template_last_fail_at_ = {};   // allow an immediate re-source
+    }
+    work_generation_.fetch_add(1, std::memory_order_relaxed);
+    LOG_WARNING << "[DASH-STRATUM] template cache INVALIDATED (" << reason
+                << ") -- cached GBT/masternode-payee snapshot dropped; all "
+                   "sessions will re-pull fresh work (generation="
+                << work_generation_.load(std::memory_order_relaxed) << ")";
 }
 
 }  // namespace dash::stratum
