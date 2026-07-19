@@ -380,10 +380,16 @@ if (BUILD_TESTING AND GTest_FOUND)
     # prospective share_info assembly, ref_hash/hash_link producers, oracle
     # retarget + gentx byte goldens. Compiled into this EXISTING allowlisted
     # target so the CI build.yml allowlist stays untouched (proven pattern).
+    # test_dash_mint_runloop.cpp (mint campaign slice 3): the run-loop mint
+    # pipeline -- producer job -> coinb1/coinb2 split -> real X11 solve ->
+    # mint_from_inputs -> tracker insert -> wire round-trip -> best-share
+    # election -> PPLNS oracle-window pin. Same allowlisted target (proven
+    # pattern), no build.yml change.
     add_executable(test_dash_share_hash_link
         test_dash_share_hash_link.cpp
         test_dash_share_producer.cpp
-        test_dash_share_producer_bind.cpp)
+        test_dash_share_producer_bind.cpp
+        test_dash_mint_runloop.cpp)
     target_link_libraries(test_dash_share_hash_link PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
