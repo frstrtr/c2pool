@@ -945,7 +945,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     add_executable(test_dash_cb_payee test_dash_cb_payee.cpp)
     target_link_libraries(test_dash_cb_payee PRIVATE
         GTest::gtest_main GTest::gtest
-        core
+        dash_x11 core
         nlohmann_json::nlohmann_json
         ${Boost_LIBRARIES}
     )

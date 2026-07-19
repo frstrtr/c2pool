@@ -91,7 +91,24 @@ inline std::vector<MinerPayout> compute_dash_payouts(
     const Script donation_script(dash::DONATION_SCRIPT.begin(),
                                   dash::DONATION_SCRIPT.end());
 
-    // 1. payments_tx: preserves GBT order, drops zero-value entries + undecodable payees.
+    // 1. payments_tx: preserves GBT order, drops zero-value entries.
+    //
+    // bad-cb-payee HARD RULE: every non-zero packed payment is a
+    // consensus-REQUIRED coinbase output (masternode / superblock / platform
+    // burn — dashd's ConnectBlock enforces payee+amount). A coinbase missing
+    // one is guaranteed-rejected, so a won block would be silently lost.
+    // Resolution order per entry:
+    //   (a) decode the payee string ("!"+hex raw script, or base58 address
+    //       under the CURRENT net params) — the share-wire-compatible form;
+    //   (b) if that fails, fall back to the GBT-provided raw scriptPubKey
+    //       bytes VERBATIM (rpc_data.hpp normalize_payment preserves them) —
+    //       byte-faithful to what dashd will enforce, LOUD warning (the
+    //       classic trigger is a wrong-net binary: mainnet address_version
+    //       applied to a testnet payee);
+    //   (c) if NEITHER is available, THROW — refuse to build a doomed
+    //       coinbase (the stratum path serves no job and screams, instead of
+    //       letting a miner burn hashrate on a block dashd must reject).
+    // NEVER silently drop.
     std::vector<MinerPayout> payments_tx;
     payments_tx.reserve(packed_payments.size());
     uint64_t total_payments = 0;
@@ -99,7 +116,26 @@ inline std::vector<MinerPayout> compute_dash_payouts(
         if (p.amount == 0) continue;
         auto pm_script = dash::decode_payee_script(
             p.payee, params.address_version, params.address_p2sh_version);
-        if (pm_script.empty()) continue;
+        if (pm_script.empty() && !p.script.empty()) {
+            pm_script = p.script;   // byte-faithful GBT scriptPubKey fallback
+            LOG_WARNING << "[compute_dash_payouts] payee '" << p.payee
+                        << "' does not decode under address_version="
+                        << static_cast<int>(params.address_version)
+                        << "/p2sh=" << static_cast<int>(params.address_p2sh_version)
+                        << " -- using the GBT-provided scriptPubKey verbatim ("
+                        << p.script.size() << "B). Check the --testnet flag "
+                           "matches the daemon's chain.";
+        }
+        if (pm_script.empty()) {
+            // (c): no usable script AT ALL. A coinbase without this output is
+            // guaranteed bad-cb-payee => lost block reward. Refuse to build.
+            throw std::runtime_error(
+                "compute_dash_payouts: GBT payment payee '" + p.payee
+                + "' (amount=" + std::to_string(p.amount)
+                + ") is undecodable and carries no raw script -- refusing to "
+                  "build a coinbase missing a consensus-required payee output "
+                  "(bad-cb-payee)");
+        }
         MinerPayout out;
         out.amount = p.amount;
         out.script = std::move(pm_script);

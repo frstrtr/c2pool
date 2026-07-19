@@ -21,9 +21,20 @@ namespace coin
 // One masternode / superblock / platform payment entry after normalization.
 // payee == "!" + hex_script when the payment is a raw script (OP_RETURN
 // platform payment); otherwise payee is a base58 address.
+//
+// script carries dashd's GBT-provided scriptPubKey bytes VERBATIM whenever the
+// entry had a "script" field — even when the base58 payee wins the payee
+// string. It is the byte-faithful fallback for the coinbase lane: if the payee
+// string later fails to decode (wrong-net address version, future address
+// type), the coinbase builder emits these exact bytes instead of silently
+// dropping a consensus-REQUIRED output (bad-cb-payee => every won block lost).
+// The payee STRING semantics are unchanged (share-wire compatible — the
+// sharechain PackedPayment in share_types.hpp is a distinct struct and still
+// carries only the string).
 struct PackedPayment {
     std::string payee;
     uint64_t    amount{0};
+    std::vector<unsigned char> script;   // raw GBT scriptPubKey (may be empty)
 };
 
 // Normalize ONE masternode / superblock / platform payment entry from a dashd
@@ -49,6 +60,32 @@ inline PackedPayment normalize_payment(const nlohmann::json& entry)
             pp.payee = "!" + entry["script"].get<std::string>();
         if (entry.contains("amount"))
             pp.amount = entry["amount"].get<uint64_t>();
+        // ALWAYS preserve the raw GBT scriptPubKey bytes alongside the payee
+        // string (bad-cb-payee hardening): dashd hands us the exact script it
+        // will enforce at ConnectBlock; keeping it means the coinbase builder
+        // never has to silently drop a consensus-required output just because
+        // the base58 round-trip failed. Manual hex decode keeps this header
+        // dependency-light (nlohmann-only, mirrors decode_payee_script).
+        if (entry.contains("script") && entry["script"].is_string())
+        {
+            const std::string hex = entry["script"].get<std::string>();
+            auto nib = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                return -1;
+            };
+            std::vector<unsigned char> raw;
+            raw.reserve(hex.size() / 2);
+            bool ok = (hex.size() % 2 == 0);
+            for (size_t i = 0; ok && i + 1 < hex.size(); i += 2) {
+                const int hi = nib(hex[i]), lo = nib(hex[i + 1]);
+                if (hi < 0 || lo < 0) { ok = false; break; }
+                raw.push_back(static_cast<unsigned char>((hi << 4) | lo));
+            }
+            if (ok)
+                pp.script = std::move(raw);
+        }
     }
     return pp;
 }

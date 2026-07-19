@@ -205,11 +205,39 @@ bool NodeRPC::check()
 {
     uint256 genesis = uint256S(dash_genesis_hash(IS_TESTNET));
     bool has_block = check_blockheader(genesis);
-    bool is_main_chain = getblockchaininfo()["chain"].get<std::string>() == "main";
+    const std::string chain = getblockchaininfo()["chain"].get<std::string>();
+    bool is_main_chain = chain == "main";
 
     if (is_main_chain && !has_block)
     {
         LOG_ERROR << "Check failed! Make sure that you're connected to the right dashd with --dash-rpc-port, and that it has finished syncing!" << std::endl;
+        return false;
+    }
+
+    // Chain-identity guard (bad-cb-payee root-cause hardening): a net-mode /
+    // daemon-chain mismatch previously passed this probe silently in BOTH
+    // wrong directions except mainnet-vs-mainnet-genesis-missing. The lethal
+    // one is a MAINNET-mode binary against a testnet daemon: every GBT
+    // masternode payee ('y...') fails base58 decode under mainnet
+    // address_version=76, the required payee output vanished from the built
+    // coinbase, and every won block was rejected bad-cb-payee (hex-confirmed
+    // against dashd getblocktemplate proposal mode). Fail LOUDLY at connect
+    // instead. --testnet accepts test/regtest/devnet (the tuned-net + G3b
+    // harness posture) but never "main".
+    if (!IS_TESTNET && !is_main_chain)
+    {
+        LOG_ERROR << "Chain mismatch: dashd reports chain='" << chain
+                  << "' but c2pool-dash is in MAINNET mode. A mainnet-mode "
+                     "coinbase drops the daemon's masternode payee outputs "
+                     "(bad-cb-payee -- every won block would be lost). "
+                     "Run with --testnet or point --coin-rpc at a mainnet dashd.";
+        return false;
+    }
+    if (IS_TESTNET && is_main_chain)
+    {
+        LOG_ERROR << "Chain mismatch: dashd reports chain='main' but "
+                     "c2pool-dash is in TESTNET mode (--testnet). Drop "
+                     "--testnet or point --coin-rpc at a testnet dashd.";
         return false;
     }
 

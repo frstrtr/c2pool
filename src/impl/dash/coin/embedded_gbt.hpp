@@ -214,6 +214,11 @@ inline DashWorkData build_embedded_workdata(
                 pp.payee = "!" + hex_script;
             }
             pp.amount = static_cast<uint64_t>(mn_payment);
+            // Byte-faithful fallback (bad-cb-payee hardening, mirrors the RPC
+            // arm): carry the raw scriptPayout bytes so the coinbase builder
+            // can emit them verbatim if the derived address ever fails to
+            // round-trip under the active net params.
+            pp.script.assign(script.begin(), script.end());
             w.m_packed_payments.push_back(std::move(pp));
         }
     }

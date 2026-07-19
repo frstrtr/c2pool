@@ -133,15 +133,18 @@ TEST(DashCoinbaseParity, TxOutOnWireBytesMatchOracle) {
 }
 
 // (8) compute_dash_payouts tx_out ORDER == oracle generate_transaction:
-//     worker_tx (finder) || payments_tx (GBT order, nonzero+decodable only) ||
-//     donation_tx (always last). Drops zero-amount + "script:"/undecodable payees.
+//     worker_tx (finder) || payments_tx (GBT order, nonzero only) ||
+//     donation_tx (always last). Drops zero-amount entries ONLY — a non-zero
+//     undecodable payee now THROWS instead of being silently dropped
+//     (bad-cb-payee hard rule, 2026-07-19; see test (8b) below): a coinbase
+//     missing a consensus-required payment is guaranteed-rejected by dashd,
+//     so the builder must refuse rather than build a doomed coinbase.
 TEST(DashCoinbaseParity, TxOutOrderingWorkerPaymentsDonation) {
     auto params = dash::make_coin_params(true); // testnet: ver 140 / p2sh 19
 
     std::vector<dash::coin::PackedPayment> payments;
     payments.push_back({kAddrP2PKH,          5000}); // valid base58 P2PKH -> kept
     payments.push_back({"!6a04deadbeef",        1}); // valid raw script   -> kept
-    payments.push_back({"script:76a914aa88ac",  9}); // legacy form        -> dropped
     payments.push_back({kAddrP2SH,              0}); // zero amount        -> dropped
 
     // Distinct finder hash so its script never coalesces with a payee script.
@@ -166,6 +169,28 @@ TEST(DashCoinbaseParity, TxOutOrderingWorkerPaymentsDonation) {
     // sum(outs) == subsidy (data.py worker_payout invariant).
     uint64_t sum = 0; for (auto& o : outs) sum += o.amount;
     EXPECT_EQ(sum, subsidy);
+}
+
+// (8b) bad-cb-payee hard rule: a NON-ZERO payment whose payee cannot be
+//      decoded (legacy "script:" form, corrupt string) and which carries no
+//      raw GBT script bytes must THROW — never be silently dropped. The
+//      pre-fix silent drop built a coinbase missing a consensus-required
+//      output; dashd rejected the won block with bad-cb-payee (hex-confirmed
+//      live on testnet 2026-07-19).
+TEST(DashCoinbaseParity, UndecodablePayeeThrowsNeverDrops) {
+    auto params = dash::make_coin_params(true);
+
+    std::vector<dash::coin::PackedPayment> payments;
+    payments.push_back({"script:76a914aa88ac", 9}); // legacy form, no raw script
+
+    std::vector<unsigned char> finder_h(20, 0x07);
+    uint160 finder(finder_h);
+
+    EXPECT_THROW(
+        dash::coinbase::compute_dash_payouts(
+            5000000000ull, payments, finder, /*weights=*/{},
+            /*total_weight=*/0, params),
+        std::runtime_error);
 }
 
 // (9) v36 ARM: full-weight split, NO 2% block-finder fee, donation = remainder.
