@@ -231,6 +231,28 @@ public:
         const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>& merged_addrs)>;
     void set_pplns_inputs_fn(PplnsInputsFn fn);
 
+    /// External-daemon GBT tip fallback (the fallback V36 mandates PERSIST).
+    /// While the embedded HeaderChain is unfed -- tip_hash()==nullopt, which is
+    /// the live state of a freshly-stood-up :5025 node whose Scrypt-only header
+    /// ingest has not yet populated the chain -- the header walk can supply
+    /// NEITHER previousblockhash NOR the authoritative MultiShield-V4 bits (a
+    /// Scrypt-only walk cannot reconstruct the 5-algo retarget window == V37).
+    /// This seam lets get_current_work_template() AND get_current_gbt_prevhash()
+    /// source BOTH from the external digibyted getblocktemplate. Bound in
+    /// main_dgb.cpp to a lambda over NodeRPC::getblocktemplate -- the RPC
+    /// transport stays OUT of stratum/, mirroring set_pplns_inputs_fn and dash's
+    /// dashd_fallback closure (#726). Returns nullopt when the seam is unbound,
+    /// no digibyted creds are armed, or the RPC call fails -- both fields then
+    /// stay a truthful ABSENCE exactly as before (never a fabricated tip/bits).
+    /// Consumed ONLY when the embedded chain has no tip; a real embedded tip
+    /// always wins (single truthful source, never a prevhash/bits height split).
+    struct GbtTip {
+        std::string previousblockhash;  ///< GBT big-endian display hex (u256_be_display_hex convention)
+        std::string bits;               ///< GBT nBits compact hex, daemon-authoritative
+    };
+    using GbtTipFn = std::function<std::optional<GbtTip>()>;
+    void set_gbt_tip_fn(GbtTipFn fn);
+
     /// Dispatch one share-difficulty submission to the bound mint callback.
     /// The stage-4d mining_submit classify branch calls this on the
     /// "pow_hash <= share target" outcome. Returns the minted share hash, or a
@@ -296,6 +318,23 @@ private:
     // per-connection coinbase path returns an empty job (pre-wire behavior).
     mutable std::mutex          pplns_inputs_mutex_;
     PplnsInputsFn               pplns_inputs_fn_;
+
+    // External-daemon GBT tip fallback (set_gbt_tip_fn). Empty until bound in
+    // main_dgb; while empty the embedded-empty-chain path is byte-identical to
+    // the prior truthful-absence. A short TTL cache bounds how often the blocking
+    // getblocktemplate RPC round-trip runs on the single io_context thread (the
+    // template + prevhash accessors can be polled per stratum session heartbeat).
+    mutable std::mutex            gbt_tip_mutex_;
+    GbtTipFn                      gbt_tip_fn_;
+    mutable std::optional<GbtTip> gbt_tip_cache_;
+    mutable int64_t               gbt_tip_cache_time_ = 0;
+    static constexpr int64_t      GBT_TIP_TTL_SECONDS = 5;
+
+    // Resolve the external-daemon GBT tip fallback (previousblockhash + bits),
+    // TTL-cached. Returns nullopt when no seam is bound / RPC unavailable / the
+    // call failed. Consumed by get_current_work_template() and
+    // get_current_gbt_prevhash() ONLY when chain_.tip_hash() is nullopt.
+    std::optional<GbtTip> resolve_gbt_tip_fallback() const;
 
     // Template cache (filled lazily; invalidated when work_generation_ bumps)
     // Stage 4c populates these.

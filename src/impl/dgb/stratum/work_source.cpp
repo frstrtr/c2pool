@@ -31,6 +31,7 @@
 
 #include <core/log.hpp>
 #include <core/hash.hpp>                        // Hash (sha256d) for coinbase txid + merkle pair
+#include <core/target_utils.hpp>            // chain::target_to_difficulty (vardiff/pool unit parity)
 #include <core/address_utils.hpp>              // address_to_script (share payout from username)
 
 #include <btclibs/util/strencodings.h>          // ParseHex
@@ -172,6 +173,14 @@ std::string DGBWorkSource::get_current_gbt_prevhash() const
     // embedded P2P header ingest) -- a truthful absence, never a fabricated id.
     if (auto th = chain_.tip_hash())
         return u256_be_display_hex(*th);
+    // Embedded chain unfed -> external-daemon GBT fallback (the mining.notify
+    // prevhash path: stratum_server.cpp get_current_gbt_prevhash caller). Drawn
+    // from the SAME single GBT source as get_current_work_template()'s
+    // previousblockhash, so the dedicated getter and the assembled template can
+    // never diverge. Empty on unbound / no-creds / RPC-failure -- the server
+    // then falls back to the best-share hash (its documented empty-prevhash path).
+    if (auto tip = resolve_gbt_tip_fallback())
+        return tip->previousblockhash;
     return {};
 }
 
@@ -323,8 +332,19 @@ nlohmann::json DGBWorkSource::get_current_work_template() const
     in.median_time_past  = chain_.median_time_past();
     in.curtime           = static_cast<int64_t>(std::time(nullptr));
     in.transactions      = tx_sel.transactions;
-    if (auto th = chain_.tip_hash())
+    if (auto th = chain_.tip_hash()) {
+        // Embedded chain carries a real tip -> source previousblockhash from it.
+        // bits stays absent here: the Scrypt-only walk cannot reconstruct the
+        // MultiShield-V4 5-algo window (== V37) -- unchanged truthful absence.
         in.previousblockhash = u256_be_display_hex(*th);
+    } else if (auto tip = resolve_gbt_tip_fallback()) {
+        // Embedded HeaderChain unfed -> external-daemon GBT fallback (persist per
+        // V36). Sources BOTH previousblockhash and the daemon-authoritative bits
+        // from ONE getblocktemplate snapshot (consistent height). Unbound / no
+        // creds / RPC failure -> both stay absent, byte-identical to before.
+        in.previousblockhash = tip->previousblockhash;
+        in.bits              = tip->bits;
+    }
 
     return dgb::coin::build_work_template(in);
 }
@@ -614,20 +634,75 @@ nlohmann::json DGBWorkSource::mining_submit(
     }
 }
 double DGBWorkSource::compute_share_difficulty(
-    const std::string& /*coinb1*/, const std::string& /*coinb2*/,
-    const std::string& /*extranonce1*/, const std::string& /*extranonce2*/,
-    const std::string& /*ntime*/, const std::string& /*nonce*/,
-    uint32_t /*version*/, const std::string& /*prevhash_hex*/,
-    const std::string& /*nbits_hex*/,
-    const std::vector<std::string>& /*merkle_branches*/) const
+    const std::string& coinb1, const std::string& coinb2,
+    const std::string& extranonce1, const std::string& extranonce2,
+    const std::string& ntime, const std::string& nonce,
+    uint32_t version, const std::string& prevhash_hex,
+    const std::string& nbits_hex,
+    const std::vector<std::string>& merkle_branches) const
 {
-    // Stage 4b/4c: reconstruct the 80-byte header from (coinb1+en1+en2+coinb2)
-    // merkle-rooted with merkle_branches, then scrypt_1024_1_1_256(header) and
-    // return diff1 / pow_hash. Until then the coin-agnostic StratumServer must
-    // not credit pseudoshares it cannot score, so we return 0.0 — the documented
-    // parse-error / not-yet sentinel that the vardiff gate already treats as a
-    // hard reject (no garbage difficulty leaks into the rate monitor).
-    return 0.0;
+    // Stage 4b/4c LIVE: reconstruct the 80-byte header EXACTLY as mining_submit
+    // does (coinb1||en1||en2||coinb2 -> sha256d txid -> ascend merkle branches ->
+    // header), run the DGB-Scrypt digest (scrypt_1024_1_1_256, the sole algo V36
+    // validates), and return the achieved difficulty in the SAME unit the coin-
+    // agnostic StratumServer vardiff/pool gate uses (chain::target_to_difficulty,
+    // diff-1 == 0x1d00ffff). A malformed reconstruct (bad hex -> header != 80B)
+    // returns the documented 0.0 not-scored sentinel, which the gate treats as a
+    // hard reject -- so no garbage difficulty leaks into the rate monitor.
+
+    // 1. coinbase = coinb1 || extranonce1 || extranonce2 || coinb2
+    auto coinb1_bytes = ParseHex(coinb1);
+    auto en1_bytes    = ParseHex(extranonce1);
+    auto en2_bytes    = ParseHex(extranonce2);
+    auto coinb2_bytes = ParseHex(coinb2);
+
+    std::vector<uint8_t> coinbase;
+    coinbase.reserve(coinb1_bytes.size() + en1_bytes.size()
+                     + en2_bytes.size() + coinb2_bytes.size());
+    coinbase.insert(coinbase.end(), coinb1_bytes.begin(), coinb1_bytes.end());
+    coinbase.insert(coinbase.end(), en1_bytes.begin(),    en1_bytes.end());
+    coinbase.insert(coinbase.end(), en2_bytes.begin(),    en2_bytes.end());
+    coinbase.insert(coinbase.end(), coinb2_bytes.begin(), coinb2_bytes.end());
+
+    // 2. coinbase_txid = sha256d(coinbase) (non-witness txid for the merkle root)
+    uint256 coinbase_txid = Hash(
+        std::span<const uint8_t>(coinbase.data(), coinbase.size()));
+
+    // 3. merkle_root = ascend the frozen stratum merkle branches (LE-internal).
+    uint256 merkle_root = coinbase_txid;
+    for (const auto& branch_hex : merkle_branches) {
+        uint256 b;
+        auto bb = ParseHex(branch_hex);
+        if (bb.size() == 32) std::memcpy(b.begin(), bb.data(), 32);
+        merkle_root = merkle_pair(merkle_root, b);
+    }
+
+    // 4. header = version(LE) || prev(LE) || merkle_root || ntime(LE)
+    //             || nbits(LE) || nonce(LE); prevhash arrives BE-display, so
+    //    reverse to internal byte order (mirrors mining_submit byte-for-byte).
+    auto prevhash_be = ParseHex(prevhash_hex);
+    std::vector<uint8_t> prevhash_le(prevhash_be.rbegin(), prevhash_be.rend());
+
+    std::vector<uint8_t> header;
+    header.reserve(80);
+    push_u32_le(header, version);
+    header.insert(header.end(), prevhash_le.begin(), prevhash_le.end());
+    header.insert(header.end(), merkle_root.data(), merkle_root.data() + 32);
+    push_u32_le(header, parse_be_hex_u32(ntime));
+    push_u32_le(header, parse_be_hex_u32(nbits_hex));   // share target bits
+    push_u32_le(header, parse_be_hex_u32(nonce));
+
+    if (header.size() != 80)
+        return 0.0;  // malformed reconstruct -> not-scored sentinel (hard reject).
+
+    // 5. DGB-Scrypt PoW digest, then difficulty relative to diff-1. Bridge the
+    //    coin-space u256 into core uint256 via the u256_be_display_hex SSOT so
+    //    the number is unit-identical to required_difficulty / pool_difficulty
+    //    (both computed through chain::target_to_difficulty on the core side).
+    dgb::coin::u256 pow_hash = dgb::coin::scrypt_pow_hash(header.data());
+    uint256 pow_core;
+    pow_core.SetHex(dgb::coin::u256_be_display_hex(pow_hash));
+    return chain::target_to_difficulty(pow_core);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -656,6 +731,40 @@ void DGBWorkSource::set_pplns_inputs_fn(PplnsInputsFn fn)
 {
     std::lock_guard<std::mutex> lk(pplns_inputs_mutex_);
     pplns_inputs_fn_ = std::move(fn);
+}
+
+void DGBWorkSource::set_gbt_tip_fn(GbtTipFn fn)
+{
+    std::lock_guard<std::mutex> lk(gbt_tip_mutex_);
+    gbt_tip_fn_ = std::move(fn);
+    gbt_tip_cache_.reset();     // drop any stale cache when the seam is (re)bound
+    gbt_tip_cache_time_ = 0;
+}
+
+std::optional<DGBWorkSource::GbtTip> DGBWorkSource::resolve_gbt_tip_fallback() const
+{
+    // Copy the seam + serve a fresh-enough cache under the lock; run the blocking
+    // RPC round-trip OUTSIDE the lock (single io_context thread today, but never
+    // hold a lock across network IO). TTL-bound so per-heartbeat template/prevhash
+    // polls do not each trigger a getblocktemplate round-trip.
+    GbtTipFn fn;
+    const int64_t now = static_cast<int64_t>(std::time(nullptr));
+    {
+        std::lock_guard<std::mutex> lk(gbt_tip_mutex_);
+        if (gbt_tip_cache_ && (now - gbt_tip_cache_time_) < GBT_TIP_TTL_SECONDS)
+            return gbt_tip_cache_;
+        fn = gbt_tip_fn_;  // copy so a concurrent set_gbt_tip_fn() cannot tear it out
+    }
+    if (!fn)
+        return std::nullopt;   // unbound (no digibyted creds armed) -> truthful absence
+
+    std::optional<GbtTip> tip = fn();   // blocking getblocktemplate; nullopt on RPC failure
+    if (tip) {
+        std::lock_guard<std::mutex> lk(gbt_tip_mutex_);
+        gbt_tip_cache_      = tip;
+        gbt_tip_cache_time_ = now;
+    }
+    return tip;
 }
 
 uint256 DGBWorkSource::try_mint_share(const MintShareInputs& in) const

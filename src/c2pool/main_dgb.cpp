@@ -645,6 +645,58 @@ int run_node(const core::CoinParams& params, bool testnet,
         header_chain, mempool, testnet, std::move(stratum_submit_fn),
         params.subsidy_func);
 
+    // -- External-daemon GBT tip fallback bind (the fallback V36 mandates PERSIST)
+    // While the embedded HeaderChain is unfed (tip_hash()==nullopt -- the live
+    // state of a freshly-stood-up :5025 node) the Scrypt-only walk supplies
+    // NEITHER previousblockhash NOR the MultiShield-V4 bits. Bind the RPC arm so
+    // get_current_work_template() + get_current_gbt_prevhash() (the mining.notify
+    // prevhash source) draw both from digibyted getblocktemplate. The RPC
+    // transport stays in main (mirrors the #82 submit arm + dash's #726
+    // dashd_fallback); stratum/ holds only the std::function seam. UNARMED (no
+    // digibyte.conf creds) -> seam left unbound -> truthful absence, byte-identical
+    // to the daemon-less default build. A real embedded tip always wins over this.
+    if (rpc) {
+        auto* rpc_ptr = rpc.get();
+        work_source->set_gbt_tip_fn(
+            [rpc_ptr]() -> std::optional<dgb::stratum::DGBWorkSource::GbtTip> {
+                try {
+                    // DGB GBT: "segwit" BIP9 rule; NodeRPC::getblocktemplate injects
+                    // the mandatory separate Scrypt "algo" param (V36 Scrypt-only).
+                    nlohmann::json tmpl = rpc_ptr->getblocktemplate({"segwit"});
+                    if (!tmpl.is_object())
+                        return std::nullopt;
+                    auto ph = tmpl.find("previousblockhash");
+                    auto bt = tmpl.find("bits");
+                    if (ph == tmpl.end() || !ph->is_string() ||
+                        bt == tmpl.end() || !bt->is_string())
+                        return std::nullopt;
+                    dgb::stratum::DGBWorkSource::GbtTip tip;
+                    tip.previousblockhash = ph->get<std::string>();
+                    tip.bits              = bt->get<std::string>();
+                    // GBT previousblockhash is 64-hex big-endian display -- the
+                    // exact u256_be_display_hex convention the embedded path emits,
+                    // so it flows verbatim (parity by the daemon's own GBT contract).
+                    // Width-guard so a malformed reply is a truthful absence, never a
+                    // fabricated short id.
+                    if (tip.previousblockhash.size() != 64)
+                        return std::nullopt;
+                    return tip;
+                } catch (const std::exception& e) {
+                    std::cerr << "[DGB-STRATUM] GBT tip fallback RPC failed: "
+                              << e.what() << " -- prevhash/bits held absent"
+                              << std::endl;
+                    return std::nullopt;
+                }
+            });
+        std::cout << "[DGB] stratum GBT tip fallback ARMED: previousblockhash+bits "
+                     "<- digibyted getblocktemplate (embedded-empty-chain path)"
+                  << std::endl;
+    } else {
+        std::cout << "[DGB] stratum GBT tip fallback UNARMED (no digibyted creds) "
+                     "-- prevhash/bits truthful-absent until embedded chain feeds"
+                  << std::endl;
+    }
+
     // -- Phase-B producer bind: per-connection coinbase PPLNS inputs ----------
     // Bind DGBWorkSource::set_pplns_inputs_fn -- the SOLE empty-jobs seam. While
     // unbound, build_connection_coinbase() returns an empty job (pre-wire stub);
