@@ -562,8 +562,23 @@ jobs:
               if [ -x "$bin" ]; then echo "CHROME_BIN=$bin" >> "$GITHUB_ENV"; break; fi
             done
           else
-            CHROME_BIN="$(npx --yes @puppeteer/browsers install chrome@stable | tail -1 | awk '{print $NF}')"
-            test -x "$CHROME_BIN" || { echo "puppeteer chrome install failed"; exit 1; }
+            # Self-hosted: REUSE a Chrome-for-Testing already unpacked under
+            # ~/.cache/puppeteer if present (VM905 persists it across jobs) so
+            # the warm path touches NO network. Only on a cold cache do we
+            # fetch from Google's CDN, and then with bounded retries — a
+            # single-attempt download false-reds the whole gate on a transient
+            # outbound blip (ENETUNREACH/ETIMEDOUT, run 29675949544), failing
+            # PRs that never touch web/.
+            CHROME_BIN="$(ls -1 "$HOME"/.cache/puppeteer/chrome/*/chrome-linux64/chrome 2>/dev/null | tail -1 || true)"
+            if [ ! -x "$CHROME_BIN" ]; then
+              for attempt in 1 2 3; do
+                CHROME_BIN="$(npx --yes @puppeteer/browsers install chrome@stable | tail -1 | awk '{print $NF}')" \
+                  && [ -x "$CHROME_BIN" ] && break
+                echo "chrome-for-testing fetch attempt $attempt failed; retrying in $((attempt*10))s"
+                sleep $((attempt*10))
+              done
+            fi
+            test -x "$CHROME_BIN" || { echo "puppeteer chrome install failed after retries"; exit 1; }
             echo "CHROME_BIN=$CHROME_BIN" >> "$GITHUB_ENV"
           fi
 
