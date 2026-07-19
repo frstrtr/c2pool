@@ -677,7 +677,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     # real Events (no direct poke), honour dispose(), and reach the embedded
     # template. Same header-only link set as the maintainer suite (no NodeImpl
     # -> no pool/storage dep).
-    add_executable(test_dash_node_reception_wire test_dash_node_reception_wire.cpp)
+    # Second TU (E2a): test_dash_live_feed_bridge.cpp — the live-feed bridge
+    # (live_feed.hpp) translating raw coin-P2P wire events into the derived
+    # ingest events (new_headers->HeaderChain, full_block->block_connected) + the
+    # pure tip_advance_from_chain gate. Same target/link set; no new allowlist.
+    add_executable(test_dash_node_reception_wire test_dash_node_reception_wire.cpp
+                   test_dash_live_feed_bridge.cpp)
     target_link_libraries(test_dash_node_reception_wire PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core

@@ -327,6 +327,19 @@ public:
         m_peer->write(msg);
     }
 
+    /// Request the peer's mempool inventory (E2a initial-sync seam). The peer
+    /// replies with inv(MSG_TX,...) announcements; our inv handler currently
+    /// only pulls block invs (tx pull is relay-driven), so this primes the
+    /// relay feed — mempool contents are OPTIONAL for embedded-template
+    /// viability (an empty mempool still yields a valid coinbase-only template),
+    /// so this never gates populate; it only enriches the assembled template.
+    void send_mempool()
+    {
+        if (!m_peer) return;
+        auto msg = message_mempool::make_raw();
+        m_peer->write(msg);
+    }
+
     /// Request a full block via plain MSG_BLOCK getdata (E2 pull seam).
     void request_block(const uint256& block_hash)
     {
@@ -556,9 +569,11 @@ private:
 
     ADD_P2P_HANDLER(block)
     {
-        // NOTE: dash BlockType wire-deserialization is header-only today
-        // (block.hpp S5 note) — msg->m_block carries the header; body ingest
-        // needs the raw-payload parser (E2).
+        // E2a: BlockType now deserializes the full body (header + tx set), so
+        // msg->m_block carries the transactions the ingest legs consume
+        // (MnStateMachine::apply_block special txs, UTXO connect_block). The
+        // full_block event below feeds the E2a live-feed bridge, which derives
+        // the block height off the header chain and fires block_connected.
         auto header = static_cast<BlockHeaderType>(msg->m_block);
         auto packed_header = pack(header);
         auto blockhash = dash::crypto::hash_x11(packed_header.get_span());
@@ -571,10 +586,11 @@ private:
 
     ADD_P2P_HANDLER(headers)
     {
-        // E1 receives unsolicited single-entry announcements at most (we do
-        // not send sendheaders/getheaders). Multi-entry batches need the
-        // raw-payload parser (dash BlockType is header-only on the wire) —
-        // that is the E2 sync slice.
+        // E2a: BlockType now round-trips the wire `headers` layout (each entry
+        // is an 80-byte header + CompactSize(0) tx-count), so multi-entry
+        // getheaders-driven batches deserialize correctly. The new_headers event
+        // feeds the E2a live-feed bridge -> HeaderChain::add_headers, which is
+        // the tip authority driving the embedded template's next-work/MTP.
         std::vector<BlockHeaderType> vheaders;
         for (auto& block : msg->m_headers)
         {
