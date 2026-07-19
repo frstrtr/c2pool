@@ -1069,8 +1069,21 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     if (sb != 0)
         pool_difficulty = chain::target_to_difficulty(chain::bits_to_target(sb));
 
-    // Use VARDIFF as stratum acceptance threshold
+    // Use VARDIFF as stratum acceptance threshold — but validate the share
+    // against the difficulty THIS job was issued at (the target the miner
+    // actually received), not the live vardiff. A vardiff UP-retarget between
+    // job-issue and submit must not reject the miner's in-flight shares — that
+    // was the sole source of the DASH hotel's ~28% "Low difficulty share"
+    // rejects (X11 hashrate swings oscillate vardiff; every up-retarget
+    // rejected in-flight work). Faithful port of p2pool-dash work.py:477
+    // ("within 3 work events" grace): p2pool judges each share by its OWN job's
+    // target. Take the lenient lower of {live vardiff, this job's issued diff}.
+    // issued_difficulty==0 (unset) ⇒ old behavior. REWARD-NEUTRAL: the pool
+    // target + block-target checks below are independent and unchanged, so a
+    // real block (which far exceeds any vardiff) is unaffected on all coins.
     double required_difficulty = vardiff_difficulty;
+    if (job.issued_difficulty > 0.0 && job.issued_difficulty < required_difficulty)
+        required_difficulty = job.issued_difficulty;
 
     // Build JobSnapshot BEFORE the rejection gate — needed for block-level
     // checking which must run on ALL submissions, not just accepted ones.
@@ -1604,6 +1617,10 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         je.version = version_u32;
         je.gbt_block_nbits = gbt_block_nbits;
         je.created_at = now_steady;
+        // Freeze the vardiff advertised with this job so the submit gate can
+        // validate a share against the target the miner actually received
+        // (p2pool-dash work.py:477 grace), immune to later vardiff retargets.
+        je.issued_difficulty = hashrate_tracker_.get_current_difficulty();
         active_jobs_[job_id] = std::move(je);
         job_order_.push_back(job_id);
     }

@@ -157,6 +157,13 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
         // Creation stamp for TTL eviction (steady clock — immune to wall-clock
         // jumps; the wire ntime field above is unchanged and stays wall-clock).
         std::chrono::steady_clock::time_point created_at{};
+        // VARDIFF difficulty advertised WITH this job, frozen at creation. The
+        // submit gate validates a share against THIS (the target the miner
+        // actually received), not the live vardiff, so a vardiff up-retarget
+        // between job-issue and submit does not reject in-flight shares. Port
+        // of p2pool-dash work.py:477 grace (p2pool judges each share by its own
+        // job's target). 0.0 = unset ⇒ gate falls back to the live vardiff.
+        double issued_difficulty{0.0};
     };
     std::unordered_map<std::string, JobEntry> active_jobs_;
     // Insertion-order companion to active_jobs_ (hotel interim fix #1).
