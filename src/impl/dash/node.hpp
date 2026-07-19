@@ -41,6 +41,7 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <set>
 #include <shared_mutex>
 #include <thread>
 #include <vector>
@@ -199,6 +200,22 @@ protected:
     // Buffer of pruned share hashes, batch-deleted from LevelDB after clean.
     std::vector<uint256> m_removal_flush_buf;
 
+    // ── Run-loop mint slice (3/3) state ─────────────────────────────────
+    // Best-share election result — published by run_think() on the compute
+    // thread under m_tracker_mutex (mirrors btc::NodeImpl::m_best_share_hash).
+    uint256 m_best_share_hash;
+    // De-dup set for broadcast_share (hashes already relayed to peers).
+    std::set<uint256> m_shared_share_hashes;
+    // Hashes of the CURRENT template's txs registered in m_known_txs by
+    // register_template_txs — replaced wholesale each registration so the
+    // known-tx pool stays bounded by one template.
+    std::set<uint256> m_template_tx_hashes;
+    // Fired on the IO thread when run_think() elects a new best share
+    // (p2pool: new_work_event) — main_dash binds the stratum work refresh.
+    std::function<void()> m_on_best_share_changed;
+    // Chain-relative block height for think() scoring; unbound -> zero fn.
+    std::function<int32_t(uint256)> m_block_rel_height_fn;
+
 public:
     // Default (rig-free) construction for tests/standalone: no io_context, the
     // share-getter requester is a no-op (reception slice supplies the real
@@ -276,10 +293,65 @@ public:
         // slice; post-handshake messages are dropped for now.
     }
 
-    // BaseNode pure-virtuals. Slice A provides minimal stubs so NodeImpl is a
-    // concrete, instantiable type for the KAT; the reception/handshake slice (B)
-    // replaces these with the real ping + version handshake.
-    void send_ping(peer_ptr /*peer*/) override { }
+    // Keep-alive ping (reception's ping handler is live; the sender keeps the
+    // peer's timeout timer from firing on the remote side).
+    void send_ping(peer_ptr peer) override
+    {
+        auto rmsg = dash::message_ping::make_raw();
+        peer->write(std::move(rmsg));
+    }
+
+    // Run-loop mint slice (3/3): SEND our version on every new connection —
+    // without it a p2pool-dash peer times out waiting for our handshake and
+    // drops the link (reception alone cannot hold a session). Advertises
+    // advertised_best_share() so peers pull our chain (btc ROOT-2 parity).
+    // INLINE (not node.cpp): connected() is virtual, so its body must be
+    // visible to every TU that emits the NodeImpl vtable — the link-deferred
+    // KAT targets instantiate NodeImpl without the node.cpp TU.
+    void connected(std::shared_ptr<core::Socket> socket) override
+    {
+        // BaseNode creates the peer + timeout timer; then OPEN the handshake.
+        // p2pool sends version from both sides on connectionMade — a silent
+        // side gets dropped by the remote's handshake timeout.
+        base_t::connected(socket);
+        auto it = m_connections.find(socket->get_addr());
+        if (it != m_connections.end())
+            send_version(it->second);
+    }
+
+    void send_version(peer_ptr peer)
+    {
+        auto rmsg = dash::message_version::make_raw(
+            SharechainConfig::MINIMUM_PROTOCOL_VERSION,  // oracle p2p VERSION (1700 lineage)
+            1,                                           // services
+            addr_t{1, peer->addr()},                     // addr_to (the remote)
+            addr_t{1, NetService{"0.0.0.0", SharechainConfig::p2p_port()}},  // addr_from
+            m_nonce,
+            std::string("c2pool"),
+            1,                                           // mode (always 1, legacy compat)
+            advertised_best_share());                    // head advert (raw pre-sync)
+        peer->write(std::move(rmsg));
+    }
+
+    /// Head advertised to peers: think()'s best when known, else the tallest
+    /// RAW chain head (btc ROOT-2: a pre-sync/genesis node must still let a
+    /// connecting peer learn it HAS a chain and pull it). Inline — reachable
+    /// from send_version() above.
+    uint256 advertised_best_share()
+    {
+        if (!m_best_share_hash.IsNull())
+            return m_best_share_hash;
+        uint256 best;
+        int32_t best_height = -1;
+        for (const auto& [head_hash, tail_hash] : m_tracker.chain.get_heads()) {
+            const auto h = static_cast<int32_t>(m_tracker.chain.get_height(head_hash));
+            if (h > best_height) {
+                best = head_hash;
+                best_height = h;
+            }
+        }
+        return best;
+    }
 
     // #646 min-protocol ratchet gate -- LIVE per-instance floor. Default-
     // constructed it holds the oracle accept-all floor (1700), so at the default
@@ -348,6 +420,59 @@ public:
     // verified batch (non-blocking lock; defers to m_pending_adds if the
     // compute thread holds the exclusive lock). Body in node.cpp.
     void add_verified_shares(HandleSharesData& data, NetService addr);
+
+    // ── Run-loop mint slice (3/3) surface — bodies in node.cpp ──────────
+    // Ports of the btc::NodeImpl prod reference (src/impl/btc/node.cpp),
+    // reconciled to the DASH pool-node. These make --run actually MINT:
+    // stratum ShareAccept -> add_local_share -> broadcast_share, with think()
+    // electing the best share the next job builds on.
+
+    /// Open the LevelDB sharechain store for `net_name`, wire the verified-
+    /// hash persistence + removal hooks, and load persisted shares into the
+    /// tracker. Call ONCE from the run-loop before serving work.
+    void init_storage(const std::string& net_name);
+    void load_persisted_shares();
+    /// Serialize one share into a LevelDB batch entry ([8B ver][contents]).
+    void collect_share_batch_entry(ShareType& share,
+        std::vector<c2pool::storage::SharechainStorage::ShareBatchEntry>& out);
+    void flush_verified_to_leveldb();
+    /// Flush pending persistence buffers (call at shutdown).
+    void shutdown_persistence();
+
+    /// Async best-chain selection: post tracker.think() to the compute
+    /// thread (exclusive lock), publish m_best_share_hash + snapshot, then
+    /// IO-phase: drain deferred share batches, fire on_best_share_changed,
+    /// re-broadcast the new head. Serialized via m_think_running.
+    void run_think();
+    void drain_pending_adds();
+
+    /// Verified-work-first best share (mint_runloop.hpp elect_best_share
+    /// policy — btc parity). ZERO with peers but no verified chain (never
+    /// mint on an unverified foreign chain); raw-head bootstrap on genesis.
+    /// (advertised_best_share — the peer-facing raw-head variant — is inline
+    /// above, next to send_version.)
+    uint256 best_share_hash();
+
+    /// Relay a share (and up to 4 un-broadcast ancestors) to all peers via
+    /// the message_shares wire codec (+ remember_tx/forget_tx for txs the
+    /// peer lacks). try_to_lock; deferred if the compute thread is busy.
+    void broadcast_share(const uint256& share_hash);
+    void send_shares(peer_ptr peer, const std::vector<uint256>& share_hashes);
+
+    /// Insert a locally-minted, ALREADY self-verified share into the tracker
+    /// (+ LevelDB persist + attempt_verify), then broadcast + run_think.
+    /// Returns the share hash, or ZERO when the tracker lock is busy or the
+    /// share is a duplicate (fail-closed: caller declines the mint).
+    uint256 add_local_share(ShareType share);
+
+    /// Register the current template's txs in m_known_txs so send_shares can
+    /// serve remember_tx for a minted share's new_transaction_hashes. The
+    /// previous template's leftovers are dropped (bounded by one template).
+    void register_template_txs(const std::vector<coin::Transaction>& txs,
+                               const std::vector<uint256>& hashes);
+
+    void set_on_best_share_changed(std::function<void()> fn) { m_on_best_share_changed = std::move(fn); }
+    void set_block_rel_height_fn(std::function<int32_t(uint256)> fn) { m_block_rel_height_fn = std::move(fn); }
 
     // Completes a pending async share request when a sharereply arrives.
     // Inline (mirrors dgb) so the reply-matcher plumbing needs no node.cpp.
