@@ -85,8 +85,7 @@ jobs:
         run: conan profile show -pr:a=ci/conan/linux-gcc13.profile
 
       - name: Restore Conan cache (github-hosted only)
-        if: runner.environment == 'github-hosted'
-        if: steps.presence.outputs.exists == '1'
+        if: runner.environment == 'github-hosted' && steps.presence.outputs.exists == '1'
         uses: actions/cache@v5
         with:
           path: ${{ runner.temp }}/conan2
