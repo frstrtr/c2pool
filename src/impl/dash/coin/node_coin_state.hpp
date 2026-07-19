@@ -73,12 +73,25 @@ public:
 
     bool populated() const { return m_populated; }
 
-    /// Assemble the selector input. has_state is populated(); the two required
-    /// pointers are always non-null (members), so viable() reduces to
-    /// populated() -- exactly the semantics work_source.hpp documents.
+    /// Coinbase-maturity mining gate (E2b/#738) — the dash analog of the LTC
+    /// EmbeddedCoinNode::set_utxo_ready_fn (main_ltc.cpp ~1785-1801). When
+    /// set, embedded-template viability additionally requires the predicate
+    /// (UtxoLane::mining_utxo_ready: blocks_connected >= 106) so templates
+    /// cannot include txs spending immature coinbase outputs; until then
+    /// has_state stays false and get_work routes to the retained dashd
+    /// fallback. Unset (default) preserves the pre-E2b behaviour exactly.
+    void set_utxo_ready_fn(std::function<bool()> fn) {
+        m_utxo_ready_fn = std::move(fn);
+    }
+
+    /// Assemble the selector input. has_state is populated() gated by the
+    /// optional UTXO-maturity predicate; the two required pointers are always
+    /// non-null (members), so viable() reduces to that gate -- exactly the
+    /// semantics work_source.hpp documents.
     EmbeddedWorkInputs make_embedded_work_inputs() const {
         EmbeddedWorkInputs e;
-        e.has_state            = m_populated;
+        e.has_state            = m_populated
+                                 && (!m_utxo_ready_fn || m_utxo_ready_fn());
         e.prev_height          = m_prev_height;
         e.prev_hash            = m_prev_hash;
         e.mnstates             = &m_mnstates;
@@ -105,6 +118,7 @@ public:
 private:
     MnStateMachine m_mnstates;
     Mempool        m_mempool;
+    std::function<bool()> m_utxo_ready_fn;   // optional UTXO maturity gate (E2b)
     uint32_t m_prev_height{0};
     uint256  m_prev_hash;
     uint32_t m_bits_for_next{0};

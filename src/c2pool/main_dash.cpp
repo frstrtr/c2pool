@@ -55,6 +55,8 @@
 #include <impl/dash/coin/rpc_conf.hpp>     // dash.conf creds resolution (rpcpassword off argv)
 #include <impl/dash/coin/node_interface.hpp>
 #include <impl/dash/coin/p2p_client.hpp>   // dash::coin::p2p::CoinClient — OPT-IN coin-network dial (E1, --coin-p2p-connect)
+#include <impl/dash/coin/node_coin_state.hpp>  // dash::coin::NodeCoinState (embedded work bundle)
+#include <impl/dash/coin/utxo_lane.hpp>    // dash::coin::UtxoLane — embedded UTXO/fee lane (E2b, #738)
 #include <impl/dash/node.hpp>          // dash::Node — sharechain pool-node (NodeBridge<NodeImpl,Legacy,Actual>)
 #include <impl/dash/config.hpp>        // dash::Config (PoolConfig/CoinConfig)
 #include <impl/dash/config_pool.hpp>   // dash::SharechainConfig — P2P_PORT / PREFIX / min-proto SSOT
@@ -170,6 +172,7 @@ void print_banner(const char* argv0)
         << "           [--testnet] [--submit-block HEX | --submit-block-file PATH]\n"
         << "           [--listen [HOST:]PORT] [--addnode HOST:PORT]... [--connect HOST:PORT]...\n"
         << "           [--stratum [HOST:]PORT] [--coin-p2p-connect HOST:PORT]...\n"
+        << "           [--embedded-utxo]\n"
         << "       " << argv0 << " --mine-block [--coin-rpc H:P] [--coin-rpc-auth PATH]\n"
         << "           [--testnet] [--payout-pubkey-hash HEX] [--max-nonce N]\n\n"
         << "Status: consensus layer live (X11 PoW, subsidy, oracle CoinParams).\n"
@@ -336,7 +339,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              const std::string& rpc_conf_path, const std::string& submit_hex,
              const PeeringConfig& peer,
              const std::string& stratum_host, uint16_t stratum_port,
-             const std::vector<NetService>& coin_p2p_targets)
+             const std::vector<NetService>& coin_p2p_targets,
+             bool embedded_utxo)
 {
     namespace io = boost::asio;
 
@@ -484,7 +488,58 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // ioc.run() tears the acceptor down while node_coin_state is still alive.
     // Default (unpopulated) bundle: populated()==false, so get_work() takes the
     // retained dashd-fallback arm -- correct + documented for the 4a standup.
+    //
+    // E2b (#738) UTXO/fee lane: utxo_lane is declared BEFORE node_coin_state
+    // deliberately -- attach() hands the lane's UTXOViewCache pointer to the
+    // bundle's Mempool (set_utxo), so the lane must outlive the mempool that
+    // references it (reverse destruction order at scope exit).
+    dash::coin::UtxoLane utxo_lane;
     dash::coin::NodeCoinState node_coin_state;
+
+    // ── E2b (#738): the embedded UTXO/fee lane -- OPT-IN via --embedded-utxo.
+    // Transliterated from the PROVEN LTC wiring (main_ltc.cpp ~1750-1801 con-
+    // struction + set_utxo + maturity gate; ~2385-2433 block-connect leg; see
+    // utxo_lane.hpp). This is the root-cause fix for the fee_known=false ->
+    // empty-template defect: Mempool::set_utxo previously had zero dash-arm
+    // callers, so every relayed tx stayed unknown-fee and the conservative
+    // selection guard (unknown fees EXCLUDED so coinbasevalue never overstates
+    // vs dashd's GBT -- guard untouched) returned an empty selection forever.
+    //
+    // Default (flag absent): NOTHING here is constructed or subscribed -- the
+    // dashd-RPC fallback path (mining-hotel prod) is byte-unchanged. With the
+    // flag: the lane opens its LevelDB, arms the mempool's fee machinery, and
+    // subscribes the coin-state block_connected seam (leg 3, the same event
+    // block_connect_ingest.hpp routes to CoinStateMaintainer). The LIVE block
+    // feed that FIRES that event is the E1/E2a coin-P2P leg; until it lands
+    // the lane sits armed-but-dormant and get_work still routes to the
+    // retained dashd fallback (populated()==false).
+    std::shared_ptr<EventDisposable> utxo_block_sub;
+    if (embedded_utxo) {
+        const auto utxo_path = (core::filesystem::config_path()
+            / net_subdir / "utxo_leveldb").string();
+        if (utxo_lane.open(utxo_path)) {
+            utxo_lane.attach(node_coin_state.mempool());
+            // Mining gate: coinbase_maturity + reorg buffer = 100 + 6 = 106
+            // (DASH_MINING_GATE_DEPTH, utxo_adapter.hpp; mirrors the LTC
+            // set_utxo_ready_fn gate) -- embedded templates stay off until
+            // the UTXO view is deep enough to exclude immature coinbase
+            // spends. The dashd fallback is unaffected.
+            node_coin_state.set_utxo_ready_fn(
+                [&utxo_lane]() { return utxo_lane.mining_utxo_ready(); });
+            utxo_block_sub = coin_state.block_connected.subscribe(
+                [&utxo_lane](const dash::interfaces::BlockConnected& bc) {
+                    utxo_lane.on_block_connected(bc.block, bc.height);
+                });
+            std::cout << "[run] embedded UTXO/fee lane ARMED: db=" << utxo_path
+                      << " best_height=" << utxo_lane.cache()->get_best_height()
+                      << " (mempool fee pricing live; block feed = E1/E2a leg;"
+                         " maturity gate " << dash::coin::DASH_MINING_GATE_DEPTH
+                      << " blocks)\n";
+        } else {
+            std::cout << "[run] embedded UTXO/fee lane FAILED to open " << utxo_path
+                      << " -- fees stay unknown; dashd-RPC fallback unaffected\n";
+        }
+    }
 
     // REQUIRED always-reachable dashd-RPC fallback arm -- the safety +
     // [GBT-XCHECK] cross-check path, NEVER removed (operator standing rule).
@@ -721,6 +776,7 @@ int main(int argc, char** argv)
     std::vector<std::string> coin_p2p_raw;     // --coin-p2p-connect HOST:PORT (repeatable; E1 opt-in coin-network dial)
     std::string stratum_host = "0.0.0.0";      // --stratum [HOST:]PORT bind interface (default all)
     uint16_t    stratum_port = 0;              // 0 disables the Stratum accept-loop; --stratum sets it
+    bool embedded_utxo = false;                // --embedded-utxo: arm the E2b UTXO/fee lane (opt-in)
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
             std::cout << "c2pool-dash " << C2POOL_VERSION << "\n";
@@ -752,6 +808,8 @@ int main(int argc, char** argv)
             connect_raw.emplace_back(argv[++i]);
         else if (std::strcmp(argv[i], "--coin-p2p-connect") == 0 && i + 1 < argc)
             coin_p2p_raw.emplace_back(argv[++i]);
+        else if (std::strcmp(argv[i], "--embedded-utxo") == 0)
+            embedded_utxo = true;
         else if (std::strcmp(argv[i], "--stratum") == 0 && i + 1 < argc) {
             // --stratum [HOST:]PORT -- bind a Stratum TCP listener for miners.
             // Bare PORT keeps the default 0.0.0.0 bind host (parse_listen SSOT).
@@ -818,7 +876,8 @@ int main(int argc, char** argv)
             coin_p2p_targets.push_back(ns);
         }
         return run_node(testnet, rpc_endpoint, rpc_conf_path, submit_hex, peer,
-                        stratum_host, stratum_port, coin_p2p_targets);
+                        stratum_host, stratum_port, coin_p2p_targets,
+                        embedded_utxo);
     }
     return run_selftest();
 }
