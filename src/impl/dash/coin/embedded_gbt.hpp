@@ -85,6 +85,15 @@ inline bool underfill_guard_trips(uint64_t selected_bytes,
 /// Build the GBT-equivalent fields we currently know how to compute
 /// for a block at height (prev_height+1). Returns a partially-filled
 /// DashWorkData; missing fields documented above.
+// Forward decls (definitions below) -- E2d folds the DIP-0004 type-5
+// CCbTx extra_payload into the embedded template via these.
+inline vendor::CCbTx build_embedded_cbtx(
+    uint32_t, const vendor::CSimplifiedMNList&, const QuorumManager&,
+    int32_t, const std::array<uint8_t, 96>&, int64_t);
+inline std::vector<unsigned char> encode_cbtx(const vendor::CCbTx&);
+// Zero CLSIG default for the E2d best_cl_sig seam (no temporary-bound ref).
+inline const std::array<uint8_t, 96> k_zero_cl_sig{};
+
 inline DashWorkData build_embedded_workdata(
     uint32_t prev_height,
     const uint256& prev_hash,
@@ -109,7 +118,16 @@ inline DashWorkData build_embedded_workdata(
     // guard KAT passes a bool to pin the wiring without a log scraper. The
     // guard itself is log-only (WARNING), exactly like LTC/DOGE — it never
     // alters the template.
-    bool* underfill_tripped = nullptr)
+    bool* underfill_tripped = nullptr,
+    // E2d seams: optional SML/quorum inputs for the DIP-0004 type-5
+    // CCbTx extra_payload. Default nullptr so every existing caller is
+    // byte-for-byte unchanged (SAFE-ADDITIVE) and still gets an empty
+    // payload; when supplied, the template becomes block-valid.
+    const vendor::CSimplifiedMNList* sml = nullptr,
+    const QuorumManager* qmgr = nullptr,
+    int32_t best_cl_height = 0,
+    const std::array<uint8_t, 96>& best_cl_sig = k_zero_cl_sig,
+    int64_t last_observed_credit_pool = 0)
 {
     DashWorkData w;
     w.m_height          = prev_height + 1;
@@ -218,9 +236,20 @@ inline DashWorkData build_embedded_workdata(
         }
     }
 
-    // CCbTx extra_payload not yet built (needs ChainLock cycle +
-    // asset-lock state machine for the full v3+ payload).
-    w.m_coinbase_payload.clear();
+    // E2d: fold the DIP-0004 type-5 CCbTx extra_payload so the block is
+    // consensus-valid. Minimal cut -- version/height/merkleRootMNList/
+    // merkleRootQuorums (+ bestCL when known); the v3+ asset-lock/DIP-0027
+    // credit-pool state machine is still deferred and seeded from
+    // last_observed_credit_pool. When the SML/quorum inputs are not
+    // supplied (legacy callers) fall back to an empty payload.
+    if (sml != nullptr && qmgr != nullptr) {
+        vendor::CCbTx cb = build_embedded_cbtx(
+            prev_height, *sml, *qmgr, best_cl_height, best_cl_sig,
+            last_observed_credit_pool);
+        w.m_coinbase_payload = encode_cbtx(cb);
+    } else {
+        w.m_coinbase_payload.clear();
+    }
 
     return w;
 }
