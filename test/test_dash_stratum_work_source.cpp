@@ -20,6 +20,7 @@
 #include <impl/dash/stratum/submit_payee_guard.hpp>  // check_submit_payee (stale-payee fix)
 #include <impl/dash/coinbase_builder.hpp>     // compute_dash_payouts, build, split_coinb, be_hex_u32
 #include <impl/dash/coin/block_producer.hpp>  // coinbase_txid, compute_merkle_root, serialize_header80, target_from_nbits
+#include <impl/dash/coin/zmq_tip_notify.hpp>  // dash::coin::TipHashDedup, zmq_hashblock_frame_to_hex (ZMQ hashblock instant tip-notify)
 #include <impl/dash/crypto/hash_x11.hpp>
 #include <impl/dash/params.hpp>
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>  // CSimplifiedMNListEntry (embedded SML seed)
@@ -877,6 +878,109 @@ TEST(DashStratumWorkSource, IoThreadDecoupleServesCachedAndRefreshesOffThread)
     { std::lock_guard<std::mutex> l(jm); job1 = jobs[0]; jobs.clear(); }
     std::thread(job1).join();
     EXPECT_EQ(fallback_calls.load(), 2);
+}
+
+// ── dashd ZMQ `hashblock` INSTANT tip-notify (hardening on the #770 poll) ────
+//
+// dashd publishes a `hashblock` ZMQ message the instant it connects a new
+// block, so a SUB subscriber closes the lost-block window from <=3 s (poll) to
+// ~0 s. On a hashblock frame the subscriber fires the SAME refresh trio the
+// poll fires (invalidate_template_cache + bump_work_generation + notify_all),
+// and BOTH paths share ONE last-seen-tip dedup so a double-fire on the same
+// block coalesces to a single refresh. These KATs pin that contract without a
+// live daemon or libzmq: the pure frame-decode + dedup + the work-source trio.
+
+// dashd publishes the hashblock frame ALREADY in RPC/display byte order
+// (CZMQPublishHashBlockNotifier::NotifyBlock reverses the internal little-endian
+// array before sending; Bitcoin Core doc/zmq.md: "reversed byte order, the same
+// format as the RPC interface"). So the decoder hex-encodes the frame DIRECTLY
+// — NO further reversal — which is exactly what makes a ZMQ notify and a poll
+// tick on the SAME block produce the SAME getbestblockhash string and thus dedup
+// against each other. (A second reversal here would break cross-path dedup and
+// double-fire the refresh trio every block.)
+TEST(DashZmqHashblock, FrameDecodeMatchesGetbestblockhashByteOrder)
+{
+    // 32-byte frame 0x00,0x01,...,0x1f -> hex encodes DIRECTLY, no reversal.
+    unsigned char frame[32];
+    for (unsigned i = 0; i < 32; ++i) frame[i] = static_cast<unsigned char>(i);
+    const std::string hex = dash::coin::zmq_hashblock_frame_to_hex(frame, 32);
+    // Straight order: first byte (0x00) first ... last byte (0x1f) last — the
+    // string getbestblockhash would return for this block hash.
+    EXPECT_EQ(hex,
+              "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+    // Cross-path contract: the frame decodes to the SAME string a poll would
+    // report (both are already display order), so the shared dedup coalesces.
+    const std::string poll_would_report =
+        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    EXPECT_EQ(hex, poll_would_report);
+    // Malformed length -> empty (never a bogus tip that would false-fire).
+    EXPECT_TRUE(dash::coin::zmq_hashblock_frame_to_hex(frame, 31).empty());
+    EXPECT_TRUE(dash::coin::zmq_hashblock_frame_to_hex(nullptr, 32).empty());
+}
+
+// Core KAT: a ZMQ hashblock message drives the refresh+notify trio exactly
+// once, a double-fire (ZMQ then poll, or poll then ZMQ, on the SAME tip) is
+// deduped to a no-op, and a subsequent DIFFERENT tip fires again — proving the
+// poll path still works (no regression) and coexists with the ZMQ path via the
+// shared dedup. Fallback arm only (unpopulated coin-state -> dashd fallback).
+TEST(DashZmqHashblock, InstantNotifyFiresTrioOnceAndDedupesDoubleFire)
+{
+    Fixture fx(true);
+    ASSERT_FALSE(fx.coin_state.populated());
+    auto ws = fx.make();
+
+    // Mirror main_dash's shared refresh: ONE dedup consulted by both paths, and
+    // the trio (invalidate + bump + [notify counter]) fired only on a NEW tip.
+    dash::coin::TipHashDedup dedup;
+    int notify_count = 0;
+    auto fire_refresh = [&](const std::string& tip) {
+        if (!dedup.is_new_tip(tip)) return;     // coalesce poll+ZMQ double-fire
+        ws->invalidate_template_cache("kat: tip-notify best-block changed");
+        ws->bump_work_generation();
+        ++notify_count;                          // stands in for notify_all()
+    };
+
+    // Startup baseline: the poll seeds the dedup with the tip we are already
+    // mining WITHOUT notifying (matches main_dash's tip_dedup->set_last()).
+    const std::string tip_old(64, 'a');
+    dedup.set_last(tip_old);
+    const uint64_t gen_before = ws->get_work_generation();
+    auto tmpl_before = ws->get_current_work_template();
+    ASSERT_FALSE(tmpl_before.empty());
+    EXPECT_EQ(tmpl_before.value("previousblockhash", ""), std::string(kPrevHashHex));
+
+    // (1) A new block arrives on dashd: the fallback now sources the new-tip
+    //     template, and a ZMQ hashblock frame decodes to the new tip hash.
+    fx.fallback_work = rotated_work();
+    unsigned char frame[32];
+    for (unsigned i = 0; i < 32; ++i) frame[i] = static_cast<unsigned char>(0xB0 + (i & 0x0f));
+    const std::string tip_new = dash::coin::zmq_hashblock_frame_to_hex(frame, 32);
+    ASSERT_FALSE(tip_new.empty());
+    ASSERT_NE(tip_new, tip_old);
+
+    // ZMQ fires first (instant).
+    fire_refresh(tip_new);
+    EXPECT_EQ(notify_count, 1);                       // trio fired exactly once
+    EXPECT_GT(ws->get_work_generation(), gen_before); // clean_jobs/notify signal
+    auto tmpl_after = ws->get_current_work_template();
+    ASSERT_FALSE(tmpl_after.empty());
+    EXPECT_EQ(tmpl_after.value("previousblockhash", ""),
+              std::string(kRotatedPrevHashHex));       // no stale-tip mining
+    EXPECT_EQ(tmpl_after.value("height", 0u), 424243u);
+
+    // (2) The 3 s poll wakes ~instant later and observes the SAME new tip:
+    //     shared dedup -> no-op (harmless double-fire coalesced).
+    const uint64_t gen_after_zmq = ws->get_work_generation();
+    fire_refresh(tip_new);
+    EXPECT_EQ(notify_count, 1);                        // still ONE — deduped
+    EXPECT_EQ(ws->get_work_generation(), gen_after_zmq);
+
+    // (3) A THIRD, different tip (e.g. ZMQ absent and the poll alone catches the
+    //     next block) fires again -> the poll path works, coexisting with ZMQ.
+    const std::string tip_third(64, 'c');
+    fire_refresh(tip_third);
+    EXPECT_EQ(notify_count, 2);
+    EXPECT_GT(ws->get_work_generation(), gen_after_zmq);
 }
 
 // Fix 3 pin (work-source side of the zero-hash pre-auth job_0 defect): a

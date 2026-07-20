@@ -56,6 +56,7 @@
 #include <impl/dash/coin/node_interface.hpp>
 #include <impl/dash/coin/p2p_client.hpp>   // dash::coin::p2p::CoinClient — OPT-IN coin-network dial (E1, --coin-p2p-connect)
 #include <impl/dash/coin/won_block_dispatch.hpp> // dash::coin::broadcast_won_block — S8 dual-path won-block dispatcher (embedded P2P primary + submitblock RPC backup)
+#include <impl/dash/coin/zmq_tip_notify.hpp> // dash::coin::TipHashDedup / ZmqHashblockSubscriber — dashd ZMQ hashblock INSTANT tip-notify (opt-in, hardening on the #770 poll)
 #include <impl/dash/coin/node_coin_state.hpp>  // dash::coin::NodeCoinState (embedded work bundle)
 #include <impl/dash/coin/dkg_window.hpp>       // dash::coin::is_dkg_commitment_window (BLOCKER-1 guard)
 #include <impl/dash/coin/utxo_lane.hpp>    // dash::coin::UtxoLane — embedded UTXO/fee lane (E2b, #738)
@@ -198,6 +199,7 @@ void print_banner(const char* argv0)
         << "           [--embedded-utxo]\n"
         << "           [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n"
         << "           [--redistribute pplns|fee|boost|donate]\n"
+        << "           [--coin-zmq-hashblock tcp://HOST:PORT]\n"
         << "       " << argv0 << " --mine-block [--coin-rpc H:P] [--coin-rpc-auth PATH]\n"
         << "           [--testnet] [--payout-pubkey-hash HEX] [--max-nonce N]\n\n"
         << "Status: consensus layer live (X11 PoW, subsidy, oracle CoinParams).\n"
@@ -212,6 +214,11 @@ void print_banner(const char* argv0)
         << "        --coin-p2p-connect HOST:PORT (repeatable) OPT-IN dials the DASH\n"
         << "        coin network directly (version/verack + keep-alive + reconnect);\n"
         << "        absent => no coin P2P client, dashd-RPC fallback path unchanged.\n"
+        << "        --coin-zmq-hashblock tcp://HOST:PORT (opt-in) subscribes to dashd's\n"
+        << "        ZMQ `hashblock` topic for INSTANT (~0 s) new-tip template refresh +\n"
+        << "        clean_jobs notify on the fallback arm; absent/unreachable => the 3 s\n"
+        << "        getbestblockhash poll is the active path (requires dashd\n"
+        << "        zmqpubhashblock=tcp://HOST:PORT). No consensus effect.\n"
         << "        --web-port PORT (alias --http-port, default 8080) serves the FULL\n"
         << "        c2pool web dashboard + JSON API on --web-host (default 0.0.0.0)\n"
         << "        from --dashboard-dir (default web-static); --web-port 0 disables.\n"
@@ -384,7 +391,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              const std::string& node_owner_address,
              const std::string& redistribute_mode,
              bool no_p2p_relay,
-             bool embedded_mainnet)
+             bool embedded_mainnet,
+             const std::string& coin_zmq_hashblock)
 {
     namespace io = boost::asio;
 
@@ -1708,14 +1716,19 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // kStaleAfter) — there is NO tip-change signal like the embedded arm's
     // header_chain->set_on_tip_changed callback. DASH blocks arrive ~every
     // 150 s, so up to ~30 s of stale-tip mining can occur per block (accepted
-    // pseudoshares that can no longer win the current block). Poll dashd for
-    // its best-block hash every 3 s; on a change, drop the cached template +
-    // bump work-generation + notify every session (clean_jobs) — the SAME
-    // refresh pair the embedded arm fires. Gated on the fallback arm (coin_p2p
-    // null) AND an armed rpc AND a live stratum acceptor. getbestblockhash is a
-    // trivial RPC; failures are swallowed so a daemon hiccup never crashes the
-    // run-loop (retry next tick). Reuses the existing NodeRPC client — no new
-    // dependency, no dashd config change, no new notify mechanism.
+    // pseudoshares that can no longer win the current block).
+    //
+    // TWO tip-notify paths, sharing ONE last-seen-tip dedup so a poll+ZMQ
+    // double-fire on the same block coalesces to a single refresh:
+    //   • BACKSTOP (always, #770): a 3 s getbestblockhash poll. When ZMQ is
+    //     unconfigured/unreachable this is the sole active path.
+    //   • PRIMARY (opt-in, --coin-zmq-hashblock): a dashd ZMQ `hashblock` SUB
+    //     subscriber fires the INSTANT (~0 s) the daemon connects a new block.
+    // On a genuine tip CHANGE either path drops the cached template + bumps
+    // work-generation + notifies every session (clean_jobs) — the SAME refresh
+    // pair the embedded arm fires. Gated on the fallback arm (coin_p2p null) AND
+    // an armed rpc AND a live stratum acceptor. getbestblockhash is a trivial
+    // RPC; failures are swallowed so a daemon hiccup never crashes the run-loop.
     // io-thread-decouple: dedicated single-thread pool for the fallback arm's
     // BLOCKING dashd RPC (getbestblockhash tip probe + the background template
     // re-source). Mirrors main_ltc.cpp hdr_pool ("keeps scrypt off io_context"):
@@ -1726,6 +1739,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // loop -- and its destructor -- happen BEFORE those objects unwind: no
     // background probe is ever mid-flight against freed state. Only created on
     // the fallback arm; null on the embedded arm (legacy inline path unchanged).
+    // The opt-in ZMQ subscriber (declared here for the same teardown ordering)
+    // only posts onto ioc; when unconfigured/uncompiled the poll is the whole
+    // mechanism -- byte-identical to the poll-only #770/#781 behavior.
+#ifdef C2POOL_ZMQ
+    std::unique_ptr<dash::coin::ZmqHashblockSubscriber> zmq_sub;
+#endif
     std::shared_ptr<boost::asio::thread_pool> rpc_pool;
     if (!coin_p2p && rpc && stratum_server) {
         rpc_pool = std::make_shared<boost::asio::thread_pool>(1);
@@ -1740,25 +1759,49 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 boost::asio::post(*rpc_pool, std::move(job));
             });
 
+        // Shared last-seen-tip dedup — the poll AND the ZMQ subscriber consult
+        // it, so if both observe the same new block only the first fires the
+        // refresh trio (the second is_new_tip() returns false → no-op).
+        auto tip_dedup = std::make_shared<dash::coin::TipHashDedup>();
+
+        // The refresh trio, shared by both paths. Runs on the io_context thread
+        // ONLY (the poll follow-up is posted back to ioc; the ZMQ callback posts
+        // onto ioc), so ws/ss/dedup are never touched concurrently. `verb`
+        // differentiates the instant (ZMQ) vs polled log line.
+        std::function<void(const std::string&, const char*, const char*)>
+            fire_refresh = [ws = work_source.get(), ss = stratum_server.get(),
+                            tip_dedup](const std::string& tip,
+                                       const char* source, const char* verb) {
+                if (!tip_dedup->is_new_tip(tip))
+                    return;   // dedup: coalesce a poll+ZMQ double-fire on one tip
+                ws->invalidate_template_cache(
+                    "tip-notify: dashd best-block changed");
+                ws->bump_work_generation();
+                ss->notify_all();
+                LOG_INFO << "[Stratum] " << source << ": " << tip.substr(0, 16)
+                         << " -> " << verb;
+                std::cout << "[Stratum] " << source << ": " << tip.substr(0, 16)
+                          << " -> " << verb << "\n";
+            };
+
+        // BACKSTOP: 3 s getbestblockhash poll (#770), io-decoupled (#781).
         auto tip_timer = std::make_shared<io::steady_timer>(ioc);
-        auto last_tip = std::make_shared<std::string>();
         auto tip_tick = std::make_shared<
             std::function<void(const boost::system::error_code&)>>();
         // tip_tick runs ON ioc when the 3 s timer fires. It does NOT call the
         // blocking RPC itself: it hands getbestblockhash to rpc_pool and posts
-        // the tip-change follow-up (invalidate + bump + notify) + the timer
-        // re-arm BACK onto ioc (ws/ss/tip_timer are io-thread-confined), exactly
-        // like main_ltc.cpp's post-to-pool -> post-back-to-ioc pattern. The
-        // timer is re-armed only AFTER the RPC completes, so a slow dashd cannot
-        // pile up overlapping polls. Lost-block-prevention is preserved: a real
-        // tip change still fires invalidate + notify -- only WHERE the probe runs
-        // has moved off the stratum io thread.
-        *tip_tick = [rpc = rpc.get(), ws = work_source.get(),
-                     ss = stratum_server.get(), tip_timer, last_tip, tip_tick,
-                     rpc_pool, &ioc](const boost::system::error_code& ec) {
+        // the tip-change follow-up + the timer re-arm BACK onto ioc (fire_refresh
+        // / tip_timer are io-thread-confined), exactly like main_ltc.cpp's
+        // post-to-pool -> post-back-to-ioc pattern. The timer is re-armed only
+        // AFTER the RPC completes, so a slow dashd cannot pile up overlapping
+        // polls. Lost-block-prevention is preserved: a real tip change still
+        // fires the refresh trio -- only WHERE the probe runs has moved off the
+        // stratum io thread.
+        *tip_tick = [rpc = rpc.get(), tip_dedup, fire_refresh, tip_timer,
+                     tip_tick, rpc_pool, &ioc](const boost::system::error_code& ec) {
             if (ec) return;   // cancelled at shutdown
             boost::asio::post(*rpc_pool,
-                [rpc, ws, ss, tip_timer, last_tip, tip_tick, &ioc]() {
+                [rpc, tip_dedup, fire_refresh, tip_timer, tip_tick, &ioc]() {
                     std::string tip;
                     bool ok = false;
                     try {
@@ -1774,23 +1817,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     // state). If ioc is already stopped (shutdown) this handler
                     // simply never runs -> the poll stops cleanly.
                     boost::asio::post(ioc,
-                        [ok, tip = std::move(tip), ws, ss, tip_timer, last_tip, tip_tick]() {
-                            if (ok && !tip.empty() && *last_tip != tip) {
-                                const bool first_seen = last_tip->empty();
-                                *last_tip = tip;
-                                // Skip the notify on the very first observation
-                                // (baseline); only a genuine tip CHANGE refreshes.
-                                if (!first_seen) {
-                                    ws->invalidate_template_cache(
-                                        "tip-poll: dashd best-block changed");
-                                    ws->bump_work_generation();
-                                    ss->notify_all();
-                                    LOG_INFO << "[Stratum] tip-poll: new tip "
-                                             << tip.substr(0, 16)
-                                             << ", forcing template refresh + notify";
-                                    std::cout << "[Stratum] tip-poll: new tip "
-                                              << tip.substr(0, 16)
-                                              << ", forcing template refresh + notify\n";
+                        [ok, tip = std::move(tip), tip_dedup, fire_refresh,
+                         tip_timer, tip_tick]() {
+                            if (ok && !tip.empty()) {
+                                if (tip_dedup->last().empty()) {
+                                    // Startup baseline: this is the tip we are
+                                    // already mining, not a change — seed the
+                                    // dedup, do NOT notify.
+                                    tip_dedup->set_last(tip);
+                                } else {
+                                    fire_refresh(tip, "tip-poll",
+                                                 "template refresh + notify");
                                 }
                             }
                             tip_timer->expires_after(std::chrono::seconds(3));
@@ -1804,6 +1841,37 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                      "every 3 s on a dedicated RPC thread -> event-driven template "
                      "refresh + clean_jobs notify on tip change; io thread never "
                      "blocks on dashd)\n";
+
+        // PRIMARY: dashd ZMQ `hashblock` INSTANT tip-notify (opt-in). Absent or
+        // uncompiled => the poll above is the sole active path (zero regression).
+        if (coin_zmq_hashblock.empty()) {
+            std::cout << "[run] ZMQ hashblock tip-notify NOT configured "
+                         "(--coin-zmq-hashblock unset); the 3 s poll is the "
+                         "active tip-notify path\n";
+        } else {
+#ifdef C2POOL_ZMQ
+            // Every hashblock frame is a genuine new-block event. Hop onto the
+            // io_context thread before touching ws/ss (fire_refresh contract);
+            // the shared dedup coalesces it against the poll on the same block.
+            zmq_sub = std::make_unique<dash::coin::ZmqHashblockSubscriber>(
+                coin_zmq_hashblock,
+                [&ioc, fire_refresh](const std::string& hash_hex) {
+                    boost::asio::post(ioc, [fire_refresh, hash_hex]() {
+                        fire_refresh(hash_hex, "zmq hashblock",
+                                     "instant template refresh + notify");
+                    });
+                });
+            zmq_sub->start();
+            std::cout << "[run] ZMQ hashblock tip-notify ARMED at "
+                      << coin_zmq_hashblock
+                      << " (PRIMARY instant tip-notify; 3 s poll is the "
+                         "backstop; reconnects if dashd ZMQ is down)\n";
+#else
+            std::cout << "[run] --coin-zmq-hashblock " << coin_zmq_hashblock
+                      << " requested but this build has no libzmq (C2POOL_ZMQ "
+                         "off); the 3 s poll is the active tip-notify path\n";
+#endif
+        }
     }
 
     std::cout << "[run] run-loop up (Ctrl-C to stop); won blocks relay DUAL-PATH:\n"
@@ -1833,7 +1901,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         }
     }
 
-    // io-thread-decouple: join the background RPC pool FIRST, before any of the
+    // Stop the ZMQ hashblock subscriber (joins its thread) BEFORE the stratum
+    // acceptor + work source it refreshes are torn down. Its callback only posts
+    // onto the now-stopped ioc, so no refresh can run past here.
+#ifdef C2POOL_ZMQ
+    if (zmq_sub) {
+        zmq_sub->stop();
+        zmq_sub.reset();
+    }
+#endif
+
+    // io-thread-decouple: join the background RPC pool, before any of the
     // objects it dereferences (rpc / work_source / stratum_server) unwind. run()
     // has returned (ioc stopped), so no NEW work is posted; stop()+join() waits
     // out any in-flight getbestblockhash/GBT re-source (bounded by the NodeRPC
@@ -2029,6 +2107,7 @@ int main(int argc, char** argv)
     uint16_t    web_port      = 8080;          // --web-port / --http-port (0 disables)
     std::string dashboard_dir = "web-static";  // --dashboard-dir static asset root
     std::string redistribute_mode = "pplns";   // --redistribute pplns|fee|boost|donate
+    std::string coin_zmq_hashblock;             // --coin-zmq-hashblock ENDPOINT (opt-in dashd ZMQ hashblock instant tip-notify, e.g. tcp://127.0.0.1:28332)
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
             std::cout << "c2pool-dash " << C2POOL_VERSION << "\n";
@@ -2076,6 +2155,8 @@ int main(int argc, char** argv)
             node_owner_address = argv[++i];
         else if (std::strcmp(argv[i], "--redistribute") == 0 && i + 1 < argc)
             redistribute_mode = argv[++i];
+        else if (std::strcmp(argv[i], "--coin-zmq-hashblock") == 0 && i + 1 < argc)
+            coin_zmq_hashblock = argv[++i];   // opt-in dashd ZMQ hashblock endpoint
         else if ((std::strcmp(argv[i], "--web-port") == 0 ||
                   std::strcmp(argv[i], "--http-port") == 0) && i + 1 < argc) {
             const long p = std::strtol(argv[++i], nullptr, 10);
@@ -2167,7 +2248,8 @@ int main(int argc, char** argv)
                         dashboard_dir, coin_p2p_targets,
                         embedded_utxo, dev_donation, node_owner_fee,
                         node_owner_address, redistribute_mode, no_p2p_relay,
-                        embedded_mainnet);
+                        embedded_mainnet,
+                        coin_zmq_hashblock);
     }
     return run_selftest();
 }

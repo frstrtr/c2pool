@@ -34,12 +34,22 @@ target_link_libraries(dash_block_replay PRIVATE core nlohmann_json::nlohmann_jso
 # links it is c2pool-dash (this slice), so the ltc/btc/doge/dgb build + ctest
 # surfaces are untouched. Per-coin isolation held: src/impl/dash only, no
 # shared-base/core SOURCE edit, dashd RPC fallback preserved.
-add_library(dash_rpc STATIC coin/rpc.cpp)
+add_library(dash_rpc STATIC coin/rpc.cpp coin/zmq_tip_notify.cpp)
 target_include_directories(dash_rpc PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/btclibs
     ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(dash_rpc PRIVATE core nlohmann_json::nlohmann_json ${Boost_LIBRARIES})
+
+# dashd ZMQ `hashblock` instant tip-notify (coin/zmq_tip_notify.cpp). libzmq is
+# OPTIONAL: when available, compile the subscriber (C2POOL_ZMQ) and link libzmq.
+# The define + link are PUBLIC so the ONLY consumer (c2pool-dash / main_dash.cpp)
+# inherits them — one wiring point. When libzmq is absent only the pure hex
+# helper compiles and c2pool-dash is byte-identical to the poll-only path.
+if(C2POOL_ZMQ_AVAILABLE)
+    target_compile_definitions(dash_rpc PUBLIC C2POOL_ZMQ)
+    target_link_libraries(dash_rpc PUBLIC ${C2POOL_ZMQ_TARGET})
+endif()
 
 # S8 sharechain-p2p dispatch layer (slice S8-p2p.2). Mirrors the dgb pool OBJECT
 # lib (src/impl/dgb/CMakeLists.txt add_library(dgb OBJECT ...)): compiles the

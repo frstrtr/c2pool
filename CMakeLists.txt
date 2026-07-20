@@ -34,6 +34,35 @@ find_package(Boost QUIET OPTIONAL_COMPONENTS system)
 find_package(nlohmann_json REQUIRED)
 find_package(yaml-cpp REQUIRED)  # hoisted to root so yaml-cpp::yaml-cpp is visible to src/c2pool OBJECT libs (sibling of src/core)
 
+# Optional dashd ZMQ `hashblock` INSTANT tip-notify (DASH fallback-arm hardening
+# on top of the #770 3 s poll). libzmq is an OPTIONAL dependency: when present
+# the c2pool-dash --coin-zmq-hashblock path is compiled (C2POOL_ZMQ define);
+# when absent c2pool-dash builds + runs exactly as the poll-only path. The conan
+# recipe (zeromq/4.3.5) exposes the CMake target `libzmq` via package `ZeroMQ`.
+option(C2POOL_WITH_ZMQ "Build dashd ZMQ hashblock instant tip-notify (optional; needs libzmq)" ON)
+set(C2POOL_ZMQ_AVAILABLE OFF)
+set(C2POOL_ZMQ_TARGET "")
+if(C2POOL_WITH_ZMQ)
+    find_package(ZeroMQ QUIET)
+    if(TARGET libzmq)
+        set(C2POOL_ZMQ_AVAILABLE ON)
+        set(C2POOL_ZMQ_TARGET libzmq)
+    elseif(TARGET libzmq-static)
+        set(C2POOL_ZMQ_AVAILABLE ON)
+        set(C2POOL_ZMQ_TARGET libzmq-static)
+    elseif(TARGET zmq)
+        set(C2POOL_ZMQ_AVAILABLE ON)
+        set(C2POOL_ZMQ_TARGET zmq)
+    endif()
+    if(C2POOL_ZMQ_AVAILABLE)
+        message(STATUS "dashd ZMQ hashblock tip-notify: ENABLED (libzmq via ${C2POOL_ZMQ_TARGET})")
+    else()
+        message(STATUS "dashd ZMQ hashblock tip-notify: DISABLED (libzmq not found; c2pool-dash builds poll-only)")
+    endif()
+else()
+    message(STATUS "dashd ZMQ hashblock tip-notify: DISABLED (C2POOL_WITH_ZMQ=OFF)")
+endif()
+
 # Threading (needed by LevelDB on some platforms)
 find_package(Threads REQUIRED)
 
