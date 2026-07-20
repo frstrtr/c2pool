@@ -391,12 +391,18 @@ if (BUILD_TESTING AND GTest_FOUND)
     # sharereply's shares (RawShare round-trip, child->parent order) insert +
     # verify and ROOT a previously-unrooted live-pushed tip. Same allowlisted
     # target (proven pattern), no build.yml change.
+    # test_dash_v36_share.cpp (Phase A DASH v36 share-type): byte-parity of the
+    # standardized cross-coin v36 prefix vs the non-segwit (BCH) v36 shape,
+    # round-trip through the version-36 ShareVariants dispatch, merged-fields-
+    # inert convention, and v16 backward-compat. Same allowlisted target (proven
+    # pattern), no build.yml change (avoids the #769 new-target/allowlist trap).
     add_executable(test_dash_share_hash_link
         test_dash_share_hash_link.cpp
         test_dash_share_producer.cpp
         test_dash_share_producer_bind.cpp
         test_dash_mint_runloop.cpp
-        test_dash_share_download.cpp)
+        test_dash_share_download.cpp
+        test_dash_v36_share.cpp)
     target_link_libraries(test_dash_share_hash_link PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
