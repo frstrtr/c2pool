@@ -153,7 +153,13 @@ DASHWorkSource::DASHWorkSource(const coin::NodeCoinState& coin_state,
     config_.tcp_keepalive_interval_sec = 10;
     config_.tcp_keepalive_count      = 3;       // ~90 s to detect a dead peer
     config_.handshake_timeout_sec    = 30;      // drop never-authorize probes
-    config_.session_idle_timeout_sec = 600;     // reap 10-min-silent zombies (live rigs submit far sooner)
+    // Idle reaper is a BACKSTOP to TCP keepalive (the real liveness authority),
+    // not the primary zombie killer. 1800 s + the keepalive-aware skip in
+    // start_idle_reaper() means an authorized rig on a high fixed-diff suffix
+    // (e.g. ADDR+4096 at modest X11 hashrate -> multi-minute share intervals) is
+    // NEVER reaped for idleness while its socket is keepalive-validated; only
+    // genuinely dead / never-authorized sessions are reclaimed.
+    config_.session_idle_timeout_sec = 1800;
     config_.max_write_queue_depth    = 256;     // drop a stuck-write dead peer
     LOG_INFO << "[DASH-STRATUM] DASHWorkSource constructed"
              << " (min_diff=" << config_.min_difficulty

@@ -135,7 +135,7 @@ void StratumServer::stop()
         boost::system::error_code ec;
         acceptor_.cancel(ec);
         acceptor_.close(ec);
-        idle_reap_timer_.cancel(ec);   // stop the zombie-session reaper
+        idle_reap_timer_.cancel();     // stop the zombie-session reaper
         running_ = false;
 
         // Snapshot + clear the live-sessions set under the mutex, then close
@@ -393,15 +393,17 @@ void StratumServer::start_idle_reaper()
     // timeout. A live miner submits shares far inside the window; a half-open
     // NAT-dead peer sends nothing. No-op (never re-armed) unless the DASH-set
     // StratumConfig::session_idle_timeout_sec > 0 -> other coins unchanged.
-    const uint32_t timeout = mining_interface_
-        ? mining_interface_->get_stratum_config().session_idle_timeout_sec : 0;
+    const auto& cfg0 = mining_interface_ ? mining_interface_->get_stratum_config()
+                                         : core::stratum::StratumConfig{};
+    const uint32_t timeout = cfg0.session_idle_timeout_sec;
+    const bool keepalive_on = cfg0.tcp_keepalive_enabled;
     if (timeout == 0 || !running_) return;
 
     // Sweep at half the timeout, bounded to [15 s, 60 s], so a dead session is
     // reclaimed within ~1.5x the timeout.
     const uint32_t period = std::max<uint32_t>(15, std::min<uint32_t>(60, timeout / 2));
     idle_reap_timer_.expires_after(std::chrono::seconds(period));
-    idle_reap_timer_.async_wait([this, timeout](const boost::system::error_code& ec) {
+    idle_reap_timer_.async_wait([this, timeout, keepalive_on](const boost::system::error_code& ec) {
         if (ec) return;        // cancelled at shutdown
         if (!running_) return;
         std::vector<std::shared_ptr<StratumSession>> snapshot;
@@ -411,10 +413,23 @@ void StratumServer::start_idle_reaper()
         }
         size_t reaped = 0;
         for (auto& s : snapshot) {
-            if (s->is_connected() && s->seconds_since_activity() > timeout) {
-                s->drop_stale("idle timeout (no inbound share/line)");
-                ++reaped;
-            }
+            if (!s->is_connected())
+                continue;   // socket already dead -> notify_all prunes it
+            if (s->seconds_since_activity() <= timeout)
+                continue;   // recently active
+            // KEEPALIVE-AWARE: when OS TCP keepalive is enabled it is the
+            // liveness authority -- a still-open socket means keepalive has NOT
+            // declared the peer dead (it force-closes dead NAT paths, which the
+            // is_connected() guard above then catches). Do NOT reap an idle-but-
+            // keepalive-validated AUTHORIZED rig: a high fixed-diff suffix
+            // (ADDR+N) can legitimately exceed the idle window between submits,
+            // and reaping it would drop a LIVE, paying miner. Idle-time reaping
+            // is the FALLBACK only where keepalive is unavailable; unauthorized
+            // sessions (never completed handshake) are always fair game.
+            if (keepalive_on && s->is_authorized())
+                continue;
+            s->drop_stale("idle timeout (no inbound share/line)");
+            ++reaped;
         }
         if (reaped)
             LOG_INFO << "[Stratum] idle-reaper closed " << reaped
