@@ -444,6 +444,18 @@ nlohmann::json NodeRPC::getmininginfo()
     return CallAPIMethod("getmininginfo");
 }
 
+// Trivial tip probe -- `getbestblockhash` returns the best-block hash as a bare
+// JSON string. Returns "" if the daemon result is null/absent (never throws on
+// a well-formed-but-empty result; transport errors still propagate to the
+// caller, which swallows them). No dashd config change is required.
+std::string NodeRPC::getbestblockhash()
+{
+    auto result = CallAPIMethod("getbestblockhash");
+    if (result.is_string())
+        return result.get<std::string>();
+    return {};
+}
+
 // verbose: true -- json result, false -- hex-encode result;
 nlohmann::json NodeRPC::getblockheader(uint256 header, bool verbose)
 {

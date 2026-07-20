@@ -741,6 +741,56 @@ TEST(DashStratumWorkSource, InvalidateTemplateCacheForcesRefetchAndBumpsGenerati
     EXPECT_EQ(fallback_calls, 2);
 }
 
+// Fallback-arm event-driven tip refresh pin: on the dashd-fallback arm the
+// template cache only re-sources on the 30 s staleness TTL, so a new DASH block
+// can leave miners hashing a stale tip for up to ~30 s (accepted pseudoshares
+// that can no longer win the current block). The run-path tip poller
+// (main_dash.cpp) closes that window by firing the SAME refresh pair on a
+// dashd best-block change that the embedded arm fires from its header-chain
+// tip-changed callback: invalidate_template_cache() + bump_work_generation(),
+// then notify_all() pushes a clean_jobs mining.notify. This KAT pins the
+// work-source contract that pair relies on: on a tip change the served template
+// must SWAP to the new tip (no stale-tip mining) AND the work generation must
+// bump (the clean_jobs/notify signal every session re-pulls on). Fallback arm
+// only: an UNPOPULATED coin-state, so get_work routes to the dashd fallback.
+TEST(DashStratumWorkSource, FallbackArmTipChangeRefreshesTemplateAndBumpsGeneration)
+{
+    Fixture fx(true);                       // unpopulated coin-state -> fallback arm
+    ASSERT_FALSE(fx.coin_state.populated());
+    auto ws = fx.make();
+
+    // Baseline: the fallback serves the pre-tip-change template, cached at the
+    // old tip. This is what an idle miner would keep hashing until the TTL.
+    auto tmpl_before = ws->get_current_work_template();
+    ASSERT_FALSE(tmpl_before.empty());
+    EXPECT_EQ(tmpl_before.value("previousblockhash", ""), std::string(kPrevHashHex));
+    const uint64_t gen_before = ws->get_work_generation();
+
+    // A new DASH block arrives: dashd's best-block hash changes. The fallback
+    // now sources a new-tip template (rotated prev + rotated payee), exactly as
+    // getbestblockhash flips for the run-path poller.
+    fx.fallback_work = rotated_work();
+
+    // The poller's refresh action on an observed tip change (the SAME pair the
+    // embedded header-chain tip-changed callback fires).
+    ws->invalidate_template_cache("kat: fallback-arm dashd best-block changed");
+    ws->bump_work_generation();
+
+    // (a) clean_jobs/notify signal: work generation advanced, so notify_all()
+    //     will push a fresh mining.notify to every session.
+    EXPECT_GT(ws->get_work_generation(), gen_before);
+
+    // (b) no more stale-tip mining: the next served template is the NEW tip,
+    //     not the cached pre-change one.
+    auto tmpl_after = ws->get_current_work_template();
+    ASSERT_FALSE(tmpl_after.empty());
+    EXPECT_EQ(tmpl_after.value("previousblockhash", ""),
+              std::string(kRotatedPrevHashHex));
+    EXPECT_NE(tmpl_after.value("previousblockhash", ""),
+              tmpl_before.value("previousblockhash", ""));
+    EXPECT_EQ(tmpl_after.value("height", 0u), 424243u);
+}
+
 // Fix 3 pin (work-source side of the zero-hash pre-auth job_0 defect): a
 // template with a zeroed prev is NOT mineable work — honest set-gap, never a
 // zero-prev job.

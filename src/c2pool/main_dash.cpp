@@ -1481,6 +1481,65 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         }
     }
 
+    // ── Fallback-arm event-driven tip refresh ────────────────────────────
+    // On the dashd-fallback arm (no embedded coin-P2P tip source) the template
+    // cache only re-sources on the 30 s staleness TTL (work_source.cpp
+    // kStaleAfter) — there is NO tip-change signal like the embedded arm's
+    // header_chain->set_on_tip_changed callback. DASH blocks arrive ~every
+    // 150 s, so up to ~30 s of stale-tip mining can occur per block (accepted
+    // pseudoshares that can no longer win the current block). Poll dashd for
+    // its best-block hash every 3 s; on a change, drop the cached template +
+    // bump work-generation + notify every session (clean_jobs) — the SAME
+    // refresh pair the embedded arm fires. Gated on the fallback arm (coin_p2p
+    // null) AND an armed rpc AND a live stratum acceptor. getbestblockhash is a
+    // trivial RPC; failures are swallowed so a daemon hiccup never crashes the
+    // run-loop (retry next tick). Reuses the existing NodeRPC client — no new
+    // dependency, no dashd config change, no new notify mechanism.
+    if (!coin_p2p && rpc && stratum_server) {
+        auto tip_timer = std::make_shared<io::steady_timer>(ioc);
+        auto last_tip = std::make_shared<std::string>();
+        auto tip_tick = std::make_shared<
+            std::function<void(const boost::system::error_code&)>>();
+        *tip_tick = [rpc = rpc.get(), ws = work_source.get(),
+                     ss = stratum_server.get(), tip_timer, last_tip, tip_tick](
+                        const boost::system::error_code& ec) {
+            if (ec) return;   // cancelled at shutdown
+            try {
+                const std::string tip = rpc->getbestblockhash();
+                if (!tip.empty() && *last_tip != tip) {
+                    const bool first_seen = last_tip->empty();
+                    *last_tip = tip;
+                    // Skip the notify on the very first observation (baseline);
+                    // only a genuine tip CHANGE forces a refresh.
+                    if (!first_seen) {
+                        ws->invalidate_template_cache(
+                            "tip-poll: dashd best-block changed");
+                        ws->bump_work_generation();
+                        ss->notify_all();
+                        LOG_INFO << "[Stratum] tip-poll: new tip "
+                                 << tip.substr(0, 16)
+                                 << ", forcing template refresh + notify";
+                        std::cout << "[Stratum] tip-poll: new tip "
+                                  << tip.substr(0, 16)
+                                  << ", forcing template refresh + notify\n";
+                    }
+                }
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[Stratum] tip-poll getbestblockhash failed "
+                               "(non-fatal, retry next tick): " << e.what();
+            } catch (...) {
+                // swallow — never crash the run-loop on a tip probe
+            }
+            tip_timer->expires_after(std::chrono::seconds(3));
+            tip_timer->async_wait(*tip_tick);
+        };
+        tip_timer->expires_after(std::chrono::seconds(3));
+        tip_timer->async_wait(*tip_tick);
+        std::cout << "[run] fallback-arm tip-poll ARMED (dashd getbestblockhash "
+                     "every 3 s -> event-driven template refresh + clean_jobs "
+                     "notify on tip change)\n";
+    }
+
     std::cout << "[run] run-loop up (Ctrl-C to stop); won blocks relay DUAL-PATH:\n"
                  "[run]   ARM A embedded coin-P2P relay (primary, daemonless) = "
               << (p2p_relay ? "ARMED" : (no_p2p_relay ? "SUPPRESSED (--no-p2p-relay)"
