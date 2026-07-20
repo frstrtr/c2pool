@@ -9,8 +9,10 @@
 
 #include <util/strencodings.h>   // ParseHex / HexStr
 
+#ifndef _WIN32
 #include <sys/socket.h>          // setsockopt SO_SND/RCVTIMEO (Send() deadline)
 #include <sys/time.h>            // struct timeval
+#endif
 
 namespace dash
 {
@@ -169,7 +171,11 @@ void NodeRPC::apply_socket_timeouts()
     // wedged dashd. (beast tcp_stream::expires_after cannot be used: it only
     // governs ASYNC ops -- the sync path calls socket.read_some() directly.)
     // Per-operation inactivity timeout: a large-but-steadily-arriving GBT does
-    // NOT trip it; only a genuine stall does. Linux release target.
+    // NOT trip it; only a genuine stall does. POSIX (SO_*TIMEO takes a timeval);
+    // guarded off Windows (no <sys/time.h>/timeval, and Winsock SO_RCVTIMEO takes
+    // a DWORD) -- the DASH deploy target is Linux, and macOS keeps the real
+    // deadline. On Windows this is a no-op (pre-PR behaviour: no deadline).
+#ifndef _WIN32
     if (!m_stream.socket().is_open())
         return;
     boost::system::error_code ec;
@@ -182,6 +188,7 @@ void NodeRPC::apply_socket_timeouts()
     const int fd = m_stream.socket().native_handle();
     ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
 }
 
 std::string NodeRPC::Send(const std::string &request)

@@ -1889,26 +1889,31 @@ void StratumSession::apply_socket_keepalive()
     if (!cfg.tcp_keepalive_enabled) return;
 
     boost::system::error_code ec;
-    socket_.set_option(boost::asio::socket_base::keep_alive(true), ec);
+    socket_.set_option(boost::asio::socket_base::keep_alive(true), ec);   // portable (asio)
     if (ec) {
         LOG_WARNING << "[Stratum] SO_KEEPALIVE set failed: " << ec.message();
         return;
     }
+    // Per-probe tuning (idle/interval/count) is Linux-specific -- Windows tunes
+    // keepalive via WSAIoctl(SIO_KEEPALIVE_VALS) and macOS via TCP_KEEPALIVE, so
+    // guard exactly like sample_tcp_rtt_ms() above (#ifdef __linux__). Off-Linux
+    // the portable keep_alive(true) above still arms keepalive with OS defaults;
+    // the DASH deploy target is Linux, where the 60/10/3 tuning (~90 s detect)
+    // applies. This keeps core building on the Windows/macOS CI lanes.
+#ifdef __linux__
     const int fd = socket_.native_handle();
     int idle  = static_cast<int>(cfg.tcp_keepalive_idle_sec);
     int intvl = static_cast<int>(cfg.tcp_keepalive_interval_sec);
     int cnt   = static_cast<int>(cfg.tcp_keepalive_count);
-#ifdef TCP_KEEPIDLE
     ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(idle));
-#endif
-#ifdef TCP_KEEPINTVL
     ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
-#endif
-#ifdef TCP_KEEPCNT
     ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
-#endif
     LOG_TRACE << "[Stratum] TCP keepalive armed (idle=" << idle
               << "s interval=" << intvl << "s count=" << cnt << ")";
+#else
+    LOG_TRACE << "[Stratum] TCP keepalive armed (OS-default probe timing; "
+                 "per-probe tuning is Linux-only)";
+#endif
 }
 
 void StratumSession::arm_handshake_timer()
