@@ -184,6 +184,13 @@ void HashrateTracker::set_difficulty_from_hashrate(double now) {
     if (h <= 0.0) return;
     double d = h * target_time_per_mining_share_ / 4294967296.0;
     d = std::max(min_difficulty_, std::min(max_difficulty_, d));
+    // Firmware-grid fix: many ASIC firmwares round the advertised pool difficulty
+    // DOWN to a power-of-two grid, then mine that easier target and submit shares
+    // the pool's exact (higher) required difficulty rejects. Advertise only
+    // power-of-two difficulties so advertised == applied == required. Round DOWN so
+    // accepted-share cadence never drops below target.
+    d = std::exp2(std::floor(std::log2(d)));
+    d = std::max(min_difficulty_, d);
     if (current_difficulty_ > 0.0) {
         double ratio = d / current_difficulty_;
         // Dead-band: absorb estimator noise, no needless set_difficulty churn.

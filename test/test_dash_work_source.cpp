@@ -14,6 +14,9 @@
 ///   4. viable but null mempool  -> fallback (defensive null-guard).
 
 #include <impl/dash/coin/work_source.hpp>
+#include <c2pool/hashrate/tracker.hpp>
+
+#include <cmath>
 
 #include <gtest/gtest.h>
 
@@ -128,4 +131,67 @@ TEST(DashWorkSource, NullMempoolRoutesFallback)
     EXPECT_EQ(sel.source, WorkSource::DashdFallback);
     EXPECT_FALSE(emb_ran);
     EXPECT_TRUE(fb_ran);
+}
+
+// ─── Firmware-grid vardiff quantization KAT (retention fix) ──────────────────
+// HashrateTracker::set_difficulty_from_hashrate must advertise ONLY power-of-two
+// difficulties, rounded DOWN from the estimator's ideal D. Many ASIC firmwares
+// round the advertised pool difficulty down to a power-of-two grid, mine that
+// easier target, and submit shares the pool's exact (higher) required difficulty
+// silently rejects. Advertising the largest power of two <= D makes
+// advertised == applied == required, and rounding DOWN keeps the accepted-share
+// cadence at or above target. Driven purely through the public API.
+namespace {
+// Oracle mirroring the documented estimator (port of p2pool-dash work.py):
+//   D_ideal = ewma_work * target / norm,  norm = tau*(1 - exp(-2*target/tau))
+// with all accepted shares recorded in the same wall-second (decay ~ 1), so
+// ewma_work == N*share_diff and the bias-corrected age floors at 2*target.
+double ideal_D(int n, double share_diff, double target, double tau) {
+    const double norm = tau * (1.0 - std::exp(-2.0 * target / tau));
+    return static_cast<double>(n) * share_diff * target / norm;
+}
+bool is_power_of_two(double d) {
+    if (!(d > 0.0)) return false;
+    const double l = std::log2(d);
+    return std::abs(l - std::floor(l)) < 1e-9;
+}
+} // namespace
+
+TEST(HashrateVardiffQuantize, AdvertisesPowerOfTwoRoundedDown)
+{
+    constexpr double kTarget = 10.0;   // set_target_time_per_mining_share
+    constexpr double kTau    = 90.0;   // vardiff_ewma_tau_ (fixed default)
+    constexpr int    kShares = 15;     // > warmup (4)
+    constexpr double kDiff   = 12.0;   // per accepted-share issued difficulty
+
+    c2pool::hashrate::HashrateTracker t;
+    t.set_difficulty_bounds(0.0005, 1e9);   // wide: exercise quantization, not clamp
+    t.set_target_time_per_mining_share(kTarget);
+    t.set_hashrate_vardiff(true);
+    t.enable_vardiff(true);
+
+    for (int i = 0; i < kShares; ++i)
+        t.record_mining_share_submission(kDiff, /*accepted=*/true);
+
+    const double q = t.get_current_difficulty();
+    const double D = ideal_D(kShares, kDiff, kTarget, kTau);
+
+    // (1) Advertised value is an exact power of two (timing-independent).
+    EXPECT_TRUE(is_power_of_two(q)) << "advertised diff not power-of-two: " << q;
+    // (2) Rounds DOWN — never advertise more than the estimator's ideal D.
+    EXPECT_LE(q, D) << "advertised " << q << " exceeds ideal D " << D;
+    // (3) It is THE largest such power of two (down one step, not two): 2q > D.
+    EXPECT_GT(2.0 * q, D) << "advertised " << q << " rounded down too far vs D " << D;
+}
+
+TEST(HashrateVardiffQuantize, QuantizationFormulaIsFloorLog2)
+{
+    // Pure-math intent check: for any ideal D, the advertised value is the
+    // largest power of two not exceeding D  (floor on the log2 grid).
+    for (double D : {0.75, 1.0, 1.5, 3.0, 63.9, 64.0, 100.4, 65535.0}) {
+        const double q = std::exp2(std::floor(std::log2(D)));
+        EXPECT_TRUE(is_power_of_two(q));
+        EXPECT_LE(q, D);
+        EXPECT_GT(2.0 * q, D);
+    }
 }
