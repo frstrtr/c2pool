@@ -688,8 +688,14 @@ if (BUILD_TESTING AND GTest_FOUND)
     # (live_feed.hpp) translating raw coin-P2P wire events into the derived
     # ingest events (new_headers->HeaderChain, full_block->block_connected) + the
     # pure tip_advance_from_chain gate. Same target/link set; no new allowlist.
+    # Third TU (E2c): test_dash_mn_seed.cpp — the RPC protx-list MN-set seed
+    # (mn_seed.hpp): payoutAddress->scriptPayout byte-exact round trip,
+    # fail-closed abort on undecodable payees, and the seed->leg-4-event->
+    # populated()-flips->embedded-template-pays-the-correct-MN capstone. Same
+    # target/link set (core already carries address_utils); no new allowlist.
     add_executable(test_dash_node_reception_wire test_dash_node_reception_wire.cpp
-                   test_dash_live_feed_bridge.cpp)
+                   test_dash_live_feed_bridge.cpp
+                   test_dash_mn_seed.cpp)
     target_link_libraries(test_dash_node_reception_wire PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core

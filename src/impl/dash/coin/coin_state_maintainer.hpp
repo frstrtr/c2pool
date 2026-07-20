@@ -56,8 +56,19 @@ public:
     /// coinbase pays. An EMPTY list is treated as a gap -- it cannot back a
     /// valid payee, so it clears MN-readiness and drops the bundle to fallback
     /// rather than publishing a template with no masternode payment.
-    void on_mn_list_update(std::vector<std::pair<uint256, MNState>> mnstates) {
+    ///
+    /// as_of_height (E2c): the chain height the snapshot is CURRENT AT
+    /// (0 = unknown). Recorded so on_block_connected() can skip re-applying
+    /// blocks the snapshot already reflects -- replaying a historical coinbase
+    /// payment on top of an already-current lastPaidHeight set falsely
+    /// re-bumps the front of the GetMNPayee queue when several MNs share one
+    /// payoutAddress (live-observed: E2b's 288-block UTXO bootstrap replay
+    /// scrambled the seeded queue and the embedded template projected the
+    /// wrong payee).
+    void on_mn_list_update(std::vector<std::pair<uint256, MNState>> mnstates,
+                           uint32_t as_of_height = 0) {
         m_have_mn = !mnstates.empty();
+        m_mn_snapshot_height = as_of_height;
         m_state.mnstates().load(std::move(mnstates));
         if (!m_have_mn)
             demote();
@@ -105,6 +116,18 @@ public:
     /// template with a phantom payee. Returns apply_block's ApplyResult.
     MnStateMachine::ApplyResult
     on_block_connected(const dash::coin::BlockType& block, uint32_t height) {
+        // E2c snapshot fence: blocks the payout-bearing snapshot already
+        // reflects (height <= its as-of height) must NOT be re-folded -- the
+        // snapshot's registrations/spends/lastPaid ARE those blocks' effects,
+        // and re-attributing their coinbase payments corrupts the shared-
+        // payoutAddress payee queue (see on_mn_list_update). The E2b UTXO
+        // lane's own subscription to the same event is unaffected (it needs
+        // every block for the UTXO view; it holds no MN state).
+        if (m_mn_snapshot_height != 0 && height <= m_mn_snapshot_height) {
+            MnStateMachine::ApplyResult r;
+            r.total_after = m_state.mnstates().size();
+            return r;
+        }
         auto r    = m_state.mnstates().apply_block(block, height);
         m_have_mn = m_state.mnstates().size() != 0;
         if (!m_have_mn)
@@ -148,6 +171,10 @@ private:
 
     bool m_have_mn{false};
     bool m_have_tip{false};
+
+    // Height the last MN-set snapshot was current at (0 = none/unknown);
+    // on_block_connected skips re-applying blocks at or below it.
+    uint32_t m_mn_snapshot_height{0};
 
     // Last observed tip params, applied on republish().
     uint32_t m_prev_height{0};

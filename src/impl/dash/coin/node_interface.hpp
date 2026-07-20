@@ -65,6 +65,16 @@ struct BlockConnected
 struct MnListUpdate
 {
     std::vector<std::pair<uint256, coin::MNState>> mnstates;
+
+    // E2c: the chain height this snapshot is CURRENT AT (0 = unknown). A
+    // payout-bearing snapshot (e.g. the RPC protx-list seed) already reflects
+    // every registration/spend/payment up to this height, so the maintainer
+    // must NOT re-fold blocks at height <= as_of_height into it: replaying a
+    // historical coinbase payment on top of an already-current lastPaidHeight
+    // set falsely re-bumps the front of the GetMNPayee queue (live-observed
+    // on testnet where dozens of MNs share one payoutAddress) and projects
+    // the WRONG payee. 0 preserves the pre-E2c behavior (no skip).
+    uint32_t as_of_height{0};
 };
 
 struct Node
