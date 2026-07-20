@@ -193,7 +193,10 @@ TEST(DashStratumWorkSource, ConfigDefaultsMatchStratumConfigWithX11Overrides)
     const auto& cfg = ws->get_stratum_config();
     EXPECT_DOUBLE_EQ(cfg.min_difficulty, 0.0005);
     EXPECT_DOUBLE_EQ(cfg.max_difficulty, 65536.0);
-    EXPECT_DOUBLE_EQ(cfg.target_time, 3.0);
+    // DASH adopts p2pool-dash's field-tuned 10s vardiff share-rate default (set in
+    // the work-source ctor, ec26caef) to stop the X11 vardiff oscillation/reject
+    // storm -- NOT the 3s BTC StratumConfig default. Keep this KAT in lockstep.
+    EXPECT_DOUBLE_EQ(cfg.target_time, 10.0);
     EXPECT_TRUE(cfg.vardiff_enabled);
     // X11 = standard diff-1 scale (p2pool-dash DUMB_SCRYPT_DIFF == 1), NOT the
     // scrypt 2^16 default -- otherwise advertised difficulty inflates 65536x.
