@@ -1178,10 +1178,18 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
 
     // ── Pseudoshare accepted — record in RateMonitor ──
     // p2pool: work = target_to_average_attempts(effective_target)
-    // For us: work = vardiff_difficulty × 2^32 (equivalent unit conversion)
+    // For us: work = credited_difficulty × 2^32 (equivalent unit conversion)
     ++accepted_shares_;
     static constexpr double TWO_32 = 4294967296.0;
-    double work = vardiff_difficulty * TWO_32;
+    // #766/#762: credit the hashrate estimate at the difficulty THIS job was
+    // actually issued/mined at, not the live vardiff. A vardiff retarget
+    // between job-issue and submit must not skew the EWMA/RateMonitor input —
+    // the share represents work at its own job's target. Falls back to the live
+    // vardiff when issued_difficulty is unset (0). Estimate/stats only; the
+    // acceptance gate above is unchanged.
+    double credited_difficulty =
+        (job.issued_difficulty > 0.0) ? job.issued_difficulty : vardiff_difficulty;
+    double work = credited_difficulty * TWO_32;
     bool is_dead = (job.stale_info != 0);
 
     // Record in global RateMonitor (for get_local_addr_rates)
@@ -1189,7 +1197,7 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
         server_->record_pseudoshare(work, pubkey_hash_, username_, is_dead);
 
     // Record in per-connection tracker (for VARDIFF adjustment + per-session stats)
-    hashrate_tracker_.record_mining_share_submission(vardiff_difficulty, true);
+    hashrate_tracker_.record_mining_share_submission(credited_difficulty, true);
 
     // Check if VARDIFF changed → send new difficulty AND new work to miner.
     // p2pool (stratum.py:594-595): after adjusting target, calls _send_work()

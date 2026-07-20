@@ -126,6 +126,11 @@ public:
     nlohmann::json getnetworkinfo();
     nlohmann::json getblockchaininfo();
     nlohmann::json getmininginfo();
+    // Trivial tip probe: the current best-block hash as a hex string. Used by
+    // the fallback-arm tip poller (main_dash.cpp) to drive event-driven
+    // template refresh without waiting on the 30 s staleness TTL. Empty string
+    // on a null/absent result.
+    std::string getbestblockhash();
     // verbose: true -- json result, false -- hex-encode result;
     nlohmann::json getblockheader(uint256 header, bool verbose = true);
     // verbosity: 0 for hex-encoded data, 1 for a json object, and 2 for json object with transaction data
