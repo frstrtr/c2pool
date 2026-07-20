@@ -192,6 +192,13 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
     std::chrono::steady_clock::time_point connected_at_;
     std::string session_id_;
 
+    // Reject-reason diagnostics throttle: emit the low-diff (P5) and
+    // malformed-params (P1) reject lines at most once per REJECT_LOG_INTERVAL
+    // per session so a rig hammering rejects cannot flood the log. INFO level.
+    std::chrono::steady_clock::time_point last_lowdiff_log_{};
+    std::chrono::steady_clock::time_point last_badparams_log_{};
+    static constexpr std::chrono::seconds REJECT_LOG_INTERVAL{5};
+
     // Merged mining: per-chain payout addresses set by the miner.
     std::map<uint32_t, std::string> merged_addresses_;
 

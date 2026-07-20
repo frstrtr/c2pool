@@ -972,6 +972,17 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     if (params.size() < 5 || !params[1].is_string() || !params[2].is_string()
         || !params[3].is_string() || !params[4].is_string()) {
         ++rejected_shares_;
+        // Rate-limited (≤ once / REJECT_LOG_INTERVAL / session) malformed-params
+        // reject diagnostic — a misbehaving client sending garbage submits is
+        // otherwise silent. INFO + throttled so it cannot flood.
+        {
+            auto now_lg = std::chrono::steady_clock::now();
+            if (now_lg - last_badparams_log_ >= REJECT_LOG_INTERVAL) {
+                last_badparams_log_ = now_lg;
+                LOG_INFO << "[Stratum] REJECT bad-params user=" << username_
+                         << " nparams=" << params.size();
+            }
+        }
         nlohmann::json response;
         response["id"] = request_id;
         response["result"] = false;
@@ -1166,6 +1177,18 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     // Above pool target → also a P2P share (broadcast to network).
     if (share_difficulty < required_difficulty) {
         ++rejected_shares_;
+        // Rate-limited (≤ once / REJECT_LOG_INTERVAL / session) low-diff reject
+        // diagnostic: surfaces the exact diff triplet so a firmware-grid gap
+        // between advertised/issued and required is visible in the field.
+        {
+            auto now_lg = std::chrono::steady_clock::now();
+            if (now_lg - last_lowdiff_log_ >= REJECT_LOG_INTERVAL) {
+                last_lowdiff_log_ = now_lg;
+                LOG_INFO << "[Stratum] REJECT low-diff user=" << username_ << " job=" << job_id
+                         << " hash_diff=" << share_difficulty << " required=" << required_difficulty
+                         << " issued=" << job.issued_difficulty << " vardiff=" << vardiff_difficulty;
+            }
+        }
         // Record rejection for VARDIFF timing (p2pool only records accepted,
         // but we need the timing signal to avoid stalling VARDIFF).
         hashrate_tracker_.record_mining_share_submission(vardiff_difficulty, false);
