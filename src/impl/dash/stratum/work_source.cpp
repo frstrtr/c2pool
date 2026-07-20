@@ -50,6 +50,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <mutex>
 #include <span>
 #include <utility>
 
@@ -168,6 +169,17 @@ DASHWorkSource::~DASHWorkSource() = default;
 // ─────────────────────────────────────────────────────────────────────────────
 GetWork DASHWorkSource::get_work(const WorkJobTargetInputs& job_in) const
 {
+    // C1 mainnet gate (see cached_work): the embedded arm emits an EMPTY CCbTx
+    // extra_payload (consensus-invalid on a DIP4-active mainnet) until the
+    // SML/QuorumManager wiring lands post-v0.2.4. On mainnet never source the
+    // embedded template — use ONLY the reward-safe dashd-RPC fallback. is_testnet_
+    // defaults false, so an unconfigured node fails closed to the fallback.
+    if (!is_testnet_) {
+        coin::DashWorkData w =
+            dashd_fallback_ ? dashd_fallback_() : coin::DashWorkData{};
+        return GetWork{ coin::WorkSource::DashdFallback, std::move(w),
+                        assemble_work_job_targets(job_in) };
+    }
     // Qualify the free function explicitly: unqualified `get_work` in this
     // member body resolves to THIS member (class scope shadows the namespace),
     // so name the capstone by its namespace to avoid a self-call.
@@ -281,13 +293,44 @@ std::shared_ptr<const coin::DashWorkData> DASHWorkSource::cached_work() const
             return nullptr;
     }
 
+    // ── C1 mainnet gate (v0.2.4 tag-blocker) ────────────────────────────────
+    // The embedded template arm's only prod caller does not pass the E2d
+    // SML/QuorumManager seams, so build_embedded_workdata() clears the CCbTx
+    // extra_payload and the coinbase is a plain v1 tx with NO DIP-0004 type-5
+    // payload. On a DIP4-active DASH MAINNET that block is consensus-INVALID
+    // (bad-cbtx) and the won subsidy is lost. Populating the payload needs the
+    // SML/QuorumManager wiring that is post-v0.2.4. Until then the embedded arm
+    // is FAIL-CLOSED off mainnet: we never take the populated() embedded flip on
+    // mainnet — the template comes ONLY from the reward-safe dashd-RPC fallback
+    // (the never-removed [GBT-XCHECK] safety path). Testnet/regtest keep the
+    // embedded arm (E5 proving ground). is_testnet_ defaults false, so an
+    // unconfigured node is treated as mainnet — fail-closed by default.
+    const bool embedded_arm_enabled = is_testnet_;
+    if (!embedded_arm_enabled && coin_state_.populated()) {
+        static std::once_flag mainnet_gate_logged;
+        std::call_once(mainnet_gate_logged, [] {
+            LOG_WARNING << "[DASH-STRATUM-GBT] embedded template arm disabled on "
+                           "mainnet: CCbTx payload not yet buildable — using "
+                           "dashd-RPC fallback";
+        });
+    }
+
     // Re-source OUTSIDE the lock (the fallback arm is a blocking dashd RPC).
-    // Embedded arm when the node-held bundle is populated, retained dashd GBT
-    // fallback otherwise (the never-removed [GBT-XCHECK] safety path).
+    // Embedded arm ONLY when enabled (testnet/regtest) AND the node-held bundle
+    // is populated; otherwise the retained dashd GBT fallback.
     coin::DashWorkData work;
-    if (coin_state_.populated() || dashd_fallback_) {
+    const bool try_embedded = embedded_arm_enabled && coin_state_.populated();
+    if (try_embedded || dashd_fallback_) {
         try {
-            coin::WorkSelection sel = coin_state_.select_work(dashd_fallback_);
+            // On mainnet (embedded gated) select_work is bypassed entirely and
+            // we source directly from the reward-safe dashd fallback; on
+            // testnet/regtest select_work picks embedded-when-viable, dashd
+            // otherwise (unchanged behaviour).
+            coin::WorkSelection sel = try_embedded
+                ? coin_state_.select_work(dashd_fallback_)
+                : coin::WorkSelection{
+                      dashd_fallback_ ? dashd_fallback_() : coin::DashWorkData{},
+                      coin::WorkSource::DashdFallback };
             // E2c observability: WHICH arm served this template + the MN payee
             // it carries (the payee-correctness axis of the embedded arm). One
             // line per re-source (cache-TTL cadence), INFO -- the field-

@@ -845,10 +845,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     dash::coin::P2pRelaySink p2p_relay;
     if (coin_p2p && !no_p2p_relay) {
         p2p_relay =
-            [&ioc, &coin_p2p](const std::vector<unsigned char>& block_bytes) {
+            [&ioc, &coin_p2p](const std::vector<unsigned char>& block_bytes) -> bool {
+                // H1 honest reporting: submit_block_p2p_raw SILENTLY DROPS a won
+                // block when the coin-P2P peer is disconnected, and the io::post
+                // returns before the send even runs -- so only claim a P2P relay
+                // when the peer is actually connected+handshaked at dispatch time.
+                // If not, return false so broadcast_won_block relies on ARM B
+                // (submitblock RPC) and the NEVER-SILENT-DROP contract holds
+                // (loud dispatcher log if neither arm is reachable).
+                if (!coin_p2p || !coin_p2p->is_handshake_complete()) {
+                    std::cout << "[DASH-STRATUM-BLOCK] embedded P2P relay skipped: "
+                                 "coin-P2P peer not connected/handshaked -- relying "
+                                 "on submitblock-RPC backup\n";
+                    return false;
+                }
                 io::post(ioc, [&coin_p2p, bytes = block_bytes]() {
                     if (coin_p2p) coin_p2p->submit_block_p2p_raw(bytes);
                 });
+                return true;
             };
     } else if (no_p2p_relay) {
         std::cout << "[run] --no-p2p-relay: embedded P2P-relay arm SUPPRESSED; "
