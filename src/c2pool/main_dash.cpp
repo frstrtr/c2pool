@@ -57,6 +57,7 @@
 #include <impl/dash/coin/p2p_client.hpp>   // dash::coin::p2p::CoinClient — OPT-IN coin-network dial (E1, --coin-p2p-connect)
 #include <impl/dash/coin/won_block_dispatch.hpp> // dash::coin::broadcast_won_block — S8 dual-path won-block dispatcher (embedded P2P primary + submitblock RPC backup)
 #include <impl/dash/coin/zmq_tip_notify.hpp> // dash::coin::TipHashDedup / ZmqHashblockSubscriber — dashd ZMQ hashblock INSTANT tip-notify (opt-in, hardening on the #770 poll)
+#include <impl/dash/coin/coin_p2p_magic.hpp>      // dash::coin::select_coin_p2p_magic — E5 --coin-p2p-magic override (regtest ARM A dial)
 #include <impl/dash/coin/node_coin_state.hpp>  // dash::coin::NodeCoinState (embedded work bundle)
 #include <impl/dash/coin/dkg_window.hpp>       // dash::coin::is_dkg_commitment_window (BLOCKER-1 guard)
 #include <impl/dash/coin/utxo_lane.hpp>    // dash::coin::UtxoLane — embedded UTXO/fee lane (E2b, #738)
@@ -773,8 +774,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // live-accept harness. Transport-only; consensus/reward-neutral; the
         // mainnet/testnet defaults are byte-for-byte unchanged when unset.
         const std::string net_magic_hex =
-            !coin_p2p_magic_hex.empty() ? coin_p2p_magic_hex
-                                        : (testnet ? "cee2caff" : "bf0c6bbd");
+            dash::coin::select_coin_p2p_magic(coin_p2p_magic_hex, testnet);
         config.coin()->m_p2p.prefix = ParseHexBytes(net_magic_hex);
         config.coin()->m_p2p.address = coin_p2p_targets.front();
 
