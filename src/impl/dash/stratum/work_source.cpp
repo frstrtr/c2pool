@@ -127,6 +127,15 @@ DASHWorkSource::DASHWorkSource(const coin::NodeCoinState& coin_state,
     // (WorkSnapshot::has_header) and suppresses the job otherwise. This also
     // makes the core's legacy stub-coinbase fallback unreachable for DASH.
     config_.require_job_snapshot = true;
+    // Vardiff target share rate: adopt p2pool-dash's FIELD-TUNED default of 10s
+    // per pseudoshare (p2pool-dash/p2pool/main.py:1153 default=10., dest='share_rate'),
+    // not the 3s jtoomim/BTC default (stratum_types.hpp:40). DASH's variable X11
+    // hashrate at 3s recomputes vardiff 3.3x as often and chases the variance,
+    // producing the observed oscillation (1170->2264->1405->2041 in minutes) and
+    // the ~28% "Low difficulty share" reject storm. 10s cuts retarget frequency
+    // 3.3x and stabilises vardiff at the source. DASH-only; other coins keep the
+    // 3s StratumConfig default. Pairs with the per-job issued_difficulty grace.
+    config_.target_time = 10.0;
     LOG_INFO << "[DASH-STRATUM] DASHWorkSource constructed"
              << " (min_diff=" << config_.min_difficulty
              << " max_diff=" << config_.max_difficulty
