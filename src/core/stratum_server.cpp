@@ -15,6 +15,28 @@
 #include <cmath>
 #include <cstring>
 #include <boost/algorithm/string.hpp>
+#ifdef __linux__
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#endif
+
+namespace {
+// Sample kernel-measured TCP round-trip time for a connected socket, in ms.
+// Same value `ss -ti` prints (tcpi_rtt, microseconds). Linux-only; 0 elsewhere
+// or on any error (socket closed, not yet established).
+inline double sample_tcp_rtt_ms(int fd) {
+#ifdef __linux__
+    struct tcp_info ti;
+    socklen_t len = sizeof(ti);
+    if (fd >= 0 && ::getsockopt(fd, IPPROTO_TCP, TCP_INFO, &ti, &len) == 0)
+        return static_cast<double>(ti.tcpi_rtt) / 1000.0;
+#else
+    (void)fd;
+#endif
+    return 0.0;
+}
+}  // namespace
 
 namespace core {
 
@@ -722,6 +744,7 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
                 wi.remote_endpoint = socket_.remote_endpoint().address().to_string()
                     + ":" + std::to_string(socket_.remote_endpoint().port());
             } catch (...) {}
+            wi.rtt_ms = sample_tcp_rtt_ms(socket_.native_handle());
             mining_interface_->register_stratum_worker(session_id_, wi);
         }
         
@@ -1220,6 +1243,8 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
             0.0,
             hashrate_tracker_.get_current_difficulty(),
             accepted_shares_, rejected_shares_, stale_shares_);
+        mining_interface_->update_stratum_worker_rtt(session_id_,
+            sample_tcp_rtt_ms(socket_.native_handle()));
     }
 
     nlohmann::json response;

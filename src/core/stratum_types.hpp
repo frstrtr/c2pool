@@ -174,6 +174,7 @@ struct WorkerInfo {
     uint64_t stale{0};
     std::chrono::steady_clock::time_point connected_at;
     std::string remote_endpoint;  // "ip:port"
+    double rtt_ms{0.0};           // TCP round-trip latency in ms (Linux tcpi_rtt); 0 = unknown / non-Linux
 };
 
 }  // namespace core::stratum

@@ -1469,6 +1469,7 @@ public:
     void update_stratum_worker(const std::string& session_id,
                                double hashrate, double dead_hashrate, double difficulty,
                                uint64_t accepted, uint64_t rejected, uint64_t stale) override;
+    void update_stratum_worker_rtt(const std::string& session_id, double rtt_ms) override;
     std::map<std::string, WorkerInfo> get_stratum_workers() const;
 
 private:
