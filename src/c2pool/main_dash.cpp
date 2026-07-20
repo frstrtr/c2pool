@@ -92,6 +92,8 @@
 #include <random>
 
 #include <boost/asio.hpp>
+#include <boost/asio/thread_pool.hpp>   // io-thread-decouple: background RPC pool
+#include <boost/asio/post.hpp>
 
 #include <cstdint>
 #include <cstdlib>      // std::getenv
@@ -1495,49 +1497,94 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // trivial RPC; failures are swallowed so a daemon hiccup never crashes the
     // run-loop (retry next tick). Reuses the existing NodeRPC client — no new
     // dependency, no dashd config change, no new notify mechanism.
+    // io-thread-decouple: dedicated single-thread pool for the fallback arm's
+    // BLOCKING dashd RPC (getbestblockhash tip probe + the background template
+    // re-source). Mirrors main_ltc.cpp hdr_pool ("keeps scrypt off io_context"):
+    // synchronous beast I/O runs HERE, never on the stratum io_context, so 60+
+    // sessions never starve while dashd is queried (or wedged -- the NodeRPC
+    // socket timeout + m_rpc_mutex bound this thread). Declared here (after rpc /
+    // work_source / stratum_server) so its explicit stop()+join() after the run
+    // loop -- and its destructor -- happen BEFORE those objects unwind: no
+    // background probe is ever mid-flight against freed state. Only created on
+    // the fallback arm; null on the embedded arm (legacy inline path unchanged).
+    std::shared_ptr<boost::asio::thread_pool> rpc_pool;
     if (!coin_p2p && rpc && stratum_server) {
+        rpc_pool = std::make_shared<boost::asio::thread_pool>(1);
+
+        // Non-blocking template re-source: cached_work() hands the blocking
+        // select_work()/GBT to rpc_pool as a single-flight background job
+        // instead of blocking the io thread on every stale/generation miss (the
+        // per-share ~15-30 s GBT block). The io thread serves the cached template
+        // immediately; the pool updates it and the next notify picks it up.
+        work_source->set_refresh_executor(
+            [rpc_pool](std::function<void()> job) {
+                boost::asio::post(*rpc_pool, std::move(job));
+            });
+
         auto tip_timer = std::make_shared<io::steady_timer>(ioc);
         auto last_tip = std::make_shared<std::string>();
         auto tip_tick = std::make_shared<
             std::function<void(const boost::system::error_code&)>>();
+        // tip_tick runs ON ioc when the 3 s timer fires. It does NOT call the
+        // blocking RPC itself: it hands getbestblockhash to rpc_pool and posts
+        // the tip-change follow-up (invalidate + bump + notify) + the timer
+        // re-arm BACK onto ioc (ws/ss/tip_timer are io-thread-confined), exactly
+        // like main_ltc.cpp's post-to-pool -> post-back-to-ioc pattern. The
+        // timer is re-armed only AFTER the RPC completes, so a slow dashd cannot
+        // pile up overlapping polls. Lost-block-prevention is preserved: a real
+        // tip change still fires invalidate + notify -- only WHERE the probe runs
+        // has moved off the stratum io thread.
         *tip_tick = [rpc = rpc.get(), ws = work_source.get(),
-                     ss = stratum_server.get(), tip_timer, last_tip, tip_tick](
-                        const boost::system::error_code& ec) {
+                     ss = stratum_server.get(), tip_timer, last_tip, tip_tick,
+                     rpc_pool, &ioc](const boost::system::error_code& ec) {
             if (ec) return;   // cancelled at shutdown
-            try {
-                const std::string tip = rpc->getbestblockhash();
-                if (!tip.empty() && *last_tip != tip) {
-                    const bool first_seen = last_tip->empty();
-                    *last_tip = tip;
-                    // Skip the notify on the very first observation (baseline);
-                    // only a genuine tip CHANGE forces a refresh.
-                    if (!first_seen) {
-                        ws->invalidate_template_cache(
-                            "tip-poll: dashd best-block changed");
-                        ws->bump_work_generation();
-                        ss->notify_all();
-                        LOG_INFO << "[Stratum] tip-poll: new tip "
-                                 << tip.substr(0, 16)
-                                 << ", forcing template refresh + notify";
-                        std::cout << "[Stratum] tip-poll: new tip "
-                                  << tip.substr(0, 16)
-                                  << ", forcing template refresh + notify\n";
+            boost::asio::post(*rpc_pool,
+                [rpc, ws, ss, tip_timer, last_tip, tip_tick, &ioc]() {
+                    std::string tip;
+                    bool ok = false;
+                    try {
+                        tip = rpc->getbestblockhash();   // BLOCKING -- BACKGROUND THREAD
+                        ok = true;
+                    } catch (const std::exception& e) {
+                        LOG_WARNING << "[Stratum] tip-poll getbestblockhash failed "
+                                       "(non-fatal, retry next tick): " << e.what();
+                    } catch (...) {
+                        // swallow — never crash on a tip probe
                     }
-                }
-            } catch (const std::exception& e) {
-                LOG_WARNING << "[Stratum] tip-poll getbestblockhash failed "
-                               "(non-fatal, retry next tick): " << e.what();
-            } catch (...) {
-                // swallow — never crash the run-loop on a tip probe
-            }
-            tip_timer->expires_after(std::chrono::seconds(3));
-            tip_timer->async_wait(*tip_tick);
+                    // Follow-up + timer re-arm run BACK ON ioc (io-thread-confined
+                    // state). If ioc is already stopped (shutdown) this handler
+                    // simply never runs -> the poll stops cleanly.
+                    boost::asio::post(ioc,
+                        [ok, tip = std::move(tip), ws, ss, tip_timer, last_tip, tip_tick]() {
+                            if (ok && !tip.empty() && *last_tip != tip) {
+                                const bool first_seen = last_tip->empty();
+                                *last_tip = tip;
+                                // Skip the notify on the very first observation
+                                // (baseline); only a genuine tip CHANGE refreshes.
+                                if (!first_seen) {
+                                    ws->invalidate_template_cache(
+                                        "tip-poll: dashd best-block changed");
+                                    ws->bump_work_generation();
+                                    ss->notify_all();
+                                    LOG_INFO << "[Stratum] tip-poll: new tip "
+                                             << tip.substr(0, 16)
+                                             << ", forcing template refresh + notify";
+                                    std::cout << "[Stratum] tip-poll: new tip "
+                                              << tip.substr(0, 16)
+                                              << ", forcing template refresh + notify\n";
+                                }
+                            }
+                            tip_timer->expires_after(std::chrono::seconds(3));
+                            tip_timer->async_wait(*tip_tick);
+                        });
+                });
         };
         tip_timer->expires_after(std::chrono::seconds(3));
         tip_timer->async_wait(*tip_tick);
         std::cout << "[run] fallback-arm tip-poll ARMED (dashd getbestblockhash "
-                     "every 3 s -> event-driven template refresh + clean_jobs "
-                     "notify on tip change)\n";
+                     "every 3 s on a dedicated RPC thread -> event-driven template "
+                     "refresh + clean_jobs notify on tip change; io thread never "
+                     "blocks on dashd)\n";
     }
 
     std::cout << "[run] run-loop up (Ctrl-C to stop); won blocks relay DUAL-PATH:\n"
@@ -1565,6 +1612,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             LOG_ERROR << "[run] io handler exception (non-fatal, #755 guard): "
                          "unknown error";
         }
+    }
+
+    // io-thread-decouple: join the background RPC pool FIRST, before any of the
+    // objects it dereferences (rpc / work_source / stratum_server) unwind. run()
+    // has returned (ioc stopped), so no NEW work is posted; stop()+join() waits
+    // out any in-flight getbestblockhash/GBT re-source (bounded by the NodeRPC
+    // socket timeout) so no pool thread ever touches freed state. Any post-back
+    // to the stopped ioc simply never executes.
+    if (rpc_pool) {
+        rpc_pool->stop();
+        rpc_pool->join();
     }
 
     // Tear the acceptor + sessions down while the work source and node_coin_state

@@ -190,6 +190,10 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
     uint64_t stale_shares_    = 0;
     uint64_t doa_shares_      = 0;  // block-template changed at submit (live-vs-frozen prevhash mismatch); accounting only, share still broadcasts
     std::chrono::steady_clock::time_point connected_at_;
+    // Last inbound-line timestamp (zombie-session reaper, StratumConfig::
+    // session_idle_timeout_sec). Updated on every received stratum line; a
+    // half-open NAT-dead peer never advances it. Init to connected_at_.
+    std::chrono::steady_clock::time_point last_activity_;
     std::string session_id_;
 
     // Reject-reason diagnostics throttle: emit the low-diff (P5) and
@@ -218,6 +222,11 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
     // where the transport/protocol object owns its timers.
     boost::asio::steady_timer work_push_timer_;
 
+    // Handshake deadline (zombie-session fix, StratumConfig::handshake_timeout_
+    // sec): armed at start(), disarmed once authorize completes. A session that
+    // never authorizes (half-open / probe) is dropped when it fires.
+    boost::asio::steady_timer handshake_timer_;
+
 public:
     explicit StratumSession(tcp::socket socket, std::shared_ptr<IWorkSource> mining_interface,
                             StratumServer* server = nullptr);
@@ -225,6 +234,15 @@ public:
 
     bool is_connected() const { return socket_.is_open(); }
     bool is_subscribed() const { return subscribed_; }
+    bool is_authorized() const { return authorized_; }
+    // Seconds since the last inbound stratum line (zombie-session reaper).
+    double seconds_since_activity() const {
+        return std::chrono::duration<double>(
+                   std::chrono::steady_clock::now() - last_activity_).count();
+    }
+    // Reap a stale/zombie session: cancel timers + close the socket. The pending
+    // async_read then fails and runs the normal disconnect path. Idempotent.
+    void drop_stale(const char* reason);
     // Diagnostics / test introspection (read-only; call quiesced or from the
     // session's io_context thread — active_jobs_ mutates on notify/submit).
     size_t active_job_count() const { return active_jobs_.size(); }
@@ -267,6 +285,10 @@ private:
     void start_periodic_work_push();
     void schedule_work_push_timer();
     void cancel_timers();
+    // Zombie-session fixes (all no-op unless the DASH-set StratumConfig knobs
+    // enable them): apply OS TCP keepalive, arm the authorize deadline.
+    void apply_socket_keepalive();
+    void arm_handshake_timer();
 
     std::string generate_extranonce1();
     void parse_address_separators(std::string& username, std::string& merged_addr_raw);
@@ -302,6 +324,13 @@ class StratumServer
     mutable AddrRateMap addr_rates_cache_;
     mutable double addr_rates_cache_ts_ = 0.0;
     mutable std::mutex cache_mutex_;
+
+    // Zombie-session idle reaper (StratumConfig::session_idle_timeout_sec).
+    // Periodically closes sessions with no inbound activity past the timeout so
+    // a NAT-dead peer that OS keepalive somehow missed is still reclaimed.
+    // Disarmed (never scheduled) when the timeout is 0 -> legacy no-op.
+    boost::asio::steady_timer idle_reap_timer_;
+    void start_idle_reaper();
 
 public:
     StratumServer(net::io_context& ioc, const std::string& address, uint16_t port, std::shared_ptr<IWorkSource> mining_interface);
