@@ -3378,6 +3378,8 @@ nlohmann::json MiningInterface::rest_stratum_stats()
             workers_json[worker_key]["accepted"] = workers_json[worker_key]["accepted"].get<uint64_t>() + w.accepted;
             workers_json[worker_key]["rejected"] = workers_json[worker_key]["rejected"].get<uint64_t>() + w.rejected;
             workers_json[worker_key]["stale"] = workers_json[worker_key]["stale"].get<uint64_t>() + w.stale;
+            if (w.rtt_ms > workers_json[worker_key].value("rtt_ms", 0.0))
+                workers_json[worker_key]["rtt_ms"] = w.rtt_ms;
             workers_json[worker_key]["shares"] = workers_json[worker_key]["shares"].get<uint64_t>() + w.accepted + w.stale;
             // Keep earliest first_seen
             if (first_seen_ts < workers_json[worker_key]["first_seen"].get<uint64_t>())
@@ -3396,7 +3398,8 @@ nlohmann::json MiningInterface::rest_stratum_stats()
                 {"stale", w.stale},
                 {"shares", w.accepted + w.stale},
                 {"connected_seconds", elapsed},
-                {"remote_endpoint", w.remote_endpoint}
+                {"remote_endpoint", w.remote_endpoint},
+                {"rtt_ms", w.rtt_ms}
             };
         }
     }
@@ -6993,6 +6996,14 @@ void MiningInterface::update_stratum_worker(const std::string& session_id,
         it->second.rejected = rejected;
         it->second.stale = stale;
     }
+}
+
+void MiningInterface::update_stratum_worker_rtt(const std::string& session_id, double rtt_ms)
+{
+    std::lock_guard<std::mutex> lock(m_stratum_workers_mutex);
+    auto it = m_stratum_workers.find(session_id);
+    if (it != m_stratum_workers.end())
+        it->second.rtt_ms = rtt_ms;
 }
 
 std::map<std::string, MiningInterface::WorkerInfo> MiningInterface::get_stratum_workers() const

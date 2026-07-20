@@ -90,6 +90,12 @@ public:
                                        uint64_t accepted, uint64_t rejected,
                                        uint64_t stale) = 0;
 
+    // Optional: record per-session TCP round-trip latency (ms), sampled from the
+    // kernel socket by the stratum session. Default no-op so per-coin work sources
+    // need no override; MiningInterface stores it for dashboard display.
+    virtual void update_stratum_worker_rtt(const std::string& /*session_id*/,
+                                           double /*rtt_ms*/) {}
+
     // ── Work generation ──────────────────────────────────────────────────
     // Called per-job-issue (when sending mining.notify). Implementors
     // must produce a snapshot consistent with their template state at
