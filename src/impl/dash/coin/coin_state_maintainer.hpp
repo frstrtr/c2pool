@@ -40,6 +40,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <utility>
 #include <vector>
 
@@ -97,6 +98,23 @@ public:
     /// SML at exactly the state dashd commits for TIP+1 is the #1 item the live
     /// byte-parity KAT against a running dashd must confirm; do not assume.
     void on_mnlistdiff(const vendor::CSimplifiedMNListDiff& diff) {
+        // H-7 base-continuity: an INCREMENTAL diff is only valid when its
+        // baseBlockHash matches the block our SML is currently current at.
+        // Applying a diff whose base is some other block upserts/erases MN
+        // records relative to a state we are not in — silently corrupting the
+        // SML (ghost MNs, wrong merkleRootMNList). A ZERO base is a full
+        // snapshot and always safe (it replaces, not patches). Reject + keep the
+        // prior SML (the tip-change driver re-requests off the correct base).
+        const uint256 have_at = m_state.sml_current_hash();
+        if (!diff.baseBlockHash.IsNull() && !have_at.IsNull()
+            && diff.baseBlockHash != have_at) {
+            LOG_WARNING << "[SML] REJECT diff: base "
+                        << diff.baseBlockHash.GetHex().substr(0, 16)
+                        << " != SML-current " << have_at.GetHex().substr(0, 16)
+                        << " (base-continuity guard) — awaiting a diff off our base";
+            return;
+        }
+
         // 1) SML (merkleRootMNList). apply_diff erases deletedMNs, upserts
         //    diff.mnList, and re-sorts by proRegTxHash (memcmp order — the
         //    Bug-A-critical ordering, already pinned by test_dash_simplifiedmns).
@@ -130,7 +148,11 @@ public:
                         int32_t cb_h = observed.nHeight;
                         int32_t best_h = (cb_h - 1)
                             - static_cast<int32_t>(observed.bestCLHeightDiff);
-                        if (best_h > 0)
+                        // H-7 monotonic-bestCL: only adopt a ChainLock that does
+                        // NOT regress our best. A stale/replayed diff carrying an
+                        // older bestCL must not roll the committed bestCL* back
+                        // (that would desync the next template's CCbTx from dashd).
+                        if (best_h > 0 && best_h >= m_state.best_cl_height())
                             m_state.set_best_cl(best_h, observed.bestCLSignature);
                     }
                 }
@@ -139,6 +161,10 @@ public:
 
         m_have_mn_sml = m_state.sml().size() != 0;
         m_state.set_have_sml(m_have_mn_sml);
+        // Record the block the SML is now current at: the freshness gate
+        // (NodeCoinState::make_embedded_work_inputs) compares this to the tip
+        // we build on, and the next incremental diff's base must match it.
+        m_state.set_sml_current_hash(diff.blockHash);
         LOG_INFO << "[SML] applied diff: SML +" << sml_r.added_or_updated
                  << " -" << sml_r.deleted << " => " << m_state.sml().size()
                  << " MNs; quorums +" << q_added << " -" << q_deleted
@@ -148,6 +174,11 @@ public:
             demote();
         else
             republish();
+        // H-6: the SML just advanced (potentially catching up to a moved tip).
+        // Bump work-generation + re-notify so a fresh template is issued now
+        // that the freshness gate can pass — otherwise miners stay on the dashd
+        // fallback until the next unrelated work signal.
+        notify_state_dirty();
     }
 
     /// ChainLock reception: adopt the freshly-observed ChainLock as the best CL
@@ -155,8 +186,12 @@ public:
     /// block_hash, 96-byte recovered threshold sig}. Only advances forward.
     void on_new_chainlock(int32_t height,
                           const std::array<uint8_t, 96>& sig) {
-        if (height > m_state.best_cl_height())
+        if (height > m_state.best_cl_height()) {
             m_state.set_best_cl(height, sig);
+            // A fresher bestCL* changes the next template's committed CCbTx —
+            // re-issue work so the served template carries the new ChainLock.
+            notify_state_dirty();
+        }
     }
 
     /// Reorg (SML axis): a chain reorganisation can invalidate the incremental
@@ -171,7 +206,14 @@ public:
         m_state.qmgr().clear();
         m_have_mn_sml = false;
         m_state.set_have_sml(false);
+        // Drop the SML's current-at marker so (a) the freshness gate fails until
+        // a fresh cold-start diff lands, and (b) the next diff is accepted as a
+        // full snapshot (base-continuity guard treats ZERO current as cold).
+        m_state.set_sml_current_hash(uint256::ZERO);
         demote();
+        // Re-issue work so miners are moved off any embedded template that was
+        // built on the now-orphaned branch onto the dashd fallback immediately.
+        notify_state_dirty();
     }
 
     /// Reception path (mempool relay): fold a relayed tx into the local
@@ -246,10 +288,24 @@ public:
         demote();
     }
 
+    /// Wire a "state changed, re-issue work" sink (main_dash points this at
+    /// DASHWorkSource::bump_work_generation + stratum notify_all). Invoked when
+    /// the SML/quorum set advances, the bestCL* moves, or a reorg wipes the
+    /// bundle — the events that change (or invalidate) the next served template
+    /// but do NOT flow through the header tip-change notify. Optional: unset
+    /// (KAT posture) makes every notify_state_dirty() a no-op.
+    void set_on_state_dirty(std::function<void()> fn) {
+        m_on_state_dirty = std::move(fn);
+    }
+
     /// True iff both prerequisites are met AND the holder is currently live.
     bool live() const { return m_state.populated(); }
 
 private:
+    void notify_state_dirty() {
+        if (m_on_state_dirty) m_on_state_dirty();
+    }
+
     // Publish only when both prerequisites are present; otherwise leave the
     // holder in whatever (un)published state it is in -- callers reach demote()
     // explicitly for the invalidating transitions.
@@ -266,6 +322,7 @@ private:
     }
 
     NodeCoinState& m_state;
+    std::function<void()> m_on_state_dirty;  // SML/bestCL/reorg -> re-issue work
 
     bool m_have_mn{false};
     bool m_have_tip{false};

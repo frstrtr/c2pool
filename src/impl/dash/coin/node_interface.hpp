@@ -9,6 +9,7 @@
 #include <core/uint256.hpp>
 #include <core/events.hpp>
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <utility>
@@ -129,6 +130,19 @@ struct Node
     // irreversible.
     Event<std::pair<uint256, int32_t>> new_chainlock;
     std::map<uint256, int32_t> chainlocked_blocks; // block_hash -> height
+
+    // ChainLock reception WITH the recovered 96-byte threshold signature. The
+    // clsig wire message carries {height, block_hash, sig(96B)}; new_chainlock
+    // above intentionally drops the sig (it only feeds the finalization map).
+    // The daemonless CCbTx path needs the sig itself: bestCLSignature is a
+    // committed field of the type-5 coinbase payload, so the maintainer adopts
+    // the freshest observed ChainLock's height + sig via on_new_chainlock.
+    struct ChainLockSigEvent {
+        int32_t                  height{0};
+        uint256                  block_hash;
+        std::array<uint8_t, 96>  sig{};
+    };
+    Event<ChainLockSigEvent> new_chainlock_sig;
 
     std::map<uint256, coin::Transaction> known_txs;
 };

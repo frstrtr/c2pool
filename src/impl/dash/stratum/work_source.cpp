@@ -169,9 +169,11 @@ DASHWorkSource::~DASHWorkSource() = default;
 // ─────────────────────────────────────────────────────────────────────────────
 GetWork DASHWorkSource::get_work(const WorkJobTargetInputs& job_in) const
 {
-    // C1 mainnet gate (see cached_work): the embedded arm emits an EMPTY CCbTx
-    // extra_payload (consensus-invalid on a DIP4-active mainnet) until the
-    // SML/QuorumManager wiring lands post-v0.2.4. On mainnet never source the
+    // INTERIM mainnet gate (see cached_work): the SML/QuorumManager wiring that
+    // assembles the real type-5 CCbTx IS landed and TESTNET-PROVING, but its
+    // byte-parity against a real dashd getblocktemplate is not yet proven, so
+    // the embedded arm is not yet trusted to be consensus-valid on a DIP4-active
+    // MAINNET. Until that proof lifts the gate, on mainnet never source the
     // embedded template — use ONLY the reward-safe dashd-RPC fallback. is_testnet_
     // defaults false, so an unconfigured node fails closed to the fallback.
     if (!is_testnet_) {
@@ -293,25 +295,27 @@ std::shared_ptr<const coin::DashWorkData> DASHWorkSource::cached_work() const
             return nullptr;
     }
 
-    // ── C1 mainnet gate (v0.2.4 tag-blocker) ────────────────────────────────
-    // The embedded template arm's only prod caller does not pass the E2d
-    // SML/QuorumManager seams, so build_embedded_workdata() clears the CCbTx
-    // extra_payload and the coinbase is a plain v1 tx with NO DIP-0004 type-5
-    // payload. On a DIP4-active DASH MAINNET that block is consensus-INVALID
-    // (bad-cbtx) and the won subsidy is lost. Populating the payload needs the
-    // SML/QuorumManager wiring that is post-v0.2.4. Until then the embedded arm
-    // is FAIL-CLOSED off mainnet: we never take the populated() embedded flip on
-    // mainnet — the template comes ONLY from the reward-safe dashd-RPC fallback
-    // (the never-removed [GBT-XCHECK] safety path). Testnet/regtest keep the
-    // embedded arm (E5 proving ground). is_testnet_ defaults false, so an
-    // unconfigured node is treated as mainnet — fail-closed by default.
+    // ── INTERIM mainnet gate (v0.2.4 tag-blocker) ───────────────────────────
+    // The SML/QuorumManager wiring IS landed: on the coin-P2P (testnet-proving)
+    // arm the maintainer feeds the SML/quorum/bestCL/creditPool seams and
+    // build_embedded_workdata() emits a real DIP-0004 type-5 CCbTx payload. What
+    // is NOT yet proven is byte-parity of that payload against a real dashd
+    // getblocktemplate — until that proof lands (the dash/embedded-mainnet-
+    // validity follow-up: real-dashd byte-parity fixture + special-tx filter +
+    // creditPool accrual), an assembled coinbase could still diverge from
+    // consensus on a DIP4-active DASH MAINNET (bad-cbtx, lost subsidy). So the
+    // embedded arm stays FAIL-CLOSED off mainnet: we never take the populated()
+    // embedded flip on mainnet — the template comes ONLY from the reward-safe
+    // dashd-RPC fallback (the never-removed [GBT-XCHECK] safety path).
+    // Testnet/regtest keep the embedded arm (the proving ground). is_testnet_
+    // defaults false, so an unconfigured node is treated as mainnet — fail-closed.
     const bool embedded_arm_enabled = is_testnet_;
     if (!embedded_arm_enabled && coin_state_.populated()) {
         static std::once_flag mainnet_gate_logged;
         std::call_once(mainnet_gate_logged, [] {
-            LOG_WARNING << "[DASH-STRATUM-GBT] embedded template arm disabled on "
-                           "mainnet: CCbTx payload not yet buildable — using "
-                           "dashd-RPC fallback";
+            LOG_WARNING << "[DASH-STRATUM-GBT] embedded template arm held behind "
+                           "interim mainnet gate: CCbTx byte-parity not yet proven "
+                           "— using dashd-RPC fallback";
         });
     }
 

@@ -72,6 +72,16 @@ public:
     void set_have_sml(bool v) { m_have_sml = v; }
     bool have_sml() const { return m_have_sml; }
 
+    /// The block hash the applied SML is CURRENT AT (== the last accepted
+    /// mnlistdiff's blockHash; ZERO before the first diff / after a reorg wipe).
+    /// Under require_sml, template viability additionally requires this to equal
+    /// the tip we are building on (prev_hash) — so during the tip-change ->
+    /// getmnlistd round-trip, before the fresh diff lands, the embedded arm
+    /// serves nothing (H-6: no stale-SML template at a moved tip; fail to the
+    /// dashd fallback until the SML catches up to the new tip).
+    void set_sml_current_hash(const uint256& h) { m_sml_current_hash = h; }
+    const uint256& sml_current_hash() const { return m_sml_current_hash; }
+
     /// Seed the version-appropriate CCbTx fields the SML/quorum roots do not
     /// carry: the best-ChainLock height+signature and the DIP-0027 credit-pool
     /// balance. Sourced by the maintainer from the diff's embedded cbTx (the
@@ -134,7 +144,9 @@ public:
         EmbeddedWorkInputs e;
         e.has_state            = m_populated
                                  && (!m_utxo_ready_fn || m_utxo_ready_fn())
-                                 && (!m_require_sml || m_have_sml);
+                                 && (!m_require_sml
+                                     || (m_have_sml
+                                         && m_sml_current_hash == m_prev_hash));
         e.prev_height          = m_prev_height;
         e.prev_hash            = m_prev_hash;
         e.mnstates             = &m_mnstates;
@@ -180,6 +192,7 @@ private:
     std::array<uint8_t, 96> m_best_cl_sig{};  // best observed ChainLock signature
     int64_t  m_credit_pool{0};                // DIP-0027 credit-pool balance (seeded from cbTx)
     bool     m_have_sml{false};               // a non-empty SML has been applied
+    uint256  m_sml_current_hash;              // block hash the SML is current at (ZERO = cold/reorg)
     bool     m_require_sml{false};            // gate viability on have_sml (embedded arm)
     std::function<bool()> m_utxo_ready_fn;   // optional UTXO maturity gate (E2b)
     uint32_t m_prev_height{0};

@@ -29,6 +29,8 @@
 #include <impl/dash/coin/utxo_adapter.hpp>
 #include <impl/dash/coin/rpc_data.hpp>
 #include <impl/dash/coin/transaction.hpp>
+#include <impl/dash/coin/vendor/smldiff.hpp>
+#include <impl/dash/coin/vendor/simplifiedmns.hpp>
 
 #include <core/uint256.hpp>
 
@@ -289,4 +291,100 @@ TEST(DashCoinStateMaintainer, BlockConnectCollateralSpendDropsToFallback) {
     WorkSelection sel = st.select_work([&]() { fb = true; return DashWorkData{}; });
     EXPECT_EQ(sel.source, WorkSource::DashdFallback);
     EXPECT_TRUE(fb) << "empty DMN set must route get_work to the dashd RPC fallback";
+}
+
+// ========================================================================
+// SML-axis reception behaviours (C-2 / H-6 / H-7).
+// ========================================================================
+using dash::coin::vendor::CSimplifiedMNListDiff;
+using dash::coin::vendor::CSimplifiedMNListEntry;
+
+static CSimplifiedMNListEntry sml_entry(uint8_t seed) {
+    CSimplifiedMNListEntry e;
+    e.proRegTxHash  = raw256(seed);
+    e.confirmedHash = raw256(seed + 1);
+    e.isValid = true;
+    return e;
+}
+
+// H-7 base-continuity: once the SML is current at block A, an INCREMENTAL diff
+// whose base is NOT A is rejected — the SML and its current-at marker are left
+// untouched (no ghost-MN corruption from applying a diff off the wrong base).
+TEST(DashCoinStateMaintainer, MnlistdiffBaseContinuityRejectsMismatchedBase) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+
+    // Cold-start full snapshot (base ZERO) -> SML current at A.
+    CSimplifiedMNListDiff d1;
+    d1.baseBlockHash = uint256::ZERO;
+    d1.blockHash     = raw256(0xA0);
+    d1.mnList = {sml_entry(0x40), sml_entry(0x60)};
+    m.on_mnlistdiff(d1);
+    ASSERT_TRUE(st.have_sml());
+    ASSERT_EQ(st.sml().size(), 2u);
+    ASSERT_EQ(st.sml_current_hash(), raw256(0xA0));
+
+    // A diff based on some OTHER block B (!= A) must be rejected.
+    CSimplifiedMNListDiff bad;
+    bad.baseBlockHash = raw256(0xB0);
+    bad.blockHash     = raw256(0xC0);
+    bad.mnList = {sml_entry(0x80)};
+    m.on_mnlistdiff(bad);
+    EXPECT_EQ(st.sml().size(), 2u) << "mismatched-base diff must not mutate the SML";
+    EXPECT_EQ(st.sml_current_hash(), raw256(0xA0)) << "current-at marker must not advance";
+
+    // A correctly-based incremental diff (base == A) IS accepted.
+    CSimplifiedMNListDiff d2;
+    d2.baseBlockHash = raw256(0xA0);
+    d2.blockHash     = raw256(0xD0);
+    d2.mnList = {sml_entry(0x80)};
+    m.on_mnlistdiff(d2);
+    EXPECT_EQ(st.sml_current_hash(), raw256(0xD0));
+    EXPECT_EQ(st.sml().size(), 3u);
+}
+
+// C-2 chainlock: on_new_chainlock adopts a fresher ChainLock as the CCbTx
+// bestCL* and fires the state-dirty sink; a non-advancing height is ignored.
+TEST(DashCoinStateMaintainer, OnNewChainlockAdoptsForwardOnlyAndFiresDirty) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    int dirty = 0;
+    m.set_on_state_dirty([&] { ++dirty; });
+
+    std::array<uint8_t, 96> sig{}; sig[0] = 0x11;
+    m.on_new_chainlock(1500000, sig);
+    EXPECT_EQ(st.best_cl_height(), 1500000);
+    EXPECT_EQ(dirty, 1) << "a fresher ChainLock must re-issue work";
+
+    // A stale (<=) height is ignored — no adoption, no re-issue.
+    std::array<uint8_t, 96> older{}; older[0] = 0x22;
+    m.on_new_chainlock(1499999, older);
+    EXPECT_EQ(st.best_cl_height(), 1500000);
+    EXPECT_EQ(dirty, 1);
+
+    // A forward ChainLock advances + re-issues again.
+    m.on_new_chainlock(1500005, sig);
+    EXPECT_EQ(st.best_cl_height(), 1500005);
+    EXPECT_EQ(dirty, 2);
+}
+
+// H-6 state-dirty: applying an mnlistdiff (SML advance) fires the re-issue sink,
+// and a reorg wipe fires it too (miners move off the orphaned-branch template).
+TEST(DashCoinStateMaintainer, SmlApplyAndReorgFireStateDirty) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    int dirty = 0;
+    m.set_on_state_dirty([&] { ++dirty; });
+
+    CSimplifiedMNListDiff d1;
+    d1.baseBlockHash = uint256::ZERO;
+    d1.blockHash     = raw256(0xA0);
+    d1.mnList = {sml_entry(0x40)};
+    m.on_mnlistdiff(d1);
+    EXPECT_EQ(dirty, 1) << "SML advance must re-issue work (freshness gate can now pass)";
+
+    m.on_sml_reorg();
+    EXPECT_FALSE(st.have_sml());
+    EXPECT_EQ(st.sml_current_hash(), uint256::ZERO);
+    EXPECT_EQ(dirty, 2) << "reorg wipe must re-issue work (drop orphaned-branch template)";
 }

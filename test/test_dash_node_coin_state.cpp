@@ -320,9 +320,35 @@ TEST(DashNodeCoinState, RequireSmlGateFallsBackUntilSmlApplied) {
     EXPECT_TRUE(fb);
 
     seed_sml(st);
+    // Freshness gate (H-6): require_sml also requires the SML to be current AT
+    // the tip we build on. seed_sml() bypasses the maintainer, so set the
+    // current-at hash to the tip prev_hash explicitly (the maintainer does this
+    // from diff.blockHash on the live path).
+    st.set_sml_current_hash(raw256(0xAB));
     EXPECT_TRUE(st.make_embedded_work_inputs().viable());
     EXPECT_EQ(st.select_work([&]{ return DashWorkData{}; }).source,
               WorkSource::Embedded);
+}
+
+// Freshness gate (H-6): with require_sml + an applied SML, a tip that moves
+// AHEAD of the SML (sml_current_hash != prev_hash) must gate the embedded arm
+// OFF until a fresh mnlistdiff re-aligns the SML to the new tip — no stale-SML
+// template served at a moved tip.
+TEST(DashNodeCoinState, RequireSmlFreshnessGateHoldsWhenSmlStaleAtTip) {
+    NodeCoinState st;
+    st.set_require_sml(true);
+    seed_single_mn(st, p2pkh_script(0x30));
+    seed_sml(st);
+    // SML is current at block A, but the tip advanced to build on block B.
+    st.set_sml_current_hash(raw256(0xAB));
+    st.set_tip(H - 1, raw256(0xCD), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER);
+    EXPECT_FALSE(st.make_embedded_work_inputs().viable())
+        << "stale SML at a moved tip must gate the embedded arm off";
+
+    // The fresh diff for block B lands: SML now current at the tip -> viable.
+    st.set_sml_current_hash(raw256(0xCD));
+    EXPECT_TRUE(st.make_embedded_work_inputs().viable());
 }
 
 // Maintainer wiring: on_mnlistdiff applies the vendored apply_diff into the

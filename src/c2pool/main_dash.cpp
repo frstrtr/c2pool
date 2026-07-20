@@ -1333,6 +1333,33 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // after any reorg wipe, get_work stays on the retained dashd fallback.
         node_coin_state.set_require_sml(true);
 
+        // H-6: SML/quorum apply and bestCL adoption move ASYNCHRONOUSLY to the
+        // header tip. When they advance (catching the SML up to a moved tip, or
+        // adopting a fresher ChainLock) the served template changes but no tip
+        // signal fires — so drive the same re-issue path the tip-change uses.
+        // A reorg wipe also routes here so miners drop the orphaned-branch
+        // template immediately. (weak_ptr so a late event can't resurrect a
+        // torn-down work source during shutdown.)
+        {
+            std::weak_ptr<dash::stratum::DASHWorkSource> ws_dirty = work_source;
+            maintainer->set_on_state_dirty(
+                [ws_dirty, &stratum_server]() {
+                    if (auto ws = ws_dirty.lock()) ws->bump_work_generation();
+                    if (stratum_server) stratum_server->notify_all();
+                });
+        }
+
+        // Leg 6 (ChainLock sig): Node::new_chainlock_sig -> maintainer
+        // .on_new_chainlock. The clsig message carries the recovered 96-byte
+        // threshold sig (new_chainlock above drops it); the maintainer adopts
+        // the freshest observed ChainLock height+sig as the CCbTx bestCL*.
+        coin_feed_subs.push_back(
+            coin_state.new_chainlock_sig.subscribe(
+                [m = maintainer.get()]
+                (const dash::interfaces::Node::ChainLockSigEvent& c) {
+                    m->on_new_chainlock(c.height, c.sig);
+                }));
+
         // Bridge: new_headers -> HeaderChain::add_headers (X11 PoW + DGW
         // validated). The tip authority for the embedded template.
         coin_feed_subs.push_back(
@@ -1388,8 +1415,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         header_chain->set_on_tip_changed(
             [&coin_state, &stratum_server, hc = header_chain.get(),
              addr_ver, p2sh_ver, ws = work_source.get(),
-             cp = coin_p2p.get(), sml_base]
-            (const uint256&, uint32_t, const uint256& new_tip, uint32_t new_height) {
+             cp = coin_p2p.get(), sml_base, m = maintainer.get()]
+            (const uint256&, uint32_t, const uint256& new_tip, uint32_t new_height,
+             bool was_reorg) {
                 auto ta = dash::coin::tip_advance_from_chain(
                     *hc, addr_ver, p2sh_ver);
                 if (ta) {
@@ -1399,14 +1427,31 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                              << " bits=0x" << std::hex << ta->bits_for_next << std::dec
                              << " -> new_tip fired (maintainer arm)";
                 }
+                // C-2 reorg wiring: a branch switch invalidates the incremental
+                // SML (its applied diffs were relative to the orphaned branch).
+                // Wipe + drop have_sml so the embedded arm falls back to dashd,
+                // reset the sync base to ZERO, and re-request a FULL cold-start
+                // snapshot at the new tip (an incremental diff off the stale base
+                // would be rejected by the base-continuity guard anyway).
+                if (was_reorg && m) {
+                    LOG_WARNING << "[SML] reorg to h=" << new_height
+                                << " -> SML wipe + cold-resync";
+                    m->on_sml_reorg();
+                    *sml_base = uint256::ZERO;
+                }
                 // SML axis: pull the mnlistdiff current AT the new tip. dashcore
                 // computes block (tip+1)'s CbTx merkleRootMNList/Quorums from the
                 // DMN/quorum list as-of `tip` (GetListForBlock(pindexPrev)), so
                 // targeting the diff at `new_tip` puts the local SML in exactly
                 // the state needed to build tip+1. Incremental off the last
-                // synced base; the new_mnlistdiff subscription advances sml_base.
+                // synced base (ZERO after a reorg = full snapshot); the
+                // new_mnlistdiff subscription advances sml_base on acceptance.
                 if (cp) cp->send_getmnlistd(*sml_base, new_tip);
-                // #739: event-driven stale-work notify.
+                // #739: event-driven stale-work notify. NOTE: the freshness gate
+                // now holds the embedded arm on the dashd fallback until the
+                // getmnlistd above lands and re-notifies (maintainer state-dirty),
+                // so this notify serves the reward-safe fallback, not a stale-SML
+                // embedded template.
                 if (ws) ws->bump_work_generation();
                 if (stratum_server) stratum_server->notify_all();
             });
