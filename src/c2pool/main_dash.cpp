@@ -25,17 +25,17 @@
 //         (3) subsidy           — post-V20 block reward + 3/4 MN payment match
 //             the live-validated mainnet value (test_dash_subsidy.cpp).
 //
-// BLOCK-SUBMISSION (--run) — EXPLICITLY DEFERRED, NOT a silent stub. A won DASH
-// block reaches the network by a dual-path broadcaster, BOTH arms of which live
-// in the unmerged dash-spv-embedded work and are NOT on master:
-//   - dashd-RPC submitblock fallback: needs a DASH NodeRPC TU (rpc.cpp/rpc.hpp/
-//     rpc_conf.hpp) — DASH has only coin/rpc_data.hpp (a data placeholder), no
-//     RPC client. Porting it (mirroring dgb/coin/rpc.cpp) is the NEXT slice.
-//   - embedded P2P relay arm: the broadcaster_full / reconstruct stack (S8).
-// The CoinParams *path* the RPC fallback consumes IS wired here (make_coin_params,
-// oracle-sourced via dash::PoolConfig SSOT); the block-submission SINKS are the
-// deferred piece. --run prints this status and exits cleanly so a smoke gate that
-// invokes it is never misled into thinking block relay is live.
+// BLOCK-SUBMISSION (--run) — LIVE, dual-path (S8). A won DASH block reaches the
+// network via dash::coin::broadcast_won_block over BOTH independent arms, wired
+// into the DASHWorkSource won-block sink (stratum_submit_fn):
+//   - ARM A embedded P2P relay (ALWAYS-PRIMARY, daemonless): the E1 CoinClient
+//     (coin/p2p_client.hpp, --coin-p2p-connect) submit_block_p2p_raw pushes the
+//     packed block onto the coin P2P net. With NO local dashd, a won block still
+//     reaches the network on this arm alone — the daemonless critical path.
+//   - ARM B dashd submitblock RPC backup (on-demand): the DASH NodeRPC TU
+//     (coin/rpc.cpp, submit_block_hex), fired whenever a local dashd is armed
+//     (also covers a cold/faulted relay). --no-p2p-relay suppresses ARM A only
+//     (A/B isolation). NEVER a silent drop: reaching NEITHER sink logs LOUDLY.
 //
 // Conformance oracle: frstrtr/p2pool-dash (older-than-v35; transition 16 -> v36).
 // External dashd RPC stays as a fallback alongside the (future) embedded path.
@@ -55,6 +55,7 @@
 #include <impl/dash/coin/rpc_conf.hpp>     // dash.conf creds resolution (rpcpassword off argv)
 #include <impl/dash/coin/node_interface.hpp>
 #include <impl/dash/coin/p2p_client.hpp>   // dash::coin::p2p::CoinClient — OPT-IN coin-network dial (E1, --coin-p2p-connect)
+#include <impl/dash/coin/won_block_dispatch.hpp> // dash::coin::broadcast_won_block — S8 dual-path won-block dispatcher (embedded P2P primary + submitblock RPC backup)
 #include <impl/dash/coin/node_coin_state.hpp>  // dash::coin::NodeCoinState (embedded work bundle)
 #include <impl/dash/coin/utxo_lane.hpp>    // dash::coin::UtxoLane — embedded UTXO/fee lane (E2b, #738)
 #include <impl/dash/coin/header_chain.hpp>       // dash::coin::HeaderChain — SPV header/tip authority (E2a)
@@ -377,7 +378,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              bool embedded_utxo,
              double dev_donation, double node_owner_fee,
              const std::string& node_owner_address,
-             const std::string& redistribute_mode)
+             const std::string& redistribute_mode,
+             bool no_p2p_relay)
 {
     namespace io = boost::asio;
 
@@ -418,7 +420,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                   << conf.host << ":" << conf.port << " (creds from dash.conf)\n";
     } else {
         std::cout << "[run] external-daemon submit arm UNARMED "
-                     "(no dash.conf creds / no port); embedded P2P relay leg is S8.\n";
+                     "(no dash.conf creds / no port); the embedded coin-P2P relay "
+                     "is the primary won-block path (daemonless) when "
+                     "--coin-p2p-connect is set.\n";
     }
 
     // One-shot submit: the G2 won-block-reaches-network evidence path.
@@ -815,29 +819,68 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             return rpc->getwork();
         };
 
-    // Won-block dispatch: mirrors the DGB stratum_submit_fn. On a won X11 block,
-    // HexStr the bytes, log a [DASH-STRATUM-BLOCK] line, and dispatch via the
-    // EXISTING external-dashd submitblock-RPC arm (rpc->submit_block_hex). If the
-    // RPC arm is UNARMED (no dash.conf creds), no sink is reached (the embedded
-    // P2P relay arm is S8) -- log loudly and return false; never a silent drop.
+    // Won-block dispatch (S8): the DUAL-PATH broadcaster, mirroring DGB's
+    // make_on_block_found dual-arm structure. A won X11 block reaches the network
+    // over BOTH independent arms via dash::coin::broadcast_won_block:
+    //   ARM A -- embedded P2P relay (ALWAYS-PRIMARY, daemonless): the E1
+    //            CoinClient's submit_block_p2p_raw pushes the packed block onto
+    //            the coin P2P net. This closes the daemonless critical path: with
+    //            NO local dashd, a won block still reaches the network here alone.
+    //   ARM B -- submitblock RPC backup (on-demand): dashd submitblock, fired
+    //            whenever a local dashd is armed (also covers a cold/faulted relay).
+    // NEVER a silent drop: broadcast_won_block logs LOUDLY and any()==false if the
+    // block reaches NEITHER sink, and the stratum surface below echoes that.
+    //
+    // ARM A binding: the sink is EMPTY (no embedded relay) when no
+    // --coin-p2p-connect peer is dialed OR --no-p2p-relay suppresses it (the A/B
+    // isolation toggle: prove the RPC backup lands the block ON ITS OWN, not
+    // masked by a silent relay). Present: the relay fires from the stratum/compute
+    // path, so the peer write is posted onto the io thread (CoinClient is
+    // single-thread-confined), mirroring DGB's io::post relay sink.
+    dash::coin::P2pRelaySink p2p_relay;
+    if (coin_p2p && !no_p2p_relay) {
+        p2p_relay =
+            [&ioc, &coin_p2p](const std::vector<unsigned char>& block_bytes) {
+                io::post(ioc, [&coin_p2p, bytes = block_bytes]() {
+                    if (coin_p2p) coin_p2p->submit_block_p2p_raw(bytes);
+                });
+            };
+    } else if (no_p2p_relay) {
+        std::cout << "[run] --no-p2p-relay: embedded P2P-relay arm SUPPRESSED; "
+                     "submitblock-RPC backup remains live (A/B isolation)\n";
+    }
+
+    // ARM B binding: EMPTY when no dashd creds are armed (daemonless deployment).
+    // ignore_failure=true so a duplicate/already-have after an ARM A accept is
+    // success, not failure, and never masks the primary win.
+    dash::coin::RpcSubmitSink rpc_submit;
+    if (rpc) {
+        rpc_submit = [&rpc](const std::string& block_hex) -> bool {
+            return rpc->submit_block_hex(block_hex, /*ignore_failure=*/true);
+        };
+    }
+
     dash::stratum::DASHWorkSource::SubmitBlockFn stratum_submit_fn =
-        [&rpc](const std::vector<unsigned char>& block_bytes,
-               uint32_t height) -> bool {
+        [p2p_relay, rpc_submit](const std::vector<unsigned char>& block_bytes,
+                                uint32_t height) -> bool {
             const std::string block_hex = HexStr(block_bytes);
             std::cout << "[DASH-STRATUM-BLOCK] won block height=" << height
                       << " bytes=" << block_bytes.size()
-                      << " -- dispatching via submitblock-RPC arm\n";
-            if (!rpc) {
-                std::cout << "[DASH-STRATUM-BLOCK] submit arm UNARMED -- reached NO "
-                             "sink (no dashd RPC creds; embedded P2P relay is S8) -- "
+                      << " -- dispatching dual-path (embedded P2P primary + "
+                         "submitblock-RPC backup)\n";
+            const auto bcast = dash::coin::broadcast_won_block(
+                p2p_relay, rpc_submit, block_bytes, block_hex);
+            if (!bcast.any()) {
+                std::cout << "[DASH-STRATUM-BLOCK] reached NEITHER sink "
+                             "(no embedded P2P peer AND no dashd RPC creds) -- "
                              "won block NOT broadcast\n";
                 return false;
             }
-            const bool ok = rpc->submit_block_hex(block_hex, /*ignore_failure=*/false);
-            if (!ok)
-                std::cout << "[DASH-STRATUM-BLOCK] dashd submitblock REJECTED the "
-                             "won block\n";
-            return ok;
+            std::cout << "[DASH-STRATUM-BLOCK] relayed: p2p="
+                      << (bcast.p2p_sent ? "sent" : "off")
+                      << " rpc=" << (bcast.rpc_ok ? "ok" : "off")
+                      << " landed_first=" << bcast.landed_first << "\n";
+            return true;
         };
 
     // DASHWorkSource holds a non-owning ref to node_coin_state (declared above,
@@ -1398,8 +1441,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         }
     }
 
-    std::cout << "[run] run-loop up (Ctrl-C to stop); won blocks relay via the\n"
-                 "[run] dashd-RPC submitblock fallback + the embedded sharechain P2P leg.\n";
+    std::cout << "[run] run-loop up (Ctrl-C to stop); won blocks relay DUAL-PATH:\n"
+                 "[run]   ARM A embedded coin-P2P relay (primary, daemonless) = "
+              << (p2p_relay ? "ARMED" : (no_p2p_relay ? "SUPPRESSED (--no-p2p-relay)"
+                                                       : "off (no --coin-p2p-connect peer)"))
+              << "\n[run]   ARM B dashd submitblock RPC backup = "
+              << (rpc_submit ? "ARMED" : "off (no dashd creds)") << "\n";
     // #755 guard (btc main_btc.cpp:1309-1315 parity): an exception escaping an
     // io handler must NOT terminate the node (Exit 134 core-dump — e.g. a
     // chain-walk throw over unrooted persisted shares after a partial join).
@@ -1592,6 +1639,7 @@ int main(int argc, char** argv)
     std::vector<std::string> addnode_raw;      // --addnode HOST:PORT (persistent outbound)
     std::vector<std::string> connect_raw;      // --connect HOST:PORT (connect-only)
     std::vector<std::string> coin_p2p_raw;     // --coin-p2p-connect HOST:PORT (repeatable; E1 opt-in coin-network dial)
+    bool no_p2p_relay = false;                 // --no-p2p-relay: suppress the embedded P2P-relay won-block arm (A/B isolation; RPC backup stays live)
     std::string stratum_host = "0.0.0.0";      // --stratum [HOST:]PORT bind interface (default all)
     uint16_t    stratum_port = 0;              // 0 disables the Stratum accept-loop; --stratum sets it
     bool embedded_utxo = false;                // --embedded-utxo: arm the E2b UTXO/fee lane (opt-in)
@@ -1635,6 +1683,8 @@ int main(int argc, char** argv)
             connect_raw.emplace_back(argv[++i]);
         else if (std::strcmp(argv[i], "--coin-p2p-connect") == 0 && i + 1 < argc)
             coin_p2p_raw.emplace_back(argv[++i]);
+        else if (std::strcmp(argv[i], "--no-p2p-relay") == 0)
+            no_p2p_relay = true;
         else if (std::strcmp(argv[i], "--embedded-utxo") == 0)
             embedded_utxo = true;
         else if ((std::strcmp(argv[i], "--give-author") == 0 ||
@@ -1737,7 +1787,7 @@ int main(int argc, char** argv)
                         stratum_host, stratum_port, web_host, web_port,
                         dashboard_dir, coin_p2p_targets,
                         embedded_utxo, dev_donation, node_owner_fee,
-                        node_owner_address, redistribute_mode);
+                        node_owner_address, redistribute_mode, no_p2p_relay);
     }
     return run_selftest();
 }

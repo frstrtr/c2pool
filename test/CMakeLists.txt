@@ -861,7 +861,12 @@ if (BUILD_TESTING AND GTest_FOUND)
         nlohmann_json::nlohmann_json)
     gtest_add_tests(test_dash_rpc_request "" AUTO)
 
-    add_executable(test_dash_broadcaster_full test_dash_broadcaster_full.cpp)
+    # test_dash_won_block_dualpath.cpp is FOLDED into this already-allowlisted
+    # target (was a standalone test_dash_won_block_dualpath executable that CI's
+    # build.yml --target allowlist never built -> NOT_BUILT/CTest "Could not find
+    # executable" red). Separate TU, own anon namespace + distinct
+    # DashWonBlockDualPath suite, gtest_main-provided main() -> no symbol clash.
+    add_executable(test_dash_broadcaster_full test_dash_broadcaster_full.cpp test_dash_won_block_dualpath.cpp)
     target_link_libraries(test_dash_broadcaster_full PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -943,6 +948,15 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_dash_block_relay_dual_arm PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_block_relay_dual_arm "" AUTO)
+
+    # S8 broadcaster dual-path GATE KAT: one forced won block fans out down BOTH
+    # arms (embedded P2P primary + submitblock RPC backup) byte-identically, and
+    # a no-arm block reaches NEITHER sink (fail-loud). Mirrors
+    # dgb_forced_won_share_dualpath_test. Its source (test_dash_won_block_dualpath.cpp)
+    # is FOLDED into the test_dash_broadcaster_full target above (which IS in the
+    # build.yml --target allowlist) so CI actually builds+runs it -- a standalone
+    # target here was never allowlisted and tripped the NOT_BUILT/CTest
+    # "Could not find executable" red.
 
     add_executable(test_dash_coinbase_parity test_dash_coinbase_parity.cpp)
     target_link_libraries(test_dash_coinbase_parity PRIVATE
