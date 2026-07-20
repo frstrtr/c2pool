@@ -6,6 +6,7 @@
 #include <core/uint256.hpp>
 #include <core/common.hpp>
 #include <core/random.hpp>
+#include <core/version_gate.hpp>   // core::version_gate::V36_ACTIVATION_VERSION (ratchet v36 guard)
 
 #include <boost/asio/post.hpp>
 
@@ -382,6 +383,81 @@ void NodeImpl::shutdown_persistence()
     }
 }
 
+void NodeImpl::apply_min_protocol_ratchet()
+{
+    // Runtime wiring of the v36 accept-floor ratchet (auto_ratchet.hpp pure fns).
+    // Structural mirror of dgb::NodeImpl::apply_min_protocol_ratchet (src/impl/dgb/
+    // node.cpp:815), called at the same best-share-advance sites. Lifts the inbound
+    // P2P accept-floor 1700 -> 3600 once the best share's DESIRED version holds
+    // >= 95% of the work-weighted desired-version tally over the [9/10..10/10] window
+    // behind the best share's parent — the SAME window the 60% successor gate reads
+    // (version_negotiation.hpp). MUST run under the exclusive m_tracker_mutex.
+    const uint32_t target  = SharechainConfig::NEW_MINIMUM_PROTOCOL_VERSION;  // 3600
+    const uint32_t current =
+        m_runtime_min_protocol_version.load(std::memory_order_relaxed);
+    if (current >= target)                    // already ratcheted -> latched, no-op
+        return;
+    if (m_best_share_hash.IsNull() || !m_tracker.chain.contains(m_best_share_hash))
+        return;
+
+    // DASH DIVERGENCE FROM dgb (flagged for integrator): dgb keys the ratchet on the
+    // best share's static TYPE version (35 -> 36 after the format switch). DASH has
+    // NO v36 share TYPE — DashShare is permanently wire-type 16 — so "the best share
+    // is v36" is expressed by its m_desired_version VOTE reaching 36, and that vote is
+    // what the work-weighted tally is keyed by. Using the static type here would check
+    // weights[16] (always ~100% pre-crossing) and FALSELY lift the floor; using the
+    // vote checks weights[36], which is ~0 until the crossing actually happens.
+    int64_t best_desired = 0;
+    uint256 prev_hash;
+    m_tracker.chain.get_share(m_best_share_hash).invoke([&](auto* obj) {
+        best_desired = static_cast<int64_t>(obj->m_desired_version);
+        prev_hash    = obj->m_prev_hash;
+    });
+
+    // SAFETY GUARD (DASH-specific): only a best share that itself desires v36 can lift
+    // the floor. Without this, a fully-agreed pre-crossing chain (everyone desires 16)
+    // would satisfy weights[best_desired=16] >= 95% and spuriously ratchet to 3600,
+    // partitioning the pool from every legacy 1700 peer. dgb gets this for free because
+    // its target floor is reachable only once the best share TYPE is already 36.
+    if (best_desired < static_cast<int64_t>(
+            core::version_gate::V36_ACTIVATION_VERSION))               // < 36
+        return;
+
+    if (prev_hash.IsNull() || !m_tracker.chain.contains(prev_hash))
+        return;
+
+    const int32_t CL = static_cast<int32_t>(SharechainConfig::chain_length());
+    const int32_t parent_height = m_tracker.chain.get_height(prev_hash);
+
+    // Sample the SAME window the 60% switch gate reads (version_negotiation.hpp
+    // negotiation_window): anchor = nth_parent(parent, CHAIN_LENGTH*9/10),
+    // size = CHAIN_LENGTH/10.
+    const uint32_t window_start = (static_cast<uint32_t>(CL) * 9) / 10;
+    const uint32_t window_size  =  static_cast<uint32_t>(CL) / 10;
+    const uint256 anchor = m_tracker.chain.get_nth_parent_key(
+        prev_hash, static_cast<int32_t>(window_start));
+    auto weights = dash::version_negotiation::get_desired_version_weights(
+        m_tracker.chain, anchor, window_size);
+
+    // apply_min_protocol_ratchet_decision applies the full-window guard (parent_height
+    // >= CHAIN_LENGTH) the pure ratchet omits, then delegates to the floor-divided 95%
+    // work-weighted gate.
+    const uint32_t lifted = dash::apply_min_protocol_ratchet_decision(
+        parent_height, CL, weights, best_desired, current, target);
+    if (lifted != current) {
+        // Publish via the ATOMIC only. The IO-thread handshake (handle_version)
+        // reads m_runtime_min_protocol_version.load() and composes it with the
+        // operator knob (m_min_protocol_gate) via max(), so the ratcheted floor is
+        // enforced immediately with NO data race on the plain-uint32 gate member
+        // (which stays IO-thread-owned / operator-set).
+        m_runtime_min_protocol_version.store(lifted, std::memory_order_relaxed);
+        LOG_INFO << "[min-proto-ratchet] MINIMUM_PROTOCOL_VERSION " << current
+                 << " -> " << lifted << " (>=95% window work desires v"
+                 << best_desired << ", best="
+                 << m_best_share_hash.GetHex().substr(0, 16) << ")";
+    }
+}
+
 void NodeImpl::run_think()
 {
     // Serialize: only one think() in flight (compute pool has 1 thread).
@@ -426,6 +502,7 @@ void NodeImpl::run_think()
             if (!result.best.IsNull()) {
                 best_changed = (m_best_share_hash != result.best);
                 m_best_share_hash = result.best;
+                apply_min_protocol_ratchet();  // v36 accept-floor ratchet (dgb node.cpp:1526 parallel)
             }
             publish_snapshot();
 
@@ -773,8 +850,10 @@ void NodeImpl::clean_tracker()
                                           /*previous_block=*/uint256(),
                                           /*bits=*/0, bootstrap);
             m_last_top5_heads = std::move(result.top5_heads);
-            if (!result.best.IsNull())
+            if (!result.best.IsNull()) {
                 m_best_share_hash = result.best;
+                apply_min_protocol_ratchet();  // v36 accept-floor ratchet (dgb node.cpp:1905 parallel)
+            }
             flush_verified_to_leveldb();
         }
 
@@ -893,6 +972,7 @@ void NodeImpl::clean_tracker()
             if (!result.best.IsNull()) {
                 clean_best_changed = (m_best_share_hash != result.best);
                 m_best_share_hash = result.best;
+                apply_min_protocol_ratchet();  // v36 accept-floor ratchet (dgb node.cpp:2077 parallel)
             }
             publish_snapshot();
             flush_verified_to_leveldb();

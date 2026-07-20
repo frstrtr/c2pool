@@ -22,6 +22,8 @@
 #include "share_tracker.hpp"
 #include "peer.hpp"
 #include "min_protocol_gate.hpp"
+#include "auto_ratchet.hpp"          // dash::apply_min_protocol_ratchet_decision (v36 accept-floor ratchet)
+#include "version_negotiation.hpp"   // dash::version_negotiation::get_desired_version_weights (ratchet window)
 #include "messages.hpp"
 #include "coin/transaction.hpp"
 #include "coin/node_coin_state.hpp"       // dash::coin::NodeCoinState (node-held embedded bundle)
@@ -36,6 +38,7 @@
 #include <boost/asio/thread_pool.hpp>
 #include <boost/asio/steady_timer.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -207,6 +210,17 @@ protected:
     // Best-share election result — published by run_think() on the compute
     // thread under m_tracker_mutex (mirrors btc::NodeImpl::m_best_share_hash).
     uint256 m_best_share_hash;
+
+    // ── v36 min-protocol accept-floor ratchet (#643/#646, mirrors dgb) ──────────
+    // Runtime P2P accept-floor, seeded from the COLD config floor (1700, accept-all)
+    // and lifted to NEW_MINIMUM_PROTOCOL_VERSION (3600) by apply_min_protocol_ratchet()
+    // once the work-weighted desired-version tally over the [9/10..10/10] window behind
+    // the best share holds >= 95% for v36. Mutated ONLY on the compute thread under the
+    // exclusive m_tracker_mutex (same sites as m_best_share_hash); it drives the LIVE
+    // m_min_protocol_gate.min_version so the handshake reception reflects the ratchet.
+    std::atomic<uint32_t> m_runtime_min_protocol_version{
+        SharechainConfig::MINIMUM_PROTOCOL_VERSION};
+
     // De-dup set for broadcast_share (hashes already relayed to peers).
     std::set<uint256> m_shared_share_hashes;
     // Hashes of the CURRENT template's txs registered in m_known_txs by
@@ -465,7 +479,7 @@ public:
     void send_version(peer_ptr peer)
     {
         auto rmsg = dash::message_version::make_raw(
-            SharechainConfig::MINIMUM_PROTOCOL_VERSION,  // oracle p2p VERSION (1700 lineage)
+            SharechainConfig::ADVERTISED_PROTOCOL_VERSION,  // advertise v36 capability (3600); >= ratchet target so ratcheted peers accept us. Legacy peers (floor 1700) accept any >=1700, so backward-compatible.
             1,                                           // services
             addr_t{1, peer->addr()},                     // addr_to (the remote)
             addr_t{1, NetService{"0.0.0.0", SharechainConfig::p2p_port()}},  // addr_from
@@ -530,9 +544,16 @@ public:
             return std::nullopt;
 
         // #646 min-protocol ratchet -- LIVE discrimination. Throwing here makes
-        // the NodeBridge close the connection (pool/node.hpp handle()). At the
-        // default floor (1700) every real DASH peer is admitted (accept-all).
-        if (m_min_protocol_gate.rejects(msg->m_version))
+        // the NodeBridge close the connection (pool/node.hpp handle()). The
+        // effective floor is the MAX of the operator knob (m_min_protocol_gate,
+        // IO-thread-owned) and the auto-ratchet floor (m_runtime_min_protocol_version,
+        // lifted 1700 -> 3600 on the compute thread by apply_min_protocol_ratchet).
+        // Reading the atomic here is race-free; at the cold default (both 1700) every
+        // real DASH peer is admitted (accept-all).
+        const uint32_t effective_floor = std::max(
+            m_min_protocol_gate.min_version,
+            m_runtime_min_protocol_version.load(std::memory_order_relaxed));
+        if (msg->m_version < effective_floor)
             throw std::runtime_error("peer protocol below min-protocol floor");
 
         peer->m_nonce = msg->m_nonce;
@@ -560,8 +581,8 @@ public:
         // peers negotiate the actual (v36) protocol; otherwise legacy (parity
         // with the ltc reference, which returns legacy unconditionally).
         const bool ratcheted =
-            m_min_protocol_gate.min_version > SharechainConfig::MINIMUM_PROTOCOL_VERSION;
-        return (ratcheted && msg->m_version >= m_min_protocol_gate.min_version)
+            effective_floor > SharechainConfig::MINIMUM_PROTOCOL_VERSION;
+        return (ratcheted && msg->m_version >= effective_floor)
                    ? pool::PeerConnectionType::actual
                    : pool::PeerConnectionType::legacy;
     }
@@ -605,6 +626,18 @@ public:
     /// re-broadcast the new head. Serialized via m_think_running.
     void run_think();
     void drain_pending_adds();
+
+    /// v36 accept-floor AutoRatchet — runtime wiring of the pure decision in
+    /// auto_ratchet.hpp (mirrors dgb::NodeImpl::apply_min_protocol_ratchet, the
+    /// three best-share-advance call sites in src/impl/dgb/node.cpp). Over the
+    /// [CHAIN_LENGTH*9/10 .. CHAIN_LENGTH] window behind the best share's parent
+    /// — the SAME window the 60% successor gate reads — lift the P2P accept floor
+    /// 1700 -> 3600 once >= 95% of the work-weighted desired-version tally desires
+    /// v36. Latched (never lowers), full-window-guarded (never lifts on a partial
+    /// window), and DASH-specific keyed on the best share's m_desired_version (DASH
+    /// has no v36 share TYPE — the vote carries v36-ness). MUST be called under the
+    /// exclusive m_tracker_mutex. Body in node.cpp.
+    void apply_min_protocol_ratchet();
 
     /// Periodic maintenance (btc node.cpp:1878-2173 / p2pool node.py:355-402
     /// clean_tracker port): think + eat stale heads + drop tails beyond

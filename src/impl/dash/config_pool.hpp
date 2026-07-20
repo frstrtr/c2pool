@@ -38,7 +38,31 @@ struct SharechainConfig
     static constexpr uint32_t REAL_CHAIN_LENGTH         = 4320;
     static constexpr uint32_t TARGET_LOOKBEHIND         = 100;
     static constexpr uint32_t SPREAD                    = 10;     // blocks
-    static constexpr uint32_t MINIMUM_PROTOCOL_VERSION  = 1700;   // protocol v1700 floor
+    static constexpr uint32_t MINIMUM_PROTOCOL_VERSION  = 1700;   // protocol v1700 floor (COLD accept-all; oracle dash.py:23)
+
+    // ── v36 crossing protocol versions (c2pool v36-native — NOT oracle-derived) ──
+    // The DASH oracle (frstrtr/p2pool-dash) has NO NEW_MINIMUM_PROTOCOL_VERSION and
+    // NO advertised-capability field; MINIMUM_PROTOCOL_VERSION is the static 1700 net
+    // constant. The two values below are c2pool v36-native choices made at the ratchet
+    // wire-up (dash/v36-ratchet-wireup) and are FLAGGED for integrator review:
+    //
+    //   NEW_MINIMUM_PROTOCOL_VERSION (3600): the RATCHET TARGET floor. It is the DASH
+    //     analog of ltc MINIMUM_PROTOCOL_VERSION=3301 / dgb SHARE_MINIMUM_PROTOCOL_VERSION
+    //     =3500 and matches the cross-coin v36 protocol lineage (ltc advertises 3600 for
+    //     v36 capability). The accept floor is NEVER set to this statically — that was the
+    //     v36 min-proto-3600 transition regression (a hard cut that blocked pre-v36 peers
+    //     from joining). It is reached ONLY by the work-weighted 95% AutoRatchet
+    //     (auto_ratchet.hpp), so a node still JOINS at the cold 1700 floor and ratchets UP.
+    //
+    //   ADVERTISED_PROTOCOL_VERSION (3600): the protocol version a v36-capable DASH node
+    //     puts on the wire in its version handshake. Required for ratchet COHERENCE: once
+    //     two nodes ratchet their accept floor to 3600 they must each advertise >= 3600 or
+    //     they would reject each other. Backward-compatible: legacy p2pool-dash peers accept
+    //     any version >= their own 1700 floor, so advertising 3600 pre-crossing rejects
+    //     nobody and does NOT prematurely negotiate the "actual" (v36) protocol path
+    //     (handle_version gates that on the accept floor being ratcheted, not on the advert).
+    static constexpr uint32_t NEW_MINIMUM_PROTOCOL_VERSION = 3600;  // AutoRatchet TARGET floor (v36-native)
+    static constexpr uint32_t ADVERTISED_PROTOCOL_VERSION  = 3600;  // v36-capability advert (>= target floor)
 
     // ---- testnet (networks/dash_testnet.py) ----
     static constexpr uint16_t TESTNET_P2P_PORT          = 18999;

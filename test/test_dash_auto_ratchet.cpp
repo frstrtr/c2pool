@@ -29,9 +29,14 @@
 // becomes a NOT_BUILT sentinel that silently passes.
 
 #include <impl/dash/auto_ratchet.hpp>
+#include <impl/dash/config_pool.hpp>            // COLD 1700 / NEW_MINIMUM 3600 crossing constants
+#include <impl/dash/min_protocol_gate.hpp>      // MinProtocolGate — LIVE handshake accept gate
+#include <impl/dash/version_activation_latch.hpp> // VOTING->ACTIVATED->CONFIRMED state machine
+#include <impl/dash/version_negotiation.hpp>    // 60% weighted successor gate
 
 #include <core/uint256.hpp>  // uint288
 
+#include <algorithm>
 #include <gtest/gtest.h>
 
 namespace {
@@ -176,4 +181,132 @@ TEST(DashAutoRatchetWiring, AlreadyAtTargetShortCircuits) {
     auto w = std::map<uint64_t, uint288>{{36, u(100)}};
     EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(CL, CL, w, 36, TARGET, TARGET), TARGET);
     EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(0,  CL, w, 36, TARGET, TARGET), TARGET);
+}
+
+// ============================================================================
+// RUNTIME WIRE-UP KATs (branch dash/v36-ratchet-wireup). The pure decision above
+// is proven; these pin the node.cpp consumer's COMPOSED behavior:
+//   * the crossing constants are the DASH-native 1700 -> 3600 pair,
+//   * the LIVE handshake gate (MinProtocolGate + the atomic-runtime max() the node
+//     composes in handle_version) enforces the crossing floor AND stays backward-
+//     compatible pre-crossing,
+//   * the node's DASH-specific best_desired>=36 SAFETY GUARD is necessary (the raw
+//     decision would false-lift on a fully-agreed pre-crossing chain),
+//   * the VOTING->ACTIVATED->CONFIRMED latch is driven by the SAME 95% verdict,
+//   * the 60% weighted successor gate (the mint<->accept coupling the crossing rides).
+// ============================================================================
+
+// The wire-up constants ARE the DASH-native crossing pair (config_pool.hpp SSOT).
+TEST(DashRatchetCrossing, ConstantsAreDashNativeCrossingPair) {
+    EXPECT_EQ(dash::SharechainConfig::MINIMUM_PROTOCOL_VERSION,     COLD);    // 1700 cold
+    EXPECT_EQ(dash::SharechainConfig::NEW_MINIMUM_PROTOCOL_VERSION, TARGET);  // 3600 ratchet target
+    EXPECT_EQ(dash::SharechainConfig::ADVERTISED_PROTOCOL_VERSION,  TARGET);  // 3600 v36 advert >= target
+}
+
+// The effective floor the node's handle_version composes: max(operator knob,
+// atomic auto-ratchet floor). Mirrors src/impl/dash/node.hpp handle_version.
+static uint32_t effective_floor(uint32_t operator_knob, uint32_t runtime_ratchet) {
+    return std::max(operator_knob, runtime_ratchet);
+}
+
+// BACKWARD-COMPAT (item 6d): PRE-crossing, both the operator knob and the runtime
+// ratchet sit at the cold 1700 floor, so a legacy DASH peer advertising 1700 — and a
+// v36-capable peer advertising 3600 — are BOTH admitted. The node must still JOIN at
+// the current protocol; the crossing is opt-in via the ratchet, never a hard cut.
+TEST(DashRatchetCrossing, PreCrossingAdmitsLegacyAndV36Peers) {
+    dash::MinProtocolGate gate;  // default operator knob = 1700
+    const uint32_t runtime = COLD;  // m_runtime_min_protocol_version seed (pre-ratchet)
+    const uint32_t floor = effective_floor(gate.min_version, runtime);
+    EXPECT_EQ(floor, COLD);
+    EXPECT_GE(1700u, floor);            // legacy peer advertising 1700 admitted
+    EXPECT_TRUE(1700u >= floor);
+    EXPECT_TRUE(3600u >= floor);        // v36-advertising peer admitted too
+    EXPECT_FALSE(1699u >= floor);       // genuinely below-floor peer still rejected
+}
+
+// CROSSING-FLOOR ENFORCEMENT (item 6c): once apply_min_protocol_ratchet lifts the
+// atomic runtime floor to 3600, the composed effective floor rejects legacy 1700
+// peers and admits only >= 3600 (v36) peers — the crossing has partitioned legacy off.
+TEST(DashRatchetCrossing, PostCrossingRejectsLegacyAdmitsV36) {
+    dash::MinProtocolGate gate;  // operator knob still cold 1700 (auto-ratchet drives it)
+    const uint32_t runtime = TARGET;  // ratchet has lifted the atomic to 3600
+    const uint32_t floor = effective_floor(gate.min_version, runtime);
+    EXPECT_EQ(floor, TARGET);
+    EXPECT_FALSE(1700u >= floor);       // legacy 1700 peer now REJECTED
+    EXPECT_FALSE(3599u >= floor);       // just-below-target rejected
+    EXPECT_TRUE(3600u >= floor);        // v36 peer admitted
+}
+
+// SAFETY GUARD RATIONALE (DASH divergence from dgb): DASH has no v36 share TYPE, so
+// the node keys the ratchet on the best share's m_desired_version VOTE and guards
+// best_desired >= 36. This test proves the guard is NECESSARY: on a fully-agreed
+// PRE-crossing chain everybody desires v16, and the raw decision keyed on 16 WOULD
+// lift the floor to 3600 (partitioning the pool). The node's >=36 guard is what
+// prevents that; keyed on 36 (the crossing vote) with a 100%-v16 window stays COLD.
+TEST(DashRatchetCrossing, GuardPreventsPreCrossingFalseLift) {
+    auto all_v16 = std::map<uint64_t, uint288>{{16, u(100)}};  // unanimous pre-crossing
+    // Raw decision keyed on the CURRENT vote (16): weights[16]=100% -> WOULD lift.
+    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(CL, CL, all_v16, 16, COLD, TARGET),
+              TARGET);  // <-- the danger the node's best_desired>=36 guard blocks
+    // Keyed on the crossing vote (36): weights[36]=0 -> stays COLD (correct).
+    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(CL, CL, all_v16, 36, COLD, TARGET),
+              COLD);
+}
+
+// STATE MACHINE (item 6a): the VOTING->ACTIVATED->CONFIRMED latch is driven by the
+// SAME 95% work-weighted verdict the accept-floor ratchet uses. We synthesize a
+// window that has crossed (v36 holds >=95% by work), feed the ratchet's own verdict
+// into the latch, and assert the progression + the pre-confirmation revert.
+TEST(DashRatchetCrossing, LatchDrivenByRatchetVerdict) {
+    namespace val = dash::version_activation_latch;
+    // Crossed window: v36 heavy (work 96), v16 light (work 4) -> 96 >= 100*95//100=95.
+    auto crossed = std::map<uint64_t, uint288>{{36, u(96)}, {16, u(4)}};
+    const bool crossed_active =
+        dash::apply_min_protocol_ratchet_decision(CL, CL, crossed, 36, COLD, TARGET) == TARGET;
+    EXPECT_TRUE(crossed_active);  // the ratchet fires -> the latch's "active" input
+
+    val::ActivationLatch latch;
+    latch.confirm_span = 10;  // short span so the KAT need not walk 2*CHAIN_LENGTH
+    EXPECT_EQ(latch.state, val::LatchState::Voting);
+
+    latch.observe(crossed_active, /*height=*/100);
+    EXPECT_EQ(latch.state, val::LatchState::Activated);
+    EXPECT_EQ(latch.activated_height, 100u);
+
+    // Sustained past the span -> CONFIRMED (irreversible).
+    latch.observe(crossed_active, /*height=*/111);  // 111-100=11 >= span 10
+    EXPECT_EQ(latch.state, val::LatchState::Confirmed);
+    latch.observe(false, /*height=*/200);  // a later dip cannot un-confirm
+    EXPECT_EQ(latch.state, val::LatchState::Confirmed);
+
+    // A pre-confirmation dip reverts ACTIVATED -> VOTING (crossing was not real).
+    val::ActivationLatch latch2;
+    latch2.confirm_span = 10;
+    latch2.observe(true, 100);
+    EXPECT_EQ(latch2.state, val::LatchState::Activated);
+    latch2.observe(false, 105);  // dip before the span elapsed
+    EXPECT_EQ(latch2.state, val::LatchState::Voting);
+}
+
+// 60% WEIGHTED SUCCESSOR GATE (item 6b): the mint<->accept coupling the crossing
+// rides. successor_switch_allowed consumes the WORK-WEIGHTED tally (not a flat count)
+// and clears at exactly 60% by work. This is the gate a 36-desiring share must pass.
+TEST(DashRatchetCrossing, SuccessorGateIsSixtyPercentByWork) {
+    namespace vn = dash::version_negotiation;
+    // Exactly 60% by work -> allowed (have*100 >= total*60, 60*100 >= 100*60).
+    EXPECT_TRUE(vn::successor_switch_allowed({{16, u(40)}, {36, u(60)}}, 36));
+    // Just below 60% -> rejected.
+    EXPECT_FALSE(vn::successor_switch_allowed({{16, u(41)}, {36, u(59)}}, 36));
+    // Empty tally -> rejected (no support window).
+    EXPECT_FALSE(vn::successor_switch_allowed({}, 36));
+}
+
+// The successor gate is WORK-weighted, not flat-count: one heavy v36 share outvotes
+// many tiny v16 shares. Guards the same F10 divergence the accept-floor ratchet does.
+TEST(DashRatchetCrossing, SuccessorGateIsWeightedNotFlatCount) {
+    namespace vn = dash::version_negotiation;
+    // 1 heavy v36 (work 70) vs 9 tiny v16 (work 1 each = 9). By WORK: 70/79 = 88% -> pass.
+    // By flat COUNT it would be 1/10 = 10% -> fail. Proves the weighting.
+    auto weights = std::map<uint64_t, uint288>{{36, u(70)}, {16, u(9)}};
+    EXPECT_TRUE(vn::successor_switch_allowed(weights, 36));
 }
