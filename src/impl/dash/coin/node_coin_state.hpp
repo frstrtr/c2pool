@@ -23,9 +23,12 @@
 #include <impl/dash/coin/mn_state_machine.hpp>   // MnStateMachine
 #include <impl/dash/coin/mempool.hpp>            // Mempool
 #include <impl/dash/coin/rpc_data.hpp>           // DashWorkData
+#include <impl/dash/coin/quorum_manager.hpp>     // QuorumManager (merkleRootQuorums source)
+#include <impl/dash/coin/vendor/simplifiedmns.hpp> // vendor::CSimplifiedMNList (merkleRootMNList source)
 
 #include <core/uint256.hpp>
 
+#include <array>
 #include <cstdint>
 #include <functional>
 
@@ -47,6 +50,45 @@ public:
     // these from mnlistdiff + relayed mempool txs).
     MnStateMachine& mnstates() { return m_mnstates; }
     Mempool&        mempool()  { return m_mempool; }
+
+    // ── SML / quorum consensus-commitment state (daemonless CCbTx) ────────
+    // The deterministic MN list + LLMQ quorum set the CCbTx extra_payload
+    // commits to. Populated by CoinStateMaintainer::on_mnlistdiff (apply_diff
+    // + QuorumManager::apply) off the live coin-P2P mnlistdiff feed. These are
+    // the merkleRootMNList / merkleRootQuorums sources build_embedded_workdata
+    // needs to emit a MAINNET-VALID type-5 coinbase. In-memory only (no
+    // SMLDb/QuorumDb persistence yet — a restart re-requests a cold-start
+    // mnlistdiff(zero, tip), see main_dash.cpp handshake driver).
+    vendor::CSimplifiedMNList& sml() { return m_sml; }
+    QuorumManager&             qmgr() { return m_qmgr; }
+    const vendor::CSimplifiedMNList& sml() const { return m_sml; }
+    const QuorumManager&             qmgr() const { return m_qmgr; }
+
+    /// Mark whether a valid SML is present (set by the maintainer after the
+    /// first accepted mnlistdiff yields a non-empty list). When require_sml
+    /// is enabled (the mainnet / DIP-0004 posture), viability additionally
+    /// requires this — the embedded arm must NOT serve a template with an
+    /// empty/absent CCbTx (that block would be consensus-invalid).
+    void set_have_sml(bool v) { m_have_sml = v; }
+    bool have_sml() const { return m_have_sml; }
+
+    /// Seed the version-appropriate CCbTx fields the SML/quorum roots do not
+    /// carry: the best-ChainLock height+signature and the DIP-0027 credit-pool
+    /// balance. Sourced by the maintainer from the diff's embedded cbTx (the
+    /// authoritative wire form as-of blockHash) and from new_chainlock events.
+    void set_best_cl(int32_t height, const std::array<uint8_t, 96>& sig) {
+        m_best_cl_height = height;
+        m_best_cl_sig    = sig;
+    }
+    void set_credit_pool(int64_t balance) { m_credit_pool = balance; }
+    int32_t best_cl_height() const { return m_best_cl_height; }
+    int64_t credit_pool() const { return m_credit_pool; }
+
+    /// Enable the SML-required viability gate. main_dash.cpp turns this on for
+    /// the embedded coin-P2P arm so a template is only served once the CCbTx
+    /// commitment inputs are present (review finding H3: no mid-sync half-built block).
+    /// Default OFF preserves the pre-CCbTx KAT/testnet posture byte-for-byte.
+    void set_require_sml(bool v) { m_require_sml = v; }
 
     /// Record the header-tip parameters and mark the bundle live. Call after
     /// the tip advances AND the MN list + mempool are seeded; until then the
@@ -91,7 +133,8 @@ public:
     EmbeddedWorkInputs make_embedded_work_inputs() const {
         EmbeddedWorkInputs e;
         e.has_state            = m_populated
-                                 && (!m_utxo_ready_fn || m_utxo_ready_fn());
+                                 && (!m_utxo_ready_fn || m_utxo_ready_fn())
+                                 && (!m_require_sml || m_have_sml);
         e.prev_height          = m_prev_height;
         e.prev_hash            = m_prev_hash;
         e.mnstates             = &m_mnstates;
@@ -102,6 +145,19 @@ public:
         e.address_p2sh_version = m_address_p2sh_version;
         e.curtime              = m_curtime;
         e.version              = m_version;
+        // CCbTx seams: pass the SML + quorum set ONLY when present, so a
+        // legacy/testnet-without-SML bundle still builds the pre-CCbTx template
+        // (empty payload) byte-for-byte, while a live daemonless bundle emits
+        // the real type-5 coinbase. build_embedded_workdata folds these into
+        // build_embedded_cbtx (merkleRootMNList + merkleRootQuorums + bestCL* +
+        // creditPool) when both pointers are non-null.
+        if (m_have_sml) {
+            e.sml              = &m_sml;
+            e.qmgr             = &m_qmgr;
+            e.best_cl_height   = m_best_cl_height;
+            e.best_cl_sig      = m_best_cl_sig;
+            e.credit_pool      = m_credit_pool;
+        }
         return e;
     }
 
@@ -118,6 +174,13 @@ public:
 private:
     MnStateMachine m_mnstates;
     Mempool        m_mempool;
+    vendor::CSimplifiedMNList m_sml;         // merkleRootMNList source (mnlistdiff-fed)
+    QuorumManager  m_qmgr;                    // merkleRootQuorums source (quorum-tail-fed)
+    int32_t  m_best_cl_height{0};             // best observed ChainLock height
+    std::array<uint8_t, 96> m_best_cl_sig{};  // best observed ChainLock signature
+    int64_t  m_credit_pool{0};                // DIP-0027 credit-pool balance (seeded from cbTx)
+    bool     m_have_sml{false};               // a non-empty SML has been applied
+    bool     m_require_sml{false};            // gate viability on have_sml (embedded arm)
     std::function<bool()> m_utxo_ready_fn;   // optional UTXO maturity gate (E2b)
     uint32_t m_prev_height{0};
     uint256  m_prev_hash;

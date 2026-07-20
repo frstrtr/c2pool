@@ -71,7 +71,9 @@ TEST(DashWonBlockDualPath, BothArmsCarryIdenticalBlock)
 
     std::vector<unsigned char> relayed;
     bool did_relay = false;
-    P2pRelaySink p2p = [&](const std::vector<unsigned char>& b) { did_relay = true; relayed = b; };
+    P2pRelaySink p2p = [&](const std::vector<unsigned char>& b) -> bool {
+        did_relay = true; relayed = b; return true;   // connected peer -> relayed
+    };
 
     std::string submitted_hex;
     int submit_calls = 0;
@@ -107,7 +109,9 @@ TEST(DashWonBlockDualPath, DaemonlessP2pOnlyReachesNetwork)
     const std::string block_hex = to_hex(block);
 
     std::vector<unsigned char> relayed;
-    P2pRelaySink p2p = [&](const std::vector<unsigned char>& b) { relayed = b; };
+    P2pRelaySink p2p = [&](const std::vector<unsigned char>& b) -> bool {
+        relayed = b; return true;   // connected peer -> relayed
+    };
 
     const auto r = broadcast_won_block(p2p, /*rpc=*/{}, block, block_hex);
 
@@ -164,7 +168,7 @@ TEST(DashWonBlockDualPath, ThrowingPrimaryFallsThroughToBackup)
     const auto block = make_block_bytes();
     const std::string block_hex = to_hex(block);
 
-    P2pRelaySink p2p = [&](const std::vector<unsigned char>&) {
+    P2pRelaySink p2p = [&](const std::vector<unsigned char>&) -> bool {
         throw std::runtime_error("relay socket down");
     };
     std::string submitted_hex;
@@ -179,4 +183,55 @@ TEST(DashWonBlockDualPath, ThrowingPrimaryFallsThroughToBackup)
     EXPECT_EQ(submitted_hex, block_hex);
     EXPECT_TRUE(r.any());              // block still reached the network
     EXPECT_STREQ(r.landed_first, "rpc");
+}
+
+// 6) H1 HONEST REPORTING: a DISCONNECTED coin-P2P peer makes submit_block_p2p_raw
+//    silently drop the block, so the relay sink reports false. The dispatcher must
+//    NOT claim p2p_sent -- it relies on the submitblock RPC backup, and
+//    landed_first is "rpc", never a false "p2p". (Before the fix the sink returned
+//    void and p2p_sent was set true unconditionally: a lost subsidy logged as a win.)
+TEST(DashWonBlockDualPath, DisconnectedP2pNotClaimedRelaysViaBackup)
+{
+    const auto block = make_block_bytes();
+    const std::string block_hex = to_hex(block);
+
+    // The sink reports the peer is not connected -> NOT relayed.
+    bool relay_attempted = false;
+    P2pRelaySink p2p = [&](const std::vector<unsigned char>&) -> bool {
+        relay_attempted = true;
+        return false;   // coin-P2P peer disconnected: silent-drop territory
+    };
+    std::string submitted_hex;
+    RpcSubmitSink rpc = [&](const std::string& hex) -> bool {
+        submitted_hex = hex; return true;
+    };
+
+    const auto r = broadcast_won_block(p2p, rpc, block, block_hex);
+
+    EXPECT_TRUE(relay_attempted);
+    EXPECT_FALSE(r.p2p_sent);           // honest: the disconnected arm did NOT send
+    EXPECT_TRUE(r.rpc_ok);              // backup carried it
+    EXPECT_EQ(submitted_hex, block_hex);
+    EXPECT_STREQ(r.landed_first, "rpc");   // NOT a false "p2p"
+    EXPECT_TRUE(r.any());
+}
+
+// 7) H1 fail-loud: a disconnected P2P arm AND no RPC backup => the block reached
+//    NEITHER sink. any()==false and p2p_sent must be honest (false), so the caller
+//    takes the LOUD "block NOT relayed" path instead of a silent lost subsidy.
+TEST(DashWonBlockDualPath, DisconnectedP2pWithNoBackupReachesNeither)
+{
+    const auto block = make_block_bytes();
+    const std::string block_hex = to_hex(block);
+
+    P2pRelaySink p2p = [&](const std::vector<unsigned char>&) -> bool {
+        return false;   // disconnected
+    };
+
+    const auto r = broadcast_won_block(p2p, /*rpc=*/{}, block, block_hex);
+
+    EXPECT_FALSE(r.p2p_sent);
+    EXPECT_FALSE(r.rpc_ok);
+    EXPECT_FALSE(r.any());              // LOUD "block NOT relayed", never a silent win
+    EXPECT_STREQ(r.landed_first, "none");
 }

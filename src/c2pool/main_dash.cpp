@@ -845,10 +845,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     dash::coin::P2pRelaySink p2p_relay;
     if (coin_p2p && !no_p2p_relay) {
         p2p_relay =
-            [&ioc, &coin_p2p](const std::vector<unsigned char>& block_bytes) {
+            [&ioc, &coin_p2p](const std::vector<unsigned char>& block_bytes) -> bool {
+                // H1 honest reporting: submit_block_p2p_raw SILENTLY DROPS a won
+                // block when the coin-P2P peer is disconnected, and the io::post
+                // returns before the send even runs -- so only claim a P2P relay
+                // when the peer is actually connected+handshaked at dispatch time.
+                // If not, return false so broadcast_won_block relies on ARM B
+                // (submitblock RPC) and the NEVER-SILENT-DROP contract holds
+                // (loud dispatcher log if neither arm is reachable).
+                if (!coin_p2p || !coin_p2p->is_handshake_complete()) {
+                    std::cout << "[DASH-STRATUM-BLOCK] embedded P2P relay skipped: "
+                                 "coin-P2P peer not connected/handshaked -- relying "
+                                 "on submitblock-RPC backup\n";
+                    return false;
+                }
                 io::post(ioc, [&coin_p2p, bytes = block_bytes]() {
                     if (coin_p2p) coin_p2p->submit_block_p2p_raw(bytes);
                 });
+                return true;
             };
     } else if (no_p2p_relay) {
         std::cout << "[run] --no-p2p-relay: embedded P2P-relay arm SUPPRESSED; "
@@ -1292,6 +1306,33 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         coin_feed_subs.push_back(
             c2pool::dash::wire_mn_list_ingest(coin_state, *maintainer));
 
+        // Leg 5 (SML axis — DAEMONLESS CCbTx, v0.2.4 critical path): the raw
+        // mnlistdiff off the live coin-P2P feed advances the SML
+        // (merkleRootMNList) + QuorumManager (merkleRootQuorums) + seeds
+        // bestCL*/creditPool via CoinStateMaintainer::on_mnlistdiff. This is
+        // what makes the embedded coinbase's DIP-0004 type-5 payload
+        // MAINNET-VALID (review finding C1). Distinct from leg 4 (the RPC-seeded PAYEE
+        // axis). The getmnlistd request driver below primes it.
+        coin_feed_subs.push_back(
+            c2pool::dash::wire_mnlistdiff_ingest(coin_state, *maintainer));
+
+        // getmnlistd base tracker: the block hash the local SML is current at.
+        // Cold start = ZERO (full snapshot). Each accepted mnlistdiff advances
+        // it to diff.blockHash so the NEXT request is an incremental diff off
+        // the last synced point (avoids re-pulling the full ~450 kB list).
+        auto sml_base = std::make_shared<uint256>(uint256::ZERO);
+        coin_feed_subs.push_back(
+            coin_state.new_mnlistdiff.subscribe(
+                [sml_base](const dash::coin::vendor::CSimplifiedMNListDiff& d) {
+                    *sml_base = d.blockHash;
+                }));
+
+        // review finding H3: the embedded arm must NOT serve a template without a valid
+        // CCbTx (that block is consensus-invalid on mainnet). Gate embedded
+        // viability on an applied SML — until the first mnlistdiff lands, and
+        // after any reorg wipe, get_work stays on the retained dashd fallback.
+        node_coin_state.set_require_sml(true);
+
         // Bridge: new_headers -> HeaderChain::add_headers (X11 PoW + DGW
         // validated). The tip authority for the embedded template.
         coin_feed_subs.push_back(
@@ -1346,7 +1387,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // stale work between job-push timer firings (event-driven notify).
         header_chain->set_on_tip_changed(
             [&coin_state, &stratum_server, hc = header_chain.get(),
-             addr_ver, p2sh_ver, ws = work_source.get()]
+             addr_ver, p2sh_ver, ws = work_source.get(),
+             cp = coin_p2p.get(), sml_base]
             (const uint256&, uint32_t, const uint256& new_tip, uint32_t new_height) {
                 auto ta = dash::coin::tip_advance_from_chain(
                     *hc, addr_ver, p2sh_ver);
@@ -1357,6 +1399,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                              << " bits=0x" << std::hex << ta->bits_for_next << std::dec
                              << " -> new_tip fired (maintainer arm)";
                 }
+                // SML axis: pull the mnlistdiff current AT the new tip. dashcore
+                // computes block (tip+1)'s CbTx merkleRootMNList/Quorums from the
+                // DMN/quorum list as-of `tip` (GetListForBlock(pindexPrev)), so
+                // targeting the diff at `new_tip` puts the local SML in exactly
+                // the state needed to build tip+1. Incremental off the last
+                // synced base; the new_mnlistdiff subscription advances sml_base.
+                if (cp) cp->send_getmnlistd(*sml_base, new_tip);
                 // #739: event-driven stale-work notify.
                 if (ws) ws->bump_work_generation();
                 if (stratum_server) stratum_server->notify_all();
@@ -1380,11 +1429,18 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // Kick the initial sync once the version/verack handshake completes:
         // getheaders off our current locator + a mempool prime.
         coin_p2p->set_on_handshake_complete(
-            [cp = coin_p2p.get(), hc = header_chain.get()]() {
+            [cp = coin_p2p.get(), hc = header_chain.get(), sml_base]() {
                 LOG_INFO << "[EMB-DASH] handshake complete -> initial sync:"
-                            " getheaders + mempool";
+                            " getheaders + mempool + mnlistdiff(cold)";
                 cp->send_getheaders(70230, hc->get_locator(), uint256::ZERO);
                 cp->send_mempool();
+                // Cold-start SML sync: full snapshot (base=ZERO) up to our best
+                // known header tip. Steady-state incremental diffs then ride the
+                // tip-changed driver. If the header chain is still empty at
+                // handshake, target ZERO too — the first tip-change re-requests.
+                auto tip_entry = hc->tip();
+                const uint256 tip = tip_entry ? tip_entry->hash : uint256::ZERO;
+                cp->send_getmnlistd(*sml_base, tip);
             });
 
         std::cout << "[run] E2a live-feed wired: header-chain(" << hdr_db

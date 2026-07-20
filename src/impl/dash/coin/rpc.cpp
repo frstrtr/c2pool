@@ -412,11 +412,16 @@ void NodeRPC::submit_block(BlockType& block, bool ignore_failure)
 bool NodeRPC::submit_block_hex(const std::string& block_hex, bool ignore_failure)
 {
     auto result = m_client.CallMethod<nlohmann::json>(ID, "submitblock", {block_hex});
-    bool success = result.is_null();
+    // Dual-path contract (M1): a "duplicate"/"inconclusive"/already-have result
+    // means the OTHER broadcast arm already landed this block on the network —
+    // that is SUCCESS, not failure. See submitblock_result_accepted().
+    const bool success = dash::coin::submitblock_result_accepted(result);
     if (!success && !ignore_failure)
         LOG_ERROR << "submit_block_hex result: " << result.dump();
     else if (success)
-        LOG_INFO << "submit_block_hex accepted";
+        LOG_INFO << "submit_block_hex accepted"
+                 << (result.is_null() ? std::string{}
+                                      : " (already on network: " + result.dump() + ")");
     return success;
 }
 

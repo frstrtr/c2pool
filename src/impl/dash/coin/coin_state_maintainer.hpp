@@ -31,9 +31,14 @@
 #include <impl/dash/coin/mn_state_machine.hpp>   // MNState
 #include <impl/dash/coin/block.hpp>            // BlockType
 #include <impl/dash/coin/transaction.hpp>        // MutableTransaction
+#include <impl/dash/coin/vendor/smldiff.hpp>     // vendor::CSimplifiedMNListDiff + apply_diff
+#include <impl/dash/coin/vendor/quorum_tail.hpp> // vendor::parse_quorum_tail
+#include <impl/dash/coin/vendor/cbtx.hpp>        // vendor::parse_cbtx (bestCL*/creditPool seed)
 
 #include <core/uint256.hpp>
+#include <core/log.hpp>
 
+#include <array>
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -74,6 +79,99 @@ public:
             demote();
         else
             republish();
+    }
+
+    /// Reception path (mnlistdiff, SML axis — DAEMONLESS CCbTx source): apply a
+    /// raw deterministic-MN-list diff off the live coin-P2P feed. This is the
+    /// consensus-commitment counterpart to on_mn_list_update (which drives the
+    /// PAYEE MnStateMachine): it advances the NodeCoinState-held SML
+    /// (merkleRootMNList) and QuorumManager (merkleRootQuorums), and seeds the
+    /// version-appropriate bestCL*/creditPool from the diff's authoritative
+    /// embedded cbTx. All heavy lifting is the already-tested vendor code
+    /// (apply_diff / parse_quorum_tail / parse_cbtx) — this method is the wire.
+    ///
+    /// NOTE (consensus-timing, FLAGGED for byte-parity review): the diff
+    /// advances the SML/quorum set to `diff.blockHash`. dashd's GBT for the
+    /// NEXT block computes the CbTx roots over the DMN/quorum state AS OF that
+    /// next block's connect. Whether requesting mnlistdiff(base, TIP) leaves the
+    /// SML at exactly the state dashd commits for TIP+1 is the #1 item the live
+    /// byte-parity KAT against a running dashd must confirm; do not assume.
+    void on_mnlistdiff(const vendor::CSimplifiedMNListDiff& diff) {
+        // 1) SML (merkleRootMNList). apply_diff erases deletedMNs, upserts
+        //    diff.mnList, and re-sorts by proRegTxHash (memcmp order — the
+        //    Bug-A-critical ordering, already pinned by test_dash_simplifiedmns).
+        auto sml_r = vendor::apply_diff(m_state.sml(), diff);
+
+        // 2) Quorum set (merkleRootQuorums). The opaque tail parser fails SAFE:
+        //    a parse failure logs + skips quorum tracking for this diff without
+        //    aborting SML sync (the SML acceptance gate must not depend on it).
+        vendor::QuorumTail qt;
+        size_t q_added = 0, q_deleted = 0;
+        if (vendor::parse_quorum_tail(diff.quorum_tail, qt)) {
+            auto qr = m_state.qmgr().apply(qt);
+            q_added = qr.added_or_updated;
+            q_deleted = qr.deleted;
+        }
+
+        // 3) bestCL* + creditPool: the diff's embedded cbTx is the coinbase of
+        //    diff.blockHash and its extra_payload is the authoritative type-5
+        //    CCbTx for that height. Seed the fields the roots don't carry so the
+        //    next template's CCbTx matches dashd. Fails SAFE (leaves prior seed).
+        if (diff.cbTx.type == 5 && !diff.cbTx.extra_payload.empty()) {
+            vendor::CCbTx observed;
+            if (vendor::parse_cbtx(diff.cbTx.extra_payload, observed)) {
+                if (observed.nVersion >= vendor::CCbTx::VERSION_CLSIG_AND_BALANCE) {
+                    m_state.set_credit_pool(observed.creditPoolBalance);
+                    // bestCLHeightDiff is relative to (cbHeight-1); recover the
+                    // absolute best-CL height so the next template re-derives its
+                    // own diff against ITS height. Only adopt when the observed
+                    // sig is non-null (a real ChainLock for the window).
+                    if (observed.has_best_cl_signature()) {
+                        int32_t cb_h = observed.nHeight;
+                        int32_t best_h = (cb_h - 1)
+                            - static_cast<int32_t>(observed.bestCLHeightDiff);
+                        if (best_h > 0)
+                            m_state.set_best_cl(best_h, observed.bestCLSignature);
+                    }
+                }
+            }
+        }
+
+        m_have_mn_sml = m_state.sml().size() != 0;
+        m_state.set_have_sml(m_have_mn_sml);
+        LOG_INFO << "[SML] applied diff: SML +" << sml_r.added_or_updated
+                 << " -" << sml_r.deleted << " => " << m_state.sml().size()
+                 << " MNs; quorums +" << q_added << " -" << q_deleted
+                 << " => " << m_state.qmgr().active_count()
+                 << " active; have_sml=" << (m_have_mn_sml ? "yes" : "no");
+        if (!m_have_mn_sml)
+            demote();
+        else
+            republish();
+    }
+
+    /// ChainLock reception: adopt the freshly-observed ChainLock as the best CL
+    /// for the CCbTx bestCL* fields. The clsig message carries {height,
+    /// block_hash, 96-byte recovered threshold sig}. Only advances forward.
+    void on_new_chainlock(int32_t height,
+                          const std::array<uint8_t, 96>& sig) {
+        if (height > m_state.best_cl_height())
+            m_state.set_best_cl(height, sig);
+    }
+
+    /// Reorg (SML axis): a chain reorganisation can invalidate the incremental
+    /// SML/quorum state (the diffs we applied were relative to an orphaned
+    /// branch). Wipe the SML + quorum set and drop have_sml so the embedded arm
+    /// falls back to dashd until a fresh cold-start mnlistdiff(zero, new-tip)
+    /// rebuilds them. main_dash.cpp calls this from the header-chain reorg hook
+    /// and then re-requests a full diff. (Distinct from on_invalidate, which
+    /// only drops tip-readiness and deliberately KEEPS the MN payee list.)
+    void on_sml_reorg() {
+        m_state.sml().mnList.clear();
+        m_state.qmgr().clear();
+        m_have_mn_sml = false;
+        m_state.set_have_sml(false);
+        demote();
     }
 
     /// Reception path (mempool relay): fold a relayed tx into the local
@@ -171,6 +269,7 @@ private:
 
     bool m_have_mn{false};
     bool m_have_tip{false};
+    bool m_have_mn_sml{false};   // a non-empty SML has been applied (CCbTx source)
 
     // Height the last MN-set snapshot was current at (0 = none/unknown);
     // on_block_connected skips re-applying blocks at or below it.

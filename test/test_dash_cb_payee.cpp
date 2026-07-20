@@ -88,3 +88,39 @@ TEST(DashCbPayee, NonObjectEntryYieldsEmptyPayment) {
     EXPECT_TRUE(pp.payee.empty());
     EXPECT_EQ(pp.amount, 0u);
 }
+
+// ── M1: submitblock dual-path result classification ─────────────────────────
+// submitblock returns null on accept; a "duplicate"/"inconclusive"/already-have
+// string means the OTHER dual-path arm already landed the block on the network
+// = SUCCESS under the dual-path contract, NOT failure. "duplicate-invalid" is
+// the exception (rejected as invalid = genuine failure).
+using dash::coin::submitblock_result_accepted;
+
+TEST(DashSubmitblockResult, NullResultIsAccept) {
+    EXPECT_TRUE(submitblock_result_accepted(json(nullptr)));
+}
+
+TEST(DashSubmitblockResult, DuplicateCountsAsSuccess) {
+    // The block already reached the network via the other arm.
+    EXPECT_TRUE(submitblock_result_accepted(json("duplicate")));
+    EXPECT_TRUE(submitblock_result_accepted(json("DUPLICATE")));   // case-insensitive
+}
+
+TEST(DashSubmitblockResult, InconclusiveAndAlreadyHaveCountAsSuccess) {
+    EXPECT_TRUE(submitblock_result_accepted(json("inconclusive")));
+    EXPECT_TRUE(submitblock_result_accepted(json("inconclusive-already-have")));
+    EXPECT_TRUE(submitblock_result_accepted(json("duplicate-inconclusive")));
+}
+
+TEST(DashSubmitblockResult, DuplicateInvalidIsGenuineFailure) {
+    // Already have it, but it is INVALID — must NOT be counted as landed.
+    EXPECT_FALSE(submitblock_result_accepted(json("duplicate-invalid")));
+}
+
+TEST(DashSubmitblockResult, RealRejectReasonsAreFailure) {
+    EXPECT_FALSE(submitblock_result_accepted(json("bad-cb-payee")));
+    EXPECT_FALSE(submitblock_result_accepted(json("high-hash")));
+    EXPECT_FALSE(submitblock_result_accepted(json("rejected")));
+    // Non-string, non-null (defensive): not an accept.
+    EXPECT_FALSE(submitblock_result_accepted(json::object()));
+}

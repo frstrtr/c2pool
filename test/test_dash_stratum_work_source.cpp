@@ -983,6 +983,112 @@ TEST(DashDashboardWiring, LocalStatsSumsStratumWorkerHashrate)
         EXPECT_EQ(w.get<std::string>().find("pool is idle"), std::string::npos);
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// C1 mainnet gate (v0.2.4 tag-blocker). The embedded template arm's only prod
+// caller does not pass the E2d SML/QuorumManager seams, so build_embedded_
+// workdata() emits an EMPTY CCbTx extra_payload — a coinbase that is consensus-
+// INVALID (bad-cbtx) on a DIP4-active DASH MAINNET. Until the payload is
+// buildable (post-v0.2.4) the embedded arm MUST be fail-closed off mainnet: a
+// populated NodeCoinState must NOT serve its embedded template on mainnet (it
+// routes to the reward-safe dashd-RPC fallback), while testnet/regtest keep the
+// embedded arm (E5 proving ground). is_testnet_ defaults false, so an
+// unconfigured node is treated as mainnet — fail-closed by default.
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+// A populated coin-state whose embedded template is DISTINGUISHABLE from the
+// dashd-fallback fixture (different prev/height), so the served template's
+// prevhash proves which arm ran. Empty MN/mempool is fine: the embedded build
+// still yields a valid, mineable template (non-null prev, non-zero bits).
+const char* const kEmbeddedPrevHashHex =
+    "0000000000000000abcdef0123456789abcdef0123456789abcdef0123456789";
+constexpr uint32_t kEmbeddedPrevHeight = 500000u;   // embedded template -> +1
+void seed_populated(dash::coin::NodeCoinState& cs)
+{
+    uint256 emb_prev;
+    emb_prev.SetHex(kEmbeddedPrevHashHex);
+    cs.set_tip(kEmbeddedPrevHeight, emb_prev, /*bits_for_next=*/0x1e0ffff0u,
+               /*mtp_at_tip=*/1'700'000'000u, /*addr_ver=*/76, /*p2sh_ver=*/16,
+               /*curtime=*/kCurtime, /*version=*/static_cast<uint32_t>(kVersion));
+}
+}  // namespace
+
+// MAINNET: a populated coin-state must NOT flip to the embedded arm — the served
+// template is the reward-safe dashd fallback (prev/height of rich_work), never
+// the embedded template (which would carry the empty-CCbTx coinbase).
+TEST(DashStratumC1MainnetGate, MainnetPopulatedCoinStateRoutesToDashdFallback)
+{
+    dash::coin::NodeCoinState cs;
+    seed_populated(cs);
+    ASSERT_TRUE(cs.populated());
+    ASSERT_TRUE(cs.make_embedded_work_inputs().viable());
+
+    auto fallback = []() -> dash::coin::DashWorkData { return rich_work(); };
+    auto submit   = [](const std::vector<unsigned char>&, uint32_t) { return true; };
+
+    // is_testnet=false => mainnet => embedded arm GATED off.
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/false);
+
+    auto tmpl = ws.get_current_work_template();
+    ASSERT_FALSE(tmpl.empty());
+    // The fallback's tip/height — NOT the embedded prev/height. Embedded was
+    // suppressed on mainnet.
+    EXPECT_EQ(tmpl.value("previousblockhash", ""), std::string(kPrevHashHex));
+    EXPECT_EQ(tmpl.value("height", 0u), 424242u);
+
+    // The fused adapter path is gated too: source is the retained dashd arm.
+    dash::stratum::WorkJobTargetInputs job_in;
+    job_in.sane_target_min.SetHex(
+        "0000000000000000000000000000000000000000000000000000000000000001");
+    job_in.sane_target_max.SetHex(
+        "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    job_in.share_info_bits_target.SetHex(
+        "0000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    auto gw = ws.get_work(job_in);
+    EXPECT_EQ(gw.source, dash::coin::WorkSource::DashdFallback);
+    EXPECT_EQ(gw.work.m_height, 424242u);
+}
+
+// TESTNET/REGTEST: the SAME populated coin-state DOES serve its embedded
+// template (E5 lives here) — proving the gate is mainnet-only, not a blanket
+// disable.
+TEST(DashStratumC1MainnetGate, TestnetPopulatedCoinStateServesEmbedded)
+{
+    dash::coin::NodeCoinState cs;
+    seed_populated(cs);
+    ASSERT_TRUE(cs.populated());
+
+    auto fallback = []() -> dash::coin::DashWorkData { return rich_work(); };
+    auto submit   = [](const std::vector<unsigned char>&, uint32_t) { return true; };
+
+    // is_testnet=true => testnet/regtest => embedded arm ENABLED.
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+
+    uint256 emb_prev;
+    emb_prev.SetHex(kEmbeddedPrevHashHex);
+
+    auto tmpl = ws.get_current_work_template();
+    ASSERT_FALSE(tmpl.empty());
+    // The embedded tip/height (prev_height + 1) — the embedded arm ran.
+    EXPECT_EQ(tmpl.value("previousblockhash", ""), emb_prev.GetHex());
+    EXPECT_EQ(tmpl.value("height", 0u), kEmbeddedPrevHeight + 1u);
+
+    dash::stratum::WorkJobTargetInputs job_in;
+    job_in.sane_target_min.SetHex(
+        "0000000000000000000000000000000000000000000000000000000000000001");
+    job_in.sane_target_max.SetHex(
+        "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    job_in.share_info_bits_target.SetHex(
+        "0000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    auto gw = ws.get_work(job_in);
+    EXPECT_EQ(gw.source, dash::coin::WorkSource::Embedded);
+    EXPECT_EQ(gw.work.m_height, kEmbeddedPrevHeight + 1u);
+}
+
 TEST(DashDashboardWiring, LocalStatsIdleWarningWhenNoWorkers)
 {
     // No provider wired and an empty local registry -> the honest idle warning

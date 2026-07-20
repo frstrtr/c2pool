@@ -53,6 +53,27 @@ inline PackedPayment normalize_payment(const nlohmann::json& entry)
     return pp;
 }
 
+// Classify a dashd `submitblock` RPC result under the dual-path won-block
+// contract (M1). submitblock returns null on accept; a non-null string is a
+// reject reason. A "duplicate" / "inconclusive" / "already-have" result means
+// the block is ALREADY on the network — the OTHER broadcast arm (embedded P2P
+// relay, or a peer) landed it first — which is SUCCESS (the block reached the
+// network), NOT a failure. "duplicate-invalid" is the one exception: the block
+// was rejected as invalid, a genuine failure. Pure over the JSON so the KAT can
+// pin it without a live RPC client.
+inline bool submitblock_result_accepted(const nlohmann::json& result)
+{
+    if (result.is_null()) return true;
+    if (!result.is_string()) return false;
+    std::string code = result.get<std::string>();
+    for (char& c : code)
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    const bool already_have = code == "duplicate"
+                           || code.find("inconclusive") != std::string::npos
+                           || code.find("already") != std::string::npos;
+    return already_have && code.find("invalid") == std::string::npos;
+}
+
 struct DashWorkData {
     // Raw getblocktemplate JSON response (kept for fallback access to fields
     // we haven't promoted to members yet).

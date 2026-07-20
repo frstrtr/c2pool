@@ -4,6 +4,7 @@
 #include "block.hpp"
 #include "transaction.hpp"
 #include "mn_state_machine.hpp"
+#include "vendor/smldiff.hpp"   // vendor::CSimplifiedMNListDiff (SML-axis reception feed)
 
 #include <core/uint256.hpp>
 #include <core/events.hpp>
@@ -106,6 +107,20 @@ struct Node
     // real feed (block_connected only folds per-block deltas between snapshots);
     // an empty snapshot demotes the bundle to the dashd fallback.
     Event<MnListUpdate> mn_list_update;
+
+    // Reception path (SML axis, daemonless): fires when the coin-P2P client
+    // parses a `mnlistdiff` message, carrying the RAW deterministic-MN-list
+    // diff (vendor::CSimplifiedMNListDiff) straight off the wire. Distinct from
+    // mn_list_update above, which is the PAYEE feed (MnStateMachine, MNState
+    // with scriptPayout + lastPaidHeight, seeded from dashd RPC `protx list`).
+    // The SML axis feeds the CONSENSUS-COMMITMENT machinery instead: the diff's
+    // mnList/deletedMNs advance the vendor::CSimplifiedMNList whose
+    // CalcMerkleRoot() is the CCbTx merkleRootMNList, and its opaque quorum
+    // tail advances the QuorumManager whose compute_merkle_root_quorums() is
+    // the CCbTx merkleRootQuorums. The diff's embedded cbTx also carries the
+    // authoritative bestCL* + creditPoolBalance as-of blockHash, which the
+    // maintainer seeds forward. CoinStateMaintainer::on_mnlistdiff subscribes.
+    Event<coin::vendor::CSimplifiedMNListDiff> new_mnlistdiff;
 
     // SPV A1 (parity audit): fires when dashd announces a ChainLock has
     // been aggregated for a block. Carries {block_hash, height}.
