@@ -103,6 +103,9 @@ BCHWorkSource::BCHWorkSource(bch::coin::HeaderChain&       chain,
     , submit_block_fn_(std::move(submit_fn))
     , config_(std::move(config))
 {
+    // Stable-by-construction hashrate-based vardiff (see DASH). Consensus-neutral
+    // (pseudoshare-only). PRE-STAGED — hold until DASH #766 validates live.
+    config_.use_hashrate_vardiff = true;
     LOG_INFO << "[BCH-STRATUM] BCHWorkSource constructed (testnet="
              << (is_testnet_ ? "1" : "0") << ")";
 }
