@@ -944,6 +944,21 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_block_relay_dual_arm PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_block_relay_dual_arm "" AUTO)
 
+    # S8 broadcaster dual-path GATE KAT: one forced won block fans out down BOTH
+    # arms (embedded P2P primary + submitblock RPC backup) byte-identically, and
+    # a no-arm block reaches NEITHER sink (fail-loud). Mirrors
+    # dgb_forced_won_share_dualpath_test; MUST appear in BOTH this registration
+    # AND the build.yml --target allowlist (NOT_BUILT sentinel trap).
+    add_executable(test_dash_won_block_dualpath test_dash_won_block_dualpath.cpp)
+    target_link_libraries(test_dash_won_block_dualpath PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_won_block_dualpath PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_won_block_dualpath "" AUTO)
+
     add_executable(test_dash_coinbase_parity test_dash_coinbase_parity.cpp)
     target_link_libraries(test_dash_coinbase_parity PRIVATE
         GTest::gtest_main GTest::gtest
