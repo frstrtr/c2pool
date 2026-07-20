@@ -122,6 +122,13 @@ private:
     // after every successful (re)connect. Linux release target.
     static constexpr int RPC_IO_TIMEOUT_SECONDS = 12;
     void apply_socket_timeouts();
+    // Tear down m_stream (sync_reconnect idiom). Called on a FINAL-attempt Send()
+    // failure so a half-written / unread request can never be answered into a
+    // later Send() on a reused connection -- the deadline-desync guard (the
+    // constant "curltest" id + jsonrpccxx not validating response ids makes any
+    // reused-connection off-by-one a permanent set-gap outage). Caller holds
+    // m_rpc_mutex.
+    void close_stream();
 
 public:
     NodeRPC(io::io_context* context, dash::interfaces::Node* coin, bool testnet);

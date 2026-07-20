@@ -160,6 +160,16 @@ void NodeRPC::sync_reconnect()
     LOG_INFO << "CoindRPC reconnected (sync)";
 }
 
+void NodeRPC::close_stream()
+{
+    // Same teardown idiom as sync_reconnect()/the destructor. m_connected is
+    // cleared so the next Send() write-fails into a clean sync_reconnect().
+    beast::error_code ec;
+    m_stream.socket().shutdown(io::ip::tcp::socket::shutdown_both, ec);
+    m_stream.close();
+    m_connected = false;
+}
+
 void NodeRPC::apply_socket_timeouts()
 {
     // Force the socket back to BLOCKING mode, then set kernel send/receive
@@ -216,6 +226,10 @@ std::string NodeRPC::Send(const std::string &request)
                 sync_reconnect();
                 continue;
             }
+            // Deadline-desync guard (see the read-fail path below): tear the
+            // socket down before giving up so a partially-written request can
+            // never be answered into a LATER Send() on a reused connection.
+            close_stream();
             return {};
         }
 
@@ -234,6 +248,17 @@ std::string NodeRPC::Send(const std::string &request)
                 sync_reconnect();
                 continue;
             }
+            // Deadline-desync guard (SO_RCVTIMEO deadline hazard): this final
+            // attempt has already WRITTEN the request into dashd but its response
+            // is unread (read timed out). jsonrpccxx reuses the constant id
+            // "curltest" and never validates response ids, so reusing this open
+            // connection would make the NEXT Send() read THIS request's late
+            // response -> permanent off-by-one desync (a GBT would parse a
+            // getbestblockhash string -> zeroed work -> a stuck "honest set-gap"
+            // outage until the connection churns). Tear the socket down so the
+            // next Send() write-fails into a clean sync_reconnect(). Already
+            // under m_rpc_mutex.
+            close_stream();
             return {};
         }
 
