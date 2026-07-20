@@ -378,6 +378,7 @@ StratumSession::StratumSession(tcp::socket socket, std::shared_ptr<IWorkSource> 
     const auto& cfg = mining_interface_->get_stratum_config();
     hashrate_tracker_.set_difficulty_bounds(cfg.min_difficulty, cfg.max_difficulty);
     hashrate_tracker_.set_target_time_per_mining_share(cfg.target_time);
+    hashrate_tracker_.set_hashrate_vardiff(cfg.use_hashrate_vardiff);
     if (cfg.vardiff_enabled)
         hashrate_tracker_.enable_vardiff();
 }

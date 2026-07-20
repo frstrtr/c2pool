@@ -136,6 +136,12 @@ DASHWorkSource::DASHWorkSource(const coin::NodeCoinState& coin_state,
     // 3.3x and stabilises vardiff at the source. DASH-only; other coins keep the
     // 3s StratumConfig default. Pairs with the per-job issued_difficulty grace.
     config_.target_time = 10.0;
+    // Use the stable-by-construction hashrate-based vardiff (D = H_est*target/2^32)
+    // instead of the ratio-feedback loop, which still limit-cycles ~2-3x even at
+    // 10s for variable X11 hashrate — the residual "Low difficulty share" rejects.
+    // Derived directly from a smoothed hashrate, so it cannot oscillate. DASH-only;
+    // other coins keep the legacy ratio path (use_hashrate_vardiff=false).
+    config_.use_hashrate_vardiff = true;
     LOG_INFO << "[DASH-STRATUM] DASHWorkSource constructed"
              << " (min_diff=" << config_.min_difficulty
              << " max_diff=" << config_.max_difficulty
