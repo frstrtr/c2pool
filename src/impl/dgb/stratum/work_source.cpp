@@ -119,6 +119,9 @@ DGBWorkSource::DGBWorkSource(c2pool::dgb::HeaderChain&     chain,
     // Runtime coin tag for coin-agnostic core log lines (#732).
     if (config_.coin_symbol.empty())
         config_.coin_symbol = "DGB";
+    // Stable-by-construction hashrate-based vardiff (see DASH). Consensus-neutral
+    // (pseudoshare-only). PRE-STAGED — hold until DASH #766 validates live.
+    config_.use_hashrate_vardiff = true;
     LOG_INFO << "[DGB-STRATUM] DGBWorkSource constructed"
              << " (testnet=" << is_testnet_
              << " min_diff=" << config_.min_difficulty
