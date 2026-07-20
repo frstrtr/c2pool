@@ -26,6 +26,7 @@
 #include <core/stratum_work_source.hpp>
 #include <core/target_utils.hpp>
 #include <core/uint256.hpp>
+#include <core/web_server.hpp>                // core::MiningInterface (dashboard stats seam)
 
 #include <btclibs/util/strencodings.h>        // ParseHex, HexStr
 
@@ -864,6 +865,88 @@ TEST(DashStratumWorkSource, WonBlockAcrossTipMoveStillSubmits)
     ASSERT_TRUE(result.is_boolean());
     EXPECT_TRUE(result.get<bool>());
     EXPECT_TRUE(rig.fx.submit_called);        // orphan race: still dispatched
+}
+
+// ── Dashboard stats seam (issue: /local_stats hashrate under-reported) ───────
+//
+// The DASH stratum acceptor is a standalone core::StratumServer bound to a
+// DASHWorkSource; its StratumSessions register/update per-connection hashrate +
+// share/difficulty state into the work source's OWN registry, NOT into the
+// dashboard WebServer's MiningInterface (whose acceptor is disabled). Before the
+// fix, MiningInterface::rest_local_stats read only its own empty registry, so a
+// busy pool reported miner_hash_rates {} / my_hash_rates_in_last_hour.actual 0
+// and a false "No miners connected — pool is idle" warning. main_dash wires
+// set_stratum_workers_fn -> DASHWorkSource::get_stratum_workers to close the
+// gap. This KAT pins that end-to-end: N workers of known hashrate -> summed
+// aggregate, non-empty per-worker maps, no idle warning.
+
+TEST(DashDashboardWiring, LocalStatsSumsStratumWorkerHashrate)
+{
+    Fixture fx(true);
+    auto ws = fx.make();
+
+    struct W { std::string sid, user, worker; double hr, dead, diff; uint64_t acc; };
+    // 3 X11 rigs across 2 payout addresses; hashrates in the field's TH/s range.
+    const std::vector<W> rigs = {
+        {"sess-1", "Xpayout1", "rig0", 1.20e13, 0.0,    4096.0, 100},
+        {"sess-2", "Xpayout1", "rig1", 8.00e12, 0.0,    2048.0,  80},
+        {"sess-3", "Xpayout2", "rig0", 2.50e13, 1.0e12, 8192.0, 200},
+    };
+    double expected_total = 0.0, expected_dead = 0.0;
+    for (const auto& r : rigs) {
+        core::stratum::WorkerInfo wi;
+        wi.username    = r.user;
+        wi.worker_name = r.worker;
+        wi.difficulty  = r.diff;
+        ws->register_stratum_worker(r.sid, wi);
+        ws->update_stratum_worker(r.sid, r.hr, r.dead, r.diff, r.acc, 0, 0);
+        expected_total += r.hr;
+        expected_dead  += r.dead;
+    }
+    ASSERT_EQ(ws->get_stratum_workers().size(), rigs.size());
+
+    // Wire the live registry into a DASH dashboard exactly as main_dash.cpp does.
+    core::MiningInterface mi(false, nullptr, c2pool::address::Blockchain::DASH);
+    mi.set_stratum_workers_fn([wsrc = ws.get()]() {
+        return wsrc->get_stratum_workers();
+    });
+
+    auto stats = mi.rest_local_stats();
+
+    // Aggregate hashrate == SUM of connected workers (was 0 before the fix).
+    ASSERT_TRUE(stats.contains("my_hash_rates_in_last_hour"));
+    const auto& hr = stats["my_hash_rates_in_last_hour"];
+    EXPECT_NEAR(hr["actual"].get<double>(),   expected_total,                 1.0);
+    EXPECT_NEAR(hr["nonstale"].get<double>(), expected_total - expected_dead, 1.0);
+    EXPECT_NEAR(hr["rewarded"].get<double>(), expected_total - expected_dead, 1.0);
+
+    // Per-worker maps are non-empty and keyed per "address.worker".
+    ASSERT_TRUE(stats.contains("miner_hash_rates"));
+    EXPECT_EQ(stats["miner_hash_rates"].size(), rigs.size());
+    EXPECT_FALSE(stats["miner_dead_hash_rates"].empty());
+    EXPECT_FALSE(stats["miner_last_difficulties"].empty());
+    EXPECT_NEAR(stats["miner_hash_rates"]["Xpayout1.rig0"].get<double>(), 1.20e13, 1.0);
+
+    // No false "pool is idle" warning while miners ARE connected.
+    ASSERT_TRUE(stats.contains("warnings"));
+    for (const auto& w : stats["warnings"])
+        EXPECT_EQ(w.get<std::string>().find("pool is idle"), std::string::npos);
+}
+
+TEST(DashDashboardWiring, LocalStatsIdleWarningWhenNoWorkers)
+{
+    // No provider wired and an empty local registry -> the honest idle warning
+    // fires and the per-worker map stays empty (the pre-fix state was correct
+    // ONLY when the pool truly had no miners).
+    core::MiningInterface mi(false, nullptr, c2pool::address::Blockchain::DASH);
+    auto stats = mi.rest_local_stats();
+
+    EXPECT_TRUE(stats["miner_hash_rates"].empty());
+    EXPECT_DOUBLE_EQ(stats["my_hash_rates_in_last_hour"]["actual"].get<double>(), 0.0);
+    bool idle = false;
+    for (const auto& w : stats["warnings"])
+        if (w.get<std::string>().find("pool is idle") != std::string::npos) idle = true;
+    EXPECT_TRUE(idle);
 }
 
 }  // namespace
