@@ -80,6 +80,8 @@
 #include <core/stratum_server.hpp>             // core::StratumServer — miner-facing accept-loop (run-path caller)
 #include <impl/dash/stratum/work_source.hpp>   // dash::stratum::DASHWorkSource — concrete core::stratum::IWorkSource
 #include <impl/dash/mint_runloop.hpp>          // dash::mint — run-loop share minting (slice 3/3)
+#include <core/web_server.hpp>                 // core::WebServer — the EXISTING c2pool dashboard (same wiring main_ltc.cpp uses)
+#include <impl/dash/enhanced_node.hpp>         // dash::EnhancedDashNode — core::IMiningNode the WebServer ctor takes
 #include <core/log.hpp>
 
 #include <chrono>
@@ -187,6 +189,7 @@ void print_banner(const char* argv0)
         << "           [--testnet] [--submit-block HEX | --submit-block-file PATH]\n"
         << "           [--listen [HOST:]PORT] [--addnode HOST:PORT]... [--connect HOST:PORT]...\n"
         << "           [--stratum [HOST:]PORT] [--coin-p2p-connect HOST:PORT]...\n"
+        << "           [--web-port PORT] [--web-host ADDR] [--dashboard-dir PATH]\n"
         << "           [--embedded-utxo]\n"
         << "           [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n"
         << "           [--redistribute pplns|fee|boost|donate]\n"
@@ -204,6 +207,13 @@ void print_banner(const char* argv0)
         << "        --coin-p2p-connect HOST:PORT (repeatable) OPT-IN dials the DASH\n"
         << "        coin network directly (version/verack + keep-alive + reconnect);\n"
         << "        absent => no coin P2P client, dashd-RPC fallback path unchanged.\n"
+        << "        --web-port PORT (alias --http-port, default 8080) serves the FULL\n"
+        << "        c2pool web dashboard + JSON API on --web-host (default 0.0.0.0)\n"
+        << "        from --dashboard-dir (default web-static); --web-port 0 disables.\n"
+        << "        Live sharechain tip/stats, pool hashrate and per-share difficulty\n"
+        << "        are bound to the REAL DASH tracker; local hashrate comes from the\n"
+        << "        DASH stratum acceptor. If stratum and web ports collide the web\n"
+        << "        port moves to stratum+1.\n"
         << "Consensus: X11 PoW + block identity; 2.5 min spacing; 5 DASH post-V20\n"
         << "        base, -1/14 per 210240; masternode payment 3/4 of block value.\n";
 }
@@ -361,6 +371,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              const std::string& rpc_conf_path, const std::string& submit_hex,
              const PeeringConfig& peer,
              const std::string& stratum_host, uint16_t stratum_port,
+             const std::string& web_host, uint16_t web_port,
+             const std::string& dashboard_dir,
              const std::vector<NetService>& coin_p2p_targets,
              bool embedded_utxo,
              double dev_donation, double node_owner_fee,
@@ -498,6 +510,196 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         std::cout << "[run] outbound dialing started ("
                   << config.pool()->m_bootstrap_addrs.size()
                   << " seed peer[s]); share-download leg ARMED\n";
+
+
+    // ── DASH web dashboard standup (the EXISTING c2pool dashboard) ────────
+    // This is main_ltc.cpp's WebServer wiring, reused verbatim where the DASH
+    // side has a real source for the datum. No stub metrics are invented: a
+    // stat with no live DASH producer in this slice is left UNSET so the
+    // dashboard reports its own honest "absent" state rather than a zero that
+    // reads as a real measurement.
+    //
+    // Runs on THIS ioc (WebServer moves HTTP onto its own thread internally),
+    // declared AFTER p2p_node so the callbacks it holds never outlive the node.
+    //
+    // DELIBERATE DIVERGENCE FROM main_ltc.cpp: we do NOT call
+    // web_server.set_stratum_port(). On the LTC path that setter makes
+    // WebServer::start() construct its OWN core::StratumServer driven by
+    // MiningInterface (web_server.cpp:8409 -> start_stratum_server, :8722).
+    // c2pool-dash already binds its own core::StratumServer to the
+    // DASHWorkSource below; setting it here would double-bind the port and
+    // serve X11 miners from the LTC work source. The dashboard is told the
+    // miner-facing port through mining_interface->set_worker_port() (display)
+    // and fed real stratum rates from the DASH acceptor after it starts.
+    std::unique_ptr<core::WebServer> web_server;
+    auto enhanced_node = std::make_shared<dash::EnhancedDashNode>(testnet);
+    if (web_port != 0) {
+        web_server = std::make_unique<core::WebServer>(
+            ioc, web_host, web_port, testnet,
+            std::static_pointer_cast<core::IMiningNode>(enhanced_node),
+            c2pool::address::Blockchain::DASH);
+
+        auto* mi = web_server->get_mining_interface();
+
+        // ── Real, non-negotiable node identity ────────────────────────────
+        mi->set_coin_label("DASH");
+#ifdef C2POOL_VERSION
+        mi->set_pool_version("c2pool/" C2POOL_VERSION);
+#endif
+        mi->set_worker_port(stratum_port);   // display only (see divergence note)
+        mi->set_p2p_port(bind_port);
+        // p2pool-compat protocol_version for /local_stats. The core seam
+        // documents this exact value for DASH (web_server.hpp:565) and it
+        // matches the sharechain SSOT floor.
+        mi->set_protocol_version(
+            static_cast<int>(dash::SharechainConfig::MINIMUM_PROTOCOL_VERSION));
+        // c2pool-dash drives its own work pipeline (DASHWorkSource), so the
+        // WebServer's internal refresh_work()/m_cached_template gating would
+        // hold the dashboard on the loading page forever. This seam exists in
+        // core for exactly this caller (web_server.hpp:557).
+        mi->set_dashboard_always_ready(true);
+
+        web_server->set_dashboard_dir(dashboard_dir);
+        // Explicitly DISABLE the WebServer's own stratum acceptor. Its ctor
+        // defaults stratum_port_ to (web_port + 10) (web_server.cpp:8330/8344/
+        // 8358) and start() binds it unconditionally when non-zero
+        // (web_server.cpp:8409 -> start_stratum_server, :8719), which on the
+        // DASH path silently opened a SECOND miner-facing listener driven by
+        // MiningInterface instead of DASHWorkSource (observed on the first
+        // smoke run: "StratumServer started on 0.0.0.0:18909" for --web-port
+        // 18899). c2pool-dash owns its stratum acceptor; this is the one place
+        // the LTC wiring cannot be reused verbatim.
+        web_server->set_stratum_port(0);
+
+        // ── REAL sharechain tip (ported from main_ltc.cpp:3860) ───────────
+        // std::nullopt is the honest "sharechain still bootstrapping" signal;
+        // never a fabricated height.
+        {
+            dash::Node* node_ptr = &p2p_node;
+            mi->set_sharechain_tip_fn(
+                [node_ptr]() -> std::optional<core::SharechainTip> {
+                    auto guard = node_ptr->read_tracker();
+                    if (!guard) {
+                        auto snap = node_ptr->get_tracker_snapshot();
+                        if (snap.chain_count == 0)
+                            return std::nullopt;
+                        core::SharechainTip t;
+                        t.hash   = "";
+                        t.height = snap.verified_count > 0 ? snap.chain_count : -1;
+                        t.total  = snap.chain_count;
+                        return t;
+                    }
+                    auto& chain = guard->chain;
+                    uint256 best;
+                    int32_t best_height = -1;
+                    for (const auto& [head_hash, tail_hash] : chain.get_heads()) {
+                        auto h = chain.get_height(head_hash);
+                        if (h > best_height) { best = head_hash; best_height = h; }
+                    }
+                    if (best.IsNull() && chain.size() == 0)
+                        return std::nullopt;
+                    core::SharechainTip t;
+                    t.hash   = best.IsNull() ? "" : best.GetHex().substr(0, 16);
+                    t.height = best_height;
+                    t.total  = static_cast<int>(chain.size());
+                    return t;
+                });
+            mi->mark_last_cache_tip_driven();
+
+            // ── REAL sharechain stats ─────────────────────────────────────
+            // Straight off the live tracker / published snapshot. Only fields
+            // DASH actually computes are emitted — no LTC-shaped placeholders.
+            mi->set_sharechain_stats_fn([node_ptr]() -> nlohmann::json {
+                auto snap = node_ptr->get_tracker_snapshot();
+                nlohmann::json out;
+                out["chain_length"]   = static_cast<int>(dash::SharechainConfig::chain_length());
+                out["fork_count"]     = snap.fork_count;
+                out["verified_count"] = snap.verified_count;
+                out["orphan_shares"]  = snap.orphan_shares;
+                out["dead_shares"]    = snap.dead_shares;
+                auto guard = node_ptr->read_tracker();
+                if (!guard) {
+                    // Tracker busy — report the snapshot only, and say so.
+                    out["chain_height"] = snap.chain_count;
+                    out["total_shares"] = snap.chain_count;
+                    return out;
+                }
+                auto& chain = guard->chain;
+                uint256 best;
+                int32_t best_height = -1;
+                for (const auto& [head_hash, tail_hash] : chain.get_heads()) {
+                    auto h = chain.get_height(head_hash);
+                    if (h > best_height) { best = head_hash; best_height = h; }
+                }
+                out["chain_tip_hash"] = best.IsNull() ? "" : best.GetHex();
+                out["chain_height"]   = best.IsNull() ? 0 : chain.get_height(best);
+                out["total_shares"]   = static_cast<int>(chain.size());
+                return out;
+            });
+
+            // ── REAL pool hashrate (ported from main_ltc.cpp:2865) ────────
+            // dash::ShareTracker::get_pool_attempts_per_second is the same
+            // p2pool estimator LTC uses (share_tracker.hpp:1353), over DASH's
+            // own TARGET_LOOKBEHIND. Returns the last good value on lock
+            // contention rather than a spurious 0.
+            mi->set_pool_hashrate_fn([node_ptr]() -> double {
+                static double s_last_good = 0.0;
+                auto best = node_ptr->best_share_hash();
+                if (best.IsNull()) return s_last_good;
+                auto guard = node_ptr->read_tracker();
+                if (!guard) return s_last_good;
+                if (!guard->chain.contains(best)) return s_last_good;
+                int height = guard->chain.get_height(best);
+                if (height < 3) return s_last_good;
+                auto lookbehind = std::min(
+                    height - 1,
+                    static_cast<int>(dash::SharechainConfig::TARGET_LOOKBEHIND));
+                auto aps = guard->get_pool_attempts_per_second(best, lookbehind, false);
+                double hr = static_cast<double>(aps.GetLow64());
+                if (hr > 0) s_last_good = hr;
+                return s_last_good;
+            });
+
+            // ── REAL best-share hash ──────────────────────────────────────
+            web_server->set_best_share_hash_fn(
+                [node_ptr]() { return node_ptr->best_share_hash(); });
+        }
+
+        // ── REAL per-share difficulty feed (main_ltc.cpp:4213) ────────────
+        // Every verified DASH share reports its difficulty + miner through the
+        // tracker hook (share_tracker.hpp:374); that is what drives the
+        // dashboard's per-miner share tables and the share-difficulty graph.
+        // NOT chained: nothing else on the DASH path installs this hook today
+        // (verified by grep for m_on_share_difficulty in main_dash.cpp).
+        {
+            core::WebServer* ws = web_server.get();
+            p2p_node.tracker().m_on_share_difficulty =
+                [ws](double diff, const std::string& miner) {
+                    ws->get_mining_interface()->record_share_difficulty(diff, miner);
+                };
+        }
+
+        // ── REAL node-owner fee (already parsed from argv above) ──────────
+        if (node_owner_fee > 0.0 && !node_owner_address.empty())
+            mi->set_node_fee_from_address(node_owner_fee, node_owner_address);
+
+        // Auto-detect the public IP for the "connect to this pool" panel.
+        // Non-blocking, detached; identical to the LTC path.
+        mi->auto_detect_external_info();
+
+        if (web_server->start()) {
+            std::cout << "[run] web dashboard LIVE on http://" << web_host << ":"
+                      << web_port << " (dashboard-dir=" << dashboard_dir
+                      << ") — real sharechain tip/stats/pool-hashrate + per-share\n"
+                         "[run]       difficulty feed bound; stratum rates bind below\n";
+        } else {
+            std::cout << "[run] web dashboard FAILED to bind " << web_host << ":"
+                      << web_port << " — dashboard disabled (mining unaffected)\n";
+            web_server.reset();
+        }
+    } else {
+        std::cout << "[run] web dashboard disabled (--web-port 0)\n";
+    }
 
     // ── E1: OPT-IN embedded coin-network P2P dial (--coin-p2p-connect) ────
     // GUARANTEE: with no --coin-p2p-connect on argv, coin_p2p stays null and
@@ -857,9 +1059,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     guard->chain, mint_params, prev_share_hash, block_bits);
             });
 
-        // New best share -> stratum work refresh (sessions re-notify).
-        p2p_node.set_on_best_share_changed(
-            [ws = work_source.get()]() { ws->bump_work_generation(); });
+        // New best share -> stratum work refresh (sessions re-notify) AND a
+        // debounced dashboard work refresh, so /api tip + graphs move on the
+        // real tip-change event (main_ltc.cpp:2768) rather than a poll timer.
+        {
+            core::WebServer* web = web_server.get();   // may be null (dashboard off)
+            p2p_node.set_on_best_share_changed(
+                [ws = work_source.get(), web]() {
+                    ws->bump_work_generation();
+                    if (web) web->trigger_work_refresh_debounced();
+                });
+        }
 
         std::cout << "[run] mint wiring LIVE: ShareAccept -> producer rebuild -> "
                      "tracker insert + broadcast (legacy v16 shares; PPLNS window "
@@ -892,6 +1102,26 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                       << " serving + submit scoring; templates source from the"
                       << " embedded coin-state when seeded, else the retained"
                       << " dashd-RPC GBT fallback)\n";
+            // ── REAL local (stratum) hashrate into the dashboard ───────
+            // Same two callbacks WebServer wires for its own acceptor
+            // (web_server.cpp:8730-8740), but sourced from the DASH
+            // StratumServer that actually serves X11 miners. This is what
+            // makes /local_stats report a truthful local hashrate + DOA
+            // window instead of nothing.
+            if (web_server) {
+                auto* ss = stratum_server.get();
+                auto* mi = web_server->get_mining_interface();
+                mi->set_stratum_hashrate_fn(
+                    [ss]() -> double { return ss->get_total_hashrate(); });
+                mi->set_stratum_rate_stats_fn(
+                    [ss]() -> core::MiningInterface::RateStats {
+                        auto s = ss->get_rate_stats();
+                        return {s.hashrate, s.effective_dt, s.total_datums,
+                                s.dead_datums};
+                    });
+                std::cout << "[run] dashboard local-hashrate bound to the DASH "
+                             "stratum acceptor\n";
+            }
         } else {
             std::cout << "[run] stratum FAILED to bind " << stratum_host << ":"
                       << stratum_port << " -- stratum disabled\n";
@@ -1196,6 +1426,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // (stratum_server was declared before them, so it would otherwise outlive them).
     stratum_server.reset();
 
+    // Stop the dashboard BEFORE p2p_node unwinds: its callbacks hold a raw
+    // dash::Node* and the HTTP thread must be joined while that is still valid.
+    if (web_server) {
+        web_server->stop();
+        web_server.reset();
+    }
+
     // Flush pending sharechain persistence buffers (verified marks + removals).
     p2p_node.shutdown_persistence();
 
@@ -1361,6 +1598,11 @@ int main(int argc, char** argv)
     double dev_donation = 0.1;                 // --give-author (donation_percentage; README default 0.1%)
     double node_owner_fee = 0.0;               // -f / --fee (node_owner_fee; default 0)
     std::string node_owner_address;            // --node-owner-address (fee destination)
+    // Web dashboard (the EXISTING c2pool dashboard, same defaults as main_ltc.cpp:
+    // http_port 8080, dashboard_dir "web-static"). Default-ON for --run.
+    std::string web_host      = "0.0.0.0";     // --web-host bind interface
+    uint16_t    web_port      = 8080;          // --web-port / --http-port (0 disables)
+    std::string dashboard_dir = "web-static";  // --dashboard-dir static asset root
     std::string redistribute_mode = "pplns";   // --redistribute pplns|fee|boost|donate
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
@@ -1405,6 +1647,19 @@ int main(int argc, char** argv)
             node_owner_address = argv[++i];
         else if (std::strcmp(argv[i], "--redistribute") == 0 && i + 1 < argc)
             redistribute_mode = argv[++i];
+        else if ((std::strcmp(argv[i], "--web-port") == 0 ||
+                  std::strcmp(argv[i], "--http-port") == 0) && i + 1 < argc) {
+            const long p = std::strtol(argv[++i], nullptr, 10);
+            if (p < 0 || p > 65535) {
+                std::cout << "c2pool-dash: --web-port out of range: " << argv[i] << "\n";
+                return 2;
+            }
+            web_port = static_cast<uint16_t>(p);
+        }
+        else if (std::strcmp(argv[i], "--web-host") == 0 && i + 1 < argc)
+            web_host = argv[++i];
+        else if (std::strcmp(argv[i], "--dashboard-dir") == 0 && i + 1 < argc)
+            dashboard_dir = argv[++i];
         else if (std::strcmp(argv[i], "--stratum") == 0 && i + 1 < argc) {
             // --stratum [HOST:]PORT -- bind a Stratum TCP listener for miners.
             // Bare PORT keeps the default 0.0.0.0 bind host (parse_listen SSOT).
@@ -1470,8 +1725,17 @@ int main(int argc, char** argv)
             }
             coin_p2p_targets.push_back(ns);
         }
+        // Guard against port conflicts between stratum and the web dashboard
+        // (main_ltc.cpp:1480, same posture and same +1 resolution).
+        if (stratum_port != 0 && web_port != 0 && stratum_port == web_port) {
+            std::cout << "[run] stratum port " << stratum_port
+                      << " conflicts with web dashboard port, moving dashboard to "
+                      << (stratum_port + 1) << "\n";
+            web_port = static_cast<uint16_t>(stratum_port + 1);
+        }
         return run_node(testnet, rpc_endpoint, rpc_conf_path, submit_hex, peer,
-                        stratum_host, stratum_port, coin_p2p_targets,
+                        stratum_host, stratum_port, web_host, web_port,
+                        dashboard_dir, coin_p2p_targets,
                         embedded_utxo, dev_donation, node_owner_fee,
                         node_owner_address, redistribute_mode);
     }
