@@ -223,6 +223,10 @@ void print_banner(const char* argv0)
         << "        clean_jobs notify on the fallback arm; absent/unreachable => the 3 s\n"
         << "        getbestblockhash poll is the active path (requires dashd\n"
         << "        zmqpubhashblock=tcp://HOST:PORT). No consensus effect.\n"
+        << "        --coin-p2p-magic HEX overrides the embedded coin-P2P wire magic\n"
+        << "        (default mainnet bf0c6bbd / testnet cee2caff; regtest 0da64dad).\n"
+        << "        --regtest-force-won-block (regtest E5 harness, fail-closed) drives\n"
+        << "        ONE real won block through the run-path dual-path dispatch.\n"
         << "        --web-port PORT (alias --http-port, default 8080) serves the FULL\n"
         << "        c2pool web dashboard + JSON API on --web-host (default 0.0.0.0)\n"
         << "        from --dashboard-dir (default web-static); --web-port 0 disables.\n"
@@ -401,7 +405,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              bool no_p2p_relay,
              bool embedded_mainnet,
              const std::string& coin_zmq_hashblock,
-             const std::string& external_ip)
+             const std::string& external_ip,
+             const std::string& coin_p2p_magic_hex,
+             bool force_won_block)
 {
     namespace io = boost::asio;
 
@@ -760,8 +766,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     std::unique_ptr<dash::coin::p2p::CoinClient<dash::Config>> coin_p2p;
     if (!coin_p2p_targets.empty()) {
         config.coin()->m_testnet = testnet;
-        config.coin()->m_p2p.prefix =
-            ParseHexBytes(testnet ? "cee2caff" : "bf0c6bbd");
+        // Coin-network wire magic (dashd pchMessageStart). Default: mainnet
+        // bf0c6bbd / testnet cee2caff. A dev regtest dashd uses a DISTINCT magic
+        // (empirically 0da64dad on Dash Core v22 regtest), so --coin-p2p-magic
+        // HEX overrides it to let ARM A dial a regtest coin daemon for the E5
+        // live-accept harness. Transport-only; consensus/reward-neutral; the
+        // mainnet/testnet defaults are byte-for-byte unchanged when unset.
+        const std::string net_magic_hex =
+            !coin_p2p_magic_hex.empty() ? coin_p2p_magic_hex
+                                        : (testnet ? "cee2caff" : "bf0c6bbd");
+        config.coin()->m_p2p.prefix = ParseHexBytes(net_magic_hex);
         config.coin()->m_p2p.address = coin_p2p_targets.front();
 
         coin_p2p = std::make_unique<dash::coin::p2p::CoinClient<dash::Config>>(
@@ -773,7 +787,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                           ? " (+" + std::to_string(coin_p2p_targets.size() - 1)
                                 + " alternate[s], reconnect rotates)"
                           : "")
-                  << " magic=" << (testnet ? "cee2caff" : "bf0c6bbd")
+                  << " magic=" << net_magic_hex
                   << " proto=70230 (E1: dial+handshake+keep-alive only;\n"
                      "[run]       ingest legs are later slices — templates still source from\n"
                      "[run]       the dashd-RPC fallback until NodeCoinState is fed)\n";
@@ -938,6 +952,117 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                       << " landed_first=" << bcast.landed_first << "\n";
             return true;
         };
+
+    // ── E5 REGTEST-GATED forced-won-block LIVE seam (--regtest-force-won-block) ──
+    //
+    // The DASH analog of DGB's #82 --regtest-force-won-share. It drives ONE real
+    // won block through the SAME run-path dual-path dispatch (stratum_submit_fn ->
+    // broadcast_won_block: ARM A embedded coin-P2P relay primary + ARM B
+    // submitblock RPC backup) so the embedded-relay arm is proven LIVE end to end
+    // -- not just by the KAT (whose sinks are synthetic). The block is a GENUINE
+    // one: pulled from the coin daemon's getblocktemplate, coinbase built by the
+    // SSOT dash::coinbase::build, and X11-mined to satisfy the template bits (on
+    // regtest bits 0x207fffff the target is trivial so a winner is found at once).
+    //
+    // FAIL-CLOSED GATE: fires ONLY when (a) --regtest/--testnet is set (never a
+    // mainnet path) AND (b) a coin-daemon RPC arm is armed (the GBT + submitblock
+    // seam). Even if mis-invoked on the real testnet, the block is built at that
+    // net's real difficulty, so no winning nonce is found in the bounded range and
+    // nothing is dispatched -- only a trivial-difficulty regtest actually produces
+    // a block. Reward/consensus-NEUTRAL: broadcast/relay path only; a no-op unless
+    // the flag is explicitly passed. Fired on a readiness-gated timer so the ARM A
+    // coin-P2P peer handshake has completed before the relay leg is exercised.
+    io::steady_timer force_won_timer(ioc);
+    if (force_won_block) {
+        if (!testnet) {
+            std::cout << "[run] REFUSED --regtest-force-won-block: not a "
+                         "regtest/testnet run (mainnet path) -- fail-closed, seam "
+                         "NOT armed\n";
+        } else if (!rpc) {
+            std::cout << "[run] REFUSED --regtest-force-won-block: no coin-daemon "
+                         "RPC arm (need --coin-rpc/--coin-daemon for getblocktemplate "
+                         "+ submitblock) -- fail-closed, seam NOT armed\n";
+        } else {
+            auto forced_dispatch = stratum_submit_fn;   // copy BEFORE work_source moves it
+            auto fw_attempt = std::make_shared<int>(0);
+            constexpr int FW_MAX_ATTEMPTS = 40;         // 40 * 1.5s = 60s cap
+            auto fw_poll = std::make_shared<
+                std::function<void(const boost::system::error_code&)>>();
+            auto fire_forced =
+                [&ioc, &rpc, testnet, no_p2p_relay, forced_dispatch](const char* why) {
+                    std::cout << "[run] E5 forced-won-block seam firing (regtest, "
+                              << why << "); "
+                              << (no_p2p_relay ? "ARM B (submitblock) ISOLATED "
+                                                 "(--no-p2p-relay)"
+                                               : "BOTH arms (embedded P2P relay + "
+                                                 "submitblock)")
+                              << "\n";
+                    try {
+                        // 1) Pull the coin-daemon template (real prev/bits/height).
+                        dash::coin::DashWorkData work = rpc->getwork();
+                        std::cout << "[run] E5 template: height=" << work.m_height
+                                  << " bits=0x" << std::hex << work.m_bits << std::dec
+                                  << " coinbase_value=" << work.m_coinbase_value << "\n";
+                        // 2) Build a genesis-style coinbase (finder-only payout).
+                        const core::CoinParams params = dash::make_coin_params(testnet);
+                        uint160 payout_pkh;   // all-zero placeholder finder
+                        std::map<std::vector<unsigned char>, uint64_t> empty_weights;
+                        auto tx_outs = dash::coinbase::compute_dash_payouts(
+                            work.m_coinbase_value, work.m_packed_payments, payout_pkh,
+                            empty_weights, /*total_weight=*/0, params);
+                        auto layout = dash::coinbase::build(
+                            work, tx_outs, /*pool_tag=*/"c2pool", params,
+                            /*ref_hash=*/uint256::ZERO);
+                        // 3) X11-mine to satisfy the template bits.
+                        dash::coin::MineResult mr = dash::coin::mine_block(
+                            work, layout.bytes, /*max_nonce=*/2000000ull);
+                        if (!mr.found) {
+                            std::cout << "[run] E5 forced-won-block: NO winning nonce "
+                                         "in bound (real-difficulty net?) -- nothing "
+                                         "dispatched\n";
+                            return;
+                        }
+                        std::cout << "[run] E5 WON: nonce=" << mr.nonce << " powhash="
+                                  << mr.block_hash.GetHex() << " block="
+                                  << (mr.block_hex.size() / 2) << " bytes\n";
+                        // 4) Drive the REAL run-path dual-path dispatch.
+                        std::vector<unsigned char> block_bytes = ParseHex(mr.block_hex);
+                        if (forced_dispatch)
+                            forced_dispatch(block_bytes, work.m_height);
+                        else
+                            std::cout << "[run] E5 forced-won-block: dispatch sink "
+                                         "UNBOUND -- nothing fired\n";
+                    } catch (const std::exception& e) {
+                        std::cout << "[run] E5 forced-won-block: FAILED (" << e.what()
+                                  << ") -- named blocker, no block dispatched\n";
+                    }
+                };
+            *fw_poll = [&force_won_timer, &coin_p2p, fw_poll, fw_attempt,
+                        no_p2p_relay, fire_forced](const boost::system::error_code& ec) {
+                if (ec) return;
+                // Readiness: the ARM A coin-P2P peer handshake must be complete so
+                // submit_block_p2p_raw has a live peer. When ARM A is suppressed
+                // (--no-p2p-relay) OR no peer was dialed, do not wait on it.
+                const bool relay_ready =
+                    no_p2p_relay || !coin_p2p || coin_p2p->is_handshake_complete();
+                if (relay_ready) {
+                    fire_forced("readiness latched");
+                    return;
+                }
+                if (++(*fw_attempt) >= FW_MAX_ATTEMPTS) {
+                    fire_forced("readiness TIMEOUT (coin-P2P handshake never "
+                                "completed -- NAMED BLOCKER)");
+                    return;
+                }
+                force_won_timer.expires_after(std::chrono::milliseconds(1500));
+                force_won_timer.async_wait(*fw_poll);
+            };
+            force_won_timer.expires_after(std::chrono::milliseconds(1500));
+            force_won_timer.async_wait(*fw_poll);
+            std::cout << "[run] E5 --regtest-force-won-block ARMED "
+                         "(readiness-gated one-shot; regtest harness)\n";
+        }
+    }
 
     // DASHWorkSource holds a non-owning ref to node_coin_state (declared above,
     // same scope). The StratumServer co-owns the work source via shared_ptr.
@@ -2266,6 +2391,8 @@ int main(int argc, char** argv)
     std::vector<std::string> coin_p2p_raw;     // --coin-p2p-connect HOST:PORT (repeatable; E1 opt-in coin-network dial)
     bool no_p2p_relay = false;                 // --no-p2p-relay: suppress the embedded P2P-relay won-block arm (A/B isolation; RPC backup stays live)
     bool embedded_mainnet = false;             // --embedded-mainnet: gate-lift, allow the daemonless embedded template arm on MAINNET (byte-parity proven; default OFF = dashd fallback)
+    std::string coin_p2p_magic = "";           // --coin-p2p-magic HEX: override the embedded CoinClient wire magic (e.g. regtest 0da64dad); default mainnet/testnet
+    bool force_won_block = false;              // --regtest-force-won-block: fail-closed regtest E5 harness (drive one real won block through the run-path dual-path)
     std::string stratum_host = "0.0.0.0";      // --stratum [HOST:]PORT bind interface (default all)
     uint16_t    stratum_port = 0;              // 0 disables the Stratum accept-loop; --stratum sets it
     bool embedded_utxo = false;                // --embedded-utxo: arm the E2b UTXO/fee lane (opt-in)
@@ -2327,6 +2454,10 @@ int main(int argc, char** argv)
             no_p2p_relay = true;
         else if (std::strcmp(argv[i], "--embedded-mainnet") == 0)
             embedded_mainnet = true;
+        else if (std::strcmp(argv[i], "--coin-p2p-magic") == 0 && i + 1 < argc)
+            coin_p2p_magic = argv[++i];
+        else if (std::strcmp(argv[i], "--regtest-force-won-block") == 0)
+            force_won_block = true;
         else if (std::strcmp(argv[i], "--embedded-utxo") == 0)
             embedded_utxo = true;
         else if ((std::strcmp(argv[i], "--give-author") == 0 ||
@@ -2442,7 +2573,8 @@ int main(int argc, char** argv)
                         node_owner_address, redistribute_mode, no_p2p_relay,
                         embedded_mainnet,
                         coin_zmq_hashblock,
-                        external_ip);
+                        external_ip,
+                        coin_p2p_magic, force_won_block);
     }
     return run_selftest();
 }
