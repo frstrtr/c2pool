@@ -29,6 +29,10 @@ void HashrateTracker::record_mining_share_submission(double difficulty, bool acc
         // think the miner is 10-100x faster → difficulty spikes.
         auto tp = clock::now();
         recent_share_times_.push_back(tp);
+        // Feed the hashrate-based vardiff estimator with the issued difficulty
+        // of this accepted share (only when that path is active).
+        if (use_hashrate_vardiff_)
+            record_share_for_hashrate(difficulty, static_cast<double>(now));
     }
 
     adjust_difficulty();
@@ -141,9 +145,66 @@ void HashrateTracker::set_difficulty_hint(double hint) {
 // 2 back-to-back shares at the correct difficulty level.
 // No cooldown — p2pool doesn't use one; the window reset after each
 // adjustment means VARDIFF_TRIGGER shares must accumulate again.
+// --- Hashrate-based vardiff (stable-by-construction). Port of p2pool-dash
+// work.py:369-376: set pseudoshare difficulty directly from the smoothed
+// hashrate so the miner emits ~1 share per target_time. D = H_est*target/2^32
+// has no dependence on current_difficulty_, so there is no loop to oscillate. ---
+static inline double ewma_decay(double dt, double tau) {
+    return dt <= 0.0 ? 1.0 : std::exp(-dt / tau);
+}
+
+// Called (shares_mutex_ held) when an accepted share is recorded, with the
+// share's issued difficulty — consistent with the #762 grace, so counted work
+// matches hashes actually done.
+void HashrateTracker::record_share_for_hashrate(double issued_difficulty, double now) {
+    if (ewma_share_count_ == 0) {
+        ewma_first_share_time_ = now;
+        ewma_last_decay_time_  = now;
+    }
+    ewma_work_ = ewma_work_ * ewma_decay(now - ewma_last_decay_time_, vardiff_ewma_tau_)
+               + issued_difficulty;
+    ewma_last_decay_time_ = now;
+    ++ewma_share_count_;
+}
+
+double HashrateTracker::get_recent_hashrate(double now) const {
+    if (ewma_share_count_ == 0) return 0.0;
+    double work = ewma_work_ * ewma_decay(now - ewma_last_decay_time_, vardiff_ewma_tau_);
+    // Bias-corrected normalizer (unbiased during warm-up); floor the age so a
+    // fresh connection cannot divide by ~0.
+    double age  = std::max(now - ewma_first_share_time_, 2.0 * target_time_per_mining_share_);
+    double norm = vardiff_ewma_tau_ * (1.0 - std::exp(-age / vardiff_ewma_tau_));
+    if (norm <= 0.0) return 0.0;
+    return work * 4294967296.0 / norm;   // H/s (2^32 attempts per difficulty-1 share)
+}
+
+void HashrateTracker::set_difficulty_from_hashrate(double now) {
+    if (ewma_share_count_ < static_cast<uint64_t>(vardiff_warmup_shares_)) return; // keep seed diff
+    double h = get_recent_hashrate(now);
+    if (h <= 0.0) return;
+    double d = h * target_time_per_mining_share_ / 4294967296.0;
+    d = std::max(min_difficulty_, std::min(max_difficulty_, d));
+    if (current_difficulty_ > 0.0) {
+        double ratio = d / current_difficulty_;
+        // Dead-band: absorb estimator noise, no needless set_difficulty churn.
+        if (ratio < 1.0 + vardiff_deadband_ && ratio > 1.0 / (1.0 + vardiff_deadband_))
+            return;
+    }
+    LOG_INFO << "[Stratum] VARDIFF(hashrate): " << current_difficulty_ << " -> " << d
+             << " (H_est=" << h << " H/s, target=" << target_time_per_mining_share_ << "s)";
+    current_difficulty_ = d;  // downstream notify + stratum 1% resend guard unchanged
+}
+
 void HashrateTracker::adjust_difficulty() {
     if (!vardiff_enabled_)
         return;
+
+    // Stable-by-construction path (DASH): derive difficulty from smoothed
+    // hashrate, no ratio feedback → no oscillation. Legacy path below unchanged.
+    if (use_hashrate_vardiff_) {
+        set_difficulty_from_hashrate(static_cast<double>(std::time(nullptr)));
+        return;
+    }
 
     size_t num_shares = recent_share_times_.size();
     if (num_shares == 0)

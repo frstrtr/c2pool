@@ -39,6 +39,7 @@ struct StratumConfig {
     double max_difficulty       = 65536.0;  // ceiling for per-connection vardiff
     double target_time          = 3.0;      // seconds between pseudoshares (p2pool default: 3)
     bool   vardiff_enabled      = true;     // auto-adjust per-connection difficulty
+    bool   use_hashrate_vardiff = false;    // stable-by-construction hashrate-based vardiff (DASH); off = legacy ratio feedback
     size_t max_coinbase_outputs = 4000;     // Python p2pool's [-4000:] cap; no consensus limit
     // Per-network mining.set_difficulty multiplier (p2pool net.DUMB_SCRYPT_DIFF):
     // 2^16 (65536) for scrypt nets (LTC/DOGE), 1 for SHA256d nets (bitcoin).
