@@ -200,6 +200,16 @@ public:
                                double hashrate, double dead_hashrate, double difficulty,
                                uint64_t accepted, uint64_t rejected, uint64_t stale) override;
 
+    /// Thread-safe snapshot of the per-connection worker registry
+    /// (session_id -> WorkerInfo). The DASH stratum acceptor is a standalone
+    /// core::StratumServer bound to THIS work source (main_dash.cpp), so its
+    /// StratumSessions register/update HERE -- not into the dashboard
+    /// WebServer's own MiningInterface registry (that acceptor is disabled).
+    /// main_dash.cpp feeds this snapshot to
+    /// MiningInterface::set_stratum_workers_fn so /local_stats reports the
+    /// real per-worker hashrates + share/difficulty state (display only).
+    std::map<std::string, core::stratum::WorkerInfo> get_stratum_workers() const;
+
     // ── IWorkSource: work generation ─────────────────────────────────────
     nlohmann::json                      get_current_work_template() const override;
     std::vector<std::string>            get_stratum_merkle_branches() const override;
@@ -276,6 +286,15 @@ public:
     /// further job may be served from it. The generation bump makes every
     /// stratum session re-pull a FRESH template on its next heartbeat.
     void invalidate_template_cache(const char* reason = "reconnect");
+
+    /// Non-fetching read of the last DashWorkData sourced through the
+    /// embedded/dashd selector. Returns the cached snapshot (or nullptr when
+    /// none has been sourced yet) WITHOUT triggering a refresh -- safe to call
+    /// from the dashboard HTTP thread. main_dash.cpp feeds it to
+    /// MiningInterface::set_coin_work_fn so /local_stats can report the real
+    /// block_value / masternode payment split / network difficulty from the
+    /// live template (display only; never drives coinbase or consensus).
+    std::shared_ptr<const coin::DashWorkData> peek_template() const;
 
 private:
     /// Template cache resolve: return the cached DashWorkData snapshot when it

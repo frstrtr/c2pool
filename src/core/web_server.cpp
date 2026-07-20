@@ -3314,7 +3314,7 @@ nlohmann::json MiningInterface::rest_uptime()
 nlohmann::json MiningInterface::rest_connected_miners()
 {
     // p2pool returns a simple array of unique miner addresses
-    auto workers = get_stratum_workers();
+    auto workers = effective_stratum_workers();
     std::set<std::string> unique_addrs;
     for (const auto& [sid, w] : workers) {
         // Strip worker suffix: "addr.worker" → "addr"
@@ -3334,7 +3334,7 @@ nlohmann::json MiningInterface::rest_stratum_stats()
     // p2pool format: { pool: {...}, workers: {...} }
     // stratum.html reads data.pool.* and data.workers.*
     nlohmann::json result = nlohmann::json::object();
-    auto workers = get_stratum_workers();
+    auto workers = effective_stratum_workers();
     auto now = std::time(nullptr);
     auto now_steady = std::chrono::steady_clock::now();
 
@@ -4408,7 +4408,7 @@ nlohmann::json MiningInterface::rest_local_stats()
     nlohmann::json miner_rates = nlohmann::json::object();
     nlohmann::json miner_dead  = nlohmann::json::object();
     {
-        auto workers = get_stratum_workers();
+        auto workers = effective_stratum_workers();
         for (const auto& [sid, w] : workers) {
             // Key by the FULL stratum username (ADDRESS.worker) so each D9/worker
             // gets its own bucket; fall back to the bare address when no worker
@@ -4454,6 +4454,16 @@ nlohmann::json MiningInterface::rest_local_stats()
 
     result["uptime"] = rest_uptime();
 
+    // Live coin-template summary for coin targets (c2pool-dash) that drive
+    // their own work pipeline and leave WebServer's m_cached_template empty.
+    // Display only; NEVER drives coinbase or consensus. Also refreshes the
+    // network-difficulty cache so /global_stats + attempts_to_block read the
+    // real value on the DASH path (where refresh_work() never runs).
+    CoinWorkInfo coin_work;
+    if (m_coin_work_fn) coin_work = m_coin_work_fn();
+    if (coin_work.valid && coin_work.network_difficulty > 0.0)
+        m_network_difficulty.store(coin_work.network_difficulty, std::memory_order_relaxed);
+
     // block_value in coins (not satoshis)
     double block_value = 0.0;
     double payment_amount = 0.0;
@@ -4465,6 +4475,11 @@ nlohmann::json MiningInterface::rest_local_stats()
             // These are deducted from miner payout before PPLNS distribution
             payment_amount = m_cached_template.value("payment_amount", uint64_t(0)) / 1e8;
         }
+    }
+    // Fall back to the coin target's live template when WebServer has none.
+    if (block_value == 0.0 && coin_work.valid) {
+        block_value    = static_cast<double>(coin_work.coinbase_value_sat) / 1e8;
+        payment_amount = static_cast<double>(coin_work.payment_amount_sat) / 1e8;
     }
     result["block_value"] = block_value;
     // Miner portion: subsidy minus protocol payments (masternode/superblock) minus node fee
@@ -4558,7 +4573,7 @@ nlohmann::json MiningInterface::rest_local_stats()
         }
 
         // 5. No miners connected
-        if (get_stratum_workers().empty() && !m_solo_mode)
+        if (effective_stratum_workers().empty() && !m_solo_mode)
             warnings.push_back("No miners connected — pool is idle");
 
         // 6. Version signaling: majority voting for unsupported version
@@ -4605,7 +4620,7 @@ nlohmann::json MiningInterface::rest_local_stats()
     // p2pool-compat: my_hash_rates_in_last_hour — aggregate from all local workers
     double total_hr = 0, total_dead = 0;
     {
-        auto workers = get_stratum_workers();
+        auto workers = effective_stratum_workers();
         for (const auto& [sid, w] : workers) {
             total_hr += w.hashrate;
             total_dead += w.dead_hashrate;
@@ -4644,7 +4659,7 @@ nlohmann::json MiningInterface::rest_local_stats()
     // p2pool-compat: miner_last_difficulties — from stratum workers
     nlohmann::json miner_diffs = nlohmann::json::object();
     {
-        auto workers = get_stratum_workers();
+        auto workers = effective_stratum_workers();
         for (const auto& [sid, w] : workers) {
             std::string key = w.username;
             miner_diffs[key] = w.difficulty;
@@ -4811,9 +4826,12 @@ nlohmann::json MiningInterface::rest_web_currency_info()
     if (m_explorer_enabled && !m_explorer_url.empty())
         result["explorer_url"] = m_explorer_url;
 
-    // Mode indicators for conditional UI
+    // Mode indicators for conditional UI. Coin targets whose daemon RPC is an
+    // external NodeRPC arm (c2pool-dash dashd) rather than an ICoinNode set the
+    // m_coin_rpc_available flag so has_rpc is truthful.
     result["embedded"] = (m_coin_node && m_coin_node->is_embedded());
-    result["has_rpc"]  = (m_coin_node && m_coin_node->has_rpc());
+    result["has_rpc"]  = (m_coin_node && m_coin_node->has_rpc())
+                         || m_coin_rpc_available.load(std::memory_order_relaxed);
 
     // p2pool share version for the current coin — consumed by the
     // bundled @c2pool/sharechain-explorer to classify share cells.
@@ -5291,6 +5309,12 @@ nlohmann::json MiningInterface::rest_node_topology()
         if (!m_cached_template.is_null() && m_cached_template.contains("height"))
             primary_height = m_cached_template["height"].get<uint64_t>();
     }
+    // Coin targets (c2pool-dash) leave m_cached_template empty; use the live
+    // template summary's height instead.
+    if (primary_height == 0 && m_coin_work_fn) {
+        auto cw = m_coin_work_fn();
+        if (cw.valid) primary_height = cw.height;
+    }
 
     nlohmann::json coins = nlohmann::json::array();
     auto has_coin = [&](const std::string& sym) {
@@ -5305,9 +5329,11 @@ nlohmann::json MiningInterface::rest_node_topology()
         entry["primary"] = is_primary;
         entry["peers"]   = peers;
         if (is_primary) {
-            // Real embedded/RPC flags for this node's own daemon.
+            // Real embedded/RPC flags for this node's own daemon. Coin targets
+            // with an external NodeRPC arm (c2pool-dash) set m_coin_rpc_available.
             entry["embedded"] = (m_coin_node && m_coin_node->is_embedded());
-            entry["has_rpc"]  = (m_coin_node && m_coin_node->has_rpc());
+            entry["has_rpc"]  = (m_coin_node && m_coin_node->has_rpc())
+                                || m_coin_rpc_available.load(std::memory_order_relaxed);
             // Truthful tip from the embedded daemon's cached template (front-end
             // renders it only when > 0, so omit a meaningless 0).
             if (primary_height > 0)
@@ -5460,7 +5486,7 @@ nlohmann::json MiningInterface::rest_miner_stats(const std::string& address)
     uint64_t accepted = 0, rejected = 0, stale = 0;
     bool found = false;
     {
-        auto workers = get_stratum_workers();
+        auto workers = effective_stratum_workers();
         for (const auto& [sid, w] : workers) {
             // Match base address (strip worker suffix)
             std::string base = w.username;
@@ -7012,6 +7038,20 @@ std::map<std::string, MiningInterface::WorkerInfo> MiningInterface::get_stratum_
     return m_stratum_workers;
 }
 
+std::map<std::string, MiningInterface::WorkerInfo> MiningInterface::effective_stratum_workers() const
+{
+    {
+        std::lock_guard<std::mutex> lock(m_stratum_workers_mutex);
+        if (!m_stratum_workers.empty())
+            return m_stratum_workers;   // LTC path: dashboard-owned acceptor
+    }
+    // Coin targets (c2pool-dash) run their stratum acceptor against a separate
+    // IWorkSource; its per-connection registry is the ground truth.
+    if (m_stratum_workers_fn)
+        return m_stratum_workers_fn();
+    return {};
+}
+
 // ──────────── /web/ sub-endpoints (share chain inspection) ───────────────
 
 nlohmann::json MiningInterface::rest_web_heads()
@@ -7300,7 +7340,7 @@ void MiningInterface::update_stat_log()
     entry.local_hash_rates = nlohmann::json::object();
     entry.local_dead_hash_rates = nlohmann::json::object();
     {
-        auto workers = get_stratum_workers();
+        auto workers = effective_stratum_workers();
         entry.connected_count = static_cast<int>(workers.size());  // raw TCP connections
         std::set<std::string> worker_combos;
         for (const auto& [sid, w] : workers) {

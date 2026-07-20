@@ -76,6 +76,7 @@
 #include <impl/dash/coinbase_builder.hpp>      // dash::coinbase::build / compute_dash_payouts (slice 5)
 #include <impl/dash/params.hpp>                // dash::make_coin_params (already via top include)
 #include <core/uint256.hpp>                    // uint160 payout pubkey hash
+#include <core/target_utils.hpp>              // chain::target_to_difficulty (dashboard net-diff)
 
 #include <core/stratum_server.hpp>             // core::StratumServer — miner-facing accept-loop (run-path caller)
 #include <impl/dash/stratum/work_source.hpp>   // dash::stratum::DASHWorkSource — concrete core::stratum::IWorkSource
@@ -558,6 +559,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // hold the dashboard on the loading page forever. This seam exists in
         // core for exactly this caller (web_server.hpp:557).
         mi->set_dashboard_always_ready(true);
+        // Truthful /api/node_topology has_rpc: c2pool-dash reaches its daemon
+        // through the external dashd NodeRPC arm (armed above when creds
+        // resolved), not an ICoinNode, so tell the dashboard RPC is present.
+        mi->set_coin_rpc_available(static_cast<bool>(rpc));
 
         web_server->set_dashboard_dir(dashboard_dir);
         // Explicitly DISABLE the WebServer's own stratum acceptor. Its ctor
@@ -1119,7 +1124,42 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         return {s.hashrate, s.effective_dt, s.total_datums,
                                 s.dead_datums};
                     });
-                std::cout << "[run] dashboard local-hashrate bound to the DASH "
+                // ── REAL per-worker registry into the dashboard ────────────
+                // The DASH stratum acceptor's StratumSessions register/update
+                // their per-connection hashrate + share/difficulty state into
+                // DASHWorkSource (NOT the dashboard's own MiningInterface,
+                // whose acceptor is disabled). Feed that live registry so
+                // /local_stats + /stratum_stats report the true per-miner
+                // hashrates, non-empty miner maps, and a correct connected-
+                // miner count (no false "pool is idle"). Display only.
+                mi->set_stratum_workers_fn(
+                    [wsrc = work_source.get()]()
+                        -> std::map<std::string, core::MiningInterface::WorkerInfo> {
+                        return wsrc->get_stratum_workers();
+                    });
+                // ── REAL block value + network difficulty into the dashboard ─
+                // c2pool-dash drives its own work pipeline, so WebServer's
+                // m_cached_template stays empty. Expose the last-sourced dashd
+                // GBT template so block_value / masternode payment split /
+                // attempts_to_block read the live values. Non-fetching peek;
+                // display only, never drives coinbase or consensus.
+                mi->set_coin_work_fn(
+                    [wsrc = work_source.get()]()
+                        -> core::MiningInterface::CoinWorkInfo {
+                        core::MiningInterface::CoinWorkInfo info;
+                        auto t = wsrc->peek_template();
+                        if (!t) return info;
+                        info.valid              = true;
+                        info.coinbase_value_sat = t->m_coinbase_value;
+                        info.payment_amount_sat = t->m_payment_amount;
+                        info.height             = t->m_height;
+                        if (t->m_bits != 0)
+                            info.network_difficulty = chain::target_to_difficulty(
+                                dash::coin::target_from_nbits(t->m_bits));
+                        return info;
+                    });
+                std::cout << "[run] dashboard local-hashrate + per-worker "
+                             "registry + block-value/net-diff bound to the DASH "
                              "stratum acceptor\n";
             }
         } else {

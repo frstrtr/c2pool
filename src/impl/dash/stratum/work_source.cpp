@@ -249,6 +249,19 @@ void DASHWorkSource::update_stratum_worker(const std::string& session_id,
     it->second.stale         = stale;
 }
 
+std::map<std::string, core::stratum::WorkerInfo>
+DASHWorkSource::get_stratum_workers() const
+{
+    std::lock_guard<std::mutex> lk(workers_mutex_);
+    return workers_;   // copy under lock -- dashboard stats seam
+}
+
+std::shared_ptr<const coin::DashWorkData> DASHWorkSource::peek_template() const
+{
+    std::lock_guard<std::mutex> lk(template_mutex_);
+    return template_cache_;   // last-sourced snapshot; no refresh triggered
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // IWorkSource: work generation -- Stage 4c (the template trio).
 // ─────────────────────────────────────────────────────────────────────────────

@@ -577,6 +577,40 @@ public:
     void set_stratum_rate_stats_fn(std::function<RateStats()> fn) { m_stratum_rate_stats_fn = thread_safe_wrap(std::move(fn)); }
     RateStats get_stratum_rate_stats() const { return m_stratum_rate_stats_fn ? m_stratum_rate_stats_fn() : RateStats{}; }
 
+    // Per-worker stratum registry provider (display only). On the LTC path the
+    // dashboard's OWN core::StratumServer registers workers straight into
+    // m_stratum_workers (register_stratum_worker). Coin targets that run their
+    // own stratum acceptor bound to a separate IWorkSource (c2pool-dash ->
+    // DASHWorkSource) leave m_stratum_workers empty; they wire THIS provider so
+    // /local_stats + /stratum_stats read the live per-connection registry from
+    // that acceptor. effective_stratum_workers() prefers the local registry and
+    // falls back to this provider, so LTC behavior is byte-unchanged.
+    void set_stratum_workers_fn(std::function<std::map<std::string, core::stratum::WorkerInfo>()> fn) {
+        m_stratum_workers_fn = thread_safe_wrap(std::move(fn));
+    }
+
+    // Live coin-template summary provider (display only; NEVER drives coinbase
+    // or consensus). Coin targets that drive their own work pipeline
+    // (c2pool-dash -> DASHWorkSource) leave WebServer's internal
+    // refresh_work()/m_cached_template unpopulated, so block_value / masternode
+    // payment split / network difficulty read 0 on /local_stats. They wire this
+    // to expose the last-sourced template's coinbase value, payment split,
+    // height and network difficulty. Unset on the LTC path (m_cached_template
+    // is populated there), so LTC behavior is byte-unchanged.
+    struct CoinWorkInfo {
+        bool     valid = false;
+        double   network_difficulty = 0.0;   // from template nbits
+        uint64_t coinbase_value_sat = 0;      // "coinbasevalue"
+        uint64_t payment_amount_sat = 0;      // masternode+treasury share
+        uint64_t height = 0;                  // template height
+    };
+    void set_coin_work_fn(std::function<CoinWorkInfo()> fn) { m_coin_work_fn = thread_safe_wrap(std::move(fn)); }
+
+    // Truthful RPC availability for coin targets whose daemon RPC is not
+    // exposed through m_coin_node (c2pool-dash uses an external dashd NodeRPC
+    // arm, not an ICoinNode). OR'd into the /api/node_topology has_rpc flag.
+    void set_coin_rpc_available(bool v) { m_coin_rpc_available.store(v, std::memory_order_relaxed); }
+
     // Current PPLNS outputs for payout display
     // Coin targets (c2pool-dash) that compute PPLNS outside the
     // refresh_work() path can push the current distribution here so
@@ -1473,8 +1507,16 @@ public:
     std::map<std::string, WorkerInfo> get_stratum_workers() const;
 
 private:
+    // Effective per-worker registry for the stats/display path: the locally
+    // registered workers (LTC dashboard-owned acceptor) when present, else the
+    // external provider (coin-target acceptor bound to its own IWorkSource).
+    std::map<std::string, WorkerInfo> effective_stratum_workers() const;
+
     std::map<std::string, WorkerInfo> m_stratum_workers;
     mutable std::mutex m_stratum_workers_mutex;
+    std::function<std::map<std::string, WorkerInfo>()> m_stratum_workers_fn;  // external provider (coin targets)
+    std::function<CoinWorkInfo()> m_coin_work_fn;                             // live template summary (coin targets)
+    std::atomic<bool> m_coin_rpc_available{false};                           // external daemon RPC present
     std::chrono::steady_clock::time_point m_stratum_start_time{std::chrono::steady_clock::now()};
 };
 
