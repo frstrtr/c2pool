@@ -225,7 +225,7 @@ void print_banner(const char* argv0)
         << "        getbestblockhash poll is the active path (requires dashd\n"
         << "        zmqpubhashblock=tcp://HOST:PORT). No consensus effect.\n"
         << "        --coin-p2p-magic HEX overrides the embedded coin-P2P wire magic\n"
-        << "        (default mainnet bf0c6bbd / testnet cee2caff; regtest 0da64dad).\n"
+        << "        (default mainnet bf0c6bbd / testnet cee2caff; regtest fcc1b7dc).\n"
         << "        --regtest-force-won-block (regtest E5 harness, fail-closed) drives\n"
         << "        ONE real won block through the run-path dual-path dispatch.\n"
         << "        --web-port PORT (alias --http-port, default 8080) serves the FULL\n"
@@ -769,7 +769,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         config.coin()->m_testnet = testnet;
         // Coin-network wire magic (dashd pchMessageStart). Default: mainnet
         // bf0c6bbd / testnet cee2caff. A dev regtest dashd uses a DISTINCT magic
-        // (empirically 0da64dad on Dash Core v22 regtest), so --coin-p2p-magic
+        // (empirically fcc1b7dc on Dash Core v22 regtest), so --coin-p2p-magic
         // HEX overrides it to let ARM A dial a regtest coin daemon for the E5
         // live-accept harness. Transport-only; consensus/reward-neutral; the
         // mainnet/testnet defaults are byte-for-byte unchanged when unset.
@@ -2391,7 +2391,7 @@ int main(int argc, char** argv)
     std::vector<std::string> coin_p2p_raw;     // --coin-p2p-connect HOST:PORT (repeatable; E1 opt-in coin-network dial)
     bool no_p2p_relay = false;                 // --no-p2p-relay: suppress the embedded P2P-relay won-block arm (A/B isolation; RPC backup stays live)
     bool embedded_mainnet = false;             // --embedded-mainnet: gate-lift, allow the daemonless embedded template arm on MAINNET (byte-parity proven; default OFF = dashd fallback)
-    std::string coin_p2p_magic = "";           // --coin-p2p-magic HEX: override the embedded CoinClient wire magic (e.g. regtest 0da64dad); default mainnet/testnet
+    std::string coin_p2p_magic = "";           // --coin-p2p-magic HEX: override the embedded CoinClient wire magic (e.g. regtest fcc1b7dc); default mainnet/testnet
     bool force_won_block = false;              // --regtest-force-won-block: fail-closed regtest E5 harness (drive one real won block through the run-path dual-path)
     std::string stratum_host = "0.0.0.0";      // --stratum [HOST:]PORT bind interface (default all)
     uint16_t    stratum_port = 0;              // 0 disables the Stratum accept-loop; --stratum sets it
