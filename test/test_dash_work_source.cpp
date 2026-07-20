@@ -184,6 +184,52 @@ TEST(HashrateVardiffQuantize, AdvertisesPowerOfTwoRoundedDown)
     EXPECT_GT(2.0 * q, D) << "advertised " << q << " rounded down too far vs D " << D;
 }
 
+// Floor-pinned KAT (F-1 regression): when a rig slows so far that the estimator's
+// ideal D falls BELOW min_difficulty_, the [min,max] clamp pins the raw diff at the
+// floor. DASH's min_difficulty_ (0.0005) is NOT itself on the power-of-two grid, so
+// the pre-fix re-floor (max(min_difficulty_, d)) advertised the raw 0.0005 and
+// re-opened the firmware reject gap at the floor. Post-fix the advertised value must
+// STILL be an exact power of two: the largest grid step <= the floor (0.00048828125),
+// i.e. at most one step below the configured floor, preserving the round-DOWN cadence.
+// This assertion would FAIL pre-fix. A prior higher diff is seeded via the hint so the
+// small (~2.3%) floor correction is not swallowed by the vardiff dead-band — this is
+// the realistic path (a rig that had been faster and then slowed below the floor).
+TEST(HashrateVardiffQuantize, FloorPinnedAdvertiseIsPowerOfTwo)
+{
+    constexpr double kTarget = 10.0;
+    constexpr double kTau    = 90.0;
+    constexpr int    kShares = 15;      // > warmup (4)
+    constexpr double kFloor  = 0.0005;  // DASH min_difficulty_ (not a power of two)
+    constexpr double kDiff   = 1e-5;    // tiny issued diff => ideal D below the floor
+
+    c2pool::hashrate::HashrateTracker t;
+    t.set_difficulty_bounds(kFloor, 1e9);
+    t.set_target_time_per_mining_share(kTarget);
+    t.set_hashrate_vardiff(true);
+    t.enable_vardiff(true);
+    // Rig was previously running well above the floor; the slow-down below the floor
+    // is what the fix must quantize (also keeps the correction outside the dead-band).
+    t.set_difficulty_hint(0.01);
+
+    for (int i = 0; i < kShares; ++i)
+        t.record_mining_share_submission(kDiff, /*accepted=*/true);
+
+    const double q = t.get_current_difficulty();
+    const double D = ideal_D(kShares, kDiff, kTarget, kTau);
+
+    // Precondition: this really is the floor-pinned regime (ideal D below the floor).
+    ASSERT_LT(D, kFloor) << "test mis-scaled: ideal D " << D << " not below floor";
+
+    // (1) Advertised value is an exact power of two even when floor-pinned
+    //     (pre-fix advertised the raw 0.0005 here and FAILED this assertion).
+    EXPECT_TRUE(is_power_of_two(q)) << "floor-pinned advertise not power-of-two: " << q;
+    // (2) It is the largest power of two <= the configured floor: one grid step below
+    //     0.0005 (0.00048828125), never rounding down more than a single step.
+    EXPECT_EQ(q, std::exp2(std::floor(std::log2(kFloor))));
+    EXPECT_LE(q, kFloor);
+    EXPECT_GT(2.0 * q, kFloor) << "floor-pinned advertise " << q << " rounded down too far";
+}
+
 TEST(HashrateVardiffQuantize, QuantizationFormulaIsFloorLog2)
 {
     // Pure-math intent check: for any ideal D, the advertised value is the
