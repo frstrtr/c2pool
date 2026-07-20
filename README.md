@@ -39,6 +39,8 @@ Development is supported by Anthropic's [Claude for Open Source](https://claude.
 > **Recent Bitcoin Block Mined by P2pool** (2026-06-27 05:34:44 UTC) BTC [#955609](https://blockchair.com/bitcoin/block/955609)
 > 
 > **Recent Bitcoin Block Mined by P2pool** (2025-03-07 06:08:22 UTC) BTC [#886688](https://blockchair.com/bitcoin/block/886688)
+>
+> **First DASH Block Mined by c2pool** (2026-07-20 01:15:15 UTC) DASH [#2507753](https://blockchair.com/dash/block/2507753) — solo X11 block, DIP4 coinbase reward-safe with the correct masternode payee, accepted by dashd
 
 ---
 
