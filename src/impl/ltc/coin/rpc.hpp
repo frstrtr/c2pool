@@ -58,6 +58,29 @@ private:
     std::string Send(const std::string &request) override;
     nlohmann::json CallAPIMethod(const std::string& method, const jsonrpccxx::positional_parameter& params = {});
 
+    // Socket deadline (parity with dash #781, impl/dash/coin/rpc.{hpp,cpp}): a
+    // REAL bound on the synchronous Send() I/O so a wedged-but-connected
+    // litecoind/dogecoind (socket open, no bytes) cannot hang the caller forever
+    // -- today that permanently wedges the RPC path (refresh-wedge) AND blocks
+    // join() at shutdown (SIGINT-hang). beast's SYNCHRONOUS read_some/write_some
+    // call socket.read_some() directly and do NOT honour tcp_stream::
+    // expires_after (that timer only fires for ASYNC ops), so the robust bound is
+    // a kernel SO_RCV/SNDTIMEO on the socket forced back to BLOCKING mode
+    // (async_connect leaves asio's non_blocking flag set, under which SO_*TIMEO
+    // is a no-op). apply_socket_timeouts() does both; called after every
+    // successful (re)connect. Linux release target; no-op on Windows (pre-parity
+    // behaviour: no deadline).
+    static constexpr int RPC_IO_TIMEOUT_SECONDS = 12;
+    void apply_socket_timeouts();
+    // Tear down m_stream (sync_reconnect idiom). Called on a FINAL-attempt Send()
+    // failure so a half-written / unread request can never be answered into a
+    // later Send() on a reused connection -- the deadline-desync guard. The
+    // constant "curltest" id (ID above) + jsonrpccxx not validating response ids
+    // make any reused-connection off-by-one a permanent set-gap outage (a GBT
+    // would parse a getbestblockhash string -> zeroed work). Caller holds
+    // m_rpc_mutex.
+    void close_stream();
+
 public:
     NodeRPC(io::io_context* context, ltc::interfaces::Node* coin, bool testnet);
     ~NodeRPC();
