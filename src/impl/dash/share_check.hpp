@@ -197,6 +197,13 @@ inline void check_share_target_valid(const uint256& target, const core::CoinPara
 // recomputing X11. thread_local: each verify thread keeps its own last-result.
 inline thread_local bool g_last_init_is_block = false;
 inline thread_local uint256 g_last_pow_hash;  // X11 hash of the share header
+// gentx txid the share's hash_link commits to (the coinbase the miner actually
+// hashed). Cached by share_init_verify so the accept path can compare it against
+// the PPLNS-recomputed expected coinbase (verify_payout_commitment, Phase 3)
+// WITHOUT re-deriving the ref_hash / hash_link a second time. Same-thread,
+// same-call contract as g_last_pow_hash: read it immediately after the
+// share_init_verify that produced it, on the same thread.
+inline thread_local uint256 g_last_gentx_hash;
 
 // ── share_init_verify (Dash v16) ─────────────────────────────────────────────
 // Verifies PoW, hash_link, merkle_link. Returns share hash (SHA256d of header).
@@ -302,6 +309,7 @@ inline uint256 share_init_verify(const DashShare& share,
 
     // ── check_hash_link → gentx_hash ──
     uint256 gentx_hash = check_hash_link(share.m_hash_link, hash_link_data, gentx_before_refhash);
+    g_last_gentx_hash = gentx_hash;  // cache for the Phase-3 payout-commitment gate
 
     // ── Merkle root (no segwit for Dash) ──
     uint256 merkle_root = check_merkle_link(gentx_hash, share.m_merkle_link);
@@ -532,19 +540,43 @@ uint256 generate_share_transaction(const DashShare& share, TrackerT& tracker,
 
     if (!prev_hash.IsNull() && tracker.chain.contains(prev_hash))
     {
-        auto height = tracker.chain.get_height(prev_hash);
+        // Oracle (ref/p2pool-dash data.py:181): the PPLNS window starts at
+        // previous_share.previous_share_hash -- the GRANDPARENT of the share
+        // being built -- NOT at prev_hash itself. Walking from prev_hash shifts
+        // the whole window one share toward the tip: it wrongly INCLUDES the
+        // direct parent and DROPS the deepest share, so the recomputed coinbase
+        // pays a different set of scripts than the producer / oracle mint. This
+        // divergence stayed latent because generate_share_transaction had ZERO
+        // instantiations before the payout-commitment gate wired it into the
+        // accept path; the producer (share_producer.hpp build_share ->
+        // get_cumulative_weights) always walked from the grandparent, so the two
+        // MUST agree here or a node self-rejects its own freshly-minted shares
+        // (invariant c). get_acc_height + start-at-grandparent + the
+        // min(max_shares, height) clamp mirror build_share exactly.
+        uint256 grandparent;
+        tracker.chain.get_share(prev_hash).invoke([&](auto* obj) {
+            grandparent = obj->m_prev_hash;
+        });
+
+        auto height = tracker.chain.get_acc_height(prev_hash);
         auto chain_len = std::max(0, std::min(height, static_cast<int32_t>(params.real_chain_length)) - 1);
 
         auto block_target = chain::bits_to_target(share.m_min_header.m_bits);
         auto max_weight = chain::target_to_average_attempts(block_target)
                           * params.spread * 65535;
 
-        // Walk chain and accumulate per-script weights (linear, no decay)
-        // Python: get_cumulative_weights starts from previous_share.previous_share_hash
-        auto walk_count = static_cast<size_t>(chain_len);
-        auto walk_view = tracker.chain.get_chain(prev_hash, walk_count);
+        // Walk from the grandparent, accumulating per-script weights (linear, no
+        // decay). Clamp the count at the grandparent's own height so get_chain
+        // never walks past genesis (mirrors get_cumulative_weights'
+        // min(max_shares, height) clamp). Iterate by value: ChainView::operator*
+        // yields a prvalue pair<hash, chain_data&>, so `auto&` will not bind.
+        size_t walk_count = 0;
+        if (!grandparent.IsNull() && tracker.chain.contains(grandparent))
+            walk_count = static_cast<size_t>(std::min(
+                chain_len, tracker.chain.get_acc_height(grandparent)));
+        auto walk_view = tracker.chain.get_chain(grandparent, walk_count);
 
-        for (auto& [hash, data] : walk_view)
+        for (auto [hash, data] : walk_view)
         {
             uint288 share_att;
             uint32_t share_don = 0;
@@ -714,8 +746,18 @@ uint256 generate_share_transaction(const DashShare& share, TrackerT& tracker,
         ref_stream << share.m_payment_amount;
         ref_stream << share.m_packed_payments;
         ref_stream << share.m_new_transaction_hashes;
-        for (auto& v : share.m_transaction_hash_refs)
-            ::Serialize(ref_stream, VarInt(v));
+        // transaction_hash_refs: ListType(VarIntType(), 2) -- writes count/2 then
+        // all elements. MUST match share_init_verify byte-for-byte or the
+        // recomputed ref_hash (hence the OP_RETURN and the gentx txid) diverges
+        // from what the share committed to. The pair_count VarInt was previously
+        // omitted here -- invisible while generate_share_transaction had no
+        // instantiations, fatal once the payout-commitment gate compares txids.
+        {
+            uint64_t pair_count = share.m_transaction_hash_refs.size() / 2;
+            ::Serialize(ref_stream, VarInt(pair_count));
+            for (auto& v : share.m_transaction_hash_refs)
+                ::Serialize(ref_stream, VarInt(v));
+        }
         ref_stream << share.m_far_share_hash;
         ref_stream << share.m_max_bits;
         ref_stream << share.m_bits;
@@ -752,6 +794,54 @@ uint256 generate_share_transaction(const DashShare& share, TrackerT& tracker,
     auto tx_span = std::span<const unsigned char>(
         reinterpret_cast<const unsigned char*>(tx.data()), tx.size());
     return Hash(tx_span);
+}
+
+// === verify_payout_commitment (Dash accept-path step 3: trustless PPLNS payout) ===
+// THE KEYSTONE cross-node-safety gate. Before this, dash's share-accept path
+// (share_init_verify) verified only PoW / hash_link / merkle / target -- it NEVER
+// checked that a peer's coinbase actually pays the PPLNS window. A malicious peer
+// could submit a share with valid PoW whose coinbase pays ONLY itself; it would
+// be ACCEPTED, corrupting PPLNS and stealing rewards. This is the port of the
+// LTC/btc/dgb "GENTX-MISMATCH" guard (src/impl/ltc/share_check.hpp:1813-1834):
+// recompute the expected coinbase from the on-chain PPLNS weights + the share's
+// own fields (generate_share_transaction), then require its txid to equal the
+// gentx_hash the share's hash_link actually committed to (what the miner hashed).
+//
+// Oracle: ref/p2pool-dash/p2pool/data.py Share.check() -- gentx =
+// generate_transaction(...); assert coinbase commits to gentx. Uses the SHARE's
+// own version/fields, so the recompute is byte-identical to the p2pool-dash mint.
+//
+// INVARIANTS (proven by test_dash_payout_commitment KATs):
+//   (a) a share whose coinbase pays the WRONG set (e.g. only the submitter) has a
+//       committed gentx_hash != the PPLNS-recomputed expected txid  -> REJECTED.
+//   (b) a share whose coinbase pays the CORRECT PPLNS window matches -> ACCEPTED.
+//   (c) our own locally-minted shares are NOT self-rejected: the producer
+//       (share_producer.hpp build_share -> get_cumulative_weights, walking from
+//       the grandparent) and this recompute (generate_share_transaction, same
+//       grandparent walk) compute the SAME expected coinbase, so the equality
+//       holds for every share this node mints.
+//
+// gentx_hash is the value share_init_verify cached in g_last_gentx_hash (read it
+// on the SAME thread immediately after the share_init_verify that produced it),
+// or any equivalently-derived committed txid. Throws std::invalid_argument on a
+// mismatch (attempt_verify logs e.what() and drops the share); returns normally
+// when the coinbase commitment is correct. No-op until the parent is in-chain,
+// since the PPLNS walk needs the ancestor window (matches ltc share_check, which
+// only runs the gentx compare when tracker.chain.contains(prev_hash)).
+template <typename TrackerT>
+inline void verify_payout_commitment(const DashShare& share, TrackerT& tracker,
+                                     const core::CoinParams& params,
+                                     const uint256& gentx_hash)
+{
+    if (share.m_prev_hash.IsNull() || !tracker.chain.contains(share.m_prev_hash))
+        return;  // genesis / parent not yet in chain -- no PPLNS window to bind
+
+    uint256 expected_gentx = generate_share_transaction(share, tracker, params);
+    if (expected_gentx != gentx_hash)
+        throw std::invalid_argument(
+            "GENTX-MISMATCH: coinbase does not commit to the expected PPLNS payout"
+            " (expected " + expected_gentx.ToString().substr(0, 16) +
+            " committed " + gentx_hash.ToString().substr(0, 16) + ")");
 }
 
 // === verify_version_transition (Dash accept-path step 2: mint<->accept coupling) ===

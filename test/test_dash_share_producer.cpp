@@ -765,3 +765,101 @@ TEST(DashShareProducerBuild, MerkleLinkMatchesCoinbaseBuilder) {
         EXPECT_EQ(link.m_index, 0u);
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// KEYSTONE: trustless PPLNS payout-commitment gate (dash::verify_payout_commitment
+// / generate_share_transaction). Ports the ltc/btc/dgb GENTX-MISMATCH guard onto
+// the DASH accept path. Invariants:
+//   (a) a coinbase paying the WRONG set (e.g. only the submitter) is REJECTED;
+//   (b) a coinbase paying the CORRECT PPLNS window is ACCEPTED;
+//   (c) our own producer-minted share is NOT self-rejected (producer and the
+//       accept-path recompute walk the SAME grandparent window -> same coinbase).
+// ═════════════════════════════════════════════════════════════════════════════
+
+// generate_share_transaction takes a TRACKER exposing .chain (in prod the live
+// ShareTracker). This minimal view over the synthetic ShareChain is enough to
+// drive the recompute/compare exactly as attempt_verify does with *this.
+namespace { struct PayoutTrackerView { dash::ShareChain& chain; }; }
+
+// Build the canonical g(A) <- s1(B) <- s2(C, tip) window into `sc` and mint miner
+// C's next share on top (finder = C; PPLNS window = grandparent walk {s1(B),
+// g(A)}). Returns the built share (BuiltShare is movable; SyntheticChain, holding
+// a non-movable ShareChain, stays owned by the caller).
+static dash::producer::BuiltShare mint_scene(SyntheticChain& sc,
+                                             const core::CoinParams& params) {
+    const uint160 A = h160_uniform(0xaa), B = h160_uniform(0xbb), C = h160_uniform(0xcc);
+    uint256 g  = sc.add(0x01, uint256(), BITS_DIFF1, BITS_DIFF1, 1699999900, A, 0,
+                        1, u128_hex(ATA_DIFF1_HEX));
+    uint256 s1 = sc.add(0x02, g,  BITS_DIFF1, BITS_DIFF1, 1699999920, B, 0,
+                        2, u128_hex(ATA_DIFF1_HEX) * 2u);
+    uint256 s2 = sc.add(0x03, s1, BITS_DIFF1, BITS_DIFF1, 1699999940, C, 0,
+                        3, u128_hex(ATA_DIFF1_HEX) * 3u);
+    ProducerJobInputs in;
+    in.prev_share_hash = s2; in.coinbase_scriptSig = {0x03,0x01,0x02,0x03};
+    in.share_nonce = 7; in.pubkey_hash = C; in.subsidy = 500000000;
+    in.donation = 0; in.desired_version = 16; in.desired_timestamp = 1700000000;
+    in.desired_target = params.max_target;
+    auto info = dash::producer::generate_prospective_share_info(sc.chain, params, in);
+    return dash::producer::build_share(
+        sc.chain, params, info, fixture_min_header(), F1_NONCE64, /*check_pow=*/false);
+}
+
+// (b)+(c) The accept-path recompute reproduces the EXACT gentx the producer
+// committed to, so verify_payout_commitment admits our own freshly-minted share.
+TEST(DashPayoutCommitment, LocalMintCoinbaseAccepted) {
+    const auto params = dash::make_coin_params(false);
+    SyntheticChain sc;
+    auto built = mint_scene(sc, params);
+    PayoutTrackerView tv{sc.chain};
+
+    // Recompute matches the committed gentx byte-for-byte.
+    uint256 expected = dash::generate_share_transaction(built.share, tv, params);
+    EXPECT_EQ(hex_of(expected), hex_of(built.gentx_hash));
+
+    // The gate admits the producer's own coinbase commitment (no throw).
+    EXPECT_NO_THROW(dash::verify_payout_commitment(
+        built.share, tv, params, built.gentx_hash));
+}
+
+// (a) A coinbase that does NOT pay the PPLNS window (here: the empty-window /
+// "solo" coinbase a self-dealing peer would commit to) has a txid != the
+// window-derived expected, so the gate REJECTS it.
+TEST(DashPayoutCommitment, WrongCoinbaseRejected) {
+    const auto params = dash::make_coin_params(false);
+    SyntheticChain sc;
+    auto built = mint_scene(sc, params);
+    PayoutTrackerView tv{sc.chain};
+
+    // Expected coinbase pays the window {A,B} + finder C. Model the attacker's
+    // self-paying commitment as the coinbase for the SAME share fields but with
+    // NO PPLNS window (prev null) -- it pays only finder/donation, not A & B.
+    dash::DashShare solo = built.share;
+    solo.m_prev_hash = uint256();  // empty window -> nothing paid to A/B
+    uint256 solo_txid = dash::generate_share_transaction(solo, tv, params);
+    ASSERT_NE(hex_of(solo_txid), hex_of(built.gentx_hash))
+        << "solo coinbase must differ from the honest window coinbase";
+
+    // Honest share, but committing to the solo (wrong) coinbase -> REJECTED.
+    EXPECT_THROW(dash::verify_payout_commitment(
+        built.share, tv, params, solo_txid), std::invalid_argument);
+}
+
+// Sanity: the recompute is payout-sensitive -- changing the finder (pubkey_hash)
+// changes the expected txid, so a share whose committed coinbase does not match
+// its declared finder is rejected (defends against payout-field tampering).
+TEST(DashPayoutCommitment, FinderTamperRejected) {
+    const auto params = dash::make_coin_params(false);
+    SyntheticChain sc;
+    auto built = mint_scene(sc, params);
+    PayoutTrackerView tv{sc.chain};
+
+    dash::DashShare tampered = built.share;
+    tampered.m_pubkey_hash = h160_uniform(0xee);  // redirect finder fee to attacker
+    uint256 tampered_expected = dash::generate_share_transaction(tampered, tv, params);
+    ASSERT_NE(hex_of(tampered_expected), hex_of(built.gentx_hash));
+
+    // The committed coinbase (built.gentx_hash) still pays finder C, so the
+    // tampered share's recomputed coinbase no longer matches -> REJECTED.
+    EXPECT_THROW(dash::verify_payout_commitment(
+        tampered, tv, params, built.gentx_hash), std::invalid_argument);
+}

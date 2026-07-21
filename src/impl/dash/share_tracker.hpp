@@ -499,9 +499,33 @@ public:
             auto t0 = std::chrono::steady_clock::now();
             auto& share_var = chain.get_share(share_hash);
             share_var.ACTION({
+                // Phase 1: structural + X11 PoW, hash_link, merkle, target.
+                // Caches g_last_gentx_hash (the coinbase txid this share's
+                // hash_link committed to) for the Phase-3 payout gate below.
                 auto computed_hash = share_init_verify(
                     *obj, m_coin_params, /*check_pow=*/obj->m_hash.IsNull());
                 (void)computed_hash;
+
+                // Phase 2: chain-relative version-transition gate (mint<->accept
+                // version coupling: 95%-weighted v36 obsolescence + 60%-weighted
+                // successor). Was KAT-proven in isolation but had ZERO accept-path
+                // consumers until wired here (mirrors btc/dgb live coupling).
+                dash::verify_version_transition(
+                    *obj, chain, SharechainConfig::chain_length());
+
+                // Phase 3 (KEYSTONE, reward-critical cross-node safety): recompute
+                // the expected coinbase from the on-chain PPLNS window + this
+                // share's fields and REJECT if it does not match the coinbase the
+                // share actually committed to (g_last_gentx_hash). Without this a
+                // peer could submit a valid-PoW share whose coinbase pays only
+                // itself and have it ACCEPTED, corrupting PPLNS. Port of the
+                // ltc/btc/dgb GENTX-MISMATCH guard. g_last_gentx_hash is valid
+                // here: share_init_verify above ran synchronously on this thread.
+                // Invariant (c): our own minted shares pass -- the producer and
+                // generate_share_transaction walk the SAME grandparent PPLNS
+                // window and build the SAME coinbase.
+                dash::verify_payout_commitment(
+                    *obj, *this, m_coin_params, dash::g_last_gentx_hash);
             });
             {
                 auto dt = std::chrono::duration_cast<std::chrono::microseconds>(
