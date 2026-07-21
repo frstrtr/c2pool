@@ -220,6 +220,54 @@ TEST(DashEmbeddedGbt, WorkdataHeaderFieldsAndSubsidyArithmetic) {
     EXPECT_EQ(w.m_tx_hashes[0], dash::coin::dash_txid(tx));
 }
 
+// C-3 (consensus): the embedded block MUST exclude every DIP special-tx type
+// (1-4 ProTx, 6 quorum-commitment, 8/9 asset-lock/unlock). build_embedded_cbtx
+// commits merkle roots + creditPool computed from the SML/quorum/seed state
+// WITHOUT applying the block's own txs' state effects, so a selected special tx
+// (which changes the MN list / quorums / creditPool) would make the committed
+// CbTx inconsistent -> consensus-invalid (bad-cbtx / bad merkle). End-to-end via
+// build_embedded_workdata (the serving path). Each special tx is UTXO-priced
+// (fee-known) so it WOULD be selected but for the type filter.
+TEST(DashEmbeddedGbt, EmbeddedBlockExcludesAllDipSpecialTxs) {
+    UTXOViewCache utxo(nullptr);
+    Mempool mp;
+    mp.set_utxo(&utxo);
+
+    // A standard (type-0) fee-paying tx — MUST be selected.
+    uint256 p0 = mint_hash(0x50);
+    utxo.add_coin(Outpoint(p0, 0), Coin(100'000, {}, /*height=*/1, /*cb=*/false));
+    auto std_tx = make_spend(p0, 0, 90'000, /*salt=*/1);   // type 0, fee 10'000
+    ASSERT_TRUE(mp.add_tx(std_tx));
+
+    // DIP special txs (1,2,3,4,6,8,9), each UTXO-priced (fee-known) — MUST be
+    // excluded. (Type 5 is the coinbase itself, never a mempool tx.)
+    const uint16_t special_types[] = {1, 2, 3, 4, 6, 8, 9};
+    std::vector<uint256> special_ids;
+    uint32_t seed = 0x60;
+    for (uint16_t t : special_types) {
+        uint256 pv = mint_hash(seed++);
+        utxo.add_coin(Outpoint(pv, 0), Coin(100'000, {}, 1, false));
+        auto sp = make_spend(pv, 0, 90'000, /*salt=*/100u + t);
+        sp.type = t;                     // DIP special type
+        ASSERT_TRUE(mp.add_tx(sp));
+        special_ids.push_back(dash::coin::dash_txid(sp));
+    }
+
+    auto mnstates = single_mn(p2pkh_script(0x30));
+    auto w = build_embedded_workdata(
+        H - 1, raw256(0xAB), mnstates, mp,
+        0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER);
+
+    // Only the standard tx is in the embedded block; no special tx leaked in.
+    ASSERT_EQ(w.m_txs.size(), 1u)
+        << "embedded block must contain only the standard tx (all special txs excluded)";
+    EXPECT_EQ(w.m_txs[0].type, 0);
+    EXPECT_EQ(w.m_tx_hashes[0], dash::coin::dash_txid(std_tx));
+    for (const auto& id : special_ids)
+        for (const auto& h : w.m_tx_hashes)
+            EXPECT_NE(h, id) << "a DIP special tx must never reach the embedded block";
+}
+
 TEST(DashEmbeddedGbt, PlatformBurnIsFirstPaymentAndMnPayeeBase58) {
     UTXOViewCache utxo(nullptr);   // empty mempool path (no fees)
     Mempool mp;

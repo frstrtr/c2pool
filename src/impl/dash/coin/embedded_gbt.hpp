@@ -144,8 +144,13 @@ inline DashWorkData build_embedded_workdata(
     // Subsidy + tx selection.
     int64_t reward = compute_dash_block_reward_post_v20(w.m_height);
     constexpr uint32_t MAX_BLOCK_BYTES = 1'990'000;  // leave headroom for cb
+    // C-3: exclude Dash special txs (tx.type != 0) from the embedded template.
+    // dashd recomputes the CbTx roots + creditPool by applying the block's own
+    // special txs; including one without accounting for it yields bad-cbtx. The
+    // safe-minimal cut keeps the embedded block special-tx-free so the creditPool
+    // accrual below is exactly the platform-reward term.
     auto [selected, total_fees] =
-        mempool.get_sorted_txs_with_fees(MAX_BLOCK_BYTES);
+        mempool.get_sorted_txs_with_fees(MAX_BLOCK_BYTES, /*exclude_special=*/true);
     int64_t block_value      = reward + static_cast<int64_t>(total_fees);
     int64_t platform_reward  = compute_dash_platform_reward_post_v20_mn_rr(w.m_height);
     int64_t mn_payment       = compute_dash_mn_payment_post_v20(block_value) - platform_reward;
@@ -243,9 +248,25 @@ inline DashWorkData build_embedded_workdata(
     // last_observed_credit_pool. When the SML/quorum inputs are not
     // supplied (legacy callers) fall back to an empty payload.
     if (sml != nullptr && qmgr != nullptr) {
+        // H-4 creditPool accrual. dashd commits, for block N, the credit-pool
+        // balance AFTER block N's activity (evo/creditpool.cpp DiffFromBlock):
+        //   creditPoolBalance(N) = creditPoolBalance(N-1)
+        //                          + platformReward(N)              (locked this block)
+        //                          + Σ assetLocks(N) − Σ assetUnlocks(N)
+        // last_observed_credit_pool is creditPoolBalance(N-1) (the freshness gate
+        // guarantees the SML/CCbTx seed is current at the tip we build on). The
+        // embedded template excludes special txs (C-3 mempool filter), so the
+        // asset-lock/unlock terms are exactly zero and the accrual reduces to the
+        // platform-reward burn locked this block. Verified byte-exact against a
+        // real testnet dashd getblocktemplate: creditPoolBalance stepped by
+        // exactly the platform reward (66966830 duff) each block — see
+        // test_dash_embedded_cbtx_byte_parity.cpp. When platform_reward is 0
+        // (pre-MN_RR) the balance carries forward unchanged, also correct.
+        const int64_t accrued_credit_pool =
+            last_observed_credit_pool + platform_reward;
         vendor::CCbTx cb = build_embedded_cbtx(
             prev_height, *sml, *qmgr, best_cl_height, best_cl_sig,
-            last_observed_credit_pool);
+            accrued_credit_pool);
         w.m_coinbase_payload = encode_cbtx(cb);
     } else {
         w.m_coinbase_payload.clear();
@@ -378,11 +399,11 @@ inline vendor::CCbTx build_embedded_cbtx(
         c.bestCLSignature  = {};
     }
 
-    // Step 11: seed creditPoolBalance from the most recently
-    // observed CCbTx. Until the asset-lock state machine (DIP-0027)
-    // ships, this is the best we can do — and it's correct for any
-    // block where no asset-lock OR asset-unlock activity occurred
-    // since we last observed (the common case on mainnet).
+    // creditPoolBalance: the caller (build_embedded_workdata) supplies the
+    // ALREADY-ACCRUED balance for THIS block — i.e. creditPoolBalance(N-1) +
+    // platformReward(N) (+ asset lock/unlock, which are zero because the
+    // embedded template excludes special txs). We commit it verbatim. See the
+    // H-4 accrual note in build_embedded_workdata and the byte-parity KAT.
     c.creditPoolBalance  = last_observed_credit_pool;
     return c;
 }

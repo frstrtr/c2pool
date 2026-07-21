@@ -366,8 +366,17 @@ public:
         uint32_t           base_size{0};
     };
 
+    // exclude_special (C-3): when true, drop every Dash special tx (tx.type != 0
+    // — ProRegTx/ProUpServTx/asset-lock/asset-unlock) from the selection. dashd
+    // recomputes the coinbase CbTx roots (merkleRootMNList/Quorums) and the
+    // DIP-0027 creditPoolBalance by APPLYING the block's own special txs, so
+    // including one in the embedded template WITHOUT folding its effect into the
+    // CbTx yields bad-cbtx and a rejected block. build_embedded_workdata passes
+    // true (safe-minimal: the creditPool accrual then reduces to the platform-
+    // reward term only). Default false preserves the mempool's general pricing +
+    // selection capability (including the asset-unlock fee path) unchanged.
     std::pair<std::vector<SelectedTx>, uint64_t>
-    get_sorted_txs_with_fees(uint32_t max_bytes) const
+    get_sorted_txs_with_fees(uint32_t max_bytes, bool exclude_special = false) const
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         std::vector<SelectedTx> result;
@@ -381,6 +390,7 @@ public:
             if (pit == m_pool.end()) continue;
             const auto& entry = pit->second;
             if (!entry.fee_known) continue;
+            if (exclude_special && entry.tx.type != 0) continue;
             if (total_bytes + entry.base_size > max_bytes) continue;
 
             // Stale-input guard.

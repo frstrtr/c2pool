@@ -29,6 +29,8 @@
 #include <impl/dash/coin/utxo_adapter.hpp>
 #include <impl/dash/coin/rpc_data.hpp>
 #include <impl/dash/coin/transaction.hpp>
+#include <impl/dash/coin/vendor/smldiff.hpp>
+#include <impl/dash/coin/vendor/simplifiedmns.hpp>
 
 #include <core/uint256.hpp>
 
@@ -289,4 +291,226 @@ TEST(DashCoinStateMaintainer, BlockConnectCollateralSpendDropsToFallback) {
     WorkSelection sel = st.select_work([&]() { fb = true; return DashWorkData{}; });
     EXPECT_EQ(sel.source, WorkSource::DashdFallback);
     EXPECT_TRUE(fb) << "empty DMN set must route get_work to the dashd RPC fallback";
+}
+
+// ========================================================================
+// SML-axis reception behaviours (C-2 / H-6 / H-7).
+// ========================================================================
+using dash::coin::vendor::CSimplifiedMNListDiff;
+using dash::coin::vendor::CSimplifiedMNListEntry;
+
+static CSimplifiedMNListEntry sml_entry(uint8_t seed) {
+    CSimplifiedMNListEntry e;
+    e.proRegTxHash  = raw256(seed);
+    e.confirmedHash = raw256(seed + 1);
+    e.isValid = true;
+    return e;
+}
+
+// H-7 base-continuity: once the SML is current at block A, an INCREMENTAL diff
+// whose base is NOT A is rejected — the SML and its current-at marker are left
+// untouched (no ghost-MN corruption from applying a diff off the wrong base).
+TEST(DashCoinStateMaintainer, MnlistdiffBaseContinuityRejectsMismatchedBase) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+
+    // Cold-start full snapshot (base ZERO) -> SML current at A.
+    CSimplifiedMNListDiff d1;
+    d1.baseBlockHash = uint256::ZERO;
+    d1.blockHash     = raw256(0xA0);
+    d1.mnList = {sml_entry(0x40), sml_entry(0x60)};
+    m.on_mnlistdiff(d1);
+    ASSERT_TRUE(st.have_sml());
+    ASSERT_EQ(st.sml().size(), 2u);
+    ASSERT_EQ(st.sml_current_hash(), raw256(0xA0));
+
+    // A diff based on some OTHER block B (!= A) must be rejected.
+    CSimplifiedMNListDiff bad;
+    bad.baseBlockHash = raw256(0xB0);
+    bad.blockHash     = raw256(0xC0);
+    bad.mnList = {sml_entry(0x80)};
+    m.on_mnlistdiff(bad);
+    EXPECT_EQ(st.sml().size(), 2u) << "mismatched-base diff must not mutate the SML";
+    EXPECT_EQ(st.sml_current_hash(), raw256(0xA0)) << "current-at marker must not advance";
+
+    // A correctly-based incremental diff (base == A) IS accepted.
+    CSimplifiedMNListDiff d2;
+    d2.baseBlockHash = raw256(0xA0);
+    d2.blockHash     = raw256(0xD0);
+    d2.mnList = {sml_entry(0x80)};
+    m.on_mnlistdiff(d2);
+    EXPECT_EQ(st.sml_current_hash(), raw256(0xD0));
+    EXPECT_EQ(st.sml().size(), 3u);
+}
+
+// C-2 chainlock: on_new_chainlock adopts a fresher ChainLock as the CCbTx
+// bestCL* and fires the state-dirty sink; a non-advancing height is ignored.
+TEST(DashCoinStateMaintainer, OnNewChainlockAdoptsForwardOnlyAndFiresDirty) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    int dirty = 0;
+    m.set_on_state_dirty([&] { ++dirty; });
+
+    std::array<uint8_t, 96> sig{}; sig[0] = 0x11;
+    m.on_new_chainlock(1500000, sig);
+    EXPECT_EQ(st.best_cl_height(), 1500000);
+    EXPECT_EQ(dirty, 1) << "a fresher ChainLock must re-issue work";
+
+    // A stale (<=) height is ignored — no adoption, no re-issue.
+    std::array<uint8_t, 96> older{}; older[0] = 0x22;
+    m.on_new_chainlock(1499999, older);
+    EXPECT_EQ(st.best_cl_height(), 1500000);
+    EXPECT_EQ(dirty, 1);
+
+    // A forward ChainLock advances + re-issues again.
+    m.on_new_chainlock(1500005, sig);
+    EXPECT_EQ(st.best_cl_height(), 1500005);
+    EXPECT_EQ(dirty, 2);
+}
+
+// H-1 (PR #780): a malformed quorum tail must NOT be papered over. It heals like
+// a quorum-axis reorg (wipe + force full re-sync); a later clean INCREMENTAL diff
+// is REJECTED by base-continuity (state stays wiped) — only a full snapshot
+// recovers. This closes the un-latch where quorum_healthy flipped back true on
+// the next incremental while the QuorumManager stayed permanently wrong.
+TEST(DashCoinStateMaintainer, MalformedQuorumTailHealsViaFullResyncNotIncremental) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    int resync_calls = 0;
+    m.set_on_full_resync([&] { ++resync_calls; });
+
+    // 1) Cold full snapshot with a valid (empty) quorum tail -> applied.
+    CSimplifiedMNListDiff d_full1;
+    d_full1.baseBlockHash = uint256::ZERO;
+    d_full1.blockHash     = raw256(0xA0);
+    d_full1.mnList = {sml_entry(0x40), sml_entry(0x60)};
+    // quorum_tail empty => parse_quorum_tail returns true.
+    m.on_mnlistdiff(d_full1);
+    ASSERT_TRUE(st.have_sml());
+    ASSERT_EQ(st.sml().size(), 2u);
+    ASSERT_EQ(st.sml_current_hash(), raw256(0xA0));
+    ASSERT_TRUE(st.quorum_healthy());
+
+    // 2) Incremental off A with a MALFORMED quorum tail -> HEAL: wipe + resync.
+    CSimplifiedMNListDiff d_bad;
+    d_bad.baseBlockHash = raw256(0xA0);
+    d_bad.blockHash     = raw256(0xB0);
+    d_bad.mnList = {sml_entry(0x80)};
+    d_bad.quorum_tail = {0x01};   // deletedQuorums count=1 with no body => parse fails
+    m.on_mnlistdiff(d_bad);
+    EXPECT_FALSE(st.have_sml())      << "malformed tail must wipe (fail closed)";
+    EXPECT_EQ(st.sml().size(), 0u);
+    EXPECT_EQ(st.sml_current_hash(), uint256::ZERO);
+    EXPECT_FALSE(st.quorum_healthy());
+    EXPECT_EQ(resync_calls, 1)       << "must force a full re-sync from zero";
+
+    // 3) A clean INCREMENTAL diff must NOT recover — base-continuity rejects it
+    //    (base=B != current=ZERO), so the skipped delta can't be ridden over.
+    CSimplifiedMNListDiff d_incr;
+    d_incr.baseBlockHash = raw256(0xB0);
+    d_incr.blockHash     = raw256(0xC0);
+    d_incr.mnList = {sml_entry(0x90)};
+    m.on_mnlistdiff(d_incr);
+    EXPECT_FALSE(st.have_sml()) << "a clean incremental after a wipe must STILL refuse";
+    EXPECT_EQ(st.sml().size(), 0u);
+    EXPECT_EQ(st.sml_current_hash(), uint256::ZERO);
+    EXPECT_FALSE(st.quorum_healthy());
+
+    // 4) Only a FULL snapshot (base=ZERO) heals the state.
+    CSimplifiedMNListDiff d_full2;
+    d_full2.baseBlockHash = uint256::ZERO;
+    d_full2.blockHash     = raw256(0xC0);
+    d_full2.mnList = {sml_entry(0x40), sml_entry(0x60), sml_entry(0x90)};
+    m.on_mnlistdiff(d_full2);
+    EXPECT_TRUE(st.have_sml());
+    EXPECT_EQ(st.sml().size(), 3u);
+    EXPECT_EQ(st.sml_current_hash(), raw256(0xC0));
+    EXPECT_TRUE(st.quorum_healthy());
+}
+
+// Build a diff carrying a type-5 cbTx seed (creditPool @ cb_height).
+static CSimplifiedMNListDiff diff_with_seed(const uint256& base, const uint256& block,
+                                            int32_t cb_height, int64_t credit_pool,
+                                            CSimplifiedMNListEntry mn) {
+    CSimplifiedMNListDiff d;
+    d.baseBlockHash = base;
+    d.blockHash     = block;
+    d.mnList = {mn};
+    dash::coin::vendor::CCbTx cb;
+    cb.nVersion = dash::coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+    cb.nHeight  = cb_height;
+    cb.creditPoolBalance = credit_pool;
+    d.cbTx.version = 3;
+    d.cbTx.type    = 5;
+    d.cbTx.extra_payload = dash::coin::encode_cbtx(cb);
+    return d;
+}
+
+// SOAK FIX v3 — POST-RESTART: after a cold snapshot the credit-pool seed MUST
+// advance off the snapshot on the first incremental (the re-soak #2 defect was
+// it staying put). And a non-advancing seed (a diff whose cbTx does not carry a
+// newer height) leaves the seed height behind → the freshness gate fails closed.
+TEST(DashCoinStateMaintainer, PostRestartColdSnapshotThenIncrementalAdvancesSeed) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+
+    // Cold snapshot at tip height 1518654 (base=ZERO).
+    m.on_mnlistdiff(diff_with_seed(uint256::ZERO, raw256(0x54), 1518654,
+                                   111'000'000LL, sml_entry(0x40)));
+    ASSERT_EQ(st.credit_pool_height(), 1518654);
+    ASSERT_EQ(st.credit_pool(), 111'000'000LL);
+
+    // First incremental to 1518655 (base=0x54) — the seed MUST advance.
+    m.on_mnlistdiff(diff_with_seed(raw256(0x54), raw256(0x55), 1518655,
+                                   111'066'966'830LL, sml_entry(0x41)));
+    EXPECT_EQ(st.credit_pool_height(), 1518655)
+        << "credit-pool seed must advance off the cold snapshot on the first incremental";
+    EXPECT_EQ(st.credit_pool(), 111'066'966'830LL);
+    EXPECT_EQ(st.sml_current_hash(), raw256(0x55));
+
+    // Full bundle so viability can be judged: MN payee + tip at 1518655.
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)));
+    st.set_require_sml(true);
+    st.set_require_fresh_credit_pool(true);
+    m.on_new_tip(1518655, raw256(0x55), 0x1b104be3u, 1'700'000'000u,
+                 DASH_PUBKEY_VER, DASH_P2SH_VER);
+    // Seed height (1518655) == tip (1518655) => credit-pool axis is fresh.
+    EXPECT_TRUE(st.make_embedded_work_inputs().viable())
+        << "an advanced seed current at the tip must serve";
+
+    // Now the tip moves to 1518656 but a NON-ADVANCING diff arrives (its cbTx is
+    // type-0 / carries no newer seed): the seed height stays at 1518655 while the
+    // tip is 1518656 => the credit-pool freshness gate fails closed.
+    CSimplifiedMNListDiff stale;
+    stale.baseBlockHash = raw256(0x55);
+    stale.blockHash     = raw256(0x56);
+    stale.mnList = {sml_entry(0x42)};
+    // cbTx.type == 0 => the seed step is skipped; credit_pool_height stays 1518655.
+    m.on_mnlistdiff(stale);
+    EXPECT_EQ(st.credit_pool_height(), 1518655) << "a diff without a newer seed must not advance it";
+    m.on_new_tip(1518656, raw256(0x56), 0x1b104be3u, 1'700'000'000u,
+                 DASH_PUBKEY_VER, DASH_P2SH_VER);
+    EXPECT_FALSE(st.make_embedded_work_inputs().viable())
+        << "seed height 1518655 behind tip 1518656 must fail closed (independent height check)";
+}
+
+// H-6 state-dirty: applying an mnlistdiff (SML advance) fires the re-issue sink,
+// and a reorg wipe fires it too (miners move off the orphaned-branch template).
+TEST(DashCoinStateMaintainer, SmlApplyAndReorgFireStateDirty) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    int dirty = 0;
+    m.set_on_state_dirty([&] { ++dirty; });
+
+    CSimplifiedMNListDiff d1;
+    d1.baseBlockHash = uint256::ZERO;
+    d1.blockHash     = raw256(0xA0);
+    d1.mnList = {sml_entry(0x40)};
+    m.on_mnlistdiff(d1);
+    EXPECT_EQ(dirty, 1) << "SML advance must re-issue work (freshness gate can now pass)";
+
+    m.on_sml_reorg();
+    EXPECT_FALSE(st.have_sml());
+    EXPECT_EQ(st.sml_current_hash(), uint256::ZERO);
+    EXPECT_EQ(dirty, 2) << "reorg wipe must re-issue work (drop orphaned-branch template)";
 }

@@ -62,4 +62,20 @@ wire_mn_list_ingest(::dash::interfaces::Node& node,
         });
 }
 
+// Subscribe maint to node.new_mnlistdiff: the SML axis (DAEMONLESS CCbTx). Each
+// parsed mnlistdiff off the live coin-P2P feed advances the SML
+// (merkleRootMNList) + QuorumManager (merkleRootQuorums) + seeds bestCL*/
+// creditPool via CoinStateMaintainer::on_mnlistdiff. Distinct from
+// wire_mn_list_ingest above (the PAYEE axis). Returns the subscription handle.
+inline std::shared_ptr<EventDisposable>
+wire_mnlistdiff_ingest(::dash::interfaces::Node& node,
+                       ::dash::coin::CoinStateMaintainer& maint)
+{
+    return node.new_mnlistdiff.subscribe(
+        [&maint](const ::dash::coin::vendor::CSimplifiedMNListDiff& diff)
+        {
+            maint.on_mnlistdiff(diff);
+        });
+}
+
 } // namespace c2pool::dash

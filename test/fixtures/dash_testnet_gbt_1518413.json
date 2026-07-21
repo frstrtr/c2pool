@@ -1,0 +1,54 @@
+{
+  "provenance": {
+    "source": "real dashd getblocktemplate (Dash Core testnet), captured for embedded-CbTx byte-parity",
+    "network": "test",
+    "node": "dash-testnet (testnet3, fully synced)",
+    "rpc": "getblocktemplate {\"rules\":[]}",
+    "note": "NOT self-referential: coinbase_payload is dashd-produced bytes, not c2pool output."
+  },
+  "template_height": 1518413,
+  "previousblockhash": "0000000ca59dee8875cafe6911f0c8329327d8b228f5912600089dc1120778ee",
+  "version": 536870912,
+  "coinbasevalue": 238104286,
+  "target": "0000005b96ac0000000000000000000000000000000000000000000000000000",
+  "bits": "1d5b96ac",
+  "curtime": 1784576053,
+  "mintime": 1784575233,
+  "superblocks_enabled": true,
+  "superblock": [],
+  "masternode": [
+    {
+      "payee": "",
+      "script": "6a",
+      "amount": 66966830
+    },
+    {
+      "payee": "yVXDAM73Tg6A44Bm3qduXsMCYxzuqBCT48",
+      "script": "76a91464f2b2b84f62d68a2cd7f7f5fb2b5aa75ef716d788ac",
+      "amount": 111611384
+    }
+  ],
+  "coinbase_payload_hex": "03004d2b17008fd43916c4062570542a746a18808d00bb47107d541c0eeb0defc107fd07bc6bfb1dff7b7ee05a246fe0fa0a3dc3a3a516578f857bee925a586e840272c101190197902356524fd09c8bd3e892367863a5b7791f885c1da7d946efde9f38e82b6ead4fd6934e5c62c96470c63e6661b65611849196fe6498c29c246d82dcba6b00d062a37cd35b62cd676dc8d5f8c46d0d60d69c6db90f3c5e0aa21bf1a2349deda4c96f7ae21e0000",
+  "decoded": {
+    "nVersion": 3,
+    "nHeight": 1518413,
+    "merkleRootMNList": "6bbc07fd07c1ef0deb0e1c547d1047bb008d80186a742a54702506c41639d48f",
+    "merkleRootQuorums": "1901c17202846e585a92ee7b858f5716a5a3c33d0afae06f245ae07e7bff1dfb",
+    "bestCLHeightDiff": 1,
+    "bestCLSignature_present": true,
+    "creditPoolBalance_sat": 33958065588644
+  },
+  "creditpool_accrual_evidence": {
+    "platform_reward_sat_per_block": 66966830,
+    "prev_block_1518412_creditPool_sat": 33957998621814,
+    "template_1518413_creditPool_sat": 33958065588644,
+    "delta_sat": 66966830,
+    "series_sat": {
+      "1518408": 33957730754494,
+      "1518409": 33957797721324,
+      "1518410": 33957864688154,
+      "1518411": 33957931654984,
+      "1518412": 33957998621814
+    }
+  }
+}

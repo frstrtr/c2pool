@@ -40,6 +40,7 @@
 #include <impl/dash/coin/block_producer.hpp>  // compute_merkle_root, append_compact_size, target_from_nbits
 #include <impl/dash/crypto/hash_x11.hpp>      // dash::crypto::hash_x11 (X11 PoW SSOT)
 #include <impl/dash/params.hpp>               // dash::make_coin_params
+#include <impl/dash/coin/vendor/cbtx.hpp>     // vendor::parse_cbtx (GBT-xcheck creditPool)
 
 #include <core/address_utils.hpp>             // core::address_to_script (mint payout from username)
 #include <core/log.hpp>
@@ -50,6 +51,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <mutex>
 #include <span>
 #include <utility>
 
@@ -187,6 +189,15 @@ DASHWorkSource::~DASHWorkSource() = default;
 // ─────────────────────────────────────────────────────────────────────────────
 GetWork DASHWorkSource::get_work(const WorkJobTargetInputs& job_in) const
 {
+    // Mainnet embedded gate (see resource_template_now): default OFF keeps an
+    // unconfigured mainnet node on the reward-safe dashd fallback (fail-closed);
+    // testnet/regtest and the --embedded-mainnet opt-in run the embedded arm.
+    if (!is_testnet_ && !embedded_mainnet_) {
+        coin::DashWorkData w =
+            dashd_fallback_ ? dashd_fallback_() : coin::DashWorkData{};
+        return GetWork{ coin::WorkSource::DashdFallback, std::move(w),
+                        assemble_work_job_targets(job_in) };
+    }
     // Qualify the free function explicitly: unqualified `get_work` in this
     // member body resolves to THIS member (class scope shadows the namespace),
     // so name the capstone by its namespace to avoid a self-call.
@@ -291,12 +302,75 @@ void DASHWorkSource::resource_template_now() const
     // inline on the caller (legacy blocking path) OR on the background rpc_pool
     // thread (io-thread-decouple, via refresh_executor_). select_work() is done
     // OUTSIDE the lock (the fallback arm is a blocking dashd RPC); the cache is
-    // then updated under template_mutex_. Byte-for-byte the SAME template the
-    // old inline path produced -- transport/threading change only.
+    // then updated under template_mutex_.
+
+    // ── Mainnet embedded gate (v0.2.4 trigger) ──────────────────────────────
+    // The SML/QuorumManager wiring emits a real DIP-0004 type-5 CCbTx, and its
+    // byte-parity against a real dashd getblocktemplate is PROVEN (from the raw
+    // mnlistdiff wire: both merkle roots + bestCL + creditPool accrual). The
+    // mainnet gate LIFTS behind the explicit set_embedded_mainnet opt-in
+    // (--embedded-mainnet). Default OFF => unconfigured mainnet nodes stay
+    // FAIL-CLOSED on the reward-safe dashd-RPC fallback. Testnet/regtest always
+    // run the embedded arm. Even when enabled, the NodeCoinState viability gate
+    // (SML+quorum fresh at the tip, non-superblock, credit-pool seed height at
+    // tip, bestCL fresh) fails safe to the fallback, so no invalid template mines.
+    const bool embedded_arm_enabled = is_testnet_ || embedded_mainnet_;
+    if (!embedded_arm_enabled && coin_state_.populated()) {
+        static std::once_flag mainnet_gate_logged;
+        std::call_once(mainnet_gate_logged, [] {
+            LOG_WARNING << "[DASH-STRATUM-GBT] embedded template arm disabled on "
+                           "mainnet (byte-parity proven; enable with --embedded-mainnet) "
+                           "— using dashd-RPC fallback";
+        });
+    }
+
     coin::DashWorkData work;
-    if (coin_state_.populated() || dashd_fallback_) {
+    bool work_is_embedded = false;   // tracks the FINAL sourced arm for the cache tag
+    const bool try_embedded = embedded_arm_enabled && coin_state_.populated();
+    if (try_embedded || dashd_fallback_) {
         try {
-            coin::WorkSelection sel = coin_state_.select_work(dashd_fallback_);
+            // Mainnet-gated: bypass select_work and source the reward-safe dashd
+            // fallback directly; testnet/regtest picks embedded-when-viable.
+            coin::WorkSelection sel = try_embedded
+                ? coin_state_.select_work(dashd_fallback_)
+                : coin::WorkSelection{
+                      dashd_fallback_ ? dashd_fallback_() : coin::DashWorkData{},
+                      coin::WorkSource::DashdFallback };
+            // BLOCKER-3 pre-emit HARD GATE (PR #780): re-validate an EMBEDDED
+            // template's CbTx against consensus invariants (both roots recomputed,
+            // DKG/superblock/bestCL/credit-pool-height guards) before it can be
+            // served; on any failure DISCARD it for the reward-safe dashd arm.
+            if (sel.source == coin::WorkSource::Embedded
+                && !coin_state_.embedded_template_emit_ok(sel.work)) {
+                LOG_WARNING << "[DASH-STRATUM-GBT] embedded CbTx pre-emit check "
+                               "FAILED at h=" << sel.work.m_height
+                            << " — discarding, using dashd fallback";
+                sel = coin::WorkSelection{
+                    dashd_fallback_ ? dashd_fallback_() : coin::DashWorkData{},
+                    coin::WorkSource::DashdFallback };
+            }
+            // GBT-xcheck reward-safety BACKSTOP (soak): when enabled and a dashd
+            // is reachable, cross-check the embedded CbTx creditPoolBalance
+            // against dashd getblocktemplate; on a same-height mismatch serve
+            // dashd's template. Catches ANY seed bug the daemonless self-checks
+            // miss. Opt-in (--embedded-mainnet-with-dashd), not pure-daemonless.
+            if (sel.source == coin::WorkSource::Embedded && gbt_xcheck_ && dashd_fallback_) {
+                coin::DashWorkData dref = dashd_fallback_();
+                coin::vendor::CCbTx emb_cb, dref_cb;
+                const bool emb_ok  = coin::vendor::parse_cbtx(sel.work.m_coinbase_payload, emb_cb);
+                const bool dref_ok = coin::vendor::parse_cbtx(dref.m_coinbase_payload, dref_cb);
+                if (emb_ok && dref_ok
+                    && dref.m_height == sel.work.m_height
+                    && emb_cb.creditPoolBalance != dref_cb.creditPoolBalance) {
+                    LOG_WARNING << "[DASH-STRATUM-GBT] GBT-xcheck MISMATCH at h="
+                                << sel.work.m_height << " embedded creditPool="
+                                << emb_cb.creditPoolBalance << " dashd="
+                                << dref_cb.creditPoolBalance
+                                << " — serving dashd template (reward-safety backstop)";
+                    sel = coin::WorkSelection{ std::move(dref),
+                                               coin::WorkSource::DashdFallback };
+                }
+            }
             // E2c observability: WHICH arm served this template + the MN payee
             // it carries (the payee-correctness axis of the embedded arm). One
             // line per re-source (cache-TTL cadence), INFO -- the field-
@@ -310,6 +384,7 @@ void DASHWorkSource::resource_template_now() const
                              ? "EMBEDDED" : "dashd-fallback")
                      << " h=" << sel.work.m_height
                      << " mn_payee=" << mn_payee;
+            work_is_embedded = (sel.source == coin::WorkSource::Embedded);
             work = std::move(sel.work);
         } catch (const std::exception& e) {
             LOG_WARNING << "[DASH-STRATUM] template sourcing threw: " << e.what();
@@ -335,6 +410,7 @@ void DASHWorkSource::resource_template_now() const
     template_cache_ = std::make_shared<const coin::DashWorkData>(std::move(work));
     template_cache_gen_ = work_generation_.load(std::memory_order_relaxed);
     template_cache_at_  = now;
+    template_cache_is_embedded_ = work_is_embedded;
     template_last_fail_at_ = {};
 }
 
@@ -350,8 +426,22 @@ std::shared_ptr<const coin::DashWorkData> DASHWorkSource::cached_work() const
         // still trigger a refresh -- but io-thread-decouple moves WHERE that
         // refresh runs off the stratum io thread (below).
         if (template_cache_ && template_cache_gen_ == gen
-            && now - template_cache_at_ < kStaleAfter)
-            return template_cache_;
+            && now - template_cache_at_ < kStaleAfter) {
+            // Serve-time re-check (soak build-vs-serve skew): an EMBEDDED cached
+            // template is re-validated against the CURRENT coin-state before it
+            // is served. The credit-pool seed can advance without a
+            // work_generation bump reaching here first, leaving a cached CbTx
+            // that commits a stale creditPoolBalance (bad-cbtx-assetlocked-amount)
+            // — the pre-emit gate's value/height re-check catches it. If it no
+            // longer validates, drop the cache and re-source (below). A dashd
+            // fallback cached template is served as-is.
+            if (!template_cache_is_embedded_
+                || coin_state_.embedded_template_emit_ok(*template_cache_))
+                return template_cache_;
+            LOG_WARNING << "[DASH-STRATUM-GBT] cached EMBEDDED template failed "
+                           "serve-time re-check (stale creditPool/roots) — re-sourcing";
+            template_cache_.reset();
+        }
 
         if (refresh_executor_) {
             // NON-BLOCKING scale path (the fix for 60+ sessions freezing on each

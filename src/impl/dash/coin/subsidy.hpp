@@ -46,6 +46,7 @@ inline constexpr int DASH_V20_HEIGHT_MAINNET       = 1'987'776;
 inline constexpr int DASH_BRR_HEIGHT_MAINNET       = 1'374'912;
 inline constexpr int DASH_MN_RR_HEIGHT_MAINNET     = 2'128'896;
 inline constexpr int DASH_SUPERBLOCK_CYCLE_MAINNET = 16616;
+inline constexpr int DASH_SUPERBLOCK_CYCLE_TESTNET = 24;   // dashcore testnet nSuperblockCycle
 
 /// Returns the BLOCK reward (excluding tx fees) for a block at height
 /// `height` on Dash mainnet. Equivalent to dashcore's

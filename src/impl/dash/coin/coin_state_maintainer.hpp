@@ -31,10 +31,16 @@
 #include <impl/dash/coin/mn_state_machine.hpp>   // MNState
 #include <impl/dash/coin/block.hpp>            // BlockType
 #include <impl/dash/coin/transaction.hpp>        // MutableTransaction
+#include <impl/dash/coin/vendor/smldiff.hpp>     // vendor::CSimplifiedMNListDiff + apply_diff
+#include <impl/dash/coin/vendor/quorum_tail.hpp> // vendor::parse_quorum_tail
+#include <impl/dash/coin/vendor/cbtx.hpp>        // vendor::parse_cbtx (bestCL*/creditPool seed)
 
 #include <core/uint256.hpp>
+#include <core/log.hpp>
 
+#include <array>
 #include <cstdint>
+#include <functional>
 #include <utility>
 #include <vector>
 
@@ -74,6 +80,166 @@ public:
             demote();
         else
             republish();
+    }
+
+    /// Reception path (mnlistdiff, SML axis — DAEMONLESS CCbTx source): apply a
+    /// raw deterministic-MN-list diff off the live coin-P2P feed. This is the
+    /// consensus-commitment counterpart to on_mn_list_update (which drives the
+    /// PAYEE MnStateMachine): it advances the NodeCoinState-held SML
+    /// (merkleRootMNList) and QuorumManager (merkleRootQuorums), and seeds the
+    /// version-appropriate bestCL*/creditPool from the diff's authoritative
+    /// embedded cbTx. All heavy lifting is the already-tested vendor code
+    /// (apply_diff / parse_quorum_tail / parse_cbtx) — this method is the wire.
+    ///
+    /// NOTE (consensus-timing, FLAGGED for byte-parity review): the diff
+    /// advances the SML/quorum set to `diff.blockHash`. dashd's GBT for the
+    /// NEXT block computes the CbTx roots over the DMN/quorum state AS OF that
+    /// next block's connect. Whether requesting mnlistdiff(base, TIP) leaves the
+    /// SML at exactly the state dashd commits for TIP+1 is the #1 item the live
+    /// byte-parity KAT against a running dashd must confirm; do not assume.
+    void on_mnlistdiff(const vendor::CSimplifiedMNListDiff& diff) {
+        // H-7 base-continuity: an INCREMENTAL diff is only valid when its
+        // baseBlockHash matches the block our SML/quorum state is CURRENT AT.
+        // Applying a diff whose base is some other block upserts/erases MN +
+        // quorum records relative to a state we are not in — silently corrupting
+        // the roots (ghost MNs/quorums). A ZERO base is a full snapshot and
+        // always safe (it replaces, not patches). When have_at is ZERO (cold OR
+        // post-wipe, review H-1) this ALSO rejects any INCREMENTAL (non-null
+        // base): only a full snapshot re-seeds us, so a skipped-delta wipe cannot
+        // be papered over by a later clean incremental. Reject + keep prior state.
+        const uint256 have_at = m_state.sml_current_hash();
+        if (!diff.baseBlockHash.IsNull() && diff.baseBlockHash != have_at) {
+            LOG_WARNING << "[SML] REJECT diff: base "
+                        << diff.baseBlockHash.GetHex().substr(0, 16)
+                        << " != SML-current " << have_at.GetHex().substr(0, 16)
+                        << " (base-continuity guard) — awaiting a full/base-matched diff";
+            return;
+        }
+
+        // review PR #780 H-1 (HIGH): parse the quorum tail FIRST. quorumsdiff
+        // deltas are BASE-RELATIVE — if a tail fails to parse (wire-format drift:
+        // proto bump / new CFinalCommitment version), skipping its qmgr apply
+        // while the SML advances PERMANENTLY loses that delta (the next
+        // incremental rides the advanced base), leaving merkleRootQuorums
+        // silently wrong forever. Heal it like a quorum-axis reorg: wipe SML +
+        // qmgr (on_sml_reorg drops have_sml + resets sml_current_hash=ZERO so the
+        // embedded arm fails closed) and force a full-snapshot re-sync via
+        // m_on_full_resync (resets the sml_base tracker to ZERO). Do NOT apply
+        // this diff's SML — we are discarding it and re-syncing from zero.
+        vendor::QuorumTail qt;
+        if (!vendor::parse_quorum_tail(diff.quorum_tail, qt)) {
+            LOG_WARNING << "[SML] quorum tail parse FAILED (wire-format drift?) "
+                           "— wiping SML/quorum state + forcing full re-sync (H-1)";
+            m_state.set_quorum_healthy(false);
+            on_sml_reorg();               // wipe + demote + notify_state_dirty
+            if (m_on_full_resync) m_on_full_resync();
+            return;
+        }
+
+        // 1) SML (merkleRootMNList). apply_diff erases deletedMNs, upserts
+        //    diff.mnList, and re-sorts by proRegTxHash (memcmp order — the
+        //    Bug-A-critical ordering, already pinned by test_dash_simplifiedmns).
+        auto sml_r = vendor::apply_diff(m_state.sml(), diff);
+
+        // 2) Quorum set (merkleRootQuorums) — tail already parsed clean above.
+        auto qr = m_state.qmgr().apply(qt);
+        const size_t q_added = qr.added_or_updated;
+        const size_t q_deleted = qr.deleted;
+        m_state.set_quorum_healthy(true);
+
+        // 3) bestCL* + creditPool: the diff's embedded cbTx is the coinbase of
+        //    diff.blockHash and its extra_payload is the authoritative type-5
+        //    CCbTx for that height. Seed the fields the roots don't carry so the
+        //    next template's CCbTx matches dashd. Fails SAFE (leaves prior seed).
+        if (diff.cbTx.type == 5 && !diff.cbTx.extra_payload.empty()) {
+            vendor::CCbTx observed;
+            if (vendor::parse_cbtx(diff.cbTx.extra_payload, observed)) {
+                if (observed.nVersion >= vendor::CCbTx::VERSION_CLSIG_AND_BALANCE) {
+                    // Seed with the cbTx's OWN nHeight (authoritative off the
+                    // wire) as the seed height — the independent freshness key.
+                    // When this step is skipped (non-type-5 / parse-fail cbTx) or
+                    // the seed does not advance to the tip, the seed height stays
+                    // behind m_prev_height and the freshness gate fails closed
+                    // instead of committing a lagged creditPoolBalance (soak fix).
+                    m_state.set_credit_pool(observed.creditPoolBalance,
+                                            diff.blockHash, observed.nHeight);
+                    // bestCLHeightDiff is relative to (cbHeight-1); recover the
+                    // absolute best-CL height so the next template re-derives its
+                    // own diff against ITS height. Only adopt when the observed
+                    // sig is non-null (a real ChainLock for the window).
+                    if (observed.has_best_cl_signature()) {
+                        int32_t cb_h = observed.nHeight;
+                        int32_t best_h = (cb_h - 1)
+                            - static_cast<int32_t>(observed.bestCLHeightDiff);
+                        // H-7 monotonic-bestCL: only adopt a ChainLock that does
+                        // NOT regress our best. A stale/replayed diff carrying an
+                        // older bestCL must not roll the committed bestCL* back
+                        // (that would desync the next template's CCbTx from dashd).
+                        if (best_h > 0 && best_h >= m_state.best_cl_height())
+                            m_state.set_best_cl(best_h, observed.bestCLSignature);
+                    }
+                }
+            }
+        }
+
+        m_have_mn_sml = m_state.sml().size() != 0;
+        m_state.set_have_sml(m_have_mn_sml);
+        // Record the block the SML is now current at: the freshness gate
+        // (NodeCoinState::make_embedded_work_inputs) compares this to the tip
+        // we build on, and the next incremental diff's base must match it.
+        m_state.set_sml_current_hash(diff.blockHash);
+        LOG_INFO << "[SML] applied diff: SML +" << sml_r.added_or_updated
+                 << " -" << sml_r.deleted << " => " << m_state.sml().size()
+                 << " MNs; quorums +" << q_added << " -" << q_deleted
+                 << " => " << m_state.qmgr().active_count()
+                 << " active; have_sml=" << (m_have_mn_sml ? "yes" : "no");
+        if (!m_have_mn_sml)
+            demote();
+        else
+            republish();
+        // H-6: the SML just advanced (potentially catching up to a moved tip).
+        // Bump work-generation + re-notify so a fresh template is issued now
+        // that the freshness gate can pass — otherwise miners stay on the dashd
+        // fallback until the next unrelated work signal.
+        notify_state_dirty();
+    }
+
+    /// ChainLock reception: adopt the freshly-observed ChainLock as the best CL
+    /// for the CCbTx bestCL* fields. The clsig message carries {height,
+    /// block_hash, 96-byte recovered threshold sig}. Only advances forward.
+    void on_new_chainlock(int32_t height,
+                          const std::array<uint8_t, 96>& sig) {
+        if (height > m_state.best_cl_height()) {
+            m_state.set_best_cl(height, sig);
+            // A fresher bestCL* changes the next template's committed CCbTx —
+            // re-issue work so the served template carries the new ChainLock.
+            notify_state_dirty();
+        }
+    }
+
+    /// Reorg (SML axis): a chain reorganisation can invalidate the incremental
+    /// SML/quorum state (the diffs we applied were relative to an orphaned
+    /// branch). Wipe the SML + quorum set and drop have_sml so the embedded arm
+    /// falls back to dashd until a fresh cold-start mnlistdiff(zero, new-tip)
+    /// rebuilds them. main_dash.cpp calls this from the header-chain reorg hook
+    /// and then re-requests a full diff. (Distinct from on_invalidate, which
+    /// only drops tip-readiness and deliberately KEEPS the MN payee list.)
+    void on_sml_reorg() {
+        m_state.sml().mnList.clear();
+        m_state.qmgr().clear();
+        m_have_mn_sml = false;
+        m_state.set_have_sml(false);
+        // Drop the SML's current-at marker so (a) the freshness gate fails until
+        // a fresh cold-start diff lands, and (b) the next diff is accepted as a
+        // full snapshot (base-continuity guard treats ZERO current as cold).
+        m_state.set_sml_current_hash(uint256::ZERO);
+        // Invalidate the credit-pool seed's freshness too (height -1 != any tip),
+        // so the arm fails closed on the credit-pool axis until a fresh re-seed.
+        m_state.set_credit_pool(0, uint256::ZERO, -1);
+        demote();
+        // Re-issue work so miners are moved off any embedded template that was
+        // built on the now-orphaned branch onto the dashd fallback immediately.
+        notify_state_dirty();
     }
 
     /// Reception path (mempool relay): fold a relayed tx into the local
@@ -148,10 +314,34 @@ public:
         demote();
     }
 
+    /// Wire a "state changed, re-issue work" sink (main_dash points this at
+    /// DASHWorkSource::bump_work_generation + stratum notify_all). Invoked when
+    /// the SML/quorum set advances, the bestCL* moves, or a reorg wipes the
+    /// bundle — the events that change (or invalidate) the next served template
+    /// but do NOT flow through the header tip-change notify. Optional: unset
+    /// (KAT posture) makes every notify_state_dirty() a no-op.
+    void set_on_state_dirty(std::function<void()> fn) {
+        m_on_state_dirty = std::move(fn);
+    }
+
+    /// Wire a "force a full mnlistdiff re-sync from ZERO" sink (main_dash resets
+    /// the sml_base request tracker to ZERO and re-requests getmnlistd(ZERO,tip)).
+    /// Invoked on the H-1 quorum-tail-failure heal path: after wiping the
+    /// base-relative state, the next request MUST be a full snapshot so the
+    /// skipped delta cannot be silently ridden over. Optional (unset in KATs =
+    /// no-op; the wipe + base-continuity guard alone still fail the arm closed).
+    void set_on_full_resync(std::function<void()> fn) {
+        m_on_full_resync = std::move(fn);
+    }
+
     /// True iff both prerequisites are met AND the holder is currently live.
     bool live() const { return m_state.populated(); }
 
 private:
+    void notify_state_dirty() {
+        if (m_on_state_dirty) m_on_state_dirty();
+    }
+
     // Publish only when both prerequisites are present; otherwise leave the
     // holder in whatever (un)published state it is in -- callers reach demote()
     // explicitly for the invalidating transitions.
@@ -168,9 +358,12 @@ private:
     }
 
     NodeCoinState& m_state;
+    std::function<void()> m_on_state_dirty;  // SML/bestCL/reorg -> re-issue work
+    std::function<void()> m_on_full_resync;  // H-1 heal -> reset sml_base + full re-sync
 
     bool m_have_mn{false};
     bool m_have_tip{false};
+    bool m_have_mn_sml{false};   // a non-empty SML has been applied (CCbTx source)
 
     // Height the last MN-set snapshot was current at (0 = none/unknown);
     // on_block_connected skips re-applying blocks at or below it.
