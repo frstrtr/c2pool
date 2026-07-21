@@ -97,6 +97,19 @@ struct StratumConfig {
     //     exceeds this many frames (a dead peer whose kernel send buffer filled
     //     accumulates unbounded). 0=unlimited (legacy).
     size_t   max_write_queue_depth      = 0;
+    // (e) Idle keepalive-notify: re-send a mining.notify (a normal, non-
+    //     clean_jobs refresh of the CURRENT job) to a connected+subscribed
+    //     session that has received NO notify for ~this many seconds, driven by
+    //     the per-session periodic work-push timer -- regardless of tip/work
+    //     changes and regardless of whether the session is submitting. This
+    //     feeds a CLIENT-SIDE no-notify watchdog (measured Antminer D9: drops a
+    //     pool after 60.0 s without a notify) so an otherwise-idle BACKUP pool
+    //     connection stays alive independent of slot/path/RPC-timeout settings.
+    //     Set comfortably under the client watchdog (DASH: 25 s vs the 60 s D9
+    //     watchdog). clean_jobs is NEVER forced on this refresh, so ASIC work is
+    //     not reset. 0 = off (LTC/BTC/DGB unchanged: periodic push stays purely
+    //     work-generation-gated).
+    uint32_t keepalive_notify_sec       = 0;
 };
 
 /// Frozen share-construction fields returned by ref_hash_fn. These

@@ -163,6 +163,16 @@ DASHWorkSource::DASHWorkSource(const coin::NodeCoinState& coin_state,
     // genuinely dead / never-authorized sessions are reclaimed.
     config_.session_idle_timeout_sec = 1800;
     config_.max_write_queue_depth    = 256;     // drop a stuck-write dead peer
+    // Idle keepalive-notify (coupled with the #751 idle-reconnect churn fix):
+    // measured Antminer D9 rigs DROP a pool connection that receives no
+    // mining.notify for 60.0 s (then retry after 30 s). Until the #751 fix, the
+    // CoindRPC idle-reconnect churn re-broadcast work every ~30 s and was the
+    // ONLY thing keeping idle BACKUP pool connections alive; reducing that churn
+    // without feeding idle sessions would make every idle backup flap every
+    // ~90 s. Re-notify the CURRENT job (non-clean, so no ASIC work reset) every
+    // 25 s -- comfortably under the 60 s watchdog -- so any node is a stable
+    // backup regardless of slot/path/RPC-timeout settings.
+    config_.keepalive_notify_sec     = 25;
     LOG_INFO << "[DASH-STRATUM] DASHWorkSource constructed"
              << " (min_diff=" << config_.min_difficulty
              << " max_diff=" << config_.max_difficulty
