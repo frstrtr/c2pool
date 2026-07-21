@@ -74,6 +74,12 @@
 #include <c2pool/storage/found_block_store.hpp>
 #include <c2pool/payout/payout_manager.hpp>
 
+// Precomputed at startup (after the --data-dir pre-scan in main) so the POSIX
+// signal-handler path build is allocation-free. Empty until set; the handler
+// falls back to /tmp when a crash predates initialization. Rooted under
+// config_path() so co-located instances keep separate crash logs (#722).
+static std::string g_crash_log_path;
+
 // --- Platform-specific crash handler ---
 #ifdef _WIN32
 #include <windows.h>
@@ -189,7 +195,11 @@ static void segfault_handler(int sig) {
 #include <cxxabi.h>
 
 static void write_crash_log(const char* reason) {
-    int fd = open("/tmp/c2pool_crash.log", O_WRONLY | O_CREAT | O_APPEND, 0640);
+    // Precomputed path (config_path()/crash.log) honors --data-dir; fall back
+    // to the historical /tmp location if a crash predates its initialization.
+    const char* crash_path = g_crash_log_path.empty()
+        ? "/tmp/c2pool_crash.log" : g_crash_log_path.c_str();
+    int fd = open(crash_path, O_WRONLY | O_CREAT | O_APPEND, 0640);
     if (fd < 0) return;
     FILE* f = fdopen(fd, "a");
     if (!f) { close(fd); return; }
@@ -525,6 +535,23 @@ void print_help() {
 }
 
 int main(int argc, char* argv[]) {
+    // Pre-scan for --data-dir BEFORE anything reads config_path() — the crash
+    // handlers, the Settings ctor (Fileconfig captures its path at
+    // construction), and the file-log sink all resolve through it. Redirecting
+    // the chokepoint here guarantees the override wins everywhere. See #722.
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--data-dir") {
+            if (i + 1 >= argc || argv[i + 1][0] == '\0' || argv[i + 1][0] == '-') {
+                std::cerr << "error: --data-dir requires a PATH argument\n";
+                return 1;
+            }
+            core::filesystem::set_data_dir(argv[i + 1]);
+        }
+    }
+    // Precompute the (now data-dir-aware) POSIX crash-log path for the
+    // async-signal-safe handler above.
+    g_crash_log_path = (core::filesystem::config_path() / "crash.log").string();
+
     // Install crash handlers
     std::set_terminate(c2pool_terminate_handler);
     std::signal(SIGINT, signal_handler);

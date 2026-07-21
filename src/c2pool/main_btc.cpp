@@ -142,10 +142,14 @@ int main(int argc, char* argv[])
             print_usage();
             return 0;
         }
-        else if (arg == "--data-dir" && i + 1 < argc)
+        else if (arg == "--data-dir")
         {
             // Isolate per-instance on-disk state (LevelDB sharechain, addr
             // store, logs, ...) under PATH. Default keeps ~/.c2pool. See #722.
+            if (i + 1 >= argc || argv[i + 1][0] == '\0' || argv[i + 1][0] == '-') {
+                std::cerr << "error: --data-dir requires a PATH argument\n";
+                return 1;
+            }
             core::filesystem::set_data_dir(argv[++i]);
         }
         else if (arg == "--testnet")

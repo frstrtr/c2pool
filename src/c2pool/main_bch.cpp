@@ -714,11 +714,16 @@ int main(int argc, char** argv)
             return 0;
         }
         if (std::strcmp(argv[i], "--help") == 0)     want_help = true;
-        if (std::strcmp(argv[i], "--data-dir") == 0 && i + 1 < argc)
+        if (std::strcmp(argv[i], "--data-dir") == 0) {
             // Root all per-instance state (LevelDB sharechain, addr store,
             // logs, ...) under PATH so co-located instances don't contend the
             // LevelDB LOCK. Default keeps ~/.c2pool. See #722.
+            if (i + 1 >= argc || argv[i + 1][0] == '\0' || argv[i + 1][0] == '-') {
+                std::cerr << "error: --data-dir requires a PATH argument\n";
+                return 1;
+            }
             core::filesystem::set_data_dir(argv[++i]);
+        }
         if (std::strcmp(argv[i], "--ibd") == 0)      want_ibd = true;
         if (std::strcmp(argv[i], "--with-peer-verify") == 0) want_with_peer_verify = true;
         if (std::strcmp(argv[i], "--pool") == 0)     want_pool = true;

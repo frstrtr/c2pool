@@ -1913,9 +1913,15 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
             }
         }
 
-        // Save block hex to file for manual submitblock testing
+        // Save block hex to file for manual submitblock testing.
+        // Root under config_path()/tmp so co-located instances stay isolated
+        // and the dump honors --data-dir (#722).
         {
-            std::string path = "/tmp/c2pool_block_" + std::to_string(std::time(nullptr)) + ".hex";
+            std::error_code dir_ec;
+            auto tmp_dir = core::filesystem::config_path() / "tmp";
+            std::filesystem::create_directories(tmp_dir, dir_ec);
+            std::string path = (tmp_dir / ("c2pool_block_"
+                + std::to_string(std::time(nullptr)) + ".hex")).string();
             std::ofstream f(path);
             if (f) {
                 f << hex_data;
