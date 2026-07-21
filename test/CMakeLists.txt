@@ -765,7 +765,11 @@ if (BUILD_TESTING AND GTest_FOUND)
     # client (p2p_client.hpp): handshake state machine, dial-plan rotation, and
     # the byte-exact version/verack handshake drive. Same target, no new
     # allowlist entry needed.
-    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp)
+    # Third TU: test_dash_coin_peer_manager.cpp — the DASH-ISOLATED CoinPeerManager
+    # (coin/coin_peer_manager.hpp): source scoring (daemon penalty / addr-crawl
+    # bonus), selection ordering, /16 Sybil group caps, anchor persistence, and
+    # the pinned protected local node. Same target, no new allowlist entry.
+    add_executable(test_dash_p2p_node test_dash_p2p_node.cpp test_dash_coin_p2p_client.cpp test_dash_coin_peer_manager.cpp)
     target_link_libraries(test_dash_p2p_node PRIVATE
         GTest::gtest_main GTest::gtest
         dash_block_replay   # E1: coin/vendor/blockencodings.cpp — the full p2p Handler

@@ -208,6 +208,13 @@ private:
     PeerHeightCallback m_on_peer_height;
     using HandshakeCallback = std::function<void()>;
     HandshakeCallback m_on_handshake_complete;
+    // Peer lifecycle seams for the DASH-isolated CoinPeerManager scoring feed
+    // (coin/coin_peer_manager.hpp). Fired with the peer's "host:port" key so the
+    // manager can score connects/disconnects and persist anchors. Both optional;
+    // unset on the legacy single-peer --coin-p2p-connect path (no behaviour change).
+    using PeerLifecycleCallback = std::function<void(const NetService&)>;
+    PeerLifecycleCallback m_on_peer_connected;
+    PeerLifecycleCallback m_on_peer_disconnected;
 
 public:
     CoinClient(io::io_context* context, dash::interfaces::Node* coin, config_t* config,
@@ -228,25 +235,54 @@ public:
 
     /// Dial the given targets with automatic reconnection (30s interval,
     /// round-robin over the target list on each retry).
+    ///
+    /// An EMPTY target list is legal in the --coin-p2p-discover cold-start case
+    /// (fresh peer-db + DNS unavailable): the reconnect loop is armed anyway and
+    /// simply idles (the empty-plan guard below), so when update_dial_targets()
+    /// later delivers seed-discovered peers (fixed seeds at t+60s / HTTP at
+    /// t+90s) the dial starts — no restart needed. Without this, an initially
+    /// empty discover peer set would wedge permanently.
     void connect(std::vector<NetService> targets)
     {
-        if (targets.empty()) return;
         m_dial_plan.set_targets(std::move(targets));
         m_reconnect_enabled = true;
-        LOG_INFO << "[" << m_chain_label << "] dialing "
-                 << m_dial_plan.current().to_string()
-                 << " (" << m_dial_plan.size() << " target[s] in plan)";
-        core::Factory<core::Client>::connect(m_dial_plan.current());
+        if (!m_dial_plan.empty()) {
+            LOG_INFO << "[" << m_chain_label << "] dialing "
+                     << m_dial_plan.current().to_string()
+                     << " (" << m_dial_plan.size() << " target[s] in plan)";
+            core::Factory<core::Client>::connect(m_dial_plan.current());
+        } else {
+            LOG_INFO << "[" << m_chain_label << "] no initial dial targets; "
+                        "reconnect loop armed, awaiting seed discovery";
+        }
+        arm_reconnect_timer();
+    }
 
-        m_reconnect_timer = std::make_unique<core::Timer>(m_context, /*repeat=*/true);
-        m_reconnect_timer->start(RECONNECT_INTERVAL_SEC, [this]() {
-            if (!m_peer && m_reconnect_enabled) {
-                const auto& target = m_dial_plan.advance();
-                LOG_INFO << "[" << m_chain_label << "] reconnecting to "
-                         << target.to_string() << "...";
-                core::Factory<core::Client>::connect(target);
-            }
-        });
+    /// Refresh the reconnect dial plan in place WITHOUT tearing the current
+    /// connection. The DASH-isolated CoinPeerManager calls this periodically
+    /// with a freshly-scored, group-diverse target set (pinned local dashd
+    /// first, then the highest-scoring discovered peers) so that on the next
+    /// reconnect the single embedded connection rotates onto an INDEPENDENT
+    /// peer — the mechanism that graduates the embedded arm to a network-
+    /// standalone witness. Empty target lists are ignored (never wedge redial).
+    ///
+    /// Cold-start kick: if the plan was EMPTY (the discover daemonless case) and
+    /// we are currently disconnected with the reconnect loop armed, dial the
+    /// first new target immediately rather than waiting up to 30s for the next
+    /// reconnect tick — so the arm connects as soon as seeds arrive.
+    void update_dial_targets(std::vector<NetService> targets)
+    {
+        if (targets.empty()) return;
+        bool was_empty = m_dial_plan.empty();
+        m_dial_plan.set_targets(std::move(targets));
+        LOG_DEBUG_COIND << "[" << m_chain_label << "] dial plan refreshed ("
+                        << m_dial_plan.size() << " scored target[s])";
+        if (was_empty && !m_peer && m_reconnect_enabled) {
+            LOG_INFO << "[" << m_chain_label << "] cold-start dial "
+                     << m_dial_plan.current().to_string()
+                     << " (first seed-discovered target)";
+            core::Factory<core::Client>::connect(m_dial_plan.current());
+        }
     }
 
     // INetwork
@@ -259,6 +295,8 @@ public:
         LOG_INFO << "[" << m_chain_label << "] connected to "
                  << m_peer->get_addr().to_string() << " — sending version (proto "
                  << PROTOCOL_VERSION << ")";
+        if (m_on_peer_connected)
+            m_on_peer_connected(m_peer->get_addr());
 
         // Require version/verack progress soon after connect.
         ensure_timeout_timer();
@@ -310,6 +348,12 @@ public:
     /// Fired once per session when the version/verack handshake completes —
     /// the hook E2 uses to kick the initial getheaders/mnlistdiff sync.
     void set_on_handshake_complete(HandshakeCallback cb) { m_on_handshake_complete = std::move(cb); }
+    /// Fired on socket connect (before handshake) with the peer endpoint — the
+    /// DashCoinPeerManager scores the connect + tracks anchors off this.
+    void set_on_peer_connected(PeerLifecycleCallback cb) { m_on_peer_connected = std::move(cb); }
+    /// Fired on disconnect/error with the peer endpoint — the DashCoinPeerManager
+    /// scores the drop + applies exponential backoff off this.
+    void set_on_peer_disconnected(PeerLifecycleCallback cb) { m_on_peer_disconnected = std::move(cb); }
 
     /// Send a getheaders request (E2 sync driver seam; unused by E1 run_node).
     void send_getheaders(uint32_t version, const std::vector<uint256>& locator, const uint256& stop)
@@ -382,6 +426,8 @@ public:
         LOG_WARNING << "[" << m_chain_label << "] peer " << svc_copy.to_string()
                     << " disconnected: " << err
                     << (m_reconnect_enabled ? " (reconnect armed)" : "");
+        if (m_on_peer_disconnected)
+            m_on_peer_disconnected(svc_copy);
         if (m_peer)
             m_peer.reset();
         // else: already disconnected (double-fire race) — safe to ignore
@@ -428,6 +474,24 @@ public:
     }
 
 private:
+    /// Arm the 30s round-robin reconnect loop. The empty-plan guard makes it
+    /// safe to arm before any target exists (--coin-p2p-discover cold start):
+    /// the tick no-ops until update_dial_targets() supplies seed-discovered
+    /// peers, then rotates over them. current()/advance() on an empty plan
+    /// would throw, hence the guard.
+    void arm_reconnect_timer()
+    {
+        m_reconnect_timer = std::make_unique<core::Timer>(m_context, /*repeat=*/true);
+        m_reconnect_timer->start(RECONNECT_INTERVAL_SEC, [this]() {
+            if (!m_peer && m_reconnect_enabled && !m_dial_plan.empty()) {
+                const auto& target = m_dial_plan.advance();
+                LOG_INFO << "[" << m_chain_label << "] reconnecting to "
+                         << target.to_string() << "...";
+                core::Factory<core::Client>::connect(target);
+            }
+        });
+    }
+
     void ensure_timeout_timer()
     {
         if (!m_timeout_timer)
