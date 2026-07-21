@@ -40,7 +40,9 @@ Development is supported by Anthropic's [Claude for Open Source](https://claude.
 > 
 > **Recent Bitcoin Block Mined by P2pool** (2025-03-07 06:08:22 UTC) BTC [#886688](https://blockchair.com/bitcoin/block/886688)
 >
-> **First DASH Block Mined by c2pool** (2026-07-20 01:15:15 UTC) DASH [#2507753](https://blockchair.com/dash/block/2507753) — solo X11 block, DIP4 coinbase reward-safe with the correct masternode payee, accepted by dashd
+> **First DASH block, c2pool** (2026-07-20 01:15:15 UTC) DASH [#2507753](https://blockchair.com/dash/block/2507753) — a solo X11 block. The DIP4 coinbase pays the masternode the network requires at that height, and dashd accepted it. The payee is checked against the template before the block is broadcast; work built on a stale template is discarded, not mined.
+>
+> **DASH block at a full-payment height** (2026-07-20 23:25:32 UTC) DASH [#2508254](https://blockchair.com/dash/block/2508254) — six transactions, three consensus-mandated payments in the coinbase. The full payee set was assembled and verified against the template before submission, and dashd accepted the block. The demanding case takes the same path as the trivial one.
 
 ---
 
