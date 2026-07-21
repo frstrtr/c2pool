@@ -29,6 +29,7 @@ set(source
     random.hpp random.cpp
     addr_store.hpp addr_store.cpp
     web_server.hpp web_server.cpp
+    http_session.cpp
     stratum_server.hpp stratum_server.cpp
     stratum_types.hpp
     stratum_work_source.hpp
