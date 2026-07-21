@@ -173,6 +173,23 @@ struct ClientRig
     }
 };
 
+// ── (b') Cold-start empty dial plan (daemonless --coin-p2p-discover) ────────
+//
+// Regression pin for the discover cold-start wedge: connect() with an EMPTY
+// target list (fresh peer-db + DNS unavailable) must NOT early-return into a
+// dead state — it arms the reconnect loop and idles, leaving the client
+// safely disconnected (no throw, no session) until seed-discovered peers land
+// via update_dial_targets(). An empty update is a safe no-op.
+TEST(DashCoinP2PClient, empty_connect_arms_without_wedging)
+{
+    ClientRig rig;
+    EXPECT_NO_THROW(rig.client.connect({}));      // empty initial dial plan
+    EXPECT_FALSE(rig.client.is_connected());
+    EXPECT_FALSE(rig.client.is_handshake_complete());
+    EXPECT_NO_THROW(rig.client.update_dial_targets({}));   // empty refresh: no-op
+    EXPECT_FALSE(rig.client.is_connected());
+}
+
 TEST(DashCoinP2PClient, client_completes_handshake_and_captures_peer_metadata)
 {
     ClientRig rig;

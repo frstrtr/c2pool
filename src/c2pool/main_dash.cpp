@@ -731,12 +731,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // layers, never conflated. The client rides the SAME ioc as the
     // sharechain node and stratum; declared after config/coin_state (both of
     // which it borrows), so it is destroyed before them at scope exit.
-    std::unique_ptr<dash::coin::p2p::CoinClient<dash::Config>> coin_p2p;
     // DASH-ISOLATED scored/diverse peer discovery (--coin-p2p-discover). Owns
     // its own peer table + seed bootstrap + scoring; feeds the single embedded
-    // connection an INDEPENDENT (non-dashd) diverse peer set. Declared BEFORE
-    // coin_p2p so it outlives the client that borrows it (reverse-destruction).
+    // connection an INDEPENDENT (non-dashd) diverse peer set. Declared FIRST of
+    // the three so it is destroyed LAST — the CoinClient's callbacks and the
+    // refresh timer both capture it by raw pointer, so it must outlive both.
     std::unique_ptr<dash::coin::DashCoinPeerManager> coin_peer_mgr;
+    std::unique_ptr<dash::coin::p2p::CoinClient<dash::Config>> coin_p2p;
+    // Refresh timer declared LAST -> destroyed FIRST: it stops (and its lambda
+    // stops capturing coin_p2p / coin_peer_mgr) before either is torn down.
     std::unique_ptr<core::Timer> coin_dial_refresh_timer;
     if (!coin_p2p_targets.empty() || coin_p2p_discover) {
         config.coin()->m_testnet = testnet;
@@ -770,6 +773,25 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             }
             coin_peer_mgr->set_dns_seeds(dash::coin::dash_dns_seeds(testnet));
             coin_peer_mgr->set_fixed_seeds(dash::coin::dash_fixed_seeds(testnet));
+
+            // ── ACTIVE daemon-disjointness (connect+discover / oracle-shadow) ──
+            // When a local dashd RPC is armed, feed its getpeerinfo so the
+            // manager tracks the daemon's OWN peers (m_coind_peers). That is
+            // what makes the coind-source -20 penalty AND the daemon-peer
+            // overlap filter engage — without it those ported mechanisms stay
+            // dormant (m_coind_peers empty => no peer ever Source::coind) and
+            // only passive independence holds. Mirrors main_ltc.cpp:5484.
+            // Absent RPC (fully daemonless) => seeds-only, passive independence.
+            if (rpc) {
+                coin_peer_mgr->set_getpeerinfo_fn(
+                    [rp = rpc.get()]() -> std::vector<NetService> {
+                        try { return rp->getpeerinfo(); }
+                        catch (...) { return {}; }
+                    });
+                std::cout << "[run]       daemon-disjointness ACTIVE: dashd getpeerinfo "
+                             "wired -> coind -20 penalty + overlap filter engage\n";
+            }
+
             coin_peer_mgr->start();
 
             // addr-crawl discoveries feed back into the manager (source-scored
@@ -787,11 +809,18 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     mgr->notify_disconnected(s.to_string());
                 });
 
+            // Pinned keys: passed to get_peers_to_connect() as the "already
+            // handled" set so the protected pinned node (score 999999, always
+            // ranked first) is NOT also appended by the scorer — the pinned
+            // entries are prepended explicitly, so this dedups them out.
+            std::set<std::string> pinned_keys;
+            for (auto& t : coin_p2p_targets) pinned_keys.insert(t.to_string());
+
             // Initial dial plan: pinned local dashd first (preferred), then the
-            // top scored+diverse discovered peers.
+            // top scored+diverse discovered peers (pinned excluded from that set).
             std::vector<NetService> dial;
             for (auto& t : coin_p2p_targets) dial.push_back(t);
-            for (auto& ep : coin_peer_mgr->get_peers_to_connect({}))
+            for (auto& ep : coin_peer_mgr->get_peers_to_connect(pinned_keys))
                 dial.push_back(ep.to_net_service());
             coin_p2p->connect(dial);
 
@@ -801,9 +830,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             coin_dial_refresh_timer = std::make_unique<core::Timer>(&ioc, /*repeat=*/true);
             coin_dial_refresh_timer->start(60, [cp = coin_p2p.get(),
                                                 mgr = coin_peer_mgr.get(),
-                                                pinned = coin_p2p_targets]() {
-                std::vector<NetService> refreshed = pinned; // pinned always preferred
-                for (auto& ep : mgr->get_peers_to_connect({}))
+                                                pinned = coin_p2p_targets,
+                                                pinned_keys]() {
+                std::vector<NetService> refreshed = pinned; // pinned always preferred, first
+                for (auto& ep : mgr->get_peers_to_connect(pinned_keys))
                     refreshed.push_back(ep.to_net_service());
                 cp->update_dial_targets(std::move(refreshed));
             });

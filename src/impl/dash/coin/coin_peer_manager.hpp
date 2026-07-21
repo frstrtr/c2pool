@@ -467,15 +467,6 @@ public:
         return static_cast<int>(m_peers.size()) < m_config.max_peers;
     }
 
-    /// Whether a given peer key is the daemon's own peer (overlap filter).
-    /// Exposed so the dialer can prefer independent (non-overlapping) peers —
-    /// the crux of "different peers → independent mempool/relay view".
-    bool is_daemon_overlap_peer(const std::string& key) const
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return m_coind_peers.count(key) > 0;
-    }
-
     /// Remove peers that are exhausted (max attempts reached, not protected).
     void prune_dead_peers()
     {

@@ -235,25 +235,27 @@ public:
 
     /// Dial the given targets with automatic reconnection (30s interval,
     /// round-robin over the target list on each retry).
+    ///
+    /// An EMPTY target list is legal in the --coin-p2p-discover cold-start case
+    /// (fresh peer-db + DNS unavailable): the reconnect loop is armed anyway and
+    /// simply idles (the empty-plan guard below), so when update_dial_targets()
+    /// later delivers seed-discovered peers (fixed seeds at t+60s / HTTP at
+    /// t+90s) the dial starts — no restart needed. Without this, an initially
+    /// empty discover peer set would wedge permanently.
     void connect(std::vector<NetService> targets)
     {
-        if (targets.empty()) return;
         m_dial_plan.set_targets(std::move(targets));
         m_reconnect_enabled = true;
-        LOG_INFO << "[" << m_chain_label << "] dialing "
-                 << m_dial_plan.current().to_string()
-                 << " (" << m_dial_plan.size() << " target[s] in plan)";
-        core::Factory<core::Client>::connect(m_dial_plan.current());
-
-        m_reconnect_timer = std::make_unique<core::Timer>(m_context, /*repeat=*/true);
-        m_reconnect_timer->start(RECONNECT_INTERVAL_SEC, [this]() {
-            if (!m_peer && m_reconnect_enabled) {
-                const auto& target = m_dial_plan.advance();
-                LOG_INFO << "[" << m_chain_label << "] reconnecting to "
-                         << target.to_string() << "...";
-                core::Factory<core::Client>::connect(target);
-            }
-        });
+        if (!m_dial_plan.empty()) {
+            LOG_INFO << "[" << m_chain_label << "] dialing "
+                     << m_dial_plan.current().to_string()
+                     << " (" << m_dial_plan.size() << " target[s] in plan)";
+            core::Factory<core::Client>::connect(m_dial_plan.current());
+        } else {
+            LOG_INFO << "[" << m_chain_label << "] no initial dial targets; "
+                        "reconnect loop armed, awaiting seed discovery";
+        }
+        arm_reconnect_timer();
     }
 
     /// Refresh the reconnect dial plan in place WITHOUT tearing the current
@@ -263,12 +265,24 @@ public:
     /// reconnect the single embedded connection rotates onto an INDEPENDENT
     /// peer — the mechanism that graduates the embedded arm to a network-
     /// standalone witness. Empty target lists are ignored (never wedge redial).
+    ///
+    /// Cold-start kick: if the plan was EMPTY (the discover daemonless case) and
+    /// we are currently disconnected with the reconnect loop armed, dial the
+    /// first new target immediately rather than waiting up to 30s for the next
+    /// reconnect tick — so the arm connects as soon as seeds arrive.
     void update_dial_targets(std::vector<NetService> targets)
     {
         if (targets.empty()) return;
+        bool was_empty = m_dial_plan.empty();
         m_dial_plan.set_targets(std::move(targets));
         LOG_DEBUG_COIND << "[" << m_chain_label << "] dial plan refreshed ("
                         << m_dial_plan.size() << " scored target[s])";
+        if (was_empty && !m_peer && m_reconnect_enabled) {
+            LOG_INFO << "[" << m_chain_label << "] cold-start dial "
+                     << m_dial_plan.current().to_string()
+                     << " (first seed-discovered target)";
+            core::Factory<core::Client>::connect(m_dial_plan.current());
+        }
     }
 
     // INetwork
@@ -460,6 +474,24 @@ public:
     }
 
 private:
+    /// Arm the 30s round-robin reconnect loop. The empty-plan guard makes it
+    /// safe to arm before any target exists (--coin-p2p-discover cold start):
+    /// the tick no-ops until update_dial_targets() supplies seed-discovered
+    /// peers, then rotates over them. current()/advance() on an empty plan
+    /// would throw, hence the guard.
+    void arm_reconnect_timer()
+    {
+        m_reconnect_timer = std::make_unique<core::Timer>(m_context, /*repeat=*/true);
+        m_reconnect_timer->start(RECONNECT_INTERVAL_SEC, [this]() {
+            if (!m_peer && m_reconnect_enabled && !m_dial_plan.empty()) {
+                const auto& target = m_dial_plan.advance();
+                LOG_INFO << "[" << m_chain_label << "] reconnecting to "
+                         << target.to_string() << "...";
+                core::Factory<core::Client>::connect(target);
+            }
+        });
+    }
+
     void ensure_timeout_timer()
     {
         if (!m_timeout_timer)

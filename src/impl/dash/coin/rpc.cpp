@@ -528,6 +528,40 @@ std::string NodeRPC::getbestblockhash()
     return {};
 }
 
+// getpeerinfo -> the dashd's own connected-peer addresses. Each entry's "addr"
+// is "host:port" (IPv6 as "[::1]:9999"); parsed to NetService. Empty on a
+// non-array/absent result. Validation (routable/port) is the peer manager's.
+std::vector<NetService> NodeRPC::getpeerinfo()
+{
+    std::vector<NetService> peers;
+    auto result = CallAPIMethod("getpeerinfo");
+    if (!result.is_array())
+        return peers;
+    for (auto& entry : result)
+    {
+        if (!entry.contains("addr") || !entry["addr"].is_string())
+            continue;
+        std::string addr = entry["addr"].get<std::string>();
+        auto colon = addr.rfind(':');
+        if (colon == std::string::npos)
+            continue;
+        std::string host = addr.substr(0, colon);
+        uint16_t port = 0;
+        try {
+            port = static_cast<uint16_t>(std::stoul(addr.substr(colon + 1)));
+        } catch (...) {
+            continue;
+        }
+        // Strip IPv6 brackets: "[2001:db8::1]" -> "2001:db8::1".
+        if (host.size() >= 2 && host.front() == '[' && host.back() == ']')
+            host = host.substr(1, host.size() - 2);
+        if (host.empty() || port == 0)
+            continue;
+        peers.emplace_back(host, port);
+    }
+    return peers;
+}
+
 // verbose: true -- json result, false -- hex-encode result;
 nlohmann::json NodeRPC::getblockheader(uint256 header, bool verbose)
 {
