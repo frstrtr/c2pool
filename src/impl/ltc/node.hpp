@@ -90,6 +90,11 @@ protected:
     // compute thread (unsafe); the stuck cycle, if it ever returns, finds the
     // flag already false and its idempotent IO-phase drain runs harmlessly.
     static constexpr int THINK_WATCHDOG_SECONDS = 30;
+    // MAX_PENDING_ADDS caps the deferred queue so a stuck/slow think() cannot
+    // grow memory without bound — over the cap new batches are dropped with a
+    // LOG_WARNING backpressure message (peers re-advertise, so dropped shares
+    // are re-requested later).
+    static constexpr size_t MAX_PENDING_ADDS = 256;
     std::atomic<int64_t>  m_think_deadline_ns{0};
     std::atomic<uint64_t> m_think_generation{0};
     std::unique_ptr<boost::asio::steady_timer> m_watchdog_timer;
