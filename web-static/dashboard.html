@@ -1841,6 +1841,7 @@
                         <div class="stat-value" style="display: flex; align-items: baseline; justify-content: flex-start; gap: 4px;"><span id="best_share_round_pct_fancy" style="color: var(--primary);">-</span><span id="best_share_merged_round_part" style="display: none;"> / <span id="best_share_merged_pct_fancy" style="color: #c3a634;">-</span></span></div>
                         <div class="stat-sub" style="font-size: 0.85em;"><span id="best_share_round_diff" style="color: var(--primary);">-</span> / <span id="best_share_net_diff" style="opacity: 0.55;">-</span><span id="best_share_merged_diff_part" style="display: none;"> &nbsp;·&nbsp; <span id="best_share_merged_round_diff" style="color: #c3a634;">-</span> / <span id="best_share_merged_net_diff" style="opacity: 0.55;">-</span></span></div>
                         <div class="stat-detail">🏆 <span style="color: var(--primary);"><span id="best_share_alltime_pct_fancy">-</span></span><span id="best_share_merged_record_part" style="display: none;"> / <span style="color: #c3a634;"><span id="best_share_merged_alltime_pct_fancy">-</span></span></span><span id="best_share_median_part" style="display: none;"> &nbsp;· x̃ <span style="color: var(--primary);"><span id="best_share_median_pct_fancy">-</span></span><span id="best_share_merged_median_part" style="display: none;"> / <span style="color: #c3a634;"><span id="best_share_merged_median_pct_fancy">-</span></span></span></span></div>
+                        <div class="stat-detail" style="font-size: 0.75em; opacity: 0.7; font-family: monospace; display: none;" id="best_share_hash_line" title=""></div>
                     </div>
                 </div>
                 
@@ -2992,6 +2993,20 @@
             d3.select('#best_share_round_diff').text(format_difficulty(bs.round.difficulty));
             d3.select('#best_share_net_diff').text(format_difficulty(bs.network_difficulty));
             d3.select('#best_share_alltime_pct_fancy').html(format_pct_fancy(bs.all_time.pct_of_block));
+            // Record-share hash (the exact hash that got closest to a block).
+            var recHash = (bs.round && bs.round.hash) ? bs.round.hash
+                        : ((bs.all_time && bs.all_time.hash) ? bs.all_time.hash : '');
+            var recMiner = (bs.round && bs.round.miner) ? bs.round.miner
+                        : ((bs.all_time && bs.all_time.miner) ? bs.all_time.miner : '');
+            var hl = d3.select('#best_share_hash_line');
+            if (recHash) {
+                hl.style('display', 'block')
+                  .attr('title', recHash + (recMiner ? '  —  ' + recMiner : ''))
+                  .text('⛏ ' + recHash.substr(0, 12) + '…' + recHash.substr(-8)
+                        + (recMiner ? '  ·  ' + recMiner.substr(0, 10) : ''));
+            } else {
+                hl.style('display', 'none');
+            }
             if (bs.merged) {
                 d3.select('#best_share_merged_round_part').style('display', 'inline');
                 d3.select('#best_share_merged_pct_fancy').html(format_pct_fancy(bs.merged.round.pct_of_block));

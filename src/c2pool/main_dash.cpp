@@ -674,6 +674,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // ── REAL best-share hash ──────────────────────────────────────
             web_server->set_best_share_hash_fn(
                 [node_ptr]() { return node_ptr->best_share_hash(); });
+
+            // ── REAL pool-peer info (node-status card) ────────────────────
+            // /local_stats {peers:{incoming,outgoing}} + the peer table read
+            // this. Without it the node-status card reported 0 peers on DASH
+            // (the m_node fallback in rest_local_stats never sees the pool
+            // p2p peers). Same shape main_ltc.cpp:2830 uses. Display only.
+            mi->set_peer_info_fn(
+                [&p2p_node]() -> nlohmann::json {
+                    return p2p_node.get_peer_info_json();
+                });
         }
 
         // ── REAL per-share difficulty feed (main_ltc.cpp:4213) ────────────
@@ -939,6 +949,48 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // verified-chain so we never mint on an unverified foreign chain).
         work_source->set_best_share_hash_fn(
             [node_ptr]() -> uint256 { return node_ptr->best_share_hash(); });
+
+        // ── REAL best-share feed for the dashboard "Best Share" card ──────
+        // Every ACCEPTED stratum submit reports the actual PoW difficulty of
+        // the found hash (target_to_difficulty(pow_hash)) + miner + pow-hash.
+        // record_share_difficulty tracks the pool-wide/session/round max WITH
+        // the hash + timestamp; /best_share + /local_stats render it. This is
+        // the PRIMARY best-share feed on the DASH solo path — the tracker's
+        // verified-share m_on_share_difficulty hook (wired above) almost never
+        // fires here because solo shares seldom mint onto the sharechain, so
+        // without this the 🎯 Best Share card sat empty. Display only; the
+        // callback touches no share/target/payout logic (consensus-neutral).
+        if (web_server) {
+            core::WebServer* ws = web_server.get();
+            work_source->set_on_share_difficulty_fn(
+                [ws](double diff, const std::string& miner, const uint256& pow_hash) {
+                    ws->get_mining_interface()->record_share_difficulty(
+                        diff, miner, pow_hash.GetHex());
+                });
+
+            // ── Recent-blocks feed: DASH block wins into the history card ──
+            // Every dispatched block solution records to /recent_blocks with
+            // the height, X11 block hash (== pow_hash for DASH), miner, and the
+            // net difficulty at find time. Without this DASH block wins never
+            // appeared on the recent-blocks card (main_ltc.cpp:2970 parity).
+            // Display only; the callback runs after dispatch, never gates it.
+            work_source->set_on_found_block_fn(
+                [ws](uint32_t height, const uint256& block_hash,
+                     const std::string& miner, bool reached_network) {
+                    auto* mi = ws->get_mining_interface();
+                    mi->record_found_block(
+                        height, block_hash,
+                        static_cast<uint64_t>(std::time(nullptr)),
+                        "DASH", miner, block_hash.GetHex(),
+                        mi->get_network_difficulty(),
+                        /*share_difficulty=*/0.0,
+                        /*pool_hashrate=*/0.0,
+                        /*subsidy=*/0);
+                    if (!reached_network)
+                        LOG_WARNING << "[DASH] recorded found block height="
+                                    << height << " that reached NO network sink";
+                });
+        }
 
         // Producer job: the stratum coinbase IS the producer share gentx
         // (byte-parity with the mint-time rebuild by construction). The

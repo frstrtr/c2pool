@@ -1286,6 +1286,20 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     // Record in per-connection tracker (for VARDIFF adjustment + per-session stats)
     hashrate_tracker_.record_mining_share_submission(credited_difficulty, true);
 
+    // Best-share dashboard feed: every ACCEPTED pseudoshare's real (X11/scrypt)
+    // difficulty is a candidate for the "Best Share" card (highest-difficulty
+    // share seen — how close a miner got to a block). Default no-op; a work
+    // source whose dashboard is a separate object (c2pool-dash) overrides this
+    // to forward into the dashboard's best-share tracker. share_difficulty is
+    // the true per-hash difficulty computed above; pass the raw submit fields so
+    // the implementor can recover the exact pow-hash. Display only.
+    mining_interface_->record_best_pseudoshare(
+        share_difficulty, username_,
+        job.payload->coinb1, job.payload->coinb2,
+        extranonce1_, extranonce2, ntime, nonce,
+        effective_version, job.gbt_prevhash, job.nbits,
+        job.payload->merkle_branches);
+
     // Check if VARDIFF changed → send new difficulty AND new work to miner.
     // p2pool (stratum.py:594-595): after adjusting target, calls _send_work()
     // which sends both set_difficulty and mining.notify. Without new work,

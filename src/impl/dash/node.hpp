@@ -620,6 +620,30 @@ public:
     /// above, next to send_version.)
     uint256 best_share_hash();
 
+    /// Pool-peer info for the dashboard node-status card (ltc node.hpp:302
+    /// parity). Display only — MiningInterface::set_peer_info_fn feeds
+    /// /local_stats {peers:{incoming,outgoing}} and the peer table. Read-only
+    /// over the live m_peers map; touches no share/target/payout state.
+    nlohmann::json get_peer_info_json() const {
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& [nonce, peer] : m_peers) {
+            if (!peer) continue;
+            auto addr = peer->addr();
+            bool incoming = (m_outbound_addrs.find(addr) == m_outbound_addrs.end());
+            auto uptime_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - peer->m_connected_at).count();
+            arr.push_back({
+                {"address", addr.to_string()},
+                {"version", peer->m_other_subversion},
+                {"incoming", incoming},
+                {"uptime", uptime_sec},
+                {"downtime", 0},
+                {"web_port", 0}
+            });
+        }
+        return arr;
+    }
+
     /// Relay a share (and up to 4 un-broadcast ancestors) to all peers via
     /// the message_shares wire codec (+ remember_tx/forget_tx for txs the
     /// peer lacks). try_to_lock; deferred if the compute thread is busy.

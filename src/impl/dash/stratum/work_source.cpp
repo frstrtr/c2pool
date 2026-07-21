@@ -710,6 +710,12 @@ nlohmann::json DASHWorkSource::mining_submit(
         }
     };
 
+    // NOTE: the dashboard "Best Share" feed is NOT recorded here — mining_submit
+    // only runs for pool-quality shares / block solutions (the stratum session
+    // gates it), so it would miss ordinary pseudoshares. Every accepted
+    // pseudoshare is instead recorded via record_best_pseudoshare(), which the
+    // core stratum session calls on the vardiff-accept path.
+
     // 6. Classify (tighten-first: block target before share target).
     if (pow_hash <= block_target) {
         // A full network block. NEVER drop it.
@@ -803,6 +809,19 @@ nlohmann::json DASHWorkSource::mining_submit(
                          "BLOCK height=" << height << " not broadcast -- lost subsidy!";
         }
 
+        // Recent-blocks dashboard record: a genuine block solution we
+        // dispatched to the network. A local payee-guard reject was never sent
+        // (not a won block) so it is skipped. Display only; fired after the
+        // dispatch decision, never gates it.
+        if (!payee_guard_reject) {
+            FoundBlockFn fb_fn;
+            {
+                std::lock_guard<std::mutex> lk(found_block_mutex_);
+                fb_fn = on_found_block_fn_;
+            }
+            if (fb_fn) fb_fn(height, pow_hash, username, reached_network);
+        }
+
         bump(true);
         return nlohmann::json(true);
     }
@@ -874,23 +893,23 @@ nlohmann::json DASHWorkSource::mining_submit(
     return reject(23, "Low difficulty share");
 }
 
-double DASHWorkSource::compute_share_difficulty(
+// Shared header reconstruction → X11 pow-hash. Used by BOTH the vardiff-gate
+// difficulty (compute_share_difficulty) and the best-share dashboard feed
+// (record_best_pseudoshare) so the two never diverge. Returns a null uint256
+// on any malformed input.
+static uint256 dash_reconstruct_pow_hash(
     const std::string& coinb1, const std::string& coinb2,
     const std::string& extranonce1, const std::string& extranonce2,
     const std::string& ntime, const std::string& nonce,
     uint32_t version, const std::string& prevhash_hex,
     const std::string& nbits_hex,
-    const std::vector<std::string>& merkle_branches) const
+    const std::vector<std::string>& merkle_branches)
 {
-    // Per-coin PoW difficulty for the vardiff gate: the SAME header
-    // reconstruction as mining_submit, ending in diff1 / x11(header). 0.0 on
-    // any malformed input (the documented parse-error sentinel the vardiff
-    // gate treats as a hard reject).
     auto coinb1_bytes = ParseHex(coinb1);
     auto en1_bytes    = ParseHex(extranonce1);
     auto en2_bytes    = ParseHex(extranonce2);
     auto coinb2_bytes = ParseHex(coinb2);
-    if (coinb1_bytes.empty() || coinb2_bytes.empty()) return 0.0;
+    if (coinb1_bytes.empty() || coinb2_bytes.empty()) return uint256();
 
     std::vector<unsigned char> coinbase;
     coinbase.reserve(coinb1_bytes.size() + en1_bytes.size()
@@ -908,9 +927,8 @@ double DASHWorkSource::compute_share_difficulty(
         merkle_root = merkle_pair(merkle_root, b);
     }
 
-    // prevhash arrives BE-display; 64 hex chars or it's malformed.
     auto prevhash_be = ParseHex(prevhash_hex);
-    if (prevhash_be.size() != 32) return 0.0;
+    if (prevhash_be.size() != 32) return uint256();
     uint256 prev_block;
     prev_block.SetHex(prevhash_hex.c_str());
 
@@ -920,9 +938,53 @@ double DASHWorkSource::compute_share_difficulty(
         parse_be_hex_u32(ntime), parse_be_hex_u32(nbits_hex),
         parse_be_hex_u32(nonce));
 
-    const uint256 pow_hash = dash::crypto::hash_x11(header, sizeof(header));
+    return dash::crypto::hash_x11(header, sizeof(header));
+}
+
+double DASHWorkSource::compute_share_difficulty(
+    const std::string& coinb1, const std::string& coinb2,
+    const std::string& extranonce1, const std::string& extranonce2,
+    const std::string& ntime, const std::string& nonce,
+    uint32_t version, const std::string& prevhash_hex,
+    const std::string& nbits_hex,
+    const std::vector<std::string>& merkle_branches) const
+{
+    // Per-coin PoW difficulty for the vardiff gate: the SAME header
+    // reconstruction as mining_submit, ending in diff1 / x11(header). 0.0 on
+    // any malformed input (the documented parse-error sentinel the vardiff
+    // gate treats as a hard reject).
+    const uint256 pow_hash = dash_reconstruct_pow_hash(
+        coinb1, coinb2, extranonce1, extranonce2, ntime, nonce,
+        version, prevhash_hex, nbits_hex, merkle_branches);
     if (pow_hash.IsNull()) return 0.0;
     return chain::target_to_difficulty(pow_hash);
+}
+
+void DASHWorkSource::record_best_pseudoshare(
+    double share_difficulty, const std::string& miner,
+    const std::string& coinb1, const std::string& coinb2,
+    const std::string& extranonce1, const std::string& extranonce2,
+    const std::string& ntime, const std::string& nonce,
+    uint32_t version, const std::string& prevhash_hex,
+    const std::string& nbits_hex,
+    const std::vector<std::string>& merkle_branches)
+{
+    ShareDifficultyFn fn;
+    {
+        std::lock_guard<std::mutex> lk(share_difficulty_mutex_);
+        fn = on_share_difficulty_fn_;
+    }
+    if (!fn) return;
+    const uint256 pow_hash = dash_reconstruct_pow_hash(
+        coinb1, coinb2, extranonce1, extranonce2, ntime, nonce,
+        version, prevhash_hex, nbits_hex, merkle_branches);
+    // Prefer the difficulty the stratum session already computed; fall back to
+    // the reconstructed hash if the caller passed 0.
+    double diff = share_difficulty > 0.0
+                      ? share_difficulty
+                      : (pow_hash.IsNull() ? 0.0 : chain::target_to_difficulty(pow_hash));
+    if (diff > 0.0)
+        fn(diff, miner, pow_hash);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -933,6 +995,18 @@ void DASHWorkSource::set_best_share_hash_fn(std::function<uint256()> fn)
 {
     std::lock_guard<std::mutex> lk(best_share_mutex_);
     best_share_hash_fn_ = std::move(fn);
+}
+
+void DASHWorkSource::set_on_share_difficulty_fn(ShareDifficultyFn fn)
+{
+    std::lock_guard<std::mutex> lk(share_difficulty_mutex_);
+    on_share_difficulty_fn_ = std::move(fn);
+}
+
+void DASHWorkSource::set_on_found_block_fn(FoundBlockFn fn)
+{
+    std::lock_guard<std::mutex> lk(found_block_mutex_);
+    on_found_block_fn_ = std::move(fn);
 }
 
 void DASHWorkSource::set_mint_share_fn(MintShareFn fn)
