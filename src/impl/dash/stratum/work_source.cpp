@@ -843,33 +843,40 @@ nlohmann::json DASHWorkSource::mining_submit(
             block_bytes.insert(block_bytes.end(), tx_bytes.begin(), tx_bytes.end());
         }
 
-        // ── SUBMIT-TIME PAYEE GUARD (stale-payee fix, defect 4) ──────────
-        // Last line of defense: validate the job's frozen coinbase against
-        // the CURRENT template's GBT-mandated payments before dispatch. A
-        // same-height payee mismatch is a deterministic dashd bad-cb-payee
-        // reject (the hex-confirmed h1517420 class) — reject LOUDLY here
-        // instead of submitting a doomed block (steward-ruled posture). A
-        // moved tip is an orphan-race candidate and still submits; a guard-
-        // side parse failure never blocks a submission.
+        // ── SUBMIT-TIME PAYEE GUARD (payee-script set-membership) ────────
+        // Last line of defense before dispatch. REWARD INVARIANT: never refuse
+        // a block dashd would ACCEPT (a false refusal forfeits ~0.44 DASH),
+        // while still refusing one dashd would deterministically reject for
+        // bad-cb-payee. The guard verifies the job's frozen coinbase pays every
+        // GBT-mandated payee SCRIPT by SET MEMBERSHIP — it does NOT compare
+        // amounts against the current template (the masternode amount is
+        // subsidy + fees and drifts with the mempool on every re-pull; dashd
+        // checks it against the block's OWN fees). Refuse only when the tip has
+        // moved (wrong height) or a mandated payee SCRIPT is genuinely absent;
+        // a guard-side parse failure never blocks a submission.
         bool payee_guard_reject = false;
         if (wd) {
             const auto guard = check_submit_payee(
                 coinbase, job->gbt_prevhash, *wd,
                 dash::make_coin_params(is_testnet_));
             switch (guard.verdict) {
-            case PayeeGuardVerdict::StalePayee:
+            case PayeeGuardVerdict::PayeeMissing:
                 payee_guard_reject = true;
                 LOG_ERROR << "[DASH-STRATUM-PAYEE-GUARD] WON BLOCK LOCALLY "
                              "REJECTED, NOT submitted: " << guard.detail
                           << " user=" << username << " job=" << job_id
-                          << " -- a stale-payee coinbase is a guaranteed "
-                             "bad-cb-payee network reject; the job/template "
-                             "pipeline served stale work (investigate!)";
+                          << " -- a coinbase that omits a mandated payee script "
+                             "is a guaranteed bad-cb-payee network reject; the "
+                             "job/template pipeline served stale work "
+                             "(investigate!)";
                 break;
-            case PayeeGuardVerdict::TipMoved:
-                LOG_WARNING << "[DASH-STRATUM-PAYEE-GUARD] " << guard.detail
-                            << " -- submitting anyway (block is self-"
-                               "consistent for its own height)";
+            case PayeeGuardVerdict::WrongHeight:
+                payee_guard_reject = true;
+                LOG_ERROR << "[DASH-STRATUM-PAYEE-GUARD] WON BLOCK LOCALLY "
+                             "REJECTED, NOT submitted: " << guard.detail
+                          << " user=" << username << " job=" << job_id
+                          << " -- the job's parent is no longer the chain tip; "
+                             "dashd would reject this wrong-height block";
                 break;
             case PayeeGuardVerdict::Unverifiable:
                 LOG_WARNING << "[DASH-STRATUM-PAYEE-GUARD] guard could not "
@@ -877,9 +884,11 @@ nlohmann::json DASHWorkSource::mining_submit(
                             << ") -- submitting unblocked";
                 break;
             case PayeeGuardVerdict::Ok:
-                LOG_INFO << "[DASH-STRATUM-PAYEE-GUARD] coinbase payee set "
-                            "verified against current template ("
-                         << guard.detail << ")";
+                LOG_INFO << "[DASH-STRATUM-PAYEE-GUARD] coinbase pays all "
+                            "mandated payee scripts at the current height ("
+                         << guard.detail
+                         << ") -- amount drift (if any) is validated by dashd "
+                            "against the block's own fees; submitting";
                 break;
             }
         }
