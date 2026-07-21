@@ -639,20 +639,23 @@ if (BUILD_TESTING AND GTest_FOUND)
     # core (links core for script_to_address in address_utils.cpp). Last S7
     # capstone; node-backed end-to-end parity deferred to a live-harness leaf.
     #
-    # CI-fold (build.yml "Build tests" allowlists this target but not the two
-    # byte-parity executables): the real-dashd CbTx byte-parity + from-wire
-    # merkle-root parity proofs are COMPILED INTO this already-built+CI-run
-    # executable (their TEST() suites are distinct: DashEmbeddedCbtxByteParity,
-    # DashMnlistdiffRootParity), so they actually run in CI. Do NOT re-add
-    # standalone add_executable/gtest_add_tests for them — CTest would register
-    # unbuilt executables (ctest "Not Run" exit 8, the Linux x86_64 red).
+    # CI-fold (build.yml "Build tests" allowlists this target but not the extra
+    # byte-parity/oracle-shadow executables): the real-dashd CbTx byte-parity +
+    # from-wire merkle-root parity proofs AND the embedded oracle-shadow
+    # validator KATs are COMPILED INTO this already-built+CI-run executable
+    # (distinct TEST() suites), so they actually run in CI. The oracle-shadow
+    # fold also avoids a new build.yml --target (push bot lacks `workflow` scope
+    # -> a standalone target would be a NOT_BUILT sentinel). Do NOT re-add
+    # standalone add_executable/gtest_add_tests for any of them — CTest would
+    # register unbuilt executables (ctest "Not Run" exit 8, the Linux x86_64 red).
     # DASH_FIXTURE_DIR is needed by the from-wire fixture loader (mnlistdiff).
     add_executable(test_dash_embedded_gbt
         test_dash_embedded_gbt.cpp
         test_dash_embedded_cbtx_byte_parity.cpp
         test_dash_mnlistdiff_root_parity.cpp
         test_dash_dkg_commitments.cpp
-        test_dash_sml_quorum_db.cpp)
+        test_dash_sml_quorum_db.cpp
+        test_dash_embedded_oracle_shadow.cpp)
     target_compile_definitions(test_dash_embedded_gbt PRIVATE
         DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     target_link_libraries(test_dash_embedded_gbt PRIVATE
@@ -663,23 +666,6 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_dash_embedded_gbt PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_embedded_gbt "" AUTO)
-
-    # DASH Embedded ORACLE-SHADOW VALIDATOR: hermetic KATs for the pure
-    # classify/compare/graduation decision logic (embedded_oracle_shadow.hpp) the
-    # per-block dashd cross-check relies on -- determinism tagging (mempool/fee
-    # differences are NOT divergences; roots/identity are), the graduation
-    # predicate (N consecutive clean + K per-class coverage + reorg), and the
-    # height-class periodicity. Same link set as the embedded_gbt capstone
-    # (pulls node_coin_state -> work_source + vendor/cbtx via the header).
-    add_executable(test_dash_embedded_oracle_shadow test_dash_embedded_oracle_shadow.cpp)
-    target_link_libraries(test_dash_embedded_oracle_shadow PRIVATE
-        GTest::gtest_main GTest::gtest
-        dash_x11 core
-        nlohmann_json::nlohmann_json
-        ${Boost_LIBRARIES}
-    )
-    target_link_libraries(test_dash_embedded_oracle_shadow PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
-    gtest_add_tests(test_dash_embedded_oracle_shadow "" AUTO)
 
     # DASH underfill guard: port of the LTC/DOGE "near-empty template on a
     # non-empty mempool" template-builder guard to the DASH embedded GBT path
