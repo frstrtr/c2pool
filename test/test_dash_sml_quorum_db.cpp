@@ -24,13 +24,13 @@
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
 
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <random>
 #include <string>
 #include <vector>
-
-#include <unistd.h>   // getpid (unique scratch-dir naming)
 
 using dash::coin::vendor::CSimplifiedMNListDiff;
 using dash::coin::vendor::CSimplifiedMNList;
@@ -76,13 +76,19 @@ static void build_full_state(CSimplifiedMNList& sml, QuorumManager& qmgr,
     qmgr.apply(tail);
 }
 
-// Unique scratch dir per test; removed on teardown.
+// Unique scratch dir per test; removed on teardown. Uses only portable
+// std::filesystem + std::random_device (no POSIX getpid/unistd.h), so the
+// KAT compiles under MSVC as well as libstdc++/libc++.
 struct TmpDir {
     std::filesystem::path root;
     TmpDir() {
+        static std::atomic<uint64_t> counter{0};
+        std::random_device rd;
+        const uint64_t uniq = (static_cast<uint64_t>(rd()) << 32)
+                            ^ static_cast<uint64_t>(rd())
+                            ^ counter.fetch_add(1);
         root = std::filesystem::temp_directory_path()
-             / ("c2pool_sml_db_kat_" + std::to_string(::getpid()) + "_"
-                + std::to_string(reinterpret_cast<uintptr_t>(this)));
+             / ("c2pool_sml_db_kat_" + std::to_string(uniq));
         std::filesystem::create_directories(root);
     }
     ~TmpDir() { std::error_code ec; std::filesystem::remove_all(root, ec); }
