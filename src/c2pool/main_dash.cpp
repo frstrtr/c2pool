@@ -55,6 +55,8 @@
 #include <impl/dash/coin/rpc_conf.hpp>     // dash.conf creds resolution (rpcpassword off argv)
 #include <impl/dash/coin/node_interface.hpp>
 #include <impl/dash/coin/p2p_client.hpp>   // dash::coin::p2p::CoinClient — OPT-IN coin-network dial (E1, --coin-p2p-connect)
+#include <impl/dash/coin/coin_peer_manager.hpp> // dash::coin::DashCoinPeerManager — DASH-ISOLATED scored/diverse peer discovery (--coin-p2p-discover; network-standalone gate)
+#include <impl/dash/coin/chain_seeds.hpp>  // dash::coin::dash_dns_seeds / dash_fixed_seeds — DASH mainnet/testnet seed bootstrap
 #include <impl/dash/coin/won_block_dispatch.hpp> // dash::coin::broadcast_won_block — S8 dual-path won-block dispatcher (embedded P2P primary + submitblock RPC backup)
 #include <impl/dash/coin/zmq_tip_notify.hpp> // dash::coin::TipHashDedup / ZmqHashblockSubscriber — dashd ZMQ hashblock INSTANT tip-notify (opt-in, hardening on the #770 poll)
 #include <impl/dash/coin/coin_p2p_magic.hpp>      // dash::coin::select_coin_p2p_magic — E5 --coin-p2p-magic override (regtest ARM A dial)
@@ -205,7 +207,7 @@ void print_banner(const char* argv0)
         << "       " << argv0 << " --run [--coin-rpc H:P] [--coin-rpc-auth PATH]\n"
         << "           [--testnet] [--submit-block HEX | --submit-block-file PATH]\n"
         << "           [--listen [HOST:]PORT] [--addnode HOST:PORT]... [--connect HOST:PORT]...\n"
-        << "           [--stratum [HOST:]PORT] [--coin-p2p-connect HOST:PORT]...\n"
+        << "           [--stratum [HOST:]PORT] [--coin-p2p-connect HOST:PORT]... [--coin-p2p-discover]\n"
         << "           [--web-port PORT] [--web-host ADDR] [--dashboard-dir PATH]\n"
         << "           [--external-ip ADDR]\n"
         << "           [--embedded-utxo]\n"
@@ -236,6 +238,12 @@ void print_banner(const char* argv0)
         << "        (default mainnet bf0c6bbd / testnet cee2caff; regtest fcc1b7dc).\n"
         << "        --regtest-force-won-block (regtest E5 harness, fail-closed) drives\n"
         << "        ONE real won block through the run-path dual-path dispatch.\n"
+        << "        --coin-p2p-discover arms the DASH-isolated peer manager: seed\n"
+        << "        (dnsseed.dash.org + fixed) bootstrap, source-scored + group-diverse\n"
+        << "        (Sybil-capped) peer selection, anchors, and a self-healing dial\n"
+        << "        rotation INDEPENDENT of the local dashd — the network-standalone\n"
+        << "        arm (daemonless witness). Any --coin-p2p-connect peer is kept as a\n"
+        << "        pinned/preferred node alongside the discovered set.\n"
         << "        --web-port PORT (alias --http-port, default 8080) serves the FULL\n"
         << "        c2pool web dashboard + JSON API on --web-host (default 0.0.0.0)\n"
         << "        from --dashboard-dir (default web-static); --web-port 0 disables.\n"
@@ -413,6 +421,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              const std::string& web_host, uint16_t web_port,
              const std::string& dashboard_dir,
              const std::vector<NetService>& coin_p2p_targets,
+             bool coin_p2p_discover,
              bool embedded_utxo,
              double dev_donation, double node_owner_fee,
              const std::string& node_owner_address,
@@ -1064,7 +1073,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // sharechain node and stratum; declared after config/coin_state (both of
     // which it borrows), so it is destroyed before them at scope exit.
     std::unique_ptr<dash::coin::p2p::CoinClient<dash::Config>> coin_p2p;
-    if (!coin_p2p_targets.empty()) {
+    // DASH-ISOLATED scored/diverse peer discovery (--coin-p2p-discover). Owns
+    // its own peer table + seed bootstrap + scoring; feeds the single embedded
+    // connection an INDEPENDENT (non-dashd) diverse peer set. Declared BEFORE
+    // coin_p2p so it outlives the client that borrows it (reverse-destruction).
+    std::unique_ptr<dash::coin::DashCoinPeerManager> coin_peer_mgr;
+    std::unique_ptr<core::Timer> coin_dial_refresh_timer;
+    if (!coin_p2p_targets.empty() || coin_p2p_discover) {
         config.coin()->m_testnet = testnet;
         // Coin-network wire magic (dashd pchMessageStart). Default: mainnet
         // bf0c6bbd / testnet cee2caff. A dev regtest dashd uses a DISTINCT magic
@@ -1075,21 +1090,94 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         const std::string net_magic_hex =
             dash::coin::select_coin_p2p_magic(coin_p2p_magic_hex, testnet);
         config.coin()->m_p2p.prefix = ParseHexBytes(net_magic_hex);
-        config.coin()->m_p2p.address = coin_p2p_targets.front();
+        if (!coin_p2p_targets.empty())
+            config.coin()->m_p2p.address = coin_p2p_targets.front();
 
         coin_p2p = std::make_unique<dash::coin::p2p::CoinClient<dash::Config>>(
             &ioc, &coin_state, &config, "COIN-P2P");
-        coin_p2p->connect(coin_p2p_targets);
-        std::cout << "[run] coin-network P2P client dialing "
-                  << coin_p2p_targets.front().to_string()
-                  << (coin_p2p_targets.size() > 1
-                          ? " (+" + std::to_string(coin_p2p_targets.size() - 1)
-                                + " alternate[s], reconnect rotates)"
-                          : "")
-                  << " magic=" << net_magic_hex
-                  << " proto=70230 (E1: dial+handshake+keep-alive only;\n"
-                     "[run]       ingest legs are later slices — templates still source from\n"
-                     "[run]       the dashd-RPC fallback until NodeCoinState is fed)\n";
+
+        if (coin_p2p_discover) {
+            // ── Network-standalone arm: seed-discovered, SCORED, group-diverse
+            // peer set INDEPENDENT of the local dashd. The pinned local dashd
+            // (--coin-p2p-connect front target, if any) is registered as the
+            // PROTECTED/preferred peer that carries the redundant block-relay
+            // leg; it coexists with — never suppresses — the discovered set.
+            const uint16_t coin_port = testnet ? 19999 : 9999;
+            dash::coin::DashPeerManagerConfig pm_cfg;
+            pm_cfg.valid_ports = { coin_port };
+            const std::string pm_data_dir = (core::filesystem::config_path()
+                / net_subdir / "dash_embedded_peers").string();
+            coin_peer_mgr = std::make_unique<dash::coin::DashCoinPeerManager>(
+                ioc, "DASH", pm_data_dir, pm_cfg);
+
+            // Pin the local dashd (if supplied) as the protected preferred peer.
+            std::string pinned_str = "(none — fully daemonless)";
+            if (!coin_p2p_targets.empty()) {
+                if (coin_peer_mgr->set_local_node(coin_p2p_targets.front()))
+                    pinned_str = coin_p2p_targets.front().to_string();
+            }
+            coin_peer_mgr->set_dns_seeds(dash::coin::dash_dns_seeds(testnet));
+            coin_peer_mgr->set_fixed_seeds(dash::coin::dash_fixed_seeds(testnet));
+            coin_peer_mgr->start();
+
+            // addr-crawl discoveries feed back into the manager (source-scored
+            // +50); handshake connect/disconnect drive scoring + anchors.
+            coin_p2p->set_addr_callback(
+                [mgr = coin_peer_mgr.get()](const std::vector<NetService>& addrs) {
+                    for (auto& a : addrs) mgr->add_discovered_peer(a);
+                });
+            coin_p2p->set_on_peer_connected(
+                [mgr = coin_peer_mgr.get()](const NetService& s) {
+                    mgr->notify_connected(s.to_string());
+                });
+            coin_p2p->set_on_peer_disconnected(
+                [mgr = coin_peer_mgr.get()](const NetService& s) {
+                    mgr->notify_disconnected(s.to_string());
+                });
+
+            // Initial dial plan: pinned local dashd first (preferred), then the
+            // top scored+diverse discovered peers.
+            std::vector<NetService> dial;
+            for (auto& t : coin_p2p_targets) dial.push_back(t);
+            for (auto& ep : coin_peer_mgr->get_peers_to_connect({}))
+                dial.push_back(ep.to_net_service());
+            coin_p2p->connect(dial);
+
+            // Periodic dial-plan refresh (60s): rebuild from the freshly-scored,
+            // group-diverse set so newly-discovered high-score peers enter the
+            // rotation on the next reconnect — the self-healing witness loop.
+            coin_dial_refresh_timer = std::make_unique<core::Timer>(&ioc, /*repeat=*/true);
+            coin_dial_refresh_timer->start(60, [cp = coin_p2p.get(),
+                                                mgr = coin_peer_mgr.get(),
+                                                pinned = coin_p2p_targets]() {
+                std::vector<NetService> refreshed = pinned; // pinned always preferred
+                for (auto& ep : mgr->get_peers_to_connect({}))
+                    refreshed.push_back(ep.to_net_service());
+                cp->update_dial_targets(std::move(refreshed));
+            });
+
+            std::cout << "[run] coin-network P2P DISCOVERY armed (--coin-p2p-discover): "
+                         "DASH-isolated scored/diverse peer set, pinned="
+                      << pinned_str << " magic=" << net_magic_hex
+                      << " proto=70230 dns_seeds=" << dash::coin::dash_dns_seeds(testnet).size()
+                      << " fixed_seeds=" << dash::coin::dash_fixed_seeds(testnet).size()
+                      << " initial_dial=" << dial.size() << " target[s]\n"
+                         "[run]       (network-standalone witness: independent peers -> independent\n"
+                         "[run]       mempool/relay view; oracle-shadow standalone graduation gate)\n";
+        } else {
+            // Legacy single/pinned dial (--coin-p2p-connect only, no discovery).
+            coin_p2p->connect(coin_p2p_targets);
+            std::cout << "[run] coin-network P2P client dialing "
+                      << coin_p2p_targets.front().to_string()
+                      << (coin_p2p_targets.size() > 1
+                              ? " (+" + std::to_string(coin_p2p_targets.size() - 1)
+                                    + " alternate[s], reconnect rotates)"
+                              : "")
+                      << " magic=" << net_magic_hex
+                      << " proto=70230 (E1: dial+handshake+keep-alive only;\n"
+                         "[run]       ingest legs are later slices — templates still source from\n"
+                         "[run]       the dashd-RPC fallback until NodeCoinState is fed)\n";
+        }
     }
 
     // ── S8 miner-facing Stratum accept-loop standup (run-path caller) ─────
@@ -2434,11 +2522,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // Kick the initial sync once the version/verack handshake completes:
         // getheaders off our current locator + a mempool prime.
         coin_p2p->set_on_handshake_complete(
-            [cp = coin_p2p.get(), hc = header_chain.get(), sml_base]() {
+            [cp = coin_p2p.get(), hc = header_chain.get(), sml_base,
+             discover = coin_p2p_discover]() {
                 LOG_INFO << "[EMB-DASH] handshake complete -> initial sync:"
-                            " getheaders + mempool + mnlistdiff(cold)";
+                            " getheaders + mempool + mnlistdiff(cold)"
+                         << (discover ? " + getaddr (peer crawl)" : "");
                 cp->send_getheaders(70230, hc->get_locator(), uint256::ZERO);
                 cp->send_mempool();
+                // Peer-crawl: getaddr feeds set_addr_callback -> the isolated
+                // peer manager (addr-crawl source, +50 scored) so the diverse
+                // independent peer set grows off live wire discovery.
+                if (discover) cp->send_getaddr();
                 // Cold-start SML sync: full snapshot (base=ZERO) up to our best
                 // known header tip. Steady-state incremental diffs then ride the
                 // tip-changed driver. If the header chain is still empty at
@@ -3015,6 +3109,7 @@ int main(int argc, char** argv)
     std::vector<std::string> addnode_raw;      // --addnode HOST:PORT (persistent outbound)
     std::vector<std::string> connect_raw;      // --connect HOST:PORT (connect-only)
     std::vector<std::string> coin_p2p_raw;     // --coin-p2p-connect HOST:PORT (repeatable; E1 opt-in coin-network dial)
+    bool coin_p2p_discover = false;            // --coin-p2p-discover: DASH-isolated scored/diverse peer discovery (network-standalone arm; independent of local dashd)
     bool no_p2p_relay = false;                 // --no-p2p-relay: suppress the embedded P2P-relay won-block arm (A/B isolation; RPC backup stays live)
     bool embedded_mainnet = false;             // --embedded-mainnet: gate-lift, allow the daemonless embedded template arm on MAINNET (byte-parity proven; default OFF = dashd fallback)
     std::string coin_p2p_magic = "";           // --coin-p2p-magic HEX: override the embedded CoinClient wire magic (e.g. regtest fcc1b7dc); default mainnet/testnet
@@ -3079,6 +3174,8 @@ int main(int argc, char** argv)
             connect_raw.emplace_back(argv[++i]);
         else if (std::strcmp(argv[i], "--coin-p2p-connect") == 0 && i + 1 < argc)
             coin_p2p_raw.emplace_back(argv[++i]);
+        else if (std::strcmp(argv[i], "--coin-p2p-discover") == 0)
+            coin_p2p_discover = true;
         else if (std::strcmp(argv[i], "--no-p2p-relay") == 0)
             no_p2p_relay = true;
         else if (std::strcmp(argv[i], "--embedded-mainnet") == 0)
@@ -3200,7 +3297,7 @@ int main(int argc, char** argv)
         }
         return run_node(testnet, rpc_endpoint, rpc_conf_path, submit_hex, peer,
                         stratum_host, stratum_port, web_host, web_port,
-                        dashboard_dir, coin_p2p_targets,
+                        dashboard_dir, coin_p2p_targets, coin_p2p_discover,
                         embedded_utxo, dev_donation, node_owner_fee,
                         node_owner_address, redistribute_mode, no_p2p_relay,
                         embedded_mainnet,
