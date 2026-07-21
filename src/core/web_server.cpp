@@ -383,6 +383,8 @@ void HttpSession::process_request()
                 rest_result = mining_interface_->rest_node_info();
             else if (target == "/api/node_topology")
                 rest_result = mining_interface_->rest_node_topology();
+            else if (target == "/embedded_oracle")
+                rest_result = mining_interface_->rest_embedded_oracle();
             else if (target == "/luck_stats")
                 rest_result = mining_interface_->rest_luck_stats();
             else if (target == "/ban_stats")
@@ -5272,6 +5274,21 @@ void MiningInterface::auto_detect_external_info()
 // (LTC/DOGE/BTC/DGB/DASH/BCH) runs a different coin set + embedded daemons;
 // the dashboard must reflect THAT node's REAL shape, auto-detected from live
 // state -- never a hardcoded LTC+DOGE shape. Web/diagnostic layer only.
+// Embedded ORACLE-SHADOW validator stats (/embedded_oracle). Returns the
+// per-block dashd cross-check coverage ledger + objective GRADUATION verdict
+// (the safe-to-disable-dashd gate) when the wiring layer feeds the hook;
+// otherwise a {mode:disabled} shape. OBSERVE-only reporting.
+nlohmann::json MiningInterface::rest_embedded_oracle()
+{
+    if (m_embedded_oracle_fn) {
+        auto j = m_embedded_oracle_fn();
+        if (!j.is_null())
+            return j;
+    }
+    return nlohmann::json{{"mode", "disabled"},
+        {"note", "embedded-oracle-shadow not wired on this node"}};
+}
+
 nlohmann::json MiningInterface::rest_node_topology()
 {
     // D0.3 seam: prefer the per-coin StatsProvider hook when the wiring layer

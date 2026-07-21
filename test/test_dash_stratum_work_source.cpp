@@ -32,14 +32,10 @@
 
 #include <gtest/gtest.h>
 
-#include <atomic>
 #include <cstring>
-#include <functional>
 #include <memory>
-#include <mutex>
 #include <span>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace {
@@ -793,87 +789,6 @@ TEST(DashStratumWorkSource, FallbackArmTipChangeRefreshesTemplateAndBumpsGenerat
     EXPECT_NE(tmpl_after.value("previousblockhash", ""),
               tmpl_before.value("previousblockhash", ""));
     EXPECT_EQ(tmpl_after.value("height", 0u), 424243u);
-}
-
-// ── io-thread-decouple KAT (mining-hotel stratum-stall fix, v0.2.3.8) ────────
-// The stall fix: the stratum io_context thread must NEVER block on the dashd
-// fallback getblocktemplate. cached_work() re-sources through a background
-// executor (the dedicated rpc_pool in main_dash.cpp) as a SINGLE-FLIGHT job and
-// serves the cached template immediately, so a generation bump (a minted share,
-// ~every 15-30 s) no longer freezes 60+ sessions on a blocking GBT. Pins:
-//   (a) with an executor wired, a cache-miss / gen-bump does NOT call the (slow)
-//       fallback on the calling (io) thread -- it schedules ONE background job
-//       and serves the current cache immediately;
-//   (b) the re-source runs on the EXECUTOR's thread, not the caller's;
-//   (c) single-flight: concurrent misses schedule at most one refresh;
-//   (d) the gen-key freshness contract (double-fetch-race fix) is preserved --
-//       a bump still triggers a refresh, only OFF the io thread.
-TEST(DashStratumWorkSource, IoThreadDecoupleServesCachedAndRefreshesOffThread)
-{
-    dash::coin::NodeCoinState cs;   // unpopulated -> dashd-fallback arm
-    std::atomic<int> fallback_calls{0};
-    std::atomic<bool> fallback_on_caller{false};
-    const auto caller_tid = std::this_thread::get_id();
-
-    auto ws = std::make_unique<dash::stratum::DASHWorkSource>(
-        cs,
-        [&]() -> dash::coin::DashWorkData {
-            fallback_calls.fetch_add(1);
-            if (std::this_thread::get_id() == caller_tid)
-                fallback_on_caller.store(true);
-            return rich_work();
-        });
-
-    // Controllable executor: capture jobs so the test drives WHEN the background
-    // re-source runs. Single-flight is enforced inside the work source.
-    std::mutex jm;
-    std::vector<std::function<void()>> jobs;
-    ws->set_refresh_executor([&](std::function<void()> job) {
-        std::lock_guard<std::mutex> l(jm);
-        jobs.push_back(std::move(job));
-    });
-
-    // (1) First request: cache empty. The io thread does NOT call the fallback --
-    //     it schedules ONE background job and serves an empty set-gap template.
-    auto t0 = ws->get_current_work_template();
-    EXPECT_TRUE(t0.empty());
-    EXPECT_EQ(fallback_calls.load(), 0);              // io thread never blocked on dashd
-    { std::lock_guard<std::mutex> l(jm); ASSERT_EQ(jobs.size(), 1u); }
-
-    // (1b) Single-flight: another request while a refresh is in flight schedules
-    //      no additional job.
-    (void)ws->get_current_work_template();
-    { std::lock_guard<std::mutex> l(jm); EXPECT_EQ(jobs.size(), 1u); }
-
-    // (2) Run the background job on a DIFFERENT thread (the rpc_pool stand-in).
-    //     The blocking fallback runs THERE; the cache is populated.
-    std::function<void()> job0;
-    { std::lock_guard<std::mutex> l(jm); job0 = jobs[0]; jobs.clear(); }
-    std::thread(job0).join();
-    EXPECT_EQ(fallback_calls.load(), 1);
-    EXPECT_FALSE(fallback_on_caller.load());          // re-source ran OFF the caller thread
-
-    // (3) Now cached + fresh: served immediately, no new fallback call, no job.
-    auto t1 = ws->get_current_work_template();
-    EXPECT_FALSE(t1.empty());
-    EXPECT_EQ(t1.value("previousblockhash", ""), std::string(kPrevHashHex));
-    EXPECT_EQ(fallback_calls.load(), 1);
-    { std::lock_guard<std::mutex> l(jm); EXPECT_TRUE(jobs.empty()); }
-
-    // (4) A generation bump (a minted best-share) breaks freshness, but the io
-    //     thread STILL does not block: it serves the cached template and
-    //     schedules a single background refresh.
-    ws->bump_work_generation();
-    auto t2 = ws->get_current_work_template();
-    EXPECT_FALSE(t2.empty());                          // served cached template -- no stall
-    EXPECT_EQ(fallback_calls.load(), 1);               // fallback NOT called on the io thread
-    { std::lock_guard<std::mutex> l(jm); ASSERT_EQ(jobs.size(), 1u); }
-
-    // Draining the scheduled refresh runs the fallback off-thread again.
-    std::function<void()> job1;
-    { std::lock_guard<std::mutex> l(jm); job1 = jobs[0]; jobs.clear(); }
-    std::thread(job1).join();
-    EXPECT_EQ(fallback_calls.load(), 2);
 }
 
 // Fix 3 pin (work-source side of the zero-hash pre-auth job_0 defect): a

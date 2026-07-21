@@ -182,58 +182,30 @@ void HashrateTracker::set_difficulty_from_hashrate(double now) {
     if (ewma_share_count_ < static_cast<uint64_t>(vardiff_warmup_shares_)) return; // keep seed diff
     double h = get_recent_hashrate(now);
     if (h <= 0.0) return;
-    // Un-quantized ideal difficulty from the smoothed hashrate. The [min,max]
-    // clamp is part of the ideal (a rig outside the bounds should sit at the
-    // bound), so hysteresis below operates on this clamped-but-unquantized value.
-    double d_ideal = h * target_time_per_mining_share_ / 4294967296.0;
-    d_ideal = std::max(min_difficulty_, std::min(max_difficulty_, d_ideal));
+    double d = h * target_time_per_mining_share_ / 4294967296.0;
+    d = std::max(min_difficulty_, std::min(max_difficulty_, d));
     // Firmware-grid fix: many ASIC firmwares round the advertised pool difficulty
     // DOWN to a power-of-two grid, then mine that easier target and submit shares
     // the pool's exact (higher) required difficulty rejects. Advertise only
     // power-of-two difficulties so advertised == applied == required. Round DOWN so
     // accepted-share cadence never drops below target.
+    d = std::exp2(std::floor(std::log2(d)));
     // Quantize the floor too so a floor-pinned/warm-up advertise is still a
     // power of two. min_difficulty_ (e.g. 0.0005) is not itself on the grid, so
     // re-flooring at it would re-open the firmware reject gap at the floor.
     // Advertise at most one grid step below the configured floor (0.000488 vs
     // 0.0005), preserving the round-DOWN cadence invariant.
-    double d_q = std::max(std::exp2(std::floor(std::log2(min_difficulty_))),
-                          std::exp2(std::floor(std::log2(d_ideal))));
-
-    // Hysteresis around the current power-of-two bucket. After the firmware-grid
-    // fix quantizes advertised diff to powers of two, both d_q and
-    // current_difficulty_ live on the 2^n grid, so a dead-band on the QUANTIZED
-    // ratio is inert (ratios are only 1, 2, 0.5). A rig whose un-quantized ideal
-    // D sits near a 2^n boundary would then flap its advertised bucket
-    // 2^n <-> 2^(n+1) on estimator noise (~+/-24% at tau=90s), doubling
-    // set_difficulty churn and jittering rig-side hashrate graphs.
-    //
-    // Fix: hold the current bucket [C, 2C) and only re-quantize when the
-    // UN-QUANTIZED ideal D leaves it DECISIVELY -- at/above 2C by the dead-band
-    // margin (step up) or below C by the dead-band margin (step down). Values in
-    // the band [C*(1-deadband), 2C*(1+deadband)) keep the current advertisement,
-    // so boundary noise no longer churns. This only widens the transition: it
-    // never advertises above ideal D by more than the margin, and never below the
-    // (quantized) floor. Round-DOWN cadence and warm-up/clamp are preserved.
+    d = std::max(std::exp2(std::floor(std::log2(min_difficulty_))),
+                 std::exp2(std::floor(std::log2(d))));
     if (current_difficulty_ > 0.0) {
-        const double C = current_difficulty_;
-        // Only hold when the current advertisement is itself on the 2^n grid
-        // (a value we previously advertised). A non-grid seed/hint (e.g. the raw
-        // min_difficulty_ or an operator hint) must be corrected onto the grid
-        // immediately, not frozen in place by the hysteresis band.
-        const bool current_on_grid = (C == std::exp2(std::floor(std::log2(C))));
-        if (current_on_grid) {
-            const double up_threshold   = 2.0 * C * (1.0 + vardiff_deadband_);
-            const double down_threshold = C * (1.0 - vardiff_deadband_);
-            if (d_ideal >= down_threshold && d_ideal < up_threshold)
-                return;  // inside the hysteresis band -- keep the current bucket
-        }
+        double ratio = d / current_difficulty_;
+        // Dead-band: absorb estimator noise, no needless set_difficulty churn.
+        if (ratio < 1.0 + vardiff_deadband_ && ratio > 1.0 / (1.0 + vardiff_deadband_))
+            return;
     }
-
-    if (d_q == current_difficulty_) return;  // decisive move re-adopts same grid step
-    LOG_INFO << "[Stratum] VARDIFF(hashrate): " << current_difficulty_ << " -> " << d_q
+    LOG_INFO << "[Stratum] VARDIFF(hashrate): " << current_difficulty_ << " -> " << d
              << " (H_est=" << h << " H/s, target=" << target_time_per_mining_share_ << "s)";
-    current_difficulty_ = d_q;  // downstream notify + stratum 1% resend guard unchanged
+    current_difficulty_ = d;  // downstream notify + stratum 1% resend guard unchanged
 }
 
 void HashrateTracker::adjust_difficulty() {

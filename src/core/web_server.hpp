@@ -488,6 +488,14 @@ public:
     void set_node_topology_fn(node_topology_fn_t fn) { m_node_topology_fn = std::move(fn); }
     nlohmann::json rest_node_topology();              // /api/node_topology
 
+    // Embedded ORACLE-SHADOW validator stats seam (/embedded_oracle). When set
+    // by a wiring layer (main_dash.cpp), returns the per-block dashd cross-check
+    // coverage ledger + objective GRADUATION verdict. OBSERVE-only reporting;
+    // touches no serving/consensus state. Unset -> a {mode:disabled} shape.
+    using embedded_oracle_fn_t = std::function<nlohmann::json()>;
+    void set_embedded_oracle_fn(embedded_oracle_fn_t fn) { m_embedded_oracle_fn = thread_safe_wrap(std::move(fn)); }
+    nlohmann::json rest_embedded_oracle();            // /embedded_oracle
+
     // Sharechain stats callback — returns live tracker data for the /sharechain/stats endpoint
     using sharechain_stats_fn_t = std::function<nlohmann::json()>;
     void set_sharechain_stats_fn(sharechain_stats_fn_t fn) { m_sharechain_stats_fn = thread_safe_wrap(std::move(fn)); }
@@ -1035,6 +1043,7 @@ private:
     spv_progress_fn_t m_spv_progress_fn;
     coin_peers_fn_t m_coin_peers_fn;
     node_topology_fn_t m_node_topology_fn;  // D0.3 per-coin stats provider (optional)
+    embedded_oracle_fn_t m_embedded_oracle_fn;  // /embedded_oracle shadow-validator stats (optional)
     // Rate limiter for /api/coin_peers: IP → last request time
     std::map<std::string, std::chrono::steady_clock::time_point> m_coin_peers_rate_limit;
     sharechain_window_fn_t m_sharechain_window_fn;

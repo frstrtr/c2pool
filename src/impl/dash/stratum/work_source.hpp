@@ -305,23 +305,6 @@ private:
     /// Bumps work_generation_ when a refresh observes a moved coin tip so
     /// stratum sessions re-push work on their next heartbeat.
     std::shared_ptr<const coin::DashWorkData> cached_work() const;
-    // io-thread-decouple: the blocking select_work()/dashd-GBT re-source, factored
-    // out so it runs either inline (legacy blocking path, no executor wired) OR
-    // on the background rpc_pool thread (via refresh_executor_). Updates the
-    // template cache under template_mutex_.
-    void resource_template_now() const;
-
-public:
-    // io-thread-decouple: wire a background executor (main_dash.cpp posts onto
-    // the dedicated rpc_pool). When set, cached_work() NEVER blocks the caller
-    // on a dashd GBT: it serves the (possibly stale) cache immediately and hands
-    // the blocking re-source to this executor as a SINGLE-FLIGHT background job.
-    // Set once at startup before the io loop runs. Only wired on the dashd-
-    // fallback arm; unset -> the legacy inline-blocking path (embedded/tests).
-    void set_refresh_executor(std::function<void(std::function<void()>)> fn)
-    { refresh_executor_ = std::move(fn); }
-
-private:
     // External dependencies (non-owning references) -- see Lifetime note.
     const coin::NodeCoinState&  coin_state_;    ///< embedded work arm (populated -> Embedded)
     std::function<coin::DashWorkData()> dashd_fallback_;  ///< always-reachable dashd GBT RPC arm (never removed)
@@ -370,13 +353,6 @@ private:
     mutable uint64_t            template_cache_gen_{0};
     mutable std::chrono::steady_clock::time_point template_cache_at_{};
     mutable std::chrono::steady_clock::time_point template_last_fail_at_{};
-
-    // io-thread-decouple: background single-flight template refresh.
-    // refresh_executor_ posts the blocking re-source onto the rpc_pool thread
-    // (set_refresh_executor); template_refresh_inflight_ collapses concurrent
-    // refreshes to one. Empty executor -> legacy inline-blocking cached_work().
-    std::function<void(std::function<void()>)> refresh_executor_;
-    mutable std::atomic<bool>   template_refresh_inflight_{false};
 };
 
 }  // namespace dash::stratum
