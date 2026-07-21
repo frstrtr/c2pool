@@ -575,3 +575,32 @@ TEST(WebHonestyRegression, PatronSendmanySelfLabelsAsStubNeverFabricatesPayouts)
     EXPECT_EQ(p.value("total", std::string{}), "12.5")
         << "the echoed total must be the operator-supplied value, not invented";
 }
+// ── Stratum-URL external_ip override (DASH NAT/port-mapped nodes) ──────────
+// The dashboard Stratum-URL card renders nodeInfo.external_ip
+// (dashboard.html:2889-2892). When a node NATs out through a shared gateway
+// (both hotel DASH nodes: LAN 192.168.1.x, one public 31.172.65.125), the
+// auto-detected OUTBOUND IP is NOT the address miners dial -- they reach the
+// external-mapped hosts (109.161.57.3 / 109.161.52.148). c2pool-dash exposes
+// --external-ip (alias --stratum-advertise / --public-host) which feeds
+// set_external_ip(); rest_node_info() must then SERVE that operator-supplied
+// host verbatim so the Stratum URL is truthful. Unset must stay honest-absent
+// ("0.0.0.0"), leaving the auto-detect / window.location.hostname fallback --
+// no regression. Pins the flag -> served-external_ip plumbing.
+TEST(WebHonestyRegression, NodeInfoExternalIpUnsetIsHonestlyUnspecified) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::DASH);
+    json ni = mi.rest_node_info();
+    EXPECT_EQ(ni.value("external_ip", std::string{}), "0.0.0.0")
+        << "unset external_ip must serve the honest-absent sentinel so the "
+           "dashboard falls back to auto-detect / window.location.hostname";
+}
+
+TEST(WebHonestyRegression, NodeInfoExternalIpServesOperatorAdvertisedHost) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::DASH);
+    // Operator advertises the real miner-facing external-mapped host (primary
+    // hotel node), NOT the auto-detected 31.172.65.125 NAT gateway.
+    mi.set_external_ip("109.161.57.3");
+    json ni = mi.rest_node_info();
+    EXPECT_EQ(ni.value("external_ip", std::string{}), "109.161.57.3")
+        << "served external_ip must be the operator-advertised miner-facing "
+           "host so the dashboard Stratum URL is not the wrong NAT IP";
+}
