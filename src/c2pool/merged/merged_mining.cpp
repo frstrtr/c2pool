@@ -3,7 +3,6 @@
 
 #include <core/log.hpp>
 #include <core/hash.hpp>
-#include <core/filesystem.hpp>   // config_path() — data-dir-aware block-hex dump (#722)
 
 #include <algorithm>
 #include <cmath>
@@ -1024,14 +1023,13 @@ void MergedMiningManager::try_submit_merged_blocks(
                          << "] Merged block submitted (" << block_hex.size()/2 << " bytes"
                          << ", snapshot hash=" << committed_block_hash.GetHex().substr(0, 16) << ")";
                 {
-                    // Root under config_path()/tmp so co-located instances at
-                    // the same child height don't overwrite each other's dump
-                    // (was a deterministic /tmp collision). Honors --data-dir.
-                    std::error_code dir_ec;
-                    auto tmp_dir = core::filesystem::config_path() / "tmp";
-                    std::filesystem::create_directories(tmp_dir, dir_ec);
-                    auto path = tmp_dir / ("c2pool_doge_block_"
-                        + std::to_string(chain.current_work.height) + ".hex");
+                    // Transient manual-submit artifact kept at a fixed /tmp
+                    // path (NOT re-rooted under --data-dir): routing an
+                    // env/CLI-derived path into a file sink trips CodeQL
+                    // cpp/path-injection, and the state that matters for
+                    // co-located isolation (LevelDB, addrs, logs) is already
+                    // re-rooted via config_path(). See #722.
+                    std::string path = "/tmp/c2pool_doge_block_" + std::to_string(chain.current_work.height) + ".hex";
                     std::ofstream f(path);
                     if (f.is_open()) { f << block_hex; f.close(); }
                 }

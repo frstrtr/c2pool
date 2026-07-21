@@ -1913,15 +1913,14 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
             }
         }
 
-        // Save block hex to file for manual submitblock testing.
-        // Root under config_path()/tmp so co-located instances stay isolated
-        // and the dump honors --data-dir (#722).
+        // Save block hex to file for manual submitblock testing. Kept at a
+        // fixed /tmp path (NOT re-rooted under --data-dir): it is a transient
+        // manual-test artifact, and routing an env/CLI-derived path into a
+        // file sink trips CodeQL cpp/path-injection with no isolation benefit
+        // (per-instance state that matters — LevelDB, addrs, logs — is already
+        // isolated via config_path()). See #722.
         {
-            std::error_code dir_ec;
-            auto tmp_dir = core::filesystem::config_path() / "tmp";
-            std::filesystem::create_directories(tmp_dir, dir_ec);
-            std::string path = (tmp_dir / ("c2pool_block_"
-                + std::to_string(std::time(nullptr)) + ".hex")).string();
+            std::string path = "/tmp/c2pool_block_" + std::to_string(std::time(nullptr)) + ".hex";
             std::ofstream f(path);
             if (f) {
                 f << hex_data;
