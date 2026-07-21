@@ -1112,38 +1112,45 @@ TEST(DashSubmitPayeeGuard, OkWhenAllMandatedPaymentsPresent)
     EXPECT_EQ(r.verdict, dash::stratum::PayeeGuardVerdict::Ok);
 }
 
-TEST(DashSubmitPayeeGuard, StalePayeeWhenPayeeRotatedAtSameHeight)
+TEST(DashSubmitPayeeGuard, PayeeMissingWhenPayeeScriptRotatedAtSameHeight)
 {
     // Same prev (same height context) but the current template now mandates a
-    // ROTATED masternode payee the frozen coinbase does not pay: the exact
-    // hex-confirmed bad-cb-payee class. The guard must forbid the submit.
+    // ROTATED masternode payee SCRIPT the frozen coinbase does not pay at all:
+    // the genuine bad-cb-payee class (wrong PAYEE, not a mere amount drift).
+    // The guard must forbid the submit.
     const auto cb = fixture_coinbase_bytes();
     dash::coin::DashWorkData current = rotated_work();
-    current.m_previous_block.SetHex(kPrevHashHex);   // same height, new payee
+    current.m_previous_block.SetHex(kPrevHashHex);   // same height, new payee script
     const auto r = dash::stratum::check_submit_payee(
         cb, kPrevHashHex, current, dash::make_coin_params(false));
-    EXPECT_EQ(r.verdict, dash::stratum::PayeeGuardVerdict::StalePayee);
+    EXPECT_EQ(r.verdict, dash::stratum::PayeeGuardVerdict::PayeeMissing);
     EXPECT_NE(r.detail.find("bad-cb-payee"), std::string::npos);
 }
 
-TEST(DashSubmitPayeeGuard, StalePayeeWhenMandatedAmountChanged)
+TEST(DashSubmitPayeeGuard, OkWhenMandatedAmountDriftsButScriptPresent)
 {
+    // THE reward-critical false-refusal fix. Same prev, same payee SCRIPT, but
+    // the current template's mandated amount differs from the job's frozen one
+    // (fees moved on a template re-pull at the same height). dashd validates
+    // the masternode amount against the block's OWN fees, so this is a valid
+    // winning block — the guard must PASS it (set-membership on scripts, no
+    // amount comparison). This exact drift lost mainnet blocks 2508655/2508696.
     const auto cb = fixture_coinbase_bytes();
     dash::coin::DashWorkData current = rich_work();
-    current.m_packed_payments[0].amount += 1;   // same script, wrong amount
+    current.m_packed_payments[0].amount += 54321;   // same script, drifted amount
     const auto r = dash::stratum::check_submit_payee(
         cb, kPrevHashHex, current, dash::make_coin_params(false));
-    EXPECT_EQ(r.verdict, dash::stratum::PayeeGuardVerdict::StalePayee);
+    EXPECT_EQ(r.verdict, dash::stratum::PayeeGuardVerdict::Ok);
 }
 
-TEST(DashSubmitPayeeGuard, TipMovedWhenPrevDiffers)
+TEST(DashSubmitPayeeGuard, WrongHeightWhenPrevDiffers)
 {
-    // A moved tip is an orphan-race candidate, NOT a doomed bad-cb-payee: the
-    // block stays self-consistent for its own height and must still submit.
+    // The job's parent is no longer the chain tip: the block is for the wrong
+    // height and dashd would reject it. The guard must refuse the submit.
     const auto cb = fixture_coinbase_bytes();
     const auto r = dash::stratum::check_submit_payee(
         cb, kPrevHashHex, rotated_work(), dash::make_coin_params(false));
-    EXPECT_EQ(r.verdict, dash::stratum::PayeeGuardVerdict::TipMoved);
+    EXPECT_EQ(r.verdict, dash::stratum::PayeeGuardVerdict::WrongHeight);
 }
 
 TEST(DashSubmitPayeeGuard, UnverifiableOnGarbageCoinbaseNeverBlocks)
@@ -1156,9 +1163,9 @@ TEST(DashSubmitPayeeGuard, UnverifiableOnGarbageCoinbaseNeverBlocks)
 
 // ── Fix 4 wired into the hot path: mining_submit ────────────────────────────
 
-// A won block whose payee rotated at the SAME height between job issue and
-// submit is locally rejected LOUDLY — the broadcaster must NOT fire (never
-// submit a doomed bad-cb-payee block; steward-ruled posture).
+// A won block whose payee SCRIPT rotated at the SAME height between job issue
+// and submit is locally rejected LOUDLY — the broadcaster must NOT fire (never
+// submit a doomed bad-cb-payee block; a genuinely omitted mandated payee).
 TEST(DashStratumWorkSource, WonBlockWithStalePayeeIsLocallyRejectedNotSubmitted)
 {
     SubmitRig rig;
@@ -1169,9 +1176,9 @@ TEST(DashStratumWorkSource, WonBlockWithStalePayeeIsLocallyRejectedNotSubmitted)
         return pow <= block_target;
     });
 
-    // Between job issue and submit: the payee ROTATES at the same height
+    // Between job issue and submit: the payee SCRIPT ROTATES at the same height
     // (the churn/staleness window). The re-sourced current template now
-    // mandates a payee the frozen job coinbase does not pay.
+    // mandates a payee SCRIPT the frozen job coinbase does not pay at all.
     rig.fx.fallback_work = rotated_work();
     rig.fx.fallback_work.m_previous_block.SetHex(kPrevHashHex);  // same prev
     rig.ws->bump_work_generation();   // submit-side cached_work re-sources
@@ -1182,9 +1189,37 @@ TEST(DashStratumWorkSource, WonBlockWithStalePayeeIsLocallyRejectedNotSubmitted)
     EXPECT_FALSE(rig.fx.submit_called);       // ...but NOTHING was dispatched
 }
 
-// A won block across a MOVED tip is an orphan-race candidate and still
-// dispatches (self-consistent for its own height — never guard-blocked).
-TEST(DashStratumWorkSource, WonBlockAcrossTipMoveStillSubmits)
+// THE reward-critical false-refusal fix, end-to-end on the hot path. A won
+// block whose mandated masternode AMOUNT drifted (fees moved on a same-height
+// template re-pull) but whose payee SCRIPT is unchanged is a VALID winning
+// block — dashd validates the amount against the block's own fees. The guard
+// must PASS it and the broadcaster MUST fire. This drift lost mainnet blocks
+// 2508655/2508696 before the set-membership fix.
+TEST(DashStratumWorkSource, WonBlockWithMandatedAmountDriftStillSubmits)
+{
+    SubmitRig rig;
+    rig.job.share_bits  = 0x207fffffu;
+    rig.job.block_nbits = "207fffff";
+    const uint256 block_target = dash::coin::target_from_nbits(0x207fffffu);
+    const uint32_t nonce = rig.find_nonce([&](const uint256& pow) {
+        return pow <= block_target;
+    });
+
+    // Same prev, same payee SCRIPT, only the mandated amount drifts (fee churn).
+    rig.fx.fallback_work = rich_work();
+    rig.fx.fallback_work.m_packed_payments[0].amount += 98765;
+    rig.ws->bump_work_generation();
+
+    auto result = rig.submit(nonce);
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());
+    EXPECT_TRUE(rig.fx.submit_called);        // amount drift is NOT a refusal
+}
+
+// A won block across a MOVED tip is for the wrong height (the job's parent is
+// no longer the chain tip) — dashd would reject it, so the guard refuses and
+// the broadcaster must NOT fire.
+TEST(DashStratumWorkSource, WonBlockAcrossTipMoveIsLocallyRejected)
 {
     SubmitRig rig;
     rig.job.share_bits  = 0x207fffffu;
@@ -1199,8 +1234,8 @@ TEST(DashStratumWorkSource, WonBlockAcrossTipMoveStillSubmits)
 
     auto result = rig.submit(nonce);
     ASSERT_TRUE(result.is_boolean());
-    EXPECT_TRUE(result.get<bool>());
-    EXPECT_TRUE(rig.fx.submit_called);        // orphan race: still dispatched
+    EXPECT_TRUE(result.get<bool>());          // the miner's work was honest
+    EXPECT_FALSE(rig.fx.submit_called);       // ...but wrong-height: NOT dispatched
 }
 
 // ── Dashboard stats seam (issue: /local_stats hashrate under-reported) ───────
