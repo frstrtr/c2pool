@@ -1575,12 +1575,21 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // synced base (ZERO after a reorg = full snapshot); the
                 // new_mnlistdiff subscription advances sml_base on acceptance.
                 if (cp) cp->send_getmnlistd(*sml_base, new_tip);
-                // #739: event-driven stale-work notify. NOTE: the freshness gate
-                // now holds the embedded arm on the dashd fallback until the
-                // getmnlistd above lands and re-notifies (maintainer state-dirty),
-                // so this notify serves the reward-safe fallback, not a stale-SML
-                // embedded template.
-                if (ws) ws->bump_work_generation();
+                // #739 + stale-payee window close: event-driven stale-work
+                // notify. INVALIDATE the template cache FIRST (mirrors the
+                // #770/#772 fire_refresh trio: invalidate + bump + notify) so the
+                // next served job is ALWAYS re-sourced with the fresh-tip payee,
+                // regardless of refresh_executor_ state. Without the explicit
+                // invalidate the window only stays closed IMPLICITLY (the coin-P2P
+                // arm has no refresh_executor_, so cached_work() re-sources inline);
+                // if io-decouple is ever extended to this arm, cached_work() would
+                // serve the STALE cached template while refreshing async and a
+                // stale-payee job would go out. Make it robust, not implicit.
+                if (ws) {
+                    ws->invalidate_template_cache(
+                        "coin-P2P tip changed: fresh-payee re-source");
+                    ws->bump_work_generation();
+                }
                 if (stratum_server) stratum_server->notify_all();
             });
 

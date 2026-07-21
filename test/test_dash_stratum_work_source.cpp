@@ -1411,4 +1411,93 @@ TEST(DashDashboardWiring, LocalStatsIdleWarningWhenNoWorkers)
     EXPECT_TRUE(idle);
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// coin-P2P tip event closes the stale-payee window EXPLICITLY (robust under a
+// future io-decouple-extended config where refresh_executor_ is SET).
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+// A DEFERRED refresh executor (models the rpc_pool background thread): jobs are
+// queued, not run inline, so cached_work() takes the serve-stale-while-refreshing
+// path — exactly the config where a bump-only tip event would REOPEN the window.
+struct DeferredExecutor {
+    std::vector<std::function<void()>> jobs;
+    void operator()(std::function<void()> j) { jobs.push_back(std::move(j)); }
+    void run() { auto q = std::move(jobs); jobs.clear(); for (auto& j : q) j(); }
+};
+}  // namespace
+
+// THE FIX: invalidate_template_cache() on the coin-P2P tip event guarantees the
+// next served job is re-sourced (fresh payee), never the stale cached one — even
+// with a background refresh_executor_ set.
+TEST(DashStratumCoinP2pTipInvalidate, InvalidateClosesStalePayeeWindowUnderRefreshExecutor)
+{
+    auto current  = std::make_shared<dash::coin::DashWorkData>(rich_work());   // tip A
+    auto fallback = [current]() -> dash::coin::DashWorkData { return *current; };
+    auto submit   = [](const std::vector<unsigned char>&, uint32_t) { return true; };
+    dash::coin::NodeCoinState cs;   // unpopulated -> fallback arm
+
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{}, /*is_testnet=*/false);
+    auto exec = std::make_shared<DeferredExecutor>();
+    ws.set_refresh_executor([exec](std::function<void()> j) { (*exec)(std::move(j)); });
+
+    // Prime the cache with tip A (dispatch the bg refresh, then run it).
+    ws.get_current_work_template();   // dispatches; returns set-gap
+    exec->run();                      // bg refresh sources tip A -> cache = A
+    ASSERT_EQ(ws.get_current_work_template().value("previousblockhash", ""),
+              std::string(kPrevHashHex));
+
+    // The coin-P2P feed advances to tip B (a DIFFERENT masternode payee).
+    *current = rotated_work();
+
+    // The coin-P2P on_tip_changed handler fires: invalidate + bump (+ notify).
+    ws.invalidate_template_cache("coin-P2P tip changed: fresh-payee re-source");
+    ws.bump_work_generation();
+
+    // Under refresh_executor_ the served job must NEVER be the stale tip-A
+    // template: the invalidate dropped the cache -> honest set-gap until the bg
+    // refresh lands tip B.
+    auto served = ws.get_current_work_template();
+    if (!served.empty())
+        EXPECT_NE(served.value("previousblockhash", ""), std::string(kPrevHashHex))
+            << "stale tip-A template must not be served after a coin-P2P tip event";
+    exec->run();   // the deferred bg refresh completes
+    auto fresh = ws.get_current_work_template();
+    ASSERT_FALSE(fresh.empty());
+    EXPECT_EQ(fresh.value("previousblockhash", ""), std::string(kRotatedPrevHashHex))
+        << "the served job must carry the FRESH-tip (B) template/payee";
+}
+
+// CONTRAST (the window this fix closes): bump_work_generation() ALONE, under a
+// refresh_executor_, serves the STALE cached tip-A template while refreshing
+// async — the implicit-only path that reopens the stale-payee window.
+TEST(DashStratumCoinP2pTipInvalidate, BumpAloneServesStaleUnderRefreshExecutor)
+{
+    auto current  = std::make_shared<dash::coin::DashWorkData>(rich_work());
+    auto fallback = [current]() -> dash::coin::DashWorkData { return *current; };
+    auto submit   = [](const std::vector<unsigned char>&, uint32_t) { return true; };
+    dash::coin::NodeCoinState cs;
+
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{}, /*is_testnet=*/false);
+    auto exec = std::make_shared<DeferredExecutor>();
+    ws.set_refresh_executor([exec](std::function<void()> j) { (*exec)(std::move(j)); });
+
+    ws.get_current_work_template();
+    exec->run();
+    ASSERT_EQ(ws.get_current_work_template().value("previousblockhash", ""),
+              std::string(kPrevHashHex));
+
+    *current = rotated_work();
+    ws.bump_work_generation();   // NO invalidate — the pre-fix implicit path
+
+    // Serves the STALE tip-A template (cache still held; async refresh not landed).
+    auto served = ws.get_current_work_template();
+    ASSERT_FALSE(served.empty());
+    EXPECT_EQ(served.value("previousblockhash", ""), std::string(kPrevHashHex))
+        << "bump-only under refresh_executor_ serves the STALE tip-A payee — the "
+           "window invalidate_template_cache() closes";
+}
+
 }  // namespace
