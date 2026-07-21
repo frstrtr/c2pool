@@ -14,10 +14,13 @@
 // run-loop; idempotent (set_block_broadcaster replaces).
 //
 // The sink being live is NECESSARY but NOT SUFFICIENT to close the gate to
-// verified: reconstruct_won_block() still returns nullopt until gentx (coinbase)
-// full-body reconstruction lands (share_check.hpp:472) and leg C is exercised
-// against VM300 (192.168.86.110:8333). Until then the lambda has a live sink yet
-// emits nothing -- the gate stays honestly GAP and no partial block is relayed.
+// verified: reconstruct_won_block() now fully reconstructs the block (gentx +
+// header + full wire serialization), so on a won share the lambda emits a
+// complete block down BOTH broadcast arms. What remains before the gate flips to
+// verified is a run-path dual-path soak -- leg C (submitblock RPC) exercised
+// against a live BCHN (e.g. VM300, 192.168.86.110:8333) alongside the P2P relay
+// arm. Until that soak lands the gate stays honestly GAP on VERIFICATION, not on
+// missing code; no partial block is ever relayed (nullopt on incomplete txs).
 //
 // PER-COIN ISOLATION: src/impl/bch only. Zero p2pool-merged-v36 surface -- block
 // dispatch, NOT share/PPLNS/coinbase bytes. BCH = SHA256d standalone parent.

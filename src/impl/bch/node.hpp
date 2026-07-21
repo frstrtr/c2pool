@@ -197,10 +197,11 @@ public:
     // other_txs from m_known_txs via the share transaction_hash_refs over
     // parent shares (data.py get_other_tx_hashes / _get_other_txs); returns
     // nullopt when not all parent txs are present (== as_block None).
-    // NOTE: coinbase (gentx) full-body reconstruction (GenerateShareTransaction,
-    // share_check.hpp:472) is the remaining dependency before this emits a
-    // complete block; until it lands this returns nullopt -- no partial/
-    // invalid block is ever broadcast. The other_tx gather seam is here.
+    // Coinbase (gentx) full-body reconstruction is IMPLEMENTED below via
+    // generate_share_transaction (the same fn the verify path uses), so this
+    // emits a COMPLETE wire block on success. nullopt is returned ONLY when not
+    // all parent txs are present (== as_block None) or the gentx/header build
+    // fails -- never a partial/invalid block. The other_tx gather seam is here.
     std::optional<std::pair<std::vector<unsigned char>, std::string>>
         reconstruct_won_block(const uint256& share_hash)
     {
