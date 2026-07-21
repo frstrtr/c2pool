@@ -781,10 +781,31 @@ TEST(DashShareProducerBuild, MerkleLinkMatchesCoinbaseBuilder) {
 // drive the recompute/compare exactly as attempt_verify does with *this.
 namespace { struct PayoutTrackerView { dash::ShareChain& chain; }; }
 
+// Realistic DASH masternode-style P2PKH payee, expressed in the "!<hex-script>"
+// raw form so decode_payee_script yields exactly this script (both the producer
+// and the accept-path recompute must agree, so use decodable payees only -- an
+// UNdecodable payee would be subtracted by generate_share_transaction but skipped
+// by the producer, which is a separate divergence not under test here).
+static dash::PackedPayment mn_payment(uint8_t tag, uint64_t amount) {
+    std::vector<unsigned char> script = {0x76, 0xa9, 0x14};      // OP_DUP OP_HASH160 <20>
+    script.insert(script.end(), 20, tag);                        // 20-byte pubkey hash
+    script.push_back(0x88); script.push_back(0xac);              // OP_EQUALVERIFY OP_CHECKSIG
+    dash::PackedPayment p;
+    p.m_payee = std::string("!") + hex_of_bytes(script);
+    p.m_amount = amount;
+    return p;
+}
+
 // Build the canonical g(A) <- s1(B) <- s2(C, tip) window into `sc` and mint miner
 // C's next share on top (finder = C; PPLNS window = grandparent walk {s1(B),
 // g(A)}). Returns the built share (BuiltShare is movable; SyntheticChain, holding
 // a non-movable ShareChain, stays owned by the caller).
+//
+// Production realism (nit coverage): the minted share carries NON-EMPTY
+// packed_payments (masternode + platform payees, like a real DASH coinbase) AND
+// NON-EMPTY transaction_hash_refs, so the byte-parity check exercises exactly the
+// serialization the bug-2 fix touched (the transaction_hash_refs pair-count VarInt
+// and the m_packed_payments operator path) with realistic data.
 static dash::producer::BuiltShare mint_scene(SyntheticChain& sc,
                                              const core::CoinParams& params) {
     const uint160 A = h160_uniform(0xaa), B = h160_uniform(0xbb), C = h160_uniform(0xcc);
@@ -799,6 +820,13 @@ static dash::producer::BuiltShare mint_scene(SyntheticChain& sc,
     in.share_nonce = 7; in.pubkey_hash = C; in.subsidy = 500000000;
     in.donation = 0; in.desired_version = 16; in.desired_timestamp = 1700000000;
     in.desired_target = params.max_target;
+    // Realistic masternode + platform payments (decodable payees, template order).
+    // subsidy 5e8 - payments 2.5e8 = 2.5e8 worker_payout, still splitting A/B/C.
+    in.packed_payments = { mn_payment(0xd1, 150000000), mn_payment(0xd2, 100000000) };
+    in.payment_amount  = 250000000;
+    // Non-empty GBT tx set -> new_transaction_hashes + transaction_hash_refs
+    // (pair_count VarInt = 2, exercising the exact bug-2 field).
+    in.desired_tx_hashes = { h256_tag(0x71), h256_tag(0x72) };
     auto info = dash::producer::generate_prospective_share_info(sc.chain, params, in);
     return dash::producer::build_share(
         sc.chain, params, info, fixture_min_header(), F1_NONCE64, /*check_pow=*/false);
@@ -812,7 +840,16 @@ TEST(DashPayoutCommitment, LocalMintCoinbaseAccepted) {
     auto built = mint_scene(sc, params);
     PayoutTrackerView tv{sc.chain};
 
-    // Recompute matches the committed gentx byte-for-byte.
+    // Guard the coverage: the minted share must carry the realistic fields the
+    // bug-2 fix touched, else this byte-parity check is hollow.
+    ASSERT_FALSE(built.share.m_packed_payments.empty())
+        << "KAT must exercise non-empty packed_payments";
+    ASSERT_FALSE(built.share.m_transaction_hash_refs.empty())
+        << "KAT must exercise non-empty transaction_hash_refs (pair-count VarInt)";
+
+    // Recompute matches the committed gentx byte-for-byte -- with masternode
+    // payments + tx refs present, this is the exact production regression the
+    // bug-2 fix guards against.
     uint256 expected = dash::generate_share_transaction(built.share, tv, params);
     EXPECT_EQ(hex_of(expected), hex_of(built.gentx_hash));
 
