@@ -4,10 +4,12 @@
 #include "block.hpp"
 #include "transaction.hpp"
 #include "mn_state_machine.hpp"
+#include "vendor/smldiff.hpp"   // vendor::CSimplifiedMNListDiff (SML-axis reception feed)
 
 #include <core/uint256.hpp>
 #include <core/events.hpp>
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <utility>
@@ -107,6 +109,20 @@ struct Node
     // an empty snapshot demotes the bundle to the dashd fallback.
     Event<MnListUpdate> mn_list_update;
 
+    // Reception path (SML axis, daemonless): fires when the coin-P2P client
+    // parses a `mnlistdiff` message, carrying the RAW deterministic-MN-list
+    // diff (vendor::CSimplifiedMNListDiff) straight off the wire. Distinct from
+    // mn_list_update above, which is the PAYEE feed (MnStateMachine, MNState
+    // with scriptPayout + lastPaidHeight, seeded from dashd RPC `protx list`).
+    // The SML axis feeds the CONSENSUS-COMMITMENT machinery instead: the diff's
+    // mnList/deletedMNs advance the vendor::CSimplifiedMNList whose
+    // CalcMerkleRoot() is the CCbTx merkleRootMNList, and its opaque quorum
+    // tail advances the QuorumManager whose compute_merkle_root_quorums() is
+    // the CCbTx merkleRootQuorums. The diff's embedded cbTx also carries the
+    // authoritative bestCL* + creditPoolBalance as-of blockHash, which the
+    // maintainer seeds forward. CoinStateMaintainer::on_mnlistdiff subscribes.
+    Event<coin::vendor::CSimplifiedMNListDiff> new_mnlistdiff;
+
     // SPV A1 (parity audit): fires when dashd announces a ChainLock has
     // been aggregated for a block. Carries {block_hash, height}.
     // Consumers (e.g. block-find submit handler) can consult
@@ -114,6 +130,19 @@ struct Node
     // irreversible.
     Event<std::pair<uint256, int32_t>> new_chainlock;
     std::map<uint256, int32_t> chainlocked_blocks; // block_hash -> height
+
+    // ChainLock reception WITH the recovered 96-byte threshold signature. The
+    // clsig wire message carries {height, block_hash, sig(96B)}; new_chainlock
+    // above intentionally drops the sig (it only feeds the finalization map).
+    // The daemonless CCbTx path needs the sig itself: bestCLSignature is a
+    // committed field of the type-5 coinbase payload, so the maintainer adopts
+    // the freshest observed ChainLock's height + sig via on_new_chainlock.
+    struct ChainLockSigEvent {
+        int32_t                  height{0};
+        uint256                  block_hash;
+        std::array<uint8_t, 96>  sig{};
+    };
+    Event<ChainLockSigEvent> new_chainlock_sig;
 
     std::map<uint256, coin::Transaction> known_txs;
 };

@@ -52,7 +52,14 @@ namespace coin
 // Embedded P2P relay sink (ARM A, primary): the run-loop binds this to the E1
 // CoinClient's submit_block_p2p_raw. EMPTY == no embedded P2P sink present
 // (no --coin-p2p-connect peer, or --no-p2p-relay suppression).
-using P2pRelaySink = std::function<void(const std::vector<unsigned char>&)>;
+//
+// RETURNS true iff the block was actually relayed onto a CONNECTED coin-P2P
+// peer (H1 honest-reporting contract). submit_block_p2p_raw SILENTLY DROPS a
+// won block when the peer is disconnected, so the sink MUST report false in
+// that case — otherwise the dispatcher would claim landed_first=p2p while the
+// block was dropped, falsely relying on a dead arm instead of the submitblock
+// RPC backup.
+using P2pRelaySink = std::function<bool(const std::vector<unsigned char>&)>;
 
 // submitblock RPC sink (ARM B, backup): the run-loop binds this to
 // NodeRPC::submit_block_hex. Returns true iff dashd accepted (or duplicate).
@@ -64,7 +71,7 @@ using RpcSubmitSink = std::function<bool(const std::string&)>;
 // which path was engaged first for the record.
 struct BlockBroadcast
 {
-    bool        p2p_sent     = false;   // embedded P2P relay issued (sink present)
+    bool        p2p_sent     = false;   // embedded P2P relay issued to a CONNECTED peer
     bool        rpc_ok       = false;   // submitblock returned ok OR duplicate
     const char* landed_first = "none";  // "p2p" | "rpc" | "none"
 
@@ -92,11 +99,22 @@ inline BlockBroadcast broadcast_won_block(const P2pRelaySink& p2p_relay,
     // block (lost subsidy).
     if (p2p_relay) {
         try {
-            p2p_relay(block_bytes);
-            r.p2p_sent = true;
-            r.landed_first = "p2p";
-            LOG_INFO << "[EMB-DASH] won-block embedded P2P relay issued ("
-                     << block_bytes.size() << " bytes) -- primary path.";
+            // H1 honest reporting: only claim p2p_sent when the sink confirms the
+            // block was relayed onto a CONNECTED peer. A disconnected coin-P2P
+            // peer means submit_block_p2p_raw would silently drop the block, so
+            // the sink returns false and we rely on ARM B instead of masking the
+            // loss with a false landed_first=p2p.
+            const bool relayed = p2p_relay(block_bytes);
+            if (relayed) {
+                r.p2p_sent = true;
+                r.landed_first = "p2p";
+                LOG_INFO << "[EMB-DASH] won-block embedded P2P relay issued ("
+                         << block_bytes.size() << " bytes) -- primary path.";
+            } else {
+                LOG_WARNING << "[EMB-DASH] won-block embedded P2P relay NOT sent "
+                               "(coin-P2P peer not connected/handshaked) -- "
+                               "relying on submitblock RPC backup.";
+            }
         } catch (const std::exception& e) {
             LOG_ERROR << "[EMB-DASH] won-block embedded P2P relay threw (" << e.what()
                       << ") -- falling through to submitblock RPC backup.";

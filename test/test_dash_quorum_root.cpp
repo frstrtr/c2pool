@@ -129,39 +129,16 @@ QuorumManager::Entry make_entry(uint8_t llmqType, unsigned char hash_seed,
 }
 
 // Reference re-implementation of the SET selected by
-// compute_merkle_root_quorums: every non-rotated entry, plus the
-// latest-mining-height entry per (rotated type, quorumIndex). Returns
-// the lexicographically-sorted commitment hashes — the leaves that feed
-// the merkle root. Deliberately independent of the per-type pre-sort in
-// quorum_root.hpp (which the final lexicographic sort makes irrelevant
-// to the root), so this pins the SET-selection consensus behavior.
+// compute_merkle_root_quorums: EVERY active commitment (dashcore's
+// CalcCbTxMerkleRootQuorums includes all mined+active commitments, including
+// all ring members of rotated types — no per-index dedup, no mining-height
+// ordering; the final leaf-hash sort makes ordering irrelevant). Proven
+// byte-identical to real dashd in test_dash_mnlistdiff_root_parity.cpp.
 std::vector<uint256> reference_leaves(const QuorumManager& q)
 {
-    std::vector<const QuorumManager::Entry*> selected;
-    // non-rotated: all.
-    for (const auto& e : q.active_entries()) {
-        if (!llmq_uses_rotation(e.key.llmqType)) selected.push_back(&e);
-    }
-    // rotated: latest mining_height per (type, quorumIndex).
-    std::vector<const QuorumManager::Entry*> rotated;
-    for (const auto& e : q.active_entries()) {
-        if (llmq_uses_rotation(e.key.llmqType)) rotated.push_back(&e);
-    }
-    for (auto* ep : rotated) {
-        bool superseded = false;
-        for (auto* other : rotated) {
-            if (other == ep) continue;
-            if (other->key.llmqType == ep->key.llmqType
-                && other->commitment.quorumIndex == ep->commitment.quorumIndex
-                && other->mining_height > ep->mining_height) {
-                superseded = true;
-                break;
-            }
-        }
-        if (!superseded) selected.push_back(ep);
-    }
     std::vector<uint256> leaves;
-    for (auto* ep : selected) leaves.push_back(hash_commitment(ep->commitment));
+    for (const auto& e : q.active_entries())
+        leaves.push_back(hash_commitment(e.commitment));
     std::sort(leaves.begin(), leaves.end(),
         [](const uint256& a, const uint256& b) {
             return std::memcmp(a.data(), b.data(), 32) < 0;
@@ -269,11 +246,13 @@ TEST(DashQuorumRootKat, NonRotatedIncludesAllEntriesSorted)
     EXPECT_NE(compute_merkle_root_quorums(q), uint256::ZERO);
 }
 
-TEST(DashQuorumRootKat, RotatedDedupKeepsLatestPerIndex)
+TEST(DashQuorumRootKat, RotatedRingMembersAllIncluded)
 {
-    // Two rotated (type 5) entries share quorumIndex 0; the older one
-    // (mining_height 50) must be dropped, the newer (80) kept. A third
-    // at quorumIndex 1 is independent and kept.
+    // dashcore includes EVERY mined+active commitment, including all ring
+    // members of rotated types — NO per-index dedup (proven byte-identical to a
+    // real dashd mnlistdiff carrying 32+24 rotated ring members in
+    // test_dash_mnlistdiff_root_parity.cpp). Two type-5 entries sharing
+    // quorumIndex 0 are BOTH included.
     QuorumManager q;
     std::vector<QuorumManager::Entry> active;
     active.push_back(make_entry(CFinalCommitment::LLMQ_60_75, 0xaa, /*qi*/0, 50));
@@ -282,18 +261,18 @@ TEST(DashQuorumRootKat, RotatedDedupKeepsLatestPerIndex)
     q.replace_state(std::move(active), {});
 
     auto leaves = reference_leaves(q);
-    EXPECT_EQ(leaves.size(), 2u);   // older qi=0 dropped
+    EXPECT_EQ(leaves.size(), 3u);   // all three included — no dedup
     EXPECT_EQ(compute_merkle_root_quorums(q),
               compute_merkle_root_local(leaves));
 
-    // The dropped older entry must NOT influence the root: a manager
-    // holding only {newer qi=0, qi=1} yields the same root.
+    // Every ring member is part of the set: dropping the older qi=0 entry
+    // CHANGES the root (it is not deduped away).
     QuorumManager q2;
     std::vector<QuorumManager::Entry> active2;
     active2.push_back(make_entry(CFinalCommitment::LLMQ_60_75, 0xbb, 0, 80));
     active2.push_back(make_entry(CFinalCommitment::LLMQ_60_75, 0xcc, 1, 70));
     q2.replace_state(std::move(active2), {});
-    EXPECT_EQ(compute_merkle_root_quorums(q), compute_merkle_root_quorums(q2));
+    EXPECT_NE(compute_merkle_root_quorums(q), compute_merkle_root_quorums(q2));
 }
 
 TEST(DashQuorumRootKat, AddingDistinctIndexChangesRoot)
@@ -318,18 +297,20 @@ TEST(DashQuorumRootKat, MixedRotatedAndNonRotatedFrozenGolden)
     std::vector<QuorumManager::Entry> active;
     active.push_back(make_entry(CFinalCommitment::LLMQ_50_60,  0x11, 0, 100));
     active.push_back(make_entry(CFinalCommitment::LLMQ_400_85, 0x22, 0, 95));
-    active.push_back(make_entry(CFinalCommitment::LLMQ_60_75,  0xaa, 0, 50));  // dropped
-    active.push_back(make_entry(CFinalCommitment::LLMQ_60_75,  0xbb, 0, 80));  // kept
+    active.push_back(make_entry(CFinalCommitment::LLMQ_60_75,  0xaa, 0, 50));  // ring member — included
+    active.push_back(make_entry(CFinalCommitment::LLMQ_60_75,  0xbb, 0, 80));  // ring member — included
     active.push_back(make_entry(CFinalCommitment::LLMQ_25_67,  0xcc, 3, 70));
     q.replace_state(std::move(active), {});
 
     auto leaves = reference_leaves(q);
-    EXPECT_EQ(leaves.size(), 4u);   // 2 non-rotated + 2 rotated (one deduped)
+    EXPECT_EQ(leaves.size(), 5u);   // ALL active commitments — no rotated dedup
     uint256 root = compute_merkle_root_quorums(q);
     EXPECT_EQ(root, compute_merkle_root_local(leaves));
 
-    // Frozen golden (display/reversed hex). Drift => set-selection or
-    // serialization changed; re-pin only after verifying intentional.
+    // Frozen golden (display/reversed hex) for the corrected all-inclusive
+    // algorithm. The consensus anchor is the real-dashd from-wire parity in
+    // test_dash_mnlistdiff_root_parity.cpp; this pins the local set + encode.
+    // Drift => set-selection or serialization changed; re-pin only if intentional.
     EXPECT_EQ(to_hex_rev(root),
-              "2cc59f74a7c40646968dafddcfba9759bc66a327c83695b304984f84dbeb0c37");
+              "5d7e9396d02003862f46cc39ebe7d4860dc2f1d1d68a8a7ebba98c938ec0307f");
 }

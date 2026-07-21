@@ -266,6 +266,27 @@ public:
     /// Triggers stratum sessions to re-push work on their next heartbeat.
     void bump_work_generation() { work_generation_.fetch_add(1, std::memory_order_relaxed); }
 
+    /// Gate-lift (v0.2.4 trigger): allow the daemonless embedded arm on MAINNET.
+    /// The embedded CbTx (version, merkleRootMNList, merkleRootQuorums, bestCL,
+    /// creditPoolBalance) is proven BYTE-IDENTICAL to a real dashd
+    /// getblocktemplate — both roots reproduced from the raw mnlistdiff wire
+    /// (test_dash_embedded_cbtx_byte_parity.cpp + test_dash_mnlistdiff_root_parity.cpp).
+    /// Default OFF: an unconfigured mainnet node stays on the reward-safe dashd
+    /// fallback (unchanged behaviour). When ON, the embedded arm still serves
+    /// ONLY when NodeCoinState viability holds — SML+quorum fresh AT the tip and
+    /// not a superblock height — else it fails safe to the dashd fallback.
+    void set_embedded_mainnet(bool v) { embedded_mainnet_ = v; }
+
+    /// GBT-xcheck reward-safety BACKSTOP (soak). When a dashd is reachable (the
+    /// fallback arm), cross-check the EMBEDDED CbTx's creditPoolBalance against
+    /// dashd getblocktemplate's before serving; on mismatch, serve dashd's
+    /// reward-safe template instead. Catches ANY credit-pool seed bug (present or
+    /// future) that the daemonless self-checks cannot. NOT pure-daemonless (uses
+    /// dashd), so it is opt-in; main_dash enables it for --embedded-mainnet where
+    /// a dashd fallback is configured. Pure-daemonless mode leaves it off and
+    /// relies on the independent seed-height gate.
+    void set_gbt_xcheck(bool v) { gbt_xcheck_ = v; }
+
     /// Set the current share-target bits (compact-target encoding).
     /// `max_bits` is the easiest the share target can be. Both atomically
     /// visible to stratum sessions.
@@ -374,6 +395,8 @@ private:
 
     // Network selector for coin-params resolution (address versions + v36 gate).
     bool is_testnet_{false};
+    bool embedded_mainnet_{false};   // gate-lift opt-in: daemonless embedded arm on mainnet
+    bool gbt_xcheck_{false};         // reward-safety backstop: cross-check embedded creditPool vs dashd
 
     // Atomic state. work_generation_ is mutable: the const template-cache
     // resolve (cached_work) bumps it when a refresh observes a moved tip.
@@ -417,6 +440,11 @@ private:
     mutable std::shared_ptr<const coin::DashWorkData> template_cache_;
     mutable uint64_t            template_cache_gen_{0};
     mutable std::chrono::steady_clock::time_point template_cache_at_{};
+    // Whether the cached template came from the EMBEDDED arm. Serve-time re-check
+    // (soak build-vs-serve skew): an embedded cache HIT is re-validated against
+    // the CURRENT coin-state before being served, so a template built with a
+    // stale credit-pool seed cannot be served after the seed advances.
+    mutable bool                template_cache_is_embedded_{false};
     mutable std::chrono::steady_clock::time_point template_last_fail_at_{};
 
     // io-thread-decouple: background single-flight template refresh.

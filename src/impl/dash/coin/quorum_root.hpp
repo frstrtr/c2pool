@@ -3,47 +3,33 @@
 
 /// Phase C-TEMPLATE step 4c: vendor compute_merkle_root_quorums.
 ///
-/// Mirrors dashcore evo/cbtx.cpp::CalcCbTxMerkleRootQuorums @ cfad414
-/// using our QuorumManager state as input. Per-type ordering matches
-/// dashcore's GetMinedCommitmentsUntilBlock semantics: for non-rotated
-/// LLMQ types, hashes ordered NEWEST-FIRST by mining_height; for
-/// rotated types, hashes per quorumIndex (latest mining_height per
-/// index).
+/// Mirrors dashcore evo/cbtx.cpp::CalcCbTxMerkleRootQuorums. The upstream
+/// function collects ::SerializeHash(commitment) for every mined+active
+/// commitment (all llmqTypes, INCLUDING every ring member of rotated types),
+/// then does `std::sort(vec_hashes_final)` (uint256 operator< == memcmp of the
+/// internal LE bytes) and computes the standard SHA256d merkle root.
 ///
-/// Algorithm:
-///   1. Group active entries by llmqType.
-///   2. Per non-rotated type: sort by mining_height DESC, take all
-///      (mnlistdiff already enforced signingActiveQuorumCount cap).
-///   3. Per rotated type: group by quorumIndex, take latest per index
-///      by mining_height.
-///   4. For each entry: hash = SHA256d(pack(commitment))
-///      (= dashcore's SerializeHash(commitment) — NOT the wrapping
-///      CFinalCommitmentTxPayload).
-///   5. Concatenate per-type hash lists into vec_hashes_final
-///      (std::map iteration = ascending llmqType, matching dashcore's
-///      `for (const auto& [llmqType, vec] : qcHashes)` pattern).
-///   6. Sort vec_hashes_final lexicographically using std::memcmp
-///      (matches dashcore's uint256 operator< = LE-byte comparison;
-///      same gotcha as Bug A in vendor/simplifiedmns.hpp's sort).
-///   7. Compute Bitcoin/Dash merkle root over vec_hashes_final.
+/// Algorithm (byte-verified against real dashd — see below):
+///   1. For each active entry: leaf = SHA256d(pack(commitment))
+///      (= dashcore's SerializeHash(CFinalCommitment) — NOT the wrapping
+///      CFinalCommitmentTxPayload). ALL entries, no per-index dedup, no
+///      mining-height ordering, no per-type grouping.
+///   2. Sort the leaves lexicographically via std::memcmp on the internal
+///      bytes (== dashcore's uint256 operator<).
+///   3. Standard Bitcoin/Dash merkle root (duplicate-last-on-odd) over the
+///      sorted leaves.
 ///
-/// Limitations vs dashcore-bit-exact:
-///   - We use OUR active set as of last applied mnlistdiff. Doesn't
-///     include qfcommit additions from blocks not yet covered by
-///     mnlistdiff (e.g., the current block being validated). For
-///     [QUORUMS-XCHECK] log-only this means MISMATCH may fire on
-///     blocks at or just past tip during catch-up.
-///   - Entries with mining_height=0 (un-observed qfcommit, e.g.
-///     pre-checkpoint quorums) sort to the END (oldest-equivalent).
-///     If real ordering differs, MISMATCH surfaces it.
+/// Because the sort is over the leaf HASHES, delivery order / mining height /
+/// per-type grouping are IRRELEVANT to the result — only the SET of active
+/// commitments matters. That set is exactly what the mnlistdiff carries
+/// (base list − deletedQuorums + newQuorums), so the root is fully derivable
+/// from the wire with NO block-body qc ingest.
 ///
-/// LLMQ params hardcoded for Dash mainnet (consensus/llmq.cpp):
-///   type 1 LLMQ_50_60   useRotation=false signingCount=24
-///   type 2 LLMQ_400_60  useRotation=false signingCount=4
-///   type 3 LLMQ_400_85  useRotation=false signingCount=4
-///   type 4 LLMQ_100_67  useRotation=false signingCount=24
-///   type 5 LLMQ_60_75   useRotation=true  signingCount=32
-///   type 6 LLMQ_25_67   useRotation=true  signingCount=24
+/// PROVEN byte-identical to dashd: over the block-1518412 testnet mnlistdiff
+/// (109 active commitments across types 1-6, incl. 32+24 rotated ring members),
+/// this reproduces dashd's committed merkleRootQuorums exactly
+/// (test_dash_mnlistdiff_root_parity.cpp). A prior revision dedup'd rotated
+/// types by quorumIndex, dropping ring-member leaves — that diverged (bad-cbtx).
 
 #include <impl/dash/coin/quorum_manager.hpp>
 #include <impl/dash/coin/vendor/llmq_commitment.hpp>
@@ -114,53 +100,26 @@ inline uint256 compute_merkle_root_local(std::vector<uint256> hashes)
 
 inline uint256 compute_merkle_root_quorums(const QuorumManager& qmgr)
 {
-    // Group entries by llmqType.
-    std::map<uint8_t, std::vector<const QuorumManager::Entry*>> by_type;
-    for (const auto& e : qmgr.active_entries()) {
-        by_type[e.key.llmqType].push_back(&e);
-    }
-
+    // dashcore evo/cbtx.cpp CalcCbTxMerkleRootQuorums: collect the SerializeHash
+    // of EVERY mined+active commitment (across all llmqTypes, INCLUDING all ring
+    // members of rotated types — no per-index dedup), then
+    //   std::sort(vec_hashes_final.begin(), vec_hashes_final.end());
+    // (uint256 operator< == memcmp of the internal little-endian bytes) and take
+    // the standard SHA256d merkle root. Because the final sort is over the leaf
+    // HASHES, the per-type grouping / delivery order / mining-height ordering is
+    // irrelevant to the result — only the SET of leaf hashes matters.
+    //
+    // PROVEN byte-identical to real dashd: over the block-1518412 testnet
+    // mnlistdiff (109 active commitments; types 1-6, incl. 32+24 rotated ring
+    // members), this yields dashd's committed merkleRootQuorums
+    // (test_dash_mnlistdiff_root_parity.cpp). The earlier per-index dedup of
+    // rotated types dropped ring-member leaves and diverged (bad-cbtx).
     std::vector<uint256> vec_hashes_final;
     vec_hashes_final.reserve(qmgr.active_entries().size());
-
-    for (auto& [llmqType, entries] : by_type) {
-        if (llmq_uses_rotation(llmqType)) {
-            // Group by quorumIndex; pick latest mining_height per
-            // index. dashcore iterates std::map<int, hash> = sorted
-            // by quorumIndex ascending.
-            std::map<int16_t, const QuorumManager::Entry*> by_index;
-            for (auto* ep : entries) {
-                int16_t qi = ep->commitment.quorumIndex;
-                auto it = by_index.find(qi);
-                if (it == by_index.end()
-                    || ep->mining_height > it->second->mining_height) {
-                    by_index[qi] = ep;
-                }
-            }
-            for (auto& [_, ep] : by_index) {
-                vec_hashes_final.push_back(hash_commitment(ep->commitment));
-            }
-        } else {
-            // Non-rotated: sort by mining_height DESCENDING (newest
-            // first). Tiebreak by quorumHash memcmp (deterministic
-            // for entries with mining_height=0 / unknown).
-            std::sort(entries.begin(), entries.end(),
-                [](const QuorumManager::Entry* a,
-                   const QuorumManager::Entry* b) {
-                    if (a->mining_height != b->mining_height)
-                        return a->mining_height > b->mining_height;
-                    return std::memcmp(a->key.quorumHash.data(),
-                                       b->key.quorumHash.data(), 32) < 0;
-                });
-            for (auto* ep : entries) {
-                vec_hashes_final.push_back(hash_commitment(ep->commitment));
-            }
-        }
+    for (const auto& e : qmgr.active_entries()) {
+        vec_hashes_final.push_back(hash_commitment(e.commitment));
     }
 
-    // Final sort: lexicographic by uint256 (memcmp = dashcore's
-    // uint256 operator< for the `std::sort(vec_hashes_final.begin(),
-    // vec_hashes_final.end())` call at cbtx.cpp:192).
     std::sort(vec_hashes_final.begin(), vec_hashes_final.end(),
         [](const uint256& a, const uint256& b) {
             return std::memcmp(a.data(), b.data(), 32) < 0;

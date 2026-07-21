@@ -27,6 +27,13 @@
 #include <impl/dash/coin/utxo_adapter.hpp>
 #include <impl/dash/coin/rpc_data.hpp>
 #include <impl/dash/coin/transaction.hpp>
+#include <impl/dash/coin/coin_state_maintainer.hpp>
+#include <impl/dash/coin/vendor/simplifiedmns.hpp>
+#include <impl/dash/coin/vendor/smldiff.hpp>
+#include <impl/dash/coin/vendor/cbtx.hpp>
+#include <impl/dash/coin/quorum_manager.hpp>
+#include <impl/dash/coin/quorum_root.hpp>
+#include <impl/dash/coin/dkg_window.hpp>
 
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
@@ -46,6 +53,12 @@ using dash::coin::MnStateMachine;
 using dash::coin::Mempool;
 using dash::coin::MutableTransaction;
 using dash::coin::build_embedded_workdata;
+using dash::coin::CoinStateMaintainer;
+using dash::coin::QuorumManager;
+using dash::coin::vendor::CSimplifiedMNList;
+using dash::coin::vendor::CSimplifiedMNListEntry;
+using dash::coin::vendor::CSimplifiedMNListDiff;
+using dash::coin::vendor::CCbTx;
 using ::core::coin::UTXOViewCache;
 using ::core::coin::Outpoint;
 using ::core::coin::Coin;
@@ -192,4 +205,409 @@ TEST(DashNodeCoinState, InvalidateRevertsToFallback) {
     WorkSelection sel = st.select_work([&]() { fallback_called = true; return DashWorkData{}; });
     EXPECT_EQ(sel.source, WorkSource::DashdFallback);
     EXPECT_TRUE(fallback_called);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// CCbTx WIRING (v0.2.4 daemonless critical path).
+//
+// Proves the end-to-end seam: a NodeCoinState carrying an applied SML +
+// QuorumManager routes the Embedded arm AND emits the real DIP-0004 type-5
+// CCbTx extra_payload (non-empty m_coinbase_payload), byte-identical to a
+// direct build_embedded_workdata() call passing the same SML/quorum seams.
+// The pre-wiring bundle (no SML) emits an EMPTY payload — the C1 gap.
+// ════════════════════════════════════════════════════════════════════════
+
+static CSimplifiedMNListEntry sml_entry(uint8_t seed) {
+    CSimplifiedMNListEntry e;
+    e.proRegTxHash = raw256(seed);
+    e.confirmedHash = raw256(seed + 1);
+    e.isValid = true;
+    return e;
+}
+
+// Seed the NodeCoinState SML/quorum stores directly (as the maintainer would
+// after an accepted mnlistdiff) and mark have_sml.
+static void seed_sml(NodeCoinState& st) {
+    st.sml().mnList = {sml_entry(0x40), sml_entry(0x60)};
+    st.sml().sort();
+    st.set_have_sml(true);
+}
+
+TEST(DashNodeCoinState, SmlPresentEmitsRealCcbtxPayloadByteEqualToDirectBuild) {
+    UTXOViewCache utxo(nullptr);
+    uint256 prev = raw256(0x77);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, {}, 1, false));
+
+    auto payout = p2pkh_script(0x30);
+    const uint256 prev_hash = raw256(0xAB);
+    const uint32_t bits = 0x1b104be3u, mtp = 1'700'000'000u;
+    const uint32_t curtime = 1'700'000'123u, version = 0x20000000u;
+
+    NodeCoinState st;
+    seed_single_mn(st, payout);
+    seed_sml(st);
+    st.mempool().set_utxo(&utxo);
+    ASSERT_TRUE(st.mempool().add_tx(make_spend(prev, 0, 90'000, 1)));
+    st.set_tip(H - 1, prev_hash, bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER, curtime, version);
+
+    ASSERT_TRUE(st.make_embedded_work_inputs().viable());
+
+    // Independent reference: direct build with the SAME SML/quorum seams.
+    CSimplifiedMNList ref_sml = st.sml();
+    QuorumManager ref_qmgr;   // empty active set == st.qmgr() here
+    DashWorkData reference = build_embedded_workdata(
+        H - 1, prev_hash, st.mnstates(), st.mempool(),
+        bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER, curtime, version,
+        /*underfill=*/nullptr, &ref_sml, &ref_qmgr,
+        /*best_cl_height=*/0, dash::coin::k_zero_cl_sig, /*credit_pool=*/0);
+
+    bool fallback_called = false;
+    WorkSelection sel = st.select_work([&]() { fallback_called = true; return DashWorkData{}; });
+
+    EXPECT_EQ(sel.source, WorkSource::Embedded);
+    EXPECT_FALSE(fallback_called);
+    // THE CORE ASSERTION: a real, non-empty type-5 payload, byte-equal to ref.
+    EXPECT_FALSE(sel.work.m_coinbase_payload.empty())
+        << "SML-backed bundle must emit a non-empty CCbTx extra_payload";
+    EXPECT_EQ(sel.work.m_coinbase_payload, reference.m_coinbase_payload);
+
+    // And it decodes as a v3 CCbTx whose merkleRootMNList is our SML root.
+    CCbTx decoded;
+    ASSERT_TRUE(dash::coin::vendor::parse_cbtx(sel.work.m_coinbase_payload, decoded));
+    EXPECT_EQ(decoded.nVersion, CCbTx::VERSION_CLSIG_AND_BALANCE);
+    EXPECT_EQ(decoded.nHeight, static_cast<int32_t>(H));
+    EXPECT_EQ(decoded.merkleRootMNList, ref_sml.CalcMerkleRoot());
+    EXPECT_EQ(decoded.merkleRootQuorums,
+              dash::coin::compute_merkle_root_quorums(ref_qmgr));
+}
+
+// Without an SML the bundle still routes Embedded but emits an EMPTY payload —
+// the exact C1 gap (invalid on mainnet). This pins the pre/post contrast.
+TEST(DashNodeCoinState, NoSmlEmitsEmptyPayloadC1Gap) {
+    UTXOViewCache utxo(nullptr);
+    uint256 prev = raw256(0x77);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, {}, 1, false));
+    NodeCoinState st;
+    seed_single_mn(st, p2pkh_script(0x30));
+    st.mempool().set_utxo(&utxo);
+    ASSERT_TRUE(st.mempool().add_tx(make_spend(prev, 0, 90'000, 1)));
+    st.set_tip(H - 1, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER);
+    WorkSelection sel = st.select_work([&]() { return DashWorkData{}; });
+    EXPECT_EQ(sel.source, WorkSource::Embedded);
+    EXPECT_TRUE(sel.work.m_coinbase_payload.empty());
+}
+
+// require_sml gate (review finding H3): the embedded arm must NOT serve a template with
+// no CCbTx. With the gate on, a bundle lacking an SML falls back to dashd;
+// applying an SML flips it to Embedded.
+TEST(DashNodeCoinState, RequireSmlGateFallsBackUntilSmlApplied) {
+    UTXOViewCache utxo(nullptr);
+    uint256 prev = raw256(0x77);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, {}, 1, false));
+    NodeCoinState st;
+    st.set_require_sml(true);
+    seed_single_mn(st, p2pkh_script(0x30));
+    st.mempool().set_utxo(&utxo);
+    ASSERT_TRUE(st.mempool().add_tx(make_spend(prev, 0, 90'000, 1)));
+    st.set_tip(H - 1, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER);
+
+    EXPECT_FALSE(st.make_embedded_work_inputs().viable())
+        << "require_sml + no SML must gate the embedded arm off";
+    bool fb = false;
+    EXPECT_EQ(st.select_work([&]{ fb = true; return DashWorkData{}; }).source,
+              WorkSource::DashdFallback);
+    EXPECT_TRUE(fb);
+
+    seed_sml(st);
+    // Freshness gate (H-6): require_sml also requires the SML to be current AT
+    // the tip we build on. seed_sml() bypasses the maintainer, so set the
+    // current-at hash to the tip prev_hash explicitly (the maintainer does this
+    // from diff.blockHash on the live path).
+    st.set_sml_current_hash(raw256(0xAB));
+    EXPECT_TRUE(st.make_embedded_work_inputs().viable());
+    EXPECT_EQ(st.select_work([&]{ return DashWorkData{}; }).source,
+              WorkSource::Embedded);
+}
+
+// Freshness gate (H-6): with require_sml + an applied SML, a tip that moves
+// AHEAD of the SML (sml_current_hash != prev_hash) must gate the embedded arm
+// OFF until a fresh mnlistdiff re-aligns the SML to the new tip — no stale-SML
+// template served at a moved tip.
+TEST(DashNodeCoinState, RequireSmlFreshnessGateHoldsWhenSmlStaleAtTip) {
+    NodeCoinState st;
+    st.set_require_sml(true);
+    seed_single_mn(st, p2pkh_script(0x30));
+    seed_sml(st);
+    // SML is current at block A, but the tip advanced to build on block B.
+    st.set_sml_current_hash(raw256(0xAB));
+    st.set_tip(H - 1, raw256(0xCD), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER);
+    EXPECT_FALSE(st.make_embedded_work_inputs().viable())
+        << "stale SML at a moved tip must gate the embedded arm off";
+
+    // The fresh diff for block B lands: SML now current at the tip -> viable.
+    st.set_sml_current_hash(raw256(0xCD));
+    EXPECT_TRUE(st.make_embedded_work_inputs().viable());
+}
+
+// Superblock guard: on a superblock-height NEXT block, the embedded arm must
+// refuse (route to the reward-safe dashd fallback that carries the governance
+// outputs) rather than emit an invalid non-superblock coinbase.
+TEST(DashNodeCoinState, SuperblockHeightRefusesEmbedded) {
+    NodeCoinState st;
+    seed_single_mn(st, p2pkh_script(0x30));
+    seed_sml(st);
+    st.set_sml_current_hash(raw256(0xAB));
+    // Predicate flags exactly height H (the next block) as a superblock.
+    st.set_is_superblock_fn([](uint32_t next_h) { return next_h == H; });
+
+    // Tip at H-1 => next block is H => superblock => embedded refused.
+    st.set_tip(H - 1, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER);
+    EXPECT_FALSE(st.make_embedded_work_inputs().viable())
+        << "superblock height must refuse the embedded arm";
+    bool fb = false;
+    EXPECT_EQ(st.select_work([&]{ fb = true; return DashWorkData{}; }).source,
+              WorkSource::DashdFallback);
+    EXPECT_TRUE(fb);
+
+    // Tip at H => next block is H+1 => not a superblock => embedded serves.
+    st.set_tip(H, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER);
+    EXPECT_TRUE(st.make_embedded_work_inputs().viable());
+}
+
+// BLOCKER-1 (PR #780): is_dkg_commitment_window over REAL live-testnet heights —
+// the DKG mining windows the review pulled must be flagged, the fixture height
+// (a non-qc coinbase-only block) must not.
+TEST(DashDkgWindow, RealTestnetCommitmentHeightsFlagged) {
+    // Live testnet blocks 1518418/19/42 each carry 3 mandatory type-6 commitments.
+    EXPECT_TRUE(dash::coin::is_dkg_commitment_window(1518418));  // h%24=10
+    EXPECT_TRUE(dash::coin::is_dkg_commitment_window(1518419));  // h%24=11
+    EXPECT_TRUE(dash::coin::is_dkg_commitment_window(1518442));  // h%24=10
+    // The byte-parity fixture height 1518413 is a non-qc block (h%24=5).
+    EXPECT_FALSE(dash::coin::is_dkg_commitment_window(1518413));
+    // Whole [10,18] window of the 24-interval types must be refused.
+    for (uint32_t p = 10; p <= 18; ++p)
+        EXPECT_TRUE(dash::coin::is_dkg_commitment_window(1518408 + p));
+    // Phases just outside the window proceed.
+    EXPECT_FALSE(dash::coin::is_dkg_commitment_window(1518408 + 9));
+    EXPECT_FALSE(dash::coin::is_dkg_commitment_window(1518408 + 19));
+}
+
+// BLOCKER-1 viability: the embedded arm fails closed on a DKG commitment height
+// and serves on a clear height.
+TEST(DashNodeCoinState, DkgCommitmentHeightRefusesEmbedded) {
+    NodeCoinState st;
+    seed_single_mn(st, p2pkh_script(0x30));
+    seed_sml(st);
+    st.set_commitment_window_fn(
+        [](uint32_t next_h) { return dash::coin::is_dkg_commitment_window(next_h); });
+
+    // Tip at 1518417 => next block 1518418 (commitment window) => refuse.
+    st.set_sml_current_hash(raw256(0xAB));
+    st.set_tip(1518417, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER);
+    EXPECT_FALSE(st.make_embedded_work_inputs().viable())
+        << "DKG commitment height must fail closed to the dashd fallback";
+
+    // Tip at 1518412 => next block 1518413 (clear) => serve.
+    st.set_tip(1518412, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER);
+    EXPECT_TRUE(st.make_embedded_work_inputs().viable());
+}
+
+// BLOCKER-2 viability: a stale/absent bestCL fails closed; a fresh one serves.
+TEST(DashNodeCoinState, StaleBestClRefusesEmbedded) {
+    NodeCoinState st;
+    seed_single_mn(st, p2pkh_script(0x30));
+    seed_sml(st);
+    st.set_sml_current_hash(raw256(0xAB));
+    st.set_require_fresh_bestcl(true);
+
+    // No ChainLock observed (best_cl_height == 0) at a high tip => refuse.
+    st.set_tip(1518412, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER);
+    EXPECT_FALSE(st.make_embedded_work_inputs().viable())
+        << "absent bestCL must fail closed";
+
+    // A ChainLock two blocks back (prev_height-2) is still too stale => refuse.
+    std::array<uint8_t, 96> sig{}; sig[0] = 0x11;
+    st.set_best_cl(1518410, sig);   // prev_height-2
+    EXPECT_FALSE(st.make_embedded_work_inputs().viable())
+        << "bestCL older than prev_height-1 must fail closed";
+
+    // A ChainLock at prev_height-1 is fresh enough => serve (matches the
+    // real fixture: block 1518412 committed bestCL height 1518411 = prev-1).
+    st.set_best_cl(1518411, sig);
+    EXPECT_TRUE(st.make_embedded_work_inputs().viable());
+
+    // A ChainLock at the tip itself is also fine.
+    st.set_best_cl(1518412, sig);
+    EXPECT_TRUE(st.make_embedded_work_inputs().viable());
+}
+
+// SOAK FIX v3 (INDEPENDENT height check): the credit-pool seed can lag one block
+// behind the tip while its VALUE and hash-tag look fresh (built = stale_seed +
+// reward is self-consistent but wrong — 3 soaks refuted the hash- and value-self-
+// checks). The independent gate compares the seed cbTx's OWN height to the tip:
+// a seed for block N-1 while building on tip N-1 (to make block N) must have
+// seed height == N-1. A seed at N-2 fails closed. Real re-soak #2 values.
+TEST(DashNodeCoinState, CreditPoolSeedHeightBehindTipRefusesEmbedded) {
+    NodeCoinState st;
+    seed_single_mn(st, p2pkh_script(0x30));
+    seed_sml(st);
+    st.set_require_sml(true);
+    st.set_sml_current_hash(raw256(0xAB));   // SML fresh at the tip
+    st.set_require_fresh_credit_pool(true);
+    // Building block 1518657 (tip = 1518656 = prev) — the re-soak #2 failure.
+    st.set_tip(1518656, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER);
+
+    // Seed is creditPool(1518655) at HEIGHT 1518655 — one block behind the tip
+    // (exactly what the soak committed). Its value/hash look plausibly fresh, but
+    // the height (1518655) != tip height (1518656) => FAIL CLOSED.
+    st.set_credit_pool(33974827375826LL, raw256(0xAB), 1518655);
+    EXPECT_FALSE(st.make_embedded_work_inputs().viable())
+        << "a seed one block behind the tip must fail closed (independent height check)";
+    {
+        bool fb = false;
+        EXPECT_EQ(st.select_work([&]{ fb = true; return DashWorkData{}; }).source,
+                  WorkSource::DashdFallback);
+        EXPECT_TRUE(fb);
+    }
+
+    // Seed advances to creditPool(1518656) at HEIGHT 1518656 == tip => serves.
+    st.set_credit_pool(33974894342656LL, raw256(0xAB), 1518656);
+    ASSERT_TRUE(st.make_embedded_work_inputs().viable());
+    WorkSelection sel = st.select_work([]{ return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded);
+    EXPECT_TRUE(st.embedded_template_emit_ok(sel.work));
+}
+
+// Defence-in-depth: the pre-emit VALUE re-check still rejects a built template
+// whose committed creditPool != current_seed + reward (a seed with a matching
+// height but a value that changed between build and emit).
+TEST(DashNodeCoinState, StaleBuiltCreditPoolFailsPreEmitValueCheck) {
+    NodeCoinState st;
+    seed_single_mn(st, p2pkh_script(0x30));
+    seed_sml(st);
+    st.set_require_sml(true);
+    st.set_sml_current_hash(raw256(0xAB));
+    st.set_require_fresh_credit_pool(true);
+    st.set_tip(1518608, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER);
+
+    const int64_t v1 = 33971612967986LL;
+    const int64_t v2 = v1 + 66966830LL;
+    // Seed height == tip (1518608) so viability/height pass; build a template.
+    st.set_credit_pool(v1, raw256(0xAB), 1518608);
+    ASSERT_TRUE(st.make_embedded_work_inputs().viable());
+    WorkSelection sel = st.select_work([]{ return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded);
+    EXPECT_TRUE(st.embedded_template_emit_ok(sel.work));
+
+    // The seed VALUE changes (height still 1518608): the built template's baked
+    // creditPool now mismatches current_seed + reward => VALUE re-check rejects.
+    st.set_credit_pool(v2, raw256(0xAB), 1518608);
+    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work))
+        << "a built creditPool != current seed + reward must fail the value re-check";
+}
+
+// BLOCKER-3 (PR #780): the pre-emit hard gate accepts a valid built CbTx and
+// fails closed on a tampered/empty payload, a re-asserted height-class guard,
+// or an unhealthy quorum set.
+TEST(DashNodeCoinState, PreEmitGateAcceptsValidRejectsTampered) {
+    NodeCoinState st;
+    seed_single_mn(st, p2pkh_script(0x30));
+    seed_sml(st);
+    st.set_require_sml(true);
+    st.set_sml_current_hash(raw256(0xAB));
+    st.set_tip(1518412, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER);
+
+    ASSERT_TRUE(st.make_embedded_work_inputs().viable());
+    WorkSelection sel = st.select_work([]{ return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded);
+    ASSERT_FALSE(sel.work.m_coinbase_payload.empty());
+
+    // Valid built template passes the pre-emit gate.
+    EXPECT_TRUE(st.embedded_template_emit_ok(sel.work));
+
+    // Tamper a byte inside merkleRootMNList => root mismatch => fail closed.
+    DashWorkData bad = sel.work;
+    bad.m_coinbase_payload[10] ^= 0xFF;
+    EXPECT_FALSE(st.embedded_template_emit_ok(bad));
+
+    // Empty payload (the C1 gap) under require_sml => fail closed.
+    DashWorkData empty = sel.work;
+    empty.m_coinbase_payload.clear();
+    EXPECT_FALSE(st.embedded_template_emit_ok(empty));
+
+    // Height-class guard re-asserted at emit: a commitment window fails closed
+    // even though the payload itself is well-formed.
+    st.set_commitment_window_fn([](uint32_t){ return true; });
+    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work));
+    st.set_commitment_window_fn(nullptr);
+    EXPECT_TRUE(st.embedded_template_emit_ok(sel.work));
+
+    // Quorum-tail health: an unhealthy quorum set fails viability closed (the
+    // review nit — a silently-skipped quorum tail leaves a stale set).
+    st.set_quorum_healthy(false);
+    EXPECT_FALSE(st.make_embedded_work_inputs().viable());
+    st.set_quorum_healthy(true);
+    EXPECT_TRUE(st.make_embedded_work_inputs().viable());
+}
+
+// Maintainer wiring: on_mnlistdiff applies the vendored apply_diff into the
+// node-held SML and flips have_sml, so a subsequent select_work emits the
+// real payload — the full reception path minus the socket.
+TEST(DashNodeCoinState, MaintainerOnMnlistdiffPopulatesSmlAndEmitsPayload) {
+    UTXOViewCache utxo(nullptr);
+    uint256 prev = raw256(0x77);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, {}, 1, false));
+
+    NodeCoinState st;
+    st.set_require_sml(true);
+    CoinStateMaintainer maint(st);
+
+    // Reception order mirrors the live node: MN payee set THROUGH the
+    // maintainer (leg 4 — arms the maintainer's own have_mn gate), mempool
+    // (leg 1), then the SML diff (new leg), then the tip (leg 2).
+    MNState pm; pm.isValid = true; pm.nRegisteredHeight = 2'300'000;
+    pm.nLastPaidHeight = 0; pm.scriptPayout.m_data = p2pkh_script(0x30);
+    maint.on_mn_list_update(
+        std::vector<std::pair<uint256, MNState>>{{raw256(0x01), pm}}, 0);
+    st.mempool().set_utxo(&utxo);
+    ASSERT_TRUE(st.mempool().add_tx(make_spend(prev, 0, 90'000, 1)));
+
+    // Build a minimal mnlistdiff: two fresh MNs, no deletes, empty quorum tail,
+    // default (type-0) cbTx so the credit-pool seed is skipped.
+    CSimplifiedMNListDiff diff;
+    diff.baseBlockHash = uint256::ZERO;
+    diff.blockHash = raw256(0xAB);
+    diff.mnList = {sml_entry(0x40), sml_entry(0x60)};
+
+    EXPECT_FALSE(st.have_sml());
+    maint.on_mnlistdiff(diff);
+    EXPECT_TRUE(st.have_sml());
+    EXPECT_EQ(st.sml().size(), 2u);
+
+    // Arm the tip AFTER the SML so republish sees both halves.
+    maint.on_new_tip(H - 1, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+                     DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'123u, 0x20000000u);
+    ASSERT_TRUE(st.populated());
+    ASSERT_TRUE(st.make_embedded_work_inputs().viable());
+
+    WorkSelection sel = st.select_work([&]() { return DashWorkData{}; });
+    EXPECT_EQ(sel.source, WorkSource::Embedded);
+    EXPECT_FALSE(sel.work.m_coinbase_payload.empty());
+
+    // A reorg wipe drops the SML and gates the arm back to fallback.
+    maint.on_sml_reorg();
+    EXPECT_FALSE(st.have_sml());
+    EXPECT_EQ(st.sml().size(), 0u);
+    EXPECT_FALSE(st.make_embedded_work_inputs().viable());
 }

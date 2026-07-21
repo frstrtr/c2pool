@@ -45,6 +45,7 @@
 
 #include <impl/dash/crypto/hash_x11.hpp>   // block identity on Dash = X11(header)
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <vector>
@@ -628,13 +629,37 @@ private:
         LOG_INFO << "[" << m_chain_label << "] chainlock: height=" << msg->m_height
                  << " block=" << msg->m_block_hash.GetHex().substr(0, 16) << "...";
         m_coin->new_chainlock.happened({msg->m_block_hash, msg->m_height});
+        // Daemonless CCbTx path: forward the recovered 96-byte threshold sig so
+        // the maintainer can adopt this ChainLock as the coinbase bestCLSignature.
+        // m_sig is decoded as a fixed 96-byte array (p2p_messages.hpp clsig);
+        // guard the copy defensively in case a peer sent a short blob.
+        if (msg->m_sig.size() == 96) {
+            ::dash::interfaces::Node::ChainLockSigEvent ev;
+            ev.height     = msg->m_height;
+            ev.block_hash = msg->m_block_hash;
+            std::copy(msg->m_sig.begin(), msg->m_sig.end(), ev.sig.begin());
+            m_coin->new_chainlock_sig.happened(ev);
+        }
     }
 
     ADD_P2P_HANDLER(mnlistdiff)
     {
-        // SML snapshot — the CoinStateMaintainer::on_mn_list_update feed is a
-        // later slice; receipt is logged so the live wire is observable.
-        LOG_INFO << "[" << m_chain_label << "] mnlistdiff received (SML ingest is E2+)";
+        // SML/quorum snapshot. message_mnlistdiff already fully deserialized the
+        // wire form into msg->m_diff (a vendor::CSimplifiedMNListDiff, see
+        // p2p_messages.hpp) — apply_diff + the QuorumTail parser + the CCbTx
+        // seed all consume it downstream. Fire the reception event so the
+        // subscribed CoinStateMaintainer::on_mnlistdiff advances the local SML
+        // (merkleRootMNList), the QuorumManager (merkleRootQuorums), and seeds
+        // bestCL*/creditPool from the diff's embedded cbTx. With no subscriber
+        // (E1 posture / coin-P2P off) this is a no-op and the node keeps taking
+        // the retained dashd-RPC fallback — zero behavior change on that path.
+        LOG_INFO << "[" << m_chain_label << "] mnlistdiff: base="
+                 << msg->m_diff.baseBlockHash.GetHex().substr(0, 16)
+                 << " tip=" << msg->m_diff.blockHash.GetHex().substr(0, 16)
+                 << " +" << msg->m_diff.mnList.size() << "mn -"
+                 << msg->m_diff.deletedMNs.size() << "del qtail="
+                 << msg->m_diff.quorum_tail.size() << "B";
+        m_coin->new_mnlistdiff.happened(msg->m_diff);
     }
 
     // ── tolerated / ignored peer traffic ─────────────────────────────────

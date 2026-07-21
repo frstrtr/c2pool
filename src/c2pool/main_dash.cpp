@@ -57,6 +57,7 @@
 #include <impl/dash/coin/p2p_client.hpp>   // dash::coin::p2p::CoinClient — OPT-IN coin-network dial (E1, --coin-p2p-connect)
 #include <impl/dash/coin/won_block_dispatch.hpp> // dash::coin::broadcast_won_block — S8 dual-path won-block dispatcher (embedded P2P primary + submitblock RPC backup)
 #include <impl/dash/coin/node_coin_state.hpp>  // dash::coin::NodeCoinState (embedded work bundle)
+#include <impl/dash/coin/dkg_window.hpp>       // dash::coin::is_dkg_commitment_window (BLOCKER-1 guard)
 #include <impl/dash/coin/utxo_lane.hpp>    // dash::coin::UtxoLane — embedded UTXO/fee lane (E2b, #738)
 #include <impl/dash/coin/header_chain.hpp>       // dash::coin::HeaderChain — SPV header/tip authority (E2a)
 #include <impl/dash/coin/coin_state_maintainer.hpp>  // dash::coin::CoinStateMaintainer — populate ordering gate (E2a)
@@ -382,7 +383,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              double dev_donation, double node_owner_fee,
              const std::string& node_owner_address,
              const std::string& redistribute_mode,
-             bool no_p2p_relay)
+             bool no_p2p_relay,
+             bool embedded_mainnet)
 {
     namespace io = boost::asio;
 
@@ -857,10 +859,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     dash::coin::P2pRelaySink p2p_relay;
     if (coin_p2p && !no_p2p_relay) {
         p2p_relay =
-            [&ioc, &coin_p2p](const std::vector<unsigned char>& block_bytes) {
+            [&ioc, &coin_p2p](const std::vector<unsigned char>& block_bytes) -> bool {
+                // H1 honest reporting: submit_block_p2p_raw SILENTLY DROPS a won
+                // block when the coin-P2P peer is disconnected, and the io::post
+                // returns before the send even runs -- so only claim a P2P relay
+                // when the peer is actually connected+handshaked at dispatch time.
+                // If not, return false so broadcast_won_block relies on ARM B
+                // (submitblock RPC) and the NEVER-SILENT-DROP contract holds
+                // (loud dispatcher log if neither arm is reachable).
+                if (!coin_p2p || !coin_p2p->is_handshake_complete()) {
+                    std::cout << "[DASH-STRATUM-BLOCK] embedded P2P relay skipped: "
+                                 "coin-P2P peer not connected/handshaked -- relying "
+                                 "on submitblock-RPC backup\n";
+                    return false;
+                }
                 io::post(ioc, [&coin_p2p, bytes = block_bytes]() {
                     if (coin_p2p) coin_p2p->submit_block_p2p_raw(bytes);
                 });
+                return true;
             };
     } else if (no_p2p_relay) {
         std::cout << "[run] --no-p2p-relay: embedded P2P-relay arm SUPPRESSED; "
@@ -905,6 +921,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     auto work_source = std::make_shared<dash::stratum::DASHWorkSource>(
         node_coin_state, std::move(dashd_fallback), std::move(stratum_submit_fn),
         core::stratum::StratumConfig{}, testnet);
+    // Gate-lift (v0.2.4): allow the daemonless embedded arm on mainnet when the
+    // operator opts in via --embedded-mainnet. The CbTx is proven byte-identical
+    // to real dashd (both merkle roots reproduced from the mnlistdiff wire); the
+    // SML+quorum freshness + superblock viability gates keep it fail-safe.
+    work_source->set_embedded_mainnet(embedded_mainnet);
+    // Reward-safety backstop: when a dashd fallback is configured, cross-check
+    // the embedded creditPool against dashd's GBT before serving (catches any
+    // seed bug the daemonless self-checks miss). Enabled alongside the embedded
+    // arm; pure-daemonless deployments (no dashd) leave it off and rely on the
+    // independent seed-height gate.
+    work_source->set_gbt_xcheck(testnet || embedded_mainnet);
 
     // ── Mint slice 3/3: run-loop share minting wiring ─────────────────────
     // ShareAccept -> build_mint_share -> tracker insert -> peer broadcast.
@@ -1346,6 +1373,113 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         coin_feed_subs.push_back(
             c2pool::dash::wire_mn_list_ingest(coin_state, *maintainer));
 
+        // Leg 5 (SML axis — DAEMONLESS CCbTx, v0.2.4 critical path): the raw
+        // mnlistdiff off the live coin-P2P feed advances the SML
+        // (merkleRootMNList) + QuorumManager (merkleRootQuorums) + seeds
+        // bestCL*/creditPool via CoinStateMaintainer::on_mnlistdiff. This is
+        // what makes the embedded coinbase's DIP-0004 type-5 payload
+        // MAINNET-VALID (review finding C1). Distinct from leg 4 (the RPC-seeded PAYEE
+        // axis). The getmnlistd request driver below primes it.
+        coin_feed_subs.push_back(
+            c2pool::dash::wire_mnlistdiff_ingest(coin_state, *maintainer));
+
+        // getmnlistd base tracker: the block hash the local SML is current at.
+        // Cold start = ZERO (full snapshot). Each accepted mnlistdiff advances
+        // it to diff.blockHash so the NEXT request is an incremental diff off
+        // the last synced point (avoids re-pulling the full ~450 kB list).
+        auto sml_base = std::make_shared<uint256>(uint256::ZERO);
+        coin_feed_subs.push_back(
+            coin_state.new_mnlistdiff.subscribe(
+                [sml_base](const dash::coin::vendor::CSimplifiedMNListDiff& d) {
+                    *sml_base = d.blockHash;
+                }));
+
+        // review finding H3: the embedded arm must NOT serve a template without a valid
+        // CCbTx (that block is consensus-invalid on mainnet). Gate embedded
+        // viability on an applied SML — until the first mnlistdiff lands, and
+        // after any reorg wipe, get_work stays on the retained dashd fallback.
+        node_coin_state.set_require_sml(true);
+
+        // Superblock guard: on a Dash superblock height the coinbase must pay the
+        // governance/treasury outputs, which the embedded template does not
+        // compute. Refuse the embedded arm on those heights and let the reward-
+        // safe dashd fallback serve the correct superblock template. Cycle is
+        // network-specific (mainnet 16616, testnet 24).
+        {
+            const int sb_cycle = testnet
+                ? dash::coin::DASH_SUPERBLOCK_CYCLE_TESTNET
+                : dash::coin::DASH_SUPERBLOCK_CYCLE_MAINNET;
+            node_coin_state.set_is_superblock_fn(
+                [sb_cycle](uint32_t next_height) {
+                    return dash::coin::is_superblock_height(next_height, sb_cycle);
+                });
+        }
+
+        // review PR #780 BLOCKER-1 (CRITICAL): refuse the embedded arm on DKG
+        // commitment-window heights. There the block MUST carry mandatory type-6
+        // quorum-commitment txs (which the C-3 filter strips) and merkleRootQuorums
+        // must include them (which the mnlistdiff-fed set omits) — the embedded
+        // arm would produce a bad-qc-missing / wrong-root block. Fail closed to
+        // the reward-safe dashd fallback at those heights (it builds the qc block).
+        node_coin_state.set_commitment_window_fn(
+            [](uint32_t next_height) {
+                return dash::coin::is_dkg_commitment_window(next_height);
+            });
+
+        // review PR #780 BLOCKER-2 (HIGH): refuse the embedded arm on a stale or
+        // absent bestCL (dashcore CheckCbTxBestChainlock rejects null/older CL).
+        // Only meaningful when the embedded arm actually serves (testnet or
+        // --embedded-mainnet); harmless otherwise (the arm is off, work_source
+        // never consults viability).
+        node_coin_state.set_require_fresh_bestcl(testnet || embedded_mainnet);
+
+        // SOAK FIX (bad-cbtx-assetlocked-amount): the DIP-0027 credit-pool seed
+        // rides a separate on_mnlistdiff step and can lag one block while the SML
+        // hash is already at the tip; the accrual then commits a stale
+        // creditPoolBalance. Refuse the embedded arm unless the credit-pool seed
+        // is current AT the tip, same discipline as the SML axis.
+        node_coin_state.set_require_fresh_credit_pool(testnet || embedded_mainnet);
+
+        // H-6: SML/quorum apply and bestCL adoption move ASYNCHRONOUSLY to the
+        // header tip. When they advance (catching the SML up to a moved tip, or
+        // adopting a fresher ChainLock) the served template changes but no tip
+        // signal fires — so drive the same re-issue path the tip-change uses.
+        // A reorg wipe also routes here so miners drop the orphaned-branch
+        // template immediately. (weak_ptr so a late event can't resurrect a
+        // torn-down work source during shutdown.)
+        {
+            std::weak_ptr<dash::stratum::DASHWorkSource> ws_dirty = work_source;
+            maintainer->set_on_state_dirty(
+                [ws_dirty, &stratum_server]() {
+                    if (auto ws = ws_dirty.lock()) ws->bump_work_generation();
+                    if (stratum_server) stratum_server->notify_all();
+                });
+        }
+
+        // review PR #780 H-1 heal: on a malformed quorum tail the maintainer
+        // wipes the base-relative SML/quorum state and asks for a FULL re-sync.
+        // Reset the sml_base request tracker to ZERO and re-request a full
+        // snapshot at the current tip, so the next mnlistdiff is base=ZERO (the
+        // skipped delta cannot be silently ridden over by an incremental).
+        maintainer->set_on_full_resync(
+            [sml_base, cp = coin_p2p.get(), hc = header_chain.get()]() {
+                *sml_base = uint256::ZERO;
+                auto tip_entry = hc->tip();
+                const uint256 tip = tip_entry ? tip_entry->hash : uint256::ZERO;
+                if (cp) cp->send_getmnlistd(uint256::ZERO, tip);
+            });
+
+        // Leg 6 (ChainLock sig): Node::new_chainlock_sig -> maintainer
+        // .on_new_chainlock. The clsig message carries the recovered 96-byte
+        // threshold sig (new_chainlock above drops it); the maintainer adopts
+        // the freshest observed ChainLock height+sig as the CCbTx bestCL*.
+        coin_feed_subs.push_back(
+            coin_state.new_chainlock_sig.subscribe(
+                [m = maintainer.get()]
+                (const dash::interfaces::Node::ChainLockSigEvent& c) {
+                    m->on_new_chainlock(c.height, c.sig);
+                }));
+
         // Bridge: new_headers -> HeaderChain::add_headers (X11 PoW + DGW
         // validated). The tip authority for the embedded template.
         coin_feed_subs.push_back(
@@ -1400,8 +1534,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // stale work between job-push timer firings (event-driven notify).
         header_chain->set_on_tip_changed(
             [&coin_state, &stratum_server, hc = header_chain.get(),
-             addr_ver, p2sh_ver, ws = work_source.get()]
-            (const uint256&, uint32_t, const uint256& new_tip, uint32_t new_height) {
+             addr_ver, p2sh_ver, ws = work_source.get(),
+             cp = coin_p2p.get(), sml_base, m = maintainer.get()]
+            (const uint256&, uint32_t, const uint256& new_tip, uint32_t new_height,
+             bool was_reorg) {
                 auto ta = dash::coin::tip_advance_from_chain(
                     *hc, addr_ver, p2sh_ver);
                 if (ta) {
@@ -1411,7 +1547,31 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                              << " bits=0x" << std::hex << ta->bits_for_next << std::dec
                              << " -> new_tip fired (maintainer arm)";
                 }
-                // #739: event-driven stale-work notify.
+                // C-2 reorg wiring: a branch switch invalidates the incremental
+                // SML (its applied diffs were relative to the orphaned branch).
+                // Wipe + drop have_sml so the embedded arm falls back to dashd,
+                // reset the sync base to ZERO, and re-request a FULL cold-start
+                // snapshot at the new tip (an incremental diff off the stale base
+                // would be rejected by the base-continuity guard anyway).
+                if (was_reorg && m) {
+                    LOG_WARNING << "[SML] reorg to h=" << new_height
+                                << " -> SML wipe + cold-resync";
+                    m->on_sml_reorg();
+                    *sml_base = uint256::ZERO;
+                }
+                // SML axis: pull the mnlistdiff current AT the new tip. dashcore
+                // computes block (tip+1)'s CbTx merkleRootMNList/Quorums from the
+                // DMN/quorum list as-of `tip` (GetListForBlock(pindexPrev)), so
+                // targeting the diff at `new_tip` puts the local SML in exactly
+                // the state needed to build tip+1. Incremental off the last
+                // synced base (ZERO after a reorg = full snapshot); the
+                // new_mnlistdiff subscription advances sml_base on acceptance.
+                if (cp) cp->send_getmnlistd(*sml_base, new_tip);
+                // #739: event-driven stale-work notify. NOTE: the freshness gate
+                // now holds the embedded arm on the dashd fallback until the
+                // getmnlistd above lands and re-notifies (maintainer state-dirty),
+                // so this notify serves the reward-safe fallback, not a stale-SML
+                // embedded template.
                 if (ws) ws->bump_work_generation();
                 if (stratum_server) stratum_server->notify_all();
             });
@@ -1434,11 +1594,18 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // Kick the initial sync once the version/verack handshake completes:
         // getheaders off our current locator + a mempool prime.
         coin_p2p->set_on_handshake_complete(
-            [cp = coin_p2p.get(), hc = header_chain.get()]() {
+            [cp = coin_p2p.get(), hc = header_chain.get(), sml_base]() {
                 LOG_INFO << "[EMB-DASH] handshake complete -> initial sync:"
-                            " getheaders + mempool";
+                            " getheaders + mempool + mnlistdiff(cold)";
                 cp->send_getheaders(70230, hc->get_locator(), uint256::ZERO);
                 cp->send_mempool();
+                // Cold-start SML sync: full snapshot (base=ZERO) up to our best
+                // known header tip. Steady-state incremental diffs then ride the
+                // tip-changed driver. If the header chain is still empty at
+                // handshake, target ZERO too — the first tip-change re-requests.
+                auto tip_entry = hc->tip();
+                const uint256 tip = tip_entry ? tip_entry->hash : uint256::ZERO;
+                cp->send_getmnlistd(*sml_base, tip);
             });
 
         std::cout << "[run] E2a live-feed wired: header-chain(" << hdr_db
@@ -1849,6 +2016,7 @@ int main(int argc, char** argv)
     std::vector<std::string> connect_raw;      // --connect HOST:PORT (connect-only)
     std::vector<std::string> coin_p2p_raw;     // --coin-p2p-connect HOST:PORT (repeatable; E1 opt-in coin-network dial)
     bool no_p2p_relay = false;                 // --no-p2p-relay: suppress the embedded P2P-relay won-block arm (A/B isolation; RPC backup stays live)
+    bool embedded_mainnet = false;             // --embedded-mainnet: gate-lift, allow the daemonless embedded template arm on MAINNET (byte-parity proven; default OFF = dashd fallback)
     std::string stratum_host = "0.0.0.0";      // --stratum [HOST:]PORT bind interface (default all)
     uint16_t    stratum_port = 0;              // 0 disables the Stratum accept-loop; --stratum sets it
     bool embedded_utxo = false;                // --embedded-utxo: arm the E2b UTXO/fee lane (opt-in)
@@ -1894,6 +2062,8 @@ int main(int argc, char** argv)
             coin_p2p_raw.emplace_back(argv[++i]);
         else if (std::strcmp(argv[i], "--no-p2p-relay") == 0)
             no_p2p_relay = true;
+        else if (std::strcmp(argv[i], "--embedded-mainnet") == 0)
+            embedded_mainnet = true;
         else if (std::strcmp(argv[i], "--embedded-utxo") == 0)
             embedded_utxo = true;
         else if ((std::strcmp(argv[i], "--give-author") == 0 ||
@@ -1996,7 +2166,8 @@ int main(int argc, char** argv)
                         stratum_host, stratum_port, web_host, web_port,
                         dashboard_dir, coin_p2p_targets,
                         embedded_utxo, dev_donation, node_owner_fee,
-                        node_owner_address, redistribute_mode, no_p2p_relay);
+                        node_owner_address, redistribute_mode, no_p2p_relay,
+                        embedded_mainnet);
     }
     return run_selftest();
 }

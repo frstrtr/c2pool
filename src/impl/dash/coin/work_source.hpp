@@ -25,6 +25,7 @@
 
 #include <core/uint256.hpp>
 
+#include <array>
 #include <ctime>
 #include <cstdint>
 #include <functional>
@@ -51,6 +52,17 @@ struct EmbeddedWorkInputs {
     // defaults (std::time(nullptr) / 0x20000000 BIP9 baseline).
     uint32_t              curtime{0};
     uint32_t              version{0};
+
+    // CCbTx (DIP-0004 type-5 extra_payload) seams. When sml AND qmgr are both
+    // non-null, build_embedded_workdata folds the real type-5 payload
+    // (merkleRootMNList + merkleRootQuorums + version-appropriate bestCL* +
+    // creditPool) so the assembled coinbase is MAINNET-VALID. Left null by
+    // legacy callers => empty payload (pre-CCbTx behavior, byte-unchanged).
+    const vendor::CSimplifiedMNList* sml{nullptr};
+    const QuorumManager*             qmgr{nullptr};
+    int32_t                          best_cl_height{0};
+    std::array<uint8_t, 96>          best_cl_sig{};
+    int64_t                          credit_pool{0};
 
     bool viable() const {
         return has_state && mnstates != nullptr && mempool != nullptr;
@@ -93,7 +105,14 @@ inline WorkSelection select_dash_work(
                 emb.address_version, emb.address_p2sh_version,
                 emb.curtime ? emb.curtime
                             : static_cast<uint32_t>(std::time(nullptr)),
-                emb.version ? emb.version : 0x20000000u);
+                emb.version ? emb.version : 0x20000000u,
+                // underfill-observation seam left default (nullptr); the CCbTx
+                // seams thread the SML/quorum/bestCL/creditPool through so the
+                // LIVE embedded arm emits the real type-5 payload (empty when
+                // sml/qmgr null — legacy callers unchanged).
+                /*underfill_tripped=*/nullptr,
+                emb.sml, emb.qmgr,
+                emb.best_cl_height, emb.best_cl_sig, emb.credit_pool);
         },
         dashd_fallback);
 }

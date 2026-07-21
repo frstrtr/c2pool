@@ -542,6 +542,40 @@ TEST(DashMempool, AssetUnlockType9PricedFromPayloadFee)
     EXPECT_EQ(fees2, 7'000u) << "only the well-formed unlock is priced";
 }
 
+// C-3 special-tx filter: the embedded-template selection (exclude_special=true)
+// drops every Dash special tx (tx.type != 0) while keeping standard fee-paying
+// txs, so an embedded block is special-tx-free (its CbTx creditPool accrual then
+// reduces to the platform-reward term). The DEFAULT path (exclude_special=false)
+// still prices+selects the asset-unlock, preserving the general capability.
+TEST(DashMempool, EmbeddedSelectionExcludesSpecialTxs)
+{
+    Mempool mp;
+    // A standard fee-paying tx priced from payload (type-9 uses payload.fee),
+    // plus a type-9 asset-unlock. The default selector takes both; the
+    // embedded selector must drop the type-9 special tx.
+    auto std_spend = make_asset_unlock(300'000, /*fee=*/5'000, /*salt=*/61);
+    std_spend.type = 0;                       // force a standard tx (fee still from payload path? no)
+    // Give the standard tx a real UTXO-priced fee instead.
+    UtxoLane lane; ASSERT_TRUE(lane.open("")); lane.attach(mp);
+    auto cb = make_coinbase({80'000}, /*salt=*/62);
+    lane.on_block_connected(make_block({cb}, /*salt=*/62), /*height=*/1);
+    auto ord = make_spend(dash_txid(cb), 0, 70'000, /*salt=*/63);   // fee 10000, type 0
+    ASSERT_TRUE(mp.add_tx(ord));
+    auto t9 = make_asset_unlock(400'000, /*fee=*/7'000, /*salt=*/64); // type 9
+    ASSERT_TRUE(mp.add_tx(t9));
+
+    // Default: both priced txs selectable.
+    auto [all, all_fees] = mp.get_sorted_txs_with_fees(1'000'000);
+    EXPECT_EQ(all.size(), 2u);
+    EXPECT_EQ(all_fees, 17'000u);
+
+    // Embedded (C-3): the type-9 special tx is excluded; only the standard tx.
+    auto [emb, emb_fees] = mp.get_sorted_txs_with_fees(1'000'000, /*exclude_special=*/true);
+    ASSERT_EQ(emb.size(), 1u) << "embedded template must be special-tx-free";
+    EXPECT_EQ(emb[0].tx.type, 0);
+    EXPECT_EQ(emb_fees, 10'000u);
+}
+
 // (b)+(d) coinbasevalue = subsidy + summed real fees, matching a hand-
 //     computed oracle; unknown-fee ordinary txs contribute NOTHING, so the
 //     value can never overstate what dashd's GBT would report.
