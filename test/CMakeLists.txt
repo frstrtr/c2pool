@@ -652,7 +652,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     # DASHWorkSource (dash::stratum): concrete core::stratum::IWorkSource for
     # DASH X11 -- 4b construction + contract KAT. Links the dash_stratum OBJECT
     # lib (work_source.cpp) on top of the header-only coin selector link set.
-    add_executable(test_dash_stratum_work_source test_dash_stratum_work_source.cpp)
+    # Includes coin/zmq_tip_notify.cpp directly (NOT the C2POOL_ZMQ-guarded
+    # subscriber — only the pure TipHashDedup / frame-decode helpers) so the
+    # ZMQ hashblock instant-tip-notify KAT links without libzmq.
+    add_executable(test_dash_stratum_work_source
+        test_dash_stratum_work_source.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/dash/coin/zmq_tip_notify.cpp)
     target_link_libraries(test_dash_stratum_work_source PRIVATE
         GTest::gtest_main GTest::gtest
         dash_stratum dash_x11 core
