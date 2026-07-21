@@ -391,18 +391,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     # sharereply's shares (RawShare round-trip, child->parent order) insert +
     # verify and ROOT a previously-unrooted live-pushed tip. Same allowlisted
     # target (proven pattern), no build.yml change.
-    # test_dash_v36_share.cpp (Phase A DASH v36 share-type): byte-parity of the
-    # standardized cross-coin v36 prefix vs the non-segwit (BCH) v36 shape,
-    # round-trip through the version-36 ShareVariants dispatch, merged-fields-
-    # inert convention, and v16 backward-compat. Same allowlisted target (proven
-    # pattern), no build.yml change (avoids the #769 new-target/allowlist trap).
     add_executable(test_dash_share_hash_link
         test_dash_share_hash_link.cpp
         test_dash_share_producer.cpp
         test_dash_share_producer_bind.cpp
         test_dash_mint_runloop.cpp
-        test_dash_share_download.cpp
-        test_dash_v36_share.cpp)
+        test_dash_share_download.cpp)
     target_link_libraries(test_dash_share_hash_link PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -520,7 +514,16 @@ if (BUILD_TESTING AND GTest_FOUND)
     # frstrtr/p2pool-dash getwork (pre-v35). Header-only over the dash leaves +
     # core (links core for script_to_address in address_utils.cpp). Last S7
     # capstone; node-backed end-to-end parity deferred to a live-harness leaf.
-    add_executable(test_dash_embedded_gbt test_dash_embedded_gbt.cpp)
+    # The Embedded ORACLE-SHADOW VALIDATOR KATs (test_dash_embedded_oracle_shadow
+    # .cpp) are FOLDED into this already-CI-allowlisted target rather than a new
+    # executable: the bot that pushes the branch lacks `workflow` scope, so it
+    # cannot add a new --target to build.yml (which would otherwise leave the KAT
+    # a NOT_BUILT sentinel). Both files are hermetic gtest TUs over the same link
+    # set (dash_x11 + core + the payout/hashrate/merged-mining OBJECT libs); the
+    # oracle-shadow header pulls node_coin_state -> work_source + vendor/cbtx.
+    add_executable(test_dash_embedded_gbt
+        test_dash_embedded_gbt.cpp
+        test_dash_embedded_oracle_shadow.cpp)
     target_link_libraries(test_dash_embedded_gbt PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core

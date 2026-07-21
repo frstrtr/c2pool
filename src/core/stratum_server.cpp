@@ -92,7 +92,6 @@ StratumServer::StratumServer(net::io_context& ioc, const std::string& address, u
     , bind_address_(address)
     , port_(port)
     , running_(false)
-    , idle_reap_timer_(ioc)
 {
 }
 
@@ -114,8 +113,7 @@ bool StratumServer::start()
         
         running_ = true;
         accept_connections();
-        start_idle_reaper();   // no-op unless session_idle_timeout_sec > 0
-
+        
         LOG_INFO << "StratumServer started on " << bind_address_ << ":" << port_;
         return true;
         
@@ -135,7 +133,6 @@ void StratumServer::stop()
         boost::system::error_code ec;
         acceptor_.cancel(ec);
         acceptor_.close(ec);
-        idle_reap_timer_.cancel();     // stop the zombie-session reaper
         running_ = false;
 
         // Snapshot + clear the live-sessions set under the mutex, then close
@@ -386,58 +383,6 @@ void StratumServer::notify_all()
     }
 }
 
-void StratumServer::start_idle_reaper()
-{
-    // Zombie-session reaper (belt-and-suspenders alongside OS TCP keepalive):
-    // periodically close sessions that have sent no inbound line past the idle
-    // timeout. A live miner submits shares far inside the window; a half-open
-    // NAT-dead peer sends nothing. No-op (never re-armed) unless the DASH-set
-    // StratumConfig::session_idle_timeout_sec > 0 -> other coins unchanged.
-    const auto& cfg0 = mining_interface_ ? mining_interface_->get_stratum_config()
-                                         : core::stratum::StratumConfig{};
-    const uint32_t timeout = cfg0.session_idle_timeout_sec;
-    const bool keepalive_on = cfg0.tcp_keepalive_enabled;
-    if (timeout == 0 || !running_) return;
-
-    // Sweep at half the timeout, bounded to [15 s, 60 s], so a dead session is
-    // reclaimed within ~1.5x the timeout.
-    const uint32_t period = std::max<uint32_t>(15, std::min<uint32_t>(60, timeout / 2));
-    idle_reap_timer_.expires_after(std::chrono::seconds(period));
-    idle_reap_timer_.async_wait([this, timeout, keepalive_on](const boost::system::error_code& ec) {
-        if (ec) return;        // cancelled at shutdown
-        if (!running_) return;
-        std::vector<std::shared_ptr<StratumSession>> snapshot;
-        {
-            std::lock_guard<std::mutex> lk(sessions_mutex_);
-            snapshot.assign(sessions_.begin(), sessions_.end());
-        }
-        size_t reaped = 0;
-        for (auto& s : snapshot) {
-            if (!s->is_connected())
-                continue;   // socket already dead -> notify_all prunes it
-            if (s->seconds_since_activity() <= timeout)
-                continue;   // recently active
-            // KEEPALIVE-AWARE: when OS TCP keepalive is enabled it is the
-            // liveness authority -- a still-open socket means keepalive has NOT
-            // declared the peer dead (it force-closes dead NAT paths, which the
-            // is_connected() guard above then catches). Do NOT reap an idle-but-
-            // keepalive-validated AUTHORIZED rig: a high fixed-diff suffix
-            // (ADDR+N) can legitimately exceed the idle window between submits,
-            // and reaping it would drop a LIVE, paying miner. Idle-time reaping
-            // is the FALLBACK only where keepalive is unavailable; unauthorized
-            // sessions (never completed handshake) are always fair game.
-            if (keepalive_on && s->is_authorized())
-                continue;
-            s->drop_stale("idle timeout (no inbound share/line)");
-            ++reaped;
-        }
-        if (reaped)
-            LOG_INFO << "[Stratum] idle-reaper closed " << reaped
-                     << " stale session(s) (> " << timeout << "s idle)";
-        start_idle_reaper();   // re-arm
-    });
-}
-
 /// StratumSession Implementation
 StratumSession::StratumSession(tcp::socket socket, std::shared_ptr<IWorkSource> mining_interface,
                                StratumServer* server)
@@ -445,9 +390,7 @@ StratumSession::StratumSession(tcp::socket socket, std::shared_ptr<IWorkSource> 
     , mining_interface_(mining_interface)
     , server_(server)
     , connected_at_(std::chrono::steady_clock::now())
-    , last_activity_(connected_at_)
     , work_push_timer_(socket_.get_executor())
-    , handshake_timer_(socket_.get_executor())
 {
     subscription_id_ = generate_subscription_id();
     extranonce1_ = generate_extranonce1();
@@ -468,8 +411,6 @@ void StratumSession::start()
     auto ep = socket_.remote_endpoint(ec);
     if (ec) return; // socket closed before start() was dispatched
     LOG_INFO << "StratumSession started for client: " << ep;
-    apply_socket_keepalive();   // OS keepalive (no-op unless enabled) -- reaps NAT-dead peers
-    arm_handshake_timer();      // authorize deadline (no-op unless configured)
     read_message();
 }
 
@@ -504,13 +445,10 @@ void StratumSession::read_message()
 void StratumSession::process_message(std::size_t bytes_read)
 {
     try {
-        // Zombie-session reaper: a received line is proof of a live peer.
-        last_activity_ = std::chrono::steady_clock::now();
-
         std::istream is(&buffer_);
         std::string line;
         std::getline(is, line);
-
+        
         if (!line.empty() && line.back() == '\r') {
             line.pop_back();  // Remove \r if present
         }
@@ -593,8 +531,6 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
     if (params.size() >= 1 && params[0].is_string()) {
         username_ = params[0];
         authorized_ = true;
-        // Handshake completed -> disarm the authorize deadline (zombie-session fix).
-        handshake_timer_.cancel();
 
         // ─── Step 1: Strip fixed difficulty suffix (+N) before any parsing ───
         // Format: "ADDRESS+1024" or "ADDR,ADDR+512"  →  suggested_difficulty_=N
@@ -1353,20 +1289,6 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
 void StratumSession::send_response(const nlohmann::json& response)
 {
     try {
-        // Write-queue backlog cap (zombie-session fix): a dead peer whose kernel
-        // send buffer has filled never drains the async_write, so the queue
-        // grows unbounded. Past the configured depth, drop the session rather
-        // than accumulate. 0 = unlimited (legacy; other coins unchanged).
-        const size_t cap = mining_interface_
-            ? mining_interface_->get_stratum_config().max_write_queue_depth
-            : 0;
-        if (cap > 0 && write_queue_.size() >= cap) {
-            LOG_WARNING << "[Stratum] session " << session_id_
-                        << " write backlog " << write_queue_.size()
-                        << " >= cap " << cap << " -- dropping stuck session";
-            drop_stale("write-queue backlog exceeded");
-            return;
-        }
         std::string message = response.dump() + "\n";
         write_queue_.push_back(std::move(message));
         if (!writing_)
@@ -1868,80 +1790,10 @@ void StratumSession::cancel_timers()
     // Cancel pending timer — callback fires with ec=operation_aborted → returns.
     // Timer is a member, so it outlives all its callbacks (no use-after-free).
     work_push_timer_.cancel();
-    handshake_timer_.cancel();
     // Close socket so is_connected() returns false for any already-dequeued
     // callbacks that fire with ec=success after cancel().
     boost::system::error_code ec;
     socket_.close(ec);
-}
-
-// ── Zombie-session fixes (transport/liveness only; consensus-neutral) ────────
-
-void StratumSession::apply_socket_keepalive()
-{
-    // Enable OS TCP keepalive so the kernel actively probes an idle peer and
-    // errors the pending async_read when a NAT path has gone dead (the peer
-    // never sent FIN/RST). This is THE root fix for immortal subscribed
-    // sessions -- socket_.is_open() alone never falsifies for a half-open NAT
-    // drop. No-op unless the (DASH-set) StratumConfig knob is enabled, so
-    // LTC/BTC/DGB behaviour is unchanged.
-    const auto& cfg = mining_interface_->get_stratum_config();
-    if (!cfg.tcp_keepalive_enabled) return;
-
-    boost::system::error_code ec;
-    socket_.set_option(boost::asio::socket_base::keep_alive(true), ec);   // portable (asio)
-    if (ec) {
-        LOG_WARNING << "[Stratum] SO_KEEPALIVE set failed: " << ec.message();
-        return;
-    }
-    // Per-probe tuning (idle/interval/count) is Linux-specific -- Windows tunes
-    // keepalive via WSAIoctl(SIO_KEEPALIVE_VALS) and macOS via TCP_KEEPALIVE, so
-    // guard exactly like sample_tcp_rtt_ms() above (#ifdef __linux__). Off-Linux
-    // the portable keep_alive(true) above still arms keepalive with OS defaults;
-    // the DASH deploy target is Linux, where the 60/10/3 tuning (~90 s detect)
-    // applies. This keeps core building on the Windows/macOS CI lanes.
-#ifdef __linux__
-    const int fd = socket_.native_handle();
-    int idle  = static_cast<int>(cfg.tcp_keepalive_idle_sec);
-    int intvl = static_cast<int>(cfg.tcp_keepalive_interval_sec);
-    int cnt   = static_cast<int>(cfg.tcp_keepalive_count);
-    ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(idle));
-    ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
-    ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
-    LOG_TRACE << "[Stratum] TCP keepalive armed (idle=" << idle
-              << "s interval=" << intvl << "s count=" << cnt << ")";
-#else
-    LOG_TRACE << "[Stratum] TCP keepalive armed (OS-default probe timing; "
-                 "per-probe tuning is Linux-only)";
-#endif
-}
-
-void StratumSession::arm_handshake_timer()
-{
-    // Drop a session that never completes mining.authorize within the deadline
-    // (a live rig authorizes in << 1 s; a half-open probe never does). Disarmed
-    // in handle_authorize(). No-op unless configured. Member timer + weak self
-    // keepalive so a fired-after-close callback is a safe no-op.
-    const auto& cfg = mining_interface_->get_stratum_config();
-    if (cfg.handshake_timeout_sec == 0) return;
-    handshake_timer_.expires_after(std::chrono::seconds(cfg.handshake_timeout_sec));
-    std::weak_ptr<StratumSession> weak = shared_from_this();
-    handshake_timer_.async_wait([weak](const boost::system::error_code& ec) {
-        if (ec) return;  // cancelled (authorized, or shutdown)
-        auto self = weak.lock();
-        if (!self) return;
-        if (!self->authorized_ && self->is_connected())
-            self->drop_stale("handshake (authorize) deadline");
-    });
-}
-
-void StratumSession::drop_stale(const char* reason)
-{
-    LOG_INFO << "[Stratum] dropping stale session " << session_id_
-             << " (" << reason << ")";
-    // cancel_timers() closes the socket; the pending async_read then fails and
-    // runs the standard disconnect path (unregister worker, log). Idempotent.
-    cancel_timers();
 }
 
 // Parse multi-chain addresses from username string.

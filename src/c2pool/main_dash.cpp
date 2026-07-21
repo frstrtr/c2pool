@@ -63,6 +63,7 @@
 #include <impl/dash/coin/live_feed.hpp>          // E2a live-feed bridge (raw wire events -> derived ingest events)
 #include <impl/dash/coin/mempool_ingest.hpp>     // wire_mempool_ingest (leg 1)
 #include <impl/dash/coin/tip_ingest.hpp>         // wire_tip_ingest (leg 2)
+#include <impl/dash/coin/embedded_oracle_shadow.hpp> // dash::coin::EmbeddedOracleShadow — per-block dashd cross-check (OBSERVE-only)
 #include <impl/dash/coin/block_connect_ingest.hpp>   // wire_block_connect_ingest (leg 3)
 #include <impl/dash/coin/mn_list_ingest.hpp>     // wire_mn_list_ingest (leg 4)
 #include <impl/dash/coin/mn_seed.hpp>            // E2c: RPC protx-list MN-set seed (parse_protx_list_seed)
@@ -92,8 +93,6 @@
 #include <random>
 
 #include <boost/asio.hpp>
-#include <boost/asio/thread_pool.hpp>   // io-thread-decouple: background RPC pool
-#include <boost/asio/post.hpp>
 
 #include <cstdint>
 #include <cstdlib>      // std::getenv
@@ -194,7 +193,8 @@ void print_banner(const char* argv0)
         << "           [--listen [HOST:]PORT] [--addnode HOST:PORT]... [--connect HOST:PORT]...\n"
         << "           [--stratum [HOST:]PORT] [--coin-p2p-connect HOST:PORT]...\n"
         << "           [--web-port PORT] [--web-host ADDR] [--dashboard-dir PATH]\n"
-        << "           [--embedded-utxo]\n"
+        << "           [--embedded-utxo] [--embedded-oracle-shadow]\n"
+        << "           [--oracle-graduation-blocks N] [--oracle-class-coverage K]\n"
         << "           [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n"
         << "           [--redistribute pplns|fee|boost|donate]\n"
         << "       " << argv0 << " --mine-block [--coin-rpc H:P] [--coin-rpc-auth PATH]\n"
@@ -214,6 +214,12 @@ void print_banner(const char* argv0)
         << "        --web-port PORT (alias --http-port, default 8080) serves the FULL\n"
         << "        c2pool web dashboard + JSON API on --web-host (default 0.0.0.0)\n"
         << "        from --dashboard-dir (default web-static); --web-port 0 disables.\n"
+        << "        --embedded-oracle-shadow runs the OBSERVE-only per-block dashd\n"
+        << "        cross-check: dashd getblocktemplate{mode:proposal} is the VERDICT,\n"
+        << "        regime-aware field-compare is the DIAGNOSIS; a persisted graduation\n"
+        << "        ledger + /embedded_oracle verdict signal when the embedded arm is\n"
+        << "        proven equivalent (safe to disable dashd, served domain). Needs the\n"
+        << "        dashd RPC arm; never changes serving. N/K tune the graduation gate.\n"
         << "        Live sharechain tip/stats, pool hashrate and per-share difficulty\n"
         << "        are bound to the REAL DASH tracker; local hashrate comes from the\n"
         << "        DASH stratum acceptor. If stratum and web ports collide the web\n"
@@ -382,7 +388,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              double dev_donation, double node_owner_fee,
              const std::string& node_owner_address,
              const std::string& redistribute_mode,
-             bool no_p2p_relay)
+             bool no_p2p_relay,
+             bool embedded_oracle_shadow = false,
+             uint64_t oracle_grad_blocks = 5000,
+             uint64_t oracle_class_coverage = 20)
 {
     namespace io = boost::asio;
 
@@ -538,6 +547,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // serve X11 miners from the LTC work source. The dashboard is told the
     // miner-facing port through mining_interface->set_worker_port() (display)
     // and fed real stratum rates from the DASH acceptor after it starts.
+    // Embedded ORACLE-SHADOW validator (--embedded-oracle-shadow). Declared here
+    // (before web_server) so the /embedded_oracle endpoint closure can read it;
+    // constructed + subscribed to the tip event later in the coin_p2p block, once
+    // node_coin_state exists. OBSERVE-only: stats_json() touches no serving state.
+    std::shared_ptr<dash::coin::EmbeddedOracleShadow> oracle_shadow;
+
     std::unique_ptr<core::WebServer> web_server;
     auto enhanced_node = std::make_shared<dash::EnhancedDashNode>(testnet);
     if (web_port != 0) {
@@ -569,6 +584,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // through the external dashd NodeRPC arm (armed above when creds
         // resolved), not an ICoinNode, so tell the dashboard RPC is present.
         mi->set_coin_rpc_available(static_cast<bool>(rpc));
+
+        // ── /embedded_oracle stats endpoint (OBSERVE-only) ────────────────
+        // JSON coverage ledger + objective GRADUATION verdict (safe-to-disable-
+        // dashd gate). Reads the shadow validator's own structures; never the
+        // serving path. Empty/disabled shape when --embedded-oracle-shadow off.
+        mi->set_embedded_oracle_fn([&oracle_shadow]() -> nlohmann::json {
+            if (oracle_shadow) return oracle_shadow->stats_json();
+            return nlohmann::json{{"mode", "disabled"},
+                {"note", "run with --embedded-oracle-shadow to enable"}};
+        });
 
         web_server->set_dashboard_dir(dashboard_dir);
         // Explicitly DISABLE the WebServer's own stratum acceptor. Its ctor
@@ -1280,6 +1305,116 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // header chain), NOT the raw wire.
         coin_feed_subs.push_back(
             c2pool::dash::wire_tip_ingest(coin_state, *maintainer));
+
+        // ── Embedded ORACLE-SHADOW: per-block dashd cross-check (OBSERVE-only) ─
+        // Subscribed to the SAME new_tip event AFTER wire_tip_ingest, so the
+        // maintainer has already republished the embedded bundle for this tip
+        // before the shadow reads it. The shadow builds the embedded template
+        // via node_coin_state.select_work (the SAME build path the serve arm
+        // uses) and cross-checks it against a fresh dashd getblocktemplate,
+        // gating divergence/graduation on the DETERMINISTIC field set only (the
+        // two nodes have intentionally different mempools/peers). It NEVER
+        // changes the serving decision. Requires the alongside dashd RPC arm.
+        if (embedded_oracle_shadow) {
+            if (!rpc) {
+                std::cout << "[run] --embedded-oracle-shadow given but the dashd "
+                             "RPC arm is UNARMED (need dash.conf creds / --coin-rpc); "
+                             "the shadow has no oracle to cross-check against -- "
+                             "disabled.\n";
+            } else {
+                dash::coin::EmbeddedOracleShadow::Config oc;
+                oc.testnet = testnet;
+                oc.grad.consecutive_clean_target  = oracle_grad_blocks;
+                oc.grad.per_class_coverage_target = oracle_class_coverage;
+#ifdef C2POOL_VERSION
+                oc.c2pool_commit = C2POOL_VERSION;
+#endif
+                try { oc.dashd_version =
+                    rpc->getnetworkinfo().value("subversion", std::string{}); }
+                catch (...) { /* best-effort ledger identity */ }
+                const auto oracle_dir =
+                    (core::filesystem::config_path() / net_subdir).string();
+                oc.divergence_ledger_path =
+                    oracle_dir + "/embedded_oracle_divergence.jsonl";
+                oc.graduation_state_path =
+                    oracle_dir + "/embedded_oracle_graduation.json";
+
+                // Proposal VERDICT leg: assemble the embedded block (pool-only
+                // coinbase, no miner payout -- consensus-irrelevant to dashd
+                // TestBlockValidity) with the SAME SSOTs the --mine-block path
+                // uses, and submit getblocktemplate{mode:proposal}. "" = dashd
+                // ACCEPTED; else the reject reason. This is the authoritative,
+                // mempool-independent per-height verdict (§6 condition 2).
+                auto proposal_fn =
+                    [testnet, rp = rpc.get()](const dash::coin::DashWorkData& wd)
+                        -> dash::coin::ProposalResult {
+                    dash::coin::ProposalResult r;
+                    r.attempted = true;
+                    try {
+                        const core::CoinParams params = dash::make_coin_params(testnet);
+                        std::map<std::vector<unsigned char>, uint64_t> empty_weights;
+                        uint160 zero_pkh;   // pool-only coinbase (no finder)
+                        auto tx_outs = dash::coinbase::compute_dash_payouts(
+                            wd.m_coinbase_value, wd.m_packed_payments, zero_pkh,
+                            empty_weights, /*total_weight=*/0, params);
+                        auto layout = dash::coinbase::build(
+                            wd, tx_outs, /*pool_tag=*/"c2pool", params,
+                            /*ref_hash=*/uint256::ZERO);
+                        // nonce 0 + curtime: proposal mode skips PoW; validity is
+                        // structure + payee + CbTx + tx-set (TestBlockValidity).
+                        auto block = dash::coin::serialize_full_block(
+                            wd, layout.bytes, /*nonce=*/0,
+                            wd.m_curtime ? wd.m_curtime
+                                         : static_cast<uint32_t>(std::time(nullptr)));
+                        const std::string reason = rp->propose_block_hex(HexStr(block));
+                        r.accepted = reason.empty();
+                        r.reason = reason;
+                    } catch (const std::exception& e) {
+                        r.accepted = false; r.reason = std::string("assemble:") + e.what();
+                    }
+                    return r;
+                };
+
+                // creditPool INVARIANT base = the CONNECTED block N-1's committed
+                // creditPoolBalance (dashd getblock verbosity 2 -> tx[0].cbTx),
+                // not dashd's previous *template* projection (review nit d).
+                auto base_cp_fn =
+                    [rp = rpc.get()](const uint256& prev_hash)
+                        -> std::optional<int64_t> {
+                    try {
+                        auto blk = rp->getblock(prev_hash, /*verbosity=*/2);
+                        if (blk.contains("tx") && blk["tx"].is_array()
+                            && !blk["tx"].empty()) {
+                            const auto& cb = blk["tx"][0];
+                            if (cb.contains("cbTx")
+                                && cb["cbTx"].contains("creditPoolBalance"))
+                                return cb["cbTx"]["creditPoolBalance"].get<int64_t>();
+                        }
+                    } catch (...) { /* nullopt -> fall back to template base */ }
+                    return std::nullopt;
+                };
+
+                oracle_shadow = std::make_shared<dash::coin::EmbeddedOracleShadow>(
+                    node_coin_state,
+                    [rp = rpc.get()]() { return rp->getwork(); },
+                    std::move(proposal_fn),
+                    std::move(oc),
+                    std::move(base_cp_fn));
+                auto* shadow = oracle_shadow.get();
+                coin_feed_subs.push_back(
+                    coin_state.new_tip.subscribe(
+                        [shadow](const ::dash::interfaces::TipAdvance& t) {
+                            shadow->on_new_tip(t.prev_height + 1, t.prev_hash);
+                        }));
+                std::cout << "[run] --embedded-oracle-shadow ARMED: per-block dashd "
+                             "PROPOSAL verdict + regime-aware field diagnosis (N="
+                          << oracle_grad_blocks << " K=" << oracle_class_coverage
+                          << "); ledger at " << oracle_dir
+                          << "/embedded_oracle_*.{jsonl,json}; verdict at "
+                             "/embedded_oracle\n";
+            }
+        }
+
         // Leg 3 (block connect): Node::block_connected -> maintainer
         // .on_block_connected (MnStateMachine::apply_block, folds DIP3 special
         // txs into the DMN set). block_connected is fired by the live-feed
@@ -1497,94 +1632,49 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // trivial RPC; failures are swallowed so a daemon hiccup never crashes the
     // run-loop (retry next tick). Reuses the existing NodeRPC client — no new
     // dependency, no dashd config change, no new notify mechanism.
-    // io-thread-decouple: dedicated single-thread pool for the fallback arm's
-    // BLOCKING dashd RPC (getbestblockhash tip probe + the background template
-    // re-source). Mirrors main_ltc.cpp hdr_pool ("keeps scrypt off io_context"):
-    // synchronous beast I/O runs HERE, never on the stratum io_context, so 60+
-    // sessions never starve while dashd is queried (or wedged -- the NodeRPC
-    // socket timeout + m_rpc_mutex bound this thread). Declared here (after rpc /
-    // work_source / stratum_server) so its explicit stop()+join() after the run
-    // loop -- and its destructor -- happen BEFORE those objects unwind: no
-    // background probe is ever mid-flight against freed state. Only created on
-    // the fallback arm; null on the embedded arm (legacy inline path unchanged).
-    std::shared_ptr<boost::asio::thread_pool> rpc_pool;
     if (!coin_p2p && rpc && stratum_server) {
-        rpc_pool = std::make_shared<boost::asio::thread_pool>(1);
-
-        // Non-blocking template re-source: cached_work() hands the blocking
-        // select_work()/GBT to rpc_pool as a single-flight background job
-        // instead of blocking the io thread on every stale/generation miss (the
-        // per-share ~15-30 s GBT block). The io thread serves the cached template
-        // immediately; the pool updates it and the next notify picks it up.
-        work_source->set_refresh_executor(
-            [rpc_pool](std::function<void()> job) {
-                boost::asio::post(*rpc_pool, std::move(job));
-            });
-
         auto tip_timer = std::make_shared<io::steady_timer>(ioc);
         auto last_tip = std::make_shared<std::string>();
         auto tip_tick = std::make_shared<
             std::function<void(const boost::system::error_code&)>>();
-        // tip_tick runs ON ioc when the 3 s timer fires. It does NOT call the
-        // blocking RPC itself: it hands getbestblockhash to rpc_pool and posts
-        // the tip-change follow-up (invalidate + bump + notify) + the timer
-        // re-arm BACK onto ioc (ws/ss/tip_timer are io-thread-confined), exactly
-        // like main_ltc.cpp's post-to-pool -> post-back-to-ioc pattern. The
-        // timer is re-armed only AFTER the RPC completes, so a slow dashd cannot
-        // pile up overlapping polls. Lost-block-prevention is preserved: a real
-        // tip change still fires invalidate + notify -- only WHERE the probe runs
-        // has moved off the stratum io thread.
         *tip_tick = [rpc = rpc.get(), ws = work_source.get(),
-                     ss = stratum_server.get(), tip_timer, last_tip, tip_tick,
-                     rpc_pool, &ioc](const boost::system::error_code& ec) {
+                     ss = stratum_server.get(), tip_timer, last_tip, tip_tick](
+                        const boost::system::error_code& ec) {
             if (ec) return;   // cancelled at shutdown
-            boost::asio::post(*rpc_pool,
-                [rpc, ws, ss, tip_timer, last_tip, tip_tick, &ioc]() {
-                    std::string tip;
-                    bool ok = false;
-                    try {
-                        tip = rpc->getbestblockhash();   // BLOCKING -- BACKGROUND THREAD
-                        ok = true;
-                    } catch (const std::exception& e) {
-                        LOG_WARNING << "[Stratum] tip-poll getbestblockhash failed "
-                                       "(non-fatal, retry next tick): " << e.what();
-                    } catch (...) {
-                        // swallow — never crash on a tip probe
+            try {
+                const std::string tip = rpc->getbestblockhash();
+                if (!tip.empty() && *last_tip != tip) {
+                    const bool first_seen = last_tip->empty();
+                    *last_tip = tip;
+                    // Skip the notify on the very first observation (baseline);
+                    // only a genuine tip CHANGE forces a refresh.
+                    if (!first_seen) {
+                        ws->invalidate_template_cache(
+                            "tip-poll: dashd best-block changed");
+                        ws->bump_work_generation();
+                        ss->notify_all();
+                        LOG_INFO << "[Stratum] tip-poll: new tip "
+                                 << tip.substr(0, 16)
+                                 << ", forcing template refresh + notify";
+                        std::cout << "[Stratum] tip-poll: new tip "
+                                  << tip.substr(0, 16)
+                                  << ", forcing template refresh + notify\n";
                     }
-                    // Follow-up + timer re-arm run BACK ON ioc (io-thread-confined
-                    // state). If ioc is already stopped (shutdown) this handler
-                    // simply never runs -> the poll stops cleanly.
-                    boost::asio::post(ioc,
-                        [ok, tip = std::move(tip), ws, ss, tip_timer, last_tip, tip_tick]() {
-                            if (ok && !tip.empty() && *last_tip != tip) {
-                                const bool first_seen = last_tip->empty();
-                                *last_tip = tip;
-                                // Skip the notify on the very first observation
-                                // (baseline); only a genuine tip CHANGE refreshes.
-                                if (!first_seen) {
-                                    ws->invalidate_template_cache(
-                                        "tip-poll: dashd best-block changed");
-                                    ws->bump_work_generation();
-                                    ss->notify_all();
-                                    LOG_INFO << "[Stratum] tip-poll: new tip "
-                                             << tip.substr(0, 16)
-                                             << ", forcing template refresh + notify";
-                                    std::cout << "[Stratum] tip-poll: new tip "
-                                              << tip.substr(0, 16)
-                                              << ", forcing template refresh + notify\n";
-                                }
-                            }
-                            tip_timer->expires_after(std::chrono::seconds(3));
-                            tip_timer->async_wait(*tip_tick);
-                        });
-                });
+                }
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[Stratum] tip-poll getbestblockhash failed "
+                               "(non-fatal, retry next tick): " << e.what();
+            } catch (...) {
+                // swallow — never crash the run-loop on a tip probe
+            }
+            tip_timer->expires_after(std::chrono::seconds(3));
+            tip_timer->async_wait(*tip_tick);
         };
         tip_timer->expires_after(std::chrono::seconds(3));
         tip_timer->async_wait(*tip_tick);
         std::cout << "[run] fallback-arm tip-poll ARMED (dashd getbestblockhash "
-                     "every 3 s on a dedicated RPC thread -> event-driven template "
-                     "refresh + clean_jobs notify on tip change; io thread never "
-                     "blocks on dashd)\n";
+                     "every 3 s -> event-driven template refresh + clean_jobs "
+                     "notify on tip change)\n";
     }
 
     std::cout << "[run] run-loop up (Ctrl-C to stop); won blocks relay DUAL-PATH:\n"
@@ -1614,21 +1704,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         }
     }
 
-    // io-thread-decouple: join the background RPC pool FIRST, before any of the
-    // objects it dereferences (rpc / work_source / stratum_server) unwind. run()
-    // has returned (ioc stopped), so no NEW work is posted; stop()+join() waits
-    // out any in-flight getbestblockhash/GBT re-source (bounded by the NodeRPC
-    // socket timeout) so no pool thread ever touches freed state. Any post-back
-    // to the stopped ioc simply never executes.
-    if (rpc_pool) {
-        rpc_pool->stop();
-        rpc_pool->join();
-    }
-
     // Tear the acceptor + sessions down while the work source and node_coin_state
     // it references are still alive -- explicit reset keeps destruction order safe
     // (stratum_server was declared before them, so it would otherwise outlive them).
     stratum_server.reset();
+
+    // Join the oracle-shadow worker thread BEFORE node_coin_state / rpc unwind:
+    // the worker dereferences both (select_work + getwork/proposal), and
+    // oracle_shadow is declared earlier than node_coin_state so it would
+    // otherwise outlive it. ioc.run() has returned, so no further new_tip fires.
+    if (oracle_shadow) oracle_shadow.reset();
 
     // Stop the dashboard BEFORE p2p_node unwinds: its callbacks hold a raw
     // dash::Node* and the HTTP thread must be joined while that is still valid.
@@ -1800,6 +1885,9 @@ int main(int argc, char** argv)
     std::string stratum_host = "0.0.0.0";      // --stratum [HOST:]PORT bind interface (default all)
     uint16_t    stratum_port = 0;              // 0 disables the Stratum accept-loop; --stratum sets it
     bool embedded_utxo = false;                // --embedded-utxo: arm the E2b UTXO/fee lane (opt-in)
+    bool embedded_oracle_shadow = false;       // --embedded-oracle-shadow: per-block dashd cross-check (OBSERVE-only)
+    uint64_t oracle_grad_blocks = 5000;        // --oracle-graduation-blocks N (consecutive clean)
+    uint64_t oracle_class_coverage = 20;       // --oracle-class-coverage K (per height class)
     double dev_donation = 0.1;                 // --give-author (donation_percentage; README default 0.1%)
     double node_owner_fee = 0.0;               // -f / --fee (node_owner_fee; default 0)
     std::string node_owner_address;            // --node-owner-address (fee destination)
@@ -1844,6 +1932,12 @@ int main(int argc, char** argv)
             no_p2p_relay = true;
         else if (std::strcmp(argv[i], "--embedded-utxo") == 0)
             embedded_utxo = true;
+        else if (std::strcmp(argv[i], "--embedded-oracle-shadow") == 0)
+            embedded_oracle_shadow = true;
+        else if (std::strcmp(argv[i], "--oracle-graduation-blocks") == 0 && i + 1 < argc)
+            oracle_grad_blocks = std::strtoull(argv[++i], nullptr, 10);
+        else if (std::strcmp(argv[i], "--oracle-class-coverage") == 0 && i + 1 < argc)
+            oracle_class_coverage = std::strtoull(argv[++i], nullptr, 10);
         else if ((std::strcmp(argv[i], "--give-author") == 0 ||
                   std::strcmp(argv[i], "--dev-donation") == 0) && i + 1 < argc)
             dev_donation = std::strtod(argv[++i], nullptr);
@@ -1944,7 +2038,9 @@ int main(int argc, char** argv)
                         stratum_host, stratum_port, web_host, web_port,
                         dashboard_dir, coin_p2p_targets,
                         embedded_utxo, dev_donation, node_owner_fee,
-                        node_owner_address, redistribute_mode, no_p2p_relay);
+                        node_owner_address, redistribute_mode, no_p2p_relay,
+                        embedded_oracle_shadow, oracle_grad_blocks,
+                        oracle_class_coverage);
     }
     return run_selftest();
 }
