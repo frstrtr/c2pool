@@ -59,9 +59,11 @@ public:
     // commits to. Populated by CoinStateMaintainer::on_mnlistdiff (apply_diff
     // + QuorumManager::apply) off the live coin-P2P mnlistdiff feed. These are
     // the merkleRootMNList / merkleRootQuorums sources build_embedded_workdata
-    // needs to emit a MAINNET-VALID type-5 coinbase. In-memory only (no
-    // SMLDb/QuorumDb persistence yet — a restart re-requests a cold-start
-    // mnlistdiff(zero, tip), see main_dash.cpp handshake driver).
+    // needs to emit a MAINNET-VALID type-5 coinbase. Persisted across restarts
+    // by SMLDb/QuorumDb (sml_quorum_db.hpp): main_dash warms these on startup
+    // from the last root-verified state and requests an INCREMENTAL
+    // mnlistdiff(persisted-tip, tip) rather than a cold mnlistdiff(zero, tip);
+    // a corrupt/stale store fails closed to the cold path.
     vendor::CSimplifiedMNList& sml() { return m_sml; }
     QuorumManager&             qmgr() { return m_qmgr; }
     const vendor::CSimplifiedMNList& sml() const { return m_sml; }

@@ -532,7 +532,8 @@ if (BUILD_TESTING AND GTest_FOUND)
     add_executable(test_dash_embedded_gbt
         test_dash_embedded_gbt.cpp
         test_dash_embedded_cbtx_byte_parity.cpp
-        test_dash_mnlistdiff_root_parity.cpp)
+        test_dash_mnlistdiff_root_parity.cpp
+        test_dash_sml_quorum_db.cpp)
     target_compile_definitions(test_dash_embedded_gbt PRIVATE
         DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     target_link_libraries(test_dash_embedded_gbt PRIVATE
