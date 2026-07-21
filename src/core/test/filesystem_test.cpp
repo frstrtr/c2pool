@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Regression test for the --data-dir isolation chokepoint (issue #722).
+// Lives in the core_test executable (already built + run in CI) so it is
+// exercised without a dedicated build.yml --target entry.
 //
 // core::filesystem::config_path() is the single root every per-instance state
 // path derives from (sharechain LevelDB, addr store, whitelist, ratchet,
