@@ -557,7 +557,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         nlohmann_json::nlohmann_json
         ${Boost_LIBRARIES}
     )
-    target_link_libraries(test_btc_underfill_guard PRIVATE c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage btc_coin btclibs pool sharechain ${SECP256K1_LIBRARIES})  # OBJECT-lib SCC direct-naming (#22/#39), btc twin
+    target_link_libraries(test_btc_underfill_guard PRIVATE btc_stratum c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage btc_coin btclibs pool sharechain ${SECP256K1_LIBRARIES})  # OBJECT-lib SCC direct-naming (#22/#39), btc twin; btc_stratum owns BTCWorkSource (zombie-reap opt-in KAT)
     gtest_add_tests(test_btc_underfill_guard "" AUTO)
 
     # DGB underfill guard: same LTC/DOGE guard ported to the DGB embedded

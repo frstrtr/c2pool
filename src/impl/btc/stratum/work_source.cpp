@@ -132,6 +132,30 @@ BTCWorkSource::BTCWorkSource(btc::coin::HeaderChain&       chain,
     if (config_.coin_symbol.empty())
         config_.coin_symbol = "BTC";
 
+    // ── Zombie-session leak fix: OPT BTC IN to the live-session hygiene knobs
+    // (default-off in StratumConfig so other coins stay byte-unchanged; the
+    // machinery lives in core::StratumServer). The live c2pool-btc node serves
+    // ~23 public/NAT rigs, and a NAT-dropped rig's TCP session is frequently
+    // never FIN/RST'd, so socket_.is_open() stays true forever and the session
+    // is never reaped -- every failed retry mints an immortal subscribed session
+    // that keeps drawing full per-notify job builds (the 66-sockets-for-~23-rigs
+    // class), multiplying the per-notify JSON churn. Transport/liveness only;
+    // ZERO wire-byte change and consensus-neutral.
+    config_.tcp_keepalive_enabled      = true;   // kernel probes dead NAT paths (root fix)
+    config_.tcp_keepalive_idle_sec     = 60;
+    config_.tcp_keepalive_interval_sec = 10;
+    config_.tcp_keepalive_count        = 3;      // ~90 s to detect a dead peer
+    config_.handshake_timeout_sec      = 30;     // drop never-authorize probes
+    // Idle reaper is a BACKSTOP to TCP keepalive (the real liveness authority),
+    // NOT the primary zombie killer. 1800 s (NOT the 600 s that would clip a
+    // live rig) + the keepalive-aware skip in core::StratumServer::
+    // start_idle_reaper() means an AUTHORIZED rig on a high fixed-diff suffix
+    // (e.g. ADDR+65536 at modest SHA256d hashrate -> multi-minute share
+    // intervals) is NEVER reaped for idleness while its socket is keepalive-
+    // validated; only genuinely dead / never-authorized sessions are reclaimed.
+    config_.session_idle_timeout_sec   = 1800;
+    config_.max_write_queue_depth      = 256;    // drop a stuck-write dead peer
+
     LOG_INFO << "[BTC-STRATUM] BTCWorkSource constructed"
              << " (testnet=" << is_testnet_
              << " min_diff=" << config_.min_difficulty

@@ -39,6 +39,8 @@
 #include <impl/btc/coin/header_chain.hpp>
 #include <impl/btc/coin/mempool.hpp>
 #include <impl/btc/coin/transaction.hpp>
+#include <impl/btc/stratum/work_source.hpp>   // zombie-reap opt-in KAT (below)
+#include <core/stratum_types.hpp>
 
 #include <core/uint256.hpp>
 #include <core/coin/utxo_view_cache.hpp>
@@ -275,4 +277,54 @@ TEST(BtcUnderfillGuard, DefaultSeamLeavesExistingCallersUnchanged) {
     EXPECT_EQ(legacy->m_data["coinbasevalue"],     seamed->m_data["coinbasevalue"]);
     EXPECT_EQ(legacy->m_data["mintime"],           seamed->m_data["mintime"]);
     EXPECT_EQ(legacy->m_data["transactions"],      seamed->m_data["transactions"]);
+}
+
+// ── Zombie-session reap opt-in KAT ───────────────────────────────────────────
+// The live c2pool-btc node serves the miner socket via core::StratumServer,
+// whose live-session hygiene knobs (TCP keepalive + handshake deadline + idle
+// reaper + write-queue cap) all DEFAULT OFF so LTC/BTC/DGB stay byte-unchanged.
+// A NAT-dropped rig's TCP session is frequently never FIN/RST'd, so
+// socket_.is_open() stays true forever and the session is never reaped -- every
+// failed retry mints an immortal subscribed session drawing full per-notify job
+// builds (the 66-sockets-for-~23-rigs class). BTC OPTS IN in the BTCWorkSource
+// ctor. These KATs pin that opt-in and the SAFE values so a refactor cannot
+// silently re-expose the live node or clip a live rig by resurrecting the 600 s
+// idle default. The reap MACHINERY itself lives in core::StratumServer and is
+// exercised by the DASH stratum harness; this guards only the BTC config
+// contract. Transport/liveness only -- consensus-neutral, zero wire-byte change.
+// (Folded into this already-allowlisted target rather than a standalone binary.)
+
+TEST(BtcZombieReapOptIn, KnobsAreOptedInWithSafeValues) {
+    auto params = BTCChainParams::regtest();
+    HeaderChain chain(params, /*db_path=*/"");   // in-memory; ctor does no I/O
+    Mempool mempool;
+    btc::stratum::BTCWorkSource::SubmitBlockFn submit =
+        [](const std::vector<unsigned char>&, unsigned int) { return true; };
+    btc::stratum::BTCWorkSource ws(chain, mempool, /*is_testnet=*/false, std::move(submit));
+
+    const auto& cfg = ws.get_stratum_config();
+
+    // (a) OS TCP keepalive is the root fix -- ON, ~90 s detect (60/10/3).
+    EXPECT_TRUE(cfg.tcp_keepalive_enabled);
+    EXPECT_EQ(cfg.tcp_keepalive_idle_sec, 60u);
+    EXPECT_EQ(cfg.tcp_keepalive_interval_sec, 10u);
+    EXPECT_EQ(cfg.tcp_keepalive_count, 3u);
+    // (b) Handshake deadline drops never-authorize probes.
+    EXPECT_EQ(cfg.handshake_timeout_sec, 30u);
+    // (c) Idle reaper is a BACKSTOP at the SAFE 1800 s -- explicitly NOT the
+    //     600 s that would clip a live high-fixed-diff rig between submits.
+    EXPECT_EQ(cfg.session_idle_timeout_sec, 1800u);
+    EXPECT_NE(cfg.session_idle_timeout_sec, 600u);
+    // (d) Write-queue backlog cap drops a stuck-write dead peer.
+    EXPECT_EQ(cfg.max_write_queue_depth, static_cast<size_t>(256));
+}
+
+TEST(BtcZombieReapOptIn, DefaultStratumConfigLeavesAllKnobsOff) {
+    // The contract the opt-in relies on: the SHARED default is neutral, so any
+    // coin that does NOT opt in (LTC/DGB) stays byte-unchanged.
+    core::stratum::StratumConfig def{};
+    EXPECT_FALSE(def.tcp_keepalive_enabled);
+    EXPECT_EQ(def.handshake_timeout_sec, 0u);
+    EXPECT_EQ(def.session_idle_timeout_sec, 0u);
+    EXPECT_EQ(def.max_write_queue_depth, static_cast<size_t>(0));
 }
