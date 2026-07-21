@@ -8,6 +8,16 @@ if (BUILD_TESTING AND GTest_FOUND)
     # had masked this, surfacing it on test_dgb_subsidy (the first PRE_TEST call).
     include(GoogleTest)
 
+    # --data-dir isolation chokepoint (issue #722). core/filesystem.hpp
+    # config_path() is fully inline/header-only; no c2pool runtime link
+    # required. MUST also be in the build.yml --target allowlist (#143).
+    add_executable(test_data_dir_isolation test_data_dir_isolation.cpp)
+    target_link_libraries(test_data_dir_isolation PRIVATE
+        GTest::gtest_main GTest::gtest
+        ${Boost_LIBRARIES}
+    )
+    gtest_discover_tests(test_data_dir_isolation DISCOVERY_MODE PRE_TEST)
+
     # DGB block subsidy oracle-conformance (card #156). config_coin.hpp
     # subsidy() is header-only/static; no dgb runtime link required.
     add_executable(test_dgb_subsidy test_dgb_subsidy.cpp)
