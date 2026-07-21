@@ -799,6 +799,100 @@ TEST(DashStratumWorkSource, FallbackArmTipChangeRefreshesTemplateAndBumpsGenerat
     EXPECT_EQ(tmpl_after.value("height", 0u), 424243u);
 }
 
+// ── #751 idle-reconnect churn fix KAT ───────────────────────────────────────
+// dashd closes an idle keep-alive connection on its rpcservertimeout (default
+// 30 s), so on an otherwise-idle pool c2pool reconnects every ~30-90 s. The old
+// behaviour invalidated the template cache (and fired clean_jobs) on EVERY such
+// reconnect, flapping the endpoint and wasting rig work even though nothing
+// changed on-chain. The fix makes the fallback-arm reconnect observer tip-aware:
+// on a reconnect it probes dashd's best-block hash and invalidates ONLY if the
+// tip actually moved during the disconnect.
+//
+// This KAT models that observer (mirroring main_dash.cpp's reconnect handler the
+// same way the ZMQ KAT models fire_refresh) and pins all three cases:
+//   (1) reconnect with the tip UNCHANGED -> NO invalidate (cache retained, no
+//       clean_jobs) -- the churn fix;
+//   (2) reconnect with the tip CHANGED during the disconnect -> DOES invalidate
+//       + bump (the stale-masternode-payee INVARIANT is preserved -- a moved tip
+//       must still re-source fresh-payee work);
+//   (3) reconnect where the best-block probe FAILS -> FAIL-SAFE invalidate
+//       (never serve stale-payee work on an unproven tip).
+TEST(DashStratumWorkSource, ReconnectInvalidatesOnlyWhenTipChanged)
+{
+    Fixture fx(true);                       // unpopulated coin-state -> fallback arm
+    ASSERT_FALSE(fx.coin_state.populated());
+    auto ws = fx.make();
+
+    // Shared last-seen-tip dedup + the tip-aware reconnect observer, mirroring
+    // main_dash.cpp: fire_refresh invalidates+bumps IFF the tip is new; the
+    // reconnect handler adds the fail-safe invalidate on a probe failure.
+    dash::coin::TipHashDedup dedup;
+    int notify_count = 0;
+    auto fire_refresh = [&](const std::string& tip) -> bool {
+        if (!dedup.is_new_tip(tip)) return false;   // unchanged tip -> no-op
+        ws->invalidate_template_cache("kat: tip changed during disconnect");
+        ws->bump_work_generation();
+        ++notify_count;                              // stands in for notify_all()
+        return true;
+    };
+    auto on_reconnect = [&](bool probe_ok, const std::string& probed_tip) {
+        if (!probe_ok || probed_tip.empty()) {
+            // FAIL-SAFE: unproven tip -> conservatively invalidate.
+            ws->invalidate_template_cache("kat: reconnect probe failed");
+            ++notify_count;
+            return;
+        }
+        // Benign idle-timeout reconnect (tip unchanged) coalesces to a no-op;
+        // a real tip change fires the refresh trio.
+        fire_refresh(probed_tip);
+    };
+
+    // Startup baseline: seed the dedup with the tip we are already mining (as the
+    // poll does at startup, WITHOUT notifying).
+    const std::string tip_old(64, 'a');
+    dedup.set_last(tip_old);
+    auto tmpl_before = ws->get_current_work_template();
+    ASSERT_FALSE(tmpl_before.empty());
+    EXPECT_EQ(tmpl_before.value("previousblockhash", ""), std::string(kPrevHashHex));
+    const uint64_t gen_baseline = ws->get_work_generation();
+
+    // (1) Idle-timeout reconnect, tip UNCHANGED -> NO invalidate, NO clean_jobs.
+    //     The endpoint does not flap; the cached template stays put.
+    on_reconnect(true, tip_old);
+    EXPECT_EQ(notify_count, 0);
+    EXPECT_EQ(ws->get_work_generation(), gen_baseline);   // no work-gen bump
+    auto tmpl_still = ws->get_current_work_template();
+    ASSERT_FALSE(tmpl_still.empty());
+    EXPECT_EQ(tmpl_still.value("previousblockhash", ""), std::string(kPrevHashHex));
+
+    // (2) A real tip change during the disconnect window -> MUST invalidate + bump
+    //     (stale-masternode-payee invariant preserved). The fallback now sources
+    //     the rotated-tip/rotated-payee template.
+    fx.fallback_work = rotated_work();
+    const std::string tip_new(64, 'b');
+    ASSERT_NE(tip_new, tip_old);
+    on_reconnect(true, tip_new);
+    EXPECT_EQ(notify_count, 1);                            // trio fired
+    EXPECT_GT(ws->get_work_generation(), gen_baseline);   // clean_jobs/notify signal
+    auto tmpl_after = ws->get_current_work_template();
+    ASSERT_FALSE(tmpl_after.empty());
+    EXPECT_EQ(tmpl_after.value("previousblockhash", ""),   // no stale-tip mining
+              std::string(kRotatedPrevHashHex));
+    EXPECT_EQ(tmpl_after.value("height", 0u), 424243u);
+
+    // (2b) An immediate follow-up reconnect on the SAME (now current) tip is again
+    //      benign -> deduped no-op (proves case (1) still holds after a change).
+    const uint64_t gen_after_change = ws->get_work_generation();
+    on_reconnect(true, tip_new);
+    EXPECT_EQ(notify_count, 1);
+    EXPECT_EQ(ws->get_work_generation(), gen_after_change);
+
+    // (3) FAIL-SAFE: the best-block probe fails on reconnect (RPC not ready) ->
+    //     invalidate conservatively rather than risk serving stale-payee work.
+    on_reconnect(false, "");
+    EXPECT_EQ(notify_count, 2);                            // fail-safe invalidate fired
+}
+
 // ── io-thread-decouple KAT (mining-hotel stratum-stall fix, v0.2.3.8) ────────
 // The stall fix: the stratum io_context thread must NEVER block on the dashd
 // fallback getblocktemplate. cached_work() re-sources through a background
