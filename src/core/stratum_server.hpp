@@ -194,6 +194,12 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
     // session_idle_timeout_sec). Updated on every received stratum line; a
     // half-open NAT-dead peer never advances it. Init to connected_at_.
     std::chrono::steady_clock::time_point last_activity_;
+    // Last OUTBOUND mining.notify timestamp (idle keepalive-notify, StratumConfig::
+    // keepalive_notify_sec). Distinct from last_activity_ (inbound): the keepalive
+    // must fire on an idle-but-live session that is receiving nothing AND sending
+    // nothing. Updated whenever send_notify_work() actually emits a notify; init
+    // to connected_at_.
+    std::chrono::steady_clock::time_point last_notify_at_;
     std::string session_id_;
 
     // Reject-reason diagnostics throttle: emit the low-diff (P5) and
@@ -221,6 +227,12 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
     // the timer outlives all its callbacks.  Matches p2pool Twisted semantics
     // where the transport/protocol object owns its timers.
     boost::asio::steady_timer work_push_timer_;
+    // One-shot guard so the periodic work-push / idle-keepalive timer is armed
+    // exactly once. It is armed at subscribe (so a subscribe-only backup session
+    // is kept alive by the keepalive) and again after authorize (payout-aware
+    // resend); this flag makes the second call a no-op so the timer chain never
+    // forks into a double-notify cadence.
+    bool periodic_push_started_ = false;
 
     // Handshake deadline (zombie-session fix, StratumConfig::handshake_timeout_
     // sec): armed at start(), disarmed once authorize completes. A session that
@@ -239,6 +251,11 @@ public:
     double seconds_since_activity() const {
         return std::chrono::duration<double>(
                    std::chrono::steady_clock::now() - last_activity_).count();
+    }
+    // Seconds since the last OUTBOUND mining.notify (idle keepalive-notify).
+    double seconds_since_last_notify() const {
+        return std::chrono::duration<double>(
+                   std::chrono::steady_clock::now() - last_notify_at_).count();
     }
     // Reap a stale/zombie session: cancel timers + close the socket. The pending
     // async_read then fails and runs the normal disconnect path. Idempotent.

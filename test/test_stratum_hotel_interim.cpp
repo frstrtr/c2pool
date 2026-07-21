@@ -332,6 +332,7 @@ public:
     }
 
     std::vector<std::string> jobs;         // job ids, in notify order
+    std::vector<bool> clean_flags;         // clean_jobs (params[8]) per notify, in order
     std::string last_ntime = "65a812c0";   // overwritten by record_notify
 
 private:
@@ -341,6 +342,7 @@ private:
             && j.contains("params") && j["params"].is_array()
             && j["params"].size() >= 9) {
             jobs.push_back(j["params"][0].get<std::string>());
+            clean_flags.push_back(j["params"][8].get<bool>());
             last_ntime = j["params"][7].get<std::string>();
         }
     }
@@ -492,4 +494,72 @@ TEST(StratumHotelInterim, FlatRssSharedPayloadIdentity)
     // one copy per job. This is the de-duped "memory bomb" assertion.
     EXPECT_EQ(distinct, kSessions)
         << "expected 1 shared payload per session (jobs=" << total << ")";
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// KAT 4 — IDLE KEEPALIVE-NOTIFY (D9 60 s backup-watchdog flap fix,
+// StratumConfig::keepalive_notify_sec). An idle, subscribe-only, NON-submitting
+// session must keep receiving mining.notify at the keepalive cadence even though
+// the work generation NEVER changes and no share is ever submitted — this is
+// what keeps an idle BACKUP pool connection alive under a client-side no-notify
+// watchdog (measured Antminer D9: drops a pool after 60 s without a notify). The
+// keepalive refresh must be NON-clean (clean_jobs=false) so the ASIC's current
+// work is not reset. A control run with keepalive OFF must NOT emit those extra
+// notifies (proving the notifies are the keepalive, not some other path, and
+// that other coins with keepalive_notify_sec==0 are unaffected).
+//
+// Uses a 1 s keepalive interval so the KAT runs in a few seconds of wall-clock
+// while exercising the real per-session steady-timer path end-to-end.
+TEST(StratumHotelInterim, IdleKeepaliveNotifyFeedsSubscribeOnlySession)
+{
+    ServerHarness h;
+    h.ws->cfg.keepalive_notify_sec = 1;   // 1 s cadence for a fast KAT
+    ASSERT_TRUE(h.start());
+
+    Client c;
+    ASSERT_TRUE(c.connect(h.port));
+    ASSERT_TRUE(c.subscribe());           // subscribe-only: never authorize, never submit
+
+    // The generation is pinned (FakeWorkSource::generation stays 1) and we drive
+    // NO notify_storm, so every notify beyond the initial subscribe push is a
+    // pure idle keepalive. Collect over ~4.5 s: at a 1 s cadence an idle session
+    // must receive several. Without the keepalive this would time out at 1.
+    const bool got = c.collect_notifies(4, 4500ms);
+    EXPECT_TRUE(got) << "idle subscribe-only session received only "
+                     << c.jobs.size() << " notify(ies) — keepalive not firing";
+    EXPECT_GE(c.jobs.size(), 4u);
+
+    // Every keepalive refresh after the first (subscribe) notify must be
+    // NON-clean: clean_jobs=false, so the ASIC keeps hashing its current work.
+    ASSERT_FALSE(c.clean_flags.empty());
+    for (size_t i = 1; i < c.clean_flags.size(); ++i)
+        EXPECT_FALSE(c.clean_flags[i])
+            << "keepalive notify #" << i << " forced clean_jobs (would reset ASIC work)";
+
+    // Generation never moved: the notifies came purely from the keepalive path,
+    // not from a work-generation change.
+    EXPECT_EQ(h.ws->generation.load(), 1u);
+}
+
+// KAT 4b — CONTROL: with keepalive OFF (keepalive_notify_sec==0, the default and
+// the LTC/BTC/DGB setting), an idle subscribe-only session receives NO periodic
+// notify — the periodic push stays purely work-generation-gated. This pins that
+// the extra notifies in KAT 4 are the keepalive and that the feature is opt-in.
+TEST(StratumHotelInterim, KeepaliveOffLeavesIdleSessionUnfed)
+{
+    ServerHarness h;
+    h.ws->cfg.keepalive_notify_sec = 0;   // default / other-coins behaviour
+    ASSERT_TRUE(h.start());
+
+    Client c;
+    ASSERT_TRUE(c.connect(h.port));
+    ASSERT_TRUE(c.subscribe());
+    const size_t after_subscribe = c.jobs.size();
+
+    // No generation change, no storm, keepalive off: no further notify should
+    // arrive. collect_notifies must TIME OUT (return false) here.
+    const bool got_more = c.collect_notifies(after_subscribe + 2, 3500ms);
+    EXPECT_FALSE(got_more)
+        << "idle session got unexpected notifies with keepalive OFF (jobs="
+        << c.jobs.size() << ")";
 }

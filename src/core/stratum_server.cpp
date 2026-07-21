@@ -446,6 +446,7 @@ StratumSession::StratumSession(tcp::socket socket, std::shared_ptr<IWorkSource> 
     , server_(server)
     , connected_at_(std::chrono::steady_clock::now())
     , last_activity_(connected_at_)
+    , last_notify_at_(connected_at_)
     , work_push_timer_(socket_.get_executor())
     , handshake_timer_(socket_.get_executor())
 {
@@ -555,6 +556,16 @@ void StratumSession::process_message(std::size_t bytes_read)
                 : hashrate_tracker_.get_current_difficulty();
             send_set_difficulty(initial_diff);
             send_notify_work();
+            // Idle keepalive only: arm the periodic work-push / keepalive timer
+            // as soon as the session is subscribed -- a backup pool connection
+            // commonly subscribes and then sits idle without ever submitting, and
+            // it must still be fed keepalive notifies (D9 60 s watchdog).
+            // Idempotent: the authorize path re-calls start_periodic_work_push()
+            // and it no-ops. Gated on keepalive being enabled so coins with it
+            // OFF (LTC/BTC/DGB) keep the legacy authorize-only arming.
+            if (mining_interface_
+                && mining_interface_->get_stratum_config().keepalive_notify_sec > 0)
+                start_periodic_work_push();
         }
         
     } catch (const std::exception& e) {
@@ -1828,6 +1839,13 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
     // Track generation so safety timer doesn't re-push unchanged work
     last_pushed_generation_ = mining_interface_->get_work_generation();
 
+    // Idle keepalive-notify bookkeeping: record when we last put a mining.notify
+    // on the wire so the periodic push can tell an idle session (no notify for
+    // keepalive_notify_sec) from a recently-fed one. Covers EVERY notify path
+    // (event-driven, VARDIFF, safety, keepalive) so a real notify resets the
+    // idle clock and the keepalive never piggybacks right after one.
+    last_notify_at_ = std::chrono::steady_clock::now();
+
     send_response(notification);
 }
 
@@ -1835,9 +1853,19 @@ void StratumSession::start_periodic_work_push()
 {
     // Safety-net timer: push work only if the template changed since last push.
     // p2pool has no periodic push — work is pushed purely by events (new block,
-    // new best_share, VARDIFF). This 30-second fallback catches edge cases where
-    // an event-driven notify_all() might miss a session.
-    work_push_timer_.expires_after(std::chrono::seconds(5));
+    // new best_share, VARDIFF). This fallback catches edge cases where an
+    // event-driven notify_all() might miss a session. When idle keepalive-notify
+    // is enabled (StratumConfig::keepalive_notify_sec) the SAME timer also feeds
+    // an idle-but-live session a non-clean refresh so a client-side no-notify
+    // watchdog never drops it (see schedule_work_push_timer). First tick soon;
+    // never later than the keepalive interval so an idle session is fed promptly.
+    if (periodic_push_started_) return;   // arm exactly once (subscribe/authorize)
+    periodic_push_started_ = true;
+    const auto& cfg = mining_interface_->get_stratum_config();
+    uint32_t first = 5;
+    if (cfg.keepalive_notify_sec > 0)
+        first = std::min<uint32_t>(first, cfg.keepalive_notify_sec);
+    work_push_timer_.expires_after(std::chrono::seconds(first));
     schedule_work_push_timer();
 }
 
@@ -1849,13 +1877,34 @@ void StratumSession::schedule_work_push_timer()
     // Matches p2pool Twisted: transport owns timers, connectionLost is teardown.
     work_push_timer_.async_wait([self = shared_from_this()](boost::system::error_code ec) {
         if (ec || !self->is_connected()) return;
-        self->work_push_timer_.expires_after(std::chrono::seconds(30));
+        const auto& cfg = self->mining_interface_->get_stratum_config();
+        // Re-arm at the keepalive interval when enabled (so the idle check runs
+        // often enough to stay under the client watchdog), else the legacy 30 s
+        // safety cadence -- LTC/BTC/DGB (keepalive_notify_sec == 0) unchanged.
+        const uint32_t interval =
+            cfg.keepalive_notify_sec > 0 ? cfg.keepalive_notify_sec : 30;
+        self->work_push_timer_.expires_after(std::chrono::seconds(interval));
         self->schedule_work_push_timer();
         try {
             auto current_gen = self->mining_interface_->get_work_generation();
             if (current_gen != self->last_pushed_generation_) {
+                // Work actually changed -> event-style push (may be clean_jobs).
                 self->send_notify_work();
                 self->last_pushed_generation_ = current_gen;
+            } else if (cfg.keepalive_notify_sec > 0
+                       && self->is_subscribed()
+                       && self->seconds_since_last_notify() * 2
+                              >= static_cast<double>(cfg.keepalive_notify_sec)) {
+                // Idle keepalive: nothing changed and this session has had no
+                // notify for >= half the interval. Re-send the CURRENT job as a
+                // non-clean (force_clean=false) mining.notify to feed a client-
+                // side no-notify watchdog (measured D9: 60 s) so an otherwise-
+                // idle BACKUP connection never flaps. clean_jobs stays false, so
+                // the ASIC keeps its current work -- this is a liveness ping, not
+                // a work reset. The half-interval guard bounds the worst-case gap
+                // between notifies to ~1.5x the interval (well under the watchdog)
+                // while never piggybacking right after an event notify.
+                self->send_notify_work(false);
             }
         } catch (const std::exception& e) {
             LOG_WARNING << "[STRATUM] Work push error: " << e.what();

@@ -1221,6 +1221,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // mining (and later submitting) a payee from before the churn. weak_ptr:
     // rpc outlives work_source in this scope (declared earlier), so the
     // callback must not extend or assume the work source's lifetime.
+    //
+    // This is the conservative DEFAULT (covers the embedded arm, and the
+    // fallback arm before its tip poll is armed): every reconnect invalidates
+    // unconditionally. On the fallback arm the tip-poll block below OVERRIDES
+    // this with a tip-aware version that skips the invalidate when the tip is
+    // provably unchanged (#751 idle-reconnect churn fix) -- see there.
     if (rpc) {
         std::weak_ptr<dash::stratum::DASHWorkSource> ws_weak = work_source;
         rpc->set_on_reconnect([ws_weak]() {
@@ -1776,13 +1782,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // The refresh trio, shared by both paths. Runs on the io_context thread
         // ONLY (the poll follow-up is posted back to ioc; the ZMQ callback posts
         // onto ioc), so ws/ss/dedup are never touched concurrently. `verb`
-        // differentiates the instant (ZMQ) vs polled log line.
-        std::function<void(const std::string&, const char*, const char*)>
+        // differentiates the instant (ZMQ) vs polled log line. Returns true iff
+        // the refresh trio actually fired (a NEW tip vs the shared dedup); false
+        // when the tip was unchanged and the call coalesced to a no-op -- the
+        // reconnect observer below uses that to tell a real tip change apart from
+        // a benign idle-timeout reconnect.
+        std::function<bool(const std::string&, const char*, const char*)>
             fire_refresh = [ws = work_source.get(), ss = stratum_server.get(),
                             tip_dedup](const std::string& tip,
                                        const char* source, const char* verb) {
                 if (!tip_dedup->is_new_tip(tip))
-                    return;   // dedup: coalesce a poll+ZMQ double-fire on one tip
+                    return false; // dedup: coalesce a poll+ZMQ double-fire on one tip
                 ws->invalidate_template_cache(
                     "tip-notify: dashd best-block changed");
                 ws->bump_work_generation();
@@ -1791,7 +1801,73 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                          << " -> " << verb;
                 std::cout << "[Stratum] " << source << ": " << tip.substr(0, 16)
                           << " -> " << verb << "\n";
+                return true;
             };
+
+        // #751 churn fix: refine the CoindRPC reconnect-churn observer on the
+        // fallback arm. dashd closes an idle keep-alive connection on its
+        // rpcservertimeout (default 30 s), so on an otherwise-idle pool c2pool
+        // reconnects every ~30-90 s. The unconditional invalidate wired on the
+        // main path (see "reconnect-churn observer" above) then fires clean_jobs
+        // to every stratum session on EVERY such reconnect -> the endpoint flaps
+        // and rigs waste work even though NOTHING changed on-chain. Here we
+        // OVERRIDE that observer (this assignment runs after the main-path one,
+        // still before the io loop starts) with a tip-aware version: on a
+        // reconnect, probe dashd's best-block hash and invalidate ONLY if the tip
+        // actually moved while we were disconnected.
+        //
+        //   INVARIANT (must NOT regress the stale-masternode-payee lost-block
+        //   class): a tip change during the disconnect window MUST still
+        //   invalidate -- a new tip means a new masternode payee, so any template
+        //   cached from before the churn is stale and unsafe to serve or submit.
+        //   We skip the invalidate ONLY when the tip is PROVABLY unchanged (probe
+        //   succeeded AND equals the last-seen tip). If the probe itself fails
+        //   (RPC not ready on the fresh socket) we FALL BACK to invalidating --
+        //   never serve stale-payee work on an unproven tip.
+        //
+        // Deadlock note: m_on_reconnect fires from inside NodeRPC::sync_reconnect(),
+        // which runs UNDER m_rpc_mutex from within Send(). A synchronous
+        // getbestblockhash() here would re-enter Send() and self-deadlock on that
+        // non-recursive mutex, so the probe is POSTED to rpc_pool (the RPC thread)
+        // and runs after the triggering Send() releases the lock. The tip compare
+        // + refresh trio then post BACK onto ioc, where fire_refresh / tip_dedup
+        // are io-thread-confined -- identical threading to the 3 s tip poll below.
+        rpc->set_on_reconnect(
+            [rpc = rpc.get(), rpc_pool, fire_refresh, ws = work_source.get(),
+             &ioc]() {
+                boost::asio::post(*rpc_pool, [rpc, fire_refresh, ws, &ioc]() {
+                    std::string tip;
+                    bool ok = false;
+                    try {
+                        tip = rpc->getbestblockhash(); // BLOCKING -- background thread
+                        ok = true;
+                    } catch (...) {
+                        // swallow -- treated as a probe failure (fail-safe below)
+                    }
+                    boost::asio::post(ioc,
+                        [ok, tip = std::move(tip), fire_refresh, ws]() {
+                            if (!ok || tip.empty()) {
+                                // FAIL-SAFE: tip unproven -> conservatively drop
+                                // the cache (the pre-#751 unconditional behaviour).
+                                ws->invalidate_template_cache(
+                                    "CoindRPC reconnect: tip probe failed "
+                                    "(fail-safe invalidate)");
+                                return;
+                            }
+                            // fire_refresh invalidates + bumps + notifies IFF the
+                            // tip is NEW vs the shared last-seen dedup; an unchanged
+                            // tip is a benign idle-timeout reconnect -> cache kept.
+                            if (!fire_refresh(tip, "reconnect",
+                                              "tip changed during disconnect -> "
+                                              "refresh + notify")) {
+                                LOG_INFO << "[Stratum] reconnect: benign idle-"
+                                            "timeout, tip unchanged ("
+                                         << tip.substr(0, 16)
+                                         << ") -- template cache retained";
+                            }
+                        });
+                });
+            });
 
         // BACKSTOP: 3 s getbestblockhash poll (#770), io-decoupled (#781).
         auto tip_timer = std::make_shared<io::steady_timer>(ioc);
