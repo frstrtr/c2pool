@@ -165,6 +165,14 @@ public:
     // template refresh without waiting on the 30 s staleness TTL. Empty string
     // on a null/absent result.
     std::string getbestblockhash();
+    // getpeerinfo -> the dashd's OWN connected-peer addresses (the "addr" field
+    // of each entry), parsed to NetService. Feeds the embedded
+    // DashCoinPeerManager's daemon-peer overlap filter + coind-source -20 score
+    // penalty so the embedded arm actively avoids mirroring the local dashd's
+    // peers (network-view disjointness). Returns empty on a null/absent result;
+    // transport errors propagate (the caller swallows them). No dashd config
+    // change required (getpeerinfo is a default RPC).
+    std::vector<NetService> getpeerinfo();
     // verbose: true -- json result, false -- hex-encode result;
     nlohmann::json getblockheader(uint256 header, bool verbose = true);
     // verbosity: 0 for hex-encoded data, 1 for a json object, and 2 for json object with transaction data
