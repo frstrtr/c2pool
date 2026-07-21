@@ -1375,11 +1375,31 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     return r;
                 };
 
+                // creditPool INVARIANT base = the CONNECTED block N-1's committed
+                // creditPoolBalance (dashd getblock verbosity 2 -> tx[0].cbTx),
+                // not dashd's previous *template* projection (review nit d).
+                auto base_cp_fn =
+                    [rp = rpc.get()](const uint256& prev_hash)
+                        -> std::optional<int64_t> {
+                    try {
+                        auto blk = rp->getblock(prev_hash, /*verbosity=*/2);
+                        if (blk.contains("tx") && blk["tx"].is_array()
+                            && !blk["tx"].empty()) {
+                            const auto& cb = blk["tx"][0];
+                            if (cb.contains("cbTx")
+                                && cb["cbTx"].contains("creditPoolBalance"))
+                                return cb["cbTx"]["creditPoolBalance"].get<int64_t>();
+                        }
+                    } catch (...) { /* nullopt -> fall back to template base */ }
+                    return std::nullopt;
+                };
+
                 oracle_shadow = std::make_shared<dash::coin::EmbeddedOracleShadow>(
                     node_coin_state,
                     [rp = rpc.get()]() { return rp->getwork(); },
                     std::move(proposal_fn),
-                    std::move(oc));
+                    std::move(oc),
+                    std::move(base_cp_fn));
                 auto* shadow = oracle_shadow.get();
                 coin_feed_subs.push_back(
                     coin_state.new_tip.subscribe(
@@ -1688,6 +1708,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // it references are still alive -- explicit reset keeps destruction order safe
     // (stratum_server was declared before them, so it would otherwise outlive them).
     stratum_server.reset();
+
+    // Join the oracle-shadow worker thread BEFORE node_coin_state / rpc unwind:
+    // the worker dereferences both (select_work + getwork/proposal), and
+    // oracle_shadow is declared earlier than node_coin_state so it would
+    // otherwise outlive it. ioc.run() has returned, so no further new_tip fires.
+    if (oracle_shadow) oracle_shadow.reset();
 
     // Stop the dashboard BEFORE p2p_node unwinds: its callbacks hold a raw
     // dash::Node* and the HTTP thread must be joined while that is still valid.

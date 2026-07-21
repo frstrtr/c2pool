@@ -514,7 +514,16 @@ if (BUILD_TESTING AND GTest_FOUND)
     # frstrtr/p2pool-dash getwork (pre-v35). Header-only over the dash leaves +
     # core (links core for script_to_address in address_utils.cpp). Last S7
     # capstone; node-backed end-to-end parity deferred to a live-harness leaf.
-    add_executable(test_dash_embedded_gbt test_dash_embedded_gbt.cpp)
+    # The Embedded ORACLE-SHADOW VALIDATOR KATs (test_dash_embedded_oracle_shadow
+    # .cpp) are FOLDED into this already-CI-allowlisted target rather than a new
+    # executable: the bot that pushes the branch lacks `workflow` scope, so it
+    # cannot add a new --target to build.yml (which would otherwise leave the KAT
+    # a NOT_BUILT sentinel). Both files are hermetic gtest TUs over the same link
+    # set (dash_x11 + core + the payout/hashrate/merged-mining OBJECT libs); the
+    # oracle-shadow header pulls node_coin_state -> work_source + vendor/cbtx.
+    add_executable(test_dash_embedded_gbt
+        test_dash_embedded_gbt.cpp
+        test_dash_embedded_oracle_shadow.cpp)
     target_link_libraries(test_dash_embedded_gbt PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -523,23 +532,6 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_dash_embedded_gbt PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_embedded_gbt "" AUTO)
-
-    # DASH Embedded ORACLE-SHADOW VALIDATOR: hermetic KATs for the pure
-    # classify/compare/graduation decision logic (embedded_oracle_shadow.hpp) the
-    # per-block dashd cross-check relies on -- determinism tagging (mempool/fee
-    # differences are NOT divergences; roots/identity are), the graduation
-    # predicate (N consecutive clean + K per-class coverage + reorg), and the
-    # height-class periodicity. Same link set as the embedded_gbt capstone
-    # (pulls node_coin_state -> work_source + vendor/cbtx via the header).
-    add_executable(test_dash_embedded_oracle_shadow test_dash_embedded_oracle_shadow.cpp)
-    target_link_libraries(test_dash_embedded_oracle_shadow PRIVATE
-        GTest::gtest_main GTest::gtest
-        dash_x11 core
-        nlohmann_json::nlohmann_json
-        ${Boost_LIBRARIES}
-    )
-    target_link_libraries(test_dash_embedded_oracle_shadow PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
-    gtest_add_tests(test_dash_embedded_oracle_shadow "" AUTO)
 
     # DASH underfill guard: port of the LTC/DOGE "near-empty template on a
     # non-empty mempool" template-builder guard to the DASH embedded GBT path

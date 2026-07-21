@@ -88,6 +88,7 @@
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <condition_variable>
 #include <cstdint>
 #include <ctime>
 #include <fstream>
@@ -97,6 +98,8 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 namespace dash {
@@ -534,19 +537,37 @@ public:
     // (has the coinbase builders + RPC). Unbound ⇒ proposal leg unavailable ⇒
     // NO served height can be CLEAN (condition 2: proposal is required).
     using ProposalFn = std::function<ProposalResult(const DashWorkData&)>;
+    // Optional: fetch the CONNECTED block N-1's committed creditPoolBalance
+    // (dashd getblock verbosity 2 -> tx[0].cbTx.creditPoolBalance) to use as the
+    // creditPool INVARIANT base, instead of the previous *template's* projected
+    // value (review nit d — the actually-connected block can differ from the
+    // template on real asset-lock chains -> fewer false VIOLs). Bound in
+    // main_dash.cpp; when unbound the invariant falls back to the previous
+    // compared template value with contiguity. Returns nullopt on any failure.
+    using BaseCreditPoolFn = std::function<std::optional<int64_t>(const uint256& prev_hash)>;
 
     EmbeddedOracleShadow(const NodeCoinState& coin_state,
                          std::function<DashWorkData()> dashd_gbt,
-                         ProposalFn proposal_fn, Config cfg)
+                         ProposalFn proposal_fn, Config cfg,
+                         BaseCreditPoolFn base_credit_pool_fn = {})
         : coin_state_(coin_state)
         , dashd_gbt_(std::move(dashd_gbt))
         , proposal_fn_(std::move(proposal_fn))
+        , base_credit_pool_fn_(std::move(base_credit_pool_fn))
         , cfg_(std::move(cfg))
         , periodicity_(NetPeriodicity::for_net(cfg_.testnet))
     {
         load_graduation_state();
+        // A fallback/dev/no-git commit string (empty, "dev", or the CMake
+        // "0.1.0-alpha" default) can be shared across DIFFERENT binaries, so it
+        // must NEVER inherit a prior streak (review nit c). `--dirty` in the git
+        // describe (CMakeLists) covers tag-exact dirty rebuilds; this covers the
+        // no-git fallbacks.
+        const bool fallback_commit = cfg_.c2pool_commit.empty()
+            || cfg_.c2pool_commit == "dev" || cfg_.c2pool_commit == "0.1.0-alpha";
         // Streak-invalidation on identity change (§6 cond. 4).
-        if (ledger_.key_comparator != kOracleComparatorVersion
+        if (fallback_commit
+            || ledger_.key_comparator != kOracleComparatorVersion
             || ledger_.key_commit != cfg_.c2pool_commit
             || ledger_.key_dashd_version != cfg_.dashd_version
             || ledger_.key_net != (cfg_.testnet ? "testnet" : "mainnet")) {
@@ -567,17 +588,90 @@ public:
                  << " K=" << cfg_.grad.per_class_coverage_target
                  << " proposal=" << (proposal_fn_ ? "wired(VERDICT)" : "UNSET(field-compare only)")
                  << " comparator_v=" << kOracleComparatorVersion << ")";
+        // Async worker: the per-block compare runs 2-3 dashd RPCs + file writes;
+        // running it INLINE on the tip-dispatch thread would let a slow/hung
+        // dashd stall the tip event chain (review nit e). The tip thread only
+        // ENQUEUES (coalescing to the latest tip); this thread does the work.
+        worker_ = std::thread([this] { worker_loop(); });
     }
 
-    /// Per-block shadow-compare. OBSERVE-ONLY.
+    ~EmbeddedOracleShadow() {
+        { std::lock_guard<std::mutex> lk(q_mu_); stop_ = true; }
+        q_cv_.notify_all();
+        if (worker_.joinable()) worker_.join();
+    }
+
+    EmbeddedOracleShadow(const EmbeddedOracleShadow&) = delete;
+    EmbeddedOracleShadow& operator=(const EmbeddedOracleShadow&) = delete;
+
+    /// Tip-thread entry: ENQUEUE ONLY (never blocks the caller). The worker
+    /// thread runs the compare so a hung dashd cannot perturb tip processing.
+    /// Coalescing: if a tip is already pending unprocessed, it is replaced by
+    /// the newest (a shadow samples tips; a skipped intermediate is a coverage
+    /// gap, never a wrong count — and on the ~2.6 min interval the worker keeps
+    /// up with room to spare).
     void on_new_tip(uint32_t next_height, const uint256& next_prev_hash) {
-        std::lock_guard<std::mutex> lk(mu_);
+        {
+            std::lock_guard<std::mutex> lk(q_mu_);
+            pending_ = std::make_pair(next_height, next_prev_hash);
+        }
+        q_cv_.notify_one();
+    }
+
+    /// The actual per-block shadow-compare (worker thread). OBSERVE-ONLY. All
+    /// heavy RPCs run here BEFORE mu_ is taken, so /embedded_oracle (stats_json)
+    /// never blocks on a dashd RPC.
+    void process_tip(uint32_t next_height, const uint256& next_prev_hash) {
         if (!dashd_gbt_) { LOG_WARNING << "[EMB-ORACLE] no dashd oracle bound"; return; }
 
+        // ── Phase 1: ALL heavy RPCs, NO lock ────────────────────────────────
+        // Runs on the worker thread; taking mu_ here would make /embedded_oracle
+        // (stats_json) block on a dashd RPC. So gather everything unlocked, then
+        // take mu_ only for the fast analysis + ledger phase.
+        WorkSelection sel = coin_state_.select_work(dashd_gbt_);
+        const bool is_embedded = (sel.source == WorkSource::Embedded);
+        DashWorkData emb, dashd;
+        bool dashd_rpc_ok = false, aligned = false;
+        std::optional<int64_t> base_cp;   // creditPool(N-1) from the CONNECTED block
+        bool base_from_connected = false;
+        ProposalResult pr;
+
+        if (is_embedded) {
+            emb = std::move(sel.work);
+            try { dashd = dashd_gbt_(); dashd_rpc_ok = true; }
+            catch (const std::exception& ex) {
+                LOG_WARNING << "[EMB-ORACLE] dashd oracle threw: " << ex.what() << " — void";
+            }
+            if (dashd_rpc_ok) {
+                aligned = (emb.m_height == dashd.m_height
+                           && emb.m_previous_block == dashd.m_previous_block);
+                if (aligned) {
+                    // Fix (d): base the creditPool invariant on the ACTUALLY-
+                    // connected block N-1's committed value, not dashd's previous
+                    // *template* projection (which can differ on real asset-lock
+                    // chains -> false VIOLs). Unlocked RPC; nullopt on failure.
+                    if (base_credit_pool_fn_) {
+                        try { base_cp = base_credit_pool_fn_(emb.m_previous_block); }
+                        catch (...) { base_cp.reset(); }
+                        base_from_connected = base_cp.has_value();
+                    }
+                    // Proposal VERDICT (unlocked RPC).
+                    if (proposal_fn_) {
+                        try { pr = proposal_fn_(emb); }
+                        catch (const std::exception& ex) {
+                            pr.attempted = true; pr.accepted = false;
+                            pr.reason = std::string("throw:") + ex.what();
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Phase 2: analysis + ledger, UNDER mu_ (pure CPU + brief file I/O) ─
+        std::lock_guard<std::mutex> lk(mu_);
         const bool reorg = detect_reorg(next_height, next_prev_hash);
 
-        WorkSelection sel = coin_state_.select_work(dashd_gbt_);
-        if (sel.source != WorkSource::Embedded) {
+        if (!is_embedded) {
             embedded_armed_ = false;
             ledger_.note_fall_closed(next_height, classify(next_height, {}, false, reorg, false));
             LOG_INFO << "[EMB-ORACLE] h=" << next_height
@@ -586,17 +680,10 @@ public:
             remember_tip(next_height, next_prev_hash);
             return;
         }
-        DashWorkData emb = std::move(sel.work);
-
-        DashWorkData dashd;
-        try { dashd = dashd_gbt_(); }
-        catch (const std::exception& ex) {
-            LOG_WARNING << "[EMB-ORACLE] dashd oracle threw: " << ex.what() << " — void";
+        if (!dashd_rpc_ok) {
             ledger_.note_void(next_height); remember_tip(next_height, next_prev_hash); return;
         }
-
-        // Alignment key: (height, prev_hash). A skew VOIDs the sample.
-        if (emb.m_height != dashd.m_height || emb.m_previous_block != dashd.m_previous_block) {
+        if (!aligned) {
             LOG_INFO << "[EMB-ORACLE] tip-skew emb(h=" << emb.m_height << ",prev="
                      << emb.m_previous_block.GetHex().substr(0, 12) << ") dashd(h="
                      << dashd.m_height << ",prev=" << dashd.m_previous_block.GetHex().substr(0, 12)
@@ -622,26 +709,44 @@ public:
         d.empty_template = dashd.m_tx_hashes.empty();
 
         const bool dkg = periodicity_.is_dkg_window(emb.m_height);
-        const bool contiguous = (have_prev_ && prev_compared_height_ + 1 == emb.m_height);
+        // Prefer the connected-block base (contiguous by construction); else the
+        // previous compared template value with the height-contiguity guard.
         std::optional<int64_t> prev_cp;
-        if (have_prev_) prev_cp = prev_credit_pool_;
+        bool contiguous;
+        if (base_from_connected) { prev_cp = base_cp; contiguous = true; }
+        else { contiguous = (have_prev_ && prev_compared_height_ + 1 == emb.m_height);
+               if (have_prev_) prev_cp = prev_credit_pool_; }
 
+        // Fix (1): NonEmptyTemplate is the class that must force-sample the
+        // EMBEDDED arm's tx-selection / fee-split / special-tx path. Classify it
+        // on the EMBEDDED side ONLY — dashd's near-always-non-empty template
+        // would otherwise tick the class while the embedded arm serves empty
+        // templates, accruing coverage without ever exercising the path the
+        // class exists to force (false-graduation vector).
         std::set<HeightClass> classes = classify(emb.m_height, dc, dok, reorg,
-                                                 !e.empty_template || !d.empty_template);
+                                                 !e.empty_template);
 
         auto fields = compare_templates(e, d, prev_cp, dkg, contiguous);
 
-        // ── PROPOSAL VERDICT (the authoritative gate) ───────────────────────
-        ProposalResult pr;
-        if (proposal_fn_) {
-            try { pr = proposal_fn_(emb); }
-            catch (const std::exception& ex) {
-                pr.attempted = true; pr.accepted = false; pr.reason = std::string("throw:") + ex.what();
-            }
-        }
         // Without a proposal leg, condition 2 forbids certifying — treat as
         // not-accepted so the height cannot count clean.
         const bool proposal_ok = pr.attempted && pr.accepted;
+
+        // Fixes (a)+(b): a proposal reason that is a DASHD-SIDE RPC blip
+        // ("rpc-error:") or a proposal-mode TIP RACE ("inconclusive" /
+        // "not-best-prevblk" / "stale") is NOT an embedded consensus fault —
+        // VOID the sample (don't count, don't reset the streak) rather than
+        // false-REJECT. (The bounded settle-resample is a scoped follow-up.)
+        if (pr.attempted && !pr.accepted && is_void_proposal_reason(pr.reason)) {
+            LOG_INFO << "[EMB-ORACLE] h=" << emb.m_height
+                     << " proposal VOID (dashd-side/tip-race): " << pr.reason;
+            ledger_.note_void(emb.m_height);
+            // still advance the credit-pool / quorum trackers for continuity
+            if (dok) prev_credit_pool_ = dc.creditPoolBalance;
+            prev_compared_height_ = emb.m_height; have_prev_ = dok;
+            remember_tip(next_height, next_prev_hash);
+            return;
+        }
 
         std::vector<std::string> counted;
         for (const auto& f : fields) if (f.counts) counted.push_back(f.field);
@@ -667,7 +772,8 @@ public:
         if (proposal_ok && counted.empty())
             LOG_INFO << "[EMB-ORACLE] AGREE height=" << emb.m_height
                      << " class=" << height_class_name(primary)
-                     << " (proposal ACCEPTED; all equality/invariant fields match)";
+                     << " (proposal ACCEPTED; all equality/invariant fields match; base_cp="
+                     << (base_from_connected ? "connected" : "template") << ")";
 
         ledger_.record_served(emb.m_height, classes, proposal_ok, counted);
         append_divergence_ledger(emb.m_height, classes, primary, fields, pr, counted);
@@ -692,6 +798,33 @@ public:
     }
 
 private:
+    // Worker loop: drains the coalescing tip queue so the compare (2-3 dashd
+    // RPCs + file writes) never runs on the tip-dispatch thread.
+    void worker_loop() {
+        for (;;) {
+            std::pair<uint32_t, uint256> job;
+            {
+                std::unique_lock<std::mutex> lk(q_mu_);
+                q_cv_.wait(lk, [this] { return stop_ || pending_.has_value(); });
+                if (stop_ && !pending_.has_value()) return;
+                job = *pending_;
+                pending_.reset();
+            }
+            try { process_tip(job.first, job.second); }
+            catch (const std::exception& e) {
+                LOG_WARNING << "[EMB-ORACLE] worker exception: " << e.what();
+            }
+        }
+    }
+
+    // A proposal reject reason that is a dashd-side RPC blip or a proposal-mode
+    // TIP RACE — not an embedded consensus fault. VOID it (don't count / reset).
+    static bool is_void_proposal_reason(const std::string& r) {
+        auto has = [&](const char* s) { return r.find(s) != std::string::npos; };
+        return has("rpc-error:") || has("inconclusive")
+            || has("prevblk") || has("not-best") || has("stale");
+    }
+
     void revoke(const std::string& reason) {
         if (ledger_.revoked) return;
         ledger_.revoked = true; ledger_.revoked_reason = reason;
@@ -776,12 +909,21 @@ private:
     const NodeCoinState&          coin_state_;
     std::function<DashWorkData()> dashd_gbt_;
     ProposalFn                    proposal_fn_;
+    BaseCreditPoolFn              base_credit_pool_fn_;
     Config                        cfg_;
     NetPeriodicity                periodicity_;
 
-    mutable std::mutex mu_;
+    mutable std::mutex mu_;      // guards ledger_ (worker writes, web thread reads)
     GraduationLedger   ledger_;
 
+    // Coalescing tip queue + worker thread (decouple compare from tip thread).
+    std::thread             worker_;
+    std::mutex              q_mu_;
+    std::condition_variable q_cv_;
+    std::optional<std::pair<uint32_t, uint256>> pending_;
+    bool                    stop_{false};
+
+    // Trackers below are WORKER-THREAD-EXCLUSIVE (process_tip only) — no lock.
     bool     embedded_armed_{false};
     uint32_t cold_heights_seen_{0};
     bool     have_prev_{false};
