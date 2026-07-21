@@ -3803,6 +3803,29 @@ nlohmann::json MiningInterface::rest_local_stats()
     }
     result["miner_last_difficulties"] = miner_diffs;
 
+    // Best-share summary (highest-difficulty pseudoshare seen). Mirrors the
+    // dedicated /best_share endpoint so /local_stats consumers get the "how
+    // close did the best share get to a block" metric inline. Display only.
+    {
+        std::lock_guard<std::mutex> lock(m_best_diff_mutex);
+        auto pct = [&](double d) { return net_diff > 0 ? d / net_diff * 100.0 : 0.0; };
+        auto bs_entry = [&](double diff, const std::string& miner,
+                            const std::string& hash, uint64_t ts) {
+            return nlohmann::json{
+                {"difficulty", diff}, {"pct_of_block", pct(diff)},
+                {"miner", miner}, {"hash", hash}, {"timestamp", ts}};
+        };
+        result["best_share"] = {
+            {"network_difficulty", net_diff},
+            {"round", bs_entry(m_best_difficulty.round, m_best_difficulty.miner,
+                               m_best_difficulty.hash, m_best_difficulty.timestamp)},
+            {"session", bs_entry(m_best_difficulty.session, m_best_difficulty.session_miner,
+                                 m_best_difficulty.session_hash, m_best_difficulty.session_ts)},
+            {"all_time", bs_entry(m_best_difficulty.all_time, m_best_difficulty.all_time_miner,
+                                  m_best_difficulty.all_time_hash, m_best_difficulty.all_time_ts)}
+        };
+    }
+
     // p2pool-compat: version and protocol_version
     result["version"] = m_pool_version;
     result["protocol_version"] = m_protocol_version.load(std::memory_order_relaxed);
@@ -4746,23 +4769,28 @@ nlohmann::json MiningInterface::rest_best_share()
             best_round = avg;
         }
 
-        auto make_entry = [&](double diff, const std::string& miner, uint64_t ts) {
+        auto make_entry = [&](double diff, const std::string& miner, uint64_t ts,
+                              const std::string& hash) {
             nlohmann::json e;
             e["difficulty"] = diff;
             e["pct_of_block"] = (net_diff > 0) ? (diff / net_diff * 100.0) : 0.0;
             e["miner"] = miner;
             e["timestamp"] = ts;
+            e["hash"] = hash;   // pow-hash of the record share (empty until wired)
             return e;
         };
 
         result["all_time"] = make_entry(best_all,
-            m_best_difficulty.all_time_miner, m_best_difficulty.all_time_ts);
+            m_best_difficulty.all_time_miner, m_best_difficulty.all_time_ts,
+            m_best_difficulty.all_time_hash);
         auto session = make_entry(best_sess,
-            m_best_difficulty.session_miner, m_best_difficulty.session_ts);
+            m_best_difficulty.session_miner, m_best_difficulty.session_ts,
+            m_best_difficulty.session_hash);
         session["started"] = m_start_time.time_since_epoch().count() / 1000000000ULL;
         result["session"] = session;
         auto round = make_entry(best_round,
-            m_best_difficulty.miner, m_best_difficulty.timestamp);
+            m_best_difficulty.miner, m_best_difficulty.timestamp,
+            m_best_difficulty.hash);
         round["started"] = m_best_difficulty.round_start;
         result["round"] = round;
     }
@@ -6402,7 +6430,8 @@ nlohmann::json MiningInterface::rest_web_graph_data(const std::string& source, c
 
 // ──────────── Difficulty tracking and stat log helpers ────────────────────
 
-void MiningInterface::record_share_difficulty(double difficulty, const std::string& miner)
+void MiningInterface::record_share_difficulty(double difficulty, const std::string& miner,
+                                              const std::string& share_hash)
 {
     // Feed the rolling-hashrate ring. Independent of the best-diff
     // tracking below; the ring has its own internal lock.
@@ -6414,16 +6443,19 @@ void MiningInterface::record_share_difficulty(double difficulty, const std::stri
     if (difficulty > m_best_difficulty.all_time) {
         m_best_difficulty.all_time = difficulty;
         m_best_difficulty.all_time_miner = miner;
+        m_best_difficulty.all_time_hash = share_hash;
         m_best_difficulty.all_time_ts = now_ts;
     }
     if (difficulty > m_best_difficulty.session) {
         m_best_difficulty.session = difficulty;
         m_best_difficulty.session_miner = miner;
+        m_best_difficulty.session_hash = share_hash;
         m_best_difficulty.session_ts = now_ts;
     }
     if (difficulty > m_best_difficulty.round) {
         m_best_difficulty.round = difficulty;
         m_best_difficulty.miner = miner;
+        m_best_difficulty.hash = share_hash;
         m_best_difficulty.timestamp = now_ts;
     }
 }

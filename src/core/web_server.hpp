@@ -1364,7 +1364,11 @@ public:
     void auto_detect_external_info();
 
     // Best share difficulty tracking (for /best_share, /miner_stats)
-    void record_share_difficulty(double difficulty, const std::string& miner);
+    // share_hash: optional pow-hash of the record-setting share (display only;
+    // DASH stratum submit path supplies it so the Best Share card can show the
+    // exact hash that got closest to net difficulty).
+    void record_share_difficulty(double difficulty, const std::string& miner,
+                                 const std::string& share_hash = "");
     void record_merged_share_difficulty(double difficulty, const std::string& miner);
 
     // Stat log entry (appended every 5 minutes, rolling 24h window for /web/log JSON)
@@ -1426,12 +1430,15 @@ private:
     struct BestDifficulty {
         double all_time{0.0};
         std::string all_time_miner;
+        std::string all_time_hash;   // pow-hash of the record share (display only)
         uint64_t all_time_ts{0};
         double session{0.0};
         std::string session_miner;
+        std::string session_hash;
         uint64_t session_ts{0};
         double round{0.0};
         std::string miner;       // round-level miner (backward compat)
+        std::string hash;        // round-level pow-hash (display only)
         uint64_t timestamp{0};   // round-level timestamp (backward compat)
         uint64_t round_start{0};
         // Merged chain (DOGE) best share tracking

@@ -241,6 +241,20 @@ public:
         const std::string& nbits_hex,
         const std::vector<std::string>& merkle_branches) const override;
 
+    /// IWorkSource best-share feed: recompute the exact X11 pow-hash for this
+    /// accepted pseudoshare and forward (difficulty, miner, pow_hash) to the
+    /// dashboard best-share tracker via on_share_difficulty_fn_. Every accepted
+    /// pseudoshare flows here (the stratum vardiff-accept path), so the "Best
+    /// Share" card populates on the DASH solo path where shares seldom mint.
+    void record_best_pseudoshare(
+        double share_difficulty, const std::string& miner,
+        const std::string& coinb1, const std::string& coinb2,
+        const std::string& extranonce1, const std::string& extranonce2,
+        const std::string& ntime, const std::string& nonce,
+        uint32_t version, const std::string& prevhash_hex,
+        const std::string& nbits_hex,
+        const std::vector<std::string>& merkle_branches) override;
+
     // ── IWorkSource: atomic state ────────────────────────────────────────
     uint32_t get_share_bits() const override     { return share_bits_.load(); }
     uint32_t get_share_max_bits() const override { return share_max_bits_.load(); }
@@ -265,6 +279,32 @@ public:
     /// hash. Called once at startup from main_dash.cpp after the DASH
     /// ShareTracker is constructed.
     void set_best_share_hash_fn(std::function<uint256()> fn);
+
+    /// Best-share (highest-difficulty pseudoshare) reporter. Fired from
+    /// mining_submit for EVERY accepted submission with the actual PoW
+    /// difficulty of the found hash (target_to_difficulty(pow_hash)), the
+    /// submitting miner (stratum username), and the pow-hash hex. main_dash.cpp
+    /// binds this to MiningInterface::record_share_difficulty so the dashboard
+    /// "Best Share" card shows how close DASH solo shares got to net difficulty
+    /// even when no share ever mints onto the sharechain. Display only — never
+    /// touches share/target/payout logic. While unbound this is a no-op.
+    using ShareDifficultyFn =
+        std::function<void(double difficulty, const std::string& miner,
+                           const uint256& pow_hash)>;
+    void set_on_share_difficulty_fn(ShareDifficultyFn fn);
+
+    /// Found-block reporter for the dashboard "Recent Blocks" card. Fired from
+    /// mining_submit the moment a submission meets the full network block
+    /// target AND is dispatched to the network (NOT on a local payee-guard
+    /// reject). Carries the block height, the X11 block hash (== pow_hash for
+    /// DASH), the submitting miner, and whether at least one network sink was
+    /// reached. main_dash.cpp binds this to MiningInterface::record_found_block
+    /// so DASH block wins appear in the found-block history. Display only —
+    /// never gates the won-block dispatch. While unbound this is a no-op.
+    using FoundBlockFn =
+        std::function<void(uint32_t height, const uint256& block_hash,
+                           const std::string& miner, bool reached_network)>;
+    void set_on_found_block_fn(FoundBlockFn fn);
 
     /// Wire the sharechain mint dispatch (stage 4d follow-up). While unbound,
     /// share-target submissions are accepted for vardiff + loudly logged.
@@ -348,6 +388,14 @@ private:
     // Best-share callback (from ShareTracker). Empty until wired.
     mutable std::mutex          best_share_mutex_;
     std::function<uint256()>    best_share_hash_fn_;
+
+    // Best-share (highest-difficulty pseudoshare) reporter. Empty until wired.
+    mutable std::mutex          share_difficulty_mutex_;
+    ShareDifficultyFn           on_share_difficulty_fn_;
+
+    // Found-block reporter (dashboard recent-blocks card). Empty until wired.
+    mutable std::mutex          found_block_mutex_;
+    FoundBlockFn                on_found_block_fn_;
 
     // Sharechain mint dispatch (stage 4d). Empty until wired.
     mutable std::mutex          mint_share_mutex_;

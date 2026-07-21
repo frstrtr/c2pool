@@ -183,6 +183,25 @@ public:
         uint32_t version, const std::string& prevhash_hex,
         const std::string& nbits_hex,
         const std::vector<std::string>& merkle_branches) const = 0;
+
+    /// Record an ACCEPTED pseudoshare for the dashboard "Best Share" card
+    /// (the highest-difficulty share seen — how close a miner got to a block).
+    /// The stratum session invokes this for EVERY accepted pseudoshare (the
+    /// vardiff-gate acceptance path), passing the already-computed X11/scrypt
+    /// share difficulty plus the raw submit fields so an implementor that wants
+    /// the exact pow-hash can recompute it. Default no-op — only work sources
+    /// whose dashboard is a separate object (c2pool-dash: the DASHWorkSource
+    /// drives its own stratum acceptor, distinct from the WebServer's
+    /// MiningInterface) override this to forward to the dashboard's best-share
+    /// tracker. Display only — never affects acceptance, target, or payout.
+    virtual void record_best_pseudoshare(
+        double /*share_difficulty*/, const std::string& /*miner*/,
+        const std::string& /*coinb1*/, const std::string& /*coinb2*/,
+        const std::string& /*extranonce1*/, const std::string& /*extranonce2*/,
+        const std::string& /*ntime*/, const std::string& /*nonce*/,
+        uint32_t /*version*/, const std::string& /*prevhash_hex*/,
+        const std::string& /*nbits_hex*/,
+        const std::vector<std::string>& /*merkle_branches*/) {}
 };
 
 }  // namespace core::stratum
