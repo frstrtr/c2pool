@@ -67,6 +67,36 @@ struct StratumConfig {
     // fetches, and the legacy stub-coinbase fallback is unreachable.
     // Default false: LTC/BTC/DGB behavior is byte-unchanged.
     bool require_job_snapshot{false};
+
+    // ── Live-session hygiene (mining-hotel ZOMBIE-SESSION LEAK fix) ──────────
+    // A NAT-dropped miner's TCP connection is frequently never FIN/RST'd, so
+    // StratumSession::is_connected() (socket_.is_open()) stays true FOREVER and
+    // the session is never reaped -- every failed rig retry then mints an
+    // immortal subscribed session that keeps drawing full per-notify job builds
+    // (observed: 66 sockets for ~23 rigs). At the default cap these zombies also
+    // lock real rigs out (admission control). These knobs bound that leak. ALL
+    // default OFF/neutral so LTC/BTC/DGB behaviour is BYTE-UNCHANGED; DASH opts
+    // in (impl/dash/stratum/work_source.cpp ctor). Transport/liveness only --
+    // zero wire-byte change and consensus-neutral.
+    //
+    // (a) OS TCP keepalive: the kernel probes an idle peer and errors the
+    //     pending async_read on a dead NAT path, which runs the normal
+    //     disconnect+prune. THE root fix for the immortal-session class.
+    bool     tcp_keepalive_enabled      = false;
+    uint32_t tcp_keepalive_idle_sec     = 60;   // begin probing after 60 s idle
+    uint32_t tcp_keepalive_interval_sec = 10;   // 10 s between probes
+    uint32_t tcp_keepalive_count        = 3;    // drop after 3 failed probes
+    // (b) Handshake deadline: drop a session that has not completed
+    //     mining.authorize within N s (a live rig authorizes in << 1 s). 0=off.
+    uint32_t handshake_timeout_sec      = 0;
+    // (c) Application idle reaper (belt-and-suspenders for keepalive): reap a
+    //     session that has sent NO inbound line for N s. A live miner submits
+    //     shares far inside this window; a half-open zombie sends nothing. 0=off.
+    uint32_t session_idle_timeout_sec   = 0;
+    // (d) Write-queue backlog cap: drop a session whose un-acked write backlog
+    //     exceeds this many frames (a dead peer whose kernel send buffer filled
+    //     accumulates unbounded). 0=unlimited (legacy).
+    size_t   max_write_queue_depth      = 0;
 };
 
 /// Frozen share-construction fields returned by ref_hash_fn. These

@@ -142,6 +142,25 @@ DASHWorkSource::DASHWorkSource(const coin::NodeCoinState& coin_state,
     // Derived directly from a smoothed hashrate, so it cannot oscillate. DASH-only;
     // other coins keep the legacy ratio path (use_hashrate_vardiff=false).
     config_.use_hashrate_vardiff = true;
+    // ── Zombie-session leak fix (mining-hotel): OPT DASH IN to the live-session
+    // hygiene knobs (default-off in StratumConfig so other coins are unchanged).
+    // A NAT-dropped rig's TCP session is never FIN/RST'd, so socket_.is_open()
+    // stays true forever and the session is never reaped -- every failed retry
+    // minted an immortal subscribed session drawing full per-notify job builds
+    // (66 sockets for ~23 rigs). Transport/liveness only; consensus-neutral.
+    config_.tcp_keepalive_enabled    = true;   // kernel probes dead NAT paths (root fix)
+    config_.tcp_keepalive_idle_sec   = 60;
+    config_.tcp_keepalive_interval_sec = 10;
+    config_.tcp_keepalive_count      = 3;       // ~90 s to detect a dead peer
+    config_.handshake_timeout_sec    = 30;      // drop never-authorize probes
+    // Idle reaper is a BACKSTOP to TCP keepalive (the real liveness authority),
+    // not the primary zombie killer. 1800 s + the keepalive-aware skip in
+    // start_idle_reaper() means an authorized rig on a high fixed-diff suffix
+    // (e.g. ADDR+4096 at modest X11 hashrate -> multi-minute share intervals) is
+    // NEVER reaped for idleness while its socket is keepalive-validated; only
+    // genuinely dead / never-authorized sessions are reclaimed.
+    config_.session_idle_timeout_sec = 1800;
+    config_.max_write_queue_depth    = 256;     // drop a stuck-write dead peer
     LOG_INFO << "[DASH-STRATUM] DASHWorkSource constructed"
              << " (min_diff=" << config_.min_difficulty
              << " max_diff=" << config_.max_difficulty
@@ -266,24 +285,14 @@ std::shared_ptr<const coin::DashWorkData> DASHWorkSource::peek_template() const
 // IWorkSource: work generation -- Stage 4c (the template trio).
 // ─────────────────────────────────────────────────────────────────────────────
 
-std::shared_ptr<const coin::DashWorkData> DASHWorkSource::cached_work() const
+void DASHWorkSource::resource_template_now() const
 {
-    const uint64_t gen = work_generation_.load(std::memory_order_relaxed);
-    const auto now = std::chrono::steady_clock::now();
-    {
-        std::lock_guard<std::mutex> lk(template_mutex_);
-        if (template_cache_ && template_cache_gen_ == gen
-            && now - template_cache_at_ < kStaleAfter)
-            return template_cache_;
-        // Negative cache: a recent failed sourcing attempt -> don't re-poll yet.
-        if (!template_cache_ && template_last_fail_at_.time_since_epoch().count() != 0
-            && now - template_last_fail_at_ < kRetryAfter)
-            return nullptr;
-    }
-
-    // Re-source OUTSIDE the lock (the fallback arm is a blocking dashd RPC).
-    // Embedded arm when the node-held bundle is populated, retained dashd GBT
-    // fallback otherwise (the never-removed [GBT-XCHECK] safety path).
+    // The blocking select_work()/dashd-GBT re-source + cache update. Runs either
+    // inline on the caller (legacy blocking path) OR on the background rpc_pool
+    // thread (io-thread-decouple, via refresh_executor_). select_work() is done
+    // OUTSIDE the lock (the fallback arm is a blocking dashd RPC); the cache is
+    // then updated under template_mutex_. Byte-for-byte the SAME template the
+    // old inline path produced -- transport/threading change only.
     coin::DashWorkData work;
     if (coin_state_.populated() || dashd_fallback_) {
         try {
@@ -308,6 +317,7 @@ std::shared_ptr<const coin::DashWorkData> DASHWorkSource::cached_work() const
         }
     }
 
+    const auto now = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lk(template_mutex_);
     if (work.m_bits == 0 || work.m_previous_block.IsNull()) {
         // Set-gap (unarmed fallback / empty GBT) OR a zero-prev template (the
@@ -316,7 +326,7 @@ std::shared_ptr<const coin::DashWorkData> DASHWorkSource::cached_work() const
         // serving a stale tip is worse than waiting.
         template_cache_.reset();
         template_last_fail_at_ = now;
-        return nullptr;
+        return;
     }
     // Tip moved since the last snapshot? Bump work_generation_ so sessions
     // detect stale work between their timer firings and re-push.
@@ -326,6 +336,58 @@ std::shared_ptr<const coin::DashWorkData> DASHWorkSource::cached_work() const
     template_cache_gen_ = work_generation_.load(std::memory_order_relaxed);
     template_cache_at_  = now;
     template_last_fail_at_ = {};
+}
+
+std::shared_ptr<const coin::DashWorkData> DASHWorkSource::cached_work() const
+{
+    const uint64_t gen = work_generation_.load(std::memory_order_relaxed);
+    const auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lk(template_mutex_);
+        // FRESH cache (same generation, inside the TTL) -> serve it. The
+        // generation key is load-bearing: bump_work_generation() is the "the tip
+        // may have rotated, re-source" signal (double-fetch-race fix), so it must
+        // still trigger a refresh -- but io-thread-decouple moves WHERE that
+        // refresh runs off the stratum io thread (below).
+        if (template_cache_ && template_cache_gen_ == gen
+            && now - template_cache_at_ < kStaleAfter)
+            return template_cache_;
+
+        if (refresh_executor_) {
+            // NON-BLOCKING scale path (the fix for 60+ sessions freezing on each
+            // re-source): the io thread NEVER runs the blocking select_work()/
+            // dashd-GBT. Hand it to the background rpc_pool as a SINGLE-FLIGHT
+            // job and serve the CURRENT cache (possibly stale, or null on a
+            // set-gap) immediately. A minted share bumps the generation ~every
+            // 15-30 s; before, that blocked the io thread on a full GBT -- now it
+            // costs one background fetch, coalesced. A stale serve is bounded by
+            // the bg refresh latency AND the 3 s tip-poll invalidation (which
+            // RESETS the cache on a real tip change, so a rotated tip is served
+            // as a set-gap until the fresh template lands, never as stale work).
+            const bool recently_failed =
+                !template_cache_
+                && template_last_fail_at_.time_since_epoch().count() != 0
+                && now - template_last_fail_at_ < kRetryAfter;
+            if (!recently_failed && !template_refresh_inflight_.exchange(true)) {
+                refresh_executor_([this]() {
+                    resource_template_now();
+                    template_refresh_inflight_.store(false);
+                });
+            }
+            return template_cache_;   // stale-or-null; null == honest set-gap
+        }
+
+        // Legacy inline-blocking path (executor not wired: embedded/tests) --
+        // BYTE-IDENTICAL to the pre-decouple behaviour. Negative cache: a recent
+        // failed sourcing attempt -> don't re-poll yet.
+        if (!template_cache_ && template_last_fail_at_.time_since_epoch().count() != 0
+            && now - template_last_fail_at_ < kRetryAfter)
+            return nullptr;
+    }
+
+    // Legacy path only: re-source inline (blocks the caller) then serve.
+    resource_template_now();
+    std::lock_guard<std::mutex> lk(template_mutex_);
     return template_cache_;
 }
 
