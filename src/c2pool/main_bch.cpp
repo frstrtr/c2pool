@@ -39,6 +39,7 @@
 #include <btclibs/util/strencodings.h>   // ParseHexBytes (sharechain prefix)
 
 #include <core/core_util.hpp>
+#include <core/filesystem.hpp>   // core::filesystem::set_data_dir (--data-dir, #722)
 
 #include <cstdlib>
 #include <fstream>
@@ -75,7 +76,9 @@ void print_banner(const char* argv0)
         << "       " << argv0 << " --with-peer-verify [--testnet] [--peer HOST:PORT] [--max-seconds N]\n"
         << "       " << argv0 << " --leg-c-capture [--rpc-conf PATH]\n"
         << "       " << argv0 << " --leg-c-capture-p2p [--rpc-conf PATH] [--p2p-port N]\n"
-        << "       " << argv0 << " --pool [--testnet|--testnet4|--regtest] [--stratum [HOST:]PORT] [--peer HOST:PORT] [--anchor N] [--rpc-conf PATH]\n\n"
+        << "       " << argv0 << " --pool [--testnet|--testnet4|--regtest] [--stratum [HOST:]PORT] [--peer HOST:PORT] [--anchor N] [--rpc-conf PATH]\n"
+        << "  --data-dir PATH  root all per-instance state here (default ~/.c2pool;\n"
+        << "                   also C2POOL_DATA_DIR env); isolates co-located instances\n\n"
         << "Status: M5 pool/sharechain + embedded-daemon assembly live.\n"
         << "        The embedded daemon (coin/embedded_daemon.hpp) is the primary\n"
         << "        work source; external BCHN-RPC stays as the fallback.\n"
@@ -711,6 +714,11 @@ int main(int argc, char** argv)
             return 0;
         }
         if (std::strcmp(argv[i], "--help") == 0)     want_help = true;
+        if (std::strcmp(argv[i], "--data-dir") == 0 && i + 1 < argc)
+            // Root all per-instance state (LevelDB sharechain, addr store,
+            // logs, ...) under PATH so co-located instances don't contend the
+            // LevelDB LOCK. Default keeps ~/.c2pool. See #722.
+            core::filesystem::set_data_dir(argv[++i]);
         if (std::strcmp(argv[i], "--ibd") == 0)      want_ibd = true;
         if (std::strcmp(argv[i], "--with-peer-verify") == 0) want_with_peer_verify = true;
         if (std::strcmp(argv[i], "--pool") == 0)     want_pool = true;

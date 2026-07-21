@@ -191,6 +191,8 @@ void print_banner(const char* argv0)
     std::cout
         << "c2pool-dash " << C2POOL_VERSION << " — DASH (X11, older-than-v35 -> V36)\n\n"
         << "Usage: " << argv0 << " [--version] [--help] [--selftest]\n"
+        << "  --data-dir PATH  root all per-instance state here (default ~/.c2pool;\n"
+        << "                   also C2POOL_DATA_DIR env); isolates co-located instances\n"
         << "       " << argv0 << " --run [--coin-rpc H:P] [--coin-rpc-auth PATH]\n"
         << "           [--testnet] [--submit-block HEX | --submit-block-file PATH]\n"
         << "           [--listen [HOST:]PORT] [--addnode HOST:PORT]... [--connect HOST:PORT]...\n"
@@ -2199,6 +2201,11 @@ int main(int argc, char** argv)
             return 0;
         }
         else if (std::strcmp(argv[i], "--help") == 0)    want_help = true;
+        else if (std::strcmp(argv[i], "--data-dir") == 0 && i + 1 < argc)
+            // Root all per-instance state (LevelDB sharechain, mn_state_db,
+            // addr store, logs, ...) under PATH so co-located instances don't
+            // contend the LevelDB LOCK. Default keeps ~/.c2pool. See #722.
+            core::filesystem::set_data_dir(argv[++i]);
         else if (std::strcmp(argv[i], "--run") == 0)     want_run  = true;
         else if (std::strcmp(argv[i], "--mine-block") == 0) want_mine = true;
         else if (std::strcmp(argv[i], "--payout-pubkey-hash") == 0 && i + 1 < argc)

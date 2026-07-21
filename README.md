@@ -247,6 +247,13 @@ Running `c2pool` with no arguments is equivalent to:
 | Stratum port | 9327 | `-w PORT` |
 | P2P port | 9326 | `--p2pool-port PORT` |
 | Web port | 8080 | `--web-port PORT` |
+| Data directory | `~/.c2pool` (`%APPDATA%\c2pool` on Windows) | `--data-dir PATH` (or `C2POOL_DATA_DIR` env) |
+
+> **Running two instances on one host?** Give each its own `--data-dir`.
+> All per-instance on-disk state — the sharechain LevelDB, address store,
+> whitelist, logs, ratchet, and found-blocks db — is rooted there, so
+> co-located instances never contend the same LevelDB `LOCK`. Leaving it
+> unset keeps the historical `~/.c2pool` path, byte-for-byte unchanged.
 
 ### Testnet overrides
 

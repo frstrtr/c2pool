@@ -78,6 +78,9 @@ static void print_usage()
         "  --testnet4      BTC testnet4 chain (genesis 00000000da84f2ba...)\n"
         "  --regtest       BTC regtest chain (genesis 0f9188f13cb7b2c7...)\n"
         "                  default: mainnet\n"
+        "  --data-dir PATH root all per-instance state here (default ~/.c2pool;\n"
+        "                  also C2POOL_DATA_DIR env). Isolates co-located\n"
+        "                  instances so they don't contend the LevelDB LOCK.\n"
         "  --bitcoind H:P  bitcoind P2P endpoint host:port\n"
         "                  e.g. 127.0.0.1:8333  (mainnet)\n"
         "                       127.0.0.1:18333 (testnet3)\n"
@@ -138,6 +141,12 @@ int main(int argc, char* argv[])
         {
             print_usage();
             return 0;
+        }
+        else if (arg == "--data-dir" && i + 1 < argc)
+        {
+            // Isolate per-instance on-disk state (LevelDB sharechain, addr
+            // store, logs, ...) under PATH. Default keeps ~/.c2pool. See #722.
+            core::filesystem::set_data_dir(argv[++i]);
         }
         else if (arg == "--testnet")
         {

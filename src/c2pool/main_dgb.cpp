@@ -103,7 +103,9 @@ void print_banner(const char* argv0, const core::CoinParams& p)
         << "       [--coin-daemon H:P] [--coin-magic HEX] [--regtest]\n"
         << "       [--regtest-force-won-share] [--no-p2p-relay]\n"
         << "       [--redistribute SPEC] [--sharechain-port P]\n"
-        << "       [--dev-relax-algo-softforks]\n\n"
+        << "       [--data-dir PATH] [--dev-relax-algo-softforks]\n\n"
+        << "  --data-dir PATH  root all per-instance state here (default ~/.c2pool;\n"
+        << "                   also C2POOL_DATA_DIR env); isolates co-located instances\n"
         << "Status: pool/sharechain pillars live (Phase B); run-loop up\n"
         << "        (--run: io_context + sharechain peer + Stratum standup).\n"
         << "        --stratum [HOST:]PORT binds a miner-facing TCP listener\n"
@@ -1196,6 +1198,11 @@ int main(int argc, char** argv)
             return 0;
         }
         if (std::strcmp(argv[i], "--help") == 0)     want_help = true;
+        if (std::strcmp(argv[i], "--data-dir") == 0 && i + 1 < argc)
+            // Root all per-instance state (LevelDB sharechain, addr store,
+            // logs, ...) under PATH so co-located instances don't contend the
+            // LevelDB LOCK. Default keeps ~/.c2pool. See #722.
+            core::filesystem::set_data_dir(argv[++i]);
         if (std::strcmp(argv[i], "--selftest") == 0) want_selftest = true;
         if (std::strcmp(argv[i], "--run") == 0)      want_run = true;
         if (std::strcmp(argv[i], "--stratum") == 0 && i + 1 < argc) {

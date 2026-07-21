@@ -368,6 +368,8 @@ void print_help() {
     std::cout << "COMMAND LINE OPTIONS:\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
     std::cout << "  --help, -h                Show this help message and exit\n";
+    std::cout << "  --data-dir PATH           Root all per-instance state here (default: ~/.c2pool)\n";
+    std::cout << "                            (also settable via C2POOL_DATA_DIR env; isolates co-located instances)\n";
     std::cout << "  --testnet                 Use testnet instead of mainnet\n";
     std::cout << "  --integrated              Full P2P pool with sharechain (DEFAULT)\n";
     std::cout << "  --solo                    Solo pool mode (no P2P sharechain, local payouts)\n";
@@ -782,6 +784,13 @@ int main(int argc, char* argv[]) {
         if (arg == "--help" || arg == "-h") {
             print_help();
             return 0;
+        }
+        else if (arg == "--data-dir" && i + 1 < argc) {
+            // Root ALL per-instance on-disk state (sharechain LevelDB, addr
+            // store, whitelist, logs, ratchet, found-blocks db, ...) under
+            // this path so co-located instances never contend the LevelDB
+            // LOCK. Default (unset) keeps ~/.c2pool — see issue #722.
+            core::filesystem::set_data_dir(argv[++i]);
         }
         else if (arg == "--testnet") {
             settings->m_testnet = true;
