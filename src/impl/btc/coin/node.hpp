@@ -102,10 +102,12 @@ public:
     }
 
     /// Arm the submitblock RPC BACKUP leg (ARM B of the dual-path broadcaster)
-    /// WITHOUT the getwork side effect init_rpc() carries. connect() only
-    /// prepares the HTTP client + auth used by submit_block_hex; no getwork is
-    /// issued, so an external bitcoind that we drive purely for submitblock (or
-    /// one whose getwork we never call) arms cleanly. OPT-IN: main_btc calls
+    /// WITHOUT the getwork side effect init_rpc() carries. connect() runs the
+    /// read-only liveness/softfork probe check() (getblockheader + getblockchaininfo
+    /// + getnetworkinfo, results discarded by c2pool's own template path) but
+    /// never getwork, so an external bitcoind we drive purely for submitblock
+    /// arms cleanly and the embedded/daemonless template path is unperturbed.
+    /// OPT-IN: main_btc calls
     /// this only when bitcoin.conf creds resolve (rpcpassword stays off the
     /// process table); otherwise m_rpc stays null, has_rpc()==false, and
     /// submit_block_hex returns false LOUDLY -- byte-identical to the daemonless

@@ -115,3 +115,42 @@ TEST(BtcRpcConf, EndpointOverride)
     EXPECT_EQ(c.host, "10.1.2.3");
     EXPECT_EQ(c.port, 18332);
 }
+
+// ── #744/#787 B2: a malformed conf must degrade to UNARMED, never abort ──
+// The default ~/.bitcoin/bitcoin.conf is read with NO flags, so a junk rpcport
+// must not throw std::invalid_argument/out_of_range out of the parser and abort
+// the node at startup for an operator who never opted in.
+
+// 6) rpcport=abc (non-numeric): no throw; port stays 0 => UNARMED.
+TEST(BtcRpcConf, MalformedPortNoThrowUnarmed) {
+    const std::string path = write_temp_conf("badport",
+        "rpcuser=alice\n"
+        "rpcpassword=s3cr3t\n"
+        "rpcport=abc\n");
+    btc::coin::RpcConf c;
+    EXPECT_NO_THROW({ btc::coin::load_rpc_conf(path, c); });
+    EXPECT_EQ(c.port, 0);          // junk ignored, default left for caller
+    EXPECT_FALSE(c.armed());       // no port => not armed
+    EXPECT_EQ(c.user, "alice");    // creds still parsed
+    std::remove(path.c_str());
+}
+
+// 7) rpcport out of uint16 range: no throw; port stays 0.
+TEST(BtcRpcConf, OutOfRangePortNoThrow) {
+    const std::string path = write_temp_conf("bigport",
+        "rpcuser=u\nrpcpassword=p\nrpcport=99999\n");
+    btc::coin::RpcConf c;
+    EXPECT_NO_THROW({ btc::coin::load_rpc_conf(path, c); });
+    EXPECT_EQ(c.port, 0);          // 99999 > 65535 rejected (no silent truncation)
+    EXPECT_FALSE(c.armed());
+    std::remove(path.c_str());
+}
+
+// 8) --coin-rpc host:notaport endpoint override: no throw; host applied, port kept.
+TEST(BtcRpcConf, MalformedEndpointOverrideNoThrow) {
+    btc::coin::RpcConf c;
+    c.user = "u"; c.pass = "p"; c.port = 8332;
+    EXPECT_NO_THROW({ btc::coin::apply_endpoint_override("10.0.0.9:notaport", c); });
+    EXPECT_EQ(c.host, "10.0.0.9");  // host applied
+    EXPECT_EQ(c.port, 8332);        // junk port ignored, prior value stands
+}

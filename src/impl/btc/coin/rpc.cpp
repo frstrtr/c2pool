@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "rpc.hpp"
 
+#ifndef _WIN32
+#include <sys/socket.h>          // setsockopt SO_SND/RCVTIMEO (Send() deadline, #744/#787 M2)
+#include <sys/time.h>            // struct timeval
+#endif
+
 #include <impl/btc/config_pool.hpp>
 #include <impl/btc/coin/softfork_check.hpp>
+#include <impl/btc/coin/genesis.hpp>       // btc_genesis_hash — per-net check() probe (#744/#787 B1)
 
 #include <core/log.hpp>
 #include <core/hash.hpp>
@@ -65,6 +71,11 @@ void NodeRPC::connect(NetService address, std::string userpass)
                         LOG_ERROR << "CoindRPC error when try connect: [" << ec.message() << "].";
                     } else
                     {
+                        // #744/#787 M2: arm the Send() socket deadline on the
+                        // freshly-connected socket BEFORE check() issues any
+                        // blocking RPC, so a daemon that connects but never
+                        // responds cannot wedge the ioc here either.
+                        apply_socket_timeouts();
                         try
                         {
                             if (check())
@@ -128,7 +139,36 @@ void NodeRPC::sync_reconnect()
 		LOG_WARNING << "CoindRPC sync_reconnect connect failed: " << ec.message();
 		return;
 	}
+	apply_socket_timeouts();   // #744/#787 M2: re-arm the Send() deadline on the fresh socket
 	LOG_INFO << "CoindRPC reconnected (sync)";
+}
+
+void NodeRPC::apply_socket_timeouts()
+{
+	// Force the socket back to BLOCKING mode, then set kernel send/receive
+	// timeouts. async_connect leaves asio's non_blocking flag set; under it a
+	// synchronous recv returns EAGAIN immediately and SO_RCVTIMEO is a no-op. In
+	// blocking mode the sync http::write/http::read inside Send() do true
+	// blocking send()/recv() which the kernel bounds by SO_SND/RCVTIMEO, so a
+	// wedged bitcoind returns an error after RPC_IO_TIMEOUT_SECONDS instead of
+	// hanging the whole ioc. (beast tcp_stream::expires_after governs only ASYNC
+	// ops; Send() drives the sync path, so the socket-option deadline is the
+	// correct lever -- same reasoning as the DASH #781 impl.) POSIX-only; on
+	// Windows this is a no-op (pre-PR behaviour: no deadline). #744/#787 M2.
+#ifndef _WIN32
+	if (!m_stream.socket().is_open())
+		return;
+	boost::system::error_code ec;
+	m_stream.socket().non_blocking(false, ec);   // guarantee SO_*TIMEO applies
+	if (ec)
+		LOG_WARNING << "CoindRPC: could not set blocking mode: " << ec.message();
+	struct timeval tv;
+	tv.tv_sec  = RPC_IO_TIMEOUT_SECONDS;
+	tv.tv_usec = 0;
+	const int fd = m_stream.socket().native_handle();
+	::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
 }
 
 std::string NodeRPC::Send(const std::string &request)
@@ -195,7 +235,9 @@ nlohmann::json NodeRPC::CallAPIMethod(const std::string& method, const jsonrpccx
 
 bool NodeRPC::check()
 {
-	bool has_block = check_blockheader(uint256S("12a765e31ffd4059bada1e25190f6e98c99d9714d334efa41a195a7e7e04bfe2"));
+	// #744/#787 B1: probe the per-net BTC genesis (was the LITECOIN genesis,
+	// copied from the LTC impl -- broke the mainnet handshake gate below).
+	bool has_block = check_blockheader(uint256S(btc_genesis_hash(IS_TESTNET)));
 	bool is_main_chain = getblockchaininfo()["chain"].get<std::string>() == "main";
 	nlohmann::json blockchaininfo;
 
