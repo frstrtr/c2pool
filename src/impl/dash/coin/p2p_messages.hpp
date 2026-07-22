@@ -9,6 +9,7 @@
 #include "block.hpp"
 #include "vendor/blockencodings.hpp"
 #include "vendor/smldiff.hpp"
+#include "vendor/llmq_commitment.hpp"
 
 #include <impl/bitcoin_family/coin/base_p2p_messages.hpp>
 
@@ -150,6 +151,25 @@ END_MESSAGE()
 // the protocol is exclusively for light clients, which c2pool-dash now
 // is on the SML axis.
 
+// ── E1 Phase-L sourcing leg: mineable quorum commitments ──────────────
+// dashcore relays every VERIFIED DKG final commitment to all peers as
+// inv MSG_QUORUM_FINAL_COMMITMENT (21) + "qfcommit" (llmq/blockprocessor
+// .cpp ProcessMessage / AddMineableCommitment) — the exact stream its
+// OWN miner sources block-N's mandatory type-6 txs from. The payload is
+// a bare CFinalCommitment (already vendored). We pull the inv and feed
+// the MineableCommitmentCache (dkg_commitments.hpp); template INCLUSION
+// stays behind the Phase-L BLS verifier — until then the daemonless arm
+// mines the consensus-valid null commitment.
+BEGIN_MESSAGE(qfcommit)
+    MESSAGE_FIELDS
+    (
+        (vendor::CFinalCommitment, m_commitment)
+    )
+    {
+        READWRITE(obj.m_commitment);
+    }
+END_MESSAGE()
+
 BEGIN_MESSAGE(getmnlistd)
     MESSAGE_FIELDS
     (
@@ -199,6 +219,7 @@ using Handler = MessageHandler<
     message_getblocktxn,
     message_blocktxn,
     message_clsig,
+    message_qfcommit,
     message_getmnlistd,
     message_mnlistdiff
 >;

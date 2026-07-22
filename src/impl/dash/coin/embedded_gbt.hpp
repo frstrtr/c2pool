@@ -35,8 +35,11 @@
 #include <impl/dash/coin/rpc_data.hpp>
 #include <impl/dash/coin/quorum_root.hpp>
 #include <impl/dash/coin/quorum_manager.hpp>
+#include <impl/dash/coin/dkg_commitments.hpp>   // E1: build_qc_tx (mandatory type-6 txs)
 #include <impl/dash/coin/vendor/cbtx.hpp>
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>
+
+#include <btclibs/util/strencodings.h>          // HexStr (m_tx_data_hex fill)
 
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
@@ -89,7 +92,8 @@ inline bool underfill_guard_trips(uint64_t selected_bytes,
 // CCbTx extra_payload into the embedded template via these.
 inline vendor::CCbTx build_embedded_cbtx(
     uint32_t, const vendor::CSimplifiedMNList&, const QuorumManager&,
-    int32_t, const std::array<uint8_t, 96>&, int64_t);
+    int32_t, const std::array<uint8_t, 96>&, int64_t,
+    const uint256* quorum_root_override);
 inline std::vector<unsigned char> encode_cbtx(const vendor::CCbTx&);
 // Zero CLSIG default for the E2d best_cl_sig seam (no temporary-bound ref).
 inline const std::array<uint8_t, 96> k_zero_cl_sig{};
@@ -127,7 +131,14 @@ inline DashWorkData build_embedded_workdata(
     const QuorumManager* qmgr = nullptr,
     int32_t best_cl_height = 0,
     const std::array<uint8_t, 96>& best_cl_sig = k_zero_cl_sig,
-    int64_t last_observed_credit_pool = 0)
+    int64_t last_observed_credit_pool = 0,
+    // E1 seams: the mandatory type-6 quorum-commitment set for THIS height
+    // (dkg_commitments.hpp daemonless plan) and the with-block
+    // merkleRootQuorums the CbTx must commit. Default nullptr => every
+    // existing caller is byte-for-byte unchanged (SAFE-ADDITIVE): no qc txs,
+    // plain compute_merkle_root_quorums root.
+    const std::vector<vendor::CFinalCommitment>* qc_commitments = nullptr,
+    const uint256* quorum_root_override = nullptr)
 {
     DashWorkData w;
     w.m_height          = prev_height + 1;
@@ -160,15 +171,43 @@ inline DashWorkData build_embedded_workdata(
 
     // Selected txs — populate the wire-form fields the existing
     // coinbase_builder.hpp expects.
-    w.m_txs.reserve(selected.size());
-    w.m_tx_hashes.reserve(selected.size());
-    w.m_tx_fees.reserve(selected.size());
+    w.m_txs.reserve(selected.size()
+                    + (qc_commitments ? qc_commitments->size() : 0));
+    w.m_tx_hashes.reserve(w.m_txs.capacity());
+    w.m_tx_fees.reserve(w.m_txs.capacity());
+    w.m_tx_data_hex.reserve(w.m_txs.capacity());
+    // Wire-form hex of one tx (the submit-time block body source). The
+    // embedded arm previously left m_tx_data_hex EMPTY (only the dashd-GBT
+    // parser filled it), so a won embedded block's body could omit txs whose
+    // ids were already folded into the job merkle — fill it here for every
+    // template tx (E1; additive, the dashd fallback path is untouched).
+    auto tx_hex = [](const MutableTransaction& mtx) {
+        auto stream = ::pack(mtx);
+        auto sp = stream.get_span();
+        return HexStr(std::span<const unsigned char>(
+            reinterpret_cast<const unsigned char*>(sp.data()), sp.size()));
+    };
+    // E1: mandatory type-6 quorum-commitment txs FIRST — dashd's miner
+    // places them immediately after the coinbase, before mempool txs
+    // (node/miner.cpp CreateNewBlock), and the daemonless template mirrors
+    // that for byte parity. Zero fee, zero in/out; consensus-checked via
+    // the NodeCoinState emit gate against the same deterministic plan.
+    if (qc_commitments != nullptr) {
+        for (const auto& c : *qc_commitments) {
+            MutableTransaction qtx = build_qc_tx(w.m_height, c);
+            w.m_txs.emplace_back(qtx);
+            w.m_tx_hashes.push_back(dash::coin::dash_txid(qtx));
+            w.m_tx_fees.push_back(0);
+            w.m_tx_data_hex.push_back(tx_hex(qtx));
+        }
+    }
     uint64_t selected_bytes = 0;  // wire bytes packed into this template (underfill guard)
     for (auto& s : selected) {
         selected_bytes += s.base_size;
         w.m_txs.emplace_back(s.tx);
         w.m_tx_hashes.push_back(dash::coin::dash_txid(s.tx));
         w.m_tx_fees.push_back(s.fee);
+        w.m_tx_data_hex.push_back(tx_hex(s.tx));
     }
 
     // ── Underfill guard ─────────────────────────────────────────────
@@ -266,7 +305,7 @@ inline DashWorkData build_embedded_workdata(
             last_observed_credit_pool + platform_reward;
         vendor::CCbTx cb = build_embedded_cbtx(
             prev_height, *sml, *qmgr, best_cl_height, best_cl_sig,
-            accrued_credit_pool);
+            accrued_credit_pool, quorum_root_override);
         w.m_coinbase_payload = encode_cbtx(cb);
     } else {
         w.m_coinbase_payload.clear();
@@ -372,7 +411,12 @@ inline vendor::CCbTx build_embedded_cbtx(
     const QuorumManager& qmgr,
     int32_t  best_cl_height,
     const std::array<uint8_t, 96>& best_cl_sig,
-    int64_t  last_observed_credit_pool)
+    int64_t  last_observed_credit_pool,
+    // E1: the with-block merkleRootQuorums (fold of the template's own
+    // type-6 commitments over the active set). nullptr (default) => the
+    // plain PROVEN active-set root — byte-identical for every pre-E1 caller
+    // AND for all-null commitment sets.
+    const uint256* quorum_root_override = nullptr)
 {
     vendor::CCbTx c;
     c.nVersion           = vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
@@ -383,7 +427,9 @@ inline vendor::CCbTx build_embedded_cbtx(
     // budget for log-only validation.
     auto sml_mut = sml;
     c.merkleRootMNList   = sml_mut.CalcMerkleRoot();
-    c.merkleRootQuorums  = compute_merkle_root_quorums(qmgr);
+    c.merkleRootQuorums  = quorum_root_override
+        ? *quorum_root_override
+        : compute_merkle_root_quorums(qmgr);
 
     // bestCL fields: only set when we have an actual best.
     // dashcore's formula is heightDiff = (cb_height - 1) - bestCLHeight.

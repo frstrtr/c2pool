@@ -554,6 +554,18 @@ private:
         // NO getdata pulls yet — the ingest legs are later slices.
         for (auto& inv : msg->m_invs)
         {
+            // E1 Phase-L sourcing leg: pull relayed DKG final commitments
+            // (MSG_QUORUM_FINAL_COMMITMENT = 21, dashcore protocol.h). The
+            // qfcommit handler below feeds the MineableCommitmentCache.
+            if (static_cast<uint32_t>(inv.m_type) == 21u)
+            {
+                auto getdata_msg = message_getdata::make_raw(
+                    {inventory_type(
+                        static_cast<inventory_type::inv_type>(21u),
+                        inv.m_hash)});
+                m_peer->write(getdata_msg);
+                continue;
+            }
             if (inv.base_type() == inventory_type::block)
             {
                 LOG_INFO << "[" << m_chain_label << "] block inv "
@@ -640,6 +652,20 @@ private:
             std::copy(msg->m_sig.begin(), msg->m_sig.end(), ev.sig.begin());
             m_coin->new_chainlock_sig.happened(ev);
         }
+    }
+
+    ADD_P2P_HANDLER(qfcommit)
+    {
+        // E1 Phase-L sourcing leg: a peer-relayed DKG final commitment — the
+        // same stream dashd's own miner mines type-6 txs from. Fire the event
+        // seam; main_dash feeds the MineableCommitmentCache (structural
+        // admission there; BLS verification is the Phase-L gate before any
+        // template inclusion). No subscriber => no-op, zero behavior change.
+        LOG_INFO << "[" << m_chain_label << "] qfcommit: type="
+                 << static_cast<int>(msg->m_commitment.llmqType)
+                 << " quorum=" << msg->m_commitment.quorumHash.GetHex().substr(0, 16)
+                 << "... signers=" << msg->m_commitment.CountSigners();
+        m_coin->new_qfcommit.happened(msg->m_commitment);
     }
 
     ADD_P2P_HANDLER(mnlistdiff)

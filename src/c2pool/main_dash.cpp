@@ -59,6 +59,7 @@
 #include <impl/dash/coin/zmq_tip_notify.hpp> // dash::coin::TipHashDedup / ZmqHashblockSubscriber — dashd ZMQ hashblock INSTANT tip-notify (opt-in, hardening on the #770 poll)
 #include <impl/dash/coin/node_coin_state.hpp>  // dash::coin::NodeCoinState (embedded work bundle)
 #include <impl/dash/coin/dkg_window.hpp>       // dash::coin::is_dkg_commitment_window (BLOCKER-1 guard)
+#include <impl/dash/coin/dkg_commitments.hpp>  // E1: build_daemonless_qc_plan (serve DKG windows daemonlessly)
 #include <impl/dash/coin/utxo_lane.hpp>    // dash::coin::UtxoLane — embedded UTXO/fee lane (E2b, #738)
 #include <impl/dash/coin/header_chain.hpp>       // dash::coin::HeaderChain — SPV header/tip authority (E2a)
 #include <impl/dash/coin/coin_state_maintainer.hpp>  // dash::coin::CoinStateMaintainer — populate ordering gate (E2a)
@@ -1521,10 +1522,74 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // must include them (which the mnlistdiff-fed set omits) — the embedded
         // arm would produce a bad-qc-missing / wrong-root block. Fail closed to
         // the reward-safe dashd fallback at those heights (it builds the qc block).
+        // With the E1 qc plan below installed this fn is the DORMANT fallback
+        // posture (the plan supersedes it); it stays authoritative whenever the
+        // plan is not installed.
         node_coin_state.set_commitment_window_fn(
             [](uint32_t next_height) {
                 return dash::coin::is_dkg_commitment_window(next_height);
             });
+
+        // E1 — daemonless DKG-window serving (dkg_commitments.hpp). Where the
+        // embedded arm is enabled (testnet, or mainnet behind the explicit
+        // --embedded-mainnet gate-lift; default OFF), DKG mining-window heights
+        // are SERVED instead of refused: the mandatory type-6 commitment set is
+        // derived from local state only — params-table math + quorum base
+        // hashes off the embedded header chain + the mnlistdiff-fed
+        // QuorumManager as dashd's HasMinedCommitment — and filled with the
+        // consensus-valid NULL commitments dashd's own miner mines when it
+        // holds no verified DKG result (real relayed commitments are Phase L,
+        // behind a BLS verifier). merkleRootQuorums stays the PROVEN
+        // active-set root (null commitments never fold in). Any height where
+        // the set cannot be derived (header gap, below the per-network V19
+        // serve floor — which also covers --regtest chains riding the testnet
+        // flag) yields nullopt and the arm fails closed to the dashd fallback,
+        // exactly the old refusal. The emit gate re-derives this same plan and
+        // hard-rejects any template whose type-6 set drifts from it.
+        if (testnet || embedded_mainnet) {
+            const auto qc_net = testnet ? dash::coin::LlmqNetwork::Testnet
+                                        : dash::coin::LlmqNetwork::Mainnet;
+            // Phase-L sourcing leg: collect REAL relayed DKG commitments off
+            // the coin-P2P qfcommit stream (structural admission only). The
+            // cache serves NOTHING into templates until a BLS12-381 verifier
+            // is installed (MineableCommitmentCache::set_bls_verify_fn — the
+            // exact Phase-L follow-up); until then every required slot mines
+            // the consensus-valid null commitment, same as dashd without a
+            // DKG result. [QC-MINEABLE] is the field-checkable signal that
+            // the sourcing leg is live.
+            auto qc_cache =
+                std::make_shared<dash::coin::MineableCommitmentCache>();
+            coin_feed_subs.push_back(
+                coin_state.new_qfcommit.subscribe(
+                    [qc_cache, qc_net]
+                    (const dash::coin::vendor::CFinalCommitment& c) {
+                        if (qc_cache->ingest(qc_net, c)) {
+                            LOG_INFO << "[QC-MINEABLE] cached commitment type="
+                                     << static_cast<int>(c.llmqType)
+                                     << " quorum="
+                                     << c.quorumHash.GetHex().substr(0, 16)
+                                     << "... signers=" << c.CountSigners()
+                                     << " cache=" << qc_cache->size()
+                                     << " (inclusion pending Phase-L BLS)";
+                        }
+                    }));
+            node_coin_state.set_qc_plan_fn(
+                [&node_coin_state, hc = header_chain.get(), qc_net, qc_cache]
+                (uint32_t next_h) -> std::optional<dash::coin::QcBlockPlan> {
+                    return dash::coin::build_daemonless_qc_plan(
+                        qc_net, next_h, node_coin_state.qmgr(),
+                        [hc](uint32_t h) -> std::optional<uint256> {
+                            if (auto e = hc->get_header_by_height(h))
+                                return e->hash;
+                            return std::nullopt;
+                        },
+                        [hc](const uint256& qh) -> std::optional<uint32_t> {
+                            if (auto e = hc->get_header(qh)) return e->height;
+                            return std::nullopt;
+                        },
+                        qc_cache.get());
+                });
+        }
 
         // review PR #780 BLOCKER-2 (HIGH): refuse the embedded arm on a stale or
         // absent bestCL (dashcore CheckCbTxBestChainlock rejects null/older CL).

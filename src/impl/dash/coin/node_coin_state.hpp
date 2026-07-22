@@ -25,6 +25,7 @@
 #include <impl/dash/coin/rpc_data.hpp>           // DashWorkData
 #include <impl/dash/coin/quorum_manager.hpp>     // QuorumManager (merkleRootQuorums source)
 #include <impl/dash/coin/quorum_root.hpp>        // compute_merkle_root_quorums (pre-emit recompute)
+#include <impl/dash/coin/dkg_commitments.hpp>    // QcBlockPlan (E1 daemonless DKG-window serving)
 #include <impl/dash/coin/vendor/simplifiedmns.hpp> // vendor::CSimplifiedMNList (merkleRootMNList source)
 #include <impl/dash/coin/vendor/cbtx.hpp>        // vendor::parse_cbtx (pre-emit CbTx self-check)
 #include <impl/dash/coin/subsidy.hpp>            // compute_dash_platform_reward_post_v20_mn_rr (creditPool re-check)
@@ -191,6 +192,19 @@ public:
         m_commitment_window_fn = std::move(fn);
     }
 
+    /// E1 — daemonless DKG-window serving. When set, this SUPERSEDES the
+    /// commitment-window refusal: at every height the plan fn derives the
+    /// mandatory type-6 commitment set + the with-block merkleRootQuorums
+    /// from local state only (header chain + mnlistdiff-fed QuorumManager,
+    /// see dkg_commitments.hpp). nullopt => the set cannot be derived
+    /// safely and viability fails closed to the dashd fallback — the same
+    /// reward-safe outcome as the PHASE-1 refusal, but now only when
+    /// genuinely unable instead of for the whole 9-block window. Unset
+    /// (default) preserves the refusal posture exactly.
+    void set_qc_plan_fn(std::function<std::optional<QcBlockPlan>(uint32_t)> fn) {
+        m_qc_plan_fn = std::move(fn);
+    }
+
     /// bestCL freshness guard (review PR #780 BLOCKER-2, HIGH). dashcore
     /// CheckCbTxBestChainlock rejects a block whose committed bestCLSignature is
     /// null or older than the previous block's committed ChainLock
@@ -233,7 +247,29 @@ public:
         if (!m_quorum_healthy) return false;
         const uint32_t next_h = m_prev_height + 1;
         if (m_is_superblock_fn && m_is_superblock_fn(next_h)) return false;
-        if (m_commitment_window_fn && m_commitment_window_fn(next_h)) return false;
+        // E1: with a qc plan installed the DKG-window heights are SERVED, not
+        // refused — re-derive the mandatory type-6 set here and require the
+        // BUILT template to carry exactly it (count + payload bytes, in
+        // order). Any drift (missing/extra/reordered commitment) is a
+        // bad-qc-missing / bad-qc-not-allowed block => discard for the
+        // reward-safe fallback. Without a plan fn the PHASE-1 refusal stays.
+        std::optional<QcBlockPlan> qc_plan;
+        if (m_qc_plan_fn) {
+            qc_plan = m_qc_plan_fn(next_h);
+            if (!qc_plan) return false;   // underivable — fail closed
+            // Collect the type-6 payloads actually in the template.
+            std::vector<std::vector<unsigned char>> got;
+            for (const auto& tx : w.m_txs)
+                if (tx.type == vendor::CFinalCommitmentTxPayload::SPECIALTX_TYPE)
+                    got.push_back(tx.extra_payload);
+            if (got.size() != qc_plan->commitments.size()) return false;
+            for (size_t i = 0; i < got.size(); ++i) {
+                auto expect = build_qc_tx(next_h, qc_plan->commitments[i]);
+                if (got[i] != expect.extra_payload) return false;
+            }
+        } else if (m_commitment_window_fn && m_commitment_window_fn(next_h)) {
+            return false;
+        }
         if (m_require_fresh_bestcl
             && m_best_cl_height < static_cast<int32_t>(m_prev_height) - 1)
             return false;
@@ -249,7 +285,14 @@ public:
         if (cb.nHeight != static_cast<int32_t>(next_h)) return false;
         auto sml_copy = m_sml;
         if (cb.merkleRootMNList != sml_copy.CalcMerkleRoot()) return false;
-        if (cb.merkleRootQuorums != compute_merkle_root_quorums(m_qmgr)) return false;
+        // E1: under a qc plan the committed root must be the WITH-BLOCK root
+        // (fold of the plan's commitments over the active set — equal to the
+        // plain root while the plan is all-null, diverging only once Phase L
+        // serves real commitments). Without a plan, the plain PROVEN root.
+        const uint256 expected_quorum_root = qc_plan
+            ? qc_plan->merkle_root_quorums
+            : compute_merkle_root_quorums(m_qmgr);
+        if (cb.merkleRootQuorums != expected_quorum_root) return false;
         if (m_require_fresh_bestcl && !cb.has_best_cl_signature()) return false;
         // SOAK RE-FIX (build-vs-serve skew): re-derive the expected creditPool
         // from the CURRENT seed at emit/serve time and require the BUILT CbTx to
@@ -275,12 +318,26 @@ public:
     /// semantics work_source.hpp documents.
     EmbeddedWorkInputs make_embedded_work_inputs() const {
         EmbeddedWorkInputs e;
+        // E1: with a qc plan fn installed, DKG-window heights are SERVED
+        // daemonlessly — the plan carries the mandatory type-6 set + the
+        // with-block merkleRootQuorums. A nullopt plan (header gap / below
+        // serve floor) refuses exactly like the PHASE-1 posture. Without a
+        // plan fn the BLOCKER-1 window refusal below stays authoritative.
+        std::optional<QcBlockPlan> qc_plan;
+        bool qc_ok = true;
+        if (m_qc_plan_fn && m_populated) {
+            qc_plan = m_qc_plan_fn(m_prev_height + 1);
+            qc_ok = qc_plan.has_value();
+        }
         e.has_state            = m_populated
+                                 && qc_ok
                                  && (!m_utxo_ready_fn || m_utxo_ready_fn())
                                  && (!m_is_superblock_fn
                                      || !m_is_superblock_fn(m_prev_height + 1))
-                                 // BLOCKER-1: refuse DKG commitment-window heights.
-                                 && (!m_commitment_window_fn
+                                 // BLOCKER-1: refuse DKG commitment-window
+                                 // heights — unless the E1 qc plan serves them.
+                                 && (m_qc_plan_fn
+                                     || !m_commitment_window_fn
                                      || !m_commitment_window_fn(m_prev_height + 1))
                                  // BLOCKER-2: refuse a stale/absent bestCL.
                                  && (!m_require_fresh_bestcl
@@ -321,6 +378,14 @@ public:
             e.best_cl_sig      = m_best_cl_sig;
             e.credit_pool      = m_credit_pool;
         }
+        // E1: hand the daemonless qc plan to the template builder — the
+        // mandatory type-6 txs to place after the coinbase and the
+        // with-block merkleRootQuorums the CbTx must commit.
+        if (qc_plan) {
+            e.qc_commitments       = std::move(qc_plan->commitments);
+            e.has_quorum_root_override = true;
+            e.quorum_root_override = qc_plan->merkle_root_quorums;
+        }
         return e;
     }
 
@@ -348,6 +413,7 @@ private:
     std::function<bool()> m_utxo_ready_fn;   // optional UTXO maturity gate (E2b)
     std::function<bool(uint32_t)> m_is_superblock_fn;  // refuse embedded on superblock heights
     std::function<bool(uint32_t)> m_commitment_window_fn;  // refuse embedded on DKG commitment heights
+    std::function<std::optional<QcBlockPlan>(uint32_t)> m_qc_plan_fn;  // E1: serve DKG windows daemonlessly
     bool     m_require_fresh_bestcl{false};  // refuse embedded on a stale/absent bestCL
     bool     m_require_fresh_credit_pool{false}; // refuse embedded on a lagged credit-pool seed
     uint256  m_credit_pool_current_hash;     // block hash the credit-pool seed is current at
