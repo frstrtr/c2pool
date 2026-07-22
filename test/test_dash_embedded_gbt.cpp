@@ -61,6 +61,7 @@
 #include <impl/dash/coin/coin_state_maintainer.hpp>    // E2: CoinStateMaintainer (independent advance)
 #include <impl/dash/coin/credit_pool.hpp>              // E2: CreditPool (running accrual)
 #include <impl/dash/coin/block.hpp>                    // E2: BlockType (ingested block)
+#include <impl/dash/coin/block_producer.hpp>           // E2 finding A: compute_merkle_root / block_body_binds_to_header
 
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
@@ -663,7 +664,23 @@ static BlockType e2_block_with_cbtx(int32_t cb_height, int64_t credit_pool) {
     TxIn cin; cin.prevout.hash = uint256::ZERO; cin.prevout.index = 0xffffffffu;
     coinbase.vin.push_back(cin);
     blk.m_txs.push_back(std::move(coinbase));
+    // Bind the body to the header: commit the merkle root over the actual tx set,
+    // so the E2 finding-A guard (block_body_binds_to_header) accepts this block.
+    std::vector<uint256> txids;
+    for (const auto& tx : blk.m_txs) txids.push_back(dash::coin::dash_txid(tx));
+    blk.m_merkle_root = dash::coin::compute_merkle_root(txids);
     return blk;
+}
+
+// A FORGED body: the header commits the real coinbase's merkle root, but the
+// delivered body swaps in a coinbase with a WRONG creditPoolBalance (same
+// nHeight). The merkle root is left committing the real coinbase, so the body no
+// longer binds to the header — a real-PoW-header + forged-body attack.
+static BlockType e2_forged_block(int32_t cb_height, int64_t real_cp,
+                                 int64_t forged_cp) {
+    BlockType blk = e2_block_with_cbtx(cb_height, real_cp);   // root commits real cbTx
+    blk.m_txs[0].extra_payload = e2_cbtx_payload(cb_height, forged_cp);  // swap in forgery
+    return blk;                                              // m_merkle_root NOT updated
 }
 
 static CSimplifiedMNListEntry e2_sml_entry(uint8_t seed) {
@@ -853,4 +870,53 @@ TEST(DashEmbeddedGbt, E2CreditPoolDriftFailsClosedNotSelfReferential) {
     m_ok.on_block_connected(good, H);
     EXPECT_EQ(st_ok.credit_pool_height(), static_cast<int32_t>(H));
     EXPECT_EQ(st_ok.credit_pool(), CP1_correct);
+}
+
+// E2 finding A — a FORGED block body (real PoW header, fake type-5 coinbase with
+// the CORRECT nHeight but a WRONG creditPoolBalance and an unbound merkle root)
+// must be REFUSED at ingestion and must NOT advance the freshness seed. Without
+// the body↔header binding this forgery would ride the non-contiguous bootstrap,
+// advance the gate, and be SERVED as a bad-cbtx — E2 widened this trust surface,
+// so the binding closes it. The verify is discriminating: a well-BOUND block
+// (correct root committing its own coinbase) still advances.
+TEST(DashEmbeddedGbt, E2ForgedBlockBodyRefusedDoesNotAdvanceSeed) {
+    const uint32_t P      = H - 1;
+    const uint256  HASH_P = raw256(0x54);
+    const int64_t  CP0    = 111'000'000'000LL;
+    const int64_t  reward = e2_platform_reward_oracle(H);
+    const int64_t  CP1_real   = CP0 + reward;
+    const int64_t  CP1_forged = CP1_real + 777;   // attacker's fabricated balance
+
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    st.set_credit_pool(CP0, HASH_P, static_cast<int32_t>(P));
+    m.restore_credit_pool(CP0, P);
+
+    // Forged body: right nHeight (H), wrong creditPoolBalance, header still commits
+    // the REAL coinbase → the delivered body does not fold to the committed root.
+    BlockType forged = e2_forged_block(static_cast<int32_t>(H), CP1_real, CP1_forged);
+    ASSERT_FALSE(dash::coin::block_body_binds_to_header(forged))
+        << "the forged body must fail the merkle body↔header binding";
+    // Re-parse confirms the forgery carries the right height but the fake balance.
+    {
+        CCbTx fake;
+        ASSERT_TRUE(parse_cbtx(forged.m_txs[0].extra_payload, fake));
+        ASSERT_EQ(fake.nHeight, static_cast<int32_t>(H));
+        ASSERT_EQ(fake.creditPoolBalance, CP1_forged);
+    }
+    m.on_block_connected(forged, H);
+
+    // Refused: the seed stayed at P — the fabricated balance was never adopted.
+    EXPECT_EQ(st.credit_pool_height(), static_cast<int32_t>(P))
+        << "a forged/unbound body must NOT advance the freshness seed";
+    EXPECT_EQ(st.credit_pool(), CP0);
+    EXPECT_NE(st.credit_pool(), CP1_forged);
+
+    // Discriminating: a well-bound block at H (root commits its own coinbase) IS
+    // accepted and advances — the guard rejects only unbound bodies, not valid ones.
+    BlockType good = e2_block_with_cbtx(static_cast<int32_t>(H), CP1_real);
+    ASSERT_TRUE(dash::coin::block_body_binds_to_header(good));
+    m.on_block_connected(good, H);
+    EXPECT_EQ(st.credit_pool_height(), static_cast<int32_t>(H));
+    EXPECT_EQ(st.credit_pool(), CP1_real);
 }

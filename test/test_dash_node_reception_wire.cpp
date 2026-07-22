@@ -40,6 +40,7 @@
 #include <impl/dash/coin/block.hpp>
 #include <impl/dash/coin/mempool.hpp>
 #include <impl/dash/coin/utxo_adapter.hpp>
+#include <impl/dash/coin/block_producer.hpp>   // compute_merkle_root (E2 finding A body↔header bind)
 #include <impl/dash/coin/rpc_data.hpp>
 #include <impl/dash/coin/transaction.hpp>
 
@@ -100,6 +101,15 @@ static MutableTransaction make_spend(const uint256& prev, uint32_t idx,
     TxOut o; o.value = out_value;
     tx.vout.push_back(o);
     return tx;
+}
+
+// Bind a hand-built block to its header so the E2 finding-A body↔header guard
+// (block_body_binds_to_header, enforced in on_block_connected) accepts it — as a
+// real PoW-headed, P2P-delivered block is bound.
+static void bind_block(dash::coin::BlockType& b) {
+    std::vector<uint256> ids;
+    for (const auto& tx : b.m_txs) ids.push_back(dash::coin::dash_txid(tx));
+    b.m_merkle_root = dash::coin::compute_merkle_root(ids);
 }
 
 static std::vector<std::pair<uint256, MNState>> single_mn(const std::vector<unsigned char>& payout) {
@@ -312,6 +322,7 @@ TEST(DashReceptionWire, BlockConnectRelayDrivesApplyBlockThenDemotes) {
     bc.height = H;
     bc.block.m_txs.push_back(make_spend(raw256(0x90), 0, 500'000'000, 1));  // cb (idx 0, skipped)
     bc.block.m_txs.push_back(make_spend(coll, 3, 400'000'000, 2));          // spends MN collateral
+    bind_block(bc.block);
     node.block_connected.happened(bc);
 
     EXPECT_EQ(st.mnstates().size(), 0u) << "apply_block (via wire) must remove the MN";
@@ -344,6 +355,7 @@ TEST(DashReceptionWire, BlockConnectRelayNoSpecialTxPreservesReadiness) {
     bc.height = H;
     bc.block.m_txs.push_back(make_spend(raw256(0x90), 0, 500'000'000, 1));  // cb (idx 0, skipped)
     bc.block.m_txs.push_back(make_spend(raw256(0x91), 0, 400'000'000, 2));  // plain spend, no collateral
+    bind_block(bc.block);
     node.block_connected.happened(bc);
 
     EXPECT_EQ(st.mnstates().size(), 1u) << "no-special-tx block must not touch the DMN set";
@@ -374,6 +386,7 @@ TEST(DashReceptionWire, DisposeStopsBlockConnectIngest) {
     bc.height = H;
     bc.block.m_txs.push_back(make_spend(raw256(0x90), 0, 500'000'000, 1));  // cb (idx 0, skipped)
     bc.block.m_txs.push_back(make_spend(coll, 3, 400'000'000, 2));          // would spend MN collateral
+    bind_block(bc.block);
     node.block_connected.happened(bc);
 
     EXPECT_EQ(st.mnstates().size(), 1u) << "after dispose, a connected block must not be applied";

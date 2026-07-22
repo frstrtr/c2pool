@@ -29,10 +29,13 @@
 // ---------------------------------------------------------------------------
 
 #include "rpc_data.hpp"                       // dash::coin::DashWorkData
+#include "block.hpp"                          // dash::coin::BlockType (body↔header binding)
 #include <impl/dash/crypto/hash_x11.hpp>      // dash::crypto::hash_x11
 #include <impl/dash/coinbase_builder.hpp>     // dash::coinbase::sha256d (Hash sha256d)
 
 #include <core/uint256.hpp>
+#include <core/pack.hpp>                      // ::pack (canonical tx bytes for txid)
+#include <core/hash.hpp>                      // ::Hash (sha256d txid)
 #include <btclibs/util/strencodings.h>        // HexStr, ParseHex
 
 #include <cstdint>
@@ -74,6 +77,49 @@ inline uint256 compute_merkle_root(const std::vector<uint256>& txids)
         layer.swap(next);
     }
     return layer[0];
+}
+
+// Body↔header binding (reward-critical, E2 finding A). The P2P layer validates
+// HEADERS (X11 PoW + DarkGravityWave) but delivers block BODIES cryptographically
+// UNBOUND: nothing checks the tx set against the header's committed merkle root.
+// A forged body under a real PoW header — e.g. a fake type-5 coinbase carrying
+// the correct nHeight but a WRONG creditPoolBalance — would otherwise be adopted
+// by the daemonless credit-pool bootstrap and served as a bad-cbtx. This binds
+// them: the merkle root folded over the body's tx set must equal the header's
+// committed root. Reuses the SAME fold dashcore commits (compute_merkle_root:
+// duplicate-last on odd, via bp_sha256d) so a valid body is NEVER false-rejected,
+// PLUS dashcore's consensus/merkle.cpp CVE-2012-2459 mutation guard: a body
+// padded with duplicate txids yields the same root but is consensus-INVALID, so
+// we reject it too (never false-ACCEPT a mutated body). Matches dashcore block
+// acceptance byte-for-byte. txid = sha256d(canonical tx bytes) == dash_txid.
+inline bool block_body_binds_to_header(const BlockType& block)
+{
+    if (block.m_txs.empty()) return false;   // a real block always carries a coinbase
+    std::vector<uint256> layer;
+    layer.reserve(block.m_txs.size());
+    for (const auto& tx : block.m_txs) {
+        auto packed = ::pack(tx);
+        layer.push_back(::Hash(packed.get_span()));
+    }
+    bool mutated = false;
+    while (layer.size() > 1) {
+        // dashcore mutation check: equal adjacent children (before odd-padding)
+        // flag a CVE-2012-2459 duplicate-padding mutation.
+        for (size_t pos = 0; pos + 1 < layer.size(); pos += 2)
+            if (layer[pos] == layer[pos + 1]) mutated = true;
+        if (layer.size() & 1) layer.push_back(layer.back());   // duplicate last on odd
+        std::vector<uint256> next;
+        next.reserve(layer.size() / 2);
+        for (size_t i = 0; i + 1 < layer.size(); i += 2) {
+            unsigned char buf[64];
+            std::memcpy(buf,      layer[i].data(),     32);
+            std::memcpy(buf + 32, layer[i + 1].data(), 32);
+            next.push_back(bp_sha256d(std::span<const unsigned char>(buf, 64)));
+        }
+        layer.swap(next);
+    }
+    if (mutated) return false;               // mutated body — consensus-invalid, fail closed
+    return layer[0] == block.m_merkle_root;
 }
 
 // Compact nBits -> 256-bit target (Bitcoin/Dash compact form). uint256 carries

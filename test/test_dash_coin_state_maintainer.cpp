@@ -26,6 +26,7 @@
 #include <impl/dash/coin/mn_state_machine.hpp>
 #include <impl/dash/coin/mempool.hpp>
 #include <impl/dash/coin/block.hpp>
+#include <impl/dash/coin/block_producer.hpp>   // compute_merkle_root (E2 finding A body↔header bind)
 #include <impl/dash/coin/utxo_adapter.hpp>
 #include <impl/dash/coin/rpc_data.hpp>
 #include <impl/dash/coin/transaction.hpp>
@@ -73,6 +74,16 @@ static std::vector<unsigned char> p2pkh_script(uint8_t hashseed) {
     for (int i = 0; i < 20; ++i) s.push_back(static_cast<unsigned char>(hashseed + i));
     s.push_back(0x88); s.push_back(0xac);
     return s;
+}
+
+// Bind a hand-built block body to its header: commit the merkle root over the
+// tx set so on_block_connected's E2 finding-A guard (block_body_binds_to_header)
+// accepts it. Every block fed to the connect path must be bound (as a real
+// P2P-delivered, PoW-headed block is).
+static void bind_block(BlockType& b) {
+    std::vector<uint256> ids;
+    for (const auto& tx : b.m_txs) ids.push_back(dash::coin::dash_txid(tx));
+    b.m_merkle_root = dash::coin::compute_merkle_root(ids);
 }
 
 static MutableTransaction make_spend(const uint256& prev, uint32_t idx,
@@ -260,6 +271,7 @@ TEST(DashCoinStateMaintainer, BlockConnectNoSpecialTxPreservesReadiness) {
     BlockType blk;
     blk.m_txs.push_back(make_spend(raw256(0x90), 0, 500000000, 1));  // cb (idx 0, skipped)
     blk.m_txs.push_back(make_spend(raw256(0x91), 0, 400000000, 2));  // plain spend, no collateral match
+    bind_block(blk);
     auto r = m.on_block_connected(blk, H);
 
     EXPECT_EQ(r.registered, 0u);
@@ -282,6 +294,7 @@ TEST(DashCoinStateMaintainer, BlockConnectCollateralSpendDropsToFallback) {
     BlockType blk;
     blk.m_txs.push_back(make_spend(raw256(0x90), 0, 500000000, 1));  // cb (idx 0, skipped)
     blk.m_txs.push_back(make_spend(coll, 3, 400000000, 2));          // spends the MN collateral
+    bind_block(blk);
     m.on_block_connected(blk, H);
 
     EXPECT_EQ(st.mnstates().size(), 0u);

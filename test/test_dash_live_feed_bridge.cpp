@@ -26,6 +26,8 @@
 #include <impl/dash/coin/header_chain.hpp>
 #include <impl/dash/coin/node_interface.hpp>
 #include <impl/dash/coin/block.hpp>
+#include <impl/dash/coin/block_producer.hpp>   // compute_merkle_root (E2 finding A body↔header bind)
+#include <impl/dash/coin/utxo_adapter.hpp>     // dash_txid
 
 #include <core/pack.hpp>
 #include <core/uint256.hpp>
@@ -53,10 +55,22 @@ BlockType make_block(uint8_t seed) {
     BlockType b;
     b.m_version        = 0x20000000u | seed;
     b.m_previous_block.SetHex("00");
-    b.m_merkle_root.SetHex("00");
     b.m_timestamp      = 1'700'000'000u + seed;
     b.m_bits           = 0x1e0ffff0u;
     b.m_nonce          = 0x12340000u + seed;
+    // A minimal coinbase so the body binds to the header (E2 finding A: the
+    // bridge now verifies the tx set folds to the committed merkle root before
+    // firing block_connected). A real P2P block always carries a coinbase.
+    dash::coin::MutableTransaction cb;
+    cb.version = 1; cb.type = 0; cb.locktime = seed;
+    ::bitcoin_family::coin::TxIn in;
+    in.prevout.hash = uint256::ZERO; in.prevout.index = 0xffffffffu;
+    in.sequence = 0xffffffffu;
+    cb.vin.push_back(in);
+    b.m_txs.push_back(cb);
+    std::vector<uint256> ids;
+    for (const auto& tx : b.m_txs) ids.push_back(dash::coin::dash_txid(tx));
+    b.m_merkle_root = dash::coin::compute_merkle_root(ids);
     return b;
 }
 

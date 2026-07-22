@@ -36,6 +36,7 @@
 #include <impl/dash/coin/vendor/cbtx.hpp>        // vendor::parse_cbtx (bestCL*/creditPool seed)
 #include <impl/dash/coin/credit_pool.hpp>        // CreditPool (independent per-block accrual, E2)
 #include <impl/dash/coin/subsidy.hpp>            // compute_dash_platform_reward_post_v20_mn_rr
+#include <impl/dash/coin/block_producer.hpp>     // block_body_binds_to_header (E2 finding A body↔header bind)
 #include <impl/dash/crypto/hash_x11.hpp>         // dash::crypto::hash_x11 (block identity for the seed)
 
 #include <core/uint256.hpp>
@@ -328,6 +329,23 @@ public:
     /// template with a phantom payee. Returns apply_block's ApplyResult.
     MnStateMachine::ApplyResult
     on_block_connected(const dash::coin::BlockType& block, uint32_t height) {
+        // E2 finding A (reward-critical, defence-in-depth): this component EXTRACTS
+        // the reward-critical creditPoolBalance from the block's coinbase, so it
+        // validates its own input at the trust boundary. The body↔header binding is
+        // the outer wire's job (wire_full_block_ingest), but ANY caller reaching
+        // on_block_connected directly (tests / future legs) must not adopt an
+        // unbound body. A body whose tx set does not fold to the header's committed
+        // merkle root (forged/mutated) is refused: no credit-pool advance, no
+        // apply_block, no state change — the prior (valid) seed is retained.
+        if (!dash::coin::block_body_binds_to_header(block)) {
+            LOG_WARNING << "[CREDITPOOL] on_block_connected h=" << height
+                        << " body merkle root != header commitment — REFUSED "
+                           "(no advance, no apply_block)";
+            MnStateMachine::ApplyResult r;
+            r.total_after = m_state.mnstates().size();
+            return r;
+        }
+
         // E2 (independent credit-pool advance): fold THIS block's own credit-pool
         // accrual so the DIP-0027 balance tracks the tip on every ingested block,
         // NOT only when the periodic mnlistdiff re-seeds it. This is what lets the
@@ -475,6 +493,16 @@ private:
         const int64_t from_wire = observed.creditPoolBalance;
         const int64_t reward =
             dash::coin::compute_dash_platform_reward_post_v20_mn_rr(height);
+
+        // Nit C — monotonic guard: never regress the freshness seed on a
+        // duplicate/late OLD block. A contiguous advance is height ==
+        // sm.height()+1 and a forward gap is height > sm.height()+1 (both >
+        // sm.height()); only height <= sm.height() is a backwards/duplicate
+        // delivery — skip it so it cannot roll the seed back to a stale height.
+        // (Same-height reorgs are handled by on_sml_reorg's wipe, not here.)
+        if (m_credit_pool_sm.initialized()
+            && height <= m_credit_pool_sm.height())
+            return;
 
         if (m_credit_pool_sm.initialized()
             && m_credit_pool_sm.height() + 1 == height) {
