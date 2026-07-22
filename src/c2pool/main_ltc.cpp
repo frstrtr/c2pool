@@ -656,6 +656,14 @@ int main(int argc, char* argv[]) {
     // Stratum tuning (configurable via CLI or YAML)
     core::StratumConfig stratum_config;  // defaults: min=0.0005, max=65536, target=3.0s, vardiff=true
     stratum_config.coin_symbol = "LTC";  // runtime coin tag for coin-agnostic core log lines
+    // Idle keepalive-notify (cross-coin reuse of DASH's D9 mitigation): many
+    // ASIC/proxy clients drop a pool connection that receives no mining.notify
+    // within ~60 s (LTC/DOGE ~2.5 min block cadence gives long idle gaps at high
+    // fixed diff). 25 s is safely under any reasonable client watchdog and kept
+    // identical to the other coins for consistency. Re-notify the CURRENT job
+    // (non-clean, so no ASIC work reset and NO work-generation bump); this is
+    // transport/liveness only -- ZERO wire-byte and consensus change.
+    stratum_config.keepalive_notify_sec = 25;
 
     // Operational tuning (configurable via CLI or YAML)
     std::string log_file;                        // empty = default "debug.log"
