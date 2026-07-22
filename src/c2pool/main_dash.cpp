@@ -62,6 +62,7 @@
 #include <impl/dash/coin/utxo_lane.hpp>    // dash::coin::UtxoLane — embedded UTXO/fee lane (E2b, #738)
 #include <impl/dash/coin/header_chain.hpp>       // dash::coin::HeaderChain — SPV header/tip authority (E2a)
 #include <impl/dash/coin/coin_state_maintainer.hpp>  // dash::coin::CoinStateMaintainer — populate ordering gate (E2a)
+#include <impl/dash/coin/sml_quorum_db.hpp>      // dash::coin::SMLDb / QuorumDb — SML+quorum persistence (incremental restart)
 #include <impl/dash/coin/live_feed.hpp>          // E2a live-feed bridge (raw wire events -> derived ingest events)
 #include <impl/dash/coin/mempool_ingest.hpp>     // wire_mempool_ingest (leg 1)
 #include <impl/dash/coin/tip_ingest.hpp>         // wire_tip_ingest (leg 2)
@@ -1407,6 +1408,77 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 [sml_base](const dash::coin::vendor::CSimplifiedMNListDiff& d) {
                     *sml_base = d.blockHash;
                 }));
+
+        // ── SML + quorum PERSISTENCE (SMLDb/QuorumDb) ────────────────────────
+        // Persist the applied SML (merkleRootMNList) + active quorum set
+        // (merkleRootQuorums) under the per-net subdir so a restart resumes
+        // INCREMENTALLY: load the last verified state, set the getmnlistd base
+        // to the persisted tip, and apply only the delta from there instead of a
+        // cold mnlistdiff(zero, tip). When the stores are empty/absent (first
+        // run) or fail the on-load root-verify, sml_base stays ZERO and the arm
+        // cold-syncs exactly as before — DEFAULT BEHAVIOUR UNCHANGED.
+        auto sml_db = std::make_shared<dash::coin::SMLDb>(
+            (core::filesystem::config_path() / net_subdir / "dash_sml_db").string());
+        auto quorum_db = std::make_shared<dash::coin::QuorumDb>(
+            (core::filesystem::config_path() / net_subdir / "dash_quorum_db").string());
+        const bool sml_persist_ok = sml_db->open() && quorum_db->open();
+        if (!sml_persist_ok) {
+            LOG_WARNING << "[SML-DB] open failed -> persistence DISABLED "
+                           "(cold mnlistdiff(zero,tip) each restart, as before)";
+        } else {
+            // Warm restart: load both stores, INDEPENDENTLY root-verified inside
+            // load_verified() (a corrupt/stale store fails closed to cold sync).
+            dash::coin::vendor::CSimplifiedMNList loaded_sml;
+            const bool sml_warm = sml_db->load_verified(loaded_sml);
+            const bool quo_warm = quorum_db->load_verified(node_coin_state.qmgr());
+            const bool tips_match =
+                sml_db->get_best_hash() == quorum_db->get_best_hash();
+            const bool warm = sml_warm && quo_warm && tips_match
+                              && !sml_db->get_best_hash().IsNull();
+            if (warm) {
+                node_coin_state.sml() = std::move(loaded_sml);
+                node_coin_state.set_have_sml(node_coin_state.sml().size() != 0);
+                node_coin_state.set_sml_current_hash(sml_db->get_best_hash());
+                *sml_base = sml_db->get_best_hash();  // handshake -> incremental
+                LOG_INFO << "[SML-DB] WARM restart: SML(" << node_coin_state.sml().size()
+                         << ") + quorums(" << node_coin_state.qmgr().active_count()
+                         << ") @ " << sml_db->get_best_hash().GetHex().substr(0, 16)
+                         << " h=" << sml_db->get_best_height()
+                         << " -> incremental mnlistdiff(persisted-tip, tip)";
+            } else {
+                // Undo any partial warm (quorum load may have replaced qmgr state)
+                // and drop divergent/one-sided persisted state so we cold-resync.
+                node_coin_state.qmgr().clear();
+                if (sml_warm || quo_warm) {
+                    LOG_WARNING << "[SML-DB] partial/divergent persisted state "
+                                   "(sml_warm=" << sml_warm << " quo_warm=" << quo_warm
+                                << " tips_match=" << tips_match
+                                << ") -> wipe + cold re-sync";
+                    sml_db->clear();
+                    quorum_db->clear();
+                }
+            }
+
+            // Persist-on-apply: after each accepted mnlistdiff the maintainer
+            // fires this with the block the SML/quorum state is now current at.
+            maintainer->set_on_sml_persist(
+                [&node_coin_state, sml_db, quorum_db, hc = header_chain.get()]
+                (const uint256& cur_hash) {
+                    uint32_t h = 0;
+                    if (auto e = hc->get_header(cur_hash)) h = e->height;
+                    sml_db->write_sml(node_coin_state.sml(), cur_hash, h);
+                    quorum_db->write_quorums(node_coin_state.qmgr(), cur_hash, h);
+                });
+            // Wipe-on-reorg/heal: the persisted state is now for an orphaned
+            // branch (self-consistent, so the root-verify would pass) — clear it.
+            maintainer->set_on_sml_clear(
+                [sml_db, quorum_db]() {
+                    sml_db->clear();
+                    quorum_db->clear();
+                    LOG_INFO << "[SML-DB] reorg/heal -> persisted SML+quorum wiped "
+                                "(cold re-sync)";
+                });
+        }
 
         // review finding H3: the embedded arm must NOT serve a template without a valid
         // CCbTx (that block is consensus-invalid on mainnet). Gate embedded

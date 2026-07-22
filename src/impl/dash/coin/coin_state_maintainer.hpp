@@ -193,6 +193,14 @@ public:
                  << " MNs; quorums +" << q_added << " -" << q_deleted
                  << " => " << m_state.qmgr().active_count()
                  << " active; have_sml=" << (m_have_mn_sml ? "yes" : "no");
+        // SML/quorum persistence (SMLDb/QuorumDb): the applied state is now
+        // current AT diff.blockHash — flush it so a restart resumes from this
+        // tip incrementally instead of a cold mnlistdiff(zero, tip). Only when
+        // a non-empty SML actually applied (an empty set is a gap, not a
+        // persistable tip). main_dash points this at SMLDb::write_sml +
+        // QuorumDb::write_quorums; unset (KAT posture) makes it a no-op.
+        if (m_have_mn_sml && m_on_sml_persist)
+            m_on_sml_persist(diff.blockHash);
         if (!m_have_mn_sml)
             demote();
         else
@@ -236,6 +244,12 @@ public:
         // Invalidate the credit-pool seed's freshness too (height -1 != any tip),
         // so the arm fails closed on the credit-pool axis until a fresh re-seed.
         m_state.set_credit_pool(0, uint256::ZERO, -1);
+        // Wipe the PERSISTED SML/quorum stores too. The on-disk state is now for
+        // an orphaned branch; it is self-consistent so the root-verify on the
+        // next restart WOULD pass and serve a wrong-branch template. Clearing it
+        // forces a cold full-snapshot re-sync (main_dash points this at
+        // SMLDb::clear + QuorumDb::clear; unset in KATs = no-op).
+        if (m_on_sml_clear) m_on_sml_clear();
         demote();
         // Re-issue work so miners are moved off any embedded template that was
         // built on the now-orphaned branch onto the dashd fallback immediately.
@@ -334,6 +348,25 @@ public:
         m_on_full_resync = std::move(fn);
     }
 
+    /// Wire the SML/quorum PERSISTENCE sink (main_dash points this at
+    /// SMLDb::write_sml + QuorumDb::write_quorums). Invoked after each accepted
+    /// mnlistdiff that leaves a non-empty SML applied, with the block hash the
+    /// state is now current at, so a restart resumes incrementally from that
+    /// tip. Optional (unset in KATs = no-op; persistence is a restart
+    /// optimisation, never a correctness prerequisite for the running arm).
+    void set_on_sml_persist(std::function<void(const uint256&)> fn) {
+        m_on_sml_persist = std::move(fn);
+    }
+
+    /// Wire the SML/quorum store WIPE sink (main_dash points this at
+    /// SMLDb::clear + QuorumDb::clear). Invoked on the reorg / H-1 heal path
+    /// where the in-memory state is discarded: the persisted state is now for an
+    /// orphaned branch and MUST be wiped so a restart cold-resyncs rather than
+    /// loading a self-consistent wrong-branch state. Optional (unset = no-op).
+    void set_on_sml_clear(std::function<void()> fn) {
+        m_on_sml_clear = std::move(fn);
+    }
+
     /// True iff both prerequisites are met AND the holder is currently live.
     bool live() const { return m_state.populated(); }
 
@@ -360,6 +393,8 @@ private:
     NodeCoinState& m_state;
     std::function<void()> m_on_state_dirty;  // SML/bestCL/reorg -> re-issue work
     std::function<void()> m_on_full_resync;  // H-1 heal -> reset sml_base + full re-sync
+    std::function<void(const uint256&)> m_on_sml_persist;  // accepted diff -> SMLDb/QuorumDb write
+    std::function<void()> m_on_sml_clear;    // reorg/heal -> SMLDb/QuorumDb wipe
 
     bool m_have_mn{false};
     bool m_have_tip{false};
