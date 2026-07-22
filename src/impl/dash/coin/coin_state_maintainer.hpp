@@ -491,8 +491,14 @@ private:
             return;
         }
         const int64_t from_wire = observed.creditPoolBalance;
+        // Network-aware platform-share gate (E4 re-soak fix): the MN_RR
+        // activation height is per-chainparams; the state holds the network's
+        // value. With the mainnet constant hard-coded here, testnet heights got
+        // reward=0, the contiguous advance under-accrued by exactly one block's
+        // platform reward, and every block fired ACCRUAL DRIFT + re-seeded.
         const int64_t reward =
-            dash::coin::compute_dash_platform_reward_post_v20_mn_rr(height);
+            dash::coin::compute_dash_platform_reward_post_v20_mn_rr(
+                height, m_state.mn_rr_height());
 
         // Nit C — monotonic guard: never regress the freshness seed on a
         // duplicate/late OLD block. A contiguous advance is height ==

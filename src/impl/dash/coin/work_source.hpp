@@ -63,6 +63,10 @@ struct EmbeddedWorkInputs {
     int32_t                          best_cl_height{0};
     std::array<uint8_t, 96>          best_cl_sig{};
     int64_t                          credit_pool{0};
+    // Network MN_RR activation height for the DIP-0027 platform-share accrual
+    // (per-chainparams in dashcore). Mainnet default; main_dash sets the
+    // testnet value via NodeCoinState::set_mn_rr_height (E4 re-soak fix).
+    int                              mn_rr_height{DASH_MN_RR_HEIGHT_MAINNET};
 
     bool viable() const {
         return has_state && mnstates != nullptr && mempool != nullptr;
@@ -112,7 +116,8 @@ inline WorkSelection select_dash_work(
                 // sml/qmgr null — legacy callers unchanged).
                 /*underfill_tripped=*/nullptr,
                 emb.sml, emb.qmgr,
-                emb.best_cl_height, emb.best_cl_sig, emb.credit_pool);
+                emb.best_cl_height, emb.best_cl_sig, emb.credit_pool,
+                emb.mn_rr_height);
         },
         dashd_fallback);
 }

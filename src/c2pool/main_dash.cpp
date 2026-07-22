@@ -1569,6 +1569,21 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 });
         }
 
+        // E4 re-soak fix (constant −66,966,830-duff creditPool bias): the
+        // DIP-0027 platform-share accrual is gated on the NETWORK'S MN_RR
+        // activation height (per-chainparams in dashcore: mainnet 2,128,896,
+        // testnet 1,066,900 — buried, cross-checked live via getblockchaininfo
+        // softforks). With the mainnet constant in force on testnet the
+        // platform reward evaluated to 0 for every current testnet height, so
+        // the embedded template committed creditPoolBalance(N-1) + 0 — exactly
+        // one block's platform reward LOW, at every height, surviving restart
+        // (the persisted seed was correct; the accrual term was the bias).
+        // This threads the network's height into the template build, the
+        // pre-emit value re-check, and the per-block credit-pool advance.
+        node_coin_state.set_mn_rr_height(
+            testnet ? dash::coin::DASH_MN_RR_HEIGHT_TESTNET
+                    : dash::coin::DASH_MN_RR_HEIGHT_MAINNET);
+
         // review PR #780 BLOCKER-1 (CRITICAL): refuse the embedded arm on DKG
         // commitment-window heights. There the block MUST carry mandatory type-6
         // quorum-commitment txs (which the C-3 filter strips) and merkleRootQuorums

@@ -45,6 +45,15 @@ inline constexpr int DASH_SUBSIDY_HALVING_INTERVAL = 210240;
 inline constexpr int DASH_V20_HEIGHT_MAINNET       = 1'987'776;
 inline constexpr int DASH_BRR_HEIGHT_MAINNET       = 1'374'912;
 inline constexpr int DASH_MN_RR_HEIGHT_MAINNET     = 2'128'896;
+// Testnet activation heights (dashcore chainparams.cpp CTestNetParams;
+// cross-checked live against testnet dashd getblockchaininfo softforks:
+// v20 buried @905100, mn_rr buried @1066900). MN_RR gates the DIP-0027
+// platform-share credit-pool accrual — using the MAINNET height on testnet
+// makes the per-block platform reward evaluate to 0 for every testnet
+// height in [1066900, 2128896), i.e. a constant −66,966,830-duff
+// creditPoolBalance bias at current testnet heights (E4 re-soak finding).
+inline constexpr int DASH_V20_HEIGHT_TESTNET       = 905'100;
+inline constexpr int DASH_MN_RR_HEIGHT_TESTNET     = 1'066'900;
 inline constexpr int DASH_SUPERBLOCK_CYCLE_MAINNET = 16616;
 inline constexpr int DASH_SUPERBLOCK_CYCLE_TESTNET = 24;   // dashcore testnet nSuperblockCycle
 
@@ -85,9 +94,17 @@ inline int64_t compute_dash_mn_payment_post_v20(int64_t block_value)
 /// truncates between the two divisions, so we replicate that order exactly.
 /// The result is added as an OP_RETURN coinbase output and DEDUCTED from the
 /// MN's portion (miner share is unaffected).
-inline int64_t compute_dash_platform_reward_post_v20_mn_rr(uint32_t height)
+///
+/// `mn_rr_height` is the NETWORK'S MN_RR activation height (dashcore keys this
+/// off Params().GetConsensus().MN_RRHeight, i.e. per-chainparams). Defaults to
+/// MAINNET; callers on testnet MUST pass DASH_MN_RR_HEIGHT_TESTNET — the E4
+/// re-soak proved that gating testnet heights on the mainnet constant returns
+/// 0 here and biases every committed creditPoolBalance low by exactly one
+/// block's platform reward (66,966,830 duffs at testnet h≈1.519M).
+inline int64_t compute_dash_platform_reward_post_v20_mn_rr(
+    uint32_t height, int mn_rr_height = DASH_MN_RR_HEIGHT_MAINNET)
 {
-    if (static_cast<int>(height) < DASH_MN_RR_HEIGHT_MAINNET) return 0;
+    if (static_cast<int>(height) < mn_rr_height) return 0;
     int64_t mn_subsidy_share = compute_dash_block_reward_post_v20(height) * 3 / 4;
     return mn_subsidy_share * 375 / 1000;
 }

@@ -127,7 +127,14 @@ inline DashWorkData build_embedded_workdata(
     const QuorumManager* qmgr = nullptr,
     int32_t best_cl_height = 0,
     const std::array<uint8_t, 96>& best_cl_sig = k_zero_cl_sig,
-    int64_t last_observed_credit_pool = 0)
+    int64_t last_observed_credit_pool = 0,
+    // Network seam: the MN_RR activation height gating the DIP-0027
+    // platform-share accrual (dashcore Params().GetConsensus().MN_RRHeight).
+    // Defaults to MAINNET (existing callers byte-unchanged); testnet callers
+    // MUST pass DASH_MN_RR_HEIGHT_TESTNET or the platform reward evaluates to
+    // 0 and the committed creditPoolBalance sits one block-reward low (the E4
+    // re-soak constant −66,966,830-duff bias).
+    int mn_rr_height = DASH_MN_RR_HEIGHT_MAINNET)
 {
     DashWorkData w;
     w.m_height          = prev_height + 1;
@@ -152,7 +159,8 @@ inline DashWorkData build_embedded_workdata(
     auto [selected, total_fees] =
         mempool.get_sorted_txs_with_fees(MAX_BLOCK_BYTES, /*exclude_special=*/true);
     int64_t block_value      = reward + static_cast<int64_t>(total_fees);
-    int64_t platform_reward  = compute_dash_platform_reward_post_v20_mn_rr(w.m_height);
+    int64_t platform_reward  = compute_dash_platform_reward_post_v20_mn_rr(
+        w.m_height, mn_rr_height);
     int64_t mn_payment       = compute_dash_mn_payment_post_v20(block_value) - platform_reward;
 
     w.m_coinbase_value  = static_cast<uint64_t>(block_value);
