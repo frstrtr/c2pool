@@ -63,6 +63,7 @@
 #include <impl/dash/coin/header_chain.hpp>       // dash::coin::HeaderChain — SPV header/tip authority (E2a)
 #include <impl/dash/coin/coin_state_maintainer.hpp>  // dash::coin::CoinStateMaintainer — populate ordering gate (E2a)
 #include <impl/dash/coin/sml_quorum_db.hpp>      // dash::coin::SMLDb / QuorumDb — SML+quorum persistence (incremental restart)
+#include <impl/dash/coin/credit_pool_db.hpp>     // dash::coin::CreditPoolDb — credit-pool tip persistence (E2 restart resume)
 #include <impl/dash/coin/live_feed.hpp>          // E2a live-feed bridge (raw wire events -> derived ingest events)
 #include <impl/dash/coin/mempool_ingest.hpp>     // wire_mempool_ingest (leg 1)
 #include <impl/dash/coin/tip_ingest.hpp>         // wire_tip_ingest (leg 2)
@@ -1469,7 +1470,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             (core::filesystem::config_path() / net_subdir / "dash_sml_db").string());
         auto quorum_db = std::make_shared<dash::coin::QuorumDb>(
             (core::filesystem::config_path() / net_subdir / "dash_quorum_db").string());
-        const bool sml_persist_ok = sml_db->open() && quorum_db->open();
+        // E2: the DIP-0027 credit-pool tip is persisted alongside SML/quorum so a
+        // warm restart resumes the pool at the SAME tip (matching best_hash),
+        // rather than the arm falling back to dashd until the next mnlistdiff
+        // re-seeds the credit pool for the restart tip.
+        auto credit_pool_db = std::make_shared<dash::coin::CreditPoolDb>(
+            (core::filesystem::config_path() / net_subdir / "dash_credit_pool_db").string());
+        const bool cp_open_ok = credit_pool_db->open();
+        const bool sml_persist_ok = sml_db->open() && quorum_db->open() && cp_open_ok;
         if (!sml_persist_ok) {
             LOG_WARNING << "[SML-DB] open failed -> persistence DISABLED "
                            "(cold mnlistdiff(zero,tip) each restart, as before)";
@@ -1493,6 +1501,35 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                          << ") @ " << sml_db->get_best_hash().GetHex().substr(0, 16)
                          << " h=" << sml_db->get_best_height()
                          << " -> incremental mnlistdiff(persisted-tip, tip)";
+                // E2: restore the credit-pool seed to the SAME tip. Sentinel: the
+                // persisted credit-pool best_hash must match the SML tip (both are
+                // written per accepted mnlistdiff for diff.blockHash). On match,
+                // seed BOTH the NodeCoinState freshness seed (keyed on this height)
+                // and the maintainer's running accrual, so the credit-pool
+                // freshness gate passes at the restart tip and the first
+                // post-restart block advances contiguously + verifies against its
+                // own from-wire cbTx. On mismatch (partial/divergent), wipe the
+                // credit-pool store and let it re-seed cold from the next block/diff.
+                if (credit_pool_db->is_initialized()
+                    && credit_pool_db->get_best_hash() == sml_db->get_best_hash()
+                    && !credit_pool_db->get_best_hash().IsNull()) {
+                    node_coin_state.set_credit_pool(
+                        credit_pool_db->get_balance(),
+                        credit_pool_db->get_best_hash(),
+                        static_cast<int32_t>(credit_pool_db->get_best_height()));
+                    maintainer->restore_credit_pool(
+                        credit_pool_db->get_balance(),
+                        credit_pool_db->get_best_height());
+                    LOG_INFO << "[CP-DB] WARM restart: credit pool "
+                             << credit_pool_db->get_balance() << " @ h="
+                             << credit_pool_db->get_best_height()
+                             << " (tip matches SML) -> freshness gate live at restart tip";
+                } else {
+                    LOG_WARNING << "[CP-DB] credit-pool tip "
+                                << credit_pool_db->get_best_hash().GetHex().substr(0, 16)
+                                << " != SML tip (or empty) -> wipe + cold re-seed";
+                    credit_pool_db->clear();
+                }
             } else {
                 // Undo any partial warm (quorum load may have replaced qmgr state)
                 // and drop divergent/one-sided persisted state so we cold-resync.
@@ -1505,6 +1542,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     sml_db->clear();
                     quorum_db->clear();
                 }
+                // E2: the SML cold-resyncs, so any persisted credit-pool tip is
+                // orphaned relative to the tip we will rebuild — wipe it so the
+                // pool re-seeds cold from the next block/diff (never a stale carry).
+                credit_pool_db->clear();
             }
 
             // Persist-on-apply: after each accepted mnlistdiff the maintainer
@@ -1517,14 +1558,27 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     sml_db->write_sml(node_coin_state.sml(), cur_hash, h);
                     quorum_db->write_quorums(node_coin_state.qmgr(), cur_hash, h);
                 });
+            // E2 credit-pool persist: written per accepted mnlistdiff with the SAME
+            // (blockHash, height) the SML persist uses, so the CreditPoolDb tip
+            // tracks the SML tip and the restart sentinel (cp_hash == sml_hash)
+            // holds. balance is the authoritative cbTx creditPoolBalance the diff
+            // re-anchored the pool to.
+            maintainer->set_on_credit_pool_persist(
+                [credit_pool_db]
+                (const uint256& cur_hash, uint32_t h, int64_t balance) {
+                    credit_pool_db->write_state(cur_hash, h, balance,
+                                                /*initialized=*/true);
+                });
             // Wipe-on-reorg/heal: the persisted state is now for an orphaned
             // branch (self-consistent, so the root-verify would pass) — clear it.
+            // Extended to the credit-pool store (same orphaned-branch hazard).
             maintainer->set_on_sml_clear(
-                [sml_db, quorum_db]() {
+                [sml_db, quorum_db, credit_pool_db]() {
                     sml_db->clear();
                     quorum_db->clear();
-                    LOG_INFO << "[SML-DB] reorg/heal -> persisted SML+quorum wiped "
-                                "(cold re-sync)";
+                    credit_pool_db->clear();
+                    LOG_INFO << "[SML-DB] reorg/heal -> persisted SML+quorum+creditpool "
+                                "wiped (cold re-sync)";
                 });
         }
 
@@ -1548,6 +1602,21 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     return dash::coin::is_superblock_height(next_height, sb_cycle);
                 });
         }
+
+        // E4 re-soak fix (constant −66,966,830-duff creditPool bias): the
+        // DIP-0027 platform-share accrual is gated on the NETWORK'S MN_RR
+        // activation height (per-chainparams in dashcore: mainnet 2,128,896,
+        // testnet 1,066,900 — buried, cross-checked live via getblockchaininfo
+        // softforks). With the mainnet constant in force on testnet the
+        // platform reward evaluated to 0 for every current testnet height, so
+        // the embedded template committed creditPoolBalance(N-1) + 0 — exactly
+        // one block's platform reward LOW, at every height, surviving restart
+        // (the persisted seed was correct; the accrual term was the bias).
+        // This threads the network's height into the template build, the
+        // pre-emit value re-check, and the per-block credit-pool advance.
+        node_coin_state.set_mn_rr_height(
+            testnet ? dash::coin::DASH_MN_RR_HEIGHT_TESTNET
+                    : dash::coin::DASH_MN_RR_HEIGHT_MAINNET);
 
         // review PR #780 BLOCKER-1 (CRITICAL): refuse the embedded arm on DKG
         // commitment-window heights. There the block MUST carry mandatory type-6

@@ -44,6 +44,7 @@
 #include "node_interface.hpp"   // dash::interfaces::Node + TipAdvance/BlockConnected
 #include "block.hpp"            // BlockType / BlockHeaderType
 #include "header_chain.hpp"     // HeaderChain, x11_hash, IndexEntry
+#include "block_producer.hpp"   // dash::coin::block_body_binds_to_header (E2 finding A)
 
 #include <impl/dash/crypto/hash_x11.hpp>
 
@@ -114,6 +115,19 @@ wire_full_block_ingest(::dash::interfaces::Node& node, HeaderChain& chain)
             if (!entry) {
                 LOG_DEBUG_COIND << "[EMB-DASH] full_block " << hash.GetHex().substr(0, 16)
                                 << " not in header chain yet — deferring connect";
+                return;
+            }
+            // E2 finding A (reward-critical): the header is PoW/DGW-validated, but
+            // the BODY arrives cryptographically UNBOUND. Bind it before firing
+            // block_connected — the merkle root over the tx set must match the
+            // header's committed root — so a forged body (e.g. a fake type-5
+            // coinbase with the right nHeight but a wrong creditPoolBalance) can
+            // never reach the credit-pool bootstrap / apply_block / UTXO legs.
+            // Fail closed: skip the connect (the real body re-request closes it).
+            if (!dash::coin::block_body_binds_to_header(block)) {
+                LOG_WARNING << "[EMB-DASH] full_block " << hash.GetHex().substr(0, 16)
+                            << " body merkle root != header commitment (forged/mutated"
+                               " body) — REFUSING connect (fail closed to dashd fallback)";
                 return;
             }
             node.block_connected.happened(

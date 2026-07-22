@@ -56,6 +56,12 @@
 #include <impl/dash/coin/transaction.hpp>
 #include <impl/dash/coin/vendor/cbtx.hpp>
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>
+#include <impl/dash/coin/vendor/smldiff.hpp>           // E2: CSimplifiedMNListDiff (restart-seed KAT)
+#include <impl/dash/coin/node_coin_state.hpp>          // E2: NodeCoinState freshness gate
+#include <impl/dash/coin/coin_state_maintainer.hpp>    // E2: CoinStateMaintainer (independent advance)
+#include <impl/dash/coin/credit_pool.hpp>              // E2: CreditPool (running accrual)
+#include <impl/dash/coin/block.hpp>                    // E2: BlockType (ingested block)
+#include <impl/dash/coin/block_producer.hpp>           // E2 finding A: compute_merkle_root / block_body_binds_to_header
 
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
@@ -86,7 +92,12 @@ using dash::coin::compute_merkle_root_quorums;
 using dash::coin::vendor::CCbTx;
 using dash::coin::vendor::CSimplifiedMNList;
 using dash::coin::vendor::CSimplifiedMNListEntry;
+using dash::coin::vendor::CSimplifiedMNListDiff;
 using dash::coin::vendor::parse_cbtx;
+using dash::coin::NodeCoinState;
+using dash::coin::CoinStateMaintainer;
+using dash::coin::BlockType;
+using dash::coin::compute_dash_block_reward_post_v20;
 using ::core::coin::UTXOViewCache;
 using ::core::coin::Outpoint;
 using ::core::coin::Coin;
@@ -603,4 +614,309 @@ TEST(DashEmbeddedGbt, G1GoldenVersionSeamEchoesInjectedVersion) {
     EXPECT_EQ(injected.m_mintime,        baseline.m_mintime);
     EXPECT_EQ(injected.m_coinbase_value, baseline.m_coinbase_value);
     EXPECT_EQ(injected.m_payment_amount, baseline.m_payment_amount);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// E2 — independent credit-pool advance on ingestion, POST-RESTART.
+//
+// The gap: m_credit_pool is seeded only by the periodic mnlistdiff cbTx, and is
+// NOT persisted. After a warm restart the SML resumes from its persisted tip
+// (#800), but the credit pool re-seeds to nothing until the NEXT mnlistdiff —
+// so for the tip that existed AT restart the credit-pool freshness gate fails
+// closed and the daemonless arm falls back to dashd.
+//
+// The fix (verified here):
+//   (1) persist the credit-pool tip alongside the SML (same blockHash/height)
+//       and RESTORE it on warm restart, so the gate is live at the restart tip;
+//   (2) ADVANCE the pool INDEPENDENTLY on every ingested block, verified against
+//       that block's OWN from-wire cbTx creditPoolBalance at nHeight == height —
+//       NOT against a template we built from the seed (the self-consistent-but-
+//       stale trap that refuted 3 prior soaks).
+//
+// Oracle discipline: the block's committed creditPoolBalance is built from the
+// raw dashcore platform-share formula (subsidy*3/4*375/1000, recomputed here),
+// and we assert the maintainer's independent accrual reproduces exactly that
+// from-wire value — two independent derivations meeting, never a self-check.
+// ════════════════════════════════════════════════════════════════════════
+
+// v3 CCbTx extra_payload at a given height carrying a given creditPoolBalance.
+static std::vector<unsigned char> e2_cbtx_payload(int32_t cb_height,
+                                                  int64_t credit_pool) {
+    CCbTx cb;
+    cb.nVersion          = CCbTx::VERSION_CLSIG_AND_BALANCE;
+    cb.nHeight           = cb_height;
+    cb.creditPoolBalance = credit_pool;
+    return dash::coin::encode_cbtx(cb);
+}
+
+// A block whose coinbase (tx 0) is a type-5 CbTx committing creditPoolBalance at
+// cb_height. No special asset-lock/unlock txs, so the per-block accrual reduces
+// to the platform-reward term (the mainnet steady state at H).
+static BlockType e2_block_with_cbtx(int32_t cb_height, int64_t credit_pool) {
+    BlockType blk;
+    blk.m_bits = 0x1b104be3u;                 // non-null header (identity hashable)
+    MutableTransaction coinbase;
+    coinbase.version       = 3;
+    coinbase.type          = 5;               // CbTx
+    coinbase.extra_payload = e2_cbtx_payload(cb_height, credit_pool);
+    // A coinbase input (prevout null) — not inspected by the credit-pool walk
+    // (it skips tx 0), present only so the block looks well-formed.
+    TxIn cin; cin.prevout.hash = uint256::ZERO; cin.prevout.index = 0xffffffffu;
+    coinbase.vin.push_back(cin);
+    blk.m_txs.push_back(std::move(coinbase));
+    // Bind the body to the header: commit the merkle root over the actual tx set,
+    // so the E2 finding-A guard (block_body_binds_to_header) accepts this block.
+    std::vector<uint256> txids;
+    for (const auto& tx : blk.m_txs) txids.push_back(dash::coin::dash_txid(tx));
+    blk.m_merkle_root = dash::coin::compute_merkle_root(txids);
+    return blk;
+}
+
+// A FORGED body: the header commits the real coinbase's merkle root, but the
+// delivered body swaps in a coinbase with a WRONG creditPoolBalance (same
+// nHeight). The merkle root is left committing the real coinbase, so the body no
+// longer binds to the header — a real-PoW-header + forged-body attack.
+static BlockType e2_forged_block(int32_t cb_height, int64_t real_cp,
+                                 int64_t forged_cp) {
+    BlockType blk = e2_block_with_cbtx(cb_height, real_cp);   // root commits real cbTx
+    blk.m_txs[0].extra_payload = e2_cbtx_payload(cb_height, forged_cp);  // swap in forgery
+    return blk;                                              // m_merkle_root NOT updated
+}
+
+static CSimplifiedMNListEntry e2_sml_entry(uint8_t seed) {
+    CSimplifiedMNListEntry e;
+    e.proRegTxHash  = raw256(seed);
+    e.confirmedHash = raw256(seed + 1);
+    e.isValid = true;
+    return e;
+}
+
+// mnlistdiff carrying a type-5 cbTx seed (credit pool @ cb_height).
+static CSimplifiedMNListDiff e2_diff_with_seed(const uint256& base,
+                                               const uint256& block,
+                                               int32_t cb_height,
+                                               int64_t credit_pool) {
+    CSimplifiedMNListDiff d;
+    d.baseBlockHash = base;
+    d.blockHash     = block;
+    d.mnList = {e2_sml_entry(0x40)};
+    d.cbTx.version       = 3;
+    d.cbTx.type          = 5;
+    d.cbTx.extra_payload = e2_cbtx_payload(cb_height, credit_pool);
+    return d;
+}
+
+static std::vector<std::pair<uint256, MNState>>
+e2_mn_pairs(const std::vector<unsigned char>& payout) {
+    MNState s;
+    s.isValid = true;
+    s.nRegisteredHeight = 2'300'000;
+    s.nLastPaidHeight = 0;
+    s.scriptPayout.m_data = payout;
+    return std::vector<std::pair<uint256, MNState>>{{raw256(0x01), s}};
+}
+
+// The independent platform-reward oracle at a height (raw dashcore formula,
+// truncation order preserved), NOT compute_dash_platform_reward_post_v20_mn_rr.
+static int64_t e2_platform_reward_oracle(uint32_t height) {
+    int64_t mn_share = compute_dash_block_reward_post_v20(height) * 3 / 4;
+    return mn_share * 375 / 1000;
+}
+
+TEST(DashEmbeddedGbt, E2CreditPoolIndependentAdvancePostRestart) {
+    // Snapshot tip at P = H-1; the first post-restart block is at H.
+    const uint32_t P       = H - 1;
+    const uint256  HASH_P  = raw256(0x54);
+    const int64_t  CP0     = 111'000'000'000LL;             // snapshot balance @ P
+    const int64_t  reward  = e2_platform_reward_oracle(H);  // locked at block H
+    ASSERT_GT(reward, 0) << "H must be past MN_RR so the platform burn is active";
+    const int64_t  CP1     = CP0 + reward;                  // committed balance @ H
+
+    // ── Pre-restart: a cold snapshot seeds + PERSISTS the credit pool @ P. ──
+    uint256 persist_hash; uint32_t persist_h = 0; int64_t persist_bal = 0; bool persisted = false;
+    {
+        NodeCoinState st;
+        CoinStateMaintainer m(st);
+        m.set_on_credit_pool_persist(
+            [&](const uint256& h, uint32_t ht, int64_t bal) {
+                persist_hash = h; persist_h = ht; persist_bal = bal; persisted = true;
+            });
+        m.on_mnlistdiff(e2_diff_with_seed(uint256::ZERO, HASH_P,
+                                          static_cast<int32_t>(P), CP0));
+        ASSERT_EQ(st.credit_pool(), CP0);
+        ASSERT_EQ(st.credit_pool_height(), static_cast<int32_t>(P));
+        ASSERT_TRUE(persisted) << "an accepted diff with a v3 cbTx must persist the pool tip";
+        EXPECT_EQ(persist_hash, HASH_P);
+        EXPECT_EQ(persist_h, P);
+        EXPECT_EQ(persist_bal, CP0);
+    }
+
+    // Helper: simulate a warm SML restore (loaded from SMLDb directly, NOT via a
+    // diff), so the credit pool is the ONLY axis under test.
+    auto warm_restore_sml = [&](NodeCoinState& st) {
+        st.sml() = CSimplifiedMNList(std::vector<CSimplifiedMNListEntry>{e2_sml_entry(0x40)});
+        st.set_have_sml(true);
+        st.set_sml_current_hash(HASH_P);
+    };
+    auto arm_full_bundle = [&](NodeCoinState& st, CoinStateMaintainer& m) {
+        st.set_require_sml(true);
+        st.set_require_fresh_credit_pool(true);
+        m.on_mn_list_update(e2_mn_pairs(p2pkh_script(0x30)));
+        m.on_new_tip(P, HASH_P, 0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER);
+    };
+
+    // ── Restart WITHOUT the credit-pool restore (the bug): SML resumes @ P but
+    //    the pool is unseeded (height -1) → the freshness gate fails closed. ──
+    {
+        NodeCoinState st;
+        CoinStateMaintainer m(st);
+        warm_restore_sml(st);
+        arm_full_bundle(st, m);
+        EXPECT_EQ(st.credit_pool_height(), -1)
+            << "without persistence the pool is unseeded at the restart tip";
+        EXPECT_FALSE(st.make_embedded_work_inputs().viable())
+            << "unseeded credit pool at the restart tip must fail closed to dashd fallback";
+    }
+
+    // ── Restart WITH the credit-pool restore (the fix): pool resumes @ P, the
+    //    gate is live at the restart tip, and the first ingested block advances
+    //    the pool INDEPENDENTLY, VERIFIED against its own from-wire cbTx. ──
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    warm_restore_sml(st);
+    // Restore both the freshness seed (NodeCoinState) and the running accrual.
+    st.set_credit_pool(persist_bal, persist_hash, static_cast<int32_t>(persist_h));
+    m.restore_credit_pool(persist_bal, persist_h);
+    arm_full_bundle(st, m);
+    EXPECT_EQ(st.credit_pool_height(), static_cast<int32_t>(P));
+    EXPECT_EQ(st.credit_pool(), CP0);
+    EXPECT_TRUE(st.make_embedded_work_inputs().viable())
+        << "restored credit pool current at the restart tip must serve daemonlessly";
+
+    // First incremental block @ H carrying the from-wire committed balance CP1.
+    BlockType blk = e2_block_with_cbtx(static_cast<int32_t>(H), CP1);
+    // Sanity: the block's OWN coinbase commits CP1 at nHeight H (the independent
+    // source of truth the advance is verified against — re-parsed here).
+    {
+        CCbTx from_wire;
+        ASSERT_TRUE(parse_cbtx(blk.m_txs[0].extra_payload, from_wire));
+        ASSERT_EQ(from_wire.nHeight, static_cast<int32_t>(H));
+        ASSERT_EQ(from_wire.creditPoolBalance, CP1);
+    }
+    m.on_block_connected(blk, H);
+    // The pool advanced to the tip, matching the block's OWN committed value.
+    EXPECT_EQ(st.credit_pool_height(), static_cast<int32_t>(H))
+        << "the pool must advance to the ingested block's height independently";
+    EXPECT_EQ(st.credit_pool(), CP1)
+        << "advance must equal the block's from-wire committed creditPoolBalance";
+    // Non-self-referential: the advanced value equals CP0 + the INDEPENDENTLY
+    // derived platform reward, i.e. the seed plus this block's own accrual —
+    // reproduced from the raw formula, not read back off a template we built.
+    EXPECT_EQ(st.credit_pool(), CP0 + e2_platform_reward_oracle(H));
+
+    // The advanced pool is fresh at the new tip → still serves at H.
+    m.on_new_tip(H, raw256(0x55), 0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER);
+    // (sml_current_hash must also be at the new tip for full viability; the
+    // credit-pool axis specifically is proven fresh below regardless.)
+    EXPECT_EQ(st.credit_pool_height(), static_cast<int32_t>(H));
+}
+
+// E2 — the independent verify is REAL: a block whose coinbase commits a WRONG
+// creditPoolBalance (inconsistent with the accrual) is REJECTED — the freshness
+// seed is NOT advanced, so the arm fails closed rather than serving a bad-cbtx
+// balance. A self-referential built==seed+reward check could not catch this
+// (it would happily rebuild the wrong value); comparing our independent accrual
+// to the block's own committed value does.
+TEST(DashEmbeddedGbt, E2CreditPoolDriftFailsClosedNotSelfReferential) {
+    const uint32_t P      = H - 1;
+    const uint256  HASH_P = raw256(0x54);
+    const int64_t  CP0    = 111'000'000'000LL;
+    const int64_t  reward = e2_platform_reward_oracle(H);
+    const int64_t  CP1_correct = CP0 + reward;
+    const int64_t  CP1_wrong   = CP1_correct + 1;   // off-by-one bad-cbtx
+
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    // Warm-restore the pool @ P (contiguous predecessor of block H).
+    st.sml() = CSimplifiedMNList(std::vector<CSimplifiedMNListEntry>{e2_sml_entry(0x40)});
+    st.set_have_sml(true);
+    st.set_sml_current_hash(HASH_P);
+    st.set_credit_pool(CP0, HASH_P, static_cast<int32_t>(P));
+    m.restore_credit_pool(CP0, P);
+
+    // A block @ H whose committed balance disagrees with the accrual by 1 duff.
+    BlockType bad = e2_block_with_cbtx(static_cast<int32_t>(H), CP1_wrong);
+    m.on_block_connected(bad, H);
+
+    // Fail closed: the freshness seed stayed at P (did NOT advance to H), so with
+    // the tip at H the credit-pool gate refuses the arm — the invariant "never
+    // serve a wrong creditPoolBalance" holds by failing to fallback, not by
+    // adopting the bad value.
+    EXPECT_EQ(st.credit_pool_height(), static_cast<int32_t>(P))
+        << "a drifted (bad-cbtx) balance must NOT advance the freshness seed";
+    EXPECT_NE(st.credit_pool(), CP1_wrong)
+        << "the wrong committed balance must never be adopted as the seed";
+    EXPECT_EQ(st.credit_pool(), CP0)
+        << "the seed must remain the last independently-confirmed value";
+
+    // Contrast — the SAME block with the CORRECT committed balance DOES verify
+    // (contiguous advance from the restored P) and advances the seed to H. This
+    // is what proves the check is discriminating, not merely always-refusing.
+    NodeCoinState st_ok;
+    CoinStateMaintainer m_ok(st_ok);
+    st_ok.set_credit_pool(CP0, HASH_P, static_cast<int32_t>(P));
+    m_ok.restore_credit_pool(CP0, P);
+    BlockType good = e2_block_with_cbtx(static_cast<int32_t>(H), CP1_correct);
+    m_ok.on_block_connected(good, H);
+    EXPECT_EQ(st_ok.credit_pool_height(), static_cast<int32_t>(H));
+    EXPECT_EQ(st_ok.credit_pool(), CP1_correct);
+}
+
+// E2 finding A — a FORGED block body (real PoW header, fake type-5 coinbase with
+// the CORRECT nHeight but a WRONG creditPoolBalance and an unbound merkle root)
+// must be REFUSED at ingestion and must NOT advance the freshness seed. Without
+// the body↔header binding this forgery would ride the non-contiguous bootstrap,
+// advance the gate, and be SERVED as a bad-cbtx — E2 widened this trust surface,
+// so the binding closes it. The verify is discriminating: a well-BOUND block
+// (correct root committing its own coinbase) still advances.
+TEST(DashEmbeddedGbt, E2ForgedBlockBodyRefusedDoesNotAdvanceSeed) {
+    const uint32_t P      = H - 1;
+    const uint256  HASH_P = raw256(0x54);
+    const int64_t  CP0    = 111'000'000'000LL;
+    const int64_t  reward = e2_platform_reward_oracle(H);
+    const int64_t  CP1_real   = CP0 + reward;
+    const int64_t  CP1_forged = CP1_real + 777;   // attacker's fabricated balance
+
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    st.set_credit_pool(CP0, HASH_P, static_cast<int32_t>(P));
+    m.restore_credit_pool(CP0, P);
+
+    // Forged body: right nHeight (H), wrong creditPoolBalance, header still commits
+    // the REAL coinbase → the delivered body does not fold to the committed root.
+    BlockType forged = e2_forged_block(static_cast<int32_t>(H), CP1_real, CP1_forged);
+    ASSERT_FALSE(dash::coin::block_body_binds_to_header(forged))
+        << "the forged body must fail the merkle body↔header binding";
+    // Re-parse confirms the forgery carries the right height but the fake balance.
+    {
+        CCbTx fake;
+        ASSERT_TRUE(parse_cbtx(forged.m_txs[0].extra_payload, fake));
+        ASSERT_EQ(fake.nHeight, static_cast<int32_t>(H));
+        ASSERT_EQ(fake.creditPoolBalance, CP1_forged);
+    }
+    m.on_block_connected(forged, H);
+
+    // Refused: the seed stayed at P — the fabricated balance was never adopted.
+    EXPECT_EQ(st.credit_pool_height(), static_cast<int32_t>(P))
+        << "a forged/unbound body must NOT advance the freshness seed";
+    EXPECT_EQ(st.credit_pool(), CP0);
+    EXPECT_NE(st.credit_pool(), CP1_forged);
+
+    // Discriminating: a well-bound block at H (root commits its own coinbase) IS
+    // accepted and advances — the guard rejects only unbound bodies, not valid ones.
+    BlockType good = e2_block_with_cbtx(static_cast<int32_t>(H), CP1_real);
+    ASSERT_TRUE(dash::coin::block_body_binds_to_header(good));
+    m.on_block_connected(good, H);
+    EXPECT_EQ(st.credit_pool_height(), static_cast<int32_t>(H));
+    EXPECT_EQ(st.credit_pool(), CP1_real);
 }

@@ -123,6 +123,17 @@ public:
     /// reward-safe dashd fallback. Default OFF preserves prior unit-test posture.
     void set_require_fresh_credit_pool(bool v) { m_require_fresh_credit_pool = v; }
 
+    /// Network MN_RR activation height (dashcore Params().GetConsensus()
+    /// .MN_RRHeight — per-chainparams). Gates the DIP-0027 platform-share
+    /// credit-pool accrual in the template build, the pre-emit value re-check,
+    /// and the per-block advance. main_dash sets the testnet value; the
+    /// mainnet default keeps every existing caller byte-unchanged. E4 re-soak
+    /// fix: leaving the MAINNET constant in force on testnet zeroes the
+    /// platform reward and biases every committed creditPoolBalance low by
+    /// exactly one block's platform reward (constant 66,966,830 duffs).
+    void set_mn_rr_height(int h) { m_mn_rr_height = h; }
+    int mn_rr_height() const { return m_mn_rr_height; }
+
     /// Enable the SML-required viability gate. main_dash.cpp turns this on for
     /// the embedded coin-P2P arm so a template is only served once the CCbTx
     /// commitment inputs are present (review finding H3: no mid-sync half-built block).
@@ -263,7 +274,8 @@ public:
         if (m_require_fresh_credit_pool) {
             const int64_t expected_credit_pool =
                 m_credit_pool
-                + compute_dash_platform_reward_post_v20_mn_rr(next_h);
+                + compute_dash_platform_reward_post_v20_mn_rr(next_h,
+                                                              m_mn_rr_height);
             if (cb.creditPoolBalance != expected_credit_pool) return false;
         }
         return true;
@@ -308,6 +320,7 @@ public:
         e.address_p2sh_version = m_address_p2sh_version;
         e.curtime              = m_curtime;
         e.version              = m_version;
+        e.mn_rr_height         = m_mn_rr_height;
         // CCbTx seams: pass the SML + quorum set ONLY when present, so a
         // legacy/testnet-without-SML bundle still builds the pre-CCbTx template
         // (empty payload) byte-for-byte, while a live daemonless bundle emits
@@ -350,6 +363,7 @@ private:
     std::function<bool(uint32_t)> m_commitment_window_fn;  // refuse embedded on DKG commitment heights
     bool     m_require_fresh_bestcl{false};  // refuse embedded on a stale/absent bestCL
     bool     m_require_fresh_credit_pool{false}; // refuse embedded on a lagged credit-pool seed
+    int      m_mn_rr_height{DASH_MN_RR_HEIGHT_MAINNET}; // network MN_RR activation height (platform-share gate)
     uint256  m_credit_pool_current_hash;     // block hash the credit-pool seed is current at
     int32_t  m_credit_pool_height{-1};       // seed cbTx's OWN height (-1 = never seeded)
     bool     m_quorum_healthy{true};         // last diff's quorum tail parsed OK

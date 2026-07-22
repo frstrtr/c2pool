@@ -31,6 +31,8 @@
 #include <impl/dash/coin/mn_list_ingest.hpp>       // wire_mn_list_ingest (leg 4)
 #include <impl/dash/coin/tip_ingest.hpp>           // wire_tip_ingest (leg 2)
 #include <impl/dash/coin/block_connect_ingest.hpp> // wire_block_connect_ingest (leg 3)
+#include <impl/dash/coin/block_producer.hpp>        // compute_merkle_root (E2 finding A body↔header bind)
+#include <impl/dash/coin/utxo_adapter.hpp>          // dash_txid
 #include <impl/dash/coin/coin_state_maintainer.hpp>
 #include <impl/dash/coin/node_coin_state.hpp>
 #include <impl/dash/coin/rpc_data.hpp>
@@ -344,6 +346,10 @@ TEST(DashMnSeed, SnapshotHeightFencesReplayedBlocks)
         o.scriptPubKey.m_data = shared;
         cb.vout.push_back(o);
         bc.block.m_txs.push_back(cb);
+        // Bind the body to the header (E2 finding A) so on_block_connected accepts it.
+        std::vector<uint256> ids;
+        for (const auto& tx : bc.block.m_txs) ids.push_back(dash::coin::dash_txid(tx));
+        bc.block.m_merkle_root = dash::coin::compute_merkle_root(ids);
         return bc;
     };
     auto bc_old = paying_block(2'399'901);
