@@ -907,12 +907,18 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     }
 
     // ARM B binding: EMPTY when no dashd creds are armed (daemonless deployment).
-    // ignore_failure=true so a duplicate/already-have after an ARM A accept is
-    // success, not failure, and never masks the primary win.
+    // ignore_failure=false: submitblock_result_accepted() ALREADY treats
+    // duplicate/inconclusive/already-have as success (so an ARM A accept is
+    // never re-reported as failure); what ignore_failure=true additionally
+    // suppressed was the ONLY record of a REAL dashd rejection reason. On the
+    // hotel mainnet orphans (h2508929/h2509044) the bad-cb-payee verdict was
+    // swallowed and the log showed just "no-ack", masking a consensus-invalid
+    // block as a mere broadcast hiccup. A won-block rejection reason is
+    // reward-critical diagnosis: log it loudly.
     dash::coin::RpcSubmitSink rpc_submit;
     if (rpc) {
         rpc_submit = [&rpc](const std::string& block_hex) -> bool {
-            return rpc->submit_block_hex(block_hex, /*ignore_failure=*/true);
+            return rpc->submit_block_hex(block_hex, /*ignore_failure=*/false);
         };
     }
 
@@ -1073,12 +1079,40 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 const ProducerJobKey key{prev_share_hash, payout_script};
 
                 // Cache hit: same sharechain tip, same coin template, fresh.
+                //
+                // "Same coin template" MUST mean the same TX SET, not merely the
+                // same tip+height: dashd re-sources GBT ~every 30 s at the SAME
+                // (tip, height) while the mempool moves, and the masternode
+                // payout amount inside the cached gentx is fee-dependent
+                // (MN share of subsidy+fees). Serving a cached gentx built over
+                // an older poll's fee total while build_connection_coinbase
+                // freezes the CURRENT wd's tx set around it yields a merkle-
+                // consistent but consensus-INVALID block: the coinbase underpays
+                // the MN payee by the fee delta's share and dashd rejects it
+                // with bad-cb-payee (hotel mainnet h2508929: paid the exact
+                // GBT@fees=1074 amount vs expected GBT@fees=1301 amount;
+                // h2509044: paid GBT@fees=85791 vs expected GBT@fees=88051 --
+                // both found blocks lost). desired_tx_hashes equality pins the
+                // cached coinbase to the exact tx set (and therefore the exact
+                // fee total) it was computed for; payment_amount equality is the
+                // cheap belt for any same-height payment-array drift.
                 if (auto it = job_cache->find(key); it != job_cache->end()) {
                     auto& e = it->second;
                     if (e.coin_tip == wd.m_previous_block && e.height == wd.m_height
+                        && e.build.frozen.payment_amount == wd.m_payment_amount
+                        && e.build.frozen.desired_tx_hashes == wd.m_tx_hashes
                         && now - e.at < std::chrono::seconds(30)) {
                         mint_registry->put(e.build.job.ref_hash, e.build.frozen);
                         return e.build.job;
+                    }
+                    if (e.coin_tip == wd.m_previous_block && e.height == wd.m_height
+                        && now - e.at < std::chrono::seconds(30)) {
+                        static int drift_log = 0;
+                        if (drift_log++ % 20 == 0)
+                            LOG_INFO << "[MINT] producer job cache invalidated: "
+                                        "template tx-set/fee drift at same tip "
+                                        "(h=" << wd.m_height << ") -- rebuilding "
+                                        "gentx over the current template";
                     }
                     job_cache->erase(it);
                 }
