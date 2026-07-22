@@ -210,6 +210,12 @@ jobs:
           name: pkg-linux-${{ matrix.coin }}
           path: c2pool-*-linux-x86_64.tar.gz
 
+      # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
+      # checkout payload and _temp, keep _actions/_tool/_update. Always runs.
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace
+
   # ════════════════════════════════════════════════════════════════════════════
   # macOS universal (arm64 + x86_64) — operator decision 2026-06-11.
   # Each arch builds natively on its own runner (macos-14 = Apple Silicon ->
@@ -698,3 +704,9 @@ jobs:
               --notes "Draft assembled by release.yml -- operator reviews and publishes manually." \
               dist/*
           fi
+
+      # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
+      # checkout payload and _temp, keep _actions/_tool/_update. Always runs.
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace

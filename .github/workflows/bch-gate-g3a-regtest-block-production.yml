@@ -110,3 +110,9 @@ jobs:
           BCH_RPC_PASS: ${{ secrets.BCH_RPC_PASS }}
           BCH_RPC_AUTH: ${{ secrets.BCH_RPC_AUTH }}
         run: bash tests/gates/bch_g3a_regtest_block_production.sh
+
+      # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
+      # checkout payload and _temp, keep _actions/_tool/_update. Always runs.
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace

@@ -46,3 +46,9 @@ jobs:
         run: |
           node --import tsx --import ./.ci-seed-pin.mjs \
             --test "tests/unit/pplns-parse-properties.test.ts"
+
+      # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
+      # checkout payload and _temp, keep _actions/_tool/_update. Always runs.
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace

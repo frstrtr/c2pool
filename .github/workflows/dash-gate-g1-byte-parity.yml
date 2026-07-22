@@ -103,3 +103,9 @@ jobs:
         env:
           BUILD_DIR: ${{ github.workspace }}/build_g1
         run: bash tests/gates/g1_byte_parity_kat.sh
+
+      # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
+      # checkout payload and _temp, keep _actions/_tool/_update. Always runs.
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace
