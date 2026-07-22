@@ -34,8 +34,12 @@
 #include <impl/dash/coin/vendor/smldiff.hpp>     // vendor::CSimplifiedMNListDiff + apply_diff
 #include <impl/dash/coin/vendor/quorum_tail.hpp> // vendor::parse_quorum_tail
 #include <impl/dash/coin/vendor/cbtx.hpp>        // vendor::parse_cbtx (bestCL*/creditPool seed)
+#include <impl/dash/coin/credit_pool.hpp>        // CreditPool (independent per-block accrual, E2)
+#include <impl/dash/coin/subsidy.hpp>            // compute_dash_platform_reward_post_v20_mn_rr
+#include <impl/dash/crypto/hash_x11.hpp>         // dash::crypto::hash_x11 (block identity for the seed)
 
 #include <core/uint256.hpp>
+#include <core/pack.hpp>
 #include <core/log.hpp>
 
 #include <array>
@@ -98,6 +102,13 @@ public:
     /// SML at exactly the state dashd commits for TIP+1 is the #1 item the live
     /// byte-parity KAT against a running dashd must confirm; do not assume.
     void on_mnlistdiff(const vendor::CSimplifiedMNListDiff& diff) {
+        // E2 credit-pool persist locals: set when the diff's cbTx re-anchors the
+        // pool, flushed (aligned with the SML persist) at the bottom so a restart
+        // resumes the credit pool at the SAME tip as SMLDb/QuorumDb.
+        bool     cp_seeded  = false;
+        int64_t  cp_balance = 0;
+        uint32_t cp_height  = 0;
+
         // H-7 base-continuity: an INCREMENTAL diff is only valid when its
         // baseBlockHash matches the block our SML/quorum state is CURRENT AT.
         // Applying a diff whose base is some other block upserts/erases MN +
@@ -163,6 +174,16 @@ public:
                     // instead of committing a lagged creditPoolBalance (soak fix).
                     m_state.set_credit_pool(observed.creditPoolBalance,
                                             diff.blockHash, observed.nHeight);
+                    // E2: re-anchor the independent running accrual to this
+                    // authoritative snapshot value/height so the per-block advance
+                    // (on_block_connected) continues contiguously from here, and
+                    // record it for the aligned CreditPoolDb persist below (same
+                    // blockHash/height as the SML persist → matching restart tip).
+                    m_credit_pool_sm.seed(observed.creditPoolBalance,
+                                          static_cast<uint32_t>(observed.nHeight));
+                    cp_seeded  = true;
+                    cp_balance = observed.creditPoolBalance;
+                    cp_height  = static_cast<uint32_t>(observed.nHeight);
                     // bestCLHeightDiff is relative to (cbHeight-1); recover the
                     // absolute best-CL height so the next template re-derives its
                     // own diff against ITS height. Only adopt when the observed
@@ -201,6 +222,13 @@ public:
         // QuorumDb::write_quorums; unset (KAT posture) makes it a no-op.
         if (m_have_mn_sml && m_on_sml_persist)
             m_on_sml_persist(diff.blockHash);
+        // E2: persist the credit-pool tip alongside the SML tip (same blockHash +
+        // height), so the CreditPoolDb sentinel (cp_hash == sml_hash) holds and a
+        // warm restart restores the pool to exactly the SML's resume point. Only
+        // when the SML actually applied non-empty (a persistable tip) AND the
+        // diff carried a v3+ cbTx seed.
+        if (m_have_mn_sml && cp_seeded && m_on_credit_pool_persist)
+            m_on_credit_pool_persist(diff.blockHash, cp_height, cp_balance);
         if (!m_have_mn_sml)
             demote();
         else
@@ -244,6 +272,10 @@ public:
         // Invalidate the credit-pool seed's freshness too (height -1 != any tip),
         // so the arm fails closed on the credit-pool axis until a fresh re-seed.
         m_state.set_credit_pool(0, uint256::ZERO, -1);
+        // E2: wipe the independent running accrual as well — its balance was built
+        // on the now-orphaned branch. It re-bootstraps from the first post-reorg
+        // block's / full-snapshot's authoritative cbTx (never a stale carry-over).
+        m_credit_pool_sm.clear();
         // Wipe the PERSISTED SML/quorum stores too. The on-disk state is now for
         // an orphaned branch; it is self-consistent so the root-verify on the
         // next restart WOULD pass and serve a wrong-branch template. Clearing it
@@ -296,6 +328,15 @@ public:
     /// template with a phantom payee. Returns apply_block's ApplyResult.
     MnStateMachine::ApplyResult
     on_block_connected(const dash::coin::BlockType& block, uint32_t height) {
+        // E2 (independent credit-pool advance): fold THIS block's own credit-pool
+        // accrual so the DIP-0027 balance tracks the tip on every ingested block,
+        // NOT only when the periodic mnlistdiff re-seeds it. This is what lets the
+        // freshness gate pass daemonlessly between diffs and — paired with the
+        // CreditPoolDb restore in main_dash — on the tip that existed at restart.
+        // Runs BEFORE the MN snapshot fence: the credit pool is a distinct axis
+        // (asset-lock/unlock + platform-reward), independent of the payee set.
+        advance_credit_pool_on_block(block, height);
+
         // E2c snapshot fence: blocks the payout-bearing snapshot already
         // reflects (height <= its as-of height) must NOT be re-folded -- the
         // snapshot's registrations/spends/lastPaid ARE those blocks' effects,
@@ -367,12 +408,107 @@ public:
         m_on_sml_clear = std::move(fn);
     }
 
+    /// Wire the credit-pool PERSISTENCE sink (main_dash points this at
+    /// CreditPoolDb::write_state). Invoked from on_mnlistdiff after an accepted
+    /// diff re-anchors the pool, with the same (blockHash, height) the SML persist
+    /// uses so the on-disk credit-pool tip matches SMLDb/QuorumDb exactly (E2).
+    /// Optional (unset in KATs = no-op; the running arm never needs persistence).
+    void set_on_credit_pool_persist(
+        std::function<void(const uint256&, uint32_t, int64_t)> fn) {
+        m_on_credit_pool_persist = std::move(fn);
+    }
+
+    /// Restore the independent running credit-pool accrual on a warm restart
+    /// (main_dash calls this when CreditPoolDb loads a tip matching the SML's).
+    /// Seeds the state machine to the persisted balance/height so the first
+    /// post-restart block advances contiguously (and verifies against its own
+    /// from-wire cbTx) instead of the arm falling back to dashd for the restart
+    /// tip. The caller sets the NodeCoinState freshness seed in parallel (E2).
+    void restore_credit_pool(int64_t balance, uint32_t height) {
+        m_credit_pool_sm.seed(balance, height);
+    }
+
     /// True iff both prerequisites are met AND the holder is currently live.
     bool live() const { return m_state.populated(); }
 
 private:
     void notify_state_dirty() {
         if (m_on_state_dirty) m_on_state_dirty();
+    }
+
+    // Block identity hash (Dash: X11 of the 80-byte header). Marks the credit-pool
+    // seed as current AT this exact block; cheap (~0.1 ms) and computed off the
+    // ingested block, never from any template we built.
+    static uint256 block_identity_hash(const dash::coin::BlockType& block) {
+        auto packed = ::pack(
+            static_cast<const bitcoin_family::coin::BlockHeaderType&>(block));
+        return dash::crypto::hash_x11(packed.get_span());
+    }
+
+    // E2 — INDEPENDENT per-block credit-pool advance + non-self-referential verify.
+    //
+    // Every ingested block carries, in its OWN coinbase CCbTx, the creditPoolBalance
+    // dashd committed for that height. That is the independent, off-the-wire source
+    // of truth. We (a) run our own accrual state machine forward across the block
+    // and (b) require the result to equal the block's own committed value. Two
+    // independent sources are compared — our recomputation vs dashd's committed
+    // value at the same height — NOT a built template against its own seed (the
+    // self-consistent-but-stale trap that refuted 3 prior soaks). The seed's height
+    // is taken straight off the wire (cbTx.nHeight == connected height, checked),
+    // so it can never be mistaken as current at a height we did not observe.
+    void advance_credit_pool_on_block(const dash::coin::BlockType& block,
+                                      uint32_t height) {
+        if (block.m_txs.empty()) return;                 // no coinbase
+        const auto& cb = block.m_txs[0];                 // coinbase = tx 0
+        if (cb.type != 5 || cb.extra_payload.empty())
+            return;                                      // pre-v20 / non-CbTx: leave prior seed
+        vendor::CCbTx observed;
+        if (!vendor::parse_cbtx(cb.extra_payload, observed)) return;
+        if (observed.nVersion < vendor::CCbTx::VERSION_CLSIG_AND_BALANCE) return;
+        // Never seed a balance against a height we did not verify off the wire.
+        if (observed.nHeight != static_cast<int32_t>(height)) {
+            LOG_WARNING << "[CREDITPOOL] block cbTx nHeight " << observed.nHeight
+                        << " != connected height " << height
+                        << " — skip credit-pool advance";
+            return;
+        }
+        const int64_t from_wire = observed.creditPoolBalance;
+        const int64_t reward =
+            dash::coin::compute_dash_platform_reward_post_v20_mn_rr(height);
+
+        if (m_credit_pool_sm.initialized()
+            && m_credit_pool_sm.height() + 1 == height) {
+            // CONTIGUOUS: advance the running accrual by THIS block's own delta
+            // (platform reward + Σ assetLocks − Σ assetUnlocks) and cross-check it
+            // against the block's OWN committed balance (the independent verify).
+            m_credit_pool_sm.apply_block(block, height, reward);
+            if (m_credit_pool_sm.balance() != from_wire) {
+                // Drift: our model disagrees with the wire. Fail CLOSED — do not
+                // advance the freshness seed (get_work falls back to the reward-safe
+                // dashd path for this height). Re-anchor the state machine to the
+                // authoritative wire value so the next block re-verifies, and surface
+                // the drift for soak triage. (Making the advance correct — not
+                // relaxing the gate — is the fix if this ever fires.)
+                LOG_WARNING << "[CREDITPOOL] ACCRUAL DRIFT h=" << height
+                            << " computed=" << m_credit_pool_sm.balance()
+                            << " from-wire=" << from_wire
+                            << " — freshness seed NOT advanced (fail closed to fallback)";
+                m_credit_pool_sm.seed(from_wire, height);
+                return;
+            }
+            // Verified: an independently-confirmed advance to this height.
+        } else {
+            // NON-CONTIGUOUS (cold / gap / first block post-restart before a diff
+            // re-anchor): no running prediction to verify against, so bootstrap
+            // directly from the block's own committed balance. Still non-self-
+            // referential — value AND height come straight off the wire.
+            m_credit_pool_sm.seed(from_wire, height);
+        }
+        // Advance the freshness seed to THIS block: height == the tip we build the
+        // next template on, so the credit-pool freshness gate passes at the right
+        // height without waiting for the next mnlistdiff.
+        m_state.set_credit_pool(from_wire, block_identity_hash(block),
+                                static_cast<int32_t>(height));
     }
 
     // Publish only when both prerequisites are present; otherwise leave the
@@ -394,7 +530,12 @@ private:
     std::function<void()> m_on_state_dirty;  // SML/bestCL/reorg -> re-issue work
     std::function<void()> m_on_full_resync;  // H-1 heal -> reset sml_base + full re-sync
     std::function<void(const uint256&)> m_on_sml_persist;  // accepted diff -> SMLDb/QuorumDb write
-    std::function<void()> m_on_sml_clear;    // reorg/heal -> SMLDb/QuorumDb wipe
+    std::function<void()> m_on_sml_clear;    // reorg/heal -> SMLDb/QuorumDb wipe (extended to CreditPoolDb)
+    // E2: independent DIP-0027 credit-pool accrual, advanced per ingested block
+    // (on_block_connected) and re-anchored per accepted mnlistdiff. Verified
+    // against each block's own from-wire cbTx; persisted via the hook below.
+    CreditPool m_credit_pool_sm;
+    std::function<void(const uint256&, uint32_t, int64_t)> m_on_credit_pool_persist;
 
     bool m_have_mn{false};
     bool m_have_tip{false};
