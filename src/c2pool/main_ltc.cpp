@@ -368,6 +368,8 @@ void print_help() {
     std::cout << "COMMAND LINE OPTIONS:\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
     std::cout << "  --help, -h                Show this help message and exit\n";
+    std::cout << "  --data-dir PATH           Root all per-instance state here (default: ~/.c2pool)\n";
+    std::cout << "                            (isolates co-located instances)\n";
     std::cout << "  --testnet                 Use testnet instead of mainnet\n";
     std::cout << "  --integrated              Full P2P pool with sharechain (DEFAULT)\n";
     std::cout << "  --solo                    Solo pool mode (no P2P sharechain, local payouts)\n";
@@ -523,6 +525,20 @@ void print_help() {
 }
 
 int main(int argc, char* argv[]) {
+    // Pre-scan for --data-dir BEFORE anything reads config_path() — the
+    // Settings ctor (Fileconfig captures its path at construction) and the
+    // file-log sink both resolve through it. Redirecting the chokepoint here
+    // guarantees the override wins everywhere. See #722.
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--data-dir") {
+            if (i + 1 >= argc || argv[i + 1][0] == '\0' || argv[i + 1][0] == '-') {
+                std::cerr << "error: --data-dir requires a PATH argument\n";
+                return 1;
+            }
+            core::filesystem::set_data_dir(argv[i + 1]);
+        }
+    }
+
     // Install crash handlers
     std::set_terminate(c2pool_terminate_handler);
     std::signal(SIGINT, signal_handler);
@@ -782,6 +798,13 @@ int main(int argc, char* argv[]) {
         if (arg == "--help" || arg == "-h") {
             print_help();
             return 0;
+        }
+        else if (arg == "--data-dir" && i + 1 < argc) {
+            // Root ALL per-instance on-disk state (sharechain LevelDB, addr
+            // store, whitelist, logs, ratchet, found-blocks db, ...) under
+            // this path so co-located instances never contend the LevelDB
+            // LOCK. Default (unset) keeps ~/.c2pool — see issue #722.
+            core::filesystem::set_data_dir(argv[++i]);
         }
         else if (arg == "--testnet") {
             settings->m_testnet = true;

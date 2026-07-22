@@ -1023,6 +1023,12 @@ void MergedMiningManager::try_submit_merged_blocks(
                          << "] Merged block submitted (" << block_hex.size()/2 << " bytes"
                          << ", snapshot hash=" << committed_block_hash.GetHex().substr(0, 16) << ")";
                 {
+                    // Transient manual-submit artifact kept at a fixed /tmp
+                    // path (NOT re-rooted under --data-dir): routing an
+                    // env/CLI-derived path into a file sink trips CodeQL
+                    // cpp/path-injection, and the state that matters for
+                    // co-located isolation (LevelDB, addrs, logs) is already
+                    // re-rooted via config_path(). See #722.
                     std::string path = "/tmp/c2pool_doge_block_" + std::to_string(chain.current_work.height) + ".hex";
                     std::ofstream f(path);
                     if (f.is_open()) { f << block_hex; f.close(); }
