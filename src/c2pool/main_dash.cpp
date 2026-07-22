@@ -199,6 +199,7 @@ void print_banner(const char* argv0)
         << "           [--listen [HOST:]PORT] [--addnode HOST:PORT]... [--connect HOST:PORT]...\n"
         << "           [--stratum [HOST:]PORT] [--coin-p2p-connect HOST:PORT]...\n"
         << "           [--web-port PORT] [--web-host ADDR] [--dashboard-dir PATH]\n"
+        << "           [--external-ip ADDR]\n"
         << "           [--embedded-utxo]\n"
         << "           [--give-author PCT] [-f|--fee PCT] [--node-owner-address ADDR]\n"
         << "           [--redistribute pplns|fee|boost|donate]\n"
@@ -229,6 +230,10 @@ void print_banner(const char* argv0)
         << "        are bound to the REAL DASH tracker; local hashrate comes from the\n"
         << "        DASH stratum acceptor. If stratum and web ports collide the web\n"
         << "        port moves to stratum+1.\n"
+        << "        --external-ip ADDR (alias --stratum-advertise / --public-host)\n"
+        << "        overrides the miner-facing host shown in the dashboard Stratum\n"
+        << "        URL -- for NAT / port-mapped nodes whose outbound IP is not the\n"
+        << "        address miners dial; unset => auto-detect (no regression).\n"
         << "Consensus: X11 PoW + block identity; 2.5 min spacing; 5 DASH post-V20\n"
         << "        base, -1/14 per 210240; masternode payment 3/4 of block value.\n";
 }
@@ -395,7 +400,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              const std::string& redistribute_mode,
              bool no_p2p_relay,
              bool embedded_mainnet,
-             const std::string& coin_zmq_hashblock)
+             const std::string& coin_zmq_hashblock,
+             const std::string& external_ip)
 {
     namespace io = boost::asio;
 
@@ -568,6 +574,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
 #endif
         mi->set_worker_port(stratum_port);   // display only (see divergence note)
         mi->set_p2p_port(bind_port);
+        // Serve the operator-advertised miner-facing host (--external-ip) so
+        // the dashboard Stratum URL renders the NAT-external address miners
+        // actually dial, not the auto-detected outbound gateway IP. Unset =>
+        // MiningInterface keeps its auto-detect path (no regression).
+        if (!external_ip.empty())
+            mi->set_external_ip(external_ip);
         // p2pool-compat protocol_version for /local_stats. The core seam
         // documents this exact value for DASH (web_server.hpp:565) and it
         // matches the sharechain SSOT floor.
@@ -2267,6 +2279,9 @@ int main(int argc, char** argv)
     std::string dashboard_dir = "web-static";  // --dashboard-dir static asset root
     std::string redistribute_mode = "pplns";   // --redistribute pplns|fee|boost|donate
     std::string coin_zmq_hashblock;             // --coin-zmq-hashblock ENDPOINT (opt-in dashd ZMQ hashblock instant tip-notify, e.g. tcp://127.0.0.1:28332)
+    // Operator-supplied miner-facing host for the dashboard Stratum URL.
+    // Empty => auto-detect the outbound public IP (current behaviour).
+    std::string external_ip;                   // --external-ip / --stratum-advertise / --public-host
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
             std::cout << "c2pool-dash " << C2POOL_VERSION << "\n";
@@ -2337,6 +2352,14 @@ int main(int argc, char** argv)
         }
         else if (std::strcmp(argv[i], "--web-host") == 0 && i + 1 < argc)
             web_host = argv[++i];
+        // Miner-facing host override for the dashboard Stratum URL. Both hotel
+        // nodes NAT out through one gateway, so the auto-detected outbound IP
+        // is NOT the address miners reach; the operator advertises the real
+        // external-mapped host here. Aliases match how the flag is referenced.
+        else if ((std::strcmp(argv[i], "--external-ip") == 0 ||
+                  std::strcmp(argv[i], "--stratum-advertise") == 0 ||
+                  std::strcmp(argv[i], "--public-host") == 0) && i + 1 < argc)
+            external_ip = argv[++i];
         else if (std::strcmp(argv[i], "--dashboard-dir") == 0 && i + 1 < argc)
             dashboard_dir = argv[++i];
         else if (std::strcmp(argv[i], "--stratum") == 0 && i + 1 < argc) {
@@ -2418,7 +2441,8 @@ int main(int argc, char** argv)
                         embedded_utxo, dev_donation, node_owner_fee,
                         node_owner_address, redistribute_mode, no_p2p_relay,
                         embedded_mainnet,
-                        coin_zmq_hashblock);
+                        coin_zmq_hashblock,
+                        external_ip);
     }
     return run_selftest();
 }
