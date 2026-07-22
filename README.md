@@ -6,6 +6,7 @@
 C++ reimplementation of [forrestv/p2pool](https://github.com/p2pool/p2pool) targeting the **V36 share format**, with **per-coin binaries** for five parent chains and their merged-mining children: **Litecoin** (flagship — LTC + DOGE, PEP, BELLS, LKY, JKC, SHIC), **Bitcoin** (+ Namecoin), **DigiByte** (Scrypt), **Bitcoin Cash**, and **Dash**. See [Supported chains](#supported-chains) for the full matrix and status.
 
 Bitcoin wiki: <https://en.bitcoin.it/wiki/P2Pool>
+
 Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 
 ## Supported chains
