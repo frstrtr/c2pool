@@ -191,8 +191,8 @@ void print_banner(const char* argv0)
     std::cout
         << "c2pool-dash " << C2POOL_VERSION << " — DASH (X11, older-than-v35 -> V36)\n\n"
         << "Usage: " << argv0 << " [--version] [--help] [--selftest]\n"
-        << "  --data-dir PATH  root all per-instance state here (default ~/.c2pool;\n"
-        << "                   also C2POOL_DATA_DIR env); isolates co-located instances\n"
+        << "  --data-dir PATH  root all per-instance state here (default ~/.c2pool);\n"
+        << "                   isolates co-located instances\n"
         << "       " << argv0 << " --run [--coin-rpc H:P] [--coin-rpc-auth PATH]\n"
         << "           [--testnet] [--submit-block HEX | --submit-block-file PATH]\n"
         << "           [--listen [HOST:]PORT] [--addnode HOST:PORT]... [--connect HOST:PORT]...\n"

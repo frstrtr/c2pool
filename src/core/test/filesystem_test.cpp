@@ -5,16 +5,15 @@
 //
 // core::filesystem::config_path() is the single root every per-instance state
 // path derives from (sharechain LevelDB, addr store, whitelist, ratchet,
-// found-blocks db, logs, crash/block hex dumps). This test pins its three-tier
-// resolution order so co-located instances can each own an isolated namespace:
+// found-blocks db, logs). This test pins its resolution order so co-located
+// instances can each own an isolated namespace:
 //
-//   1. --data-dir PATH  -> set_data_dir()      (highest priority)
-//   2. C2POOL_DATA_DIR  -> environment         (config-less isolation)
-//   3. historical platform default             (byte-for-byte unchanged)
+//   1. --data-dir PATH  -> set_data_dir()   (operator-supplied CLI flag)
+//   2. historical platform default          (byte-for-byte unchanged)
 //
-// The default-parity case is the ship-critical invariant: with neither the
-// flag nor the env var set, config_path() MUST return the exact prior
-// expression so single-instance deployments are unaffected.
+// The default-parity case is the ship-critical invariant: with no --data-dir
+// set, config_path() MUST return the exact prior expression so single-instance
+// deployments are unaffected.
 
 #include <gtest/gtest.h>
 
@@ -41,50 +40,28 @@ fs::path historical_default()
 #endif
 }
 
-const char* kEnvVar = "C2POOL_DATA_DIR";
-
-// Fixture that snapshots and restores the override + env var so tests do not
-// leak process-wide state into one another (config_path() reads both).
+// Fixture that clears the override before and after each test so tests do not
+// leak process-wide state into one another (config_path() reads it).
 class DataDirTest : public ::testing::Test {
 protected:
-    void SetUp() override {
-        core::filesystem::set_data_dir("");   // clear CLI override
-        if (const char* prev = std::getenv(kEnvVar))
-            m_saved_env = std::string(prev);
-        unsetenv(kEnvVar);
-    }
-    void TearDown() override {
-        core::filesystem::set_data_dir("");
-        if (m_saved_env.has_value())
-            setenv(kEnvVar, m_saved_env->c_str(), 1);
-        else
-            unsetenv(kEnvVar);
-    }
-    std::optional<std::string> m_saved_env;
+    void SetUp() override    { core::filesystem::set_data_dir(""); }
+    void TearDown() override { core::filesystem::set_data_dir(""); }
 };
 
-// Tier 3: neither flag nor env -> exact historical default (ship-critical).
+// Tier 2: no --data-dir -> exact historical default (ship-critical parity).
 TEST_F(DataDirTest, DefaultUnchangedWhenUnset)
 {
     EXPECT_EQ(core::filesystem::config_path(), historical_default());
 }
 
-// Tier 2: env var wins over the platform default.
-TEST_F(DataDirTest, EnvOverrideTakesEffect)
+// Tier 1: --data-dir (set_data_dir) overrides the platform default.
+TEST_F(DataDirTest, CliOverrideTakesEffect)
 {
-    setenv(kEnvVar, "/tmp/c2pool_env_instX", 1);
-    EXPECT_EQ(core::filesystem::config_path(), fs::path("/tmp/c2pool_env_instX"));
-}
-
-// Tier 1: --data-dir (set_data_dir) wins over BOTH env and default.
-TEST_F(DataDirTest, CliOverrideBeatsEnv)
-{
-    setenv(kEnvVar, "/tmp/c2pool_env_instX", 1);
     core::filesystem::set_data_dir("/tmp/c2pool_cli_instY");
     EXPECT_EQ(core::filesystem::config_path(), fs::path("/tmp/c2pool_cli_instY"));
 }
 
-// Clearing the override falls back through the chain again (no sticky state).
+// Clearing the override falls back to the default again (no sticky state).
 TEST_F(DataDirTest, ClearOverrideFallsBack)
 {
     core::filesystem::set_data_dir("/tmp/c2pool_cli_instY");

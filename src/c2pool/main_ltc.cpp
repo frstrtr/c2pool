@@ -369,7 +369,7 @@ void print_help() {
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
     std::cout << "  --help, -h                Show this help message and exit\n";
     std::cout << "  --data-dir PATH           Root all per-instance state here (default: ~/.c2pool)\n";
-    std::cout << "                            (also settable via C2POOL_DATA_DIR env; isolates co-located instances)\n";
+    std::cout << "                            (isolates co-located instances)\n";
     std::cout << "  --testnet                 Use testnet instead of mainnet\n";
     std::cout << "  --integrated              Full P2P pool with sharechain (DEFAULT)\n";
     std::cout << "  --solo                    Solo pool mode (no P2P sharechain, local payouts)\n";
