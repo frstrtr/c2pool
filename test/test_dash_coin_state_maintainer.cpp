@@ -257,14 +257,57 @@ TEST(DashCoinStateMaintainer, BlockConnectNoSpecialTxPreservesReadiness) {
     m.on_new_tip(H - 1, PREV_HASH, BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER, CURTIME, VERSION);
     ASSERT_TRUE(m.live());
 
+    // Post projection-attribution: a connected block's coinbase pays the
+    // PROJECTED payee (every dashd-accepted block does) — that is the
+    // readiness-preserving "normal" block. A coinbase that does NOT pay the
+    // projected MN is a payee DESYNC (own KAT below), not a no-op.
     BlockType blk;
-    blk.m_txs.push_back(make_spend(raw256(0x90), 0, 500000000, 1));  // cb (idx 0, skipped)
+    blk.m_txs.push_back(make_spend(raw256(0x90), 0, 500000000, 1));  // cb (idx 0)
+    blk.m_txs[0].vout[0].scriptPubKey.m_data = p2pkh_script(0x30);   // pays projected MN
     blk.m_txs.push_back(make_spend(raw256(0x91), 0, 400000000, 2));  // plain spend, no collateral match
     auto r = m.on_block_connected(blk, H);
 
     EXPECT_EQ(r.registered, 0u);
+    EXPECT_EQ(r.paid, 1u) << "projected payee must be marked paid";
+    EXPECT_FALSE(r.payee_desync);
     EXPECT_EQ(st.mnstates().size(), 1u);
     EXPECT_TRUE(m.live()) << "no-op block must not drop the live bundle";
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Soak-found 2026-07-22 (E4 re-soak, 13x bad-cb-payee): the payee queue can
+// desync from the network's DIP-3 payment schedule (duplicated attribution,
+// missed block, corrupted seed). A connected block whose coinbase does NOT
+// pay the MN we project is that desync made visible. The maintainer must
+// fail CLOSED: wipe the untrustworthy payee set, demote to the dashd
+// fallback, and fire the authoritative re-seed hook — never keep serving a
+// guessed payee (dashd rejects it with bad-cb-payee).
+// ════════════════════════════════════════════════════════════════════════
+TEST(DashCoinStateMaintainer, PayeeDesyncWipesDemotesAndFiresReseed) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    bool reseed_fired = false;
+    m.set_on_mn_reseed([&]() { reseed_fired = true; });
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)));
+    m.on_new_tip(H - 1, PREV_HASH, BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER, CURTIME, VERSION);
+    ASSERT_TRUE(m.live());
+
+    // Coinbase pays a DIFFERENT script than the projected MN's payout.
+    BlockType blk;
+    blk.m_txs.push_back(make_spend(raw256(0x90), 0, 500000000, 1));
+    blk.m_txs[0].vout[0].scriptPubKey.m_data = p2pkh_script(0x77);  // NOT the MN
+    auto r = m.on_block_connected(blk, H);
+
+    EXPECT_TRUE(r.payee_desync);
+    EXPECT_EQ(r.paid, 0u) << "a desynced payment must NOT be guessed onto some MN";
+    EXPECT_EQ(st.mnstates().size(), 0u) << "desynced payee set must be wiped";
+    EXPECT_FALSE(m.live()) << "desync must demote the bundle to the dashd fallback";
+    EXPECT_TRUE(reseed_fired) << "desync must request an authoritative re-seed";
+
+    bool fb = false;
+    WorkSelection sel = st.select_work([&]() { fb = true; return DashWorkData{}; });
+    EXPECT_EQ(sel.source, WorkSource::DashdFallback);
+    EXPECT_TRUE(fb) << "after a payee desync, get_work must serve the dashd fallback";
 }
 
 // A block whose non-coinbase tx spends the sole MN's collateral removes it

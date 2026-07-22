@@ -1740,6 +1740,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // NodeRPC::Send self-connects via the blocking sync_reconnect fallback
         // (the same property --submit-block relies on).
         if (rpc) {
+            // Reusable authoritative seed fetch: invoked once at startup AND
+            // re-invoked by the maintainer's payee-desync fail-closed path
+            // (set_on_mn_reseed below) after it wiped a desynced payee queue.
+            // Lifetime: rpc/coin_state are main()-scope and outlive ioc.run().
+            auto seed_mn_set_from_rpc = [rpc_ptr = rpc.get(), addr_ver,
+                                         p2sh_ver, &coin_state](const char* tag) {
             try {
                 // Height-stable fetch: the snapshot must carry the exact
                 // height it is current at (the maintainer fences off
@@ -1752,10 +1758,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 uint32_t as_of = 0;
                 for (int attempt = 0; attempt < 3; ++attempt) {
                     const uint32_t h_before = static_cast<uint32_t>(
-                        rpc->getblockchaininfo().value("blocks", 0));
-                    protx_list = rpc->protx_list_valid_detailed();
+                        rpc_ptr->getblockchaininfo().value("blocks", 0));
+                    protx_list = rpc_ptr->protx_list_valid_detailed();
                     const uint32_t h_after = static_cast<uint32_t>(
-                        rpc->getblockchaininfo().value("blocks", 0));
+                        rpc_ptr->getblockchaininfo().value("blocks", 0));
                     if (h_before == h_after && h_after != 0) {
                         as_of = h_after;
                         break;
@@ -1769,7 +1775,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     up.mnstates     = std::move(seed);
                     up.as_of_height = as_of;
                     coin_state.mn_list_update.happened(up);
-                    std::cout << "[run] E2c MN-set seed LOADED: "
+                    std::cout << "[run] E2c MN-set seed LOADED (" << tag
+                              << "): "
                               << seed_stats.seeded << "/" << seed_stats.total
                               << " valid MNs (" << seed_stats.evo << " Evo)"
                                  " as-of h=" << as_of << " from dashd `protx"
@@ -1777,13 +1784,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                  " ARMED; populated() flips once the header"
                                  " tip syncs\n";
                 } else if (as_of == 0) {
-                    std::cout << "[run] E2c MN-set seed SKIPPED (dashd tip"
+                    std::cout << "[run] E2c MN-set seed SKIPPED (" << tag
+                              << ": dashd tip"
                                  " moved during every fetch attempt / height"
                                  " unavailable) -- populated() waits for the"
                                  " special-tx replay path; dashd fallback"
                                  " keeps serving\n";
                 } else {
-                    std::cout << "[run] E2c MN-set seed EMPTY/ABORTED (total="
+                    std::cout << "[run] E2c MN-set seed EMPTY/ABORTED (" << tag
+                              << ": total="
                               << seed_stats.total << " decode_failed="
                               << seed_stats.payout_decode_failed
                               << " malformed=" << seed_stats.malformed
@@ -1791,11 +1800,22 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                  " replay path; dashd fallback keeps serving\n";
                 }
             } catch (const std::exception& e) {
-                std::cout << "[run] E2c MN-set seed FAILED (protx list RPC: "
+                std::cout << "[run] E2c MN-set seed FAILED (" << tag
+                          << ": protx list RPC: "
                           << e.what() << ") -- populated() waits for the"
                              " special-tx replay path; dashd fallback keeps"
                              " serving\n";
             }
+            };
+            seed_mn_set_from_rpc("startup");
+            // Payee-desync heal (soak-found bad-cb-payee class): after the
+            // maintainer wiped a desynced payee queue and demoted to the
+            // dashd fallback, re-arm the embedded payee half from the
+            // authoritative protx list. Until the re-seed lands, get_work
+            // keeps serving the reward-safe fallback.
+            maintainer->set_on_mn_reseed([seed_mn_set_from_rpc]() {
+                seed_mn_set_from_rpc("payee-desync re-seed");
+            });
         } else {
             // Pure daemonless: no dashd RPC to seed from. The DMN set must
             // come from a DIP3-height special-tx replay (sync block bodies

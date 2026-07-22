@@ -75,6 +75,10 @@ public:
                            uint32_t as_of_height = 0) {
         m_have_mn = !mnstates.empty();
         m_mn_snapshot_height = as_of_height;
+        // An authoritative (non-empty) resync clears the payee-desync latch:
+        // the queue is trustworthy again from this snapshot forward.
+        if (m_have_mn)
+            m_mn_needs_reseed = false;
         m_state.mnstates().load(std::move(mnstates));
         if (!m_have_mn)
             demote();
@@ -309,7 +313,33 @@ public:
             return r;
         }
         auto r    = m_state.mnstates().apply_block(block, height);
-        m_have_mn = m_state.mnstates().size() != 0;
+        // PAYEE DESYNC (soak-found 2026-07-22, bad-cb-payee class): the
+        // connected block's coinbase does not pay the MN our queue projects.
+        // The payee set can no longer back a template — serving from it
+        // WOULD emit a coinbase dashd rejects with bad-cb-payee. Fail
+        // CLOSED: wipe the payee set (a desynced queue must not be trusted
+        // for later heights either), drop MN-readiness so get_work() routes
+        // to the dashd fallback, and ask main for an authoritative re-seed
+        // (protx list) when a coin RPC is configured. The wipe also resets
+        // the snapshot fence so the re-seed's as_of re-arms it.
+        if (r.payee_desync) {
+            LOG_WARNING << "[EMB-DASH] MN payee queue DESYNC at h=" << height
+                        << " — wiping payee set, demoting to dashd fallback,"
+                           " requesting authoritative re-seed";
+            m_state.mnstates().load({});
+            m_mn_snapshot_height = 0;
+            m_have_mn = false;
+            // Latch: only an authoritative on_mn_list_update resync may re-arm
+            // MN-readiness. Without this, a stray ProRegTx observed in a later
+            // block would register into the wiped set and republish a 1-MN
+            // "queue" — a guessed payee by another name.
+            m_mn_needs_reseed = true;
+            demote();
+            notify_state_dirty();
+            if (m_on_mn_reseed) m_on_mn_reseed();
+            return r;
+        }
+        m_have_mn = !m_mn_needs_reseed && m_state.mnstates().size() != 0;
         if (!m_have_mn)
             demote();
         else
@@ -336,6 +366,17 @@ public:
     /// (KAT posture) makes every notify_state_dirty() a no-op.
     void set_on_state_dirty(std::function<void()> fn) {
         m_on_state_dirty = std::move(fn);
+    }
+
+    /// Wire the authoritative MN re-seed sink (main_dash points this at the
+    /// E2c `protx list valid true` seed fetch when a coin RPC is configured).
+    /// Invoked from on_block_connected's payee-desync fail-closed path AFTER
+    /// the payee set is wiped and the bundle demoted — the arm stays on the
+    /// dashd fallback until the re-seed lands via on_mn_list_update. Optional:
+    /// unset (KAT posture / pure daemonless) leaves the arm failed closed,
+    /// which is the safe terminal state (never serve a guessed payee).
+    void set_on_mn_reseed(std::function<void()> fn) {
+        m_on_mn_reseed = std::move(fn);
     }
 
     /// Wire a "force a full mnlistdiff re-sync from ZERO" sink (main_dash resets
@@ -392,6 +433,7 @@ private:
 
     NodeCoinState& m_state;
     std::function<void()> m_on_state_dirty;  // SML/bestCL/reorg -> re-issue work
+    std::function<void()> m_on_mn_reseed;    // payee desync -> authoritative protx re-seed
     std::function<void()> m_on_full_resync;  // H-1 heal -> reset sml_base + full re-sync
     std::function<void(const uint256&)> m_on_sml_persist;  // accepted diff -> SMLDb/QuorumDb write
     std::function<void()> m_on_sml_clear;    // reorg/heal -> SMLDb/QuorumDb wipe
@@ -403,6 +445,11 @@ private:
     // Height the last MN-set snapshot was current at (0 = none/unknown);
     // on_block_connected skips re-applying blocks at or below it.
     uint32_t m_mn_snapshot_height{0};
+
+    // Payee-desync latch: set when on_block_connected wiped a desynced payee
+    // queue; only a non-empty on_mn_list_update resync clears it. While set,
+    // MN-readiness must not re-arm off incidental per-block registrations.
+    bool m_mn_needs_reseed{false};
 
     // Last observed tip params, applied on republish().
     uint32_t m_prev_height{0};
