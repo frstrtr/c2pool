@@ -974,7 +974,16 @@ jobs:
       - name: Verify binary
         run: |
           Copy-Item "${env:GITHUB_WORKSPACE}/secp256k1/bin/libsecp256k1-6.dll" build_ci/src/c2pool/Release/
-          build_ci/src/c2pool/Release/c2pool.exe --help 2>&1 | Select-Object -First 3
+          # Run the binary to completion and capture its output BEFORE slicing.
+          # Piping straight into `Select-Object -First 3` closes the pipe after 3
+          # lines while c2pool.exe is still writing its banner, so the next stdout
+          # write hits a broken pipe and the process aborts with a non-zero exit
+          # (a race that flakes red under CI load). Capture-then-slice avoids that,
+          # and we smoke-test on "did it print output", not the binary's own exit code.
+          $out = & "build_ci/src/c2pool/Release/c2pool.exe" --help 2>&1 | Out-String
+          $out -split "`n" | Select-Object -First 3
+          if ([string]::IsNullOrWhiteSpace($out)) { Write-Error "binary produced no output"; exit 1 }
+          exit 0
 
       - name: Package release
         if: startsWith(github.ref, 'refs/tags/v')
