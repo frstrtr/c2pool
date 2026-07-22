@@ -155,6 +155,14 @@ BTCWorkSource::BTCWorkSource(btc::coin::HeaderChain&       chain,
     // validated; only genuinely dead / never-authorized sessions are reclaimed.
     config_.session_idle_timeout_sec   = 1800;
     config_.max_write_queue_depth      = 256;    // drop a stuck-write dead peer
+    // Idle keepalive-notify (cross-coin reuse of DASH's D9 mitigation): rigs on
+    // a high fixed-diff suffix can go multiple minutes between shares, and many
+    // ASIC/proxy clients drop a pool connection that receives no mining.notify
+    // within ~60 s (then retry). Re-notify the CURRENT job (non-clean, so no
+    // ASIC work reset and NO work-generation bump) every 25 s -- comfortably
+    // under any reasonable client watchdog -- so idle BTC sessions stay stable
+    // backups. Transport/liveness only; ZERO wire-byte and consensus change.
+    config_.keepalive_notify_sec       = 25;
 
     LOG_INFO << "[BTC-STRATUM] BTCWorkSource constructed"
              << " (testnet=" << is_testnet_

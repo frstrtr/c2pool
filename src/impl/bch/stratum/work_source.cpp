@@ -103,6 +103,13 @@ BCHWorkSource::BCHWorkSource(bch::coin::HeaderChain&       chain,
     , submit_block_fn_(std::move(submit_fn))
     , config_(std::move(config))
 {
+    // Idle keepalive-notify (cross-coin reuse of DASH's D9 mitigation): many
+    // ASIC/proxy clients drop a pool connection that receives no mining.notify
+    // within ~60 s. Re-notify the CURRENT job (non-clean, so no ASIC work reset
+    // and NO work-generation bump) every 25 s -- comfortably under any
+    // reasonable client watchdog -- so idle BCH sessions stay stable backups.
+    // Transport/liveness only; ZERO wire-byte and consensus change.
+    config_.keepalive_notify_sec = 25;
     LOG_INFO << "[BCH-STRATUM] BCHWorkSource constructed (testnet="
              << (is_testnet_ ? "1" : "0") << ")";
 }
