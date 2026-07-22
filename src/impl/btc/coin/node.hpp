@@ -101,6 +101,29 @@ public:
             m_p2p->enable_mempool_request();
     }
 
+    /// Arm the submitblock RPC BACKUP leg (ARM B of the dual-path broadcaster)
+    /// WITHOUT the getwork side effect init_rpc() carries. connect() runs the
+    /// read-only liveness/softfork probe check() (getblockheader + getblockchaininfo
+    /// + getnetworkinfo, results discarded by c2pool's own template path) but
+    /// never getwork, so an external bitcoind we drive purely for submitblock
+    /// arms cleanly and the embedded/daemonless template path is unperturbed.
+    /// OPT-IN: main_btc calls
+    /// this only when bitcoin.conf creds resolve (rpcpassword stays off the
+    /// process table); otherwise m_rpc stays null, has_rpc()==false, and
+    /// submit_block_hex returns false LOUDLY -- byte-identical to the daemonless
+    /// default. Mirrors main_dgb's NodeRPC arming (the #82 reference). The
+    /// embedded P2P relay (ARM A) remains the always-primary daemonless path.
+    void arm_submit_rpc(const NetService& addr, const std::string& userpass)
+    {
+        m_rpc = std::make_unique<NodeRPC>(m_context, this, m_config->coin()->m_testnet);
+        m_rpc->connect(addr, userpass);
+        LOG_INFO << "[BTC] submitblock RPC backup ARMED: NodeRPC -> "
+                 << addr.to_string() << " (creds from bitcoin.conf)";
+    }
+
+    /// True once arm_submit_rpc has bound the submitblock backup leg.
+    bool has_rpc() const { return m_rpc != nullptr; }
+
     /// Submit a block via P2P directly (faster propagation than RPC).
     void submit_block_p2p(BlockType& block)
     {
