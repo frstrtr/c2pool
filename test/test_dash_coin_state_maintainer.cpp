@@ -305,9 +305,14 @@ TEST(DashCoinStateMaintainer, PayeeDesyncWipesDemotesAndFiresReseed) {
     ASSERT_TRUE(m.live());
 
     // Coinbase pays a DIFFERENT script than the projected MN's payout.
+    // (bind_block: the E2 finding-A body-header bind guard landed after this
+    // KAT was written; an unbound block was silently REFUSED before ever
+    // reaching apply_block, so the desync path was never exercised here —
+    // repaired as part of the E4 contiguity fix.)
     BlockType blk;
     blk.m_txs.push_back(make_spend(raw256(0x90), 0, 500000000, 1));
     blk.m_txs[0].vout[0].scriptPubKey.m_data = p2pkh_script(0x77);  // NOT the MN
+    bind_block(blk);
     auto r = m.on_block_connected(blk, H);
 
     EXPECT_TRUE(r.payee_desync);

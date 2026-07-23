@@ -580,16 +580,26 @@ TEST(DashMnState, PayeeResolutionNeverRollsBackward) {
     MnStateMachine m;
     m.apply_block(b1, 2400050);
 
+    // (contiguity-cursor fix: folds must be sequential — a gapped fold is
+    // now REFUSED outright, which is even stronger no-rollback protection.)
     BlockType bhi;
     bhi.m_txs.push_back(coinbase_tx(std::vector<std::vector<unsigned char>>{payout}));
-    m.apply_block(bhi, 2400060);
-    EXPECT_EQ(m.entries().at(h).nLastPaidHeight, 2400060u);
+    m.apply_block(bhi, 2400051);
+    EXPECT_EQ(m.entries().at(h).nLastPaidHeight, 2400051u);
 
-    // out-of-order lower height must NOT roll lastPaid backwards.
+    // out-of-order lower height must NOT roll lastPaid backwards (the
+    // whole apply is skipped by the forward-only guard).
     BlockType blo;
     blo.m_txs.push_back(coinbase_tx(std::vector<std::vector<unsigned char>>{payout}));
-    m.apply_block(blo, 2400055);
-    EXPECT_EQ(m.entries().at(h).nLastPaidHeight, 2400060u);
+    auto rlo = m.apply_block(blo, 2400050);
+    EXPECT_TRUE(rlo.skipped_out_of_order);
+    EXPECT_EQ(m.entries().at(h).nLastPaidHeight, 2400051u);
+
+    // and a GAPPED higher fold is refused too (never mutate on a
+    // non-contiguous delivery — E4 re-soak contiguity fix).
+    auto rg = m.apply_block(bhi, 2400060);
+    EXPECT_TRUE(rg.gap_detected);
+    EXPECT_EQ(m.entries().at(h).nLastPaidHeight, 2400051u);
 }
 
 // pick_paid_mn / find_expected_payee tiebreak: when two MNs share a payout
