@@ -148,8 +148,8 @@ jobs:
             echo "::endgroup::"
           done
 
-      # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
-      # checkout payload and _temp, keep _actions/_tool/_update. Always runs.
-      - name: Prune runner workspace
-        if: always()
-        uses: ./.github/actions/prune-runner-workspace
+      # NOTE: deliberately NO prune-runner-workspace step here. This job never
+      # runs actions/checkout, so `uses: ./.github/actions/...` cannot resolve
+      # (the local action path does not exist in the workspace) and the step
+      # hard-fails the job. There is also nothing to prune: with no checkout the
+      # workspace holds no build tree. Do not re-add it without a checkout.
