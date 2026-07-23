@@ -48,6 +48,7 @@
 #include <impl/dash/coin/utxo_adapter.hpp>          // dash_txid (subsidy.hpp template dep)
 #include <impl/dash/coin/governance_object.hpp>
 #include <impl/dash/coin/governance_store.hpp>
+#include <impl/dash/coin/govsync_status.hpp>        // R5 completeness determination
 #include <impl/dash/coin/superblock.hpp>
 #include <impl/dash/coin/embedded_gbt.hpp>
 #include <impl/dash/coin/mn_state_machine.hpp>
@@ -773,6 +774,103 @@ TEST(DashSuperblock, CompletenessGateIsRequiredToServe) {
     ASSERT_EQ(e.superblock_payments.size(), 1u);
     EXPECT_EQ(e.superblock_payments[0].script, kScriptYeRZ);
     EXPECT_EQ(e.superblock_payments[0].amount, 500'000'000LL);
+}
+
+// ── 8a. R5: the GovSyncStatus completeness DETERMINATION (production logic) ──
+// Unit-drive the real predicate (dashcore CMasternodeSync governance-phase
+// model): completeness requires peer coverage + a settle floor + quiescence.
+// Every under-covered / not-settled / not-quiesced view is INCOMPLETE.
+TEST(DashSuperblock, GovSyncStatusCompletenessDetermination) {
+    GovSyncStatus s;
+    // min_peers=2, settle=60s, quiesce=30s (the mainnet-ish defaults).
+    s.set_params(/*min_peers=*/2, /*settle=*/60, /*quiesce=*/30);
+
+    const int64_t t0 = 1'700'000'000;
+    // Default (nothing requested) => INCOMPLETE.
+    EXPECT_FALSE(s.is_complete(t0));
+
+    // One peer requested; even long after, one peer can never be complete
+    // (partial-view hazard: a single peer may withhold the winning trigger).
+    s.note_govsync_requested("peerA", t0);
+    EXPECT_FALSE(s.is_complete(t0 + 10'000)) << "single-peer view is never complete";
+
+    // Second distinct peer covered, but the settle floor has not elapsed.
+    s.note_govsync_requested("peerB", t0 + 5);
+    EXPECT_FALSE(s.is_complete(t0 + 30)) << "not settled (60s floor since first req)";
+
+    // Settled, but an object just arrived => not quiesced.
+    s.note_object_arrival(t0 + 61);
+    EXPECT_FALSE(s.is_complete(t0 + 70)) << "recent object arrival re-arms quiescence";
+
+    // Settled AND quiesced (>=30s since last activity) AND >=2 peers => COMPLETE.
+    EXPECT_TRUE(s.is_complete(t0 + 61 + 30));
+
+    // A fresh vote arrival re-opens the sync (mid-stream again) => INCOMPLETE.
+    s.note_vote_arrival(t0 + 200);
+    EXPECT_FALSE(s.is_complete(t0 + 210));
+    EXPECT_TRUE(s.is_complete(t0 + 200 + 30)) << "quiesces again after the vote";
+
+    // reset() (desync / reorg) forces the view back to INCOMPLETE.
+    s.reset();
+    EXPECT_FALSE(s.is_complete(t0 + 100'000));
+    EXPECT_EQ(s.requested_peer_count(), 0u);
+}
+
+// ── 8b. R5: the maintainer's PRODUCTION predicate drives the serve path ──────
+// End-to-end: wire NodeCoinState::set_superblock_sync_complete_fn to the REAL
+// maintainer->gov_sync_complete() (as main_dash does), with an injected clock.
+// A mid-sync governance view REFUSES; only a peer-covered + settled + quiesced
+// view lets the trigger-confident superblock serve.
+TEST(DashSuperblock, MaintainerGovSyncCompleteGatesServe) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+
+    // Injected clock so settle/quiesce windows are deterministic.
+    int64_t now = 1'700'000'000;
+    m.set_now_fn([&now]() { return now; });
+    m.set_gov_sync_params(/*min_peers=*/2, /*settle=*/60, /*quiesce=*/30);
+
+    m.on_mn_list_update(single_mn(p2pkh_script(0x30)));
+    m.on_new_tip(SBH - 1, raw256(0xAB), 0x1e0ffff0u, 1'700'000'000u,
+                 /*addr_ver*/140, /*addr_p2sh*/19, 1'700'000'100u, 0x20000000u);
+    ASSERT_TRUE(m.live());
+
+    // Trigger-confident view + provider + flag, and the PRODUCTION completeness
+    // predicate (not a fake toggle).
+    arm_trigger_confident(m);
+    st.set_is_superblock_fn([](uint32_t h) { return h == SBH; });
+    st.set_superblock_provider([&m](uint32_t h) { return m.superblock_schedule(h); });
+    st.set_require_superblock_provider(true);
+    st.set_superblock_sync_complete_fn([&m]() { return m.gov_sync_complete(); });
+
+    // Nothing synced yet => INCOMPLETE => refuse.
+    EXPECT_FALSE(st.make_embedded_work_inputs().viable())
+        << "no govsync => incomplete => must refuse";
+
+    // One peer only => still incomplete (under-covered).
+    m.note_govsync_requested("peerA");
+    now += 10'000;
+    EXPECT_FALSE(st.make_embedded_work_inputs().viable())
+        << "single-peer govsync is never complete";
+
+    // Second peer, but not yet settled/quiesced.
+    m.note_govsync_requested("peerB");
+    now += 5;
+    EXPECT_FALSE(st.make_embedded_work_inputs().viable())
+        << "two peers but not settled/quiesced => refuse";
+
+    // Settle + quiesce elapse with no new arrivals => COMPLETE => serve.
+    now += 100;
+    auto e = st.make_embedded_work_inputs();
+    ASSERT_TRUE(e.viable()) << "peer-covered + settled + quiesced => serve";
+    ASSERT_EQ(e.superblock_payments.size(), 1u);
+    EXPECT_EQ(e.superblock_payments[0].script, kScriptYeRZ);
+
+    // A late govobject arrival re-opens the sync => refuse again (proves the
+    // reception path re-arms the production predicate).
+    m.on_govobject(hash_of(99), GOVERNANCE_OBJECT_TRIGGER, {});
+    EXPECT_FALSE(st.make_embedded_work_inputs().viable())
+        << "a fresh govobject re-arms quiescence => mid-sync => refuse";
 }
 
 // ── 9. R6: superblock desync cross-check ────────────────────────────────────

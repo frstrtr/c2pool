@@ -297,6 +297,12 @@ public:
     uint64_t peer_services() const { return m_peer_services; }
     uint32_t peer_version() const { return m_peer_version; }
     const std::string& peer_subver() const { return m_peer_subver; }
+    /// Stable identity of the currently-connected peer (addr:port) — the R5
+    /// govsync-completeness tracker keys peer coverage on this. Empty when no
+    /// peer is connected.
+    std::string peer_key() const {
+        return m_peer ? m_peer->get_addr().to_string() : std::string();
+    }
     uint32_t peer_start_height() const { return m_peer_start_height; }
     const std::string& chain_label() const { return m_chain_label; }
     int64_t peer_uptime_sec() const {
