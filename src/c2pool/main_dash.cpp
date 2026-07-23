@@ -1768,6 +1768,22 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // is current AT the tip, same discipline as the SML axis.
         node_coin_state.set_require_fresh_credit_pool(testnet || embedded_mainnet);
 
+        // E4 re-soak fix (bad-cb-payee at 1519827): the projected masternode
+        // payee is only dashd-exact when the payee queue has folded EVERY
+        // block through the tip the template builds on (dashd computes
+        // GetMNPayee(pindexPrev) on the list that connected pindexPrev).
+        // The soak's incident window — seed as-of 1519820, blocks
+        // 1519821/1519822 mined during header sync and never folded — ran
+        // the queue cursor 2 slots behind dashd's; the divergence stayed
+        // invisible inside a shared-payoutAddress group and surfaced as a
+        // served bad-cb-payee exactly at the address-group boundary. Refuse
+        // the embedded arm while the queue lags the tip (same freshness
+        // discipline as the SML hash and the credit-pool seed height); the
+        // MnStateMachine's forward-contiguity guard + the maintainer's gap
+        // fail-closed path (wipe + authoritative protx re-seed) close the
+        // gap itself.
+        node_coin_state.set_require_fresh_mn_payee(testnet || embedded_mainnet);
+
         // H-6: SML/quorum apply and bestCL adoption move ASYNCHRONOUSLY to the
         // header tip. When they advance (catching the SML up to a moved tip, or
         // adopting a fresher ChainLock) the served template changes but no tip

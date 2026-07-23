@@ -135,6 +135,25 @@ public:
         // the NEXT MN of a shared-payoutAddress group — the soak-found
         // bad-cb-payee corruption this guard closes.
         bool skipped_out_of_order{false};
+        // NON-CONTIGUOUS delivery: height > cursor + 1 — one or more blocks
+        // between the cursor (seed as-of height or last applied block) and
+        // this one were NEVER folded. dashd advanced its DIP-3 payment
+        // cursor at each skipped block; ours did not, so from here on the
+        // projected payee is some earlier queue slot than dashd's. Within a
+        // shared-payoutAddress group that divergence is INVISIBLE to the
+        // pass-3 coinbase cross-check (the script still matches) and only
+        // surfaces — as a served bad-cb-payee — when the lagged cursor
+        // crosses an address-group boundary. The WHOLE apply is refused (no
+        // state mutation); the caller must fail closed + re-seed, exactly
+        // like payee_desync.
+        //
+        // SOAK EVIDENCE (E4 re-soak 2026-07-23, binary 7daa4d61): seed
+        // as-of 1519820; blocks 1519821+1519822 mined during header sync
+        // were never folded; folds 1519823..1519826 each marked the wrong
+        // (2-slots-behind) yeRZB-group MN silently; at 1519827 dashd's head
+        // rotated to the yVXDA group while ours was still yeRZB-member
+        // 05b68797... -> bad-cb-payee served for the whole window.
+        bool gap_detected{false};
         // The coinbase does NOT pay the MN this machine projects as the
         // deterministic payee: this state desynced from the network's DMN
         // payment schedule (missed block / corrupted seed / replay). The
@@ -143,11 +162,20 @@ public:
         bool payee_desync{false};
     };
 
-    void load(std::vector<std::pair<uint256, MNState>> entries)
+    /// as_of_height: the chain height this snapshot is CURRENT AT (0 =
+    /// unknown / cold). It seeds the forward-contiguous apply cursor: the
+    /// snapshot's lastPaidHeight set IS the DIP-3 payment queue as dashd
+    /// held it AFTER connecting block as_of_height, so the ONLY block
+    /// apply_block may fold next is as_of_height + 1. Folding a later block
+    /// on top of the seed (the E4 soak's 1519823-on-a-1519820-seed) means
+    /// the skipped blocks' payments were never attributed and the queue
+    /// cursor is stale — apply_block reports gap_detected instead.
+    void load(std::vector<std::pair<uint256, MNState>> entries,
+              uint32_t as_of_height = 0)
     {
         m_entries.clear();
         m_collateral_index.clear();
-        m_last_applied_height = 0;
+        m_last_applied_height = as_of_height;
         for (auto& [h, st] : entries) {
             m_collateral_index[st.collateralOutpoint] = h;
             m_entries.emplace(h, std::move(st));
@@ -505,6 +533,30 @@ public:
         if (m_last_applied_height != 0 && height <= m_last_applied_height) {
             r.skipped_out_of_order = true;
             r.total_after = m_entries.size();
+            return r;
+        }
+
+        // Forward-CONTIGUITY guard (E4 re-soak fix, shared-address cursor
+        // lag): dashcore's BuildNewListFromBlock folds every block in
+        // sequence — the payee mark at height N is computed on the list
+        // that folded N-1. A gap (height > cursor + 1) means dashd
+        // advanced the payment queue at blocks we never saw; folding this
+        // block on the stale queue would attribute its payment to an
+        // earlier queue slot than dashd did. With shared payout addresses
+        // that wrong-specific-MN advance passes the pass-3 script
+        // cross-check (same address) and stays silently wrong until an
+        // address-group boundary — where the arm serves bad-cb-payee.
+        // Refuse the whole apply; the caller fails closed + re-seeds an
+        // authoritative snapshot (never guess across a gap).
+        if (m_last_applied_height != 0
+            && height > m_last_applied_height + 1) {
+            r.gap_detected = true;
+            r.total_after = m_entries.size();
+            LOG_WARNING << "[MNS-SM] PAYEE APPLY GAP: block h=" << height
+                        << " on cursor h=" << m_last_applied_height
+                        << " (" << (height - m_last_applied_height - 1)
+                        << " block(s) never folded) — apply refused"
+                           " (fail closed, re-seed required)";
             return r;
         }
 

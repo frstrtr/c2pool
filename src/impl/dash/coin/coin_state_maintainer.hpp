@@ -84,7 +84,14 @@ public:
         // the queue is trustworthy again from this snapshot forward.
         if (m_have_mn)
             m_mn_needs_reseed = false;
-        m_state.mnstates().load(std::move(mnstates));
+        // as_of_height also seeds the machine's forward-contiguous apply
+        // cursor (E4 re-soak fix): the snapshot IS the payment queue as of
+        // that block, so only as_of+1 may fold next; a later block reports
+        // gap_detected and on_block_connected fails closed instead of
+        // silently advancing a stale queue (blocks mined between the seed
+        // fetch and the first live full-block ingest were the soak's
+        // 2-slot cursor lag -> bad-cb-payee at the address-group boundary).
+        m_state.mnstates().load(std::move(mnstates), as_of_height);
         if (!m_have_mn)
             demote();
         else
@@ -381,8 +388,19 @@ public:
         // to the dashd fallback, and ask main for an authoritative re-seed
         // (protx list) when a coin RPC is configured. The wipe also resets
         // the snapshot fence so the re-seed's as_of re-arms it.
-        if (r.payee_desync) {
-            LOG_WARNING << "[EMB-DASH] MN payee queue DESYNC at h=" << height
+        // PAYEE APPLY GAP (E4 re-soak 2026-07-23, bad-cb-payee at 1519827):
+        // one or more blocks between the seed/cursor and this one were never
+        // folded (mined during header sync / ingest outage). dashd advanced
+        // its payment queue at each of them; ours is now some slots behind,
+        // and within a shared-payoutAddress group the divergence is invisible
+        // to the coinbase cross-check until it surfaces as a served
+        // bad-cb-payee at an address-group boundary. Same fail-closed
+        // treatment as a desync: the queue cannot be trusted — wipe, demote,
+        // re-seed authoritatively (protx list at the current tip).
+        if (r.payee_desync || r.gap_detected) {
+            LOG_WARNING << "[EMB-DASH] MN payee queue "
+                        << (r.gap_detected ? "APPLY GAP" : "DESYNC")
+                        << " at h=" << height
                         << " — wiping payee set, demoting to dashd fallback,"
                            " requesting authoritative re-seed";
             m_state.mnstates().load({});
