@@ -308,6 +308,7 @@ TEST(DashCoinStateMaintainer, PayeeDesyncWipesDemotesAndFiresReseed) {
     BlockType blk;
     blk.m_txs.push_back(make_spend(raw256(0x90), 0, 500000000, 1));
     blk.m_txs[0].vout[0].scriptPubKey.m_data = p2pkh_script(0x77);  // NOT the MN
+    bind_block(blk);
     auto r = m.on_block_connected(blk, H);
 
     EXPECT_TRUE(r.payee_desync);
