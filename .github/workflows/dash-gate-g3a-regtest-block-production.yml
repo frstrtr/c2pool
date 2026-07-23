@@ -111,3 +111,9 @@ jobs:
           DASH_RPC_PASS: ${{ secrets.DASH_RPC_PASS }}
           DASH_RPC_AUTH: ${{ secrets.DASH_RPC_AUTH }}
         run: bash tests/gates/g3a_regtest_block_production.sh
+
+      # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
+      # checkout payload and _temp, keep _actions/_tool/_update. Always runs.
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace

@@ -106,3 +106,9 @@ jobs:
           # unset — the network-free CI arm carries the gate.
           BCH_UPGRADE9_HEIGHT: ${{ secrets.BCH_UPGRADE9_HEIGHT }}
         run: bash tests/gates/bch_g3b_genuine_activation.sh
+
+      # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
+      # checkout payload and _temp, keep _actions/_tool/_update. Always runs.
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace

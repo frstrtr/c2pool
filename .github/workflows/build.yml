@@ -34,6 +34,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check coin test targets vs build.yml --target allowlist
         run: python3 tools/ci/check_test_target_allowlist.py
+
+      # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
+      # checkout payload and _temp, keep _actions/_tool/_update. Always runs.
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace
   # ════════════════════════════════════════════════════════════════════════════
   # Linux (Ubuntu 24.04, GCC 13, Conan)
   # ════════════════════════════════════════════════════════════════════════════
@@ -188,6 +194,12 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with: { name: test-results-linux, path: build_ci/Testing/, retention-days: 7 }
+
+      # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
+      # checkout payload and _temp, keep _actions/_tool/_update. Always runs.
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace
 
   # ════════════════════════════════════════════════════════════════════════════
   # Linux AddressSanitizer + UBSan (informational, not gating yet)
@@ -347,6 +359,12 @@ jobs:
         uses: actions/upload-artifact@v7
         with: { name: test-results-linux-asan, path: build_asan/Testing/, retention-days: 7 }
 
+      # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
+      # checkout payload and _temp, keep _actions/_tool/_update. Always runs.
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace
+
   # ════════════════════════════════════════════════════════════════════════════
   # COIN_BCH leg — Bitcoin Cash (SHA256d standalone parent, V36)
   #
@@ -478,6 +496,12 @@ jobs:
         uses: actions/upload-artifact@v7
         with: { name: test-results-coin-bch, path: build_bch/Testing/, retention-days: 7 }
 
+      # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
+      # checkout payload and _temp, keep _actions/_tool/_update. Always runs.
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace
+
   # ════════════════════════════════════════════════════════════════════════════
   # COIN_BCH AddressSanitizer + UBSan (informational, mirrors linux-asan posture)
   # ════════════════════════════════════════════════════════════════════════════
@@ -607,6 +631,12 @@ jobs:
         uses: actions/upload-artifact@v7
         with: { name: test-results-coin-bch-asan, path: build_bch_asan/Testing/, retention-days: 7 }
 
+      # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
+      # checkout payload and _temp, keep _actions/_tool/_update. Always runs.
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace
+
   # ════════════════════════════════════════════════════════════════════════════
   # Web-static JS verify (typecheck + build + tests + bundle-size gate)
   # Covers web-static/sharechain-explorer/: the Explorer + PPLNS View
@@ -688,6 +718,12 @@ jobs:
           name: visual-diff-out
           path: web-static/sharechain-explorer/tests/visual/out/
           retention-days: 7
+
+      # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
+      # checkout payload and _temp, keep _actions/_tool/_update. Always runs.
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace
 
   # ════════════════════════════════════════════════════════════════════════════
   # c2pool-qt leak-regression harness (Qt hybrid step 14, delta v1 §E.2)
@@ -774,6 +810,12 @@ jobs:
         run: |
           xvfb-run -a --server-args="-screen 0 1280x800x24 +extension GLX +render -noreset" \
             timeout 180 ./build-qt/c2pool-qt_test_embedded_leak
+
+      # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
+      # checkout payload and _temp, keep _actions/_tool/_update. Always runs.
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace
 
   # ════════════════════════════════════════════════════════════════════════════
   # BTC embedded smoke — RETIRED 2026-06-17 (ci-steward/retire-btc-linux).
@@ -1102,6 +1144,12 @@ jobs:
             build_dgb_auxdoge/CMakeFiles/CMakeError.log
           retention-days: 7
           if-no-files-found: ignore
+
+      # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
+      # checkout payload and _temp, keep _actions/_tool/_update. Always runs.
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace
 
   # Releases are built and published manually (not via CI).
   # See installer/ for packaging scripts (DMG, ZIP, Inno Setup).
