@@ -495,6 +495,21 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_quorum_root PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_quorum_root "" AUTO)
 
+    # E1 Phase-L: type-6 quorum-commitment BLS verify KAT. Links dash_bls_verify
+    # (which carries the C2POOL_DASH_BLS define + dashbls include/libs PUBLIC when
+    # the backend was found; a fail-closed stub otherwise). The BuildCommitmentHash
+    # byte-exactness + fail-closed KATs run in EVERY build; the BLS crypto KATs are
+    # #ifdef C2POOL_DASH_BLS-gated in the source and only exercise when linked.
+    add_executable(test_dash_bls_verify test_dash_bls_verify.cpp)
+    target_link_libraries(test_dash_bls_verify PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_bls_verify core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_bls_verify PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_bls_verify "" AUTO)
+
     # DASH masternode state-machine (S7 leaf): vendored ProTx wire
     # (providertx.hpp) + MNState persistence (mn_state_db.hpp) +
     # apply_block RebuildListFromBlock + find_expected_payee / pick_paid_mn
